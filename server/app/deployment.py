@@ -112,26 +112,100 @@ def _capture_ca_directory(value: object) -> Path:
     return path
 
 
-def capture_ca_directory_accessible(path: Path) -> bool:
-    """Whether this process can open the capture-node CA directory or its key.
+_CA_FILES = ("ca-key.pem", "ca-certificate.pem", "issuance-log.jsonl")
 
-    The service account must never be able to (Issue #109): the CA belongs to
-    the static ``serversentinel-ca`` account and only the pairing CLI's CA
-    child opens it. Fail closed: anything except a permission refusal --
-    including a missing directory, which would make the check meaningless --
-    counts as accessible.
+
+def _controlled_by_this_account(info: os.stat_result, uid: int, gids: set[int], *,
+                                allow_sticky: bool) -> bool:
+    """Whether this process's account owns ``info`` or may write to it."""
+    if info.st_uid == uid:
+        return True
+    writable = bool(info.st_mode & 0o002 or (info.st_mode & 0o020 and info.st_gid in gids))
+    if writable and allow_sticky and stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX:
+        # Like ``_administrator_directory``: in a sticky directory others
+        # cannot rename or replace an entry they do not own.
+        return False
+    return writable
+
+
+def capture_ca_path_exposed(path: Path, *, missing_is_exposed: bool = True) -> bool:
+    """Whether this process's account can reach or control the CA directory.
+
+    Run as the service account (launcher, and the pairing CLI after its
+    drop), Issue #109. Exposed when any of these holds, regardless of a
+    current permission refusal (an owner can always ``chmod`` it back):
+
+    * the directory, one of its path components or one of its CA files
+      (``ca-key.pem``, ``ca-certificate.pem``, ``issuance-log.jsonl``) is owned
+      by this account;
+    * this account can write the directory, a CA file, or a path component
+      (an ancestor only counts when it is not sticky), so it could replace
+      what lies below;
+    * a component is a symbolic link or the path is not a directory;
+    * the directory or its key file can be opened.
+
+    A missing component is exposure unless ``missing_is_exposed`` is false
+    (only ``revoke`` uses that, so a lost CA directory never blocks the
+    ledger revocation). Components this account cannot even look at (a
+    parent without search permission) are protected by that parent, which
+    was itself checked first.
     """
+    path = Path(path)
+    if not path.is_absolute():
+        return True
+    uid = os.geteuid()
+    gids = {os.getegid(), *os.getgroups()}
+    current = Path(path.anchor)
+    components = path.parts[1:]
+    for index, part in enumerate(components):
+        current = current / part
+        last = index == len(components) - 1
+        try:
+            info = os.lstat(current)
+        except (FileNotFoundError, NotADirectoryError):
+            return missing_is_exposed
+        except PermissionError:
+            return False
+        except OSError:
+            return True
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return True
+        if _controlled_by_this_account(info, uid, gids, allow_sticky=not last):
+            return True
+    for name in _CA_FILES:
+        try:
+            info = os.lstat(path / name)
+        except (FileNotFoundError, PermissionError):
+            continue
+        except OSError:
+            return True
+        if (not stat.S_ISREG(info.st_mode)
+                or _controlled_by_this_account(info, uid, gids, allow_sticky=False)):
+            return True
     for target, flags in ((path, os.O_RDONLY | os.O_DIRECTORY),
                           (path / "ca-key.pem", os.O_RDONLY | os.O_NONBLOCK)):
         try:
             descriptor = os.open(target, flags | os.O_CLOEXEC | os.O_NOFOLLOW)
         except PermissionError:
             continue
+        except (FileNotFoundError, NotADirectoryError):
+            if missing_is_exposed:
+                return True
+            continue
         except OSError:
             return True
         os.close(descriptor)
         return True
     return False
+
+
+def capture_ca_directory_accessible(path: Path) -> bool:
+    """Launcher check (Issue #109): the service must not reach or control the CA.
+
+    Fail closed: a missing directory counts as exposed too, since the check
+    would otherwise prove nothing. See ``capture_ca_path_exposed``.
+    """
+    return capture_ca_path_exposed(Path(path), missing_is_exposed=True)
 
 
 def _runtime_roots() -> tuple[Path, Path | None]:

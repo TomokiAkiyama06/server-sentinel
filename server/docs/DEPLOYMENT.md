@@ -497,14 +497,33 @@ one, so the service checks it at every start (and in `--check`):
 "capture_ca_directory": "/var/lib/serversentinel-ca"
 ```
 
-The launcher then refuses to start when the service account can open that
-directory or its key file, and also when the path does not exist (the check
-would otherwise prove nothing). It must be an absolute path outside the
+The launcher then refuses to start when the service account can reach or
+control the CA directory, and also when the path does not exist (the check
+would otherwise prove nothing). Control counts even while a permission bit
+currently refuses access: the service account must not own the directory, any
+component of its path, or `ca-key.pem` / `ca-certificate.pem` /
+`issuance-log.jsonl`, and must not be able to write the directory, those files
+or any path component (a sticky ancestor such as `/var/tmp` is tolerated, as
+for the deployment configuration); no component may be a symbolic link. The
+pairing CLI applies the same rule after its drop (`ca_directory_exposed`),
+except that `revoke` treats a missing directory as not exposed. It must be an absolute path outside the
 runtime root and the code trees. Use `null` only on a host that keeps no
 capture-node CA.
 
+**One CA conversation at a time.** The CA child holds the CA directory lock
+from its first answer until it exits, so the issuance-log check and append of
+concurrent commands cannot interleave; a second `approve`, `rotate-listener`
+or `init` started meanwhile is refused `issuer_material_busy` before any
+prompt (a concurrent `revoke` still revokes in the ledger and reports
+`ca_revocation_unrecorded`; rerun it).
+
 **Repeating or recovering `init`.** `init` is idempotent for the same server
-name and never removes or replaces CA material. If the CA already exists --
+name and never removes or replaces CA material. The listener files are first
+written under staged `*.init` names and then installed with the key last, so
+a run interrupted while writing them leaves either the complete credential or
+an incomplete set without `main-server-key.pem`; the next `init` removes only
+that incomplete set (and any `*.init` name) and writes it again. A directory
+with `main-server-key.pem` is never cleaned. If the CA already exists --
 for example the CA side committed but its reply was lost, so the listener
 side removed its files -- a rerun with an empty listener directory keeps the
 CA and issues only a new listener certificate for the server name the CA log

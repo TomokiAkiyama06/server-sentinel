@@ -305,28 +305,75 @@ class IssuerTests(Harness):
         first = self.issuer()
         first.handle({"op": "hello"})
         self.assertEqual("ok", self.sign(first, node, csr, digest)["status"])
+        first.close()
         # A retry for the same node and key is allowed (#139 expired re-pair).
         retry = self.issuer()
         retry.handle({"op": "hello"})
         self.assertEqual("ok", self.sign(retry, node, csr, digest)["status"])
+        retry.close()
         # The same key for another node is refused by the CA log alone.
         other = self.issuer()
         other.handle({"op": "hello"})
         reply = self.sign(other, uuid4(), csr, digest)
+        other.close()
         self.assertEqual(("refused", "issuer_refused_request"), (reply["status"], reply["reason"]))
         revoke = self.issuer()
         revoke.handle({"op": "hello"})
         self.assertEqual("ok", revoke.handle({"op": "revoke", "node_id": str(node)})["status"])
+        revoke.close()
         # After the CA-side revocation neither the node nor its key is signed.
         _key2, csr2, digest2 = node_request()
         for target, request, key_digest in ((node, csr2, digest2), (node, csr, digest)):
             later = self.issuer()
             later.handle({"op": "hello"})
             reply = self.sign(later, target, request, key_digest)
+            later.close()
             self.assertEqual(("refused", "issuer_refused_request"),
                              (reply["status"], reply["reason"]))
         self.assertEqual(["node", "node", "node_revocation"],
                          [record["type"] for record in self.log_records()])
+
+    def test_the_ca_lock_spans_hello_through_the_logged_operation(self):
+        # Codex P2 (PR #177, round 3): two runs approving the same key for
+        # different nodes -- exactly one is signed.
+        _key, csr, digest = node_request()
+        first, second = self.issuer(), self.issuer()
+        self.assertEqual("ok", first.handle({"op": "hello"})["status"])
+        busy = second.handle({"op": "hello"})
+        self.assertEqual(("refused", "issuer_material_busy"), (busy["status"], busy["reason"]))
+        self.assertEqual("ok", self.sign(first, uuid4(), csr, digest)["status"])
+        first.close()
+        second.close()
+        late = self.issuer()
+        late.handle({"op": "hello"})
+        reply = self.sign(late, uuid4(), csr, digest)
+        late.close()
+        self.assertEqual(("refused", "issuer_refused_request"), (reply["status"], reply["reason"]))
+        self.assertEqual(1, len([r for r in self.log_records() if r["type"] == "node"]))
+
+    def test_concurrent_approvals_of_one_key_sign_exactly_once(self):
+        import threading
+        _key, csr, digest = node_request()
+        barrier = threading.Barrier(2)
+        results = []
+
+        def run():
+            issuer = self.issuer()
+            try:
+                barrier.wait(5)
+                reply = issuer.handle({"op": "hello"})
+                if reply["status"] == "ok":
+                    reply = self.sign(issuer, uuid4(), csr, digest)
+                results.append(reply)
+            finally:
+                issuer.close()
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(1, sum(1 for reply in results if reply["status"] == "ok"), results)
+        self.assertEqual(1, len([r for r in self.log_records() if r["type"] == "node"]))
 
     def test_unwritable_log_means_no_certificate(self):
         issuer = self.issuer()
@@ -569,7 +616,7 @@ class ApproveOrderingTests(Harness):
         self.assertTrue(all(instance.closed for instance in issuer_fakes.InProcessIssuer.instances))
 
     def test_an_open_ca_directory_after_the_drop_aborts(self):
-        def exposed(path):
+        def exposed(path, **options):
             raise PrivilegeSeparationError("ca_directory_exposed")
         self.privileges.require_ca_directory_closed = exposed
         status, _stdout, stderr, _served = self.run_approve(Terminal(self.events))
@@ -748,7 +795,10 @@ print(json.dumps({"fds": fds, "new_session": session, "reaped": reaped,
         self.assertTrue(outcome["new_session"], "the child has no controlling terminal")
         self.assertTrue(outcome["reaped"])
         for target in outcome["fds"]:
-            self.assertTrue(target == "/dev/null" or target.startswith("pipe:"), outcome["fds"])
+            # Pipes, /dev/null and the CA directory itself (its flock, held for
+            # the whole conversation; Issue #109 round 3).
+            self.assertTrue(target == "/dev/null" or target.startswith("pipe:")
+                            or target == str(self.authority_dir), outcome["fds"])
         self.assertEqual(3, outcome["fds"].count("/dev/null"))
         self.assertEqual(["node_revocation"], [record["type"] for record in self.log_records()])
 
@@ -789,14 +839,9 @@ class PrivilegeTests(unittest.TestCase):
             root = Path(temporary)
             self.assertTrue(capture_ca_directory_accessible(root))
             self.assertTrue(capture_ca_directory_accessible(root / "missing"))
-            closed = root / "closed"
-            closed.mkdir(mode=0o700)
-            os.chmod(closed, 0)
-            try:
-                if os.geteuid() != 0:
-                    self.assertFalse(capture_ca_directory_accessible(closed))
-            finally:
-                os.chmod(closed, 0o700)
+            self.assertTrue(capture_ca_directory_accessible(
+                Path("/") / f"serversentinel-test-missing-{uuid4()}"))
+            self.assertTrue(capture_ca_directory_accessible(Path("relative")))
 
 
 class ServiceStartTests(unittest.TestCase):
@@ -838,7 +883,10 @@ class RevokeWithoutCaTests(RevokeTests):
 
     def test_missing_ca_directory_still_revokes_in_the_ledger(self):
         self.use_real_probe()
-        for missing in (self.root / "lost-ca", self.root / "lost-parent" / "ca"):
+        # Under a root-owned, non-writable ancestor: the test account controls
+        # no component, so only "missing" decides.
+        lost = Path("/") / f"serversentinel-test-missing-{uuid4()}"
+        for missing in (lost, lost / "ca"):
             with self.subTest(missing=missing.name):
                 status, stdout, stderr = self.revoke(missing)
                 self.assertEqual(1, status, stderr)
@@ -847,7 +895,7 @@ class RevokeWithoutCaTests(RevokeTests):
                 self.assertIn("warning: ca_revocation_unrecorded", stderr)
                 self.assertEqual("revoked", self.states()[self.node])
         # Idempotent rerun once the CA directory is back.
-        self.privileges.require_ca_directory_closed = lambda path: None
+        self.privileges.require_ca_directory_closed = lambda path, **options: None
         status, _stdout, stderr = self.revoke(self.authority_dir)
         self.assertEqual(0, status, stderr)
         self.assertEqual(["node_revocation"], [record["type"] for record in self.log_records()])
@@ -863,25 +911,92 @@ class RevokeWithoutCaTests(RevokeTests):
         self.assertEqual([], self.log_records())
 
     def test_exposure_probe_distinguishes_missing_from_reachable(self):
-        self.assertFalse(issuer_process.ca_directory_exposed(self.root / "missing"))
-        self.assertFalse(issuer_process.ca_directory_exposed(self.root / "missing" / "ca"))
+        lost = Path("/") / f"serversentinel-test-missing-{uuid4()}"
+        # Missing is not exposure only for revoke (missing_ok).
+        self.assertFalse(issuer_process.ca_directory_exposed(lost, missing_ok=True))
+        self.assertFalse(issuer_process.ca_directory_exposed(lost / "ca", missing_ok=True))
+        self.assertTrue(issuer_process.ca_directory_exposed(lost))
+        # A missing directory under a parent this account controls is exposed:
+        # the account could create it.
+        self.assertTrue(issuer_process.ca_directory_exposed(self.root / "missing",
+                                                            missing_ok=True))
         self.assertTrue(issuer_process.ca_directory_exposed(self.authority_dir))
         link = self.root / "linked-ca"
         link.symlink_to(self.authority_dir)
         self.assertTrue(issuer_process.ca_directory_exposed(link))
         afile = self.root / "a-file"
         afile.write_text("x")
-        # A file where a parent directory should be: nothing to expose.
-        self.assertFalse(issuer_process.ca_directory_exposed(afile / "ca"))
-        closed = self.root / "closed"
-        closed.mkdir(mode=0o700)
-        os.chmod(closed, 0)
+        self.assertTrue(issuer_process.ca_directory_exposed(afile / "ca", missing_ok=True))
+
+
+class ControlledCaPathTests(unittest.TestCase):
+    """Codex P1 (PR #177, round 3): a CA path the service controls is exposed."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="capture-control-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(os.path.realpath(temporary.name))
+
+    def probes(self, path):
+        return (capture_ca_directory_accessible(path),
+                issuer_process.ca_directory_exposed(path),
+                issuer_process.ca_directory_exposed(path, missing_ok=True))
+
+    def test_service_owned_directory_with_mode_000_is_exposed(self):
+        # Chowned to the service by mistake: EACCES now, but the owner can
+        # chmod it back and read its key.
+        ca = self.root / "ca"
+        ca.mkdir(mode=0o700)
+        (ca / "ca-key.pem").write_text("synthetic")
+        os.chmod(ca / "ca-key.pem", 0o600)
+        os.chmod(ca, 0)
         try:
-            if os.geteuid() != 0:
-                self.assertFalse(issuer_process.ca_directory_exposed(closed))
-                self.assertFalse(issuer_process.ca_directory_exposed(closed / "ca"))
+            self.assertEqual((True, True, True), self.probes(ca))
+            with self.assertRaises(PrivilegeSeparationError) as raised:
+                OsPrivileges().require_ca_directory_closed(ca, missing_ok=True)
+            self.assertEqual("ca_directory_exposed", raised.exception.reason)
         finally:
-            os.chmod(closed, 0o700)
+            os.chmod(ca, 0o700)
+
+    def as_other_account(self):
+        # This process stands for a service account that owns none of the
+        # paths (it cannot chown as non-root): only write access decides.
+        uid = os.geteuid() + 4242
+        return (patch("app.deployment.os.geteuid", return_value=uid),
+                patch("app.deployment.os.getegid", return_value=uid),
+                patch("app.deployment.os.getgroups", return_value=[]))
+
+    def test_service_writable_parent_is_exposed_even_when_access_is_denied(self):
+        parent = self.root / "shared"
+        parent.mkdir()
+        os.chmod(parent, 0o777)  # writable by the service, not sticky
+        ca = parent / "ca"
+        ca.mkdir(mode=0o700)
+        os.chmod(ca, 0)
+        first, second, third = self.as_other_account()
+        try:
+            with first, second, third:
+                self.assertEqual((True, True, True), self.probes(ca))
+                # A sticky ancestor (like /tmp) cannot have its entries
+                # replaced: with nothing else controlled, the closed CA is
+                # not exposed (as root the open itself would succeed).
+                os.chmod(parent, 0o1777)
+                if os.getuid() != 0:
+                    self.assertEqual((False, False, False), self.probes(ca))
+        finally:
+            os.chmod(ca, 0o700)
+
+    def test_service_writable_ca_file_is_exposed(self):
+        ca = self.root / "ca"
+        ca.mkdir(mode=0o755)
+        (ca / "issuance-log.jsonl").write_text("{}\n")
+        os.chmod(ca / "issuance-log.jsonl", 0o666)
+        first, second, third = self.as_other_account()
+        with first, second, third:
+            self.assertTrue(capture_ca_directory_accessible(ca))
+            os.chmod(ca / "issuance-log.jsonl", 0o600)
+            # Still exposed: the directory itself can be opened.
+            self.assertTrue(capture_ca_directory_accessible(ca))
 
 
 class InitRecoveryTests(unittest.TestCase):
@@ -974,6 +1089,106 @@ class InitRecoveryTests(unittest.TestCase):
         self.assertIn("refused: listener_authority_mismatch", stderr)
         self.assertEqual(before, {name: (foreign / name).read_bytes()
                                   for name in os.listdir(foreign)})
+
+
+class InterruptedListenerWriteTests(InitRecoveryTests):
+    """Codex P2 (PR #177, round 3): any partial listener write is redone; a
+    complete credential is never removed."""
+
+    def complete_files(self):
+        self.assertEqual(0, self.init()[0])
+        return {name: (self.listener / name).read_bytes() for name in
+                ("deployment-ca-certificate.pem", "main-server-certificate.pem",
+                 "main-server-key.pem")}
+
+    def build(self, files, entries):
+        self.listener = self.root / f"listener-{uuid4()}"
+        directory = PrivateDirectory(self.listener).ensure()
+        for entry in entries:
+            if " = " in entry:  # second name on the same inode
+                staged, final = entry.split(" = ")
+                os.link(self.listener / final, self.listener / staged)
+                continue
+            final = entry[:-len(".init")] if entry.endswith(".init") else entry
+            directory.write_new(entry, files[final])
+
+    def test_every_incomplete_subset_is_cleaned_and_redone(self):
+        files = self.complete_files()
+        kept = self.ca_state()
+        cases = (
+            ["deployment-ca-certificate.pem.init"],
+            ["deployment-ca-certificate.pem.init", "main-server-certificate.pem.init"],
+            ["deployment-ca-certificate.pem.init", "main-server-certificate.pem.init",
+             "main-server-key.pem.init"],
+            ["deployment-ca-certificate.pem", "main-server-certificate.pem.init",
+             "main-server-key.pem.init"],
+            ["deployment-ca-certificate.pem"],
+            ["deployment-ca-certificate.pem", "main-server-certificate.pem"],
+            ["deployment-ca-certificate.pem", "main-server-certificate.pem",
+             "main-server-key.pem.init"],
+            ["deployment-ca-certificate.pem", "main-server-certificate.pem",
+             "main-server-certificate.pem.init = main-server-certificate.pem",
+             "main-server-key.pem.init"],
+            ["main-server-certificate.pem"],
+        )
+        for entries in cases:
+            with self.subTest(entries=entries):
+                self.build(files, entries)
+                status, stdout, stderr = self.init()
+                self.assertEqual(0, status, stderr)
+                self.assertIn("removed an incomplete listener credential", stderr)
+                self.assertIn("init recovered", stderr)
+                self.assertEqual(sorted(files), sorted(os.listdir(self.listener)))
+                trust = DeploymentTrust.load_public(PrivateDirectory(self.listener))
+                trust.issued_listener_certificate(PrivateDirectory(self.listener))
+                self.assertEqual(kept, self.ca_state())
+
+    def test_a_complete_credential_is_never_removed(self):
+        files = self.complete_files()
+        for extra in ([], ["main-server-key.pem.init = main-server-key.pem"]):
+            with self.subTest(extra=extra):
+                self.build(files, sorted(files) + extra)
+                status, stdout, stderr = self.init()
+                self.assertEqual(0, status, stderr)
+                self.assertIn("init already complete", stderr)
+                self.assertEqual(files, {name: (self.listener / name).read_bytes()
+                                         for name in os.listdir(self.listener)})
+
+    def test_writer_stops_at_every_step_and_the_rerun_completes(self):
+        # A real interruption of write_listener_credential after each staged
+        # write and each install (no rollback runs, as after a crash).
+        steps = []
+        real_write, real_install = PrivateDirectory.write_new, PrivateDirectory.install_new
+
+        class Stop(BaseException):
+            pass
+
+        def stop_after(limit):
+            def counting(function):
+                def wrapper(directory, *args):
+                    result = function(directory, *args)
+                    if directory.path == self.listener and args[0].startswith(("main-", "deployment-")):
+                        steps.append(args)
+                        if len(steps) == limit:
+                            raise Stop()
+                    return result
+                return wrapper
+            return counting
+        for limit in range(1, 6):
+            with self.subTest(limit=limit):
+                steps.clear()
+                self.authority = self.root / f"ca-{limit}"
+                self.listener = self.root / f"listener-{limit}"
+                counting = stop_after(limit)
+                with patch.object(PrivateDirectory, "write_new", counting(real_write)), \
+                        patch.object(PrivateDirectory, "install_new", counting(real_install)), \
+                        patch.object(PrivateDirectory, "discard_created", lambda *args: None), \
+                        self.assertRaises(Stop):
+                    self.init()
+                status, _stdout, stderr = self.init()
+                self.assertEqual(0, status, stderr)
+                trust = DeploymentTrust.load_public(PrivateDirectory(self.listener))
+                trust.issued_listener_certificate(PrivateDirectory(self.listener))
 
 
 class PublicCopyValidationTests(Harness):

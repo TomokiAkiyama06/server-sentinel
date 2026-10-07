@@ -395,8 +395,11 @@ class ConcurrentInitTests(ListenerLifecycleHarness):
         foreign = b"another process's key"
 
         def racing_write(directory, name, value):
-            if name == "main-server-key.pem":
-                descriptor = os.open(listener / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            # The key is staged under ``*.init`` and installed last without
+            # ever overwriting (Issue #109): the racer takes the final name.
+            if name == "main-server-key.pem.init":
+                descriptor = os.open(listener / "main-server-key.pem",
+                                     os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(descriptor, "wb") as stream:
                     stream.write(foreign)
             return real_write(directory, name, value)

@@ -41,7 +41,7 @@ class SameAccountPrivileges:
     def harden_child(self) -> None:
         self.events.append("harden")
 
-    def require_ca_directory_closed(self, path: Path) -> None:
+    def require_ca_directory_closed(self, path: Path, *, missing_ok: bool = False) -> None:
         self.events.append("ca_closed")
 
 

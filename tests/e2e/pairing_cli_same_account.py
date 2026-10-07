@@ -34,7 +34,7 @@ class SameAccountPrivileges:
     def harden_child(self) -> None:
         pass
 
-    def require_ca_directory_closed(self, path: Path) -> None:
+    def require_ca_directory_closed(self, path: Path, *, missing_ok: bool = False) -> None:
         pass
 
 

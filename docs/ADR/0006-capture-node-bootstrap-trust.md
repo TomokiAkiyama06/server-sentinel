@@ -586,7 +586,11 @@ unchanged.
   copy is published only after the listener certificate verified. Known
   limitation: the issuance log has no hash chain (deferred by the Owner);
   only the CA account or root can modify it. The `serversentinel-pairing`
-  wrapper is #180.
+  wrapper is #180. Round 3: a CA path the service account controls (owns, or
+  can write, for the directory, its CA files or a non-sticky path
+  component) is exposed even while access is denied; the CA directory lock
+  spans each whole CA conversation; listener files are staged and installed
+  key-last so an interrupted `init` is recognized and redone.
 - **Still open (PR2).** Automatic renewal still has only an in-process
   signing primitive, used by tests and called by nothing in the application;
   wiring renewal into the ingest listener waits for the socket-activated,

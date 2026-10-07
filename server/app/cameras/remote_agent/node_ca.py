@@ -602,6 +602,34 @@ class PrivateDirectory:
         finally:
             os.close(directory)
 
+    def install_new(self, staged: str, name: str) -> None:
+        """Give the staged file ``staged`` its final ``name``; never replace an entry.
+
+        ``link`` + ``unlink`` instead of ``rename``, so an existing ``name``
+        (for example another process's file) is refused rather than
+        overwritten. A stop between the two leaves both names on one inode;
+        the next ``init`` removes the staged name (Issue #109).
+        """
+        directory = self._open_directory()
+        try:
+            try:
+                os.link(staged, name, src_dir_fd=directory, dst_dir_fd=directory,
+                        follow_symlinks=False)
+            except FileExistsError:
+                raise CaptureAuthorityError("issuer material already exists") from None
+            except OSError:
+                raise CaptureAuthorityError("issuer material could not be written") from None
+            created = self._created.pop(staged, None)
+            if created is not None:
+                self._created[name] = created
+            try:
+                os.unlink(staged, dir_fd=directory)
+                os.fsync(directory)
+            except OSError:
+                raise CaptureAuthorityError("issuer material could not be written") from None
+        finally:
+            os.close(directory)
+
     def replace_with(self, staged: str, name: str) -> None:
         """Atomically rename ``staged`` over ``name``; call under ``locked()``."""
         directory = self._open_directory()
@@ -1250,25 +1278,68 @@ def require_empty_listener_directory(listener: PrivateDirectory) -> None:
         raise CaptureAuthorityError("listener material already exists")
 
 
+# Staged names used only while a new listener credential is written (init).
+_INIT_SUFFIX = ".init"
+# Final names in install order: the key comes last, so a present final key
+# always means the whole credential was installed (Issue #109).
+_INSTALL_ORDER = (_PUBLIC_CA_CERTIFICATE, _SERVER_CERTIFICATE, _SERVER_KEY)
+
+
 def write_listener_credential(target: PrivateDirectory, key, certificate_pem: bytes,
                               ca_certificate_pem: bytes) -> MainServerCredential:
     """Write a new listener key, certificate and public CA copy, or none of them.
 
     Runs as the listener account (Issue #109), so every file is created owned
-    by it and no ownership change is needed.
+    by it and no ownership change is needed. All files are first written and
+    fsynced under staged ``*.init`` names, then installed (``install_new``,
+    never overwriting) in ``_INSTALL_ORDER`` with the key last. A stop at any
+    point therefore leaves either a complete credential (the final key exists)
+    or an incomplete one without a final key, which
+    ``clear_interrupted_listener_write`` removes before the next ``init``.
     """
+    require_matching_public_certificate(target, ca_certificate_pem)
+    content = {_PUBLIC_CA_CERTIFICATE: ca_certificate_pem,
+               _SERVER_CERTIFICATE: certificate_pem, _SERVER_KEY: _private_pem(key)}
+    names = [name for name in _INSTALL_ORDER
+             if not (name == _PUBLIC_CA_CERTIFICATE and target.exists(name))]
     try:
-        key_path = target.write_new(_SERVER_KEY, _private_pem(key))
-        certificate_path = target.write_new(_SERVER_CERTIFICATE, certificate_pem)
-        publish_public_certificate(target, ca_certificate_pem)
+        for name in names:
+            target.write_new(name + _INIT_SUFFIX, content[name])
+        for name in names:
+            target.install_new(name + _INIT_SUFFIX, name)
     except BaseException:
-        for name in _LISTENER_NAMES:
-            try:
-                target.discard_created(name)
-            except CaptureAuthorityError:
-                pass
+        for name in names:
+            for candidate in (name + _INIT_SUFFIX, name):
+                try:
+                    target.discard_created(candidate)
+                except CaptureAuthorityError:
+                    pass
         raise
-    return MainServerCredential(certificate_path=certificate_path, key_path=key_path)
+    return MainServerCredential(certificate_path=target.path / _SERVER_CERTIFICATE,
+                                key_path=target.path / _SERVER_KEY)
+
+
+def clear_interrupted_listener_write(target: PrivateDirectory) -> list[str]:
+    """Remove what an interrupted listener write left; return the removed names.
+
+    Staged ``*.init`` names exist only while ``write_listener_credential``
+    runs, so they are always leftovers. Without the final key -- installed
+    last -- no complete credential exists, so a final certificate or public
+    CA copy is a leftover too. A directory with the final key is never
+    touched here (a complete credential is never removed). Call under the
+    listener directory lock.
+    """
+    removed = []
+    for name in _INSTALL_ORDER:
+        if target.exists(name + _INIT_SUFFIX):
+            target.discard_stale(name + _INIT_SUFFIX)
+            removed.append(name + _INIT_SUFFIX)
+    if not target.exists(_SERVER_KEY):
+        for name in (_SERVER_CERTIFICATE, _PUBLIC_CA_CERTIFICATE):
+            if target.exists(name):
+                target.discard_stale(name)
+                removed.append(name)
+    return removed
 
 
 def require_matching_public_certificate(target: PrivateDirectory,

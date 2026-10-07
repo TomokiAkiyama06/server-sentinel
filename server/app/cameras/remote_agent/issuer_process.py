@@ -147,7 +147,7 @@ class Privileges(Protocol):
     def harden_child(self) -> None:
         ...
 
-    def require_ca_directory_closed(self, path: Path) -> None:
+    def require_ca_directory_closed(self, path: Path, *, missing_ok: bool = False) -> None:
         ...
 
 
@@ -195,15 +195,15 @@ class OsPrivileges:
         if os.getppid() != parent:
             raise PrivilegeSeparationError("privilege_drop_failed")
 
-    def require_ca_directory_closed(self, path: Path) -> None:
-        """After the drop the service account must not be able to open the CA directory.
+    def require_ca_directory_closed(self, path: Path, *, missing_ok: bool = False) -> None:
+        """After the drop the service account must not reach or control the CA directory.
 
-        A CA directory that does not exist (as seen by this unprivileged
-        process) holds no CA material to expose, so it is not refused here:
-        ``revoke`` must still revoke in the ledger when the CA directory was
-        lost (the CA child then reports it unavailable on its own).
+        ``missing_ok`` is used only by ``revoke``: a CA directory that does not
+        exist holds no CA material to expose, and the ledger revocation must
+        still happen when it was lost (the CA child then reports it
+        unavailable on its own).
         """
-        if ca_directory_exposed(path):
+        if ca_directory_exposed(path, missing_ok=missing_ok):
             raise PrivilegeSeparationError("ca_directory_exposed")
 
 
@@ -231,30 +231,17 @@ def ca_directory_accessible(path: Path) -> bool:
     return capture_ca_directory_accessible(Path(path))
 
 
-def ca_directory_exposed(path: Path) -> bool:
-    """Whether CA material at ``path`` is reachable by this (dropped) process.
+def ca_directory_exposed(path: Path, *, missing_ok: bool = False) -> bool:
+    """Whether the dropped process can reach or control the CA directory.
 
-    Unlike the launcher's ``ca_directory_accessible``, a missing directory is
-    not exposure: ``ENOENT``/``ENOTDIR`` -- the path or one of its parents
-    does not exist, which this process can only learn because it may search
-    every existing parent -- means there is nothing there to read. A
-    permission refusal is closed. Anything else (an openable directory or key,
-    a symbolic link, any other error) counts as exposed (fail closed).
+    The same ownership, write-access and open checks as the launcher
+    (``app.deployment.capture_ca_path_exposed``): a path this account owns or
+    can write is exposed even while a permission bit currently refuses it.
+    ``missing_ok`` (``revoke`` only) treats a missing directory as not
+    exposed, so a lost CA directory never blocks the ledger revocation.
     """
-    import errno
-    for target, flags in ((Path(path), os.O_RDONLY | os.O_DIRECTORY),
-                          (Path(path) / _CA_KEY, os.O_RDONLY | os.O_NONBLOCK)):
-        try:
-            descriptor = os.open(target, flags | os.O_CLOEXEC | os.O_NOFOLLOW)
-        except PermissionError:
-            continue
-        except OSError as error:
-            if error.errno in (errno.ENOENT, errno.ENOTDIR):
-                continue
-            return True
-        os.close(descriptor)
-        return True
-    return False
+    from app.deployment import capture_ca_path_exposed
+    return capture_ca_path_exposed(Path(path), missing_is_exposed=not missing_ok)
 
 
 # ---------------------------------------------------------------------------
@@ -438,8 +425,9 @@ def _digest(value: object) -> str:
 class CaIssuer:
     """The CA child's request handler; holds the CA key, decides from its own log.
 
-    ``hello`` loads and validates the CA (key and certificate) and returns
-    only the public certificate. Afterwards exactly one of ``sign_node``,
+    ``hello`` takes the CA directory lock (held until ``close``, as is the
+    lock ``initialize`` takes), loads and validates the CA (key and
+    certificate) and returns only the public certificate. Afterwards exactly one of ``sign_node``,
     ``sign_listener`` or ``revoke`` is accepted, then the issuer is done.
     ``initialize`` (only as the first request) creates the CA and signs the
     first listener leaf; the CA files stay provisional until ``commit``, and
@@ -490,6 +478,11 @@ class CaIssuer:
     def _hello(self) -> dict:
         if self._authority is not None:
             raise IssuerRefusedRequest("issuer request is invalid")
+        # Hold the CA directory lock from here until the conversation ends
+        # (``close``): the log's eligibility check and its append are then
+        # one serialized decision across concurrent CLI runs (a second run is
+        # refused ``issuer_material_busy`` instead of racing).
+        self._resources.enter_context(self._directory.locked())
         deployment = deployment_id_of(self._directory)
         self._authority = DeploymentAuthority.load(self._directory, deployment, clock=self._clock)
         # A damaged log is reported now, before any Owner prompt.

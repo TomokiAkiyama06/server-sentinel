@@ -118,7 +118,7 @@ from .node_ca import (
     PrivateDirectory, _certificate_pem, listener_material, main_server_name,
     main_server_not_after, new_listener_key, public_key_digest, publish_public_certificate,
     complete_listener_credential,
-    require_empty_listener_directory, rotate_listener_credential, valid_server_name,
+    clear_interrupted_listener_write, rotate_listener_credential, valid_server_name,
     write_listener_credential,
 )
 from .pairing import HmacCodeVerifier, PairingError, PairingLedger
@@ -271,10 +271,15 @@ class _Separation:
                 CaptureAuthorityError):
             raise CliRefused("issuer_unavailable") from None
 
-    def drop(self) -> None:
-        """Become the service account for good; abort unless fully unprivileged."""
+    def drop(self, *, missing_ca_ok: bool = False) -> None:
+        """Become the service account for good; abort unless fully unprivileged.
+
+        ``missing_ca_ok`` is for ``revoke`` only: a lost CA directory must not
+        block the ledger revocation.
+        """
         self.privileges.drop(self.service)
-        self.privileges.require_ca_directory_closed(self.authority_path)
+        self.privileges.require_ca_directory_closed(self.authority_path,
+                                                    missing_ok=missing_ca_ok)
 
 
 @contextmanager
@@ -692,7 +697,15 @@ def command_init(args) -> int:
         with listener.locked():
             if listener.exists("ca-key.pem") or listener.exists("ca-certificate.pem"):
                 raise CaptureAuthorityError("listener material must not share the CA directory")
-            if any(listener.exists(name) for name in _LISTENER_FILES):
+            # An interrupted listener write (Issue #109) leaves staged names
+            # or, without the final key that is installed last, an
+            # incomplete subset: remove exactly that and redo it. A
+            # directory with the final key is never touched here.
+            removed = clear_interrupted_listener_write(listener)
+            if removed:
+                print("serversentinel-pairing: init removed an incomplete listener credential "
+                      "left by an interrupted run", file=sys.stderr)
+            if listener.exists("main-server-key.pem"):
                 # Only an already completed init of this CA and name is accepted.
                 trust = separation.hello()
                 certificate = complete_listener_credential(trust, listener,
@@ -704,15 +717,10 @@ def command_init(args) -> int:
                 print(f"deployment_id={trust.deployment_id}")
                 _report_trust_expiry(trust, listener_not_after=certificate.not_valid_after_utc)
                 return 0
-            require_empty_listener_directory(listener)
             trust, certificate = _initialize_listener(separation, listener, args, deployment)
     print(f"deployment_id={trust.deployment_id}")
     _report_trust_expiry(trust, listener_not_after=certificate.not_valid_after_utc)
     return 0
-
-
-_LISTENER_FILES = ("main-server-key.pem", "main-server-certificate.pem",
-                   "deployment-ca-certificate.pem")
 
 
 def _initialize_listener(separation: "_Separation", listener: PrivateDirectory, args,
@@ -1000,7 +1008,7 @@ def command_revoke(args) -> int:
                 issuer_ready = True
             except (CliRefused, CaptureAuthorityError):
                 issuer_ready = False
-            separation.drop()
+            separation.drop(missing_ca_ok=True)
             with _ledger(args.database) as ledger:
                 owner = LocalConsoleOwner()
                 grant = owner.confirm(terminal,

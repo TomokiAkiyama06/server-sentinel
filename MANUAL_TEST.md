@@ -727,6 +727,9 @@ wrapper is #180). `AGENT_CLI` means
        `ls <ca_dir>` both fail with `Permission denied` (`EACCES`); as
        `serversentinel-ca` they work. Add `"capture_ca_directory": "<ca_dir>"`
        to the deployment configuration and confirm `--check` passes; then
+       temporarily `chown <service account> <ca_dir>` with `chmod 000
+       <ca_dir>` and confirm `--check` still fails (control, not current
+       access, decides; restore owner and mode); likewise
        temporarily `chmod 0755 <ca_dir>` and confirm `--check` fails
        (`ServerSentinel deployment validation failed`) and the service does not
        start; restore `0700`.

@@ -506,7 +506,7 @@ class PairingCliTests(EnrollmentHarness):
         real_write = PrivateDirectory.write_new
 
         def failing_write(directory, name, value):
-            if name == "main-server-certificate.pem":
+            if name == "main-server-certificate.pem.init":  # staged write (Issue #109)
                 raise pairing_cli.CaptureAuthorityError("issuer material could not be written")
             return real_write(directory, name, value)
         with patch.object(PrivateDirectory, "write_new", failing_write):

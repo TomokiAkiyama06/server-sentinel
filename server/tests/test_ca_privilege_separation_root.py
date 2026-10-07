@@ -377,6 +377,46 @@ class TwoAccountSeparationTests(unittest.TestCase):
         states = {row.node_id: row.enrollment_state for row in ledger.pairing_summaries()}
         self.assertEqual("revoked", states[node])
 
+    def exposed_as_service(self, path, *, missing_ok=False):
+        probe = self.as_service(sys.executable, "-c",
+                                "import sys; from pathlib import Path\n"
+                                "from app.deployment import capture_ca_path_exposed\n"
+                                "print(capture_ca_path_exposed(Path(sys.argv[1]), "
+                                "missing_is_exposed=sys.argv[2] != 'missing_ok'))",
+                                str(path), "missing_ok" if missing_ok else "strict")
+        self.assertEqual(0, probe.returncode, probe.stderr)
+        return probe.stdout.decode().strip() == "True"
+
+    def test_service_controlled_ca_paths_are_exposed_even_when_access_is_denied(self):
+        # Codex P1 (PR #177, round 3), with two real accounts.
+        self.init()
+        self.assertFalse(self.exposed_as_service(self.authority))
+        # Chowned to the service by mistake, mode 000: EACCES now, but the
+        # owner could chmod it back and read the key.
+        for path in [self.authority, *self.authority.iterdir()]:
+            os.chown(path, SERVICE_ID, SERVICE_ID)
+        os.chmod(self.authority, 0)
+        self.assertTrue(self.exposed_as_service(self.authority))
+        for path in [self.authority, *self.authority.iterdir()]:
+            os.chown(path, CA_ID, CA_ID)
+        os.chmod(self.authority, 0o700)
+        self.assertFalse(self.exposed_as_service(self.authority))
+        # A service-writable (non-sticky) parent could replace the directory.
+        shared = self.root / "shared"
+        shared.mkdir()
+        os.chmod(shared, 0o777)
+        moved = shared / "ca"
+        os.rename(self.authority, moved)
+        self.assertTrue(self.exposed_as_service(moved))
+        self.assertTrue(self.exposed_as_service(shared / "lost", missing_ok=True))
+        os.chmod(shared, 0o1777)  # sticky: entries cannot be replaced by others
+        self.assertFalse(self.exposed_as_service(moved))
+        # A service-owned CA file in an otherwise closed directory.
+        os.chmod(shared, 0o755)
+        os.chown(moved / "issuance-log.jsonl", SERVICE_ID, SERVICE_ID)
+        os.chmod(moved, 0o711)
+        self.assertTrue(self.exposed_as_service(moved))
+
     def test_same_account_for_ca_and_service_is_refused(self):
         status, _stdout, stderr = self.run_cli(
             "init", "--authority-dir", self.authority, "--listener-dir", self.listener,
