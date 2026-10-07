@@ -1907,5 +1907,63 @@ class ContinuityTrackerTests(unittest.TestCase):
                          tracker.receive(session, unit(0), b"v").outcome)
         self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
 
+    def test_source_restored_from_watermark_is_durable_and_keeps_no_tombstone(self):
+        # PR #137 review: a source resumed from its committed watermark is
+        # already durable up to that mark, so churning it (duplicate retry,
+        # deactivation) must not occupy the bounded released table and evict
+        # a genuinely unpersisted source's continuity.
+        def lookup(source_id):
+            if source_id == SOURCE:
+                return CommittedWatermark(NODE, 1, 5, 50)
+            return None
+        tracker, ingest, authorizer, session = self._shared_refusing_tracker(
+            watermark=lookup, released=1)
+        # OTHER_SOURCE commits a unit the durable layer never acknowledged.
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(0, source=OTHER_SOURCE), b"o").outcome)
+        ingest.drain(10)
+        self._cycle(tracker, authorizer, OTHER_SOURCE)
+        for _ in range(3):
+            # SOURCE resumes from its watermark; the retry is only a duplicate.
+            self.assertEqual(DeliveryOutcome.DUPLICATE,
+                             tracker.receive(session, unit(5), b"v").outcome)
+            self._cycle(tracker, authorizer, SOURCE)
+        # OTHER_SOURCE's unpersisted continuity survived: no second enqueue.
+        retry = tracker.receive(session, unit(0, source=OTHER_SOURCE), b"o")
+        self.assertEqual(DeliveryOutcome.DUPLICATE, retry.outcome)
+        self.assertEqual(0, ingest.snapshot().queued_messages)
+
+    def test_clock_regression_survives_watermark_resolving_to_an_older_epoch(self):
+        # PR #137 review: an epoch-3 unit refused at capture time 100 while
+        # the watermark was unavailable, then retried at time 50 once the
+        # lookup resolves to an epoch-2 watermark, is both a capture restart
+        # and an in-epoch clock regression; neither record may be dropped.
+        state = {"broken": True}
+
+        def lookup(source_id):
+            if state["broken"]:
+                raise OSError("durable store unavailable")
+            return CommittedWatermark(NODE, 2, 7, 70)
+        tracker, ingest, _, _ = build(watermark=lookup)
+        session = tracker.open_session(NODE)
+        self.assertEqual("watermark_unavailable",
+                         tracker.receive(session, unit(0, epoch=3, at=100), b"v").reason)
+        state["broken"] = False
+        result = tracker.receive(session, unit(0, epoch=3, at=50), b"v")
+        self.assertEqual(DeliveryOutcome.ACCEPTED, result.outcome)
+        self.assertEqual([(GapReason.CAPTURE_RESTART, 3, None),
+                          (GapReason.CAPTURE_CLOCK_REGRESSION, 3, 0)],
+                         [(g.reason, g.capture_epoch, g.missing_units)
+                          for g in result.gaps])
+        self.assertEqual(2, len(tracker.drain_gaps(10)))
+        # A retry at or after the attempted time is a restart only.
+        state["broken"] = True
+        tracker, ingest, _, _ = build(watermark=lookup)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0, epoch=3, at=100), b"v")
+        state["broken"] = False
+        result = tracker.receive(session, unit(0, epoch=3, at=100), b"v")
+        self.assertEqual([GapReason.CAPTURE_RESTART], [g.reason for g in result.gaps])
+
 if __name__ == "__main__":
     unittest.main()

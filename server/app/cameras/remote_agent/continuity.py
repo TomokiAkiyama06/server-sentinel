@@ -557,9 +557,13 @@ class ContinuityTracker:
             # A new capture epoch means the Agent capture process restarted;
             # the extent of any loss is not knowable here.  This holds for an
             # uncommitted state too: its attempted unit(s) of the older epoch
-            # were never committed and are now known to be lost.
+            # were never committed and are now known to be lost.  A unit of
+            # this new epoch refused before (an unavailable watermark keeps
+            # its capture time without noting loss) is still the in-epoch
+            # baseline, so a capture clock regression is reported as well.
             return (GapEvent(node_id, source_id, GapReason.CAPTURE_RESTART, epoch,
-                             None, sequence, None),)
+                             None, sequence, None),
+                    *self._clock_regression(node_id, state, header))
         if state is None or state.last_sequence is None:
             # Start of the flow in this epoch (absent, or seen but uncommitted
             # in the same epoch): leading units are reported as loss.
@@ -848,8 +852,12 @@ class ContinuityTracker:
         if attempted is not None:
             del self._sources[source_id]
         if mark is not None:
+            # The watermark is itself the durable position: a source resumed
+            # from it is covered there, so releasing it before anything newer
+            # commits keeps no entry in the bounded released table.
             state = self._sources[source_id] = _Source(
-                node_id, mark.capture_epoch, mark.sequence, mark.capture_time_ns, now)
+                node_id, mark.capture_epoch, mark.sequence, mark.capture_time_ns, now,
+                durable_epoch=mark.capture_epoch, durable_sequence=mark.sequence)
         elif attempted is not None:
             # Nothing durable: an uncommitted entry in the attempted epoch, as
             # if that refused unit had been refused by pressure.
