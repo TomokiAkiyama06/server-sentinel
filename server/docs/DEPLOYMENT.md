@@ -274,23 +274,29 @@ line, account or other process detail.
   `CAP_SYS_PTRACE` into access to another process is denied by name — `ptrace`,
   `pidfd_getfd`, `process_vm_readv`, `process_vm_writev`, `process_madvise`
   and `kcmp` (the `process_vm_*` calls belong to `@ipc`, which
-  `@system-service` includes, not to `@debug`) — as is `open_by_handle_at`, so
-  the helper cannot attach to, read, write or compare the memory or
-  descriptors of another process. It has no network.
-- File system: because `CAP_DAC_READ_SEARCH` bypasses read permission on every
-  path the helper can name, `/etc`, `/var`, `/srv`, `/mnt`, `/media`, `/opt`
-  and `/run` are replaced by empty read-only tmpfs and `/home`, `/root`,
-  `/boot` and `/efi` are inaccessible. Only the installation root, the
-  deployment configuration file (not its directory) and `/etc/ld.so.cache`
-  are bound back read-only; `/usr` and `/lib` stay visible for the
-  interpreter, so the release venv's interpreter must live under `/usr` or the
-  installation root. Two residual risks remain and are not claimed away:
-  another top-level tree (for example a separate data or recordings mount at
-  `/data`) stays readable until the Owner adds it with `InaccessiblePaths=` in
-  a `systemctl edit` drop-in, and `/proc/<pid>/root` of any host process,
-  which the helper's `/proc` access cannot exclude without hiding processes,
-  still leads to the host's own root. The masking stops path-based reads; it
-  is not a boundary against code running inside a compromised helper.
+  `@system-service` includes, not to `@debug`) — as is `open_by_handle_at`.
+  That removes those system call interfaces; it is not containment (below).
+  It has no network.
+- Mount masking (defence in depth only): `/etc`, `/var`, `/srv`, `/mnt`,
+  `/media`, `/opt` and `/run` are replaced by empty read-only tmpfs and
+  `/home`, `/root`, `/boot` and `/efi` are inaccessible. Only the installation
+  root, the deployment configuration file (not its directory) and
+  `/etc/ld.so.cache` are bound back read-only; `/usr` and `/lib` stay visible
+  for the interpreter, so the release venv's interpreter must live under
+  `/usr` or the installation root. This reduces what an uncompromised helper
+  could reach by an ordinary path; the helper's own code names no such path
+  and never opens `/proc/<pid>/root`, `cwd`, `mem` or `fd` entries (it only
+  reads the `fd` and `exe` links). It does **not** isolate a compromised
+  helper: code running inside it, holding `CAP_SYS_PTRACE` and
+  `CAP_DAC_READ_SEARCH`, can still read every host file through
+  `/proc/<pid>/root`, open any process's files through `/proc/<pid>/fd/<n>`,
+  and read or write another process's memory through `/proc/<pid>/mem`; the
+  unit cannot close these without hiding processes from the scan.
+  Containment of a compromised helper (Landlock) is planned in Issue #147
+  (Owner decision, 2026-10-07). A top-level tree outside the masked list (for
+  example a separate data or recordings mount at `/data`) is also reachable by
+  path until the Owner adds it with `InaccessiblePaths=` in a
+  `systemctl edit` drop-in.
 - Channel: systemd creates `/run/server-sentinel-socket-owner/socket`
   `root:server-sentinel-socket-owner` mode `0660` in a root-owned `0755`
   directory (socket activation). The helper answers only a peer whose

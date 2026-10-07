@@ -16,24 +16,27 @@
 # (@debug), process_vm_readv / process_vm_writev / process_madvise (these sit
 # in @ipc, which @system-service includes, NOT in @debug), and kcmp (in
 # @system-service itself). open_by_handle_at, the CAP_DAC_READ_SEARCH escape,
-# is denied by name as well as through @privileged. So the helper cannot
-# attach to, read, write or compare the memory or descriptors of any process.
+# is denied by name as well as through @privileged. This removes those system
+# call interfaces only; it does not stop a compromised helper (see below).
 # It has no network (PrivateNetwork, AF_UNIX only).
 #
-# File system: CAP_DAC_READ_SEARCH bypasses read and search permission on every
-# path the helper can name, and ProtectSystem=strict only makes trees
-# read-only, so the trees that can hold data (/etc, /var, /srv, /mnt, /media,
-# /opt, /run) are replaced by empty read-only tmpfs and /home, /root, /boot and
-# /efi are inaccessible. Only what the helper needs is bound back read-only:
-# the installation root (code and per-release venv), the one deployment
-# configuration file and the dynamic linker cache. /usr and /lib stay visible
-# for the interpreter. Residual risk: a top-level tree outside this list (a
-# custom data mount such as /data) stays readable until the Owner adds it to
-# InaccessiblePaths= in a drop-in, and /proc/<pid>/root of any host process
-# (needed /proc access cannot be narrowed without hiding processes) still
-# reaches the host's own root, so a compromised helper can read host files
-# through it. The masking stops accidental and path-based reads; it is not a
-# boundary against code execution inside the helper.
+# Mount masking (defence in depth only, NOT containment): the trees that can
+# hold data (/etc, /var, /srv, /mnt, /media, /opt, /run) are replaced by empty
+# read-only tmpfs and /home, /root, /boot and /efi are inaccessible; only the
+# installation root (code and per-release venv), the one deployment
+# configuration file and the dynamic linker cache are bound back read-only, and
+# /usr and /lib stay visible for the interpreter. This only reduces what an
+# uncompromised helper could reach by an ordinary path (its own code names no
+# such path and never opens /proc/<pid>/root, cwd, mem or fd entries). It does
+# NOT isolate a compromised helper: with CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH,
+# code running inside the helper can still read every host file through
+# /proc/<pid>/root (and cwd), open any process's files through
+# /proc/<pid>/fd/<n>, and read or write another process's memory through
+# /proc/<pid>/mem, none of which the unit can close without hiding processes
+# from the scan. Containment of a compromised helper (Landlock) is planned in
+# Issue #147 (Owner decision, 2026-10-07). A top-level tree outside the masked
+# list (a custom data mount such as /data) is also reachable by path until the
+# Owner adds it to InaccessiblePaths= in a drop-in.
 # Do not add PrivateUsers= (capabilities would no longer apply to host
 # processes) or ProtectProc=invisible / PrivatePIDs= (other processes would be
 # hidden, so every scan would be incomplete and access would stay closed).

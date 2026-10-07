@@ -1797,7 +1797,10 @@ by the Issue #6 synthetic policy model.
     of `ls /` that holds data and confirm it was added with
     `InaccessiblePaths=`. Record that the helper still started and answered
     (`event=started capabilities=complete`, `event=answered`); a mount it
-    cannot set up stops the helper and keeps access closed without revocation;
+    cannot set up stops the helper and keeps access closed without revocation.
+    This checks the defence-in-depth masking only; it does not show that a
+    compromised helper is contained (`/proc/<pid>/root`, `fd` and `mem` stay
+    reachable to it until Issue #147);
   - from an account that is neither root nor the service account (for
     example a temporary test account added to the group on a disposable
     node), a connection is closed without an answer and a coalesced

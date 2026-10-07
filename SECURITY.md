@@ -337,8 +337,12 @@ The current contract for that check (Owner decisions 2026-09-30 and
   (`ptrace`, `pidfd_getfd`, `process_vm_readv`/`process_vm_writev`,
   `process_madvise`, `kcmp` and `open_by_handle_at` denied by name; data-holding
   trees such as `/etc`, `/var`, `/opt`, `/run` masked except the installation
-  root and the one configuration file; `/proc/<pid>/root` and unlisted
-  top-level mounts remain readable to a compromised helper). It answers over a
+  root and the one configuration file as defence in depth only). Neither is
+  containment: a compromised helper can still read every host file through
+  `/proc/<pid>/root`, open any process's files through `/proc/<pid>/fd/<n>`
+  and read or write process memory through `/proc/<pid>/mem`. Containing a
+  compromised helper (Landlock) is follow-up Issue #147 (Owner decision,
+  2026-10-07); until then the helper is trusted code with that reach. It answers over a
   `root:server-sentinel-socket-owner` `0660` unix socket, only to the
   service UID verified with `SO_PEERCRED`, only about sockets listening in the
   requester's network namespace, and only with each holder's executable and

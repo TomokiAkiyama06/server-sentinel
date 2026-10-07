@@ -4,16 +4,20 @@ These only read the shipped unit files; whether systemd accepts them and the
 helper works under them on the Main Server is a MANUAL_TEST.md step.
 """
 
+import ast
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
 SYSTEMD = ROOT / "infra" / "systemd"
 CLIENT = ROOT / "server" / "app" / "auth" / "socket_owner.py"
+RESERVATION = ROOT / "server" / "app" / "auth" / "reservation.py"
 # System calls that turn CAP_SYS_PTRACE (or CAP_DAC_READ_SEARCH) into access to
 # another process's memory or descriptors, or to an arbitrary inode. They must
 # be denied by name: process_vm_readv/writev and process_madvise sit in @ipc
@@ -26,19 +30,33 @@ CROSS_PROCESS_SYSCALLS = frozenset({
 MASKED_TREES = frozenset({"/etc", "/var", "/srv", "/mnt", "/media", "/opt", "/run"})
 
 
+# CSI (colour, cursor) and OSC (hyperlink) terminal sequences; systemd 255
+# colours nested group names ("\x1b[0m@basic-io") even when piped.
+_TERMINAL_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]")
+_FILTER_ENTRY = re.compile(r"@?[a-z0-9_-]+")
+_PLAIN_ENVIRONMENT = {"SYSTEMD_COLORS": "0", "NO_COLOR": "1", "SYSTEMD_PAGER": "cat",
+                      "SYSTEMD_URLIFY": "0", "TERM": "dumb"}
+
+
 def expand_syscall_group(name: str, cache: dict) -> set:
     """System calls of a systemd group, expanded by the local systemd-analyze."""
+    if not _FILTER_ENTRY.fullmatch(name):
+        raise AssertionError(f"unparsed system call filter entry {name!r}")
     if not name.startswith("@"):
         return {name}
     if name not in cache:
         cache[name] = set()  # guards against a self-reference
         output = subprocess.run(["systemd-analyze", "--no-pager", "syscall-filter", name],
-                                check=True, capture_output=True, text=True, timeout=30).stdout
+                                check=True, capture_output=True, text=True, timeout=30,
+                                env={**os.environ, **_PLAIN_ENVIRONMENT}).stdout
         result = set()
-        for line in output.splitlines()[1:]:
+        for line in _TERMINAL_SEQUENCE.sub("", output).splitlines():
             line = line.strip()
-            if line and not line.startswith("#"):
-                result |= expand_syscall_group(line.split()[0], cache)
+            if not line or line.startswith("#") or line == name:
+                continue
+            result |= expand_syscall_group(line.split()[0], cache)
+        if not result:
+            raise AssertionError(f"systemd-analyze listed nothing for {name}")
         cache[name] = result
     return cache[name]
 
@@ -116,9 +134,32 @@ class SocketOwnerUnitTests(unittest.TestCase):
             for entry in (value[1:] if deny else value).split():
                 entries |= expand_syscall_group(entry, cache)
             allowed = allowed - entries if deny else allowed | entries
-        self.assertIn("read", allowed)  # the group expansion worked
-        self.assertIn("openat", allowed)
+        # The expansion worked: only plain system call names, a realistic
+        # count, and the calls any service needs.
+        self.assertEqual({entry for entry in allowed if not re.fullmatch(r"[a-z0-9_]+", entry)}, set())
+        self.assertGreater(len(allowed), 200)
+        self.assertLessEqual({"read", "write", "openat", "close", "mmap", "readlinkat", "recvmsg"}, allowed)
         self.assertEqual(CROSS_PROCESS_SYSCALLS & allowed, set())
+
+    def test_group_expansion_strips_terminal_colours(self):
+        # systemd 255 (Ubuntu 24.04) output shape: nested groups wrapped in colour codes.
+        listings = {
+            "@outer": "\x1b[1m@outer\x1b[0m\n    # Outer\n    \x1b[0m@inner\x1b[0m\n    \x1b]8;;x\x07kcmp\x1b]8;;\x07\n",
+            "@inner": "@inner\n    # Inner\n    \x1b[0mread\n    process_vm_readv\x1b[0m\n",
+        }
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(kwargs["env"])
+            return subprocess.CompletedProcess(command, 0, stdout=listings[command[-1]], stderr="")
+
+        with mock.patch.object(subprocess, "run", run):
+            self.assertEqual(expand_syscall_group("@outer", {}), {"read", "process_vm_readv", "kcmp"})
+        self.assertTrue(all(env["SYSTEMD_COLORS"] == "0" and env["NO_COLOR"] == "1" for env in calls))
+        with mock.patch.object(subprocess, "run", lambda command, **kwargs: subprocess.CompletedProcess(
+                command, 0, stdout="@outer\n    \x1b[0mRead!\n", stderr="")):
+            with self.assertRaises(AssertionError):
+                expand_syscall_group("@outer", {})
 
     def test_file_system_is_masked_except_what_the_helper_reads(self):
         temporary = {}
@@ -161,6 +202,50 @@ class SocketOwnerUnitTests(unittest.TestCase):
         self.assertEqual(self.one(self.service, "Unit.Requires"), "server-sentinel-socket-owner.socket")
         # Started by socket activation only.
         self.assertFalse(any(key.startswith("Install.") for key in self.service))
+
+
+class HelperProcAccessTests(unittest.TestCase):
+    """The helper's own code never names a /proc entry that leads to another
+    process's files, memory or environment (Issue #147 covers containment of a
+    compromised helper; this only keeps the uncompromised code from it)."""
+
+    FORBIDDEN = frozenset({"root", "cwd", "mem", "environ", "maps", "map_files", "fdinfo", "cmdline"})
+
+    def test_helper_code_names_no_escaping_proc_entry(self):
+        for path in (CLIENT, RESERVATION):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            names = {node.value for node in ast.walk(tree)
+                     if isinstance(node, ast.Constant) and isinstance(node.value, str)}
+            self.assertEqual(names & self.FORBIDDEN, set(), path.name)
+
+    def test_descriptor_links_are_only_read_as_links(self):
+        # /proc/<pid>/fd/<n> is passed to os.readlink only, never opened.
+        tree = ast.parse(RESERVATION.read_text(encoding="utf-8"))
+        seen = 0
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and any(
+                    isinstance(arg, ast.Call) and len(arg.args) == 3
+                    and isinstance(arg.args[1], ast.Constant) and arg.args[1].value == "fd"
+                    for arg in node.args):
+                self.assertEqual(ast.unparse(node.func), "os.readlink")
+                seen += 1
+        self.assertGreaterEqual(seen, 1)  # the descriptor walk was found
+
+
+class MaskingClaimTests(unittest.TestCase):
+    """The mount masking is described as defence in depth, never as containment
+    of a compromised helper (Owner decision 2026-10-07, Issue #147)."""
+
+    DOCUMENTS = (SYSTEMD / "server-sentinel-socket-owner.service", ROOT / "server" / "docs" / "DEPLOYMENT.md",
+                 ROOT / "SECURITY.md")
+
+    def test_documents_state_the_proc_reach_of_a_compromised_helper(self):
+        for path in self.DOCUMENTS:
+            text = " ".join(path.read_text(encoding="utf-8").replace("#", " ").split())
+            for phrase in ("Issue 147", "/proc/<pid>/root", "/proc/<pid>/fd/<n>", "/proc/<pid>/mem"):
+                self.assertTrue(phrase in text, f"{path.name}: {phrase}")
+            self.assertFalse("cannot attach to" in text, path.name)
+            self.assertFalse("read-only file system" in text, path.name)
 
 
 def normalized(path: Path) -> str:
