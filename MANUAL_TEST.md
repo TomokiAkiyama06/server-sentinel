@@ -101,7 +101,7 @@ stand-in）。一時 DB は repository 外に作り実行後に削除した。fr
 未確認: 抜線・ポート入替・再起動を伴う物理操作、非 serial 同型機、3〜4 source、
 実配信 fps の記録（registry は driver の frame interval のみ保持）。
 
-#### フレーム停止 watchdog / presence scan 抑制の実機再確認（PARTIAL: 2026-10-05 に非破壊部分のみ実施、下記記録）
+#### フレーム停止 watchdog / presence scan 抑制の実機再確認（実施済み: 2026-10-05 非破壊部分、2026-10-07 Owner 立会いの物理抜線・遮蔽。下記記録）
 
 2026-09-30 の Main Server 候補機（C960 2 台）の抜き差し試験で、source が 0 fps の
 まま約 4〜5 秒 `online` と表示された。修正（frame-progress watchdog、live 中の全
@@ -199,6 +199,61 @@ production 機での USB 再列挙を避けるため、遅延注入の再試行�
 6. 手順 5: teardown が長い場合の `offline` 表示は抜線時の close 所要時間から確認する
    （hung teardown の人工再現は行わない）。
 7. 終了後、script を止めて video descriptor 0 を確認し、一時 state を削除する。
+
+上記の要人手手順は 2026-10-07 に実施した（次の記録）。
+
+##### 実機記録 2026-10-07: Owner 立会いの物理抜線・遮蔽（PR #111 head `3ead6b5`）
+
+```text
+Date: 2026-10-07 20:06–20:23（ローカル時刻）
+ServerSentinel version / Git commit: PR #111 head 3ead6b5（main を merge 済み、未マージ）
+Main Ubuntu version / hardware: 稼働中の Main Server（正確な OS/kernel・hardware は
+  INTEGRITY-007 によりローカル記録のみ）。ServerSentinel service は未稼働
+Camera source(s) / model(s): 本節冒頭と同じ serial 付き同型 USB UVC（C960）× 2
+USB topology: 2 台とも同じ USB バス上（controller・port はローカル記録のみ）
+Tester: Owner（物理抜線・挿し直し・レンズ遮蔽・室内照明）、Claude Code（観測 script
+  の起動と記録。sudo・systemd・udev 操作・USB reset/unbind は不使用、カメラには触れない）
+```
+
+実行方法: 2026-10-05 記録と同じ観測方法。repository 外の一時 directory の driver
+script から `create_app()` lifespan を一時 SQLite（実行後削除）で起動し、実
+`LinuxDiscovery` と実 `MmapCapture` で 2 source を構成した（既定 timing:
+`frame_stall_seconds` 1.0、`frame_stall_reopen_seconds` 5.0、`presence_scan_seconds`
+1.0、`retry_delay_seconds` 0.5）。今回は software による停止注入なし。frame は
+件数・byte 数・JPEG SOI/EOI・V4L2 sequence だけをメモリ上で数えて破棄し、画像の
+保存・閲覧はしていない。kernel の USB/UVC event は種別と時刻だけを記録した。
+カメラA/B（`src1`/`src2`）は serial の hash 順の一時ラベル。
+
+Owner の物理操作（各操作は 30 秒以上の間隔）: B 抜線 20:07:58 / 挿入 約20:09:05、
+A 抜線 約20:10:19 / 挿入 約20:11:20、B 抜線 約20:13:00 / 挿入 約20:13:44、
+A 抜線 約20:14:29 / 挿入 約20:15:05。続いて室内照明を落とし、片方のレンズを
+20:17:29–20:22:41（5 分 12 秒）遮蔽、20:23:31 に遮蔽解除を報告。
+
+同一バス上の自発的な相互リセット（#112）が多発し、必要な 10 回を大きく上回る
+切断・再接続が得られたため、Owner と合意のうえ手動抜線は 4 回で打ち切った。
+17 分間で kernel の USB disconnect は 23 回（うち物理抜線 4 回）、`src1`(A) は
+open 38 回・`online` 以外への遷移 25 回、`src2`(B) は open 6 回・遷移 5 回。
+
+| # | 確認内容 | 結果 | 区分 |
+|---|---|---|---|
+| P-1 | 手順 1: 最後の frame から `online` 以外になるまで、全 30 episode で 1.13 秒以内。descriptor error / close 経路（26 件）は `offline`（`video_capture_closed`）まで 0.01–0.10 秒（1 件のみ 0.69 秒）、watchdog 経路（4 件: B 1.00 / 1.01 / 1.00 秒、A 1.13 秒）は `degraded`（`video_frame_stalled`）。期待値 1.5 秒以内を満たす。もう片方は同一バスの相互リセットでしばしば同時に切断したが、その間も `online` を表示しなかった（他方の継続性は #112 の host 問題として別途扱う） | PASS | 実機 |
+| P-2 | 手順 2（回数）: 物理抜線・挿入 4 回 + 自発的な再列挙（kernel disconnect 23 回、source の非 online episode 計 30 回）で、「10 回以上」は自発的再列挙と手動 4 回の合計で満たした | PASS（回数要件） | 実機 |
+| P-3 | 手順 2: 1 秒ごとの観測で、`online` 表示中に frame 0 の区間は 0 回。`online` への復帰は全て再 open 後の新しい frame 受信（`video_capture_ready`）による。復帰は再列挙待ちを含め 1.57–99.87 秒 | PASS | 実機 |
+| P-4 | 手順 2: 停止が `frame_stall_reopen_seconds` を超えた場合の `offline` → 再 open を物理的な停止で確認。B は 20:10:26 に 1.01 秒で `degraded`（`video_frame_stalled`）、最後の frame から 5.0 秒で `offline`（`video_capture_failed`）、再列挙後に再 open し `online`。A は 20:15:11 に 1.13 秒で `degraded`、5.1 秒で `offline`、再 open 後 `online` | PASS | 実機 |
+| P-5 | 手順 2: `video_frame_stalled` から復帰した source の negotiated profile 残存 | 未記録（観測 script が profile を出力していない。2026-10-05 R-5 の software 注入でのみ確認） | — |
+| P-6 | 手順 3: 室内照明を落とした状態で片方のレンズを 5 分 12 秒遮蔽。`video_frame_stalled` への遷移 0 回、bad JPEG 0。照明を落とした時点で両方とも auto exposure により約 30 → 約 16 fps に低下し、遮蔽中の実配信は A 平均 16.4 fps（USB reset 中の約 5 秒を含む。online 時のみでは 16.6）、B 平均 16.7 fps・最小 15.8 fps。遮蔽解除後は両方 29.9 fps。遮蔽中の 20:21:12 に A が自発的な USB reset で一時 `offline`、約 4.8 秒で `online` へ復帰（遮蔽とは無関係の #112 事象） | PASS | 実機 |
+| P-7 | 手順 5: close（`STREAMOFF`/unmap/close）所要は最大 5.5 秒（約 5 秒の close が 3 回: 5308.9 / 5008.2 / 5503.0 ms、他は 0.0–341 ms）。3 回とも teardown 開始時点で `offline`（`video_capture_closed`）が通知され（close 完了の 5.0–5.5 秒前）、teardown 中に `online` 表示なし | PASS | 実機 |
+| P-8 | 全期間で worker failure 0、watchdog failure 0、sink failure 0、dropped 0、bad JPEG 0（A 18218 frame、B 20564 frame）。V4L2 sequence 欠落は A 391、B 264 で、切断・再列挙の前後に集中。lifespan 停止 0.23 秒、停止後 video descriptor 0、registry は両方 `offline`、一時 state 削除済み | PASS | 実機 |
+
+本記録と 2026-10-05 記録で満たした手順: 1、2（profile 残存は software 注入のみ）、3、
+4（2026-10-05）、5（hung teardown の人工再現はせず、物理抜線時の約 5 秒 close で確認）。
+
+Host 側の所見（ServerSentinel の不具合ではない。詳細は #112）: 相互リセットの
+多発後、udev worker が約 1 分停止し（`udevadm settle` が timeout）、その間 video
+node は udev の権限設定前（root 所有・0600）のままで開けなかった。ServerSentinel
+はこの間 `offline`（`approved_device_absent`）を表示し続けた（fail closed）。kernel
+は USB control 転送の timeout（-110）と、カメラの audio interface の sample rate
+設定失敗を記録した。
 
 #### Real-hardware runtime procedure (serial-bearing UVC cameras)
 
