@@ -172,6 +172,9 @@ class CollectorTests(unittest.TestCase):
         self.live = self.context
         self.source = FakeSource()
         self.issuer = gate.Issuer(900001, "synthetic-review-gate")
+        self.config = publisher.RuntimeConfig("owner/repository",
+                                              self.context.repository_id,
+                                              self.issuer, 900003, root / "key.pem")
         self.collector = self.make_collector()
 
     def tearDown(self):
@@ -195,7 +198,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_trusted_clean_review_becomes_policy_receipt(self):
         self.source.add(self.context.head_sha, START - 10)  # before the request
-        outcome = self.collector.request_review("codex", self.live, self.source)
+        outcome = self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.assertTrue(outcome.created)
         self.source.add(self.context.head_sha, self.late())
         decision = self.collect()
@@ -213,7 +216,7 @@ class CollectorTests(unittest.TestCase):
     def test_trusted_clean_issue_comment_passes_for_the_exact_head(self):
         # Codex reports "no findings" as an issue comment naming a short SHA.
         self.source.add_comment("a" * 10, START - 10)  # before the request
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.assertEqual(self.collect().status, "pending")
         self.source.add_comment("a" * 10, self.late())
         decision = self.collect()
@@ -223,7 +226,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(self.source.resolved, ["a" * 10])
 
     def test_issue_comment_for_another_commit_or_too_early_never_passes(self):
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.commits.add("b" * 40)
         self.source.add_comment("b" * 10, self.late())  # another commit
         self.source.add_comment("a" * 10, self.late() - 1)  # inside the runtime bound
@@ -255,7 +258,7 @@ class CollectorTests(unittest.TestCase):
                 self.source = FakeSource()
                 if name == "colliding_prefix":
                     self.source.commits.add("a" * 10 + "e" * 30)
-                self.collector.request_review("codex", self.live, self.source,
+                self.collector.request_review("codex", self.live, self.source, config=self.config,
                                               force_new=True)
                 prefix = case.pop("prefix")
                 self.source.add_comment(prefix, self.late(), **case)
@@ -267,17 +270,17 @@ class CollectorTests(unittest.TestCase):
                     self.assertEqual(self.collect().status, "blocked")
 
     def test_issue_comment_below_the_request_watermark_is_ignored(self):
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add_comment("a" * 10, self.late())
         self.assertEqual(self.collect().status, "pass")
-        outcome = self.collector.request_review("codex", self.live, self.source,
+        outcome = self.collector.request_review("codex", self.live, self.source, config=self.config,
                                                 force_new=True)
         self.assertEqual(outcome.request.comment_watermark,
                          self.source.issue_comments[-1]["id"])
         self.assertEqual(self.collect().status, "pending")
 
     def test_claude_uses_the_same_contract_with_its_own_identity(self):
-        self.collector.request_review("claude", self.live, self.source)
+        self.collector.request_review("claude", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())  # Codex bot, not Claude
         self.assertEqual(self.collect("claude").status, "pending")
         self.source.add(self.context.head_sha, self.late(), user=CLAUDE_BOT)
@@ -286,7 +289,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(decision.check_run_request["name"], gate.CHECK_NAMES["claude"])
 
     def test_base_update_invalidates_same_head_request_and_old_review(self):
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         self.assertEqual(self.collect().status, "pass")
         # The base advances; the PR HEAD is unchanged.
@@ -303,7 +306,7 @@ class CollectorTests(unittest.TestCase):
         # predates it, so the old success cannot be carried over.
         self.live = replace(self.context, base_sha="e" * 40, test_merge_sha="9" * 40)
         self.clock.now = START + 5000
-        self.assertTrue(self.collector.request_review("codex", self.live, self.source).created)
+        self.assertTrue(self.collector.request_review("codex", self.live, self.source, config=self.config).created)
         self.assertEqual(self.collect().status, "pending")
 
     def test_stale_live_read_does_not_invalidate_a_newer_concurrent_request(self):
@@ -321,7 +324,7 @@ class CollectorTests(unittest.TestCase):
                     reads.append(1)
                     if len(reads) == 1:
                         self.clock.now += advance
-                        self.collector.request_review("codex", new_context, self.source)
+                        self.collector.request_review("codex", new_context, self.source, config=self.config)
                         return old_context
                     return new_context
                 decision = self.collect(read=stale_read)
@@ -340,13 +343,13 @@ class CollectorTests(unittest.TestCase):
     def test_mismatch_confirmation_stays_pending_if_request_is_replaced_again(self):
         first = replace(self.context, base_sha="e" * 40, test_merge_sha="9" * 40)
         second = replace(self.context, base_sha="7" * 40, test_merge_sha="8" * 40)
-        self.collector.request_review("codex", first, self.source)
+        self.collector.request_review("codex", first, self.source, config=self.config)
         reads = []
 
         def racing_read():
             reads.append(1)
             if len(reads) == 2:  # the confirmation read races a third request
-                self.collector.request_review("codex", second, self.source)
+                self.collector.request_review("codex", second, self.source, config=self.config)
             return self.context
         decision = self.collect(read=racing_read)
         self.assertEqual((decision.status, decision.reason),
@@ -361,7 +364,7 @@ class CollectorTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.clock.now += 10_000
                 self.live = self.context
-                self.collector.request_review("codex", self.live, self.source,
+                self.collector.request_review("codex", self.live, self.source, config=self.config,
                                               force_new=True)
                 self.source.add(self.context.head_sha, self.clock.now + 10_000)
                 changed = replace(self.context, **{field: value})
@@ -376,7 +379,7 @@ class CollectorTests(unittest.TestCase):
                 self.assertIsNone(decision.check_run_request)
 
     def test_review_started_under_an_older_base_is_not_attributed(self):
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         # Submitted after the request but within the provider runtime bound:
         # it may have been triggered before the base changed.
         self.source.add(self.context.head_sha, self.late() - 1)
@@ -385,7 +388,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(self.collect().status, "pass")
 
     def test_spoofed_github_token_issuer_is_rejected(self):
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         spoofs = (
             ACTIONS_BOT,  # a PR workflow's GITHUB_TOKEN review
             {**CODEX_BOT, "id": 900999},  # same login, other account
@@ -427,7 +430,7 @@ class CollectorTests(unittest.TestCase):
         for extra in cases:
             with self.subTest(extra=extra):
                 self.clock.now += 10_000
-                self.collector.request_review("codex", self.live, self.source,
+                self.collector.request_review("codex", self.live, self.source, config=self.config,
                                               force_new=True)
                 late = self.clock.now + 10_000
                 self.source.add(self.context.head_sha, late, **extra)
@@ -438,30 +441,30 @@ class CollectorTests(unittest.TestCase):
                 self.assertIsNone(decision.check_run_request)
 
     def test_early_failing_review_blocks_even_if_ambiguous(self):
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, START + 1, state="CHANGES_REQUESTED")
         self.source.add(self.context.head_sha, self.late())
         self.assertEqual(self.collect().status, "blocked")
 
     def test_suggestion_only_comments_do_not_block(self):
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late(),
                         comments=(SUGGEST + " naming",))
         self.assertEqual(self.collect().status, "pass")
 
     def test_review_of_other_head_or_before_watermark_is_ignored(self):
         self.source.add(self.context.head_sha, self.late())  # before the request
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add("e" * 40, self.late())
         self.assertEqual(self.collect().status, "pending")
 
     def test_request_is_idempotent_and_survives_restart(self):
-        first = self.collector.request_review("codex", self.live, self.source)
-        again = self.collector.request_review("codex", self.live, self.source)
+        first = self.collector.request_review("codex", self.live, self.source, config=self.config)
+        again = self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.assertFalse(again.created)
         self.assertEqual(first.request, again.request)
         restarted = self.make_collector()
-        self.assertFalse(restarted.request_review("codex", self.live, self.source).created)
+        self.assertFalse(restarted.request_review("codex", self.live, self.source, config=self.config).created)
         self.source.add(self.context.head_sha, self.late())
         self.assertEqual(restarted.collect("codex", self.read_live, self.source).status,
                          "pass")
@@ -475,7 +478,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual((decision.status, decision.reason), ("pending", "no_review_request"))
 
     def test_corrupt_or_foreign_ledger_fails_closed(self):
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         record = self.state / "900002-12-codex.json"
         original = record.read_text()
         data = json.loads(original)
@@ -523,7 +526,7 @@ class CollectorTests(unittest.TestCase):
         os.replace = failing_replace
         try:
             with self.assertRaisesRegex(collector.CollectorFailure, "write failed"):
-                self.collector.request_review("codex", self.live, self.source)
+                self.collector.request_review("codex", self.live, self.source, config=self.config)
         finally:
             os.replace = original
         self.assertEqual(list(self.state.glob("*.json")), [])
@@ -532,7 +535,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_hostile_or_incomplete_listings_fail_closed(self):
         self.source.add(self.context.head_sha, START - 10)
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         good = self.source.reviews
         for reviews in (
@@ -562,14 +565,14 @@ class CollectorTests(unittest.TestCase):
 
     def test_listing_regression_blocks_new_request(self):
         self.source.add(self.context.head_sha, START - 10)
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.reviews = []
         with self.assertRaisesRegex(collector.CollectorFailure, "regressed"):
-            self.collector.request_review("codex", self.live, self.source, force_new=True)
+            self.collector.request_review("codex", self.live, self.source, config=self.config, force_new=True)
 
     def test_busy_lock_times_out_instead_of_hanging(self):
         import fcntl
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         lock = os.open(self.state / "900002-12.lock", os.O_RDWR)
         try:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -587,7 +590,7 @@ class CollectorTests(unittest.TestCase):
     def test_logs_carry_reason_codes_but_no_review_text(self):
         secret_text = "SYNTHETIC-REVIEW-BODY-SHOULD-NOT-BE-LOGGED"
         with self.assertLogs("server_sentinel.review_gate.collector", "DEBUG") as logs:
-            self.collector.request_review("codex", self.live, self.source)
+            self.collector.request_review("codex", self.live, self.source, config=self.config)
             self.source.add(self.context.head_sha, self.late(),
                             body=PASS + " " + secret_text)
             self.collect()
@@ -597,10 +600,7 @@ class CollectorTests(unittest.TestCase):
 
     def publication(self):
         client = FakeCheckRuns(self.issuer)
-        config = publisher.RuntimeConfig("owner/repository", self.context.repository_id,
-                                         self.issuer, 900003,
-                                         Path(self.temp.name) / "key.pem")
-        credentials = publisher.AppCredentials(config, b"synthetic-key", "t" * 40)
+        credentials = publisher.AppCredentials(self.config, b"synthetic-key", "t" * 40)
         patcher = mock.patch.object(publisher, "collect_live_context",
                                     lambda *args: self.live)
         patcher.start()
@@ -633,7 +633,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_pass_is_published_once_across_polls_and_restart(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         for _ in range(3):
             self.assertEqual(self.reconcile(client, credentials).status, "pass")
@@ -648,17 +648,17 @@ class CollectorTests(unittest.TestCase):
 
     def test_superseded_pass_decision_is_never_posted(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         stale = self.collect()
         self.assertEqual(stale.status, "pass")
-        self.collector.request_review("codex", self.live, self.source, force_new=True)
+        self.collector.request_review("codex", self.live, self.source, config=self.config, force_new=True)
         self.assertFalse(self.collector.publish(client, credentials, stale)["published"])
         self.assertEqual(client.posts, [])
 
     def test_later_blocking_review_supersedes_the_published_success(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         self.assertEqual(self.reconcile(client, credentials).status, "pass")
         self.source.add(self.context.head_sha, self.late() + 5, body=BLOCK)
@@ -672,16 +672,16 @@ class CollectorTests(unittest.TestCase):
 
     def test_force_new_rerun_requires_revoking_the_standing_success(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         self.reconcile(client, credentials)
         with self.assertRaises(collector.CollectorFailure):
-            self.collector.request_review("codex", self.live, self.source, force_new=True)
+            self.collector.request_review("codex", self.live, self.source, config=self.config, force_new=True)
         self.assertTrue(self.collector.revoke_published(client, credentials, "codex", 12))
         self.assertFalse(self.collector.revoke_published(client, credentials, "codex", 12))
         self.clock.now = self.late() + 10
         self.assertTrue(self.collector.request_review(
-            "codex", self.live, self.source, force_new=True).created)
+            "codex", self.live, self.source, config=self.config, force_new=True).created)
         self.assertEqual(self.reconcile(client, credentials).status, "pending")
         self.source.add(self.context.head_sha, self.clock.now + RUNTIME
                         + collector.CLOCK_SKEW_ALLOWANCE_SECONDS)
@@ -691,7 +691,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_collection_error_supersedes_the_published_success(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         self.reconcile(client, credentials)
         good = self.source.reviews
@@ -706,7 +706,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_failed_revocation_is_retried_and_never_reads_as_current(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         self.reconcile(client, credentials)
         client.fail = True
@@ -734,7 +734,7 @@ class CollectorTests(unittest.TestCase):
                     path.unlink()
                 client, credentials = self.publication()
                 self.source = FakeSource()
-                self.collector.request_review("codex", self.live, self.source)
+                self.collector.request_review("codex", self.live, self.source, config=self.config)
                 self.source.add(self.context.head_sha, self.late())
                 client.after_accept = {"lost_response": "raise",
                                        "malformed_response": "no_id"}.get(mode)
@@ -758,7 +758,7 @@ class CollectorTests(unittest.TestCase):
                     path.unlink()
                 client, credentials = self.publication()
                 self.source = FakeSource()
-                self.collector.request_review("codex", self.live, self.source)
+                self.collector.request_review("codex", self.live, self.source, config=self.config)
                 self.source.add(self.context.head_sha, self.late())
                 client.after_accept = "crash"
                 with self.assertRaises(KeyboardInterrupt):  # the process dies
@@ -777,10 +777,10 @@ class CollectorTests(unittest.TestCase):
         client, credentials = self.publication()
         other = replace(self.context, pr_number=13, test_merge_sha="9" * 40)
         # PR 12 has a published success; PR 13 has an active request.
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         self.reconcile(client, credentials)
-        self.collector.request_review("codex", other, self.source)
+        self.collector.request_review("codex", other, self.source, config=self.config)
         other_before = (self.state / "900002-13-codex.json").read_text()
         self.source.add(other.head_sha, self.late() + 5, body=BLOCK)  # 13 would block
         foreign_repository = replace(self.context, repository_id=900009)
@@ -798,9 +798,66 @@ class CollectorTests(unittest.TestCase):
                          [("success", self.context.test_merge_sha),
                           ("failure", self.context.test_merge_sha)])
 
+    def test_request_is_bound_to_the_configured_repository_before_watermarks(self):
+        # #119: a source miswired to another repository (whose same-numbered
+        # PR has higher review IDs) must not record that repository's maximum
+        # as the watermark, which would later be refused as a regression for
+        # the correct repository even with force_new.
+        class CountingSource(FakeSource):
+            def __init__(self, repository="owner/repository"):
+                super().__init__(repository)
+                self.listings = 0
+
+            def list_reviews(self, pr_number):
+                self.listings += 1
+                return super().list_reviews(pr_number)
+
+            def list_issue_comments(self, pr_number):
+                self.listings += 1
+                return super().list_issue_comments(pr_number)
+
+        foreign = CountingSource("other/repository")
+        foreign.next_id = 990000
+        foreign.add(self.context.head_sha, START - 10)
+        unnamed = CountingSource()
+        del unnamed.repository
+        record = self.state / "900002-12-codex.json"
+        for wrong in (foreign, unnamed):
+            with self.subTest(source=getattr(wrong, "repository", None)):
+                with self.assertRaisesRegex(collector.CollectorFailure,
+                                            "another repository"):
+                    self.collector.request_review("codex", self.live, wrong,
+                                                  config=self.config)
+                self.assertEqual(wrong.listings, 0)
+                self.assertFalse(record.exists())
+        foreign_live = replace(self.live, repository_id=900009)
+        with self.assertRaisesRegex(collector.CollectorFailure, "another repository"):
+            self.collector.request_review("codex", foreign_live, self.source,
+                                          config=self.config)
+        self.assertFalse((self.state / "900009-12-codex.json").exists())
+        with self.assertRaisesRegex(collector.CollectorFailure,
+                                    "invalid repository configuration"):
+            self.collector.request_review("codex", self.live, self.source,
+                                          config="owner/repository")
+        with self.assertRaises(TypeError):
+            self.collector.request_review("codex", self.live, self.source)
+        self.assertFalse(record.exists())
+        # Once the wiring names the configured repository (case-insensitively),
+        # the request records that repository's own watermark and passes.
+        self.source.repository = "Owner/Repository"
+        self.source.add(self.context.head_sha, START - 10)
+        outcome = self.collector.request_review("codex", self.live, self.source,
+                                                config=self.config)
+        self.assertTrue(outcome.created)
+        self.assertEqual(outcome.request.review_watermark, self.source.reviews[-1]["id"])
+        self.assertLess(outcome.request.review_watermark, foreign.reviews[-1]["id"])
+        self.source.add(self.context.head_sha, self.late())
+        self.clock.now = self.late()
+        self.assertEqual(self.collect().status, "pass")
+
     def test_reconciliation_refuses_a_source_for_another_repository(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         self.assertEqual(self.reconcile(client, credentials).status, "pass")
         # Same PR number and head commit (e.g. a fork), but another repository's
@@ -833,7 +890,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_unwritable_ledger_still_supersedes_the_standing_success(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         self.reconcile(client, credentials)
         standing = self.ledger()["published"]
@@ -864,7 +921,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_clean_pass_republishes_after_an_unrecorded_revocation(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         self.reconcile(client, credentials)
         good = self.source.reviews
@@ -898,7 +955,7 @@ class CollectorTests(unittest.TestCase):
                 self.setUp()
                 client, credentials = self.publication()
                 other = self.make_collector()
-                self.collector.request_review("codex", self.live, self.source)
+                self.collector.request_review("codex", self.live, self.source, config=self.config)
                 self.source.add(self.context.head_sha, self.late())
                 self.reconcile(client, credentials,
                                collector_=other if case == "other_worker" else None)
@@ -927,7 +984,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_attempt_limit_stops_republishing_on_every_poll(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         self.reconcile(client, credentials)
         # So many attempts exist that the latest one can never be verified.
@@ -945,7 +1002,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_unverifiable_latest_attempt_is_never_reused(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         self.reconcile(client, credentials)
         # An incomplete listing proves nothing: supersede and republish.
@@ -967,7 +1024,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_overlapping_pass_cannot_revoke_a_newer_success(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         other = self.make_collector()
         outcomes = []
 
@@ -1000,7 +1057,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_context_change_supersedes_success_on_the_old_test_merge(self):
         client, credentials = self.publication()
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.context.head_sha, self.late())
         self.reconcile(client, credentials)
         self.live = replace(self.context, base_sha="e" * 40, test_merge_sha="9" * 40)
@@ -1009,7 +1066,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(client.posts[-1]["conclusion"], "failure")
         # A new request for the new context carries no stale success forward.
         self.clock.now = self.late() + 10
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.assertIsNone(self.ledger()["published"])
 
     def test_external_config_loader(self):
@@ -1022,7 +1079,7 @@ class CollectorTests(unittest.TestCase):
         os.chmod(config, 0o600)
         env = {collector.COLLECTOR_CONFIG_ENV: str(config)}
         loaded = collector.load_collector(env, self.checkout, self.clock)
-        self.assertTrue(loaded.request_review("codex", self.live, self.source).created)
+        self.assertTrue(loaded.request_review("codex", self.live, self.source, config=self.config).created)
         for bad in ({"state_dir": str(self.state), "providers": {}},
                     {"state_dir": str(self.state), "providers": {"codex": {**entry, "x": 1}}},
                     {"state_dir": str(self.state),
@@ -1225,6 +1282,7 @@ class LiveContextCacheTests(unittest.TestCase):
         self.github = FakeLiveGitHub(self.issuer)
         config = publisher.RuntimeConfig("owner/repository", 900002, self.issuer, 900003,
                                          root / "key.pem")
+        self.config = config
         self.credentials = publisher.AppCredentials(config, b"synthetic-key", "t" * 40)
         self.collector = collector.ReviewCollector(
             collector.LedgerStore(state, self.checkout), {"codex": identity()}, self.clock)
@@ -1240,7 +1298,7 @@ class LiveContextCacheTests(unittest.TestCase):
                                                   self.github, self.credentials)
 
     def test_passing_reconciliation_reads_each_git_object_once(self):
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.live.head_sha, START + RUNTIME + collector.CLOCK_SKEW_ALLOWANCE_SECONDS)
         decision = self.reconcile()
         self.assertEqual(decision.status, "pass")
@@ -1258,7 +1316,7 @@ class LiveContextCacheTests(unittest.TestCase):
         self.assertEqual(self.github.reads["/repos/owner/repository/pulls/12"], 5)
 
     def test_changed_mutable_state_is_still_seen(self):
-        self.collector.request_review("codex", self.live, self.source)
+        self.collector.request_review("codex", self.live, self.source, config=self.config)
         self.source.add(self.live.head_sha, START + RUNTIME + collector.CLOCK_SKEW_ALLOWANCE_SECONDS)
         self.assertEqual(self.reconcile().status, "pass")
         new_head = f"{0xA0000 + 2:040x}"

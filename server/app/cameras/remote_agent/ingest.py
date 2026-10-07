@@ -315,12 +315,6 @@ class AgentIngestQueue:
         with self._lock:
             self._windows.pop(node_id, None)
 
-    def holds(self, node_id: UUID, source_id: UUID) -> bool:
-        """Whether accepted media of this node/source still awaits ``drain``."""
-        with self._lock:
-            return any(item.node_id == node_id and item.source_id == source_id
-                       for item in self._queue)
-
     def drain(self, maximum_messages: int) -> tuple[AgentMessage, ...]:
         """Remove a bounded batch for one downstream consumer attempt."""
         if type(maximum_messages) is not int or maximum_messages <= 0:

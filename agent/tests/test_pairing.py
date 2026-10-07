@@ -108,6 +108,27 @@ class NodeCredentialStoreTests(unittest.TestCase):
             self.store.install(self.material(private_key=b"replacement"))
         self.assertEqual((self.root / "node-credentials" / "current.json").read_bytes(), manifest)
 
+    def test_identity_replacement_swaps_only_to_a_new_node_of_the_same_deployment(self):
+        self.store.install(self.material())
+        credentials = self.root / "node-credentials"
+        before = set(path.name for path in credentials.iterdir())
+        other = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+        for material, reason in (
+                (self.material(private_key=b"same-node"), "repair_identity_rejected"),
+                (self.material(node_id=other, deployment_id=other), "renewal_identity_mismatch")):
+            with self.assertRaisesRegex(PairingRefused, reason):
+                self.store.replace_identity(material)
+        with self.assertRaisesRegex(PairingRefused, "renewal_identity_mismatch"):
+            self.store.rotate(self.material(node_id=other))
+        self.assertEqual(before, set(path.name for path in credentials.iterdir()))
+        self.store.replace_identity(self.material(node_id=other, private_key=b"new-node-key"))
+        self.assertTrue(self.store.installed())
+        manifest = json.loads((credentials / "current.json").read_text(encoding="utf-8"))
+        self.assertEqual(str(other), manifest["node_id"])
+        after = set(path.name for path in credentials.iterdir())
+        self.assertEqual({".pairing.lock", "current.json"}, before & after,
+                         "the old generation is deleted after the swap commits")
+
     def test_symlinked_credential_directory_and_marker_are_refused(self):
         target = self.root / "target"
         target.mkdir(mode=0o700)
@@ -151,6 +172,75 @@ class NodeCredentialStoreTests(unittest.TestCase):
         (credentials / "private-key-orphan.pem").write_bytes(b"orphan")
         (credentials / "private-key-orphan.pem").chmod(0o600)
         self.assertFalse(self.store.installed())
+
+    def test_lost_commit_marker_after_install_fails_closed(self):
+        # PR #139 review: once an identity was installed, losing current.json
+        # (or the whole credential directory) is corruption, never "unpaired".
+        self.store.install(self.material())
+        marker = self.root / "node-identity-installed"
+        self.assertEqual(0o600, marker.stat().st_mode & 0o777)
+        credentials = self.root / "node-credentials"
+        (credentials / "current.json").unlink()
+        with self.assertRaisesRegex(PairingRefused, "credential_commit_missing"):
+            self.store.installed_node_id()
+        with self.assertRaisesRegex(PairingRefused, "credential_commit_missing"):
+            self.store.install(self.material(private_key=b"replacement"))
+        self.assertFalse((credentials / "current.json").exists())
+        for entry in credentials.iterdir():
+            entry.unlink()
+        credentials.rmdir()
+        with self.assertRaisesRegex(PairingRefused, "credential_commit_missing"):
+            self.store.installed()
+
+    def test_interrupted_first_install_stays_unpaired_and_can_retry(self):
+        with patch("media_capture_agent.pairing.os.link", side_effect=OSError("synthetic")):
+            with self.assertRaisesRegex(PairingRefused, "credential_storage_unavailable"):
+                self.store.install(self.material())
+        self.assertFalse((self.root / "node-identity-installed").exists())
+        self.assertIsNone(self.store.installed_node_id())
+        self.store.install(self.material())
+        self.assertEqual(NODE, self.store.installed_node_id())
+
+    def test_swaps_keep_or_restore_the_installed_evidence(self):
+        self.store.install(self.material())
+        marker = self.root / "node-identity-installed"
+        marker.unlink()  # e.g. a crash between the commit and the evidence write
+        other = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+        self.store.replace_identity(self.material(node_id=other, private_key=b"new-node-key"))
+        self.assertTrue(marker.exists())
+        self.store.rotate(self.material(node_id=other, private_key=b"renewed-key"))
+        self.assertTrue(marker.exists())
+        (self.root / "node-credentials" / "current.json").unlink()
+        with self.assertRaisesRegex(PairingRefused, "credential_commit_missing"):
+            self.store.installed()
+
+    def test_validating_a_committed_generation_backfills_the_evidence(self):
+        # PR #139 review: an identity paired before the evidence existed (or a
+        # crash between the commit and the evidence write) has a valid commit
+        # but no marker; validation must backfill it before anything is lost.
+        self.store.install(self.material())
+        marker = self.root / "node-identity-installed"
+        marker.unlink()
+        self.assertEqual(NODE, self.store.installed_node_id())
+        self.assertTrue(marker.exists())
+        self.assertEqual(0o600, marker.stat().st_mode & 0o777)
+        (self.root / "node-credentials" / "current.json").unlink()
+        with self.assertRaisesRegex(PairingRefused, "credential_commit_missing"):
+            self.store.installed_node_id()
+
+    def test_evidence_that_cannot_be_backfilled_fails_closed(self):
+        self.store.install(self.material())
+        (self.root / "node-identity-installed").unlink()
+        real_open = os.open
+
+        def refuse_marker(path, *args, **kwargs):
+            if path == "node-identity-installed":
+                raise OSError(28, "synthetic no space")
+            return real_open(path, *args, **kwargs)
+        with patch("media_capture_agent.pairing.os.open", refuse_marker):
+            with self.assertRaisesRegex(PairingRefused, "credential_storage_unavailable"):
+                self.store.installed_node_id()
+        self.assertFalse((self.root / "node-identity-installed").exists())
 
     def test_committed_manifest_generation_survives_without_cleanup_step(self):
         self.store.install(self.material())

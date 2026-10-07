@@ -257,6 +257,144 @@ ServerSentinel service cannot read a root-owned `sshd`'s `/proc/<pid>/fd` and
 `exe`, so an excepted `sshd` stays `LISTENER_OWNER_UNVERIFIED` and human
 access stays closed. ServerSentinel itself is never given root for this.
 
+### Capture-node CA and Main listener certificate
+
+The local pairing CLI (`python -m app.cameras.remote_agent.pairing_cli`, see
+`server/app/cameras/remote_agent/README.md`) keeps the deployment CA key and the
+Main capture listener credential in two different owner-only directories
+(0700, files 0600), both outside the checkout and media trees. The application
+does not start the ingest listener yet (#14/#15); these steps prepare it.
+
+**Separate accounts (Issue #124).** The CA directory belongs to the account
+that runs the CLI. The listener directory may belong to a different,
+non-root ingest service account that must never be able to read the CA key.
+Pass `--listener-owner <account or UID>` to `init`, `rotate-listener`,
+`export-bundle` and `approve`. The CLI then creates the listener directory and
+files already owned by that account (`fchown` happens before any key byte is
+written), so no manual `chown` is needed and the ingest service reads them as
+its own. Required privileges for that CLI run:
+
+- writing (`init`, `rotate-listener`): effective `CAP_CHOWN` and
+  `CAP_DAC_OVERRIDE`;
+- reading (`export-bundle`, `approve`): `CAP_DAC_OVERRIDE` or
+  `CAP_DAC_READ_SEARCH`.
+
+Root has both, so the simplest form is running the CLI as root with a
+root-owned CA directory. A non-root CA account can instead be given exactly
+these effective capabilities for that one administrative command (for example
+through systemd ambient capabilities); no service is given them. That variant
+is not yet verified on a real host (`MANUAL_TEST.md`). Without them
+the command refuses with `listener_owner_requires_privilege` before writing
+anything. Without `--listener-owner`, the listener files belong to the
+account running the CLI, and an ingest service under another account refuses
+to load them (fail closed). `approve` still opens the CA key, the listener
+credential and the application database in one process (separating the CA key
+from the enrollment listener is #109), so the account running it needs the CA
+directory as its own, the read privilege above for the listener directory, and
+the database as its own; `list` and `revoke` need only the database.
+`approve`, `list` and `revoke` never create a database: `--database` must name
+the application's existing database file (canonical path, regular file with
+one link, owned by the account running the command, not group- or
+other-writable), otherwise they refuse `database_not_found`,
+`database_path_rejected` or `database_rejected`. They never migrate either:
+the database must already carry exactly this release's schema history,
+otherwise they refuse `database_schema_outdated` (start the application once
+so its startup migration runs) or `database_schema_unsupported`. The validated
+file stays pinned for the whole command: if it is renamed, replaced or removed
+afterwards (for example while `approve`/`revoke` waits for the typed
+confirmation), every later ledger access and commit refuses
+`database_rejected`, nothing is written to whatever is now at the path and no
+file is recreated. Each connection is also checked against the inode SQLite
+actually opened (the process's descriptors in `/proc/self/fd`), so a path
+switched to another file only for the moment of the open is refused too. `export-bundle` and `approve`
+refuse `listener_authority_mismatch` when the listener certificate was not
+issued by the selected CA directory.
+
+**Rotating the Main listener certificate (Issue #125).** The listener leaf
+defaults to 397 days and is not renewed automatically. Rotate it before it
+expires, as the account (and with the privileges) used for `init`:
+
+```sh
+python -m app.cameras.remote_agent.pairing_cli rotate-listener \
+  --authority-dir <ca_dir> --listener-dir <listener_dir> [--listener-owner <account>]
+# prints: listener rotated: not_after=<UTC time>
+```
+
+then restart the process that serves the capture listener so it loads the new
+pair (a running listener keeps the pair it loaded at start). The CA and the
+server name do not change, so Agents keep their trust bundle and need no
+action; `export-bundle` output is unchanged. Rotation refuses
+`listener_authority_mismatch` when the listener certificate was not issued by
+the selected CA directory (for example two deployments' directories mixed up),
+and `issuer_material_busy` while another `init`/`rotate-listener` holds the
+directory. The old key is removed by the rename; nothing is kept beside it.
+If a rotation is interrupted between replacing the key and the certificate,
+loading the listener refuses `listener_material_inconsistent`; rerun
+`rotate-listener`, which completes the interrupted rotation (`listener
+rotation completed (interrupted run)`) instead of issuing another one. The
+same applies when the key rename took effect but the directory fsync after it
+failed (`issuer_material_replacement_unconfirmed`): the staged certificate is
+kept, and the rerun completes the pair.
+
+**CA validity.** A leaf is never issued beyond the deployment CA's own
+expiry. When the CA has less than the requested validity left, `init`,
+`rotate-listener` and `approve` refuse `deployment_ca_validity_insufficient`
+(a shorter `--server-validity-days` still rotates the listener), and node
+renewals are refused `renewal_ca_validity_insufficient` and raise the local
+Owner warning `capture_trust_warning` (not the per-node renewal warning).
+`CaptureCredentialMonitor` can also raise it ahead of time from the CA and
+listener expiry (30 days before the CA stops covering a 397-day node leaf, and
+30 days before the listener certificate expires); no scheduler runs the
+monitor yet (#14/#15), so until then track the printed `not_after` yourself.
+Replacing an expiring CA means a new `init` and re-pairing every Agent; plan
+it before the CA has 397 days left.
+
+### Capture-node re-pairing (expired or revoked node)
+
+A `remote_agent` capture node whose credential expired, or that the Owner
+revoked, is re-paired with the Main's local pairing CLI and the Agent's
+`media_capture_agent.enroll --repair` mode (#116, Owner policy 2026-10-01);
+nothing is deleted from the Main database. Run
+`python -m app.cameras.remote_agent.pairing_cli list --database <data_dir>/state.sqlite3`
+first to see whether the node is `credential=revoked`:
+
+- not revoked, certificate expired: the Agent runs `request --repair expired`
+  (its same key); `approve` shows `existing capture node: <uuid>` and the Owner
+  types `APPROVE`; the Agent runs `pair --repair expired`. The node UUID and its
+  camera sources stay the same.
+- revoked: the Agent runs `request --repair revoked` (a fresh key). `approve`
+  refuses the old key (`public_key_revoked`) and shows `new capture node` for
+  the new one. After `pair --repair revoked` the Agent holds a new node UUID
+  and prints the exact change (`config_update_required: set "node_id": "<new
+  uuid>" ...`). Make that edit in the Agent's protected configuration by hand:
+  until then the Agent refuses to start (`node_identity_mismatch`, also from
+  `--check`), with no capture or ingest. Then approve that node's camera
+  sources again. The revoked node stays listed as revoked, and
+  its recordings stay under it until normal retention removes them.
+  `--repair revoked` does not revoke anything on the Main: if it was used for a
+  node that was not revoked (for example one that had only expired), the
+  replaced node stays active on the Main until the Owner runs `pairing_cli
+  revoke` for it, which the Owner must then do. Each further `request --repair
+  revoked` after a completed swap prepares yet another new node, so do not
+  repeat it once `pair --repair revoked` has succeeded.
+
+If the Agent refuses with `node_credential_unavailable` because its installed
+credential's commit was lost (`credential_commit_missing`: the
+`node-identity-installed` evidence is present but `node-credentials/current.json`
+or the directory is missing), there is no in-place repair. The Owner revokes
+the old node on the Main (`pairing_cli revoke`); until then it stays active
+there. The operator, as the Agent service account with the service stopped,
+moves aside (does not delete until no longer needed for diagnosis)
+`<runtime_root>/node-credentials/`, `<runtime_root>/node-identity-installed` and
+any `pending-*` directories, then pairs again from scratch (`request`, `approve`,
+`pair`) as a new node, sets the printed `node_id` in the configuration and has
+the Owner approve its camera sources again.
+
+Stop the Agent's `media-capture-agent` service before re-pairing and start it
+afterwards. The full Agent-side procedure and its refusal words are in
+[`agent/pairing/README.md`](../../agent/pairing/README.md); the real-LAN
+checks are MANUAL_TEST §B step 15 (not yet executed on real hosts).
+
 ## Install, update, and rollback
 
 Run the separately downloaded installer only after verifying its published
