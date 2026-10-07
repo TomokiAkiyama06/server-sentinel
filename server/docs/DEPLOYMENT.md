@@ -304,7 +304,9 @@ file stays pinned for the whole command: if it is renamed, replaced or removed
 afterwards (for example while `approve`/`revoke` waits for the typed
 confirmation), every later ledger access and commit refuses
 `database_rejected`, nothing is written to whatever is now at the path and no
-file is recreated. `export-bundle` and `approve`
+file is recreated. Each connection is also checked against the inode SQLite
+actually opened (the process's descriptors in `/proc/self/fd`), so a path
+switched to another file only for the moment of the open is refused too. `export-bundle` and `approve`
 refuse `listener_authority_mismatch` when the listener certificate was not
 issued by the selected CA directory.
 

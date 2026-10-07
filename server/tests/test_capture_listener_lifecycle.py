@@ -787,6 +787,49 @@ class PinnedDatabaseTests(ListenerLifecycleHarness):
                 ledger.pairing_summaries()
             self.assertTrue(ledger.database.rejected)
 
+    def test_a_connection_opened_on_a_substitute_file_is_refused(self):
+        # Codex PR #141: the path names file B only while SQLite opens it and
+        # is restored to the pinned file A before the post-open check. A
+        # pathname check passes; the opened descriptor's inode must not.
+        database = existing_database(self.root)
+        substitute = existing_database(self.root)
+        parked = self.root / f"parked-{uuid4()}.sqlite3"
+        real_connect = sqlite3.connect
+
+        def swapping_connect(*args, **kwargs):
+            os.rename(database, parked)
+            os.rename(substitute, database)
+            try:
+                return real_connect(*args, **kwargs)
+            finally:
+                os.rename(database, substitute)
+                os.rename(parked, database)
+        with pairing_cli._ledger(database) as ledger:
+            owner = pairing_cli.LocalConsoleOwner()
+            grant = object()
+            owner._grants.append(grant)
+            with patch.object(pairing_cli.sqlite3, "connect", swapping_connect):
+                with self.assertRaises(pairing_cli.PairingError):
+                    ledger.revoke(owner, grant, node_id=uuid4())
+            self.assertTrue(ledger.database.rejected)
+        self.assertEqual(0, self.audit_rows(substitute))
+        self.assertEqual(0, self.audit_rows(database))
+
+    def test_wal_mode_database_with_sidecars_is_accepted(self):
+        database = existing_database(self.root)
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual("wal", connection.execute("PRAGMA journal_mode = WAL").fetchone()[0])
+        holder = sqlite3.connect(database)  # keeps -wal/-shm present
+        self.addCleanup(holder.close)
+        holder.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        status, _stdout, stderr = run_cli("list", "--database", str(database))
+        self.assertEqual(0, status, stderr)
+        terminal = ReplacingTerminal("REVOKE", lambda: None)
+        with patch.object(pairing_cli, "ControllingTerminal", lambda: terminal):
+            status, stdout, stderr = run_cli("revoke", "--database", str(database),
+                                             "--node", str(uuid4()))
+        self.assertNotIn("database_rejected", stderr)
+
     def test_ledger_database_refuses_once_released(self):
         database = existing_database(self.root)
         with pairing_cli._ledger(database) as ledger:

@@ -135,7 +135,8 @@ or other-writable) and refuse `database_not_found` / `database_rejected` /
 `database_schema_outdated` / `database_schema_unsupported` instead of
 migrating (migrations run only at application startup), and keep the validated
 file pinned so a later rename/replacement refuses `database_rejected` on every
-connection and before every commit (SQLite `mode=rw`, never created); `approve` refuses
+connection and before every commit (SQLite `mode=rw`, never created; the
+descriptor SQLite opened must be the pinned inode, checked via `/proc/self/fd`); `approve` refuses
 `deployment_ca_validity_insufficient` before any
 approval when the CA can no longer cover a 397-day node leaf. The bootstrap
 listener sets `SO_REUSEADDR` (never `SO_REUSEPORT`) so a re-run binds while the

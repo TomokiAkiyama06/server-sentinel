@@ -59,6 +59,7 @@ import secrets
 import sqlite3
 import stat
 import sys
+import threading
 from typing import Iterator
 from urllib.parse import quote
 from uuid import UUID, uuid4
@@ -239,6 +240,30 @@ class _VerifiedConnection(sqlite3.Connection):
         return super().commit()
 
 
+_CONNECT_LOCK = threading.Lock()
+
+
+def _regular_descriptors() -> dict[int, tuple[int, int]]:
+    """This process's open regular-file descriptors as (device, inode).
+
+    Read from ``/proc/self/fd`` (the Main is Linux-only); when it cannot be
+    read the ledger connection is refused rather than left unverified.
+    """
+    try:
+        names = os.listdir("/proc/self/fd")
+    except OSError:
+        raise _LedgerDatabaseChanged("open descriptors cannot be inspected") from None
+    found = {}
+    for name in names:
+        try:
+            info = os.stat(f"/proc/self/fd/{name}")
+        except OSError:
+            continue  # closed meanwhile (including the listing's own descriptor)
+        if stat.S_ISREG(info.st_mode):
+            found[int(name)] = (info.st_dev, info.st_ino)
+    return found
+
+
 class _PinnedLedgerDatabase(Database):
     """The application's existing database, pinned for every ledger operation.
 
@@ -285,20 +310,59 @@ class _PinnedLedgerDatabase(Database):
                 or (current.st_dev, current.st_ino) != self._identity):
             self._reject()
 
+    def _check_backing_file(self, before: dict[int, tuple[int, int]]) -> None:
+        """Require the file SQLite actually opened to be the pinned inode.
+
+        A path check alone cannot prove which inode ``sqlite3.connect()``
+        opened: the path could name another file during the open and be
+        restored before the post-open check. So the regular files this
+        process gained during the open are compared by (device, inode) and
+        every one must be the pinned file or one of its SQLite sidecars
+        (``-journal``/``-wal``/``-shm``) at the expected path; a descriptor
+        to any other file rejects the connection. SQLite may reuse a
+        descriptor it already holds for the same inode (while another
+        connection in this process keeps a lock on it) instead of opening a
+        new one, so it is enough that some descriptor other than the pin
+        refers to the pinned file.
+        """
+        after = _regular_descriptors()
+        gained = {identity for descriptor, identity in after.items()
+                  if before.get(descriptor) != identity}
+        sidecars = set()
+        for suffix in ("-journal", "-wal", "-shm"):
+            try:
+                info = os.lstat(str(self.path) + suffix)
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                sidecars.add((info.st_dev, info.st_ino))
+        opened = any(identity == self._identity and descriptor != self._descriptor
+                     for descriptor, identity in after.items())
+        if not opened or gained - sidecars - {self._identity}:
+            self._reject()
+
     def connect(self) -> sqlite3.Connection:
-        self.verify()
-        connection = sqlite3.connect(
-            "file:" + quote(str(self.path)) + "?mode=rw", uri=True, timeout=5,
-            isolation_level=None, factory=_VerifiedConnection)
-        try:
-            # The path could have been swapped between the check and the open.
+        # One open at a time per process, so concurrent opens (the enrollment
+        # listener's workers) never look like an unexpected descriptor.
+        with _CONNECT_LOCK:
             self.verify()
-            connection.verify_database = self.verify
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
-        except BaseException:
-            connection.close()
-            raise
+            before = _regular_descriptors()
+            connection = sqlite3.connect(
+                "file:" + quote(str(self.path)) + "?mode=rw", uri=True, timeout=5,
+                isolation_level=None, factory=_VerifiedConnection)
+            try:
+                # Force the open and the schema read (and any WAL sidecars),
+                # then check what was actually opened and that the path still
+                # names the pinned file.
+                connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+                self._check_backing_file(before)
+                self.verify()
+                connection.verify_database = self.verify
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA foreign_keys = ON")
+            except BaseException:
+                connection.close()
+                raise
         return connection
 
     def release(self) -> None:
