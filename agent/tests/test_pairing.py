@@ -214,6 +214,34 @@ class NodeCredentialStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(PairingRefused, "credential_commit_missing"):
             self.store.installed()
 
+    def test_validating_a_committed_generation_backfills_the_evidence(self):
+        # PR #139 review: an identity paired before the evidence existed (or a
+        # crash between the commit and the evidence write) has a valid commit
+        # but no marker; validation must backfill it before anything is lost.
+        self.store.install(self.material())
+        marker = self.root / "node-identity-installed"
+        marker.unlink()
+        self.assertEqual(NODE, self.store.installed_node_id())
+        self.assertTrue(marker.exists())
+        self.assertEqual(0o600, marker.stat().st_mode & 0o777)
+        (self.root / "node-credentials" / "current.json").unlink()
+        with self.assertRaisesRegex(PairingRefused, "credential_commit_missing"):
+            self.store.installed_node_id()
+
+    def test_evidence_that_cannot_be_backfilled_fails_closed(self):
+        self.store.install(self.material())
+        (self.root / "node-identity-installed").unlink()
+        real_open = os.open
+
+        def refuse_marker(path, *args, **kwargs):
+            if path == "node-identity-installed":
+                raise OSError(28, "synthetic no space")
+            return real_open(path, *args, **kwargs)
+        with patch("media_capture_agent.pairing.os.open", refuse_marker):
+            with self.assertRaisesRegex(PairingRefused, "credential_storage_unavailable"):
+                self.store.installed_node_id()
+        self.assertFalse((self.root / "node-identity-installed").exists())
+
     def test_committed_manifest_generation_survives_without_cleanup_step(self):
         self.store.install(self.material())
         credentials = self.root / "node-credentials"

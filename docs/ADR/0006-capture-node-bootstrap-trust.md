@@ -457,7 +457,13 @@ installed deployment; a different CA is a fresh install, never an in-place swap.
   unreadable, or its commit marker is lost after an identity was committed (a
   durable, never-removed `node-identity-installed` file records the first
   commit). Only a store without that evidence -- fresh, or a first install
-  interrupted before its commit -- reads as unpaired.
+  interrupted before its commit -- reads as unpaired. Every validation of a
+  committed credential durably backfills missing evidence (identities paired
+  by an earlier release, or a stop between the commit and the evidence write)
+  and refuses the credential if it cannot be written. Writing the evidence
+  before the commit was rejected: an interrupted first install would then look
+  like a lost commit and could not be retried. Residual: a commit lost after
+  such a stop and before any validation still reads as unpaired.
 - **Atomicity.** Both modes write and fsync the new generation, then atomically
   rename it over `current.json`; the old generation's files are deleted only
   after that commit. A renewal key staged for the old credential is discarded

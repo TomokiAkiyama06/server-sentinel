@@ -136,7 +136,15 @@ Owner policy (2026-10-01). Check the node's state on the Main first
   lost `node-credentials/current.json` or credential directory after pairing is
   also `node_credential_unavailable` (`credential_commit_missing`); only a store
   without that file (fresh, or a first install interrupted before its commit)
-  reads as unpaired. The Owner
+  reads as unpaired. Every validation of a committed credential (service start,
+  `--check`, `request`/`pair`) creates the file if it is missing (0600, file and
+  runtime root fsynced), so a node paired by an earlier release, or stopped
+  between the commit and the evidence write, gains it on first use; if it
+  cannot be written the credential is refused (`node_credential_unavailable`),
+  never accepted without it. Residual: losing `current.json` after such a stop
+  but before any validation still reads as unpaired; the file is deliberately
+  not written before the commit, because an interrupted first install would
+  then look corrupted and could not be retried. The Owner
   approves the new node's camera sources again on the Main; the old node's
   recordings stay under the old node until retention. The Agent's local ring
   buffer and protected incidents are not touched by re-pairing.

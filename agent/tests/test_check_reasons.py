@@ -326,6 +326,14 @@ class CheckReasonTests(unittest.TestCase):
         (self.runtime / "node-credentials" / "current.json").unlink()
         self.assert_reason("node_credential_unavailable")
 
+    def test_check_backfills_evidence_for_an_identity_paired_before_it_existed(self):
+        self.install_credential(UUID(self.value["node_id"]))
+        (self.runtime / "node-identity-installed").unlink()
+        self.assertEqual(self.run_check(), (0, PASSED, ""))
+        self.assertTrue((self.runtime / "node-identity-installed").exists())
+        (self.runtime / "node-credentials" / "current.json").unlink()
+        self.assert_reason("node_credential_unavailable")
+
     # Unexpected internal errors.
 
     def test_unexpected_error_is_check_failed_without_exception_text(self):

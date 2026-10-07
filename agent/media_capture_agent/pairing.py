@@ -145,7 +145,13 @@ class NodeCredentialStore:
     ``current.json`` the store reads as unpaired only while that evidence is
     absent (a fresh store, or a first install interrupted before its commit);
     with the evidence present the missing commit is corruption
-    (``credential_commit_missing``), never "unpaired".
+    (``credential_commit_missing``), never "unpaired". Every validation of a
+    committed generation (startup, ``--check``, pairing) backfills missing
+    evidence durably and fails closed if it cannot, so identities committed
+    before the evidence existed, or just before a stop, gain it on first use.
+    The evidence is not written before the commit: an "install intent" file
+    would make an interrupted first install indistinguishable from a lost
+    commit and block its retry.
     """
 
     def __init__(self, runtime_root: Path, *, owner_uid: int | None = None):
@@ -360,7 +366,10 @@ class NodeCredentialStore:
         ``None`` means no identity is installed; a damaged or unreadable
         generation raises ``PairingRefused`` (never treated as unpaired), and so
         does a missing commit once ``node-identity-installed`` records that an
-        identity was committed (``credential_commit_missing``).
+        identity was committed (``credential_commit_missing``). A generation
+        that validates backfills missing evidence durably before it is
+        returned; if that write fails the result is
+        ``credential_storage_unavailable``.
         """
         root_fd = credentials_fd = None
         try:
@@ -429,6 +438,11 @@ class NodeCredentialStore:
                     raise ValueError
             except (KeyError, TypeError, ValueError, UnicodeError):
                 raise PairingRefused("credential_identity_rejected") from None
+            # Backfill the evidence for an identity committed before it existed
+            # (an older release, or a stop between the commit and the evidence
+            # write). Fail closed if it cannot be made durable: a store whose
+            # loss could later read as unpaired is not accepted as installed.
+            self._record_installed(root_fd)
             return UUID(value["node_id"])
         except (OSError, StorageRefused):
             raise PairingRefused("credential_storage_unavailable") from None
@@ -444,19 +458,26 @@ class NodeCredentialStore:
         return None
 
     def _record_installed(self, root_fd: int) -> None:
+        """Durably create the installed-identity evidence if it is missing.
+
+        Idempotent; any existing entry counts as evidence (its content is not
+        meaningful). The runtime root is fsynced on every call so an entry left
+        by an earlier, interrupted call is made durable too. Errors propagate.
+        """
         try:
             descriptor = os.open(
                 _INSTALLED_MARKER,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                 0o600, dir_fd=root_fd)
         except FileExistsError:
-            return
-        try:
-            if os.write(descriptor, b"1\n") != 2:
-                raise OSError(errno.EIO, "installed evidence write failed")
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+            descriptor = None
+        if descriptor is not None:
+            try:
+                if os.write(descriptor, b"1\n") != 2:
+                    raise OSError(errno.EIO, "installed evidence write failed")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
         os.fsync(root_fd)
 
     def _open_credentials_directory(self, root_fd: int) -> int:
