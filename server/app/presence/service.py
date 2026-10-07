@@ -16,7 +16,7 @@ from .access import DenyAccess
 from .delivery import ActionResult
 from .models import (CRITICAL, InvalidObservation, Kind, Observation, PresenceState, Quality,
                      Value, timestamp, utc)
-from app.storage.database import PinnedDatabase
+from app.storage.database import PinnedDatabase, read_database_prefix
 from app.storage.retention import RetentionPeriods
 
 
@@ -69,17 +69,14 @@ def _wal_database(path):
     A missing file is not WAL here: the read-only open that follows fails
     instead of creating it. An empty or foreign file is not WAL either, and a
     rollback-journal read never creates a file beside the database.
+
+    The header is read through the process-wide held descriptor, never a
+    fresh ``open``/``close``: closing a descriptor on the database would drop
+    the POSIX locks this process's own SQLite connections hold on it.
     """
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY)
-    except FileNotFoundError:
+    header = read_database_prefix(path, 20)
+    if header is None:
         return False
-    except OSError:
-        raise ValueError("database location is unavailable") from None
-    try:
-        header = os.pread(descriptor, 20, 0)
-    finally:
-        os.close(descriptor)
     return len(header) == 20 and header[:16] == SQLITE_MAGIC and WAL_FORMAT in (header[18], header[19])
 
 

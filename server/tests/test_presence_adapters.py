@@ -1365,6 +1365,62 @@ class OwnerTrackerGateTests(PresenceFixture, TestCase):
         self.assertEqual((item["kind"], item["value"], item["quality"]), ("entrance_gate", "unknown", "unknown"))
 
 
+OTHER_PROCESS_WRITE = """
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
+try:
+    connection.execute("BEGIN IMMEDIATE")
+except sqlite3.OperationalError:
+    print("locked")
+else:
+    connection.execute("ROLLBACK")
+    print("acquired")
+"""
+
+
+def other_process_begin_immediate(path):
+    """Whether a separate process can take RESERVED on ``path`` right now."""
+    return subprocess.run([sys.executable, "-I", "-c", OTHER_PROCESS_WRITE, os.fspath(path)],
+                          capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+
+
+class DatabaseLockTests(TestCase):
+    """App-level database file handling never drops this process's SQLite locks (#129)."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.database = Database(Path(directory.name) / "locks.sqlite3")
+        with closing(self.database.connect()) as db:
+            db.execute("CREATE TABLE t (x)")
+        self.writer = sqlite3.connect(self.database.path, isolation_level=None)
+        self.addCleanup(self.writer.close)
+        self.writer.execute("BEGIN IMMEDIATE")
+        self.assertEqual(other_process_begin_immediate(self.database.path), "locked")
+
+    def test_pin_and_release_keep_the_writer_lock(self):
+        pinned = PinnedDatabase(self.database)
+        pinned.pin()
+        with closing(pinned.connect_read_only()) as db:
+            db.execute("SELECT count(*) FROM t").fetchone()
+        pinned.pin()
+        pinned.release()
+        self.assertFalse(pinned.pinned)
+        self.assertEqual(other_process_begin_immediate(self.database.path), "locked")
+
+    def test_refused_pin_keeps_the_writer_lock(self):
+        pinned = PinnedDatabase(self.database)
+        with mock.patch.object(PinnedDatabase, "_path_identity", side_effect=ValueError("synthetic")):
+            with self.assertRaises(ValueError):
+                pinned.pin()
+        self.assertEqual(other_process_begin_immediate(self.database.path), "locked")
+
+    def test_connecting_to_an_existing_database_keeps_the_writer_lock(self):
+        with closing(self.database.connect()) as db:
+            db.execute("SELECT count(*) FROM t").fetchone()
+        self.assertEqual(other_process_begin_immediate(self.database.path), "locked")
+
+
 class WalReadTests(PresenceFixture, TestCase):
     """Status and history reads never create WAL sidecars outside a reservation (#129)."""
 
@@ -1451,6 +1507,21 @@ class WalReadTests(PresenceFixture, TestCase):
                 self.entered.clear()
                 self.assertIsNone(self.presence.timeline_gap())
                 self.assertEqual(self.entered, [["-shm", "-wal"]])
+
+    def test_read_keeps_this_process_sqlite_locks(self):
+        # Closing any descriptor on the database file releases every POSIX
+        # lock this process holds on it. A read (and its WAL header probe)
+        # while an in-process writer holds RESERVED must leave that lock in
+        # place, so another process still cannot begin a write.
+        with closing(sqlite3.connect(self.database.path)) as db:
+            self.assertEqual(db.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+        writer = sqlite3.connect(self.database.path, isolation_level=None)
+        self.addCleanup(writer.close)
+        writer.execute("BEGIN IMMEDIATE")
+        self.assertEqual(other_process_begin_immediate(self.database.path), "locked")
+        self.assertIsNone(self.presence.timeline_gap())
+        self.assertEqual(other_process_begin_immediate(self.database.path), "locked")
+        writer.execute("ROLLBACK")
 
     def test_rollback_journal_read_needs_no_reservation(self):
         with closing(sqlite3.connect(self.database.path)) as db:
