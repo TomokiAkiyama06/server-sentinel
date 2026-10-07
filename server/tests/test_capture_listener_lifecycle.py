@@ -8,7 +8,6 @@ the dedicated refusal when the CA is too close to expiry. Every CA and key is
 generated per test in a temporary directory; no real host, account change or
 network beyond loopback is involved.
 """
-import argparse
 from contextlib import closing
 import datetime
 import errno
@@ -33,7 +32,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from app.cameras.remote_agent import node_ca, pairing_cli
+from app.cameras.remote_agent import issuer_process, node_ca, pairing_cli
 from app.cameras.remote_agent.enrollment import (
     ENROLLMENT_ALPN, EnrollmentConfigurationError, EnrollmentLimits, EnrollmentListener,
     EnrollmentListenerConfig, build_enrollment_server_context,
@@ -47,11 +46,15 @@ from app.storage import database as storage_database
 from app.storage.database import Database, held_descriptors
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
+from tests import issuer_fakes
 
 
 SERVER_NAME = "capture-main.serversentinel.test"
 DAY = datetime.timedelta(days=1)
-LISTENER_FILES = ("main-server-certificate.pem", "main-server-key.pem")
+LISTENER_PAIR = ("main-server-certificate.pem", "main-server-key.pem")
+# The listener directory also keeps the public CA copy (Issue #109).
+LISTENER_FILES = LISTENER_PAIR + ("deployment-ca-certificate.pem",)
+ISSUANCE_LOG = "issuance-log.jsonl"
 
 
 
@@ -96,6 +99,9 @@ class ListenerLifecycleHarness(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(os.path.realpath(temporary.name))
         os.chmod(self.root, 0o700)
+        # Unprivileged and in-process: no root start, no account change, the
+        # CA child's handler runs here (Issue #109; see tests/issuer_fakes.py).
+        self.privileges = issuer_fakes.install(self)
 
     def fresh(self, label="a"):
         return self.root / f"ca-{label}-{uuid4()}", self.root / f"listener-{label}-{uuid4()}"
@@ -132,6 +138,7 @@ class ListenerRotationTests(ListenerLifecycleHarness):
         authority, listener = self.fresh()
         self.init(authority, listener)
         ca_before = self.snapshot(authority)
+        log_before = ca_before.pop(ISSUANCE_LOG)
         old = self.snapshot(listener)
         old_certificate = self.certificate(listener)
         bundle_ca = ca_before["ca-certificate.pem"]
@@ -139,12 +146,21 @@ class ListenerRotationTests(ListenerLifecycleHarness):
         self.assertEqual(0, status, stderr)
         self.assertIn("listener rotated: not_after=", stdout)
         self.assertNotIn("PRIVATE KEY", stdout + stderr)
-        # The CA directory is untouched, so the exported trust bundle is too.
-        self.assertEqual(ca_before, self.snapshot(authority))
+        # The CA key and certificate are untouched, so the exported trust
+        # bundle is too; the CA-only issuance log gained one listener record.
+        ca_after = self.snapshot(authority)
+        log_after = ca_after.pop(ISSUANCE_LOG)
+        self.assertEqual(ca_before, ca_after)
+        self.assertTrue(log_after.startswith(log_before))
+        added = [json.loads(line) for line in log_after[len(log_before):].splitlines()]
+        self.assertEqual(["listener"], [record["type"] for record in added])
+        self.assertEqual(SERVER_NAME, added[0]["server_name"])
         self.assertEqual(sorted(LISTENER_FILES), sorted(os.listdir(listener)))
         new = self.snapshot(listener)
+        self.assertEqual(old["deployment-ca-certificate.pem"], new["deployment-ca-certificate.pem"])
         for name in LISTENER_FILES:
-            self.assertNotEqual(old[name], new[name])
+            if name in LISTENER_PAIR:
+                self.assertNotEqual(old[name], new[name])
             info = os.lstat(listener / name)
             self.assertEqual(0o600, stat.S_IMODE(info.st_mode))
             self.assertEqual(os.geteuid(), info.st_uid)
@@ -207,7 +223,7 @@ class ListenerRotationTests(ListenerLifecycleHarness):
         with self.assertRaises(ListenerMaterialInconsistent):
             listener_material(PrivateDirectory(listener))
         status, stdout, stderr = run_cli(
-            "export-bundle", "--authority-dir", str(authority), "--listener-dir", str(listener),
+            "export-bundle", "--listener-dir", str(listener),
             "--endpoint", "10.0.0.5:8443", "--output", str(self.root / f"bundle-{uuid4()}.json"))
         self.assertEqual(0, status, stderr)  # public bundle does not depend on the leaf pair
         status, stdout, stderr = self.rotate(authority, listener)
@@ -366,7 +382,8 @@ class ConcurrentInitTests(ListenerLifecycleHarness):
         self.assertEqual(2, status)
         self.assertEqual("", stdout)
         self.assertIn("refused: issuer_material_busy", stderr)
-        self.assertEqual([], os.listdir(authority))
+        # The listener side is refused first, so the CA side created nothing.
+        self.assertEqual([], os.listdir(authority) if authority.exists() else [])
         self.assertEqual([], os.listdir(listener))
         self.init(authority, listener)
 
@@ -378,8 +395,11 @@ class ConcurrentInitTests(ListenerLifecycleHarness):
         foreign = b"another process's key"
 
         def racing_write(directory, name, value):
-            if name == "main-server-key.pem":
-                descriptor = os.open(listener / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            # The key is staged under ``*.init`` and installed last without
+            # ever overwriting (Issue #109): the racer takes the final name.
+            if name == "main-server-key.pem.init":
+                descriptor = os.open(listener / "main-server-key.pem",
+                                     os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(descriptor, "wb") as stream:
                     stream.write(foreign)
             return real_write(directory, name, value)
@@ -391,7 +411,10 @@ class ConcurrentInitTests(ListenerLifecycleHarness):
         self.assertIn("refused", stderr)
         self.assertEqual(foreign, (listener / "main-server-key.pem").read_bytes())
         self.assertEqual(["main-server-key.pem"], os.listdir(listener))
-        self.assertEqual([], os.listdir(authority))
+        # The key is installed last, after the CA was committed (Issue #109),
+        # so the committed CA is kept; it is never removed by a rollback.
+        self.assertEqual(["ca-certificate.pem", "ca-key.pem", "issuance-log.jsonl"],
+                         sorted(os.listdir(authority)))
 
     def test_discard_created_ignores_a_replaced_entry(self):
         directory = PrivateDirectory(self.root / f"replaced-{uuid4()}").ensure()
@@ -437,8 +460,8 @@ class SeparateListenerAccountTests(ListenerLifecycleHarness):
                 patch.object(node_ca, "ownership_privilege_available", lambda *, assign: True), \
                 patch("app.cameras.remote_agent.node_ca.os.fchown", recording_fchown):
             ca.issue_main_server_credential(target, server_name=SERVER_NAME, validity=30 * DAY)
-        # The new directory and both files, each before content was written.
-        self.assertEqual([(True, real_uid, -1), (False, real_uid, -1), (False, real_uid, -1)], calls)
+        # The new directory and the three files, each before content was written.
+        self.assertEqual([(True, real_uid, -1)] + [(False, real_uid, -1)] * 3, calls)
         # The listener account (here this process) reads it as its own.
         listener_material(PrivateDirectory(listener))
 
@@ -486,20 +509,6 @@ class SeparateListenerAccountTests(ListenerLifecycleHarness):
             os.umask(previous)
         self.assertEqual(0o600, stat.S_IMODE(os.lstat(directory.path / "value").st_mode))
 
-    def test_missing_privilege_is_refused_before_anything_is_written(self):
-        authority, listener = self.fresh()
-        other = os.geteuid() + 4242
-        with patch.object(node_ca, "_effective_capabilities", lambda: 0):
-            status, stdout, stderr = run_cli("init", "--authority-dir", str(authority),
-                                             "--listener-dir", str(listener),
-                                             "--server-name", SERVER_NAME,
-                                             "--listener-owner", str(other))
-        self.assertEqual(2, status)
-        self.assertEqual("", stdout)
-        self.assertIn("refused: listener_owner_requires_privilege", stderr)
-        self.assertFalse((authority / "ca-key.pem").exists())
-        self.assertFalse(listener.exists())
-
     def test_reading_another_accounts_listener_requires_privilege(self):
         authority, listener = self.fresh()
         self.init(authority, listener)
@@ -544,13 +553,17 @@ class SeparateListenerAccountTests(ListenerLifecycleHarness):
                     patch.object(node_ca, "_effective_capabilities", lambda mask=mask: mask):
                 self.assertEqual(expected, node_ca.ownership_privilege_available(assign=assign))
 
-    def test_listener_owner_argument_accepts_names_and_uids_only(self):
-        self.assertEqual(1234, pairing_cli._account("1234"))
-        name = pwd.getpwuid(os.geteuid()).pw_name
-        self.assertEqual(os.geteuid(), pairing_cli._account(name))
+    def test_account_option_accepts_names_and_uids_only(self):
+        # ``--ca-user`` / ``--service-user`` resolve to an existing account
+        # (uid and primary gid); an unknown one is refused (Issue #109).
+        privileges = issuer_process.OsPrivileges()
+        entry = pwd.getpwuid(os.geteuid())
+        expected = issuer_process.Account(entry.pw_uid, entry.pw_gid)
+        self.assertEqual(expected, privileges.account(str(entry.pw_uid)))
+        self.assertEqual(expected, privileges.account(entry.pw_name))
         for bad in ("no-such-account-serversentinel", str(2 ** 32)):
-            with self.subTest(bad=bad), self.assertRaises(argparse.ArgumentTypeError):
-                pairing_cli._account(bad)
+            with self.subTest(bad=bad), self.assertRaises(issuer_process.PrivilegeSeparationError):
+                privileges.account(bad)
 
 
 class AuthorityValidityTests(ListenerLifecycleHarness):
@@ -618,7 +631,7 @@ class TrustExpiryReportTests(ListenerLifecycleHarness):
         self.assertIn("warning: deployment_ca_expiring", stderr)
         self.assertNotIn("listener_certificate", stderr)
         status, _stdout, stderr = run_cli(
-            "export-bundle", "--authority-dir", str(authority), "--listener-dir", str(listener),
+            "export-bundle", "--listener-dir", str(listener),
             "--endpoint", "10.0.0.5:8443", "--output", str(self.root / f"bundle-{uuid4()}.json"))
         self.assertEqual(0, status, stderr)
         self.assertIn("warning: deployment_ca_expiring", stderr)
@@ -716,23 +729,53 @@ class AuthorityConsistencyTests(ListenerLifecycleHarness):
     """#125 item 4: a CA directory and a listener directory of different deployments."""
 
     def test_export_bundle_refuses_a_listener_from_another_deployment(self):
+        # export-bundle reads only public material in the listener directory
+        # (Issue #109); a CA copy that did not issue the listener leaf is refused.
         authority_a, listener_a = self.fresh("a")
         authority_b, listener_b = self.fresh("b")
         self.init(authority_a, listener_a)
         self.init(authority_b, listener_b)
+        copy = listener_b / "deployment-ca-certificate.pem"
+        original = copy.read_bytes()
+        copy.unlink()
+        PrivateDirectory(listener_b).write_new(
+            "deployment-ca-certificate.pem", (authority_a / "ca-certificate.pem").read_bytes())
         output = self.root / f"bundle-{uuid4()}.json"
         status, stdout, stderr = run_cli(
-            "export-bundle", "--authority-dir", str(authority_a), "--listener-dir", str(listener_b),
+            "export-bundle", "--listener-dir", str(listener_b),
             "--endpoint", "10.0.0.5:8443", "--output", str(output))
         self.assertEqual(2, status)
         self.assertEqual("", stdout)
         self.assertIn("refused: listener_authority_mismatch", stderr)
         self.assertFalse(output.exists())
+        copy.unlink()
+        PrivateDirectory(listener_b).write_new("deployment-ca-certificate.pem", original)
         status, stdout, stderr = run_cli(
-            "export-bundle", "--authority-dir", str(authority_a), "--listener-dir", str(listener_a),
+            "export-bundle", "--listener-dir", str(listener_b),
             "--endpoint", "10.0.0.5:8443", "--output", str(output))
         self.assertEqual(0, status, stderr)
         self.assertRegex(stdout, r"^trust_bundle_sha256=[0-9a-f]{64}\n$")
+        bundle = json.loads(output.read_bytes())
+        self.assertEqual(original.decode("ascii"), bundle["ca_certificate"])
+
+    def test_export_bundle_without_the_public_ca_copy_is_refused(self):
+        # A listener directory written before Issue #109 has no public copy;
+        # export-bundle never falls back to the CA directory.
+        authority, listener = self.fresh()
+        self.init(authority, listener)
+        (listener / "deployment-ca-certificate.pem").unlink()
+        output = self.root / f"bundle-{uuid4()}.json"
+        status, stdout, stderr = run_cli(
+            "export-bundle", "--listener-dir", str(listener),
+            "--endpoint", "10.0.0.5:8443", "--output", str(output))
+        self.assertEqual(2, status)
+        self.assertIn("refused: deployment_ca_certificate_missing", stderr)
+        self.assertFalse(output.exists())
+        # rotate-listener (through the CA child) publishes it again.
+        status, _stdout, stderr = self.rotate(authority, listener)
+        self.assertEqual(0, status, stderr)
+        self.assertEqual((authority / "ca-certificate.pem").read_bytes(),
+                         (listener / "deployment-ca-certificate.pem").read_bytes())
 
     def test_export_bundle_refuses_a_tailscale_endpoint_without_writing(self):
         # Issue #150 (Owner decision 2026-10-07).
@@ -742,7 +785,7 @@ class AuthorityConsistencyTests(ListenerLifecycleHarness):
             output = self.root / f"bundle-{uuid4()}.json"
             with self.subTest(endpoint=endpoint):
                 status, stdout, stderr = run_cli(
-                    "export-bundle", "--authority-dir", str(authority),
+                    "export-bundle",
                     "--listener-dir", str(listener), "--endpoint", endpoint,
                     "--output", str(output))
                 self.assertEqual(2, status)
@@ -777,7 +820,8 @@ class ExistingDatabaseTests(ListenerLifecycleHarness):
 
     def refused(self, database, *, command="list"):
         argv = {"list": ["list", "--database", str(database)],
-                "revoke": ["revoke", "--database", str(database), "--node", str(uuid4())]}[command]
+                "revoke": ["revoke", "--database", str(database), "--node", str(uuid4()),
+                           "--authority-dir", str(self.root / "no-ca")]}[command]
         with patch.object(pairing_cli, "ControllingTerminal", NoPromptTerminal):
             status, stdout, stderr = run_cli(*argv)
         self.assertEqual(2, status)
@@ -910,7 +954,8 @@ class PinnedDatabaseTests(ListenerLifecycleHarness):
         terminal = ReplacingTerminal("REVOKE", lambda: moved.setdefault("path", self.replace(database)))
         with patch.object(pairing_cli, "ControllingTerminal", lambda: terminal):
             status, stdout, stderr = run_cli("revoke", "--database", str(database),
-                                             "--node", str(uuid4()))
+                                             "--node", str(uuid4()),
+                                             "--authority-dir", str(self.root / "no-ca"))
         self.assertEqual(2, status)
         self.assertEqual("", stdout)
         self.assertIn("refused: database_rejected", stderr)
@@ -922,7 +967,8 @@ class PinnedDatabaseTests(ListenerLifecycleHarness):
         terminal = ReplacingTerminal("REVOKE", lambda: os.unlink(database))
         with patch.object(pairing_cli, "ControllingTerminal", lambda: terminal):
             status, _stdout, stderr = run_cli("revoke", "--database", str(database),
-                                              "--node", str(uuid4()))
+                                              "--node", str(uuid4()),
+                                              "--authority-dir", str(self.root / "no-ca"))
         self.assertEqual(2, status)
         self.assertIn("refused: database_rejected", stderr)
         self.assertFalse(database.exists())
@@ -983,7 +1029,8 @@ class PinnedDatabaseTests(ListenerLifecycleHarness):
         terminal = ReplacingTerminal("REVOKE", lambda: None)
         with patch.object(pairing_cli, "ControllingTerminal", lambda: terminal):
             status, stdout, stderr = run_cli("revoke", "--database", str(database),
-                                             "--node", str(uuid4()))
+                                             "--node", str(uuid4()),
+                                             "--authority-dir", str(self.root / "no-ca"))
         self.assertNotIn("database_rejected", stderr)
 
     def test_ledger_database_refuses_once_released(self):

@@ -95,6 +95,144 @@ def _administrator_directory(directory: Path) -> None:
         raise ConfigurationError("deployment configuration is unavailable") from None
 
 
+class CaptureCaSettingMissing(ConfigurationError):
+    """``capture_ca_directory`` is absent; it must be a path or an explicit ``null``."""
+
+    REASON = ("capture_ca_directory is required: the capture-node CA directory path, "
+              "or null when this host keeps no capture-node CA")
+
+
+def _capture_ca_directory(value: object) -> Path:
+    """The configured capture-node CA directory (Issue #109): an absolute path."""
+    if not isinstance(value, str) or not value or "\0" in value:
+        raise ConfigurationError("invalid capture CA directory")
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ConfigurationError("capture CA directory must be absolute")
+    return path
+
+
+_CA_FILES = ("ca-key.pem", "ca-certificate.pem", "issuance-log.jsonl")
+
+
+def _effective_access(path: Path, mode: int) -> bool:
+    """``access(2)`` with this process's effective ids, ACLs included.
+
+    Fail closed: where effective-id checks are unsupported or the check
+    errors, access is assumed.
+    """
+    if os.access not in os.supports_effective_ids:
+        return True
+    try:
+        return os.access(path, mode, effective_ids=True, follow_symlinks=False)
+    except (OSError, NotImplementedError, ValueError, TypeError):
+        return True
+
+
+def _controlled_by_this_account(path: Path, info: os.stat_result, uid: int, *,
+                                allow_sticky: bool) -> bool:
+    """Whether this process's account owns ``path`` or may write to it.
+
+    Write access is the kernel's answer for the effective ids (owner, group,
+    other bits and POSIX ACLs alike), not an interpretation of mode bits.
+    """
+    if info.st_uid == uid:
+        return True
+    writable = _effective_access(path, os.W_OK)
+    if writable and allow_sticky and stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX:
+        # Like ``_administrator_directory``: in a sticky directory others
+        # cannot rename or replace an entry they do not own.
+        return False
+    return writable
+
+
+def capture_ca_path_exposed(path: Path, *, missing_is_exposed: bool = True) -> bool:
+    """Whether this process's account can reach or control the CA directory.
+
+    Run as the service account (launcher, and the pairing CLI after its
+    drop), Issue #109. Exposed when any of these holds, regardless of a
+    current permission refusal (an owner can always ``chmod`` it back):
+
+    * the directory, one of its path components or one of its CA files
+      (``ca-key.pem``, ``ca-certificate.pem``, ``issuance-log.jsonl``) is owned
+      by this account;
+    * this account can write the directory, a CA file, or a path component
+      (an ancestor only counts when it is not sticky), so it could replace
+      what lies below -- decided by ``access(2)`` with the effective ids, so
+      POSIX ACLs count, and assumed where that is unsupported;
+    * this account may read or search the directory, or read a CA file;
+    * a component is a symbolic link or the path is not a directory;
+    * the directory or its key file can be opened.
+
+    A missing component is exposure unless ``missing_is_exposed`` is false
+    (only ``revoke`` uses that, so a lost CA directory never blocks the
+    ledger revocation). Components this account cannot even look at (a
+    parent without search permission) are protected by that parent, which
+    was itself checked first.
+    """
+    path = Path(path)
+    if not path.is_absolute():
+        return True
+    uid = os.geteuid()
+    current = Path(path.anchor)
+    components = path.parts[1:]
+    for index, part in enumerate(components):
+        current = current / part
+        last = index == len(components) - 1
+        try:
+            info = os.lstat(current)
+        except (FileNotFoundError, NotADirectoryError):
+            return missing_is_exposed
+        except PermissionError:
+            return False
+        except OSError:
+            return True
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return True
+        if _controlled_by_this_account(current, info, uid, allow_sticky=not last):
+            return True
+        if last and (_effective_access(current, os.R_OK)
+                     or _effective_access(current, os.X_OK)):
+            # The CA directory is 0700 for its own account: this account may
+            # neither list nor search it (ACLs included).
+            return True
+    for name in _CA_FILES:
+        try:
+            info = os.lstat(path / name)
+        except (FileNotFoundError, PermissionError):
+            continue
+        except OSError:
+            return True
+        if (not stat.S_ISREG(info.st_mode)
+                or _controlled_by_this_account(path / name, info, uid, allow_sticky=False)
+                or _effective_access(path / name, os.R_OK)):
+            return True
+    for target, flags in ((path, os.O_RDONLY | os.O_DIRECTORY),
+                          (path / "ca-key.pem", os.O_RDONLY | os.O_NONBLOCK)):
+        try:
+            descriptor = os.open(target, flags | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except PermissionError:
+            continue
+        except (FileNotFoundError, NotADirectoryError):
+            if missing_is_exposed:
+                return True
+            continue
+        except OSError:
+            return True
+        os.close(descriptor)
+        return True
+    return False
+
+
+def capture_ca_directory_accessible(path: Path) -> bool:
+    """Launcher check (Issue #109): the service must not reach or control the CA.
+
+    Fail closed: a missing directory counts as exposed too, since the check
+    would otherwise prove nothing. See ``capture_ca_path_exposed``.
+    """
+    return capture_ca_path_exposed(Path(path), missing_is_exposed=True)
+
+
 def _runtime_roots() -> tuple[Path, Path | None]:
     try:
         code_root = Path(__file__).resolve(strict=True).parents[1]
@@ -165,6 +303,13 @@ class Deployment:
     # source's detector observation stays unknown/model_unavailable; there is
     # no default model, cadence or limit (see detection/foundation/config.py).
     detection: DetectionConfiguration | None = field(default=None, repr=False)
+    # The capture-node CA directory. When configured, the launcher refuses to
+    # run if the service account can open it (Issue #109).
+    capture_ca_directory: Path | None = field(default=None, repr=False)
+    # Whether the configuration contains the ``capture_ca_directory`` key at
+    # all (``null`` counts). The installer compares it with the release it
+    # switches to (Issue #109, review of PR #177).
+    capture_ca_configured: bool = field(default=True, repr=False)
 
     @property
     def state_directory(self) -> Path:
@@ -172,7 +317,17 @@ class Deployment:
 
     @classmethod
     def load(cls, path: Path, *, code_root: Path | None = None,
-             install_root: Path | None = None) -> "Deployment":
+             install_root: Path | None = None,
+             capture_ca_setting: str = "required") -> "Deployment":
+        """Load and validate the configuration.
+
+        ``capture_ca_setting`` is ``"required"`` for the service itself. The
+        installer passes ``"optional"`` and then requires or forbids the key
+        according to the release it switches to: a release from before
+        Issue #109 refuses the key as unknown (``capture_ca_configured``).
+        """
+        if capture_ca_setting not in ("required", "optional"):
+            raise ConfigurationError("invalid deployment configuration")
         value, info = _read_configuration(path)
         code_root = code_root or Path(__file__).resolve().parents[1]
         allowed = {
@@ -181,9 +336,16 @@ class Deployment:
             "human_host", "human_port", "log_level",
         }
         if (not allowed <= set(value)
-                or not set(value) <= allowed | {"monitoring", "local_uvc", "detection"}
+                or not set(value) <= allowed | {"monitoring", "local_uvc", "detection",
+                                                "capture_ca_directory"}
                 or type(value.get("service_uid")) is not int):
             raise ConfigurationError("invalid deployment configuration")
+        # Required (Owner decision 2026-10-07, Issue #109): every configuration
+        # states where the capture-node CA lives, or ``null`` for none, so the
+        # start-time check can never be skipped by omission.
+        configured = "capture_ca_directory" in value
+        if not configured and capture_ca_setting == "required":
+            raise CaptureCaSettingMissing("capture_ca_directory is required")
         uid = value["service_uid"]
         if uid <= 0:
             raise ConfigurationError("deployment configuration must name a non-root account")
@@ -261,8 +423,14 @@ class Deployment:
             )
         local_uvc = parse_local_uvc(value["local_uvc"]) if "local_uvc" in value else None
         detection = parse_detection(value["detection"]) if "detection" in value else None
+        capture_ca = (None if value.get("capture_ca_directory") is None
+                      else _capture_ca_directory(value["capture_ca_directory"]))
+        if capture_ca is not None and (capture_ca.is_relative_to(runtime_root)
+                                       or any(capture_ca.is_relative_to(root) for root in roots)):
+            raise ConfigurationError("capture CA directory must be outside runtime data and code")
         return cls(runtime_root, uid, settings, directories[1], directories[2], monitoring,
-                   local_uvc=local_uvc, detection=detection)
+                   local_uvc=local_uvc, detection=detection, capture_ca_directory=capture_ca,
+                   capture_ca_configured=configured)
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -283,6 +451,14 @@ def main(arguments: list[str] | None = None) -> int:
         # launcher refuse, so a deployment never runs with them silently absent.
         if deployment.monitoring is None or not deployment.monitoring.storage_configured:
             raise ConfigurationError("monitoring storage configuration is required")
+        # The service must not be able to open the capture-node CA directory
+        # (Issue #109); `--check` refuses too, so the unit never starts.
+        if (deployment.capture_ca_directory is not None
+                and capture_ca_directory_accessible(deployment.capture_ca_directory)):
+            raise ConfigurationError("service account can open the capture CA directory")
+    except CaptureCaSettingMissing:
+        parser.exit(1, "ServerSentinel deployment validation failed: "
+                       + CaptureCaSettingMissing.REASON + "\n")
     except ConfigurationError:
         parser.exit(1, "ServerSentinel deployment validation failed\n")
     if args.check:

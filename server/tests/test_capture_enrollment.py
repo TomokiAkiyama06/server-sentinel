@@ -33,7 +33,7 @@ from app.audit.store import AuditStore
 from app.cameras.remote_agent import pairing_cli
 from app.cameras.remote_agent.enrollment import (
     ENROLLMENT_ALPN, MAX_REQUEST_BYTES, EnrollmentConfigurationError, EnrollmentLimits,
-    EnrollmentListener, EnrollmentListenerConfig, EnrollmentService,
+    EnrollmentListener, EnrollmentListenerConfig, EnrollmentService, PresignedEnrollment,
     build_enrollment_server_context,
 )
 from app.cameras.remote_agent.node_ca import (
@@ -44,6 +44,7 @@ from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingError, Pai
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
+from tests import issuer_fakes
 
 
 SERVER_NAME = "capture-main.serversentinel.test"
@@ -106,7 +107,14 @@ class EnrollmentHarness(unittest.TestCase):
         key, csr, digest = node_request()
         approval, code = self.ledger.approve(Owner(), "owner", node_id=uuid4(),
                                              public_key_digest=digest)
+        self.csrs = getattr(self, "csrs", {})
+        self.csrs[approval.enrollment_id] = csr
         return key, csr, approval, code.value
+
+    def presigned(self, approval):
+        """What the CA-account issuer signs after approval, before redemption (#109)."""
+        return PresignedEnrollment(approval, self.authority.issue_approved_node_certificate(
+            approval.node_id, self.csrs[approval.enrollment_id], approval.public_key_digest))
 
     def serve(self, approvals, *, limits=None, expires_in=30.0):
         with socket.create_server(("127.0.0.1", 0)) as probe:
@@ -115,7 +123,8 @@ class EnrollmentHarness(unittest.TestCase):
                                       limits=limits or self.limits)
         listener.open()
         self.port = listener.address[1]
-        service = EnrollmentService(self.ledger, self.authority, tuple(approvals))
+        service = EnrollmentService(self.ledger, self.authority.public_trust(),
+                                    tuple(self.presigned(approval) for approval in approvals))
         self.stop = threading.Event()
         self.outcome = None
 
@@ -378,6 +387,11 @@ class EnrollmentConfigurationTests(unittest.TestCase):
 
 
 class PairingCliTests(EnrollmentHarness):
+    def setUp(self):
+        super().setUp()
+        # Unprivileged and in-process (Issue #109; see tests/issuer_fakes.py).
+        self.privileges = issuer_fakes.install(self)
+
     def request_file(self, **changes):
         _key, csr, digest = node_request()
         value = {"format_version": 1, "csr": csr.decode(), "public_key_digest": digest}
@@ -492,7 +506,7 @@ class PairingCliTests(EnrollmentHarness):
         real_write = PrivateDirectory.write_new
 
         def failing_write(directory, name, value):
-            if name == "main-server-certificate.pem":
+            if name == "main-server-certificate.pem.init":  # staged write (Issue #109)
                 raise pairing_cli.CaptureAuthorityError("issuer material could not be written")
             return real_write(directory, name, value)
         with patch.object(PrivateDirectory, "write_new", failing_write):
@@ -511,7 +525,7 @@ class PairingCliTests(EnrollmentHarness):
         real_write = PrivateDirectory.write_new
 
         def failing_write(directory, name, value):
-            if name == "ca-certificate.pem":
+            if name == "ca-certificate.pem.init":  # staged (Issue #109)
                 raise pairing_cli.CaptureAuthorityError("issuer material could not be written")
             return real_write(directory, name, value)
         with patch.object(PrivateDirectory, "write_new", failing_write):
@@ -549,7 +563,7 @@ class PairingCliTests(EnrollmentHarness):
         failing_directory_fsync = self._failing_directory_fsync
 
         def failing_write(directory, name, value):
-            if name == "ca-certificate.pem":
+            if name == "ca-certificate.pem.init":  # staged (Issue #109)
                 with failing_directory_fsync():
                     return real_write(directory, name, value)
             return real_write(directory, name, value)

@@ -59,6 +59,23 @@ class CIWorkflowTests(unittest.TestCase):
         harness = (ROOT / "tests/e2e/harness.py").read_text(encoding="utf-8")
         self.assertIn('REQUIRE_FULL_COVERAGE = "E2E_REQUIRE_FULL_COVERAGE"\n', harness)
 
+    def test_two_account_separation_runs_as_root_and_cannot_skip(self):
+        # Issue #109: the real account drops are only exercised as root.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        repository, separator, _remaining = workflow.partition("\n  components:\n")
+        self.assertTrue(separator, "components job boundary is missing")
+        runtime = repository.find("--input server/requirements.lock\n")
+        step = repository.find("- name: Two-account CA key separation as root (Issue #109)")
+        self.assertNotEqual(-1, runtime)
+        self.assertNotEqual(-1, step)
+        self.assertLess(runtime, step)
+        body = repository[step:repository.find("\n      - name:", step + 1)]
+        self.assertIn("sudo -n env PYTHONDONTWRITEBYTECODE=1 CA_SEPARATION_REQUIRE_ROOT=1", body)
+        self.assertIn("-m unittest -v tests.test_ca_privilege_separation_root", body)
+        test = (ROOT / "server/tests/test_ca_privilege_separation_root.py").read_text(
+            encoding="utf-8")
+        self.assertIn('REQUIRE_ROOT = "CA_SEPARATION_REQUIRE_ROOT"', test)
+
 
 if __name__ == "__main__":
     unittest.main()

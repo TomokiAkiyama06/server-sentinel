@@ -113,7 +113,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
             "runtime_root": str(self.runtime),
             "runtime_mount_point": str(self.root),
             "runtime_device": [os.major(device), os.minor(device)],
-            "runtime_filesystem_uuid": self.filesystem_uuid,
+            "runtime_filesystem_uuid": self.filesystem_uuid, "capture_ca_directory": None,
             "service_uid": self.uid,
             "human_host": "127.0.0.1",
             "human_port": 8000,
@@ -927,7 +927,7 @@ class DeploymentConfigurationTests(unittest.TestCase):
                 "runtime_root": str(runtime), "service_uid": os.geteuid(),
                 "runtime_mount_point": str(root),
                 "runtime_device": [os.major(device), os.minor(device)],
-                "runtime_filesystem_uuid": uuid,
+                "runtime_filesystem_uuid": uuid, "capture_ca_directory": None,
                 "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
             }
 
@@ -1031,7 +1031,7 @@ class DeploymentConfigurationTests(unittest.TestCase):
                 "runtime_root": str(root / "runtime"), "service_uid": os.geteuid(),
                 "runtime_mount_point": str(root),
                 "runtime_device": [os.major(device), os.minor(device)],
-                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444",
+                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444", "capture_ca_directory": None,
                 "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
             }))
             config.chmod(0o644)
@@ -1050,7 +1050,7 @@ class DeploymentConfigurationTests(unittest.TestCase):
                 "runtime_root": str(runtime), "service_uid": os.geteuid(),
                 "runtime_mount_point": str(root),
                 "runtime_device": [os.major(device), os.minor(device)],
-                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444",
+                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444", "capture_ca_directory": None,
                 "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
             }
             (root / "code").mkdir()
@@ -1122,6 +1122,18 @@ class DeploymentConfigurationTests(unittest.TestCase):
                     load(config)
 
 
+def drop_socket_capability(release: Path) -> None:
+    """Model a release from before socket activation, keeping its other capabilities.
+
+    These socket-activation tests isolate that boundary; the
+    ``capture_ca_directory`` boundary (Issue #109) has its own tests.
+    """
+    path = release / install.RELEASE_CAPABILITIES
+    text = path.read_text()
+    path.chmod(0o644)
+    path.write_text(text.replace("HUMAN_UPSTREAM_SOCKET_ACTIVATION = True\n", ""))
+
+
 class ActivationBoundaryTests(unittest.TestCase):
     """Issue #126 / PR #153: an update or rollback never switches to a release
     from before socket activation while the host could not start it."""
@@ -1152,7 +1164,7 @@ class ActivationBoundaryTests(unittest.TestCase):
     def installed_old_then_new(self):
         with self.legacy("1.0.0"):
             self.perform(self.arguments("install", "1.0.0"))
-        (self.installation / "releases/1.0.0" / install.RELEASE_CAPABILITIES).unlink()
+        drop_socket_capability(self.installation / "releases/1.0.0")
         self.perform(self.arguments("update", "1.1.0"))
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.1.0")
 
@@ -1269,7 +1281,7 @@ class ActivationBoundaryTests(unittest.TestCase):
         with self.legacy("1.1.0"):
             self.perform(self.arguments("update", "1.1.0"))
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.1.0")
-        (self.installation / "releases/1.1.0" / install.RELEASE_CAPABILITIES).unlink()
+        drop_socket_capability(self.installation / "releases/1.1.0")
         self.assertFalse(self.unit_names_socket())
         # Back to an activation release.
         self.perform(self.arguments("update", "1.2.0"))
@@ -1390,6 +1402,103 @@ class ActivationBoundaryTests(unittest.TestCase):
             install.main()
         self.assertEqual(exited.exception.code, 1)
         self.assertIn("synthetic owner steps", stderr.getvalue())
+
+
+class CaptureCaSettingBoundaryTests(unittest.TestCase):
+    """Issue #109 (review of PR #177): ``capture_ca_directory`` is required by
+    releases with ``CAPTURE_CA_DIRECTORY_SETTING`` and refused as an unknown
+    key by earlier ones, so update and rollback check the configuration
+    against the release they switch to, before any change."""
+
+    setUp_lifecycle = ReleaseLifecycleTests.setUp
+    artifact = ReleaseLifecycleTests.artifact
+    arguments = ReleaseLifecycleTests.arguments
+    perform = ReleaseLifecycleTests.perform
+    approved_device_lookup = ReleaseLifecycleTests.approved_device_lookup
+
+    def setUp(self):
+        self.setUp_lifecycle()
+        port_start = patch("install._unprivileged_port_start", return_value=1024)
+        port_start.start()
+        self.addCleanup(port_start.stop)
+        self.legacy_versions = set()
+        real = getattr(install, "_supports_capture_ca_setting", None)
+        if real is None:
+            return  # an installer without the boundary (fail-before runs)
+
+        def capability(release):
+            name = Path(release).name.lstrip(".").removesuffix(".staging")
+            return False if name in self.legacy_versions else real(release)
+        supports = patch("install._supports_capture_ca_setting", side_effect=capability)
+        supports.start()
+        self.addCleanup(supports.stop)
+
+    def configure(self, present):
+        value = json.loads(self.config.read_text())
+        value.pop("capture_ca_directory", None)
+        if present:
+            value["capture_ca_directory"] = None
+        self.config.chmod(0o600)
+        self.config.write_text(json.dumps(value))
+
+    def state(self):
+        previous = self.installation / "previous"
+        return (os.readlink(self.installation / "current"),
+                os.readlink(previous) if previous.is_symlink() else None, self.unit.read_text())
+
+    def refused(self, arguments, *phrases):
+        before = self.state()
+        with self.assertRaises(install.ActivationBoundaryRefused) as refused:
+            self.perform(arguments)
+        self.assertEqual(before, self.state(), "nothing may change")
+        message = str(refused.exception)
+        self.assertIn("before any change", message)
+        for phrase in phrases:
+            self.assertIn(phrase, message)
+        return message
+
+    def test_artifact_release_declares_the_capture_ca_setting(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        capabilities = (self.installation / "releases/1.0.0" / install.RELEASE_CAPABILITIES)
+        self.assertIn("\nCAPTURE_CA_DIRECTORY_SETTING = True\n", capabilities.read_text())
+
+    def test_setting_capable_legacy_capable_cycle(self):
+        # A deployment on a release from before Issue #109 (no key).
+        self.legacy_versions.add("1.0.0")
+        self.configure(present=False)
+        self.perform(self.arguments("install", "1.0.0"))
+        # Updating to a release that requires the key is refused with the steps.
+        update = self.arguments("update", "1.1.0")
+        self.refused(update, "requires \"capture_ca_directory\"",
+                     "add \"capture_ca_directory\"", "rerun the same command (update ...)")
+        self.assertFalse((self.installation / "releases/1.1.0").exists())
+        self.configure(present=True)
+        self.perform(update)
+        self.assertEqual("releases/1.1.0", os.readlink(self.installation / "current"))
+        # Rolling back to the legacy release with the key is refused before
+        # any change, with the exact steps for both directions.
+        self.refused(self.arguments("rollback"), "predates the \"capture_ca_directory\"",
+                     "remove the \"capture_ca_directory\" entry",
+                     "rerun the same command (rollback)", "first add the entry back")
+        self.configure(present=False)
+        self.perform(self.arguments("rollback"))
+        self.assertEqual("releases/1.0.0", os.readlink(self.installation / "current"))
+        # And forward again to the capable release.
+        self.refused(self.arguments("rollback", "1.1.0"), "requires \"capture_ca_directory\"",
+                     "rerun the same command (rollback --version 1.1.0)")
+        self.configure(present=True)
+        self.perform(self.arguments("rollback", "1.1.0"))
+        self.assertEqual("releases/1.1.0", os.readlink(self.installation / "current"))
+
+    def test_update_to_a_legacy_artifact_with_the_key_is_refused_before_its_check(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        self.legacy_versions.add("1.1.0")
+        checks = len([call for call, _ in self.runner.calls if "--check" in call])
+        self.refused(self.arguments("update", "1.1.0"), "remove the \"capture_ca_directory\" entry")
+        self.assertEqual(checks, len([call for call, _ in self.runner.calls if "--check" in call]),
+                         "the release's own --check never ran")
+        self.assertFalse((self.installation / "releases/1.1.0").exists())
+        self.assertFalse((self.installation / "releases/.1.1.0.staging").exists())
 
 
 if __name__ == "__main__":

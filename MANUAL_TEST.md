@@ -546,25 +546,27 @@ that. Use a disposable deployment CA and synthetic server name; never paste
 keys, codes, certificates, bundle contents, LAN addresses or hostnames into
 Issues, PRs or CI artifacts. Below, `MAIN_CLI` means
 `python -m app.cameras.remote_agent.pairing_cli` run from the Main's `server/`
-code with the reviewed runtime installed. `AGENT_CLI` means
+code with the reviewed runtime installed; `init`, `rotate-listener`, `approve`
+and `revoke` run as `sudo MAIN_CLI ...` (Issue #109) and `export-bundle` and
+`list` as `sudo -u <service account> MAIN_CLI ...` (the `serversentinel-pairing`
+wrapper is #180). `AGENT_CLI` means
 `python -m media_capture_agent.enroll` run from the Agent's code with
 `cryptography` installed.
 
-1. On the Main host, as the local administrative account that owns the
-   application database, run
-   `MAIN_CLI init --authority-dir <ca_dir> --listener-dir <listener_dir> --server-name <dns name>`
-   with both directories outside the checkout and media trees. Confirm both are
-   0700 and every file 0600, owned by that account, and that the two directories
-   differ. Separate-account variant (Issue #124, `server/docs/DEPLOYMENT.md`):
-   on a disposable deployment with a dedicated non-root ingest account, run the
-   same `init` as root with `--listener-owner <ingest account>`; confirm the
-   listener directory and both files are owned by the ingest account (0700 /
-   0600), that the ingest account can read them and cannot open `<ca_dir>`,
-   and that the same command run as a non-root account without
-   `CAP_CHOWN`/`CAP_DAC_OVERRIDE` refuses `listener_owner_requires_privilege`
-   and leaves no CA or listener file behind. If a non-root CA account with
-   only those ambient capabilities is used instead of root, record that it
-   works.
+1. On the Main host, create the static `serversentinel-ca` account and the
+   two directories as in `server/docs/DEPLOYMENT.md` ("Accounts, ownership and
+   modes"), then run
+   `sudo MAIN_CLI init --authority-dir <ca_dir> --listener-dir <listener_dir> --server-name <dns name>`
+   (add `--service-user <account>` when the service account is not
+   `server-sentinel`) with both directories outside the checkout and media
+   trees. Confirm `<ca_dir>` is 0700 `serversentinel-ca` with `ca-key.pem`,
+   `ca-certificate.pem` and `issuance-log.jsonl` 0600 `serversentinel-ca`;
+   `<listener_dir>` is 0700 service account with `main-server-key.pem`,
+   `main-server-certificate.pem` and `deployment-ca-certificate.pem` 0600
+   service account; and the two directories differ. The same command without
+   `sudo` refuses `privilege_separation_requires_root` and writes nothing, and
+   with `--ca-user` equal to `--service-user` refuses
+   `ca_account_must_differ_from_service_account`.
 2. Choose the bootstrap endpoint: the Main's private-LAN IP and a port distinct
    from the dashboard (loopback-only) and any ingest port. Public addresses
    and Tailscale addresses (IPv4 `100.64.0.0/10` and IPv6
@@ -573,10 +575,11 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    private LAN and need no Tailscale. On a Main that runs Tailscale, confirm
    `approve --listen` with the node's own Tailscale IPv4 and IPv6 address
    (`tailscale ip -4` / `tailscale ip -6`) each refuses before any prompt. Run
-   `MAIN_CLI export-bundle --authority-dir <ca_dir> --listener-dir <listener_dir> --endpoint <ip>:<port> --output bundle.json`
-   and note the printed full `trust_bundle_sha256`. Running it with another
-   deployment's `--listener-dir` must refuse `listener_authority_mismatch`
-   and write no bundle. On a Main that runs Tailscale, confirm
+   `sudo -u <service account> MAIN_CLI export-bundle --listener-dir <listener_dir> --endpoint <ip>:<port> --output bundle.json`
+   (public material only; no root) and note the printed full
+   `trust_bundle_sha256`. A listener directory whose `deployment-ca-certificate.pem`
+   did not issue its listener certificate must refuse
+   `listener_authority_mismatch` and write no bundle. On a Main that runs Tailscale, confirm
    `export-bundle --endpoint` with its Tailscale IPv4 and IPv6 address
    (`--endpoint [<ipv6>]:<port>`) each refuses
    `trust_bundle_endpoint_tailscale_address_refused` and writes no bundle.
@@ -593,8 +596,10 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    Tailscale or admin credential was needed. Confirm running it as root is
    refused (`root_refused`). Note the printed `public_key_sha256`.
 5. Carry `request.json` (public) to the Main. Run
-   `MAIN_CLI approve --database <data_dir>/state.sqlite3 --authority-dir <ca_dir> --listener-dir <listener_dir> --request request.json --listen <ip>:<port>`
-   from an interactive terminal; `<data_dir>/state.sqlite3` must be the
+   `sudo MAIN_CLI approve --database <data_dir>/state.sqlite3 --authority-dir <ca_dir> --listener-dir <listener_dir> --request request.json --listen <ip>:<port>`
+   from an interactive terminal (`request.json` readable by the service
+   account; `--listen` port at or above `ip_unprivileged_port_start`);
+   `<data_dir>/state.sqlite3` must be the
    database the application already created (a mistyped path refuses
    `database_not_found` and creates nothing; a database the current release has
    not yet migrated refuses `database_schema_outdated` and is left unchanged
@@ -636,7 +641,7 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    Optionally capture the exchange with `tcpdump` on a disposable deployment and
    confirm it shows only TLS records. Do not keep or upload the capture.
 8. Confirm `<runtime_root>/node-credentials` is 0700 with 0600 files and that
-   the pending key was removed. Run `MAIN_CLI list --database ...` and confirm
+   the pending key was removed. Run `sudo -u <service account> MAIN_CLI list --database ...` and confirm
    it shows the node as `activated`/`active` with no digests.
 9. With a fresh runtime root, repeat steps 4–5 and let the five minutes pass
    before typing the code: expect `enrollment closed: reason=expired` on the
@@ -657,7 +662,9 @@ code with the reviewed runtime installed. `AGENT_CLI` means
     From another LAN host without a node certificate, with a certificate from a
     different CA, and with an expired certificate: expect refusal before any
     capture message is accepted *(needs ingest wiring)*.
-12. Run `MAIN_CLI revoke --database ... --node <uuid>` and type `REVOKE`. The
+12. Run `sudo MAIN_CLI revoke --database ... --authority-dir <ca_dir> --node <uuid>` and type `REVOKE`;
+    confirm the last line of `<ca_dir>/issuance-log.jsonl` (read as root) is a
+    `node_revocation` for that UUID. The
     open session closes on the next admission check, and reconnecting is
     refused although the certificate has not expired *(needs ingest wiring)*.
     Approving the old `request.json` again must be refused
@@ -679,18 +686,19 @@ code with the reviewed runtime installed. `AGENT_CLI` means
     `capture_credential_warning`. *(needs transport wiring and a scheduler)*
 15. Main listener certificate rotation (Issue #125), on a disposable
     deployment after step 7: record the listener `not_after`, run
-    `MAIN_CLI rotate-listener --authority-dir <ca_dir> --listener-dir <listener_dir>`
-    (plus `--listener-owner` if used in step 1) and confirm it prints a new
-    `not_after` about 397 days ahead, that `<ca_dir>` and the exported bundle's
-    SHA-256 are unchanged, that the listener directory again holds exactly the
-    two 0600 files with the expected owner and no `*.next` file, and that the
+    `sudo MAIN_CLI rotate-listener --authority-dir <ca_dir> --listener-dir <listener_dir>`
+    and confirm it prints a new
+    `not_after` about 397 days ahead, that the CA key and certificate and the
+    exported bundle's SHA-256 are unchanged (the issuance log gains one
+    `listener` record), that the listener directory again holds exactly the
+    three 0600 files owned by the service account and no `*.next` file, and that the
     key file's SHA-256 changed (compare hashes; never print the key). Restart the listener process, then confirm the
     already-paired Agent connects with its existing trust bundle and no Agent
     change *(needs ingest wiring, #14/#15)*; until then, rerun `approve` with
     a fresh request and confirm `AGENT_CLI pair` with the unchanged bundle
     authenticates the rotated certificate. Negative checks: running
     `rotate-listener` with another deployment's `--authority-dir` refuses
-    `listener_authority_mismatch` and changes nothing; two `rotate-listener`
+    (`listener_authority_mismatch`) and changes nothing; two `rotate-listener`
     (or `init`) runs started together on the same listener directory leave
     exactly one winner and the other refuses `issuer_material_busy`. Re-running
     `approve` within a minute of a completed one binds again (no
@@ -709,6 +717,65 @@ code with the reviewed runtime installed. `AGENT_CLI` means
     renewal against such a CA is refused `renewal_ca_validity_insufficient`
     and the Owner sees `capture_trust_warning`, not the per-node warning
     *(needs transport wiring and a scheduler)*.
+
+17. CA key separation (Issue #109 PR1). Status: **unverified on real
+    hardware**; verified only by the unprivileged tests and by
+    `server/tests/test_ca_privilege_separation_root.py` as root in CI and in a
+    container (`docker run --cap-add SYS_PTRACE ...`) with two numeric
+    accounts. On the Main, with a disposable deployment from step 1:
+    a. As the service account, `cat <ca_dir>/ca-key.pem` and
+       `ls <ca_dir>` both fail with `Permission denied` (`EACCES`); as
+       `serversentinel-ca` they work. Add `"capture_ca_directory": "<ca_dir>"`
+       to the deployment configuration and confirm `--check` passes; then
+       temporarily `chown <service account> <ca_dir>` with `chmod 000
+       <ca_dir>` and confirm `--check` still fails (control, not current
+       access, decides; restore owner and mode); give the service account
+       write access to `<ca_dir>`'s parent only through a named ACL
+       (`setfacl -m u:<service account>:rwx <parent>`) and confirm `--check`
+       fails, then remove the ACL (`setfacl -x u:<service account> <parent>`); likewise
+       temporarily `chmod 0755 <ca_dir>` and confirm `--check` fails
+       (`ServerSentinel deployment validation failed`) and the service does not
+       start; restore `0700`.
+    b. While `sudo MAIN_CLI approve ...` waits at `Type APPROVE`, confirm from
+       another root shell that its process tree has two processes: the command
+       (`/proc/<pid>/status` `Uid`/`Gid` all the service account, `CapEff` and
+       `CapPrm` `0000000000000000`, `NoNewPrivs: 1`) and its CA child (all
+       `serversentinel-ca`, `CapEff` zero, no `/dev/pts/*` and no database in
+       `ls -l /proc/<child>/fd`, a different session id). After `APPROVE` and
+       before the Agent pairs (the code is shown), confirm the CA child is gone
+       (`ps --ppid <pid>` lists nothing) and only the service-account process
+       listens on `--listen`.
+    c. During that serving phase, as root, scan the serving process's memory
+       for the CA key: read `/proc/<pid>/maps` and every readable range of
+       `/proc/<pid>/mem` and search for the 32-byte private scalar (big- and
+       little-endian), the PKCS#8 DER and the first 40 base64 characters of
+       `ca-key.pem` (a short Python script; keep it and its output local).
+       Expect no match. As a positive control, the same scan of a root Python
+       process that loaded `ca-key.pem` must match.
+    d. Make the issuance log unwritable for the CA account (for example
+       `chattr +i <ca_dir>/issuance-log.jsonl` on a disposable deployment):
+       `approve` must refuse `issuer_unavailable` (`issuer_detail=issuance_log_unavailable`)
+       after `APPROVE` without ever showing a code; remove the attribute.
+       Change `<ca_dir>` to the service account's ownership: `approve` refuses
+       `issuer_unavailable` before the prompt; restore the ownership.
+    e. Run `sudo MAIN_CLI revoke ...` for a test node and confirm the
+       `node_revocation` record; approving that node's old key again is
+       refused by the ledger (`public_key_revoked`) and would also be refused
+       by the CA log.
+    f. With `<ca_dir>` renamed away, `sudo MAIN_CLI revoke ...` still
+       revokes in the ledger, prints `ca_revocation_unrecorded` and exits 1
+       (never `ca_directory_exposed`); after renaming it back a rerun records
+       the revocation. Remove `capture_ca_directory` from the deployment
+       configuration: `--check` fails with `capture_ca_directory is required`.
+    g. Kill `sudo MAIN_CLI init ...` on a disposable deployment right after
+       the CA side committed (or simulate a lost reply), then rerun the same
+       `init`: the CA files are unchanged and only a listener certificate is
+       issued (`init recovered`); a further rerun reports `init already
+       complete`.
+    h. Migration (`server/docs/DEPLOYMENT.md`): on a copy of a pre-#109
+       deployment, after the `chown`, `export-bundle` refuses
+       `deployment_ca_certificate_missing` until `sudo MAIN_CLI rotate-listener`
+       has run once; existing nodes keep connecting.
 
 15. Re-pairing (#116, Owner policy 2026-10-01; mock-verified only by
     `agent/tests/test_enroll.py` and

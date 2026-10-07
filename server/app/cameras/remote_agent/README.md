@@ -31,12 +31,35 @@ capture-node authorization primitive: it cannot authorize a human/API route.
 loads the EC P-256 deployment CA from an owner-only (0700) directory with
 write-once 0600 files, writes the serverAuth-only Main ingest certificate/key to a
 *different* private directory, exports the public trust bundle with its full
-SHA-256 digest, and issues a capture-only client certificate for a redeemed
-`EnrollmentClaim`. The CSR only proves possession of the approved key; the node
-cannot choose its identity, SANs, key usage or scope. `issue_and_activate` signs
-and then activates the exact certificate digest in the ledger, so a certificate
-whose activation failed stays unusable. Validity is an explicit bounded
-parameter that defaults to the Owner-decided 397 days.
+SHA-256 digest, and issues a capture-only client certificate for an
+Owner-approved key. The CSR only proves possession of the approved key; the node
+cannot choose its identity, SANs, key usage or scope. Validity is an explicit
+bounded parameter that defaults to the Owner-decided 397 days.
+
+Public and signing roles are separate (Issue #109). `DeploymentTrust` holds
+only the CA certificate: CSR proof of possession, CA validity checks, listener
+and node certificate verification (`verify_issued_node_certificate` /
+`verify_issued_listener_certificate` check the direct issuer, the fixed leaf
+profile, the URIs and the key), staged-renewal re-validation and the trust
+bundle. `DeploymentAuthority` extends it with the CA private key and is
+constructed only by the CA-account issuer (`issuer_process.py`) and by tests.
+The listener directory keeps a public copy of the CA certificate
+(`deployment-ca-certificate.pem`) so the service account can verify and export
+without the CA directory.
+
+`issuer_process.py` is the CA side of the pairing CLI. `ForkedIssuer.start`
+forks, before any thread exists, a child that starts a new session, keeps only
+its two pipe ends (stdin/stdout/stderr become `/dev/null`), drops to the
+static `serversentinel-ca` account (`setgroups([])`, `setresgid`,
+`setresuid`, no_new_privs, non-dumpable, parent-death signal) and verifies the
+drop. `CaIssuer` answers `hello` with the public CA certificate and then
+performs at most one of `sign_node`, `sign_listener`, `revoke` (or
+`initialize` with a later `commit`/`abort`), deciding from its CA-only
+issuance log (`issuance-log.jsonl`, 0600): a node revoked there, or a key bound
+there to another or a revoked node, is refused, and every signature or
+revocation is appended with fsync before it is answered (an unwritable log
+means nothing is signed). Frames are length-prefixed JSON over the pipes;
+every child failure is `issuer_unavailable` for the caller.
 
 `renewal.py` implements automatic renewal (Owner decision 2026-09-30).
 `renew_node_credential` issues a certificate only for the presenting session's
@@ -77,6 +100,10 @@ listener certificate. The renewal exchange and the monitor are not yet run by
 any listener or scheduler (#14/#15); meanwhile `pairing_cli` `init`,
 `rotate-listener`, `export-bundle` and `approve` print the CA expiry and the
 same warning words on stderr (`ca_expiry_reason` / `listener_expiry_reason`).
+Interim (Issue #109): renewal signs through `renewal.RenewalIssuer`, which
+today only an in-process `DeploymentAuthority` implements (tests); nothing in
+the application calls it, and wiring it into a listener waits for the
+renewal-only signer of Issue #109 PR2.
 
 Listener credential lifecycle (#124/#125). `PrivateDirectory(owner_uid=...)`
 may name another account than the process: new entries get their final 0600
@@ -147,15 +174,22 @@ applies.
 
 `pairing_cli.py` (`python -m app.cameras.remote_agent.pairing_cli`) is the local
 Owner CLI: `init`, `rotate-listener`, `export-bundle`, `approve`, `list`,
-`revoke`. `--listener-owner` names the listener directory's account when it
-differs from the CLI's (see `server/docs/DEPLOYMENT.md`). `rotate-listener`
+`revoke`. `init`, `rotate-listener`, `approve` and `revoke` start as root
+(`sudo`), fork the CA child (above), and then drop to the service account
+(`--service-user`, default `server-sentinel`; `--ca-user` defaults to
+`serversentinel-ca`), verifying `CapEff==0` and `euid!=0` and that the CA
+directory can no longer be opened, before they open the request file or the
+database (`server/docs/DEPLOYMENT.md`). Listener keys are generated on the
+service-account side and only their CSR goes to the CA child, so nothing
+changes owner. `export-bundle` and `list` run as the service account and read
+only public material and the database. `rotate-listener`
 replaces the Main listener leaf before it expires and keeps the CA and server
 name; `export-bundle` and `approve` refuse `listener_authority_mismatch` when
-the listener certificate was not issued by the selected CA directory (two
+the listener certificate was not issued by the deployment CA (two
 deployments' directories mixed up); `approve`, `list` and `revoke` require
 `--database` to name the application's existing database (canonical path,
-regular file with one link, owned by the account running the CLI, not group-
-or other-writable) and refuse `database_not_found` / `database_rejected` /
+regular file with one link, owned by the service account the command runs as,
+not group- or other-writable) and refuse `database_not_found` / `database_rejected` /
 `database_path_rejected` instead of creating one, refuse
 `database_schema_outdated` / `database_schema_unsupported` instead of
 migrating (migrations run only at application startup), and keep the validated
@@ -171,11 +205,18 @@ it writes the write-once CA, and removes what it created if listener issuance
 still fails, so a corrected rerun works without manual secret-file cleanup.
 `approve` shows
 the request's key digest, requires a typed `APPROVE` on the controlling
-terminal, creates the pairing through `PairingLedger.approve`, writes the code
-once to the controlling terminal (never stdout, stderr, logs or files), and
-serves the listener in the same process (the ledger's process epoch makes
-approvals from other processes unusable; the HMAC key is per run and never
-stored). It refuses before any state change when there is no controlling
+terminal, creates the pairing through `PairingLedger.approve`, has the CA child
+sign the node certificate (signed after approval and before redemption, valid
+only after activation; ADR-0006 follow-up of 2026-10-07), verifies it against
+the public CA and waits for the child to exit, then writes the code once to
+the controlling terminal (never stdout, stderr, logs or files) and serves the
+listener in the same process with no CA-key process alive (the ledger's
+process epoch makes approvals from other processes unusable; the HMAC key is
+per run and never stored). On redemption the listener, which holds only
+`DeploymentTrust`, activates exactly that pre-signed certificate; any issuer
+failure refuses `issuer_unavailable` without showing the code. `revoke`
+revokes in the ledger, then records `node_revocation` in the CA issuance log
+(`ca_revocation_unrecorded` and exit 1 if that fails; a rerun records it). It refuses before any state change when there is no controlling
 terminal. `--human-host` (loopback IP) and `--human-port` name the dashboard
 listener so the bootstrap listener can never take its socket. A key already
 bound to a live node is re-approved for that same node (shown on the prompt),
@@ -188,9 +229,9 @@ transaction). A revoked node re-pairs only as a new node with a new key: the
 prompt says `new capture node`, no camera source is carried over from the old
 node (the Owner approves the new node's sources again), and the old node's
 ledger rows stay `revoked` -- nothing is deleted, so its recordings stay
-attributed to the old node until normal retention removes them. Until #6 lands, Owner authority in this CLI is the local account that
-owns the issuer material and database plus one typed confirmation per
-approve/revoke; see the ADR-0006 follow-up notes.
+attributed to the old node until normal retention removes them. Until #6 lands, Owner authority in this CLI is the local administrator who
+can start it as root plus one typed confirmation per approve/revoke; see the
+ADR-0006 follow-up notes.
 
 ## Transport-neutral bounded ingest core
 

@@ -837,7 +837,7 @@ class DeploymentMonitoringTests(unittest.TestCase):
             base = {
                 "runtime_root": str(runtime), "runtime_mount_point": str(root),
                 "runtime_device": [os.major(device), os.minor(device)],
-                "runtime_filesystem_uuid": uuid, "service_uid": os.geteuid(),
+                "runtime_filesystem_uuid": uuid, "capture_ca_directory": None, "service_uid": os.geteuid(),
                 "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
             }
             monitoring = {

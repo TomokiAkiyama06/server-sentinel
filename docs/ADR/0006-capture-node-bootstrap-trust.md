@@ -524,3 +524,105 @@ installed deployment; a different CA is a fresh install, never an in-place swap.
   `server/tests/test_capture_enrollment.py`,
   `tests/e2e/test_capture_enrollment_scenarios.py`); real-host re-pairing is in
   `MANUAL_TEST.md` and unverified.
+
+## Follow-up notes (2026-10-07, Issue #109 PR1: CA key separation)
+
+These notes record the Owner decision of 2026-10-07 ("Plan B", Issue #109)
+and its first implementation step. They amend one ordering of this ADR, as
+the Owner approved; the bootstrap trust decision and the ADR status are
+unchanged.
+
+- **Amended ordering: signed after approval, before redemption, valid only
+  after activation.** Step 7 of the enrollment flow and the 2026-09-30 note
+  ("signing happens after ledger consumption") said the Main signs after it
+  consumes the approval. Now the node certificate is signed after the Owner's
+  `APPROVE` and the ledger approval, and before any redemption; the code is
+  shown only after that certificate verified. Redemption (single use,
+  constant-time code check, proof of possession of the approved key) then
+  activates exactly that pre-signed certificate digest. A pre-signed
+  certificate admits nothing until that activation, because ingest admission
+  always requires the ledger's active record; an unredeemed or interrupted
+  approval therefore leaves an inert certificate, as a signed-but-unactivated
+  one did before. A lost response still needs a fresh Owner approval.
+- **Accounts and processes.** The CA directory belongs to the static system
+  account `serversentinel-ca` (not DynamicUser); the database and the Main
+  listener directory belong to the service account. `init`,
+  `rotate-listener`, `approve` and `revoke` are each one `sudo` command that
+  forks a CA child before any thread exists. The child drops to the CA
+  account (`setgroups([])`, `setresgid`, `setresuid`, no_new_privs,
+  non-dumpable, parent-death signal, new session, only its pipe descriptors)
+  and verifies the drop; the parent drops to the service account,
+  verifies `CapEff==0` and `euid!=0` and only then opens the listener
+  directory (TLS material from verified descriptors), the request file and
+  the database. The CA child signs at most one
+  fixed-profile leaf (or records one revocation) and exits; the parent
+  verifies the certificate against the public CA certificate and serves only
+  after the child exited. The enrollment listener therefore never runs in a
+  process that holds or can load the CA key, which closes the "narrower
+  issuance capability" item still open in the 2026-09-30 notes for
+  enrollment.
+- **CA-only issuance log.** The CA child decides from its own append-only
+  log (`issuance-log.jsonl`, CA account, 0600) and the certificate chain, not
+  from the application ledger, so the application database keeps its 0700
+  service-account directory. The log records every CA creation, listener
+  leaf, node leaf (node UUID, key and certificate digests, expiry) and
+  revocation; it never holds a key, CSR, code or certificate body. A node
+  revoked in the log, or a key the log binds to another or a revoked node, is
+  refused; an unwritable or damaged log means nothing is signed. `revoke`
+  records the revocation there after the ledger revocation (Owner default),
+  so the later renewal signer can refuse revoked nodes.
+- **Listener keys stay on the listener side.** `init` and `rotate-listener`
+  generate the listener key as the service account; the CA child only signs a
+  subject-free CSR with the fixed serverAuth profile. No file changes owner,
+  which removes the `--listener-owner` option and the `CAP_CHOWN` /
+  `CAP_DAC_OVERRIDE` requirement of the 2026-10-05 notes (#149 no longer
+  applies to the CLI). A public CA copy is kept in the listener directory so
+  `export-bundle` runs as the service account with public material only.
+- **Review follow-ups (2026-10-07).** `capture_ca_directory` is a required
+  deployment setting (a path, or an explicit `null` without a capture CA). A
+  missing CA directory is not "exposed" for the dropped CLI, so `revoke`
+  keeps working on the ledger when the CA directory is lost. `init` is
+  idempotent and recovers a lost `commit` reply by keeping the existing CA
+  and issuing only a listener leaf; CA material is never removed. A public CA
+  copy is published only after the listener certificate verified. Known
+  limitation: the issuance log has no hash chain (deferred by the Owner);
+  only the CA account or root can modify it. The `serversentinel-pairing`
+  wrapper is #180. Round 3: a CA path the service account controls (owns, or
+  can write, for the directory, its CA files or a non-sticky path
+  component) is exposed even while access is denied; the CA directory lock
+  spans each whole CA conversation; listener files are staged and installed
+  key-last so an interrupted `init` is recognized and redone. Round 4: the CA
+  pair is staged and installed key-last too; a partial CA without any
+  issuance record is cleaned and recreated, one with records is never
+  removed (`issuer_material_incomplete`); access checks use `access(2)` with
+  effective ids (ACLs included, fail closed where unsupported); a torn final
+  log line is ignored and dropped by the next append. Round 5: every read
+  of a directory that uses staged installs first removes a staged name that
+  is the second link of its final file (an install stopped between link
+  and unlink), before the one-link check runs. Round 6: the new CA is
+  committed before the listener key is installed (a final listener key
+  implies a committed CA); every crash point of `init`, `rotate-listener`,
+  `approve` and `revoke` is a named fault-injection point, and a
+  parametrized test stops each command at each point (command, CA child or
+  both dying) and checks that the next run of every command converges
+  without removing committed material. `approve` opens nothing of the
+  listener directory before the drop and loads its TLS material from
+  verified descriptors. Round 7: releases declare
+  `CAPTURE_CA_DIRECTORY_SETTING`; the installer checks the configuration
+  against the release it switches to (required for those, refused for
+  earlier ones) before any change, so update and rollback across the
+  boundary print the Owner steps instead of failing.
+- **Still open (PR2).** Automatic renewal still has only an in-process
+  signing primitive, used by tests and called by nothing in the application;
+  wiring renewal into the ingest listener waits for the socket-activated,
+  renewal-only signer of Issue #109 PR2 (rate limits and log checks as decided
+  on 2026-10-07).
+- **Evidence.** Unprivileged unit and loopback tests with seams for the root
+  start, the drops and the fork (`server/tests/test_issuer_process.py`,
+  `server/tests/issuer_fakes.py`), the real forked child as one account in the
+  E2E CLI scenarios (`tests/e2e/test_capture_enrollment_scenarios.py`), and a
+  root-only two-account test (`server/tests/test_ca_privilege_separation_root.py`,
+  run as root by CI and in a container) that checks ownership and modes,
+  `EACCES` on the CA key for the service account, the serving process's
+  credentials and the absence of CA key bytes in its memory. Real-host
+  verification is in `MANUAL_TEST.md` §B and unverified.

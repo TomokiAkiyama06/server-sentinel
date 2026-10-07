@@ -60,6 +60,18 @@ jobs:
           python scripts/ci/license_gate.py \
             --resolved-python "${RUNNER_TEMP}/server-runtime-report.json" \
             --input server/requirements.lock
+      - name: Two-account CA key separation as root (Issue #109)
+        # The only root step: two unused numeric accounts stand for
+        # serversentinel-ca and the service account (no account is created).
+        # A copy under a traversable temporary directory lets those accounts
+        # import the code after the drop; the test fails instead of skipping.
+        run: |
+          workdir="$(mktemp -d)"
+          cp -R server "$workdir/server"
+          chmod -R a+rX "$workdir"
+          cd "$workdir/server"
+          sudo -n env PYTHONDONTWRITEBYTECODE=1 CA_SEPARATION_REQUIRE_ROOT=1 \
+            "$(command -v python)" -m unittest -v tests.test_ca_privilege_separation_root
       - name: Hardware-free mock E2E core scenarios
         env:
           PYTHONDONTWRITEBYTECODE: '1'
