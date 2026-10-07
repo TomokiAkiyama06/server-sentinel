@@ -476,5 +476,63 @@ descriptors, which it can always read: a replacement bound by another process
 is an exposure. The missing-proxy-socket handling was accepted by the Owner
 on 2026-10-01.
 
+Owner decision, 2026-10-05 (PR #142): the socket owner resolver is mandatory,
+and a check without one never opens human access. Ownership that cannot be
+verified keeps access closed without revocation and reopens once ownership
+verifies again; only an observed other owner or holder is an exposure that
+revokes every human session. This supersedes the 2026-10-01 wording above that
+treated unverifiable ownership as an exposure.
+
+Owner decision, 2026-10-07 (Issue #126, replacing closed PR #142): the
+privileged helper is not built. Enumerating another account's descriptors
+needs ptrace-level privilege (`CAP_SYS_PTRACE`), which would let a compromised
+helper read and write every process's memory through `/proc/<pid>/mem`. The
+property checked changes from "every current holder matches" to "the creating
+systemd unit (and uid) matches":
+
+- The backend itself, unprivileged and without a helper, asks the kernel's
+  socket diagnostics (`NETLINK_SOCK_DIAG`, `inet_diag` dumps of TCP and UDP,
+  IPv4 and IPv6) for each verified socket's uid and creating cgroup
+  (`INET_DIAG_CGROUP_ID`), and resolves the cgroup id to its
+  `/sys/fs/cgroup` path. systemd creates a `.socket` unit's sockets in the
+  socket unit's cgroup and a service's own sockets in the service's cgroup;
+  only root can place a process in a `system.slice` cgroup. Listener
+  enumeration stays on `/proc/net`; sock_diag is only the owner resolver.
+- Exceptions and `proxy_owner` name a systemd unit and uid only; the
+  executable-path identity is dropped, and `.socket` units are allowed, so
+  `tcp/22` is `ssh.socket` (uid 0). This reverts the 2026-10-01 "run `sshd` as
+  `ssh.service` only" step. Stored executable-path exceptions fail closed as
+  outdated until the Owner re-enters them.
+- A creator that cannot be resolved (`/init.scope`, the root cgroup, a deleted
+  or unknown cgroup id, no cgroup attribute) is `LISTENER_OWNER_UNVERIFIED`
+  (closed, no revocation) while the socket's uid is one of the expected
+  identities' uids, and always for `/init.scope` with uid 0; with a uid none
+  of them has it is another creator (amended by the Owner the same day). A
+  socket in `/proc/net` but not in the dump, or a failed or slow dump, is
+  unverified. A resolved different cgroup or uid is `UNEXPECTED_LISTENER`
+  (revocation) only when an immediate second dump in the same check repeats
+  it; otherwise it is unverified.
+- The human upstream moves to systemd socket activation:
+  `server-sentinel-upstream.socket` (loopback, a port below 1024,
+  `ReusePort=no`) is created by systemd as uid 0 and passed to the
+  unprivileged backend. The check requires the socket to be in the backend's
+  own descriptors, created in that `.socket` unit's cgroup by uid 0, on a port
+  below `ip_unprivileged_port_start` (otherwise a configuration error that
+  keeps access closed without revocation), and held by no other process of
+  the ServerSentinel unit's cgroups (a same-uid `/proc/<pid>/fd` scan;
+  sharing is an exposure only when the same process, by pid and start time,
+  still holds the socket in a second scan about 100 ms later, because a child
+  between `fork` and `exec` briefly holds every descriptor; otherwise, and
+  when a process stays unreadable, it is unverified).
+- Every lookup first verifies a loopback probe listener of its own appears
+  with the backend's cgroup and uid (the startup self-check, repeated on every
+  check), so a missing netlink permission, kernel attribute or a mismatched
+  cgroup view fails closed. The backend needs `AF_NETLINK`, the host network
+  namespace and no `ProtectControlGroups=private|strict`.
+- Residual risk accepted by the Owner: sock_diag reports the socket's
+  creator, not its current holder. A legitimately created socket whose
+  creating process is compromised and hands the descriptor to another process
+  (`fork`, `SCM_RIGHTS`) outside the ServerSentinel unit is not detected.
+
 Clarification, 2026-10-01 (PR #91): where this record says the startup and daily check closes access "on any other answer", read "on any other answer it can see". The check enumerates listening sockets (`/proc/net`) and Tailscale Serve routes only; kernel forwarding to the reserved address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF `sk_lookup`, IPVS) is not visible to it and must be excluded by the deployment isolation and verified by the operator per `MANUAL_TEST.md`. The current contract is in `server/app/auth/README.md`. This is still detection: it bounds how long an exposed
 cookie stays usable, and does not prevent the exposure.

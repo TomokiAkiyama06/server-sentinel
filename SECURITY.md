@@ -363,39 +363,66 @@ see, which bounds rather than removes that exposure. The check sees only sockets
 sockets it sees, the check bounds the exposure rather than preventing it: the
 application cannot prevent a local process from binding.
 
-The current contract for that check (Owner decisions 2026-09-30 and
-2026-10-01; details in `server/app/auth/README.md` and ADR-0003):
+The current contract for that check (Owner decisions 2026-09-30,
+2026-10-01, 2026-10-05 and 2026-10-07; details in `server/app/auth/README.md`
+and ADR-0003):
 
 - Each check re-resolves the reserved name. A resolved address set that
   differs from the recorded one is treated as an exposure. A missing resolver
   or a resolution that fails or times out keeps human access closed but is not
   an exposure: access reopens without revocation once the name resolves to the
   recorded set again, unless an exposure was seen meanwhile.
-- After any exposure (another listener or route, a changed address set, an
-  excepted listener with an unverifiable owner, or a listener/route
-  enumeration that fails or times out) access reopens only after every human
+- After any exposure (another listener or route, a changed address set, or
+  a listener/route enumeration that fails or times out) access reopens only after every human
   session, the Owner's included, has been revoked by advancing the
   authorization generation, with its `system` audit record committed. The
   requirement is persisted as a marker before reopening; if the marker cannot
   be written, every human session is revoked at once instead. A check without
   a durable revoker never opens human access.
-- An Owner listener exception names a port together with its owning
-  executable or systemd unit, never a port alone, and every check verifies the
-  socket's owning processes. Another process, or ownership that cannot be read
-  completely, closes access as an exposure. ServerSentinel stays non-root;
-  reading root-owned sockets is left to a separate privileged helper service
-  (Issue #126), and until it exists an excepted root-owned `sshd` keeps human
-  access closed. The Main Server runs `sshd` as `ssh.service` without
-  `ssh.socket`, with the exception `tcp/22` owned by `/usr/sbin/sshd`
-  (`server/docs/DEPLOYMENT.md`).
-- Every recorded proxy socket must be present and held only by the recorded
-  proxy process (for example `tailscaled.service`), verified the same way.
-  Another or unverifiable holder is an exposure; a missing recorded socket
-  closes access without revocation until it returns. Until #126 lands, a
-  root-owned proxy's sockets keep human access closed.
-- The loopback human upstream must be a socket the ServerSentinel process
-  itself holds (checked in its own `/proc/self/fd`, without privilege); a
-  replacement bound by another process is an exposure.
+- An Owner listener exception names a port together with its creating
+  systemd unit (`.service` or `.socket`) and uid, never a port alone, and
+  every check verifies the socket's creating unit and uid. The unprivileged
+  backend asks the kernel's socket diagnostics (`NETLINK_SOCK_DIAG`) for each
+  socket's uid and creating cgroup and maps the cgroup id to its
+  `/sys/fs/cgroup` path; no helper, capability or root is used (Issue #126,
+  Owner decision 2026-10-07). A socket created by another unit or uid, when
+  an immediate second lookup confirms it, closes access as an exposure. The
+  Main Server keeps `ssh.socket`; the exception is `tcp/22` created by
+  `ssh.socket` as uid 0 (`server/docs/DEPLOYMENT.md`).
+- Every recorded proxy socket must be present and created by the recorded
+  proxy unit and uid (for example `tailscaled.service`, uid 0), verified the
+  same way. A confirmed other creator is an exposure; a missing recorded
+  socket closes access without revocation until it returns.
+- The loopback human upstream is created by systemd socket activation
+  (`server-sentinel-upstream.socket`, uid 0, a loopback port below 1024) and
+  passed to the unprivileged backend. It must be a socket the ServerSentinel
+  process holds (its own `/proc/self/fd`), created by that socket unit, on a
+  port below `ip_unprivileged_port_start`, and held by no other process of the
+  ServerSentinel unit (a same-uid descriptor scan); a replacement bound by
+  another process, a confirmed other creator, or the socket shared with
+  another unit process is an exposure.
+- Ownership that cannot be verified (no resolver; a sock_diag or cgroup
+  lookup that is denied, fails, times out or fails its self-check; a socket
+  missing from the lookup; a creating cgroup that is deleted, the root cgroup
+  or `/init.scope` while the socket's uid is an expected one, or
+  `/init.scope` with uid 0; an unconfirmed mismatch; an upstream holder seen
+  in only one of two scans; a kernel-owned socket; an upstream port that is
+  not privileged; an unreadable descriptor table) keeps human access closed
+  without revoking sessions, and access reopens once ownership verifies. An
+  unresolved creating cgroup with a uid none of the expected identities has
+  is an exposure once confirmed (Owner decision, 2026-10-07).
+- Residual risk accepted by the Owner (2026-10-07): the kernel reports the
+  socket's creator, not its current holder. If a legitimately created
+  socket's process is compromised and hands the descriptor to another process
+  (`fork`, `SCM_RIGHTS`), the check does not see it, except for the human
+  upstream's sharing within the ServerSentinel unit. The backend needs
+  `AF_NETLINK` and the host network namespace for this lookup; `AF_NETLINK`
+  also lets a compromised backend use every other netlink protocol open to an
+  unprivileged process, for example reading routes and addresses (largely
+  readable from `/proc` already) or listening to kernel uevents
+  (`NETLINK_KOBJECT_UEVENT`, device add/remove events). Narrowing this with a
+  `SystemCallFilter=`/socket-protocol restriction is planned for when the
+  check is wired into the running service.
 
 ## Shared Tailnet account
 

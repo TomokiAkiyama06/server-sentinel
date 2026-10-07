@@ -1440,18 +1440,48 @@ revokes every human session; a hostname resolution failure alone keeps access
 closed and reopens without revocation once the name resolves to the recorded
 set again (Owner decision, 2026-10-01; details in `server/app/auth/README.md`).
 An Owner listener exception covers a wildcard system listener only by port
-plus owning executable or systemd unit, verified on every check through the
-socket's owning processes; another or unverifiable owner is an exposure
-reason, and stored port-only exceptions fail closed until re-entered (Owner
-decision, 2026-10-01). Each recorded proxy socket requires a recorded proxy
-process identity (`proxy_owner`) and must be present and held by that process
-alone: a missing recorded socket keeps access closed without revocation, and
-another or unverifiable holder is an exposure (Owner decision, 2026-10-01).
+plus creating systemd unit (`.service` or `.socket`) and uid, verified on every
+check through an unprivileged `NETLINK_SOCK_DIAG` `inet_diag` dump of the
+socket's creating cgroup (`INET_DIAG_CGROUP_ID`, matched to
+`/sys/fs/cgroup/system.slice/<unit>`) and uid; a socket created by another unit
+or uid is an exposure reason (`UNEXPECTED_LISTENER`) once an immediate second
+dump in the same check confirms it, and stored port-only or executable-path
+exceptions fail closed (`LISTENER_EXCEPTIONS_OUTDATED`) until re-entered (Owner
+decisions, 2026-10-01 and 2026-10-07). Each recorded proxy socket requires a
+recorded proxy identity (`proxy_owner`: systemd unit and uid) and must be
+present and created by it: a missing recorded socket keeps access closed
+without revocation, and another creator is an exposure (Owner decision,
+2026-10-01). Ownership that cannot be verified
+(`LISTENER_OWNER_UNVERIFIED`: no socket-owner resolver, a sock_diag or cgroup
+lookup that is unavailable, times out or fails its self-check, a socket in
+`/proc/net` but not in the dump, a creating cgroup that cannot be resolved —
+deleted, the root cgroup or `/init.scope` — while the socket's uid is one of the
+expected identities' uids, `/init.scope` with uid 0, a mismatch the second dump
+does not confirm, another upstream holder seen in only one of two scans of the
+same check (a child between `fork` and `exec`), a kernel-owned socket (inode 0), an upstream port at or above `ip_unprivileged_port_start`, or an
+unreadable own or unit descriptor table) is not an exposure reason: it keeps
+access closed without revocation and access reopens once ownership verifies
+again (Owner decisions, 2026-10-05 and 2026-10-07, superseding the 2026-10-01
+wording that treated an unverifiable owner or holder as an exposure). The
+socket-owner resolver (`app.auth.sock_diag.SockDiagOwners` in production) is
+mandatory; a check without one never opens access. sock_diag reports the
+creator, not the current holder (residual risk accepted by the Owner,
+2026-10-07). An unresolved creating cgroup with a uid none of the expected
+identities has counts as another creator (`UNEXPECTED_LISTENER` once the second
+dump confirms it; Owner decision, 2026-10-07). A unit matches a socket created
+in `/system.slice/<unit>` or below nested system slices
+(`/system.slice/system-cups.slice/cups.service`).
 The check sees only sockets in `/proc/net` and Serve status. Traffic the kernel redirects before it reaches a listening socket on the reserved address — nftables/iptables DNAT or REDIRECT (for example Docker with `userland-proxy=false`), TPROXY, eBPF `sk_lookup` or IPVS — is not visible to it, so it cannot claim that nothing else answers; the deployment isolation must exclude such forwarding, and the Owner verifies it manually.
-The loopback human upstream passes only as a socket in the ServerSentinel
-process's own `/proc/self/fd`; a single replacement bound by any other
-process is an exposure, and an unreadable own fd table keeps access closed as
-an exposure. A check without a durable session revoker never opens access.
+The loopback human upstream is created by systemd socket activation
+(`server-sentinel-upstream.socket`, `ListenStream=` a loopback port below 1024,
+`ReusePort=no`) and passed to the unprivileged backend (`LISTEN_FDS` /
+`LISTEN_PID`). It passes only as a socket in the ServerSentinel process's own
+`/proc/self/fd`, created in that socket unit's cgroup by uid 0, on a port below
+`ip_unprivileged_port_start`, and held by no other process of the
+ServerSentinel unit's cgroups (a same-uid `/proc/<pid>/fd` scan); a single
+replacement bound by any other process, a confirmed other creator, or the
+socket shared with another process is an exposure. A check without a durable
+session revoker never opens access.
 That bounds the exposure window rather
 than preventing the bind: a process that binds between two checks receives
 credentials and cookies for that origin until the next check.

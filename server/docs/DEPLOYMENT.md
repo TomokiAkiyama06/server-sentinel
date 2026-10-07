@@ -70,7 +70,7 @@ defaults):
   "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444",
   "service_uid": 991,
   "human_host": "127.0.0.1",
-  "human_port": 8000,
+  "human_port": 880,
   "log_level": "INFO"
 }
 ```
@@ -97,6 +97,9 @@ operating-system root filesystem or backed by its device.
 Keep actual paths, filesystem identity and UID private. A loopback literal is
 mandatory for the human listener; expose it through the separately configured
 trusted private proxy after application authorization is available.
+In production `human_port` is a loopback port below 1024 that systemd creates
+through `server-sentinel-upstream.socket` and passes to the service (see
+"Listener owners, the upstream socket and host SSH" below).
 
 ### Monitoring section (required to run the service)
 
@@ -229,33 +232,121 @@ detector observation remains `unknown`, never `absent`. An invalid object fails
 `--check` with the value-free validation message. Keep the artifact path in
 this private file only.
 
-### Host SSH and the reserved-hostname listener exception
+### Listener owners, the upstream socket and host SSH (Issue #126)
 
-The hostname reservation check (ADR-0003, `server/app/auth/README.md`) excepts
-a wildcard system listener only by port plus owning process. On the Main
-Server, run `sshd` as `ssh.service` itself rather than socket-activated
-through `ssh.socket` (Owner decision, 2026-10-01): with socket activation PID 1
-holds the listening socket, which no exception identifies narrowly, so access
-would stay closed. The Owner exception is then `tcp/22` owned by
-`/usr/sbin/sshd`. These are host administration steps for the Owner; keep a
-console or second session open while changing SSH:
+The hostname reservation check (ADR-0003, `server/app/auth/README.md`) needs
+to know which systemd unit created each socket it verifies: an excepted
+wildcard system listener (for example SSH on tcp/22), a recorded proxy socket,
+and the human upstream. The backend finds this out itself, without root, a
+helper process or any capability (Owner decision, 2026-10-07): it asks the
+kernel's socket diagnostics (`NETLINK_SOCK_DIAG`) for each socket's uid and
+the cgroup it was created in, and maps that cgroup to its
+`/sys/fs/cgroup/system.slice/<unit>` path. The kernel reports the socket's
+creator, not its current holder; a legitimately created socket handed to
+another process by a compromised creator is not detected (accepted residual
+risk).
+
+Service requirements for this lookup (the unit `server/install.py` renders
+meets them; keep them in any drop-in):
+
+- the backend runs in the host network namespace that holds the reserved
+  addresses: no `PrivateNetwork=`, `NetworkNamespacePath=` or
+  `JoinsNamespaceOf=` (sock_diag and `/proc/net` see only the caller's
+  namespace);
+- `RestrictAddressFamilies=` includes `AF_NETLINK` (the rendered unit allows
+  `AF_UNIX AF_INET AF_INET6 AF_NETLINK`);
+- `ProtectControlGroups=` is `true`/`yes` or unset, never `private` or
+  `strict`: those give the service its own cgroup namespace and view, so
+  cgroup ids no longer map to the host paths;
+- the service stays in its own `server-sentinel.service` cgroup (no
+  `Delegate=` sub-cgroups that hide processes from the same-uid scan).
+
+Every lookup starts with a self-check: the backend opens a loopback probe
+listener of its own and requires the dump to report it with the backend's own
+cgroup and uid. If netlink is denied, the kernel lacks the cgroup attribute or
+the cgroup view does not match, the self-check fails and human access stays
+closed with `LISTENER_OWNER_UNVERIFIED` (no session revocation). Nothing is
+widened to make it pass.
+
+#### Human upstream through socket activation
+
+The loopback human upstream is created by systemd, as root, through
+`server-sentinel-upstream.socket`, and passed to the unprivileged backend
+(`Sockets=server-sentinel-upstream.socket` in the rendered service unit). The
+check requires the upstream to be created by that socket unit as uid 0 and to
+use a port below `/proc/sys/net/ipv4/ip_unprivileged_port_start` (1024 by
+default), so no unprivileged process can bind it. Without activation the
+backend, which has no capability, cannot bind a port below 1024 and the
+service fails to start; on a port at or above `ip_unprivileged_port_start` it
+binds the port itself, which the check treats as a configuration error: human
+access stays closed without revocation. These are host
+administration steps for the Owner:
+
+0. Update to a release that supports socket activation first (this one or
+   later; `app/release_capabilities.py` declares it). An older release ignores
+   the passed socket and could not start on the new port.
+1. Choose a free loopback port below 1024 (the template uses `880`) and set
+   `"human_port"` in the deployment configuration to it, with
+   `"human_host": "127.0.0.1"`. Point the Tailscale Serve mapping at
+   `http://127.0.0.1:<port>`.
+2. Install `infra/systemd/server-sentinel-upstream.socket` as
+   `/etc/systemd/system/server-sentinel-upstream.socket` (root-owned, mode
+   `0644`) with `ListenStream=127.0.0.1:<port>` set to the same port. Keep
+   `ReusePort=no`, `Accept=no` and `Service=server-sentinel.service`.
+3. Enable it and restart the service through the normal release lifecycle
+   (or once by hand):
 
 ```sh
-sudo systemctl disable --now ssh.socket
-sudo systemctl enable --now ssh.service
-systemctl is-enabled ssh.socket ssh.service   # expect: disabled / enabled
-sudo ss -ltnp 'sport = :22'                   # expect: users:(("sshd",pid=N,...))
-sudo readlink /proc/N/exe                     # expect: /usr/sbin/sshd
+sudo systemctl daemon-reload
+sudo systemctl enable --now server-sentinel-upstream.socket
+sudo systemctl restart server-sentinel.service
+cat /proc/sys/net/ipv4/ip_unprivileged_port_start  # expect: greater than <port>
+sudo ss -ltnep 'sport = :<port>'                   # expect: one row, held by the backend
 ```
 
-Repeat the `ss`/`readlink` check after each `openssh-server` upgrade and restart
-`ssh.service` once upgraded: until then the running executable shows as
-`(deleted)` and the check keeps access closed.
+The backend refuses to start (`human_listener_activation_invalid`) when the
+passed socket is not exactly one listening TCP socket on
+`human_host:human_port`, so a port mismatch between the socket unit and the
+configuration is caught at start. A port at or above
+`ip_unprivileged_port_start` cannot be served by activation's guarantee;
+lowering that sysctl later keeps human access closed until it is restored.
 
-Until the privileged socket-owner helper of Issue #126 lands, the non-root
-ServerSentinel service cannot read a root-owned `sshd`'s `/proc/<pid>/fd` and
-`exe`, so an excepted `sshd` stays `LISTENER_OWNER_UNVERIFIED` and human
-access stays closed. ServerSentinel itself is never given root for this.
+#### Host SSH and other system listeners
+
+Units in nested system slices are matched by their own name (for example
+`cups.service` created in `/system.slice/system-cups.slice/cups.service`);
+exceptions name `.service` or `.socket` units only. A socket the kernel itself
+owns (inode 0 in `/proc/net`, for example a kernel WireGuard UDP socket) has no
+creator to verify, so human access stays closed while one is on a port an
+exception covers; keep such sockets off the wildcard address or off the host.
+
+Socket-activated system services are allowed (Owner decision, 2026-10-07,
+reverting the 2026-10-01 step that disabled `ssh.socket`). On the Main Server,
+keep Ubuntu's default `ssh.socket`; systemd creates the tcp/22 sockets in the
+`ssh.socket` cgroup as uid 0, so the Owner exception is `tcp/22` with unit
+`ssh.socket` and uid `0`. If `ssh.socket` was disabled for the earlier
+decision, it may be restored (keep a console or second session open while
+changing SSH):
+
+```sh
+sudo systemctl disable ssh.service
+sudo systemctl enable --now ssh.socket
+sudo systemctl restart ssh.service   # the running daemon releases :22 to the socket
+systemctl is-enabled ssh.socket      # expect: enabled
+```
+
+Running `sshd` as `ssh.service` alone also works: the exception is then
+`tcp/22` with unit `ssh.service` and uid `0`. Other wildcard system listeners
+are excepted the same way by unit and uid, for example `tailscaled` on its UDP
+port as `tailscaled.service` with uid `0`. Find the unit and uid of a listener
+without privilege, as the service account, with the Issue #126 procedure in
+`MANUAL_TEST.md` (section "ADR-0003 follow-up: accepted human-access
+boundary").
+
+Exceptions stored before this change (an executable path such as
+`/usr/sbin/sshd`, or a unit without a uid) are not migrated: the check reports
+`LISTENER_EXCEPTIONS_OUTDATED` and keeps human access closed until the Owner
+enters them again through the audited Owner path.
 
 ### Capture-node CA and Main listener certificate
 
@@ -443,6 +534,83 @@ inside one guarded transaction: a failure at any point restores both pointers an
 the previous unit and restarts the release that was running before the attempt.
 One service-global lock covers each whole install, update, and rollback, so
 overlapping administrator invocations are serialized rather than interleaved.
+
+**Crossing the socket-activation boundary (Issue #126).** A release from before
+socket activation has no `app/release_capabilities.py` declaring
+`HUMAN_UPSTREAM_SOCKET_ACTIVATION`: it ignores the socket passed by
+`server-sentinel-upstream.socket` and binds `human_host:human_port` itself.
+It cannot start while systemd still has that socket unit: a present unit file
+is pulled in again by the `Sockets=`/`Wants=` dependency of an activation
+release or at boot, and a socket that still runs keeps holding the endpoint.
+Nor can it start on a port below `ip_unprivileged_port_start`, which the
+non-root service may not bind. Before switching an `update`, `install` or
+`rollback` to such a release, the installer checks both. For the socket unit
+it only queries `systemctl show -p LoadState --value` and
+`-p ActiveState --value`, and treats the unit as gone only when they are
+`not-found` and `inactive`; anything else, an unclear answer, a timeout or a
+query that cannot run counts as in use. If either holds, it refuses before
+changing anything: the running release, both pointers and the unit stay as
+they were, a staged release is removed, and it prints these Owner steps, in
+this order, with the actual configuration path:
+
+```sh
+# 1. edit the deployment configuration: "human_port" back to the port that
+#    release used (at or above /proc/sys/net/ipv4/ip_unprivileged_port_start)
+# 2. stop the socket unit; the running service keeps its passed socket until
+#    it is restarted, so the dashboard stays up until step 4
+sudo systemctl disable --now server-sentinel-upstream.socket
+# 3. park the hand-placed unit file and reload; with no unit file nothing can
+#    start it (no Sockets=/Wants= pull, no boot), and systemd forgets it
+sudo mkdir -p /etc/server-sentinel/disabled
+sudo mv /etc/systemd/system/server-sentinel-upstream.socket /etc/server-sentinel/disabled/
+sudo systemctl daemon-reload
+systemctl show -p LoadState -p ActiveState server-sentinel-upstream.socket
+#    expect: LoadState=not-found, ActiveState=inactive
+# 4. the same command again; it restarts the service on that release, which
+#    binds the restored port itself (no separate restart is needed)
+sudo /tmp/server-sentinel-installer-<version>.pyz --destination ... --config ... \
+  --unit /etc/systemd/system/server-sentinel.service rollback
+# 5. point the Tailscale Serve target at http://127.0.0.1:<that port>
+# 6. verify: ss -ltn shows the service on that port and the dashboard answers
+```
+
+Do not use `systemctl mask` for this: it refuses to mask a unit whose file is
+in `/etc/systemd/system` (where the mask link would go), and a masked socket
+that was not stopped still reports `active`. Stopping alone is not enough
+either: a disabled but present unit file is started again by any start of an
+activation release (including the installer's own restart and its automatic
+recovery). If the unit file is moved without `daemon-reload`, or the socket
+was not stopped first, systemd still reports it `loaded` or `active` and the
+installer keeps refusing. These states were measured with throwaway systemd
+259 user units. The installer renders `Sockets=` only into the unit of a
+release that declares the capability, and a rollback refuses a stored unit of
+a release without it that still names the socket unit.
+
+To return to socket activation later, in this order:
+
+```sh
+# 1. update to a release that supports socket activation; with the unit file
+#    parked nothing pulls the socket in, and the release binds the old,
+#    unprivileged port itself (the reservation check keeps human access closed
+#    without revocation until step 4)
+# 2. edit the deployment configuration: "human_port" back to the ListenStream
+#    port of server-sentinel-upstream.socket (below ip_unprivileged_port_start)
+# 3. put the unit file back and bind the socket; starting it cannot hand it to
+#    the running service
+sudo mv /etc/server-sentinel/disabled/server-sentinel-upstream.socket /etc/systemd/system/server-sentinel-upstream.socket
+sudo systemctl daemon-reload
+sudo systemctl enable --now server-sentinel-upstream.socket
+# 4. restart the service so systemd passes the socket and the new port applies
+sudo systemctl restart server-sentinel.service
+# 5. point the Tailscale Serve target back at http://127.0.0.1:<that port>
+# 6. verify: one socket on that port whose inode is in /proc/<service pid>/fd
+sudo ss -ltne 'sport = :<port>'
+```
+
+The installer never starts, stops, enables or disables the socket unit and
+never rewrites the deployment configuration: both are Owner-managed, and
+changing them inside the transaction would leave the human endpoint down if
+the restart then failed.
 
 Releases and runtime data are never deleted by these operations; only a staged
 release whose own installation failed is removed. Database migrations are

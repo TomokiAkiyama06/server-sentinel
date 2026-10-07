@@ -20,13 +20,23 @@ def run(settings: Settings, monitoring=None, local_uvc=None) -> int:
     if monitoring is None or not monitoring.storage_configured:
         logging.getLogger(__name__).error(Event.MONITORING_UNCONFIGURED)
         return 1
-    from app.systemd import build_server
-    server = build_server(
-        create_app(settings, monitoring=monitoring, local_uvc=local_uvc), host=settings.human_host, port=settings.human_port,
-        server_header=False, date_header=False, access_log=False, log_config=None,
-        proxy_headers=False, forwarded_allow_ips="", ws="none",
-    )
-    server.run()
+    from app.systemd import SocketActivationError, activated_listener, build_server
+    try:
+        # Production: systemd creates the loopback upstream as root through
+        # server-sentinel-upstream.socket and passes it here (Issue #126); the
+        # backend stays unprivileged. Without activation it binds the port
+        # itself, which the reservation check treats as unverified.
+        listener = activated_listener(settings.human_host, settings.human_port)
+    except SocketActivationError:
+        logging.getLogger(__name__).error(Event.HUMAN_LISTENER_ACTIVATION_INVALID)
+        return 1
+    options = dict(server_header=False, date_header=False, access_log=False, log_config=None,
+                   proxy_headers=False, forwarded_allow_ips="", ws="none")
+    application = create_app(settings, monitoring=monitoring, local_uvc=local_uvc)
+    if listener is None:
+        build_server(application, host=settings.human_host, port=settings.human_port, **options).run()
+    else:
+        build_server(application, **options).run(sockets=[listener])
     return 0
 
 

@@ -1,0 +1,29 @@
+# ServerSentinel human upstream listener (Issue #126, Owner decision 2026-10-07).
+#
+# systemd (uid 0) creates this loopback socket in this unit's own cgroup
+# (/system.slice/server-sentinel-upstream.socket) and passes it to the
+# unprivileged server-sentinel.service, which serves on it without any
+# capability. The hostname reservation check verifies, through sock_diag,
+# that the upstream it holds was created here by uid 0, and that the port is
+# below /proc/sys/net/ipv4/ip_unprivileged_port_start, so no unprivileged
+# process can bind it. See server/docs/DEPLOYMENT.md.
+#
+# Install as /etc/systemd/system/server-sentinel-upstream.socket (root-owned,
+# mode 0644). Replace the example port with the deployment configuration's
+# "human_port" (below 1024); "human_host" must be the same loopback address.
+# The backend refuses to start when the passed socket does not match both.
+
+[Unit]
+Description=ServerSentinel human upstream listener (loopback)
+
+[Socket]
+ListenStream=127.0.0.1:880
+# One listener and no shared port: another socket on the same endpoint is
+# always another process.
+ReusePort=no
+FreeBind=no
+Accept=no
+Service=server-sentinel.service
+
+[Install]
+WantedBy=sockets.target
