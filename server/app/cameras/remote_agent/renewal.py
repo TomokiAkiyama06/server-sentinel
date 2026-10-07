@@ -10,7 +10,8 @@ ledger-admitted mTLS session. This module is the Main side of that exchange:
   ledger's active one and unexpired, and only for a fresh EC P-256 key whose
   CSR requests no subject or extension. It stages the new certificate in the
   ledger. Revoked, expired, superseded or unknown credentials cannot renew and
-  must re-pair.
+  must re-pair. A retry with the same pending key is certificate-idempotent:
+  it is answered with the certificate first staged for that key (Issue #123).
 * Supersession: the old certificate stays admitted until the new one is first
   presented; that first admission atomically promotes the new credential and
   the old certificate is no longer admitted, even though it has not expired.
@@ -102,15 +103,25 @@ def renew_node_credential(authority: DeploymentAuthority, ledger: PairingLedger,
         except CaptureAuthorityError:
             raise RenewalRefused("renewal_request_invalid") from None
         try:
-            ledger.stage_renewal(node_id=identity.node_id,
-                                 current_public_key_digest=identity.public_key_digest,
-                                 current_credential_digest=identity.credential_digest,
-                                 public_key_digest=issued.public_key_digest,
-                                 credential_serial_digest=issued.credential_digest,
-                                 not_after=issued.not_after.timestamp())
+            staged = ledger.stage_renewal(node_id=identity.node_id,
+                                          current_public_key_digest=identity.public_key_digest,
+                                          current_credential_digest=identity.credential_digest,
+                                          public_key_digest=issued.public_key_digest,
+                                          credential_serial_digest=issued.credential_digest,
+                                          not_after=issued.not_after.timestamp(),
+                                          certificate_pem=issued.certificate_pem)
         except (PairingError, ValueError):
             raise RenewalRefused("renewal_not_eligible") from None
-        return issued
+        if staged.credential_serial_digest == issued.credential_digest:
+            return issued
+        # A same-key retry (Issue #123): resend the certificate first staged
+        # for this key; the certificate just signed is never staged or sent.
+        try:
+            return authority.staged_renewal_credential(
+                identity.node_id, issued.public_key_digest,
+                staged.credential_serial_digest, staged.certificate_pem)
+        except CaptureAuthorityError:
+            raise RenewalRefused("renewal_not_eligible") from None
     except RenewalRefused as refusal:
         if monitor is not None:
             monitor.renewal_refused(identity if isinstance(identity, CaptureNodeIdentity) else None,

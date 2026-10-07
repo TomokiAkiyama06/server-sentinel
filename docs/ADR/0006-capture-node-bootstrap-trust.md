@@ -267,15 +267,30 @@ status or decision.
     expired or superseded credentials cannot renew; the node must re-pair with a
     fresh Owner approval.
   - *Supersession.* The renewed certificate is staged in the ledger (one per
-    node; a retry replaces it; staging writes no audit record, so repeated
-    requests cannot grow the audit table). The old certificate stays admitted
+    node; a retry with a fresh key replaces it; staging writes no audit record,
+    so repeated requests cannot grow the audit table). The old certificate stays admitted
     until the renewed one is first presented. That admission atomically promotes
     it and appends an `activate_capture_node_credential` record (actor `system`).
     From then on only the new certificate is admitted, even though the old one
     has not expired. This keeps exactly one active credential per node, so
     revocation and audit stay per node. An Agent that never received or
     installed the response is not locked out: it keeps its old certificate and
-    retries. Revocation deletes any staged renewal.
+    retries. Revocation deletes any staged renewal. A connection that loses a
+    concurrent promotion of the same staged renewal re-reads the active
+    credential in its write transaction and is admitted only if its exact key
+    and certificate are now active (Issue #121); it writes no second audit
+    record, and a revocation committed in between still refuses it.
+  - *Certificate-idempotent retries (Issue #123).* The staged row also keeps
+    the issued certificate's public PEM (migration 21; never a key or CSR),
+    checked against the staged certificate digest. A retry with the currently
+    staged key (the Agent reuses its pending key) leaves the row unchanged and
+    is answered with that first certificate, re-verified as this CA's leaf for
+    the same node and key; the certificate signed for the retry is never staged
+    or sent. So a delayed first response and every retry response name the one
+    staged credential. A stored certificate that fails these checks is refused
+    (`renewal_not_eligible`) rather than replaced. A row staged before
+    migration 21 has no certificate; its next same-key retry stages a new one as
+    before.
   - *Key uniqueness (Owner decision 2026-09-30).* A node public key is bound
     to at most one node, for good. `pairing_key_bindings` records every key
     the ledger approves, activates, stages or promotes and is never pruned. Approval,

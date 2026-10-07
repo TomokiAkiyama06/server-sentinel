@@ -921,6 +921,35 @@ class DeploymentAuthority:
         public, key_digest = self._proof_of_possession(csr_pem, strict=True)
         return self._sign_node(node_id, public, key_digest, validity)
 
+    def staged_renewal_credential(self, node_id: UUID, public_key_digest_value: str,
+                                  credential_digest: str, certificate_pem: bytes
+                                  ) -> IssuedNodeCredential:
+        """Re-validate a certificate this CA issued for a staged renewal (Issue #123).
+
+        Used when a same-key retry is answered with the certificate first
+        staged for that key. It must be a node leaf signed by this deployment
+        CA for exactly ``node_id`` and the retried key, and match the staged
+        digest; otherwise nothing is returned.
+        """
+        if not isinstance(node_id, UUID) or not isinstance(certificate_pem, bytes):
+            raise CaptureAuthorityError("staged renewal certificate is invalid")
+        try:
+            certificate = x509.load_pem_x509_certificate(certificate_pem)
+            certificate.verify_directly_issued_by(self.certificate)
+            key_digest = public_key_digest(certificate.public_key())
+            digest = certificate_digest(certificate)
+        except (ValueError, TypeError, InvalidSignature):
+            raise CaptureAuthorityError("staged renewal certificate is invalid") from None
+        expected_uris = sorted([node_uri(node_id), deployment_uri(self.deployment_id)])
+        if (not isinstance(public_key_digest_value, str) or not isinstance(credential_digest, str)
+                or not hmac.compare_digest(key_digest, public_key_digest_value)
+                or not hmac.compare_digest(digest, credential_digest)
+                or _is_ca(certificate) or sorted(_uris(certificate)) != expected_uris):
+            raise CaptureAuthorityError("staged renewal certificate is invalid")
+        return IssuedNodeCredential(node_id=node_id, certificate_pem=certificate_pem,
+                                    public_key_digest=key_digest, credential_digest=digest,
+                                    not_after=certificate.not_valid_after_utc)
+
     def issue_and_activate(self, ledger: PairingLedger, claim: EnrollmentClaim, csr_pem: bytes, *,
                            validity: datetime.timedelta = DEFAULT_NODE_VALIDITY
                            ) -> IssuedNodeCredential:

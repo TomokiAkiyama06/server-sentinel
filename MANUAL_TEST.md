@@ -490,7 +490,9 @@ code with the reviewed runtime installed. `AGENT_CLI` means
     validity so it enters the 30-day window. Confirm that the Agent renews over
     its admitted session, that `pending-renewal/` is 0700 with a 0600 key, and
     that the old certificate keeps working until the renewed one first connects
-    and is refused afterwards. A revoked node's renewal must be refused. After
+    and is refused afterwards. Interrupt the first renewal response (for
+    example drop the connection after Main stages it) and confirm the Agent's
+    retry receives the same certificate (same SHA-256) and that it is admitted. A revoked node's renewal must be refused. After
     the credential expires, the node must re-pair. Block renewal (for example
     stop the Main) until the 14-day threshold and confirm the Owner sees a
     `capture_credential_warning`. *(needs transport wiring and a scheduler)*

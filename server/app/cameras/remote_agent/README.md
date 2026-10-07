@@ -54,7 +54,13 @@ whose certificate Main issued stays bound even if a retry replaces the staged
 row or the node is revoked first. Bindings per node are capped (1024); beyond
 that renewal is refused and the node must re-pair. A key already bound to the
 node is accepted only as a retry of the currently staged key; a superseded or
-out-of-order earlier staged key is refused.
+out-of-order earlier staged key is refused. Such a retry is
+certificate-idempotent (Issue #123): the staged row keeps the issued
+certificate's public PEM, bound to its digest, and the retry is answered with
+that first certificate (re-verified as this CA's leaf for the node and key)
+instead of a newly signed one. A connection that loses a concurrent promotion
+of the same staged renewal is admitted if its exact key and certificate are by
+then the active credential (Issue #121).
 `CaptureCredentialMonitor` raises the local `capture_credential_warning`
 notification through an injected hook in three cases: a credential within
 14 days of expiry, an expired credential, or a refused renewal. A renewal

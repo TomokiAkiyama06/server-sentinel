@@ -40,6 +40,19 @@ class IdentityTests(unittest.TestCase):
         self.assertTrue(same_physical_camera(weak, replace(weak, by_id=("synthetic-alias",))))
         self.assertFalse(same_physical_camera(weak, replace(weak, instance_token=(1, 2, 4))))
 
+    def test_capture_ready_accepts_refreshed_metadata_but_not_another_instance(self):
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.control.approve(weak, [weak])
+        refreshed = replace(weak, by_id=("synthetic-alias",), formats=("MJPG",))
+        self.assertEqual(refreshed, self.control.reconcile([refreshed]))
+        self.control.capture_ready(refreshed)
+        self.assertEqual(self.control.state, CameraState.ONLINE)
+        with self.assertRaises(ValueError):
+            self.control.capture_ready(replace(weak, instance_token=(1, 2, 4)))
+        twin = replace(weak, device_path="/dev/video1", instance_token=(5, 6, 7))
+        with self.assertRaises(ValueError):
+            self.control.capture_profile_unavailable(twin)
+
     def test_duplicate_serial_requires_owner_and_latches(self):
         other = replace(self.camera, device_path="/dev/video1")
         self.assertIsNone(self.control.reconcile([self.camera, other]))

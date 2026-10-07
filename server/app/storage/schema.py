@@ -2,7 +2,9 @@
 
 from app.audit.schema import audit_migration
 from app.auth.schema import access_migration, access_shared_identity_migration, access_webauthn_migration
-from app.cameras.remote_agent.schema import PAIRING_MIGRATION, pairing_renewal_migration
+from app.cameras.remote_agent.schema import (
+    PAIRING_MIGRATION, pairing_renewal_certificate_migration, pairing_renewal_migration,
+)
 from app.cameras.registry.schema import REGISTRY_MIGRATION
 from app.cameras.uvc.schema import UVC_MIGRATION, uvc_explicit_binding_migration
 from app.detection.roi.schema import roi_calibration_migration
@@ -51,4 +53,7 @@ APPLICATION_MIGRATIONS = (
     # Durable presence timeline-gap marker (#25/#26), after #97 (17), #107 (18)
     # and #100 (19); the runner requires a contiguous sequence.
     presence_gap_migration(20),
+    # Issues #121/#123: the staged renewal keeps its issued certificate so a
+    # same-key retry is certificate-idempotent.
+    pairing_renewal_certificate_migration(21),
 )
