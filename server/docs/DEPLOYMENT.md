@@ -703,8 +703,12 @@ database uses the DELETE journal mode; against a database switched to WAL
 mode, even a read-only open creates the `-wal` / `-shm` files next to it.
 Durable tables not yet inventoried are listed as `not_inventoried (#132)` in
 the record and verify output: `recording_source_discontinuities`,
-`roi_calibration_history`, `uvc_approvals.session_token`, `integrity_status`
-and `recording_health_status`; do not read a pass as covering them.
+`notification_events`, `roi_calibration_history`,
+`uvc_approvals.session_token`, `integrity_status` and
+`recording_health_status`; do not read a pass as covering them. Of
+`notification_events`, only the hardware-integrity alert kinds are checked,
+for the pending-alert invariant; other kinds and the delivery / confirmed
+fields are not inventoried (the output says so).
 
 `record` writes a baseline only if verifying that very state, unchanged,
 would pass: it runs every current-state check `verify` runs (schema,
@@ -941,7 +945,10 @@ intact. The required invariants are:
   could have written (unspooled, unchecked, past the current cursor, at most
   one). A source cursor is never deleted, its end never moves back or beyond
   the verify time, and while the last published segment is still catalogued
-  the cursor's stream and sequence are that segment's. A value of the wrong
+  the cursor's stream and sequence are that segment's. A cursor whose end has
+  not moved keeps every recorded column (`cursor_changed` otherwise), except
+  `active` going from 1 to 0 (`release_source()`); only a publication, which
+  advances the end, sets it back to 1. A value of the wrong
   type anywhere is reported (`invalid_value`); verification never aborts on
   one and, if no rule anticipated it, still writes a failed report marked
   `unverifiable`. Every ready pre-roll spool segment (`state='ready'`,

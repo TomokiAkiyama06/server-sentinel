@@ -128,14 +128,29 @@ NOT_APPLICABLE = {
 # Durable tables this tool does not inventory yet (#132); the report lists
 # them so a pass is never read as covering them.
 NOT_INVENTORIED = (
-    "recording_source_discontinuities",
+    "recording_source_discontinuities", "notification_events",
     "roi_calibration_history", "uvc_approvals.session_token",
     "integrity_status", "recording_health_status",
 )
 
-# Every Main-database table the inventory reads. A table recorded present
-# must still exist at verify time, whatever its comparator does with an
-# empty or absent section (a table dropped while empty is still a loss).
+# Why a listed table is not (fully) inventoried, when it is more than #132.
+NOT_INVENTORIED_NOTES = {
+    "notification_events": "not_inventoried (#132): only hardware-integrity alert kinds are "
+                           "checked, for the pending-alert invariant; other kinds and the "
+                           "delivery/confirmed fields are not inventoried",
+}
+
+
+def _not_inventoried() -> dict:
+    return {name: NOT_INVENTORIED_NOTES.get(name, "not_inventoried (#132)")
+            for name in NOT_INVENTORIED}
+
+
+# Every Main-database table the inventory reads, except notification_events
+# (only partly read: listed in NOT_INVENTORIED with its note). A table
+# recorded present must still exist at verify time, whatever its comparator
+# does with an empty or absent section (a table dropped while empty is still
+# a loss); the schema comparison covers every other migration table.
 INVENTORIED_TABLES = (
     "recordings", "recording_links", "recording_segments", "recording_discontinuities",
     "recording_source_cursors",
@@ -149,7 +164,7 @@ INVENTORIED_TABLES = (
     "presence_deliveries", "presence_source_facts", "presence_outbox_sessions",
     "pairing_node_credentials", "pairing_enrollments", "pairing_node_renewals",
     "pairing_key_bindings", "capture_nodes",
-    "integrity_outbox", "integrity_overflow", "notification_events", "integrity_baseline",
+    "integrity_outbox", "integrity_overflow", "integrity_baseline",
     "schema_migrations",
 )
 
@@ -476,6 +491,14 @@ def _publications_since(connection, tables, cursors) -> dict | None:
                 "sequence": row["sequence"], "start_ms": row["start_ms"],
                 "end_ms": row["end_ms"]}
     return result
+
+
+def _cursor_rows(connection, tables) -> dict | None:
+    """Every column of each source cursor row, to check its transitions."""
+    if "recording_source_cursors" not in tables:
+        return None
+    return {row["source_id"]: {key: row[key] for key in row.keys()}
+            for row in connection.execute("SELECT * FROM recording_source_cursors")}
 
 
 def _spool_file_matches(directory: Path, segment_id: str, catalog: list) -> bool:
@@ -2715,6 +2738,7 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             "recordings": _recordings(connection, tables),
             "spool_segments": _spool_segments(connection, tables),
             "recording_source_cursors": _source_cursors(connection, tables),
+            "recording_source_cursor_rows": _cursor_rows(connection, tables),
             "pending_segments": _pending_segments(connection, tables),
             "publications_since_record": _publications_since(connection, tables,
                                                              since_cursors),
@@ -2751,7 +2775,7 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             1 for item in (inventory["recordings"] or {}).values() if not item["segments"]),
     }
     inventory["not_applicable"] = dict(NOT_APPLICABLE)
-    inventory["not_inventoried"] = {name: "not_inventoried (#132)" for name in NOT_INVENTORIED}
+    inventory["not_inventoried"] = _not_inventoried()
     inventory["manual"] = dict(MANUAL)
     return inventory
 
@@ -3262,6 +3286,23 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
                     and _int(now_cursor[2]) and _int(recorded[2])
                     and now_cursor[2] >= recorded[2]):
                 failed.append({"id": f"cursor:{source_id}", "reason": "cursor_regressed"})
+    # A cursor changes only with a publication, which advances its end and
+    # sets active (_publish()), or release_source(), which only clears
+    # active. With its end unchanged every other column stays as recorded
+    # (a rewritten stream or sequence would make the next same-stream append
+    # fail RECORDING_TIMELINE_REGRESSION); an advanced end is checked against
+    # the catalogued publication it names (_domain_errors()).
+    recorded_rows, current_rows = context.get("cursor_rows") or (None, None)
+    for source_id, before in sorted((recorded_rows or {}).items()):
+        after = (current_rows or {}).get(source_id)
+        if current_rows is None or after is None or after.get("end_ms") != before.get("end_ms"):
+            continue  # missing or moved: cursor_regressed / the domain checks
+        unchanged = all(after.get(key) == value for key, value in before.items()
+                        if key != "active")
+        released = after.get("active") == before.get("active") or (
+            before.get("active") == 1 and after.get("active") == 0)
+        if not (unchanged and released and set(after) == set(before)):
+            failed.append({"id": f"cursor:{source_id}", "reason": "cursor_changed"})
     # A recording that appeared since the record is listed as appended,
     # but its segments must still be ones the store would have linked.
     for key in result.get("appended", ()):
@@ -3639,6 +3680,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
                      "published": current.get("publications_since_record"),
                      "pending": current.get("pending_segments"),
                      "current_cursors": current.get("recording_source_cursors"),
+                     "cursor_rows": (baseline.get("recording_source_cursor_rows"),
+                                     current.get("recording_source_cursor_rows")),
                      "recorded_spool": baseline.get("spool_segments")}),
         "audit_security_admin": _compare_audit(
             baseline["audit"].get("security_admin"), current["audit"].get("security_admin"),
@@ -3716,7 +3759,7 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
         "empty_coverage": empty_coverage,
         "sections": sections,
         "not_applicable": dict(NOT_APPLICABLE),
-        "not_inventoried": {name: "not_inventoried (#132)" for name in NOT_INVENTORIED},
+        "not_inventoried": _not_inventoried(),
         "manual": dict(MANUAL),
     }
 
@@ -3947,8 +3990,7 @@ def main(arguments: list[str] | None = None) -> int:
             report = {"format": FORMAT + "-verification", "format_version": FORMAT_VERSION,
                       "status": "failed", "unverifiable": type(exc).__name__, "sections": {},
                       "empty_coverage": [], "not_applicable": dict(NOT_APPLICABLE),
-                      "not_inventoried": {name: "not_inventoried (#132)"
-                                          for name in NOT_INVENTORIED},
+                      "not_inventoried": _not_inventoried(),
                       "manual": dict(MANUAL)}
         if args.report is not None:
             write_private(args.report, args.runtime_root, report)

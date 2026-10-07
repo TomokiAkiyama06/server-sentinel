@@ -4504,11 +4504,18 @@ class LifecycleInventoryTests(unittest.TestCase):
                      "recording_health_status"):
             self.assertEqual(report["not_inventoried"][name], "not_inventoried (#132)")
             self.assertIn(f"{name}: not_inventoried (#132)", stdout)
-        # Inventoried now (source cursors; integrity notification events),
-        # so never listed as uncovered.
-        for name in ("recording_source_cursors", "notification_events"):
-            self.assertNotIn(name, report["not_inventoried"])
-            self.assertIn(name, inventory.INVENTORIED_TABLES)
+        # Source cursors are inventoried, so never listed as uncovered.
+        self.assertNotIn("recording_source_cursors", report["not_inventoried"])
+        self.assertIn("recording_source_cursors", inventory.INVENTORIED_TABLES)
+        # Only the hardware-integrity alert kinds of notification_events are
+        # read: it is listed as not inventoried with that note, never covered.
+        note = ("not_inventoried (#132): only hardware-integrity alert kinds are checked, "
+                "for the pending-alert invariant; other kinds and the delivery/confirmed "
+                "fields are not inventoried")
+        self.assertEqual(report["not_inventoried"]["notification_events"], note)
+        self.assertIn(f"notification_events: {note}", stdout)
+        self.assertNotIn("notification_events", inventory.INVENTORIED_TABLES)
+        self.assertNotIn("notification_events", report["sections"]["tables"]["preserved"])
 
     def test_verify_refuses_a_baseline_that_is_not_private(self):
         self.runtime.seed()
@@ -6042,6 +6049,59 @@ class LifecycleInventoryTests(unittest.TestCase):
         with evicting(evict=False):
             code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+
+    def test_a_source_cursor_changes_only_with_a_publication_or_release(self):
+        # Codex P1: once the segment the cursor names left the catalog, a
+        # rewritten stream or a 2^63-1 sequence with the end unchanged would
+        # make the next same-stream append fail RECORDING_TIMELINE_REGRESSION.
+        # With its end unchanged the recorded cursor stays exactly as it was,
+        # except release_source() clearing active; only a publication (which
+        # advances the end) sets it again.
+        import zlib
+        from app.media.recording import Segment
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        store = self._recording_store(connection)
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+        released, live, stream_id = uuid4(), uuid4(), uuid4()
+
+        def put(source, sequence, start, end):
+            return store.append(Segment(source, stream_id, sequence, base + start, base + end,
+                                        "synthetic", "deflate", payload))
+        put(released, 0, 0, 10_000)
+        put(live, 0, 0, 10_000)
+        # Released before the record: its spooled segment is evicted and the
+        # cursor no longer names a catalogued segment.
+        store.release_source(released)
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM recording_segments WHERE source_id=?",
+                                         (str(released),)).fetchone())
+        code, baseline = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        # The service's own transitions: a release, then a new publication.
+        store.release_source(live)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+        put(live, 1, 10_000, 20_000)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+        original = self.runtime.database.read_bytes()
+        expected = {"id": f"cursor:{released}", "reason": "cursor_changed"}
+        for label, sql, value in (
+                ("stream rewritten", "stream_id=?", str(uuid4())),
+                ("sequence maxed", "sequence=?", 2**63 - 1),
+                ("capture node set", "capture_node_id=?", str(uuid4())),
+                ("reactivated without a publication", "active=?", 1)):
+            with self.subTest(label):
+                self.runtime.database.write_bytes(original)
+                self.runtime.execute(f"UPDATE recording_source_cursors SET {sql} "
+                                     "WHERE source_id=?", (value, str(released)))
+                code, report, _ = self.verify(baseline)
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertIn(expected, report["sections"]["recordings"]["failed"])
+        self.runtime.database.write_bytes(original)
 
 if __name__ == "__main__":
     unittest.main()
