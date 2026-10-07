@@ -260,10 +260,10 @@ no unit and does not match), and a port-only, doubly identified or malformed ent
 rejected. Each check reads the socket inode from `/proc/net` and the injected
 `socket_owners` (`ProcSocketOwners`, walking `/proc/<pid>/fd`) maps it to every
 process holding it; the socket is excepted only when every holder matches.
-Another process holding it (alone or alongside the named one) counts as
-`UNEXPECTED_LISTENER`; a socket with no inode or no holder found, an
-unreadable executable/unit, or an owner lookup that fails or times out counts
-as `LISTENER_OWNER_UNVERIFIED`. Only the first is an exposure reason; an
+Another process holding it (alone or alongside the named one), including a
+holder that is seen but whose executable or unit cannot be read, counts as
+`UNEXPECTED_LISTENER`; a socket with no inode or no holder found, or an owner
+lookup that fails or times out, counts as `LISTENER_OWNER_UNVERIFIED`. Only the first is an exposure reason; an
 unverifiable owner, including a socket-owner helper that is absent, slow,
 rate-limited or answers malformed, keeps access closed without revocation and
 reopens once ownership verifies again (Owner decision, 2026-10-05: unverifiable ownership keeps access closed without revocation; only an observed other holder is an exposure). The scan is all or

@@ -270,10 +270,27 @@ line, account or other process detail.
   `CAP_DAC_READ_SEARCH` (list another account's `/proc/<pid>/fd`, read the
   group-only deployment configuration) and `CAP_SYS_PTRACE` (the kernel's
   `ptrace_may_access` read check on the `fd/*` and `exe` links). These are the
-  minimum the kernel requires; root is not used. The ptrace-family system
-  calls (`~@debug`) and `open_by_handle_at` (`~@privileged`) are filtered, so
-  the helper cannot attach to or read the memory of another process. It has no
-  network and a read-only file system.
+  minimum the kernel requires; root is not used. Every system call that turns
+  `CAP_SYS_PTRACE` into access to another process is denied by name — `ptrace`,
+  `pidfd_getfd`, `process_vm_readv`, `process_vm_writev`, `process_madvise`
+  and `kcmp` (the `process_vm_*` calls belong to `@ipc`, which
+  `@system-service` includes, not to `@debug`) — as is `open_by_handle_at`, so
+  the helper cannot attach to, read, write or compare the memory or
+  descriptors of another process. It has no network.
+- File system: because `CAP_DAC_READ_SEARCH` bypasses read permission on every
+  path the helper can name, `/etc`, `/var`, `/srv`, `/mnt`, `/media`, `/opt`
+  and `/run` are replaced by empty read-only tmpfs and `/home`, `/root`,
+  `/boot` and `/efi` are inaccessible. Only the installation root, the
+  deployment configuration file (not its directory) and `/etc/ld.so.cache`
+  are bound back read-only; `/usr` and `/lib` stay visible for the
+  interpreter, so the release venv's interpreter must live under `/usr` or the
+  installation root. Two residual risks remain and are not claimed away:
+  another top-level tree (for example a separate data or recordings mount at
+  `/data`) stays readable until the Owner adds it with `InaccessiblePaths=` in
+  a `systemctl edit` drop-in, and `/proc/<pid>/root` of any host process,
+  which the helper's `/proc` access cannot exclude without hiding processes,
+  still leads to the host's own root. The masking stops path-based reads; it
+  is not a boundary against code running inside a compromised helper.
 - Channel: systemd creates `/run/server-sentinel-socket-owner/socket`
   `root:server-sentinel-socket-owner` mode `0660` in a root-owned `0755`
   directory (socket activation). The helper answers only a peer whose
@@ -305,8 +322,9 @@ sudo install -m 0644 -o root -g root \
   infra/systemd/server-sentinel-socket-owner.socket \
   infra/systemd/server-sentinel-socket-owner.service /etc/systemd/system/
 # Only when the installation root or configuration path differs from
-# /opt/server-sentinel-main and /etc/server-sentinel/deployment.json:
-sudo systemctl edit server-sentinel-socket-owner.service   # override ExecStart=/WorkingDirectory=
+# /opt/server-sentinel-main and /etc/server-sentinel/deployment.json, or when
+# another top-level data tree must be masked (InaccessiblePaths=-/<tree>):
+sudo systemctl edit server-sentinel-socket-owner.service   # override ExecStart=/WorkingDirectory=/BindReadOnlyPaths=
 sudo systemctl daemon-reload
 sudo systemctl enable --now server-sentinel-socket-owner.socket
 sudo systemctl restart server-sentinel.service   # picks up the new group membership

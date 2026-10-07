@@ -1416,17 +1416,29 @@ closed and reopens without revocation once the name resolves to the recorded
 set again (Owner decision, 2026-10-01; details in `server/app/auth/README.md`).
 An Owner listener exception covers a wildcard system listener only by port
 plus owning executable or systemd unit, verified on every check through the
-socket's owning processes; another or unverifiable owner is an exposure
-reason, and stored port-only exceptions fail closed until re-entered (Owner
-decision, 2026-10-01). Each recorded proxy socket requires a recorded proxy
-process identity (`proxy_owner`) and must be present and held by that process
-alone: a missing recorded socket keeps access closed without revocation, and
-another or unverifiable holder is an exposure (Owner decision, 2026-10-01).
+socket's owning processes; another owner is an exposure reason
+(`UNEXPECTED_LISTENER`), and stored port-only exceptions fail closed until
+re-entered (Owner decision, 2026-10-01). Each recorded proxy socket requires a
+recorded proxy process identity (`proxy_owner`) and must be present and held
+by that process alone: a missing recorded socket keeps access closed without
+revocation, and another holder is an exposure (Owner decision, 2026-10-01).
+A holder process that is seen but whose executable or unit cannot be read
+counts as another owner or holder. Ownership that cannot be verified
+(`LISTENER_OWNER_UNVERIFIED`: no socket-owner resolver, an owner lookup that is
+unavailable, slow, rate-limited or malformed, no holder found, or an
+unreadable own descriptor table) is not an exposure reason: it keeps access
+closed without revocation and access reopens once ownership verifies again
+(Owner decision, 2026-10-05, superseding the 2026-10-01 wording that treated
+an unverifiable owner or holder as an exposure). The socket-owner resolver
+(the Issue #126 helper in production) is mandatory; a check without one never
+opens access.
 The check sees only sockets in `/proc/net` and Serve status. Traffic the kernel redirects before it reaches a listening socket on the reserved address — nftables/iptables DNAT or REDIRECT (for example Docker with `userland-proxy=false`), TPROXY, eBPF `sk_lookup` or IPVS — is not visible to it, so it cannot claim that nothing else answers; the deployment isolation must exclude such forwarding, and the Owner verifies it manually.
 The loopback human upstream passes only as a socket in the ServerSentinel
-process's own `/proc/self/fd`; a single replacement bound by any other
-process is an exposure, and an unreadable own fd table keeps access closed as
-an exposure. A check without a durable session revoker never opens access.
+process's own `/proc/self/fd` that no other process also holds; a single
+replacement bound by any other process, or the socket shared with one, is an
+exposure, and an unreadable own fd table or an unverifiable sole holding keeps
+access closed without revocation (`LISTENER_OWNER_UNVERIFIED`, Owner decision,
+2026-10-05). A check without a durable session revoker never opens access.
 That bounds the exposure window rather
 than preventing the bind: a process that binds between two checks receives
 credentials and cookies for that origin until the next check.

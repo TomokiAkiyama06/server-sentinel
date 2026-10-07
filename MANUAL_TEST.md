@@ -1787,7 +1787,17 @@ by the Issue #6 synthetic policy model.
     `journalctl -u server-sentinel-socket-owner` shows
     `event=started capabilities=complete` and `event=answered` lines;
   - `systemctl show -p SystemCallFilter server-sentinel-socket-owner.service`
-    excludes `ptrace`, `process_vm_readv` and `open_by_handle_at`;
+    excludes `ptrace`, `pidfd_getfd`, `process_vm_readv`,
+    `process_vm_writev`, `process_madvise`, `kcmp` and `open_by_handle_at`;
+  - in the helper's mount namespace (`sudo nsenter -t <helper pid> -m ls -a
+    /etc /var /opt /run /srv /mnt /media`), `/etc` lists only
+    `server-sentinel` (holding only `deployment.json`) and `ld.so.cache`,
+    `/opt` only the installation root, and the others nothing; `/home`,
+    `/root` and `/boot` are inaccessible; record every other top-level tree
+    of `ls /` that holds data and confirm it was added with
+    `InaccessiblePaths=`. Record that the helper still started and answered
+    (`event=started capabilities=complete`, `event=answered`); a mount it
+    cannot set up stops the helper and keeps access closed without revocation;
   - from an account that is neither root nor the service account (for
     example a temporary test account added to the group on a disposable
     node), a connection is closed without an answer and a coalesced

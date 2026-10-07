@@ -334,7 +334,11 @@ The current contract for that check (Owner decisions 2026-09-30 and
   root-owned sockets are read by a separate helper service (Issue #126,
   `server/app/auth/socket_owner.py`, `infra/systemd/`) running as a transient
   non-root account with only `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`
-  (ptrace and `open_by_handle_at` system calls filtered). It answers over a
+  (`ptrace`, `pidfd_getfd`, `process_vm_readv`/`process_vm_writev`,
+  `process_madvise`, `kcmp` and `open_by_handle_at` denied by name; data-holding
+  trees such as `/etc`, `/var`, `/opt`, `/run` masked except the installation
+  root and the one configuration file; `/proc/<pid>/root` and unlisted
+  top-level mounts remain readable to a compromised helper). It answers over a
   `root:server-sentinel-socket-owner` `0660` unix socket, only to the
   service UID verified with `SO_PEERCRED`, only about sockets listening in the
   requester's network namespace, and only with each holder's executable and

@@ -11,18 +11,37 @@
 #                        configuration);
 #   CAP_SYS_PTRACE       pass ptrace_may_access(PTRACE_MODE_READ) for the
 #                        /proc/<pid>/fd/* and /proc/<pid>/exe links.
-# The ptrace-family system calls are filtered out (~@debug), so the helper
-# cannot attach to or read the memory of any process, and open_by_handle_at
-# (the CAP_DAC_READ_SEARCH escape) is filtered out with @privileged. It has
-# no network (PrivateNetwork, AF_UNIX only) and a read-only file system.
+# Every system call that turns CAP_SYS_PTRACE into access to another process
+# is denied by name, not only through a group: ptrace and pidfd_getfd
+# (@debug), process_vm_readv / process_vm_writev / process_madvise (these sit
+# in @ipc, which @system-service includes, NOT in @debug), and kcmp (in
+# @system-service itself). open_by_handle_at, the CAP_DAC_READ_SEARCH escape,
+# is denied by name as well as through @privileged. So the helper cannot
+# attach to, read, write or compare the memory or descriptors of any process.
+# It has no network (PrivateNetwork, AF_UNIX only).
+#
+# File system: CAP_DAC_READ_SEARCH bypasses read and search permission on every
+# path the helper can name, and ProtectSystem=strict only makes trees
+# read-only, so the trees that can hold data (/etc, /var, /srv, /mnt, /media,
+# /opt, /run) are replaced by empty read-only tmpfs and /home, /root, /boot and
+# /efi are inaccessible. Only what the helper needs is bound back read-only:
+# the installation root (code and per-release venv), the one deployment
+# configuration file and the dynamic linker cache. /usr and /lib stay visible
+# for the interpreter. Residual risk: a top-level tree outside this list (a
+# custom data mount such as /data) stays readable until the Owner adds it to
+# InaccessiblePaths= in a drop-in, and /proc/<pid>/root of any host process
+# (needed /proc access cannot be narrowed without hiding processes) still
+# reaches the host's own root, so a compromised helper can read host files
+# through it. The masking stops accidental and path-based reads; it is not a
+# boundary against code execution inside the helper.
 # Do not add PrivateUsers= (capabilities would no longer apply to host
 # processes) or ProtectProc=invisible / PrivatePIDs= (other processes would be
 # hidden, so every scan would be incomplete and access would stay closed).
 #
 # The paths below are the documented defaults (server/docs/DEPLOYMENT.md);
 # when the installation root or configuration path differs, override
-# ExecStart= and WorkingDirectory= with `systemctl edit`, never by editing
-# this file in place.
+# ExecStart=, WorkingDirectory= and the matching BindReadOnlyPaths= entry with
+# `systemctl edit`, never by editing this file in place.
 
 [Unit]
 Description=ServerSentinel listener socket-owner helper
@@ -46,6 +65,11 @@ NoNewPrivileges=yes
 UMask=0077
 ProtectSystem=strict
 ProtectHome=yes
+TemporaryFileSystem=/etc:ro /var:ro /srv:ro /mnt:ro /media:ro /opt:ro /run:ro
+InaccessiblePaths=-/boot -/efi
+BindReadOnlyPaths=/opt/server-sentinel-main
+BindReadOnlyPaths=/etc/server-sentinel/deployment.json
+BindReadOnlyPaths=-/etc/ld.so.cache
 PrivateTmp=yes
 PrivateDevices=yes
 PrivateNetwork=yes
@@ -68,6 +92,7 @@ RemoveIPC=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@debug @privileged @resources @mount
+SystemCallFilter=~ptrace pidfd_getfd process_vm_readv process_vm_writev process_madvise kcmp open_by_handle_at
 SystemCallErrorNumber=EPERM
 TasksMax=4
 MemoryMax=128M
