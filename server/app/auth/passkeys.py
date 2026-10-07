@@ -30,8 +30,8 @@ Invariants enforced here:
   verified authenticator is backup eligible in a deployment that requires
   device-bound credentials).
 
-Every commit that redeems an invitation, establishes a session or refreshes a
-session's verification time runs inside ``session_gate.admit()`` (in
+Every commit that redeems an invitation, establishes a session or updates a
+session's user-verification time runs inside ``session_gate.admit()`` (in
 production the ``HostnameReservationCheck``), which re-checks under the gate
 lock that human access is still open, so a reservation check that closes
 access and revokes sessions cannot interleave with it (Issue #144). Only that

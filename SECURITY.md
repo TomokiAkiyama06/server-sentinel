@@ -379,11 +379,16 @@ and ADR-0003):
   requirement is persisted as a marker before reopening; if the marker cannot
   be written, every human session is revoked at once instead. A check without
   a durable revoker never opens human access. The check and every commit that
-  creates or refreshes a human session or creates or redeems an enrollment
-  authorization share one lock (Issue #144, Owner decision 2026-10-07): the
-  commit re-checks that access is open inside it, and the check closes access
-  and revokes inside it, so a request that saw access open before a check
-  closed it cannot commit a session after that check's revocation.
+  creates a human session, updates a session's user-verification time, or
+  creates or redeems an enrollment authorization share one lock (Issue #144,
+  Owner decision 2026-10-07): the commit re-checks that access is open inside
+  it, and the check closes access inside it and keeps the verdict closed until
+  any required revocation has committed, so a request that saw access open
+  before a check closed it cannot commit a session after that check's
+  revocation. The check also decides and revokes inside the lock as defense in
+  depth. The idle-expiry touch of an existing session stays outside the lock;
+  revocation advances the authorization generation, so a touch can never make
+  a revoked session valid again.
 - An Owner listener exception names a port together with its creating
   systemd unit (`.service` or `.socket`) and uid, never a port alone, and
   every check verifies the socket's creating unit and uid. The unprivileged

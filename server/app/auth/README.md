@@ -247,10 +247,10 @@ the failure streak starts and each time it doubles, and
 `session_revocation_marker_saved` once it commits.
 
 Session gate (Issue #144, Owner decision 2026-10-07: serialize). The check and
-every commit that creates or refreshes a human session or creates or redeems an
-enrollment authorization share one lock, `HostnameReservationCheck.admit()`:
+every commit that creates a human session, updates a session's user-verification
+time, or creates or redeems an enrollment authorization share one lock, `HostnameReservationCheck.admit()`:
 `PasskeyCeremonies.finish_authentication()` (new session),
-`finish_step_up()` (verification refresh) and `finish_registration()`
+`finish_step_up()` (user-verification time) and `finish_registration()`
 (invitation redemption) run their store commit inside it, and so does
 `AccessAdministration.issue_invitation()` when it is constructed with the
 check as `session_gate` (required for wiring a human route reaches; `None` only
@@ -258,23 +258,32 @@ for a caller no human route reaches). `PasskeyCeremonies` cannot be constructed
 without a gate. Inside the lock the commit re-checks the published verdict right
 before its SQLite write transaction and is refused (generic denial; a `failed`
 audit record for the Owner operation) while access is closed. The check takes
-the same lock to close access at its start, and again to decide and commit:
-the marker, the fallback and reopening revocations and the published verdict.
-A request that saw access open before a check closed it therefore either
-committed before the close, so every later revocation covers it, or is refused;
-it can no longer commit after the immediate fallback revocation. A restart that
+the same lock to close access at its start, and the verdict stays closed until
+any required revocation has committed. That is the essential property: a
+request that saw access open before a check closed it either committed before
+the close, so every later revocation covers it, or is refused; it can no longer
+commit after the immediate fallback revocation. The check also takes the lock
+again to decide and commit (the marker, the fallback and reopening revocations
+and the published verdict); doing that inside the gate is defense in depth. A restart that
 finds no marker after a committed fallback revocation (the residual risk of PR
 #134) thus finds no session or enrollment authorization from before the close.
 Lock order, outermost first: `exception_change_lock`, `_check_lock`, the
 session gate lock, then the SQLite write lock (`BEGIN IMMEDIATE`). Session
 paths take only the last two, in that order. Enumeration, hostname resolution
-and Owner fault delivery run outside the gate lock; only local SQLite writes
-run under it. The verdict lives in the check's memory, so the check and every
+and Owner fault delivery run outside the gate lock. Under it run only local
+work: the SQLite write transactions, their storage admission (the audit
+store's free-space reservation) and the identifier-free marker log event. The verdict lives in the check's memory, so the check and every
 session-establishing path must run in one process (the backend runs a single
 `uvicorn.Server` from `app.systemd.build_server`, without worker processes); a
 second serving process would have no gate. The low-level
 `AccessStore.establish_session` / `issue_enrollment` wrappers are fixture and
 local entries outside the gate and must not be reached from a human route.
+Two session writes stay outside the gate on purpose: the idle-expiry touch
+(`last_seen`) in `authorize()` / `authorize_owner()` and the expiry sweep. They
+never make a session valid: revocation advances the authorization generation
+and invalidates every row in one transaction, so a touch committed after it
+finds the session invalid and is refused, and one committed before it is
+revoked with the row.
 
 Two cases do not revoke twice. A fallback revocation that commits in the same
 check that reopens access, while access has never been open in this process (a

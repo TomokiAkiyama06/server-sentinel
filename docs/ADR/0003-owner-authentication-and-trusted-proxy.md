@@ -554,12 +554,16 @@ the last scan also leaves the upstream unverified, and the same process
 unreadable in every scan fails the lookup (unverified).
 
 Owner decision, 2026-10-07 (Issue #144): the reservation check and every
-commit that creates or refreshes a human session or creates or redeems an
-enrollment authorization are serialized by one in-process lock. The commit
-re-checks that access is open inside the lock right before it writes; the
-check closes access, and later decides, revokes and publishes its verdict,
-inside the same lock. A request that saw access open before a check closed it
-can therefore no longer commit a session after that check's immediate
-revocation, so a restart that finds no revocation marker no longer keeps such
-a session. Enumeration and network I/O stay outside the lock. The lock order
+commit that creates a human session, updates a session's user-verification
+time, or creates or redeems an enrollment authorization are serialized by one
+in-process lock. The commit re-checks that access is open inside the lock right
+before it writes; the check closes access inside the same lock and keeps the
+verdict closed until any required revocation has committed. That is the
+essential property: a request that saw access open before a check closed it
+can no longer commit a session after that check's immediate revocation, so a
+restart that finds no revocation marker no longer keeps such a session. The
+check also decides, revokes and publishes its verdict inside the lock, as
+defense in depth. The idle-expiry touch of an existing session stays outside
+the lock, which is safe because revocation advances the authorization
+generation. Enumeration and network I/O stay outside the lock. The lock order
 and the single-process requirement are in `server/app/auth/README.md`.

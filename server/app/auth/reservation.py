@@ -1110,23 +1110,30 @@ class HostnameReservationCheck:
     period does not revoke (Issue #144).
 
     Session gate (Issue #144, Owner decision 2026-10-07: serialize). Every
-    commit that creates or refreshes a human session or creates or redeems
-    an enrollment authorization runs inside ``admit()``, which holds
+    commit that creates a human session, updates a session's
+    user-verification time, or creates or redeems an enrollment
+    authorization runs inside ``admit()``, which holds
     ``_session_gate_lock`` and re-checks the published verdict right before
     the commit. The check takes the same lock to close access (at its start)
-    and again for decide + commit: ``_after_evaluation`` (marker, fallback
-    and reopening revocations) together with publishing the verdict. So once
-    a check has closed access, no commit that observed the earlier open
-    verdict can land afterwards: it either committed before the close, and
-    every later revocation covers it, or it re-checks, finds access closed
-    and is refused with ``HumanAccessClosed``.
+    and keeps the verdict closed until any required revocation has
+    committed; that is the essential property. Once a check has closed
+    access, no commit that observed the earlier open verdict can land
+    afterwards: it either committed before the close, and every later
+    revocation covers it, or it re-checks, finds access closed and is
+    refused with ``HumanAccessClosed``. Taking the lock again for decide +
+    commit (``_after_evaluation`` with the marker, fallback and reopening
+    revocations, together with publishing the verdict) is defense in depth.
+    The idle-expiry touch in ``AccessStore.authorize()`` /
+    ``authorize_owner()`` stays outside the gate: revocation advances the
+    authorization generation, so a touch never makes a revoked session valid.
 
     Lock order (outermost first): ``exception_change_lock`` ->
     ``_check_lock`` -> ``_session_gate_lock`` -> the SQLite write lock
     (``BEGIN IMMEDIATE``). Session paths take only the last two, in that
     order, and never take the gate lock while already inside a write
     transaction. Enumeration, resolution and Owner fault delivery run outside
-    the gate lock; only local SQLite writes run under it. The verdict lives
+    the gate lock; under it run only local SQLite write transactions, their
+    storage admission and the marker log event. The verdict lives
     in this object's memory, so the gate and every session-establishing path
     must share one process.
 
@@ -1238,8 +1245,9 @@ class HostnameReservationCheck:
     def access_open(self) -> bool:
         """Precedes identity, session and permission evaluation (ADR-0003).
 
-        A request-time read only: a commit that creates or refreshes a session
-        or an enrollment authorization goes through ``admit()`` instead, which
+        A request-time read only: a commit that creates a session, updates its
+        user-verification time, or creates or redeems an enrollment
+        authorization goes through ``admit()`` instead, which
         re-checks under the gate lock (Issue #144).
         """
         return self._verdict.open

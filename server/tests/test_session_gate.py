@@ -381,14 +381,22 @@ class GateLockOrderTests(SessionGateFixture):
         stop.set()
         self.assertEqual([worker for worker in workers if worker.is_alive()], [])
         self.assertEqual(errors, [])
-        self.assertTrue(granted)
-        # Afterwards an exposure and a clean check still revoke every session.
+        # Whether any login got through during the concurrent phase depends on
+        # scheduling, so it is not asserted. Afterwards a deterministic clean
+        # check opens the gate and a login succeeds through it.
         reservation_admin.set_listener_exceptions(OWNER_SESSION, {SSH})
+        self.files.files["tcp"] = Files(**WILDCARD_SSH.raw).files["tcp"]
+        self.assertTrue(self.check._check(CheckKind.RETRY).open)
+        _, authenticator = users[0]
+        grant = self.ceremonies.finish_authentication("synthetic-0@example.invalid", self.assertion(authenticator))
+        self.assertTrue(self.valid(grant, "synthetic-0@example.invalid"))
+        # An exposure and a clean check then revoke every session.
         self.files.files["tcp"] = EXPOSED
         self.assertFalse(self.check._check(CheckKind.RETRY).open)
         self.files.files["tcp"] = Files(**WILDCARD_SSH.raw).files["tcp"]
         self.assertTrue(self.check._check(CheckKind.RETRY).open)
         self.assertEqual(self.live_sessions(), 0)
+        self.assertFalse(self.valid(grant, "synthetic-0@example.invalid"))
 
 
 if __name__ == "__main__":
