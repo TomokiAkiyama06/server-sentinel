@@ -89,6 +89,10 @@ class CaptureFactory:
         self.discovery = discovery
         self.instances = []
         self.block = None
+        # Set once a read has entered ``block``.
+        self.blocked = threading.Event()
+        # Set to an Event to make close() hang (STREAMOFF/unmap/close).
+        self.close_block = None
         self.lock = threading.Lock()
 
     def __call__(self, candidate, profile, *, verify_identity):
@@ -109,6 +113,7 @@ class CaptureFactory:
             def read_frame(self, timeout):
                 block = factory.block
                 if block is not None:
+                    factory.blocked.set()
                     block.wait(10)
                 time.sleep(0.005)
                 if self.candidate not in factory.discovery.devices:
@@ -117,6 +122,9 @@ class CaptureFactory:
                 return VideoFrame(b"synthetic-frame", self.sequence, 1.0)
 
             def close(self):
+                close_block = factory.close_block
+                if close_block is not None:
+                    close_block.wait(30)
                 self.closed = True
 
         capture = Capture()
@@ -165,9 +173,10 @@ class RuntimeFixture(unittest.TestCase):
         with self.frame_lock:
             return sum(1 for item in self.frames if item[0] == source_id)
 
-    def runtime(self, *source_ids, health_sink=None, **kwargs):
+    def runtime(self, *source_ids, health_sink=None, configuration_timing=None, **kwargs):
         runtime = LocalUvcRuntime(
-            LocalUvcConfiguration(tuple(source_ids), **FAST), self.registry,
+            LocalUvcConfiguration(tuple(source_ids), **FAST, **(configuration_timing or {})),
+            self.registry,
             on_frame=self.on_frame, health_sink=health_sink,
             discovery=self.discovery, capture_factory=self.captures, **kwargs,
         )
@@ -202,6 +211,87 @@ class RuntimeLifecycleTests(RuntimeFixture):
         self.assertEqual([], self.captures.instances)
         self.assertEqual(0, self.frame_count(source.id))
         self.assertIs(self.health(source.id), SourceHealthState.OFFLINE)
+
+    def test_worker_blocked_without_frames_is_not_left_online(self):
+        # Reproduces the hardware finding: the worker is stuck inside a call
+        # and delivers no frame, so its own read timeout never runs. The
+        # supervisor watchdog must still lower the online claim, and only
+        # resumed frames restore it.
+        source = self.source()
+        runtime = self.runtime(source.id, configuration_timing=dict(
+            frame_stall_seconds=0.25, frame_stall_reopen_seconds=30.0))
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        block = threading.Event()
+        self.captures.block = block
+        self.addCleanup(block.set)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.DEGRADED, timeout=3.0))
+        self.assertIs(CameraState.DEGRADED, runtime.status().sources[0].camera_state)
+        # The descriptor was not torn down by the watchdog.
+        self.assertEqual(1, len(self.captures.instances))
+        self.assertFalse(self.captures.instances[0].closed)
+        self.captures.block = None
+        block.set()
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+
+    def test_blocking_health_sink_does_not_hold_the_transition_lock(self):
+        # A downstream sink (logging, preview invalidation, notification) that
+        # blocks while handling ``video_capture_ready`` must not keep the
+        # watchdog from lowering the online claim.
+        source = self.source()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        armed = threading.Event()
+
+        def blocking_sink(event):
+            if armed.is_set() and event.reason == "video_capture_ready":
+                armed.clear()
+                entered.set()
+                release.wait(10)
+
+        runtime = self.runtime(source.id, health_sink=blocking_sink, configuration_timing=dict(
+            frame_stall_seconds=0.25, frame_stall_reopen_seconds=30.0))
+        runtime.start()
+        armed.set()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(entered.wait(5))
+        # The worker is stuck in the sink and delivers no frame.
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.DEGRADED, timeout=3.0))
+        self.assertIs(CameraState.DEGRADED, runtime.status().sources[0].camera_state)
+        release.set()
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+
+    def test_blocking_sink_on_a_watchdog_stall_does_not_stall_the_watchdog(self):
+        # The watchdog itself emits ``video_frame_stalled``. A sink that blocks
+        # on that event must not run on the watchdog thread, or the reopen
+        # deadline (and every other source) would never be checked again.
+        source = self.source()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def blocking_sink(event):
+            if event.reason == "video_frame_stalled" and not release.is_set():
+                entered.set()
+                release.wait(10)
+
+        runtime = self.runtime(source.id, health_sink=blocking_sink, configuration_timing=dict(
+            frame_stall_seconds=0.25, frame_stall_reopen_seconds=1.0))
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        block = threading.Event()
+        self.captures.block = block
+        self.addCleanup(block.set)
+        self.assertTrue(entered.wait(5))
+        # The sink is still blocked; the watchdog keeps enforcing the reopen
+        # deadline for the blocked worker.
+        self.assertTrue(wait_for(
+            lambda: runtime.status().sources[0].camera_state is CameraState.OFFLINE, 5.0))
+        release.set()
+        self.captures.block = None
+        block.set()
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
 
     def test_start_reapprove_stream_and_stop(self):
         source = self.source()
@@ -440,7 +530,7 @@ class RuntimeLifecycleTests(RuntimeFixture):
         self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
         block = threading.Event()
         self.captures.block = block
-        time.sleep(0.05)
+        self.assertTrue(self.captures.blocked.wait(5))
         status = runtime.stop()
         self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
         # The adapter was not closed from the stopping thread while the worker
@@ -451,6 +541,153 @@ class RuntimeLifecycleTests(RuntimeFixture):
         self.assertTrue(wait_for(lambda: all(capture.closed
                                              for capture in self.captures.instances)))
         self.assertTrue(wait_for(lambda: self.health(source.id) is SourceHealthState.OFFLINE))
+
+    def test_hung_stall_write_does_not_stop_the_watchdog_for_other_sources(self):
+        second_camera = DeviceEvidence("/dev/video2", "synthetic", "model", "serial-b")
+        self.discovery.devices = [self.camera, second_camera]
+        first, second = self.source("First"), self.source("Second")
+        runtime = self.runtime(first.id, second.id)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", first.id, self.camera)
+        runtime.reapprove(self.admin, "synthetic-owner", second.id, second_camera)
+        self.assertTrue(self.wait_health(first.id, SourceHealthState.ONLINE))
+        self.assertTrue(self.wait_health(second.id, SourceHealthState.ONLINE))
+        armed, hung, release = threading.Event(), [], threading.Event()
+        self.addCleanup(release.set)
+        original = self.registry.update_source_health
+
+        def hanging_write(source_id, **values):
+            if armed.is_set() and values.get("health_state") is not SourceHealthState.ONLINE:
+                with self.frame_lock:
+                    first_hang = not hung
+                    if first_hang:
+                        hung.append(source_id)
+                if first_hang:
+                    # SQLite/storage hangs indefinitely on the first stall write.
+                    release.wait(30)
+            return original(source_id, **values)
+
+        self.registry.update_source_health = hanging_write
+        block = threading.Event()
+        self.addCleanup(block.set)
+        armed.set()
+        # Both workers block in a kernel read, so only the watchdog can
+        # report their stalls.
+        self.captures.block = block
+        self.assertTrue(wait_for(lambda: bool(hung)))
+        other = second.id if hung[0] == first.id else first.id
+        self.assertTrue(wait_for(lambda: self.health(other) is not SourceHealthState.ONLINE, 8))
+        # The hung source's in-memory state left online too.
+        status = runtime.status()
+        hung_source = next(item for item in status.sources if item.source_id == hung[0])
+        self.assertFalse(hung_source.health_persisted)
+        self.assertIsNot(hung_source.camera_state, CameraState.ONLINE)
+        self.captures.block = None
+        block.set()
+        release.set()
+
+    def test_worker_blocked_through_a_refused_reapproval_stays_watched(self):
+        source = self.source()
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), poll_timeout_seconds=0.05,
+                                  retry_delay_seconds=0.05, join_timeout_seconds=0.1),
+            self.registry, on_frame=self.on_frame, discovery=self.discovery,
+            capture_factory=self.captures,
+        )
+        self.addCleanup(runtime.stop)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        block = threading.Event()
+        self.addCleanup(block.set)
+        self.captures.block = block
+        self.assertTrue(self.captures.blocked.wait(5))
+        # The worker is blocked in a kernel call, so the stop for the
+        # approval times out and the approval is refused; the source is
+        # still RUNNING and its worker still registered with stop requested.
+        with self.assertRaisesRegex(ValueError, "could not stop"):
+            runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertIs(runtime.status().sources[0].state, SourceRuntimeState.RUNNING)
+        self.assertTrue(wait_for(lambda: self.health(source.id) is not SourceHealthState.ONLINE))
+        self.captures.block = None
+
+    def test_hung_teardown_notifies_offline_and_reports_unpersisted_first(self):
+        source = self.source()
+        offline = threading.Event()
+
+        def sink(event):
+            # Production wiring: local_preview.on_health() runs first here.
+            if event.state is CameraState.OFFLINE:
+                offline.set()
+
+        runtime = self.runtime(source.id, health_sink=sink)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        release = threading.Event()
+        self.addCleanup(release.set)
+        original = self.registry.update_source_health
+
+        def hanging_write(source_id, **values):
+            if values.get("health_state") is SourceHealthState.OFFLINE and not release.is_set():
+                release.wait(30)
+            return original(source_id, **values)
+
+        self.registry.update_source_health = hanging_write
+        self.captures.close_block = release
+        # Unplug: the worker starts the teardown and hangs in close().
+        self.discovery.devices = []
+        # Before the descriptor is closed, the offline transition already
+        # reached the sink (preview invalidation) and the stale ONLINE row is
+        # reported unpersisted.
+        self.assertTrue(offline.wait(5))
+        self.assertTrue(wait_for(lambda: not runtime.status().sources[0].health_persisted))
+        self.assertFalse(all(capture.closed for capture in self.captures.instances))
+        self.assertIs(self.health(source.id), SourceHealthState.ONLINE)
+        self.captures.close_block = None
+        release.set()
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.OFFLINE))
+        self.assertTrue(wait_for(lambda: runtime.status().sources[0].health_persisted))
+
+    def test_teardown_closes_the_descriptor_despite_hung_health_io(self):
+        source = self.source()
+        armed, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        sink_entered, write_entered = threading.Event(), threading.Event()
+
+        def hanging_sink(event):
+            if armed.is_set():
+                sink_entered.set()
+                release.wait(30)
+
+        runtime = self.runtime(source.id, health_sink=hanging_sink)
+        original = self.registry.update_source_health
+
+        def hanging_write(source_id, **values):
+            if armed.is_set() and values.get("health_state") is SourceHealthState.OFFLINE:
+                write_entered.set()
+                release.wait(30)
+            return original(source_id, **values)
+
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        # SQLite/storage and the downstream health sink both hang.
+        self.registry.update_source_health = hanging_write
+        armed.set()
+        result = []
+        stopper = threading.Thread(target=lambda: result.append(runtime.stop()))
+        stopper.start()
+        stopper.join(10)
+        self.assertFalse(stopper.is_alive())
+        self.assertIs(result[0].state, LocalUvcRuntimeState.STOPPED)
+        self.assertTrue(all(capture.closed for capture in self.captures.instances))
+        # The transition itself still happened; only its I/O is pending.
+        self.assertIs(result[0].sources[0].camera_state, CameraState.OFFLINE)
+        self.assertTrue(write_entered.wait(5))
+        self.assertTrue(sink_entered.wait(5))
+        release.set()
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.OFFLINE))
 
     def test_health_sink_failure_and_event_bound_do_not_stop_capture(self):
         source = self.source()
@@ -761,6 +998,49 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
                             for capture in self.dependencies.capture_factory.instances))
         self.assertIs(registry.get_source(source.id).health_state, SourceHealthState.OFFLINE)
         self.assertEqual(0, application.state.local_preview.status.retained_bytes)
+
+    async def test_blocked_optional_sink_never_delays_preview_invalidation(self):
+        database = Database(self.settings.database_path)
+        with closing(database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        source = CameraRegistry(database, unaudited_writes=True).create_source(
+            source_type=SourceType.LOCAL_UVC, name="Synthetic source", enabled=True,
+            desired_capture_profile=PROFILE,
+        )
+        release, ready_entered = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def blocking_sink(event):
+            # An optional downstream sink hangs while handling video ready.
+            if event.reason == "video_capture_ready":
+                ready_entered.set()
+                release.wait(30)
+
+        self.dependencies = replace(self.dependencies, health_sink=blocking_sink)
+        application = create_app(
+            self.settings, storage_reservation=synthetic_admission,
+            local_uvc=LocalUvcConfiguration((source.id,), **FAST),
+            local_uvc_dependencies=self.dependencies,
+        )
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(database), PermitOwner()), CameraRegistry(database),
+        )
+        block = threading.Event()
+        self.addCleanup(block.set)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.local_uvc
+            preview = application.state.local_preview
+            runtime.reapprove(admin, "synthetic-owner", source.id, self.camera)
+            self.assertTrue(wait_for(ready_entered.is_set))
+            self.assertTrue(preview.source(source.id).live)
+            # Frames stop; the stall must invalidate the preview although the
+            # optional sink is still stuck on the earlier ready event.
+            self.dependencies.capture_factory.block = block
+            self.assertTrue(wait_for(lambda: not preview.source(source.id).live, 8))
+            self.assertIsNone(preview.latest(source.id))
+            self.dependencies.capture_factory.block = None
+            block.set()
+            release.set()
 
     async def test_runtime_start_failure_does_not_abort_application(self):
         application = create_app(
@@ -1395,6 +1675,20 @@ class ConfigurationParsingTests(unittest.TestCase):
         self.assertEqual(2.0, parsed.retry_delay_seconds)
         self.assertNotIn(identities[0], repr(parsed))
 
+    def test_frame_progress_timing_is_parsed_and_bounded(self):
+        identity = str(uuid4())
+        parsed = parse_local_uvc({"source_ids": [identity]})
+        self.assertEqual(1.0, parsed.frame_stall_seconds)
+        self.assertEqual(5.0, parsed.frame_stall_reopen_seconds)
+        self.assertEqual(1.0, parsed.presence_scan_seconds)
+        parsed = parse_local_uvc({
+            "source_ids": [identity], "frame_stall_seconds": 2,
+            "frame_stall_reopen_seconds": 10, "presence_scan_seconds": 0.5,
+        })
+        self.assertEqual((2.0, 10.0, 0.5), (
+            parsed.frame_stall_seconds, parsed.frame_stall_reopen_seconds,
+            parsed.presence_scan_seconds))
+
     def test_invalid_configuration_is_value_free(self):
         identity = str(uuid4())
         cases = [
@@ -1409,6 +1703,14 @@ class ConfigurationParsingTests(unittest.TestCase):
             {"source_ids": [identity], "retry_delay_seconds": True},
             {"source_ids": [identity], "join_timeout_seconds": float("nan")},
             {"source_ids": [identity], "retry_delay_seconds": 1e9},
+            {"source_ids": [identity], "frame_stall_seconds": 0},
+            {"source_ids": [identity], "frame_stall_seconds": 1e9},
+            {"source_ids": [identity], "frame_stall_reopen_seconds": float("inf")},
+            {"source_ids": [identity], "presence_scan_seconds": 0},
+            {"source_ids": [identity], "presence_scan_seconds": 3600},
+            # Reopen before the stall is even reported would hide the stall.
+            {"source_ids": [identity], "frame_stall_seconds": 5,
+             "frame_stall_reopen_seconds": 2},
             {"source_ids": [7]},
         ]
         for value in cases:

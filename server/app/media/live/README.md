@@ -31,10 +31,13 @@ layer without a route. `LocalPreviewHub.on_frame` runs on capture worker
 threads, is lock-protected and never raises into capture; it keeps at most one
 latest frame per configured source (bounded by `max_frame_bytes`) and only while
 that source has viewer demand, so zero subscribers retain nothing.
-`LocalPreviewHub.on_health` is wired to the runtime's camera health: any
-non-`online` transition (disconnect, capture failure, manual intervention)
-drops the retained frame and refuses new frames until the camera is `online`
-again, so a pre-loss image is never served as current live video.
+`LocalPreviewHub.on_health` is wired to the runtime's in-memory camera state
+listener (`on_camera_state`): any non-`online` transition (disconnect, capture
+failure, frame stall, manual intervention) drops the retained frame and
+refuses new frames until the camera is `online` again, so a pre-loss image is
+never served as current live video. It runs in transition order with the
+runtime's in-memory health record, not behind the optional downstream health
+sink, so a slow or hung sink cannot delay the invalidation.
 `LocalPreviewHub.clear()` runs when capture stops and permanently marks every
 source non-live, so a worker still finishing a read after a timed-out stop
 (`stop_failed`) cannot publish a late frame or re-enable a source.

@@ -111,6 +111,7 @@ class LocalUvcRuntime:
     def __init__(self, configuration: LocalUvcConfiguration, registry: CameraRegistry, *,
                  on_frame: Callable[[UUID, object], None],
                  health_sink: Callable[[HealthEvent], None] | None = None,
+                 on_camera_state: Callable[[HealthEvent], None] | None = None,
                  discovery=None, capture_factory=MmapCapture,
                  supervisor_factory=LocalUvcSupervisor, adapter_factory=LocalUvcAdapter,
                  max_health_events: int = MAX_HEALTH_EVENTS, monotonic=time.monotonic):
@@ -120,12 +121,17 @@ class LocalUvcRuntime:
             raise TypeError("local UVC frame sink is required")
         if health_sink is not None and not callable(health_sink):
             raise TypeError("local UVC health sink must be callable")
+        if on_camera_state is not None and not callable(on_camera_state):
+            raise TypeError("local UVC camera state listener must be callable")
         if type(max_health_events) is not int or not 1 <= max_health_events <= 4096:
             raise ValueError("health event bound is invalid")
         self.configuration = configuration
         self.registry = registry
         self._on_frame = on_frame
         self._health_sink = health_sink
+        # In-memory listener (preview invalidation), called in transition
+        # order with the in-memory record, never behind a downstream sink.
+        self._on_camera_state = on_camera_state
         self._discovery = discovery
         self._capture_factory = capture_factory
         self._supervisor_factory = supervisor_factory
@@ -148,14 +154,40 @@ class LocalUvcRuntime:
 
     # -- health events -------------------------------------------------
     def _health(self, event: HealthEvent) -> None:
-        """Adapter health callback; never raises into the capture worker."""
-        now = self._monotonic()
+        """Record and publish one event (both halves of the adapter callback)."""
+        self._record_health(event)
+        self._publish_health(event)
+
+    def _record_health(self, event: HealthEvent) -> None:
+        """In-memory half, called under the source's transition lock.
+
+        It only updates bounded in-memory state and never blocks, so the
+        runtime status follows every transition even while a downstream sink
+        is slow.
+        """
         with self._events_lock:
             if len(self._events) == self._events.maxlen:
                 self._events_dropped += 1
             self._events.append(event)
             if event.source_id in self._sources:
                 self._camera[event.source_id] = event.state
+        # ``on_camera_state`` must itself be in-memory and non-blocking (the
+        # preview hub only flips a flag and drops its retained frame). It runs
+        # here, not with the downstream sinks, so a slow or hung optional sink
+        # handling an earlier event can never delay a non-online transition
+        # from invalidating the preview.
+        if self._on_camera_state is not None:
+            try:
+                self._on_camera_state(event)
+            except Exception:
+                with self._events_lock:
+                    self._sink_failures += 1
+
+    def _publish_health(self, event: HealthEvent) -> None:
+        """Downstream half (logging, health sink), called after the source's
+        transition lock is released; never raises into the capture worker."""
+        now = self._monotonic()
+        with self._events_lock:
             last = self._last_logged.get(event.source_id)
             log = (event.state is CameraState.MANUAL or last is None
                    or now - last >= HEALTH_LOG_INTERVAL_SECONDS)
@@ -213,8 +245,12 @@ class LocalUvcRuntime:
             self._started = True
             try:
                 self.adapter = self._adapter_factory(
-                    self.registry, emit_audit=self._health, on_frame=self._on_frame,
+                    self.registry, emit_audit=self._record_health,
+                    publish=self._publish_health, on_frame=self._on_frame,
                     discovery=self._discovery, capture_factory=self._capture_factory,
+                    frame_stall_seconds=self.configuration.frame_stall_seconds,
+                    frame_stall_reopen_seconds=self.configuration.frame_stall_reopen_seconds,
+                    presence_scan_seconds=self.configuration.presence_scan_seconds,
                 )
                 self._supervisor = self._supervisor_factory(
                     self.adapter, poll_timeout=self.configuration.poll_timeout_seconds,

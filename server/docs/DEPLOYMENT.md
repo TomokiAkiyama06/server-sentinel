@@ -166,7 +166,10 @@ The optional `local_uvc` object names the logical Camera Registry sources
   "source_ids": ["00000000-0000-4000-8000-000000000001"],
   "poll_timeout_seconds": 1.0,
   "retry_delay_seconds": 1.0,
-  "join_timeout_seconds": 3.0
+  "join_timeout_seconds": 3.0,
+  "frame_stall_seconds": 1.0,
+  "frame_stall_reopen_seconds": 5.0,
+  "presence_scan_seconds": 1.0
 }
 ```
 
@@ -175,7 +178,15 @@ The optional `local_uvc` object names the logical Camera Registry sources
 for each source is selected only by the audited Owner approval and stays in the
 private approval store. A listed source without that approval stays `offline`
 and never opens a device. The timing keys are optional (bounded; invalid values
-fail `--check`). A UUID that is not a `local_uvc` registry source is rejected at
+fail `--check`). `frame_stall_seconds` (0.25–30) is how long a live capture
+may deliver no frame before its source is reported `degraded`
+(`video_frame_stalled`) instead of `online`; the effective window is never
+shorter than 10 negotiated frame intervals, so a slow profile cannot flap.
+`frame_stall_reopen_seconds` (0.5–300, not less than `frame_stall_seconds`,
+scaled by the same factor) is how long a stall lasts before the source is
+reported `offline` and the capture is closed and reopened (also enforced by the
+watchdog while the worker is blocked). `presence_scan_seconds` (0.1–10) bounds how
+often the full device scan runs while a capture is live. A UUID that is not a `local_uvc` registry source is rejected at
 startup and reported, never silently skipped. Without the object the backend
 logs `local_uvc_unconfigured` and keeps an explicit `unconfigured` local capture
 state; remote-agent-only deployments need no `local_uvc` object.
@@ -439,6 +450,13 @@ switched to another file only for the moment of the open is refused too. `export
 refuse `listener_authority_mismatch` when the listener certificate was not
 issued by the selected CA directory.
 
+The pin is never closed, not even when the command ends or refuses the file
+(Issue #152): closing any descriptor on the database file would drop every
+SQLite lock the process holds on it, including one an enrollment worker that
+outlived the listener's bounded wait may still hold. Such a worker's later
+commit is refused instead. The descriptor is released only when the command's
+process exits.
+
 **Bootstrap endpoint and Tailscale (Issue #150).** Capture enrollment and
 ingest are private-LAN only and need no Tailscale on either host. The
 enrollment bind (`approve --listen`), the ingest listener and the
@@ -694,6 +712,17 @@ fails rather than accepting a merely spawned process. Enabling the unit at boot
 remains an explicit administrator action. Install the Ubuntu package providing
 `venv` for the selected Python before the first release operation; the installer
 fails closed if it cannot create the per-release environment.
+
+**Database volume maintenance (Issue #152).** The service and the pairing CLI
+never close a descriptor they opened on the application database file, because
+closing one would release the process's SQLite locks on it (see
+`app/storage/database.py`). Those descriptors stay open for the life of the
+process, even after the file is replaced, so the volume holding `state` stays
+busy (unmount fails with `EBUSY`) and a replaced database file keeps its blocks
+allocated until the process exits. Remount, restore or replace the database
+volume or file only with `server-sentinel.service` stopped and no pairing CLI
+command running; start the service again afterwards. Never swap the database
+file under a running service.
 
 ## Preservation inventory across update and rollback
 

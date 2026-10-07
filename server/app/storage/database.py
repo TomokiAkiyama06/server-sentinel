@@ -95,6 +95,25 @@ def read_database_prefix(path: Path, size: int) -> bytes | None:
         raise ValueError("database location is unavailable") from None
 
 
+def hold_database_file(path: Path) -> tuple[int, tuple[int, int]]:
+    """The process-held read descriptor and identity of the file at ``path``.
+
+    For callers outside this module that must pin an existing database file
+    (the pairing CLI's ledger). The descriptor belongs to the process-wide
+    holder above: callers must never close it, and it stays open after their
+    use ends. Raises ``FileNotFoundError`` for a missing file and
+    ``ValueError`` for anything else unusable; nothing is ever created.
+    """
+    with _HELD_LOCK:
+        return _hold_locked(path)
+
+
+def held_descriptors() -> frozenset[int]:
+    """Every descriptor the process-wide holder keeps open (never SQLite's)."""
+    with _HELD_LOCK:
+        return frozenset(_HELD.values()) | frozenset(_DUPLICATES)
+
+
 def _hold_file(path: Path) -> tuple[int, tuple[int, int]]:
     with _HELD_LOCK:
         try:
