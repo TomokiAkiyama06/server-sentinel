@@ -413,9 +413,12 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    works.
 2. Choose the bootstrap endpoint: the Main's private-LAN IP and a port distinct
    from the dashboard (loopback-only) and any ingest port. Public addresses
-   and Tailscale addresses (`100.64.0.0/10`) are refused
+   and Tailscale addresses (IPv4 `100.64.0.0/10` and IPv6
+   `fd7a:115c:a1e0::/48`) are refused
    (`enrollment_bind_requires_private_address`); enrollment and ingest use the
-   private LAN and need no Tailscale. Run
+   private LAN and need no Tailscale. On a Main that runs Tailscale, confirm
+   `approve --listen` with the node's own Tailscale IPv4 and IPv6 address
+   (`tailscale ip -4` / `tailscale ip -6`) each refuses before any prompt. Run
    `MAIN_CLI export-bundle --authority-dir <ca_dir> --listener-dir <listener_dir> --endpoint <ip>:<port> --output bundle.json`
    and note the printed full `trust_bundle_sha256`. Running it with another
    deployment's `--listener-dir` must refuse `listener_authority_mismatch`
@@ -472,7 +475,8 @@ code with the reviewed runtime installed. `AGENT_CLI` means
 10. Start the ingest listener bound to the Main's private-LAN IP and a port
     distinct from the dashboard and bootstrap listeners; confirm the dashboard
     listener still binds loopback only and the ingest port answers no HTTP
-    route *(needs ingest wiring, #14/#15)*.
+    route, and that a Tailscale IPv4 or IPv6 bind is refused with
+    `ingest_bind_tailscale_address_refused` *(needs ingest wiring, #14/#15)*.
 11. Connect from the Agent: expect a TLS 1.3 session admitted as that node.
     From another LAN host without a node certificate, with a certificate from a
     different CA, and with an expired certificate: expect refusal before any

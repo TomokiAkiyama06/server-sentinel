@@ -99,8 +99,9 @@ turns an accepted TCP connection into an `AuthenticatedCaptureSession` whose
 `CaptureNodeIdentity` carries a node UUID and digests only, never a human role.
 Every connection re-reads the ledger's active record; `still_admitted()` must be
 called before committing queued work and closes the session after revocation.
-`IngestListenerConfig` refuses wildcard binds and the human listener's
-address/port. Nothing starts this listener yet: the ingest core below and #14/#15
+`IngestListenerConfig` refuses wildcard binds, Tailscale addresses
+(`ingest_bind_tailscale_address_refused`, same ranges as below) and the human
+listener's address/port. Nothing starts this listener yet: the ingest core below and #14/#15
 own wiring, per-connection byte limits and connection counts.
 
 ## Bootstrap enrollment listener and local approval CLI (Issue #13)
@@ -116,9 +117,13 @@ complete or expire, or after too many refused requests. Explicit
 `EnrollmentLimits` bound frame sizes, concurrent connections, a single
 per-connection deadline and attempts per source address. Logs carry fixed
 reason words only.
-Tailscale addresses (`100.64.0.0/10`, CGNAT) are also refused with
-`enrollment_bind_requires_private_address`: capture enrollment and ingest are
-designed for the private LAN and do not need Tailscale on either host.
+Tailscale addresses are also refused with
+`enrollment_bind_requires_private_address`: IPv4 `100.64.0.0/10` (CGNAT) and
+IPv6 `fd7a:115c:a1e0::/48` (a ULA, so being "private" does not exempt it), in
+either spelling of an IPv4-mapped address (Issue #150). Capture enrollment and
+ingest are designed for the private LAN and do not need Tailscale on either
+host. `addresses.py` holds these ranges for both listeners; it classifies by
+address only, so another network that reuses those ranges is refused too.
 
 `pairing_cli.py` (`python -m app.cameras.remote_agent.pairing_cli`) is the local
 Owner CLI: `init`, `rotate-listener`, `export-bundle`, `approve`, `list`,
