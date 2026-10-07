@@ -508,7 +508,12 @@ for the deployment configuration), and must not be able to read or search the
 directory or read a CA file; no component may be a symbolic link. Access is
 decided by the kernel's `access(2)` for the effective ids, so POSIX ACL
 entries count exactly like mode bits (where that check is unsupported, access
-is assumed and the start is refused). The
+is assumed and the start is refused). The launcher runs with the service's
+real supplementary groups and so checks them; the pairing CLI's own check
+after its drop runs with no supplementary group (`setgroups([])`), so it
+covers only the service account's own uid and primary group. Keep the CA
+directory out of reach of every group the service account belongs to; the
+launcher check at each start is the one that covers them. The
 pairing CLI applies the same rule after its drop (`ca_directory_exposed`),
 except that `revoke` treats a missing directory as not exposed. It must be an absolute path outside the
 runtime root and the code trees. Use `null` only on a host that keeps no
@@ -527,10 +532,19 @@ written under staged `*.init` names and then installed with the key last, so
 a run interrupted while writing them leaves either the complete credential or
 an incomplete set without `main-server-key.pem`; the next `init` removes only
 that incomplete set (and any `*.init` name) and writes it again. A directory
-with `main-server-key.pem` is never cleaned. The CA pair is staged the same
+with `main-server-key.pem` is never cleaned. The new CA is committed before
+that key is installed, so a final listener key always belongs to a committed
+CA; `init` refuses `listener_complete_but_deployment_ca_unavailable` (and
+removes nothing) if the CA it is pointed at cannot be loaded, because a
+mistyped `--authority-dir` and a lost CA look the same. `export-bundle`
+refuses `listener_credential_incomplete` until the key exists. A rotation
+interrupted between its renames is completed by the next `init`, `approve`
+or `rotate-listener`. The CA pair is staged the same
 way (certificate installed first, `ca-key.pem` last): a CA directory without a
-complete pair and without any issuance-log record (missing or empty log) is
-an uncommitted `init` and is removed and created again; with any record, or a
+complete pair and without any issuance-log record (missing or empty log),
+and without a final `ca-key.pem`, is an uncommitted `init` and is removed and
+created again (a lone final `ca-key.pem` is never removed: it may be a
+pre-#109 CA, which has no log); with any record, or a
 log that cannot be read, nothing is removed and `init` refuses
 `issuer_material_incomplete` for the Owner to inspect. A log line torn by a
 crash during an append (no final newline) belongs to an operation that never
@@ -567,10 +581,11 @@ whenever it changes (after `init`, each `approve`, `rotate-listener` and
 `revoke`), to Owner-controlled offline storage that only the Owner can read,
 and restore it with the same owner (`serversentinel-ca`) and modes. Never put
 it in the application backup or the media volume, and never give the service
-account read access to the backup. The issuance log refuses signing if it is
-damaged; after a crash that left an incomplete last line (normally prevented:
-a failed append is truncated back), inspect it as root and remove only that
-incomplete line.
+account read access to the backup. An incomplete last line of the issuance
+log (a crash during an append) needs no action: it is ignored and the next
+append removes it. Only a damaged complete line makes the log invalid; the
+CA side then refuses to sign (`issuance_log_unavailable`) until the Owner
+restores the directory from the backup.
 
 **Migrating a deployment initialised before Issue #109.** Earlier releases
 put the CA directory under root (or the CLI account) and had no public CA
@@ -749,6 +764,12 @@ afterwards. The full Agent-side procedure and its refusal words are in
 checks are MANUAL_TEST §B step 15 (not yet executed on real hosts).
 
 ## Install, update, and rollback
+
+Before updating to a release with Issue #109, add `"capture_ca_directory"`
+(the CA directory path, or `null` on a host without a capture CA) to the
+deployment configuration: without it the new release refuses to start, and
+the installer refuses the update before staging it with `ServerSentinel
+release operation failed: capture_ca_directory is required ...`.
 
 Run the separately downloaded installer only after verifying its published
 SHA-256. Global arguments precede the operation:

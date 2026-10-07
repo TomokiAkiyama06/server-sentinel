@@ -411,7 +411,10 @@ class ConcurrentInitTests(ListenerLifecycleHarness):
         self.assertIn("refused", stderr)
         self.assertEqual(foreign, (listener / "main-server-key.pem").read_bytes())
         self.assertEqual(["main-server-key.pem"], os.listdir(listener))
-        self.assertEqual([], os.listdir(authority))
+        # The key is installed last, after the CA was committed (Issue #109),
+        # so the committed CA is kept; it is never removed by a rollback.
+        self.assertEqual(["ca-certificate.pem", "ca-key.pem", "issuance-log.jsonl"],
+                         sorted(os.listdir(authority)))
 
     def test_discard_created_ignores_a_replaced_entry(self):
         directory = PrivateDirectory(self.root / f"replaced-{uuid4()}").ensure()

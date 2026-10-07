@@ -108,6 +108,7 @@ from .enrollment import (
     EnrollmentError, EnrollmentLimits, EnrollmentListener, EnrollmentListenerConfig,
     EnrollmentService, PresignedEnrollment, build_enrollment_server_context,
 )
+from . import faults
 from .issuer_process import (
     DEFAULT_CA_ACCOUNT, DEFAULT_SERVICE_ACCOUNT, Account, ForkedIssuer, IssuerChannel,
     OsPrivileges, Privileges, checked_reply,
@@ -117,7 +118,7 @@ from .node_ca import (
     MAX_LEAF_VALIDITY, AuthorityValidityExceeded, CaptureAuthorityError, DeploymentTrust,
     PrivateDirectory, _certificate_pem, listener_material, main_server_name,
     main_server_not_after, new_listener_key, public_key_digest, publish_public_certificate,
-    complete_listener_credential,
+    complete_interrupted_rotation, complete_listener_credential,
     clear_interrupted_listener_write, rotate_listener_credential, valid_server_name,
     write_listener_credential,
 )
@@ -707,7 +708,15 @@ def command_init(args) -> int:
                       "left by an interrupted run", file=sys.stderr)
             if listener.exists("main-server-key.pem"):
                 # Only an already completed init of this CA and name is accepted.
-                trust = separation.hello()
+                # A complete listener credential is never removed here, even
+                # when the CA cannot be loaded: a mistyped --authority-dir
+                # looks exactly like a lost CA (Issue #109). Since the CA is
+                # committed before the listener key is installed, this state
+                # is not produced by an interrupted init.
+                try:
+                    trust = separation.hello()
+                except CliRefused:
+                    raise CliRefused("listener_complete_but_deployment_ca_unavailable") from None
                 certificate = complete_listener_credential(trust, listener,
                                                            server_name=args.server_name)
                 if certificate is None:
@@ -751,9 +760,24 @@ def _initialize_listener(separation: "_Separation", listener: PrivateDirectory, 
         if not existing:
             _abort_initialize(separation)
         raise CliRefused("issuer_unavailable") from None
+    def commit() -> None:
+        # The new CA is committed after every listener file but the key is
+        # installed and before the key is (Issue #109): a final listener key
+        # therefore always implies a committed CA. If the commit fails (or
+        # its reply is lost), the listener write is undone; a rerun then
+        # either initializes from scratch (CA discarded) or recovers with
+        # the kept CA (CA committed).
+        if existing:
+            return
+        try:
+            checked_reply(separation.issuer, {"op": "commit"})
+        except CaptureAuthorityError as error:
+            raise _issuer_refusal(error) from None
+        faults.reached("init.committed")
+
     try:
-        credential = write_listener_credential(listener, key, _certificate_pem(certificate),
-                                               trust.ca_certificate_pem())
+        write_listener_credential(listener, key, _certificate_pem(certificate),
+                                  trust.ca_certificate_pem(), before_key=commit)
     except BaseException:
         if not existing:
             _abort_initialize(separation)
@@ -762,20 +786,6 @@ def _initialize_listener(separation: "_Separation", listener: PrivateDirectory, 
         # The CA was already committed; only the listener side was missing.
         print("serversentinel-pairing: init recovered: the existing deployment CA was kept "
               "and a new listener certificate was issued", file=sys.stderr)
-        return trust, certificate
-    try:
-        checked_reply(separation.issuer, {"op": "commit"})
-    except CaptureAuthorityError as error:
-        # The commit may or may not have taken effect at the CA side. Remove
-        # the listener side either way: a rerun then either initializes from
-        # scratch (CA discarded) or recovers with the kept CA (CA committed).
-        for name in (credential.key_path.name, credential.certificate_path.name,
-                     "deployment-ca-certificate.pem"):
-            try:
-                listener.discard_created(name)
-            except CaptureAuthorityError:
-                pass
-        raise _issuer_refusal(error) from None
     return trust, certificate
 
 
@@ -823,6 +833,11 @@ def command_export_bundle(args) -> int:
     # Public material only, as the service account (Issue #109): the CA
     # certificate copy and the listener certificate in the listener directory.
     listener_directory = _directory(args.listener_dir)
+    # The listener key is installed last (Issue #109): without it an init was
+    # interrupted and the CA it named may have been discarded, so no bundle
+    # is exported for it.
+    if not listener_directory.exists("main-server-key.pem"):
+        raise CliRefused("listener_credential_incomplete")
     trust = DeploymentTrust.load_public(listener_directory)
     # A bundle is only exported for a listener certificate this CA issued,
     # so mixed-up deployments fail here, not later at the Agent's TLS check.
@@ -898,10 +913,12 @@ def _approve_and_serve(ledger, trust, issuer, listener, terminal, csr, digest):
                                             public_key_digest=digest)
         except PairingError:
             raise _ledger_refusal(ledger, "approval_refused") from None
+        faults.reached("approve.approved")
         # Signed after the Owner's approval and before any redemption
         # (ADR-0006 follow-up, Issue #109). Without a verified certificate
         # the code is never shown; the pending approval then expires unused.
         credential = _sign_approved(issuer, trust, approval, csr, digest)
+        faults.reached("approve.signed")
         terminal.write(
             "\nOne-time pairing code (shown once, valid for 5 minutes):\n\n"
             f"    {_group(code.value)}\n\n"
@@ -916,6 +933,20 @@ def _approve_and_serve(ledger, trust, issuer, listener, terminal, csr, digest):
     # validated file.
     _confirm_database(ledger)
     return outcome, approval
+
+
+def _enrollment_context(directory: PrivateDirectory):
+    """The enrollment TLS context loaded from verified, O_NOFOLLOW descriptors.
+
+    ``ssl`` only loads by path, so it is given ``/proc/self/fd/N`` of files
+    opened without following symlinks and checked as this account's private
+    regular files: a name swapped afterwards can no longer change what is
+    loaded (review B1).
+    """
+    with directory.open_private("main-server-certificate.pem") as certificate, \
+            directory.open_private("main-server-key.pem") as key:
+        return build_enrollment_server_context(Path(f"/proc/self/fd/{certificate}"),
+                                               Path(f"/proc/self/fd/{key}"))
 
 
 def command_approve(args) -> int:
@@ -940,18 +971,20 @@ def command_approve(args) -> int:
             # Refuse before any approval when the CA can no longer cover a
             # node leaf; the code would otherwise be burned by a failed issuance.
             trust.check_leaf_validity(DEFAULT_NODE_VALIDITY)
-            listener_directory = _directory(args.listener_dir,
-                                            owner_uid=separation.service.uid)
-            material = listener_material(listener_directory)
-            listener_certificate = trust.verify_listener_certificate(listener_directory)
-            listener = EnrollmentListener(
-                config, build_enrollment_server_context(material.certificate_path,
-                                                        material.key_path),
-                limits=EnrollmentLimits())
-            # From here on: the service account, no capability, before the
-            # request file or the database is opened.
+            # From here on: the service account, no capability. Nothing of the
+            # listener directory is opened as root (Issue #109, review B1): the
+            # service account owns it and could swap a name for a symlink to
+            # the CA key between a check and a path-based load; as itself it
+            # cannot read the CA key, and the TLS material is loaded from the
+            # verified descriptors, never by path.
             separation.drop()
-            publish_public_certificate(_directory(args.listener_dir), trust.ca_certificate_pem())
+            listener_directory = _directory(args.listener_dir)
+            complete_interrupted_rotation(trust, listener_directory)
+            listener_material(listener_directory)
+            listener_certificate = trust.verify_listener_certificate(listener_directory)
+            listener = EnrollmentListener(config, _enrollment_context(listener_directory),
+                                          limits=EnrollmentLimits())
+            publish_public_certificate(listener_directory, trust.ca_certificate_pem())
             _report_trust_expiry(trust,
                                  listener_not_after=listener_certificate.not_valid_after_utc)
             csr, digest = parse_enrollment_request(
@@ -1023,6 +1056,7 @@ def command_revoke(args) -> int:
                         ledger.revoke(owner, grant, node_id=args.node)
                     except PairingError:
                         raise _ledger_refusal(ledger, "revocation_refused") from None
+                    faults.reached("revoke.ledger_revoked")
                 _confirm_database(ledger)
             if issuer_ready:
                 try:

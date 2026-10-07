@@ -627,6 +627,40 @@ class ApproveOrderingTests(Harness):
         self.assertEqual([(logged[0]["node_id"], logged[0]["credential_digest"], "active")],
                          activated)
 
+    def test_no_listener_file_is_opened_before_the_drop(self):
+        # Review B1: as root (DAC override) a path-based load of a name the
+        # service account swapped for a symlink would read the CA key.
+        real_open = os.open
+        listener = str(self.listener_dir)
+
+        def recording_open(path, flags, *args, **kwargs):
+            directory = kwargs.get("dir_fd")
+            target = (os.readlink(f"/proc/self/fd/{directory}") + "/" + str(path)
+                      if directory is not None else str(path))
+            if target.startswith(listener + "/") or target.startswith("/proc/self/fd/"):
+                self.events.append("listener_file_opened")
+            return real_open(path, flags, *args, **kwargs)
+        terminal = Terminal(self.events)
+        with patch("app.cameras.remote_agent.node_ca.os.open", recording_open):
+            status, _stdout, stderr, _served = self.run_approve(terminal)
+        self.assertEqual(1, status, stderr)  # expired: the fake listener never serves
+        self.assertIn("listener_file_opened", self.events)
+        self.assertLess(self.events.index("drop"), self.events.index("listener_file_opened"),
+                        self.events)
+
+    def test_a_listener_key_swapped_for_a_symlink_is_refused(self):
+        # Even after the drop, the TLS material is loaded from O_NOFOLLOW
+        # descriptors: a symlink at the key name is refused, never followed.
+        other = self.root / "elsewhere-key.pem"
+        os.rename(self.listener_dir / "main-server-key.pem", other)
+        os.symlink(other, self.listener_dir / "main-server-key.pem")
+        terminal = Terminal(self.events)
+        status, _stdout, stderr, served = self.run_approve(terminal)
+        self.assertEqual(2, status)
+        self.assertIn("refused", stderr)
+        self.assertEqual([], terminal.written)
+        self.assertEqual({}, served)
+
     def test_failed_drop_aborts_before_the_request_or_database(self):
         def failing(account):
             self.events.append("drop")
@@ -833,6 +867,55 @@ print(json.dumps({"fds": fds, "new_session": session, "reaped": reaped,
         outcome = self.run_script("eof")
         self.assertFalse(outcome["alive"])
 
+    def test_fork_is_refused_when_the_kernel_reports_another_thread(self):
+        # Review: a native thread Python does not know about also refuses.
+        with patch.object(issuer_process, "_kernel_thread_count", return_value=2), \
+                patch.object(issuer_process.os, "fork",
+                             side_effect=AssertionError("must not fork")):
+            with self.assertRaises(IssuerUnavailable):
+                issuer_process.ForkedIssuer.start(self.authority_dir, Account(1, 1), None)
+        with patch.object(issuer_process, "_kernel_thread_count", return_value=None), \
+                patch.object(issuer_process.os, "fork",
+                             side_effect=AssertionError("must not fork")):
+            with self.assertRaises(IssuerUnavailable):
+                issuer_process.ForkedIssuer.start(self.authority_dir, Account(1, 1), None)
+
+    ISOLATE = r'''
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+from app.cameras.remote_agent import issuer_process
+report = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+extra = [os.open(sys.argv[2] + ".x", os.O_RDONLY | os.O_CREAT, 0o600) for _ in range(3)]
+real_listdir = os.listdir
+def listdir(path=".", *args):
+    if str(path).startswith("/proc"):
+        raise OSError(2, "synthetic: no /proc")
+    return real_listdir(path, *args)
+os.listdir = listdir
+issuer_process._isolate_descriptors({report})
+still = []
+for number in extra:
+    try:
+        os.fstat(number)
+        still.append(number)
+    except OSError:
+        pass
+os.write(report, json.dumps({"open_extra": still,
+                             "null": [os.path.samestat(os.fstat(n), os.stat("/dev/null"))
+                                      for n in (0, 1, 2)]}).encode())
+'''
+
+    def test_descriptor_isolation_without_proc_closes_everything_but_kept(self):
+        # Review: the fallback when /proc/self/fd is unreadable is a full
+        # close_range around the kept descriptors.
+        report = self.root / "isolate.json"
+        result = subprocess.run([sys.executable, "-c", self.ISOLATE, str(SERVER_ROOT),
+                                 str(report)], capture_output=True, timeout=60, check=False)
+        self.assertEqual(0, result.returncode, result.stderr)
+        outcome = json.loads(report.read_text())
+        self.assertEqual([], outcome["open_extra"])
+        self.assertEqual([True, True, True], outcome["null"])
+
     def test_fork_is_refused_once_a_thread_exists(self):
         self.assertEqual({"refused": "issuer_unavailable"}, self.run_script("thread"))
 
@@ -856,6 +939,66 @@ class PrivilegeTests(unittest.TestCase):
                 privileges.check_accounts(ca, service)
             self.assertEqual(reason, raised.exception.reason)
         privileges.check_accounts(Account(1001, 1001), Account(1002, 1002))
+
+    def dropped_state(self, **changes):
+        """Patches that make this process look exactly like a clean drop to Account(1001, 1001)."""
+        from contextlib import ExitStack
+        state = {"resuid": (1001, 1001, 1001), "resgid": (1001, 1001, 1001), "groups": [],
+                 "euid": 1001, "CapEff": 0, "CapPrm": 0, "dumpable": 0, "no_new_privs": 1}
+        state.update(changes)
+        stack = ExitStack()
+        stack.enter_context(patch.object(issuer_process.os, "getresuid",
+                                         return_value=state["resuid"]))
+        stack.enter_context(patch.object(issuer_process.os, "getresgid",
+                                         return_value=state["resgid"]))
+        stack.enter_context(patch.object(issuer_process.os, "getgroups",
+                                         return_value=state["groups"]))
+        stack.enter_context(patch.object(issuer_process.os, "geteuid",
+                                         return_value=state["euid"]))
+        stack.enter_context(patch.object(issuer_process, "_status_mask",
+                                         lambda field: state[field.decode()]))
+        stack.enter_context(patch.object(
+            issuer_process, "_prctl",
+            lambda option, argument=0: {issuer_process._PR_GET_DUMPABLE: state["dumpable"],
+                                        issuer_process._PR_GET_NO_NEW_PRIVS:
+                                            state["no_new_privs"]}.get(option, 0)))
+        return stack
+
+    def test_each_residual_privilege_fails_the_drop_verification(self):
+        # Review B2: every condition of verify_dropped is pinned.
+        account = Account(1001, 1001)
+        with self.dropped_state():
+            issuer_process.verify_dropped(account)
+        for label, changes in (
+                ("CapEff", {"CapEff": 1 << 21}), ("CapPrm", {"CapPrm": 1}),
+                ("unreadable CapEff", {"CapEff": None}), ("unreadable CapPrm", {"CapPrm": None}),
+                ("dumpable", {"dumpable": 1}), ("no_new_privs missing", {"no_new_privs": 0}),
+                ("supplementary group", {"groups": [27]}),
+                ("saved uid root", {"resuid": (1001, 1001, 0)}),
+                ("real gid", {"resgid": (0, 1001, 1001)}),
+                ("euid root", {"euid": 0, "resuid": (0, 0, 0)})):
+            with self.subTest(label), self.dropped_state(**changes), \
+                    self.assertRaises(PrivilegeSeparationError) as raised:
+                issuer_process.verify_dropped(account)
+            self.assertEqual("privilege_drop_failed", raised.exception.reason)
+
+    def test_drop_runs_the_verification(self):
+        calls = []
+        with patch.object(issuer_process.os, "setgroups", lambda groups: calls.append("groups")), \
+                patch.object(issuer_process.os, "setresgid", lambda *ids: calls.append("gid")), \
+                patch.object(issuer_process.os, "setresuid", lambda *ids: calls.append("uid")), \
+                patch.object(issuer_process, "_prctl", lambda *args: 0), \
+                patch.object(issuer_process, "verify_dropped",
+                             lambda account: calls.append(("verify", account))):
+            OsPrivileges().drop(Account(1001, 1001))
+        self.assertEqual(["groups", "gid", "uid", ("verify", Account(1001, 1001))], calls)
+        # And a failing verification fails the drop.
+        with patch.object(issuer_process.os, "setgroups", lambda groups: None), \
+                patch.object(issuer_process.os, "setresgid", lambda *ids: None), \
+                patch.object(issuer_process.os, "setresuid", lambda *ids: None), \
+                patch.object(issuer_process, "_prctl", lambda *args: 0), \
+                self.assertRaises(PrivilegeSeparationError):
+            OsPrivileges().drop(Account(os.getuid() + 1, os.getgid()))
 
     def test_verification_refuses_a_process_that_is_not_exactly_the_account(self):
         with self.assertRaises(PrivilegeSeparationError):
@@ -1038,6 +1181,41 @@ class ControlledCaPathTests(unittest.TestCase):
         finally:
             os.chmod(ca, 0o700)
 
+    def test_an_erroring_effective_access_check_fails_closed(self):
+        ca = self.root / "ca"
+        ca.mkdir(mode=0o700)
+        os.chmod(ca, 0)
+
+        def failing(path, mode, *, effective_ids=False, follow_symlinks=True):
+            raise OSError(5, "synthetic")
+        first, second, third = self.as_other_account()
+        try:
+            with first, second, third, \
+                    patch("app.deployment.os.access", failing), \
+                    patch("app.deployment.os.supports_effective_ids", {failing}):
+                self.assertEqual((True, True, True), self.probes(ca))
+        finally:
+            os.chmod(ca, 0o700)
+
+    def test_a_search_only_ca_directory_is_exposed(self):
+        # X without R still lets this account reach files by name.
+        parent = self.root / "parent"
+        parent.mkdir(mode=0o755)
+        ca = parent / "ca"
+        ca.mkdir(mode=0o700)
+        os.chmod(ca, 0)
+
+        def access(path, mode, *, effective_ids=False, follow_symlinks=True):
+            return Path(path) == ca and mode == os.X_OK
+        first, second, third = self.as_other_account()
+        try:
+            with first, second, third, \
+                    patch("app.deployment.os.access", access), \
+                    patch("app.deployment.os.supports_effective_ids", {access}):
+                self.assertEqual((True, True, True), self.probes(ca))
+        finally:
+            os.chmod(ca, 0o700)
+
     def test_unsupported_effective_access_check_fails_closed(self):
         ca = self.root / "ca"
         ca.mkdir(mode=0o700)
@@ -1127,6 +1305,36 @@ class InitRecoveryTests(unittest.TestCase):
         self.assertEqual(before, {name: (self.listener / name).read_bytes()
                                   for name in os.listdir(self.listener)})
         self.assertEqual(kept, self.ca_state())
+
+    def test_command_killed_at_commit_never_leaves_a_listener_key_without_a_ca(self):
+        # Codex P2 (PR #177, round 6): the command dies while committing, so
+        # the CA child sees end of stream and discards the provisional CA.
+        # The final listener key is installed only after the commit, so the
+        # rerun is not wedged by a "complete" listener of a discarded CA.
+        class Killed(BaseException):
+            pass
+        real_reply = pairing_cli.checked_reply
+        real_discard = PrivateDirectory.discard_created
+        listener = self.listener
+
+        def dying_reply(channel, message):
+            if message.get("op") == "commit":
+                raise Killed()
+            return real_reply(channel, message)
+
+        def no_cleanup_in_the_listener(directory, name):
+            if directory.path == listener:
+                return None  # a killed command cleans nothing up
+            return real_discard(directory, name)
+        with patch.object(pairing_cli, "checked_reply", dying_reply), \
+                patch.object(PrivateDirectory, "discard_created", no_cleanup_in_the_listener), \
+                self.assertRaises(Killed):
+            self.init()
+        self.assertFalse((self.listener / "main-server-key.pem").exists())
+        status, stdout, stderr = self.init()
+        self.assertEqual(0, status, stderr)
+        trust = DeploymentTrust.load_public(PrivateDirectory(self.listener))
+        trust.issued_listener_certificate(PrivateDirectory(self.listener))
 
     def test_recovery_refuses_another_server_name_and_never_touches_the_ca(self):
         with self.lose_commit_reply():
@@ -1289,9 +1497,7 @@ class PartialCaInitTests(InitRecoveryTests):
             (["ca-certificate.pem", "ca-key.pem.init",
               "ca-certificate.pem.init = ca-certificate.pem"], None),
             (["ca-certificate.pem"], None),
-            (["ca-key.pem"], None),  # key-only (the order before round 4)
-            (["ca-key.pem"], b""),  # plus a log created empty by a crash
-            ([], b""),
+            ([], b""),  # a log created empty by a crash
         )
         for entries, log in cases:
             with self.subTest(entries=entries, log=log):
@@ -1319,8 +1525,12 @@ class PartialCaInitTests(InitRecoveryTests):
         files = self.ca_files()
         record = (b'{"at":"2026-10-07T00:00:00+00:00","format":1,"type":"node_revocation",'
                   b'"node_id":"00000000-0000-4000-8000-000000000001"}\n')
+        # A lone final key is never removed either, with or without a log: it
+        # may be a pre-#109 CA (no log) whose certificate was lost.
         for entries, log in ((["ca-key.pem"], record), (["ca-certificate.pem"], record),
-                             (["ca-key.pem"], b"not json\n")):
+                             (["ca-key.pem"], b"not json\n"), (["ca-key.pem"], None),
+                             (["ca-key.pem"], b""),
+                             (["ca-key.pem", "ca-certificate.pem.init"], None)):
             with self.subTest(entries=entries, log=log):
                 self.build_ca(files, entries, log)
                 before = {name: (self.authority / name).read_bytes()
@@ -1500,6 +1710,19 @@ class PublicCopyValidationTests(Harness):
 
 class CaptureCaSettingTests(unittest.TestCase):
     """Owner decision 2026-10-07: ``capture_ca_directory`` must be present (path or null)."""
+
+    def test_installer_names_the_missing_setting_before_staging(self):
+        import install
+        from app import deployment
+        stderr = io.StringIO()
+        with patch.object(install, "execute",
+                          side_effect=deployment.CaptureCaSettingMissing("missing")), \
+                patch("sys.argv", ["installer", "--destination", "/x", "--config", "/y",
+                                   "--unit", "/z", "rollback"]), \
+                patch("sys.stderr", stderr), self.assertRaises(SystemExit) as stopped:
+            install.main()
+        self.assertEqual(1, stopped.exception.code)
+        self.assertIn("capture_ca_directory is required", stderr.getvalue())
 
     def run_check(self, value):
         from app import deployment

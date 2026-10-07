@@ -51,6 +51,7 @@ import time
 from typing import Callable, Protocol
 from uuid import UUID
 
+from . import faults
 from .node_ca import (
     DEFAULT_NODE_VALIDITY, MAX_CA_VALIDITY, MAX_LEAF_VALIDITY, CaptureAuthorityError,
     DeploymentAuthority, IssuanceLogUnavailable, IssuerRefusedRequest, PrivateDirectory,
@@ -511,6 +512,7 @@ class CaIssuer:
                           "public_key_digest": issued.public_key_digest,
                           "credential_digest": issued.credential_digest,
                           "not_after": issued.not_after.isoformat(timespec="seconds")})
+        faults.reached("child.sign_node.logged")
         self.done = True
         return {"status": "ok", "certificate": issued.certificate_pem.decode("ascii")}
 
@@ -519,6 +521,7 @@ class CaIssuer:
             _text(message.get("csr")), server_name=self._server_name(message),
             validity=_days(message.get("validity_days"), MAX_LEAF_VALIDITY))
         self._record_listener(certificate)
+        faults.reached("child.sign_listener.logged")
         self.done = True
         return {"status": "ok", "certificate": _certificate_pem(certificate).decode("ascii")}
 
@@ -540,6 +543,7 @@ class CaIssuer:
         node = _uuid(message.get("node_id"))
         self._log.records()
         self._log.append({"type": "node_revocation", "node_id": str(node)})
+        faults.reached("child.revoke.logged")
         self.done = True
         return {"status": "ok"}
 
@@ -569,7 +573,9 @@ class CaIssuer:
             self._log.append({"type": "deployment_ca", "deployment_id": str(deployment),
                               "credential_digest": certificate_digest(authority.certificate),
                               "not_after": authority.not_valid_after.isoformat(timespec="seconds")})
+            faults.reached("child.init.logged_ca")
             self._record_listener(certificate)
+            faults.reached("child.init.logged_listener")
         except BaseException:
             self._discard()
             raise
@@ -625,8 +631,11 @@ class CaIssuer:
             recorded = self._log.records()
         except CaptureAuthorityError:
             recorded = None
-        if recorded != []:
-            raise IssuerMaterialIncomplete("partial CA with issuance records")
+        if recorded != [] or _CA_KEY in present:
+            # A final ca-key.pem is installed last by this release, so a lone
+            # one is not an interrupted init: it may be a pre-#109 CA (which
+            # has no issuance log) whose certificate was lost. Never delete it.
+            raise IssuerMaterialIncomplete("partial CA with issuance records or a final key")
         for name in present:
             self._directory.discard_stale(name)
 
@@ -637,6 +646,7 @@ class CaIssuer:
             self._discard()
         self._provisional = False
         self.done = True
+        faults.reached("child.init.committed" if commit else "child.init.aborted")
         return {"status": "ok"}
 
     def _discard(self) -> None:
@@ -703,16 +713,28 @@ _OWNER_ACTIONABLE = frozenset({
 def _isolate_descriptors(keep: set[int]) -> None:
     """Close every descriptor but ``keep``; stdin/stdout/stderr become /dev/null."""
     try:
-        names = os.listdir("/proc/self/fd")
-    except OSError:
-        names = [str(number) for number in range(3, 1024)]
-    for name in names:
-        number = int(name)
-        if number > 2 and number not in keep:
-            try:
-                os.close(number)
-            except OSError:
-                pass
+        names = [int(name) for name in os.listdir("/proc/self/fd")]
+    except (OSError, ValueError):
+        names = None
+    if names is None:
+        # Without /proc: close every descriptor from 3 up to the limit except
+        # ``keep`` (close_range in ranges around the kept ones).
+        try:
+            limit = os.sysconf("SC_OPEN_MAX")
+        except (OSError, ValueError):
+            limit = 1 << 20
+        start = 3
+        for kept in sorted(number for number in keep if number >= 3):
+            os.closerange(start, kept)
+            start = kept + 1
+        os.closerange(start, max(limit, start))
+    else:
+        for number in names:
+            if number > 2 and number not in keep:
+                try:
+                    os.close(number)
+                except OSError:
+                    pass
     null = os.open("/dev/null", os.O_RDWR)
     for number in (0, 1, 2):
         os.dup2(null, number)
@@ -741,6 +763,18 @@ def _child_main(requests: int, replies: int, authority_path: Path, ca: Account,
     return 0
 
 
+def _kernel_thread_count() -> int | None:
+    """``Threads:`` of /proc/self/status, or ``None`` (which refuses the fork)."""
+    try:
+        with open("/proc/self/status", "rb") as status:
+            for line in status:
+                if line.startswith(b"Threads:"):
+                    return int(line.split(b":", 1)[1].strip())
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 class ForkedIssuer:
     """Parent end of the CA child: two pipes and the child's pid."""
 
@@ -753,7 +787,9 @@ class ForkedIssuer:
     @classmethod
     def start(cls, authority_path: Path, ca: Account, privileges: Privileges) -> "ForkedIssuer":
         """Fork the CA child; refused unless this process has exactly one thread."""
-        if threading.active_count() != 1:
+        if threading.active_count() != 1 or _kernel_thread_count() != 1:
+            # Checked both for Python threads and for any native thread the
+            # kernel reports (``Threads:`` in /proc/self/status, review).
             raise IssuerUnavailable("issuer must be started before any thread")
         to_child, requests = os.pipe()
         replies, from_child = os.pipe()

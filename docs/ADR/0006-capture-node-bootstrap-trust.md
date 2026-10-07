@@ -551,9 +551,10 @@ unchanged.
   forks a CA child before any thread exists. The child drops to the CA
   account (`setgroups([])`, `setresgid`, `setresuid`, no_new_privs,
   non-dumpable, parent-death signal, new session, only its pipe descriptors)
-  and verifies the drop; the parent builds the listener TLS context, drops
-  to the service account, verifies `CapEff==0` and `euid!=0` and only then
-  opens the request file and the database. The CA child signs at most one
+  and verifies the drop; the parent drops to the service account,
+  verifies `CapEff==0` and `euid!=0` and only then opens the listener
+  directory (TLS material from verified descriptors), the request file and
+  the database. The CA child signs at most one
   fixed-profile leaf (or records one revocation) and exits; the parent
   verifies the certificate against the public CA certificate and serves only
   after the child exited. The enrollment listener therefore never runs in a
@@ -598,7 +599,15 @@ unchanged.
   log line is ignored and dropped by the next append. Round 5: every read
   of a directory that uses staged installs first removes a staged name that
   is the second link of its final file (an install stopped between link
-  and unlink), before the one-link check runs.
+  and unlink), before the one-link check runs. Round 6: the new CA is
+  committed before the listener key is installed (a final listener key
+  implies a committed CA); every crash point of `init`, `rotate-listener`,
+  `approve` and `revoke` is a named fault-injection point, and a
+  parametrized test stops each command at each point (command, CA child or
+  both dying) and checks that the next run of every command converges
+  without removing committed material. `approve` opens nothing of the
+  listener directory before the drop and loads its TLS material from
+  verified descriptors.
 - **Still open (PR2).** Automatic renewal still has only an in-process
   signing primitive, used by tests and called by nothing in the application;
   wiring renewal into the ingest listener waits for the socket-activated,

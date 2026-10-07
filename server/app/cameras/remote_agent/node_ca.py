@@ -61,6 +61,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from .addresses import is_tailscale_address
+from . import faults
 from .pairing import EnrollmentClaim, PairingLedger
 
 
@@ -470,6 +471,34 @@ class PrivateDirectory:
                 os.close(descriptor)
         finally:
             os.close(directory)
+
+    @contextmanager
+    def open_private(self, name: str, *, maximum: int = MAX_PEM_BYTES) -> Iterator[int]:
+        """A read-only descriptor of the private file ``name``, checked like ``read``.
+
+        Opened with ``O_NOFOLLOW`` relative to the validated directory, so a
+        caller that must hand a file to a path-only loader (``ssl``) can pass
+        ``/proc/self/fd/N`` and load exactly the checked inode (Issue #109).
+        """
+        self.recover_interrupted_installs()
+        directory = self._open_directory()
+        try:
+            try:
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+                                     | os.O_NONBLOCK, dir_fd=directory)
+            except OSError:
+                raise CaptureAuthorityError("issuer material is unavailable") from None
+        finally:
+            os.close(directory)
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner_uid
+                    or info.st_mode & 0o077 or info.st_nlink != 1
+                    or not 0 < info.st_size <= maximum):
+                raise CaptureAuthorityError("issuer material is not a private file")
+            yield descriptor
+        finally:
+            os.close(descriptor)
 
     def read_optional(self, name: str, *, maximum: int = MAX_PEM_BYTES,
                       allow_empty: bool = False) -> bytes | None:
@@ -1112,8 +1141,10 @@ class DeploymentAuthority(DeploymentTrust):
         try:
             for name, value in staged:
                 directory.write_new(name + _INIT_SUFFIX, value)
+                faults.reached("ca.staged." + name)
             for name, _value in staged:
                 directory.install_new(name + _INIT_SUFFIX, name)
+                faults.reached("ca.installed." + name)
         except BaseException:
             for name, _value in staged:
                 for candidate in (name + _INIT_SUFFIX, name):
@@ -1376,7 +1407,9 @@ _INSTALL_ORDER = (_PUBLIC_CA_CERTIFICATE, _SERVER_CERTIFICATE, _SERVER_KEY)
 
 
 def write_listener_credential(target: PrivateDirectory, key, certificate_pem: bytes,
-                              ca_certificate_pem: bytes) -> MainServerCredential:
+                              ca_certificate_pem: bytes, *,
+                              before_key: Callable[[], None] | None = None
+                              ) -> MainServerCredential:
     """Write a new listener key, certificate and public CA copy, or none of them.
 
     Runs as the listener account (Issue #109), so every file is created owned
@@ -1386,6 +1419,11 @@ def write_listener_credential(target: PrivateDirectory, key, certificate_pem: by
     point therefore leaves either a complete credential (the final key exists)
     or an incomplete one without a final key, which
     ``clear_interrupted_listener_write`` removes before the next ``init``.
+
+    ``before_key`` runs after everything but the final key is installed and
+    before the key is (``init`` commits the new CA there, Issue #109), so a
+    final listener key implies that step succeeded. If it raises, nothing of
+    this write stays behind.
     """
     require_matching_public_certificate(target, ca_certificate_pem)
     content = {_PUBLIC_CA_CERTIFICATE: ca_certificate_pem,
@@ -1396,7 +1434,12 @@ def write_listener_credential(target: PrivateDirectory, key, certificate_pem: by
         for name in names:
             target.write_new(name + _INIT_SUFFIX, content[name])
         for name in names:
+            if name == _SERVER_KEY:
+                faults.reached("listener.before_key")
+                if before_key is not None:
+                    before_key()
             target.install_new(name + _INIT_SUFFIX, name)
+            faults.reached("listener.installed." + name)
     except BaseException:
         for name in names:
             for candidate in (name + _INIT_SUFFIX, name):
@@ -1484,11 +1527,26 @@ def complete_listener_credential(trust: "DeploymentTrust", target: PrivateDirect
     if not any(target.exists(name) for name in _LISTENER_NAMES):
         return None
     require_matching_public_certificate(target, trust.ca_certificate_pem())
+    # A rotation interrupted between its renames is completed (or its staged
+    # leftovers discarded) first, as the next rotate-listener would.
+    _recover_interrupted_rotation(trust, target)
     certificate = trust.issued_listener_certificate(target)
     if _single_server_name(certificate) != server_name:
         raise CaptureAuthorityError("listener material already exists")
     publish_public_certificate(target, trust.ca_certificate_pem())
     return certificate
+
+
+def complete_interrupted_rotation(trust: "DeploymentTrust", target: PrivateDirectory) -> bool:
+    """Finish a listener rotation interrupted between its renames; return whether one was.
+
+    For commands that only use the listener credential (``approve``): under
+    the listener directory lock and after the public copy check, exactly
+    the recovery ``rotate-listener`` would run (Issue #109).
+    """
+    with target.locked():
+        require_matching_public_certificate(target, trust.ca_certificate_pem())
+        return _recover_interrupted_rotation(trust, target) is not None
 
 
 def rotate_listener_credential(trust: DeploymentTrust, target: PrivateDirectory, *,
@@ -1548,9 +1606,12 @@ def rotate_listener_credential(trust: DeploymentTrust, target: PrivateDirectory,
             public_key_digest_value=public_key_digest(key.public_key()))
         try:
             target.write_new(_STAGED_SERVER_KEY, _private_pem(key))
+            faults.reached("rotate.staged_key")
             target.write_new(_STAGED_SERVER_CERTIFICATE, _certificate_pem(certificate))
+            faults.reached("rotate.staged_certificate")
             # Nothing current has changed until this rename succeeds.
             target.replace_with(_STAGED_SERVER_KEY, _SERVER_KEY)
+            faults.reached("rotate.renamed_key")
         except ReplacementNotDurable:
             # The key rename took effect although its directory fsync failed:
             # the new key is current, so the staged certificate must stay for

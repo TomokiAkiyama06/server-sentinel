@@ -17,7 +17,7 @@ import subprocess
 import tarfile
 import time
 
-from app.deployment import Deployment
+from app.deployment import CaptureCaSettingMissing, Deployment
 from app.settings import ConfigurationError
 
 
@@ -830,6 +830,12 @@ def main() -> None:
         execute(args)
     except ActivationBoundaryRefused as refused:
         parser.exit(1, str(refused))
+    except CaptureCaSettingMissing:
+        # Releases with Issue #109 require the setting: say so before any
+        # release is staged or activated, instead of a generic failure.
+        parser.exit(1, "ServerSentinel release operation failed: "
+                       + CaptureCaSettingMissing.REASON
+                       + " (add it to the deployment configuration first)\n")
     except (OSError, ValueError, ConfigurationError, KeyError, subprocess.SubprocessError,
             tarfile.TarError):
         parser.exit(1, "ServerSentinel release operation failed\n")
