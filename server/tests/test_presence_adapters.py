@@ -32,7 +32,7 @@ from app.presence.adapters import (CriticalTimelineRecorder, EntranceObservation
 from app.presence.delivery import ActionResult
 from app.presence.models import InvalidObservation, Kind, Observation, PresenceState, Quality, Value, timestamp
 from app.presence.schema import CRITICAL_SOURCE_KINDS, STAGED_SOURCE_KINDS
-from app.presence.service import SOURCE_CLOCK, SOURCE_CLOCK_TABLES, PresenceService
+from app.presence.service import SHM_REGION, SOURCE_CLOCK, SOURCE_CLOCK_TABLES, PresenceService
 from app.storage.database import Database, PinnedDatabase
 from app.storage.migrations import migrate
 from app.storage.policy import StorageState, StorageTransition
@@ -1429,6 +1429,28 @@ class WalReadTests(PresenceFixture, TestCase):
         self.refuse = True
         self.assertIsNone(self.presence.timeline_gap())
         self.assertEqual(self.entered, [])
+
+    def test_malformed_sidecars_need_admission(self):
+        # Both sidecar names are regular files, but the -shm is empty or a
+        # partial region (an interrupted creation). SQLite would initialise or
+        # resize it on open, so a refused reservation fails the read and the
+        # files are left exactly as they were.
+        for size in (0, 1000, SHM_REGION + 4096):
+            with self.subTest(size=size):
+                for suffix, length in (("-wal", 0), ("-shm", size)):
+                    with open(self.database.path.with_name(self.database.path.name + suffix), "wb") as handle:
+                        handle.write(b"\0" * length)
+                self.refuse = True
+                self.entered.clear()
+                with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+                    self.presence.timeline_gap()
+                self.assertEqual(self.entered, [["-shm", "-wal"]])
+                shm = self.database.path.with_name(self.database.path.name + "-shm")
+                self.assertEqual(shm.stat().st_size, size)
+                self.refuse = False
+                self.entered.clear()
+                self.assertIsNone(self.presence.timeline_gap())
+                self.assertEqual(self.entered, [["-shm", "-wal"]])
 
     def test_rollback_journal_read_needs_no_reservation(self):
         with closing(sqlite3.connect(self.database.path)) as db:

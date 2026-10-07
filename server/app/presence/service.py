@@ -56,6 +56,11 @@ COMMITTED_LOCK_POLL = 0.005
 SQLITE_MAGIC = b"SQLite format 3\x00"
 WAL_FORMAT = 2
 WAL_SIDECARS = ("-wal", "-shm")
+# SQLite's unix VFS grows the ``-shm`` wal-index in whole 32 KiB regions, and
+# region 0 always exists once any connection has initialised it. A smaller or
+# partial file is empty, truncated or mid-initialisation: opening the database
+# would initialise or resize it.
+SHM_REGION = 32 * 1024
 
 
 def _wal_database(path):
@@ -79,13 +84,28 @@ def _wal_database(path):
 
 
 def _sidecars_present(path):
-    """Whether both WAL sidecars already exist as regular files beside ``path``."""
+    """Whether both WAL sidecars already exist beside ``path`` in a usable shape.
+
+    Both must be regular files, and the ``-shm`` wal-index must already span
+    whole 32 KiB regions. An empty, truncated or partly extended ``-shm`` (an
+    interrupted sidecar creation, or another opener's reset in progress) is
+    not trusted: SQLite would initialise or grow it even during a ``mode=ro``
+    open, so that read needs admission like a missing sidecar.
+
+    Only ``lstat`` is used. Opening and closing a sidecar here would release
+    every POSIX lock this process's own SQLite connections hold on it, so its
+    contents are never read. A full-sized wal-index left by a crashed process
+    may still be rebuilt by the read, but only in place: the unchanged WAL
+    needs no more regions than the file its writer already extended.
+    """
     for suffix in WAL_SIDECARS:
         try:
             info = os.lstat(path.with_name(path.name + suffix))
         except OSError:
             return False
         if not stat.S_ISREG(info.st_mode):
+            return False
+        if suffix == "-shm" and (info.st_size < SHM_REGION or info.st_size % SHM_REGION):
             return False
     return True
 
@@ -189,7 +209,9 @@ class PresenceService:
         That read therefore runs under the storage reservation, through a
         no-create read-write connection with ``query_only`` set, so the
         sidecars it creates are removed again when it closes as the last
-        connection. A refused or missing reservation fails the read instead of
+        connection. Sidecars that exist but cannot be trusted, such as an
+        empty or truncated ``-shm``, are treated the same way, since SQLite
+        would initialise or resize them. A refused or missing reservation fails the read instead of
         writing outside it. ``immutable`` is never used: it would read a file
         a live writer is changing as if nothing could change it.
         """
