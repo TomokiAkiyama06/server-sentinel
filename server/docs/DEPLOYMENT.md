@@ -425,11 +425,10 @@ enters them again through the audited Owner path.
 
 ### Capture-node CA and Main listener certificate
 
-The local pairing CLI (`serversentinel-pairing` below; until the installer
-ships that wrapper (#180) run it with the installed release's interpreter,
-for example `sudo /opt/server-sentinel-main/current/venv/bin/python -I -m
-app.cameras.remote_agent.pairing_cli approve ...`, as for
-`app.lifecycle_inventory` below; see
+The local pairing CLI (`serversentinel-pairing` below: the
+`/usr/local/sbin/serversentinel-pairing` wrapper that install and update
+place, which runs `python -m app.cameras.remote_agent.pairing_cli` of the
+installed release; see "The `serversentinel-pairing` wrapper" below and
 `server/app/cameras/remote_agent/README.md`) keeps the deployment CA key and
 the Main capture listener credential in two different owner-only directories
 owned by two different accounts, both outside the checkout and media trees.
@@ -473,6 +472,45 @@ sudo -u <service account> serversentinel-pairing export-bundle --listener-dir ..
   --endpoint <ip>:<port> --output <bundle.json>
 sudo -u <service account> serversentinel-pairing list --database ...
 ```
+
+**The `serversentinel-pairing` wrapper (Issue #180).** `install` and `update`
+place `/usr/local/sbin/serversentinel-pairing`, a `root:root` `0755` shell
+script written under a temporary name and renamed into place, so neither the
+service account nor the CA account can change it. Each run reads the
+installation's `current` pointer once, accepts only `releases/<version>`, and
+then uses only that release directory: it runs
+`<release>/venv/bin/python -I` in an environment emptied with `env -i` (only
+`PATH=/usr/bin:/bin`), puts `<release>` first on `sys.path` and runs
+`app.cameras.remote_agent.pairing_cli` as `-m` would, passing every argument
+unchanged. `PATH`, `PYTHONPATH`, `PYTHONHOME` or any other caller variable,
+the user site directory and the working directory therefore select neither
+the interpreter nor the code. (`python -I -m app...` alone would not work:
+`-I` also keeps `-m` from adding any directory to `sys.path`.) The working
+directory itself is kept, so relative `--request` / `--output` paths mean
+what was typed. Because the wrapper follows `current` at run time rather than
+naming a release, update and rollback never rewrite it: the next command runs
+the release the service runs, also after a failed update or rollback restored
+the earlier one, and one command never mixes two releases. Without a valid
+`current`, or when that release has no pairing CLI (a release from before
+Issue #13), it prints only
+`serversentinel-pairing: refused: no_installed_release` or
+`... refused: release_without_pairing_cli` and exits 2.
+
+The installer replaces only a wrapper it generated (recognized by its second
+line); an installer-generated wrapper whose text, owner, mode or link count
+differs is rewritten on the next `install` or `update`. Anything else at that
+path (a hand-written script, a symbolic link, a directory) is Owner-managed:
+`install` and `update` refuse before any change and print the steps (move it
+away, then rerun the same command). A failed `install` removes the wrapper only
+if it created it; a failed `update` keeps it, since it then runs the restored
+release. `rollback` never touches it. There is no uninstall operation; when
+removing a deployment, delete `/usr/local/sbin/serversentinel-pairing` together
+with the service unit and the installation root. The underlying command stays
+`python -m app.cameras.remote_agent.pairing_cli`; run without the wrapper, use
+the installed release's interpreter with that release directory as the working
+directory (for example
+`cd /opt/server-sentinel-main/current && sudo ./venv/bin/python -m app.cameras.remote_agent.pairing_cli ...`,
+where relative paths then resolve against that directory), not a checkout.
 
 `--ca-user` defaults to `serversentinel-ca` and `--service-user` to
 `server-sentinel`; pass them when the accounts are named differently. `init`,
@@ -819,6 +857,12 @@ sudo /tmp/server-sentinel-installer-1.1.0.pyz \
 `--unit` accepts exactly `/etc/systemd/system/server-sentinel.service`. Using one
 canonical administrator unit prevents another systemd search path from selecting
 a different definition when the installer restarts the logical service.
+
+`install` and `update` also place the `/usr/local/sbin/serversentinel-pairing`
+wrapper (Issue #180; see "The `serversentinel-pairing` wrapper" above). It
+names no release and follows `current`, so a switch never rewrites it and
+`rollback` leaves it alone; a hand-placed file at that path is refused before
+any change.
 
 `--destination` is created when it does not exist. An existing directory is
 adopted only when it is empty or is already a ServerSentinel installation root,

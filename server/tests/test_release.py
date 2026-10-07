@@ -6,6 +6,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import pwd
+import stat
 import subprocess
 import sys
 import tarfile
@@ -132,6 +133,10 @@ class ReleaseLifecycleTests(unittest.TestCase):
                     (name + version).encode()
                 )
         self.runner = Runner(self.installation)
+        # Issue #180: a fake root prefix for /usr/local/sbin; nothing is
+        # written outside the temporary tree.
+        self.wrapper = self.root / "usr/local/sbin/serversentinel-pairing"
+        self.wrapper.parent.mkdir(parents=True)
 
     def artifact(self, version):
         path = self.root / ("server-sentinel-" + version + ".tar.gz")
@@ -172,7 +177,9 @@ class ReleaseLifecycleTests(unittest.TestCase):
                 "app.deployment._approved_filesystem_device", side_effect=uuid_lookup), patch(
                 "install.PRIVATE_TMP_ROOTS", private_tmp), patch(
                 "install.PROTECTED_HOME_ROOTS", protected_home), patch(
-                "install.pwd.getpwuid", return_value=account):
+                "install.pwd.getpwuid", return_value=account), patch(
+                "install.PAIRING_WRAPPER", self.wrapper), patch(
+                "install.PAIRING_WRAPPER_OWNER", (self.uid, self.gid)):
             execute(arguments, runner=self.runner)
 
     def approved_device_lookup(self, approved_device=None):
@@ -1499,6 +1506,257 @@ class CaptureCaSettingBoundaryTests(unittest.TestCase):
                          "the release's own --check never ran")
         self.assertFalse((self.installation / "releases/1.1.0").exists())
         self.assertFalse((self.installation / "releases/.1.1.0.staging").exists())
+
+
+PAIRING_PROBE = '''import json, os, sys
+print(json.dumps({"argv": sys.argv[1:], "file": __file__, "executable": sys.executable,
+                  "path0": sys.path[0], "cwd": os.getcwd(), "environ": dict(os.environ),
+                  "isolated": sys.flags.isolated, "name": __name__}))
+'''
+
+
+class PairingWrapperTests(unittest.TestCase):
+    """Issue #180: the installer places ``serversentinel-pairing`` (root:root
+    0755). It runs the pairing CLI of the release ``current`` names, with that
+    release's interpreter and code, whatever the caller's environment."""
+
+    setUp_lifecycle = ReleaseLifecycleTests.setUp
+    artifact = ReleaseLifecycleTests.artifact
+    arguments = ReleaseLifecycleTests.arguments
+    perform = ReleaseLifecycleTests.perform
+    approved_device_lookup = ReleaseLifecycleTests.approved_device_lookup
+
+    def setUp(self):
+        self.setUp_lifecycle()
+        port_start = patch("install._unprivileged_port_start", return_value=1024)
+        port_start.start()
+        self.addCleanup(port_start.stop)
+        # What an untrusted caller environment could offer instead of the
+        # release: an ``app`` package, ``python``, ``readlink`` and ``env``.
+        self.hostile = self.root / "hostile"
+        module = self.hostile / "app/cameras/remote_agent/pairing_cli.py"
+        module.parent.mkdir(parents=True)
+        (self.hostile / "app/__init__.py").write_text("")
+        (self.hostile / "app/cameras/remote_agent/__init__.py").write_text("")
+        module.write_text("print('HOSTILE')\n")
+        (self.hostile / "bin").mkdir()
+        for name in ("python", "python3", "readlink", "env"):
+            tool = self.hostile / "bin" / name
+            tool.write_text("#!/bin/sh\necho HOSTILE\n")
+            tool.chmod(0o755)
+        (self.hostile / "sitecustomize.py").write_text("print('HOSTILE')\n")
+
+    def probe(self, version):
+        """Let an installed release run: the test interpreter stands for its
+        venv interpreter, and its pairing CLI reports how it was started."""
+        release = self.installation / "releases" / version
+        python = release / "venv/bin/python"
+        python.unlink()
+        python.symlink_to(sys.executable)
+        module = release / "app/cameras/remote_agent/pairing_cli.py"
+        module.unlink()
+        module.write_text(PAIRING_PROBE)
+        return release
+
+    def run_wrapper(self, *arguments):
+        environment = {
+            "PATH": str(self.hostile / "bin") + ":/usr/bin:/bin",
+            "PYTHONPATH": str(self.hostile), "PYTHONHOME": str(self.hostile),
+            "PYTHONSTARTUP": str(self.hostile / "sitecustomize.py"),
+            "PYTHONUSERBASE": str(self.hostile), "PYTHONSAFEPATH": "",
+            "ENV": str(self.hostile / "sitecustomize.py"), "IFS": "/",
+            "SYNTHETIC_SECRET": "not-for-the-cli",
+        }
+        return subprocess.run([str(self.wrapper), *arguments], cwd=self.hostile, env=environment,
+                              capture_output=True, text=True, timeout=60)
+
+    def ran(self, *arguments):
+        result = self.run_wrapper(*arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("HOSTILE", result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def assert_runs(self, version, arguments=("list", "--database", "state.sqlite3")):
+        release = self.installation / "releases" / version
+        report = self.ran(*arguments)
+        self.assertEqual(report["executable"], str(release / "venv/bin/python"))
+        self.assertEqual(report["file"], str(release / "app/cameras/remote_agent/pairing_cli.py"))
+        self.assertEqual(report["path0"], str(release))
+        self.assertEqual(report["argv"], list(arguments))
+        self.assertEqual(report["name"], "__main__")
+        self.assertEqual(report["isolated"], 1)
+        # env -i: only the fixed PATH (plus the locale Python itself may set).
+        self.assertEqual(report["environ"].get("PATH"), "/usr/bin:/bin")
+        self.assertLessEqual(set(report["environ"]), {"PATH", "LC_CTYPE"})
+        # The working directory is kept, so relative arguments keep meaning.
+        self.assertEqual(Path(report["cwd"]).resolve(), self.hostile.resolve())
+        return report
+
+    def test_wrapper_owner_is_root(self):
+        self.assertEqual(install.PAIRING_WRAPPER, Path("/usr/local/sbin/serversentinel-pairing"))
+        self.assertEqual(install.PAIRING_WRAPPER_OWNER, (0, 0))
+        with patch("install.os.fchown") as fchown:
+            install._root_owned(7)
+        fchown.assert_called_once_with(7, 0, 0)
+
+    def test_install_places_a_root_owned_wrapper_for_the_installation(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        info = self.wrapper.lstat()
+        self.assertTrue(stat.S_ISREG(info.st_mode))
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o755)
+        self.assertEqual((info.st_uid, info.st_gid), (self.uid, self.gid))  # the patched root:root
+        text = self.wrapper.read_text()
+        self.assertTrue(text.startswith("#!/bin/sh\n" + install.PAIRING_WRAPPER_MARKER + "\n"))
+        self.assertIn("root='" + str(self.installation) + "'\n", text)
+        self.assertIn("/usr/bin/env -i PATH=/usr/bin:/bin", text)
+        self.assertIn('"$release/venv/bin/python" -I -c', text)
+        self.assertIn(install.PAIRING_MODULE, text)
+        self.assertEqual(text, install.render_pairing_wrapper(self.installation))
+        self.assertEqual(list(self.wrapper.parent.iterdir()), [self.wrapper])
+
+    def test_wrapper_follows_current_across_update_and_rollback(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        self.probe("1.0.0")
+        inode = self.wrapper.stat().st_ino
+        self.assert_runs("1.0.0")
+        self.perform(self.arguments("update", "1.1.0"))
+        self.probe("1.1.0")
+        self.assert_runs("1.1.0")
+        self.perform(self.arguments("rollback"))
+        self.assert_runs("1.0.0")
+        self.perform(self.arguments("rollback", "1.1.0"))
+        self.assert_runs("1.1.0")
+        # One release-independent file: never rewritten by a switch.
+        self.assertEqual(self.wrapper.stat().st_ino, inode)
+
+    def test_arguments_pass_through_unchanged(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        self.probe("1.0.0")
+        tricky = ("approve", "--request", "relative/request.json", "two words", "$HOME",
+                  "*", "'", '"', "--", "-c", "", "-I", "a\nb")
+        self.assert_runs("1.0.0", tricky)
+
+    def test_wrapper_refuses_without_a_valid_release(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        release = self.probe("1.0.0")
+        current = self.installation / "current"
+        refusal = "serversentinel-pairing: refused: no_installed_release\n"
+        for target in ("releases/..", "releases/1.0.0/../../hostile", "hostile",
+                       "releases/1.0.0/", "releases/../releases/1.0.0", None):
+            with self.subTest(target=target):
+                current.unlink(missing_ok=True)
+                if target is not None:
+                    current.symlink_to(target)
+                result = self.run_wrapper("list")
+                self.assertEqual((result.returncode, result.stdout, result.stderr),
+                                 (2, "", refusal))
+        current.symlink_to("releases/1.0.0")
+        (release / "app/cameras/remote_agent/pairing_cli.py").unlink()
+        result = self.run_wrapper("list")
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (2, "", "serversentinel-pairing: refused: release_without_pairing_cli\n"))
+
+    def test_foreign_wrapper_is_refused_before_any_change(self):
+        arguments = self.arguments("install", "1.0.0")
+        for kind in ("script", "symlink", "directory"):
+            with self.subTest(kind=kind):
+                if kind == "script":
+                    self.wrapper.write_text("#!/bin/sh\nexec something-else \"$@\"\n")
+                elif kind == "symlink":
+                    self.wrapper.symlink_to(self.hostile / "bin/python")
+                else:
+                    self.wrapper.mkdir()
+                with self.assertRaises(install.PairingWrapperConflict) as refused:
+                    self.perform(arguments)
+                message = str(refused.exception)
+                self.assertIn("before any change", message)
+                self.assertIn(str(self.wrapper), message)
+                self.assertFalse((self.installation / "current").is_symlink())
+                self.assertFalse((self.installation / "releases").exists())
+                self.assertFalse(self.unit.exists())
+                if kind == "symlink":
+                    self.assertTrue(self.wrapper.is_symlink())
+                    self.wrapper.unlink()
+                elif kind == "directory":
+                    self.wrapper.rmdir()
+                else:
+                    self.assertIn("something-else", self.wrapper.read_text())
+                    self.wrapper.unlink()
+
+    def test_update_refuses_a_foreign_wrapper_and_keeps_the_running_release(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        self.wrapper.unlink()
+        self.wrapper.write_text("#!/bin/sh\n# Owner's own helper\n")
+        unit = self.unit.read_text()
+        with self.assertRaises(install.PairingWrapperConflict):
+            self.perform(self.arguments("update", "1.1.0"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+        self.assertFalse((self.installation / "releases/1.1.0").exists())
+        self.assertEqual(self.unit.read_text(), unit)
+        self.assertEqual(self.wrapper.read_text(), "#!/bin/sh\n# Owner's own helper\n")
+
+    def test_update_adds_a_missing_wrapper_and_repairs_a_stale_one(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        self.wrapper.unlink()  # an installation made before Issue #180
+        self.perform(self.arguments("update", "1.1.0"))
+        expected = install.render_pairing_wrapper(self.installation)
+        self.assertEqual(self.wrapper.read_text(), expected)
+        # An installer-generated wrapper with other text, or a widened mode,
+        # is replaced by a new root-owned 0755 file.
+        stale = install.render_pairing_wrapper(self.root / "elsewhere")
+        for text, mode, version in ((stale, 0o755, "1.2.0"), (expected, 0o775, "1.3.0")):
+            with self.subTest(mode=oct(mode)):
+                self.wrapper.unlink()
+                self.wrapper.write_text(text)
+                self.wrapper.chmod(mode)
+                inode = self.wrapper.stat().st_ino
+                self.perform(self.arguments("rollback"))  # rollback leaves it alone
+                self.assertEqual(self.wrapper.stat().st_ino, inode)
+                self.perform(self.arguments("update", version))
+                self.assertEqual(self.wrapper.read_text(), expected)
+                self.assertEqual(stat.S_IMODE(self.wrapper.stat().st_mode), 0o755)
+                self.assertNotEqual(self.wrapper.stat().st_ino, inode)
+        self.assertEqual(list(self.wrapper.parent.iterdir()), [self.wrapper])
+
+    def test_failed_install_removes_only_a_wrapper_it_created(self):
+        self.runner.fail_version = "1.0.0"
+        arguments = self.arguments("install", "1.0.0")
+        with self.assertRaises(OSError):
+            self.perform(arguments)
+        self.assertFalse(self.wrapper.exists())
+        self.assertFalse(self.unit.exists())
+        expected = install.render_pairing_wrapper(self.installation)
+        self.wrapper.write_text(expected)
+        self.wrapper.chmod(0o755)
+        with self.assertRaises(OSError):
+            self.perform(arguments)
+        self.assertEqual(self.wrapper.read_text(), expected)
+
+    def test_failed_update_keeps_a_wrapper_that_runs_the_restored_release(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        self.wrapper.unlink()
+        self.probe("1.0.0")
+        self.runner.fail_version = "1.1.0"
+        with self.assertRaises(OSError):
+            self.perform(self.arguments("update", "1.1.0"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+        self.assert_runs("1.0.0")
+
+    def test_unrenderable_installation_root_is_refused(self):
+        for root in ("/opt/it's", "/opt/line\nbreak", "/opt/tab\there", "relative", "/opt/../etc"):
+            with self.subTest(root=root), self.assertRaises(ValueError):
+                install.render_pairing_wrapper(Path(root))
+
+    def test_conflict_prints_the_owner_steps(self):
+        conflict = install.PairingWrapperConflict("refused before any change: steps\n")
+        stderr = io.StringIO()
+        with patch("install.execute", side_effect=conflict), patch.object(
+                sys, "argv", ["install.py", "--destination", "/opt/x", "--config", "/etc/x.json",
+                              "--unit", str(install.SYSTEMD_UNIT), "rollback"]), \
+                patch("sys.stderr", stderr), self.assertRaises(SystemExit) as exited:
+            install.main()
+        self.assertEqual(exited.exception.code, 1)
+        self.assertEqual(stderr.getvalue(), "refused before any change: steps\n")
 
 
 if __name__ == "__main__":
