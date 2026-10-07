@@ -1037,7 +1037,10 @@ delivered job stays delivered; attempts rise only with a claim, which also
 advances the generation, so they never rise more than the generation, and a
 generation rising more than the attempts requires the requeue mark), the high-water clocks (may only advance), open
 outbox session rows (a row a live outbox held at record time may end in its
-clean close; a stale one only in an interrupted gap) and the Owner override
+clean close; a stale one only in an interrupted gap; the outbox lock is probed
+before and after the database snapshot, and `record` refuses (exit 2) when the
+two answers differ, because an outbox that started or stopped in between
+would pair the copied rows with the wrong lock state) and the Owner override
 (dropped only once the control clock has reached its expiry);
 `presence_inputs` (live inputs with their own validity windows) and
 `presence_delivery_fairness` (a round-robin cursor) replay nothing and hide no
@@ -1245,7 +1248,13 @@ schema CHECK constraint limits (the schema comparison keeps those
 constraints in place) are validated on every current row as the owning
 service writes them (`invalid_value`): audit rows through the audit store's
 record validation, integrity audit actors and revisions, storage-state audit
-states, Owner-template audit operations and generations, presence audit
+states, Owner-template audit operations and generations, the Owner-template
+row itself through the store's own read model (`read_template_row()`, which
+`_load_for_verification()` uses: a non-negative integer generation and, when
+enrolled, a non-empty BLOB template within the largest size any store accepts
+(a deployment's stricter configured limit is not read) and provenance that
+loads as `ModelProvenance`; reported as `template` `invalid_value`, so `record`
+refuses such a state), presence audit
 actions and actors, job states and counters, marker counts, the override
 state and actor, observation payloads, recording identities, statuses and
 boundaries, discontinuity bounds, integrity outbox findings and flag, the
@@ -1357,7 +1366,11 @@ file's digest and size and the catalog byte length. The rewritten files must
 match their updated catalog digest and byte length with a single link, and
 every other recorded field (star and critical flags, boundaries, event link,
 discontinuities, segment set and the remaining segment catalog fields) must be
-unchanged; otherwise the declared recording is still `changed`. The comparison is `empty` (exit 3),
+unchanged; otherwise the declared recording is still `changed`. When the
+only difference from a full pass is such declared recordings, the status is
+`preserved_except_declared_rewrites` with exit 4, never 0: the declared
+recordings still need the manual re-verification before the result is
+accepted. The comparison is `empty` (exit 3),
 never success, while the baseline lacks any of: an ordinary recording, a
 starred recording, a camera source, a security/admin audit row, the Owner, a
 `live:view`-only grant, a `recordings:view`-only grant, or a revoked principal
@@ -1432,8 +1445,9 @@ intact. The required invariants are:
   not moved keeps every recorded column (`cursor_changed` otherwise), except
   `active` going from 1 to 0 (`release_source()`); only a publication, which
   advances the end, sets it back to 1. An advanced end must come with a
-  publication-shaped change: on the same stream a higher sequence (another
-  stream may start at any sequence). Once the segment it names has left the
+  publication-shaped change: the cursor active, as `_publish()` leaves it (an
+  inactive cursor does not count against the active-source limit), and on the
+  same stream a higher sequence (another stream may start at any sequence). Once the segment it names has left the
   catalog, the exact end value itself cannot be checked. A value of the wrong
   type anywhere is reported (`invalid_value`); verification never aborts on
   one and, if no rule anticipated it, still writes a failed report marked
@@ -1490,7 +1504,11 @@ nothing wrong; investigate, then take a new baseline):
 
 - a session revocation inside the window advances the authorization
   generation, which ends every recorded invitation, so those invitations are
-  reported `changed`;
+  reported `generation_advanced` (an invitation that also changed in any other
+  way is `changed`);
+- `release_source()` after a publication inside the window leaves the
+  advanced cursor inactive, which is reported `cursor_changed` (Main does not
+  call `release_source()`; revisit this rule if it ever does);
 - for a recording with no linked segment at record time, when the first
   segment that is later linked continues a pre-roll publication that the
   spool has since evicted, and does not continue the recorded cursor, the
