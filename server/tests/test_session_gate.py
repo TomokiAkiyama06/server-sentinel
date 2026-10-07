@@ -366,36 +366,61 @@ class SessionCommitRaceTests(SessionGateFixture):
         with closing(self.database.connect()) as connection:
             return connection.execute("SELECT count(*) FROM access_webauthn_challenges").fetchone()[0]
 
-    def test_challenge_insert_paused_across_a_cycle_is_refused_for_every_begin_step(self):
-        # PR #174 review (Codex P1): a begin_* request starts while access is
-        # open and pauses before storing its challenge; a check closes access
-        # (revoking and deleting every pending challenge on an exposure) and a
-        # clean check reopens; the paused request must not store its
-        # challenge, or a later finish_* (with a post-reopen epoch) could use it.
+    # PR #174 review (Codex P1): a begin_* request starts while access is
+    # open and pauses before storing its challenge; a check closes access
+    # (revoking and deleting every pending challenge on an exposure) and a
+    # clean check reopens; the paused request must not store its challenge,
+    # or a later finish_* (with a post-reopen epoch) could use it. Each path
+    # has its own fixture and first shows that the same call succeeds unpaused.
+
+    def owner_session(self):
         owner = self.access.bootstrap_owner("Synthetic owner")
         self.access.issue_enrollment(owner.id, b"o" * 32, self.ceremony_clock() + timedelta(minutes=30))
         owner_key = SyntheticAuthenticator()
         creation = self.ceremonies.begin_registration(b"o" * 32, "owner@example.invalid")
         self.ceremonies.finish_registration(b"o" * 32, "owner@example.invalid", owner_key.register(creation))
-        grant = self.ceremonies.finish_authentication("owner@example.invalid", self.assertion(owner_key))
+        return self.ceremonies.finish_authentication("owner@example.invalid", self.assertion(owner_key))
+
+    def assert_paused_insert_refused(self, call, *, exposure):
+        before = self.challenges()
+        call()  # positive control: unpaused, the same call stores a challenge
+        self.assertEqual(self.challenges(), before + 1)
+        stored = self.challenges() if not exposure else 0  # an exposure deletes every pending one
+        box = self.paused_during(self.ceremonies, "_challenge", call, exposure=exposure)
+        self.assertIsInstance(box.get("error"), CeremonyDenied)
+        self.assertEqual(self.challenges(), stored)
+
+    def test_authentication_challenge_paused_across_a_cycle_is_not_stored(self):
+        self.assert_paused_insert_refused(self.ceremonies.begin_authentication, exposure=True)
+
+    def test_registration_challenge_paused_across_a_cycle_is_not_stored(self):
+        # Without an exposure: a revocation alone would void the invitation.
         pending = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
         self.access.issue_enrollment(pending.id, b"p" * 32, self.ceremony_clock() + timedelta(minutes=30))
-        cases = {
-            # With an exposure the revocation alone would void the invitation
-            # and the Owner session, so those two use a close without one.
-            "authentication": (lambda: self.ceremonies.begin_authentication(), True),
-            "registration": (lambda: self.ceremonies.begin_registration(b"p" * 32, "pending@example.invalid"),
-                             False),
-            "step-up": (lambda: self.ceremonies.begin_step_up(grant.token, "owner@example.invalid"), False),
-        }
-        for name, (call, exposure) in cases.items():
-            with self.subTest(begin=name):
-                self.assertEqual(self.challenges(), 0)
-                box = self.paused_during(self.ceremonies, "_challenge", call, exposure=exposure)
-                self.assertIsInstance(box.get("error"), CeremonyDenied)
-                self.assertEqual(self.challenges(), 0)
-        # After the cycles a fresh request stores its challenge normally.
-        self.ceremonies.begin_authentication()
+        self.assert_paused_insert_refused(
+            lambda: self.ceremonies.begin_registration(b"p" * 32, "pending@example.invalid"), exposure=False)
+
+    def test_step_up_challenge_paused_across_a_cycle_is_not_stored(self):
+        # Without an exposure: a revocation alone would end the Owner session.
+        grant = self.owner_session()
+        self.assert_paused_insert_refused(
+            lambda: self.ceremonies.begin_step_up(grant.token, "owner@example.invalid"), exposure=False)
+
+    def test_closed_gate_refuses_before_consuming_or_verifying(self):
+        # Review suggestion: with access closed at the start, a finish_* step
+        # refuses at once and leaves the challenge and credential untouched.
+        _, authenticator = self.enroll()
+        assertion = self.assertion(authenticator)
+        self.check._resolver.answer = OSError("synthetic resolver failure")
+        self.assertFalse(self.check._check(CheckKind.RETRY).open)
+        with patch.object(self.access, "assertion_subject") as subject, \
+                patch.object(self.access, "mark_credential_inconsistent") as mark:
+            with self.assertRaises(CeremonyDenied):
+                self.ceremonies.finish_authentication(VIEWER, assertion)
+            with self.assertRaises(CeremonyDenied):
+                self.ceremonies.begin_authentication()
+        subject.assert_not_called()
+        mark.assert_not_called()
         self.assertEqual(self.challenges(), 1)
 
     def test_challenge_issued_before_a_revocation_cannot_be_used_after_it(self):

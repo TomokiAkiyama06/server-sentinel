@@ -268,7 +268,9 @@ at its start, and the verdict stays closed until any required revocation has
 committed. That is the essential property: a request commits only if access
 stayed open from its start to its commit, so no revocation ran in between.
 It either committed before the close, so every later revocation covers it, or
-is refused, also when a whole close, revoke and reopen cycle completed while it
+is refused (at once, before any challenge is consumed or assertion verified,
+when access is already closed at its start), also when a whole close, revoke
+and reopen cycle completed while it
 was verifying (PR #174 review); it can no longer commit after the immediate
 fallback revocation, and an invitation can no longer commit on an Owner
 authorization that a revocation ended. A challenge is issued by an earlier

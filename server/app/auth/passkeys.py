@@ -43,7 +43,10 @@ step stores its challenge the same way (epoch at its start, insert inside
 ``admit(epoch)``), so a challenge either committed before a close, and the
 revocation that follows deletes every pending challenge, or is never stored
 (PR #174 review); one issued before a revocation cannot be used afterwards. Only the local
-commit runs inside the gate. A gate refusal is the same generic denial.
+commit runs inside the gate. A step that finds access already closed
+(``epoch()`` is ``None``) refuses at once, before it consumes a challenge or
+verifies or records anything; the final ``admit(epoch)`` check still runs.
+A gate refusal is the same generic denial.
 
 Revocation is credential-scoped: revoking a credential disables it wherever a
 synced passkey exists, not on one device. Nothing here receives or stores a
@@ -196,6 +199,9 @@ class PasskeyCeremonies:
             # First: the challenge is stored only if access stays open from
             # here to its commit (PR #174 review).
             epoch = self.session_gate.epoch()
+            if epoch is None:
+                # Closed: refuse before consuming or verifying anything.
+                raise CeremonyDenied()
             challenge = self._challenge()
             with self.session_gate.admit(epoch):
                 subject = self.store.begin_registration(
@@ -223,6 +229,9 @@ class PasskeyCeremonies:
         try:
             # First: a close after this point refuses the commit (Issue #144).
             epoch = self.session_gate.epoch()
+            if epoch is None:
+                # Closed: refuse before consuming or verifying anything.
+                raise CeremonyDenied()
             at = self._now()
             challenge = webauthn.registration_challenge(credential, self.rp)
             consumed = self.store.consume_challenge(_digest(challenge), "registration", at=at)
@@ -252,6 +261,9 @@ class PasskeyCeremonies:
         """
         try:
             epoch = self.session_gate.epoch()
+            if epoch is None:
+                # Closed: refuse before consuming or verifying anything.
+                raise CeremonyDenied()
             challenge = self._challenge()
             with self.session_gate.admit(epoch):
                 self.store.issue_authentication_challenge(_digest(challenge), at=self._now(),
@@ -300,6 +312,9 @@ class PasskeyCeremonies:
         try:
             # First: a close after this point refuses the commit (Issue #144).
             epoch = self.session_gate.epoch()
+            if epoch is None:
+                # Closed: refuse before consuming or verifying anything.
+                raise CeremonyDenied()
             at = self._now()
             claims = webauthn.assertion_claims(credential, self.rp)
             self.store.consume_challenge(_digest(claims.challenge), "authentication", at=at)
@@ -331,6 +346,9 @@ class PasskeyCeremonies:
         """Issue a challenge bound to this Owner session and its own credential only."""
         try:
             epoch = self.session_gate.epoch()
+            if epoch is None:
+                # Closed: refuse before consuming or verifying anything.
+                raise CeremonyDenied()
             challenge = self._challenge()
             with self.session_gate.admit(epoch):
                 credential_id = self.store.begin_step_up(token, proxy_identity, _digest(challenge),
@@ -352,6 +370,9 @@ class PasskeyCeremonies:
         try:
             # First: a close after this point refuses the commit (Issue #144).
             epoch = self.session_gate.epoch()
+            if epoch is None:
+                # Closed: refuse before consuming or verifying anything.
+                raise CeremonyDenied()
             at = self._now()
             claims = webauthn.assertion_claims(credential, self.rp)
             consumed = self.store.consume_challenge(_digest(claims.challenge), "step_up", at=at)
