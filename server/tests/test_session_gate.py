@@ -558,61 +558,67 @@ class GateLockOrderTests(SessionGateFixture):
         reservation_admin = ReservationAdministration(self.service, self.check)
         self.files.files.update(Files(**WILDCARD_SSH.raw).files)
         reservation_admin.set_listener_exceptions(OWNER_SESSION, {SSH})
-        stop = threading.Event()
+        pending = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
         errors = []
         granted = []
         rounds = 30
+        # The workers run in lockstep rounds: in each round every worker starts
+        # one operation at the same moment, so checks, logins, Owner changes and
+        # invitations overlap on the gate and on the SQLite write lock. Unpaced
+        # loops instead let five writers retake the SQLite write lock back to
+        # back while the Owner change only polls for it in its busy handler, so
+        # on a slow runner that change could exceed the 5 s busy timeout
+        # ("database is locked") without any lock-order problem. A round bounds
+        # each wait by the few short transactions of the others; a real
+        # lock-order inversion still holds a lock while waiting for another
+        # and fails a round (busy timeout or the barrier timeout below).
+        workers_count = 6
+        barrier = threading.Barrier(workers_count, timeout=60)
 
         def guarded(body):
             def run():
                 try:
-                    body()
+                    for index in range(rounds):
+                        barrier.wait()
+                        body(index)
                 except BaseException as error:
                     errors.append(error)
+                    barrier.abort()  # release the others instead of waiting out the timeout
             return run
 
-        def checks():
-            for index in range(rounds):
-                self.files.files["tcp"] = EXPOSED if index % 3 == 0 else Files(**WILDCARD_SSH.raw).files["tcp"]
-                self.check._check(CheckKind.RETRY)
-            stop.set()
+        def checks(index):
+            self.files.files["tcp"] = EXPOSED if index % 3 == 0 else Files(**WILDCARD_SSH.raw).files["tcp"]
+            self.check._check(CheckKind.RETRY)
 
-        def changes():
-            index = 0
-            while not stop.is_set():
-                reservation_admin.set_listener_exceptions(OWNER_SESSION, {SSH} if index % 2 else set())
-                index += 1
+        def changes(index):
+            reservation_admin.set_listener_exceptions(OWNER_SESSION, {SSH} if index % 2 else set())
 
-        def logins(index):
-            def run():
-                principal, authenticator = users[index]
-                identity = f"synthetic-{index}@example.invalid"
-                while not stop.is_set():
-                    try:
-                        granted.append(self.ceremonies.finish_authentication(
-                            identity, self.assertion(authenticator)))
-                    except CeremonyDenied:
-                        pass
-            return run
+        def logins(user):
+            _, authenticator = users[user]
+            identity = f"synthetic-{user}@example.invalid"
 
-        def invitations():
-            principal = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
-            index = 0
-            while not stop.is_set():
+            def run(index):
                 try:
-                    admin.issue_invitation(OWNER_SESSION, principal.id, index.to_bytes(32, "big"),
-                                           self.ceremony_clock() + timedelta(minutes=30))
-                except Exception:
+                    granted.append(self.ceremonies.finish_authentication(
+                        identity, self.assertion(authenticator)))
+                except CeremonyDenied:
                     pass
-                index += 1
+            return run
 
-        workers = [threading.Thread(target=guarded(body), daemon=True)
-                   for body in (checks, changes, invitations, *(logins(index) for index in range(3)))]
+        def invitations(index):
+            try:
+                admin.issue_invitation(OWNER_SESSION, pending.id, index.to_bytes(32, "big"),
+                                       self.ceremony_clock() + timedelta(minutes=30))
+            except HumanAccessClosed:
+                pass  # refused while a check holds access closed
+
+        bodies = (checks, changes, invitations, *(logins(user) for user in range(3)))
+        self.assertEqual(len(bodies), workers_count)
+        workers = [threading.Thread(target=guarded(body), daemon=True) for body in bodies]
         for worker in workers:
             worker.start()
         for worker in workers:
-            worker.join(60)
-        stop.set()
+            worker.join(120)
         self.assertEqual([worker for worker in workers if worker.is_alive()], [])
         self.assertEqual(errors, [])
         # Whether any login got through during the concurrent phase depends on
