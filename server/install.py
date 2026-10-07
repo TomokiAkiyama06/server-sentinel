@@ -257,9 +257,13 @@ def _unprivileged_port_start() -> int | None:
 def _socket_unit_in_use(runner) -> bool:
     """Whether the upstream socket unit is active or enabled; unknown counts as in use."""
     for query in ("is-active", "is-enabled"):
-        result = runner(["systemctl", query, "--quiet", UPSTREAM_SOCKET_UNIT],
-                        check=False, timeout=30, stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL)
+        try:
+            result = runner(["systemctl", query, "--quiet", UPSTREAM_SOCKET_UNIT],
+                            check=False, timeout=30, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            # Timed out, not executable, or failed: unknown, so in use.
+            return True
         # 0 is active / enabled. Only "not enabled" (1), "inactive" (3) and
         # "no such unit" (4) are a clear no; anything else counts as in use.
         if getattr(result, "returncode", None) not in (1, 3, 4):
@@ -298,14 +302,25 @@ def _require_startable(args, root: Path, target: str, deployment: Deployment, ru
         "ServerSentinel release operation refused before any change: release "
         f"{target} predates human upstream socket activation and could not start:\n"
         + "".join(f"  - {reason}\n" for reason in reasons)
-        + "To switch to it, as the Owner:\n"
-        f"  1. sudo systemctl disable --now {UPSTREAM_SOCKET_UNIT}\n"
-        f"  2. edit {args.config}: set \"human_port\" to the port that release used, at or above\n"
-        "     /proc/sys/net/ipv4/ip_unprivileged_port_start, and point Tailscale Serve at\n"
-        "     http://<human_host>:<that port>\n"
+        + "To switch to it, as the Owner, in this order:\n"
+        f"  1. edit {args.config}: set \"human_port\" to the port that release used, at or\n"
+        "     above /proc/sys/net/ipv4/ip_unprivileged_port_start\n"
+        f"  2. sudo systemctl disable --now {UPSTREAM_SOCKET_UNIT}\n"
+        "     (the running service keeps its passed socket until it is restarted)\n"
         f"  3. run the same command again: ... {rerun}\n"
-        "To return to socket activation later: update to a release that supports it, restore\n"
-        f"\"human_port\", then sudo systemctl enable --now {UPSTREAM_SOCKET_UNIT}\n"
+        "     (it restarts the service on that release, which binds the port itself)\n"
+        "  4. point the Tailscale Serve target at http://<human_host>:<that port>\n"
+        "  5. verify: ss -ltn shows the service on that port and the dashboard answers\n"
+        "To return to socket activation later, in this order:\n"
+        "  1. update to a release that supports it (it still binds the old port itself)\n"
+        f"  2. edit {args.config}: set \"human_port\" back to the ListenStream port of\n"
+        f"     {UPSTREAM_SOCKET_UNIT} (below ip_unprivileged_port_start)\n"
+        f"  3. sudo systemctl enable --now {UPSTREAM_SOCKET_UNIT}\n"
+        "  4. sudo systemctl restart server-sentinel.service\n"
+        "     (starting the socket unit cannot hand its socket to the running service)\n"
+        "  5. point the Tailscale Serve target back at http://<human_host>:<that port>\n"
+        "  6. verify: ss -ltne shows one socket on that port whose inode is in\n"
+        "     /proc/<service pid>/fd\n"
         "(server/docs/DEPLOYMENT.md, Install, update, and rollback).\n")
 
 

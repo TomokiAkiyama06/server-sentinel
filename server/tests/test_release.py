@@ -80,7 +80,10 @@ class Runner:
             python.write_text("synthetic")
         if (arguments[:1] == ["systemctl"] and arguments[1] in self.socket_codes
                 and arguments[2:] == ["--quiet", install.UPSTREAM_SOCKET_UNIT]):
-            return SimpleNamespace(returncode=self.socket_codes[arguments[1]])
+            code = self.socket_codes[arguments[1]]
+            if isinstance(code, BaseException):
+                raise code
+            return SimpleNamespace(returncode=code)
         if arguments[:2] == ["systemctl", "restart"] and self.fail_version:
             current = os.readlink(self.root / "current")
             if current == "releases/" + self.fail_version:
@@ -1211,6 +1214,54 @@ class ActivationBoundaryTests(unittest.TestCase):
         self.runner.socket_codes["is-active"] = 5
         with self.assertRaises(install.ActivationBoundaryRefused):
             self.perform(self.arguments("rollback"))
+
+    def test_failed_socket_query_counts_as_in_use_with_the_owner_steps(self):
+        # PR #153 review: a query that times out or cannot run is unknown, so
+        # in use; the refusal still carries the Owner procedure.
+        failures = {"timeout": subprocess.TimeoutExpired(["systemctl"], 30),
+                    "no systemctl": FileNotFoundError("systemctl"),
+                    "os error": PermissionError("synthetic"),
+                    "subprocess error": subprocess.SubprocessError("synthetic")}
+        for name, failure in failures.items():
+            for query in ("is-active", "is-enabled"):
+                with self.subTest(name=name, query=query):
+                    self.setUp()
+                    self.installed_old_then_new()
+                    self.runner.socket_codes[query] = failure
+                    before = self.state()
+                    with self.assertRaises(install.ActivationBoundaryRefused) as refused:
+                        self.perform(self.arguments("rollback"))
+                    self.assertEqual(self.state(), before)
+                    self.assertIn("server-sentinel-upstream.socket is active", str(refused.exception))
+                    self.assertIn("sudo systemctl disable --now", str(refused.exception))
+
+    def test_printed_steps_are_in_a_working_order(self):
+        # PR #153 review: starting the socket unit cannot hand its socket to a
+        # running service, so returning needs an explicit restart, and both
+        # directions restore the Tailscale Serve target.
+        self.installed_old_then_new()
+        self.runner.socket_codes["is-enabled"] = 0
+        with self.assertRaises(install.ActivationBoundaryRefused) as refused:
+            self.perform(self.arguments("rollback"))
+        message = str(refused.exception)
+        switch, _, back = message.partition("To return to socket activation later")
+        self.assertTrue(back)
+
+        def ordered(text, phrases):
+            positions = [text.find(phrase) for phrase in phrases]
+            self.assertNotIn(-1, positions, phrases)
+            self.assertEqual(positions, sorted(positions), phrases)
+
+        ordered(switch, ['set "human_port" to the port that release used',
+                         "sudo systemctl disable --now server-sentinel-upstream.socket",
+                         "run the same command again: ... rollback",
+                         "point the Tailscale Serve target at", "verify:"])
+        ordered(back, ["update to a release that supports it",
+                       'set "human_port" back to the ListenStream port',
+                       "sudo systemctl enable --now server-sentinel-upstream.socket",
+                       "sudo systemctl restart server-sentinel.service",
+                       "point the Tailscale Serve target back at", "verify:"])
+        self.assertNotIn("restart server-sentinel.service", switch)
 
     def test_capability_file_is_read_as_text_strictly(self):
         release = self.root / "release"

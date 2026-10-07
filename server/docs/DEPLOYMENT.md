@@ -534,28 +534,51 @@ hold again at boot, the endpoint), nor on a port below
 `ip_unprivileged_port_start`, which the non-root service may not bind. Before
 switching an `update`, `install` or `rollback` to such a release, the
 installer checks both (it only queries `systemctl is-active` / `is-enabled`
-for the socket unit; an unclear answer counts as in use) and, if either
-holds, refuses before changing anything: the running release, both pointers
-and the unit stay as they were, a staged release is removed, and it prints
-these Owner steps with the actual configuration path:
+for the socket unit; an unclear answer, a timeout or a query that cannot run
+counts as in use) and, if either holds, refuses before changing anything: the
+running release, both pointers and the unit stay as they were, a staged release
+is removed, and it prints these Owner steps, in this order, with the actual
+configuration path:
 
 ```sh
+# 1. edit the deployment configuration: "human_port" back to the port that
+#    release used (at or above /proc/sys/net/ipv4/ip_unprivileged_port_start)
+# 2. stop the socket unit; the running service keeps its passed socket until
+#    it is restarted, so the dashboard stays up until step 3
 sudo systemctl disable --now server-sentinel-upstream.socket
-# edit the deployment configuration: "human_port" back to the port that release
-# used (at or above /proc/sys/net/ipv4/ip_unprivileged_port_start), and point
-# Tailscale Serve at http://127.0.0.1:<that port>
+# 3. the same command again; it restarts the service on that release, which
+#    binds the restored port itself (no separate restart is needed)
 sudo /tmp/server-sentinel-installer-<version>.pyz --destination ... --config ... \
-  --unit /etc/systemd/system/server-sentinel.service rollback   # the same command again
+  --unit /etc/systemd/system/server-sentinel.service rollback
+# 4. point the Tailscale Serve target at http://127.0.0.1:<that port>
+# 5. verify: ss -ltn shows the service on that port and the dashboard answers
 ```
 
-Run the rollback right after disabling the socket: while the newer release is
-still running, its `Sockets=` dependency starts the socket unit again if that
-service restarts. To return to socket activation later, update to a release
-that supports it, restore `"human_port"` to the privileged port and run
-`sudo systemctl enable --now server-sentinel-upstream.socket`. The installer
-never starts, stops, enables or disables the socket unit and never rewrites the
-deployment configuration: both are Owner-managed, and changing them inside the
-transaction would leave the human endpoint down if the restart then failed.
+Run step 3 right after step 2: while the newer release is still running, its
+`Sockets=` dependency starts the socket unit again if that service restarts,
+and the rerun then refuses again.
+
+To return to socket activation later, in this order:
+
+```sh
+# 1. update to a release that supports socket activation; it still binds the
+#    old, unprivileged port itself (the reservation check keeps human access
+#    closed without revocation until step 4)
+# 2. edit the deployment configuration: "human_port" back to the ListenStream
+#    port of server-sentinel-upstream.socket (below ip_unprivileged_port_start)
+# 3. bind the socket; starting it cannot hand it to the running service
+sudo systemctl enable --now server-sentinel-upstream.socket
+# 4. restart the service so systemd passes the socket and the new port applies
+sudo systemctl restart server-sentinel.service
+# 5. point the Tailscale Serve target back at http://127.0.0.1:<that port>
+# 6. verify: one socket on that port whose inode is in /proc/<service pid>/fd
+sudo ss -ltne 'sport = :<port>'
+```
+
+The installer never starts, stops, enables or disables the socket unit and
+never rewrites the deployment configuration: both are Owner-managed, and
+changing them inside the transaction would leave the human endpoint down if
+the restart then failed.
 
 Releases and runtime data are never deleted by these operations; only a staged
 release whose own installation failed is removed. Database migrations are
