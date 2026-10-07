@@ -32,6 +32,10 @@ _MAX_MANIFEST_BYTES = 16 * 1024
 _CREDENTIAL_DIRECTORY = "node-credentials"
 _CURRENT_MANIFEST = "current.json"
 _ENROLLMENT_LOCK = "node-enrollment.lock"
+# Durable evidence that an identity was committed at least once. Written after
+# the first commit and never removed, so a later loss of ``current.json`` (or of
+# the whole credential directory) fails closed instead of reading as unpaired.
+_INSTALLED_MARKER = "node-identity-installed"
 _FILES = {
     "private_key": "private-key",
     "client_certificate": "client-certificate",
@@ -135,6 +139,13 @@ class NodeCredentialStore:
     manifest is the atomic commit point.  Readers must ignore every generation
     unless ``current.json`` names and hashes it.  An existing marker is never
     replaced, including after a competing process bypasses the advisory lock.
+
+    After the first commit a private ``node-identity-installed`` file in the
+    runtime root records that an identity exists; it is never removed. Without
+    ``current.json`` the store reads as unpaired only while that evidence is
+    absent (a fresh store, or a first install interrupted before its commit);
+    with the evidence present the missing commit is corruption
+    (``credential_commit_missing``), never "unpaired".
     """
 
     def __init__(self, runtime_root: Path, *, owner_uid: int | None = None):
@@ -155,6 +166,10 @@ class NodeCredentialStore:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             if self._entry_exists(credentials_fd, _CURRENT_MANIFEST):
                 raise PairingRefused("node_identity_already_exists")
+            if self._entry_exists(root_fd, _INSTALLED_MARKER):
+                # An identity was committed before and its commit is gone:
+                # never install a second identity over the evidence.
+                raise PairingRefused("credential_commit_missing")
 
             generation = uuid4().hex
             values = {
@@ -191,6 +206,7 @@ class NodeCredentialStore:
                 raise PairingRefused("node_identity_already_exists") from None
             committed = True
             os.fsync(credentials_fd)
+            self._record_installed(root_fd)
         except PairingRefused:
             raise
         except (OSError, StorageRefused, ValueError, TypeError):
@@ -281,6 +297,9 @@ class NodeCredentialStore:
                 except OSError:
                     pass
             os.fsync(credentials_fd)
+            # Restores the evidence if a crash between the first commit and its
+            # evidence write left it missing.
+            self._record_installed(root_fd)
         except PairingRefused:
             raise
         except (OSError, StorageRefused, ValueError, TypeError, KeyError, IndexError):
@@ -339,7 +358,9 @@ class NodeCredentialStore:
         """The committed generation's node UUID after the full integrity check.
 
         ``None`` means no identity is installed; a damaged or unreadable
-        generation raises ``PairingRefused`` (never treated as unpaired).
+        generation raises ``PairingRefused`` (never treated as unpaired), and so
+        does a missing commit once ``node-identity-installed`` records that an
+        identity was committed (``credential_commit_missing``).
         """
         root_fd = credentials_fd = None
         try:
@@ -352,14 +373,14 @@ class NodeCredentialStore:
                     dir_fd=root_fd,
                 )
             except FileNotFoundError:
-                return None
+                return self._unpaired(root_fd)
             self._validate_directory(credentials_fd, "credential_directory_rejected")
             try:
                 manifest = self._read_file(credentials_fd, _CURRENT_MANIFEST,
                                            maximum=_MAX_MANIFEST_BYTES,
                                            expected_links=2)
             except FileNotFoundError:
-                return None
+                return self._unpaired(root_fd)
             try:
                 value = json.loads(manifest.decode("utf-8"))
                 if (not isinstance(value, dict)
@@ -416,6 +437,27 @@ class NodeCredentialStore:
                 os.close(credentials_fd)
             if root_fd is not None:
                 os.close(root_fd)
+
+    def _unpaired(self, root_fd: int) -> None:
+        if self._entry_exists(root_fd, _INSTALLED_MARKER):
+            raise PairingRefused("credential_commit_missing")
+        return None
+
+    def _record_installed(self, root_fd: int) -> None:
+        try:
+            descriptor = os.open(
+                _INSTALLED_MARKER,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600, dir_fd=root_fd)
+        except FileExistsError:
+            return
+        try:
+            if os.write(descriptor, b"1\n") != 2:
+                raise OSError(errno.EIO, "installed evidence write failed")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(root_fd)
 
     def _open_credentials_directory(self, root_fd: int) -> int:
         try:

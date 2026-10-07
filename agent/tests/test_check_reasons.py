@@ -321,6 +321,11 @@ class CheckReasonTests(unittest.TestCase):
             entry.write_bytes(b"tampered")
         self.assert_reason("node_credential_unavailable")
 
+    def test_lost_credential_commit_is_not_treated_as_unpaired(self):
+        self.install_credential(UUID(self.value["node_id"]))
+        (self.runtime / "node-credentials" / "current.json").unlink()
+        self.assert_reason("node_credential_unavailable")
+
     # Unexpected internal errors.
 
     def test_unexpected_error_is_check_failed_without_exception_text(self):

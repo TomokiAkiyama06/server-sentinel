@@ -63,7 +63,9 @@ the node must re-pair. No scheduler runs this yet (#15 transport).
 runtime-wide interprocess lock (`EnrollmentLock`: `flock` on
 `<runtime_root>/node-enrollment.lock`, a 0600 regular file owned by the service
 account; no root needed). `pair` holds it from the installed-identity check
-through the exchange, install and pending-key cleanup. A second run on the same
+through the exchange, install and pending-key cleanup, and `request` from key
+selection through writing its request file, so a concurrent `pair` cannot
+consume the pending key before the request it reported exists. A second run on the same
 runtime root is refused at once with `enrollment_in_progress`, before any
 network traffic or code prompt, so two concurrent `pair` runs can no longer
 both pass the installed check and install different certificates for one node.
@@ -129,7 +131,12 @@ Owner policy (2026-10-01). Check the node's state on the Main first
   start, fail closed: service startup and `--check` both exit with the fixed
   reason `node_identity_mismatch` before any capture or session is created. A
   damaged or unreadable installed credential is reported as
-  `node_credential_unavailable`, never as unpaired. The Owner
+  `node_credential_unavailable`, never as unpaired. The first commit also
+  writes `<runtime_root>/node-identity-installed` (0600, never removed), so a
+  lost `node-credentials/current.json` or credential directory after pairing is
+  also `node_credential_unavailable` (`credential_commit_missing`); only a store
+  without that file (fresh, or a first install interrupted before its commit)
+  reads as unpaired. The Owner
   approves the new node's camera sources again on the Main; the old node's
   recordings stay under the old node until retention. The Agent's local ring
   buffer and protected incidents are not touched by re-pairing.

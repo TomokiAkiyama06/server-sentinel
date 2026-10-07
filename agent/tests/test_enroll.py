@@ -319,6 +319,22 @@ class EnrollmentLockTests(EnrollFixture):
         with self.assertRaisesRegex(PairingRefused, "node_identity_already_exists"):
             enroll.pair(self.runtime, bundle, prompt=self.prompt_after(peer))
 
+    def test_request_file_is_written_while_the_lock_is_held(self):
+        attempts = []
+        original = enroll._write_public_file
+
+        def racing_write(path, content):
+            # A concurrent run reaching this point must still be refused.
+            try:
+                with EnrollmentLock(self.runtime):
+                    attempts.append("acquired")
+            except PairingRefused as error:
+                attempts.append(str(error))
+            original(path, content)
+        with patch.object(enroll, "_write_public_file", racing_write):
+            enroll.create_enrollment_request(self.runtime, self.root / "locked.json")
+        self.assertEqual(["enrollment_in_progress"], attempts)
+
     def test_lock_held_by_another_process_refuses_pairing(self):
         peer = self.peer()
         holder = subprocess.Popen(
@@ -455,6 +471,31 @@ class RepairTests(EnrollFixture):
         self.assertEqual(self.old_files,
                          sorted(p.name for p in (self.runtime / "node-credentials").iterdir()))
         self.assertTrue((self.runtime / "pending-repair" / "node-key.pem").exists())
+
+    def test_revoked_repair_request_is_written_before_a_concurrent_pair_can_run(self):
+        # PR #139 review: a pair --repair revoked racing request must not
+        # consume the pending repair key before the request file is written.
+        new_node = uuid4()
+        peer = self.peer(respond=issuing(self.authority, new_node))
+        outcomes = []
+        original = enroll._write_public_file
+
+        def racing_write(path, content):
+            try:
+                enroll.pair(self.runtime, self.bundle(peer.port),
+                            prompt=self.prompt_after(peer), repair="revoked")
+                outcomes.append("paired")
+            except PairingRefused as error:
+                outcomes.append(str(error))
+            original(path, content)
+        with patch.object(enroll, "_write_public_file", racing_write):
+            enroll.create_enrollment_request(self.runtime, self.root / "revoked.json",
+                                             repair="revoked")
+        self.assertEqual(["enrollment_in_progress"], outcomes)
+        self.assertEqual(0, peer.connections)
+        self.assertTrue((self.runtime / "pending-repair" / "node-key.pem").exists())
+        self.assertEqual(new_node, enroll.pair(self.runtime, self.bundle(peer.port),
+                                               prompt=self.prompt_after(peer), repair="revoked"))
 
     def test_interrupted_revoked_repair_completes_without_a_second_new_node(self):
         enroll.create_enrollment_request(self.runtime, self.root / "revoked.json", repair="revoked")

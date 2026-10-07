@@ -35,8 +35,9 @@ atomically and delete the old files only after the swap commits.
 
 Every ``request`` and ``pair`` run holds a runtime-wide interprocess lock
 (``EnrollmentLock``, a ``flock`` on ``<runtime_root>/node-enrollment.lock``) from
-the installed-identity check through install and pending-key cleanup (#117); a
-concurrent run is refused with ``enrollment_in_progress``.
+the installed-identity check through install and pending-key cleanup (#117), and
+``request`` through writing its request file; a concurrent run is refused with
+``enrollment_in_progress``.
 
 Any verification failure aborts before the prompt, so no code byte is ever
 sent to an unverified peer. There is no plaintext, insecure, proxy or redirect
@@ -188,17 +189,20 @@ def create_enrollment_request(runtime_root: Path, output: Path, *, repair: str |
     ``repair="expired"`` re-exports the installed key (same key, same node) and
     only when the installed certificate has expired; ``repair="revoked"``
     creates (or re-exports) one fresh key in ``pending-repair/`` for a new node.
-    Key selection runs under the runtime-wide ``EnrollmentLock``.
+    Key selection and the request-file write both run under the runtime-wide
+    ``EnrollmentLock``, so a concurrent ``pair`` cannot install a credential
+    and discard the pending key before this run has written its request and
+    reported success.
     """
     with EnrollmentLock(runtime_root):
         key = _request_key(runtime_root, repair, now)
         request = build_enrollment_request(key)
-    content = json.dumps({
-        "format_version": REQUEST_FORMAT,
-        "csr": request.csr_pem.decode("ascii"),
-        "public_key_digest": request.public_key_digest,
-    }, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
-    _write_public_file(output, content)
+        content = json.dumps({
+            "format_version": REQUEST_FORMAT,
+            "csr": request.csr_pem.decode("ascii"),
+            "public_key_digest": request.public_key_digest,
+        }, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+        _write_public_file(output, content)
     return request.public_key_digest
 
 
