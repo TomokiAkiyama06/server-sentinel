@@ -59,6 +59,7 @@ from scripts.ci import review_gate_publisher
 from scripts.ci.review_gate_publisher import (AppCredentials, CachingGitHubTransport,
                                               GitHubTransport, GitObjectCache,
                                               MAX_CHECK_RUN_ATTEMPTS, PublisherFailure,
+                                              RuntimeConfig,
                                               _secure_private_bytes, check_run_attempts,
                                               publish_revocation, publish_success,
                                               success_is_latest_attempt)
@@ -229,9 +230,9 @@ class ReviewSource(Protocol):
     """Authenticated, completely paginated provider review evidence.
 
     ``repository`` names the ``owner/name`` repository whose reviews the
-    source reads; ``collect_and_publish`` refuses a source that does not name
-    the configured repository, and ``publish`` refuses a pass collected from
-    one.
+    source reads; ``request_review`` and ``collect_and_publish`` refuse a
+    source that does not name the configured repository, and ``publish``
+    refuses a pass collected from one.
     """
 
     repository: str
@@ -562,8 +563,19 @@ class ReviewCollector:
         return int(now)
 
     def request_review(self, reviewer: str, live: Context, source: ReviewSource,
-                       *, force_new: bool = False) -> RequestOutcome:
+                       *, config: RuntimeConfig,
+                       force_new: bool = False) -> RequestOutcome:
         """Durably record a request before the caller posts its trigger.
+
+        The request is bound to the configured repository (``config``) like
+        reconciliation and publication: ``live`` must carry the configured
+        repository ID and ``source`` must name the configured repository,
+        both checked before any ledger or provider listing is read.  A source
+        miswired to another repository would otherwise record that
+        repository's (possibly higher) review ID as the watermark; once the
+        wiring is fixed, the correct repository's lower maximum would be
+        refused as a regression even with ``force_new`` and the PR would stay
+        blocked until the ledger is removed by hand.
 
         Repeating the call for an unchanged active context returns the same
         request (``created=False``) so a retried trigger delivery does not
@@ -576,6 +588,11 @@ class ReviewCollector:
         self._identity(reviewer)
         if not isinstance(live, Context):
             raise CollectorFailure("invalid live context")
+        if not isinstance(config, RuntimeConfig):
+            raise CollectorFailure("invalid repository configuration")
+        if live.repository_id != config.repository_id:
+            raise CollectorFailure("live context names another repository")
+        _require_source_repository(source, config.repository)
         with self._store.lock(live.repository_id, live.pr_number):
             existing = self._store.load(live.repository_id, live.pr_number, reviewer)
             if (existing is not None and existing.state == "active"
