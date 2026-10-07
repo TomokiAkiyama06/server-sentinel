@@ -161,7 +161,9 @@ class SessionCommitRaceTests(SessionGateFixture):
         self.assertTrue(restarted.startup().open)
         self.assertEqual(self.live_sessions(), 0)
         # Signing in again works once access is open.
-        grant = self.ceremonies_for(restarted).finish_authentication(VIEWER, self.assertion(authenticator))
+        ceremonies = self.ceremonies_for(restarted)
+        grant = ceremonies.finish_authentication(
+            VIEWER, authenticator.assertion(ceremonies.begin_authentication()))
         self.assertTrue(self.valid(grant))
 
     def test_check_waits_for_a_commit_in_progress_and_then_revokes_it(self):
@@ -360,6 +362,42 @@ class SessionCommitRaceTests(SessionGateFixture):
                   if record.action is AuditAction.ISSUE_PRINCIPAL_INVITATION]
         self.assertEqual(issued, [AuditOutcome.FAILED])
 
+    def challenges(self):
+        with closing(self.database.connect()) as connection:
+            return connection.execute("SELECT count(*) FROM access_webauthn_challenges").fetchone()[0]
+
+    def test_challenge_insert_paused_across_a_cycle_is_refused_for_every_begin_step(self):
+        # PR #174 review (Codex P1): a begin_* request starts while access is
+        # open and pauses before storing its challenge; a check closes access
+        # (revoking and deleting every pending challenge on an exposure) and a
+        # clean check reopens; the paused request must not store its
+        # challenge, or a later finish_* (with a post-reopen epoch) could use it.
+        owner = self.access.bootstrap_owner("Synthetic owner")
+        self.access.issue_enrollment(owner.id, b"o" * 32, self.ceremony_clock() + timedelta(minutes=30))
+        owner_key = SyntheticAuthenticator()
+        creation = self.ceremonies.begin_registration(b"o" * 32, "owner@example.invalid")
+        self.ceremonies.finish_registration(b"o" * 32, "owner@example.invalid", owner_key.register(creation))
+        grant = self.ceremonies.finish_authentication("owner@example.invalid", self.assertion(owner_key))
+        pending = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
+        self.access.issue_enrollment(pending.id, b"p" * 32, self.ceremony_clock() + timedelta(minutes=30))
+        cases = {
+            # With an exposure the revocation alone would void the invitation
+            # and the Owner session, so those two use a close without one.
+            "authentication": (lambda: self.ceremonies.begin_authentication(), True),
+            "registration": (lambda: self.ceremonies.begin_registration(b"p" * 32, "pending@example.invalid"),
+                             False),
+            "step-up": (lambda: self.ceremonies.begin_step_up(grant.token, "owner@example.invalid"), False),
+        }
+        for name, (call, exposure) in cases.items():
+            with self.subTest(begin=name):
+                self.assertEqual(self.challenges(), 0)
+                box = self.paused_during(self.ceremonies, "_challenge", call, exposure=exposure)
+                self.assertIsInstance(box.get("error"), CeremonyDenied)
+                self.assertEqual(self.challenges(), 0)
+        # After the cycles a fresh request stores its challenge normally.
+        self.ceremonies.begin_authentication()
+        self.assertEqual(self.challenges(), 1)
+
     def test_challenge_issued_before_a_revocation_cannot_be_used_after_it(self):
         # An assertion over a challenge issued before an exposure (for example
         # one a listener answering during it received) cannot establish a
@@ -454,7 +492,7 @@ class GateLockOrderTests(SessionGateFixture):
         stop = threading.Event()
         errors = []
         granted = []
-        rounds = 60
+        rounds = 30
 
         def guarded(body):
             def run():

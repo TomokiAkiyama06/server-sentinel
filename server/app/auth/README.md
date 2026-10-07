@@ -248,7 +248,8 @@ the failure streak starts and each time it doubles, and
 
 Session gate (Issue #144, Owner decision 2026-10-07: serialize). The check and
 every commit that creates a human session, updates a session's user-verification
-time, or creates or redeems an enrollment authorization share one lock, `HostnameReservationCheck.admit()`:
+time, creates or redeems an enrollment authorization, or stores a WebAuthn
+challenge share one lock, `HostnameReservationCheck.admit()`:
 `PasskeyCeremonies.finish_authentication()` (new session),
 `finish_step_up()` (user-verification time) and `finish_registration()`
 (invitation redemption) run their store commit inside it, and so does
@@ -270,11 +271,19 @@ It either committed before the close, so every later revocation covers it, or
 is refused, also when a whole close, revoke and reopen cycle completed while it
 was verifying (PR #174 review); it can no longer commit after the immediate
 fallback revocation, and an invitation can no longer commit on an Owner
-authorization that a revocation ended. The challenge was issued by an earlier
-request, before the epoch is taken; the revocation therefore also deletes every
-pending WebAuthn challenge, so an assertion over a challenge issued before it
-(for example one a listener answering during the exposure received) cannot
-establish a session afterwards. A request that merely spans a close without an
+authorization that a revocation ended. A challenge is issued by an earlier
+request, so `begin_registration()`, `begin_authentication()` and
+`begin_step_up()` store theirs the same way: the epoch is taken at the start of
+the `begin` request and the insert commits inside `admit(epoch)` (they are the
+only callers of the store's challenge inserts). A revocation deletes every
+pending WebAuthn challenge, so every challenge either committed before a close
+and is deleted by the revocation that follows, or is never stored (PR #174
+review); an assertion over a challenge issued before a revocation (for example
+one a listener answering during the exposure received) cannot establish a
+session afterwards. The challenge row carries no authorization generation: with
+gated inserts any revocation either precedes the whole `begin` request or
+deletes the row, so a generation would add nothing, and the table has no
+column for one without a migration. A request that merely spans a close without an
 exposure is refused too and simply starts again. The check also takes the lock
 again to decide and commit (the marker, the fallback and reopening revocations
 and the published verdict); doing that inside the gate is defense in depth. A restart that

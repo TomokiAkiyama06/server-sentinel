@@ -564,8 +564,9 @@ revocation has committed. That is the essential property: a request that saw
 access open before a check closed it can no longer commit a session after
 that check's revocation, even if access reopened in between (PR #174 review),
 so a restart that finds no revocation marker no longer keeps such a session.
-A revocation also deletes every pending WebAuthn challenge, so an assertion
-over a challenge issued before it cannot establish a session afterwards. The
+Every WebAuthn challenge is stored under the same lock and epoch, and a
+revocation deletes every pending challenge, so an assertion over a challenge
+issued before a revocation cannot establish a session afterwards. The
 check also decides, revokes and publishes its verdict inside the lock, as
 defense in depth. The idle-expiry touch of an existing session stays outside
 the lock, which is safe because revocation advances the authorization

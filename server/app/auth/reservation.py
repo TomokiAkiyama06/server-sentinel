@@ -1111,8 +1111,8 @@ class HostnameReservationCheck:
 
     Session gate (Issue #144, Owner decision 2026-10-07: serialize). A
     request that may create a human session, update a session's
-    user-verification time, or create or redeem an enrollment authorization
-    first takes ``epoch()``, before it reads or verifies anything the commit
+    user-verification time, create or redeem an enrollment authorization, or
+    store a WebAuthn challenge first takes ``epoch()``, before it reads or verifies anything the commit
     relies on, and then commits inside ``admit(epoch)``, which holds
     ``_session_gate_lock`` and re-checks right before the commit that access
     is open and that the epoch is unchanged. The epoch advances on every

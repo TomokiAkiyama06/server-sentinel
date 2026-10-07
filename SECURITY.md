@@ -387,7 +387,9 @@ and ADR-0003):
   keeps the verdict closed until any required revocation has committed. So a
   request that saw access open before a check closed it cannot commit a
   session after that check's revocation, even if access has reopened in
-  between, and a revocation also deletes every pending WebAuthn challenge. The check also decides and revokes inside the lock as defense in
+  between. WebAuthn challenges are stored under the same lock and epoch, and a
+  revocation deletes every pending one, so a challenge issued before a
+  revocation cannot be used after it. The check also decides and revokes inside the lock as defense in
   depth. The idle-expiry touch of an existing session stays outside the lock;
   revocation advances the authorization generation, so a touch can never make
   a revoked session valid again.

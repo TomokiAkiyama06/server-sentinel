@@ -38,9 +38,11 @@ before it consumes the challenge or verifies anything, and commits inside
 access is open and has not closed since that epoch (Issue #144, PR #174
 review). A reservation check that closes access and revokes sessions can
 therefore neither interleave with the commit nor complete a whole close ->
-revoke -> reopen cycle while the request is verifying. The challenge itself
-was issued by an earlier request; a revocation deletes every pending
-challenge, so one issued before it cannot be used afterwards. Only the local
+revoke -> reopen cycle while the request is verifying. Every ``begin_*``
+step stores its challenge the same way (epoch at its start, insert inside
+``admit(epoch)``), so a challenge either committed before a close, and the
+revocation that follows deletes every pending challenge, or is never stored
+(PR #174 review); one issued before a revocation cannot be used afterwards. Only the local
 commit runs inside the gate. A gate refusal is the same generic denial.
 
 Revocation is credential-scoped: revoking a credential disables it wherever a
@@ -191,10 +193,14 @@ class PasskeyCeremonies:
         policy. No camera, recording, timeline or deployment data.
         """
         try:
+            # First: the challenge is stored only if access stays open from
+            # here to its commit (PR #174 review).
+            epoch = self.session_gate.epoch()
             challenge = self._challenge()
-            subject = self.store.begin_registration(
-                enrollment_secret, proxy_identity, _digest(challenge),
-                at=self._now(), lifetime=self.challenge_lifetime)
+            with self.session_gate.admit(epoch):
+                subject = self.store.begin_registration(
+                    enrollment_secret, proxy_identity, _digest(challenge),
+                    at=self._now(), lifetime=self.challenge_lifetime)
         except Exception:
             raise CeremonyDenied() from None
         return {
@@ -245,9 +251,11 @@ class PasskeyCeremonies:
         whether any identity is invited.
         """
         try:
+            epoch = self.session_gate.epoch()
             challenge = self._challenge()
-            self.store.issue_authentication_challenge(_digest(challenge), at=self._now(),
-                                                      lifetime=self.challenge_lifetime)
+            with self.session_gate.admit(epoch):
+                self.store.issue_authentication_challenge(_digest(challenge), at=self._now(),
+                                                          lifetime=self.challenge_lifetime)
         except Exception:
             raise CeremonyDenied() from None
         return {"challenge": webauthn.b64url_encode(challenge), "rpId": self.rp.rp_id,
@@ -322,9 +330,11 @@ class PasskeyCeremonies:
     def begin_step_up(self, token: bytes, proxy_identity: str) -> dict:
         """Issue a challenge bound to this Owner session and its own credential only."""
         try:
+            epoch = self.session_gate.epoch()
             challenge = self._challenge()
-            credential_id = self.store.begin_step_up(token, proxy_identity, _digest(challenge),
-                                                     at=self._now(), lifetime=self.challenge_lifetime)
+            with self.session_gate.admit(epoch):
+                credential_id = self.store.begin_step_up(token, proxy_identity, _digest(challenge),
+                                                         at=self._now(), lifetime=self.challenge_lifetime)
         except Exception:
             raise CeremonyDenied() from None
         return {"challenge": webauthn.b64url_encode(challenge), "rpId": self.rp.rp_id,

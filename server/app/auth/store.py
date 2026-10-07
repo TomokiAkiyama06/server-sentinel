@@ -692,6 +692,19 @@ class AccessStore:
 
     def _insert_challenge_on(self, connection, digest: bytes, ceremony: str, at: datetime, lifetime: timedelta,
                              *, invitation_id: str | None = None, session_id: str | None = None) -> None:
+        """Insert a challenge digest; reached only from the three ``begin`` steps below.
+
+        Their only runtime caller, ``PasskeyCeremonies``, runs each of them
+        inside the reservation session gate (``admit(epoch)``, epoch taken at
+        the start of the request), so a challenge either commits before a
+        close, and ``invalidate_all_sessions_on`` deletes it with every other
+        pending challenge, or is never stored (Issue #144, PR #174 review).
+        The row carries no authorization generation: under that gate any
+        revocation either precedes the request (the challenge is fresh) or
+        follows the insert (it deletes the row), so a generation column would
+        add nothing, and the table has no column to hold one without a
+        migration.
+        """
         if not isinstance(digest, bytes) or len(digest) != 32:
             raise AccessValidationError("access is unavailable")
         if not isinstance(lifetime, timedelta) or not timedelta(0) < lifetime <= MAX_CHALLENGE_LIFETIME:

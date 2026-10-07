@@ -214,6 +214,8 @@ class DeploymentRequirementTests(unittest.TestCase):
         self.assertIn("whole close, revoke and reopen cycle", readme)
         self.assertIn("deletes every pending WebAuthn challenge", readme)
         self.assertIn("even if access reopened in between", adr)
+        self.assertIn("store theirs the same way", readme)
+        self.assertIn("Every WebAuthn challenge is stored under the same lock and epoch", adr)
 
 
 class SecurityNoteTests(unittest.TestCase):
