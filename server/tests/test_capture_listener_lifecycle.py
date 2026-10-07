@@ -21,6 +21,8 @@ import socket
 import sqlite3
 import ssl
 import stat
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -41,7 +43,8 @@ from app.cameras.remote_agent.node_ca import (
     ListenerMaterialInconsistent, OwnershipPrivilegeRequired, PrivateDirectory,
     deployment_id_of, listener_material, main_server_name,
 )
-from app.storage.database import Database
+from app.storage import database as storage_database
+from app.storage.database import Database, held_descriptors
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
@@ -973,6 +976,129 @@ class PinnedDatabaseTests(ListenerLifecycleHarness):
             pass
         with self.assertRaises(sqlite3.DatabaseError):
             ledger.database.connect()
+
+
+SECOND_PROCESS_WRITER = """
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
+try:
+    connection.execute("BEGIN IMMEDIATE")
+except sqlite3.OperationalError as error:
+    print("locked" if "locked" in str(error) else "error")
+else:
+    connection.execute("ROLLBACK")
+    print("acquired")
+"""
+
+
+def second_process_writer(path):
+    """Whether another process can take the write lock right now (no waiting)."""
+    result = subprocess.run([sys.executable, "-I", "-c", SECOND_PROCESS_WRITER, str(path)],
+                            capture_output=True, text=True, timeout=30, check=True)
+    return result.stdout.strip()
+
+
+class PinnedLedgerDescriptorTests(ListenerLifecycleHarness):
+    """Issue #152: the ledger pin never closes a database descriptor.
+
+    Closing any descriptor this process holds on the database drops every
+    POSIX lock the process holds on it. These tests take a real write lock
+    in this process and probe it from a second process.
+    """
+
+    def test_release_keeps_the_write_lock_of_a_lingering_worker_connection(self):
+        database = existing_database(self.root)
+        with pairing_cli._ledger(database) as ledger:
+            # An enrollment worker that outlived serve()'s bounded join,
+            # still inside a write transaction when the ledger is released.
+            worker = ledger.database.connect()
+            self.addCleanup(worker.close)
+            worker.execute("BEGIN IMMEDIATE")
+            worker.execute("INSERT INTO application_metadata VALUES ('probe', 'x')")
+            self.assertEqual("locked", second_process_writer(database))
+        self.assertEqual("locked", second_process_writer(database))
+        # Its commit after the release is refused and nothing is written.
+        with self.assertRaises(sqlite3.DatabaseError):
+            worker.execute("COMMIT")
+        self.assertEqual("locked", second_process_writer(database))
+        worker.close()
+        self.assertEqual("acquired", second_process_writer(database))
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM application_metadata WHERE key = 'probe'").fetchone()[0])
+
+    def test_release_leaves_the_pinned_descriptor_with_the_process_holder(self):
+        database = existing_database(self.root)
+        with pairing_cli._ledger(database) as ledger:
+            descriptor = ledger.database._descriptor
+            self.assertIn(descriptor, held_descriptors())
+        info = os.fstat(descriptor)
+        self.assertEqual(ledger.database._identity, (info.st_dev, info.st_ino))
+        self.assertIn(descriptor, held_descriptors())
+
+    def test_a_refused_database_file_keeps_this_processs_locks(self):
+        database = existing_database(self.root)
+        os.chmod(database, 0o664)
+        holder = sqlite3.connect(database, isolation_level=None)
+        self.addCleanup(holder.close)
+        holder.execute("BEGIN IMMEDIATE")
+        with patch.object(pairing_cli, "ControllingTerminal", NoPromptTerminal):
+            status, _stdout, stderr = run_cli("list", "--database", str(database))
+        self.assertEqual(2, status)
+        self.assertIn("refused: database_rejected", stderr)
+        self.assertEqual("locked", second_process_writer(database))
+
+    def test_application_held_descriptors_are_no_witness_of_the_opened_file(self):
+        # The pinned file A is already held by the process-wide holder (the
+        # test created it through Database.connect()). A connection that
+        # SQLite opened on another file B without gaining a descriptor must
+        # still be refused: the held descriptor on A is not SQLite's.
+        database = existing_database(self.root)
+        substitute = existing_database(self.root)
+        opened_elsewhere = sqlite3.connect(
+            substitute, isolation_level=None, factory=pairing_cli._VerifiedConnection)
+        self.addCleanup(opened_elsewhere.close)
+        opened_elsewhere.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        with pairing_cli._ledger(database) as ledger:
+            with patch.object(pairing_cli.sqlite3, "connect", lambda *args, **kwargs: opened_elsewhere):
+                with self.assertRaises(sqlite3.DatabaseError):
+                    ledger.database.connect()
+            self.assertTrue(ledger.database.rejected)
+
+    def test_a_duplicate_held_descriptor_on_the_pinned_file_is_no_witness(self):
+        # The process-wide holder keeps a second descriptor on the pinned
+        # inode in _DUPLICATES (the path was swapped back between stat and
+        # open). It is neither the pin nor a _HELD value, yet it is still
+        # not SQLite's: a connection SQLite opened on another file must be
+        # refused even though that duplicate refers to the pinned inode.
+        database = existing_database(self.root)
+        substitute = existing_database(self.root)
+        opened_elsewhere = sqlite3.connect(
+            substitute, isolation_level=None, factory=pairing_cli._VerifiedConnection)
+        self.addCleanup(opened_elsewhere.close)
+        opened_elsewhere.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        with pairing_cli._ledger(database) as ledger:
+            # Kept open for the process lifetime like every held descriptor.
+            duplicate = os.open(database, os.O_RDONLY | os.O_CLOEXEC)
+            with storage_database._HELD_LOCK:
+                identity = storage_database._adopt_locked(duplicate)
+                self.assertIn(duplicate, storage_database._DUPLICATES)
+                self.assertNotIn(duplicate, storage_database._HELD.values())
+            self.assertEqual(ledger.database._identity, identity)
+            self.assertNotEqual(ledger.database._descriptor, duplicate)
+            self.assertIn(duplicate, held_descriptors())
+            with patch.object(pairing_cli.sqlite3, "connect", lambda *args, **kwargs: opened_elsewhere):
+                with self.assertRaises(sqlite3.DatabaseError):
+                    ledger.database.connect()
+            self.assertTrue(ledger.database.rejected)
+
+    def test_the_test_process_descriptor_limit_is_raised(self):
+        import resource
+        import tests
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        expected = tests.TEST_DESCRIPTOR_LIMIT if hard == resource.RLIM_INFINITY else min(
+            hard, tests.TEST_DESCRIPTOR_LIMIT)
+        self.assertTrue(soft == resource.RLIM_INFINITY or soft >= expected)
 
 
 if __name__ == "__main__":

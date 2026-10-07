@@ -450,6 +450,13 @@ switched to another file only for the moment of the open is refused too. `export
 refuse `listener_authority_mismatch` when the listener certificate was not
 issued by the selected CA directory.
 
+The pin is never closed, not even when the command ends or refuses the file
+(Issue #152): closing any descriptor on the database file would drop every
+SQLite lock the process holds on it, including one an enrollment worker that
+outlived the listener's bounded wait may still hold. Such a worker's later
+commit is refused instead. The descriptor is released only when the command's
+process exits.
+
 **Rotating the Main listener certificate (Issue #125).** The listener leaf
 defaults to 397 days and is not renewed automatically. Rotate it before it
 expires, as the account (and with the privileges) used for `init`:
@@ -691,6 +698,17 @@ fails rather than accepting a merely spawned process. Enabling the unit at boot
 remains an explicit administrator action. Install the Ubuntu package providing
 `venv` for the selected Python before the first release operation; the installer
 fails closed if it cannot create the per-release environment.
+
+**Database volume maintenance (Issue #152).** The service and the pairing CLI
+never close a descriptor they opened on the application database file, because
+closing one would release the process's SQLite locks on it (see
+`app/storage/database.py`). Those descriptors stay open for the life of the
+process, even after the file is replaced, so the volume holding `state` stays
+busy (unmount fails with `EBUSY`) and a replaced database file keeps its blocks
+allocated until the process exits. Remount, restore or replace the database
+volume or file only with `server-sentinel.service` stopped and no pairing CLI
+command running; start the service again afterwards. Never swap the database
+file under a running service.
 
 ## Preservation inventory across update and rollback
 
