@@ -894,6 +894,73 @@ checkout. Use an administrator-private directory outside those
 trees. The console summary carries only statuses and counts; the files contain
 logical IDs and digests and stay deployment-local, never in GitHub.
 
+### Scope, threat model and limits
+
+Owner decision 2026-10-07: the tool guards against a broken or buggy
+migration or update (including a buggy rollback), not against an adversary.
+A `preserved` result means that the invariants below held between `record`
+and `verify`; it is not a proof that every service state is semantically
+intact. The required invariants are:
+
+- recordings: every recording row, its linked segments (catalog fields and
+  the SHA-256, size and single hard link of each `.seg` file), its links and
+  explicit discontinuity markers, with only the growth the recording store
+  performs for a recording in progress. This includes a recording with no
+  linked segment (recorded as `no_evidence`; only its row must survive), whose
+  markers present at record time must stay, and whose first newly linked
+  segment must carry the marker the store adds when that segment does not
+  continue the source cursor recorded at record time (or a publication still
+  catalogued since). Every ready pre-roll spool segment (`state='ready'`,
+  `spool=1`), which a later recording links without re-checking it, must have
+  a file matching its catalog digest, byte length and single link
+  (`spool_file_mismatch` otherwise);
+- the starred flag, which no update may change, and automatic retention only
+  of recordings the retention rules make eligible;
+- the audit tables, append-only except for rows the service retention removes;
+- the Owner and the per-principal grant separation (`live:view` and
+  `recordings:view` independently);
+- revocation is never undone: revoked principals, invitations, pairing
+  credentials, key bindings, capture nodes and invalidated sessions stay
+  revoked or invalidated, and the authorization generation never decreases;
+- the schema and the applied migration history;
+- the session-revocation exposure marker (#134): the
+  `application_metadata` row `auth.reservation.session_revocation_pending`
+  holds only `1`; when it existed at record time and is gone afterwards,
+  verification requires the revocation that alone removes it (a new system
+  `invalidate_human_sessions` audit row, an advanced authorization generation
+  and every recorded session still present invalidated), otherwise it fails as
+  `cleared_without_revocation`;
+- the staged renewal certificate of migration 21:
+  `pairing_node_renewals.certificate_pem` is either NULL (a row staged before
+  the migration) or exactly one PEM certificate whose DER SHA-256 is the
+  staged serial digest, the same check the pairing ledger applies, and a
+  certificate staged at record time stays with its row while the row and its
+  key are kept.
+
+Out of scope, and not claimed by a passing verification:
+
+- detecting deliberate tampering by anyone with write access to the state
+  database or the runtime tree (for example replacing a live session's token
+  digest while keeping its row shape valid, or rewriting rows and their digests
+  consistently); the baseline is an administrator-private file, not a
+  signature;
+- full re-verification of every service's state-transition semantics. The
+  pairing ledger, presence delivery jobs and clocks, and similar service state
+  are checked only as far as the rules above describe; the tables listed as
+  `not_inventoried` are not compared at all.
+
+Known fail-closed side effects (verification fails although the service did
+nothing wrong; investigate, then take a new baseline):
+
+- a session revocation inside the window advances the authorization
+  generation, which ends every recorded invitation, so those invitations are
+  reported `changed`;
+- for a recording with no linked segment at record time, when the first
+  segment that is later linked continues a pre-roll publication that the
+  spool has since evicted, and does not continue the recorded cursor, the
+  marker the tool expects from the recorded cursor is missing and the
+  recording is reported `changed`.
+
 Deployed acceptance of this lifecycle — systemd activation, the trusted-proxy
 boundary, real mount substitution, and the recording/audit content comparison
 across update and rollback — is recorded in `MANUAL_TEST.md` section V for Issue

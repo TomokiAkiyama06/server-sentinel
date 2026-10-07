@@ -33,6 +33,17 @@
   signature counter per usable (unrevoked and consistent) credential, every
   invitation validity field and a keyed digest of its secret digest.
 
+- every ready pre-roll spool segment (its file must match its catalog) and
+  the per-source publish cursor, the reference for the marker the first
+  segment of a recording without evidence must bring;
+- the session-revocation exposure marker (#134) and the staged renewal
+  certificate (migration 21), checked as their services write them.
+
+Threat model (Owner decision 2026-10-07): a broken or buggy migration or
+update. Deliberate tampering by someone with write access to the database
+and full re-verification of every service's transition semantics are out of
+scope (server/docs/DEPLOYMENT.md, "Scope, threat model and limits").
+
 Keyed digests are HMAC-SHA-256 under a random per-baseline salt stored in the
 baseline.
 
@@ -76,8 +87,10 @@ from types import SimpleNamespace
 from uuid import UUID, uuid5
 
 from app.audit.store import DEFAULT_RETENTION as AUDIT_RETENTION, AuditStore
-from app.cameras.remote_agent.pairing import _MAX_KEY_BINDINGS_PER_NODE
+from app.cameras.remote_agent.pairing import (_MAX_KEY_BINDINGS_PER_NODE, PairingValidationError,
+                                              _certificate_pem)
 from app.auth.model import Permission
+from app.auth.reservation_store import HUMAN_SESSIONS_ID, REVOCATION_PENDING_KEY
 from app.auth.store import MAX_REDEMPTION_ATTEMPTS, AccessStore
 from app.cameras.registry.repository import CameraRegistry
 from app.media.recording.store import RecordingStore
@@ -144,7 +157,10 @@ INVENTORIED_TABLES = (
 # NOT_INVENTORIED ones above, still to be covered by #132).
 TRANSIENT_TABLES = {
     "access_webauthn_challenges": "short-lived single-use WebAuthn challenges",
-    "application_metadata": "foundation key/value scaffold, unused by stored evidence",
+    # Only its reservation exposure marker (#134) is state: it is read into
+    # security_state (session_revocation_pending), not the table as a whole.
+    "application_metadata": "key/value store; its session-revocation exposure marker "
+                            "(#134) is checked in security_state",
     "notification_schedule": "daily-summary schedule cursor",
     "presence_delivery_fairness": "round-robin cursor between delivery classes",
     "presence_inputs": "live presence inputs with their own validity windows",
@@ -321,6 +337,78 @@ def _recordings(connection, tables) -> dict | None:
             "decode_verification": "manual",
         }
     return result
+
+
+def _spool_segments(connection, tables) -> dict | None:
+    """Every ready pre-roll spool row (spool=1), read in the snapshot.
+
+    RecordingStore._start() links each overlapping one into a new recording
+    without re-validating it, so its file is checked like linked evidence
+    (_hash_spool()). Its stream position also tells which unlinked
+    publication moved a source cursor after the record (_prior_publication()).
+    """
+    if "recording_segments" not in tables:
+        return None
+    return {row["id"]: {
+        "source_id": row["source_id"], "stream_id": row["stream_id"],
+        "sequence": row["sequence"], "start_ms": row["start_ms"], "end_ms": row["end_ms"],
+        "_catalog": [row["sha256"], row["byte_length"]], "catalog_match": False,
+    } for row in connection.execute(
+        "SELECT id, source_id, stream_id, sequence, start_ms, end_ms, sha256, byte_length "
+        "FROM recording_segments WHERE state = 'ready' AND spool = 1 ORDER BY id")}
+
+
+def _source_cursors(connection, tables) -> dict | None:
+    """The publish cursor per source (stream, sequence, end), as
+    RecordingStore._publish() leaves it; a reference for the first
+    publication into a recording that had no segment at record time."""
+    if "recording_source_cursors" not in tables:
+        return None
+    return {row["source_id"]: [row["stream_id"], row["sequence"], row["end_ms"]]
+            for row in connection.execute(
+                "SELECT source_id, stream_id, sequence, end_ms FROM recording_source_cursors")}
+
+
+def _spool_file_matches(directory: Path, segment_id: str, catalog: list) -> bool:
+    digest, size, links = _file_digest(directory, segment_id)
+    return digest is not None and [digest, size] == catalog and links == 1
+
+
+def _hash_spool(spool: dict | None, directory: Path, database: Path) -> list:
+    """Hash every ready spool file outside the snapshot; return the mismatches.
+
+    A file that does not match its catalog digest, byte length or single
+    hard link is reported unless its row has since left the ready spool
+    (_trim() clears spool=1 before it unlinks an unreferenced file), so a
+    live writer's eviction during hashing is not a loss.
+    """
+    mismatched = []
+    for segment_id, item in (spool or {}).items():
+        catalog = item.pop("_catalog")
+        item["catalog_match"] = _spool_file_matches(directory, segment_id, catalog)
+        if not item["catalog_match"]:
+            mismatched.append((segment_id, catalog))
+    if not mismatched:
+        return []
+    connection = _connect_read_only(database)
+    try:
+        still = []
+        for segment_id, catalog in mismatched:
+            row = connection.execute(
+                "SELECT sha256, byte_length FROM recording_segments WHERE id = ? "
+                "AND state = 'ready' AND spool = 1", (segment_id,)).fetchone()
+            if row is None:
+                del spool[segment_id]
+            elif ([row[0], row[1]] != catalog
+                  or not _spool_file_matches(directory, segment_id, catalog)):
+                still.append(segment_id)
+            else:
+                spool[segment_id]["catalog_match"] = True
+    except sqlite3.Error:
+        raise InventoryError("state database could not be read") from None
+    finally:
+        connection.close()
+    return sorted(still)
 
 
 def _hash_recordings(recordings: dict | None, directory: Path) -> None:
@@ -915,9 +1003,12 @@ def _security_state(connection, tables, salt: str) -> dict:
                         f"{not_after} FROM pairing_node_credentials")
     enrollments = query("pairing_enrollments",
                         "SELECT id, node_id, public_key_digest, state FROM pairing_enrollments")
+    certificate = ("certificate_pem" if "pairing_node_renewals" in tables
+                   and "certificate_pem" in _columns(connection, "pairing_node_renewals")
+                   else "NULL AS certificate_pem")
     renewals = query("pairing_node_renewals",
-                     "SELECT node_id, public_key_digest, credential_serial_digest, not_after "
-                     "FROM pairing_node_renewals")
+                     "SELECT node_id, public_key_digest, credential_serial_digest, not_after, "
+                     f"{certificate} FROM pairing_node_renewals")
 
     def material(row):
         # What PairingLedger.admits() authenticates, as keyed digests; the
@@ -941,14 +1032,30 @@ def _security_state(connection, tables, salt: str) -> dict:
     if pairing_audit is not None:
         pairing_audit = [row for row in pairing_audit if _ledger_audit_row(row)]
     sessions = query("access_sessions", "SELECT id, invalidated_at_us FROM access_sessions")
+    # #134: ReservationSessionRevocation's pending exposure marker and the
+    # audit rows of the revocation that alone removes it.
+    marker = query("application_metadata",
+                   "SELECT value FROM application_metadata WHERE key = "
+                   f"'{REVOCATION_PENDING_KEY}'")
+    revocations = query(
+        "security_admin_audit_records",
+        "SELECT id FROM security_admin_audit_records WHERE actor_category = 'system' "
+        "AND action = 'invalidate_human_sessions' AND target_kind = 'security_settings' "
+        f"AND target_logical_id = '{HUMAN_SESSIONS_ID}' AND outcome = 'succeeded'")
     generation = query("access_deployment_state",
                        "SELECT authorization_generation FROM access_deployment_state")
     return {
         "pairing_credentials": None if credentials is None else {
             row["node_id"]: {"revoked": row["state"] == "revoked", **material(row)}
             for row in credentials},
+        # The staged certificate (migration 21) as a keyed digest of its PEM
+        # text; None for a row staged before it.
         "pairing_renewals": None if renewals is None else {
-            row["node_id"]: material(row) for row in renewals},
+            row["node_id"]: {**material(row), "certificate": None
+                             if row["certificate_pem"] is None
+                             else _keyed(salt, ["pairing-certificate-v1",
+                                                str(row["certificate_pem"])])}
+            for row in renewals},
         # Activated enrollments (a final state: PairingLedger never deletes
         # or changes them) and open ones (pending / consumed, the only states
         # activate() can still complete): id, node and key binding reference.
@@ -978,6 +1085,10 @@ def _security_state(connection, tables, salt: str) -> dict:
         "sessions_invalidated": None if sessions is None else {
             row[0]: row[1] is not None for row in sessions},
         "authorization_generation": generation[0][0] if generation else None,
+        "session_revocation_pending": None if marker is None else (
+            "absent" if not marker else "present" if marker[0][0] == "1" else "invalid"),
+        "session_revocation_audit": None if revocations is None else sorted(
+            row[0] for row in revocations),
     }
 
 
@@ -1481,8 +1592,13 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
                      == (before["material"], before["not_after"], before["revoked"]))
         if recorded is not None and renewal["key_ref"] == recorded["key_ref"]:
             # Kept or retried with its own key: nothing consumed it, so the
-            # credential is exactly as recorded.
-            if not unchanged:
+            # credential is exactly as recorded. A retry replaces only a row
+            # staged without a certificate (before migration 21); one that
+            # holds a certificate is kept exactly (#123 idempotent retry).
+            kept = (recorded.get("certificate") is None
+                    or all(renewal.get(field) == recorded.get(field)
+                           for field in ("material", "not_after", "certificate")))
+            if not (unchanged and kept):
                 fail("pairing_renewals", node, "changed")
         elif not newly_bound(renewal["key_ref"]):
             # Any other staged key was bound by stage_renewal() since the record.
@@ -1517,6 +1633,23 @@ def _compare_security_state(baseline: dict | None, current: dict | None) -> dict
     before, after = baseline.get("authorization_generation"), current.get("authorization_generation")
     if before is not None and (after is None or after < before):
         failed.append({"id": "authorization_generation", "reason": "decreased"})
+    # #134: a pending exposure marker leaves only with the revocation
+    # ReservationSessionRevocation commits in the same transaction: a new
+    # system invalidate_human_sessions audit row, an advanced authorization
+    # generation and every recorded session still present invalidated. An
+    # unreadable marker still counts as pending (the service fails closed).
+    if (baseline.get("session_revocation_pending") == "present"
+            and current.get("session_revocation_pending") not in ("present", "invalid")):
+        audited = set(current.get("session_revocation_audit") or ()) - set(
+            baseline.get("session_revocation_audit") or ())
+        now = current.get("sessions_invalidated")
+        revoked = (bool(audited) and before is not None and after is not None and after > before
+                   and now is not None
+                   and all(now[key] for key in (baseline.get("sessions_invalidated") or {})
+                           if key in now))
+        if not revoked:
+            failed.append({"id": "session_revocation_pending",
+                           "reason": "cleared_without_revocation"})
     return {"status": "failed" if failed else "preserved", "failed": failed}
 
 
@@ -1893,6 +2026,12 @@ def _domain_errors(connection, tables) -> list:
         bad(*message)
     for message in _pairing_row_errors(connection, tables):
         bad(*message)
+    # ReservationSessionRevocation.exposure_pending() accepts only '1'.
+    for row in rows("application_metadata",
+                    "SELECT value FROM application_metadata WHERE key = "
+                    f"'{REVOCATION_PENDING_KEY}'"):
+        if row[0] != "1":
+            bad("security_state", "session_revocation_pending")
     return errors
 
 
@@ -2029,6 +2168,22 @@ def _access_row_errors(connection, tables) -> list:
     return errors
 
 
+def _staged_certificate_valid(row) -> bool:
+    """Migration 21 (#136): NULL (staged before it) or exactly the PEM text
+    stage_renewal() stores, one certificate whose DER SHA-256 is the staged
+    serial digest (pairing._certificate_pem(), which a same-key retry also
+    applies before resending it)."""
+    if "certificate_pem" not in row.keys() or row["certificate_pem"] is None:
+        return True
+    value = row["certificate_pem"]
+    if not isinstance(value, str):
+        return False
+    try:
+        return _certificate_pem(value.encode("ascii"), row["credential_serial_digest"]) == value
+    except (UnicodeError, PairingValidationError):
+        return False
+
+
 def _pairing_row_errors(connection, tables) -> list:
     """Pairing ledger rows as PairingLedger writes them (``_identity``,
     ``_digest`` and ``_expiry``); raw key digests never appear in the report."""
@@ -2058,7 +2213,8 @@ def _pairing_row_errors(connection, tables) -> list:
         for row in connection.execute("SELECT * FROM pairing_node_renewals"):
             if not (_canonical_uuid(row["node_id"]) and _hex_digest(row["public_key_digest"])
                     and _hex_digest(row["credential_serial_digest"])
-                    and expiry(row["not_after"], False)):
+                    and expiry(row["not_after"], False)
+                    and _staged_certificate_valid(row)):
                 bad("pairing_node_renewals", row["node_id"])
     if "pairing_key_bindings" in tables:
         for row in connection.execute("SELECT * FROM pairing_key_bindings"):
@@ -2372,6 +2528,8 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             # (guarded by the schema comparison) already limits.
             "domain_errors": _domain_errors(connection, tables),
             "recordings": _recordings(connection, tables),
+            "spool_segments": _spool_segments(connection, tables),
+            "recording_source_cursors": _source_cursors(connection, tables),
             "audit": _audit(connection, tables),
             "camera_sources": _sources(connection, tables, salt),
             "access": _access(connection, tables, salt),
@@ -2388,6 +2546,11 @@ def collect(runtime_root: Path, *, salt: str | None = None,
     finally:
         connection.close()
     _hash_recordings(inventory["recordings"], tree.recordings)
+    # A ready spool row whose file is missing or differs would hand the next
+    # recording missing media: a current-state failure.
+    for segment_id in _hash_spool(inventory["spool_segments"], tree.recordings, tree.database):
+        inventory["domain_errors"].append(
+            ["recordings", f"spool:{segment_id}", "spool_file_mismatch"])
     inventory["owner_template"] = _owner_template(
         owner_template_root, salt, os.lstat(tree.database).st_uid)
     inventory["inventory_salt"] = salt
@@ -2476,7 +2639,7 @@ def _evidenced(item: dict) -> bool:
 _ACTIVE_SUCCESSORS = frozenset({"active", "complete", "gapped", "interrupted"})
 
 
-def _valid_growth(base: dict, now: dict) -> bool:
+def _valid_growth(base: dict, now: dict, context: dict | None = None) -> bool:
     """Whether a recording active at record time only grew as the store allows.
 
     Source, start, starred and critical flags are immutable; the status may only move to
@@ -2527,7 +2690,7 @@ def _valid_growth(base: dict, now: dict) -> bool:
         return False
     if dropped and not _trimmed_by_stop(base, now, dropped):
         return False
-    return _appended_publications_valid(base, now, remaining)
+    return _appended_publications_valid(base, now, remaining, context or {})
 
 
 def _trimmed_by_stop(base: dict, now: dict, dropped: list) -> bool:
@@ -2606,7 +2769,8 @@ def _expected_ended(now: dict) -> int | None:
                                          default=now["start_ms"]))
 
 
-def _appended_publications_valid(base: dict, now: dict, remaining: Counter) -> bool:
+def _appended_publications_valid(base: dict, now: dict, remaining: Counter,
+                                 context: dict) -> bool:
     """Whether newly linked segments and markers match store publications.
 
     RecordingStore.append() refuses a segment that starts before the source
@@ -2622,17 +2786,41 @@ def _appended_publications_valid(base: dict, now: dict, remaining: Counter) -> b
     """
     ordered = sorted(now["segments"], key=lambda item: (item["start_ms"], item["end_ms"]))
     if not base["segments"]:
-        # Nothing was linked at record time, so the cursor before the first
-        # new segment is not inventoried: that publication may add one
-        # marker ending at the segment's start (from an earlier cursor end).
+        # Nothing was linked at record time: the first new segment followed
+        # the source cursor recorded then, or an unlinked publication since
+        # (_prior_publication()). Its publication adds one marker ending at
+        # its start whenever it does not continue that cursor.
         if not ordered:
             return not +remaining
         allowed = _publication_markers(ordered)
         if allowed is None or +(allowed - remaining):
             return False
         extra = list((+remaining - allowed).elements())
-        return not extra or (len(extra) == 1 and extra[0][2] == "stream_discontinuity"
-                             and extra[0][0] <= extra[0][1] == ordered[0]["start_ms"])
+        first = ordered[0]
+        found, prior = _prior_publication(first, now["source_id"], context)
+        if not found:
+            # No recorded cursor (a baseline written before it was kept):
+            # at most one marker ending at the segment's start.
+            return not extra or (len(extra) == 1 and extra[0][2] == "stream_discontinuity"
+                                 and extra[0][0] <= extra[0][1] == first["start_ms"])
+        if prior is not None and first["start_ms"] < prior[2]:
+            return False  # append() refuses a start before the cursor end
+        lower = prior[2] if prior is not None else None
+        single = (len(extra) == 1 and extra[0][2] == "stream_discontinuity"
+                  and extra[0][1] == first["start_ms"]
+                  and (lower is None or lower <= extra[0][0]) and extra[0][0] <= extra[0][1])
+        if prior is None or (first["catalog"]["stream_id"] == prior[0]
+                             and first["catalog"]["sequence"] == prior[1] + 1):
+            # The first publication on the source, or one continuing the
+            # cursor: a marker only if an evicted publication came between.
+            return not extra or single
+        if (not extra and now["status"] != "active"
+                and first["start_ms"] <= now["start_ms"]):
+            # finish() deletes a marker wholly before the closed window.
+            return True
+        # The marker is due; it may start later only if an evicted
+        # (no longer catalogued) publication moved the cursor in between.
+        return single
     recorded = {item["segment_id"] for item in base["segments"]}
     first_new = next((index for index, item in enumerate(ordered)
                       if item["segment_id"] not in recorded), len(ordered))
@@ -2642,6 +2830,38 @@ def _appended_publications_valid(base: dict, now: dict, remaining: Counter) -> b
     # The store adds the marker in the same transaction that links the
     # segment, so each one must be present exactly once.
     return allowed is not None and +remaining == allowed
+
+
+def _prior_publication(first: dict, source_id: str, context: dict) -> tuple:
+    """The cursor ``first`` was published after: ``(known, (stream, sequence, end) | None)``.
+
+    It is the source cursor recorded at record time, advanced by the latest
+    segment of the source still catalogued now (linked to any recording, or
+    in the ready spool) that was published after it and ends by ``first``'s
+    start. ``None`` as the cursor: the source had none and nothing was
+    published before ``first`` (its first publication adds no marker). Not
+    known when the baseline kept no cursors. A publication evicted from the
+    spool since is not visible; the caller allows for that.
+    """
+    cursors = context.get("cursors")
+    if cursors is None:
+        return False, None
+    prior = cursors.get(source_id)
+    candidates = [(item["start_ms"], item["end_ms"], item["catalog"]["stream_id"],
+                   item["catalog"]["sequence"], item["segment_id"])
+                  for recording in (context.get("recordings") or {}).values()
+                  for item in recording["segments"] if item["source_id"] == source_id]
+    candidates += [(item["start_ms"], item["end_ms"], item["stream_id"], item["sequence"],
+                    segment_id) for segment_id, item in (context.get("spool") or {}).items()
+                   if item["source_id"] == source_id]
+    floor = None if prior is None else prior[2]
+    later = [(end, stream_id, sequence) for start, end, stream_id, sequence, segment_id
+             in candidates if segment_id != first["segment_id"] and end <= first["start_ms"]
+             and (floor is None or start >= floor)]
+    if later:
+        end, stream_id, sequence = max(later)
+        prior = [stream_id, sequence, end]
+    return True, prior
 
 
 def _publication_markers(ordered: list) -> Counter | None:
@@ -2668,7 +2888,8 @@ def _retention_eligible(item: dict, cutoff_ms: int | None) -> bool:
 
 
 def _compare_recordings(baseline: dict | None, current: dict | None, *,
-                        declared: frozenset[str], retention_cutoff_ms: int | None = None) -> dict:
+                        declared: frozenset[str], retention_cutoff_ms: int | None = None,
+                        context: dict | None = None) -> dict:
     result = _compare_keyed(baseline, current, declared=declared,
                             rewrite_only=_declared_rewrite_only)
     if result["status"] == "empty":
@@ -2712,7 +2933,7 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
         now = current.get(key)
         if base["status"] != "active" or now is None:
             continue
-        if _valid_growth(base, now):
+        if _valid_growth(base, now, context):
             failed.remove(entry)
             # Growth from a row without evidence keeps it out of preserved.
             (without if _without_evidence(base) else preserved).append(key)
@@ -3104,9 +3325,12 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
                                                  current.get("schema_migrations")),
         "tables": {"status": "failed" if table_failures else "preserved",
                    "failed": table_failures, "preserved": sorted(set(recorded_tables or ()) & present)},
-        "recordings": _compare_recordings(baseline.get("recordings"),
-                                          current.get("recordings"), declared=declared,
-                                          retention_cutoff_ms=rules["recording_cutoff_ms"]),
+        "recordings": _compare_recordings(
+            baseline.get("recordings"), current.get("recordings"), declared=declared,
+            retention_cutoff_ms=rules["recording_cutoff_ms"],
+            context={"cursors": baseline.get("recording_source_cursors"),
+                     "recordings": current.get("recordings"),
+                     "spool": current.get("spool_segments")}),
         "audit_security_admin": _compare_audit(
             baseline["audit"].get("security_admin"), current["audit"].get("security_admin"),
             rules["security_admin"]),

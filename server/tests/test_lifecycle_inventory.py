@@ -5245,5 +5245,234 @@ class LifecycleInventoryTests(unittest.TestCase):
             self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
 
 
+    def test_a_staged_renewal_certificate_must_be_the_staged_certificate(self):
+        # Migration 21 (#136): pairing_node_renewals.certificate_pem is NULL
+        # (a row staged before the migration) or exactly one PEM certificate
+        # whose DER SHA-256 is the staged serial digest, as
+        # pairing._certificate_pem() checks it. A certificate once staged
+        # stays with its row (a retry of the staged key keeps the row).
+        self.runtime.seed()
+        database = Database(self.runtime.database)
+        ledger = PairingLedger(database, HmacCodeVerifier(b"s" * 32), audit=AuditStore(database),
+                               clock=lambda: 100.0, process_epoch=uuid4())
+
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        owner, node = Owner(), uuid4()
+        approval, code = ledger.approve(owner, "owner", node_id=node, public_key_digest="a" * 64)
+        claim = ledger.redeem(enrollment_id=approval.enrollment_id, public_key_digest="a" * 64,
+                              code=code.value)
+        ledger.activate(claim, credential_serial_digest="b" * 64, not_after=50.0)
+        serial = renewal_serial("staged-certificate")
+        stage_renewal(ledger, node_id=node, current_public_key_digest="a" * 64,
+                      current_credential_digest="b" * 64, public_key_digest="c" * 64,
+                      credential_serial_digest=serial, not_after=90.0)
+        code, baseline = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
+        pem = renewal_certificate(serial).decode("ascii")
+        other = renewal_certificate(renewal_serial("another-certificate")).decode("ascii")
+        corrupted = {"another certificate": other, "not a certificate": "synthetic-not-a-pem",
+                     "two certificates": pem + pem, "truncated": pem[:-40],
+                     "not text": pem.encode("ascii")}
+        for label, value in corrupted.items():
+            with self.subTest(label):
+                self.runtime.execute("UPDATE pairing_node_renewals SET certificate_pem=? "
+                                     "WHERE node_id=?", (value, str(node)))
+                code, report, _ = self.verify(baseline)
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertIn({"id": f"pairing_node_renewals:{node}", "reason": "invalid_value"},
+                              report["sections"]["security_state"]["failed"])
+                self.assert_record_refused("security_state:invalid_value")
+        # The staged certificate vanishing from its kept row is not a ledger path.
+        self.runtime.execute("UPDATE pairing_node_renewals SET certificate_pem=NULL "
+                             "WHERE node_id=?", (str(node),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["security_state"]["failed"],
+                         [{"id": f"pairing_renewals:{node}", "reason": "changed"}])
+        # A row staged before migration 21 (no certificate) gets one from a
+        # retry of its key, which stages the retry's certificate.
+        _, before_migration = self.record("before-migration.json")
+        retried = renewal_serial("retried-certificate")
+        staged = stage_renewal(ledger, node_id=node, current_public_key_digest="a" * 64,
+                               current_credential_digest="b" * 64, public_key_digest="c" * 64,
+                               credential_serial_digest=retried, not_after=95.0)
+        self.assertEqual(staged.certificate_pem, renewal_certificate(retried))
+        code, report, _ = self.verify(before_migration)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
+
+    def test_a_pending_session_revocation_leaves_only_with_its_revocation(self):
+        # #134: application_metadata holds the reservation exposure marker;
+        # it may only disappear through ReservationSessionRevocation, which
+        # advances the authorization generation, invalidates every human
+        # session and appends a system invalidate_human_sessions audit row in
+        # the same transaction.
+        from app.auth.reservation_store import (REVOCATION_PENDING_KEY,
+                                                ReservationSessionRevocation)
+        from app.auth.store import AccessStore
+        self.runtime.seed()
+        database = Database(self.runtime.database)
+        revocation = ReservationSessionRevocation(
+            AccessStore(database, audit=AuditStore(database)))
+        revocation.record_exposure()
+        code, baseline = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        recorded = json.loads(baseline.read_text())
+        self.assertEqual(recorded["security_state"]["session_revocation_pending"], "present")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
+        marker = {"id": "session_revocation_pending", "reason": "cleared_without_revocation"}
+        # An update that drops the marker without the revocation.
+        self.runtime.execute("DELETE FROM application_metadata WHERE key=?",
+                             (REVOCATION_PENDING_KEY,))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["security_state"]["failed"], [marker])
+        # An audit row alone, with the sessions and generation untouched.
+        self.runtime.execute(
+            "INSERT INTO security_admin_audit_records VALUES (?, 'system', "
+            "'invalidate_human_sessions', 'security_settings', "
+            "'0b6f3f64-54a9-4e0f-8f5e-7d2c9a4b1e37', ?, 'succeeded')",
+            (str(uuid4()), self.runtime.clock))
+        code, report, _ = self.verify(baseline)
+        self.assertIn(marker, report["sections"]["security_state"]["failed"])
+        # A marker the service cannot read (it refuses to open access).
+        self.runtime.execute("INSERT INTO application_metadata VALUES (?, '0')",
+                             (REVOCATION_PENDING_KEY,))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": "session_revocation_pending", "reason": "invalid_value"},
+                      report["sections"]["security_state"]["failed"])
+        self.assert_record_refused("security_state:invalid_value")
+        self.runtime.execute("UPDATE application_metadata SET value='1' WHERE key=?",
+                             (REVOCATION_PENDING_KEY,))
+        # The service path clears it with its revocation. Its generation
+        # advance also ends every recorded invitation, which verify reports
+        # as changed invitations (documented fail-closed side effect).
+        revocation.revoke_all_human_sessions()
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(report["sections"]["security_state"],
+                         {"status": "preserved", "failed": []})
+        self.assertEqual({name for name, section in report["sections"].items()
+                          if section["status"] == "failed"}, {"access_invitations"})
+
+    def _recording_store(self, connection):
+        from app.media.recording import RecordingStore, RootIdentity
+        from app.media.recording.model import Limits
+        from tests.test_recording import Reservation, SyntheticValidator
+        media = self.runtime.root / "recordings"
+        info = media.stat()
+        store = RecordingStore(connection, media, RootIdentity(info.st_dev, info.st_ino),
+                               Limits(pre_roll_bytes=4096, max_segment_bytes=512,
+                                      max_segment_ms=30_000, max_active_recordings=8,
+                                      max_spool_segments=16, max_segments_per_recording=100),
+                               Reservation(), SyntheticValidator())
+        self.addCleanup(store.close)
+        return store
+
+    def test_ready_spool_segments_need_their_files(self):
+        # Codex P1: RecordingStore._start() links every overlapping ready
+        # spool row without re-validating it, so a ready spool=1 row whose
+        # .seg file is missing or differs from its catalog digest / length /
+        # single link would hand the next recording missing media.
+        import zlib
+        from app.media.recording import Segment
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        store = self._recording_store(connection)
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        source, stream_id = uuid4(), uuid4()
+        base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+        spooled = [store.append(Segment(source, stream_id, sequence, base + sequence * 10_000,
+                                        base + (sequence + 1) * 10_000, "synthetic", "deflate",
+                                        payload)) for sequence in range(2)]
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM recording_segments WHERE "
+                                        "state='ready' AND spool=1 AND source_id=?",
+                                        (str(source),)).fetchone()[0], 2)
+        code, baseline = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        media = self.runtime.root / "recordings"
+        path = media / (spooled[0].hex + ".seg")
+        expected = {"id": f"spool:{spooled[0]}", "reason": "spool_file_mismatch"}
+        saved = path.read_bytes()
+        for label, tamper in (("missing", path.unlink),
+                              ("replaced", lambda: path.write_bytes(bytes(len(saved)))),
+                              ("hard-linked", lambda: os.link(path, self.notes / "spool-link"))):
+            with self.subTest(label):
+                tamper()
+                code, report, _ = self.verify(baseline)
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertEqual(report["sections"]["recordings"]["failed"], [expected])
+                self.assert_record_refused("recordings:spool_file_mismatch=1")
+                (self.notes / "spool-link").unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
+                path.write_bytes(saved)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+
+    def test_first_segment_marker_of_a_recording_without_evidence_is_required(self):
+        # Codex P1: a recording with no linked segment at record time keeps
+        # the "no evidence" rule (Owner decision 2026-10-05), but the marker
+        # RecordingStore._publish() adds when its first segment does not
+        # continue the source cursor recorded then must not vanish.
+        import zlib
+        from app.media.recording import Segment
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        store = self._recording_store(connection)
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+        switching, lagging = uuid4(), uuid4()
+        stream_a, stream_b = uuid4(), uuid4()
+
+        def put(source, stream_id, sequence, start, end):
+            return store.append(Segment(source, stream_id, sequence, base + start, base + end,
+                                        "synthetic", "deflate", payload))
+        for source in (switching, lagging):
+            for sequence in range(3):
+                put(source, stream_a, sequence, sequence * 10_000, (sequence + 1) * 10_000)
+        switches = store.start_manual(switching, base + 60_000, duration_ms=20_000)
+        lags = store.start_manual(lagging, base + 60_000, duration_ms=20_000)
+        code, baseline = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        recorded = json.loads(baseline.read_text())
+        self.assertEqual(recorded["recordings"][str(switches)]["evidence"], "no_evidence")
+        # A stream change: the publication adds (cursor end, start).
+        put(switching, stream_b, 0, 64_000, 72_000)
+        # An unlinked segment published before the window first moves the
+        # cursor; the linked one continues it, so no marker is due.
+        put(lagging, stream_a, 3, 40_000, 50_000)
+        put(lagging, stream_a, 4, 50_000, 66_000)
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            markers = db.execute("SELECT recording_id, start_ms, end_ms FROM "
+                                 "recording_discontinuities").fetchall()
+        self.assertEqual(markers, [(str(switches), base + 30_000, base + 64_000)])
+        code, report, _ = self.verify(baseline)
+        section = report["sections"]["recordings"]
+        self.assertEqual(code, inventory.EXIT_PRESERVED, section)
+        self.assertEqual(sorted(section["in_progress_at_record"]),
+                         sorted([str(switches), str(lags)]))
+        self.runtime.execute("DELETE FROM recording_discontinuities WHERE recording_id=?",
+                             (str(switches),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["recordings"]["failed"],
+                         [{"id": str(switches), "reason": "changed"}])
+        # A marker that starts before the recorded cursor end is not one the
+        # publication adds either.
+        self.runtime.execute("INSERT INTO recording_discontinuities VALUES "
+                             "(?, ?, ?, 'stream_discontinuity')",
+                             (str(switches), base + 20_000, base + 64_000))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(report["sections"]["recordings"]["failed"],
+                         [{"id": str(switches), "reason": "changed"}])
+
 if __name__ == "__main__":
     unittest.main()
