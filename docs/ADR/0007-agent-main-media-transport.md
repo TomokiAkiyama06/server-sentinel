@@ -72,6 +72,12 @@ explicitly forbidden by the Issue.
    commit is unusable) and its rate window is discarded, and a deactivated
    source releases its active-source slot; undrained gaps of released
    sources are handed back to the caller for persistence, never dropped.
+   The released source's continuity (committed position, attempted epoch,
+   loss already recorded from a refused unit) is kept, hard-bounded, outside
+   the slot table until the durable recording layer acknowledges a watermark
+   covering it, not merely until its units leave the ingest queue, so a
+   reactivated source neither enqueues a unit twice, accepts a stale epoch,
+   nor reports the same loss twice (Issues #113, #118).
 3. **Commit only after bounded admission.** A unit advances continuity only
    after the #14 `AgentIngestQueue` accepts it. Backpressure/rate refusal
    leaves state unchanged so the Agent retries the same sequence from its disk
@@ -90,7 +96,9 @@ explicitly forbidden by the Issue.
    unchanged, keeps the flow `degraded`, and records no loss claim. A
    `duplicate` acknowledgement means "at or behind the committed head", not
    proof that that exact sequence was committed: a late unit behind an
-   already-reported skip is also acknowledged as `duplicate`, so the Agent
+   already-reported skip is also acknowledged as `duplicate` (including a
+   skip or restart recorded from a refused unit that is not committed yet,
+   so media never contradicts the recorded gap), so the Agent
    sends each source in order and keeps loss-window protection independent of
    Main acknowledgements.
 4. **No silent healthy state.** Known loss, clock regression, or backpressure

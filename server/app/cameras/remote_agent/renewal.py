@@ -10,7 +10,8 @@ ledger-admitted mTLS session. This module is the Main side of that exchange:
   ledger's active one and unexpired, and only for a fresh EC P-256 key whose
   CSR requests no subject or extension. It stages the new certificate in the
   ledger. Revoked, expired, superseded or unknown credentials cannot renew and
-  must re-pair.
+  must re-pair. A retry with the same pending key is certificate-idempotent:
+  it is answered with the certificate first staged for that key (Issue #123).
 * Supersession: the old certificate stays admitted until the new one is first
   presented; that first admission atomically promotes the new credential and
   the old certificate is no longer admitted, even though it has not expired.
@@ -19,7 +20,11 @@ ledger-admitted mTLS session. This module is the Main side of that exchange:
   install the response: it keeps using the old certificate and retries.
 * ``CaptureCredentialMonitor`` turns ledger expiry state and renewal refusals
   into Owner-visible local ``capture_credential_warning`` notifications through
-  an injected hook.
+  an injected hook. A renewal refused because the deployment CA expires before
+  the requested leaf would (``renewal_ca_validity_insufficient``, Issue #127)
+  is not a node problem: it raises the deployment-wide
+  ``capture_trust_warning`` instead, as do an expiring CA and an expiring Main
+  listener certificate when the monitor is given their expiry.
 
 No listener or wire protocol is added here; #14/#15 carry the renewal request
 over the ingest session.
@@ -36,7 +41,8 @@ from app.notifications.slack import DeliveryResult
 
 from .ingest_tls import CaptureNodeAdmission, CaptureNodeIdentity
 from .node_ca import (
-    DEFAULT_NODE_VALIDITY, CaptureAuthorityError, DeploymentAuthority, IssuedNodeCredential,
+    DEFAULT_NODE_VALIDITY, AuthorityValidityExceeded, CaptureAuthorityError, DeploymentAuthority,
+    IssuedNodeCredential,
 )
 from .pairing import PairingError, PairingLedger
 
@@ -45,6 +51,11 @@ RENEWAL_WINDOW = datetime.timedelta(days=30)
 # Warn the Owner if a credential is this close to expiry and still not renewed:
 # the Agent has then retried for at least 16 days (see agent RenewalSchedule).
 EXPIRY_WARNING_WINDOW = datetime.timedelta(days=14)
+# Warn this long before the deployment CA stops covering a default-validity
+# node leaf, and before the Main listener certificate expires (the Owner
+# rotates it with ``pairing_cli rotate-listener``).
+TRUST_WARNING_LEAD = datetime.timedelta(days=30)
+CA_VALIDITY_REFUSAL = "renewal_ca_validity_insufficient"
 _MAX_REMEMBERED_SIGNALS = 1024
 # Hook results that confirm the warning was recorded locally (or retained by
 # NotificationService for its own retry). FAILED, any other value, or an
@@ -85,18 +96,32 @@ def renew_node_credential(authority: DeploymentAuthority, ledger: PairingLedger,
         try:
             issued = authority.issue_renewal_certificate(identity.node_id, csr_pem,
                                                          validity=validity)
+        except AuthorityValidityExceeded:
+            # The CSR was valid; the deployment CA expires before the leaf
+            # would. Not the node's fault, and not fixed by retrying.
+            raise RenewalRefused(CA_VALIDITY_REFUSAL) from None
         except CaptureAuthorityError:
             raise RenewalRefused("renewal_request_invalid") from None
         try:
-            ledger.stage_renewal(node_id=identity.node_id,
-                                 current_public_key_digest=identity.public_key_digest,
-                                 current_credential_digest=identity.credential_digest,
-                                 public_key_digest=issued.public_key_digest,
-                                 credential_serial_digest=issued.credential_digest,
-                                 not_after=issued.not_after.timestamp())
+            staged = ledger.stage_renewal(node_id=identity.node_id,
+                                          current_public_key_digest=identity.public_key_digest,
+                                          current_credential_digest=identity.credential_digest,
+                                          public_key_digest=issued.public_key_digest,
+                                          credential_serial_digest=issued.credential_digest,
+                                          not_after=issued.not_after.timestamp(),
+                                          certificate_pem=issued.certificate_pem)
         except (PairingError, ValueError):
             raise RenewalRefused("renewal_not_eligible") from None
-        return issued
+        if staged.credential_serial_digest == issued.credential_digest:
+            return issued
+        # A same-key retry (Issue #123): resend the certificate first staged
+        # for this key; the certificate just signed is never staged or sent.
+        try:
+            return authority.staged_renewal_credential(
+                identity.node_id, issued.public_key_digest,
+                staged.credential_serial_digest, staged.certificate_pem)
+        except CaptureAuthorityError:
+            raise RenewalRefused("renewal_not_eligible") from None
     except RenewalRefused as refusal:
         if monitor is not None:
             monitor.renewal_refused(identity if isinstance(identity, CaptureNodeIdentity) else None,
@@ -124,31 +149,51 @@ class CaptureCredentialMonitor:
     deterministic ``event_id`` so the local sink upserts instead of
     duplicating. Each (node, reason, expiry) is reported once per process
     once confirmed; the remembered set is bounded.
+
+    ``ca_not_after`` (the deployment CA expiry) and ``listener_not_after``
+    (the Main listener certificate expiry) are optional. When given,
+    ``check`` also raises ``capture_trust_warning`` once the CA can no longer
+    cover a ``node_validity`` leaf within ``TRUST_WARNING_LEAD``
+    (``deployment_ca_expiring``), no longer covers one at all
+    (``deployment_ca_validity_insufficient``) or has expired, and once the
+    listener certificate is within ``TRUST_WARNING_LEAD`` of expiry or expired.
     """
 
     def __init__(self, ledger: PairingLedger,
                  notify: Callable[..., object], *,
                  warning_window: datetime.timedelta = EXPIRY_WARNING_WINDOW,
-                 clock: Callable[[], datetime.datetime] = _utc_now):
+                 clock: Callable[[], datetime.datetime] = _utc_now,
+                 ca_not_after: datetime.datetime | None = None,
+                 listener_not_after: datetime.datetime | None = None,
+                 node_validity: datetime.timedelta = DEFAULT_NODE_VALIDITY):
         if not isinstance(ledger, PairingLedger) or not callable(notify):
             raise ValueError("invalid credential monitor dependency")
         if not isinstance(warning_window, datetime.timedelta) or warning_window <= datetime.timedelta(0):
             raise ValueError("invalid credential warning window")
+        if not isinstance(node_validity, datetime.timedelta) or node_validity <= datetime.timedelta(0):
+            raise ValueError("invalid credential warning window")
+        for value in (ca_not_after, listener_not_after):
+            if value is not None and (not isinstance(value, datetime.datetime)
+                                      or value.tzinfo is None):
+                raise ValueError("invalid trust expiry")
         self._ledger = ledger
         self._notify = notify
         self._window = warning_window
         self._clock = clock
+        self._ca_not_after = ca_not_after
+        self._listener_not_after = listener_not_after
+        self._node_validity = node_validity
         self._reported: set[tuple] = set()
         self.signals: list[CredentialSignal] = []
         self.notification_failed = False
 
-    def _signal(self, key: tuple, signal: CredentialSignal, at: datetime.datetime) -> None:
+    def _signal(self, key: tuple, signal: CredentialSignal, at: datetime.datetime, *,
+                kind: NotificationKind = NotificationKind.CAPTURE_CREDENTIAL_WARNING) -> None:
         if key in self._reported:
             return
         event_id = uuid5(_WARNING_NAMESPACE, repr(key))
         try:
-            result = self._notify(NotificationKind.CAPTURE_CREDENTIAL_WARNING, at=at,
-                                  event_id=event_id)
+            result = self._notify(kind, at=at, event_id=event_id)
         except Exception:
             result = None
         if result not in _CONFIRMED:
@@ -164,13 +209,13 @@ class CaptureCredentialMonitor:
     def check(self) -> tuple[CredentialSignal, ...]:
         """Report credentials inside the warning window or already expired."""
         now = self._clock()
-        found = []
+        found = list(self._check_trust(now))
         try:
             expiries = self._ledger.credential_expiries()
         except PairingError:
             signal = CredentialSignal(None, "credential_state_unavailable")
             self._signal(("unavailable", now.date()), signal, now)
-            return (signal,)
+            return tuple(found) + (signal,)
         for entry in expiries:
             expires = datetime.datetime.fromtimestamp(entry.not_after, datetime.timezone.utc)
             if expires <= now:
@@ -184,8 +229,44 @@ class CaptureCredentialMonitor:
             self._signal((entry.node_id, reason, entry.not_after), signal, now)
         return tuple(found)
 
+    def _check_trust(self, now: datetime.datetime) -> tuple[CredentialSignal, ...]:
+        found = []
+        if self._ca_not_after is not None:
+            remaining = self._ca_not_after - now
+            if remaining <= datetime.timedelta(0):
+                reason = "deployment_ca_expired"
+            elif remaining < self._node_validity:
+                reason = "deployment_ca_validity_insufficient"
+            elif remaining < self._node_validity + TRUST_WARNING_LEAD:
+                reason = "deployment_ca_expiring"
+            else:
+                reason = None
+            if reason is not None:
+                found.append(self._trust_signal(reason, self._ca_not_after, now))
+        if self._listener_not_after is not None:
+            remaining = self._listener_not_after - now
+            reason = ("listener_certificate_expired" if remaining <= datetime.timedelta(0)
+                      else "listener_certificate_expiring" if remaining <= TRUST_WARNING_LEAD
+                      else None)
+            if reason is not None:
+                found.append(self._trust_signal(reason, self._listener_not_after, now))
+        return tuple(found)
+
+    def _trust_signal(self, reason: str, expiry: datetime.datetime,
+                      now: datetime.datetime) -> CredentialSignal:
+        signal = CredentialSignal(None, reason)
+        self._signal(("trust", reason, expiry.timestamp()), signal, now,
+                     kind=NotificationKind.CAPTURE_TRUST_WARNING)
+        return signal
+
     def renewal_refused(self, identity: CaptureNodeIdentity | None, reason: str) -> None:
         now = self._clock()
+        if reason == CA_VALIDITY_REFUSAL:
+            # Deployment-wide: one warning per day, not one per node.
+            self._signal(("trust", "renewal_ca_validity_insufficient", now.date()),
+                         CredentialSignal(None, "deployment_ca_validity_insufficient"), now,
+                         kind=NotificationKind.CAPTURE_TRUST_WARNING)
+            return
         node = identity.node_id if identity is not None else None
         self._signal((node, "renewal_refused", reason, now.date()),
                      CredentialSignal(node, "renewal_refused"), now)

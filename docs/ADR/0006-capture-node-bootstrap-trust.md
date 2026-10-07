@@ -267,15 +267,30 @@ status or decision.
     expired or superseded credentials cannot renew; the node must re-pair with a
     fresh Owner approval.
   - *Supersession.* The renewed certificate is staged in the ledger (one per
-    node; a retry replaces it; staging writes no audit record, so repeated
-    requests cannot grow the audit table). The old certificate stays admitted
+    node; a retry with a fresh key replaces it; staging writes no audit record,
+    so repeated requests cannot grow the audit table). The old certificate stays admitted
     until the renewed one is first presented. That admission atomically promotes
     it and appends an `activate_capture_node_credential` record (actor `system`).
     From then on only the new certificate is admitted, even though the old one
     has not expired. This keeps exactly one active credential per node, so
     revocation and audit stay per node. An Agent that never received or
     installed the response is not locked out: it keeps its old certificate and
-    retries. Revocation deletes any staged renewal.
+    retries. Revocation deletes any staged renewal. A connection that loses a
+    concurrent promotion of the same staged renewal re-reads the active
+    credential in its write transaction and is admitted only if its exact key
+    and certificate are now active (Issue #121); it writes no second audit
+    record, and a revocation committed in between still refuses it.
+  - *Certificate-idempotent retries (Issue #123).* The staged row also keeps
+    the issued certificate's public PEM (migration 21; never a key or CSR),
+    checked against the staged certificate digest. A retry with the currently
+    staged key (the Agent reuses its pending key) leaves the row unchanged and
+    is answered with that first certificate, re-verified as this CA's leaf for
+    the same node and key; the certificate signed for the retry is never staged
+    or sent. So a delayed first response and every retry response name the one
+    staged credential. A stored certificate that fails these checks is refused
+    (`renewal_not_eligible`) rather than replaced. A row staged before
+    migration 21 has no certificate; its next same-key retry stages a new one as
+    before.
   - *Key uniqueness (Owner decision 2026-09-30).* A node public key is bound
     to at most one node, for good. `pairing_key_bindings` records every key
     the ledger approves, activates, stages or promotes and is never pruned. Approval,
@@ -417,7 +432,41 @@ acceptance" above except where listed at the end.
   separate processes (the concurrency test uses threads against the real
   listener); real LAN interoperability (MANUAL_TEST §B, unverified); a narrower
   issuance capability than the CLI process holding the CA key while it serves;
-  Main listener-certificate renewal; the #6 Owner-authentication boundary.
+  Main listener-certificate renewal (now a manual rotation command; see the 2026-10-05 notes); the #6
+  Owner-authentication boundary.
+
+## Follow-up notes (2026-10-05, Issues #124, #125, #127)
+
+These notes record implementation progress; they do not change this ADR's
+status or decision.
+
+- **Main listener rotation.** `pairing_cli rotate-listener` replaces the Main
+  listener key and leaf in place, signed by the unchanged deployment CA and
+  with the unchanged server name, so Agent trust bundles stay valid. It runs
+  under an exclusive directory lock, refuses a listener certificate that the
+  selected CA did not issue, writes the new pair under staged names and renames
+  each over the current file; an interrupted run is completed by the next one,
+  and readers refuse a mismatched key/certificate pair. Listener processes
+  reload the pair on restart. Rotation is manual (Owner command); the monitor
+  can warn 30 days before listener expiry once a scheduler runs it.
+- **Separate accounts.** Listener material can belong to a dedicated ingest
+  account: the CLI hands new files to that account before writing key bytes,
+  which needs `CAP_CHOWN` + `CAP_DAC_OVERRIDE` for that command only, and
+  refuses up front without them. This does not yet separate the CA key from the
+  enrollment listener process (#109).
+- **Concurrent `init`.** Both directories are locked for the whole run and the
+  rollback removes only the entries the run created.
+- **Operator mistakes.** `export-bundle` and `approve` refuse a listener
+  certificate the selected CA did not issue (`listener_authority_mismatch`);
+  `approve`, `list` and `revoke` refuse a missing or unsafe `--database`
+  instead of creating and migrating an empty one, refuse a schema that is not
+  exactly this release's instead of migrating it, and keep the validated file
+  pinned so a later replacement is refused rather than written to.
+- **CA validity.** A leaf beyond the CA expiry raises a dedicated error. Node
+  renewal reports `renewal_ca_validity_insufficient` and the deployment-wide
+  local `capture_trust_warning`; `approve` and `rotate-listener` refuse
+  `deployment_ca_validity_insufficient` before changing state. CA replacement
+  remains a new `init` plus re-pairing, as above.
 
 ## Follow-up notes (2026-10-07, Issues #116/#117 re-pairing and enrollment serialization)
 
