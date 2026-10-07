@@ -134,13 +134,18 @@ def _unit_path(value: Path | str) -> str:
 
 
 def render_unit(root: Path, config: Path, deployment: Deployment,
-                account: pwd.struct_passwd) -> str:
-    """Render the Main Server service unit.
+                account: pwd.struct_passwd, *, socket_activation: bool = False) -> str:
+    """Render the Main Server service unit for a release.
 
-    The human upstream is created by systemd through
-    ``server-sentinel-upstream.socket`` and passed with ``Sockets=`` (Issue
-    #126); a host without that unit only loses the passed socket, so the
-    reservation check keeps human access closed. ``AF_NETLINK`` is required
+    ``socket_activation`` is the target release's own capability
+    (``_supports_socket_activation``). Only then does the unit name the human
+    upstream socket created by ``server-sentinel-upstream.socket`` with
+    ``Sockets=`` (Issue #126): that also adds implicit ``Wants=`` and
+    ``After=`` on the socket unit, so a unit for a release that cannot accept
+    the socket must not have it, or every start of that release would pull a
+    disabled socket unit back onto its endpoint. A host without the socket
+    unit only loses the passed socket, so the reservation check keeps human
+    access closed. ``AF_NETLINK`` is required
     for the unprivileged sock_diag listener-creator lookup, and the unit keeps
     the host network namespace (no ``PrivateNetwork=``) and
     ``ProtectControlGroups=true`` (not ``private``/``strict``), which keep
@@ -157,6 +162,9 @@ def render_unit(root: Path, config: Path, deployment: Deployment,
         deployment.state_directory, deployment.recordings_directory,
         deployment.audit_directory,
     ))
+    if type(socket_activation) is not bool:
+        raise ValueError("invalid socket activation capability")
+    sockets = f"Sockets={UPSTREAM_SOCKET_UNIT}\n" if socket_activation else ""
     return f"""[Unit]
 Description=ServerSentinel Main Server
 After=local-fs.target network.target
@@ -171,8 +179,7 @@ Group={account.pw_gid}
 WorkingDirectory={_unit_path(current)}
 ExecStartPre={_quote(python)} -m app.deployment --config {_quote(config)} --check
 ExecStart={_quote(python)} -m app.deployment --config {_quote(config)}
-Sockets=server-sentinel-upstream.socket
-Restart=on-failure
+{sockets}Restart=on-failure
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -246,6 +253,13 @@ def _supports_socket_activation(release: Path) -> bool:
     return SOCKET_ACTIVATION_CAPABILITY.search(text) is not None
 
 
+def _names_upstream_socket(unit: str) -> bool:
+    """Whether a unit depends on the upstream socket unit in any directive."""
+    return any(UPSTREAM_SOCKET_UNIT in line.split("=", 1)[1]
+               for line in unit.splitlines()
+               if "=" in line and not line.lstrip().startswith(("#", ";")))
+
+
 def _unprivileged_port_start() -> int | None:
     try:
         value = UNPRIVILEGED_PORT_START.read_text(encoding="ascii").strip()
@@ -264,8 +278,9 @@ def _socket_unit_in_use(runner) -> bool:
         except (OSError, subprocess.SubprocessError, ValueError):
             # Timed out, not executable, or failed: unknown, so in use.
             return True
-        # 0 is active / enabled. Only "not enabled" (1), "inactive" (3) and
-        # "no such unit" (4) are a clear no; anything else counts as in use.
+        # 0 is active / enabled. Only "not enabled" (1, also "masked"),
+        # "inactive" (3) and "no such unit" (4) are a clear no; anything else
+        # counts as in use.
         if getattr(result, "returncode", None) not in (1, 3, 4):
             return True
     return False
@@ -306,16 +321,20 @@ def _require_startable(args, root: Path, target: str, deployment: Deployment, ru
         f"  1. edit {args.config}: set \"human_port\" to the port that release used, at or\n"
         "     above /proc/sys/net/ipv4/ip_unprivileged_port_start\n"
         f"  2. sudo systemctl disable --now {UPSTREAM_SOCKET_UNIT}\n"
-        "     (the running service keeps its passed socket until it is restarted)\n"
+        f"     sudo systemctl mask {UPSTREAM_SOCKET_UNIT}\n"
+        "     (masked, so no unit's Sockets=/Wants= can start it again; the running\n"
+        "     service keeps its passed socket until it is restarted)\n"
         f"  3. run the same command again: ... {rerun}\n"
         "     (it restarts the service on that release, which binds the port itself)\n"
         "  4. point the Tailscale Serve target at http://<human_host>:<that port>\n"
         "  5. verify: ss -ltn shows the service on that port and the dashboard answers\n"
         "To return to socket activation later, in this order:\n"
-        "  1. update to a release that supports it (it still binds the old port itself)\n"
+        "  1. update to a release that supports it (the socket unit is still masked, so it\n"
+        "     is not pulled in and the release still binds the old port itself)\n"
         f"  2. edit {args.config}: set \"human_port\" back to the ListenStream port of\n"
         f"     {UPSTREAM_SOCKET_UNIT} (below ip_unprivileged_port_start)\n"
-        f"  3. sudo systemctl enable --now {UPSTREAM_SOCKET_UNIT}\n"
+        f"  3. sudo systemctl unmask {UPSTREAM_SOCKET_UNIT}\n"
+        f"     sudo systemctl enable --now {UPSTREAM_SOCKET_UNIT}\n"
         "  4. sudo systemctl restart server-sentinel.service\n"
         "     (starting the socket unit cannot hand its socket to the running service)\n"
         "  5. point the Tailscale Serve target back at http://<human_host>:<that port>\n"
@@ -539,7 +558,7 @@ def _release_unit(root: Path, target: str) -> Path:
 
 
 def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
-           unit_content: str) -> str:
+           render) -> tuple[str, str]:
     if not VERSION.fullmatch(args.version):
         raise ValueError("invalid release version")
     content = read_artifact(args.artifact)
@@ -558,6 +577,9 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
         staging.mkdir(mode=0o755)
         try:
             _extract(content, staging, args.version)
+            # The unit follows the staged release's own capability, never the
+            # installer's: see render_unit.
+            unit_content = render(_supports_socket_activation(staging))
             root_environment = {
                 "PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1", "PYTHONSAFEPATH": "1",
             }
@@ -581,7 +603,7 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
             raise
     finally:
         os.umask(previous_umask)
-    return "releases/" + args.version
+    return "releases/" + args.version, unit_content
 
 
 def _under(resolved: Path, roots) -> bool:
@@ -668,7 +690,12 @@ def _execute_locked(args, runner) -> None:
     account = pwd.getpwuid(deployment.service_uid)
     if account.pw_uid == 0:
         raise ValueError("dedicated non-root account required")
-    unit_content = render_unit(args.destination, args.config, deployment, account)
+
+    def render(socket_activation: bool) -> str:
+        return render_unit(args.destination, args.config, deployment, account,
+                           socket_activation=socket_activation)
+
+    render(False)  # validate the account and paths before any change
     if args.command in {"install", "update"}:
         args.python = _trusted_python(args.python)
         if args.command == "install":
@@ -686,7 +713,7 @@ def _execute_locked(args, runner) -> None:
                     raise ValueError("installed service configuration differs")
             else:
                 _replace_unit(snapshot, previous_unit, mode=0o444)
-        target = _stage(args, deployment, account, runner, unit_content)
+        target, unit_content = _stage(args, deployment, account, runner, render)
         try:
             _require_startable(args, args.destination, target, deployment, runner)
         except Exception:
@@ -741,6 +768,11 @@ def _execute_locked(args, runner) -> None:
             raise ValueError("installed service configuration differs")
         target_unit = _installed_unit(_release_unit(args.destination, target))
         _require_startable(args, args.destination, target, deployment, runner)
+        if (not _supports_socket_activation(args.destination / target)
+                and _names_upstream_socket(target_unit)):
+            # A snapshot naming the socket would pull it back in on every
+            # start of a release that cannot accept it.
+            raise ValueError("installed service configuration differs")
         restored = False
 
         def restore_unit() -> None:

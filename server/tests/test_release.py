@@ -600,7 +600,8 @@ class ReleaseLifecycleTests(unittest.TestCase):
                 "app.deployment._operating_system_root_device",
                 return_value=self.runtime.stat().st_dev + 1):
             deployment = Deployment.load(self.config, code_root=code_root)
-        unit = render_unit(self.installation, self.config, deployment, account)
+        unit = render_unit(self.installation, self.config, deployment, account,
+                           socket_activation=True)
         working = [line for line in unit.splitlines()
                    if line.startswith("WorkingDirectory=")]
         self.assertEqual(working, ["WorkingDirectory=" + str(self.installation / "current")])
@@ -618,6 +619,14 @@ class ReleaseLifecycleTests(unittest.TestCase):
         # namespace and the host cgroup view.
         lines = unit.splitlines()
         self.assertIn("Sockets=server-sentinel-upstream.socket", lines)
+        # Only for a release that accepts the socket (PR #153 review): Sockets=
+        # implies Wants=/After= on the socket unit.
+        legacy = render_unit(self.installation, self.config, deployment, account)
+        self.assertNotIn("server-sentinel-upstream.socket", legacy)
+        self.assertEqual([line for line in lines if "server-sentinel-upstream.socket" not in line],
+                         legacy.splitlines())
+        with self.assertRaises(ValueError):
+            render_unit(self.installation, self.config, deployment, account, socket_activation=1)
         self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK", lines)
         self.assertIn("ProtectControlGroups=true", lines)
         self.assertFalse(any(line.startswith(("PrivateNetwork=", "NetworkNamespacePath=", "PrivateUsers="))
@@ -1128,9 +1137,19 @@ class ActivationBoundaryTests(unittest.TestCase):
         self.port_start = port_start.start()
         self.addCleanup(port_start.stop)
 
+    def legacy(self, *versions):
+        """Model releases built before app/release_capabilities.py existed."""
+        real = install._supports_socket_activation
+
+        def capability(release):
+            name = Path(release).name.lstrip(".").removesuffix(".staging")
+            return False if name in versions else real(release)
+
+        return patch("install._supports_socket_activation", side_effect=capability)
+
     def installed_old_then_new(self):
-        self.perform(self.arguments("install", "1.0.0"))
-        # Model a release built before app/release_capabilities.py existed.
+        with self.legacy("1.0.0"):
+            self.perform(self.arguments("install", "1.0.0"))
         (self.installation / "releases/1.0.0" / install.RELEASE_CAPABILITIES).unlink()
         self.perform(self.arguments("update", "1.1.0"))
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.1.0")
@@ -1209,6 +1228,50 @@ class ActivationBoundaryTests(unittest.TestCase):
         self.assertFalse((self.installation / "releases/1.1.0").exists())
         self.assertIn("run the same command again: ... update ...", str(refused.exception))
 
+    def unit_names_socket(self, path=None):
+        return "Sockets=server-sentinel-upstream.socket" in (path or self.unit).read_text().splitlines()
+
+    def test_unit_names_the_socket_only_for_an_activation_release(self):
+        # PR #153 review: Sockets= implies Wants=/After= on the socket unit, so
+        # a release that cannot accept the socket must not pull it back in.
+        with self.legacy("1.0.0"):
+            self.perform(self.arguments("install", "1.0.0"))
+        self.assertFalse(self.unit_names_socket())
+        self.assertFalse(self.unit_names_socket(self.installation / "releases/1.0.0/.server-sentinel.service"))
+        self.perform(self.arguments("update", "1.1.0"))
+        self.assertTrue(self.unit_names_socket())
+        self.assertTrue(self.unit_names_socket(self.installation / "releases/1.1.0/.server-sentinel.service"))
+
+    def test_activation_legacy_activation_cycle_renders_the_matching_unit(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        self.assertTrue(self.unit_names_socket())
+        # Owner steps done (socket unit masked: inactive, not enabled; an
+        # unprivileged human_port), then forward to a release without the capability.
+        with self.legacy("1.1.0"):
+            self.perform(self.arguments("update", "1.1.0"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.1.0")
+        (self.installation / "releases/1.1.0" / install.RELEASE_CAPABILITIES).unlink()
+        self.assertFalse(self.unit_names_socket())
+        # Back to an activation release.
+        self.perform(self.arguments("update", "1.2.0"))
+        self.assertTrue(self.unit_names_socket())
+        # Rollbacks restore each release's own snapshot.
+        self.perform(self.arguments("rollback", "1.1.0"))
+        self.assertFalse(self.unit_names_socket())
+        self.perform(self.arguments("rollback", "1.0.0"))
+        self.assertTrue(self.unit_names_socket())
+
+    def test_rollback_refuses_a_legacy_snapshot_that_names_the_socket(self):
+        self.installed_old_then_new()
+        snapshot = self.installation / "releases/1.0.0/.server-sentinel.service"
+        snapshot.chmod(0o644)
+        snapshot.write_text(snapshot.read_text().replace(
+            "[Service]\n", "[Service]\nSockets=server-sentinel-upstream.socket\n", 1))
+        before = self.state()
+        with self.assertRaisesRegex(ValueError, "installed service configuration differs"):
+            self.perform(self.arguments("rollback"))
+        self.assertEqual(self.state(), before)
+
     def test_unknown_socket_state_counts_as_in_use(self):
         self.installed_old_then_new()
         self.runner.socket_codes["is-active"] = 5
@@ -1254,10 +1317,12 @@ class ActivationBoundaryTests(unittest.TestCase):
 
         ordered(switch, ['set "human_port" to the port that release used',
                          "sudo systemctl disable --now server-sentinel-upstream.socket",
+                         "sudo systemctl mask server-sentinel-upstream.socket",
                          "run the same command again: ... rollback",
                          "point the Tailscale Serve target at", "verify:"])
         ordered(back, ["update to a release that supports it",
                        'set "human_port" back to the ListenStream port',
+                       "sudo systemctl unmask server-sentinel-upstream.socket",
                        "sudo systemctl enable --now server-sentinel-upstream.socket",
                        "sudo systemctl restart server-sentinel.service",
                        "point the Tailscale Serve target back at", "verify:"])

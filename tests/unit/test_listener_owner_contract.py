@@ -62,8 +62,13 @@ class UpstreamSocketUnitTests(unittest.TestCase):
         installer = (ROOT / "server" / "install.py").read_text(encoding="utf-8")
         start = installer.index('return f"""[Unit]')
         template = installer[start:installer.index('"""', start + len('return f"""'))].splitlines()
+        # Sockets= is rendered only for a release with the activation capability.
+        self.assertIn('sockets = f"Sockets={UPSTREAM_SOCKET_UNIT}\\n" if socket_activation else ""', installer)
+        self.assertIn("{sockets}", template[template.index(next(line for line in template
+                                                                  if line.startswith("ExecStart=")))
+                                            + 1])
         for line in ("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
-                     "Sockets=server-sentinel-upstream.socket", "CapabilityBoundingSet=",
+                     "CapabilityBoundingSet=",
                      "AmbientCapabilities=", "ProtectControlGroups=true"):
             self.assertIn(line, template)
         for line in template:

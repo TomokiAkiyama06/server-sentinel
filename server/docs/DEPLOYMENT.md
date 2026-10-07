@@ -282,6 +282,9 @@ binds the port itself, which the check treats as a configuration error: human
 access stays closed without revocation. These are host
 administration steps for the Owner:
 
+0. Update to a release that supports socket activation first (this one or
+   later; `app/release_capabilities.py` declares it). An older release ignores
+   the passed socket and could not start on the new port.
 1. Choose a free loopback port below 1024 (the template uses `880`) and set
    `"human_port"` in the deployment configuration to it, with
    `"human_host": "127.0.0.1"`. Point the Tailscale Serve mapping at
@@ -543,9 +546,11 @@ configuration path:
 ```sh
 # 1. edit the deployment configuration: "human_port" back to the port that
 #    release used (at or above /proc/sys/net/ipv4/ip_unprivileged_port_start)
-# 2. stop the socket unit; the running service keeps its passed socket until
-#    it is restarted, so the dashboard stays up until step 3
+# 2. stop and mask the socket unit; masked, no unit's Sockets=/Wants= and no
+#    reboot can start it again. The running service keeps its passed socket
+#    until it is restarted, so the dashboard stays up until step 3
 sudo systemctl disable --now server-sentinel-upstream.socket
+sudo systemctl mask server-sentinel-upstream.socket
 # 3. the same command again; it restarts the service on that release, which
 #    binds the restored port itself (no separate restart is needed)
 sudo /tmp/server-sentinel-installer-<version>.pyz --destination ... --config ... \
@@ -554,19 +559,24 @@ sudo /tmp/server-sentinel-installer-<version>.pyz --destination ... --config ...
 # 5. verify: ss -ltn shows the service on that port and the dashboard answers
 ```
 
-Run step 3 right after step 2: while the newer release is still running, its
-`Sockets=` dependency starts the socket unit again if that service restarts,
-and the rerun then refuses again.
+Mask, not only disable: a service unit with `Sockets=` also `Wants=` the
+socket unit, so a disabled but present socket unit would be started again by
+any start of an activation release (including the installer's own restart and
+its automatic recovery). The installer renders `Sockets=` only into the unit
+of a release that declares the capability, and a rollback refuses a stored
+unit of a release without it that still names the socket unit.
 
 To return to socket activation later, in this order:
 
 ```sh
-# 1. update to a release that supports socket activation; it still binds the
-#    old, unprivileged port itself (the reservation check keeps human access
-#    closed without revocation until step 4)
+# 1. update to a release that supports socket activation; the socket unit is
+#    still masked, so its Sockets= does not pull it in and the release binds
+#    the old, unprivileged port itself (the reservation check keeps human
+#    access closed without revocation until step 4)
 # 2. edit the deployment configuration: "human_port" back to the ListenStream
 #    port of server-sentinel-upstream.socket (below ip_unprivileged_port_start)
 # 3. bind the socket; starting it cannot hand it to the running service
+sudo systemctl unmask server-sentinel-upstream.socket
 sudo systemctl enable --now server-sentinel-upstream.socket
 # 4. restart the service so systemd passes the socket and the new port applies
 sudo systemctl restart server-sentinel.service
