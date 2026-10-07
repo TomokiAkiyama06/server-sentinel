@@ -40,34 +40,107 @@ class _Template:
     provenance: ModelProvenance = field(repr=False)
 
 
-def _unsubstitutable(descriptor):
+def _unsubstitutable(descriptor, owner=None):
     """Refuse a path component that another user could rename or replace.
 
     SQLite canonicalizes the connection filename and derives auxiliary names
     such as the rollback journal from it, so binding only the opened database
     is not enough: every ancestor must be owned by this service or root and
     must not be writable by others unless it is sticky, where only an entry's
-    own owner may rename or unlink it.
+    own owner may rename or unlink it. ``owner`` is the service account a
+    read-only inspector running as another user expects (default: this one).
     """
     info = os.fstat(descriptor)
-    if (info.st_uid not in (0, os.geteuid())
+    if (info.st_uid not in (0, os.geteuid() if owner is None else owner)
             or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
         raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNSAFE_PATH")
 
 
-def _directory(path: Path):
+def _service_groups(owner) -> frozenset:
+    """Group IDs of the service account, for the search-permission check."""
+    if owner is None:
+        return frozenset((os.getegid(), *os.getgroups()))
+    try:
+        import pwd
+        account = pwd.getpwuid(owner)
+        return frozenset(os.getgrouplist(account.pw_name, account.pw_gid))
+    except (ImportError, KeyError, OSError):
+        return frozenset()
+
+
+def _traversable(info, owner, groups) -> bool:
+    """Whether the service account may search this directory (its ``x`` bit).
+
+    A read-only inspector running as root can always traverse, so the bits
+    that would apply to the service account are checked explicitly. Only
+    the classic owner / group / other bits are read; POSIX ACLs are ignored.
+    """
+    uid = os.geteuid() if owner is None else owner
+    if info.st_uid == uid:
+        return bool(info.st_mode & stat.S_IXUSR)
+    if info.st_gid in groups:
+        return bool(info.st_mode & stat.S_IXGRP)
+    return bool(info.st_mode & stat.S_IXOTH)
+
+
+def _directory(path: Path, owner=None):
     if not path.is_absolute() or ".." in path.parts:
         raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNAVAILABLE")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    groups = _service_groups(owner)
     descriptor = os.open("/", flags)
     try:
-        _unsubstitutable(descriptor)
+        _unsubstitutable(descriptor, owner)
         for part in path.parts[1:]:
+            # The service account must be able to search every ancestor.
+            if not _traversable(os.fstat(descriptor), owner, groups):
+                raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNAVAILABLE")
             next_descriptor = os.open(part, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
-            _unsubstitutable(descriptor)
+            _unsubstitutable(descriptor, owner)
         return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _private_root(info, owner) -> bool:
+    # Exactly 0700, like the other runtime directories: no group / other
+    # access, and the service account can list, create and remove entries
+    # (SQLite writes its rollback journal beside the database).
+    return info.st_uid == owner and stat.S_IMODE(info.st_mode) == 0o700
+
+
+def _private_file(info, owner) -> bool:
+    # Exactly 0600: no group / other access, and the owner can read and
+    # write it (a root inspector could read a 0400 / 0200 / 0000 file the
+    # service itself cannot open read-write).
+    return (stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+            and info.st_uid == owner and stat.S_IMODE(info.st_mode) == 0o600)
+
+
+def open_private_root(root: Path, *, owner: int):
+    """Open an existing store root under the invariants the store enforces.
+
+    For a read-only inspector (the lifecycle inventory) running as another
+    user: every path component is unsubstitutable and searchable by
+    ``owner``, the root is owned by ``owner`` with mode exactly 0700, and an existing database is a
+    single-link regular file (never a symlink) owned by ``owner`` with mode
+    exactly 0600. Returns the verified directory descriptor and whether
+    the database exists; raises OwnerError otherwise.
+    """
+    descriptor = _directory(root, owner)
+    try:
+        if not _private_root(os.fstat(descriptor), owner):
+            raise OwnerError("PRIVATE_TEMPLATE_ROOT_PERMISSIONS")
+        try:
+            entry = os.stat("owner-template.sqlite3", dir_fd=descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return descriptor, False
+        if not _private_file(entry, owner):
+            raise OwnerError("PRIVATE_TEMPLATE_FILE_PERMISSIONS")
+        return descriptor, True
     except BaseException:
         os.close(descriptor)
         raise
@@ -105,7 +178,7 @@ class OwnerTemplateStore:
         try:
             self._fd = _directory(root)
             info = os.fstat(self._fd)
-            if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            if not _private_root(info, os.geteuid()):
                 raise OwnerError("PRIVATE_TEMPLATE_ROOT_PERMISSIONS")
             self._identity = (info.st_dev, info.st_ino)
             fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -114,8 +187,7 @@ class OwnerTemplateStore:
                 descriptor = os.open("owner-template.sqlite3", flags | os.O_CREAT, 0o600, dir_fd=self._fd)
                 try:
                     file_info = os.fstat(descriptor)
-                    if (not stat.S_ISREG(file_info.st_mode) or file_info.st_nlink != 1
-                            or file_info.st_uid != os.geteuid() or file_info.st_mode & 0o077):
+                    if not _private_file(file_info, os.geteuid()):
                         raise OwnerError("PRIVATE_TEMPLATE_FILE_PERMISSIONS")
                     self._file_identity = (file_info.st_dev, file_info.st_ino)
                 finally:
@@ -156,8 +228,8 @@ class OwnerTemplateStore:
             raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNAVAILABLE")
         path = f"{directory}/owner-template.sqlite3"
         entry = os.stat(path, follow_symlinks=False)
-        if ((entry.st_dev, entry.st_ino) != self._file_identity or not stat.S_ISREG(entry.st_mode)
-                or entry.st_nlink != 1 or entry.st_uid != os.geteuid() or entry.st_mode & 0o077):
+        if ((entry.st_dev, entry.st_ino) != self._file_identity
+                or not _private_file(entry, os.geteuid())):
             raise OwnerError("PRIVATE_TEMPLATE_FILE_UNAVAILABLE")
         return path
 
@@ -188,13 +260,12 @@ class OwnerTemplateStore:
             descriptor = _directory(self._root)
             info = os.fstat(descriptor)
             if ((info.st_dev, info.st_ino) != self._identity
-                    or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+                    or not _private_root(info, os.geteuid())):
                 raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNAVAILABLE")
             entry = os.stat("owner-template.sqlite3", dir_fd=descriptor,
                             follow_symlinks=False)
             if ((entry.st_dev, entry.st_ino) != self._file_identity
-                    or not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1
-                    or entry.st_uid != os.geteuid() or entry.st_mode & 0o077):
+                    or not _private_file(entry, os.geteuid())):
                 raise OwnerError("PRIVATE_TEMPLATE_FILE_UNAVAILABLE")
             with self._reservation():
                 connection = sqlite3.connect(
@@ -247,12 +318,11 @@ class OwnerTemplateStore:
         try:
             descriptor = _directory(self._root)
             info = os.fstat(descriptor)
-            if (info.st_dev, info.st_ino) != self._identity or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            if (info.st_dev, info.st_ino) != self._identity or not _private_root(info, os.geteuid()):
                 raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNAVAILABLE")
             file_info = os.stat("owner-template.sqlite3", dir_fd=descriptor, follow_symlinks=False)
             if ((file_info.st_dev, file_info.st_ino) != self._file_identity
-                    or not stat.S_ISREG(file_info.st_mode) or file_info.st_nlink != 1
-                    or file_info.st_uid != os.geteuid() or file_info.st_mode & 0o077):
+                    or not _private_file(file_info, os.geteuid())):
                 raise OwnerError("PRIVATE_TEMPLATE_FILE_UNAVAILABLE")
         except OSError:
             raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNAVAILABLE") from None

@@ -215,6 +215,52 @@ class ListenerRotationTests(ListenerLifecycleHarness):
         handshake(build_enrollment_server_context(material.certificate_path, material.key_path),
                   self.agent_context((authority / "ca-certificate.pem").read_bytes()))
 
+    def test_interrupted_rotation_is_completed_even_when_the_ca_cannot_cover_a_new_leaf(self):
+        # Issue #148: the staged certificate was already issued while the CA
+        # covered it. Recovery must run before the new leaf's window is
+        # checked against the CA expiry, or the mismatched pair is stranded.
+        authority, listener = self.fresh()
+        self.init(authority, listener, "--ca-validity-days", "100", "--server-validity-days", "30")
+        real_replace = PrivateDirectory.replace_with
+
+        def stop_after_key(directory, staged, name):
+            if name == "main-server-certificate.pem":
+                raise node_ca.CaptureAuthorityError("issuer material could not be replaced")
+            return real_replace(directory, staged, name)
+        with patch.object(PrivateDirectory, "replace_with", stop_after_key):
+            status, _stdout, stderr = self.rotate(authority, listener, "--server-validity-days", "30")
+        self.assertEqual(2, status)
+        with self.assertRaises(ListenerMaterialInconsistent):
+            listener_material(PrivateDirectory(listener))
+        staged = (listener / "main-server-certificate.pem.next").read_bytes()
+        # The default (397-day) validity is beyond this CA, yet the rerun
+        # completes the interrupted rotation instead of refusing.
+        status, stdout, stderr = self.rotate(authority, listener)
+        self.assertEqual(0, status, stderr)
+        self.assertIn("listener rotation completed (interrupted run)", stdout)
+        self.assertEqual(sorted(LISTENER_FILES), sorted(os.listdir(listener)))
+        self.assertEqual(staged, (listener / "main-server-certificate.pem").read_bytes())
+        material = listener_material(PrivateDirectory(listener))
+        handshake(build_enrollment_server_context(material.certificate_path, material.key_path),
+                  self.agent_context((authority / "ca-certificate.pem").read_bytes()))
+        # With nothing left to recover, the same validity is refused again.
+        before = self.snapshot(listener)
+        status, _stdout, stderr = self.rotate(authority, listener)
+        self.assertEqual(2, status)
+        self.assertIn("refused: deployment_ca_validity_insufficient", stderr)
+        self.assertEqual(before, self.snapshot(listener))
+
+    def test_rotation_validity_range_is_still_checked_before_anything_changes(self):
+        authority, listener = self.fresh()
+        self.init(authority, listener)
+        before = self.snapshot(listener)
+        ca = DeploymentAuthority.load(PrivateDirectory(authority),
+                                      deployment_id_of(PrivateDirectory(authority)))
+        for bad in (0 * DAY, 398 * DAY, None):
+            with self.subTest(validity=bad), self.assertRaises(node_ca.CaptureAuthorityError):
+                ca.rotate_main_server_credential(PrivateDirectory(listener), validity=bad)
+        self.assertEqual(before, self.snapshot(listener))
+
     def test_rotation_keeps_recovery_state_when_the_key_rename_is_not_durable(self):
         # Codex PR #141: the key rename succeeds but the directory fsync after
         # it fails. The new key is already current, so the staged certificate
@@ -393,6 +439,50 @@ class SeparateListenerAccountTests(ListenerLifecycleHarness):
         # The listener account (here this process) reads it as its own.
         listener_material(PrivateDirectory(listener))
 
+    def test_mode_is_never_changed_after_the_ownership_change(self):
+        # Issue #149: with only CAP_CHOWN + CAP_DAC_OVERRIDE, changing the
+        # mode of a file already handed to another account needs CAP_FOWNER
+        # and fails EPERM. Simulate that kernel rule for every descriptor.
+        authority, listener = self.fresh()
+        real_uid = os.geteuid()
+        handed = set()
+        real_fchown, real_fchmod = os.fchown, os.fchmod
+
+        def tracking_fchown(descriptor, uid, gid):
+            handed.add(os.fstat(descriptor).st_ino)
+            return real_fchown(descriptor, uid, gid)
+
+        def fowner_fchmod(descriptor, mode):
+            if os.fstat(descriptor).st_ino in handed:
+                raise PermissionError(errno.EPERM, "synthetic: CAP_FOWNER required")
+            return real_fchmod(descriptor, mode)
+        with patch.object(node_ca, "_effective_uid", lambda: real_uid + 4242), \
+                patch.object(node_ca, "ownership_privilege_available", lambda *, assign: True), \
+                patch("app.cameras.remote_agent.node_ca.os.fchown", tracking_fchown), \
+                patch("app.cameras.remote_agent.node_ca.os.fchmod", fowner_fchmod):
+            ca = DeploymentAuthority.initialize(
+                PrivateDirectory(authority, owner_uid=real_uid),
+                PrivateDirectory(listener, owner_uid=real_uid),
+                uuid4(), validity=3650 * DAY, server_name=SERVER_NAME,
+                server_validity=30 * DAY)
+            rotation = ca.rotate_main_server_credential(
+                PrivateDirectory(listener, owner_uid=real_uid), validity=30 * DAY)
+        self.assertFalse(rotation.recovered)
+        self.assertTrue(handed)
+        self.assertEqual(sorted(LISTENER_FILES), sorted(os.listdir(listener)))
+        for name in LISTENER_FILES:
+            self.assertEqual(0o600, stat.S_IMODE(os.lstat(listener / name).st_mode))
+        listener_material(PrivateDirectory(listener))
+
+    def test_new_files_are_0600_even_under_a_narrowing_umask(self):
+        directory = PrivateDirectory(self.root / f"umask-{uuid4()}").ensure()
+        previous = os.umask(0o277)
+        try:
+            directory.write_new("value", b"synthetic")
+        finally:
+            os.umask(previous)
+        self.assertEqual(0o600, stat.S_IMODE(os.lstat(directory.path / "value").st_mode))
+
     def test_missing_privilege_is_refused_before_anything_is_written(self):
         authority, listener = self.fresh()
         other = os.geteuid() + 4242
@@ -494,6 +584,53 @@ class AuthorityValidityTests(ListenerLifecycleHarness):
         self.assertEqual(2, status)
         self.assertIn("refused: deployment_ca_validity_insufficient", stderr)
         self.assertFalse(database.exists())
+
+
+class TrustExpiryReportTests(ListenerLifecycleHarness):
+    """Issue #127: the CLI shows the CA expiry with the monitor's 30-day warning words."""
+
+    def test_far_expiry_prints_the_ca_expiry_without_a_warning(self):
+        authority, listener = self.fresh()
+        status, stdout, stderr = run_cli("init", "--authority-dir", str(authority),
+                                         "--listener-dir", str(listener),
+                                         "--server-name", SERVER_NAME)
+        self.assertEqual(0, status, stderr)
+        self.assertRegex(stdout, r"^deployment_id=\S+\n$")
+        self.assertIn("serversentinel-pairing: ca_not_after=", stderr)
+        self.assertNotIn("warning", stderr)
+
+    def test_ca_close_to_no_longer_covering_a_node_leaf_is_warned(self):
+        authority, listener = self.fresh()
+        # 420 days left: within 30 days of falling below a 397-day node leaf.
+        status, stdout, stderr = run_cli("init", "--authority-dir", str(authority),
+                                         "--listener-dir", str(listener),
+                                         "--server-name", SERVER_NAME,
+                                         "--ca-validity-days", "420")
+        self.assertEqual(0, status, stderr)
+        self.assertIn("warning: deployment_ca_expiring ca_not_after=", stderr)
+        status, stdout, stderr = self.rotate(authority, listener, "--server-validity-days", "60")
+        self.assertEqual(0, status, stderr)
+        self.assertNotIn("ca_not_after", stdout)
+        self.assertIn("ca_not_after=", stderr)
+        self.assertIn("warning: deployment_ca_expiring", stderr)
+        self.assertNotIn("listener_certificate", stderr)
+        status, _stdout, stderr = run_cli(
+            "export-bundle", "--authority-dir", str(authority), "--listener-dir", str(listener),
+            "--endpoint", "10.0.0.5:8443", "--output", str(self.root / f"bundle-{uuid4()}.json"))
+        self.assertEqual(0, status, stderr)
+        self.assertIn("warning: deployment_ca_expiring", stderr)
+
+    def test_ca_that_no_longer_covers_a_node_leaf_and_expiring_listener_are_warned(self):
+        authority, listener = self.fresh()
+        status, _stdout, stderr = run_cli("init", "--authority-dir", str(authority),
+                                          "--listener-dir", str(listener),
+                                          "--server-name", SERVER_NAME,
+                                          "--ca-validity-days", "100",
+                                          "--server-validity-days", "20")
+        self.assertEqual(0, status, stderr)
+        self.assertIn("warning: deployment_ca_validity_insufficient", stderr)
+        self.assertIn("warning: listener_certificate_expiring listener_not_after=", stderr)
+        self.assertNotIn("PRIVATE KEY", stderr)
 
 
 class EnrollmentListenerRebindTests(ListenerLifecycleHarness):

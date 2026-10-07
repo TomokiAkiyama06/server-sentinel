@@ -220,6 +220,8 @@ The ingest listener:
 
 The capture machine does not need to join Tailscale merely to forward video over the same private LAN.
 
+Capture-network boundary (Owner decision 2026-10-07, Issue #150): capture enrollment and ingest are private-LAN only and never run over Tailscale. The Main refuses the Tailscale address ranges IPv4 `100.64.0.0/10` and IPv6 `fd7a:115c:a1e0::/48` (including IPv4-mapped spellings) for the enrollment bind, the ingest bind and the `export-bundle --endpoint` value (`enrollment_bind_requires_private_address`, `ingest_bind_tailscale_address_refused`, `trust_bundle_endpoint_tailscale_address_refused`). The Agent refuses a Main endpoint in those ranges, from the bundle, a `pair --endpoint` override or a DNS name's connected peer address, with `main_endpoint_tailscale_address_refused` before the TLS handshake. The refusal is by address range only: a private LAN that is not Tailscale but uses these ranges is refused too and must expose the Main on another private address. This keeps capture traffic off the Tailnet path; it is a fail-closed configuration check, not an authentication mechanism (node admission still requires mTLS and the ledger's active record).
+
 ## Human authorization
 
 ### Two-gate rule
@@ -405,8 +407,8 @@ and ADR-0003):
   lookup that is denied, fails, times out or fails its self-check; a socket
   missing from the lookup; a creating cgroup that is deleted, the root cgroup
   or `/init.scope` while the socket's uid is an expected one, or
-  `/init.scope` with uid 0; an unconfirmed mismatch; an upstream holder seen
-  in only one of two scans; a kernel-owned socket; an upstream port that is
+  `/init.scope` with uid 0; an unconfirmed mismatch; an upstream holder not
+  seen in all three scans; a kernel-owned socket; an upstream port that is
   not privileged; an unreadable descriptor table) keeps human access closed
   without revoking sessions, and access reopens once ownership verifies. An
   unresolved creating cgroup with a uid none of the expected identities has

@@ -58,7 +58,9 @@ out-of-order earlier staged key is refused. Such a retry is
 certificate-idempotent (Issue #123): the staged row keeps the issued
 certificate's public PEM, bound to its digest, and the retry is answered with
 that first certificate (re-verified as this CA's leaf for the node and key)
-instead of a newly signed one. A connection that loses a concurrent promotion
+instead of a newly signed one. The staged certificate is looked up before
+anything is signed, so a retry after the CA fell below the leaf validity still
+receives it (#148). A connection that loses a concurrent promotion
 of the same staged renewal is admitted if its exact key and certificate are by
 then the active credential (Issue #121).
 `CaptureCredentialMonitor` raises the local `capture_credential_warning`
@@ -72,11 +74,15 @@ monitor also raises `capture_trust_warning` 30 days before the CA stops
 covering a 397-day node leaf (`deployment_ca_expiring`), once it no longer
 does, when the CA expired, and 30 days before / after expiry of the Main
 listener certificate. The renewal exchange and the monitor are not yet run by
-any listener or scheduler (#14/#15).
+any listener or scheduler (#14/#15); meanwhile `pairing_cli` `init`,
+`rotate-listener`, `export-bundle` and `approve` print the CA expiry and the
+same warning words on stderr (`ca_expiry_reason` / `listener_expiry_reason`).
 
 Listener credential lifecycle (#124/#125). `PrivateDirectory(owner_uid=...)`
-may name another account than the process: new entries are then `fchown`-ed
-to it before any content is written, which needs effective `CAP_CHOWN` and
+may name another account than the process: new entries get their final 0600
+mode and are then `fchown`-ed to it before any content is written (no mode
+change after the ownership change, which would need `CAP_FOWNER`, #149),
+which needs effective `CAP_CHOWN` and
 `CAP_DAC_OVERRIDE` (reading needs `CAP_DAC_OVERRIDE` or
 `CAP_DAC_READ_SEARCH`); without them every access refuses
 (`OwnershipPrivilegeRequired`) before anything is created.
@@ -89,7 +95,8 @@ keeps its server name, writes the new pair under `*.next` names, then renames
 key and certificate over the current files. A run interrupted between the two
 renames -- or whose key rename took effect but could not be fsynced
 (`ReplacementNotDurable`, which keeps the staged certificate) -- is completed
-by the next rotation; `listener_material` refuses a
+by the next rotation, before the new validity is checked against the CA
+expiry (#148); `listener_material` refuses a
 mismatched pair (`ListenerMaterialInconsistent`) meanwhile. The CA is never
 touched, so Agent trust bundles stay valid.
 

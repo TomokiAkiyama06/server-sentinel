@@ -108,7 +108,7 @@ class UnverifiedOwnershipContractTests(unittest.TestCase):
             "`server-sentinel-upstream.socket`",
             "residual risk the Owner accepted on 2026-10-07",
             "An unresolved creating cgroup with a uid that none of the expected identities has is another creator",
-            "still holds it in a second scan of the same check",
+            "still holds it in a second scan of the same check and again in a third, whatever executable it runs",
             "A kernel-owned socket (inode 0",
         ),
         "SPECIFICATION.md": (
@@ -142,6 +142,38 @@ class DeploymentRequirementTests(unittest.TestCase):
         self.assertFalse("sudo systemctl disable --now ssh.socket" in text)
         self.assertFalse("Until the privileged socket-owner helper of Issue #126 lands" in text)
 
+    def test_ssh_socket_switch_stops_the_service_before_binding_the_socket(self):
+        # Issue #158: ``disable`` alone leaves the running daemon on tcp/22.
+        text = normalized(ROOT / "server" / "docs" / "DEPLOYMENT.md")
+        stop = text.find("sudo systemctl disable --now ssh.service")
+        bind = text.find("sudo systemctl enable --now ssh.socket")
+        self.assertGreaterEqual(stop, 0)
+        self.assertGreater(bind, stop)
+        self.assertIn("console", text[stop - 600:stop])
+        self.assertNotIn("sudo systemctl disable ssh.service", text)
+        self.assertNotIn("sudo systemctl restart ssh.service", text)
+
+    def test_cgroup_bpf_prerequisite_and_system_account_exceptions(self):
+        # Issues #157 and #160.
+        text = normalized(ROOT / "server" / "docs" / "DEPLOYMENT.md")
+        for phrase in ("cgroup-BPF support", "`UPSTREAM_CREATED_IN_INIT_SCOPE`",
+                       "`/init.scope` is never accepted instead",
+                       "dedicated system account", "never one whose `User=` is a person's account"):
+            self.assertIn(phrase, text)
+
+    def test_upstream_holder_confirmation_matches_adr_0003(self):
+        # Issue #160 / PR #170 review: the holder rule follows ADR-0003 (any
+        # executable), confirmed in three scans, and the ADR records it.
+        adr = normalized(ROOT / "docs" / "ADR" / "0003-owner-authentication-and-trusted-proxy.md")
+        self.assertIn("Clarification, 2026-10-07 (Issue #160)", adr)
+        self.assertIn("The executable the holder runs is not part of the condition", adr)
+        for name in ("REQUIREMENTS.md", "SPECIFICATION.md", "SECURITY.md"):
+            text = normalized(ROOT / name)
+            self.assertNotIn("backend's own executable", text, name)
+            self.assertNotIn("only one of two scans", text, name)
+        readme = normalized(ROOT / "server" / "app" / "auth" / "README.md")
+        self.assertIn("again in a third scan", readme)
+        self.assertNotIn("other than the backend's own", readme)
 
 
 class SecurityNoteTests(unittest.TestCase):
