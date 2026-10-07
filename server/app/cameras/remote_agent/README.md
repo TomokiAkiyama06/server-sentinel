@@ -154,9 +154,14 @@ reissued (also after `forget_node` and re-enrollment), `forget_node` also
 discards the node's ingest rate window under the tracker lock (so a
 re-enrolled node UUID never inherits the old credential's rate/clock state),
 and `forget_source`
-releases a deactivated source's slot and returns its undrained gaps; while
-that source's accepted units are still queued its committed position is kept
-outside the slot limit, so a retry after reactivation stays a `duplicate`. The
+releases a deactivated source's slot and returns its undrained gaps; its
+continuity (committed position, attempted epoch, loss already recorded from a
+refused unit) is kept outside the slot limit, hard-bounded by
+`maximum_released_sources`, until the durable recording layer calls
+`acknowledge_persisted` with a watermark covering it, so a retry after
+reactivation stays a `duplicate` and the same loss is never reported twice
+(leaving the ingest queue is not durability). A late unit behind loss already
+recorded from a refused unit is acknowledged as `duplicate`, never admitted. The
 node/source lifecycle commits a durable revocation or source deactivation
 inside `authorization_change` (tracker, or queue for direct queue users), so
 it is serialized with every grant, liveness refresh, charge and enqueue. On
