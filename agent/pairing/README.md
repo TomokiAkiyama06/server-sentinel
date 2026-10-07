@@ -54,7 +54,15 @@ when it is parsed, an IP literal (bundle or `pair --endpoint`) before
 connecting, and a DNS name by the address it actually connected to, before the
 TLS handshake. The ranges are matched by address only
 (`media_capture_agent.addresses`), so another private network that reuses them
-is refused too.
+is refused too. A DNS name is therefore refused only after the TCP connect, and
+because the first address that connects decides, a capture endpoint name must
+resolve only to LAN addresses. A bundle with a Tailscale endpoint is refused at
+parse time even with a LAN `pair --endpoint`; re-export it. The check does not
+inspect routing (a subnet route or exit node on a capture host that optionally
+runs Tailscale can still carry LAN-addressed traffic over `tailscale0`) and is
+not authentication or isolation. The connected-peer check lives in
+`connect_to_main`; the ingest client to be added in #14 / #15 must connect
+through `connect_to_main` so it applies there too.
 
 Automatic renewal (Owner decision 2026-09-30): `RenewalSchedule` starts 30 days
 before the installed certificate expires and backs off from 1 hour to at most
