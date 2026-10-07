@@ -356,6 +356,10 @@ def parse_proc_net_udp(text: str, *, ipv6: bool, byteorder: str = sys.byteorder)
     return _parse_proc_net(text, ipv6=ipv6, byteorder=byteorder, protocol=TransportProtocol.UDP)
 
 
+_PROC_NET_HEADER_V4 = ["sl", "local_address", "rem_address", "st"]
+_PROC_NET_HEADER_V6 = ["sl", "local_address", "remote_address", "st"]
+
+
 def _parse_proc_net(text: str, *, ipv6: bool, byteorder: str, protocol: TransportProtocol) -> tuple[Listener, ...]:
     listening = TCP_LISTEN if protocol is TransportProtocol.TCP else UDP_UNCONNECTED
     if not isinstance(text, str):
@@ -363,8 +367,13 @@ def _parse_proc_net(text: str, *, ipv6: bool, byteorder: str, protocol: Transpor
     lines = text.splitlines()
     if not lines or len(lines) > MAX_PROC_NET_LINES:
         raise ReservationEnumerationError("MALFORMED_PROC_NET")
+    # The kernel names the peer column per family: tcp4/udp4 print
+    # ``rem_address`` (net/ipv4/tcp_ipv4.c, udp.c) and tcp6/udp6 print
+    # ``remote_address`` (net/ipv6/tcp_ipv6.c, datagram.c). Only the spelling
+    # of the file's own family is accepted; any other header fails closed.
     header = lines[0].split()
-    if header[:4] != ["sl", "local_address", "rem_address", "st"]:
+    expected = _PROC_NET_HEADER_V6 if ipv6 else _PROC_NET_HEADER_V4
+    if header[:4] != expected:
         raise ReservationEnumerationError("MALFORMED_PROC_NET")
     result = []
     for line in lines[1:]:
