@@ -49,6 +49,18 @@ COMMITTED_LOCK_WAIT = 2.0
 COMMITTED_LOCK_POLL = 0.005
 
 
+# Unadmitted (rollback-journal) reads of this process run one at a time. A
+# read holds its SHARED lock for the whole read (#151), and SQLite's unix VFS
+# lets a connection of a process that already holds SHARED take it again
+# without checking the PENDING lock a waiting writer of another process holds.
+# Two overlapping reads here would then keep the file read-locked between
+# them and could starve that writer past its busy timeout; read one at a time,
+# the lock is released after each read and the waiting writer's PENDING stops
+# the next one until the commit. The wait matches the service busy timeout.
+_UNADMITTED_READS = threading.RLock()
+UNADMITTED_READ_WAIT = 5.0
+
+
 # The first 16 bytes of every SQLite database file. Header bytes 18 and 19
 # are the file-format write and read versions: 2 selects WAL, which is
 # persistent in the file itself rather than per connection.
@@ -180,24 +192,86 @@ class PresenceService:
         never create a file, keep working during a storage hard stop.
         ``immutable`` is never used: it would read a file a live writer is
         changing as if nothing could change it.
+
+        Another process able to write the file can still switch it to WAL, or
+        replace it with a WAL database, after the header was classified
+        (#151). An unadmitted read therefore re-reads the header after its
+        open and then holds one read transaction for the whole read: its
+        SHARED lock keeps any other connection from taking the EXCLUSIVE lock
+        a switch to WAL needs, so the mode cannot change under it between
+        statements. Only a switch between that re-read and the lock remains;
+        the connection itself then reports WAL, and the read is abandoned
+        before the caller sees it and retried under the reservation, whose
+        closing read-write connection removes the sidecars the abandoned read
+        created. Under a refused reservation that retry fails the read, and
+        those sidecars (an empty ``-wal`` and one ``-shm`` region) stay until
+        the next admitted connection closes: SQLite exposes no step between
+        locking the file and opening its WAL where the read could stop first.
+
+        Unadmitted reads of this process are serialized (``_UNADMITTED_READS``)
+        so that their read transactions never overlap: overlapping ones would
+        keep the file read-locked between them and could starve a writer in
+        another process, such as a recording append, past its busy timeout.
         """
+        path = self.database.path
+        if not path.is_absolute() or path.is_symlink():
+            raise ValueError("database location is unavailable")
+        if not _wal_database(path):
+            if not _UNADMITTED_READS.acquire(timeout=UNADMITTED_READ_WAIT):
+                raise RuntimeError("presence read busy")
+            try:
+                connection = self._unadmitted_connection(path)
+                if connection is not None:
+                    with closing(connection):
+                        try:
+                            yield connection
+                        finally:
+                            if connection.in_transaction:
+                                connection.rollback()
+                    return
+            finally:
+                _UNADMITTED_READS.release()
         with ExitStack() as held:
-            path = self.database.path
-            if not path.is_absolute() or path.is_symlink():
-                raise ValueError("database location is unavailable")
-            admitted = _wal_database(path)
-            if admitted:
-                held.enter_context(self._admission())
+            held.enter_context(self._admission())
             if isinstance(self.database, PinnedDatabase):
-                connection = self.database.connect() if admitted else self.database.connect_read_only()
+                connection = self.database.connect()
             else:
-                connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if admitted else "?mode=ro"),
-                                             uri=True, timeout=5, isolation_level=None)
+                connection = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=5,
+                                             isolation_level=None)
             held.enter_context(closing(connection))
-            if admitted:
-                connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA query_only=ON")
             connection.row_factory = sqlite3.Row
             yield connection
+
+    def _unadmitted_connection(self, path):
+        """A ``mode=ro`` read of a rollback-journal database, or None if it is WAL.
+
+        The returned connection holds an open read transaction (and so the
+        SHARED lock) that the caller ends. None means the file turned out to
+        be WAL after the first classification and the read must be admitted.
+        """
+        if isinstance(self.database, PinnedDatabase):
+            connection = self.database.connect_read_only()
+        else:
+            connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5,
+                                         isolation_level=None)
+        try:
+            # No statement has touched the file yet, so a switch seen here
+            # costs nothing: the connection closes before SQLite reads it.
+            if _wal_database(path):
+                connection.close()
+                return None
+            connection.execute("BEGIN")
+            connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+                connection.rollback()
+                connection.close()
+                return None
+        except BaseException:
+            connection.close()
+            raise
+        connection.row_factory = sqlite3.Row
+        return connection
 
     def _session_key(self):
         return os.path.realpath(self.database.path)
@@ -1122,8 +1196,11 @@ class PresenceService:
 
     def audit(self, context):
         self._owner(context)
+        # Rows are copied in one statement and turned into dicts after the
+        # read transaction ends, so its SHARED lock is not held for that work.
         with self._read() as db:
-            return [dict(row) for row in db.execute("SELECT * FROM presence_audit ORDER BY sequence")]
+            rows = db.execute("SELECT * FROM presence_audit ORDER BY sequence").fetchall()
+        return [dict(row) for row in rows]
 
     def expire_audit(self, *, now, limit=1000):
         """Apply the main 90-day audit policy to owner-control history.
@@ -1219,6 +1296,13 @@ class PresenceService:
         window = [timestamp(received_from), timestamp(received_to)]
         page = ""
         if cursor is not None:
+            # The index range starts at the cursor rather than the window
+            # start, so a late page reads about one page of rows instead of
+            # every row before it while it holds the read lock. `received` is
+            # a uniform UTC text stamp compared byte-wise by SQLite, which
+            # Python's code-point order on the same text matches, so the
+            # tighter bound selects exactly the rows the OR below selects.
+            window[0] = max(window[0], cursor[0])
             page = "AND (received>? OR (received=? AND sequence>?)) "
             window += [cursor[0], cursor[0], cursor[1]]
         with self._read() as db:

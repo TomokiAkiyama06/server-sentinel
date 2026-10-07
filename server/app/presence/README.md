@@ -309,6 +309,85 @@ orphaned, but its staged and unwritten counts are reported as unknown
 owning process. Counts are only added,
 so a retried write that had committed overstates the gap rather than hiding it.
 
+### Rollback-journal read lock (#151)
+
+Another process able to write the database file could switch it to WAL (or
+replace it with a WAL database) between the header probe and the read. An
+unadmitted read therefore re-reads the header through the held descriptor
+after its open, then holds one read transaction, and so the SQLite SHARED
+lock, for the whole read: a switch to WAL needs EXCLUSIVE, so the mode cannot
+change between its statements. If the connection still reports WAL once it
+holds the lock, the read is abandoned before the caller sees it and retried
+under the storage reservation; a refused reservation fails the read (WAL
+admission stays fail-closed).
+
+A held SHARED lock makes a writer of the same file, such as a recording
+append (busy timeout 5 s), wait until the read ends, so the work under it is
+kept small and independent of the retained timeline:
+
+- A history page with a cursor starts its index range at the cursor, not at
+  the window start, so a late page reads about one page of rows.
+- `audit()` copies its rows in one statement and builds the response after the
+  read ends.
+- Unadmitted reads of one process run one at a time. SQLite's unix VFS lets a
+  connection of a process that already holds SHARED take it again without
+  checking the PENDING lock a waiting writer in another process holds, so
+  overlapping reads could keep the file read-locked indefinitely and starve
+  that writer past its busy timeout. One at a time, the lock is released
+  after each read and the writer's PENDING holds the next read back until the
+  commit. Reads of other modules in the same process are not covered by this
+  serialization.
+
+`ReadLockBoundTests` guards these properties deterministically (SQLite VM
+steps under the lock, and the order of a waiting writer and the next read)
+and with a cross-process writer whose busy timeout is 1 s while two threads
+run large reads.
+
+Measured on the development host (32 threads, SQLite 3.46.1, Python 3.12,
+database on tmpfs, so no disk latency), as the duration of each `_read()`
+context, an upper bound on its SHARED lock. Synthetic data for 60 days of 4
+sources (three times the default 20-day recording retention): *realistic* is
+400 crossings, 400 gate-quality facts and 50 health facts per source per day,
+5 critical events per day with 2 delivery rows each, and 20 audit rows per
+day for the 90-day audit retention (204,300 observations, 135 MiB);
+*stress* is 4,320 crossings and 4,320 gate facts per source per day (one fact
+every 10 s per source), 500 critical events per day and 500 audit rows per day
+(2,103,600 observations, 60,000 delivery rows, 45,000 audit rows, 1.4 GiB).
+200 runs per read (50 for audit), longest single read transaction:
+
+| Read | realistic p99 / max | stress p99 / max |
+| --- | --- | --- |
+| Owner status (`snapshot`) | 0.31 / 0.32 ms | 6.98 / 7.13 ms |
+| history, 60-day window, first page, limit 500 | 0.42 / 0.52 ms | 0.37 / 0.40 ms |
+| history, 60-day window, mid-window cursor, limit 500 | 0.57 / 0.61 ms | 0.40 / 0.43 ms |
+| history, 1-hour window, limit 500 | 0.34 / 0.38 ms | 0.52 / 0.55 ms |
+| `audit()` (all retained rows) | 1.16 / 1.42 ms | 21.07 / 21.32 ms |
+| `timeline_gap()` | 0.31 / 0.35 ms | 0.24 / 0.26 ms |
+
+Before the cursor bound, the mid-window history page held the lock for
+p99 47 ms (stress) because it scanned every row from the window start. A
+separate process committing small transactions (busy timeout 5 s) while two
+threads read in a loop with no pause waited at most 8 ms (realistic) and
+53 ms (stress); without the serialization above, the same stress run either
+waited up to 1.3 s or exceeded the 5 s busy timeout and failed. The status
+read scans `presence_deliveries` without an index on `state`, and `audit()`
+returns every row inside the 90-day audit retention; both grow only with
+critical deliveries and Owner control actions, not with the timeline.
+
+Residual race: a switch to WAL after the post-open header re-read but before
+the read's first lock lets SQLite open the WAL right after it reads page 1,
+and SQLite offers no step in between where the read could stop. The read is
+then retried under the reservation, whose closing connection removes the
+sidecars. Only while the reservation is refused (`STORAGE_HARD_STOP`) the
+read fails and leaves an empty `-wal` and one 32 KiB `-shm` region until the
+next admitted connection closes; later reads during the same stop see the WAL
+header first and are refused before they open the file, so nothing more is
+created. When the switching process keeps its own WAL open, the sidecars are
+that process's files and the read writes no WAL frame. The application never
+switches its database to WAL, so only another process with write access to
+the database can cause this, and removing the sidecars here is unsafe while
+any other connection may still use them. This is accepted as a residual risk.
+
 `owner_presence_validity` and `maximum_source_latency` have no default; they
 are deployment decisions that need real-room and cross-host clock evaluation.
 

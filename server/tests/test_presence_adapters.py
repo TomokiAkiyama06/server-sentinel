@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from unittest import TestCase, mock
 from uuid import UUID, uuid4
 
@@ -1212,13 +1213,18 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         def gap(db):
             result = original(db)
             if not fired and result is None:
-                # The outbox persists its count between the two status reads.
-                fired.append(True)
-                self.outbox.flush()
+                # The outbox persists its count while the status read is in
+                # progress. The read holds its read transaction (#151), so the
+                # flush commits as soon as that read ends.
+                flush = threading.Thread(target=self.outbox.flush)
+                fired.append(flush)
+                flush.start()
             return result
         self.presence._gap = gap
         status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
         self.assertTrue(fired)
+        fired[0].join(30)
+        self.assertFalse(fired[0].is_alive())
         self.assertTrue(status["timeline_gap"])
         del self.presence._gap
         self.assertEqual(self.gap()[1]["refused"], 1)
@@ -1609,6 +1615,358 @@ class WalReadTests(PresenceFixture, TestCase):
         self.assertIsNone(self.presence.timeline_gap())
         self.assertEqual(self.entered, [[]])
         self.assertEqual(self.sidecars(), [])
+
+
+# Tries to switch the database to WAL from another process without waiting.
+OTHER_PROCESS_SWITCH_TO_WAL = """
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
+try:
+    print(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+except sqlite3.OperationalError:
+    print("locked")
+"""
+
+
+class WalSwitchRaceTests(PresenceFixture, TestCase):
+    """A switch to WAL after the header check never reads unadmitted (#151)."""
+
+    def setUp(self):
+        self.make_presence()
+        self.entered = []
+        refuse = self.presence.reservation
+
+        @contextmanager
+        def reservation():
+            self.entered.append(self.sidecars())
+            with refuse():
+                yield
+        self.presence.reservation = reservation
+        self.assertFalse(self.wal())
+
+    def sidecars(self):
+        return sorted(suffix for suffix in ("-wal", "-shm")
+                      if self.database.path.with_name(self.database.path.name + suffix).exists())
+
+    def wal(self):
+        header = read_database_prefix(self.database.path, 20)
+        return header[18] == 2
+
+    def switch_to_wal(self):
+        # Another writer of the file changes its mode; closing as the last
+        # connection removes the sidecars it created.
+        with closing(sqlite3.connect(self.database.path)) as db:
+            self.assertEqual(db.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        self.assertEqual(self.sidecars(), [])
+
+    def switch_on_header_read(self, number):
+        """Patch the header probe so the file turns WAL right after read ``number``."""
+        real = read_database_prefix
+        calls = []
+
+        def probe(path, size):
+            header = real(path, size)
+            calls.append(header)
+            if len(calls) == number:
+                self.switch_to_wal()
+            return header
+        return mock.patch("app.presence.service.read_database_prefix", probe)
+
+    def use_pinned(self):
+        pinned = PinnedDatabase(self.database)
+        pinned.pin()
+        self.addCleanup(pinned.release)
+        self.presence.database = pinned
+
+    def assert_switch_before_the_open_refuses_the_read(self):
+        self.refuse = True
+        with self.switch_on_header_read(1):
+            with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+                self.presence.timeline_gap()
+        self.assertEqual((self.entered, self.sidecars()), ([[]], []))
+
+    def test_switch_before_the_open_refuses_the_read_without_sidecars(self):
+        self.assert_switch_before_the_open_refuses_the_read()
+
+    def test_switch_before_the_pinned_open_refuses_the_read_without_sidecars(self):
+        self.use_pinned()
+        self.assert_switch_before_the_open_refuses_the_read()
+
+    def test_switch_before_the_open_is_read_under_the_reservation(self):
+        with self.switch_on_header_read(1):
+            self.assertIsNone(self.presence.timeline_gap())
+        self.assertEqual((self.entered, self.sidecars()), ([[]], []))
+
+    def test_switch_after_the_reread_is_abandoned_and_retried_under_the_reservation(self):
+        # The file turns WAL after the post-open re-read but before the
+        # read's first statement. The connection reports WAL, the read is
+        # retried under the reservation and its close removes the sidecars.
+        for read in (self.presence.timeline_gap, lambda: self.presence.audit("owner"), self.history):
+            with self.subTest(read=read):
+                with closing(sqlite3.connect(self.database.path)) as db:
+                    self.assertEqual(db.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+                self.entered.clear()
+                with self.switch_on_header_read(2):
+                    read()
+                self.assertEqual(len(self.entered), 1)
+                self.assertEqual(self.sidecars(), [])
+
+    def test_switch_after_the_reread_under_a_refused_reservation_fails_the_read(self):
+        self.refuse = True
+        with self.switch_on_header_read(2):
+            with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+                self.presence.timeline_gap()
+        # The residual race: SQLite created the sidecars before the read could
+        # see the mode, bounded to an empty -wal and one 32 KiB -shm region.
+        # Another read under the same hard stop is refused before its open
+        # and adds nothing. The next admitted read removes them again.
+        self.assertEqual(self.sidecars(), ["-shm", "-wal"])
+        sizes = [os.path.getsize(self.database.path.with_name(self.database.path.name + suffix))
+                 for suffix in ("-wal", "-shm")]
+        self.assertEqual(sizes[0], 0)
+        self.assertLessEqual(sizes[1], 32 * 1024)
+        with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+            self.presence.timeline_gap()
+        self.assertEqual(sizes, [os.path.getsize(self.database.path.with_name(self.database.path.name + suffix))
+                                 for suffix in ("-wal", "-shm")])
+        self.refuse = False
+        self.assertIsNone(self.presence.timeline_gap())
+        self.assertEqual(self.sidecars(), [])
+
+    def test_mode_cannot_change_while_a_read_is_open(self):
+        self.refuse = True
+        with self.presence._read() as db:
+            self.assertIsNone(self.presence._gap(db))
+            switched = subprocess.run([sys.executable, "-I", "-c", OTHER_PROCESS_SWITCH_TO_WAL,
+                                       os.fspath(self.database.path)],
+                                      capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+            self.assertEqual(switched, "locked")
+            db.execute("SELECT count(*) FROM presence_audit").fetchone()
+        self.assertFalse(self.wal())
+        self.assertEqual((self.entered, self.sidecars()), ([], []))
+
+    def test_read_does_not_keep_the_database_locked(self):
+        self.refuse = True
+        self.assertIsNone(self.presence.timeline_gap())
+        self.assertEqual(other_process_begin_immediate(self.database.path), "acquired")
+        with self.assertRaises(ZeroDivisionError):
+            with self.presence._read() as db:
+                db.execute("SELECT count(*) FROM presence_audit").fetchone()
+                1 / 0
+        self.assertEqual(other_process_begin_immediate(self.database.path), "acquired")
+
+
+class ReadLockBoundTests(PresenceFixture, TestCase):
+    """An unadmitted read holds its SHARED lock only for bounded work (#151).
+
+    The read transaction keeps a writer of the same file (such as a recording
+    append) waiting until the read ends, so the work done under it must not
+    grow with the retained timeline. Work is counted in SQLite VM steps on
+    the read's own connection rather than in wall time, so the bound is
+    deterministic; the writer test below adds a wall-clock check with a wide
+    margin.
+    """
+
+    ROWS = 20_000
+    STEP = 100
+
+    def setUp(self):
+        self.make_presence()
+        self.refuse = True
+        self.steps = []
+        original = PresenceService._unadmitted_connection
+
+        def counted(service, path):
+            connection = original(service, path)
+            if connection is not None:
+                self.steps.append(0)
+                index = len(self.steps) - 1
+
+                def tick():
+                    self.steps[index] += 1
+                    return 0
+                connection.set_progress_handler(tick, self.STEP)
+            return connection
+        patcher = mock.patch.object(PresenceService, "_unadmitted_connection", counted)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fill(self):
+        """Synthetic timeline rows spread over sixty days, in receipt order."""
+        start = NOW - timedelta(days=60)
+        rows = []
+        for index in range(self.ROWS):
+            at = start + timedelta(seconds=index * 60 * 86400 // self.ROWS)
+            item = Observation(Kind.ANONYMOUS_ENTRY, at, at, source_id=SOURCE, quality=Quality.SUFFICIENT,
+                               clock_trusted=True)
+            rows.append((str(item.identifier), item.kind.value, str(SOURCE), timestamp(at),
+                         json.dumps(item.payload())))
+        with closing(sqlite3.connect(self.database.path)) as db, db:
+            db.executemany("INSERT INTO presence_observations(id,kind,source,received,payload) "
+                           "VALUES (?,?,?,?,?)", rows)
+
+    def counted(self, read):
+        self.steps.clear()
+        result = read()
+        return result, sum(self.steps)
+
+    def page(self, after=None):
+        return self.presence.history("recordings", received_from=NOW - timedelta(days=61),
+                                     received_to=NOW + timedelta(days=1), limit=100, after=after)
+
+    def test_a_late_history_page_reads_about_one_page_under_the_lock(self):
+        self.fill()
+        first, early = self.counted(self.page)
+        with closing(sqlite3.connect(self.database.path)) as db:
+            received, sequence = db.execute("SELECT received,sequence FROM presence_observations "
+                                            "ORDER BY received,sequence LIMIT 1 OFFSET ?",
+                                            (self.ROWS * 3 // 4,)).fetchone()
+        cursor = {"received_at": received, "sequence": sequence}
+        late, steps = self.counted(lambda: self.page(cursor))
+        # The same rows as before: the page right after the cursor, in order.
+        self.assertEqual(late["items"][0]["sequence"], sequence + 1)
+        self.assertEqual([item["sequence"] for item in late["items"]], list(range(sequence + 1, sequence + 101)))
+        # Without the cursor bound the page scans every row from the window
+        # start to the cursor, about a hundred times the page itself here.
+        self.assertLessEqual(steps, 3 * early + 10)
+        # Pages still concatenate across a cursor that lies before the window.
+        before = {"received_at": timestamp(NOW - timedelta(days=90)), "sequence": 0}
+        self.assertEqual(self.page(before)["items"], first["items"])
+
+    def test_status_read_work_does_not_grow_with_the_timeline(self):
+        def status():
+            return self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        _, empty = self.counted(status)
+        self.fill()
+        _, full = self.counted(status)
+        self.assertLessEqual(full, empty + 2)
+
+    def test_a_writer_with_a_short_busy_timeout_commits_while_large_reads_run(self):
+        self.fill()
+        with closing(sqlite3.connect(self.database.path)) as db, db:
+            db.executemany("INSERT INTO presence_audit(action,actor,at,state) VALUES ('hint_set',?,?,?)",
+                           [(str(OWNER), timestamp(NOW - timedelta(minutes=index)), "probably_present")
+                            for index in range(500)])
+            db.execute("CREATE TABLE synthetic_writes (x)")
+            received, sequence = db.execute("SELECT received,sequence FROM presence_observations "
+                                            "ORDER BY received,sequence LIMIT 1 OFFSET ?",
+                                            (self.ROWS // 2,)).fetchone()
+        reads = (lambda: self.presence.owner_status("owner", now=NOW, clock_trusted=True),
+                 lambda: self.page({"received_at": received, "sequence": sequence}),
+                 lambda: self.presence.audit("owner"), self.page, self.presence.timeline_gap)
+        reading, done, failures = threading.Event(), threading.Event(), []
+
+        def reader():
+            try:
+                while not done.is_set():
+                    for read in reads:
+                        read()
+                        reading.set()
+            except BaseException as error:  # pragma: no cover - reported below
+                failures.append(error)
+                reading.set()
+
+        threads = [threading.Thread(target=reader) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        try:
+            self.assertTrue(reading.wait(30))
+            # Another process, like a recording append, with a busy timeout a
+            # fifth of the service's: far above the milliseconds one read
+            # holds its lock, so it fails only if reads keep the file locked.
+            written = subprocess.run([sys.executable, "-I", "-c", OTHER_PROCESS_COMMITS,
+                                      os.fspath(self.database.path), "1.0", "20"],
+                                     capture_output=True, text=True, check=True, timeout=60).stdout.strip()
+        finally:
+            done.set()
+            for thread in threads:
+                thread.join(30)
+        self.assertEqual((written, failures), ("20", []))
+
+    def test_a_read_waiting_behind_a_writer_does_not_join_an_open_read(self):
+        """Overlapping reads would let the next one in past a waiting writer."""
+        with closing(sqlite3.connect(self.database.path)) as db, db:
+            db.execute("CREATE TABLE synthetic_writes (x)")
+        opened, finish, seen = threading.Event(), threading.Event(), []
+
+        def first():
+            with self.presence._read() as db:
+                db.execute("SELECT count(*) FROM presence_audit").fetchone()
+                opened.set()
+                finish.wait(30)
+
+        def second():
+            with self.presence._read() as db:
+                seen.append(db.execute("SELECT count(*) FROM synthetic_writes").fetchone()[0])
+
+        holder = threading.Thread(target=first)
+        holder.start()
+        self.assertTrue(opened.wait(30))
+        writer = subprocess.Popen([sys.executable, "-I", "-c", OTHER_PROCESS_COMMITS,
+                                   os.fspath(self.database.path), "30", "1"], stdout=subprocess.PIPE, text=True)
+        try:
+            # The writer holds PENDING once a new reader of another process
+            # can no longer take SHARED: it now waits only for the open read.
+            for _ in range(3000):
+                if other_process_read(self.database.path) == "locked":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("the writer never reached PENDING")
+            follower = threading.Thread(target=second)
+            follower.start()
+            # A read that joins the open one finishes here without waiting
+            # for the writer; a serialized one is still waiting for its turn.
+            follower.join(1.0)
+            finish.set()
+            follower.join(30)
+            holder.join(30)
+            self.assertEqual(writer.communicate(timeout=60)[0].strip(), "1")
+        finally:
+            finish.set()
+            if writer.poll() is None:
+                writer.kill()
+                writer.wait()
+        # The second read began only after the waiting writer committed.
+        self.assertEqual(seen, [1])
+
+
+# Commits ``count`` single-row transactions with the given busy timeout and
+# prints how many committed, or "locked" when one timed out.
+OTHER_PROCESS_COMMITS = """
+import sqlite3, sys, time
+connection = sqlite3.connect(sys.argv[1], timeout=float(sys.argv[2]), isolation_level=None)
+committed = 0
+try:
+    for index in range(int(sys.argv[3])):
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("INSERT INTO synthetic_writes VALUES (?)", (index,))
+        connection.execute("COMMIT")
+        committed += 1
+        time.sleep(0.005)
+except sqlite3.OperationalError:
+    print("locked")
+else:
+    print(committed)
+"""
+
+
+OTHER_PROCESS_READ = """
+import sqlite3, sys
+connection = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True, timeout=0)
+try:
+    connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+except sqlite3.OperationalError:
+    print("locked")
+else:
+    print("read")
+"""
+
+
+def other_process_read(path):
+    """Whether a separate process can take SHARED on ``path`` right now."""
+    return subprocess.run([sys.executable, "-I", "-c", OTHER_PROCESS_READ, os.fspath(path)],
+                          capture_output=True, text=True, check=True, timeout=30).stdout.strip()
 
 
 class BuildFaultTests(PresenceFixture, TestCase):
