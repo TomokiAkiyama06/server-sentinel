@@ -653,6 +653,52 @@ class PairingLedger:
             )
         return StagedRenewal(key, serial, expiry, certificate.encode("ascii"))
 
+    def staged_renewal(self, *, node_id: UUID, current_public_key_digest: str,
+                       current_credential_digest: str,
+                       public_key_digest: str) -> StagedRenewal | None:
+        """The certificate already staged for ``public_key_digest``, or ``None``.
+
+        Read-only lookup that lets a same-key renewal retry be answered with
+        the staged certificate before anything is signed (Issue #148, #123).
+        A row is returned only while the presented credential (the
+        ``current_*`` digests) is still the node's active one, the staged key
+        is exactly ``public_key_digest`` and the staged row kept its
+        certificate. Anything else returns ``None`` and the caller falls back
+        to issuing and ``stage_renewal``, which re-checks eligibility in its
+        own write transaction.
+        """
+        node = _identity(node_id, "node identity")
+        current_key = _digest(current_public_key_digest, "public key digest")
+        current_serial = _digest(current_credential_digest, "credential serial digest")
+        key = _digest(public_key_digest, "public key digest")
+        if hmac.compare_digest(key, current_key):
+            return None
+        with self._transaction(write=False) as connection:
+            row = connection.execute(
+                "SELECT public_key_digest, credential_serial_digest, state "
+                "FROM pairing_node_credentials WHERE node_id = ?", (str(node),)
+            ).fetchone()
+            if not (row and row["state"] == "active"
+                    and hmac.compare_digest(row["public_key_digest"], current_key)
+                    and hmac.compare_digest(row["credential_serial_digest"], current_serial)):
+                return None
+            staged = connection.execute(
+                "SELECT r.public_key_digest, r.credential_serial_digest, r.not_after, "
+                "r.certificate_pem FROM pairing_node_renewals r "
+                "JOIN pairing_key_bindings b ON b.public_key_digest = r.public_key_digest "
+                "WHERE r.node_id = ? AND b.node_id = r.node_id AND b.revoked = 0",
+                (str(node),)).fetchone()
+        if not (staged and staged["certificate_pem"] is not None
+                and hmac.compare_digest(staged["public_key_digest"], key)):
+            return None
+        try:
+            kept = _certificate_pem(staged["certificate_pem"].encode("ascii"),
+                                    staged["credential_serial_digest"])
+        except (AttributeError, UnicodeError, PairingValidationError):
+            raise PairingStorageError("staged renewal is unavailable") from None
+        return StagedRenewal(key, staged["credential_serial_digest"],
+                             float(staged["not_after"]), kept.encode("ascii"))
+
     def bound_node(self, public_key_digest: str) -> UUID | None:
         """The node a live (never revoked) key binding names, or ``None``.
 
