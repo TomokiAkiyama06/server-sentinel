@@ -43,6 +43,7 @@ from app.cameras.remote_agent.node_ca import (
     ListenerMaterialInconsistent, OwnershipPrivilegeRequired, PrivateDirectory,
     deployment_id_of, listener_material, main_server_name,
 )
+from app.storage import database as storage_database
 from app.storage.database import Database, held_descriptors
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -1059,6 +1060,33 @@ class PinnedLedgerDescriptorTests(ListenerLifecycleHarness):
         self.addCleanup(opened_elsewhere.close)
         opened_elsewhere.execute("SELECT count(*) FROM sqlite_master").fetchone()
         with pairing_cli._ledger(database) as ledger:
+            with patch.object(pairing_cli.sqlite3, "connect", lambda *args, **kwargs: opened_elsewhere):
+                with self.assertRaises(sqlite3.DatabaseError):
+                    ledger.database.connect()
+            self.assertTrue(ledger.database.rejected)
+
+    def test_a_duplicate_held_descriptor_on_the_pinned_file_is_no_witness(self):
+        # The process-wide holder keeps a second descriptor on the pinned
+        # inode in _DUPLICATES (the path was swapped back between stat and
+        # open). It is neither the pin nor a _HELD value, yet it is still
+        # not SQLite's: a connection SQLite opened on another file must be
+        # refused even though that duplicate refers to the pinned inode.
+        database = existing_database(self.root)
+        substitute = existing_database(self.root)
+        opened_elsewhere = sqlite3.connect(
+            substitute, isolation_level=None, factory=pairing_cli._VerifiedConnection)
+        self.addCleanup(opened_elsewhere.close)
+        opened_elsewhere.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        with pairing_cli._ledger(database) as ledger:
+            # Kept open for the process lifetime like every held descriptor.
+            duplicate = os.open(database, os.O_RDONLY | os.O_CLOEXEC)
+            with storage_database._HELD_LOCK:
+                identity = storage_database._adopt_locked(duplicate)
+                self.assertIn(duplicate, storage_database._DUPLICATES)
+                self.assertNotIn(duplicate, storage_database._HELD.values())
+            self.assertEqual(ledger.database._identity, identity)
+            self.assertNotEqual(ledger.database._descriptor, duplicate)
+            self.assertIn(duplicate, held_descriptors())
             with patch.object(pairing_cli.sqlite3, "connect", lambda *args, **kwargs: opened_elsewhere):
                 with self.assertRaises(sqlite3.DatabaseError):
                     ledger.database.connect()
