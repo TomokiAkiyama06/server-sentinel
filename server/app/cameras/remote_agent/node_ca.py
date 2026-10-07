@@ -118,6 +118,17 @@ class ListenerMaterialInconsistent(CaptureAuthorityError):
     reason = "listener_material_inconsistent"
 
 
+class ReplacementNotDurable(CaptureAuthorityError):
+    """A rename took effect but the directory fsync after it failed.
+
+    The new entry is already current under the target name, so the caller
+    must treat the replacement as done (never roll back staged state that a
+    later recovery depends on). Rerunning the command completes the work.
+    """
+
+    reason = "issuer_material_replacement_unconfirmed"
+
+
 def _utc_now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
@@ -457,7 +468,9 @@ class PrivateDirectory:
             try:
                 os.fsync(directory)
             except OSError:
-                raise CaptureAuthorityError("issuer material could not be replaced") from None
+                # The rename already happened: report that, so callers do not
+                # mistake it for a replacement that never took effect.
+                raise ReplacementNotDurable("issuer material replacement is not durable") from None
         finally:
             os.close(directory)
 
@@ -794,6 +807,11 @@ class DeploymentAuthority:
                 target.write_new(_STAGED_SERVER_CERTIFICATE, _certificate_pem(certificate))
                 # Nothing current has changed until this rename succeeds.
                 target.replace_with(_STAGED_SERVER_KEY, _SERVER_KEY)
+            except ReplacementNotDurable:
+                # The key rename took effect although its directory fsync
+                # failed: the new key is current, so the staged certificate
+                # must stay for the next rotation's recovery to install.
+                raise
             except BaseException:
                 for name in (_STAGED_SERVER_CERTIFICATE, _STAGED_SERVER_KEY):
                     try:

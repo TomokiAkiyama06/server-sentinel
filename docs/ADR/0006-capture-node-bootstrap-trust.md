@@ -444,7 +444,9 @@ status or decision.
 - **Operator mistakes.** `export-bundle` and `approve` refuse a listener
   certificate the selected CA did not issue (`listener_authority_mismatch`);
   `approve`, `list` and `revoke` refuse a missing or unsafe `--database`
-  instead of creating and migrating an empty one.
+  instead of creating and migrating an empty one, refuse a schema that is not
+  exactly this release's instead of migrating it, and keep the validated file
+  pinned so a later replacement is refused rather than written to.
 - **CA validity.** A leaf beyond the CA expiry raises a dedicated error. Node
   renewal reports `renewal_ca_validity_insufficient` and the deployment-wide
   local `capture_trust_warning`; `approve` and `rotate-listener` refuse

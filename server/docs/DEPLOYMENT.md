@@ -296,7 +296,15 @@ the database as its own; `list` and `revoke` need only the database.
 the application's existing database file (canonical path, regular file with
 one link, owned by the account running the command, not group- or
 other-writable), otherwise they refuse `database_not_found`,
-`database_path_rejected` or `database_rejected`. `export-bundle` and `approve`
+`database_path_rejected` or `database_rejected`. They never migrate either:
+the database must already carry exactly this release's schema history,
+otherwise they refuse `database_schema_outdated` (start the application once
+so its startup migration runs) or `database_schema_unsupported`. The validated
+file stays pinned for the whole command: if it is renamed, replaced or removed
+afterwards (for example while `approve`/`revoke` waits for the typed
+confirmation), every later ledger access and commit refuses
+`database_rejected`, nothing is written to whatever is now at the path and no
+file is recreated. `export-bundle` and `approve`
 refuse `listener_authority_mismatch` when the listener certificate was not
 issued by the selected CA directory.
 
@@ -321,7 +329,10 @@ directory. The old key is removed by the rename; nothing is kept beside it.
 If a rotation is interrupted between replacing the key and the certificate,
 loading the listener refuses `listener_material_inconsistent`; rerun
 `rotate-listener`, which completes the interrupted rotation (`listener
-rotation completed (interrupted run)`) instead of issuing another one.
+rotation completed (interrupted run)`) instead of issuing another one. The
+same applies when the key rename took effect but the directory fsync after it
+failed (`issuer_material_replacement_unconfirmed`): the staged certificate is
+kept, and the rerun completes the pair.
 
 **CA validity.** A leaf is never issued beyond the deployment CA's own
 expiry. When the CA has less than the requested validity left, `init`,

@@ -47,7 +47,7 @@ so they load the new pair.
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
+from contextlib import closing, contextmanager
 import datetime
 import ipaddress
 import json
@@ -56,14 +56,16 @@ import os
 from pathlib import Path
 import pwd
 import secrets
+import sqlite3
 import stat
 import sys
+from typing import Iterator
+from urllib.parse import quote
 from uuid import UUID, uuid4
 
 from app.audit.service import OwnerAuthorizationError
 from app.audit.store import AuditStore
 from app.storage.database import Database
-from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
 from .enrollment import (
@@ -202,14 +204,118 @@ def _listener_directory(args) -> PrivateDirectory:
     return _directory(args.listener_dir, owner_uid=args.listener_owner)
 
 
-def _existing_database(database_path: Path) -> tuple[int, int]:
-    """Identity of the application's existing database file, or a refusal.
+def _safe_database_file(info: os.stat_result) -> bool:
+    """A regular file with one link, owned by this account, not group/other writable."""
+    return (stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+            and not info.st_mode & 0o022 and info.st_nlink == 1)
+
+
+class _LedgerDatabaseChanged(sqlite3.DatabaseError):
+    """The pinned ledger database is no longer the file that was validated.
+
+    A ``sqlite3.Error`` so the audit store rolls back and the ledger reports
+    its ordinary bounded storage failure; the CLI then refuses with
+    ``database_rejected`` instead of reporting success.
+    """
+
+
+class _VerifiedConnection(sqlite3.Connection):
+    """A connection that re-validates the pinned database before committing."""
+
+    verify_database = None
+
+    def _verify_before_commit(self, sql) -> None:
+        if (isinstance(sql, str) and sql.strip().upper() in ("COMMIT", "END")
+                and self.verify_database is not None):
+            self.verify_database()
+
+    def execute(self, sql, *parameters):
+        self._verify_before_commit(sql)
+        return super().execute(sql, *parameters)
+
+    def commit(self):
+        if self.verify_database is not None and self.in_transaction:
+            self.verify_database()
+        return super().commit()
+
+
+class _PinnedLedgerDatabase(Database):
+    """The application's existing database, pinned for every ledger operation.
+
+    ``Database.connect()`` reopens by pathname and creates a missing file, so
+    a database renamed, replaced or removed after validation -- for example
+    while ``approve``/``revoke`` waits for the Owner's confirmation -- could
+    be silently swapped for another inode or recreated empty (Issue #125).
+    Instead this object holds a read-only descriptor to the validated file,
+    so its inode cannot be freed and reused, and every connection:
+
+    * requires the path to still be canonical and name that same pinned
+      inode, and the pinned file to still be a private regular file;
+    * opens it with SQLite ``mode=rw`` (never creates a file);
+    * re-checks both right after the open and again before ``COMMIT``.
+
+    A failed check marks the database rejected; nothing is committed.
+    """
+
+    def __init__(self, path: Path, descriptor: int, identity: tuple[int, int]):
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "_descriptor", descriptor)
+        object.__setattr__(self, "_identity", identity)
+        object.__setattr__(self, "_state", {"rejected": False, "released": False})
+
+    @property
+    def rejected(self) -> bool:
+        return self._state["rejected"]
+
+    def _reject(self) -> None:
+        self._state["rejected"] = True
+        raise _LedgerDatabaseChanged("ledger database changed")
+
+    def verify(self) -> None:
+        if self._state["released"]:
+            self._reject()
+        try:
+            held = os.fstat(self._descriptor)
+            current = os.lstat(self.path)
+            canonical = os.path.realpath(self.path) == str(self.path)
+        except OSError:
+            self._reject()
+        if (not canonical or not _safe_database_file(held)
+                or (held.st_dev, held.st_ino) != self._identity
+                or (current.st_dev, current.st_ino) != self._identity):
+            self._reject()
+
+    def connect(self) -> sqlite3.Connection:
+        self.verify()
+        connection = sqlite3.connect(
+            "file:" + quote(str(self.path)) + "?mode=rw", uri=True, timeout=5,
+            isolation_level=None, factory=_VerifiedConnection)
+        try:
+            # The path could have been swapped between the check and the open.
+            self.verify()
+            connection.verify_database = self.verify
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+    def release(self) -> None:
+        if not self._state["released"]:
+            self._state["released"] = True
+            os.close(self._descriptor)
+
+
+def _existing_database(database_path: Path) -> _PinnedLedgerDatabase:
+    """The application's existing database file, pinned, or a refusal.
 
     A mistyped ``--database`` must never silently create and migrate an empty
     database that the server does not use (Issue #125): the path must be
     canonical and absolute (no symlink, no ``..``) and name an existing
     regular file with one link, owned by the account running the CLI and not
-    writable by group or others.
+    writable by group or others. The returned object keeps that exact file
+    pinned for every later ledger connection.
     """
     if not database_path.is_absolute() or os.path.realpath(database_path) != str(database_path):
         raise CliRefused("database_path_rejected")
@@ -222,32 +328,71 @@ def _existing_database(database_path: Path) -> tuple[int, int]:
         raise CliRefused("database_rejected") from None
     try:
         info = os.fstat(descriptor)
+        if not _safe_database_file(info):
+            raise CliRefused("database_rejected")
     except OSError:
-        raise CliRefused("database_rejected") from None
-    finally:
         os.close(descriptor)
-    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-            or info.st_mode & 0o022 or info.st_nlink != 1):
-        raise CliRefused("database_rejected")
-    return info.st_dev, info.st_ino
+        raise CliRefused("database_rejected") from None
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return _PinnedLedgerDatabase(database_path, descriptor, (info.st_dev, info.st_ino))
 
 
-def _ledger(database_path: Path) -> PairingLedger:
-    identity = _existing_database(database_path)
-    database = Database(database_path)
+def _require_current_schema(connection: sqlite3.Connection) -> None:
+    """Refuse unless the database already has exactly this application's schema.
+
+    Administrative commands never migrate (Issue #125): migrations belong to
+    application startup. Only ``schema_migrations`` is read.
+    """
     try:
-        with closing(database.connect()) as connection:
-            migrate(connection, APPLICATION_MIGRATIONS)
-        info = os.stat(database_path, follow_symlinks=False)
-    except Exception:
-        raise CliRefused("database_unavailable") from None
-    if (info.st_dev, info.st_ino) != identity:
-        # Replaced while opening: never keep using whatever is there now.
-        raise CliRefused("database_rejected")
-    # Pending approvals are valid only in this process, so the verifier key is
-    # per-process and never persisted.
-    return PairingLedger(database, HmacCodeVerifier(secrets.token_bytes(32)),
-                         audit=AuditStore(database))
+        history = [tuple(row) for row in connection.execute(
+            "SELECT version, name, checksum FROM schema_migrations ORDER BY version")]
+    except sqlite3.Error:
+        raise CliRefused("database_schema_unsupported") from None
+    expected = [(migration.version, migration.name, migration.checksum)
+                for migration in APPLICATION_MIGRATIONS]
+    if history == expected:
+        return
+    if len(history) < len(expected) and history == expected[:len(history)]:
+        raise CliRefused("database_schema_outdated")
+    raise CliRefused("database_schema_unsupported")
+
+
+@contextmanager
+def _ledger(database_path: Path) -> Iterator[PairingLedger]:
+    database = _existing_database(database_path)
+    try:
+        try:
+            with closing(database.connect()) as connection:
+                _require_current_schema(connection)
+        except CliRefused:
+            raise
+        except _LedgerDatabaseChanged:
+            raise CliRefused("database_rejected") from None
+        except Exception:
+            raise CliRefused("database_unavailable") from None
+        # Pending approvals are valid only in this process, so the verifier
+        # key is per-process and never persisted.
+        yield PairingLedger(database, HmacCodeVerifier(secrets.token_bytes(32)),
+                            audit=AuditStore(database))
+    finally:
+        database.release()
+
+
+def _ledger_refusal(ledger: PairingLedger, reason: str) -> CliRefused:
+    """``database_rejected`` if the pinned database changed, else ``reason``."""
+    if getattr(ledger.database, "rejected", False):
+        return CliRefused("database_rejected")
+    return CliRefused(reason)
+
+
+def _confirm_database(ledger: PairingLedger) -> None:
+    """Before reporting success, the pinned database must still be in place."""
+    try:
+        ledger.database.verify()
+    except _LedgerDatabaseChanged:
+        raise CliRefused("database_rejected") from None
 
 
 def _read_public_file(path: Path, maximum: int) -> bytes:
@@ -367,6 +512,49 @@ def command_export_bundle(args) -> int:
     return 0
 
 
+def _approve_and_serve(ledger, authority, listener, terminal, digest):
+    """Confirm, approve and serve one enrollment on the pinned ledger database."""
+    # A key stays bound to its node for good, so a retry after an
+    # interrupted, expired or unacknowledged enrollment reuses that node.
+    try:
+        bound = ledger.bound_node(digest)
+    except PairingError:
+        raise _ledger_refusal(ledger, "approval_refused") from None
+    retry = "" if bound is None else (
+        f"  existing capture node: {bound}\n"
+        "  (retry: completing it replaces that node's current certificate)\n")
+    listener.open()
+    try:
+        owner = LocalConsoleOwner()
+        grant = owner.confirm(
+            terminal,
+            "Capture-node enrollment request\n"
+            f"  public key SHA-256: {digest}\n"
+            f"{retry}"
+            "Compare it with the digest shown on the capture host.\n"
+            "Type APPROVE to approve this capture node: ",
+            "APPROVE")
+        try:
+            approval, code = ledger.approve(owner, grant, node_id=bound or uuid4(),
+                                            public_key_digest=digest)
+        except PairingError:
+            raise _ledger_refusal(ledger, "approval_refused") from None
+        terminal.write(
+            "\nOne-time pairing code (shown once, valid for 5 minutes):\n\n"
+            f"    {_group(code.value)}\n\n"
+            "Type it only into the media-capture-agent pairing prompt on the capture host.\n")
+        del code
+        print(f"enrollment listening: node_id={approval.node_id}", flush=True)
+        service = EnrollmentService(ledger, authority, (approval,))
+        outcome = listener.serve(service, expires_at_monotonic=approval.expires_at_monotonic)
+    finally:
+        listener.close()
+    # Never report an enrollment against a database that is no longer the
+    # validated file.
+    _confirm_database(ledger)
+    return outcome, approval
+
+
 def command_approve(args) -> int:
     # Refuse before any state change if the code cannot be shown privately.
     terminal = ControllingTerminal()
@@ -395,42 +583,8 @@ def command_approve(args) -> int:
         listener = EnrollmentListener(
             config, build_enrollment_server_context(material.certificate_path, material.key_path),
             limits=EnrollmentLimits())
-        ledger = _ledger(args.database)
-        # A key stays bound to its node for good, so a retry after an
-        # interrupted, expired or unacknowledged enrollment reuses that node.
-        try:
-            bound = ledger.bound_node(digest)
-        except PairingError:
-            raise CliRefused("approval_refused") from None
-        retry = "" if bound is None else (
-            f"  existing capture node: {bound}\n"
-            "  (retry: completing it replaces that node's current certificate)\n")
-        listener.open()
-        try:
-            owner = LocalConsoleOwner()
-            grant = owner.confirm(
-                terminal,
-                "Capture-node enrollment request\n"
-                f"  public key SHA-256: {digest}\n"
-                f"{retry}"
-                "Compare it with the digest shown on the capture host.\n"
-                "Type APPROVE to approve this capture node: ",
-                "APPROVE")
-            try:
-                approval, code = ledger.approve(owner, grant, node_id=bound or uuid4(),
-                                                public_key_digest=digest)
-            except PairingError:
-                raise CliRefused("approval_refused") from None
-            terminal.write(
-                "\nOne-time pairing code (shown once, valid for 5 minutes):\n\n"
-                f"    {_group(code.value)}\n\n"
-                "Type it only into the media-capture-agent pairing prompt on the capture host.\n")
-            del code
-            print(f"enrollment listening: node_id={approval.node_id}", flush=True)
-            service = EnrollmentService(ledger, authority, (approval,))
-            outcome = listener.serve(service, expires_at_monotonic=approval.expires_at_monotonic)
-        finally:
-            listener.close()
+        with _ledger(args.database) as ledger:
+            outcome, approval = _approve_and_serve(ledger, authority, listener, terminal, digest)
     finally:
         terminal.close()
     if outcome.reason == "completed":
@@ -441,8 +595,13 @@ def command_approve(args) -> int:
 
 
 def command_list(args) -> int:
-    ledger = _ledger(args.database)
-    for row in ledger.pairing_summaries():
+    with _ledger(args.database) as ledger:
+        try:
+            rows = ledger.pairing_summaries()
+        except PairingError:
+            raise _ledger_refusal(ledger, "pairing_ledger_refused") from None
+        _confirm_database(ledger)
+    for row in rows:
         expiry = ("-" if row.not_after is None else
                   datetime.datetime.fromtimestamp(row.not_after, datetime.timezone.utc)
                   .isoformat(timespec="seconds"))
@@ -454,14 +613,15 @@ def command_list(args) -> int:
 def command_revoke(args) -> int:
     terminal = ControllingTerminal()
     try:
-        ledger = _ledger(args.database)
-        owner = LocalConsoleOwner()
-        grant = owner.confirm(terminal, f"Type REVOKE to revoke capture node {args.node}: ",
-                              "REVOKE")
-        try:
-            ledger.revoke(owner, grant, node_id=args.node)
-        except PairingError:
-            raise CliRefused("revocation_refused") from None
+        with _ledger(args.database) as ledger:
+            owner = LocalConsoleOwner()
+            grant = owner.confirm(terminal, f"Type REVOKE to revoke capture node {args.node}: ",
+                                  "REVOKE")
+            try:
+                ledger.revoke(owner, grant, node_id=args.node)
+            except PairingError:
+                raise _ledger_refusal(ledger, "revocation_refused") from None
+            _confirm_database(ledger)
     finally:
         terminal.close()
     print(f"revoked: node_id={args.node}")

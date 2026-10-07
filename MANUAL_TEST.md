@@ -433,7 +433,9 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    `MAIN_CLI approve --database <data_dir>/state.sqlite3 --authority-dir <ca_dir> --listener-dir <listener_dir> --request request.json --listen <ip>:<port>`
    from an interactive terminal; `<data_dir>/state.sqlite3` must be the
    database the application already created (a mistyped path refuses
-   `database_not_found` and creates nothing) (add `--human-host`/`--human-port` when the
+   `database_not_found` and creates nothing; a database the current release has
+   not yet migrated refuses `database_schema_outdated` and is left unchanged
+   until the application's startup migrates it) (add `--human-host`/`--human-port` when the
    dashboard does not use the default `127.0.0.1:8000`, for example `::1`, and
    confirm `--listen` on that exact socket is refused with
    `enrollment_listener_must_differ_from_other_listeners`). Compare the displayed public-key SHA-256 with

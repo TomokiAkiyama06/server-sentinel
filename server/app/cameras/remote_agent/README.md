@@ -81,7 +81,9 @@ replaces the listener key and certificate in place under the listener lock:
 it verifies the current certificate was issued by this CA and matches its key,
 keeps its server name, writes the new pair under `*.next` names, then renames
 key and certificate over the current files. A run interrupted between the two
-renames is completed by the next rotation; `listener_material` refuses a
+renames -- or whose key rename took effect but could not be fsynced
+(`ReplacementNotDurable`, which keeps the staged certificate) -- is completed
+by the next rotation; `listener_material` refuses a
 mismatched pair (`ListenerMaterialInconsistent`) meanwhile. The CA is never
 touched, so Agent trust bundles stay valid.
 
@@ -123,7 +125,11 @@ deployments' directories mixed up); `approve`, `list` and `revoke` require
 `--database` to name the application's existing database (canonical path,
 regular file with one link, owned by the account running the CLI, not group-
 or other-writable) and refuse `database_not_found` / `database_rejected` /
-`database_path_rejected` instead of creating one; `approve` refuses
+`database_path_rejected` instead of creating one, refuse
+`database_schema_outdated` / `database_schema_unsupported` instead of
+migrating (migrations run only at application startup), and keep the validated
+file pinned so a later rename/replacement refuses `database_rejected` on every
+connection and before every commit (SQLite `mode=rw`, never created); `approve` refuses
 `deployment_ca_validity_insufficient` before any
 approval when the CA can no longer cover a 397-day node leaf. The bootstrap
 listener sets `SO_REUSEADDR` (never `SO_REUSEPORT`) so a re-run binds while the

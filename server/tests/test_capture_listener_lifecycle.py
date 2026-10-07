@@ -18,6 +18,7 @@ import os
 import pwd
 from pathlib import Path
 import socket
+import sqlite3
 import ssl
 import stat
 import tempfile
@@ -214,6 +215,61 @@ class ListenerRotationTests(ListenerLifecycleHarness):
         handshake(build_enrollment_server_context(material.certificate_path, material.key_path),
                   self.agent_context((authority / "ca-certificate.pem").read_bytes()))
 
+    def test_rotation_keeps_recovery_state_when_the_key_rename_is_not_durable(self):
+        # Codex PR #141: the key rename succeeds but the directory fsync after
+        # it fails. The new key is already current, so the staged certificate
+        # must survive for the next rotation to complete the pair.
+        authority, listener = self.fresh()
+        self.init(authority, listener)
+        old_certificate = (listener / "main-server-certificate.pem").read_bytes()
+        real_replace = PrivateDirectory.replace_with
+        real_fsync = os.fsync
+        state = {"renaming": None}
+
+        def tracking_replace(directory, staged, name):
+            state["renaming"] = name
+            try:
+                return real_replace(directory, staged, name)
+            finally:
+                state["renaming"] = None
+
+        def failing_fsync(descriptor):
+            if state["renaming"] == "main-server-key.pem":
+                raise OSError(errno.EIO, "simulated directory fsync failure")
+            return real_fsync(descriptor)
+        with patch.object(PrivateDirectory, "replace_with", tracking_replace), \
+                patch.object(node_ca.os, "fsync", failing_fsync):
+            status, _stdout, stderr = self.rotate(authority, listener)
+        self.assertEqual(2, status)
+        self.assertIn("refused: issuer_material_replacement_unconfirmed", stderr)
+        self.assertTrue((listener / "main-server-certificate.pem.next").exists())
+        self.assertEqual(old_certificate, (listener / "main-server-certificate.pem").read_bytes())
+        with self.assertRaises(ListenerMaterialInconsistent):
+            listener_material(PrivateDirectory(listener))
+        status, stdout, stderr = self.rotate(authority, listener)
+        self.assertEqual(0, status, stderr)
+        self.assertIn("listener rotation completed (interrupted run)", stdout)
+        self.assertEqual(sorted(LISTENER_FILES), sorted(os.listdir(listener)))
+        material = listener_material(PrivateDirectory(listener))
+        handshake(build_enrollment_server_context(material.certificate_path, material.key_path),
+                  self.agent_context((authority / "ca-certificate.pem").read_bytes()))
+
+    def test_replace_with_reports_a_completed_but_unsynced_rename(self):
+        directory = PrivateDirectory(self.root / f"replace-{uuid4()}").ensure()
+        directory.write_new("value.next", b"new")
+        directory.write_new("value", b"old")
+        real_fsync = os.fsync
+
+        def failing_fsync(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError(errno.EIO, "simulated directory fsync failure")
+            return real_fsync(descriptor)
+        with patch.object(node_ca.os, "fsync", failing_fsync):
+            with self.assertRaises(node_ca.ReplacementNotDurable):
+                directory.replace_with("value.next", "value")
+        self.assertEqual(b"new", directory.read("value"))
+        self.assertFalse(directory.exists("value.next"))
+
     def test_rotation_failing_before_the_first_rename_leaves_the_current_pair(self):
         authority, listener = self.fresh()
         self.init(authority, listener)
@@ -291,6 +347,11 @@ class ConcurrentInitTests(ListenerLifecycleHarness):
     def test_discard_created_ignores_a_replaced_entry(self):
         directory = PrivateDirectory(self.root / f"replaced-{uuid4()}").ensure()
         directory.write_new("ca-key.pem", b"mine")
+        # Keep the unlinked original open so the filesystem cannot hand its
+        # inode number to the replacement (tmpfs/ext4 reuse freed inodes at
+        # once, which made this test flaky on CI runners).
+        original = os.open(directory.path / "ca-key.pem", os.O_RDONLY)
+        self.addCleanup(os.close, original)
         os.unlink(directory.path / "ca-key.pem")
         descriptor = os.open(directory.path / "ca-key.pem", os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                              0o600)
@@ -612,11 +673,126 @@ class ExistingDatabaseTests(ListenerLifecycleHarness):
         with patch.object(pairing_cli.os, "geteuid", lambda: real_uid + 4242):
             self.assertIn("refused: database_rejected", self.refused(owned))
 
+    def test_outdated_schema_is_refused_and_never_migrated(self):
+        # Codex PR #141: administrative commands must not apply migrations.
+        database = self.root / f"old-{uuid4()}.sqlite3"
+        with closing(Database(database).connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS[:-1])
+        before = database.read_bytes()
+        for command in ("list", "revoke"):
+            with self.subTest(command=command):
+                self.assertIn("refused: database_schema_outdated",
+                              self.refused(database, command=command))
+                self.assertEqual(before, database.read_bytes())
+        with closing(sqlite3.connect(database)) as connection:
+            versions = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
+        self.assertEqual(len(APPLICATION_MIGRATIONS) - 1, versions)
+
+    def test_database_without_the_application_schema_is_refused_unchanged(self):
+        empty = self.root / f"empty-{uuid4()}.sqlite3"
+        with closing(sqlite3.connect(empty)) as connection:
+            connection.execute("CREATE TABLE unrelated (value TEXT)")
+        os.chmod(empty, 0o600)
+        before = empty.read_bytes()
+        self.assertIn("refused: database_schema_unsupported", self.refused(empty))
+        self.assertEqual(before, empty.read_bytes())
+        with closing(sqlite3.connect(empty)) as connection:
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        self.assertEqual({"unrelated"}, tables)
+
+    def test_newer_or_edited_schema_history_is_refused(self):
+        database = existing_database(self.root)
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("UPDATE schema_migrations SET checksum = 'edited' WHERE version = 1")
+            connection.commit()
+        self.assertIn("refused: database_schema_unsupported", self.refused(database))
+
     def test_existing_database_is_used(self):
         database = existing_database(self.root)
         status, stdout, stderr = run_cli("list", "--database", str(database))
         self.assertEqual(0, status, stderr)
         self.assertEqual("", stdout)
+
+
+class ReplacingTerminal:
+    """Types ``word`` after running ``action`` (the database swap) mid-confirmation."""
+
+    def __init__(self, word, action):
+        self.word, self.action = word, action
+
+    def write(self, text):
+        pass
+
+    def read_line(self):
+        self.action()
+        return self.word
+
+    def close(self):
+        pass
+
+
+class PinnedDatabaseTests(ListenerLifecycleHarness):
+    """Codex PR #141: every ledger connection stays on the validated database file."""
+
+    def replace(self, database):
+        """Move the validated file away and put another valid database at its path."""
+        moved = self.root / f"moved-{uuid4()}.sqlite3"
+        os.rename(database, moved)
+        replacement = existing_database(self.root)
+        os.rename(replacement, database)
+        return moved
+
+    @staticmethod
+    def audit_rows(path):
+        with closing(sqlite3.connect(path)) as connection:
+            return connection.execute("SELECT COUNT(*) FROM security_admin_audit_records").fetchone()[0]
+
+    def test_revoke_refuses_when_the_database_is_replaced_during_confirmation(self):
+        database = existing_database(self.root)
+        moved = {}
+        terminal = ReplacingTerminal("REVOKE", lambda: moved.setdefault("path", self.replace(database)))
+        with patch.object(pairing_cli, "ControllingTerminal", lambda: terminal):
+            status, stdout, stderr = run_cli("revoke", "--database", str(database),
+                                             "--node", str(uuid4()))
+        self.assertEqual(2, status)
+        self.assertEqual("", stdout)
+        self.assertIn("refused: database_rejected", stderr)
+        self.assertEqual(0, self.audit_rows(database))
+        self.assertEqual(0, self.audit_rows(moved["path"]))
+
+    def test_revoke_never_recreates_a_database_removed_during_confirmation(self):
+        database = existing_database(self.root)
+        terminal = ReplacingTerminal("REVOKE", lambda: os.unlink(database))
+        with patch.object(pairing_cli, "ControllingTerminal", lambda: terminal):
+            status, _stdout, stderr = run_cli("revoke", "--database", str(database),
+                                              "--node", str(uuid4()))
+        self.assertEqual(2, status)
+        self.assertIn("refused: database_rejected", stderr)
+        self.assertFalse(database.exists())
+
+    def test_every_connection_and_commit_rechecks_the_pinned_file(self):
+        database = existing_database(self.root)
+        with pairing_cli._ledger(database) as ledger:
+            connection = ledger.database.connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("INSERT INTO application_metadata VALUES ('probe', 'x')")
+                self.replace(database)
+                with self.assertRaises(sqlite3.DatabaseError):
+                    connection.execute("COMMIT")
+            finally:
+                connection.close()
+            with self.assertRaises(pairing_cli.PairingError):
+                ledger.pairing_summaries()
+            self.assertTrue(ledger.database.rejected)
+
+    def test_ledger_database_refuses_once_released(self):
+        database = existing_database(self.root)
+        with pairing_cli._ledger(database) as ledger:
+            pass
+        with self.assertRaises(sqlite3.DatabaseError):
+            ledger.database.connect()
 
 
 if __name__ == "__main__":
