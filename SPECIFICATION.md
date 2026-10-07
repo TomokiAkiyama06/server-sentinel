@@ -299,7 +299,14 @@ interfaces and no unauthenticated preview route is added. The backend lifespan
 starts one worker per deployment-configured `local_uvc` source (`local_uvc`
 deployment object, 1 to 4 registry UUIDs, no physical evidence) after storage
 migration/admission and stops them, with bounded joins, before the monitoring
-runtime stops. Missing configuration is the explicit `unconfigured` state;
+runtime stops. The workers stop in parallel under one total join bound,
+`join_timeout_seconds` (default 10 s, configurable 0.1–60 s), which covers a
+worker's device teardown (up to 5.5 s observed on a real C960 after an unplug)
+plus `HEALTH_SETTLE_SECONDS` (1 s) for its offline health write; a worker
+still alive at the bound stays watched, is never reported `online`, and the
+stop is `stop_failed`. A successful supervisor close joins the frame-progress
+watchdog with at least 1 s of its own before returning, even when the worker
+joins used up the shared bound. Missing configuration is the explicit `unconfigured` state;
 configuration without admitted storage, including a monitoring runtime whose
 startup storage open failed or an admission refused while pinning the database at start, is `storage_unadmitted` (retryable, nothing opened) and never captures until
 storage is admitted again. The application capture-service snapshot follows the live runtime status, so a later worker or storage fault is never left reported as `running`. Every later capture-driven registry/approval write is admitted by the Main storage policy like an audit write; a refused admission stops that capture visibly and retries, never writes past the hard reserve; the camera transition is still recorded in memory and the capture service reports `degraded` while health cannot be persisted. The runtime opens only the database file pinned under that admission (a held descriptor, so inode reuse by a replacement cannot pass the identity check) and never creates one, so a lost or replaced filesystem after startup cannot yield a fallback database; a registry read failure while a camera is live is reported as capture loss and degrades the service until polling succeeds. A cancelled or failed lifespan startup stops started workers; a cancelled shutdown invalidates the preview and still completes the bounded capture stop and remaining cleanup before re-raising. Capture-service state is reported separately from each source's

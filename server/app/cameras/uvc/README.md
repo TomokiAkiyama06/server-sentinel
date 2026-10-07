@@ -200,7 +200,16 @@ and every remaining cleanup step before re-raising the cancellation. A UUID
 that is not a `local_uvc` source is `rejected`, never silently skipped; a worker
 that fails to start is `worker_failed` and its camera is written `offline`.
 Service state (`running` / `degraded` / `failed` / `stopped` / `stop_failed`)
-is separate from each camera's registry health. A worker that does not stop
+is separate from each camera's registry health. Workers stop in parallel under
+one total join bound, `join_timeout_seconds` (default 10 s, configurable
+0.1–60 s). It must cover a worker's `STREAMOFF`/unmap/close (up to 5.5 s
+observed on a real C960 after an unplug, MANUAL_TEST P-7) plus
+`HEALTH_SETTLE_SECONDS` (1 s); a bound below that can turn a clean shutdown of
+a camera mid-teardown into `stop_failed`. After the workers are joined,
+`close()` joins the watchdog for at least
+`LocalUvcSupervisor.WATCHDOG_JOIN_MINIMUM_SECONDS` (1 s) even when the shared
+bound is used up, so a successful close returns with the watchdog stopped.
+A worker that does not stop
 within the join bound makes the stop `stop_failed`; the adapter is then left to
 that worker's own cleanup rather than closed from a second thread, and the
 durable session marker conservatively requires reapproval at next start.

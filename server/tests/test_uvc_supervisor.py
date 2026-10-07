@@ -222,8 +222,13 @@ class WatchedAdapter(SyntheticAdapter):
         self.checked = {}
         self.check_failures = 0
         self.checked_event = threading.Event()
+        self.check_delay = 0.0
+        self.in_check = threading.Event()
 
     def check_frame_progress(self, source_id):
+        if self.check_delay:
+            self.in_check.set()
+            time.sleep(self.check_delay)
         with self.lock:
             self.checked[source_id] = self.checked.get(source_id, 0) + 1
             fail = self.check_failures > 0
@@ -367,7 +372,33 @@ class FrameProgressWatchdogTests(unittest.TestCase):
         self.adapter.release[source].set()
         self.assertTrue(wait_until(lambda: not supervisor.status(source).running))
         supervisor.close()
-        self.assertTrue(wait_until(lambda: not supervisor.watchdog_running))
+        # A successful close has joined the watchdog before returning.
+        self.assertFalse(supervisor.watchdog_running)
+
+    def test_successful_close_joins_the_watchdog_even_past_the_worker_deadline(self):
+        # The watchdog join gets a minimum bound of its own: when joining the
+        # workers used up the shared deadline, a join of ``deadline - now``
+        # (zero) would return while the watchdog is still finishing a check.
+        # The clock reports the deadline as reached once the workers have
+        # been joined (the first two readings: deadline, then the worker's
+        # remaining time, which the real join still honours).
+        times = iter([0.0, 0.0])
+        supervisor = LocalUvcSupervisor(
+            self.adapter, poll_timeout=5.0, retry_delay=0.01, join_timeout=1.0,
+            watchdog_interval=0.01, clock=lambda: next(times, 1000.0),
+        )
+        self.addCleanup(self._close_other, supervisor)
+        source = uuid4()
+        self.adapter.prepare(source)
+        supervisor.start(source)
+        self.assertTrue(self.adapter.entered[source].wait(0.5))
+        # The watchdog is inside a slow (but finite) check when close() runs.
+        self.adapter.check_delay = 0.3
+        self.assertTrue(self.adapter.in_check.wait(1))
+        self.adapter.release[source].set()
+        supervisor.close()
+        self.assertIsNone(supervisor.status(source))
+        self.assertFalse(supervisor.watchdog_running)
 
     def _close_other(self, supervisor):
         for release in self.adapter.release.values():

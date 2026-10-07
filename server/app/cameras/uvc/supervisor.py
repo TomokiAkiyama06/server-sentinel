@@ -53,8 +53,15 @@ class LocalUvcSupervisor:
     logged with text.
     """
 
+    # close() gives the watchdog join at least this long even when joining
+    # the workers used up the shared deadline. A frame-progress check is
+    # in-memory work under a non-blocking lock (its health write runs on a
+    # background writer), so it finishes well within this bound; a successful
+    # close() then returns with the watchdog stopped.
+    WATCHDOG_JOIN_MINIMUM_SECONDS = 1.0
+
     def __init__(self, adapter, *, poll_timeout=1.0, retry_delay=0.1,
-                 join_timeout=3.0, clock=time.monotonic, watchdog_interval=0.25):
+                 join_timeout=10.0, clock=time.monotonic, watchdog_interval=0.25):
         if not callable(getattr(adapter, "poll_source", None)):
             raise TypeError("local UVC adapter is required")
         if not callable(getattr(adapter, "stop_source", None)):
@@ -254,7 +261,9 @@ class LocalUvcSupervisor:
             # The watchdog only ever lowers a health claim under the source's
             # transition lock, so a check still finishing a storage write after
             # this bound cannot race capture cleanup into a wrong state.
-            watchdog.join(max(0.0, deadline - self._clock()))
+            # The remaining shared deadline may already be zero after a slow
+            # worker join, so the watchdog gets a minimum bound of its own.
+            watchdog.join(max(self.WATCHDOG_JOIN_MINIMUM_SECONDS, deadline - self._clock()))
         if alive:
             raise WorkerStopError("local UVC workers did not stop")
         if cleanup_failed:

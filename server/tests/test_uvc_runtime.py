@@ -1724,6 +1724,28 @@ class ConfigurationParsingTests(unittest.TestCase):
             parsed.frame_stall_seconds, parsed.frame_stall_reopen_seconds,
             parsed.presence_scan_seconds))
 
+    def test_default_join_bound_covers_an_observed_real_close_and_settle(self):
+        # Issue #173 item 3: on the real C960 (MANUAL_TEST P-7, 2026-10-07)
+        # STREAMOFF/unmap/close took up to 5.5 s, and stopping a source then
+        # waits up to HEALTH_SETTLE_SECONDS for its offline health write. The
+        # default join bound must cover both with margin, or a clean shutdown
+        # of a camera mid-teardown ends in STOP_FAILED.
+        observed_close = 5.5
+        required = observed_close + LocalUvcAdapter.HEALTH_SETTLE_SECONDS + 2.0
+        parsed = parse_local_uvc({"source_ids": [str(uuid4())]})
+        self.assertGreaterEqual(parsed.join_timeout_seconds, required)
+        self.assertGreaterEqual(
+            LocalUvcConfiguration((uuid4(),)).join_timeout_seconds, required)
+        self.assertEqual(10.0, parsed.join_timeout_seconds)
+        # The bound stays configurable within the validated range.
+        identity = str(uuid4())
+        for value in (0.1, 30, 60):
+            self.assertEqual(float(value), parse_local_uvc(
+                {"source_ids": [identity], "join_timeout_seconds": value}).join_timeout_seconds)
+        for value in (0.05, 60.5, 0, -1, True, "10"):
+            with self.assertRaises(ConfigurationError):
+                parse_local_uvc({"source_ids": [identity], "join_timeout_seconds": value})
+
     def test_invalid_configuration_is_value_free(self):
         identity = str(uuid4())
         cases = [
