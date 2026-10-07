@@ -400,6 +400,59 @@ class FrameProgressWatchdogTests(unittest.TestCase):
         self.assertIsNone(supervisor.status(source))
         self.assertFalse(supervisor.watchdog_running)
 
+    def test_close_fails_while_the_watchdog_outlives_its_join(self):
+        # Codex P2 on #168: a watchdog still inside a check after its finite
+        # join may still call into the adapter, so close() must not report
+        # success (its owner would then tear the adapter down under it).
+        supervisor = LocalUvcSupervisor(
+            self.adapter, poll_timeout=5.0, retry_delay=0.01, join_timeout=0.2,
+            watchdog_interval=0.01,
+        )
+        supervisor.WATCHDOG_JOIN_MINIMUM_SECONDS = 0.05
+        self.addCleanup(self._close_other, supervisor)
+        source = uuid4()
+        self.adapter.prepare(source)
+        supervisor.start(source)
+        self.assertTrue(self.adapter.entered[source].wait(0.5))
+        self.adapter.check_delay = 1.0
+        self.assertTrue(self.adapter.in_check.wait(1))
+        self.adapter.release[source].set()
+        with self.assertRaisesRegex(WorkerStopError, "watchdog did not stop"):
+            supervisor.close()
+        # The worker itself was joined; only the watchdog is still running.
+        self.assertIsNone(supervisor.status(source))
+        self.assertTrue(supervisor.watchdog_running)
+        # Once its check returns the watchdog exits, and a repeated close
+        # succeeds.
+        self.adapter.check_delay = 0.0
+        self.assertTrue(wait_until(lambda: not supervisor.watchdog_running, 3))
+        supervisor.close()
+        self.assertFalse(supervisor.watchdog_running)
+
+    def test_repeated_close_rejoins_a_watchdog_that_outlived_its_join(self):
+        supervisor = LocalUvcSupervisor(
+            self.adapter, poll_timeout=5.0, retry_delay=0.01, join_timeout=0.1,
+            watchdog_interval=0.01,
+        )
+        supervisor.WATCHDOG_JOIN_MINIMUM_SECONDS = 0.05
+        self.addCleanup(self._close_other, supervisor)
+        source = uuid4()
+        self.adapter.prepare(source)
+        supervisor.start(source)
+        self.assertTrue(self.adapter.entered[source].wait(0.5))
+        self.adapter.check_delay = 1.0
+        self.assertTrue(self.adapter.in_check.wait(1))
+        self.adapter.release[source].set()
+        with self.assertRaises(WorkerStopError):
+            supervisor.close()
+        # Still inside the slow check: a repeated close must not succeed.
+        with self.assertRaisesRegex(WorkerStopError, "watchdog did not stop"):
+            supervisor.close()
+        self.adapter.check_delay = 0.0
+        supervisor.WATCHDOG_JOIN_MINIMUM_SECONDS = 3.0
+        supervisor.close()
+        self.assertFalse(supervisor.watchdog_running)
+
     def _close_other(self, supervisor):
         for release in self.adapter.release.values():
             release.set()

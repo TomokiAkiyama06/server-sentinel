@@ -208,7 +208,11 @@ observed on a real C960 after an unplug, MANUAL_TEST P-7) plus
 a camera mid-teardown into `stop_failed`. After the workers are joined,
 `close()` joins the watchdog for at least
 `LocalUvcSupervisor.WATCHDOG_JOIN_MINIMUM_SECONDS` (1 s) even when the shared
-bound is used up, so a successful close returns with the watchdog stopped.
+bound is used up. A watchdog still inside a frame-progress check after that
+join makes `close()` fail: the stop is `stop_failed` and the runtime leaves the
+adapter open rather than closing it under that check (a later `close()` joins
+the watchdog again). A successful close therefore returns with no worker or
+watchdog thread left that could call into the adapter.
 A worker that does not stop
 within the join bound makes the stop `stop_failed`; the adapter is then left to
 that worker's own cleanup rather than closed from a second thread, and the

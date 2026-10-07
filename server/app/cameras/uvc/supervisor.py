@@ -56,8 +56,9 @@ class LocalUvcSupervisor:
     # close() gives the watchdog join at least this long even when joining
     # the workers used up the shared deadline. A frame-progress check is
     # in-memory work under a non-blocking lock (its health write runs on a
-    # background writer), so it finishes well within this bound; a successful
-    # close() then returns with the watchdog stopped.
+    # background writer), so it normally finishes well within this bound. A
+    # watchdog still alive after it makes close() fail, so a successful
+    # close() always returns with the watchdog stopped.
     WATCHDOG_JOIN_MINIMUM_SECONDS = 1.0
 
     def __init__(self, adapter, *, poll_timeout=1.0, retry_delay=0.1,
@@ -233,9 +234,15 @@ class LocalUvcSupervisor:
         and watched, so its source cannot keep an ``online`` claim while it
         delivers no frames; the watchdog exits on its own once such workers
         have exited, or a later ``close()`` that joins them stops it.
+
+        Success means no worker and no watchdog thread is left that could
+        still call into the adapter. A watchdog still inside a check after its
+        own bounded join makes ``close()`` fail, so the owner does not tear
+        the adapter down under that check; a later ``close()`` joins it again.
         """
         with self._lock:
-            if self._closed and not self._workers:
+            if (self._closed and not self._workers
+                    and not (self._watchdog is not None and self._watchdog.is_alive())):
                 return
             self._closed = True
             watchdog = self._watchdog
@@ -266,5 +273,9 @@ class LocalUvcSupervisor:
             watchdog.join(max(self.WATCHDOG_JOIN_MINIMUM_SECONDS, deadline - self._clock()))
         if alive:
             raise WorkerStopError("local UVC workers did not stop")
+        if watchdog is not None and watchdog.is_alive():
+            # A check still running may call into the adapter: never report a
+            # clean close, or the owner would close the adapter under it.
+            raise WorkerStopError("local UVC watchdog did not stop")
         if cleanup_failed:
             raise WorkerStopError("local UVC worker cleanup failed")
