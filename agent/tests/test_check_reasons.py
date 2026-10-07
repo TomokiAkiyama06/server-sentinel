@@ -9,10 +9,12 @@ import re
 import tempfile
 import unittest
 from unittest.mock import patch
+from uuid import UUID, uuid4
 
 from media_capture_agent import cli, storage
 from media_capture_agent.cli import CHECK_REASONS, main
 from media_capture_agent.config import ExpectedMount
+from media_capture_agent.pairing import NodeCredentialMaterial, NodeCredentialStore
 from media_capture_agent.storage import MediaStore, Mount, StorageRefused
 from tests.support import configuration
 
@@ -280,6 +282,57 @@ class CheckReasonTests(unittest.TestCase):
             self.assert_reason("runtime_root_unavailable")
         finally:
             self.runtime.mkdir(mode=0o700)
+
+    # Installed node credential vs configured node_id (#116 re-pairing).
+
+    def install_credential(self, node):
+        NodeCredentialStore(self.runtime).install(NodeCredentialMaterial(
+            deployment_id=uuid4(), node_id=node, server_name="main.example.invalid",
+            private_key=b"synthetic-private", client_certificate=b"synthetic-client",
+            ca_certificate=b"synthetic-ca"))
+
+    def test_matching_installed_credential_passes(self):
+        self.install_credential(UUID(self.value["node_id"]))
+        self.assertEqual(self.run_check(), (0, PASSED, ""))
+
+    def test_node_identity_mismatch_refuses_check_and_start(self):
+        # After ``enroll pair --repair revoked`` the credential names a new node
+        # while the configuration still names the revoked one.
+        new_node = uuid4()
+        self.install_credential(new_node)
+        self.assert_reason("node_identity_mismatch")
+        config = self.write()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(cli, "MediaStore",
+                          lambda settings: MediaStore(settings, **self.store_options)), \
+                patch.object(cli.Agent, "tick", side_effect=AssertionError("started")), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(["--config", str(config)])
+        self.assertEqual((1, "", FAILED + "node_identity_mismatch\n"),
+                         (code, stdout.getvalue(), stderr.getvalue()))
+        self.assertNotIn(str(new_node), stdout.getvalue() + stderr.getvalue())
+        # The manual configuration update clears the refusal.
+        self.write(node_id=str(new_node))
+        self.assertEqual(self.run_check(), (0, PASSED, ""))
+
+    def test_damaged_installed_credential_is_not_treated_as_unpaired(self):
+        self.install_credential(UUID(self.value["node_id"]))
+        for entry in (self.runtime / "node-credentials").glob("client-certificate-*.pem"):
+            entry.write_bytes(b"tampered")
+        self.assert_reason("node_credential_unavailable")
+
+    def test_lost_credential_commit_is_not_treated_as_unpaired(self):
+        self.install_credential(UUID(self.value["node_id"]))
+        (self.runtime / "node-credentials" / "current.json").unlink()
+        self.assert_reason("node_credential_unavailable")
+
+    def test_check_backfills_evidence_for_an_identity_paired_before_it_existed(self):
+        self.install_credential(UUID(self.value["node_id"]))
+        (self.runtime / "node-identity-installed").unlink()
+        self.assertEqual(self.run_check(), (0, PASSED, ""))
+        self.assertTrue((self.runtime / "node-identity-installed").exists())
+        (self.runtime / "node-credentials" / "current.json").unlink()
+        self.assert_reason("node_credential_unavailable")
 
     # Unexpected internal errors.
 

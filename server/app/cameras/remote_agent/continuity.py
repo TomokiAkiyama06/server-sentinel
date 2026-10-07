@@ -27,6 +27,11 @@ authorized node, including a duplicate or an early refusal that is never
 enqueued, consumes that node's ingest rate budget.  Known loss is recorded
 as a bounded gap event and keeps the source ``degraded`` until a consumer
 drains it; it is never reported as a healthy flow.
+
+Releasing (deactivating) a source keeps its continuity outside the active-slot
+table until the durable recording layer acknowledges that it persisted that
+position (``acknowledge_persisted``), so a reactivated source's retry is never
+enqueued twice and loss already reported is never reported again.
 """
 
 from collections import deque
@@ -85,17 +90,22 @@ class ContinuityLimits:
     bounds tracked sources only.  ``maximum_nodes`` separately hard-bounds
     tracked node sessions (memory only, like the ingest rate-window table),
     so live source-less node sessions never consume the active-source
-    allowance.
+    allowance.  ``maximum_released_sources`` hard-bounds the continuity kept
+    for released (deactivated) sources that the durable layer has not yet
+    acknowledged; when it is full the oldest such entry is evicted, and that
+    source falls back to its durable watermark on reactivation.
     """
 
     maximum_sources: int
     maximum_pending_gaps_per_source: int
     stale_after_ns: int
     maximum_nodes: int = 64
+    maximum_released_sources: int = 64
 
     def __post_init__(self) -> None:
         values = (self.maximum_sources, self.maximum_pending_gaps_per_source,
-                  self.stale_after_ns, self.maximum_nodes)
+                  self.stale_after_ns, self.maximum_nodes,
+                  self.maximum_released_sources)
         if any(type(value) is not int or value <= 0 for value in values):
             raise ValueError("continuity limits must be positive integers")
 
@@ -211,19 +221,28 @@ class _Source:
     ``session_generation`` is the node session that last delivered this
     source; a source not yet delivered on the node's current session stays
     ``interrupted`` even though the node itself reconnected.
-    ``attempted_epoch`` is the highest epoch of a unit refused by pressure or
-    a transient refusal; a lower epoch is stale even before that unit commits,
-    so a restart already observed is never lost to an older-epoch retry.
+    ``attempted_epoch`` is the highest epoch of a unit refused by pressure, a
+    transient refusal or an unavailable watermark; a lower epoch is stale even
+    before that unit commits, so a restart already observed is never lost to
+    an older-epoch retry.  ``attempted_time_ns`` is the latest capture time
+    observed on such a refused unit of ``attempted_epoch`` since the last
+    commit (None: none), so an in-epoch capture clock regression is reported
+    even before anything of that epoch is committed.
     ``noted_epoch``/``noted_before`` record known loss (a capture restart or
     skipped sequences) that was already reported when a refused unit of that
     epoch first showed it: every uncommitted unit of ``noted_epoch`` before
     sequence ``noted_before`` is already reported, so a retry never reports
     that loss twice; a retry that starts later than ``noted_before`` reports
-    only the units in between.  ``noted_before`` None means nothing noted.
+    only the units in between, and a late unit before ``noted_before`` is a
+    ``duplicate`` (it lies behind loss already reported and is never
+    admitted).  ``noted_before`` None means nothing noted.
     ``unresolved`` marks an entry kept only because the durable watermark
     lookup failed for the source's first unit: it holds the source slot and
     reports ``degraded``, but carries no continuity, so the next attempt looks
     the watermark up again.
+    ``durable_epoch``/``durable_sequence`` is the latest position the durable
+    recording layer acknowledged as persisted (``durable_sequence`` None:
+    nothing acknowledged yet).
     """
 
     node_id: UUID
@@ -236,9 +255,12 @@ class _Source:
     gaps: deque = field(default_factory=deque)
     session_generation: int = 0
     attempted_epoch: int = 0
+    attempted_time_ns: int | None = None
     noted_epoch: int = 0
     noted_before: int | None = None
     unresolved: bool = False
+    durable_epoch: int = 0
+    durable_sequence: int | None = None
 
 
 @dataclass
@@ -284,11 +306,16 @@ class ContinuityTracker:
     reporting the durably recorded units as loss.  Until a lookup succeeds the
     source is kept as a bounded unresolved entry reported ``degraded``.
 
-    Releasing a source (deactivation) frees its active-source slot.  While
-    accepted units of that source are still in the ingest queue, its committed
-    position is kept outside the slot table, so a retry after reactivation is
-    still a ``duplicate`` and never enqueued a second time.  Once the queue
-    no longer holds them, the durable watermark is the source of truth.
+    Releasing a source (deactivation) frees its active-source slot.  Its
+    continuity (committed position, attempted epoch and loss already reported
+    on a refused unit) is kept outside the slot table, so a retry after
+    reactivation is still a ``duplicate``, is never enqueued a second time,
+    and never reports the same loss twice.  Leaving the ingest queue is not
+    durability: that entry is dropped only once the durable recording layer
+    has acknowledged (``acknowledge_persisted``) a watermark covering its
+    committed position and the entry carries nothing else, after which the
+    durable watermark is the source of truth.  These entries are hard-bounded
+    by ``maximum_released_sources`` (oldest evicted first).
     """
 
     def __init__(self, limits: ContinuityLimits, authorizer: IngestAuthorizer,
@@ -309,8 +336,9 @@ class ContinuityTracker:
         self._committed_watermark = committed_watermark
         self._nodes: dict[UUID, _Node] = {}
         self._sources: dict[UUID, _Source] = {}
-        # Committed positions of released sources whose accepted units are
-        # still queued; bounded by the ingest queue and outside the slot limit.
+        # Continuity of released sources not yet covered by a durable
+        # acknowledgement; bounded by ``maximum_released_sources`` and outside
+        # the active-source slot limit.  Insertion order is eviction order.
         self._released: dict[UUID, _Source] = {}
         # Monotonic across forget/re-enrollment; never reused for any node.
         self._generation = 0
@@ -514,30 +542,38 @@ class ContinuityTracker:
             if epoch == state.capture_epoch and state.last_sequence is not None \
                     and sequence <= state.last_sequence:
                 return "duplicate"
+            if sequence < state.noted_before:
+                # A late unit behind loss already reported: admitting it would
+                # contradict the recorded gap, so it is acknowledged instead.
+                return "duplicate"
             gaps = []
             if sequence > state.noted_before:
                 gaps.append(GapEvent(node_id, source_id, GapReason.SEQUENCE_SKIP, epoch,
                                      state.noted_before - 1 if state.noted_before else None,
                                      sequence, sequence - state.noted_before))
-            if (epoch == state.capture_epoch and state.last_sequence is not None
-                    and header.capture_time_ns < state.last_capture_time_ns):
-                gaps.append(GapEvent(node_id, source_id, GapReason.CAPTURE_CLOCK_REGRESSION,
-                                     epoch, state.last_sequence, sequence, 0))
+            gaps.extend(self._clock_regression(node_id, state, header))
             return tuple(gaps)
         if state is not None and epoch > state.capture_epoch:
             # A new capture epoch means the Agent capture process restarted;
             # the extent of any loss is not knowable here.  This holds for an
             # uncommitted state too: its attempted unit(s) of the older epoch
-            # were never committed and are now known to be lost.
+            # were never committed and are now known to be lost.  A unit of
+            # this new epoch refused before (an unavailable watermark keeps
+            # its capture time without noting loss) is still the in-epoch
+            # baseline, so a capture clock regression is reported as well.
             return (GapEvent(node_id, source_id, GapReason.CAPTURE_RESTART, epoch,
-                             None, sequence, None),)
+                             None, sequence, None),
+                    *self._clock_regression(node_id, state, header))
         if state is None or state.last_sequence is None:
             # Start of the flow in this epoch (absent, or seen but uncommitted
             # in the same epoch): leading units are reported as loss.
+            gaps = []
             if sequence:
-                return (GapEvent(node_id, source_id, GapReason.SEQUENCE_SKIP, epoch,
-                                 None, sequence, sequence),)
-            return ()
+                gaps.append(GapEvent(node_id, source_id, GapReason.SEQUENCE_SKIP, epoch,
+                                     None, sequence, sequence))
+            if state is not None:
+                gaps.extend(self._clock_regression(node_id, state, header))
+            return tuple(gaps)
         if sequence <= state.last_sequence:
             return "duplicate"
         gaps = []
@@ -545,10 +581,46 @@ class ContinuityTracker:
             gaps.append(GapEvent(node_id, source_id, GapReason.SEQUENCE_SKIP, epoch,
                                  state.last_sequence, sequence,
                                  sequence - state.last_sequence - 1))
-        if header.capture_time_ns < state.last_capture_time_ns:
-            gaps.append(GapEvent(node_id, source_id, GapReason.CAPTURE_CLOCK_REGRESSION,
-                                 epoch, state.last_sequence, sequence, 0))
+        gaps.extend(self._clock_regression(node_id, state, header))
         return tuple(gaps)
+
+    @staticmethod
+    def _clock_regression(node_id: UUID, state: _Source,
+                          header: MediaUnitHeader) -> tuple[GapEvent, ...]:
+        """Report an in-epoch capture clock regression against what was seen.
+
+        The baseline is the committed unit of this epoch and the latest
+        capture time observed on a refused unit of this epoch since that
+        commit, so a retry is compared even when nothing of the epoch is
+        committed yet (a refused first unit, or a refused restart unit).
+        """
+        epoch = header.capture_epoch
+        committed = state.last_sequence is not None and state.capture_epoch == epoch
+        baseline = [state.last_capture_time_ns] if committed else []
+        if state.attempted_time_ns is not None and state.attempted_epoch == epoch:
+            baseline.append(state.attempted_time_ns)
+        if not baseline or header.capture_time_ns >= max(baseline):
+            return ()
+        return (GapEvent(node_id, header.source_id, GapReason.CAPTURE_CLOCK_REGRESSION,
+                         epoch, state.last_sequence if committed else None,
+                         header.sequence, 0),)
+
+    @staticmethod
+    def _attempted(state: _Source, header: MediaUnitHeader) -> None:
+        """Remember the epoch and capture time of a refused, uncommitted unit.
+
+        Lower epochs are refused as stale before any attempt is recorded, so
+        ``header.capture_epoch`` is never below ``attempted_epoch`` here; an
+        older one is ignored defensively.
+        """
+        epoch, at = header.capture_epoch, header.capture_time_ns
+        if epoch < state.attempted_epoch:
+            return
+        if epoch > state.attempted_epoch or state.attempted_time_ns is None:
+            state.attempted_time_ns = at
+        else:
+            state.attempted_time_ns = max(state.attempted_time_ns, at)
+        state.attempted_epoch = epoch
 
     def _observe_loss(self, state: _Source, checked: tuple[GapEvent, ...],
                       header: MediaUnitHeader) -> tuple[GapEvent, ...]:
@@ -645,10 +717,11 @@ class ContinuityTracker:
             if state is None and len(self._sources) >= self.limits.maximum_sources:
                 return self._charged(session, DeliveryOutcome.REJECTED, "source_capacity")
             if state is None:
-                released = self._released_locked(source_id)
+                released = self._released.get(source_id)
                 if released is not None and released.node_id == node_id:
-                    # Reactivated while its accepted units are still queued:
-                    # that position is newer than the durable watermark.
+                    # Reactivated before the durable layer acknowledged
+                    # covering it: this continuity is at least as new as the
+                    # durable watermark and also carries loss already noted.
                     del self._released[source_id]
                     state = self._sources[source_id] = released
             if state is None or state.unresolved:
@@ -671,20 +744,17 @@ class ContinuityTracker:
                     mark = self._committed_watermark(source_id)
                 except Exception:
                     mark = _UNAVAILABLE
+                # The durable lookup may block: re-sample so a unit admitted
+                # or refused afterwards is never stamped with a time from
+                # before the lookup (it would read as an interrupted flow).
+                now = max(now, self._now())
                 if mark is _UNAVAILABLE or (mark is not None
                                             and not isinstance(mark, CommittedWatermark)):
                     return self._unresolved(session, node, state, header, now)
                 if mark is not None and mark.node_id != node_id:
                     return self._charged(session, DeliveryOutcome.REJECTED,
                                          "source_identity_mismatch")
-                if state is not None:
-                    # The unresolved entry carried no continuity; drop it.
-                    del self._sources[source_id]
-                    state = None
-                if mark is not None:
-                    state = self._sources[source_id] = _Source(
-                        node_id, mark.capture_epoch, mark.sequence,
-                        mark.capture_time_ns, now)
+                state = self._resolved(node_id, source_id, state, mark, header, now)
             checked = self._discontinuities(node_id, state, header)
             if checked == "duplicate":
                 # Idempotent acknowledgement: the Agent may release this unit.
@@ -697,10 +767,12 @@ class ContinuityTracker:
                 node_id, source_id, AgentAction.MEDIA, header.sequence, payload,
                 capture_epoch=header.capture_epoch,
                 capture_time_ns=header.capture_time_ns))
+            # Stamp the outcome with a time taken once admission completed.
+            now = max(now, self._now())
             if admission.outcome in (IngestOutcome.BACKPRESSURED, IngestOutcome.RATE_LIMITED):
                 pending = self._pending(state, node_id, header, now)
                 pending.backpressured = True
-                pending.attempted_epoch = header.capture_epoch
+                self._attempted(pending, header)
                 observed = self._observe_loss(pending, checked, header)
                 # The Agent is still delivering: refresh activity (not the
                 # committed sequence) so sustained pressure stays ``degraded``
@@ -728,7 +800,7 @@ class ContinuityTracker:
                 # is refreshed so a persisting refusal stays ``degraded``.
                 pending = self._pending(state, node_id, header, now)
                 pending.refused = True
-                pending.attempted_epoch = header.capture_epoch
+                self._attempted(pending, header)
                 observed = self._observe_loss(pending, checked, header)
                 self._seen(pending, now)
                 pending.session_generation = node.generation
@@ -751,6 +823,8 @@ class ContinuityTracker:
             state.capture_epoch = header.capture_epoch
             state.last_sequence = header.sequence
             state.last_capture_time_ns = header.capture_time_ns
+            # Attempts up to this commit are superseded by the committed unit.
+            state.attempted_time_ns = None
             self._seen(state, now)
             state.session_generation = node.generation
             self._seen(node, now)
@@ -763,6 +837,38 @@ class ContinuityTracker:
             if admission.outcome is IngestOutcome.REJECTED:
                 return Delivery(DeliveryOutcome.REJECTED, admission.reason, tuple(gaps))
             return Delivery(DeliveryOutcome.ACCEPTED, None, tuple(gaps))
+
+    def _resolved(self, node_id: UUID, source_id: UUID, state: _Source | None,
+                  mark: CommittedWatermark | None, header: MediaUnitHeader,
+                  now: int) -> _Source | None:
+        """Seed continuity from a successful durable-watermark lookup.
+
+        An unresolved entry carries no continuity, but the epochs (and capture
+        times) of the units it refused were attempted: they are kept, so a
+        lower epoch is still stale and an in-epoch clock regression is still
+        reported, whether or not the durable store recorded anything.
+        """
+        attempted = state
+        if attempted is not None:
+            del self._sources[source_id]
+        if mark is not None:
+            # The watermark is itself the durable position: a source resumed
+            # from it is covered there, so releasing it before anything newer
+            # commits keeps no entry in the bounded released table.
+            state = self._sources[source_id] = _Source(
+                node_id, mark.capture_epoch, mark.sequence, mark.capture_time_ns, now,
+                durable_epoch=mark.capture_epoch, durable_sequence=mark.sequence)
+        elif attempted is not None:
+            # Nothing durable: an uncommitted entry in the attempted epoch, as
+            # if that refused unit had been refused by pressure.
+            state = self._sources[source_id] = _Source(
+                node_id, attempted.attempted_epoch, None, header.capture_time_ns, now)
+        else:
+            return None
+        if attempted is not None and attempted.attempted_epoch >= state.capture_epoch:
+            state.attempted_epoch = attempted.attempted_epoch
+            state.attempted_time_ns = attempted.attempted_time_ns
+        return state
 
     def _unresolved(self, session: AgentSession, node: _Node, state: _Source | None,
                     header: MediaUnitHeader, now: int) -> Delivery:
@@ -790,6 +896,9 @@ class ContinuityTracker:
             state = self._sources[header.source_id] = _Source(
                 session.node_id, header.capture_epoch, None, header.capture_time_ns, now,
                 unresolved=True)
+        # The attempt's epoch is kept so an older-epoch retry stays stale once
+        # the watermark resolves (``_resolved``).
+        self._attempted(state, header)
         if pressured:
             state.backpressured = True
         else:
@@ -830,30 +939,73 @@ class ContinuityTracker:
                     result.append(state.gaps.popleft())
             return tuple(result)
 
-    def _released_locked(self, source_id: UUID) -> _Source | None:
-        """A released source's committed position while its units are queued."""
-        released = self._released.get(source_id)
-        if released is not None and not self._ingest.holds(released.node_id, source_id):
-            del self._released[source_id]
-            return None
-        return released
+    @staticmethod
+    def _durably_covered(state: _Source) -> bool:
+        """Whether the durable watermark alone restores this continuity.
+
+        True only when the acknowledged durable position is at or past the
+        committed one and nothing else is carried: no loss noted on a refused
+        unit and no refused attempt since the last commit.  An unresolved or
+        uncommitted entry is never covered.
+        """
+        return (not state.unresolved and state.last_sequence is not None
+                and state.durable_sequence is not None
+                and (state.durable_epoch, state.durable_sequence)
+                >= (state.capture_epoch, state.last_sequence)
+                and state.noted_before is None and state.attempted_time_ns is None
+                and state.attempted_epoch <= state.capture_epoch)
 
     def _forget_source_locked(self, source_id: UUID) -> tuple[GapEvent, ...]:
-        for released in tuple(self._released):
-            self._released_locked(released)
         state = self._sources.pop(source_id, None)
         if state is None:
             return ()
         gaps = tuple(state.gaps)
-        if (state.last_sequence is not None and not state.unresolved
-                and self._ingest.holds(state.node_id, source_id)):
-            # Keep only the committed position (gaps are handed back), so a
-            # retry after reactivation cannot enqueue a queued unit again.
-            self._released[source_id] = _Source(
-                state.node_id, state.capture_epoch, state.last_sequence,
-                state.last_capture_time_ns, state.last_seen_ns,
-                noted_epoch=state.noted_epoch, noted_before=state.noted_before)
+        # Keep the continuity (gaps are handed back) until the durable layer
+        # acknowledges covering it: leaving the ingest queue is not
+        # durability, so a retry after reactivation can neither enqueue an
+        # envelope again nor report noted loss twice.
+        released = _Source(
+            state.node_id, state.capture_epoch, state.last_sequence,
+            state.last_capture_time_ns, state.last_seen_ns,
+            attempted_epoch=state.attempted_epoch,
+            attempted_time_ns=state.attempted_time_ns,
+            noted_epoch=state.noted_epoch, noted_before=state.noted_before,
+            unresolved=state.unresolved, durable_epoch=state.durable_epoch,
+            durable_sequence=state.durable_sequence)
+        self._released.pop(source_id, None)
+        if not self._durably_covered(released):
+            while len(self._released) >= self.limits.maximum_released_sources:
+                # Hard bound: the oldest entry falls back to its durable
+                # watermark (a possible duplicate envelope or repeated gap
+                # report on reactivation, never unreported loss).
+                del self._released[next(iter(self._released))]
+            self._released[source_id] = released
         return gaps
+
+    def acknowledge_persisted(self, source_id: UUID, mark: CommittedWatermark) -> None:
+        """Record that the durable recording layer persisted ``mark``.
+
+        The durable consumer calls this after it durably records a drained
+        unit (the same watermark it will later return from
+        ``committed_watermark``).  It changes no flow state or gap; it only
+        lets a released source's kept continuity be dropped once the durable
+        watermark covers it, because only then does a reactivated source
+        resume from that watermark without enqueueing a unit twice.  An
+        acknowledgement for another node or an unknown source is ignored.
+        """
+        if not isinstance(source_id, UUID) or not isinstance(mark, CommittedWatermark):
+            raise ValueError("invalid durable persistence acknowledgement")
+        with self._lock:
+            state = self._sources.get(source_id) or self._released.get(source_id)
+            if state is None or state.node_id != mark.node_id:
+                return
+            position = (mark.capture_epoch, mark.sequence)
+            if (state.durable_sequence is None
+                    or position > (state.durable_epoch, state.durable_sequence)):
+                state.durable_epoch, state.durable_sequence = position
+            if (self._released.get(source_id) is state
+                    and self._durably_covered(state)):
+                del self._released[source_id]
 
     def _forget_node_locked(self, node_id: UUID) -> tuple[GapEvent, ...]:
         self._nodes.pop(node_id, None)

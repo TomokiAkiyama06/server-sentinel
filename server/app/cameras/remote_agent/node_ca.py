@@ -15,12 +15,23 @@ record is (see ``ingest_tls.CaptureNodeAdmission``).
 Private keys are written once, with ``O_EXCL | O_NOFOLLOW`` and mode 0600, into
 owner-only (0700) directories that are validated before every access. Errors
 carry fixed messages and never include key, CSR or certificate bytes.
+
+A directory may belong to another OS account than the issuing process (for
+example a CA account writing the ingest listener's credential, Issue #124).
+New files are then handed to ``PrivateDirectory.owner_uid`` with ``fchown``
+before any secret byte is written. That needs effective ``CAP_CHOWN`` and
+``CAP_DAC_OVERRIDE`` (root has both); without them the access is refused
+before anything is created. The Main listener leaf can be rotated in place
+while the CA, and therefore every Agent's trust bundle, stays unchanged
+(Issue #125).
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import datetime
 import errno
+import fcntl
 import hashlib
 import hmac
 import ipaddress
@@ -29,7 +40,7 @@ import os
 from pathlib import Path
 import re
 import stat
-from typing import Callable
+from typing import Callable, Iterator
 from uuid import UUID
 
 from cryptography import x509
@@ -56,15 +67,105 @@ _CA_KEY = "ca-key.pem"
 _CA_CERTIFICATE = "ca-certificate.pem"
 _SERVER_KEY = "main-server-key.pem"
 _SERVER_CERTIFICATE = "main-server-certificate.pem"
+# Staged names used only while ``rotate_main_server_credential`` holds the
+# listener directory lock; a crashed rotation is completed or discarded by the
+# next rotation, never by a reader.
+_STAGED_SERVER_KEY = _SERVER_KEY + ".next"
+_STAGED_SERVER_CERTIFICATE = _SERVER_CERTIFICATE + ".next"
+# Linux capability bits (linux/capability.h) read from /proc/self/status CapEff.
+_CAP_CHOWN = 0
+_CAP_DAC_OVERRIDE = 1
+_CAP_DAC_READ_SEARCH = 2
 _DNS_LABEL = re.compile(r"(?!-)[a-z0-9-]{1,63}(?<!-)")
 
 
 class CaptureAuthorityError(RuntimeError):
-    """A fixed CA/issuance failure that never embeds secret or peer bytes."""
+    """A fixed CA/issuance failure that never embeds secret or peer bytes.
+
+    ``reason`` is the fixed refusal word a CLI reports for this failure.
+    """
+
+    reason = "issuer_material_rejected"
+
+
+class AuthorityValidityExceeded(CaptureAuthorityError):
+    """The requested leaf would outlive the deployment CA (CA too close to expiry)."""
+
+    reason = "deployment_ca_validity_insufficient"
+
+
+class OwnershipPrivilegeRequired(CaptureAuthorityError):
+    """A directory owned by another account needs privileges this process lacks."""
+
+    reason = "listener_owner_requires_privilege"
+
+
+class IssuerMaterialBusy(CaptureAuthorityError):
+    """Another process holds the directory lock (concurrent init/rotation)."""
+
+    reason = "issuer_material_busy"
+
+
+class ListenerAuthorityMismatch(CaptureAuthorityError):
+    """The listener certificate was not issued by the selected deployment CA."""
+
+    reason = "listener_authority_mismatch"
+
+
+class ListenerMaterialInconsistent(CaptureAuthorityError):
+    """Listener key and certificate do not match (an interrupted rotation)."""
+
+    reason = "listener_material_inconsistent"
+
+
+class ReplacementNotDurable(CaptureAuthorityError):
+    """A rename took effect but the directory fsync after it failed.
+
+    The new entry is already current under the target name, so the caller
+    must treat the replacement as done (never roll back staged state that a
+    later recovery depends on). Rerunning the command completes the work.
+    """
+
+    reason = "issuer_material_replacement_unconfirmed"
 
 
 def _utc_now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _effective_uid() -> int:
+    return os.geteuid()
+
+
+def _effective_capabilities() -> int | None:
+    """The effective capability mask, or ``None`` when it cannot be read."""
+    try:
+        with open("/proc/self/status", "rb") as status:
+            for line in status:
+                if line.startswith(b"CapEff:"):
+                    return int(line.split(b":", 1)[1].strip(), 16)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def ownership_privilege_available(*, assign: bool) -> bool:
+    """Whether this process may use a private directory owned by another account.
+
+    ``assign`` (creating files there and handing them to that account) needs
+    ``CAP_CHOWN`` and ``CAP_DAC_OVERRIDE``. Reading needs ``CAP_DAC_OVERRIDE``
+    or ``CAP_DAC_READ_SEARCH``. An unreadable capability set counts as none,
+    so the caller refuses up front (fail closed) instead of failing half-way.
+    """
+    mask = _effective_capabilities()
+    if mask is None:
+        return False
+
+    def has(bit: int) -> bool:
+        return bool(mask >> bit & 1)
+    if assign:
+        return has(_CAP_CHOWN) and has(_CAP_DAC_OVERRIDE)
+    return has(_CAP_DAC_OVERRIDE) or has(_CAP_DAC_READ_SEARCH)
 
 
 def public_key_digest(public_key) -> str:
@@ -121,7 +222,13 @@ class PrivateDirectory:
 
     The directory must be a real directory (not a symlink) owned by
     ``owner_uid`` with no group/other permission bits. Files are created
-    exclusively with mode 0600 and never replaced.
+    exclusively with mode 0600, owned by ``owner_uid``, and never replaced
+    except by the listener rotation's rename under the directory lock.
+
+    ``owner_uid`` defaults to this process's effective UID. When it names
+    another account (Issue #124), every access first requires the matching
+    privilege (see ``ownership_privilege_available``) and new entries are
+    ``fchown``-ed to that account before any content is written.
     """
 
     def __init__(self, path: Path, *, owner_uid: int | None = None):
@@ -129,17 +236,52 @@ class PrivateDirectory:
         if not self.path.is_absolute() or os.path.realpath(self.path) != str(self.path):
             # Refuse relative paths, ``..`` and symlinked ancestors up front.
             raise CaptureAuthorityError("private directory must be a canonical absolute path")
-        self.owner_uid = os.geteuid() if owner_uid is None else owner_uid
+        if owner_uid is not None and (type(owner_uid) is not int or owner_uid < 0):
+            raise CaptureAuthorityError("private directory owner is invalid")
+        self.owner_uid = _effective_uid() if owner_uid is None else owner_uid
+        # Entries this object created, by (device, inode), so a rollback never
+        # removes an entry another process created under the same name.
+        self._created: dict[str, tuple[int, int]] = {}
+
+    @property
+    def foreign_owner(self) -> bool:
+        return self.owner_uid != _effective_uid()
+
+    def _require_privilege(self, *, assign: bool) -> None:
+        if self.foreign_owner and not ownership_privilege_available(assign=assign):
+            raise OwnershipPrivilegeRequired(
+                "private directory owned by another account needs extra privilege")
 
     def ensure(self) -> "PrivateDirectory":
+        self._require_privilege(assign=True)
         try:
             os.mkdir(self.path, 0o700)
         except FileExistsError:
             pass
         except OSError:
             raise CaptureAuthorityError("private directory is unavailable") from None
+        else:
+            if self.foreign_owner:
+                self._assign_new_directory()
         self._validate()
         return self
+
+    def _assign_new_directory(self) -> None:
+        try:
+            descriptor = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                                 | os.O_CLOEXEC)
+        except OSError:
+            raise CaptureAuthorityError("private directory is unavailable") from None
+        try:
+            os.fchown(descriptor, self.owner_uid, -1)
+        except OSError:
+            try:
+                os.rmdir(self.path)
+            except OSError:
+                pass
+            raise CaptureAuthorityError("private directory owner could not be set") from None
+        finally:
+            os.close(descriptor)
 
     def _validate(self) -> None:
         try:
@@ -151,6 +293,7 @@ class PrivateDirectory:
             raise CaptureAuthorityError("private directory is not owner-only")
 
     def _open_directory(self) -> int:
+        self._require_privilege(assign=False)
         self._validate()
         try:
             return os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -167,6 +310,27 @@ class PrivateDirectory:
         finally:
             os.close(directory)
 
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        """Hold an exclusive, non-blocking lock on this directory.
+
+        Serializes ``initialize`` and listener rotation across processes; a
+        second caller is refused with ``IssuerMaterialBusy`` instead of
+        waiting. The kernel releases the lock when the process exits, even
+        after a crash.
+        """
+        directory = self._open_directory()
+        try:
+            try:
+                fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise IssuerMaterialBusy("issuer material is in use by another process") from None
+            except OSError:
+                raise CaptureAuthorityError("private directory could not be locked") from None
+            yield
+        finally:
+            os.close(directory)
+
     def write_new(self, name: str, value: bytes) -> Path:
         directory = self._open_directory()
         try:
@@ -179,6 +343,10 @@ class PrivateDirectory:
             except OSError:
                 raise CaptureAuthorityError("issuer material could not be written") from None
             try:
+                if self.foreign_owner:
+                    # Hand the still-empty file to the directory's account
+                    # before any secret byte is written (Issue #124).
+                    os.fchown(descriptor, self.owner_uid, -1)
                 remaining = memoryview(value)
                 while remaining:
                     written = os.write(descriptor, remaining)
@@ -209,6 +377,12 @@ class PrivateDirectory:
                 except OSError:
                     pass
                 raise CaptureAuthorityError("issuer material could not be written") from None
+            try:
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except OSError:
+                pass
+            else:
+                self._created[name] = (info.st_dev, info.st_ino)
             return self.path / name
         finally:
             os.close(directory)
@@ -237,7 +411,36 @@ class PrivateDirectory:
             os.close(directory)
 
     def discard_created(self, name: str) -> None:
-        """Remove a file this process just created, to roll back an incomplete setup."""
+        """Remove a file this object created, to roll back an incomplete setup.
+
+        Only the exact entry ``write_new`` created through this object (same
+        device and inode) is removed. An entry of the same name created by
+        another process -- for example a concurrent ``init`` that won the
+        race -- is left untouched (Issue #125).
+        """
+        created = self._created.pop(name, None)
+        if created is None:
+            return
+        directory = self._open_directory()
+        try:
+            try:
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if (info.st_dev, info.st_ino) != created:
+                    return
+                os.unlink(name, dir_fd=directory)
+            except FileNotFoundError:
+                return
+            except OSError:
+                raise CaptureAuthorityError("issuer material could not be removed") from None
+            try:
+                os.fsync(directory)
+            except OSError:
+                raise CaptureAuthorityError("issuer material could not be removed") from None
+        finally:
+            os.close(directory)
+
+    def discard_stale(self, name: str) -> None:
+        """Remove a staged entry left by a crashed rotation; call under ``locked()``."""
         directory = self._open_directory()
         try:
             try:
@@ -250,6 +453,24 @@ class PrivateDirectory:
                 os.fsync(directory)
             except OSError:
                 raise CaptureAuthorityError("issuer material could not be removed") from None
+        finally:
+            os.close(directory)
+
+    def replace_with(self, staged: str, name: str) -> None:
+        """Atomically rename ``staged`` over ``name``; call under ``locked()``."""
+        directory = self._open_directory()
+        try:
+            try:
+                os.rename(staged, name, src_dir_fd=directory, dst_dir_fd=directory)
+            except OSError:
+                raise CaptureAuthorityError("issuer material could not be replaced") from None
+            self._created.pop(staged, None)
+            try:
+                os.fsync(directory)
+            except OSError:
+                # The rename already happened: report that, so callers do not
+                # mistake it for a replacement that never took effect.
+                raise ReplacementNotDurable("issuer material replacement is not durable") from None
         finally:
             os.close(directory)
 
@@ -389,32 +610,38 @@ class DeploymentAuthority:
         lifetime = _validity(validity, MAX_CA_VALIDITY)
         server_lifetime = _validity(server_validity, MAX_LEAF_VALIDITY)
         if server_lifetime + _CLOCK_SKEW_ALLOWANCE > lifetime:
-            raise CaptureAuthorityError("certificate validity exceeds the deployment CA")
+            raise AuthorityValidityExceeded("certificate validity exceeds the deployment CA")
         if not valid_server_name(server_name):
             raise CaptureAuthorityError("invalid Main server name")
-        if not isinstance(listener, PrivateDirectory) or listener.path == directory.path:
+        if (not isinstance(listener, PrivateDirectory) or not isinstance(directory, PrivateDirectory)
+                or listener.path == directory.path):
             raise CaptureAuthorityError("listener material must not share the CA directory")
         _checked_now(clock)
         directory.ensure()
         listener.ensure()
-        if any(directory.exists(name) for name in (_CA_KEY, _CA_CERTIFICATE)):
-            raise CaptureAuthorityError("issuer material already exists")
-        if any(listener.exists(name)
-               for name in (_CA_KEY, _CA_CERTIFICATE, _SERVER_KEY, _SERVER_CERTIFICATE)):
-            raise CaptureAuthorityError("listener material already exists")
-        authority = cls.create(directory, deployment_id, validity=lifetime, clock=clock)
-        try:
-            authority.issue_main_server_credential(listener, server_name=server_name,
-                                                   validity=server_lifetime)
-        except BaseException:
-            for target, names in ((listener, (_SERVER_CERTIFICATE, _SERVER_KEY)),
-                                  (directory, (_CA_CERTIFICATE, _CA_KEY))):
-                for name in names:
-                    try:
-                        target.discard_created(name)
-                    except CaptureAuthorityError:
-                        pass
-            raise
+        # Both directories stay locked for the whole run, in a fixed order, so
+        # concurrent ``init`` runs are serialized (the loser is refused before
+        # it writes); rollback also removes only the entries this run created.
+        first, second = sorted((directory, listener), key=lambda item: str(item.path))
+        with first.locked(), second.locked():
+            if any(directory.exists(name) for name in (_CA_KEY, _CA_CERTIFICATE)):
+                raise CaptureAuthorityError("issuer material already exists")
+            if any(listener.exists(name)
+                   for name in (_CA_KEY, _CA_CERTIFICATE, _SERVER_KEY, _SERVER_CERTIFICATE)):
+                raise CaptureAuthorityError("listener material already exists")
+            authority = cls.create(directory, deployment_id, validity=lifetime, clock=clock)
+            try:
+                authority.issue_main_server_credential(listener, server_name=server_name,
+                                                       validity=server_lifetime)
+            except BaseException:
+                for target, names in ((listener, (_SERVER_CERTIFICATE, _SERVER_KEY)),
+                                      (directory, (_CA_CERTIFICATE, _CA_KEY))):
+                    for name in names:
+                        try:
+                            target.discard_created(name)
+                        except CaptureAuthorityError:
+                            pass
+                raise
         return authority
 
     @classmethod
@@ -443,10 +670,22 @@ class DeploymentAuthority:
         lifetime = _validity(validity, MAX_LEAF_VALIDITY)
         now = _checked_now(self._clock)
         not_after = now + lifetime
-        if (now < self.certificate.not_valid_before_utc
-                or not_after > self.certificate.not_valid_after_utc):
-            raise CaptureAuthorityError("certificate validity exceeds the deployment CA")
+        if now < self.certificate.not_valid_before_utc:
+            raise CaptureAuthorityError("issuer clock precedes the deployment CA")
+        if not_after > self.certificate.not_valid_after_utc:
+            # Distinct from a malformed request: the CA itself is too close to
+            # its expiry for this leaf validity (Issue #127).
+            raise AuthorityValidityExceeded("certificate validity exceeds the deployment CA")
         return now - _CLOCK_SKEW_ALLOWANCE, not_after
+
+    @property
+    def not_valid_after(self) -> datetime.datetime:
+        """When the deployment CA itself expires (public)."""
+        return self.certificate.not_valid_after_utc
+
+    def check_leaf_validity(self, validity: datetime.timedelta) -> None:
+        """Refuse now if a leaf of ``validity`` could not be issued at this moment."""
+        self._leaf_window(validity)
 
     def _leaf_builder(self, subject: str, public_key, window) -> x509.CertificateBuilder:
         not_before, not_after = window
@@ -480,6 +719,12 @@ class DeploymentAuthority:
         target.ensure()
         if target.exists(_CA_KEY):
             raise CaptureAuthorityError("listener material must not share the CA directory")
+        key, certificate = self._main_server_leaf(server_name, window)
+        key_path = target.write_new(_SERVER_KEY, _private_pem(key))
+        certificate_path = target.write_new(_SERVER_CERTIFICATE, _certificate_pem(certificate))
+        return MainServerCredential(certificate_path=certificate_path, key_path=key_path)
+
+    def _main_server_leaf(self, server_name: str, window):
         key = _new_key()
         certificate = (
             self._leaf_builder("ServerSentinel capture ingest", key.public_key(), window)
@@ -490,9 +735,117 @@ class DeploymentAuthority:
             ]), critical=False)
             .sign(self._private_key, hashes.SHA256())
         )
-        key_path = target.write_new(_SERVER_KEY, _private_pem(key))
-        certificate_path = target.write_new(_SERVER_CERTIFICATE, _certificate_pem(certificate))
-        return MainServerCredential(certificate_path=certificate_path, key_path=key_path)
+        return key, certificate
+
+    def issued_listener_certificate(self, target: PrivateDirectory) -> x509.Certificate:
+        """Return ``target``'s Main listener certificate if this CA issued it.
+
+        Checks the issuer signature and name, the deployment URI and that the
+        stored listener key matches the certificate. Expiry is not checked, so
+        an expired listener certificate can still be rotated.
+        """
+        certificate = self.verify_listener_certificate(target)
+        if _key_digest(target, _SERVER_KEY) != public_key_digest(certificate.public_key()):
+            raise ListenerMaterialInconsistent("listener key does not match its certificate")
+        return certificate
+
+    def verify_listener_certificate(self, target: PrivateDirectory) -> x509.Certificate:
+        """Return ``target``'s listener certificate only if this CA issued it.
+
+        Used before exporting a trust bundle or serving enrollment, so a CA
+        directory of one deployment and a listener directory of another are
+        refused (``ListenerAuthorityMismatch``) instead of producing a bundle
+        whose CA cannot authenticate the listener (Issue #125). Reads only
+        the public certificate; expiry is not checked here.
+        """
+        certificate = _load_certificate(target, _SERVER_CERTIFICATE, "listener material is invalid")
+        if not self._issued(certificate):
+            raise ListenerAuthorityMismatch("listener certificate is not from this deployment CA")
+        _single_server_name(certificate)
+        return certificate
+
+    def _issued(self, certificate: x509.Certificate) -> bool:
+        try:
+            certificate.verify_directly_issued_by(self.certificate)
+        except (ValueError, TypeError, InvalidSignature):
+            return False
+        return (deployment_uri(self.deployment_id) in _uris(certificate)
+                and not _is_ca(certificate))
+
+    def rotate_main_server_credential(self, target: PrivateDirectory, *,
+                                      validity: datetime.timedelta) -> "ListenerRotation":
+        """Replace the Main listener key and certificate in place (Issue #125).
+
+        The CA is not touched, so every Agent's trust bundle (CA certificate
+        plus server name) keeps verifying the new leaf; the server name is
+        kept from the current certificate. Under the listener directory lock
+        the new key and certificate are first written under staged names,
+        then each is renamed over the current file (each rename is atomic).
+        Readers never see a partially written file; a reader that loads
+        between the two renames sees a key that does not match the
+        certificate and refuses (``ssl`` and ``listener_material`` both check
+        the pair). If the process stops between the renames, the next
+        rotation completes the interrupted one instead of issuing again.
+        """
+        if not isinstance(target, PrivateDirectory):
+            raise CaptureAuthorityError("invalid listener directory")
+        window = self._leaf_window(validity)
+        # The directory must already exist (it is never created here), and
+        # the privilege to write into it is checked before anything changes.
+        target._require_privilege(assign=True)
+        if target.exists(_CA_KEY) or target.exists(_CA_CERTIFICATE):
+            raise CaptureAuthorityError("listener material must not share the CA directory")
+        with target.locked():
+            recovered = self._recover_interrupted_rotation(target)
+            if recovered is not None:
+                return ListenerRotation(recovered.not_valid_after_utc, recovered=True)
+            current = self.issued_listener_certificate(target)
+            server_name = _single_server_name(current)
+            key, certificate = self._main_server_leaf(server_name, window)
+            try:
+                target.write_new(_STAGED_SERVER_KEY, _private_pem(key))
+                target.write_new(_STAGED_SERVER_CERTIFICATE, _certificate_pem(certificate))
+                # Nothing current has changed until this rename succeeds.
+                target.replace_with(_STAGED_SERVER_KEY, _SERVER_KEY)
+            except ReplacementNotDurable:
+                # The key rename took effect although its directory fsync
+                # failed: the new key is current, so the staged certificate
+                # must stay for the next rotation's recovery to install.
+                raise
+            except BaseException:
+                for name in (_STAGED_SERVER_CERTIFICATE, _STAGED_SERVER_KEY):
+                    try:
+                        target.discard_created(name)
+                    except CaptureAuthorityError:
+                        pass
+                raise
+            # From here the new key is current. A failure leaves the staged
+            # certificate for the next rotation to complete.
+            target.replace_with(_STAGED_SERVER_CERTIFICATE, _SERVER_CERTIFICATE)
+        return ListenerRotation(certificate.not_valid_after_utc, recovered=False)
+
+    def _recover_interrupted_rotation(self, target: PrivateDirectory) -> x509.Certificate | None:
+        """Complete or discard a crashed rotation's staged files; caller holds the lock."""
+        staged_key = target.exists(_STAGED_SERVER_KEY)
+        staged_certificate = target.exists(_STAGED_SERVER_CERTIFICATE)
+        if not staged_key and not staged_certificate:
+            return None
+        if staged_certificate and not staged_key:
+            # Stopped after the key rename: the current key is the new one.
+            certificate = _load_certificate(target, _STAGED_SERVER_CERTIFICATE,
+                                            "listener material is invalid")
+            if (self._issued(certificate)
+                    and _key_digest(target, _SERVER_KEY) == public_key_digest(certificate.public_key())):
+                _single_server_name(certificate)
+                target.replace_with(_STAGED_SERVER_CERTIFICATE, _SERVER_CERTIFICATE)
+                return certificate
+        # Stopped before any rename: the current pair is untouched, so the
+        # staged leftovers are discarded and a fresh rotation proceeds. Any
+        # other combination is not something a rotation produces; refuse.
+        self.issued_listener_certificate(target)
+        for name in (_STAGED_SERVER_CERTIFICATE, _STAGED_SERVER_KEY):
+            target.discard_stale(name)
+        return None
 
     def issue_node_certificate(self, claim: EnrollmentClaim, csr_pem: bytes, *,
                                validity: datetime.timedelta = DEFAULT_NODE_VALIDITY
@@ -568,6 +921,35 @@ class DeploymentAuthority:
         public, key_digest = self._proof_of_possession(csr_pem, strict=True)
         return self._sign_node(node_id, public, key_digest, validity)
 
+    def staged_renewal_credential(self, node_id: UUID, public_key_digest_value: str,
+                                  credential_digest: str, certificate_pem: bytes
+                                  ) -> IssuedNodeCredential:
+        """Re-validate a certificate this CA issued for a staged renewal (Issue #123).
+
+        Used when a same-key retry is answered with the certificate first
+        staged for that key. It must be a node leaf signed by this deployment
+        CA for exactly ``node_id`` and the retried key, and match the staged
+        digest; otherwise nothing is returned.
+        """
+        if not isinstance(node_id, UUID) or not isinstance(certificate_pem, bytes):
+            raise CaptureAuthorityError("staged renewal certificate is invalid")
+        try:
+            certificate = x509.load_pem_x509_certificate(certificate_pem)
+            certificate.verify_directly_issued_by(self.certificate)
+            key_digest = public_key_digest(certificate.public_key())
+            digest = certificate_digest(certificate)
+        except (ValueError, TypeError, InvalidSignature):
+            raise CaptureAuthorityError("staged renewal certificate is invalid") from None
+        expected_uris = sorted([node_uri(node_id), deployment_uri(self.deployment_id)])
+        if (not isinstance(public_key_digest_value, str) or not isinstance(credential_digest, str)
+                or not hmac.compare_digest(key_digest, public_key_digest_value)
+                or not hmac.compare_digest(digest, credential_digest)
+                or _is_ca(certificate) or sorted(_uris(certificate)) != expected_uris):
+            raise CaptureAuthorityError("staged renewal certificate is invalid")
+        return IssuedNodeCredential(node_id=node_id, certificate_pem=certificate_pem,
+                                    public_key_digest=key_digest, credential_digest=digest,
+                                    not_after=certificate.not_valid_after_utc)
+
     def issue_and_activate(self, ledger: PairingLedger, claim: EnrollmentClaim, csr_pem: bytes, *,
                            validity: datetime.timedelta = DEFAULT_NODE_VALIDITY
                            ) -> IssuedNodeCredential:
@@ -639,14 +1021,32 @@ def deployment_id_of(directory: PrivateDirectory) -> UUID:
     return deployment
 
 
-def main_server_name(directory: PrivateDirectory) -> str:
-    """Return the single DNS name of the Main listener certificate in ``directory``."""
+def _load_certificate(directory: PrivateDirectory, name: str, message: str) -> x509.Certificate:
     try:
-        certificate = x509.load_pem_x509_certificate(directory.read(_SERVER_CERTIFICATE))
-        names = certificate.extensions.get_extension_for_class(
-            x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName)
+        return x509.load_pem_x509_certificate(directory.read(name))
     except CaptureAuthorityError:
         raise
+    except (ValueError, TypeError):
+        raise CaptureAuthorityError(message) from None
+
+
+def _key_digest(directory: PrivateDirectory, name: str) -> str:
+    """Public-key digest of a stored private key; the key never leaves this call."""
+    try:
+        key = serialization.load_pem_private_key(directory.read(name), password=None)
+    except CaptureAuthorityError:
+        raise
+    except (ValueError, TypeError):
+        raise CaptureAuthorityError("listener material is invalid") from None
+    if not isinstance(key, ec.EllipticCurvePrivateKey):
+        raise CaptureAuthorityError("listener material is invalid")
+    return public_key_digest(key.public_key())
+
+
+def _single_server_name(certificate: x509.Certificate) -> str:
+    try:
+        names = certificate.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName)
     except (ValueError, TypeError, x509.ExtensionNotFound):
         raise CaptureAuthorityError("listener material is invalid") from None
     if len(names) != 1 or not valid_server_name(names[0]):
@@ -654,7 +1054,35 @@ def main_server_name(directory: PrivateDirectory) -> str:
     return names[0]
 
 
+@dataclass(frozen=True)
+class ListenerRotation:
+    """Public rotation result: the new listener expiry and whether it finished a prior run."""
+
+    not_after: datetime.datetime
+    recovered: bool
+
+
+def main_server_name(directory: PrivateDirectory) -> str:
+    """Return the single DNS name of the Main listener certificate in ``directory``."""
+    return _single_server_name(
+        _load_certificate(directory, _SERVER_CERTIFICATE, "listener material is invalid"))
+
+
+def main_server_not_after(directory: PrivateDirectory) -> datetime.datetime:
+    """When the Main listener certificate in ``directory`` expires (public)."""
+    return _load_certificate(directory, _SERVER_CERTIFICATE,
+                             "listener material is invalid").not_valid_after_utc
+
+
 def listener_material(directory: PrivateDirectory) -> MainServerCredential:
-    """Validate and return the Main ingest server certificate/key paths."""
+    """Validate and return the Main ingest server certificate/key paths.
+
+    The key must match the certificate, so a pair left mismatched by an
+    interrupted rotation is refused here with a fixed reason (rerun
+    ``rotate-listener`` to complete it) instead of as an opaque TLS failure.
+    """
+    certificate = _load_certificate(directory, _SERVER_CERTIFICATE, "listener material is invalid")
+    if _key_digest(directory, _SERVER_KEY) != public_key_digest(certificate.public_key()):
+        raise ListenerMaterialInconsistent("listener key does not match its certificate")
     return MainServerCredential(certificate_path=directory.private_file(_SERVER_CERTIFICATE),
                                 key_path=directory.private_file(_SERVER_KEY))

@@ -56,3 +56,119 @@ pending key and outliving the current certificate. It then calls
 `NodeCredentialStore.rotate`, which atomically renames the new generation over
 `current.json` and removes the old files. An expired credential cannot renew;
 the node must re-pair. No scheduler runs this yet (#15 transport).
+
+### Serialization (#117)
+
+`request`, `pair`, `prepare_renewal` and `complete_renewal` each hold one
+runtime-wide interprocess lock (`EnrollmentLock`: `flock` on
+`<runtime_root>/node-enrollment.lock`, a 0600 regular file owned by the service
+account; no root needed). `pair` holds it from the installed-identity check
+through the exchange, install and pending-key cleanup, and `request` from key
+selection through writing its request file, so a concurrent `pair` cannot
+consume the pending key before the request it reported exists. A second run on the same
+runtime root is refused at once with `enrollment_in_progress`, before any
+network traffic or code prompt, so two concurrent `pair` runs can no longer
+both pass the installed check and install different certificates for one node.
+The lock file is never removed; an unsafe lock file (wrong owner, group/other
+bits, symlink, hard link) is refused.
+
+### Re-pairing an expired or revoked node (#116)
+
+Owner policy (2026-10-01). Check the node's state on the Main first
+(`pairing_cli list`): only the Main knows whether a node was revoked.
+
+* **Expired, not revoked** -- same key, same node:
+
+  ```bash
+  python -m media_capture_agent.enroll request --runtime-root <runtime_root> \
+      --output request.json --repair expired
+  # Owner on the Main: pairing_cli approve ... --request request.json
+  #   (prompt shows "existing capture node: <uuid>"; type APPROVE)
+  python -m media_capture_agent.enroll pair --runtime-root <runtime_root> \
+      --trust-bundle bundle.json --bundle-sha256 <digest> --repair expired
+  ```
+
+  `--repair expired` is refused (`node_identity_not_expired`) while the
+  installed certificate is still valid: an unexpired node renews automatically,
+  and a revoked one needs `--repair revoked`. The request proves the installed
+  key. `pair` accepts only a certificate for the same node and deployment, for
+  that key, that outlives the expired one, then rotates atomically
+  (`NodeCredentialStore.rotate`); the expired generation's files are deleted
+  only after the new one is committed. The node UUID, and so its camera sources
+  on the Main, stay the same.
+
+* **Revoked** -- new key, new node:
+
+  ```bash
+  python -m media_capture_agent.enroll request --runtime-root <runtime_root> \
+      --output request.json --repair revoked
+  # Owner on the Main: pairing_cli approve ... --request request.json
+  #   (prompt shows "new capture node"; type APPROVE)
+  python -m media_capture_agent.enroll pair --runtime-root <runtime_root> \
+      --trust-bundle bundle.json --bundle-sha256 <digest> --repair revoked
+  ```
+
+  `request` creates one fresh key in `<runtime_root>/pending-repair/`
+  (0700/0600) and re-exports that same key on later runs. The Main refuses a
+  revoked node's keys (`public_key_revoked`), so keys stay unique across all
+  nodes and states. `pair` accepts only a certificate for a *different* node of
+  the same deployment (`repair_deployment_mismatch` otherwise, before any
+  network traffic) and swaps to it atomically
+  (`NodeCredentialStore.replace_identity`); the revoked generation's files are
+  deleted only after the swap commits. If the run stops after the swap but
+  before the pending repair key is removed, rerunning `pair --repair revoked`
+  finishes the cleanup without a second exchange and `request --repair revoked`
+  reports `repair_already_completed`. `pair --repair revoked` prints the new
+  node and the exact configuration change:
+
+  ```text
+  paired: node_id=<new uuid>
+  config_update_required: set "node_id": "<new uuid>" in the media-capture-agent configuration, then start the service (it refuses to start with node_identity_mismatch until then)
+  ```
+
+  `--repair revoked` does not revoke anything on the Main. If it is used for a
+  node that was not revoked (for example one that had only expired), the
+  replaced node stays active on the Main until the Owner revokes it with
+  `pairing_cli revoke`, which the Owner must then do. Each further
+  `request --repair revoked` after a completed swap prepares yet another new
+  node.
+
+  The configuration stays a manual Owner edit (Owner decision 2026-10-05).
+  Until `node_id` names the installed credential's node, the Agent refuses to
+  start, fail closed: service startup and `--check` both exit with the fixed
+  reason `node_identity_mismatch` before any capture or session is created. A
+  damaged or unreadable installed credential is reported as
+  `node_credential_unavailable`, never as unpaired. The first commit also
+  writes `<runtime_root>/node-identity-installed` (0600, never removed), so a
+  lost `node-credentials/current.json` or credential directory after pairing is
+  also `node_credential_unavailable` (`credential_commit_missing`); only a store
+  without that file (fresh, or a first install interrupted before its commit)
+  reads as unpaired. Every validation of a committed credential (service start,
+  `--check`, `request`/`pair`) creates the file if it is missing (0600, file and
+  runtime root fsynced), so a node paired by an earlier release, or stopped
+  between the commit and the evidence write, gains it on first use; if it
+  cannot be written the credential is refused (`node_credential_unavailable`),
+  never accepted without it. Residual: losing `current.json` after such a stop
+  but before any validation still reads as unpaired; the file is deliberately
+  not written before the commit, because an interrupted first install would
+  then look corrupted and could not be retried.
+
+  Recovery from `credential_commit_missing` (there is no in-place repair): the
+  Owner revokes the old node on the Main (`pairing_cli revoke`) -- until then
+  it stays active there. With the service stopped, the operator, as the service
+  account, moves aside `<runtime_root>/node-credentials/`,
+  `<runtime_root>/node-identity-installed` and any `pending-*` directories,
+  then pairs again from scratch (`request`, Owner `approve`, `pair`) as a new
+  node, sets the printed `node_id` in the configuration, and the Owner approves
+  its camera sources again (`server/docs/DEPLOYMENT.md`). The Owner
+  approves the new node's camera sources again on the Main; the old node's
+  recordings stay under the old node until retention. The Agent's local ring
+  buffer and protected incidents are not touched by re-pairing.
+
+Both modes discard a renewal key staged for the old credential before the swap
+(the Main drops staged renewals when a pairing activates, so it could never be
+promoted). Stop the `media-capture-agent` service before re-pairing and start
+it afterwards so it loads the new credential. A different deployment (new CA)
+is a fresh install, never an in-place swap. Re-pairing needs no root, GUI,
+Tailscale or admin credential, and the capture credential still grants no
+human/admin API.

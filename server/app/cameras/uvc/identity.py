@@ -73,6 +73,23 @@ class DeviceEvidence:
                 self.device_path, self.device_number, self.instance_token)
 
 
+def same_live_instance(first, second):
+    """True when both are evidence for the same connected device node.
+
+    Mutable metadata (by-id aliases, advertised formats) that a rescan may
+    refresh is ignored; any instance change (node, number, instance marker,
+    topology, serial) makes them different.
+    """
+    return (first is not None and second is not None
+            and first.live_instance_key == second.live_instance_key)
+
+
+def current_live_instance(devices, device):
+    """The single scan entry for ``device``'s live instance, else None."""
+    matches = [d for d in devices if same_live_instance(d, device)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def same_physical_camera(first, second, *, serial_ambiguous=False):
     """True when two pieces of evidence may name the same physical camera.
 
@@ -304,21 +321,30 @@ class ReconnectController:
         if self._profile_hold is not None:
             held, explicit = self._profile_hold
             peers = [d for d in devices if d.strong_key == held.strong_key]
-            if devices.count(held) == 1 and (explicit or held.strong_key is None
-                                               or not self.serial_ambiguous and len(peers) == 1):
+            # Compare the live instance, not the whole evidence: a rescan may
+            # refresh mutable metadata (by-id aliases, advertised formats)
+            # for the same device node, which must not release the hold.
+            current = current_live_instance(devices, held)
+            if current is not None and (explicit or held.strong_key is None
+                                        or not self.serial_ambiguous and len(peers) == 1):
                 # Same conditions as a live binding below. Nothing is opened
                 # until the profile or enablement changes (set_enabled) or
                 # the device instance changes.
+                self._profile_hold = (current, explicit)
                 self.bound = None
                 self._transition(CameraState.DEGRADED, "capture_profile_unavailable")
                 return None
             self._profile_hold = None
         # A live open capture descriptor may keep its approved weak binding.
         # Losing that descriptor ends this allowance, including process restart.
-        if self.bound is not None and devices.count(self.bound) == 1:
-            peers = [d for d in devices if d.strong_key == self.bound.strong_key]
-            if (self._explicit_binding or self.bound.strong_key is None
+        # The same live instance keeps it across a metadata-only refresh;
+        # the stored evidence is refreshed from the matching scan entry.
+        current = current_live_instance(devices, self.bound) if self.bound is not None else None
+        if current is not None:
+            peers = [d for d in devices if d.strong_key == current.strong_key]
+            if (self._explicit_binding or current.strong_key is None
                     or not self.serial_ambiguous and len(peers) == 1):
+                self.bound = current
                 return self.bound
         decision = match_reconnect(self.approved, devices, serial_ambiguous=self.serial_ambiguous)
         self.bound = decision.device
@@ -353,7 +379,8 @@ class ReconnectController:
         self._transition(CameraState.DEGRADED, "owner_approved_pending_capture")
 
     def capture_ready(self, candidate):
-        if not self.enabled or self.requires_approval or self.bound != candidate or candidate is None:
+        if (not self.enabled or self.requires_approval or candidate is None
+                or not same_live_instance(self.bound, candidate)):
             raise ValueError("capture has no approved binding")
         self._transition(CameraState.ONLINE, "video_capture_ready")
 
@@ -381,7 +408,7 @@ class ReconnectController:
         try:
             allowed = ((CameraState.ONLINE,) if only_online
                        else (CameraState.ONLINE, CameraState.DEGRADED))
-            if (self._finished or candidate is None or self.bound != candidate
+            if (self._finished or candidate is None or not same_live_instance(self.bound, candidate)
                     or self.state not in allowed):
                 return False
             if confirm is not None and not confirm():
@@ -410,9 +437,9 @@ class ReconnectController:
         visibly degraded (never online) instead of silently accepting the
         driver-adjusted profile as if it had been requested.
         """
-        if self.bound != candidate or candidate is None:
+        if candidate is None or not same_live_instance(self.bound, candidate):
             raise ValueError("capture has no approved binding")
-        self._profile_hold = (candidate, self._explicit_binding)
+        self._profile_hold = (self.bound, self._explicit_binding)
         self.bound = None
         self._explicit_binding = False
         self._transition(CameraState.DEGRADED, "capture_profile_unavailable")

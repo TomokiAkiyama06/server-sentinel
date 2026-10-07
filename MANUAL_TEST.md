@@ -500,12 +500,25 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    `MAIN_CLI init --authority-dir <ca_dir> --listener-dir <listener_dir> --server-name <dns name>`
    with both directories outside the checkout and media trees. Confirm both are
    0700 and every file 0600, owned by that account, and that the two directories
-   differ. (A separate ingest service account that cannot read the CA key is
-   #14/#15 deployment work; the CLI itself keeps both under the admin account.)
+   differ. Separate-account variant (Issue #124, `server/docs/DEPLOYMENT.md`):
+   on a disposable deployment with a dedicated non-root ingest account, run the
+   same `init` as root with `--listener-owner <ingest account>`; confirm the
+   listener directory and both files are owned by the ingest account (0700 /
+   0600), that the ingest account can read them and cannot open `<ca_dir>`,
+   and that the same command run as a non-root account without
+   `CAP_CHOWN`/`CAP_DAC_OVERRIDE` refuses `listener_owner_requires_privilege`
+   and leaves no CA or listener file behind. If a non-root CA account with
+   only those ambient capabilities is used instead of root, record that it
+   works.
 2. Choose the bootstrap endpoint: the Main's private-LAN IP and a port distinct
-   from the dashboard (loopback-only) and any ingest port. Run
+   from the dashboard (loopback-only) and any ingest port. Public addresses
+   and Tailscale addresses (`100.64.0.0/10`) are refused
+   (`enrollment_bind_requires_private_address`); enrollment and ingest use the
+   private LAN and need no Tailscale. Run
    `MAIN_CLI export-bundle --authority-dir <ca_dir> --listener-dir <listener_dir> --endpoint <ip>:<port> --output bundle.json`
-   and note the printed full `trust_bundle_sha256`.
+   and note the printed full `trust_bundle_sha256`. Running it with another
+   deployment's `--listener-dir` must refuse `listener_authority_mismatch`
+   and write no bundle.
 3. Copy `bundle.json` to the capture host over an Owner-trusted channel (for
    example removable media). Do not copy the digest over the same channel.
 4. On the capture host, as the dedicated non-root `media-capture-agent`
@@ -517,7 +530,11 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    refused (`root_refused`). Note the printed `public_key_sha256`.
 5. Carry `request.json` (public) to the Main. Run
    `MAIN_CLI approve --database <data_dir>/state.sqlite3 --authority-dir <ca_dir> --listener-dir <listener_dir> --request request.json --listen <ip>:<port>`
-   from an interactive terminal (add `--human-host`/`--human-port` when the
+   from an interactive terminal; `<data_dir>/state.sqlite3` must be the
+   database the application already created (a mistyped path refuses
+   `database_not_found` and creates nothing; a database the current release has
+   not yet migrated refuses `database_schema_outdated` and is left unchanged
+   until the application's startup migrates it) (add `--human-host`/`--human-port` when the
    dashboard does not use the default `127.0.0.1:8000`, for example `::1`, and
    confirm `--listen` on that exact socket is refused with
    `enrollment_listener_must_differ_from_other_listeners`). Compare the displayed public-key SHA-256 with
@@ -549,7 +566,8 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    interrupted, expired or unacknowledged enrollment shows
    `existing capture node: <uuid>` and re-enrolls that same node (a completed
    enrollment replaces its current certificate); it never creates a second
-   node. After `revoke`, the key cannot be approved again (`approval_refused`).
+   node. After `revoke`, the key cannot be approved again: `approve` refuses
+   with `public_key_revoked` before showing the `APPROVE` prompt.
 10. Start the ingest listener bound to the Main's private-LAN IP and a port
     distinct from the dashboard and bootstrap listeners; confirm the dashboard
     listener still binds loopback only and the ingest port answers no HTTP
@@ -562,7 +580,7 @@ code with the reviewed runtime installed. `AGENT_CLI` means
     open session closes on the next admission check, and reconnecting is
     refused although the certificate has not expired *(needs ingest wiring)*.
     Approving the old `request.json` again must be refused
-    (`approval_refused`) without showing a code.
+    (`public_key_revoked`) without showing the prompt or a code.
 13. Inspect Main and Agent logs, `ps` output, `/proc/<pid>/cmdline` and
     `environ` during the exchange, service environment and shell history on both
     hosts for key, code or certificate text; expect none.
@@ -572,10 +590,79 @@ code with the reviewed runtime installed. `AGENT_CLI` means
     validity so it enters the 30-day window. Confirm that the Agent renews over
     its admitted session, that `pending-renewal/` is 0700 with a 0600 key, and
     that the old certificate keeps working until the renewed one first connects
-    and is refused afterwards. A revoked node's renewal must be refused. After
+    and is refused afterwards. Interrupt the first renewal response (for
+    example drop the connection after Main stages it) and confirm the Agent's
+    retry receives the same certificate (same SHA-256) and that it is admitted. A revoked node's renewal must be refused. After
     the credential expires, the node must re-pair. Block renewal (for example
     stop the Main) until the 14-day threshold and confirm the Owner sees a
     `capture_credential_warning`. *(needs transport wiring and a scheduler)*
+15. Main listener certificate rotation (Issue #125), on a disposable
+    deployment after step 7: record the listener `not_after`, run
+    `MAIN_CLI rotate-listener --authority-dir <ca_dir> --listener-dir <listener_dir>`
+    (plus `--listener-owner` if used in step 1) and confirm it prints a new
+    `not_after` about 397 days ahead, that `<ca_dir>` and the exported bundle's
+    SHA-256 are unchanged, that the listener directory again holds exactly the
+    two 0600 files with the expected owner and no `*.next` file, and that the
+    key file's SHA-256 changed (compare hashes; never print the key). Restart the listener process, then confirm the
+    already-paired Agent connects with its existing trust bundle and no Agent
+    change *(needs ingest wiring, #14/#15)*; until then, rerun `approve` with
+    a fresh request and confirm `AGENT_CLI pair` with the unchanged bundle
+    authenticates the rotated certificate. Negative checks: running
+    `rotate-listener` with another deployment's `--authority-dir` refuses
+    `listener_authority_mismatch` and changes nothing; two `rotate-listener`
+    (or `init`) runs started together on the same listener directory leave
+    exactly one winner and the other refuses `issuer_material_busy`. Re-running
+    `approve` within a minute of a completed one binds again (no
+    `enrollment_listener_bind_failed` from TIME_WAIT), while a second
+    `approve` on the same `--listen` socket during a running one is refused.
+16. CA validity (Issue #127), on a disposable deployment created with
+    `--ca-validity-days 100 --server-validity-days 30`: `rotate-listener`
+    with the default validity and `approve` refuse
+    `deployment_ca_validity_insufficient` before any approval or code is
+    shown; `rotate-listener --server-validity-days 30` succeeds. A node
+    renewal against such a CA is refused `renewal_ca_validity_insufficient`
+    and the Owner sees `capture_trust_warning`, not the per-node warning
+    *(needs transport wiring and a scheduler)*.
+
+15. Re-pairing (#116, Owner policy 2026-10-01; mock-verified only by
+    `agent/tests/test_enroll.py` and
+    `tests/e2e/test_capture_enrollment_scenarios.py`). Stop the
+    `media-capture-agent` service first and start it again afterwards.
+    a. *Expired, not revoked.* On a disposable deployment, let a node
+       certificate expire (issue it with a short explicit validity). Confirm
+       `AGENT_CLI request --repair expired` is refused with
+       `node_identity_not_expired` before expiry and afterwards prints the same
+       `public_key_sha256` as the installed key. `MAIN_CLI approve` with that
+       request shows `existing capture node: <uuid>`; type `APPROVE`. Run
+       `AGENT_CLI pair ... --repair expired` and confirm it prints the same
+       `node_id`, that `node-credentials/` holds exactly one generation (the
+       expired files are gone), that `pending-renewal/` holds no key, and that
+       ingest admits the node again *(needs ingest wiring)*.
+    b. *Revoked.* `MAIN_CLI revoke` the node. Confirm approving its old request
+       is refused with `public_key_revoked`. Run
+       `AGENT_CLI request --repair revoked` and confirm a different
+       `public_key_sha256` and a 0700 `pending-repair/` with a 0600 key;
+       `MAIN_CLI approve` shows `new capture node`. After
+       `AGENT_CLI pair ... --repair revoked`, confirm a new `node_id`, one
+       credential generation, no `pending-repair/node-key.pem`, and that
+       `MAIN_CLI list` shows the old node `credential=revoked` and the new one
+       `credential=active`. Confirm `pair` printed
+       `config_update_required: set "node_id": "<new uuid>" ...`. Before editing
+       the configuration, confirm `media-capture-agent --config <file> --check`
+       and a service start both exit with `node_identity_mismatch` and that no
+       capture process starts and no connection to the Main is opened
+       (`ss -tnp`). Then set `node_id` to the new UUID by hand and confirm
+       `--check` passes. Corrupt a copy of the credential in a disposable
+       runtime root and confirm `node_credential_unavailable`. Confirm
+       the new node has no camera source until the Owner approves its sources,
+       and that the old node's recordings stay listed under the old node until
+       retention *(needs source/transport wiring, #14/#15)*.
+    c. *Serialization (#117).* With one `AGENT_CLI pair` waiting at
+       `Pairing code:`, start a second `AGENT_CLI pair` (or `request`) on the
+       same runtime root from another terminal: it must exit with
+       `enrollment_in_progress` without connecting (check with `ss -tn`) or
+       prompting. Confirm `<runtime_root>/node-enrollment.lock` is a 0600
+       regular file owned by the service account and that no root was needed.
 
 Record the Main/Agent OS, Python, OpenSSL (`cryptography` reports 4.0.2 from its
 wheel) and architecture used, without private deployment values.
@@ -862,7 +949,7 @@ the previous ledger. Its segments are otherwise unknown orphans to the new
 ledger: they are never deleted automatically and block configuration.
 
 - [x] **capacity mode** — re-verified 2026-09-30 on the sizing-fix head (see section Q record). Originally: the run found every realistic capacity refused as `insufficient_ledger_capacity` (the former 512-byte row model needed a ledger ~48x the capacity and ~33x that again as journal headroom). Repeat with the same profile shape (two sources, 4 Mbit/s, 10 s segments, 700 MiB, 32 MiB ledger cap): configuration must be admitted, `ledger_required_bytes` must stay within the cap, and T-10/T+10 must complete;
-- [ ] **hard stop while writes are refused** — refusal side re-verified 2026-09-30 (see section Q record); steady-FIFO false hard stop fixed afterwards, pending re-verification. Originally: the run found 83 `segment_storage_refused` appends near exhaustion while status stayed `STORAGE_PRESSURE / post_loss_headroom_reduced`. Repeat the near-reserve fill with **at least two sources whose real bitrate is below the max bound** (single-source or max-size synthetic bytes cannot reveal a false steady-FIFO hard stop): every status sampled before a refused append must read `STORAGE_HARD_STOP / segment_write_refused_at_reserve`, or `STORAGE_PRESSURE / segment_write_at_risk_at_maximum_bitrate` when the refused segment is larger than that source's recent maximum (the refusal is announced before it happens, never as healthy); accepted steady-FIFO appends must not read hard stop; free space must stay at or above the reserve; and status must leave hard stop once space is released. Known limitation (also documented in `agent/docs/RING_BUFFER.md`): immediately after a refusal the refused segment's `missing` row counts as that source's last write, so status may show `STORAGE_PRESSURE / post_loss_headroom_reduced` until the next refusal is imminent again, and the refused interval's coverage gap is hidden behind pressure in the status priority; record the refused intervals from the append results.
+- [ ] **hard stop while writes are refused** — refusal side re-verified 2026-09-30 (see section Q record); steady-FIFO false hard stop fixed afterwards, pending re-verification. Originally: the run found 83 `segment_storage_refused` appends near exhaustion while status stayed `STORAGE_PRESSURE / post_loss_headroom_reduced`. Repeat the near-reserve fill with **at least two sources whose real bitrate is below the max bound** (single-source or max-size synthetic bytes cannot reveal a false steady-FIFO hard stop): every status sampled before a refused append must read `STORAGE_HARD_STOP / segment_write_refused_at_reserve`, or `STORAGE_PRESSURE` (normally `segment_write_at_risk_at_maximum_bitrate`) when the refused segments exceed the recent-bitrate estimate (mean plus two standard deviations of the batch's recent real allocations, deviations added as if perfectly correlated, Issue #130) (the refusal is announced before it happens, never as healthy); accepted steady-FIFO appends with fixed-size segments must not read hard stop, and with **variable segment sizes** (real VBR) record the false hard-stop rate (hard stop read before a minute whose every append succeeded) and every refusal's preceding status: Issue #130 mock runs with normally distributed sizes read hard stop before 47 of 400 such accepted samples with two 60 s sources, the same as the pre-#130 charge, and announced every refusal with hard stop, so a higher rate, or any refusal after a healthy status, is a failure; also record the per-append size history so the deviation factor (2, Owner decision 2026-10-05) can be tuned; free space must stay at or above the reserve; and status must leave hard stop once space is released. Known limitation (also documented in `agent/docs/RING_BUFFER.md`): immediately after a refusal the refused segment's `missing` row counts as that source's last write, so status may show `STORAGE_PRESSURE / post_loss_headroom_reduced` until the next refusal is imminent again, and the refused interval's coverage gap is hidden behind pressure in the status priority; record the refused intervals from the append results.
 
 Ring-buffer configuration:
 
@@ -1151,6 +1238,7 @@ Progressively degrade lighting/blur/visibility.
 - [ ] **person detection also becomes unknown/unavailable when its own quality prerequisites fail**;
 - [ ] insufficient person quality is never displayed/stored as trustworthy `no person`;
 - [ ] entrance/presence logic does not infer absence from skipped person inference;
+- [ ] once the runtime wires the entrance adapter: the historical timeline shows an `entrance_gate` `unknown` fact when the entrance gate stops being sufficient (and when its detector stops) and a `ready` fact when it recovers, so the dark period is distinguishable from a period without crossings; the fact never reads as `no person`;
 - [ ] recovery uses suitable hysteresis;
 - [ ] no automatic torch/light behavior exists.
 
@@ -1325,6 +1413,7 @@ transport or UI. Run on the PR #104 sizing/hard-stop fix head (`4fce0df`).
 - [x] an external fill produced hard stop; deleting it cleared status to `degraded / pre_loss_coverage_gap` and appends resumed;
 - [x] regressions: 900 s duration FIFO, loss incident and 60-day expiry unchanged;
 - [ ] **FAIL, fixed — pending re-verification**: in the same near-reserve run, minutes 16–20 accepted every append (FIFO reclaimed segments older than 900 s at each append) while status still read `STORAGE_HARD_STOP / segment_write_refused_at_reserve`. Status credited reclaim only as of `now`, when the segment the next append reclaims was not yet eligible. Status now evaluates each source's next append at its own capture phase (`max(now, last trusted segment end + cadence)`); re-run and confirm that accepted steady-state appends read `STORAGE_PRESSURE` (short pre-loss headroom), not hard stop, while real refusals still read hard stop;
+- [ ] **Issue #130, pending real-disk verification**: repeat the near-reserve fill with at least two sources whose real segment sizes vary below the max bound (real segmenter output or generated variable sizes spanning many allocation units). Record per minute the status before the appends and whether every append succeeded. Expect: no refusal preceded by `healthy` or `degraded`; refusals preceded by `STORAGE_HARD_STOP / segment_write_refused_at_reserve`, except a spike above the recent-bitrate estimate, which may follow `STORAGE_PRESSURE`; hard stop before accepted minutes no more frequent than with the pre-#130 recent-maximum charge (compare against the same run on the pre-#130 code if possible; the mock runs show no reduction for normally distributed sizes, only for skewed recent histories). The Issue #130 numbers in `agent/docs/RING_BUFFER.md` come from a mock quota and seeded synthetic sizes only;
 - [x] regression on the fix head: lazy unmount / an empty same-name directory on the root filesystem / another filesystem each refused writes with `STORAGE_HARD_STOP` (`storage_path_unavailable` / `mount_replaced`), no fallback write; remounting the approved volume passed `--check` and resumed appends on the recovered ledger.
 
 ## R. Long-duration / performance
@@ -1646,6 +1735,7 @@ Issue #47 remains open. The synthetic CI tests do not complete these checks: the
 - [ ] after the update, re-verify the content evidence, not just the counts: the same recording logical IDs are present with unchanged digests, durations and decodable playback, and the audit digests match row for row apart from rows the update itself legitimately appended, each of which is accounted for; a documented migration that intentionally rewrites stored bytes states in advance which logical IDs it rewrites and how the new content is re-verified, and any other digest change is a failure;
 - [ ] when the previous version can safely read the retained state, roll back through the documented lifecycle; the service starts and the same inventory is still intact — no recording, starred recording, or audit record is deleted, truncated, or silently rewritten, proven by the same logical IDs, digests, durations, decodable playback samples and audit row digests rather than by matching counts and boundary timestamps;
 - [ ] when rolled-back code cannot safely read forward-migrated state, startup refuses and reports the incompatibility truthfully instead of destructively downgrading or discarding data; follow and record the documented recovery path, then compare the same recorded inventory after it restores a startable version/state;
+- [ ] socket-activation boundary (Issue #126): with `server-sentinel-upstream.socket` installed in `/etc/systemd/system` and enabled and `human_port` below 1024, roll back to a release from before socket activation; confirm the installer refuses before any change (same `current`/`previous`, unit and running service), prints the Owner steps (no `mask`), and only queried the socket unit (`systemctl show -p LoadState/ActiveState`). Follow the printed steps in order: restore the earlier `human_port`; `disable --now` the socket unit and confirm the dashboard still answers on the running service; rerun once before parking the file and confirm it still refuses (`LoadState=loaded`); move the unit file to `/etc/server-sentinel/disabled/`, rerun once more before `daemon-reload` and confirm it still refuses; `daemon-reload` and confirm `LoadState=not-found`, `ActiveState=inactive`; rerun the rollback and confirm the service now listens on the earlier port without a separate restart, that `systemctl show server-sentinel.service -p Wants -p After` no longer names the socket unit, and that a reboot leaves the socket unit unstarted; point Tailscale Serve at the earlier port. Then return in the printed order (update forward and confirm the parked socket unit stays not-found and the release binds the old port; set the privileged `human_port`; move the unit file back, `daemon-reload`, `enable --now` the socket unit and confirm the running service still listens on the old port; `systemctl restart server-sentinel.service`; point Serve back) and confirm the upstream is socket-activated again (one socket on the port, its inode in `/proc/<service pid>/fd`). Also make the `systemctl` query fail (for example a `PATH` without `systemctl` on a disposable host) and confirm the refusal still prints the steps;
 - [ ] repeat update and rollback with an in-progress recording and with storage near the safety reserve; no partial media is left counted as healthy, and the reserve is still honored afterwards;
 - [ ] on a disposable volume, safely simulate a missing/unmounted or substituted runtime mount and restart: install, update, and rollback refuse unsafe writes, report an explicit failed/degraded result, and never create or use a silent root-filesystem fallback directory;
 - [ ] start with missing or unreadable deployment configuration: the service fails closed with an actionable error and does not invent defaults for storage roots, listener boundary, or secrets;
@@ -1793,8 +1883,8 @@ by the Issue #6 synthetic policy model.
   network identity isolation is used. A wildcard `sshd` or other system
   service on the node is reported as an unexpected listener unless the Owner
   adds a listener exception for that port. With a wildcard `sshd` on 22:
-  confirm access closes with no exception; add `tcp/22` owned by
-  `/usr/sbin/sshd` (or unit `ssh.service`) through the audited
+  confirm access closes with no exception; add `tcp/22` created by unit
+  `ssh.socket` (or `ssh.service`) with uid 0 through the audited
   Owner path and confirm access opens and a `change_security_setting` audit
   record exists; bind a test listener to the Tailscale address on port 22
   (not wildcard) and confirm access still closes; start a wildcard listener
@@ -1832,24 +1922,71 @@ by the Issue #6 synthetic policy model.
   listener is up: confirm the `invalidate_human_sessions` record is committed
   at once, so a restart after removing the listener cannot reopen with an
   earlier session.
-- Listener exception ownership (Owner decision 2026-10-01; mock-only so far):
-  first follow the `server/docs/DEPLOYMENT.md` SSH steps (`ssh.socket`
-  disabled, `ssh.service` enabled) and record `systemctl is-enabled ssh.socket
-  ssh.service`, `ss -ltnp 'sport = :22'` and `readlink /proc/<sshd pid>/exe`.
-  Before Issue #126 (privileged owner helper) lands, confirm the non-root
-  service reports `LISTENER_OWNER_UNVERIFIED` for the excepted `sshd` and
-  human access stays closed. Once #126 is composed as `socket_owners`,
-  confirm the helper's answer matches `readlink` and access opens with `sshd`
-  on 22. With #126 composed, stop `sshd`, start another process on the
-  excepted port (for example `sudo python3 -m http.server 22`), and confirm
-  access closes with `UNEXPECTED_LISTENER` and that reopening revokes every
-  human session. Record whether the host uses `ssh.socket` (socket
-  activation: PID 1 holds the listener, so access stays closed until `sshd`
-  listens itself), and that after upgrading `openssh-server` without
-  restarting `sshd` the `(deleted)` executable keeps access closed. On a
-  disposable copy holding a version 1 (port-only) stored exception, confirm
-  startup reports `LISTENER_EXCEPTIONS_OUTDATED` and access stays closed until
-  the Owner re-enters the exception with its owner.
+- Listener owners through sock_diag (Issue #126, Owner decision 2026-10-07;
+  mock and unprivileged local experiments only so far, not yet run on the
+  Main Server). Production check procedure, all as the ServerSentinel service
+  account unless `sudo` is shown, with a console or second session open:
+  1. Service requirements: `systemctl show server-sentinel.service -p
+     RestrictAddressFamilies -p PrivateNetwork -p ProtectControlGroups -p
+     NetworkNamespacePath` shows `AF_NETLINK` allowed, `PrivateNetwork=no`, no
+     namespace path, and `ProtectControlGroups=yes` (not `private`/`strict`).
+     `cat /proc/<service pid>/cgroup` is `0::/system.slice/server-sentinel.service`
+     and `readlink /proc/<service pid>/ns/net` equals `readlink /proc/1/ns/net`
+     (read as root).
+  2. Unprivileged lookup, as the service account (`<root>` is the
+     installation root):
+
+     ```sh
+     cd / && sudo -u <service account> <root>/current/venv/bin/python -I -c '
+     import sys; sys.path.insert(0, "<root>/current")
+     from app.auth.sock_diag import NetlinkSockDiag, cgroup_paths
+     paths = cgroup_paths()
+     for s in NetlinkSockDiag().dump():
+         print(s.family, s.protocol, s.inode, s.uid, paths.get(s.cgroup_id))'
+     ```
+
+     Record that the tcp/22 sockets resolve to `/system.slice/ssh.socket` uid
+     0, `tailscaled`'s sockets to `/system.slice/tailscaled.service` uid 0,
+     and the upstream port to `/system.slice/server-sentinel-upstream.socket`
+     uid 0; compare the inodes with `sudo ss -ltnpe` / `sudo ss -lunpe`.
+     Record whether the UDP tables needed the `udp_diag` module and whether it
+     was already loaded (`lsmod | grep diag`). This runs outside the unit
+     sandbox; step 1 covers the unit's restrictions.
+  3. Upstream activation: follow the `server/docs/DEPLOYMENT.md` socket
+     activation steps; confirm `/proc/sys/net/ipv4/ip_unprivileged_port_start`
+     is greater than the port, `ss -ltne 'sport = :<port>'` shows one row whose
+     inode is in `/proc/<service pid>/fd`, the backend runs without
+     capabilities (`grep Cap /proc/<service pid>/status` all zero), and access
+     opens with the `tcp/22` `ssh.socket` (uid 0) exception entered through
+     the audited Owner path.
+  4. Mismatching listener → revoke: on a disposable node or during a
+     maintenance window, with an Owner and an invited viewer signed in, stop
+     `ssh.socket` and `ssh.service`, start a wildcard listener on 22 from a
+     login session (for example `sudo python3 -m http.server 22`; it is
+     created in the session's `user.slice` scope), and confirm the check
+     closes access with `UNEXPECTED_LISTENER` (the second dump confirmed it),
+     that reopening after restoring `ssh.socket` revokes every human session
+     with a `system` `invalidate_human_sessions` audit record, and that a
+     `user.slice` process whose cgroup ends in `ssh.socket` does not satisfy
+     the exception. Repeat on the upstream port with the backend stopped
+     (`sudo python3 -m http.server --bind 127.0.0.1 <port>`) only if a
+     disposable node is available.
+  5. Netlink denied → close only: with a drop-in that removes `AF_NETLINK`
+     from `RestrictAddressFamilies=` (or `ProtectControlGroups=private` on
+     systemd 257+), restart the service and confirm human access stays closed
+     with `LISTENER_OWNER_UNVERIFIED` only, the Owner fault arrives, no
+     `invalidate_human_sessions` record is written and existing sessions stay
+     valid after the drop-in is removed and access reopens.
+  6. Unprivileged port: on a disposable node lower
+     `net.ipv4.ip_unprivileged_port_start` below the upstream port and confirm
+     `LISTENER_OWNER_UNVERIFIED` without revocation; restore it.
+  7. Outdated exceptions: on a disposable copy holding a version 1 (port-only)
+     or version 2 (executable path, or unit without uid) stored exception,
+     confirm startup reports `LISTENER_EXCEPTIONS_OUTDATED` and access stays
+     closed until the Owner re-enters the exception with unit and uid.
+  8. Residual risk (not detectable, record only): sock_diag reports the
+     creator, not the holder; a socket passed to another process with
+     `SCM_RIGHTS` outside the ServerSentinel unit keeps its creator's cgroup.
 - Kernel forwarding (not covered by the check): on the Main Server, run
   `sudo nft list ruleset` and `sudo iptables-save -t nat` (and `-t mangle`),
   and confirm no DNAT, REDIRECT or TPROXY rule targets the reserved addresses
@@ -1857,22 +1994,25 @@ by the Issue #6 synthetic policy model.
   BPF programs (`sudo bpftool prog show`) and IPVS services
   (`sudo ipvsadm -Ln`, if installed). Any such forwarding is outside what the
   check can see and must be removed or excluded by the deployment isolation.
-- Unit identity: confirm `cat /proc/<sshd pid>/cgroup` is exactly
-  `0::/system.slice/ssh.service`, and that a user-session process whose cgroup
-  ends in `ssh.service` under `user.slice` does not satisfy a unit exception.
+- Unit identity: confirm the tcp/22 sockets' sock_diag cgroup is exactly
+  `/system.slice/ssh.socket` (step 2 above), and that a user-session process
+  whose cgroup ends in `ssh.socket` under `user.slice` does not satisfy a unit
+  exception.
 - Human upstream ownership (mock-only so far): with the check composed in the
-  running service, confirm access opens and that the upstream's inode in
-  `ss -ltne 'sport = :8080'` appears in `/proc/<service pid>/fd`. On a
-  disposable node, stop the upstream only (keep the check running), bind
+  running service and socket activation in place, confirm access opens and
+  that the upstream's inode in `ss -ltne 'sport = :<port>'` appears in
+  `/proc/<service pid>/fd` and nowhere else in the unit's processes
+  (`cat /sys/fs/cgroup/system.slice/server-sentinel.service/cgroup.procs`).
+  On a disposable node, stop the upstream only (keep the check running), bind
   another process to the same loopback address and port (one socket, no
   `SO_REUSEPORT`), and confirm `UNEXPECTED_LISTENER` closes access and that
-  reopening revokes every human session.
+  reopening revokes every human session. Start the backend without the
+  socket unit on a port at or above `ip_unprivileged_port_start` and confirm
+  `LISTENER_OWNER_UNVERIFIED` without revocation.
 - Proxy socket ownership (mock-only so far): record whether `tailscaled`
   holds a visible socket on the Tailscale address at the origin port (`sudo ss
-  -ltnp`); if it does, record its executable and unit (`readlink
-  /proc/<pid>/exe`, `/proc/<pid>/cgroup`) as `proxy_owner`. Before Issue #126,
-  confirm access stays closed with `LISTENER_OWNER_UNVERIFIED`. Once #126 is
-  composed, confirm access opens, then (on a disposable node) stop the proxy,
+  -ltnp`); if it does, record its sock_diag cgroup and uid (step 2 above, for
+  example `tailscaled.service` uid 0) as `proxy_owner`. Confirm access opens, then (on a disposable node) stop the proxy,
   bind another process to the same address and port while Serve status still
   lists the route, and confirm `UNEXPECTED_LISTENER` closes access and that
   reopening revokes every human session. Stop the proxy without a replacement

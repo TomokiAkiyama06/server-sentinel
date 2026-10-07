@@ -473,7 +473,14 @@ Implemented enrollment contract (Issue #13; ADR-0006 follow-up notes): for the M
 
 After pairing, use mutually authenticated encryption. mTLS with a deployment-local CA/issuer is the default target unless an ADR selects an equivalent mechanism.
 
-Certificate profile implemented by the Issue #13 adapters (not yet wired to a running listener): an EC P-256 deployment CA (`pathlen=0`); a Main ingest leaf with EKU `serverAuth` and the bundle's DNS server name; node leaves issued only for a redeemed ledger claim with `CA=false`, EKU `clientAuth` only and exactly two SAN URIs, `urn:serversentinel:capture-node:<node UUID>` and `urn:serversentinel:deployment:<deployment UUID>`. The node's CSR proves key possession only; its requested subject/extensions are ignored. The ledger key digest is SHA-256 of the DER SubjectPublicKeyInfo and the credential digest is SHA-256 of the DER certificate. Ingest requires TLS 1.3, a client certificate chaining to the deployment CA only, and the ledger's current active record on every connection and before committing queued work; a valid certificate alone never admits a node. Node leaf validity defaults to 397 days (the maximum; never beyond the CA) and renews automatically (Owner decision 2026-09-30). The Agent starts 30 days before expiry and retries with exponential backoff from 1 hour up to 24 hours, reusing one fresh renewal key (kept 0600 in `pending-renewal/` across retries) and an empty-subject, extension-free CSR sent over its current admitted mTLS session. The Main renews only the presenting node's own identity, and only while that exact credential is the ledger's active, unexpired one. It stages the result; the first admission of the renewed certificate atomically promotes it and supersedes the old one, and until then the old certificate stays admitted. Revoked, expired or superseded credentials must re-pair. A node public key is bound to one node for good, across all credential states (Owner decision 2026-09-30). Approval, activation, renewal staging and promotion each refuse, in the same transaction, a key already bound to or staged for another node; a revoked key is never reused, even by its own node. The Main raises the local Owner-visible `capture_credential_warning` notification when an active credential is within 14 days of expiry, expired, or a renewal is refused; a warning whose notification is not confirmed as recorded (the hook raises, or returns `failed` because the local write was refused with the retry buffer full) is retried with the same event ID rather than marked reported.
+Certificate profile implemented by the Issue #13 adapters (not yet wired to a running listener): an EC P-256 deployment CA (`pathlen=0`); a Main ingest leaf with EKU `serverAuth` and the bundle's DNS server name; node leaves issued only for a redeemed ledger claim with `CA=false`, EKU `clientAuth` only and exactly two SAN URIs, `urn:serversentinel:capture-node:<node UUID>` and `urn:serversentinel:deployment:<deployment UUID>`. The node's CSR proves key possession only; its requested subject/extensions are ignored. The ledger key digest is SHA-256 of the DER SubjectPublicKeyInfo and the credential digest is SHA-256 of the DER certificate. Ingest requires TLS 1.3, a client certificate chaining to the deployment CA only, and the ledger's current active record on every connection and before committing queued work; a valid certificate alone never admits a node. Node leaf validity defaults to 397 days (the maximum; never beyond the CA) and renews automatically (Owner decision 2026-09-30). The Agent starts 30 days before expiry and retries with exponential backoff from 1 hour up to 24 hours, reusing one fresh renewal key (kept 0600 in `pending-renewal/` across retries) and an empty-subject, extension-free CSR sent over its current admitted mTLS session. The Main renews only the presenting node's own identity, and only while that exact credential is the ledger's active, unexpired one. It stages the result; the first admission of the renewed certificate atomically promotes it and supersedes the old one, and until then the old certificate stays admitted. A connection that loses a concurrent promotion of the same staged renewal is admitted only if its exact key and certificate are then the active credential (Issue #121). A retry with the currently staged key is certificate-idempotent: the staged row keeps the issued certificate's public PEM, bound to its digest, and the retry is answered with that first certificate, re-verified as this CA's leaf for the same node and key, rather than a newly signed one (Issue #123). Revoked, expired or superseded credentials must re-pair. A node public key is bound to one node for good, across all credential states (Owner decision 2026-09-30). Approval, activation, renewal staging and promotion each refuse, in the same transaction, a key already bound to or staged for another node; a revoked key is never reused, even by its own node. The Main raises the local Owner-visible `capture_credential_warning` notification when an active credential is within 14 days of expiry, expired, or a renewal is refused; a warning whose notification is not confirmed as recorded (the hook raises, or returns `failed` because the local write was refused with the retry buffer full) is retried with the same event ID rather than marked reported. A leaf is never issued beyond the CA's own expiry: a renewal refused for that reason reports `renewal_ca_validity_insufficient` (distinct from `renewal_request_invalid`) and raises the deployment-wide local `capture_trust_warning` instead of the per-node warning; given the CA and Main listener expiry, the monitor also raises `capture_trust_warning` 30 days before the CA stops covering a 397-day node leaf and 30 days before the listener certificate expires (Issue #127). The Main listener leaf (397 days by default) is rotated by the Owner with `pairing_cli rotate-listener`, which keeps the CA and server name so Agent bundles stay valid, replaces the pair under an exclusive directory lock with staged files and per-file atomic renames, refuses a listener certificate not issued by the selected CA, and completes an interrupted run on the next invocation; readers refuse a mismatched key/certificate pair. Listener material may belong to a separate ingest account (`--listener-owner`; the CLI needs `CAP_CHOWN` + `CAP_DAC_OVERRIDE` to write it and refuses up front otherwise). Concurrent `init` runs are serialized by directory locks and roll back only their own entries; the bootstrap listener sets `SO_REUSEADDR` but never `SO_REUSEPORT` (Issues #124/#125). `export-bundle` and `approve` refuse a listener certificate not issued by the selected CA (`listener_authority_mismatch`), and `approve`/`list`/`revoke` open only the application's existing database file (canonical path, regular file, one link, owned by the CLI account, not group/other-writable), never creating one. The bootstrap bind also refuses Tailscale CGNAT addresses (`100.64.0.0/10`): enrollment and ingest are private-LAN only and need no Tailscale.
+
+Re-pairing contract (Owner decisions 2026-10-01/05; Issues #116/#117; ADR-0006 follow-up notes 2026-10-07). Re-pairing never bypasses the bootstrap above: it uses the same trust bundle, verified TLS 1.3, one-use code and typed local Owner approval, and stays inside the installed deployment (a different CA is a fresh install).
+
+- *Expired, not revoked:* `enroll request|pair --repair expired` proves the installed key again, only once the installed certificate has expired (an unexpired one renews automatically). The Main re-approves the key for its same node after the Owner types `APPROVE`; the Agent accepts only a certificate for the same node and deployment that outlives the expired one and rotates it in atomically. Node UUID and camera sources are unchanged.
+- *Revoked:* `--repair revoked` uses one fresh key (0600 in `pending-repair/`, re-exported on retries) and must receive a certificate for a different node of the same deployment, swapped in atomically. The Main refuses every key ever held by a revoked node (`public_key_revoked`) before the Owner prompt and again inside the approval transaction. No camera source is carried over; the Owner approves the new node's sources again. The old node's ledger rows stay `revoked` and its recordings stay attributed to it until normal retention.
+- *Serialization:* every `request`, `pair` and renewal step holds one non-blocking runtime-wide lock (`flock` on `<runtime_root>/node-enrollment.lock`); `pair` holds it from the installed-identity check through install and pending-key cleanup, and `request` through writing its request file. A second run is refused at once with `enrollment_in_progress`, before any network traffic or code prompt.
+- *Configuration and fail-closed start:* after a revoked re-pair the Owner updates `node_id` in the protected Agent configuration by hand (the CLI prints the exact change). Service start and `--check` refuse with `node_identity_mismatch` while the configured `node_id` differs from the installed credential's node, and with `node_credential_unavailable` when the installed credential is damaged or unreadable, including a lost commit marker once `node-identity-installed` records that an identity was committed. Only a store without that evidence (fresh, or a first install interrupted before its commit) reads as unpaired. Every validation of a committed credential (start, `--check`, pairing) durably backfills missing evidence (identities paired by an earlier release, or a stop between the commit and the evidence write) and refuses the credential if it cannot be written. The evidence is not written before the commit, so an interrupted first install stays retryable; the residual case is a commit lost after such a stop and before any validation. The old generation's files are deleted only after the swap commits; the Agent's ring buffer and protected incidents are untouched.
 
 Node identity is independent from source identity: one agent may later expose multiple cameras without gaining human/admin dashboard permissions.
 
@@ -612,7 +619,7 @@ If space becomes unsafe:
 - reclaim eligible non-protected ring-buffer segments first;
 - do not auto-delete a protected incident before its 60-day default expiry merely to satisfy ordinary buffer demand;
 - surface `agent_storage_pressure`/equivalent state and an owner-visible warning;
-- stop/refuse unsafe writes before crossing the filesystem safety reserve. Status predicts refusal from the sources' next appends, charged at each source's recent real segment allocation, with same-instant appends evaluated as one batch: while they cannot be admitted without crossing the reserve at the recent real bitrate, report `STORAGE_HARD_STOP / segment_write_refused_at_reserve` (not pressure or healthy) until space returns. If they would be refused only were every segment to reach its maximum bound, report `STORAGE_PRESSURE / segment_write_at_risk_at_maximum_bitrate` (or an earlier pressure reason), never healthy. Segment cadence is at least one second; shorter profiles are refused (`segment_duration_below_supported_cadence`);
+- stop/refuse unsafe writes before crossing the filesystem safety reserve. Status predicts refusal from the sources' next appends, charged at the sources' recent real segment allocations (the mean of the simulated appends' total plus two standard deviations of that total, the deviations of all appends added as if perfectly correlated, never above every append at its source's recent maximum; `agent/docs/RING_BUFFER.md`), with same-instant appends evaluated as one batch: while they cannot be admitted without crossing the reserve at the recent real bitrate, report `STORAGE_HARD_STOP / segment_write_refused_at_reserve` (not pressure or healthy) until space returns. If they would be refused only were every segment to reach its maximum bound, report `STORAGE_PRESSURE / segment_write_at_risk_at_maximum_bitrate` (or an earlier pressure reason), never healthy. Segment cadence is at least one second; shorter profiles are refused (`segment_duration_below_supported_cadence`);
 - if the full 10-minute pre-loss target or 10-minute post-loss continuation cannot be maintained, report the exact degraded/gap state rather than claiming complete protection.
 
 ### 5.15 Media-root mount safety
@@ -781,10 +788,28 @@ Tracked sources are bounded by the active-source limit (§3.4); tracked node
 sessions are hard-bounded separately, so live source-less node sessions never
 consume the active-source allowance. The active-source limit counts active sources, so durable deactivation or replacement of one
 source releases its slot (returning its undrained gap events to the caller)
-without discarding the node's other flows. While accepted units of a released
-source are still in the ingest queue, its committed position is kept outside
-the slot limit, so a retry after reactivation is a `duplicate` and is never
-enqueued twice; once they are drained, the durable watermark applies. A node that owns no tracked source
+without discarding the node's other flows. A released source's continuity
+(committed position, highest attempted epoch, and loss already recorded from a
+refused unit) is kept outside the slot limit, also when the ingest queue holds
+none of its units, so after reactivation a retry is a `duplicate` and never
+enqueued twice, a lower epoch than one already attempted stays stale, and the
+same loss is never handed to the durable consumer twice. Leaving the ingest
+queue is not durability: that entry is dropped only after the durable
+recording layer acknowledges persisting a watermark at or past its committed
+position (and it carries no noted loss or uncommitted attempt), after which
+the durable watermark applies. These entries are hard-bounded (deployment
+setting); when full, the oldest is evicted and that source falls back to its
+durable watermark on reactivation, which can repeat an envelope or a gap report
+but never hides loss. A unit behind loss already recorded (below the first
+refused unit that showed a skip or restart) is acknowledged as `duplicate`
+and never admitted, so media never contradicts the recorded gap. An in-epoch
+capture clock regression is measured against the committed unit and the
+latest capture time observed on a refused unit of that epoch, so it is
+reported also before anything of the epoch commits; the epoch of a unit
+refused because the watermark lookup failed is kept when the lookup later
+succeeds, even when nothing durable exists, and activity time is re-sampled
+after the lookup and after admission so a slow durable lookup cannot make a
+just-accepted flow read `interrupted`. A node that owns no tracked source
 and whose session is closed, invalidated or stale does not keep a slot.
 Liveness time is sampled while the tracker state is locked and never moves
 backwards, so a delayed or regressed clock sample cannot make an active flow
@@ -999,7 +1024,7 @@ Timeline correlation lists observations and relevant temporal context; it does n
 
 For invited non-owner users, historical timeline/event metadata is included with `recordings:view`. `live:view` alone exposes only current live/source-health information needed for live viewing.
 
-The Issue #26 internal implementation keeps Owner-control time in a marker separate from source observation time, so one skewed receipt timestamp can neither lock out Owner control nor withhold the suppression an accepted override asks for. Critical movement/tamper work is durably queued, dispatched outside the write transaction, and never retried automatically; every critical path is reported as armed, unavailable or unknown from configured ports, observed storage admission and injected detection health, and any delivery that has not completed keeps its path degraded. Stranded critical work returns to the queue only through an audited Owner-approved resubmission. Timeline pages use main-host receipt order as their single key. Reviewed producer adapters (`server/app/presence/adapters.py`) feed Owner/anonymous entrance crossings, confirmed critical ROI observations, and source/node/storage/recording health states into that timeline as neutral facts; anonymous crossings never affect presence, an unconfirmed Owner crossing makes the Owner observation `UNKNOWN`, and the Owner presence validity and source-latency bound have no default. Known or possible timeline loss is reported to the Owner as a durable `timeline_gap`, while facts still staged behind a transient storage, database or clock failure are reported separately as `timeline_pending` / `timeline_pending_count`: they degrade Owner status until written but are not counted as loss. The status projection performs no authorization check, and no human timeline, override or audit route may be registered until the Issue #10 boundary lands. See `server/app/presence/README.md` for the port, retention and status contracts.
+The Issue #26 internal implementation keeps Owner-control time in a marker separate from source observation time, so one skewed receipt timestamp can neither lock out Owner control nor withhold the suppression an accepted override asks for. Critical movement/tamper work is durably queued, dispatched outside the write transaction, and never retried automatically; every critical path is reported as armed, unavailable or unknown from configured ports, observed storage admission and injected detection health, and any delivery that has not completed keeps its path degraded. Stranded critical work returns to the queue only through an audited Owner-approved resubmission. Timeline pages use main-host receipt order as their single key. Reviewed producer adapters (`server/app/presence/adapters.py`) feed Owner/anonymous entrance crossings, confirmed critical ROI observations, and source/node/storage/recording health states into that timeline as neutral facts; anonymous crossings never affect presence, an unconfirmed Owner crossing makes the Owner observation `UNKNOWN`, and the Owner presence validity and source-latency bound have no default. Each change of an entrance source's gate quality is recorded as a neutral, main-host dated `entrance_gate` fact (`ready` while sufficient, `unknown` with the reported quality otherwise, and `unknown` when the runtime reports that the tracker stopped delivering updates), so a low-light or otherwise undeterminable entrance period stays distinguishable in the `recordings:view` history from a period without crossings; it never asserts absence or names a person. Known or possible timeline loss is reported to the Owner as a durable `timeline_gap`, while facts still staged behind a transient storage, database or clock failure are reported separately as `timeline_pending` / `timeline_pending_count`: they degrade Owner status until written but are not counted as loss. A staged fact whose observation construction fails with a programming error is quarantined rather than blocking every later fact, counted in `timeline_quarantined_count` and `timeline_gap`, logged by event name only, and recorded as lost at a clean close; consecutive transient flush failures are reported as `timeline_flush_failures` and logged when a streak starts, doubles and recovers. Owner status read through another presence service over the same database in the same process sees the outbox backlog; an outbox owned by another process makes the backlog unknown (`timeline_backlog_visible=false`, reported as pending and as a gap) and refuses the Owner gap clear there. Status and history reads take no storage reservation, except any read of a WAL database, which runs under the reservation (and fails closed without it) because SQLite may create or resize the `-wal`/`-shm` sidecars at open even when they were present just before; the application database itself uses a rollback journal, whose reads create no file. The status projection performs no authorization check, and no human timeline, override or audit route may be registered until the Issue #10 boundary lands. See `server/app/presence/README.md` for the port, retention and status contracts.
 
 ## 9. Storage/admission
 
@@ -1441,18 +1466,48 @@ revokes every human session; a hostname resolution failure alone keeps access
 closed and reopens without revocation once the name resolves to the recorded
 set again (Owner decision, 2026-10-01; details in `server/app/auth/README.md`).
 An Owner listener exception covers a wildcard system listener only by port
-plus owning executable or systemd unit, verified on every check through the
-socket's owning processes; another or unverifiable owner is an exposure
-reason, and stored port-only exceptions fail closed until re-entered (Owner
-decision, 2026-10-01). Each recorded proxy socket requires a recorded proxy
-process identity (`proxy_owner`) and must be present and held by that process
-alone: a missing recorded socket keeps access closed without revocation, and
-another or unverifiable holder is an exposure (Owner decision, 2026-10-01).
+plus creating systemd unit (`.service` or `.socket`) and uid, verified on every
+check through an unprivileged `NETLINK_SOCK_DIAG` `inet_diag` dump of the
+socket's creating cgroup (`INET_DIAG_CGROUP_ID`, matched to
+`/sys/fs/cgroup/system.slice/<unit>`) and uid; a socket created by another unit
+or uid is an exposure reason (`UNEXPECTED_LISTENER`) once an immediate second
+dump in the same check confirms it, and stored port-only or executable-path
+exceptions fail closed (`LISTENER_EXCEPTIONS_OUTDATED`) until re-entered (Owner
+decisions, 2026-10-01 and 2026-10-07). Each recorded proxy socket requires a
+recorded proxy identity (`proxy_owner`: systemd unit and uid) and must be
+present and created by it: a missing recorded socket keeps access closed
+without revocation, and another creator is an exposure (Owner decision,
+2026-10-01). Ownership that cannot be verified
+(`LISTENER_OWNER_UNVERIFIED`: no socket-owner resolver, a sock_diag or cgroup
+lookup that is unavailable, times out or fails its self-check, a socket in
+`/proc/net` but not in the dump, a creating cgroup that cannot be resolved —
+deleted, the root cgroup or `/init.scope` — while the socket's uid is one of the
+expected identities' uids, `/init.scope` with uid 0, a mismatch the second dump
+does not confirm, another upstream holder seen in only one of two scans of the
+same check (a child between `fork` and `exec`), a kernel-owned socket (inode 0), an upstream port at or above `ip_unprivileged_port_start`, or an
+unreadable own or unit descriptor table) is not an exposure reason: it keeps
+access closed without revocation and access reopens once ownership verifies
+again (Owner decisions, 2026-10-05 and 2026-10-07, superseding the 2026-10-01
+wording that treated an unverifiable owner or holder as an exposure). The
+socket-owner resolver (`app.auth.sock_diag.SockDiagOwners` in production) is
+mandatory; a check without one never opens access. sock_diag reports the
+creator, not the current holder (residual risk accepted by the Owner,
+2026-10-07). An unresolved creating cgroup with a uid none of the expected
+identities has counts as another creator (`UNEXPECTED_LISTENER` once the second
+dump confirms it; Owner decision, 2026-10-07). A unit matches a socket created
+in `/system.slice/<unit>` or below nested system slices
+(`/system.slice/system-cups.slice/cups.service`).
 The check sees only sockets in `/proc/net` and Serve status. Traffic the kernel redirects before it reaches a listening socket on the reserved address — nftables/iptables DNAT or REDIRECT (for example Docker with `userland-proxy=false`), TPROXY, eBPF `sk_lookup` or IPVS — is not visible to it, so it cannot claim that nothing else answers; the deployment isolation must exclude such forwarding, and the Owner verifies it manually.
-The loopback human upstream passes only as a socket in the ServerSentinel
-process's own `/proc/self/fd`; a single replacement bound by any other
-process is an exposure, and an unreadable own fd table keeps access closed as
-an exposure. A check without a durable session revoker never opens access.
+The loopback human upstream is created by systemd socket activation
+(`server-sentinel-upstream.socket`, `ListenStream=` a loopback port below 1024,
+`ReusePort=no`) and passed to the unprivileged backend (`LISTEN_FDS` /
+`LISTEN_PID`). It passes only as a socket in the ServerSentinel process's own
+`/proc/self/fd`, created in that socket unit's cgroup by uid 0, on a port below
+`ip_unprivileged_port_start`, and held by no other process of the
+ServerSentinel unit's cgroups (a same-uid `/proc/<pid>/fd` scan); a single
+replacement bound by any other process, a confirmed other creator, or the
+socket shared with another process is an exposure. A check without a durable
+session revoker never opens access.
 That bounds the exposure window rather
 than preventing the bind: a process that binds between two checks receives
 credentials and cookies for that origin until the next check.

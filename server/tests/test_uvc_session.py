@@ -151,6 +151,56 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.controller.state, CameraState.MANUAL)
 
 
+    def test_weak_live_binding_survives_metadata_refresh(self):
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.discovery.devices = [weak]
+        self.controller.approve(weak, [weak])
+        self.assertTrue(self.session.step())
+        capture = self.session.capture
+        refreshed = replace(weak, by_id=("synthetic-alias",), formats=("MJPG", "YUYV"))
+        self.discovery.devices = [refreshed]
+        for _ in range(3):
+            # Each step is a due presence rescan (#122 suppresses the rest).
+            self.rescan_due()
+            self.assertTrue(self.session.step())
+        self.assertIs(capture, self.session.capture)
+        self.assertFalse(capture.closed)
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+        self.assertFalse(self.controller.requires_approval)
+        # The stored binding evidence is refreshed from the scan entry.
+        self.assertEqual(refreshed, self.controller.bound)
+        # An actual instance change still ends the weak binding and never
+        # auto-binds the indistinguishable replacement.
+        self.discovery.devices = [replace(refreshed, instance_token=(4, 5, 6))]
+        self.rescan_due()
+        self.assertFalse(self.session.step())
+        self.assertTrue(capture.closed)
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.MANUAL, self.controller.state)
+        self.assertIsNone(self.session.capture)
+
+    def test_metadata_refresh_during_open_verification_still_opens(self):
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        refreshed = replace(weak, by_id=("synthetic-alias",))
+        scans = iter([[weak], [refreshed]])
+        self.discovery.scan = lambda: DiscoveryResult(tuple(next(scans, [refreshed])), 0)
+        self.controller.approve(weak, [weak])
+        self.assertTrue(self.session.step())
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+
+    def test_ambiguous_serial_live_binding_survives_metadata_refresh(self):
+        live = replace(self.camera, instance_token=(1, 2, 3))
+        twin = replace(live, device_path="/dev/video1", instance_token=(1, 3, 4))
+        self.discovery.devices = [live, twin]
+        self.controller.approve(twin, self.discovery.devices)
+        self.assertTrue(self.session.step())
+        capture = self.session.capture
+        self.discovery.devices = [live, replace(twin, formats=("MJPG",))]
+        self.assertTrue(self.session.step())
+        self.assertIs(capture, self.session.capture)
+        self.assertEqual(twin.live_instance_key, self.controller.bound.live_instance_key)
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+
 class CountingDiscovery(Discovery):
     def __init__(self, devices):
         super().__init__(devices)
@@ -275,6 +325,67 @@ class ProfileNegotiationTests(unittest.TestCase):
         self.assertFalse(self.session.step())
         self.assertEqual(CameraState.MANUAL, self.controller.state)
         self.assertEqual(1, len(self.instances))
+
+    def assert_hold_survives_metadata_refresh(self, held, *, approve):
+        self.discovery.devices = [held]
+        self.adjust = lambda profile: VideoProfile(1920, 1080, 30, "MJPG")
+        self.session = self.make_session(VideoProfile(1920, 1080, 60, "MJPG"))
+        if approve:
+            self.controller.approve(held, [held])
+        self.assertFalse(self.session.step())
+        self.assertEqual("capture_profile_unavailable", self.events[-1].reason)
+        opened, events = len(self.instances), len(self.events)
+        # A rescan refreshes mutable metadata of the same live device node.
+        refreshed = replace(held, by_id=("synthetic-alias",), formats=("MJPG", "YUYV"))
+        self.discovery.devices = [refreshed]
+        for _ in range(3):
+            self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.DEGRADED, self.controller.state)
+        self.assertEqual("capture_profile_unavailable", self.events[-1].reason)
+        self.assertEqual(opened, len(self.instances))
+        self.assertEqual(events, len(self.events))
+        self.assertTrue(self.controller.profile_unavailable)
+        return refreshed
+
+    def test_weak_hold_survives_metadata_refresh_but_not_instance_change(self):
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        refreshed = self.assert_hold_survives_metadata_refresh(weak, approve=True)
+        # An actual instance change still releases the hold and never
+        # auto-binds the indistinguishable non-serial device.
+        self.discovery.devices = [replace(refreshed, instance_token=(4, 5, 6))]
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.MANUAL, self.controller.state)
+        self.assertTrue(self.controller.requires_approval)
+
+    def test_weak_hold_with_identical_twin_never_binds_the_twin(self):
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        refreshed = self.assert_hold_survives_metadata_refresh(weak, approve=True)
+        twin = replace(refreshed, device_path="/dev/video1", instance_token=(7, 8, 9))
+        self.discovery.devices = [refreshed, twin]
+        opened = len(self.instances)
+        self.assertFalse(self.session.step())
+        self.assertEqual(opened, len(self.instances))
+        self.assertEqual(CameraState.DEGRADED, self.controller.state)
+        self.discovery.devices = [twin]
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.MANUAL, self.controller.state)
+        self.assertEqual(opened, len(self.instances))
+
+    def test_unique_serial_hold_is_not_reopened_after_metadata_refresh(self):
+        self.assert_hold_survives_metadata_refresh(replace(self.camera, instance_token=(1, 2, 3)),
+                                                   approve=False)
+
+    def test_ambiguous_serial_explicit_hold_survives_metadata_refresh(self):
+        live = replace(self.camera, instance_token=(1, 2, 3))
+        twin = replace(live, device_path="/dev/video1", instance_token=(4, 5, 6))
+        self.controller.approve(live, [live, twin])
+        self.assertTrue(self.controller.serial_ambiguous)
+        refreshed = self.assert_hold_survives_metadata_refresh(live, approve=False)
+        self.discovery.devices = [refreshed, twin]
+        opened = len(self.instances)
+        self.assertFalse(self.session.step())
+        self.assertEqual(opened, len(self.instances))
+        self.assertEqual(CameraState.DEGRADED, self.controller.state)
 
 
 class FrameProgressTests(unittest.TestCase):
@@ -479,6 +590,26 @@ class FrameProgressTests(unittest.TestCase):
         self.assertTrue(capture.closed)
         self.assertTrue(self.session.stopped)
         self.assertEqual("device_disconnected", self.events[-1].reason)
+
+    def test_stall_is_reported_after_a_metadata_only_rescan(self):
+        # #115 x #122: a due rescan that only refreshes mutable metadata keeps
+        # the live capture, and the stall checks still match the refreshed
+        # binding by live instance.
+        capture = self.go_online()
+        refreshed = replace(self.camera, by_id=("synthetic-alias",), formats=("MJPG", "YUYV"))
+        self.discovery.devices = [refreshed]
+        self.clock.advance(self.session.presence_scan_seconds)
+        self.assertTrue(self.session.step())
+        self.assertEqual(refreshed, self.controller.bound)
+        self.assertIs(capture, self.session.capture)
+        capture.stalled = True
+        self.clock.advance(self.session.frame_stall_seconds)
+        self.assertTrue(self.session.check_frame_progress())
+        self.assertEqual(CameraState.DEGRADED, self.controller.state)
+        self.assertEqual("video_frame_stalled", self.events[-1].reason)
+        self.assertTrue(self.session.step())
+        self.assertEqual("video_frame_stalled", self.events[-1].reason)
+        self.assertFalse(capture.closed)
 
     def test_watchdog_never_raises_a_closed_or_offline_source(self):
         self.go_online()
@@ -685,6 +816,7 @@ class PresenceScanTests(unittest.TestCase):
         # Losing the descriptor ends the weak live binding: Owner reapproval.
         self.assertFalse(self.session.step())
         self.assertEqual(CameraState.MANUAL, self.controller.state)
+
 
 
 if __name__ == "__main__":
