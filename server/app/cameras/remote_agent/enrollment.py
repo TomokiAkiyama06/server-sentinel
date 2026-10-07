@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Callable
 from uuid import UUID
 
+from .addresses import is_tailscale_address, socket_address
 from .node_ca import (
     MAX_CSR_BYTES, CaptureAuthorityError, DeploymentTrust,
     IssuedNodeCredential,
@@ -113,20 +114,17 @@ class EnrollmentLimits:
             raise EnrollmentConfigurationError("enrollment_limit_invalid")
 
 
-def _socket_identity(address: ipaddress.IPv4Address | ipaddress.IPv6Address):
-    """The address a reservation compares: IPv4-mapped IPv6 as its IPv4 form."""
-    mapped = getattr(address, "ipv4_mapped", None)
-    return address if mapped is None else mapped
-
-
 @dataclass(frozen=True)
 class EnrollmentListenerConfig:
-    """Explicit private bind; no default address, port, wildcard or public address.
+    """Explicit private bind; no default address, port, wildcard, public or Tailscale address.
 
     ``reserved`` lists the socket addresses of the other listeners (human
     dashboard, capture ingest) so this listener can never share one of them.
     IPv4-mapped IPv6 addresses (``::ffff:a.b.c.d``) are compared in their IPv4
-    form, because Linux treats both spellings as the same socket.
+    form, because Linux treats both spellings as the same socket; the bind
+    itself is classified in that form too. Tailscale addresses (IPv4
+    ``100.64.0.0/10`` and the IPv6 ULA ``fd7a:115c:a1e0::/48``, Issue #150) are
+    refused like public ones: enrollment is private-LAN only.
     """
 
     bind_host: str
@@ -140,7 +138,8 @@ class EnrollmentListenerConfig:
             raise EnrollmentConfigurationError("enrollment_bind_requires_ip_literal") from None
         if bind.is_unspecified or bind.is_multicast:
             raise EnrollmentConfigurationError("enrollment_bind_wildcard_refused")
-        if not bind.is_private or bind.is_global:
+        identity = socket_address(bind)
+        if not identity.is_private or identity.is_global or is_tailscale_address(identity):
             raise EnrollmentConfigurationError("enrollment_bind_requires_private_address")
         if type(self.port) is not int or not 1 <= self.port <= 65535:
             raise EnrollmentConfigurationError("enrollment_port_invalid")
@@ -154,7 +153,7 @@ class EnrollmentListenerConfig:
                 raise EnrollmentConfigurationError("enrollment_reserved_listeners_invalid") from None
             if type(port) is not int or not 1 <= port <= 65535:
                 raise EnrollmentConfigurationError("enrollment_reserved_listeners_invalid")
-            if port == self.port and (_socket_identity(other) == _socket_identity(bind)
+            if port == self.port and (socket_address(other) == identity
                                       or other.is_unspecified):
                 raise EnrollmentConfigurationError("enrollment_listener_must_differ_from_other_listeners")
 

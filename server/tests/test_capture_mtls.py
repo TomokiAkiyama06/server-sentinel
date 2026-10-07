@@ -376,6 +376,24 @@ class CaptureMtlsTests(CaptureTlsHarness):
                 self.authority.export_trust_bundle(server_name=SERVER_NAME,
                                                    endpoint_host=host, endpoint_port=7443)
 
+    def test_trust_bundle_refuses_tailscale_endpoints(self):
+        # Issue #150 (Owner decision 2026-10-07): a bundle never points an
+        # Agent at Tailscale; both families and the IPv4-mapped spelling.
+        for host in ("100.64.0.0", "100.100.100.100", "100.127.255.255", "::ffff:100.64.0.1",
+                     "fd7a:115c:a1e0::", "fd7a:115c:a1e0::53",
+                     "fd7a:115c:a1e0:ffff:ffff:ffff:ffff:ffff"):
+            with self.subTest(host=host):
+                with self.assertRaises(CaptureAuthorityError) as refused:
+                    self.authority.export_trust_bundle(server_name=SERVER_NAME,
+                                                       endpoint_host=host, endpoint_port=7443)
+                self.assertEqual("trust_bundle_endpoint_tailscale_address_refused",
+                                 refused.exception.reason)
+        for host in ("100.63.255.255", "100.128.0.0", "fd7a:115c:a1df:ffff::1",
+                     "fd7a:115c:a1e1::", "192.168.250.10", "fd00::10", SERVER_NAME):
+            with self.subTest(host=host):
+                self.authority.export_trust_bundle(server_name=SERVER_NAME,
+                                                   endpoint_host=host, endpoint_port=7443)
+
     # -- listener separation -------------------------------------------------
 
     def test_listener_configuration_is_explicit_and_separate_from_human_listener(self):
@@ -386,6 +404,20 @@ class CaptureMtlsTests(CaptureTlsHarness):
                        {"bind_host": "127.0.0.1", "port": 0}):
             with self.subTest(**kwargs), self.assertRaises(IngestConfigurationError):
                 IngestListenerConfig(human_host="127.0.0.1", human_port=8000, **kwargs)
+        # Issue #150: ingest is private-LAN only, so neither Tailscale range
+        # (nor the IPv4-mapped spelling of the IPv4 one) can be its bind.
+        for host in ("100.64.0.0", "100.101.102.103", "100.127.255.255", "::ffff:100.64.0.1",
+                     "fd7a:115c:a1e0::", "fd7a:115c:a1e0::1",
+                     "fd7a:115c:a1e0:ffff:ffff:ffff:ffff:ffff"):
+            with self.subTest(bind_host=host), self.assertRaisesRegex(
+                    IngestConfigurationError, "ingest_bind_tailscale_address_refused"):
+                IngestListenerConfig(bind_host=host, port=7443, human_host="127.0.0.1",
+                                     human_port=8000)
+        for host in ("100.63.255.255", "100.128.0.0", "fd7a:115c:a1df:ffff:ffff:ffff:ffff:ffff",
+                     "fd7a:115c:a1e1::", "192.168.1.2", "fd00::2"):
+            with self.subTest(bind_host=host):
+                IngestListenerConfig(bind_host=host, port=7443, human_host="127.0.0.1",
+                                     human_port=8000)
         with socket.create_server(("127.0.0.1", 0)) as probe:
             port = probe.getsockname()[1]
         config = IngestListenerConfig(bind_host="127.0.0.1", port=port,

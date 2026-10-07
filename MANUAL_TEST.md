@@ -568,14 +568,23 @@ and `revoke` run as `sudo MAIN_CLI ...` (Issue #109) and `export-bundle` and
    `ca_account_must_differ_from_service_account`.
 2. Choose the bootstrap endpoint: the Main's private-LAN IP and a port distinct
    from the dashboard (loopback-only) and any ingest port. Public addresses
-   and Tailscale addresses (`100.64.0.0/10`) are refused
+   and Tailscale addresses (IPv4 `100.64.0.0/10` and IPv6
+   `fd7a:115c:a1e0::/48`) are refused
    (`enrollment_bind_requires_private_address`); enrollment and ingest use the
-   private LAN and need no Tailscale. Run
+   private LAN and need no Tailscale. On a Main that runs Tailscale, confirm
+   `approve --listen` with the node's own Tailscale IPv4 and IPv6 address
+   (`tailscale ip -4` / `tailscale ip -6`) each refuses before any prompt. Run
    `sudo -u <service account> MAIN_CLI export-bundle --listener-dir <listener_dir> --endpoint <ip>:<port> --output bundle.json`
    (public material only; no root) and note the printed full
    `trust_bundle_sha256`. A listener directory whose `deployment-ca-certificate.pem`
    did not issue its listener certificate must refuse
-   `listener_authority_mismatch` and write no bundle.
+   `listener_authority_mismatch` and write no bundle. On a Main that runs Tailscale, confirm
+   `export-bundle --endpoint` with its Tailscale IPv4 and IPv6 address
+   (`--endpoint [<ipv6>]:<port>`) each refuses
+   `trust_bundle_endpoint_tailscale_address_refused` and writes no bundle.
+   The check is by address range only: a non-Tailscale private network that
+   uses `100.64.0.0/10` or `fd7a:115c:a1e0::/48` is refused the same way and
+   must use another private address for the Main.
 3. Copy `bundle.json` to the capture host over an Owner-trusted channel (for
    example removable media). Do not copy the digest over the same channel.
 4. On the capture host, as the dedicated non-root `media-capture-agent`
@@ -606,7 +615,13 @@ and `revoke` run as `sudo MAIN_CLI ...` (Issue #109) and `export-bundle` and
    `AGENT_CLI pair` with a wrong `--bundle-sha256` (no connection is made);
    with `--endpoint` pointing at a host presenting a certificate from another CA
    or for another name; with `--endpoint` pointing at a plaintext service or at
-   the dashboard port.
+   the dashboard port; with `--endpoint` set to a Tailscale address
+   (`100.64.0.0/10` or `[fd7a:115c:a1e0::...]`), which refuses
+   `main_endpoint_tailscale_address_refused` with no connection. If a DNS name
+   that resolves to a Tailscale address is available on a disposable setup,
+   confirm `--endpoint <name>:<port>` refuses the same reason before any TLS
+   handshake (no Tailscale is needed on the capture host for the literal
+   checks).
 7. Run `AGENT_CLI pair --runtime-root <runtime_root> --trust-bundle bundle.json --bundle-sha256 <digest from step 2>`.
    At `Pairing code:` type the code from step 5 (the hyphen groups may be
    kept). Confirm the typed code is not echoed, the Agent prints
@@ -630,7 +645,8 @@ and `revoke` run as `sudo MAIN_CLI ...` (Issue #109) and `export-bundle` and
 10. Start the ingest listener bound to the Main's private-LAN IP and a port
     distinct from the dashboard and bootstrap listeners; confirm the dashboard
     listener still binds loopback only and the ingest port answers no HTTP
-    route *(needs ingest wiring, #14/#15)*.
+    route, and that a Tailscale IPv4 or IPv6 bind is refused with
+    `ingest_bind_tailscale_address_refused` *(needs ingest wiring, #14/#15)*.
 11. Connect from the Agent: expect a TLS 1.3 session admitted as that node.
     From another LAN host without a node certificate, with a certificate from a
     different CA, and with an expired certificate: expect refusal before any

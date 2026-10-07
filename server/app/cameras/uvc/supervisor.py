@@ -53,8 +53,16 @@ class LocalUvcSupervisor:
     logged with text.
     """
 
+    # close() gives the watchdog join at least this long even when joining
+    # the workers used up the shared deadline. A frame-progress check is
+    # in-memory work under a non-blocking lock (its health write runs on a
+    # background writer), so it normally finishes well within this bound. A
+    # watchdog still alive after it makes close() fail, so a successful
+    # close() always returns with the watchdog stopped.
+    WATCHDOG_JOIN_MINIMUM_SECONDS = 1.0
+
     def __init__(self, adapter, *, poll_timeout=1.0, retry_delay=0.1,
-                 join_timeout=3.0, clock=time.monotonic, watchdog_interval=0.25):
+                 join_timeout=10.0, clock=time.monotonic, watchdog_interval=0.25):
         if not callable(getattr(adapter, "poll_source", None)):
             raise TypeError("local UVC adapter is required")
         if not callable(getattr(adapter, "stop_source", None)):
@@ -125,12 +133,16 @@ class LocalUvcSupervisor:
     def _watch(self):
         while not self._watchdog_stop.wait(self._watchdog_interval):
             # A requested stop is not an exit: a worker blocked in a kernel
-            # call past a timed-out stop() stays registered, and its source
-            # is still reported by that worker's last state. Keep checking
-            # it until the thread has actually exited or was removed.
+            # call past a timed-out stop() or close() stays registered, and
+            # its source is still reported by that worker's last state. Keep
+            # checking it until the thread has actually exited or was removed.
             with self._lock:
                 sources = [(source_id, worker) for source_id, worker in self._workers.items()
                            if worker.thread is not None and worker.thread.is_alive()]
+                if self._closed and not sources:
+                    # close() left this watchdog running for workers that
+                    # outlived its join bound; all of them have now exited.
+                    return
             for source_id, worker in sources:
                 if self._watchdog_stop.is_set():
                     return
@@ -215,22 +227,29 @@ class LocalUvcSupervisor:
         return True
 
     def close(self):
-        """Stop all sources within one total join deadline."""
+        """Stop all sources within one total join deadline.
+
+        The watchdog keeps running until every worker has been joined. A
+        worker blocked in a kernel call past the deadline stays registered
+        and watched, so its source cannot keep an ``online`` claim while it
+        delivers no frames; the watchdog exits on its own once such workers
+        have exited, or a later ``close()`` that joins them stops it.
+
+        Success means no worker and no watchdog thread is left that could
+        still call into the adapter. A watchdog still inside a check after its
+        own bounded join makes ``close()`` fail, so the owner does not tear
+        the adapter down under that check; a later ``close()`` joins it again.
+        """
         with self._lock:
-            if self._closed and not self._workers:
+            if (self._closed and not self._workers
+                    and not (self._watchdog is not None and self._watchdog.is_alive())):
                 return
             self._closed = True
-            self._watchdog_stop.set()
             watchdog = self._watchdog
             workers = tuple(self._workers.items())
             for _source_id, worker in workers:
                 worker.stop.set()
         deadline = self._clock() + self._join_timeout
-        if watchdog is not None:
-            # The watchdog only ever lowers a health claim under the source's
-            # transition lock, so a check still finishing a storage write after
-            # this bound cannot race capture cleanup into a wrong state.
-            watchdog.join(max(0.0, deadline - self._clock()))
         for _source_id, worker in workers:
             remaining = max(0.0, deadline - self._clock())
             worker.thread.join(remaining)
@@ -242,7 +261,21 @@ class LocalUvcSupervisor:
             for source_id, worker in workers:
                 if not worker.thread.is_alive():
                     self._workers.pop(source_id, None)
+            if not alive:
+                # Only now is no source left that the watchdog must report.
+                self._watchdog_stop.set()
+        if not alive and watchdog is not None:
+            # The watchdog only ever lowers a health claim under the source's
+            # transition lock, so a check still finishing a storage write after
+            # this bound cannot race capture cleanup into a wrong state.
+            # The remaining shared deadline may already be zero after a slow
+            # worker join, so the watchdog gets a minimum bound of its own.
+            watchdog.join(max(self.WATCHDOG_JOIN_MINIMUM_SECONDS, deadline - self._clock()))
         if alive:
             raise WorkerStopError("local UVC workers did not stop")
+        if watchdog is not None and watchdog.is_alive():
+            # A check still running may call into the adapter: never report a
+            # clean close, or the owner would close the adapter under it.
+            raise WorkerStopError("local UVC watchdog did not stop")
         if cleanup_failed:
             raise WorkerStopError("local UVC worker cleanup failed")

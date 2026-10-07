@@ -38,7 +38,14 @@ class LocalUvcConfiguration:
     # One registry health write per retry while a source has no approval, so
     # the default keeps idle write load at about one row update per second.
     retry_delay_seconds: float = 1.0
-    join_timeout_seconds: float = 3.0
+    # Total bound for joining the source workers on stop/shutdown. A worker's
+    # stop includes the STREAMOFF/unmap/close teardown (up to 5.5 s observed
+    # on a real C960 after an unplug, MANUAL_TEST P-7) plus up to
+    # HEALTH_SETTLE_SECONDS (1 s) for the offline health write, so the default
+    # leaves margin above 6.5 s. Workers stop in parallel under one deadline.
+    # A worker still alive at the bound stays supervised (never ``online``)
+    # and the runtime reports STOP_FAILED.
+    join_timeout_seconds: float = 10.0
     frame_stall_seconds: float = 1.0
     frame_stall_reopen_seconds: float = 5.0
     presence_scan_seconds: float = 1.0

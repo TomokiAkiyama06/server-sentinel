@@ -166,7 +166,7 @@ The optional `local_uvc` object names the logical Camera Registry sources
   "source_ids": ["00000000-0000-4000-8000-000000000001"],
   "poll_timeout_seconds": 1.0,
   "retry_delay_seconds": 1.0,
-  "join_timeout_seconds": 3.0,
+  "join_timeout_seconds": 10.0,
   "frame_stall_seconds": 1.0,
   "frame_stall_reopen_seconds": 5.0,
   "presence_scan_seconds": 1.0
@@ -182,6 +182,14 @@ fail `--check`). `frame_stall_seconds` (0.25–30) is how long a live capture
 may deliver no frame before its source is reported `degraded`
 (`video_frame_stalled`) instead of `online`; the effective window is never
 shorter than 10 negotiated frame intervals, so a slow profile cannot flap.
+`join_timeout_seconds` (0.1–60, default 10) bounds the total time a stop or
+shutdown waits for all source workers, which stop in parallel; it must cover the
+camera teardown (up to 5.5 s observed on a real C960 after an unplug) plus the
+1 s offline health-write settle, and a shorter value can make a clean shutdown
+`stop_failed`. A worker still alive at the bound stays watched and is never
+reported `online`. The installed unit sets no `TimeoutStopSec`, so systemd's
+default stop timeout (normally 90 s) applies and stays above the 60 s upper
+bound.
 `frame_stall_reopen_seconds` (0.5–300, not less than `frame_stall_seconds`,
 scaled by the same factor) is how long a stall lasts before the source is
 reported `offline` and the capture is closed and reopened (also enforced by the
@@ -535,6 +543,20 @@ SQLite lock the process holds on it, including one an enrollment worker that
 outlived the listener's bounded wait may still hold. Such a worker's later
 commit is refused instead. The descriptor is released only when the command's
 process exits.
+
+**Bootstrap endpoint and Tailscale (Issue #150).** Capture enrollment and
+ingest are private-LAN only and need no Tailscale on either host. The
+enrollment bind (`approve --listen`), the ingest listener and the
+`export-bundle --endpoint` value all refuse Tailscale addresses, IPv4
+`100.64.0.0/10` and IPv6 `fd7a:115c:a1e0::/48` (including IPv4-mapped
+spellings); the bundle export refuses
+`trust_bundle_endpoint_tailscale_address_refused` and writes no file. The
+Agent refuses `main_endpoint_tailscale_address_refused` for such a bundle
+endpoint, `pair --endpoint` override, or a DNS name that connects to such an
+address. The check is by address range only (Owner decision 2026-10-07): a
+LAN that is not Tailscale but uses these ranges (another CGNAT or a ULA that
+happens to match) is refused too, so give the Main another private address
+for capture traffic.
 
 **Rotating the Main listener certificate (Issue #125).** The listener leaf
 defaults to 397 days and is not renewed automatically. Rotate it before it
