@@ -289,14 +289,67 @@ Do not trust arbitrary forwarded identity headers.
 
 If Tailscale Serve/equivalent provides authenticated identity headers, the backend accepts them only on a non-bypassable local trusted-proxy path. Requests from LAN/other interfaces cannot directly set such headers and gain identity.
 
-The concrete Owner-bootstrap/session design is [ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md), which is **Accepted**.
+The concrete Owner-bootstrap/session design is [ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md), which is **Accepted** (2026-09-21).
 It states the trusted-host loopback limitation and upstream login-reuse risk,
-and defines recovery/revocation transitions. Human routes and dashboard assets
-remain closed until ADR-0004 is accepted and both records are implemented and
-tested under #10. Its model tests do not validate a
-real Tailscale installation, LAN bypass resistance, or active stream cancellation.
+and defines recovery/revocation transitions. The per-person authorization
+decision for the shared Tailnet account is
+[ADR-0004](docs/ADR/0004-shared-tailnet-account-authorization.md), **Accepted**
+on 2026-09-30 (see [Shared Tailnet account](#shared-tailnet-account)).
 
-That proposal also requires a hostname reserved for the human listener on every
+Accepting the two records does not open human access by itself. Human routes
+and dashboard assets stay closed — the backend shell denies them, including
+application assets, health/version/schema and SPA/error fallbacks — until
+Issue #10 implements and tests both records; the remaining work is listed in
+`server/app/auth/README.md`. Once they are open, a human request receives
+application data only when every one of these server-side conditions holds:
+
+- **Network gate.** The request arrived over the Owner-managed private network
+  / Tailscale path through the non-bypassable local trusted-proxy listener,
+  never as a header an ordinary LAN client supplied. This gate is necessary but
+  identifies nobody: the research room shares one Tailscale login, so the
+  login and any approved device name the shared account or a machine, not the
+  person using it. It is also not a barrier that keeps uninvited people out;
+  every holder of the shared account can reach the listener.
+- **Application gate: per-person credential.** The requester's own
+  ServerSentinel-issued WebAuthn/passkey credential, created from an Owner
+  invitation, was verified by the server — its challenge, client data,
+  authenticator data, signature and counter, relying-party id and origin, and
+  the user-verification flag, which is required at registration and at every
+  authentication — and an active, unexpired server-side session created by
+  that credential exists. The invitation and the permission the route needs
+  (`live:view` or `recordings:view`, independently) are checked per route.
+- **Proxy identity binding, where the deployment supplies one.** Where the
+  deployment supplies a verified trusted-proxy identity, the session stores
+  only a deployment-keyed HMAC binding of it, and every later request's
+  identity must reproduce that binding, compared in constant time. A mismatch
+  denies only that request generically. Per REQUIREMENTS AUTH-005 and
+  SPECIFICATION §11.8 the identity is accepted only on the trusted local path
+  and may be additionally required, and the Issue #10 acceptance criteria in
+  `docs/INITIAL_ISSUES.md` require that no route demand one where the
+  deployment supplies none.
+  The current access-layer code requires one on every ceremony and session
+  check only as an interim constraint until the routes are built (Owner
+  decision, 2026-09-30); whether a path such as a strictly local
+  `http://localhost` Owner may run without one is still undecided in
+  `server/app/auth/README.md`. Either way the per-person credential above is
+  always required, and the binding is a consistency signal, never an
+  authorization input: a Tailscale login or proxy identity header alone
+  authorizes nothing.
+- **Reserved secure-context origin.** The dashboard is served from its
+  reserved origin over a secure context, and the latest startup/daily
+  reservation check passed. That check detects; it does not prevent (below).
+- **Owner step-up.** Owner-only operations additionally require a fresh user
+  verification bound to the session's own credential.
+
+The only requests served without a credential are the enumerated
+pre-credential routes (enrollment-code redemption and authentication), which
+return no application data. Revocation stays credential-scoped: revoking a
+synced passkey applies everywhere it synced, and nothing here is per-device
+revocation. The ADR-0003 policy-model tests and the synthetic unit tests do not
+validate a real Tailscale installation, LAN bypass resistance, browser
+WebAuthn behaviour, or active stream cancellation.
+
+ADR-0003 also requires a hostname reserved for the human listener on every
 scheme and port. No other application, static tree, alias, port, or catch-all
 may answer for that name: one sharing a path would run in the same browser
 origin, and one on another HTTPS port would still receive the host-only session
