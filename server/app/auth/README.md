@@ -217,14 +217,20 @@ authorizations from the previous generation must be reissued. The exposure is
 recorded as a marker in `application_metadata` first, so a restart before the
 revocation still revokes before opening (an unreadable marker also revokes).
 When the marker cannot be written, every human session is revoked at once
-instead (access is already closed, so none is issued until reopening revokes
-again); until one of the two commits, each check retries both and keeps
+instead (access is already closed, so no later request is admitted until
+reopening revokes again); until one of the two commits, each check retries both and keeps
 `SESSION_REVOCATION_FAILED` (Owner decision, 2026-10-01). Once that immediate
 revocation has committed, the five-minute retries of the same closed period do
 not repeat it, even while the exposure and the marker failure continue
-(Issue #120): access has stayed closed since, so a repeat would only advance the
-generation again, add an audit record and void the enrollment authorizations
-issued during the outage. The revocation before reopening still runs.
+(Issue #120): a repeat would advance the generation again, add an audit record
+and void the enrollment authorizations issued during the outage. The revocation
+before reopening still runs. The marker write itself keeps being retried on
+every check until it commits (PR #134): a session-establishing request that saw
+access open before the check closed it shares no lock with the check and can
+commit after the immediate revocation, so only the marker makes a restart (after
+the exposure has gone but before the clean check) revoke that session before
+reopening. If the marker never commits before such a restart, that session can
+survive; the delivered Owner fault is then the only record.
 A check without a revoker never opens access, before or after any exposure,
 and keeps `SESSION_REVOCATION_UNAVAILABLE`: nothing durable could carry a
 revocation requirement across a restart, so a restart after an exposure must

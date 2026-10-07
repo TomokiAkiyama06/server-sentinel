@@ -1238,7 +1238,8 @@ class SessionRevocationTests(ExceptionFixture):
 
     def test_committed_fallback_revocation_is_not_repeated_while_closed(self):
         # Issue #120: the marker keeps failing and the exposure persists, but the
-        # immediate revocation already committed; retries must not repeat it.
+        # immediate revocation already committed; retries must not repeat it,
+        # but keep retrying the marker (PR #134).
         revoker = FakeRevoker()
         markers = []
 
@@ -1254,20 +1255,90 @@ class SessionRevocationTests(ExceptionFixture):
         for _ in range(5):
             clock.value += RETRY_WHILE_CLOSED_SECONDS
             self.assertEqual(check.tick().reasons, (Reason.UNEXPECTED_LISTENER,))
-        self.assertEqual((revoker.revocations, len(markers)), (1, 1))
+        self.assertEqual((revoker.revocations, len(markers)), (1, 6))
         # The revocation before reopening still runs.
         files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
         clock.value += RETRY_WHILE_CLOSED_SECONDS
         self.assertTrue(check.tick().open)
-        self.assertEqual(revoker.revocations, 2)
+        self.assertEqual((revoker.revocations, len(markers)), (2, 7))
         # A new exposure after reopening is a new closed period: it revokes again.
         files.files["tcp"] = self.EXTRA
         clock.value += DAILY_SECONDS
         self.assertFalse(check.tick().open)
-        self.assertEqual((revoker.revocations, len(markers)), (3, 2))
+        self.assertEqual((revoker.revocations, len(markers)), (3, 8))
         clock.value += RETRY_WHILE_CLOSED_SECONDS
         self.assertFalse(check.tick().open)
         self.assertEqual(revoker.revocations, 3)
+
+    def test_session_committed_after_fallback_revocation_does_not_survive_restart(self):
+        # PR #134: a session-establishing request saw access open before the
+        # check closed it and commits after the immediate fallback revocation.
+        # The marker must keep being retried so that a restart after the
+        # exposure disappears (before the clean check) still revokes it.
+        revoker = ReservationSessionRevocation(self.access)
+        clock = Clock()
+        files = Files(tcp=self.EXTRA)
+        marker = {"fail": True}
+        original = revoker.record_exposure
+
+        def record():
+            if marker["fail"]:
+                raise OSError("synthetic marker failure")
+            original()
+
+        with patch.object(revoker, "record_exposure", side_effect=record):
+            check, _, _, _ = checker(exception_store=self.exception_store, session_revoker=revoker,
+                                     files=files, clock=clock)
+            self.assertFalse(check.startup().open)
+            self.assertEqual(len(self.revocation_records()), 1)
+            self.assertIsNone(self.marker())
+            # The racing request commits its session after the revocation.
+            self.session("viewer@example.invalid", b"v" * 32)
+            marker["fail"] = False
+            clock.value += RETRY_WHILE_CLOSED_SECONDS
+            self.assertFalse(check.tick().open)
+            # No repeated revocation, but the marker is now stored.
+            self.assertEqual(len(self.revocation_records()), 1)
+            self.assertEqual(self.marker(), "1")
+        self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
+        # The exposure disappears and the process restarts before a clean check.
+        files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        restarted, _, _, _ = checker(exception_store=self.exception_store, session_revoker=revoker, files=files)
+        self.assertTrue(restarted.startup().open)
+        self.assertIsNone(self.marker())
+        with self.assertRaises(AccessValidationError):
+            self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
+
+    def test_marker_is_retried_after_fallback_while_closed_for_other_reasons(self):
+        # The exposure is gone but access stays closed for a non-exposure
+        # reason; the marker is still retried without repeating the revocation.
+        revoker = FakeRevoker()
+        marker = {"fail": True, "attempts": 0}
+
+        def record():
+            marker["attempts"] += 1
+            if marker["fail"]:
+                raise OSError("synthetic marker failure")
+            revoker.pending = True
+
+        revoker.record_exposure = record
+        resolver = Resolver()
+        check, files, _, _ = checker(session_revoker=revoker, files=Files(tcp=self.EXTRA), resolver=resolver)
+        self.assertEqual(check.startup().reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual((revoker.revocations, marker["attempts"]), (1, 1))
+        files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        resolver.answer = OSError("synthetic resolver failure")
+        self.assertEqual(check._check(CheckKind.RETRY).reasons, (Reason.HOSTNAME_RESOLUTION_UNAVAILABLE,))
+        self.assertEqual((revoker.revocations, marker["attempts"], revoker.pending), (1, 2, False))
+        marker["fail"] = False
+        self.assertEqual(check._check(CheckKind.RETRY).reasons, (Reason.HOSTNAME_RESOLUTION_UNAVAILABLE,))
+        self.assertEqual((revoker.revocations, marker["attempts"], revoker.pending), (1, 3, True))
+        # Stored: later closed checks do not rewrite it.
+        self.assertEqual(check._check(CheckKind.RETRY).reasons, (Reason.HOSTNAME_RESOLUTION_UNAVAILABLE,))
+        self.assertEqual(marker["attempts"], 3)
+        resolver.answer = (V4, V6)
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual((revoker.revocations, revoker.pending), (2, False))
 
     def test_fallback_is_retried_only_while_both_fail(self):
         revoker = FakeRevoker(fail=True)
@@ -1296,7 +1367,8 @@ class SessionRevocationTests(ExceptionFixture):
         self.assertEqual(attempts, {"marker": 3, "revoke": 3})
         for _ in range(3):
             self.assertEqual(check._check(CheckKind.RETRY).reasons, (Reason.UNEXPECTED_LISTENER,))
-        self.assertEqual(attempts, {"marker": 3, "revoke": 3})
+        # Only the marker keeps being retried (PR #134).
+        self.assertEqual(attempts, {"marker": 6, "revoke": 3})
         self.assertEqual(revoker.revocations, 1)
 
     def test_outage_enrollment_survives_retries_after_fallback_revocation(self):

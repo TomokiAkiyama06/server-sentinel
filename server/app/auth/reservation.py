@@ -925,8 +925,12 @@ class HostnameReservationCheck:
     the exposure is seen: the revoker's marker, or, when that write fails, an
     immediate revocation; until one commits, every check retries both and keeps
     ``SESSION_REVOCATION_FAILED``. After the immediate revocation commits, the
-    retries of the same closed period neither repeat it nor the marker write. If both keep failing and the process
-    restarts, only the delivered Owner fault records the requirement.
+    retries of the same closed period do not repeat it, but keep retrying the
+    marker until it commits: a session established by a request that saw access
+    open before the check closed it can commit after that revocation, and only
+    the marker carries its revocation across a restart. If both keep failing
+    and the process restarts, only the delivered Owner fault records the
+    requirement.
 
     Every check also re-resolves the hostname through ``resolver``; a missing
     resolver or a failed or timed-out resolution keeps access closed without
@@ -996,6 +1000,9 @@ class HostnameReservationCheck:
         # True once the marker-failure fallback revocation has committed during
         # the current closed period; cleared when access reopens.
         self._revoked_while_closed = False
+        # True once the marker is known to be stored for the current closed
+        # period; cleared when access reopens.
+        self._exposure_recorded = False
         self.undelivered_faults = 0
 
     @property
@@ -1052,32 +1059,40 @@ class HostnameReservationCheck:
         if self.session_revoker is None:
             return
         try:
-            pending = self.session_revoker.exposure_pending() is not False
+            stored = self.session_revoker.exposure_pending()
         except Exception:
             # Unknown: revoking is the safe answer.
-            pending = True
+            stored = None
+        pending = stored is not False
         self._revocation_required = self._revocation_required or pending
+        self._exposure_recorded = self._exposure_recorded or stored is True
 
     def _make_durable(self) -> bool:
         """Ensure a restart cannot reopen without the required revocation.
 
         Write the marker; when that fails, revoke now instead (access is closed,
-        so no session is issued until reopening revokes again). Retried on every
-        check until one of them commits. Once that immediate revocation has
+        so no later request is admitted until reopening revokes again). Retried
+        on every check until one of them commits. Once that immediate revocation has
         committed, later checks of the same closed period do not repeat it
-        (Issue #120): access has stayed closed since, so no session or cookie
-        exists that a repeat would remove, and every repeat would only advance
-        the authorization generation again, add an audit record and void the
-        enrollment authorizations issued during the outage. The revocation
-        before reopening still runs.
+        (Issue #120): every repeat would advance the authorization generation
+        again, add an audit record and void the enrollment authorizations
+        issued during the outage. The revocation before reopening still runs.
+
+        The marker itself is still retried on every check until it commits
+        (PR #134): a session-establishing request that saw access open before
+        this check closed it shares no lock with the check and can commit after
+        the immediate revocation. Only the marker makes a restart revoke that
+        session before reopening.
         """
-        if self._revoked_while_closed:
-            return True
         try:
             self.session_revoker.record_exposure()
-            return True
         except Exception:
             pass
+        else:
+            self._exposure_recorded = True
+            return True
+        if self._revoked_while_closed:
+            return True
         try:
             self.session_revoker.revoke_all_human_sessions()
         except Exception:
@@ -1093,7 +1108,10 @@ class HostnameReservationCheck:
         if any(reason in EXPOSURE_REASONS for reason in reasons):
             self._revocation_required = True
             self._revocation_durable = self._make_durable()
-        elif self._revocation_required and not self._revocation_durable:
+        elif self._revocation_required and (not self._revocation_durable
+                                            or not self._exposure_recorded):
+            # Also retry the marker after a committed immediate revocation: a
+            # session committed after it must not survive a restart.
             self._revocation_durable = self._make_durable()
         if not self._revocation_durable:
             # Only memory holds the requirement; a restart could lose it.
@@ -1107,6 +1125,7 @@ class HostnameReservationCheck:
         self._revocation_required = False
         self._revocation_durable = True
         self._revoked_while_closed = False
+        self._exposure_recorded = False
         return ()
 
     def _load_exceptions(self) -> None:
