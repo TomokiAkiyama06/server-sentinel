@@ -320,7 +320,9 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         return process
 
     def main_cli(self, *arguments, tty=True):
-        return self.run_cli(*arguments, module="app.cameras.remote_agent.pairing_cli", tty=tty)
+        # The real CLI, real forked CA child and pipes; only the root start and
+        # the account drops are no-ops on this unprivileged runner (Issue #109).
+        return self.run_cli(*arguments, module="tests.e2e.pairing_cli_same_account", tty=tty)
 
     def agent_cli(self, *arguments, tty=True):
         return self.run_cli(*arguments, module="media_capture_agent.enroll", tty=tty)
@@ -333,7 +335,7 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         deployment = UUID(re.fullmatch(r"deployment_id=(\S+)\n", output).group(1))
         bundle = self.exchange / "bundle.json"
         code, output, error = self.main_cli(
-            "export-bundle", "--authority-dir", self.authority_dir,
+            "export-bundle",
             "--listener-dir", self.listener_dir, "--endpoint", f"127.0.0.1:{endpoint_port}",
             "--output", bundle, tty=False).finish()
         self.assertEqual(0, code, error)
@@ -460,6 +462,16 @@ class CaptureEnrollmentScenario(unittest.TestCase):
             observed.append(repr(connection.execute(
                 "SELECT * FROM pairing_enrollments").fetchall()).encode())
         self.assertGreaterEqual(len(audit), 3, "approve, redeem and activate are audited")
+        # The CA child logged exactly the certificate the ledger activated
+        # (signed after approval, before redemption; Issue #109).
+        issued = [record for record in self.issuance_log() if record["type"] == "node"]
+        self.assertEqual([str(node)], [record["node_id"] for record in issued])
+        self.assertEqual(key_digest, issued[0]["public_key_digest"])
+        with closing(sqlite3.connect(self.database)) as connection:
+            activated = connection.execute(
+                "SELECT credential_serial_digest FROM pairing_node_credentials "
+                "WHERE node_id = ?", (str(node),)).fetchone()[0]
+        self.assertEqual(activated, issued[0]["credential_digest"])
         key_files = list((self.runtime / "node-credentials").glob("private-key-*.pem"))
         self.assertEqual(1, len(key_files))
         key_body = "".join(key_files[0].read_text().splitlines()[1:-1])[:48].encode()
@@ -477,11 +489,15 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         self.assertFalse((self.runtime / "pending-enrollment" / "node-key.pem").exists())
 
         # Revoke locally; the old identity is refused and its key cannot re-enroll.
-        revoke = self.main_cli("revoke", "--database", self.database, "--node", node)
+        revoke = self.main_cli("revoke", "--database", self.database, "--node", node,
+                               "--authority-dir", self.authority_dir)
         revoke.wait_for(b"Type REVOKE")
         revoke.type(b"REVOKE\n")
         status, output, error = revoke.finish()
         self.assertEqual((0, f"revoked: node_id={node}\n"), (status, output), error)
+        self.assertIn({"type": "node_revocation", "node_id": str(node)},
+                      [{key: record[key] for key in ("type", "node_id")}
+                       for record in self.issuance_log() if record["type"] == "node_revocation"])
         result, output = self.ingest_connect(deployment)
         self.assertEqual("capture_node_not_admitted", result)
         again = self.main_cli("approve", "--database", self.database,
@@ -500,6 +516,41 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         self.assertIn(f"node_id={node} enrollment=activated credential=revoked", output)
         self.assertEqual(1, output.count("node_id="), "a refused approval creates no pairing")
         self.assertNotIn(key_digest, output)
+
+    def issuance_log(self):
+        return [json.loads(line) for line in
+                (self.authority_dir / "issuance-log.jsonl").read_text().splitlines()]
+
+    def test_issuer_refusal_after_approval_never_shows_the_code(self):
+        # Issue #109: the CA child decides from its own issuance log. A key the
+        # log binds to another node is refused after the Owner's APPROVE; the
+        # code is never shown and no listener serves it.
+        listen_port = free_port()
+        self.initialise_main(listen_port)
+        request, key_digest = self.agent_request()
+        with open(self.authority_dir / "issuance-log.jsonl", "a") as log:
+            log.write(json.dumps({"format": 1, "type": "node", "node_id": str(uuid4()),
+                                  "public_key_digest": key_digest, "credential_digest": "0" * 64,
+                                  "not_after": "2030-01-01T00:00:00+00:00",
+                                  "at": "2026-10-07T00:00:00+00:00"}) + "\n")
+        main = self.main_cli("approve", "--database", self.database,
+                             "--authority-dir", self.authority_dir,
+                             "--listener-dir", self.listener_dir, "--request", request,
+                             "--listen", f"127.0.0.1:{listen_port}",
+                             "--human-port", self.human_port)
+        main.wait_for(b"Type APPROVE")
+        main.type(b"APPROVE\n")
+        status, output, error = main.finish()
+        self.assertEqual(2, status)
+        self.assertIn("refused: issuer_unavailable", error)
+        self.assertIn("issuer_detail=issuer_refused_request", error)
+        self.assertNotIn(b"One-time pairing code", main.transcript)
+        self.assertNotIn("enrollment listening", output)
+        with socket.socket() as probe:
+            self.assertNotEqual(0, probe.connect_ex(("127.0.0.1", listen_port)))
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM pairing_node_credentials").fetchone()[0])
 
     def test_interrupted_approval_is_retried_for_the_same_bound_node(self):
         listen_port = free_port()
@@ -597,7 +648,8 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         self.assertEqual(1, len(list((self.runtime / "node-credentials").glob("private-key-*.pem"))))
 
         # Revoked: the old key is refused, a new key pairs as a new node.
-        revoke = self.main_cli("revoke", "--database", self.database, "--node", node)
+        revoke = self.main_cli("revoke", "--database", self.database, "--node", node,
+                               "--authority-dir", self.authority_dir)
         revoke.wait_for(b"Type REVOKE")
         revoke.type(b"REVOKE\n")
         self.assertEqual(0, revoke.finish()[0])
@@ -664,11 +716,11 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         self.assertEqual(0, status, error)
         self.assertRegex(output, r"^listener rotated: not_after=\S+\n")
         self.assertNotEqual(before, certificate.read_bytes())
-        self.assertEqual(["main-server-certificate.pem", "main-server-key.pem"],
-                         sorted(os.listdir(self.listener_dir)))
+        self.assertEqual(["deployment-ca-certificate.pem", "main-server-certificate.pem",
+                          "main-server-key.pem"], sorted(os.listdir(self.listener_dir)))
         again = self.exchange / "bundle-after-rotation.json"
         status, output, error = self.main_cli(
-            "export-bundle", "--authority-dir", self.authority_dir,
+            "export-bundle",
             "--listener-dir", self.listener_dir, "--endpoint", f"127.0.0.1:{listen_port}",
             "--output", again, tty=False).finish()
         self.assertEqual(0, status, error)

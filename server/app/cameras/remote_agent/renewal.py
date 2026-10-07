@@ -30,12 +30,21 @@ ledger-admitted mTLS session. This module is the Main side of that exchange:
 
 No listener or wire protocol is added here; #14/#15 carry the renewal request
 over the ingest session.
+
+Interim signing path (Issue #109). Renewal needs a signature while the node
+is connected, so it cannot use the one-shot approval issuer. Until the
+renewal-only signer (Issue #109 PR2, socket-activated, CA account) exists,
+``renew_node_credential`` takes any ``RenewalIssuer``; the only implementation
+today is an in-process ``DeploymentAuthority``, used by tests. Nothing in the
+application calls it and no listener carries renewal yet, so no
+network-facing or database-owning process loads the CA key for it. Wiring
+renewal into the ingest listener must wait for that signer.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 import datetime
-from typing import Callable
+from typing import Callable, Protocol
 from uuid import UUID, uuid5
 
 from app.notifications.service import NotificationKind
@@ -43,8 +52,7 @@ from app.notifications.slack import DeliveryResult
 
 from .ingest_tls import CaptureNodeAdmission, CaptureNodeIdentity
 from .node_ca import (
-    DEFAULT_NODE_VALIDITY, AuthorityValidityExceeded, CaptureAuthorityError, DeploymentAuthority,
-    IssuedNodeCredential,
+    DEFAULT_NODE_VALIDITY, AuthorityValidityExceeded, CaptureAuthorityError, IssuedNodeCredential,
 )
 from .pairing import PairingError, PairingLedger
 
@@ -79,7 +87,23 @@ def _utc_now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-def renew_node_credential(authority: DeploymentAuthority, ledger: PairingLedger,
+class RenewalIssuer(Protocol):
+    """What renewal needs from the CA side (see the interim note above)."""
+
+    def renewal_key_digest(self, csr_pem: bytes) -> str:
+        ...
+
+    def staged_renewal_credential(self, node_id: UUID, public_key_digest_value: str,
+                                  credential_digest: str,
+                                  certificate_pem: bytes) -> IssuedNodeCredential:
+        ...
+
+    def issue_renewal_certificate(self, node_id: UUID, csr_pem: bytes, *,
+                                  validity: datetime.timedelta) -> IssuedNodeCredential:
+        ...
+
+
+def renew_node_credential(authority: RenewalIssuer, ledger: PairingLedger,
                           admission: CaptureNodeAdmission, identity: CaptureNodeIdentity,
                           csr_pem: bytes, *,
                           validity: datetime.timedelta = DEFAULT_NODE_VALIDITY,

@@ -399,42 +399,121 @@ enters them again through the audited Owner path.
 
 ### Capture-node CA and Main listener certificate
 
-The local pairing CLI (`python -m app.cameras.remote_agent.pairing_cli`, see
-`server/app/cameras/remote_agent/README.md`) keeps the deployment CA key and the
-Main capture listener credential in two different owner-only directories
-(0700, files 0600), both outside the checkout and media trees. The application
-does not start the ingest listener yet (#14/#15); these steps prepare it.
+The local pairing CLI (`serversentinel-pairing`, that is
+`python -m app.cameras.remote_agent.pairing_cli`, see
+`server/app/cameras/remote_agent/README.md`) keeps the deployment CA key and
+the Main capture listener credential in two different owner-only directories
+owned by two different accounts, both outside the checkout and media trees.
+The application does not start the ingest listener yet (#14/#15); these steps
+prepare it.
 
-**Separate accounts (Issue #124).** The CA directory belongs to the account
-that runs the CLI. The listener directory may belong to a different,
-non-root ingest service account that must never be able to read the CA key.
-Pass `--listener-owner <account or UID>` to `init`, `rotate-listener`,
-`export-bundle` and `approve`. The CLI then creates the listener directory and
-files already owned by that account (`fchown` happens before any key byte is
-written), so no manual `chown` is needed and the ingest service reads them as
-its own. Required privileges for that CLI run:
+**Accounts, ownership and modes (Issue #109).** No network-facing or
+database-owning process may load the CA private key.
 
-- writing (`init`, `rotate-listener`): effective `CAP_CHOWN` and
-  `CAP_DAC_OVERRIDE`;
-- reading (`export-bundle`, `approve`): `CAP_DAC_OVERRIDE` or
-  `CAP_DAC_READ_SEARCH`.
+| Path | Owner | Mode | Holds |
+| --- | --- | --- | --- |
+| CA directory, for example `/var/lib/serversentinel-ca` | `serversentinel-ca` | `0700` | `ca-key.pem` (the only copy of the CA private key), `ca-certificate.pem`, `issuance-log.jsonl`, each `0600` |
+| Main listener directory | service account | `0700` | `main-server-key.pem`, `main-server-certificate.pem`, `deployment-ca-certificate.pem` (public CA copy), each `0600` |
+| `<runtime_root>/state/state.sqlite3` | service account | `0600` in `0700` | application database, including the pairing ledger |
 
-Root has both, so the simplest form is running the CLI as root with a
-root-owned CA directory. A non-root CA account can instead be given exactly
-these effective capabilities for that one administrative command (for example
-through systemd ambient capabilities); no service is given them. That variant
-is not yet verified on a real host (`MANUAL_TEST.md`). Without them
-the command refuses with `listener_owner_requires_privilege` before writing
-anything. Without `--listener-owner`, the listener files belong to the
-account running the CLI, and an ingest service under another account refuses
-to load them (fail closed). `approve` still opens the CA key, the listener
-credential and the application database in one process (separating the CA key
-from the enrollment listener is #109), so the account running it needs the CA
-directory as its own, the read privilege above for the listener directory, and
-the database as its own; `list` and `revoke` need only the database.
+Create the CA account once as a static system account with no login shell and
+no home (not a systemd `DynamicUser`, whose UID would change), and the two
+directories, before the first `init`:
+
+```sh
+sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin serversentinel-ca
+sudo install -d -o serversentinel-ca -g serversentinel-ca -m 0700 /var/lib/serversentinel-ca
+sudo install -d -o <service account> -g <service account> -m 0700 <listener_dir>
+```
+
+The CA account must differ from the service account (and neither may be
+root); the commands refuse otherwise. Neither account needs any capability, a
+login, or membership in the other's group.
+
+**Which command runs as whom.**
+
+```sh
+sudo serversentinel-pairing init --authority-dir /var/lib/serversentinel-ca \
+  --listener-dir <listener_dir> --server-name <dns name> [--service-user <service account>]
+sudo serversentinel-pairing rotate-listener --authority-dir ... --listener-dir ...
+sudo serversentinel-pairing approve --database <runtime_root>/state/state.sqlite3 \
+  --authority-dir /var/lib/serversentinel-ca --listener-dir <listener_dir> \
+  --request <request.json> --listen <private ip>:<port>
+sudo serversentinel-pairing revoke --database ... --authority-dir ... --node <uuid>
+sudo -u <service account> serversentinel-pairing export-bundle --listener-dir ... \
+  --endpoint <ip>:<port> --output <bundle.json>
+sudo -u <service account> serversentinel-pairing list --database ...
+```
+
+`--ca-user` defaults to `serversentinel-ca` and `--service-user` to
+`server-sentinel`; pass them when the accounts are named differently. `init`,
+`rotate-listener`, `approve` and `revoke` must start as root and refuse
+`privilege_separation_requires_root` otherwise. Before any thread exists they
+fork a CA child that drops to the CA account (no terminal, no database
+descriptor, non-dumpable) and is the only process that ever reads
+`ca-key.pem`; the command itself then drops to the service account,
+verifies that it is no longer root and has no capability (`privilege_drop_failed`
+otherwise) and that it cannot open the CA directory (`ca_directory_exposed`
+otherwise), and only then opens the request file and the database. The
+request file must therefore be readable by the service account (for example
+mode `0644` in a directory it can enter), and `--listen` must be a port the
+service account can bind (at or above `/proc/sys/net/ipv4/ip_unprivileged_port_start`).
+`approve` shows the pairing code only after the CA child signed the node
+certificate, logged it, exited, and the certificate verified; any CA-side
+failure refuses `issuer_unavailable` (with a fixed `issuer_detail=` word)
+without showing a code. Listener keys are generated by the service-account
+side and only their CSR goes to the CA child, so every file is created by its
+final owner and no ownership change or capability is needed (the former
+`--listener-owner` option is gone). `export-bundle` and `list` need no root:
+they read only public material and the database.
+
+**Refusing to start with an exposed CA.** Add the CA directory to the
+deployment configuration so the service checks it at every start (and in
+`--check`):
+
+```json
+"capture_ca_directory": "/var/lib/serversentinel-ca"
+```
+
+The launcher then refuses to start when the service account can open that
+directory or its key file, and also when the path does not exist (the check
+would otherwise prove nothing). It must be an absolute path outside the
+runtime root and the code trees.
+
+**Revocation is also recorded at the CA.** `revoke` revokes the node in the
+ledger first (admission stops at once) and then appends a `node_revocation`
+record to the CA issuance log, so the CA side refuses that node and its keys
+from then on. If the CA record cannot be written, the ledger revocation still
+stands, the command prints `ca_revocation_unrecorded` and exits 1; rerun the
+same `revoke` (it skips the already revoked ledger entry and records it).
+
+**Back up the CA directory.** Losing `ca-key.pem` means a new `init` and
+re-pairing every Agent; losing `issuance-log.jsonl` loses the CA-side record
+of issued keys and revocations. Back up the whole CA directory, as root,
+whenever it changes (after `init`, each `approve`, `rotate-listener` and
+`revoke`), to Owner-controlled offline storage that only the Owner can read,
+and restore it with the same owner (`serversentinel-ca`) and modes. Never put
+it in the application backup or the media volume, and never give the service
+account read access to the backup. The issuance log refuses signing if it is
+damaged; after a crash that left an incomplete last line (normally prevented:
+a failed append is truncated back), inspect it as root and remove only that
+incomplete line.
+
+**Migrating a deployment initialised before Issue #109.** Earlier releases
+put the CA directory under root (or the CLI account) and had no public CA
+copy or issuance log. With the service stopped: create `serversentinel-ca` as
+above, `chown -R serversentinel-ca:serversentinel-ca <ca_dir>` and keep the
+modes `0700`/`0600`; make sure the listener directory and its files belong to
+the service account; then run `sudo serversentinel-pairing rotate-listener`
+once, which writes the public CA copy into the listener directory (until then
+`export-bundle` refuses `deployment_ca_certificate_missing`) and starts the
+issuance log. Existing nodes keep working; the log simply starts empty, so
+nodes revoked earlier are refused by the ledger but not yet by the CA log
+(rerun `revoke` for them to record it).
+
 `approve`, `list` and `revoke` never create a database: `--database` must name
 the application's existing database file (canonical path, regular file with
-one link, owned by the account running the command, not group- or
+one link, owned by the service account the command runs as, not group- or
 other-writable), otherwise they refuse `database_not_found`,
 `database_path_rejected` or `database_rejected`. They never migrate either:
 the database must already carry exactly this release's schema history,
@@ -446,9 +525,9 @@ confirmation), every later ledger access and commit refuses
 `database_rejected`, nothing is written to whatever is now at the path and no
 file is recreated. Each connection is also checked against the inode SQLite
 actually opened (the process's descriptors in `/proc/self/fd`), so a path
-switched to another file only for the moment of the open is refused too. `export-bundle` and `approve`
-refuse `listener_authority_mismatch` when the listener certificate was not
-issued by the selected CA directory.
+switched to another file only for the moment of the open is refused too.
+`export-bundle` and `approve` refuse `listener_authority_mismatch` when the
+listener certificate was not issued by the deployment CA.
 
 The pin is never closed, not even when the command ends or refuses the file
 (Issue #152): closing any descriptor on the database file would drop every
@@ -459,11 +538,11 @@ process exits.
 
 **Rotating the Main listener certificate (Issue #125).** The listener leaf
 defaults to 397 days and is not renewed automatically. Rotate it before it
-expires, as the account (and with the privileges) used for `init`:
+expires, with `sudo` like `init`:
 
 ```sh
-python -m app.cameras.remote_agent.pairing_cli rotate-listener \
-  --authority-dir <ca_dir> --listener-dir <listener_dir> [--listener-owner <account>]
+sudo serversentinel-pairing rotate-listener \
+  --authority-dir <ca_dir> --listener-dir <listener_dir>
 # prints: listener rotated: not_after=<UTC time>
 ```
 
@@ -509,7 +588,7 @@ A `remote_agent` capture node whose credential expired, or that the Owner
 revoked, is re-paired with the Main's local pairing CLI and the Agent's
 `media_capture_agent.enroll --repair` mode (#116, Owner policy 2026-10-01);
 nothing is deleted from the Main database. Run
-`python -m app.cameras.remote_agent.pairing_cli list --database <data_dir>/state.sqlite3`
+`sudo -u <service account> serversentinel-pairing list --database <data_dir>/state.sqlite3`
 first to see whether the node is `credential=revoked`:
 
 - not revoked, certificate expired: the Agent runs `request --repair expired`

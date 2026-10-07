@@ -23,8 +23,12 @@ The Main looks up the approval by the CSR's proven public key among the
 approvals created by *this process* (the ledger's process epoch makes approvals
 from any other process unusable anyway), redeems it through
 ``PairingLedger.redeem`` (HMAC digest, constant-time comparison, single use,
-five-minute monotonic lifetime), then signs and activates through
-``DeploymentAuthority.issue_and_activate``.
+five-minute monotonic lifetime), then activates the certificate that the
+CA-account issuer signed for that approval before the code was shown
+(Issue #109) and returns it. This process never holds the CA private key and
+cannot sign: it has only the public ``DeploymentTrust``. A pre-signed
+certificate admits nothing until this activation (``ingest_tls`` requires the
+ledger's active record), so an unredeemed one is inert.
 
 Resource limits are mandatory and explicit: request/response sizes, concurrent
 connections, one absolute per-connection deadline (handshake, request and
@@ -38,7 +42,6 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-import datetime
 import hmac
 import ipaddress
 import json
@@ -53,8 +56,8 @@ from typing import Callable
 from uuid import UUID
 
 from .node_ca import (
-    DEFAULT_NODE_VALIDITY, MAX_CSR_BYTES, AuthorityValidityExceeded, CaptureAuthorityError,
-    DeploymentAuthority, IssuedNodeCredential,
+    MAX_CSR_BYTES, CaptureAuthorityError, DeploymentTrust,
+    IssuedNodeCredential,
 )
 from .pairing import EnrollmentApproval, PairingError, PairingLedger
 
@@ -182,24 +185,44 @@ def _valid_code(value: object) -> bool:
             and all(character in _CODE_ALPHABET for character in value))
 
 
-class EnrollmentService:
-    """Validates one request and, for a matching approval, issues exactly once.
+@dataclass(frozen=True)
+class PresignedEnrollment:
+    """One Owner approval and the certificate the CA-account issuer signed for it.
 
-    ``approvals`` are the approvals created by this process. Every refusal is
-    reported as the same generic response.
+    The certificate was verified against the public CA (fixed clientAuth
+    profile, approved node and key) before the pairing code was shown.
     """
 
-    def __init__(self, ledger: PairingLedger, authority: DeploymentAuthority,
-                 approvals: tuple[EnrollmentApproval, ...], *,
-                 validity: datetime.timedelta = DEFAULT_NODE_VALIDITY):
-        if (not isinstance(ledger, PairingLedger) or not isinstance(authority, DeploymentAuthority)
-                or not isinstance(approvals, tuple) or not approvals
-                or not all(isinstance(approval, EnrollmentApproval) for approval in approvals)):
+    approval: EnrollmentApproval
+    credential: IssuedNodeCredential
+
+
+class EnrollmentService:
+    """Validates one request and, for a matching approval, activates exactly once.
+
+    ``enrollments`` are the approvals created by this process, each with its
+    pre-signed certificate. Every refusal is reported as the same generic
+    response. Nothing here can sign: ``trust`` is public CA material only.
+    """
+
+    def __init__(self, ledger: PairingLedger, trust: DeploymentTrust,
+                 enrollments: tuple[PresignedEnrollment, ...]):
+        # Exactly the public trust: the signing subclass (which holds the CA
+        # key) is refused, so this network-facing service can never sign.
+        if (not isinstance(ledger, PairingLedger) or type(trust) is not DeploymentTrust
+                or not isinstance(enrollments, tuple) or not enrollments
+                or not all(isinstance(entry, PresignedEnrollment)
+                           and isinstance(entry.approval, EnrollmentApproval)
+                           and isinstance(entry.credential, IssuedNodeCredential)
+                           and entry.credential.node_id == entry.approval.node_id
+                           and hmac.compare_digest(entry.credential.public_key_digest,
+                                                   entry.approval.public_key_digest)
+                           for entry in enrollments)):
             raise EnrollmentConfigurationError("enrollment_service_dependency_invalid")
         self._ledger = ledger
-        self._authority = authority
-        self._approvals = approvals
-        self._validity = validity
+        self._trust = trust
+        self._enrollments = enrollments
+        self._approvals = tuple(entry.approval for entry in enrollments)
         self._completed: set[UUID] = set()
         self._lock = threading.Lock()
 
@@ -213,12 +236,12 @@ class EnrollmentService:
             return tuple(approval.node_id for approval in self._approvals
                          if approval.enrollment_id in self._completed)
 
-    def _approval_for(self, key_digest: str) -> EnrollmentApproval | None:
+    def _enrollment_for(self, key_digest: str) -> PresignedEnrollment | None:
         match = None
-        for approval in self._approvals:
+        for entry in self._enrollments:
             # Compare every entry so timing does not depend on the position.
-            if hmac.compare_digest(approval.public_key_digest, key_digest):
-                match = approval
+            if hmac.compare_digest(entry.approval.public_key_digest, key_digest):
+                match = entry
         return match
 
     def handle(self, body: bytes) -> tuple[bytes, IssuedNodeCredential | None]:
@@ -233,28 +256,29 @@ class EnrollmentService:
                     or not _valid_code(request["code"])):
                 raise EnrollmentError("request_malformed")
             deployment = UUID(request["deployment_id"])
-            if deployment != self._authority.deployment_id:
+            if deployment != self._trust.deployment_id:
                 raise EnrollmentError("deployment_mismatch")
             csr = request["csr"].encode("ascii")
-            key_digest = DeploymentAuthority.enrollment_key_digest(csr)
-            approval = self._approval_for(key_digest)
-            if approval is None:
+            # Proof of possession of the approved key; the CSR is used for
+            # nothing else (the certificate was signed before the code).
+            key_digest = DeploymentTrust.enrollment_key_digest(csr)
+            entry = self._enrollment_for(key_digest)
+            if entry is None:
                 raise EnrollmentError("approval_unavailable")
-            # Serialize redemption and issuance: the ledger already guarantees
-            # single use, this also keeps one signature per approval.
+            approval, issued = entry.approval, entry.credential
+            # Serialize redemption and activation: the ledger already
+            # guarantees single use, this also keeps one activation per approval.
             with self._lock:
                 claim = self._ledger.redeem(enrollment_id=approval.enrollment_id,
                                             public_key_digest=key_digest,
                                             code=request["code"])
-                issued = self._authority.issue_and_activate(self._ledger, claim, csr,
-                                                            validity=self._validity)
+                if not hmac.compare_digest(claim.public_key_digest, issued.public_key_digest):
+                    raise EnrollmentError("approval_unavailable")
+                self._ledger.activate(claim, credential_serial_digest=issued.credential_digest,
+                                      not_after=issued.not_after.timestamp())
                 self._completed.add(approval.enrollment_id)
         except EnrollmentError as error:
             LOGGER.info("capture enrollment refused: reason=%s", error.reason)
-            return REFUSED, None
-        except AuthorityValidityExceeded:
-            # Main-side log only; the peer still gets the generic refusal.
-            LOGGER.info("capture enrollment refused: reason=deployment_ca_validity_insufficient")
             return REFUSED, None
         except (PairingError, CaptureAuthorityError):
             LOGGER.info("capture enrollment refused: reason=approval_unavailable")

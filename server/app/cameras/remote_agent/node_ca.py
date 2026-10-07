@@ -26,6 +26,15 @@ need ``CAP_FOWNER``, Issue #149). That needs effective ``CAP_CHOWN`` and
 before anything is created. The Main listener leaf can be rotated in place
 while the CA, and therefore every Agent's trust bundle, stays unchanged
 (Issue #125).
+
+Public and signing roles are separate classes (Issue #109). ``DeploymentTrust``
+holds only the CA certificate and does everything that needs no private key:
+listener and node certificate verification, the trust bundle, CSR proof of
+possession and CA validity checks. ``DeploymentAuthority`` extends it with the
+CA private key and is used only by the CA-account issuer process
+(``issuer_process.py``) and by in-process tests. The Main listener directory
+keeps a public copy of the CA certificate (``deployment-ca-certificate.pem``)
+so the service account can verify and export without the CA directory.
 """
 from __future__ import annotations
 
@@ -74,6 +83,10 @@ _SERVER_CERTIFICATE = "main-server-certificate.pem"
 # next rotation, never by a reader.
 _STAGED_SERVER_KEY = _SERVER_KEY + ".next"
 _STAGED_SERVER_CERTIFICATE = _SERVER_CERTIFICATE + ".next"
+# Public copy of the CA certificate kept beside the listener credential, so the
+# service account verifies and exports with public material only (Issue #109).
+_PUBLIC_CA_CERTIFICATE = "deployment-ca-certificate.pem"
+_LISTENER_NAMES = (_SERVER_KEY, _SERVER_CERTIFICATE, _PUBLIC_CA_CERTIFICATE)
 # Linux capability bits (linux/capability.h) read from /proc/self/status CapEff.
 _CAP_CHOWN = 0
 _CAP_DAC_OVERRIDE = 1
@@ -129,6 +142,24 @@ class ReplacementNotDurable(CaptureAuthorityError):
     """
 
     reason = "issuer_material_replacement_unconfirmed"
+
+
+class IssuanceLogUnavailable(CaptureAuthorityError):
+    """The CA-only issuance log cannot be read or durably appended; nothing is signed."""
+
+    reason = "issuance_log_unavailable"
+
+
+class IssuedCertificateRejected(CaptureAuthorityError):
+    """A certificate returned by the CA-side issuer did not verify (Issue #109)."""
+
+    reason = "issuer_unavailable"
+
+
+class IssuerRefusedRequest(CaptureAuthorityError):
+    """The CA-side issuer refused this request from its own issuance log (Issue #109)."""
+
+    reason = "issuer_refused_request"
 
 
 def _utc_now() -> datetime.datetime:
@@ -417,6 +448,95 @@ class PrivateDirectory:
         finally:
             os.close(directory)
 
+    def read_optional(self, name: str, *, maximum: int = MAX_PEM_BYTES) -> bytes | None:
+        """``read``, or ``None`` when ``name`` does not exist (never created here)."""
+        if not self.exists(name):
+            return None
+        return self.read(name, maximum=maximum)
+
+    def append(self, name: str, value: bytes, *, maximum: int) -> None:
+        """Durably append ``value`` to the private file ``name``, creating it if missing.
+
+        Used for the CA-only issuance log (Issue #109). The file must stay a
+        private regular file of this directory's owner with one link; the new
+        size may not exceed ``maximum``. A failed or short write is truncated
+        back to the previous size so the log never keeps a torn record, and
+        any failure raises before the caller relies on the record.
+        """
+        if not isinstance(value, bytes) or not value:
+            raise CaptureAuthorityError("issuer log record is invalid")
+        directory = self._open_directory()
+        try:
+            created = False
+            try:
+                descriptor = os.open(name, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW
+                                     | os.O_CLOEXEC, dir_fd=directory)
+            except FileNotFoundError:
+                try:
+                    descriptor = os.open(
+                        name, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                        | os.O_CLOEXEC, 0o600, dir_fd=directory)
+                except OSError:
+                    raise IssuanceLogUnavailable("issuer log could not be written") from None
+                created = True
+            except OSError:
+                raise IssuanceLogUnavailable("issuer log could not be written") from None
+            try:
+                try:
+                    if created:
+                        os.fchmod(descriptor, 0o600)
+                        if self.foreign_owner:
+                            os.fchown(descriptor, self.owner_uid, -1)
+                    info = os.fstat(descriptor)
+                except OSError:
+                    raise IssuanceLogUnavailable("issuer log could not be written") from None
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner_uid
+                        or info.st_mode & 0o077 or info.st_nlink != 1):
+                    raise IssuanceLogUnavailable("issuer log is not a private file")
+                if info.st_size + len(value) > maximum:
+                    raise IssuanceLogUnavailable("issuer log is full")
+                try:
+                    remaining = memoryview(value)
+                    while remaining:
+                        written = os.write(descriptor, remaining)
+                        if written <= 0:
+                            raise OSError(errno.EIO, "short write")
+                        remaining = remaining[written:]
+                    os.fsync(descriptor)
+                except OSError:
+                    try:
+                        os.ftruncate(descriptor, info.st_size)
+                        os.fsync(descriptor)
+                    except OSError:
+                        pass
+                    raise IssuanceLogUnavailable("issuer log could not be written") from None
+            except BaseException:
+                os.close(descriptor)
+                if created:
+                    try:
+                        os.unlink(name, dir_fd=directory)
+                    except OSError:
+                        pass
+                raise
+            os.close(descriptor)
+            if created:
+                try:
+                    os.fsync(directory)
+                except OSError:
+                    try:
+                        os.unlink(name, dir_fd=directory)
+                    except OSError:
+                        pass
+                    raise IssuanceLogUnavailable("issuer log could not be written") from None
+                try:
+                    created_info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                except OSError:
+                    pass
+                else:
+                    self._created[name] = (created_info.st_dev, created_info.st_ino)
+        finally:
+            os.close(directory)
+
     def discard_created(self, name: str) -> None:
         """Remove a file this object created, to roll back an incomplete setup.
 
@@ -539,19 +659,283 @@ class TrustBundleExport:
     sha256: str
 
 
-class DeploymentAuthority:
-    """Issuer bound to one deployment UUID and one owner-only key directory."""
+class DeploymentTrust:
+    """Public view of one deployment CA: verification only, never a private key.
+
+    Everything the Main listener side, the service account and the network
+    facing enrollment listener need (Issue #109): CA expiry and leaf-window
+    checks, CSR proof of possession, listener and node certificate
+    verification against the CA certificate, staged renewal re-validation and
+    the public trust bundle. ``DeploymentAuthority`` extends it with signing.
+    """
+
+    def __init__(self, deployment_id: UUID, certificate: x509.Certificate, *,
+                 clock: Callable[[], datetime.datetime] = _utc_now):
+        self.deployment_id = deployment_id
+        self.certificate = certificate
+        self._clock = clock
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(<redacted>)"
+
+    @classmethod
+    def from_certificate_pem(cls, certificate_pem: bytes, *, deployment_id: UUID | None = None,
+                             clock: Callable[[], datetime.datetime] = _utc_now
+                             ) -> "DeploymentTrust":
+        """Parse and validate a public deployment CA certificate.
+
+        The certificate must be a self-signed EC P-256 CA carrying exactly one
+        deployment URI; when ``deployment_id`` is given it must be that one.
+        """
+        if not isinstance(certificate_pem, bytes) or not 0 < len(certificate_pem) <= MAX_PEM_BYTES:
+            raise CaptureAuthorityError("issuer material is invalid")
+        try:
+            certificate = x509.load_pem_x509_certificate(certificate_pem)
+            certificate.verify_directly_issued_by(certificate)
+            public = certificate.public_key()
+        except (ValueError, TypeError, InvalidSignature):
+            raise CaptureAuthorityError("issuer material is invalid") from None
+        found = _deployment_of(certificate)
+        if (found is None or not _is_ca(certificate)
+                or not isinstance(public, ec.EllipticCurvePublicKey)
+                or not isinstance(public.curve, ec.SECP256R1)
+                or (deployment_id is not None and found != deployment_id)):
+            raise CaptureAuthorityError("issuer material is invalid")
+        return DeploymentTrust(found, certificate, clock=clock)
+
+    @classmethod
+    def load_public(cls, directory: PrivateDirectory, *, deployment_id: UUID | None = None,
+                    clock: Callable[[], datetime.datetime] = _utc_now) -> "DeploymentTrust":
+        """Load the public CA copy kept in the Main listener directory.
+
+        Refuses ``deployment_ca_certificate_missing`` for a listener directory
+        written before Issue #109; ``rotate-listener`` (or ``approve``) run
+        through the CA-account issuer publishes the copy.
+        """
+        if not directory.exists(_PUBLIC_CA_CERTIFICATE):
+            raise PublicCertificateMissing("public deployment CA certificate is missing")
+        return DeploymentTrust.from_certificate_pem(directory.read(_PUBLIC_CA_CERTIFICATE),
+                                                    deployment_id=deployment_id, clock=clock)
+
+    def public_trust(self) -> "DeploymentTrust":
+        """This CA as a ``DeploymentTrust`` that holds no private key."""
+        return DeploymentTrust(self.deployment_id, self.certificate, clock=self._clock)
+
+    def ca_certificate_pem(self) -> bytes:
+        return _certificate_pem(self.certificate)
+
+    def _leaf_window(self, validity: datetime.timedelta) -> tuple[datetime.datetime, datetime.datetime]:
+        lifetime = _validity(validity, MAX_LEAF_VALIDITY)
+        now = _checked_now(self._clock)
+        not_after = now + lifetime
+        if now < self.certificate.not_valid_before_utc:
+            raise CaptureAuthorityError("issuer clock precedes the deployment CA")
+        if not_after > self.certificate.not_valid_after_utc:
+            # Distinct from a malformed request: the CA itself is too close to
+            # its expiry for this leaf validity (Issue #127).
+            raise AuthorityValidityExceeded("certificate validity exceeds the deployment CA")
+        return now - _CLOCK_SKEW_ALLOWANCE, not_after
+
+    @property
+    def not_valid_after(self) -> datetime.datetime:
+        """When the deployment CA itself expires (public)."""
+        return self.certificate.not_valid_after_utc
+
+    def check_leaf_validity(self, validity: datetime.timedelta) -> None:
+        """Refuse now if a leaf of ``validity`` could not be issued at this moment."""
+        self._leaf_window(validity)
+
+    def issued_listener_certificate(self, target: PrivateDirectory) -> x509.Certificate:
+        """Return ``target``'s Main listener certificate if this CA issued it.
+
+        Checks the issuer signature and name, the deployment URI and that the
+        stored listener key matches the certificate. Expiry is not checked, so
+        an expired listener certificate can still be rotated.
+        """
+        certificate = self.verify_listener_certificate(target)
+        if _key_digest(target, _SERVER_KEY) != public_key_digest(certificate.public_key()):
+            raise ListenerMaterialInconsistent("listener key does not match its certificate")
+        return certificate
+
+    def verify_listener_certificate(self, target: PrivateDirectory) -> x509.Certificate:
+        """Return ``target``'s listener certificate only if this CA issued it.
+
+        Used before exporting a trust bundle or serving enrollment, so a CA
+        directory of one deployment and a listener directory of another are
+        refused (``ListenerAuthorityMismatch``) instead of producing a bundle
+        whose CA cannot authenticate the listener (Issue #125). Reads only
+        the public certificate; expiry is not checked here.
+        """
+        certificate = _load_certificate(target, _SERVER_CERTIFICATE, "listener material is invalid")
+        if not self._issued(certificate):
+            raise ListenerAuthorityMismatch("listener certificate is not from this deployment CA")
+        _single_server_name(certificate)
+        return certificate
+
+    def _issued(self, certificate: x509.Certificate) -> bool:
+        try:
+            certificate.verify_directly_issued_by(self.certificate)
+        except (ValueError, TypeError, InvalidSignature):
+            return False
+        return (deployment_uri(self.deployment_id) in _uris(certificate)
+                and not _is_ca(certificate))
+
+    def verify_issued_listener_certificate(self, certificate_pem: bytes, *, server_name: str,
+                                           public_key_digest_value: str) -> x509.Certificate:
+        """Verify a listener leaf returned by the CA-account issuer (Issue #109).
+
+        It must be signed directly by this CA, carry the fixed serverAuth
+        profile (``CA=false``, digitalSignature only, EKU serverAuth only),
+        exactly ``server_name`` and this deployment's URI, and certify the key
+        the listener side generated. Anything else is refused.
+        """
+        certificate = self._parse_issued(certificate_pem)
+        if (not hmac.compare_digest(public_key_digest(certificate.public_key()),
+                                    public_key_digest_value)
+                or not _leaf_profile(certificate, ExtendedKeyUsageOID.SERVER_AUTH)
+                or _uris(certificate) != [deployment_uri(self.deployment_id)]
+                or _single_server_name(certificate) != server_name):
+            raise IssuedCertificateRejected("issued certificate is invalid")
+        return certificate
+
+    def verify_issued_node_certificate(self, certificate_pem: bytes, *, node_id: UUID,
+                                       public_key_digest_value: str) -> "IssuedNodeCredential":
+        """Verify a node leaf returned by the CA-account issuer (Issue #109).
+
+        It must be signed directly by this CA, currently valid, carry the
+        fixed clientAuth profile and exactly the node and deployment URIs, and
+        certify the Owner-approved key. Only then may the approval CLI show
+        the pairing code and serve the enrollment.
+        """
+        if not isinstance(node_id, UUID):
+            raise IssuedCertificateRejected("issued certificate is invalid")
+        certificate = self._parse_issued(certificate_pem)
+        key_digest = public_key_digest(certificate.public_key())
+        expected = sorted([node_uri(node_id), deployment_uri(self.deployment_id)])
+        now = _checked_now(self._clock)
+        if (not isinstance(public_key_digest_value, str)
+                or not hmac.compare_digest(key_digest, public_key_digest_value)
+                or not _leaf_profile(certificate, ExtendedKeyUsageOID.CLIENT_AUTH)
+                or sorted(_uris(certificate)) != expected
+                or _dns_names(certificate)
+                or not certificate.not_valid_before_utc <= now < certificate.not_valid_after_utc):
+            raise IssuedCertificateRejected("issued certificate is invalid")
+        return IssuedNodeCredential(node_id=node_id,
+                                    certificate_pem=_certificate_pem(certificate),
+                                    public_key_digest=key_digest,
+                                    credential_digest=certificate_digest(certificate),
+                                    not_after=certificate.not_valid_after_utc)
+
+    def _parse_issued(self, certificate_pem: bytes) -> x509.Certificate:
+        if not isinstance(certificate_pem, bytes) or not 0 < len(certificate_pem) <= MAX_PEM_BYTES:
+            raise IssuedCertificateRejected("issued certificate is invalid")
+        try:
+            certificate = x509.load_pem_x509_certificate(certificate_pem)
+            certificate.verify_directly_issued_by(self.certificate)
+        except (ValueError, TypeError, InvalidSignature):
+            raise IssuedCertificateRejected("issued certificate is invalid") from None
+        return certificate
+
+    @staticmethod
+    def enrollment_key_digest(csr_pem: bytes) -> str:
+        """Verify an enrollment CSR's proof of possession and return its key digest.
+
+        Used by the local approval CLI (to bind the approval to the requested
+        key) and the bootstrap listener (to find the approval). Subject and
+        extensions are ignored, as for issuance.
+        """
+        return DeploymentTrust._proof_of_possession(csr_pem)[1]
+
+    @staticmethod
+    def renewal_key_digest(csr_pem: bytes) -> str:
+        """Verify a renewal CSR as ``issue_renewal_certificate`` does and return its key digest.
+
+        Lets the renewal path look up a certificate already staged for this
+        key before signing anything (Issue #148).
+        """
+        return DeploymentTrust._proof_of_possession(csr_pem, strict=True)[1]
+
+    @staticmethod
+    def _proof_of_possession(csr_pem: bytes, *, strict: bool = False):
+        """Return the CSR's EC P-256 public key and digest after verifying its signature.
+
+        ``strict`` (renewal) additionally refuses any requested subject or
+        extension, so a renewal request cannot even ask for another identity.
+        """
+        if not isinstance(csr_pem, bytes) or not 0 < len(csr_pem) <= MAX_CSR_BYTES:
+            raise CaptureAuthorityError("invalid enrollment request")
+        try:
+            request = x509.load_pem_x509_csr(csr_pem)
+            proof = request.is_signature_valid
+            public = request.public_key()
+        except (ValueError, TypeError, InvalidSignature):
+            raise CaptureAuthorityError("invalid enrollment request") from None
+        if (not proof or not isinstance(public, ec.EllipticCurvePublicKey)
+                or not isinstance(public.curve, ec.SECP256R1)):
+            raise CaptureAuthorityError("invalid enrollment request")
+        if strict and (len(request.subject) or len(request.extensions)):
+            raise CaptureAuthorityError("renewal request may not choose an identity")
+        return public, public_key_digest(public)
+
+    def staged_renewal_credential(self, node_id: UUID, public_key_digest_value: str,
+                                  credential_digest: str, certificate_pem: bytes
+                                  ) -> "IssuedNodeCredential":
+        """Re-validate a certificate this CA issued for a staged renewal (Issue #123).
+
+        Used when a same-key retry is answered with the certificate first
+        staged for that key. It must be a node leaf signed by this deployment
+        CA for exactly ``node_id`` and the retried key, and match the staged
+        digest; otherwise nothing is returned. Needs no private key.
+        """
+        if not isinstance(node_id, UUID) or not isinstance(certificate_pem, bytes):
+            raise CaptureAuthorityError("staged renewal certificate is invalid")
+        try:
+            certificate = x509.load_pem_x509_certificate(certificate_pem)
+            certificate.verify_directly_issued_by(self.certificate)
+            key_digest = public_key_digest(certificate.public_key())
+            digest = certificate_digest(certificate)
+        except (ValueError, TypeError, InvalidSignature):
+            raise CaptureAuthorityError("staged renewal certificate is invalid") from None
+        expected_uris = sorted([node_uri(node_id), deployment_uri(self.deployment_id)])
+        if (not isinstance(public_key_digest_value, str) or not isinstance(credential_digest, str)
+                or not hmac.compare_digest(key_digest, public_key_digest_value)
+                or not hmac.compare_digest(digest, credential_digest)
+                or _is_ca(certificate) or sorted(_uris(certificate)) != expected_uris):
+            raise CaptureAuthorityError("staged renewal certificate is invalid")
+        return IssuedNodeCredential(node_id=node_id, certificate_pem=certificate_pem,
+                                    public_key_digest=key_digest, credential_digest=digest,
+                                    not_after=certificate.not_valid_after_utc)
+
+    def export_trust_bundle(self, *, server_name: str, endpoint_host: str,
+                            endpoint_port: int) -> TrustBundleExport:
+        """Serialize the public bundle: no private key, code or credential."""
+        if not valid_server_name(server_name) or not _valid_endpoint_host(endpoint_host):
+            raise CaptureAuthorityError("invalid trust bundle endpoint")
+        if type(endpoint_port) is not int or not 1 <= endpoint_port <= 65535:
+            raise CaptureAuthorityError("invalid trust bundle endpoint")
+        content = json.dumps({
+            "format_version": TRUST_BUNDLE_FORMAT,
+            "deployment_id": str(self.deployment_id),
+            "ca_certificate": self.ca_certificate_pem().decode("ascii"),
+            "server_name": server_name,
+            "endpoint": {"host": endpoint_host, "port": endpoint_port},
+        }, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+        return TrustBundleExport(content=content, sha256=hashlib.sha256(content).hexdigest())
+
+
+class DeploymentAuthority(DeploymentTrust):
+    """Signing issuer bound to one deployment UUID and one owner-only key directory.
+
+    Holds the CA private key. In a deployment only the CA-account issuer
+    process (``issuer_process``) constructs it; no network-facing or
+    database-owning process loads the key (Issue #109).
+    """
 
     def __init__(self, deployment_id: UUID, certificate: x509.Certificate,
                  private_key: ec.EllipticCurvePrivateKey, *,
                  clock: Callable[[], datetime.datetime] = _utc_now):
-        self.deployment_id = deployment_id
-        self.certificate = certificate
+        super().__init__(deployment_id, certificate, clock=clock)
         self._private_key = private_key
-        self._clock = clock
-
-    def __repr__(self) -> str:
-        return "DeploymentAuthority(<redacted>)"
 
     @classmethod
     def create(cls, directory: PrivateDirectory, deployment_id: UUID, *,
@@ -607,10 +991,13 @@ class DeploymentAuthority:
                    clock: Callable[[], datetime.datetime] = _utc_now) -> "DeploymentAuthority":
         """Create the CA and the Main listener credential together, or neither.
 
-        Every input and both destinations are validated before the write-once
-        CA is persisted, so a typo never strands a CA without a listener
-        credential. If issuance still fails afterwards (I/O, clock), the files
-        this call created are removed and the same command can be rerun.
+        In-process form (library and tests). The deployment CLI runs the same
+        steps split across the CA-account issuer and the listener account
+        (Issue #109). Every input and both destinations are validated before
+        the write-once CA is persisted, so a typo never strands a CA without a
+        listener credential. If issuance still fails afterwards (I/O, clock),
+        the files this call created are removed and the same command can be
+        rerun.
         """
         if not isinstance(deployment_id, UUID):
             raise CaptureAuthorityError("invalid deployment identity")
@@ -633,15 +1020,13 @@ class DeploymentAuthority:
         with first.locked(), second.locked():
             if any(directory.exists(name) for name in (_CA_KEY, _CA_CERTIFICATE)):
                 raise CaptureAuthorityError("issuer material already exists")
-            if any(listener.exists(name)
-                   for name in (_CA_KEY, _CA_CERTIFICATE, _SERVER_KEY, _SERVER_CERTIFICATE)):
-                raise CaptureAuthorityError("listener material already exists")
+            require_empty_listener_directory(listener)
             authority = cls.create(directory, deployment_id, validity=lifetime, clock=clock)
             try:
                 authority.issue_main_server_credential(listener, server_name=server_name,
                                                        validity=server_lifetime)
             except BaseException:
-                for target, names in ((listener, (_SERVER_CERTIFICATE, _SERVER_KEY)),
+                for target, names in ((listener, _LISTENER_NAMES),
                                       (directory, (_CA_CERTIFICATE, _CA_KEY))):
                     for name in names:
                         try:
@@ -670,30 +1055,6 @@ class DeploymentAuthority:
             raise CaptureAuthorityError("issuer material is invalid")
         return cls(deployment_id, certificate, key, clock=clock)
 
-    def ca_certificate_pem(self) -> bytes:
-        return _certificate_pem(self.certificate)
-
-    def _leaf_window(self, validity: datetime.timedelta) -> tuple[datetime.datetime, datetime.datetime]:
-        lifetime = _validity(validity, MAX_LEAF_VALIDITY)
-        now = _checked_now(self._clock)
-        not_after = now + lifetime
-        if now < self.certificate.not_valid_before_utc:
-            raise CaptureAuthorityError("issuer clock precedes the deployment CA")
-        if not_after > self.certificate.not_valid_after_utc:
-            # Distinct from a malformed request: the CA itself is too close to
-            # its expiry for this leaf validity (Issue #127).
-            raise AuthorityValidityExceeded("certificate validity exceeds the deployment CA")
-        return now - _CLOCK_SKEW_ALLOWANCE, not_after
-
-    @property
-    def not_valid_after(self) -> datetime.datetime:
-        """When the deployment CA itself expires (public)."""
-        return self.certificate.not_valid_after_utc
-
-    def check_leaf_validity(self, validity: datetime.timedelta) -> None:
-        """Refuse now if a leaf of ``validity`` could not be issued at this moment."""
-        self._leaf_window(validity)
-
     def _leaf_builder(self, subject: str, public_key, window) -> x509.CertificateBuilder:
         not_before, not_after = window
         return (
@@ -718,7 +1079,8 @@ class DeploymentAuthority:
         """Write a serverAuth-only Main ingest certificate and key into ``target``.
 
         ``target`` must be a different directory from the CA key directory so
-        the ingest listener never needs read access to the CA private key.
+        the ingest listener never needs read access to the CA private key. The
+        public CA certificate copy is published there too (Issue #109).
         """
         if not valid_server_name(server_name):
             raise CaptureAuthorityError("invalid Main server name")
@@ -726,15 +1088,14 @@ class DeploymentAuthority:
         target.ensure()
         if target.exists(_CA_KEY):
             raise CaptureAuthorityError("listener material must not share the CA directory")
-        key, certificate = self._main_server_leaf(server_name, window)
-        key_path = target.write_new(_SERVER_KEY, _private_pem(key))
-        certificate_path = target.write_new(_SERVER_CERTIFICATE, _certificate_pem(certificate))
-        return MainServerCredential(certificate_path=certificate_path, key_path=key_path)
-
-    def _main_server_leaf(self, server_name: str, window):
         key = _new_key()
-        certificate = (
-            self._leaf_builder("ServerSentinel capture ingest", key.public_key(), window)
+        certificate = self._main_server_certificate(key.public_key(), server_name, window)
+        return write_listener_credential(target, key, _certificate_pem(certificate),
+                                         self.ca_certificate_pem())
+
+    def _main_server_certificate(self, public_key, server_name: str, window) -> x509.Certificate:
+        return (
+            self._leaf_builder("ServerSentinel capture ingest", public_key, window)
             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
             .add_extension(x509.SubjectAlternativeName([
                 x509.DNSName(server_name),
@@ -742,124 +1103,31 @@ class DeploymentAuthority:
             ]), critical=False)
             .sign(self._private_key, hashes.SHA256())
         )
-        return key, certificate
 
-    def issued_listener_certificate(self, target: PrivateDirectory) -> x509.Certificate:
-        """Return ``target``'s Main listener certificate if this CA issued it.
+    def sign_listener_request(self, csr_pem: bytes, *, server_name: str,
+                              validity: datetime.timedelta) -> x509.Certificate:
+        """Sign the fixed serverAuth listener profile for a listener-side key (Issue #109).
 
-        Checks the issuer signature and name, the deployment URI and that the
-        stored listener key matches the certificate. Expiry is not checked, so
-        an expired listener certificate can still be rotated.
+        The listener account generates its key and sends only a CSR without
+        subject or extensions; the CA side chooses every certificate field.
         """
-        certificate = self.verify_listener_certificate(target)
-        if _key_digest(target, _SERVER_KEY) != public_key_digest(certificate.public_key()):
-            raise ListenerMaterialInconsistent("listener key does not match its certificate")
-        return certificate
-
-    def verify_listener_certificate(self, target: PrivateDirectory) -> x509.Certificate:
-        """Return ``target``'s listener certificate only if this CA issued it.
-
-        Used before exporting a trust bundle or serving enrollment, so a CA
-        directory of one deployment and a listener directory of another are
-        refused (``ListenerAuthorityMismatch``) instead of producing a bundle
-        whose CA cannot authenticate the listener (Issue #125). Reads only
-        the public certificate; expiry is not checked here.
-        """
-        certificate = _load_certificate(target, _SERVER_CERTIFICATE, "listener material is invalid")
-        if not self._issued(certificate):
-            raise ListenerAuthorityMismatch("listener certificate is not from this deployment CA")
-        _single_server_name(certificate)
-        return certificate
-
-    def _issued(self, certificate: x509.Certificate) -> bool:
-        try:
-            certificate.verify_directly_issued_by(self.certificate)
-        except (ValueError, TypeError, InvalidSignature):
-            return False
-        return (deployment_uri(self.deployment_id) in _uris(certificate)
-                and not _is_ca(certificate))
+        if not valid_server_name(server_name):
+            raise CaptureAuthorityError("invalid Main server name")
+        public, _digest = self._proof_of_possession(csr_pem, strict=True)
+        return self._main_server_certificate(public, server_name, self._leaf_window(validity))
 
     def rotate_main_server_credential(self, target: PrivateDirectory, *,
                                       validity: datetime.timedelta) -> "ListenerRotation":
         """Replace the Main listener key and certificate in place (Issue #125).
 
-        The CA is not touched, so every Agent's trust bundle (CA certificate
-        plus server name) keeps verifying the new leaf; the server name is
-        kept from the current certificate. Under the listener directory lock
-        the new key and certificate are first written under staged names,
-        then each is renamed over the current file (each rename is atomic).
-        Readers never see a partially written file; a reader that loads
-        between the two renames sees a key that does not match the
-        certificate and refuses (``ssl`` and ``listener_material`` both check
-        the pair). If the process stops between the renames, the next
-        rotation completes the interrupted one instead of issuing again.
-
-        Recovery comes before the new leaf's window is checked against the
-        CA expiry (Issue #148): the staged certificate was already issued, so
-        a ``validity`` the CA can no longer cover must not leave the listener
-        with a mismatched pair. Only the range of ``validity`` is checked
-        before the lock; the CA coverage only when a new leaf is issued.
+        In-process form of ``rotate_listener_credential``; the deployment CLI
+        signs through the CA-account issuer instead (Issue #109).
         """
-        if not isinstance(target, PrivateDirectory):
-            raise CaptureAuthorityError("invalid listener directory")
-        _validity(validity, MAX_LEAF_VALIDITY)
-        # The directory must already exist (it is never created here), and
-        # the privilege to write into it is checked before anything changes.
-        target._require_privilege(assign=True)
-        if target.exists(_CA_KEY) or target.exists(_CA_CERTIFICATE):
-            raise CaptureAuthorityError("listener material must not share the CA directory")
-        with target.locked():
-            recovered = self._recover_interrupted_rotation(target)
-            if recovered is not None:
-                return ListenerRotation(recovered.not_valid_after_utc, recovered=True)
-            current = self.issued_listener_certificate(target)
-            server_name = _single_server_name(current)
-            window = self._leaf_window(validity)
-            key, certificate = self._main_server_leaf(server_name, window)
-            try:
-                target.write_new(_STAGED_SERVER_KEY, _private_pem(key))
-                target.write_new(_STAGED_SERVER_CERTIFICATE, _certificate_pem(certificate))
-                # Nothing current has changed until this rename succeeds.
-                target.replace_with(_STAGED_SERVER_KEY, _SERVER_KEY)
-            except ReplacementNotDurable:
-                # The key rename took effect although its directory fsync
-                # failed: the new key is current, so the staged certificate
-                # must stay for the next rotation's recovery to install.
-                raise
-            except BaseException:
-                for name in (_STAGED_SERVER_CERTIFICATE, _STAGED_SERVER_KEY):
-                    try:
-                        target.discard_created(name)
-                    except CaptureAuthorityError:
-                        pass
-                raise
-            # From here the new key is current. A failure leaves the staged
-            # certificate for the next rotation to complete.
-            target.replace_with(_STAGED_SERVER_CERTIFICATE, _SERVER_CERTIFICATE)
-        return ListenerRotation(certificate.not_valid_after_utc, recovered=False)
-
-    def _recover_interrupted_rotation(self, target: PrivateDirectory) -> x509.Certificate | None:
-        """Complete or discard a crashed rotation's staged files; caller holds the lock."""
-        staged_key = target.exists(_STAGED_SERVER_KEY)
-        staged_certificate = target.exists(_STAGED_SERVER_CERTIFICATE)
-        if not staged_key and not staged_certificate:
-            return None
-        if staged_certificate and not staged_key:
-            # Stopped after the key rename: the current key is the new one.
-            certificate = _load_certificate(target, _STAGED_SERVER_CERTIFICATE,
-                                            "listener material is invalid")
-            if (self._issued(certificate)
-                    and _key_digest(target, _SERVER_KEY) == public_key_digest(certificate.public_key())):
-                _single_server_name(certificate)
-                target.replace_with(_STAGED_SERVER_CERTIFICATE, _SERVER_CERTIFICATE)
-                return certificate
-        # Stopped before any rename: the current pair is untouched, so the
-        # staged leftovers are discarded and a fresh rotation proceeds. Any
-        # other combination is not something a rotation produces; refuse.
-        self.issued_listener_certificate(target)
-        for name in (_STAGED_SERVER_CERTIFICATE, _STAGED_SERVER_KEY):
-            target.discard_stale(name)
-        return None
+        def sign(csr_pem: bytes, server_name: str, lifetime: datetime.timedelta) -> bytes:
+            return _certificate_pem(self.sign_listener_request(
+                csr_pem, server_name=server_name, validity=lifetime))
+        return rotate_listener_credential(self.public_trust(), target, validity=validity,
+                                          sign=sign)
 
     def issue_node_certificate(self, claim: EnrollmentClaim, csr_pem: bytes, *,
                                validity: datetime.timedelta = DEFAULT_NODE_VALIDITY
@@ -867,51 +1135,26 @@ class DeploymentAuthority:
         """Sign a capture-only client certificate for a redeemed enrollment claim."""
         if not isinstance(claim, EnrollmentClaim):
             raise CaptureAuthorityError("invalid enrollment claim")
+        return self.issue_approved_node_certificate(claim.node_id, csr_pem,
+                                                    claim.public_key_digest, validity=validity)
+
+    def issue_approved_node_certificate(self, node_id: UUID, csr_pem: bytes,
+                                        approved_key_digest: str, *,
+                                        validity: datetime.timedelta = DEFAULT_NODE_VALIDITY
+                                        ) -> IssuedNodeCredential:
+        """Sign the fixed clientAuth profile for an Owner-approved node key.
+
+        The CSR only proves possession of ``approved_key_digest``; its subject
+        and extensions are ignored. Used before redemption by the CA-account
+        issuer (Issue #109): the certificate admits nothing until the ledger
+        activates it on redemption.
+        """
+        if not isinstance(node_id, UUID) or not isinstance(approved_key_digest, str):
+            raise CaptureAuthorityError("invalid enrollment claim")
         public, key_digest = self._proof_of_possession(csr_pem)
-        if not hmac.compare_digest(key_digest, claim.public_key_digest):
+        if not hmac.compare_digest(key_digest, approved_key_digest):
             raise CaptureAuthorityError("enrollment request does not match the approved key")
-        return self._sign_node(claim.node_id, public, key_digest, validity)
-
-    @staticmethod
-    def enrollment_key_digest(csr_pem: bytes) -> str:
-        """Verify an enrollment CSR's proof of possession and return its key digest.
-
-        Used by the local approval CLI (to bind the approval to the requested
-        key) and the bootstrap listener (to find the approval). Subject and
-        extensions are ignored, as for issuance.
-        """
-        return DeploymentAuthority._proof_of_possession(csr_pem)[1]
-
-    @staticmethod
-    def renewal_key_digest(csr_pem: bytes) -> str:
-        """Verify a renewal CSR as ``issue_renewal_certificate`` does and return its key digest.
-
-        Lets the renewal path look up a certificate already staged for this
-        key before signing anything (Issue #148).
-        """
-        return DeploymentAuthority._proof_of_possession(csr_pem, strict=True)[1]
-
-    @staticmethod
-    def _proof_of_possession(csr_pem: bytes, *, strict: bool = False):
-        """Return the CSR's EC P-256 public key and digest after verifying its signature.
-
-        ``strict`` (renewal) additionally refuses any requested subject or
-        extension, so a renewal request cannot even ask for another identity.
-        """
-        if not isinstance(csr_pem, bytes) or not 0 < len(csr_pem) <= MAX_CSR_BYTES:
-            raise CaptureAuthorityError("invalid enrollment request")
-        try:
-            request = x509.load_pem_x509_csr(csr_pem)
-            proof = request.is_signature_valid
-            public = request.public_key()
-        except (ValueError, TypeError, InvalidSignature):
-            raise CaptureAuthorityError("invalid enrollment request") from None
-        if (not proof or not isinstance(public, ec.EllipticCurvePublicKey)
-                or not isinstance(public.curve, ec.SECP256R1)):
-            raise CaptureAuthorityError("invalid enrollment request")
-        if strict and (len(request.subject) or len(request.extensions)):
-            raise CaptureAuthorityError("renewal request may not choose an identity")
-        return public, public_key_digest(public)
+        return self._sign_node(node_id, public, key_digest, validity)
 
     def _sign_node(self, node_id: UUID, public, key_digest: str,
                    validity: datetime.timedelta) -> IssuedNodeCredential:
@@ -938,71 +1181,218 @@ class DeploymentAuthority:
 
         This primitive checks only the CSR. Eligibility (current, admitted,
         unexpired identity) and ledger staging are enforced by the caller.
+        Interim (Issue #109): renewal is not wired to any listener yet; the
+        renewal-only signer of PR2 replaces this in-process path.
         """
         if not isinstance(node_id, UUID):
             raise CaptureAuthorityError("invalid node identity")
         public, key_digest = self._proof_of_possession(csr_pem, strict=True)
         return self._sign_node(node_id, public, key_digest, validity)
 
-    def staged_renewal_credential(self, node_id: UUID, public_key_digest_value: str,
-                                  credential_digest: str, certificate_pem: bytes
-                                  ) -> IssuedNodeCredential:
-        """Re-validate a certificate this CA issued for a staged renewal (Issue #123).
-
-        Used when a same-key retry is answered with the certificate first
-        staged for that key. It must be a node leaf signed by this deployment
-        CA for exactly ``node_id`` and the retried key, and match the staged
-        digest; otherwise nothing is returned.
-        """
-        if not isinstance(node_id, UUID) or not isinstance(certificate_pem, bytes):
-            raise CaptureAuthorityError("staged renewal certificate is invalid")
-        try:
-            certificate = x509.load_pem_x509_certificate(certificate_pem)
-            certificate.verify_directly_issued_by(self.certificate)
-            key_digest = public_key_digest(certificate.public_key())
-            digest = certificate_digest(certificate)
-        except (ValueError, TypeError, InvalidSignature):
-            raise CaptureAuthorityError("staged renewal certificate is invalid") from None
-        expected_uris = sorted([node_uri(node_id), deployment_uri(self.deployment_id)])
-        if (not isinstance(public_key_digest_value, str) or not isinstance(credential_digest, str)
-                or not hmac.compare_digest(key_digest, public_key_digest_value)
-                or not hmac.compare_digest(digest, credential_digest)
-                or _is_ca(certificate) or sorted(_uris(certificate)) != expected_uris):
-            raise CaptureAuthorityError("staged renewal certificate is invalid")
-        return IssuedNodeCredential(node_id=node_id, certificate_pem=certificate_pem,
-                                    public_key_digest=key_digest, credential_digest=digest,
-                                    not_after=certificate.not_valid_after_utc)
-
     def issue_and_activate(self, ledger: PairingLedger, claim: EnrollmentClaim, csr_pem: bytes, *,
                            validity: datetime.timedelta = DEFAULT_NODE_VALIDITY
                            ) -> IssuedNodeCredential:
         """Sign for a consumed claim, then activate that exact certificate in the ledger.
 
-        Consumption was committed by ``PairingLedger.redeem`` before signing. If
-        activation fails, the returned certificate never reaches the caller and
-        stays unusable because ingest admission requires the activation record;
-        a retry needs a fresh Owner approval.
+        In-process library form kept for tests and the interim renewal path;
+        the enrollment listener no longer signs (Issue #109): it activates a
+        certificate the CA-account issuer signed before the code was shown.
         """
         issued = self.issue_node_certificate(claim, csr_pem, validity=validity)
         ledger.activate(claim, credential_serial_digest=issued.credential_digest,
                         not_after=issued.not_after.timestamp())
         return issued
 
-    def export_trust_bundle(self, *, server_name: str, endpoint_host: str,
-                            endpoint_port: int) -> TrustBundleExport:
-        """Serialize the public bundle: no private key, code or credential."""
-        if not valid_server_name(server_name) or not _valid_endpoint_host(endpoint_host):
-            raise CaptureAuthorityError("invalid trust bundle endpoint")
-        if type(endpoint_port) is not int or not 1 <= endpoint_port <= 65535:
-            raise CaptureAuthorityError("invalid trust bundle endpoint")
-        content = json.dumps({
-            "format_version": TRUST_BUNDLE_FORMAT,
-            "deployment_id": str(self.deployment_id),
-            "ca_certificate": self.ca_certificate_pem().decode("ascii"),
-            "server_name": server_name,
-            "endpoint": {"host": endpoint_host, "port": endpoint_port},
-        }, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
-        return TrustBundleExport(content=content, sha256=hashlib.sha256(content).hexdigest())
+
+class PublicCertificateMissing(CaptureAuthorityError):
+    """The listener directory has no public CA copy yet (written before Issue #109)."""
+
+    reason = "deployment_ca_certificate_missing"
+
+
+def new_listener_key() -> tuple[ec.EllipticCurvePrivateKey, bytes]:
+    """A fresh listener key and its CSR (no subject, no extension) for the CA side."""
+    key = _new_key()
+    csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([])).sign(
+        key, hashes.SHA256())
+    return key, csr.public_bytes(serialization.Encoding.PEM)
+
+
+def require_empty_listener_directory(listener: PrivateDirectory) -> None:
+    """Refuse a listener directory that already holds CA or listener material."""
+    if any(listener.exists(name) for name in (_CA_KEY, _CA_CERTIFICATE) + _LISTENER_NAMES):
+        raise CaptureAuthorityError("listener material already exists")
+
+
+def write_listener_credential(target: PrivateDirectory, key, certificate_pem: bytes,
+                              ca_certificate_pem: bytes) -> MainServerCredential:
+    """Write a new listener key, certificate and public CA copy, or none of them.
+
+    Runs as the listener account (Issue #109), so every file is created owned
+    by it and no ownership change is needed.
+    """
+    try:
+        key_path = target.write_new(_SERVER_KEY, _private_pem(key))
+        certificate_path = target.write_new(_SERVER_CERTIFICATE, certificate_pem)
+        publish_public_certificate(target, ca_certificate_pem)
+    except BaseException:
+        for name in _LISTENER_NAMES:
+            try:
+                target.discard_created(name)
+            except CaptureAuthorityError:
+                pass
+        raise
+    return MainServerCredential(certificate_path=certificate_path, key_path=key_path)
+
+
+def publish_public_certificate(target: PrivateDirectory, ca_certificate_pem: bytes) -> bool:
+    """Keep the public CA copy in the listener directory; return whether it was written.
+
+    An existing copy must be byte-identical (``ListenerAuthorityMismatch``
+    otherwise), so a listener directory of another deployment is refused
+    instead of silently re-anchored.
+    """
+    existing = target.read_optional(_PUBLIC_CA_CERTIFICATE)
+    if existing is not None:
+        if not hmac.compare_digest(existing, ca_certificate_pem):
+            raise ListenerAuthorityMismatch("public CA copy is from another deployment CA")
+        return False
+    target.write_new(_PUBLIC_CA_CERTIFICATE, ca_certificate_pem)
+    return True
+
+
+def rotate_listener_credential(trust: DeploymentTrust, target: PrivateDirectory, *,
+                               validity: datetime.timedelta,
+                               sign: Callable[[bytes, str, datetime.timedelta], bytes]
+                               ) -> "ListenerRotation":
+    """Replace the Main listener key and certificate in place (Issues #125, #109).
+
+    Runs on the listener side with public CA material only: the new key is
+    generated here and ``sign(csr, server_name, validity)`` returns the
+    certificate PEM from the CA side, which is verified against ``trust``
+    before anything is written.
+
+    The CA is not touched, so every Agent's trust bundle (CA certificate plus
+    server name) keeps verifying the new leaf; the server name is kept from
+    the current certificate. Under the listener directory lock the new key
+    and certificate are first written under staged names, then each is renamed
+    over the current file (each rename is atomic). Readers never see a
+    partially written file; a reader that loads between the two renames sees
+    a key that does not match the certificate and refuses (``ssl`` and
+    ``listener_material`` both check the pair). If the process stops between
+    the renames, the next rotation completes the interrupted one instead of
+    issuing again.
+
+    Recovery comes before the new leaf's window is checked against the CA
+    expiry (Issue #148): the staged certificate was already issued, so a
+    ``validity`` the CA can no longer cover must not leave the listener with
+    a mismatched pair. Only the range of ``validity`` is checked before the
+    lock; the CA coverage only when a new leaf is issued.
+    """
+    if not isinstance(target, PrivateDirectory) or not isinstance(trust, DeploymentTrust):
+        raise CaptureAuthorityError("invalid listener directory")
+    _validity(validity, MAX_LEAF_VALIDITY)
+    # The directory must already exist (it is never created here), and the
+    # privilege to write into it is checked before anything changes.
+    target._require_privilege(assign=True)
+    if target.exists(_CA_KEY) or target.exists(_CA_CERTIFICATE):
+        raise CaptureAuthorityError("listener material must not share the CA directory")
+    with target.locked():
+        # A copy from another CA is refused before anything changes; a
+        # missing one (listener written before Issue #109) is published.
+        publish_public_certificate(target, trust.ca_certificate_pem())
+        recovered = _recover_interrupted_rotation(trust, target)
+        if recovered is not None:
+            return ListenerRotation(recovered.not_valid_after_utc, recovered=True)
+        current = trust.issued_listener_certificate(target)
+        server_name = _single_server_name(current)
+        trust.check_leaf_validity(validity)
+        key, csr = new_listener_key()
+        certificate_pem = sign(csr, server_name, validity)
+        certificate = trust.verify_issued_listener_certificate(
+            certificate_pem, server_name=server_name,
+            public_key_digest_value=public_key_digest(key.public_key()))
+        try:
+            target.write_new(_STAGED_SERVER_KEY, _private_pem(key))
+            target.write_new(_STAGED_SERVER_CERTIFICATE, _certificate_pem(certificate))
+            # Nothing current has changed until this rename succeeds.
+            target.replace_with(_STAGED_SERVER_KEY, _SERVER_KEY)
+        except ReplacementNotDurable:
+            # The key rename took effect although its directory fsync failed:
+            # the new key is current, so the staged certificate must stay for
+            # the next rotation's recovery to install.
+            raise
+        except BaseException:
+            for name in (_STAGED_SERVER_CERTIFICATE, _STAGED_SERVER_KEY):
+                try:
+                    target.discard_created(name)
+                except CaptureAuthorityError:
+                    pass
+            raise
+        # From here the new key is current. A failure leaves the staged
+        # certificate for the next rotation to complete.
+        target.replace_with(_STAGED_SERVER_CERTIFICATE, _SERVER_CERTIFICATE)
+    return ListenerRotation(certificate.not_valid_after_utc, recovered=False)
+
+
+def _recover_interrupted_rotation(trust: DeploymentTrust,
+                                  target: PrivateDirectory) -> x509.Certificate | None:
+    """Complete or discard a crashed rotation's staged files; caller holds the lock."""
+    staged_key = target.exists(_STAGED_SERVER_KEY)
+    staged_certificate = target.exists(_STAGED_SERVER_CERTIFICATE)
+    if not staged_key and not staged_certificate:
+        return None
+    if staged_certificate and not staged_key:
+        # Stopped after the key rename: the current key is the new one.
+        certificate = _load_certificate(target, _STAGED_SERVER_CERTIFICATE,
+                                        "listener material is invalid")
+        if (trust._issued(certificate)
+                and _key_digest(target, _SERVER_KEY) == public_key_digest(certificate.public_key())):
+            _single_server_name(certificate)
+            target.replace_with(_STAGED_SERVER_CERTIFICATE, _SERVER_CERTIFICATE)
+            return certificate
+    # Stopped before any rename: the current pair is untouched, so the staged
+    # leftovers are discarded and a fresh rotation proceeds. Any other
+    # combination is not something a rotation produces; refuse.
+    trust.issued_listener_certificate(target)
+    for name in (_STAGED_SERVER_CERTIFICATE, _STAGED_SERVER_KEY):
+        target.discard_stale(name)
+    return None
+
+
+def _leaf_profile(certificate: x509.Certificate, purpose) -> bool:
+    """The fixed leaf profile: CA=false, digitalSignature only, exactly one EKU."""
+    try:
+        extensions = certificate.extensions
+        constraints = extensions.get_extension_for_class(x509.BasicConstraints).value
+        usage = extensions.get_extension_for_class(x509.KeyUsage).value
+        purposes = list(extensions.get_extension_for_class(x509.ExtendedKeyUsage).value)
+    except (ValueError, TypeError, x509.ExtensionNotFound):
+        return False
+    return (not constraints.ca and usage.digital_signature and not usage.key_cert_sign
+            and not usage.crl_sign and not usage.key_encipherment and not usage.key_agreement
+            and not usage.content_commitment and not usage.data_encipherment
+            and purposes == [purpose])
+
+
+def _dns_names(certificate: x509.Certificate) -> list[str]:
+    try:
+        names = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    except x509.ExtensionNotFound:
+        return []
+    return names.get_values_for_type(x509.DNSName)
+
+
+def _deployment_of(certificate: x509.Certificate) -> UUID | None:
+    deployments = [uri for uri in _uris(certificate) if uri.startswith(DEPLOYMENT_URI_PREFIX)]
+    if len(deployments) != 1:
+        return None
+    text = deployments[0][len(DEPLOYMENT_URI_PREFIX):]
+    try:
+        deployment = UUID(text)
+    except ValueError:
+        return None
+    return deployment if str(deployment) == text else None
 
 
 def _uris(certificate: x509.Certificate) -> list[str]:
@@ -1031,16 +1421,9 @@ def deployment_id_of(directory: PrivateDirectory) -> UUID:
         raise
     except (ValueError, TypeError):
         raise CaptureAuthorityError("issuer material is invalid") from None
-    deployments = [uri for uri in _uris(certificate) if uri.startswith(DEPLOYMENT_URI_PREFIX)]
-    try:
-        if len(deployments) != 1:
-            raise ValueError
-        text = deployments[0][len(DEPLOYMENT_URI_PREFIX):]
-        deployment = UUID(text)
-        if str(deployment) != text:
-            raise ValueError
-    except ValueError:
-        raise CaptureAuthorityError("issuer material is invalid") from None
+    deployment = _deployment_of(certificate)
+    if deployment is None:
+        raise CaptureAuthorityError("issuer material is invalid")
     return deployment
 
 

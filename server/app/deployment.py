@@ -95,6 +95,38 @@ def _administrator_directory(directory: Path) -> None:
         raise ConfigurationError("deployment configuration is unavailable") from None
 
 
+def _capture_ca_directory(value: object) -> Path:
+    """The configured capture-node CA directory (Issue #109): an absolute path."""
+    if not isinstance(value, str) or not value or "\0" in value:
+        raise ConfigurationError("invalid capture CA directory")
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ConfigurationError("capture CA directory must be absolute")
+    return path
+
+
+def capture_ca_directory_accessible(path: Path) -> bool:
+    """Whether this process can open the capture-node CA directory or its key.
+
+    The service account must never be able to (Issue #109): the CA belongs to
+    the static ``serversentinel-ca`` account and only the pairing CLI's CA
+    child opens it. Fail closed: anything except a permission refusal --
+    including a missing directory, which would make the check meaningless --
+    counts as accessible.
+    """
+    for target, flags in ((path, os.O_RDONLY | os.O_DIRECTORY),
+                          (path / "ca-key.pem", os.O_RDONLY | os.O_NONBLOCK)):
+        try:
+            descriptor = os.open(target, flags | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except PermissionError:
+            continue
+        except OSError:
+            return True
+        os.close(descriptor)
+        return True
+    return False
+
+
 def _runtime_roots() -> tuple[Path, Path | None]:
     try:
         code_root = Path(__file__).resolve(strict=True).parents[1]
@@ -165,6 +197,9 @@ class Deployment:
     # source's detector observation stays unknown/model_unavailable; there is
     # no default model, cadence or limit (see detection/foundation/config.py).
     detection: DetectionConfiguration | None = field(default=None, repr=False)
+    # The capture-node CA directory. When configured, the launcher refuses to
+    # run if the service account can open it (Issue #109).
+    capture_ca_directory: Path | None = field(default=None, repr=False)
 
     @property
     def state_directory(self) -> Path:
@@ -181,7 +216,8 @@ class Deployment:
             "human_host", "human_port", "log_level",
         }
         if (not allowed <= set(value)
-                or not set(value) <= allowed | {"monitoring", "local_uvc", "detection"}
+                or not set(value) <= allowed | {"monitoring", "local_uvc", "detection",
+                                                "capture_ca_directory"}
                 or type(value.get("service_uid")) is not int):
             raise ConfigurationError("invalid deployment configuration")
         uid = value["service_uid"]
@@ -261,8 +297,13 @@ class Deployment:
             )
         local_uvc = parse_local_uvc(value["local_uvc"]) if "local_uvc" in value else None
         detection = parse_detection(value["detection"]) if "detection" in value else None
+        capture_ca = (_capture_ca_directory(value["capture_ca_directory"])
+                      if "capture_ca_directory" in value else None)
+        if capture_ca is not None and (capture_ca.is_relative_to(runtime_root)
+                                       or any(capture_ca.is_relative_to(root) for root in roots)):
+            raise ConfigurationError("capture CA directory must be outside runtime data and code")
         return cls(runtime_root, uid, settings, directories[1], directories[2], monitoring,
-                   local_uvc=local_uvc, detection=detection)
+                   local_uvc=local_uvc, detection=detection, capture_ca_directory=capture_ca)
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -283,6 +324,11 @@ def main(arguments: list[str] | None = None) -> int:
         # launcher refuse, so a deployment never runs with them silently absent.
         if deployment.monitoring is None or not deployment.monitoring.storage_configured:
             raise ConfigurationError("monitoring storage configuration is required")
+        # The service must not be able to open the capture-node CA directory
+        # (Issue #109); `--check` refuses too, so the unit never starts.
+        if (deployment.capture_ca_directory is not None
+                and capture_ca_directory_accessible(deployment.capture_ca_directory)):
+            raise ConfigurationError("service account can open the capture CA directory")
     except ConfigurationError:
         parser.exit(1, "ServerSentinel deployment validation failed\n")
     if args.check:
