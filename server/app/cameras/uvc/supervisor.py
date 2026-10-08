@@ -85,6 +85,9 @@ class LocalUvcSupervisor:
         self._lock = threading.Lock()
         self._workers: dict[UUID, _Worker] = {}
         self._closed = False
+        # Sticky: a worker whose own cleanup failed is removed from the
+        # registry once joined, but every later close() must still fail.
+        self._close_cleanup_failed = False
         check = getattr(adapter, "check_frame_progress", None)
         self._check = check if callable(check) else None
         self._watchdog_interval = float(watchdog_interval)
@@ -246,10 +249,14 @@ class LocalUvcSupervisor:
         still call into the adapter. A watchdog still inside a check after its
         own bounded join makes ``close()`` fail, so the owner does not tear
         the adapter down under that check; a later ``close()`` joins it again.
+        A worker whose own cleanup failed keeps every later ``close()``
+        failing even after it was removed from the registry.
         """
         with self._lock:
             if (self._closed and not self._workers
                     and not (self._watchdog is not None and self._watchdog.is_alive())):
+                if self._close_cleanup_failed:
+                    raise WorkerStopError("local UVC worker cleanup failed")
                 return
             self._closed = True
             watchdog = self._watchdog
@@ -261,13 +268,15 @@ class LocalUvcSupervisor:
             remaining = max(0.0, deadline - self._clock())
             worker.thread.join(remaining)
         alive = [source_id for source_id, worker in workers if worker.thread.is_alive()]
-        cleanup_failed = [
-            source_id for source_id, worker in workers if worker.cleanup_failed
-        ]
         with self._lock:
             for source_id, worker in workers:
                 if not worker.thread.is_alive():
                     self._workers.pop(source_id, None)
+                    # Read under the lock after the exit: the worker's
+                    # ``finally`` records a cleanup failure before it ends.
+                    if worker.cleanup_failed:
+                        self._close_cleanup_failed = True
+            cleanup_failed = self._close_cleanup_failed
             if not alive:
                 # Only now is no source left that the watchdog must report.
                 self._watchdog_stop.set()

@@ -222,8 +222,9 @@ durable session marker conservatively requires reapproval at next start.
 watchdog is left, closes the adapter (and retries a failed database release).
 A watchdog-only failure then ends `stopped`; a worker whose own cleanup failed
 (for example its session-marker release refused after the pin was released)
-keeps the stop `stop_failed`. `join_timeout_seconds` may not be shorter than
-`frame_stall_seconds`: the stop releases the database pin right after the
+keeps the stop `stop_failed`, also on a retry after the supervisor already
+removed that exited worker while another one was still hung.
+`join_timeout_seconds` may not be shorter than `frame_stall_seconds`: the stop releases the database pin right after the
 join, and the watchdog must have made a blocked worker's lowered state durable
 before then.
 `LocalUvcRuntime.reapprove()` stops the one source's worker, runs the audited

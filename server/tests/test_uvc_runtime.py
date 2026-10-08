@@ -574,6 +574,114 @@ class RuntimeLifecycleTests(RuntimeFixture):
         self.assertIs(status.state, LocalUvcRuntimeState.STOPPED)
         self.assertTrue(runtime.adapter.closed)
 
+    def test_retried_stop_keeps_a_removed_workers_cleanup_failure(self):
+        # Claude review on #188: source A's worker hangs past the join bound
+        # while source B's worker exits with a failed stop_source. The first
+        # close removes B; the retry after A exits must stay STOP_FAILED
+        # instead of reporting a clean stop.
+        hung, failing = self.source("Hung"), self.source("Failing")
+        released = threading.Event()
+        self.addCleanup(released.set)
+        entered = threading.Event()
+        armed = {"on": False}
+        adapters = []
+
+        class Adapter(LocalUvcAdapter):
+            close_calls = 0
+
+            def poll_source(self, source_id, *, timeout=1.0):
+                if armed["on"] and source_id == hung.id:
+                    entered.set()
+                    released.wait(10)
+                    return False
+                return super().poll_source(source_id, timeout=timeout)
+
+            def stop_source(self, source_id):
+                result = super().stop_source(source_id)
+                if source_id == failing.id:
+                    raise RuntimeError("synthetic private cleanup detail")
+                return result
+
+            def close(self):
+                type(self).close_calls += 1
+                return super().close()
+
+        def adapter_factory(*args, **kwargs):
+            adapter = Adapter(*args, **kwargs)
+            adapters.append(adapter)
+            return adapter
+
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((hung.id, failing.id), poll_timeout_seconds=0.05,
+                                  retry_delay_seconds=0.05, join_timeout_seconds=0.25,
+                                  frame_stall_seconds=0.25),
+            self.registry, on_frame=self.on_frame, discovery=self.discovery,
+            capture_factory=self.captures, adapter_factory=adapter_factory,
+        )
+        self.addCleanup(runtime.stop)
+        runtime.start()
+        armed["on"] = True
+        self.assertTrue(entered.wait(5))
+        status = runtime.stop()
+        self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
+        # The hung worker keeps the adapter open.
+        self.assertEqual(0, Adapter.close_calls)
+        self.assertIsNone(runtime._supervisor.status(failing.id))
+        released.set()
+
+        def settled():
+            hung_status = runtime._supervisor.status(hung.id)
+            return ((hung_status is None or not hung_status.running)
+                    and not runtime._supervisor.watchdog_running)
+
+        self.assertTrue(wait_for(settled))
+        status = runtime.stop()
+        self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
+        # Every thread is gone, so the adapter is closed; the failure stays.
+        self.assertEqual(1, Adapter.close_calls)
+        self.assertTrue(adapters[0].closed)
+        self.assertIs(runtime.stop().state, LocalUvcRuntimeState.STOP_FAILED)
+        self.assertEqual(1, Adapter.close_calls)
+
+    def test_worker_cleanup_failure_survives_a_retried_database_release(self):
+        # Claude review on #188: a worker's own cleanup failure is recorded
+        # by the runtime, so a retry that only finishes the database release
+        # (the adapter is already closed) still reports STOP_FAILED.
+        source = self.source()
+        pinned = PinnedDatabase(Database(self.database.path))
+        registry = CameraRegistry(pinned, reservation=ToggleAdmission())
+        self.addCleanup(pinned.release)
+
+        class Adapter(LocalUvcAdapter):
+            def stop_source(self, source_id):
+                super().stop_source(source_id)
+                raise RuntimeError("synthetic private cleanup detail")
+
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), **FAST), registry,
+            on_frame=self.on_frame, discovery=self.discovery,
+            capture_factory=self.captures, adapter_factory=Adapter,
+        )
+        self.addCleanup(runtime.stop)
+        runtime.start()
+        self.assertTrue(pinned.pinned)
+        release = pinned.release
+        attempts = []
+
+        def flaky_release():
+            attempts.append(None)
+            if len(attempts) == 1:
+                raise OSError("synthetic private release detail")
+            return release()
+
+        with patch.object(pinned, "release", flaky_release):
+            self.assertIs(runtime.stop().state, LocalUvcRuntimeState.STOP_FAILED)
+            self.assertTrue(runtime.adapter.closed)
+            self.assertTrue(pinned.pinned)
+            self.assertIs(runtime.stop().state, LocalUvcRuntimeState.STOP_FAILED)
+        self.assertEqual(2, len(attempts))
+        self.assertFalse(pinned.pinned)
+
     def test_worker_blocked_through_a_timed_out_stop_is_not_left_online(self):
         # Issue #122: runtime.stop() closes the supervisor. When the worker is
         # blocked in a kernel call past the join bound, the worker and adapter

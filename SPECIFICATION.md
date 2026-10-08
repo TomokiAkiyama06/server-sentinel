@@ -312,7 +312,9 @@ closed under that check. A successful close leaves no worker or watchdog
 thread that could still call into the adapter. A `stop_failed` runtime retries
 on a later stop: once no worker or watchdog is left it closes the adapter
 (a watchdog-only failure then ends `stopped`; a worker cleanup failure stays
-`stop_failed`). `join_timeout_seconds` may not be shorter than
+`stop_failed` on every retry, even when that exited worker was already removed
+while another one was still hung, because the supervisor keeps that failure
+sticky). `join_timeout_seconds` may not be shorter than
 `frame_stall_seconds`, so the watchdog can make a blocked worker's lowered
 health durable before the stop releases the pinned database. Camera-health
 transitions reach the optional health sink only through a bounded, coalescing
