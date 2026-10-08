@@ -211,6 +211,8 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertIn("ProtectSystem=strict", unit)
         self.assertIn("Type=notify", unit)
         self.assertIn("NotifyAccess=main", unit)
+        # Owner decision 2026-10-08: the stop bound is explicit, not systemd's default.
+        self.assertIn("\nTimeoutStopSec=90\n", unit)
         self.assertNotIn("Type=simple", unit)
         self.assertNotIn("0.0.0.0", unit)
 
@@ -631,6 +633,15 @@ class ReleaseLifecycleTests(unittest.TestCase):
             render_unit(self.installation, self.config, deployment, account, socket_activation=1)
         self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK", lines)
         self.assertIn("ProtectControlGroups=true", lines)
+        # Owner decision 2026-10-08 (Issue #173, PR #188): the local UVC stop can
+        # take ~62 s and the remaining shutdown steps follow it, so the stop
+        # bound is set explicitly in [Service] instead of relying on the host's
+        # DefaultTimeoutStopSec.
+        for rendered in (lines, legacy.splitlines()):
+            service = rendered[rendered.index("[Service]"):rendered.index("[Install]")]
+            self.assertEqual([line for line in rendered if line.startswith("TimeoutStop")],
+                             ["TimeoutStopSec=90"])
+            self.assertIn("TimeoutStopSec=90", service)
         self.assertFalse(any(line.startswith(("PrivateNetwork=", "NetworkNamespacePath=", "PrivateUsers="))
                              for line in lines))
         self.assertIn("CapabilityBoundingSet=", lines)
