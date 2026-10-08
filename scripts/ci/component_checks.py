@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,9 @@ OTHER_SOURCE_SUFFIXES = {".go", ".rs", ".c", ".cpp", ".java", ".sh", ".bash"}
 IGNORED_DIRS = {".git", ".venv", ".venv-ci", "node_modules", "__pycache__"}
 COMMAND_TIMEOUT = 600
 SMOKE_TIMEOUT = 120
+# After a Python check times out it receives SIGABRT, on which faulthandler
+# (PYTHONFAULTHANDLER=1) writes every thread's traceback; then it is killed.
+TRACEBACK_GRACE = 15
 
 
 class CheckFailure(Exception):
@@ -51,17 +55,65 @@ def files_under(root: Path) -> list[Path]:
     return sorted(result)
 
 
+def describe_exit(returncode: int) -> str:
+    """Name the signal of a signal-terminated command (negative return code)."""
+    if returncode < 0:
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        return f"exit {returncode}, terminated by {name}"
+    return f"exit {returncode}"
+
+
+def failure(cwd: Path, message: str) -> CheckFailure:
+    # unittest -v leaves "test_name ... " unterminated while a test runs, so a
+    # timeout or crash message must start on its own line to be noticed.
+    print(f"\n[{cwd.name}] {message}", file=sys.stderr, flush=True)
+    return CheckFailure(f"{cwd.name}: {message}")
+
+
 def run(command: list[str], cwd: Path, *, env: dict[str, str] | None = None,
-        timeout: int = COMMAND_TIMEOUT) -> None:
+        timeout: int = COMMAND_TIMEOUT, traceback_on_timeout: bool = False) -> None:
     print(f"[{cwd.name}] {shlex.join(command)}", flush=True)
+    if traceback_on_timeout:
+        run_with_traceback_on_timeout(command, cwd, env=env, timeout=timeout)
+        return
     try:
         subprocess.run(command, cwd=cwd, env=env, check=True, timeout=timeout)
     except subprocess.CalledProcessError as exc:
-        raise CheckFailure(f"{cwd.name}: command failed (exit {exc.returncode})") from exc
+        raise failure(cwd, f"command failed ({describe_exit(exc.returncode)})") from exc
     except subprocess.TimeoutExpired as exc:
-        raise CheckFailure(f"{cwd.name}: command exceeded {timeout}s") from exc
+        raise failure(cwd, f"command exceeded {timeout}s") from exc
     except OSError as exc:
         raise CheckFailure(f"{cwd.name}: cannot execute {command[0]}") from exc
+
+
+def run_with_traceback_on_timeout(command: list[str], cwd: Path, *, env: dict[str, str] | None,
+                                  timeout: int) -> None:
+    """Run a Python check; on timeout ask faulthandler for tracebacks, then kill."""
+    try:
+        process = subprocess.Popen(command, cwd=cwd, env=env)
+    except OSError as exc:
+        raise CheckFailure(f"{cwd.name}: cannot execute {command[0]}") from exc
+    try:
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.send_signal(signal.SIGABRT)
+            try:
+                process.wait(timeout=TRACEBACK_GRACE)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise failure(cwd, f"command exceeded {timeout}s; sent SIGABRT for a faulthandler "
+                               f"traceback ({describe_exit(process.returncode)})") from None
+    finally:
+        if process.returncode is None:
+            process.kill()
+            process.wait()
+    if returncode != 0:
+        raise failure(cwd, f"command failed ({describe_exit(returncode)})")
 
 
 def read_toml(path: Path) -> dict:
@@ -168,13 +220,16 @@ def python_checks(component: Path, config: dict) -> None:
             "PIP_DISABLE_PIP_VERSION_CHECK": "1",
             "PIP_NO_INPUT": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
+            # Equivalent to python -X faulthandler: a crash, fatal signal or
+            # the SIGABRT sent on timeout writes every thread's traceback.
+            "PYTHONFAULTHANDLER": "1",
         })
         run([
             str(venv / "bin/python"), "-m", "pip", "install", "--require-hashes",
             "--only-binary=:all:", "--requirement", "requirements-ci.lock",
         ], component, env=env)
         for name in ("lint", "test"):
-            run(config["checks"][name], component, env=env)
+            run(config["checks"][name], component, env=env, traceback_on_timeout=True)
 
 
 def node_checks(component: Path) -> None:

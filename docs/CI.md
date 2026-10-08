@@ -109,6 +109,14 @@ location stores its own immutable pin evidence in that same record, so a lockfil
 SHA256/SRI or resolved artifact URL that changes while the version string stays
 the same is a gate failure.
 
+Each command has a 600-second limit. The Python `lint` and `test` commands run
+with `PYTHONFAULTHANDLER=1` (equivalent to `python -X faulthandler`). When one
+exceeds the limit, CI sends it `SIGABRT`, so faulthandler writes every thread's
+traceback, and kills it if it has not exited 15 seconds later. A failure
+message starts on its own line, after any unterminated `unittest -v` progress
+line, and names the exit code and, for a signal-terminated command, the signal
+(for example `exit -9, terminated by SIGKILL`).
+
 Node components require `package.json`, `package-lock.json`, and nonempty `lint`
 and `test` scripts. CI runs `npm ci --ignore-scripts --no-audit --no-fund`,
 `npm run lint`, and `npm run test`. Their `ci.toml` requires the same version and
