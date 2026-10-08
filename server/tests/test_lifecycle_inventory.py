@@ -38,6 +38,13 @@ TOKEN_DIGEST = bytes(range(32, 64))
 CREDENTIAL_ID = b"synthetic-credential-id-marker"
 CREDENTIAL_LABEL = "synthetic-credential-label-marker"
 BINDING_DIGEST = bytes(range(64, 96))
+# Model provenance as OwnerTemplateStore._replace() encodes it; every value is
+# a generated placeholder, never a real model, license or review.
+OWNER_PROVENANCE = json.dumps({
+    "model": "synthetic-provenance-marker", "version": "0", "code_license": "synthetic",
+    "weights_license": "synthetic", "upstream": "synthetic", "artifact_sha256": "a" * 64,
+    "comparison_policy_sha256": "b" * 64,
+    "review_id": "00000000-0000-4000-8000-0000000000bb"}, separators=(",", ":"))
 
 
 # Issue #136: stage_renewal() stores the issued certificate PEM, whose DER
@@ -326,7 +333,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             if template is not None:
                 connection.execute(
                     "UPDATE owner_template SET generation=1, template=?, "
-                    "provenance='synthetic-provenance-marker' WHERE singleton=1", (template,))
+                    "provenance=? WHERE singleton=1", (template, OWNER_PROVENANCE))
                 for operation in ("ENROLL", "REPLACE"):
                     connection.execute(
                         "INSERT INTO owner_template_audit(at, actor, operation, generation) "
@@ -515,8 +522,21 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         failed = report["sections"]["access_invitations"]["failed"]
-        for invitation_id in recorded:
-            self.assertIn({"id": invitation_id, "reason": "changed"}, failed)
+        # #161: the known side effect of a session revocation keeps failing
+        # but under its own reason, apart from any other change.
+        self.assertTrue(any(item["deployment_generation_current"]
+                            for item in recorded.values()))
+        for invitation_id, item in recorded.items():
+            if item["deployment_generation_current"]:
+                self.assertIn({"id": invitation_id, "reason": "generation_advanced"}, failed)
+        # Any further change to such an invitation is an ordinary change.
+        changed = next(key for key, item in recorded.items()
+                       if item["deployment_generation_current"])
+        self.runtime.execute("UPDATE access_invitations SET attempt_count=attempt_count+1 "
+                             "WHERE id=?", (changed,))
+        code, report, _ = self.verify(baseline)
+        self.assertIn({"id": changed, "reason": "changed"},
+                      report["sections"]["access_invitations"]["failed"])
 
     def test_camera_source_configuration_and_approval_are_preserved_privately(self):
         self.runtime.seed()
@@ -1006,6 +1026,54 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(unconfigured)
         self.assertEqual(code, inventory.EXIT_PRESERVED)
         self.assertEqual(report["sections"]["owner_template"]["status"], "not_configured")
+
+    def test_owner_template_row_the_store_cannot_load_is_never_healthy(self):
+        # #159: OwnerTemplateStore._load_for_verification() refuses a row
+        # whose template is not a non-empty BLOB within the size limit, whose
+        # provenance does not load or whose generation is not a non-negative
+        # integer (PRIVATE_TEMPLATE_STATE_INVALID). bytes(1) must never pass
+        # for a one-byte template.
+        self.runtime.seed()
+        root = self.owner_template_root(template=b"synthetic-owner-template-marker")
+        option = ("--owner-template-root", str(root))
+        code, good = self.record("good.json", *option)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        database = root / "owner-template.sqlite3"
+        original = database.read_bytes()
+        cases = {
+            "integer template": ("template=?", 1),
+            "text template": ("template=?", "synthetic-text-template"),
+            "empty template": ("template=?", b""),
+            "oversized template": ("template=?",
+                                   bytes(owner_store.MAX_TEMPLATE_BYTES_CEILING + 1)),
+            "provenance not JSON": ("provenance=?", "synthetic-provenance-marker"),
+            "provenance missing a field": ("provenance=?", json.dumps({"model": "x"})),
+            "provenance missing": ("provenance=?", None),
+            "negative generation": ("generation=?", -1),
+            "text generation": ("generation=?", "synthetic"),
+        }
+        for label, (assignment, value) in cases.items():
+            with self.subTest(label):
+                database.write_bytes(original)
+                with closing(sqlite3.connect(database, isolation_level=None)) as connection:
+                    connection.execute(f"UPDATE owner_template SET {assignment} "
+                                       "WHERE singleton=1", (value,))
+                self.assert_record_refused("owner_template:invalid_value=1", *option)
+                code, report, _ = self.verify(good, *option)
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertIn({"id": "template", "reason": "invalid_value"},
+                              report["sections"]["owner_template"]["failed"])
+        with self.subTest("missing singleton row"):
+            database.write_bytes(original)
+            with closing(sqlite3.connect(database, isolation_level=None)) as connection:
+                connection.execute("DELETE FROM owner_template")
+            self.assert_record_refused("owner_template:invalid_value=1", *option)
+        # An unenrolled row (both NULL, as the store's delete leaves it) is valid.
+        database.write_bytes(original)
+        with closing(sqlite3.connect(database, isolation_level=None)) as connection:
+            connection.execute("UPDATE owner_template SET template=NULL, provenance=NULL")
+        code, _ = self.record("unenrolled.json", *option)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
 
     def test_unloadable_uvc_approval_evidence_is_never_preserved(self):
         # ApprovalStore._state() refuses evidence without by_id / formats, with
@@ -2899,6 +2967,49 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(stale)
         self.assertEqual(code, inventory.EXIT_FAILED)
 
+    def test_outbox_opening_during_the_snapshot_refuses_the_baseline(self):
+        # #162: the copied stale session row and the lock probe must be one
+        # observation. An outbox opening right after the snapshot converts
+        # the stale row into an interrupted gap and holds the committed lock;
+        # a single later probe would call the copied stale row held, and a
+        # removal of both the gap and the rows would then verify preserved.
+        self.runtime.seed()
+        @contextmanager
+        def reservation():
+            yield
+        service = PresenceService(Database(self.runtime.database), reservation=reservation)
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        stale, _ = service.open_timeline_session(now=now)
+        stale.release()
+        sessions = []
+        snapshot = inventory._snapshot
+
+        def racing_snapshot(database):
+            copy = snapshot(database)
+            if not sessions:
+                sessions.append(service.open_timeline_session(now=now)[0])
+            return copy
+        target = self.notes / "raced.json"
+        try:
+            with mock.patch.object(inventory, "_snapshot", racing_snapshot):
+                code, _, stderr = run("record", "--runtime-root", str(self.runtime.root),
+                                      "--output", str(target))
+        finally:
+            for session in sessions:
+                session.release()
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(code, inventory.EXIT_USAGE, stderr)
+        self.assertIn("presence outbox started or stopped", stderr)
+        self.assertFalse(target.exists())
+        # A settled outbox (held throughout) is still recorded as held.
+        session, _ = service.open_timeline_session(now=now)
+        try:
+            code, held = self.record("held.json")
+        finally:
+            service.record_timeline_gap(now=now, close=session)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.assertTrue(json.loads(held.read_text())["presence"]["outbox_live"])
+
     def test_presence_delivery_jobs_only_move_forward(self):
         self.runtime.seed()
         ids = self.presence_rows()
@@ -4770,7 +4881,10 @@ class LifecycleInventoryTests(unittest.TestCase):
             "(SELECT segment_id FROM recording_links WHERE recording_id=?)",
             (hashlib.sha256(rewritten).hexdigest(), seeded["ordinary"]))
         code, report, _ = self.verify(baseline, "--declared-rewrite", seeded["ordinary"])
-        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        # #161: manual re-verification is still due, so never the success
+        # exit status of a plain preserved result.
+        self.assertEqual(code, inventory.EXIT_DECLARED_REWRITES)
+        self.assertNotEqual(inventory.EXIT_DECLARED_REWRITES, inventory.EXIT_PRESERVED)
         self.assertEqual(report["status"], "preserved_except_declared_rewrites")
         self.assertEqual(report["sections"]["recordings"]["declared_rewrites"],
                          [seeded["ordinary"]])
@@ -4950,7 +5064,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             "(SELECT segment_id FROM recording_links WHERE recording_id=?)",
             (hashlib.sha256(rewritten).hexdigest(), len(rewritten), seeded["ordinary"]))
         code, report, _ = self.verify(baseline, "--declared-rewrite", seeded["ordinary"])
-        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.assertEqual(code, inventory.EXIT_DECLARED_REWRITES)
         self.assertEqual(report["sections"]["recordings"]["declared_rewrites"],
                          [seeded["ordinary"]])
 
@@ -5697,13 +5811,18 @@ class LifecycleInventoryTests(unittest.TestCase):
         with closing(sqlite3.connect(self.runtime.database)) as db:
             self.assertEqual(db.execute("SELECT state, spool FROM recording_segments WHERE id=?",
                                         (str(linked),)).fetchone(), ("ready", 0))
+        # #165: an advanced cursor must be active as _publish() leaves it, so
+        # a release after a publication inside the window (Main never calls
+        # release_source()) fails closed on the cursor alone.
+        cursor = {"id": f"cursor:{source}", "reason": "cursor_changed"}
         code, report, _ = self.verify(baseline)
-        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["recordings"]["failed"], [cursor])
         self.runtime.execute("DELETE FROM recording_links WHERE segment_id=?", (str(linked),))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertEqual(report["sections"]["recordings"]["failed"],
-                         [{"id": str(recording), "reason": "changed"}])
+                         [{"id": str(recording), "reason": "changed"}, cursor])
 
     def test_a_published_segment_never_becomes_pending(self):
         # Codex P1: RecordingStore._recover() deletes every pending row and
@@ -6130,17 +6249,26 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertIn(expected, report["sections"]["recordings"]["failed"])
         # Publication-shaped advances (segment since evicted) are accepted:
-        # the same stream with a higher sequence, or another stream.
+        # the same stream with a higher sequence, or another stream, always
+        # with the cursor active as _publish() leaves it. The same advance
+        # left inactive (#165) is no publication: append() would not count
+        # the source against RECORDING_SOURCE_LIMIT.
         for label, sql, values in (
                 ("same stream, next sequence", "sequence=sequence+1", ()),
                 ("another stream", "stream_id=?, sequence=0", (str(uuid4()),))):
-            with self.subTest(label):
-                self.runtime.database.write_bytes(original)
-                self.runtime.execute(f"UPDATE recording_source_cursors SET end_ms=end_ms+1, "
-                                     f"{sql} WHERE source_id=?", (*values, str(source)))
-                code, report, _ = self.verify(baseline)
-                self.assertEqual(code, inventory.EXIT_PRESERVED,
-                                 report["sections"]["recordings"])
+            for active in (1, 0):
+                with self.subTest(label, active=active):
+                    self.runtime.database.write_bytes(original)
+                    self.runtime.execute(
+                        f"UPDATE recording_source_cursors SET end_ms=end_ms+1, active=?, "
+                        f"{sql} WHERE source_id=?", (active, *values, str(source)))
+                    code, report, _ = self.verify(baseline)
+                    if active:
+                        self.assertEqual(code, inventory.EXIT_PRESERVED,
+                                         report["sections"]["recordings"])
+                    else:
+                        self.assertEqual(code, inventory.EXIT_FAILED)
+                        self.assertIn(expected, report["sections"]["recordings"]["failed"])
         self.runtime.database.write_bytes(original)
 
 if __name__ == "__main__":

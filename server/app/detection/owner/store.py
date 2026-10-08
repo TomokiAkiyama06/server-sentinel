@@ -25,6 +25,8 @@ _MIGRATIONS = (Migration(1, "private_owner_template", (
 
 DEFAULT_AUDIT_RETENTION = timedelta(days=90)
 DEFAULT_AUDIT_CLEANUP_BATCH_SIZE = 500
+# The largest max_template_bytes a store accepts.
+MAX_TEMPLATE_BYTES_CEILING = 1048576
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,29 @@ class _Template:
     generation: int
     data: bytes = field(repr=False)
     provenance: ModelProvenance = field(repr=False)
+
+
+def read_template_row(generation, template, provenance, *, max_bytes: int) -> _Template | None:
+    """The store's read model of its singleton row: None when not enrolled.
+
+    Raises PRIVATE_TEMPLATE_STATE_INVALID for any row the store never
+    writes: a generation that is not a non-negative integer, a template that
+    is not a non-empty BLOB within ``max_bytes``, or provenance that does not
+    load as ModelProvenance. Shared with the read-only lifecycle inventory so
+    both judge the same row the same way.
+    """
+    try:
+        if type(generation) is not int or generation < 0:
+            raise OwnerError("PRIVATE_TEMPLATE_STATE_INVALID")
+        if template is None:
+            return None
+        data = json.loads(provenance)
+        data["review_id"] = UUID(data["review_id"])
+        if type(template) is not bytes or not 0 < len(template) <= max_bytes:
+            raise OwnerError("PRIVATE_TEMPLATE_STATE_INVALID")
+        return _Template(generation, template, ModelProvenance(**data))
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise OwnerError("PRIVATE_TEMPLATE_STATE_INVALID") from None
 
 
 def _unsubstitutable(descriptor, owner=None):
@@ -151,7 +176,8 @@ class OwnerTemplateStore:
     def __init__(self, root: Path, *, max_template_bytes: int, reservation, authorizer=None,
                  audit_retention: timedelta = DEFAULT_AUDIT_RETENTION,
                  cleanup_batch_size: int = DEFAULT_AUDIT_CLEANUP_BATCH_SIZE):
-        if type(max_template_bytes) is not int or not 0 < max_template_bytes <= 1048576:
+        if (type(max_template_bytes) is not int
+                or not 0 < max_template_bytes <= MAX_TEMPLATE_BYTES_CEILING):
             raise ValueError("INVALID_TEMPLATE_LIMIT")
         if (not isinstance(audit_retention, timedelta) or audit_retention <= timedelta(0)
                 or type(cleanup_batch_size) is not int
@@ -350,12 +376,9 @@ class OwnerTemplateStore:
             row = self._db.execute("SELECT generation,template,provenance FROM owner_template WHERE singleton=1").fetchone()
             if row is None or row["template"] is None:
                 return None
-            data = json.loads(row["provenance"])
-            data["review_id"] = UUID(data["review_id"])
-            if type(row["template"]) is not bytes or not 0 < len(row["template"]) <= self._max_bytes:
-                raise OwnerError("PRIVATE_TEMPLATE_STATE_INVALID")
-            return _Template(row["generation"], row["template"], ModelProvenance(**data))
-        except (sqlite3.Error, ValueError, TypeError, KeyError):
+            return read_template_row(row["generation"], row["template"], row["provenance"],
+                                     max_bytes=self._max_bytes)
+        except sqlite3.Error:
             raise OwnerError("PRIVATE_TEMPLATE_STATE_INVALID") from None
 
     def _authorize(self, operation: Operation) -> UUID:

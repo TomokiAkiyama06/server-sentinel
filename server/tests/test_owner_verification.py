@@ -155,6 +155,22 @@ class OwnerTests(TestCase):
         self.assertFalse(self.store.status().enrolled)
         self.assertEqual(self.store.status().generation, 3)
 
+    def test_read_model_refuses_rows_the_store_never_writes(self):
+        # #159: the read model the lifecycle inventory shares; an integer
+        # template must never load as bytes(1).
+        self.enroll()
+        for assignment, value in (("template=?", 1), ("template=?", "synthetic-text"),
+                                  ("generation=?", -1), ("generation=?", "synthetic"),
+                                  ("provenance=?", "{")):
+            with self.subTest(assignment, value=value):
+                self.store._db.execute("SAVEPOINT broken")
+                self.store._db.execute(f"UPDATE owner_template SET {assignment}", (value,))
+                with self.assertRaisesRegex(OwnerError, "PRIVATE_TEMPLATE_STATE_INVALID"):
+                    self.store._load_for_verification()
+                self.store._db.execute("ROLLBACK TO broken")
+                self.store._db.execute("RELEASE broken")
+        self.assertIsNotNone(self.store._load_for_verification())
+
     def test_private_audit_retention_is_bounded_and_preserves_template(self):
         retention_now = datetime.now(timezone.utc)
         self.assertEqual(self.service.enroll(
