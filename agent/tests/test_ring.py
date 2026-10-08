@@ -39,7 +39,12 @@ class Quota:
         self.root, self.capacity, self.other = root, capacity, 0
 
     def used(self):
-        return sum(path.stat().st_blocks * 512 for path in self.root.glob("*.segment"))
+        # Called on every free-space check, so each scan touches every
+        # retained segment: os.scandir avoids pathlib's per-path overhead,
+        # which dominated long ring simulations (Issue #179).
+        with os.scandir(self.root) as entries:
+            return sum(os.stat(entry.path).st_blocks * 512 for entry in entries
+                       if entry.name.endswith(".segment"))
 
     def __call__(self, descriptor):
         actual = os.fstatvfs(descriptor)
