@@ -822,11 +822,17 @@ capture clock regression is measured against the committed unit and the
 latest capture time observed on a refused unit of that epoch, so it is
 reported also before anything of the epoch commits; the epoch of a unit
 refused because the watermark lookup failed is kept when the lookup later
-succeeds, even when nothing durable exists. That refused unit's capture time
-is kept as well, unless the resolved watermark is of the same epoch and
-either covers every such refused unit or is not earlier in capture time, in
-which case the watermark alone is the baseline (as after a commit), so a
-duplicate retry leaves the source durably covered. Activity time is re-sampled
+succeeds, even when nothing durable exists. The capture times of those
+refused units are kept as well, each associated with its sequence, except
+that a resolved watermark of the same epoch supersedes (as a commit would)
+every refused unit at or before its sequence and every one not later than its
+capture time: the baseline is then the latest capture time among the refused
+units past the watermark only, so a time observed on a covered unit never
+reports a spurious regression, and when none remains the watermark alone is
+the baseline, so a duplicate retry leaves the source durably covered. This
+association is hard-bounded per source; when the bound is reached, the oldest
+entries are merged conservatively (the later capture time is kept), which can
+report a spurious regression but never hides one. Activity time is re-sampled
 after the lookup and after admission so a slow durable lookup cannot make a
 just-accepted flow read `interrupted`. A node that owns no tracked source
 and whose session is closed, invalidated or stale does not keep a slot.

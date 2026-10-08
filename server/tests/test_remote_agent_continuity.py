@@ -10,7 +10,7 @@ from uuid import UUID
 
 from app.cameras.remote_agent.continuity import (
     AgentSession, CommittedWatermark, ContinuityLimits, ContinuityTracker, DeliveryOutcome,
-    GapReason, MediaUnitHeader, SourceFlow,
+    GapReason, MediaUnitHeader, SourceFlow, _MAXIMUM_ATTEMPT_STEPS, _record_attempt,
 )
 from app.cameras.remote_agent.ingest import (
     AgentAction, AgentIngestQueue, AgentMessage, DenyIngestAuthorizer, IngestLimits,
@@ -2053,6 +2053,168 @@ class ContinuityTrackerTests(unittest.TestCase):
         follow = tracker.receive(session, unit(7, at=65), b"v")
         self.assertEqual([GapReason.CAPTURE_CLOCK_REGRESSION],
                          [g.reason for g in follow.gaps])
+
+    @staticmethod
+    def _gap_summary(gaps):
+        return [(g.reason, g.after_sequence, g.before_sequence, g.missing_units)
+                for g in gaps]
+
+    def test_watermark_equality_boundaries_drop_the_attempted_baseline(self):
+        # PR #166 review: a mark exactly at the highest attempted sequence,
+        # or exactly at the latest uncovered attempted capture time,
+        # supersedes the baseline, so churn keeps no released entry.
+        cases = {
+            # Covers the highest refused sequence exactly, earlier in time.
+            "mark_at_highest_attempted_sequence": (
+                CommittedWatermark(NODE, 1, 7, 60), (unit(5, at=50), unit(7, at=70))),
+            # Unit 7 is not covered, but is not later than the mark's time.
+            "mark_at_uncovered_attempted_time": (
+                CommittedWatermark(NODE, 1, 6, 70), (unit(5, at=50), unit(7, at=70))),
+        }
+        for name, (mark, attempts) in cases.items():
+            with self.subTest(case=name):
+                tracker, ingest, authorizer, session, result = \
+                    self._resolve_after_outage(mark, attempts, attempts[0])
+                self.assertEqual(DeliveryOutcome.DUPLICATE, result.outcome)
+                self.assertEqual(DeliveryOutcome.ACCEPTED, tracker.receive(
+                    session, unit(0, source=OTHER_SOURCE), b"o").outcome)
+                ingest.drain(10)
+                self._cycle(tracker, authorizer, OTHER_SOURCE)
+                for _ in range(3):
+                    self.assertEqual((), self._cycle(tracker, authorizer, SOURCE))
+                    self.assertEqual(DeliveryOutcome.DUPLICATE,
+                                     tracker.receive(session, attempts[0], b"v").outcome)
+                # OTHER_SOURCE's unpersisted continuity survived the churn.
+                retry = tracker.receive(session, unit(0, source=OTHER_SOURCE), b"o")
+                self.assertEqual(DeliveryOutcome.DUPLICATE, retry.outcome)
+                self.assertEqual(0, ingest.snapshot().queued_messages)
+        # Covered exactly at the highest sequence: a later unit after the
+        # mark's capture time is no regression.
+        tracker, _, _, session, _ = self._resolve_after_outage(
+            CommittedWatermark(NODE, 1, 7, 60), (unit(5, at=50), unit(7, at=70)),
+            unit(5, at=50))
+        follow = tracker.receive(session, unit(8, at=65), b"v")
+        self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (follow.outcome, follow.gaps))
+
+    def test_partially_covered_attempts_keep_only_the_uncovered_baseline(self):
+        # Issue #171: refused (seq 5, time 100) and (seq 7, time 95); the
+        # resolved mark (seq 6, time 90) covers unit 5 only, so time 100 is
+        # superseded and the baseline is unit 7's time 95.
+        mark = CommittedWatermark(NODE, 1, 6, 90)
+        attempts = (unit(5, at=100), unit(7, at=95))
+        for order in ("forward", "reverse"):
+            with self.subTest(order=order):
+                refused = attempts if order == "forward" else attempts[::-1]
+                tracker, _, _, session, result = self._resolve_after_outage(
+                    mark, refused, attempts[0])
+                self.assertEqual(DeliveryOutcome.DUPLICATE, result.outcome)
+                follow = tracker.receive(session, unit(8, at=96), b"v")
+                self.assertEqual(DeliveryOutcome.ACCEPTED, follow.outcome)
+                self.assertEqual([(GapReason.SEQUENCE_SKIP, 6, 8, 1)],
+                                 self._gap_summary(follow.gaps))
+                # The uncovered attempt stays the baseline: a unit behind its
+                # time 95 is still a genuine regression.
+                tracker, _, _, session, _ = self._resolve_after_outage(
+                    mark, refused, attempts[0])
+                follow = tracker.receive(session, unit(8, at=93), b"v")
+                self.assertEqual([(GapReason.SEQUENCE_SKIP, 6, 8, 1),
+                                  (GapReason.CAPTURE_CLOCK_REGRESSION, 6, 8, 0)],
+                                 self._gap_summary(follow.gaps))
+
+    def test_uncovered_attempt_not_later_than_the_mark_time_is_dropped(self):
+        # Of the attempts past the mark only those later than the mark's
+        # capture time stay: (7, 95) is behind the mark's time 97, and the
+        # covered (5, 100) is superseded.
+        tracker, _, _, session, result = self._resolve_after_outage(
+            CommittedWatermark(NODE, 1, 6, 97), (unit(5, at=100), unit(7, at=95)),
+            unit(5, at=100))
+        self.assertEqual(DeliveryOutcome.DUPLICATE, result.outcome)
+        follow = tracker.receive(session, unit(8, at=98), b"v")
+        self.assertEqual([(GapReason.SEQUENCE_SKIP, 6, 8, 1)],
+                         self._gap_summary(follow.gaps))
+
+    def test_release_carries_the_attempted_sequences(self):
+        # PR #166 review: a source released while its watermark is still
+        # unresolved carries the refused units' sequences (with their
+        # capture times), so a mark resolved after reactivation still
+        # supersedes exactly the attempts it covers.
+        cases = (
+            # Covers every attempt (seq 7) though earlier in time.
+            (CommittedWatermark(NODE, 1, 7, 60), (unit(5, at=50), unit(7, at=70)),
+             65, []),
+            # Covers unit 5 only: unit 7's time 95 stays the baseline.
+            (CommittedWatermark(NODE, 1, 6, 90), (unit(5, at=100), unit(7, at=95)),
+             96, [(GapReason.SEQUENCE_SKIP, 6, 8, 1)]),
+            (CommittedWatermark(NODE, 1, 6, 90), (unit(5, at=100), unit(7, at=95)),
+             93, [(GapReason.SEQUENCE_SKIP, 6, 8, 1),
+                  (GapReason.CAPTURE_CLOCK_REGRESSION, 6, 8, 0)]),
+        )
+        for mark, attempts, follow_at, expected in cases:
+            with self.subTest(mark=mark, follow_at=follow_at):
+                state = {"broken": True}
+
+                def lookup(source_id, mark=mark, state=state):
+                    if source_id != SOURCE:
+                        return None
+                    if state["broken"]:
+                        raise OSError("durable store unavailable")
+                    return mark
+                tracker, _, authorizer, session = self._shared_refusing_tracker(
+                    watermark=lookup)
+                for header in attempts:
+                    self.assertEqual("watermark_unavailable",
+                                     tracker.receive(session, header, b"v").reason)
+                self.assertEqual((), self._cycle(tracker, authorizer, SOURCE))
+                state["broken"] = False
+                self.assertEqual(DeliveryOutcome.DUPLICATE,
+                                 tracker.receive(session, attempts[0], b"v").outcome)
+                follow = tracker.receive(session, unit(8, at=follow_at), b"v")
+                self.assertEqual(DeliveryOutcome.ACCEPTED, follow.outcome)
+                self.assertEqual(expected, self._gap_summary(follow.gaps))
+
+
+class AttemptStaircaseTests(unittest.TestCase):
+    """The bounded (sequence, capture time) record of refused attempts."""
+
+    @staticmethod
+    def _latest_after(steps, sequence):
+        return max((at for s, at in steps if s > sequence), default=None)
+
+    def test_keeps_the_latest_time_after_every_sequence(self):
+        attempts = [(5, 100), (7, 95), (6, 90), (7, 80), (3, 120), (9, 70), (5, 101)]
+        steps = ()
+        for sequence, at in attempts:
+            steps = _record_attempt(steps, sequence, at)
+        self.assertEqual(((3, 120), (5, 101), (7, 95), (9, 70)), steps)
+        for covered in range(0, 11):
+            exact = max((at for s, at in attempts if s > covered), default=None)
+            self.assertEqual(exact, self._latest_after(steps, covered))
+
+    def test_bound_merges_conservatively(self):
+        # Every later refused unit carries an earlier capture time (each one
+        # is itself a clock regression), so no step dominates another.
+        attempts = [(sequence, 1000 - sequence) for sequence in range(1, 31)]
+        steps = ()
+        for sequence, at in attempts:
+            steps = _record_attempt(steps, sequence, at)
+            self.assertLessEqual(len(steps), _MAXIMUM_ATTEMPT_STEPS)
+            self.assertEqual(sorted(steps), list(steps))
+            self.assertEqual(sorted({at for _, at in steps}, reverse=True),
+                             [at for _, at in steps])
+        self.assertEqual(attempts[-1][0], steps[-1][0])
+        self.assertEqual(max(at for _, at in attempts), steps[0][1])
+        for covered in range(0, 32):
+            exact = max((at for s, at in attempts if s > covered), default=None)
+            kept = self._latest_after(steps, covered)
+            # Never earlier than the exact baseline (no hidden regression),
+            # and exact for the most recent attempts.
+            if exact is None:
+                self.assertIsNone(kept)
+            else:
+                self.assertGreaterEqual(kept, exact)
+                if covered >= attempts[-1][0] - _MAXIMUM_ATTEMPT_STEPS + 1:
+                    self.assertEqual(exact, kept)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,33 @@ _MAXIMUM_COUNTER = 2 ** 63 - 1
 _PERMANENT_INGEST_REFUSALS = frozenset({"message_too_large"})
 # A committed-watermark lookup that raised; distinct from "nothing recorded".
 _UNAVAILABLE = object()
+# Hard bound on the refused-attempt staircase kept per source (``_Source``).
+_MAXIMUM_ATTEMPT_STEPS = 8
+
+
+def _record_attempt(steps: tuple[tuple[int, int], ...], sequence: int,
+                    at: int) -> tuple[tuple[int, int], ...]:
+    """Add a refused ``(sequence, capture time)`` to a bounded staircase.
+
+    ``steps`` is ordered by ascending sequence with strictly descending
+    capture time: an attempt is kept only while no other attempt has both a
+    sequence and a capture time at least as large, so the latest capture time
+    after any sequence is that of the first step past it.  It grows only when
+    a later refused sequence carries an earlier capture time.  Beyond
+    ``_MAXIMUM_ATTEMPT_STEPS`` the two lowest steps are merged into the
+    higher sequence with the later time: a watermark covering only the lower
+    one then keeps the later time as baseline (a possible spurious regression
+    report, never a hidden one).
+    """
+    if any(s >= sequence and t >= at for s, t in steps):
+        return steps
+    kept = [(s, t) for s, t in steps if not (s <= sequence and t <= at)]
+    kept.append((sequence, at))
+    kept.sort()
+    if len(kept) > _MAXIMUM_ATTEMPT_STEPS:
+        (_, later), (higher, _) = kept[0], kept[1]
+        kept[:2] = [(higher, later)]
+    return tuple(kept)
 
 
 class DeliveryOutcome(str, Enum):
@@ -224,13 +251,16 @@ class _Source:
     ``attempted_epoch`` is the highest epoch of a unit refused by pressure, a
     transient refusal or an unavailable watermark; a lower epoch is stale even
     before that unit commits, so a restart already observed is never lost to
-    an older-epoch retry.  ``attempted_time_ns`` is the latest capture time
-    observed on such a refused unit of ``attempted_epoch`` since the last
-    commit (None: none), so an in-epoch capture clock regression is reported
-    even before anything of that epoch is committed; ``attempted_sequence``
-    is the highest sequence among those refused units (None with
-    ``attempted_time_ns``), so a durable watermark that covers every one of
-    them supersedes that baseline like a commit does.
+    an older-epoch retry.  ``attempts`` keeps the ``(sequence, capture time)``
+    of such refused units of ``attempted_epoch`` since the last commit (empty:
+    none) as a bounded staircase (``_record_attempt``): ascending sequence,
+    strictly descending capture time, so for any sequence it gives the latest
+    capture time among the refused units after it (never earlier than the
+    exact value).  Its latest capture time (``attempted_time_ns``) is the
+    in-epoch clock baseline, so a capture clock regression is reported even
+    before anything of that epoch is committed; a durable watermark resolved
+    later supersedes only the attempts it covers (``_attempts_beyond``), like
+    a commit does.
     ``noted_epoch``/``noted_before`` record known loss (a capture restart or
     skipped sequences) that was already reported when a refused unit of that
     epoch first showed it: every uncommitted unit of ``noted_epoch`` before
@@ -258,13 +288,17 @@ class _Source:
     gaps: deque = field(default_factory=deque)
     session_generation: int = 0
     attempted_epoch: int = 0
-    attempted_time_ns: int | None = None
-    attempted_sequence: int | None = None
+    attempts: tuple[tuple[int, int], ...] = ()
     noted_epoch: int = 0
     noted_before: int | None = None
     unresolved: bool = False
     durable_epoch: int = 0
     durable_sequence: int | None = None
+
+    @property
+    def attempted_time_ns(self) -> int | None:
+        """Latest capture time of a refused attempt (None: none)."""
+        return self.attempts[0][1] if self.attempts else None
 
 
 @dataclass
@@ -617,15 +651,11 @@ class ContinuityTracker:
         ``header.capture_epoch`` is never below ``attempted_epoch`` here; an
         older one is ignored defensively.
         """
-        epoch, at = header.capture_epoch, header.capture_time_ns
+        epoch = header.capture_epoch
         if epoch < state.attempted_epoch:
             return
-        if epoch > state.attempted_epoch or state.attempted_time_ns is None:
-            state.attempted_time_ns = at
-            state.attempted_sequence = header.sequence
-        else:
-            state.attempted_time_ns = max(state.attempted_time_ns, at)
-            state.attempted_sequence = max(state.attempted_sequence, header.sequence)
+        kept = state.attempts if epoch == state.attempted_epoch else ()
+        state.attempts = _record_attempt(kept, header.sequence, header.capture_time_ns)
         state.attempted_epoch = epoch
 
     def _observe_loss(self, state: _Source, checked: tuple[GapEvent, ...],
@@ -830,7 +860,7 @@ class ContinuityTracker:
             state.last_sequence = header.sequence
             state.last_capture_time_ns = header.capture_time_ns
             # Attempts up to this commit are superseded by the committed unit.
-            state.attempted_time_ns = state.attempted_sequence = None
+            state.attempts = ()
             self._seen(state, now)
             state.session_generation = node.generation
             self._seen(node, now)
@@ -853,13 +883,14 @@ class ContinuityTracker:
         times) of the units it refused were attempted: they are kept, so a
         lower epoch is still stale and an in-epoch clock regression is still
         reported, whether or not the durable store recorded anything.
-        A watermark of the attempted epoch that covers every refused unit
-        (at or past the highest attempted sequence), or whose capture time is
-        not earlier than any of them, supersedes that capture-time baseline as
-        a commit would: it is dropped, so a duplicate retry leaves the source
-        durably covered and a release keeps no entry in the bounded released
-        table.  A refused unit past the watermark with a later capture time
-        stays the baseline, so a genuine regression is still reported.
+        A watermark of the attempted epoch supersedes, as a commit would, the
+        refused units it covers (at or before its sequence) and those not
+        later than its capture time: they are dropped, so a duplicate retry
+        of a fully superseded attempt leaves the source durably covered and a
+        release keeps no entry in the bounded released table.  A refused unit
+        past the watermark with a later capture time stays the baseline (the
+        latest such time only, never a covered unit's), so a genuine
+        regression is still reported and a covered one is not.
         """
         attempted = state
         if attempted is not None:
@@ -880,28 +911,25 @@ class ContinuityTracker:
             return None
         if attempted is not None and attempted.attempted_epoch >= state.capture_epoch:
             state.attempted_epoch = attempted.attempted_epoch
-            if not self._mark_supersedes_attempts(mark, attempted):
-                state.attempted_time_ns = attempted.attempted_time_ns
-                state.attempted_sequence = attempted.attempted_sequence
+            state.attempts = self._attempts_beyond(mark, attempted)
         return state
 
     @staticmethod
-    def _mark_supersedes_attempts(mark: CommittedWatermark | None,
-                                  attempted: _Source) -> bool:
-        """Whether a resolved watermark makes the attempted baseline redundant.
+    def _attempts_beyond(mark: CommittedWatermark | None,
+                         attempted: _Source) -> tuple[tuple[int, int], ...]:
+        """The refused attempts a resolved watermark does not supersede.
 
-        Only a watermark of the attempted epoch can: it either durably covers
-        every refused unit (whose clock order the earlier process already
-        checked when committing them), or its capture time is already the
-        larger in-epoch baseline, so dropping the attempted time changes no
-        regression report.  A higher attempted epoch keeps its baseline.
+        Only a watermark of the attempted epoch supersedes any: those at or
+        before its sequence are durably covered (their clock order the
+        earlier process already checked when committing them), and those not
+        later than its capture time add nothing to a baseline that already
+        holds the mark's time, so dropping either changes no genuine
+        regression report.  A higher attempted epoch keeps every attempt.
         """
-        if (mark is None or attempted.attempted_time_ns is None
-                or mark.capture_epoch != attempted.attempted_epoch):
-            return False
-        return ((attempted.attempted_sequence is not None
-                 and mark.sequence >= attempted.attempted_sequence)
-                or mark.capture_time_ns >= attempted.attempted_time_ns)
+        if mark is None or mark.capture_epoch != attempted.attempted_epoch:
+            return attempted.attempts
+        return tuple((sequence, at) for sequence, at in attempted.attempts
+                     if sequence > mark.sequence and at > mark.capture_time_ns)
 
     def _unresolved(self, session: AgentSession, node: _Node, state: _Source | None,
                     header: MediaUnitHeader, now: int) -> Delivery:
@@ -1001,8 +1029,7 @@ class ContinuityTracker:
             state.node_id, state.capture_epoch, state.last_sequence,
             state.last_capture_time_ns, state.last_seen_ns,
             attempted_epoch=state.attempted_epoch,
-            attempted_time_ns=state.attempted_time_ns,
-            attempted_sequence=state.attempted_sequence,
+            attempts=state.attempts,
             noted_epoch=state.noted_epoch, noted_before=state.noted_before,
             unresolved=state.unresolved, durable_epoch=state.durable_epoch,
             durable_sequence=state.durable_sequence)
