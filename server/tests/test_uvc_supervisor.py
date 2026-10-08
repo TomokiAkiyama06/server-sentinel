@@ -99,6 +99,17 @@ class LocalUvcSupervisorTests(unittest.TestCase):
         except WorkerStopError:
             pass
 
+    def test_worker_timing_range_is_validated(self):
+        # Issue #173: the supervisor validates its own join bound against the
+        # deployment upper bound, and non-finite timing is never accepted.
+        LocalUvcSupervisor(SyntheticAdapter(), join_timeout=60.0)
+        for name, value in (("join_timeout", 60.5), ("join_timeout", float("inf")),
+                            ("join_timeout", float("nan")), ("poll_timeout", float("inf")),
+                            ("retry_delay", float("nan")), ("watchdog_interval", 0),
+                            ("join_timeout", True)):
+            with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                LocalUvcSupervisor(SyntheticAdapter(), **{name: value})
+
     def test_repeated_start_keeps_one_serial_worker(self):
         source = uuid4()
         self.adapter.prepare(source)
@@ -183,6 +194,45 @@ class LocalUvcSupervisorTests(unittest.TestCase):
         self.adapter.stop_failures.clear()
         self.adapter.prepare(source)
         self.assertTrue(self.supervisor.start(source))
+
+    def test_close_retry_keeps_reporting_a_removed_workers_cleanup_failure(self):
+        # Claude review on #188: the first close() removes an exited worker
+        # whose stop_source failed while another worker is still hung. The
+        # retry that joins the hung worker must still fail, or the runtime
+        # would report a clean stop.
+        hung, failing = uuid4(), uuid4()
+        released = threading.Event()
+        self.addCleanup(released.set)
+        entered = threading.Event()
+
+        class Adapter(SyntheticAdapter):
+            def poll_source(self, source_id, *, timeout):
+                if source_id == hung:
+                    entered.set()
+                    released.wait(5)
+                else:
+                    time.sleep(0.005)
+                return False
+
+        adapter = Adapter()
+        adapter.stop_failures.add(failing)
+        supervisor = LocalUvcSupervisor(
+            adapter, poll_timeout=0.02, retry_delay=0.005, join_timeout=0.2,
+        )
+        self.addCleanup(lambda: released.set())
+        supervisor.start(hung)
+        supervisor.start(failing)
+        self.assertTrue(entered.wait(1))
+        with self.assertRaisesRegex(WorkerStopError, "did not stop"):
+            supervisor.close()
+        self.assertIsNone(supervisor.status(failing))
+        released.set()
+        self.assertTrue(wait_until(lambda: not supervisor.status(hung).running))
+        with self.assertRaisesRegex(WorkerStopError, "cleanup failed"):
+            supervisor.close()
+        # Still failing once nothing is left registered.
+        with self.assertRaisesRegex(WorkerStopError, "cleanup failed"):
+            supervisor.close()
 
     def test_stop_does_not_discard_concurrent_replacement_worker(self):
         source = uuid4()

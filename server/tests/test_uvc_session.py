@@ -94,6 +94,29 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(len(self.frames), 2)
         self.assertEqual(self.controller.state, CameraState.ONLINE)
 
+    def test_new_serial_instance_on_the_same_path_closes_the_live_capture(self):
+        # Issue #173 item 2: the live check compares the live instance, not
+        # the device path. A serial camera re-enumerated on the same node
+        # (a new instance marker) must close the old descriptor, even though
+        # the old capture still returns frames and the serial still matches.
+        live = replace(self.camera, instance_token=(1, 2, 3))
+        self.discovery.devices = [live]
+        self.assertTrue(self.session.step())
+        self.assertEqual(self.controller.state, CameraState.ONLINE)
+        old_capture = self.session.capture
+        self.discovery.devices = [replace(live, instance_token=(4, 5, 6))]
+        self.rescan_due()
+        self.assertFalse(self.session.step())
+        self.assertTrue(old_capture.closed)
+        self.assertIsNone(self.session.capture)
+        self.assertEqual(["video_capture_closed", "device_disconnected"],
+                         [event.reason for event in self.events[-2:]])
+        # The unique serial reconnects through the identity path on a new
+        # descriptor.
+        self.assertTrue(self.session.step())
+        self.assertIsNot(self.session.capture, old_capture)
+        self.assertEqual(self.controller.state, CameraState.ONLINE)
+
     def test_capture_failure_does_not_escape_worker(self):
         self.session.step()
         self.session.capture.failed = True

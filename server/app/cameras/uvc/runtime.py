@@ -39,6 +39,18 @@ MAX_HEALTH_EVENTS = 256
 # every retry. Log at most one health line per source per interval; the bounded
 # event buffer and the registry still record every transition.
 HEALTH_LOG_INTERVAL_SECONDS = 10.0
+# The optional health sink runs on one delivery thread, never on a capture
+# worker or the watchdog. At most this many events wait for it; on overflow
+# an older event of a source that has a newer one pending is dropped
+# (coalesced), so each source's latest transition is always kept.
+HEALTH_SINK_MAX_PENDING = 64
+# A sink call running longer than this is reported as a stalled delivery and
+# degrades the service state, so a hung sink is never hidden behind
+# ``running``.
+HEALTH_SINK_STALL_SECONDS = 5.0
+# stop() waits at most this long for pending sink deliveries (for example the
+# close/offline transitions raised while stopping) before returning.
+HEALTH_SINK_SETTLE_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -97,6 +109,106 @@ class LocalUvcRuntimeStatus:
     health_events_dropped: int = 0
     health_sink_failures: int = 0
     health_logs_suppressed: int = 0
+    # Events waiting for the optional health sink, events coalesced away
+    # because that bounded queue was full, and whether one sink call has run
+    # longer than ``HEALTH_SINK_STALL_SECONDS`` (the service is then
+    # ``degraded``).
+    health_sink_pending: int = 0
+    health_sink_coalesced: int = 0
+    health_sink_stalled: bool = False
+
+
+class _HealthSinkDelivery:
+    """Bounded, ordered delivery of health events to an optional sink.
+
+    ``submit`` only appends to a bounded queue and never blocks, so neither a
+    capture worker nor the watchdog ever waits for the sink. One daemon
+    thread (started on demand, exiting when the queue is empty) calls the
+    sink in submission order. A sink that hangs therefore holds only that
+    thread; later events wait in the bounded queue, where an older event of a
+    source with a newer pending event is coalesced away on overflow, and the
+    hang is reported through ``snapshot`` instead of looking healthy.
+    """
+
+    def __init__(self, sink, *, max_pending, monotonic, stall_seconds):
+        self._sink = sink
+        self._max_pending = max_pending
+        self._monotonic = monotonic
+        self._stall_seconds = stall_seconds
+        self._lock = threading.Lock()
+        self._pending: deque[HealthEvent] = deque()
+        self._running = False
+        self._in_flight_since = None
+        self._idle = threading.Event()
+        self._idle.set()
+        self.coalesced = 0
+        self.failures = 0
+
+    def _coalesce(self, event):
+        # Called with the lock held and the queue full. Drop the oldest event
+        # of a source that has a later pending (or the incoming) event; with
+        # at most 4 sources and a bound above 4 such an event always exists,
+        # so no source ever loses its latest transition.
+        superseded = 0
+        newer = {event.source_id}
+        for index in range(len(self._pending) - 1, -1, -1):
+            item = self._pending[index]
+            if item.source_id in newer:
+                superseded = index
+            newer.add(item.source_id)
+        del self._pending[superseded]
+        self.coalesced += 1
+
+    def submit(self, event):
+        with self._lock:
+            if len(self._pending) >= self._max_pending:
+                self._coalesce(event)
+            self._pending.append(event)
+            if self._running:
+                return
+            self._running = True
+            self._idle.clear()
+        thread = threading.Thread(target=self._drain, daemon=True,
+                                  name="serversentinel-local-uvc-health-sink")
+        try:
+            thread.start()
+        except BaseException:
+            with self._lock:
+                self._running = False
+                self._idle.set()
+            raise
+
+    def _drain(self):
+        while True:
+            with self._lock:
+                if not self._pending:
+                    self._running = False
+                    self._idle.set()
+                    return
+                event = self._pending.popleft()
+                self._in_flight_since = self._monotonic()
+            try:
+                self._sink(event)
+            except BaseException:
+                # Counted only: exception text may carry private details. Any
+                # escape would leave the queue without a delivery thread.
+                with self._lock:
+                    self.failures += 1
+            finally:
+                with self._lock:
+                    self._in_flight_since = None
+
+    def settle(self, timeout):
+        """Wait at most ``timeout`` for every pending event; True when idle."""
+        return self._idle.wait(timeout)
+
+    def snapshot(self):
+        """(pending, coalesced, failures, stalled) without waiting for the sink."""
+        now = self._monotonic()
+        with self._lock:
+            since = self._in_flight_since
+            stalled = since is not None and now - since >= self._stall_seconds
+            return len(self._pending), self.coalesced, self.failures, stalled
 
 
 class LocalUvcRuntime:
@@ -143,6 +255,11 @@ class LocalUvcRuntime:
         self._sink_failures = 0
         self._monotonic = monotonic
         self._last_logged: dict[UUID, float] = {}
+        self._sink_delivery = (
+            _HealthSinkDelivery(health_sink, max_pending=HEALTH_SINK_MAX_PENDING,
+                                monotonic=monotonic, stall_seconds=HEALTH_SINK_STALL_SECONDS)
+            if health_sink is not None else None
+        )
         self._camera: dict[UUID, CameraState] = {}
         self.health_logs_suppressed = 0
         self._state = LocalUvcRuntimeState.STARTING
@@ -151,6 +268,12 @@ class LocalUvcRuntime:
         self._supervisor = None
         self.adapter = None
         self._started = False
+        # Teardown steps a STOP_FAILED stop could not finish yet. A later
+        # stop() retries them (for example once a watchdog that outlived the
+        # join bound has exited); a worker cleanup failure is not retryable.
+        self._adapter_open = False
+        self._database_pinned = False
+        self._stop_cleanup_failed = False
 
     # -- health events -------------------------------------------------
     def _health(self, event: HealthEvent) -> None:
@@ -201,9 +324,12 @@ class LocalUvcRuntime:
             # The formatter discards all extras; only the fixed event name is
             # logged, never device paths, serials or the source UUID.
             logging.getLogger(__name__).log(level, Event.LOCAL_UVC_SOURCE_HEALTH_CHANGED)
-        if self._health_sink is not None:
+        if self._sink_delivery is not None:
+            # Never call the optional sink here: this runs on a capture
+            # worker (or a delivery thread the watchdog handed off to), and a
+            # slow or hung sink must not stall capture transitions.
             try:
-                self._health_sink(event)
+                self._sink_delivery.submit(event)
             except Exception:
                 with self._events_lock:
                     self._sink_failures += 1
@@ -242,6 +368,7 @@ class LocalUvcRuntime:
                     self._state = LocalUvcRuntimeState.STORAGE_UNADMITTED
                     logging.getLogger(__name__).error(Event.LOCAL_UVC_STORAGE_UNADMITTED)
                     return self.status()
+                self._database_pinned = True
             self._started = True
             try:
                 self.adapter = self._adapter_factory(
@@ -257,6 +384,7 @@ class LocalUvcRuntime:
                     retry_delay=self.configuration.retry_delay_seconds,
                     join_timeout=self.configuration.join_timeout_seconds,
                 )
+                self._adapter_open = True
             except Exception:
                 # No worker exists yet; release what was acquired so a
                 # contained startup failure never keeps the admitted
@@ -278,15 +406,18 @@ class LocalUvcRuntime:
     def _release_database(self) -> bool:
         release = getattr(self.registry.database, "release", None)
         if not callable(release):
+            self._database_pinned = False
             return True
         try:
             release()
         except Exception:
             return False
+        self._database_pinned = False
         return True
 
     def _release_partial_start(self) -> None:
         adapter, self.adapter, self._supervisor = self.adapter, None, None
+        self._adapter_open = False
         if adapter is not None:
             try:
                 adapter.close()
@@ -325,7 +456,12 @@ class LocalUvcRuntime:
         except Exception:
             pass
 
-    def _aggregate(self) -> LocalUvcRuntimeState:
+    def _aggregate(self, sink_stalled: bool | None = None) -> LocalUvcRuntimeState:
+        # ``sink_stalled`` lets ``status()`` derive the state and the reported
+        # ``health_sink_stalled`` from one sink snapshot, so the two never
+        # disagree (e.g. RUNNING next to a stalled sink).
+        if sink_stalled is None:
+            sink_stalled = self._sink_stalled()
         states = set(self._sources.values())
         if states <= {SourceRuntimeState.RUNNING, SourceRuntimeState.STOPPED_FOR_APPROVAL}:
             worker_problem = False
@@ -340,11 +476,16 @@ class LocalUvcRuntime:
                         # A live worker whose health cannot be persisted is
                         # not a healthy service: the registry may be stale.
                         worker_problem = True
-            if not worker_problem:
+            if not worker_problem and not sink_stalled:
                 return LocalUvcRuntimeState.RUNNING
         if SourceRuntimeState.RUNNING not in states:
             return LocalUvcRuntimeState.FAILED
         return LocalUvcRuntimeState.DEGRADED
+
+    def _sink_stalled(self) -> bool:
+        # A hung optional sink means health notifications are not being
+        # delivered: never report that as a healthy service.
+        return self._sink_delivery is not None and self._sink_delivery.snapshot()[3]
 
     def _health_unpersisted(self, source_id: UUID) -> bool:
         check = getattr(self.adapter, "health_unpersisted", None)
@@ -364,9 +505,19 @@ class LocalUvcRuntime:
         marker then conservatively requires Owner reapproval at next start.
         A frame-progress watchdog still inside a check after its bounded join
         likewise fails the stop and keeps the adapter open under that check.
+
+        Such a ``STOP_FAILED`` stop is retryable: a later ``stop()`` joins the
+        supervisor again and, once no worker or watchdog is left that could
+        call into the adapter, closes the adapter (and retries a failed
+        database release). A worker whose own cleanup failed keeps the stop
+        ``STOP_FAILED``. Pending health-sink deliveries get at most
+        ``HEALTH_SINK_SETTLE_SECONDS`` after the teardown.
         """
         with self._lock:
-            if self._state in (LocalUvcRuntimeState.STOPPED, LocalUvcRuntimeState.STOP_FAILED):
+            if self._state is LocalUvcRuntimeState.STOPPED:
+                return self.status()
+            if self._state is LocalUvcRuntimeState.STOP_FAILED and not (
+                    self._adapter_open or self._database_pinned):
                 return self.status()
             if not self._started or self._supervisor is None:
                 # Never started, or startup failed before any worker existed:
@@ -375,29 +526,40 @@ class LocalUvcRuntime:
                 self._state = LocalUvcRuntimeState.STOPPED
                 self._started = True
                 return self.status()
-            failed = False
-            workers_alive = False
-            try:
-                self._supervisor.close()
-            except WorkerStopError:
-                failed = True
-                # A watchdog still inside a frame-progress check may call into
-                # the adapter as well, so it keeps the adapter open too.
-                workers_alive = self._supervisor.watchdog_running or any(
-                    (status := self._supervisor.status(source_id)) is not None and status.running
-                    for source_id in self.configuration.source_ids
-                )
-            except Exception:
-                failed = True
-                workers_alive = True
-            if not workers_alive:
+            failed = self._stop_cleanup_failed
+            if self._adapter_open:
+                workers_alive = False
                 try:
-                    self.adapter.close()
+                    self._supervisor.close()
+                except WorkerStopError:
+                    failed = True
+                    # A watchdog still inside a frame-progress check may call
+                    # into the adapter as well, so it keeps the adapter open
+                    # too.
+                    workers_alive = self._supervisor.watchdog_running or any(
+                        (status := self._supervisor.status(source_id)) is not None
+                        and status.running
+                        for source_id in self.configuration.source_ids
+                    )
+                    if not workers_alive:
+                        # Every thread is gone, so this was a worker's own
+                        # cleanup failure: a retry cannot undo it.
+                        self._stop_cleanup_failed = True
                 except Exception:
+                    failed = True
+                    workers_alive = True
+                if not workers_alive:
+                    self._adapter_open = False
+                    try:
+                        self.adapter.close()
+                    except Exception:
+                        failed = True
+                        self._stop_cleanup_failed = True
+                else:
                     failed = True
             # Drop the held database pin; a worker that outlived the join
             # bound then fails closed instead of reading storage.
-            if not self._release_database():
+            if self._database_pinned and not self._release_database():
                 failed = True
             for source_id, state in tuple(self._sources.items()):
                 if state is not SourceRuntimeState.REJECTED:
@@ -408,7 +570,10 @@ class LocalUvcRuntime:
                 logging.ERROR if failed else logging.INFO,
                 Event.LOCAL_UVC_STOP_FAILED if failed else Event.LOCAL_UVC_STOPPED,
             )
-            return self.status()
+        if self._sink_delivery is not None:
+            # Outside the runtime lock: a hung sink delays only this return.
+            self._sink_delivery.settle(HEALTH_SINK_SETTLE_SECONDS)
+        return self.status()
 
     def reapprove(self, owner_administration, actor_context, source_id: UUID, candidate):
         """Run the audited Owner approval with that source's worker stopped.
@@ -459,13 +624,21 @@ class LocalUvcRuntime:
                     bool(worker and worker.cleanup_failed),
                     camera, not self._health_unpersisted(source_id),
                 ))
+            # One sink snapshot feeds both the aggregate state and the
+            # reported sink fields, so they always describe the same moment.
+            pending = coalesced = delivery_failures = 0
+            stalled = False
+            if self._sink_delivery is not None:
+                pending, coalesced, delivery_failures, stalled = self._sink_delivery.snapshot()
             state = self._state
             if state in (LocalUvcRuntimeState.RUNNING, LocalUvcRuntimeState.DEGRADED):
                 # A worker thread that died later is not hidden behind the
                 # state computed at start.
-                state = self._aggregate()
+                state = self._aggregate(sink_stalled=stalled)
                 self._state = state
         with self._events_lock:
             dropped, sink_failures = self._events_dropped, self._sink_failures
             suppressed = self.health_logs_suppressed
-        return LocalUvcRuntimeStatus(state, tuple(sources), dropped, sink_failures, suppressed)
+        sink_failures += delivery_failures
+        return LocalUvcRuntimeStatus(state, tuple(sources), dropped, sink_failures, suppressed,
+                                     pending, coalesced, stalled)

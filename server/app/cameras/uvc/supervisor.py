@@ -1,6 +1,7 @@
 """Bounded per-source workers for the synchronous local UVC adapter."""
 
 from dataclasses import dataclass
+import math
 import threading
 import time
 from uuid import UUID
@@ -60,6 +61,8 @@ class LocalUvcSupervisor:
     # watchdog still alive after it makes close() fail, so a successful
     # close() always returns with the watchdog stopped.
     WATCHDOG_JOIN_MINIMUM_SECONDS = 1.0
+    # Upper bound of the shared worker join (deployment ``join_timeout_seconds``).
+    MAX_JOIN_TIMEOUT_SECONDS = 60.0
 
     def __init__(self, adapter, *, poll_timeout=1.0, retry_delay=0.1,
                  join_timeout=10.0, clock=time.monotonic, watchdog_interval=0.25):
@@ -68,8 +71,12 @@ class LocalUvcSupervisor:
         if not callable(getattr(adapter, "stop_source", None)):
             raise TypeError("local UVC adapter cannot stop a source")
         for value in (poll_timeout, retry_delay, join_timeout, watchdog_interval):
-            if type(value) not in (int, float) or value <= 0:
+            if type(value) not in (int, float) or not 0 < value < math.inf:
                 raise ValueError("worker timing must be positive")
+        if join_timeout > self.MAX_JOIN_TIMEOUT_SECONDS:
+            # The same upper bound as the deployment configuration, so an
+            # embedder cannot make a stop wait unboundedly long either.
+            raise ValueError("worker join timeout is out of range")
         self._adapter = adapter
         self._poll_timeout = float(poll_timeout)
         self._retry_delay = float(retry_delay)
@@ -78,6 +85,9 @@ class LocalUvcSupervisor:
         self._lock = threading.Lock()
         self._workers: dict[UUID, _Worker] = {}
         self._closed = False
+        # Sticky: a worker whose own cleanup failed is removed from the
+        # registry once joined, but every later close() must still fail.
+        self._close_cleanup_failed = False
         check = getattr(adapter, "check_frame_progress", None)
         self._check = check if callable(check) else None
         self._watchdog_interval = float(watchdog_interval)
@@ -239,10 +249,14 @@ class LocalUvcSupervisor:
         still call into the adapter. A watchdog still inside a check after its
         own bounded join makes ``close()`` fail, so the owner does not tear
         the adapter down under that check; a later ``close()`` joins it again.
+        A worker whose own cleanup failed keeps every later ``close()``
+        failing even after it was removed from the registry.
         """
         with self._lock:
             if (self._closed and not self._workers
                     and not (self._watchdog is not None and self._watchdog.is_alive())):
+                if self._close_cleanup_failed:
+                    raise WorkerStopError("local UVC worker cleanup failed")
                 return
             self._closed = True
             watchdog = self._watchdog
@@ -254,13 +268,15 @@ class LocalUvcSupervisor:
             remaining = max(0.0, deadline - self._clock())
             worker.thread.join(remaining)
         alive = [source_id for source_id, worker in workers if worker.thread.is_alive()]
-        cleanup_failed = [
-            source_id for source_id, worker in workers if worker.cleanup_failed
-        ]
         with self._lock:
             for source_id, worker in workers:
                 if not worker.thread.is_alive():
                     self._workers.pop(source_id, None)
+                    # Read under the lock after the exit: the worker's
+                    # ``finally`` records a cleanup failure before it ends.
+                    if worker.cleanup_failed:
+                        self._close_cleanup_failed = True
+            cleanup_failed = self._close_cleanup_failed
             if not alive:
                 # Only now is no source left that the watchdog must report.
                 self._watchdog_stop.set()

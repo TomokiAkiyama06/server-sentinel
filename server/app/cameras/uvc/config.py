@@ -64,6 +64,14 @@ class LocalUvcConfiguration:
         if self.frame_stall_reopen_seconds < self.frame_stall_seconds:
             # Reopening before the stall is reported would hide the stall.
             raise ConfigurationError("local UVC worker timing is out of range")
+        if self.join_timeout_seconds < self.frame_stall_seconds:
+            # A stop releases the database pin right after the join bound. A
+            # worker blocked without frames past that bound is lowered from
+            # ``online`` only by the watchdog once the stall window elapsed;
+            # a shorter bound would release the pin first, so the lowered
+            # state could never become durable and the registry would keep
+            # ``online`` (Issue #173).
+            raise ConfigurationError("local UVC worker timing is out of range")
 
 
 def parse_local_uvc(value: object) -> LocalUvcConfiguration:

@@ -309,7 +309,18 @@ frame-progress watchdog with at least 1 s of its own, even when the worker
 joins used up the shared bound; a watchdog still inside a check after that
 join makes the close fail, so the stop is `stop_failed` and the adapter is not
 closed under that check. A successful close leaves no worker or watchdog
-thread that could still call into the adapter. Missing configuration is the explicit `unconfigured` state;
+thread that could still call into the adapter. A `stop_failed` runtime retries
+on a later stop: once no worker or watchdog is left it closes the adapter
+(a watchdog-only failure then ends `stopped`; a worker cleanup failure stays
+`stop_failed` on every retry, even when that exited worker was already removed
+while another one was still hung, because the supervisor keeps that failure
+sticky). `join_timeout_seconds` may not be shorter than
+`frame_stall_seconds`, so the watchdog can make a blocked worker's lowered
+health durable before the stop releases the pinned database. Camera-health
+transitions reach the optional health sink only through a bounded, coalescing
+queue drained by one delivery thread, never on a capture worker or the
+watchdog; a sink call stalled past 5 s is reported (`health_sink_stalled`) and
+degrades the capture service state. Missing configuration is the explicit `unconfigured` state;
 configuration without admitted storage, including a monitoring runtime whose
 startup storage open failed or an admission refused while pinning the database at start, is `storage_unadmitted` (retryable, nothing opened) and never captures until
 storage is admitted again. The application capture-service snapshot follows the live runtime status, so a later worker or storage fault is never left reported as `running`. Every later capture-driven registry/approval write is admitted by the Main storage policy like an audit write; a refused admission stops that capture visibly and retries, never writes past the hard reserve; the camera transition is still recorded in memory and the capture service reports `degraded` while health cannot be persisted. The runtime opens only the database file pinned under that admission (a held descriptor, so inode reuse by a replacement cannot pass the identity check) and never creates one, so a lost or replaced filesystem after startup cannot yield a fallback database; a registry read failure while a camera is live is reported as capture loss and degrades the service until polling succeeds. A cancelled or failed lifespan startup stops started workers; a cancelled shutdown invalidates the preview and still completes the bounded capture stop and remaining cleanup before re-raising. Capture-service state is reported separately from each source's
