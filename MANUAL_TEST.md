@@ -544,12 +544,21 @@ host or LAN has run these steps. The ingest listener is not started by the
 application yet, so the steps marked *(needs ingest wiring, #14/#15)* wait for
 that. Use a disposable deployment CA and synthetic server name; never paste
 keys, codes, certificates, bundle contents, LAN addresses or hostnames into
-Issues, PRs or CI artifacts. Below, `MAIN_CLI` means
-`python -m app.cameras.remote_agent.pairing_cli` run from the Main's `server/`
-code with the reviewed runtime installed; `init`, `rotate-listener`, `approve`
-and `revoke` run as `sudo MAIN_CLI ...` (Issue #109) and `export-bundle` and
-`list` as `sudo -u <service account> MAIN_CLI ...` (the `serversentinel-pairing`
-wrapper is #180). `AGENT_CLI` means
+Issues, PRs or CI artifacts. Below, `MAIN_CLI` means the
+`serversentinel-pairing` wrapper that the installer places in
+`/usr/local/sbin` (Issue #180), which runs
+`python -m app.cameras.remote_agent.pairing_cli` of the installed release;
+`init`, `rotate-listener`, `approve` and `revoke` run as `sudo MAIN_CLI ...`
+(Issue #109) and `export-bundle` and `list` as
+`sudo -u <service account> MAIN_CLI ...`. Before step 1, confirm on the Main
+that `ls -l /usr/local/sbin/serversentinel-pairing` shows `root root` and
+`-rwxr-xr-x`, that `sudo serversentinel-pairing --help` prints
+`usage: serversentinel-pairing`, and that after an `update` (and after a
+`rollback`) the same command still answers, now from the release `current`
+names (`readlink /opt/server-sentinel-main/current`). The wrapper's
+environment independence, ownership handling and switch behavior are covered
+only by synthetic tests (`server/tests/test_release.py`,
+`PairingWrapperTests`); this host check is not yet executed. `AGENT_CLI` means
 `python -m media_capture_agent.enroll` run from the Agent's code with
 `cryptography` installed.
 
