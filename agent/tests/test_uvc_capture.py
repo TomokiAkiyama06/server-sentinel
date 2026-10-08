@@ -160,6 +160,9 @@ def wait_for(predicate, timeout=5.0):
 
 class CaptureCase(unittest.TestCase):
     def setUp(self):
+        # Registered first, so it runs after every other cleanup, including
+        # closing the captures.
+        self.addCleanup(self._assert_no_agent_threads_left, set(threading.enumerate()))
         self.temporary = tempfile.TemporaryDirectory(prefix="agent-uvc-")
         self.addCleanup(self.temporary.cleanup)
         self.settings = settings(Path(self.temporary.name))
@@ -179,6 +182,23 @@ class CaptureCase(unittest.TestCase):
             discovery=discovery, limits=self.limits, clock=self.clock, **kwargs)
         self.addCleanup(self._close, capture)
         return capture
+
+    def _assert_no_agent_threads_left(self, before, timeout=2.0):
+        """A test must not leave capture threads behind (Issue #179).
+
+        A reader blocked forever on a stuck fake pipeline outlived its test
+        and the interpreter; a test that leaves a pipeline stuck must release
+        it before it ends.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            left = sorted(thread.name for thread in threading.enumerate()
+                          if thread not in before and thread.is_alive()
+                          and thread.name.startswith("media-capture-agent"))
+            if not left or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        self.assertEqual([], left, "capture threads outlived the test")
 
     @staticmethod
     def _close(capture):
@@ -1419,6 +1439,9 @@ class CaptureTests(CaptureCase):
             capture.close()
         # Shutdown still grants the stuck pipeline one more full bound.
         self.assertEqual(pipeline.stop_timeouts[-1], self.limits.stop_timeout)
+        # The process is finally reaped: its reader sees end of stream.
+        pipeline.stop_result = True
+        pipeline.stop(0)
 
     def test_simultaneous_stuck_teardowns_share_one_stop_bound(self):
         devices = [evidence(index, serial=f"SYN-{index}") for index in range(4)]

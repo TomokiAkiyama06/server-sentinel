@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import tempfile
 from uuid import UUID
 
 from media_capture_agent.config import Settings
@@ -34,6 +35,36 @@ def configuration(root):
         "heartbeat_seconds": 0.01, "clock_offset_limit_seconds": 2,
         "clock_uncertainty_limit_seconds": 0.5, "clock_step_limit_seconds": 0.1,
     }
+
+
+MEMORY_FILESYSTEM = Path("/dev/shm")
+MEMORY_FILESYSTEM_MINIMUM_FREE = 256 * 1024 * 1024
+
+
+def ring_temporary_directory(*, memory_filesystem=MEMORY_FILESYSTEM):
+    """A private directory for ring simulations, on tmpfs when one is usable.
+
+    Every ring append commits the SQLite ledger with ``synchronous = FULL`` and
+    fsyncs segments and directories. The simulations append hundreds to
+    thousands of segments, and on a disk-backed CI runner those flushes, not
+    the accounting under test, took most of the agent suite's time limit
+    (Issue #179). The same code paths, fsync included, still run on tmpfs,
+    where a flush is cheap; no test here simulates power loss, so no
+    assertion depends on the flush reaching a disk. Without a usable tmpfs
+    with room to spare, the default temporary directory is used.
+    """
+    try:
+        usable = (memory_filesystem.is_dir() and os.access(memory_filesystem, os.W_OK | os.X_OK)
+                  and _free_bytes(memory_filesystem) >= MEMORY_FILESYSTEM_MINIMUM_FREE)
+    except OSError:
+        usable = False
+    return tempfile.TemporaryDirectory(prefix="agent-ring-",
+                                       dir=str(memory_filesystem) if usable else None)
+
+
+def _free_bytes(path):
+    stat = os.statvfs(path)
+    return stat.f_bavail * stat.f_frsize
 
 
 def settings(root):

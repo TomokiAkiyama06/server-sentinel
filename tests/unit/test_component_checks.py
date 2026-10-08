@@ -1,6 +1,6 @@
 """Exercise conditional CI using synthetic projects and mocked external tools."""
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
@@ -20,11 +20,20 @@ class ComponentChecksTests(unittest.TestCase):
         for name in ci.COMPONENTS:
             self.write(f"{name}/README.md", "Future component.\n")
         self.process = patch.object(ci.subprocess, "run").start()
+        # Python lint/test commands run under Popen so a timeout can first ask
+        # faulthandler for tracebacks.
+        self.popen = patch.object(ci.subprocess, "Popen").start()
+        self.popen.return_value.wait.return_value = 0
+        self.popen.return_value.returncode = 0
         self.addCleanup(patch.stopall)
         self.output = io.StringIO()
         self.redirect = redirect_stdout(self.output)
         self.redirect.__enter__()
         self.addCleanup(self.redirect.__exit__, None, None, None)
+        self.errors = io.StringIO()
+        self.redirect_errors = redirect_stderr(self.errors)
+        self.redirect_errors.__enter__()
+        self.addCleanup(self.redirect_errors.__exit__, None, None, None)
 
     def write(self, relative, content):
         path = self.root / relative
@@ -59,7 +68,8 @@ class ComponentChecksTests(unittest.TestCase):
         self.write(f"{name}/package-lock.json", '{"lockfileVersion": 3}\n')
 
     def commands(self):
-        return [call.args[0] for call in self.process.call_args_list]
+        return [call.args[0] for call in
+                self.process.call_args_list + self.popen.call_args_list]
 
     def test_readme_only_and_root_tooling_are_explicitly_not_implemented(self):
         self.write("scripts/ci/tool.py", "pass\n")
@@ -149,6 +159,69 @@ class ComponentChecksTests(unittest.TestCase):
         for call in calls:
             self.assertTrue(call.kwargs["check"])
             self.assertGreater(call.kwargs["timeout"], 0)
+        checks = [call.args[0] for call in self.popen.call_args_list]
+        self.assertEqual(checks, [["python", "-m", "pyflakes", "."],
+                                  ["python", "-m", "unittest", "discover"]])
+        for call in self.popen.call_args_list:
+            self.assertEqual(call.kwargs["env"]["PYTHONFAULTHANDLER"], "1")
+            self.assertIn("VIRTUAL_ENV", call.kwargs["env"])
+        for call in self.popen.return_value.wait.call_args_list:
+            self.assertEqual(call.kwargs["timeout"], ci.COMMAND_TIMEOUT)
+
+    def test_python_check_timeout_requests_tracebacks_then_kills(self):
+        # Issue #179: a timed-out test run was SIGKILLed without any traceback
+        # and its message was appended to the unterminated unittest -v line.
+        self.python_component()
+        process = self.popen.return_value
+        process.returncode = None
+
+        def wait(timeout=None):
+            if process.send_signal.called and timeout is None:
+                process.returncode = -9
+                return -9
+            raise subprocess.TimeoutExpired(["python"], timeout)
+
+        process.wait.side_effect = wait
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.assertRaises(ci.CheckFailure) as caught:
+            ci.run_checks(self.root)
+        process.send_signal.assert_called_once_with(ci.signal.SIGABRT)
+        self.assertEqual([call.kwargs.get("timeout") for call in process.wait.call_args_list],
+                         [ci.COMMAND_TIMEOUT, ci.TRACEBACK_GRACE, None])
+        process.kill.assert_called_once_with()
+        self.assertIn("exceeded 600s", str(caught.exception))
+        self.assertIn("SIGKILL", str(caught.exception))
+        self.assertTrue(errors.getvalue().startswith("\n[server] command exceeded 600s"))
+        # Only the first (lint) check ran; nothing after the timeout.
+        self.assertEqual(self.popen.call_count, 1)
+        self.assertFalse(any(command[:2] == ["docker", "run"] for command in self.commands()))
+
+    def test_python_check_signal_exit_is_named(self):
+        self.python_component()
+        process = self.popen.return_value
+        process.wait.return_value = process.returncode = -11
+        errors = io.StringIO()
+        with redirect_stderr(errors), self.assertRaisesRegex(
+                ci.CheckFailure, r"command failed \(exit -11, terminated by SIGSEGV\)"):
+            ci.run_checks(self.root)
+        process.send_signal.assert_not_called()
+        self.assertIn("\n[server] command failed (exit -11", errors.getvalue())
+
+    def test_python_check_nonzero_exit_and_launch_failure(self):
+        self.python_component()
+        process = self.popen.return_value
+        process.wait.return_value = process.returncode = 1
+        with redirect_stderr(io.StringIO()), self.assertRaisesRegex(
+                ci.CheckFailure, r"command failed \(exit 1\)$"):
+            ci.run_checks(self.root)
+        self.popen.side_effect = FileNotFoundError("python")
+        with self.assertRaisesRegex(ci.CheckFailure, "cannot execute python"):
+            ci.run_checks(self.root)
+
+    def test_describe_exit_names_signals(self):
+        self.assertEqual(ci.describe_exit(1), "exit 1")
+        self.assertEqual(ci.describe_exit(-9), "exit -9, terminated by SIGKILL")
+        self.assertEqual(ci.describe_exit(-200), "exit -200, terminated by signal 200")
 
     def test_node_requires_lock_and_nonempty_lint_test_scripts(self):
         self.node_component()

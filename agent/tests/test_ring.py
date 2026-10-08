@@ -6,7 +6,6 @@ import os
 import random
 import sqlite3
 from pathlib import Path
-import tempfile
 import unittest
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -18,7 +17,8 @@ from media_capture_agent.ring_ledger import Ledger
 from media_capture_agent.ring_models import (POST, PRE, RETENTION, SECOND, RingConfig,
                                             RingRefused, SegmentProfile, round_up)
 from media_capture_agent.storage import MediaStore, StorageRefused
-from tests.support import SOURCE, settings
+from tests import support
+from tests.support import SOURCE, ring_temporary_directory, settings
 
 
 PAYLOAD = zlib.compress(b"generated-pattern-0001" * 8)
@@ -65,7 +65,7 @@ class InterruptedHoldRelease:
 
 class RingTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = ring_temporary_directory()
         self.addCleanup(self.temporary.cleanup)
         self.settings = settings(Path(self.temporary.name))
         self.quota = Quota(self.settings.media_root)
@@ -1661,3 +1661,32 @@ class RingTests(unittest.TestCase):
         before = self.store.segment_allocations()
         self.ring.tick(now_us=T0 + RETENTION, clock_trusted=False)
         self.assertEqual(self.store.segment_allocations(), before)
+
+
+class RingTemporaryDirectoryTests(unittest.TestCase):
+    """Ring simulations run on tmpfs when one is usable (Issue #179)."""
+
+    def setUp(self):
+        outer = ring_temporary_directory(memory_filesystem=Path("/nonexistent-agent-tmpfs"))
+        self.addCleanup(outer.cleanup)
+        self.memory = Path(outer.name) / "shm"
+        self.memory.mkdir(mode=0o700)
+
+    def created_under_memory(self, free):
+        with patch.object(support, "_free_bytes", return_value=free):
+            temporary = ring_temporary_directory(memory_filesystem=self.memory)
+        try:
+            return Path(temporary.name).parent == self.memory
+        finally:
+            temporary.cleanup()
+
+    def test_uses_memory_filesystem_with_room_and_falls_back_otherwise(self):
+        self.assertTrue(self.created_under_memory(support.MEMORY_FILESYSTEM_MINIMUM_FREE))
+        # A small /dev/shm (e.g. a container's 64 MiB default) is not used.
+        self.assertFalse(self.created_under_memory(support.MEMORY_FILESYSTEM_MINIMUM_FREE - 1))
+        with patch.object(support, "_free_bytes", side_effect=OSError("synthetic")):
+            temporary = ring_temporary_directory(memory_filesystem=self.memory)
+        self.addCleanup(temporary.cleanup)
+        self.assertNotEqual(Path(temporary.name).parent, self.memory)
+        self.memory.rmdir()
+        self.assertFalse(self.created_under_memory(support.MEMORY_FILESYSTEM_MINIMUM_FREE))
