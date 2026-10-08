@@ -19,7 +19,7 @@ from media_capture_agent.config import Settings
 from media_capture_agent.ring import DiskRing
 from media_capture_agent.ring_models import PRE, SECOND, RingConfig, RingRefused, SegmentProfile, round_up
 from media_capture_agent.storage import MediaStore
-from tests.support import configuration
+from tests.support import configuration, ring_temporary_directory
 from tests.test_ring import LEDGER_BYTES, T0, AllowControls, Quota
 
 
@@ -37,7 +37,7 @@ def legacy_charge():
 
 class VariableSegmentSizeTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = ring_temporary_directory()
         self.addCleanup(self.temporary.cleanup)
 
     def ring(self):

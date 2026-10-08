@@ -313,8 +313,10 @@ so a retried write that had committed overstates the gap rather than hiding it.
 
 Another process able to write the database file could switch it to WAL (or
 replace it with a WAL database) between the header probe and the read. An
-unadmitted read therefore re-reads the header through the held descriptor
-after its open, then holds one read transaction, and so the SQLite SHARED
+unadmitted read therefore re-reads the header after its open through the
+process-held descriptor of the inode the path currently names (looked up by
+the path's current device and inode, so a replaced file is read through its
+own descriptor, never the old file's), then holds one read transaction, and so the SQLite SHARED
 lock, for the whole read: a switch to WAL needs EXCLUSIVE, so the mode cannot
 change between its statements. If the connection still reports WAL once it
 holds the lock, the read is abandoned before the caller sees it and retried
@@ -329,19 +331,37 @@ kept small and independent of the retained timeline:
   the window start, so a late page reads about one page of rows.
 - `audit()` copies its rows in one statement and builds the response after the
   read ends.
-- Unadmitted reads of one process run one at a time. SQLite's unix VFS lets a
-  connection of a process that already holds SHARED take it again without
-  checking the PENDING lock a waiting writer in another process holds, so
-  overlapping reads could keep the file read-locked indefinitely and starve
-  that writer past its busy timeout. One at a time, the lock is released
-  after each read and the writer's PENDING holds the next read back until the
-  commit. Reads of other modules in the same process are not covered by this
+- Unadmitted reads of one database file in one process run one at a time.
+  SQLite's unix VFS lets a connection of a process that already holds SHARED
+  take it again without checking the PENDING lock a waiting writer in another
+  process holds, so overlapping reads could keep the file read-locked
+  indefinitely and starve that writer past its busy timeout. One at a time,
+  the lock is released after each read and the writer's PENDING holds the
+  next read back until the commit. The serialization is per database path
+  (resolved with `realpath`, like the live-session registry), so reads of
+  different database files never wait for each other. Two hard links to one
+  file would get separate locks; the application never links its database.
+  Reads of other modules in the same process are not covered by this
   serialization.
+- A read waits at most `UNADMITTED_READ_WAIT` (5 s, the service busy timeout)
+  for its turn and then raises `PresenceReadBusy` (a `RuntimeError`, message
+  `presence read busy`) before opening any connection, so nothing is read and
+  no lock is left held. It is transient load: a route exposing these reads
+  should report it as temporarily unavailable and let the client retry, never
+  as an empty history, a healthy status or an access failure.
+- The per-database lock is a `threading.RLock`, which is **not FIFO**: a
+  thread that releases it and immediately reads again can overtake threads
+  already waiting, so under sustained contention a waiting read can starve
+  for the full wait and fail with `PresenceReadBusy` even though reads keep
+  completing. The reads are milliseconds long (see #151 measurements), so
+  this needs many threads reading back to back.
 
 `ReadLockBoundTests` guards these properties deterministically (SQLite VM
-steps under the lock, and the order of a waiting writer and the next read)
-and with a cross-process writer whose busy timeout is 1 s while two threads
-run large reads.
+steps under the lock, the order of a waiting writer and the next read, the
+`PresenceReadBusy` timeout path, and per-database serialization). Its
+cross-process writer test, a writer with a 1 s busy timeout while two threads
+run large reads, is only a smoke test: at the synthetic data size it also
+passes without the serialization; the ordering test is what guards it.
 
 Measured on the development host (32 threads, SQLite 3.46.1, Python 3.12,
 database on tmpfs, so no disk latency), as the duration of each `_read()`

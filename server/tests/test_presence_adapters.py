@@ -33,7 +33,7 @@ from app.presence.adapters import (CriticalTimelineRecorder, EntranceObservation
 from app.presence.delivery import ActionResult
 from app.presence.models import InvalidObservation, Kind, Observation, PresenceState, Quality, Value, timestamp
 from app.presence.schema import CRITICAL_SOURCE_KINDS, STAGED_SOURCE_KINDS
-from app.presence.service import SOURCE_CLOCK, SOURCE_CLOCK_TABLES, PresenceService
+from app.presence.service import SOURCE_CLOCK, SOURCE_CLOCK_TABLES, PresenceReadBusy, PresenceService
 from app.storage.database import Database, PinnedDatabase, read_database_prefix
 from app.storage.migrations import migrate
 from app.storage.policy import StorageState, StorageTransition
@@ -1842,6 +1842,14 @@ class ReadLockBoundTests(PresenceFixture, TestCase):
         self.assertLessEqual(full, empty + 2)
 
     def test_a_writer_with_a_short_busy_timeout_commits_while_large_reads_run(self):
+        """Smoke test only: a cross-process writer keeps committing under read load.
+
+        At this synthetic data size it also passes with the read
+        serialization removed, so it does not guard the serialization itself;
+        `test_a_read_waiting_behind_a_writer_does_not_join_an_open_read` does.
+        It catches gross regressions such as reads holding their lock for
+        far longer than a few milliseconds.
+        """
         self.fill()
         with closing(sqlite3.connect(self.database.path)) as db, db:
             db.executemany("INSERT INTO presence_audit(action,actor,at,state) VALUES ('hint_set',?,?,?)",
@@ -1929,6 +1937,121 @@ class ReadLockBoundTests(PresenceFixture, TestCase):
                 writer.wait()
         # The second read began only after the waiting writer committed.
         self.assertEqual(seen, [1])
+
+
+class ReadTurnTests(PresenceFixture, TestCase):
+    """The bounded wait for an unadmitted read's turn and its scope (#129, #151)."""
+
+    WAIT = 0.05
+
+    def setUp(self):
+        self.make_presence()
+        self.refuse = True
+        patcher = mock.patch("app.presence.service.UNADMITTED_READ_WAIT", self.WAIT)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def hold_read(self, presence):
+        """Keep one read of ``presence`` open in another thread until released."""
+        opened, finish = threading.Event(), threading.Event()
+
+        def holder():
+            with presence._read() as db:
+                db.execute("SELECT count(*) FROM presence_audit").fetchone()
+                opened.set()
+                finish.wait(30)
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.addCleanup(thread.join, 30)
+        self.addCleanup(finish.set)
+        self.assertTrue(opened.wait(30))
+        return finish, thread
+
+    def read_in_thread(self, presence):
+        """Run one read of ``presence`` in a fresh thread; its result or error."""
+        outcome = []
+
+        def reader():
+            try:
+                with presence._read() as db:
+                    outcome.append(db.execute("SELECT count(*) FROM presence_audit").fetchone()[0])
+            except BaseException as error:  # reported to the caller
+                outcome.append(error)
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        thread.join(30)
+        self.assertFalse(thread.is_alive())
+        return outcome[0]
+
+    def other_service(self, database=None):
+        return PresenceService(database or self.database, access=MockAccess(),
+                               reservation=self.presence.reservation, detection=lambda: True,
+                               storage_status=lambda: True)
+
+    def test_a_read_that_never_gets_its_turn_raises_busy_and_leaks_no_lock(self):
+        finish, holder = self.hold_read(self.presence)
+        opened = []
+        original = PresenceService._unadmitted_connection
+
+        def recorded(service, path):
+            opened.append(path)
+            return original(service, path)
+
+        with mock.patch.object(PresenceService, "_unadmitted_connection", recorded):
+            started = time.monotonic()
+            with self.assertRaises(PresenceReadBusy) as raised:
+                with self.presence._read():
+                    self.fail("a busy read must not yield a connection")
+            waited = time.monotonic() - started
+        # A dedicated type that existing RuntimeError handlers still catch.
+        self.assertIsInstance(raised.exception, RuntimeError)
+        self.assertEqual(str(raised.exception), "presence read busy")
+        self.assertGreaterEqual(waited, self.WAIT * 0.9)
+        # It failed before opening anything, so it took no SQLite lock.
+        self.assertEqual(opened, [])
+        # Public reads report the same type.
+        with self.assertRaises(PresenceReadBusy):
+            self.presence.timeline_gap()
+        finish.set()
+        holder.join(30)
+        self.assertFalse(holder.is_alive())
+        # Nothing is left held: another thread gets its turn at once, a
+        # writer of another process can take RESERVED, and a fresh read here
+        # succeeds within the short wait.
+        self.assertEqual(self.read_in_thread(self.presence), 0)
+        self.assertEqual(other_process_begin_immediate(self.database.path), "acquired")
+        with self.presence._read() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM presence_audit").fetchone()[0], 0)
+
+    def test_a_nested_read_shares_its_threads_turn(self):
+        """The turn is reentrant per thread; other threads still wait for it."""
+        with self.presence._read():
+            # The lock is reentrant for the reading thread, so a nested read
+            # of the same database is not refused here.
+            with self.presence._read() as inner:
+                inner.execute("SELECT 1").fetchone()
+            busy = self.read_in_thread(self.presence)
+            self.assertIsInstance(busy, PresenceReadBusy)
+        self.assertEqual(self.read_in_thread(self.presence), 0)
+
+    def test_reads_of_the_same_database_wait_across_service_instances(self):
+        finish, _ = self.hold_read(self.presence)
+        self.assertIsInstance(self.read_in_thread(self.other_service()), PresenceReadBusy)
+        finish.set()
+
+    def test_reads_of_another_database_do_not_wait(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        other = Database(Path(directory.name) / "other.sqlite3")
+        with closing(other.connect()) as db:
+            migrate(db, APPLICATION_MIGRATIONS)
+        finish, _ = self.hold_read(self.presence)
+        # SQLite's locks are per file, so a read of another database file
+        # cannot keep this one read-locked and need not wait for its turn.
+        self.assertEqual(self.read_in_thread(self.other_service(other)), 0)
+        finish.set()
 
 
 # Commits ``count`` single-row transactions with the given busy timeout and

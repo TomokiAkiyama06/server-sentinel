@@ -208,10 +208,11 @@ profile of at least 1 fps). The local UVC stop as a whole can take up to
 `join_timeout_seconds` + 1 s for the frame-progress watchdog join + 1 s for
 pending health-sink deliveries (62 s at the 60 s maximum), and the remaining
 shutdown steps (monitoring runtime, audit retention) follow it. The installed
-unit sets no `TimeoutStopSec`, so systemd's default stop timeout (normally
-90 s) applies; with a join bound near the maximum, set `TimeoutStopSec`
-explicitly in a drop-in if the host's default is lower or other shutdown steps
-are slow.
+unit sets `TimeoutStopSec=90` explicitly (Owner decision 2026-10-08), so the
+stop bound does not depend on the host's `DefaultTimeoutStopSec` and stays
+above that 62 s local UVC bound. A rollback restores the target release's own
+unit snapshot, so a release installed before this change runs with that
+snapshot's (default) stop timeout.
 `frame_stall_reopen_seconds` (0.5–300, not less than `frame_stall_seconds`,
 scaled by the same factor) is how long a stall lasts before the source is
 reported `offline` and the capture is closed and reopened (also enforced by the
@@ -436,11 +437,10 @@ enters them again through the audited Owner path.
 
 ### Capture-node CA and Main listener certificate
 
-The local pairing CLI (`serversentinel-pairing` below; until the installer
-ships that wrapper (#180) run it with the installed release's interpreter,
-for example `sudo /opt/server-sentinel-main/current/venv/bin/python -I -m
-app.cameras.remote_agent.pairing_cli approve ...`, as for
-`app.lifecycle_inventory` below; see
+The local pairing CLI (`serversentinel-pairing` below: the
+`/usr/local/sbin/serversentinel-pairing` wrapper that install and update
+place, which runs `python -m app.cameras.remote_agent.pairing_cli` of the
+installed release; see "The `serversentinel-pairing` wrapper" below and
 `server/app/cameras/remote_agent/README.md`) keeps the deployment CA key and
 the Main capture listener credential in two different owner-only directories
 owned by two different accounts, both outside the checkout and media trees.
@@ -484,6 +484,45 @@ sudo -u <service account> serversentinel-pairing export-bundle --listener-dir ..
   --endpoint <ip>:<port> --output <bundle.json>
 sudo -u <service account> serversentinel-pairing list --database ...
 ```
+
+**The `serversentinel-pairing` wrapper (Issue #180).** `install` and `update`
+place `/usr/local/sbin/serversentinel-pairing`, a `root:root` `0755` shell
+script written under a temporary name and renamed into place, so neither the
+service account nor the CA account can change it. Each run reads the
+installation's `current` pointer once, accepts only `releases/<version>`, and
+then uses only that release directory: it runs
+`<release>/venv/bin/python -I` in an environment emptied with `env -i` (only
+`PATH=/usr/bin:/bin`), puts `<release>` first on `sys.path` and runs
+`app.cameras.remote_agent.pairing_cli` as `-m` would, passing every argument
+unchanged. `PATH`, `PYTHONPATH`, `PYTHONHOME` or any other caller variable,
+the user site directory and the working directory therefore select neither
+the interpreter nor the code. (`python -I -m app...` alone would not work:
+`-I` also keeps `-m` from adding any directory to `sys.path`.) The working
+directory itself is kept, so relative `--request` / `--output` paths mean
+what was typed. Because the wrapper follows `current` at run time rather than
+naming a release, update and rollback never rewrite it: the next command runs
+the release the service runs, also after a failed update or rollback restored
+the earlier one, and one command never mixes two releases. Without a valid
+`current`, or when that release has no pairing CLI (a release from before
+Issue #13), it prints only
+`serversentinel-pairing: refused: no_installed_release` or
+`... refused: release_without_pairing_cli` and exits 2.
+
+The installer replaces only a wrapper it generated (recognized by its second
+line); an installer-generated wrapper whose text, owner, mode or link count
+differs is rewritten on the next `install` or `update`. Anything else at that
+path (a hand-written script, a symbolic link, a directory) is Owner-managed:
+`install` and `update` refuse before any change and print the steps (move it
+away, then rerun the same command). A failed `install` removes the wrapper only
+if it created it; a failed `update` keeps it, since it then runs the restored
+release. `rollback` never touches it. There is no uninstall operation; when
+removing a deployment, delete `/usr/local/sbin/serversentinel-pairing` together
+with the service unit and the installation root. The underlying command stays
+`python -m app.cameras.remote_agent.pairing_cli`; run without the wrapper, use
+the installed release's interpreter with that release directory as the working
+directory (for example
+`cd /opt/server-sentinel-main/current && sudo ./venv/bin/python -m app.cameras.remote_agent.pairing_cli ...`,
+where relative paths then resolve against that directory), not a checkout.
 
 `--ca-user` defaults to `serversentinel-ca` and `--service-user` to
 `server-sentinel`; pass them when the accounts are named differently. `init`,
@@ -803,6 +842,21 @@ instead of switching to a release that could not start:
 
 The configuration is never rewritten by the installer.
 
+The two releases make contradicting demands on the same configuration file,
+so between editing it and a completed switch neither release can start from
+it: the running (old) release refuses the edited configuration, and when
+`_switch` fails, its restart of the release that was running before fails
+too (Issue #183). Therefore:
+
+- run the same `update` / `rollback` command immediately after editing the
+  configuration, with nothing restarting the service in between;
+- if that switch fails, first restore the configuration to what the running
+  (old) release accepts (undo the edit: remove the entry before starting a
+  release without Issue #109, add it back before starting one with it), and
+  only then start the old release again (`sudo systemctl restart
+  server-sentinel.service`). Then fix the cause and repeat the edit and the
+  command.
+
 Run the separately downloaded installer only after verifying its published
 SHA-256. Global arguments precede the operation:
 
@@ -830,6 +884,12 @@ sudo /tmp/server-sentinel-installer-1.1.0.pyz \
 `--unit` accepts exactly `/etc/systemd/system/server-sentinel.service`. Using one
 canonical administrator unit prevents another systemd search path from selecting
 a different definition when the installer restarts the logical service.
+
+`install` and `update` also place the `/usr/local/sbin/serversentinel-pairing`
+wrapper (Issue #180; see "The `serversentinel-pairing` wrapper" above). It
+names no release and follows `current`, so a switch never rewrites it and
+`rollback` leaves it alone; a hand-placed file at that path is refused before
+any change.
 
 `--destination` is created when it does not exist. An existing directory is
 adopted only when it is empty or is already a ServerSentinel installation root,
@@ -1048,7 +1108,10 @@ delivered job stays delivered; attempts rise only with a claim, which also
 advances the generation, so they never rise more than the generation, and a
 generation rising more than the attempts requires the requeue mark), the high-water clocks (may only advance), open
 outbox session rows (a row a live outbox held at record time may end in its
-clean close; a stale one only in an interrupted gap) and the Owner override
+clean close; a stale one only in an interrupted gap; the outbox lock is probed
+before and after the database snapshot, and `record` refuses (exit 2) when the
+two answers differ, because an outbox that started or stopped in between
+would pair the copied rows with the wrong lock state) and the Owner override
 (dropped only once the control clock has reached its expiry);
 `presence_inputs` (live inputs with their own validity windows) and
 `presence_delivery_fairness` (a round-robin cursor) replay nothing and hide no
@@ -1256,7 +1319,13 @@ schema CHECK constraint limits (the schema comparison keeps those
 constraints in place) are validated on every current row as the owning
 service writes them (`invalid_value`): audit rows through the audit store's
 record validation, integrity audit actors and revisions, storage-state audit
-states, Owner-template audit operations and generations, presence audit
+states, Owner-template audit operations and generations, the Owner-template
+row itself through the store's own read model (`read_template_row()`, which
+`_load_for_verification()` uses: a non-negative integer generation and, when
+enrolled, a non-empty BLOB template within the largest size any store accepts
+(a deployment's stricter configured limit is not read) and provenance that
+loads as `ModelProvenance`; reported as `template` `invalid_value`, so `record`
+refuses such a state), presence audit
 actions and actors, job states and counters, marker counts, the override
 state and actor, observation payloads, recording identities, statuses and
 boundaries, discontinuity bounds, integrity outbox findings and flag, the
@@ -1368,7 +1437,11 @@ file's digest and size and the catalog byte length. The rewritten files must
 match their updated catalog digest and byte length with a single link, and
 every other recorded field (star and critical flags, boundaries, event link,
 discontinuities, segment set and the remaining segment catalog fields) must be
-unchanged; otherwise the declared recording is still `changed`. The comparison is `empty` (exit 3),
+unchanged; otherwise the declared recording is still `changed`. When the
+only difference from a full pass is such declared recordings, the status is
+`preserved_except_declared_rewrites` with exit 4, never 0: the declared
+recordings still need the manual re-verification before the result is
+accepted. The comparison is `empty` (exit 3),
 never success, while the baseline lacks any of: an ordinary recording, a
 starred recording, a camera source, a security/admin audit row, the Owner, a
 `live:view`-only grant, a `recordings:view`-only grant, or a revoked principal
@@ -1443,8 +1516,9 @@ intact. The required invariants are:
   not moved keeps every recorded column (`cursor_changed` otherwise), except
   `active` going from 1 to 0 (`release_source()`); only a publication, which
   advances the end, sets it back to 1. An advanced end must come with a
-  publication-shaped change: on the same stream a higher sequence (another
-  stream may start at any sequence). Once the segment it names has left the
+  publication-shaped change: the cursor active, as `_publish()` leaves it (an
+  inactive cursor does not count against the active-source limit), and on the
+  same stream a higher sequence (another stream may start at any sequence). Once the segment it names has left the
   catalog, the exact end value itself cannot be checked. A value of the wrong
   type anywhere is reported (`invalid_value`); verification never aborts on
   one and, if no rule anticipated it, still writes a failed report marked
@@ -1501,7 +1575,11 @@ nothing wrong; investigate, then take a new baseline):
 
 - a session revocation inside the window advances the authorization
   generation, which ends every recorded invitation, so those invitations are
-  reported `changed`;
+  reported `generation_advanced` (an invitation that also changed in any other
+  way is `changed`);
+- `release_source()` after a publication inside the window leaves the
+  advanced cursor inactive, which is reported `cursor_changed` (Main does not
+  call `release_source()`; revisit this rule if it ever does);
 - for a recording with no linked segment at record time, when the first
   segment that is later linked continues a pre-roll publication that the
   spool has since evicted, and does not continue the recorded cursor, the

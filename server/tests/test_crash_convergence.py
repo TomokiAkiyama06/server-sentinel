@@ -352,6 +352,10 @@ class CrashConvergenceTests(unittest.TestCase):
                             self.assertEqual(0, status, f"{label}: revoke rerun: {stderr}")
                         if command == "approve" and first == "approve":
                             self.assertEqual(0, status, f"{label}: approve retry: {stderr}")
+                        if command == "rotate-listener" and first == "approve":
+                            # approve completes an interrupted rotation itself
+                            # (Issue #183); converge() runs rotate first.
+                            self.assertEqual(0, status, f"{label} then approve: {stderr}")
                         self.converge(clone, committed, f"{label} then {first}")
                         self.CRASH_STATES.append((label, state, first, status))
 
@@ -394,6 +398,29 @@ class CrashConvergenceTests(unittest.TestCase):
 
     def test_revoke(self):
         self.check_command("revoke")
+
+    def test_approve_first_completes_a_rotation_stopped_between_its_renames(self):
+        # Issue #183: only the new key is renamed into place, so the pair no
+        # longer matches. approve, run before any rotate-listener, finishes
+        # the rotation (complete_interrupted_rotation) and enrolls.
+        for mode in ("command", "both"):
+            with self.subTest(mode=mode):
+                deployment, context = self.prepared("rotate-listener", f"renamed-key-{mode}")
+                before = (deployment.listener / "main-server-certificate.pem").read_bytes()
+                with self.crashing(deployment, ("rotate.renamed_key", 1), mode):
+                    with self.assertRaises(Crash):
+                        deployment.rotate()
+                # The new certificate is still staged next to the new key.
+                self.assertTrue((deployment.listener / "main-server-certificate.pem.next")
+                                .exists(), os.listdir(deployment.listener))
+                status, stdout, stderr = deployment.approve(deployment.new_request())
+                self.assertEqual(0, status, stderr)
+                self.assertIn("enrollment completed", stdout)
+                self.assertNotEqual(
+                    before, (deployment.listener / "main-server-certificate.pem").read_bytes())
+                trust = DeploymentTrust.load_public(PrivateDirectory(deployment.listener))
+                trust.issued_listener_certificate(PrivateDirectory(deployment.listener))
+                pairing_cli.listener_material(PrivateDirectory(deployment.listener))
 
     def test_every_command_passes_crash_points(self):
         expected = {

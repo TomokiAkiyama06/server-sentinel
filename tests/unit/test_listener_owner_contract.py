@@ -69,7 +69,9 @@ class UpstreamSocketUnitTests(unittest.TestCase):
                                             + 1])
         for line in ("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
                      "CapabilityBoundingSet=",
-                     "AmbientCapabilities=", "ProtectControlGroups=true"):
+                     "AmbientCapabilities=", "ProtectControlGroups=true",
+                     # Owner decision 2026-10-08: explicit stop bound (PR #188).
+                     "TimeoutStopSec=90"):
             self.assertIn(line, template)
         for line in template:
             self.assertFalse(line.startswith(("PrivateNetwork=", "NetworkNamespacePath=", "Delegate=",

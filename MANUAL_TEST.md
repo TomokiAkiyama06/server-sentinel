@@ -549,12 +549,21 @@ host or LAN has run these steps. The ingest listener is not started by the
 application yet, so the steps marked *(needs ingest wiring, #14/#15)* wait for
 that. Use a disposable deployment CA and synthetic server name; never paste
 keys, codes, certificates, bundle contents, LAN addresses or hostnames into
-Issues, PRs or CI artifacts. Below, `MAIN_CLI` means
-`python -m app.cameras.remote_agent.pairing_cli` run from the Main's `server/`
-code with the reviewed runtime installed; `init`, `rotate-listener`, `approve`
-and `revoke` run as `sudo MAIN_CLI ...` (Issue #109) and `export-bundle` and
-`list` as `sudo -u <service account> MAIN_CLI ...` (the `serversentinel-pairing`
-wrapper is #180). `AGENT_CLI` means
+Issues, PRs or CI artifacts. Below, `MAIN_CLI` means the
+`serversentinel-pairing` wrapper that the installer places in
+`/usr/local/sbin` (Issue #180), which runs
+`python -m app.cameras.remote_agent.pairing_cli` of the installed release;
+`init`, `rotate-listener`, `approve` and `revoke` run as `sudo MAIN_CLI ...`
+(Issue #109) and `export-bundle` and `list` as
+`sudo -u <service account> MAIN_CLI ...`. Before step 1, confirm on the Main
+that `ls -l /usr/local/sbin/serversentinel-pairing` shows `root root` and
+`-rwxr-xr-x`, that `sudo serversentinel-pairing --help` prints
+`usage: serversentinel-pairing`, and that after an `update` (and after a
+`rollback`) the same command still answers, now from the release `current`
+names (`readlink /opt/server-sentinel-main/current`). The wrapper's
+environment independence, ownership handling and switch behavior are covered
+only by synthetic tests (`server/tests/test_release.py`,
+`PairingWrapperTests`); this host check is not yet executed. `AGENT_CLI` means
 `python -m media_capture_agent.enroll` run from the Agent's code with
 `cryptography` installed.
 
@@ -1887,7 +1896,7 @@ Issue #47 remains open. The synthetic CI tests do not complete these checks: the
 - [ ] configuration and credentials resolve outside the release checkout, remain admin-managed and runtime-readable but not writable; state/database, recordings, and audit logs use their documented separate mutable locations and are writable only by the intended runtime account;
 - [ ] the human listener stays private-by-default behind the intended trusted-proxy boundary after install; it is not exposed to the public Internet and the proxy cannot be bypassed from an ordinary LAN client;
 - [ ] before updating, seed a non-vacuous baseline: at least one ordinary recording, one starred recording, one registered camera source, several audit records, and synthetic Owner/invitation records with independent `live:view` / `recordings:view` grants plus a revoked test invitation, so that the comparisons below cannot pass on empty inventories;
-- [ ] record the content inventory with `python -m app.lifecycle_inventory record` from the installed release into an administrator-private directory outside the runtime root, installation tree and any checkout (see `server/docs/DEPLOYMENT.md`, "Preservation inventory across update and rollback"); the command must report every coverage item as `present` (exit 0), otherwise seed the missing items first. After update, after every successful rollback and after a refused rollback's documented recovery, run `python -m app.lifecycle_inventory verify` against the same baseline and record only its status line: `preserved` passes, `failed` fails, and `empty` is not a pass. Do not star or unstar recordings between `record` and `verify`; a star change is reported as `changed` and remains a failure. The tool does not probe container duration or decode media; those remain the manual items below;
+- [ ] record the content inventory with `python -m app.lifecycle_inventory record` from the installed release into an administrator-private directory outside the runtime root, installation tree and any checkout (see `server/docs/DEPLOYMENT.md`, "Preservation inventory across update and rollback"); the command must report every coverage item as `present` (exit 0), otherwise seed the missing items first. After update, after every successful rollback and after a refused rollback's documented recovery, run `python -m app.lifecycle_inventory verify` against the same baseline and record only its status line: `preserved` (exit 0) passes, `failed` (exit 1) fails, `empty` (exit 3) is not a pass, and `preserved_except_declared_rewrites` (exit 4) passes only once each declared recording has been re-verified manually. Do not star or unstar recordings between `record` and `verify`; a star change is reported as `changed` and remains a failure. The tool does not probe container duration or decode media; those remain the manual items below;
 - [ ] record a pre-update inventory (version/commit, recording count and sizes, starred recordings, audit record count with oldest/newest timestamps, camera source registrations, Owner presence, and nonidentifying invitation logical IDs with their permission/revocation state, plus Owner-approved hardware baseline) in local sanitized notes only; never record principal identity values, credentials, invitation values, or permission-bearing URLs, and mark each inventory that is empty or not applicable as such instead of counting it as preserved;
 - [ ] counts, sizes and boundary timestamps alone cannot detect replaced content, so also record content evidence for the same baseline: each seeded recording's stable logical ID with its locally computed file digest (recorded by the inventory tool), container duration and a decodable playback sample (both manual: probe and play each seeded recording with a local player and note PASS/FAIL per logical ID), and the audit rows' per-row digests or an equivalent chained digest over the whole retained set, not only the first and last rows; keep the digests and logical IDs deployment-local;
 - [ ] update to a newer version through the documented lifecycle; the reported version changes and every item of the pre-update inventory survives except for intended, documented migrations;

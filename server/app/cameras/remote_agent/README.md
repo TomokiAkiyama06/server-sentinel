@@ -172,8 +172,11 @@ client (#14 / #15) must open its Main connections through `connect_to_main`
 (not its own `socket.create_connection`) so the same post-connect check
 applies.
 
-`pairing_cli.py` (`python -m app.cameras.remote_agent.pairing_cli`) is the local
-Owner CLI: `init`, `rotate-listener`, `export-bundle`, `approve`, `list`,
+`pairing_cli.py` (`python -m app.cameras.remote_agent.pairing_cli`, run on an
+installed Main as `serversentinel-pairing`: the root-owned
+`/usr/local/sbin` wrapper the installer places, which runs this module with
+the `current` release's own isolated interpreter and code, Issue #180;
+`server/docs/DEPLOYMENT.md`) is the local Owner CLI: `init`, `rotate-listener`, `export-bundle`, `approve`, `list`,
 `revoke`. `init`, `rotate-listener`, `approve` and `revoke` start as root
 (`sudo`), fork the CA child (above), and then drop to the service account
 (`--service-user`, default `server-sentinel`; `--ca-user` defaults to

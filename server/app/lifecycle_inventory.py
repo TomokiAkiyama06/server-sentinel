@@ -193,6 +193,9 @@ EXIT_PRESERVED = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_EMPTY = 3
+# preserved_except_declared_rewrites: everything else preserved, but the
+# declared recordings still need manual re-verification, so never 0 (#161).
+EXIT_DECLARED_REWRITES = 4
 
 
 class InventoryError(RuntimeError):
@@ -2434,6 +2437,25 @@ def _pairing_row_errors(connection, tables) -> list:
     return errors
 
 
+def _owner_template_row_valid(row) -> bool:
+    """Whether the store's read model loads the singleton row.
+
+    owner_store.read_template_row() is the check
+    OwnerTemplateStore._load_for_verification() applies (generation,
+    template type and size, provenance), here under the largest template
+    size any store accepts: a deployment's stricter configured limit is not
+    read. A missing singleton row is refused by OwnerTemplateStore.status().
+    """
+    if row is None:
+        return False
+    try:
+        owner_store.read_template_row(row["generation"], row["template"], row["provenance"],
+                                      max_bytes=owner_store.MAX_TEMPLATE_BYTES_CEILING)
+    except owner_store.OwnerError:
+        return False
+    return True
+
+
 def _owner_template(root: Path | None, salt: str, owner: int) -> dict:
     """The separate private Owner-template store, as digests only.
 
@@ -2477,12 +2499,19 @@ def _owner_template(root: Path | None, salt: str, owner: int) -> dict:
         row = connection.execute(
             "SELECT generation, template, provenance FROM owner_template "
             "WHERE singleton = 1").fetchone()
+        template = None if row is None else row["template"]
         result = {
             "configured": True, "state": "present",
             "generation": None if row is None else row["generation"],
-            "enrolled": row is not None and row["template"] is not None,
-            "template_digest": None if row is None or row["template"] is None
-            else _keyed(salt, ["owner-template-v1", bytes(row["template"]).hex()]),
+            "enrolled": template is not None,
+            # Owner verification reads the row through the store's own read
+            # model; a row it refuses (PRIVATE_TEMPLATE_STATE_INVALID) leaves
+            # verification unusable, so it is never healthy here (#159).
+            "template_state": "valid" if _owner_template_row_valid(row) else "invalid",
+            # _blob_hex(), never bytes(): bytes() of an integer would stand
+            # for a zero-filled template.
+            "template_digest": None if template is None
+            else _keyed(salt, ["owner-template-v1", _blob_hex(template)]),
             "provenance_digest": None if row is None or row["provenance"] is None
             else _keyed(salt, ["owner-provenance-v1", row["provenance"]]),
             "audit": _audit_table(connection, tables, "owner_template_audit",
@@ -2564,6 +2593,28 @@ def _compare_principals(baseline: dict | None, current: dict | None) -> dict:
             advanced.append(key)
     result.update(status="failed" if result["failed"] else "preserved",
                   preserved=sorted(result["preserved"]), sign_counts_advanced=sorted(advanced))
+    return result
+
+
+def _compare_invitations(baseline: dict | None, current: dict | None) -> dict:
+    """Keyed comparison that names the known session-revocation side effect.
+
+    A session revocation advances the authorization generation, which ends
+    every invitation bound to the recorded one. An invitation that differs
+    only in that its recorded current generation is no longer current is
+    reported ``generation_advanced``: still a failure (investigate, then
+    take a new baseline), but distinguishable from any other change (#161).
+    """
+    result = _compare_keyed(baseline, current)
+    for entry in result["failed"]:
+        before, after = (baseline or {}).get(entry["id"]), (current or {}).get(entry["id"])
+        if entry["reason"] != "changed" or before is None or after is None:
+            continue
+        differing = {key for key in set(before) | set(after) if before.get(key) != after.get(key)}
+        if (differing == {"deployment_generation_current"}
+                and before["deployment_generation_current"] is True
+                and after["deployment_generation_current"] is False):
+            entry["reason"] = "generation_advanced"
     return result
 
 
@@ -2712,7 +2763,15 @@ def collect(runtime_root: Path, *, salt: str | None = None,
     # Taken before the snapshot, so a row written in between counts as
     # written after the record.
     recorded_at = _utcnow().isoformat()
+    # The outbox lock, the session rows and the timeline gap must be one
+    # observation (#162): an outbox opening between the snapshot and a
+    # single probe would convert the copied stale rows into a gap and still
+    # make them look held. The probe runs before and after the snapshot; a
+    # different answer means the outbox started or stopped in between.
+    live_before = _outbox_live(tree.database)
     connection = _snapshot(tree.database)
+    live_after = _outbox_live(tree.database)
+    live_outbox = live_before if live_before == live_after else None
     try:
         tables = _tables(connection)
         schema_version, migrations = None, None
@@ -2747,7 +2806,8 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             "access": _access(connection, tables, salt),
             "camera_registry_settings": _registry_settings(connection, tables),
             "presence_timeline_gap": _timeline_gap(connection, tables),
-            "presence": _presence(connection, tables, salt, _outbox_live(tree.database)),
+            "presence": _presence(connection, tables, salt, live_outbox),
+            "presence_outbox_settled": live_before == live_after,
             "integrity_baseline": _integrity_baseline(connection, tables, salt),
             "security_state": _security_state(connection, tables, salt),
             "integrity_delivery": _integrity_delivery(connection, tables, salt),
@@ -3304,11 +3364,18 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
             # sequence (another stream: any sequence). A backward move is
             # cursor_regressed; a catalogued last segment is compared exactly
             # by the domain checks.
+            # _publish() always leaves the advanced cursor active (#165): an
+            # inactive one is not counted by append() against
+            # RECORDING_SOURCE_LIMIT, so another source could take its slot.
+            # Main never calls release_source(); if it ever does, a release
+            # after a publication inside the window fails closed here.
             same_stream = after.get("stream_id") == before.get("stream_id")
-            if (_int(after.get("end_ms")) and _int(before.get("end_ms"))
-                    and after["end_ms"] > before["end_ms"] and same_stream
+            advanced = (_int(after.get("end_ms")) and _int(before.get("end_ms"))
+                        and after["end_ms"] > before["end_ms"])
+            if advanced and (after.get("active") != 1 or (
+                    same_stream
                     and not (_int(after.get("sequence")) and _int(before.get("sequence"))
-                             and after["sequence"] > before["sequence"])):
+                             and after["sequence"] > before["sequence"]))):
                 failed.append({"id": f"cursor:{source_id}", "reason": "cursor_changed"})
             continue
         unchanged = all(after.get(key) == value for key, value in before.items()
@@ -3731,8 +3798,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
                                                   rules["owner_template"], fresh["iso"]),
         "access_principals": _compare_principals(access_base.get("principals"),
                                                  access_now.get("principals")),
-        "access_invitations": _compare_keyed(access_base.get("invitations"),
-                                             access_now.get("invitations")),
+        "access_invitations": _compare_invitations(access_base.get("invitations"),
+                                                   access_now.get("invitations")),
     }
     # No time the services compare later may lie beyond the verify time
     # (plus a small clock-skew allowance): a far-future clock would refuse
@@ -3740,6 +3807,9 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
     late_and_invalid = _future_times(current, (now or _utcnow()) + CLOCK_SKEW_ALLOWANCE)
     for name, item, reason in current.get("domain_errors") or ():
         late_and_invalid.setdefault(name, []).append({"id": item, "reason": reason})
+    if (current.get("owner_template") or {}).get("template_state") == "invalid":
+        late_and_invalid.setdefault("owner_template", []).append(
+            {"id": "template", "reason": "invalid_value"})
     for item in (current.get("owner_template") or {}).get("invalid_audit") or ():
         late_and_invalid.setdefault("owner_template", []).append(
             {"id": f"audit:{item}", "reason": "invalid_value"})
@@ -3968,6 +4038,12 @@ def main(arguments: list[str] | None = None) -> int:
                     f"(missing {len(schema.get('missing') or ())}, "
                     f"changed {len(schema.get('changed') or ())}, "
                     f"history {'ok' if schema.get('history_matches') else 'mismatch'})")
+            if not inventory["presence_outbox_settled"]:
+                # The lock probe and the copied session rows / gap would be
+                # two observations; their pairing is what the baseline relies on.
+                raise InventoryError(
+                    "the presence outbox started or stopped while the state was read; "
+                    "run record again")
             if any(error[0] == "integrity_baseline" for error in inventory["domain_errors"]):
                 # The service's startup integrity check would reject it too.
                 raise InventoryError("approved hardware baseline cannot be read by the service")
@@ -4013,6 +4089,8 @@ def main(arguments: list[str] | None = None) -> int:
             return EXIT_FAILED
         if report["status"] == "empty":
             return EXIT_EMPTY
+        if report["status"] == "preserved_except_declared_rewrites":
+            return EXIT_DECLARED_REWRITES
         return EXIT_PRESERVED
     except InventoryError as exc:
         print(f"lifecycle inventory refused: {exc}", file=sys.stderr)
