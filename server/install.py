@@ -197,6 +197,7 @@ RequiresMountsFor={_quote(deployment.runtime_root)}
 Type=notify
 NotifyAccess=main
 TimeoutStartSec=60
+TimeoutStopSec=90
 User={account.pw_name}
 Group={account.pw_gid}
 WorkingDirectory={_unit_path(current)}

@@ -198,9 +198,11 @@ shutdown waits for all source workers, which stop in parallel; it must cover the
 camera teardown (up to 5.5 s observed on a real C960 after an unplug) plus the
 1 s offline health-write settle, and a shorter value can make a clean shutdown
 `stop_failed`. A worker still alive at the bound stays watched and is never
-reported `online`. The installed unit sets no `TimeoutStopSec`, so systemd's
-default stop timeout (normally 90 s) applies and stays above the 60 s upper
-bound.
+reported `online`. The installed unit sets `TimeoutStopSec=90` explicitly
+(Owner decision 2026-10-08), so the stop bound does not depend on the host's
+`DefaultTimeoutStopSec` and stays above the 60 s upper bound. A rollback
+restores the target release's own unit snapshot, so a release installed before
+this change runs with that snapshot's (default) stop timeout.
 `frame_stall_reopen_seconds` (0.5–300, not less than `frame_stall_seconds`,
 scaled by the same factor) is how long a stall lasts before the source is
 reported `offline` and the capture is closed and reopened (also enforced by the
