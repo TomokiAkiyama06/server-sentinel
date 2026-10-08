@@ -15,6 +15,7 @@ from __future__ import annotations
 from contextlib import closing
 import datetime
 import errno
+import fcntl
 import io
 import json
 import os
@@ -660,6 +661,76 @@ class ApproveOrderingTests(Harness):
         self.assertIn("refused", stderr)
         self.assertEqual([], terminal.written)
         self.assertEqual({}, served)
+
+    def test_enrollment_tls_is_loaded_from_the_verified_descriptors(self):
+        # Issue #183: ssl gets /proc/self/fd/N of the checked inodes, never
+        # the listener names.
+        real_build = pairing_cli.build_enrollment_server_context
+        loaded = []
+
+        def recording_build(certificate_path, key_path):
+            for name, path in (("main-server-certificate.pem", certificate_path),
+                               ("main-server-key.pem", key_path)):
+                text = str(path)
+                self.assertTrue(text.startswith("/proc/self/fd/"), text)
+                descriptor = int(text[len("/proc/self/fd/"):])
+                info, expected = os.fstat(descriptor), os.stat(self.listener_dir / name)
+                self.assertEqual((expected.st_dev, expected.st_ino), (info.st_dev, info.st_ino))
+                self.assertFalse(os.get_inheritable(descriptor))
+                self.assertEqual(os.O_RDONLY, fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE)
+                loaded.append(name)
+            return real_build(certificate_path, key_path)
+        terminal = Terminal(self.events)
+        with patch.object(pairing_cli, "build_enrollment_server_context", recording_build):
+            status, _stdout, stderr, served = self.run_approve(terminal)
+        self.assertEqual(1, status, stderr)  # expired: the fake listener never serves
+        self.assertEqual(["main-server-certificate.pem", "main-server-key.pem"], loaded)
+        self.assertIn("service", served)
+
+    def test_a_key_swapped_after_validation_does_not_change_what_is_loaded(self):
+        # Issue #183: the names are replaced after listener_material and the
+        # descriptors were checked, right before ssl loads. A path-based load
+        # would now read a key that does not match the certificate; the
+        # descriptor load still reads the validated pair.
+        real_build = pairing_cli.build_enrollment_server_context
+        replacement = ec.generate_private_key(ec.SECP256R1()).private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption())
+        swapped = []
+
+        def swapping_build(certificate_path, key_path):
+            staged = self.listener_dir / "swap.tmp"
+            descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(replacement)
+            os.rename(staged, self.listener_dir / "main-server-key.pem")
+            swapped.append(True)
+            return real_build(certificate_path, key_path)
+        terminal = Terminal(self.events)
+        with patch.object(pairing_cli, "build_enrollment_server_context", swapping_build):
+            status, _stdout, stderr, served = self.run_approve(terminal)
+        self.assertEqual([True], swapped)
+        self.assertEqual(replacement, (self.listener_dir / "main-server-key.pem").read_bytes())
+        self.assertEqual(1, status, stderr)  # expired, not enrollment_tls_material_invalid
+        self.assertNotIn("refused", stderr)
+        self.assertIn("service", served)
+
+    def test_the_descriptor_open_never_follows_a_symlink(self):
+        # Issue #183: listener_material refuses a symlink earlier, so this
+        # checks the descriptor open on its own: a symlink to a private file
+        # of the same account is refused, never followed.
+        other = self.root / "elsewhere-key.pem"
+        os.rename(self.listener_dir / "main-server-key.pem", other)
+        os.symlink(other, self.listener_dir / "main-server-key.pem")
+        built = []
+        with patch.object(pairing_cli, "build_enrollment_server_context",
+                          lambda *paths: built.append(paths)), \
+                self.assertRaises(CaptureAuthorityError):
+            pairing_cli._enrollment_context(PrivateDirectory(self.listener_dir))
+        self.assertEqual([], built)
+        with self.assertRaises(CaptureAuthorityError), \
+                PrivateDirectory(self.listener_dir).open_private("main-server-key.pem"):
+            pass
 
     def test_failed_drop_aborts_before_the_request_or_database(self):
         def failing(account):
@@ -1426,6 +1497,21 @@ class InterruptedListenerWriteTests(InitRecoveryTests):
                 self.assertEqual(files, {name: (self.listener / name).read_bytes()
                                          for name in os.listdir(self.listener)})
 
+    def test_a_complete_listener_without_its_ca_is_refused_with_the_fixed_word(self):
+        # Issue #183: a mistyped --authority-dir looks exactly like a lost CA;
+        # the complete listener credential is kept and the refusal names it.
+        files = self.complete_files()
+        kept = self.ca_state()
+        self.authority = self.root / "mistyped-ca"
+        status, stdout, stderr = self.init()
+        self.assertEqual(2, status)
+        self.assertEqual("", stdout)
+        self.assertIn("refused: listener_complete_but_deployment_ca_unavailable", stderr)
+        self.assertEqual(files, {name: (self.listener / name).read_bytes()
+                                 for name in os.listdir(self.listener)})
+        self.authority = self.root / "ca"
+        self.assertEqual(kept, self.ca_state())
+
     def test_writer_stops_at_every_step_and_the_rerun_completes(self):
         # A real interruption of write_listener_credential after each staged
         # write and each install (no rollback runs, as after a crash).
@@ -1520,6 +1606,23 @@ class PartialCaInitTests(InitRecoveryTests):
         self.assertIn("init recovered", stderr)
         self.assertEqual(files["ca-key.pem"], (self.authority / "ca-key.pem").read_bytes())
         self.assertFalse((self.authority / "ca-key.pem.init").exists())
+
+    def test_a_complete_ca_with_separate_staged_leftovers_is_kept_and_cleaned(self):
+        # Issue #183: staged names on their own inode are not second links,
+        # so only the existing-CA branch of init removes them; the CA itself
+        # is kept byte for byte.
+        files = self.ca_files()
+        self.build_ca(files, ["ca-certificate.pem", "ca-key.pem", "ca-certificate.pem.init",
+                              "ca-key.pem.init"])
+        self.assertNotEqual(os.stat(self.authority / "ca-key.pem").st_ino,
+                            os.stat(self.authority / "ca-key.pem.init").st_ino)
+        status, _stdout, stderr = self.init()
+        self.assertEqual(0, status, stderr)
+        self.assertIn("init recovered", stderr)
+        self.assertEqual(files, {name: (self.authority / name).read_bytes()
+                                 for name in ("ca-certificate.pem", "ca-key.pem")})
+        self.assertEqual(["ca-certificate.pem", "ca-key.pem", ISSUANCE_LOG],
+                         sorted(os.listdir(self.authority)))
 
     def test_a_partial_ca_with_issuance_records_is_never_removed(self):
         files = self.ca_files()
