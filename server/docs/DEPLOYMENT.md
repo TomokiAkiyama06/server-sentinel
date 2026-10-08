@@ -830,6 +830,21 @@ instead of switching to a release that could not start:
 
 The configuration is never rewritten by the installer.
 
+The two releases make contradicting demands on the same configuration file,
+so between editing it and a completed switch neither release can start from
+it: the running (old) release refuses the edited configuration, and when
+`_switch` fails, its restart of the release that was running before fails
+too (Issue #183). Therefore:
+
+- run the same `update` / `rollback` command immediately after editing the
+  configuration, with nothing restarting the service in between;
+- if that switch fails, first restore the configuration to what the running
+  (old) release accepts (undo the edit: remove the entry before starting a
+  release without Issue #109, add it back before starting one with it), and
+  only then start the old release again (`sudo systemctl restart
+  server-sentinel.service`). Then fix the cause and repeat the edit and the
+  command.
+
 Run the separately downloaded installer only after verifying its published
 SHA-256. Global arguments precede the operation:
 
