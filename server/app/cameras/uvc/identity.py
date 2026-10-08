@@ -199,7 +199,10 @@ class ReconnectController:
         self.flush = flush
         self.notify = notify
         # Events emitted under the lock, delivered to ``notify`` in the same
-        # order by one thread at a time.
+        # order by one thread at a time. ``notify`` must not block: the
+        # runtime's notify only logs and appends to a bounded queue drained by
+        # its own sink-delivery thread (Issue #173), so a worker delivering
+        # here never waits for a slow or hung downstream health sink.
         self._outbox = deque()
         self._delivery = threading.Lock()
         # A non-blocking caller (the supervisor watchdog) never runs

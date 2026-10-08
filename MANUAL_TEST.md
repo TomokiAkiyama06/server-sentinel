@@ -117,7 +117,12 @@ device scan を `presence_scan_seconds` 間隔へ抑制）は synthetic fake で
    `online` へ戻ることを確認する。`video_frame_stalled` から復帰した source の
    negotiated profile が registry に残っていること、停止が
    `frame_stall_reopen_seconds` を超えた場合は `offline` になり再 open されることも
-   確認する。
+   確認する。profile 残存を記録するため、観測 script は 1 秒ごとの行に各 source の
+   registry `negotiated_capture_profile`（`幅x高さ@fps/pixel_format`、未記録なら
+   `none`）を health と並べて出力すること。`degraded`（`video_frame_stalled`）の間と
+   `online` 復帰直後の行で profile が `none` にならないことを確認する（Issue #173、
+   P-5。2026-10-07 時点の `scripts/manual/uvc_watch.py` は profile を出力しないため、
+   次回の実機確認前に観測 script へ追加する）。
 3. レンズを覆う・暗室にするなど低照度で 5 分以上連続取得し、`video_frame_stalled`
    への遷移が 0 回であること（fps 低下で flap しないこと）を確認する。
 4. 30 fps × 2 台で 60 秒取得し、live 中の全 device scan が概ね

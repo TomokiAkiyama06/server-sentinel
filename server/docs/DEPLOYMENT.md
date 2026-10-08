@@ -193,14 +193,25 @@ fail `--check`). `frame_stall_seconds` (0.25–30) is how long a live capture
 may deliver no frame before its source is reported `degraded`
 (`video_frame_stalled`) instead of `online`; the effective window is never
 shorter than 10 negotiated frame intervals, so a slow profile cannot flap.
-`join_timeout_seconds` (0.1–60, default 10) bounds the total time a stop or
-shutdown waits for all source workers, which stop in parallel; it must cover the
-camera teardown (up to 5.5 s observed on a real C960 after an unplug) plus the
-1 s offline health-write settle, and a shorter value can make a clean shutdown
+`join_timeout_seconds` (0.1–60, default 10, and not less than
+`frame_stall_seconds`) bounds the total time a stop or shutdown waits for all
+source workers, which stop in parallel; it must cover the camera teardown (up
+to 5.5 s observed on a real C960 after an unplug) plus the 1 s offline
+health-write settle, and a shorter value can make a clean shutdown
 `stop_failed`. A worker still alive at the bound stays watched and is never
-reported `online`. The installed unit sets no `TimeoutStopSec`, so systemd's
-default stop timeout (normally 90 s) applies and stays above the 60 s upper
-bound.
+reported `online`. The bound may not be shorter than the stall window because
+the stop releases the database right after it: the watchdog must be able to
+make a blocked worker's lowered state durable first. A profile slower than
+`10 / frame_stall_seconds` fps widens the stall window to 10 frame intervals,
+so keep the join bound above that as well (the default 10 s covers every
+profile of at least 1 fps). The local UVC stop as a whole can take up to
+`join_timeout_seconds` + 1 s for the frame-progress watchdog join + 1 s for
+pending health-sink deliveries (62 s at the 60 s maximum), and the remaining
+shutdown steps (monitoring runtime, audit retention) follow it. The installed
+unit sets no `TimeoutStopSec`, so systemd's default stop timeout (normally
+90 s) applies; with a join bound near the maximum, set `TimeoutStopSec`
+explicitly in a drop-in if the host's default is lower or other shutdown steps
+are slow.
 `frame_stall_reopen_seconds` (0.5–300, not less than `frame_stall_seconds`,
 scaled by the same factor) is how long a stall lasts before the source is
 reported `offline` and the capture is closed and reopened (also enforced by the

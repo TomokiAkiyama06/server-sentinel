@@ -210,19 +210,36 @@ a camera mid-teardown into `stop_failed`. After the workers are joined,
 `LocalUvcSupervisor.WATCHDOG_JOIN_MINIMUM_SECONDS` (1 s) even when the shared
 bound is used up. A watchdog still inside a frame-progress check after that
 join makes `close()` fail: the stop is `stop_failed` and the runtime leaves the
-adapter open rather than closing it under that check (a later `close()` joins
-the watchdog again). A successful close therefore returns with no worker or
-watchdog thread left that could call into the adapter.
+adapter open rather than closing it under that check (a later supervisor
+`close()` joins the watchdog again). A successful close therefore returns with
+no worker or watchdog thread left that could call into the adapter.
 A worker that does not stop
 within the join bound makes the stop `stop_failed`; the adapter is then left to
 that worker's own cleanup rather than closed from a second thread, and the
 durable session marker conservatively requires reapproval at next start.
+`stop_failed` is not terminal for the runtime (Issue #173): a later
+`LocalUvcRuntime.stop()` retries the supervisor join and, once no worker or
+watchdog is left, closes the adapter (and retries a failed database release).
+A watchdog-only failure then ends `stopped`; a worker whose own cleanup failed
+(for example its session-marker release refused after the pin was released)
+keeps the stop `stop_failed`. `join_timeout_seconds` may not be shorter than
+`frame_stall_seconds`: the stop releases the database pin right after the
+join, and the watchdog must have made a blocked worker's lowered state durable
+before then.
 `LocalUvcRuntime.reapprove()` stops the one source's worker, runs the audited
 `OwnerAdministration.approve_uvc()`, and restarts the worker whether the
 ceremony committed or was refused. Health transitions go to a bounded
 in-memory buffer, an optional injected sink, and a rate-limited value-free log
 event (`local_uvc_source_health_changed`); durable timeline/audit ingestion of
-these camera-health events is a follow-up. The adapter refreshes `last_seen_at`
+these camera-health events is a follow-up. The optional sink never runs on a
+capture worker or the watchdog: events wait in a bounded queue
+(`HEALTH_SINK_MAX_PENDING`, 64) drained in order by one delivery thread. On
+overflow an older event of a source that has a newer pending event is
+coalesced away, so each source's latest transition is always delivered. A sink
+call running longer than `HEALTH_SINK_STALL_SECONDS` (5 s) is reported as
+`health_sink_stalled` and makes the service `degraded`; the status also
+reports `health_sink_pending` and `health_sink_coalesced`. `stop()` waits at
+most `HEALTH_SINK_SETTLE_SECONDS` (1 s) for pending deliveries. The adapter refreshes `last_seen_at`
 at most once per second and does not rewrite an unchanged offline state for an
 unapproved source, so polling does not become a steady SQLite write load.
 Frames go to `app.media.live.local_preview.LocalPreviewHub`.

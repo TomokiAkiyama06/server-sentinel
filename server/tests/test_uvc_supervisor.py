@@ -99,6 +99,17 @@ class LocalUvcSupervisorTests(unittest.TestCase):
         except WorkerStopError:
             pass
 
+    def test_worker_timing_range_is_validated(self):
+        # Issue #173: the supervisor validates its own join bound against the
+        # deployment upper bound, and non-finite timing is never accepted.
+        LocalUvcSupervisor(SyntheticAdapter(), join_timeout=60.0)
+        for name, value in (("join_timeout", 60.5), ("join_timeout", float("inf")),
+                            ("join_timeout", float("nan")), ("poll_timeout", float("inf")),
+                            ("retry_delay", float("nan")), ("watchdog_interval", 0),
+                            ("join_timeout", True)):
+            with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                LocalUvcSupervisor(SyntheticAdapter(), **{name: value})
+
     def test_repeated_start_keeps_one_serial_worker(self):
         source = uuid4()
         self.adapter.prepare(source)
