@@ -49,16 +49,56 @@ COMMITTED_LOCK_WAIT = 2.0
 COMMITTED_LOCK_POLL = 0.005
 
 
-# Unadmitted (rollback-journal) reads of this process run one at a time. A
-# read holds its SHARED lock for the whole read (#151), and SQLite's unix VFS
-# lets a connection of a process that already holds SHARED take it again
-# without checking the PENDING lock a waiting writer of another process holds.
-# Two overlapping reads here would then keep the file read-locked between
-# them and could starve that writer past its busy timeout; read one at a time,
-# the lock is released after each read and the waiting writer's PENDING stops
-# the next one until the commit. The wait matches the service busy timeout.
-_UNADMITTED_READS = threading.RLock()
+# Unadmitted (rollback-journal) reads of one database file in this process
+# run one at a time. A read holds its SHARED lock for the whole read (#151),
+# and SQLite's unix VFS lets a connection of a process that already holds
+# SHARED on a file take it again without checking the PENDING lock a waiting
+# writer of another process holds. Two overlapping reads of that file here
+# would then keep it read-locked between them and could starve that writer
+# past its busy timeout; read one at a time, the lock is released after each
+# read and the waiting writer's PENDING stops the next one until the commit.
+# SQLite's locks are per file, so reads of different database files do not
+# wait for each other: there is one lock per database path (resolved like the
+# live-session registry), created on first use and kept for the process
+# lifetime, bounded by the database files the process reads. The wait
+# matches the service busy timeout.
+#
+# The locks are `threading.RLock`, which is not FIFO: a thread that releases
+# one and acquires it again at once can win against threads already waiting,
+# so under sustained contention one reader may wait the whole
+# `UNADMITTED_READ_WAIT` and fail with `PresenceReadBusy`.
+_UNADMITTED_READS = {}
+_UNADMITTED_READS_LOCK = threading.Lock()
 UNADMITTED_READ_WAIT = 5.0
+
+
+class PresenceReadBusy(RuntimeError):
+    """An unadmitted presence read waited ``UNADMITTED_READ_WAIT`` for its turn.
+
+    Raised by ``PresenceService._read()`` (and so by Owner status, history,
+    audit and timeline-gap reads of a rollback-journal database) before any
+    connection is opened, when other reads of the same database file in this
+    process kept its read lock for longer than the wait. Nothing was read,
+    no SQLite lock is held and the per-database read lock is not held by the
+    caller, so the read can simply be retried. It is transient load, not a
+    fault of the data or an access decision: a route exposing these reads
+    should report it as a temporary unavailability (for example HTTP 503
+    with a retry hint), never as an empty result, a healthy status or a
+    permission failure. It subclasses ``RuntimeError`` so existing handlers
+    of the earlier ``RuntimeError("presence read busy")`` keep working.
+    """
+
+    def __init__(self):
+        super().__init__("presence read busy")
+
+
+def _unadmitted_read_lock(key):
+    """The process-wide lock serializing unadmitted reads of database ``key``."""
+    with _UNADMITTED_READS_LOCK:
+        lock = _UNADMITTED_READS.get(key)
+        if lock is None:
+            lock = _UNADMITTED_READS[key] = threading.RLock()
+        return lock
 
 
 # The first 16 bytes of every SQLite database file. Header bytes 18 and 19
@@ -75,9 +115,12 @@ def _wal_database(path):
     instead of creating it. An empty or foreign file is not WAL either, and a
     rollback-journal read never creates a file beside the database.
 
-    The header is read through the process-wide held descriptor, never a
-    fresh ``open``/``close``: closing a descriptor on the database would drop
-    the POSIX locks this process's own SQLite connections hold on it.
+    The header is read through the process-wide held descriptor of the inode
+    ``path`` names at that moment (opened and kept on first sight of that
+    inode), never a fresh ``open``/``close``: closing a descriptor on the
+    database would drop the POSIX locks this process's own SQLite
+    connections hold on it. If the path is replaced, the next call reads the
+    new file's own held descriptor, not the old one's.
     """
     header = read_database_prefix(path, 20)
     if header is None:
@@ -196,7 +239,8 @@ class PresenceService:
         Another process able to write the file can still switch it to WAL, or
         replace it with a WAL database, after the header was classified
         (#151). An unadmitted read therefore re-reads the header after its
-        open and then holds one read transaction for the whole read: its
+        open, through the held descriptor of the inode the path currently
+        names, and then holds one read transaction for the whole read: its
         SHARED lock keeps any other connection from taking the EXCLUSIVE lock
         a switch to WAL needs, so the mode cannot change under it between
         statements. Only a switch between that re-read and the lock remains;
@@ -208,17 +252,22 @@ class PresenceService:
         the next admitted connection closes: SQLite exposes no step between
         locking the file and opening its WAL where the read could stop first.
 
-        Unadmitted reads of this process are serialized (``_UNADMITTED_READS``)
-        so that their read transactions never overlap: overlapping ones would
-        keep the file read-locked between them and could starve a writer in
-        another process, such as a recording append, past its busy timeout.
+        Unadmitted reads of one database file in this process are serialized
+        (``_UNADMITTED_READS``, one lock per database path) so that their read
+        transactions never overlap: overlapping ones would keep the file
+        read-locked between them and could starve a writer in another
+        process, such as a recording append, past its busy timeout. A read
+        that cannot take its turn within ``UNADMITTED_READ_WAIT`` raises
+        ``PresenceReadBusy`` before opening anything; see that class for how a
+        caller reports it.
         """
         path = self.database.path
         if not path.is_absolute() or path.is_symlink():
             raise ValueError("database location is unavailable")
         if not _wal_database(path):
-            if not _UNADMITTED_READS.acquire(timeout=UNADMITTED_READ_WAIT):
-                raise RuntimeError("presence read busy")
+            turn = _unadmitted_read_lock(self._session_key())
+            if not turn.acquire(timeout=UNADMITTED_READ_WAIT):
+                raise PresenceReadBusy()
             try:
                 connection = self._unadmitted_connection(path)
                 if connection is not None:
@@ -230,7 +279,7 @@ class PresenceService:
                                 connection.rollback()
                     return
             finally:
-                _UNADMITTED_READS.release()
+                turn.release()
         with ExitStack() as held:
             held.enter_context(self._admission())
             if isinstance(self.database, PinnedDatabase):
