@@ -284,6 +284,37 @@ class RuntimeLifecycleTests(RuntimeFixture):
         # Coalescing never drops a source's latest transition.
         self.assertEqual("video_capture_ready", delivered[-1].reason)
 
+    def test_status_state_and_sink_stalled_come_from_one_snapshot(self):
+        # Codex P2 on #188: ``status()`` used to snapshot the sink once for
+        # the aggregate state and again for ``health_sink_stalled``. A sink
+        # that stalls (or recovers) between the two reads produced RUNNING
+        # next to a stalled sink, or DEGRADED next to a healthy one.
+        source = self.source()
+        runtime = self.runtime(source.id, health_sink=lambda event: None)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        self.assertTrue(wait_for(lambda: runtime.status().health_sink_pending == 0
+                                 and runtime.status().state is LocalUvcRuntimeState.RUNNING))
+        reads = []
+
+        def flipping_snapshot():
+            # Alternate the stalled flag on every read.
+            stalled = len(reads) % 2 == 1
+            reads.append(stalled)
+            return 0, 0, 0, stalled
+
+        with patch.object(runtime._sink_delivery, "snapshot", flipping_snapshot):
+            observed = []
+            for _ in range(4):
+                status = runtime.status()
+                observed.append((status.state, status.health_sink_stalled))
+        self.assertIn((LocalUvcRuntimeState.RUNNING, False), observed)
+        self.assertIn((LocalUvcRuntimeState.DEGRADED, True), observed)
+        for state, stalled in observed:
+            self.assertEqual(stalled, state is LocalUvcRuntimeState.DEGRADED,
+                             (state, stalled))
+
     def test_blocking_sink_on_a_watchdog_stall_does_not_stall_the_watchdog(self):
         # The watchdog itself emits ``video_frame_stalled``. A sink that blocks
         # on that event must not run on the watchdog thread, or the reopen

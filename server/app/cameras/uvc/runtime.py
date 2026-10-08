@@ -456,7 +456,12 @@ class LocalUvcRuntime:
         except Exception:
             pass
 
-    def _aggregate(self) -> LocalUvcRuntimeState:
+    def _aggregate(self, sink_stalled: bool | None = None) -> LocalUvcRuntimeState:
+        # ``sink_stalled`` lets ``status()`` derive the state and the reported
+        # ``health_sink_stalled`` from one sink snapshot, so the two never
+        # disagree (e.g. RUNNING next to a stalled sink).
+        if sink_stalled is None:
+            sink_stalled = self._sink_stalled()
         states = set(self._sources.values())
         if states <= {SourceRuntimeState.RUNNING, SourceRuntimeState.STOPPED_FOR_APPROVAL}:
             worker_problem = False
@@ -471,7 +476,7 @@ class LocalUvcRuntime:
                         # A live worker whose health cannot be persisted is
                         # not a healthy service: the registry may be stale.
                         worker_problem = True
-            if not worker_problem and not self._sink_stalled():
+            if not worker_problem and not sink_stalled:
                 return LocalUvcRuntimeState.RUNNING
         if SourceRuntimeState.RUNNING not in states:
             return LocalUvcRuntimeState.FAILED
@@ -619,19 +624,21 @@ class LocalUvcRuntime:
                     bool(worker and worker.cleanup_failed),
                     camera, not self._health_unpersisted(source_id),
                 ))
+            # One sink snapshot feeds both the aggregate state and the
+            # reported sink fields, so they always describe the same moment.
+            pending = coalesced = delivery_failures = 0
+            stalled = False
+            if self._sink_delivery is not None:
+                pending, coalesced, delivery_failures, stalled = self._sink_delivery.snapshot()
             state = self._state
             if state in (LocalUvcRuntimeState.RUNNING, LocalUvcRuntimeState.DEGRADED):
                 # A worker thread that died later is not hidden behind the
                 # state computed at start.
-                state = self._aggregate()
+                state = self._aggregate(sink_stalled=stalled)
                 self._state = state
         with self._events_lock:
             dropped, sink_failures = self._events_dropped, self._sink_failures
             suppressed = self.health_logs_suppressed
-        pending = coalesced = 0
-        stalled = False
-        if self._sink_delivery is not None:
-            pending, coalesced, delivery_failures, stalled = self._sink_delivery.snapshot()
-            sink_failures += delivery_failures
+        sink_failures += delivery_failures
         return LocalUvcRuntimeStatus(state, tuple(sources), dropped, sink_failures, suppressed,
                                      pending, coalesced, stalled)
