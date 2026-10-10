@@ -51,6 +51,10 @@ HEALTH_SINK_STALL_SECONDS = 5.0
 # stop() waits at most this long for pending sink deliveries (for example the
 # close/offline transitions raised while stopping) before returning.
 HEALTH_SINK_SETTLE_SECONDS = 1.0
+# A stop whose workers outlived the join bound waits at most this long for
+# their sources' ``offline`` rows to become durable before it releases the
+# pinned database (Issue #194).
+HEALTH_FENCE_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -116,6 +120,10 @@ class LocalUvcRuntimeStatus:
     health_sink_pending: int = 0
     health_sink_coalesced: int = 0
     health_sink_stalled: bool = False
+    # Pending events with no delivery thread to deliver them, because
+    # starting that thread failed; the service is then ``degraded`` and the
+    # start is retried (Issue #195 item 5).
+    health_sink_undeliverable: int = 0
 
 
 class _HealthSinkDelivery:
@@ -128,6 +136,9 @@ class _HealthSinkDelivery:
     thread; later events wait in the bounded queue, where an older event of a
     source with a newer pending event is coalesced away on overflow, and the
     hang is reported through ``snapshot`` instead of looking healthy.
+    If the thread cannot be started, the events stay pending and are counted
+    as undeliverable (never reported idle) until a later ``submit``,
+    ``resume`` or ``settle`` starts it.
     """
 
     def __init__(self, sink, *, max_pending, monotonic, stall_seconds):
@@ -143,6 +154,7 @@ class _HealthSinkDelivery:
         self._idle.set()
         self.coalesced = 0
         self.failures = 0
+        self.start_failures = 0
 
     def _coalesce(self, event):
         # Called with the lock held and the queue full. Drop the oldest event
@@ -164,10 +176,20 @@ class _HealthSinkDelivery:
             if len(self._pending) >= self._max_pending:
                 self._coalesce(event)
             self._pending.append(event)
-            if self._running:
+            self._idle.clear()
+        self.resume()
+
+    def resume(self):
+        """Start the delivery thread if events wait without one.
+
+        Never raises: a failed start leaves the events pending (and the
+        delivery not idle), counts the failure and is retried on the next
+        call, so undeliverable events are visible instead of silently lost.
+        """
+        with self._lock:
+            if self._running or not self._pending:
                 return
             self._running = True
-            self._idle.clear()
         thread = threading.Thread(target=self._drain, daemon=True,
                                   name="serversentinel-local-uvc-health-sink")
         try:
@@ -175,8 +197,7 @@ class _HealthSinkDelivery:
         except BaseException:
             with self._lock:
                 self._running = False
-                self._idle.set()
-            raise
+                self.start_failures += 1
 
     def _drain(self):
         while True:
@@ -199,16 +220,24 @@ class _HealthSinkDelivery:
                     self._in_flight_since = None
 
     def settle(self, timeout):
-        """Wait at most ``timeout`` for every pending event; True when idle."""
+        """Wait at most ``timeout`` for every pending event; True when idle.
+
+        Events left by a failed thread start are retried first; while they
+        cannot be delivered the delivery is not idle and this returns False.
+        """
+        self.resume()
         return self._idle.wait(timeout)
 
     def snapshot(self):
-        """(pending, coalesced, failures, stalled) without waiting for the sink."""
+        """(pending, coalesced, failures, stalled, undeliverable) without
+        waiting for the sink."""
         now = self._monotonic()
         with self._lock:
             since = self._in_flight_since
             stalled = since is not None and now - since >= self._stall_seconds
-            return len(self._pending), self.coalesced, self.failures, stalled
+            undeliverable = 0 if self._running else len(self._pending)
+            return (len(self._pending), self.coalesced, self.failures + self.start_failures,
+                    stalled, undeliverable)
 
 
 class LocalUvcRuntime:
@@ -483,9 +512,13 @@ class LocalUvcRuntime:
         return LocalUvcRuntimeState.DEGRADED
 
     def _sink_stalled(self) -> bool:
-        # A hung optional sink means health notifications are not being
-        # delivered: never report that as a healthy service.
-        return self._sink_delivery is not None and self._sink_delivery.snapshot()[3]
+        # A hung optional sink, or events no delivery thread can deliver,
+        # means health notifications are not being delivered: never report
+        # that as a healthy service.
+        if self._sink_delivery is None:
+            return False
+        snapshot = self._sink_delivery.snapshot()
+        return bool(snapshot[3] or snapshot[4])
 
     def _health_unpersisted(self, source_id: UUID) -> bool:
         check = getattr(self.adapter, "health_unpersisted", None)
@@ -510,7 +543,11 @@ class LocalUvcRuntime:
         supervisor again and, once no worker or watchdog is left that could
         call into the adapter, closes the adapter (and retries a failed
         database release). A worker whose own cleanup failed keeps the stop
-        ``STOP_FAILED``. Pending health-sink deliveries get at most
+        ``STOP_FAILED``. Before the database pin is released, a source whose
+        worker is still alive is lowered to ``offline`` durably by the stop
+        itself (bounded by ``HEALTH_FENCE_SECONDS``), because a slow
+        profile's stall window can outlast the join bound (Issue #194).
+        Pending health-sink deliveries get at most
         ``HEALTH_SINK_SETTLE_SECONDS`` after the teardown.
         """
         with self._lock:
@@ -557,6 +594,7 @@ class LocalUvcRuntime:
                         self._stop_cleanup_failed = True
                 else:
                     failed = True
+                    self._fence_live_workers()
             # Drop the held database pin; a worker that outlived the join
             # bound then fails closed instead of reading storage.
             if self._database_pinned and not self._release_database():
@@ -574,6 +612,38 @@ class LocalUvcRuntime:
             # Outside the runtime lock: a hung sink delays only this return.
             self._sink_delivery.settle(HEALTH_SINK_SETTLE_SECONDS)
         return self.status()
+
+    def _fence_live_workers(self) -> None:
+        """Durably lower sources whose worker outlived the join bound.
+
+        Runs before the database pin is released (Issue #194): the stall
+        window of a slow profile can exceed the join bound, so the watchdog
+        may not have lowered a blocked worker's ``online`` claim yet, and
+        after the release no write can. Bounded by ``HEALTH_FENCE_SECONDS``;
+        a write that does not finish leaves the source reported unpersisted
+        (the stop is ``stop_failed`` either way).
+        """
+        fence = getattr(self.adapter, "fence_stopping", None)
+        if not callable(fence):
+            return
+        live = []
+        for source_id, state in self._sources.items():
+            if state is SourceRuntimeState.REJECTED:
+                continue
+            try:
+                status = self._supervisor.status(source_id)
+            except Exception:
+                status = None
+            if status is not None and status.running:
+                live.append(source_id)
+        if not live:
+            return
+        try:
+            fence(live, HEALTH_FENCE_SECONDS)
+        except Exception:
+            # Counted by the unpersisted/STOP_FAILED state; text may carry
+            # private details.
+            pass
 
     def reapprove(self, owner_administration, actor_context, source_id: UUID, candidate):
         """Run the audited Owner approval with that source's worker stopped.
@@ -626,19 +696,23 @@ class LocalUvcRuntime:
                 ))
             # One sink snapshot feeds both the aggregate state and the
             # reported sink fields, so they always describe the same moment.
-            pending = coalesced = delivery_failures = 0
+            pending = coalesced = delivery_failures = undeliverable = 0
             stalled = False
             if self._sink_delivery is not None:
-                pending, coalesced, delivery_failures, stalled = self._sink_delivery.snapshot()
+                # Retry a delivery thread whose start failed (Issue #195
+                # item 5) before reporting.
+                self._sink_delivery.resume()
+                (pending, coalesced, delivery_failures, stalled,
+                 undeliverable) = self._sink_delivery.snapshot()
             state = self._state
             if state in (LocalUvcRuntimeState.RUNNING, LocalUvcRuntimeState.DEGRADED):
                 # A worker thread that died later is not hidden behind the
                 # state computed at start.
-                state = self._aggregate(sink_stalled=stalled)
+                state = self._aggregate(sink_stalled=stalled or undeliverable > 0)
                 self._state = state
         with self._events_lock:
             dropped, sink_failures = self._events_dropped, self._sink_failures
             suppressed = self.health_logs_suppressed
         sink_failures += delivery_failures
         return LocalUvcRuntimeStatus(state, tuple(sources), dropped, sink_failures, suppressed,
-                                     pending, coalesced, stalled)
+                                     pending, coalesced, stalled, undeliverable)

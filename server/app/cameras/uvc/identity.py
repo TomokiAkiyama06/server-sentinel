@@ -213,7 +213,15 @@ class ReconnectController:
         self._handoff_lock = threading.Lock()
         self._handoff_running = False
         self._handoff_pending = False
+        # Set while no handoff thread is running, so a stop can wait until
+        # every handed-off event has reached ``notify`` (Issue #195 item 3).
+        self._handoff_idle = threading.Event()
+        self._handoff_idle.set()
         self.delivery_failures = 0
+        # Set once the capture service is stopping while this controller's
+        # worker is still alive (Issue #194): the source is lowered to
+        # ``offline`` and may never be raised to ``online`` again.
+        self._stopping = False
 
     def _persist(self):
         if self.store is not None:
@@ -266,6 +274,7 @@ class ReconnectController:
                 return
             self._handoff_running = True
             self._handoff_pending = False
+            self._handoff_idle.clear()
         thread = threading.Thread(target=self._drain_handoff, daemon=True,
                                   name="serversentinel-local-uvc-health-delivery")
         try:
@@ -273,7 +282,18 @@ class ReconnectController:
         except BaseException:
             with self._handoff_lock:
                 self._handoff_running = False
+                self._handoff_idle.set()
             raise
+
+    def settle_delivery(self, timeout):
+        """Wait at most ``timeout`` for the handoff thread; True when idle.
+
+        Once idle, every event handed off so far has been passed to
+        ``notify`` (which only enqueues for the runtime's sink delivery), so
+        a stop that waits here before settling that delivery cannot miss the
+        final offline notification.
+        """
+        return self._handoff_idle.wait(timeout)
 
     def _drain_handoff(self):
         while True:
@@ -287,6 +307,7 @@ class ReconnectController:
             with self._handoff_lock:
                 if not self._handoff_pending and not self._outbox:
                     self._handoff_running = False
+                    self._handoff_idle.set()
                     return
                 self._handoff_pending = False
 
@@ -382,6 +403,10 @@ class ReconnectController:
         self._transition(CameraState.DEGRADED, "owner_approved_pending_capture")
 
     def capture_ready(self, candidate):
+        if self._stopping:
+            # A late frame from a worker that outlived the stop's join bound
+            # must not raise the source back to ``online`` (Issue #194).
+            raise ValueError("capture service is stopping")
         if (not self.enabled or self.requires_approval or candidate is None
                 or not same_live_instance(self.bound, candidate)):
             raise ValueError("capture has no approved binding")
@@ -504,6 +529,38 @@ class ReconnectController:
                 self._flush(blocking=False)
         finally:
             self._deliver(blocking=False)
+
+    def fence_stopping(self, timeout):
+        """Lower the source to ``offline`` for a stop its worker outlived.
+
+        Called from the stopping thread, not the source worker, while that
+        worker is still alive past the join bound (Issue #194). An ``online``
+        or ``degraded`` source becomes ``offline``
+        (``capture_service_stopping``). It changes
+        in-memory state only, under the transition lock (taken with
+        ``timeout`` so a stop can never wait unboundedly): the transition is
+        staged for the health writer, which the caller flushes, and its
+        notification is handed to the background delivery thread. The binding
+        and descriptor stay with the worker, which closes them when it
+        returns; from now on ``capture_ready`` refuses, so a late frame can
+        never raise the source back to ``online``. Returns False when the
+        lock could not be taken in time.
+        """
+        if not self.lock.acquire(timeout=timeout):
+            return False
+        try:
+            self._stopping = True
+            if self._finished:
+                return True
+            # Manual intervention and offline are already non-online and
+            # keep their reason.
+            changed = (self.state in (CameraState.ONLINE, CameraState.DEGRADED)
+                       and self._set_state(CameraState.OFFLINE, "capture_service_stopping"))
+        finally:
+            self.lock.release()
+        if changed:
+            self._deliver(blocking=False)
+        return True
 
     def shutdown(self):
         """Release recovery marker only after capture is closed and state durable."""

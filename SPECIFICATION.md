@@ -316,11 +316,21 @@ on a later stop: once no worker or watchdog is left it closes the adapter
 while another one was still hung, because the supervisor keeps that failure
 sticky). `join_timeout_seconds` may not be shorter than
 `frame_stall_seconds`, so the watchdog can make a blocked worker's lowered
-health durable before the stop releases the pinned database. Camera-health
+health durable before the stop releases the pinned database. Because a slow
+profile widens the effective stall window beyond that bound, a stop whose
+workers outlived the join also lowers each such source to `offline`
+(`capture_service_stopping`) itself and waits at most 1 s for that row to be
+durable before it releases the pin; such a worker never reports `online`
+again, and a write that does not finish leaves the source reported
+unpersisted (the stop is `stop_failed` either way). Camera-health
 transitions reach the optional health sink only through a bounded, coalescing
 queue drained by one delivery thread, never on a capture worker or the
 watchdog; a sink call stalled past 5 s is reported (`health_sink_stalled`) and
-degrades the capture service state. Missing configuration is the explicit `unconfigured` state;
+degrades the capture service state. A worker's stop waits (inside its join
+bound) until its close transition has been handed to that queue, so the stop's
+final sink settle cannot miss it. If the delivery thread cannot be started the
+events stay queued, are reported as `health_sink_undeliverable`, degrade the
+service and are retried on the next event, status read or stop. Missing configuration is the explicit `unconfigured` state;
 configuration without admitted storage, including a monitoring runtime whose
 startup storage open failed or an admission refused while pinning the database at start, is `storage_unadmitted` (retryable, nothing opened) and never captures until
 storage is admitted again. The application capture-service snapshot follows the live runtime status, so a later worker or storage fault is never left reported as `running`. Every later capture-driven registry/approval write is admitted by the Main storage policy like an audit write; a refused admission stops that capture visibly and retries, never writes past the hard reserve; the camera transition is still recorded in memory and the capture service reports `degraded` while health cannot be persisted. The runtime opens only the database file pinned under that admission (a held descriptor, so inode reuse by a replacement cannot pass the identity check) and never creates one, so a lost or replaced filesystem after startup cannot yield a fallback database; a registry read failure while a camera is live is reported as capture loss and degrades the service until polling succeeds. A cancelled or failed lifespan startup stops started workers; a cancelled shutdown invalidates the preview and still completes the bounded capture stop and remaining cleanup before re-raising. Capture-service state is reported separately from each source's

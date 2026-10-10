@@ -231,6 +231,12 @@ class LocalUvcAdapter:
         self._unpersisted = set()
         self._writers = {}
         self._writers_lock = threading.Lock()
+        # Sources a stopping runtime lowered while their worker outlived the
+        # join bound (Issue #194). Guarded by ``_fence_lock`` together with
+        # the session lookup, so a session created by such a worker after the
+        # fence is fenced as well.
+        self._fence_lock = threading.Lock()
+        self._fenced = set()
 
     def _source(self, source_id):
         if self.closed:
@@ -478,6 +484,14 @@ class LocalUvcAdapter:
             # registry/store failure cannot force another Owner approval.
             session = self._session(source, approved.approved, explicit_candidate=explicit)
             self._approved_handoffs.pop(source_id, None)
+        with self._fence_lock:
+            fenced = source_id in self._fenced
+        if fenced:
+            # The runtime stop gave up joining this worker: never open or
+            # resume capture for it; its stop_source() cleans up.
+            session.controller.fence_stopping(self.HEALTH_SETTLE_SECONDS)
+            session.close()
+            return False
         try:
             session.configure(enabled=source.enabled,
                               profile=capture_profile(source.desired_capture_profile))
@@ -525,6 +539,51 @@ class LocalUvcAdapter:
         return self.store.approved_elsewhere(source.id, controller.approved,
                                              serial_ambiguous=controller.serial_ambiguous)
 
+    def fence_stopping(self, source_ids, timeout):
+        """Durably lower sources whose workers outlived a stop's join bound.
+
+        Called by the stopping runtime, off the source workers, before it
+        releases the pinned database (Issue #194). The effective stall window
+        of a slow profile can exceed the join bound, so the watchdog may not
+        have lowered a blocked worker's ``online`` claim yet; once the pin is
+        released no write can do it any more. Each live session is lowered to
+        ``offline`` in memory (``ReconnectController.fence_stopping``), a
+        source without a session has ``offline`` staged directly, and the
+        writes and notifications are handed to the background threads and
+        awaited for at most ``timeout`` in total. The workers keep their
+        descriptors and close them when they return; a fenced session never
+        reports ``online`` again. Returns True when every source was fenced
+        and its health is durable.
+        """
+        deadline = time.monotonic() + timeout
+        source_ids = tuple(source_ids)
+        with self._fence_lock:
+            self._fenced.update(source_ids)
+            sessions = [(source_id, self.sessions.get(source_id)) for source_id in source_ids]
+        fenced = True
+        controllers, writers = [], []
+        for source_id, session in sessions:
+            writer = self._writer(source_id)
+            if session is None:
+                writer.stage(health_state=SourceHealthState.OFFLINE,
+                             negotiated_capture_profile=None)
+            else:
+                controllers.append(session.controller)
+                if not session.controller.fence_stopping(max(0.0, deadline - time.monotonic())):
+                    fenced = False
+            try:
+                writer.flush(blocking=False)
+            except Exception:
+                # The values stay staged and the source unpersisted.
+                fenced = False
+            writers.append((source_id, writer))
+        for controller in controllers:
+            controller.settle_delivery(max(0.0, deadline - time.monotonic()))
+        for _source_id, writer in writers:
+            writer.settle(max(0.0, deadline - time.monotonic()))
+        return fenced and not any(self.health_unpersisted(source_id)
+                                  for source_id, _writer in writers)
+
     def stop_source(self, source_id):
         """Stop one source on the same serialized worker that polls it.
 
@@ -550,10 +609,16 @@ class LocalUvcAdapter:
             # A failed release deliberately leaves the recovery marker durable.
             failures.append(error)
         self._approved_handoffs.pop(source_id, None)
+        deadline = time.monotonic() + self.HEALTH_SETTLE_SECONDS
+        # The close transition was handed to the controller's delivery
+        # thread; wait (inside the supervisor's join bound) until it has
+        # reached the runtime's sink queue, so the runtime's final sink
+        # settle cannot decide idle before it (Issue #195 item 3).
+        session.controller.settle_delivery(self.HEALTH_SETTLE_SECONDS)
         with self._writers_lock:
             writer = self._writers.get(source_id)
         if writer is not None:
-            writer.settle(self.HEALTH_SETTLE_SECONDS)
+            writer.settle(max(0.0, deadline - time.monotonic()))
         if failures:
             raise failures[0]
         return True
