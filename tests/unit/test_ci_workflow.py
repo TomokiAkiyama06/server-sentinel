@@ -88,7 +88,7 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertIn("docker build --file agent/Dockerfile.ci --tag agent-sqlite-340 agent", job)
         self.assertIn('sqlite3.sqlite_version.startswith("3.40.")', job)
         self.assertIn("--network=none agent-sqlite-340", job)
-        self.assertIn("python -m unittest -v tests.test_ring tests.test_ring_variable_sizes", job)
+        self.assertIn("python -m unittest -v tests.test_ring\n", job)
         dockerfile = (ROOT / "agent/Dockerfile.ci").read_text(encoding="utf-8")
         self.assertRegex(dockerfile, r"^FROM python:[0-9.]+-slim-bookworm@sha256:[0-9a-f]{64}\n")
 

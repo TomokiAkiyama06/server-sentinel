@@ -385,7 +385,8 @@ not used: it skips the index-versus-table comparison, and SQLite 3.40.x
 `protection` table, whose `PRIMARY KEY(segment, incident)` order differs from its
 column order (Issue #191). The ledger and its tests are verified on SQLite
 3.40.1 (Debian 12), 3.45.1 (Ubuntu 24.04, CI) and 3.46.1; CI runs the Agent
-unit tests in the Debian 12 `Dockerfile.ci` image as well as on Ubuntu 24.04.
+ring ledger tests (`tests.test_ring`) in the Debian 12 `Dockerfile.ci` image
+as well as the full Agent suite on Ubuntu 24.04.
 Older SQLite releases are unverified.
 
 A segment's interval, SHA-256 and `writing` state are committed before its media
