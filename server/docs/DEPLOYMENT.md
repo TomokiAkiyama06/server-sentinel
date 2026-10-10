@@ -202,9 +202,10 @@ health-write settle, and a shorter value can make a clean shutdown
 reported `online`. The bound may not be shorter than the stall window because
 the stop releases the database right after it: the watchdog must be able to
 make a blocked worker's lowered state durable first. A profile slower than
-`10 / frame_stall_seconds` fps widens the stall window to 10 frame intervals,
-so keep the join bound above that as well (the default 10 s covers every
-profile of at least 1 fps). The local UVC stop as a whole can take up to
+`10 / frame_stall_seconds` fps widens the stall window to 10 frame intervals
+beyond the join bound; the stop then lowers such a still-blocked source to
+`offline` itself (waiting at most 1 s for that write) before releasing the
+database, so the registry is not left `online` either way. The local UVC stop as a whole can take up to
 `join_timeout_seconds` + 1 s for the frame-progress watchdog join + 1 s for
 pending health-sink deliveries (62 s at the 60 s maximum), and the remaining
 shutdown steps (monitoring runtime, audit retention) follow it. The installed

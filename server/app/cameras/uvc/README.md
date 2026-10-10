@@ -226,7 +226,24 @@ keeps the stop `stop_failed`, also on a retry after the supervisor already
 removed that exited worker while another one was still hung.
 `join_timeout_seconds` may not be shorter than `frame_stall_seconds`: the stop releases the database pin right after the
 join, and the watchdog must have made a blocked worker's lowered state durable
-before then.
+before then. A slow profile's stall window (10 frame intervals) can still
+exceed the join, so for every worker still alive after it the stop calls
+`LocalUvcAdapter.fence_stopping()` before releasing the pin: each source's
+health writer is first fenced to `offline` with no profile (every later
+staged value, including a late `online`, keeps that on top), then the live
+session is lowered to `offline` (`capture_service_stopping`) in memory, and
+the stop waits at most `HEALTH_FENCE_SECONDS` (1 s) in total for those writes
+and notifications. The stop flag is set before the transition lock is
+requested, so even when the lock cannot be taken in time (for example a
+`capture_ready` inside a slow state callback) the durable row is still
+fenced `offline`, and that `capture_ready` lowers its own late `online` and
+refuses once it releases the lock. Such an incomplete fence is never
+ignored: it is counted (`health_fence_incomplete`) and logged with the fixed
+event `local_uvc_health_fence_incomplete` (the stop is `stop_failed`). A
+fenced controller refuses `capture_ready`, so a late frame from that worker
+never reports `online` again, and the adapter opens no capture for a fenced
+source; the worker still closes its descriptor and releases its session when
+it returns.
 `LocalUvcRuntime.reapprove()` stops the one source's worker, runs the audited
 `OwnerAdministration.approve_uvc()`, and restarts the worker whether the
 ceremony committed or was refused. Health transitions go to a bounded
@@ -239,8 +256,18 @@ overflow an older event of a source that has a newer pending event is
 coalesced away, so each source's latest transition is always delivered. A sink
 call running longer than `HEALTH_SINK_STALL_SECONDS` (5 s) is reported as
 `health_sink_stalled` and makes the service `degraded`; the status also
-reports `health_sink_pending` and `health_sink_coalesced`. `stop()` waits at
-most `HEALTH_SINK_SETTLE_SECONDS` (1 s) for pending deliveries. The adapter refreshes `last_seen_at`
+reports `health_sink_pending` and `health_sink_coalesced`. If the delivery
+thread cannot be started, the events stay queued and are reported as
+`health_sink_undeliverable` (the service is `degraded`, never `running` with
+a silently lost notification); the start is retried on the next event, on
+every `status()` and on `stop()`. A source stop waits, inside its join bound,
+until the controller's background delivery thread has handed the close
+transition to that queue. If that controller thread cannot be started either,
+its events stay queued (never reported idle), the start is retried on the
+next delivery, every `status()` and the stop, and the stop then hands the
+queue over itself; events still left are counted in
+`health_sink_undeliverable` (the service is `degraded`). `stop()` then waits at most
+`HEALTH_SINK_SETTLE_SECONDS` (1 s) for pending deliveries. The adapter refreshes `last_seen_at`
 at most once per second and does not rewrite an unchanged offline state for an
 unapproved source, so polling does not become a steady SQLite write load.
 Frames go to `app.media.live.local_preview.LocalPreviewHub`.

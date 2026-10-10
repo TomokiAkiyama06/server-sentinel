@@ -55,6 +55,11 @@ class _HealthWriter:
     most one background thread per source, which flushes until nothing new
     is staged or a write fails (the failed values stay staged for the next
     flush).
+
+    ``fence`` pins values (a stopping runtime's conservative ``offline``)
+    that every later stage, and any retried failed write, keeps on top, so
+    no late transition staged by a worker that outlived the stop can make
+    ``online`` durable again (Issue #194).
     """
 
     def __init__(self, write, mark):
@@ -63,6 +68,7 @@ class _HealthWriter:
         self._staged_lock = threading.Lock()
         self._io = threading.Lock()
         self._staged = None
+        self._fence = None
         # Values last made durable, to tell a material write from a routine
         # last_seen_at refresh.
         self._durable = {}
@@ -75,7 +81,13 @@ class _HealthWriter:
 
     def stage(self, **values):
         with self._staged_lock:
-            self._staged = {**(self._staged or {}), **values}
+            self._staged = {**(self._staged or {}), **values, **(self._fence or {})}
+
+    def fence(self, **values):
+        """Stage ``values`` and keep them over every later stage."""
+        with self._staged_lock:
+            self._fence = {**(self._fence or {}), **values}
+            self._staged = {**(self._staged or {}), **self._fence}
 
     def _material(self, values):
         # Called with _staged_lock held.
@@ -151,7 +163,8 @@ class _HealthWriter:
                     with self._staged_lock:
                         # Keep the failed values under anything newer, so a
                         # later flush retries whatever was not superseded.
-                        self._staged = {**values, **(self._staged or {})}
+                        self._staged = {**values, **(self._staged or {}),
+                                        **(self._fence or {})}
                         self._mark(True)
                     raise
                 with self._staged_lock:
@@ -231,6 +244,17 @@ class LocalUvcAdapter:
         self._unpersisted = set()
         self._writers = {}
         self._writers_lock = threading.Lock()
+        # Sources a stopping runtime lowered while their worker outlived the
+        # join bound (Issue #194). Guarded by ``_fence_lock`` together with
+        # the session lookup, so a session created by such a worker after the
+        # fence is fenced as well.
+        self._fence_lock = threading.Lock()
+        self._fenced = set()
+        # Health events a stopped session's controller could not hand to
+        # ``publish`` before its stop gave up waiting (Issue #195 item 5):
+        # counted per source so they stay visible after the session is gone.
+        self._undelivered_lock = threading.Lock()
+        self._undelivered = {}
 
     def _source(self, source_id):
         if self.closed:
@@ -273,6 +297,26 @@ class LocalUvcAdapter:
         """
         with self._unpersisted_lock:
             return source_id in self._unpersisted
+
+    def health_delivery(self):
+        """(failures, undelivered) of the controllers' event delivery.
+
+        A failed handoff start of a live session is retried first.
+        ``undelivered`` counts events still queued with no delivery thread
+        (its start failed) in live sessions, plus those a stopped session
+        left behind. Counts only; no event content.
+        """
+        failures = undelivered = 0
+        for session in tuple(self.sessions.values()):
+            controller = session.controller
+            # Retry a handoff thread whose start failed, like the runtime's
+            # own sink delivery does on every status read.
+            controller.resume_delivery()
+            failures += controller.delivery_failures + controller.delivery_start_failures
+            undelivered += controller.undelivered
+        with self._undelivered_lock:
+            undelivered += sum(self._undelivered.values())
+        return failures, undelivered
 
     def _event(self, event):
         """Controller callback under its transition lock: in-memory work only.
@@ -478,6 +522,14 @@ class LocalUvcAdapter:
             # registry/store failure cannot force another Owner approval.
             session = self._session(source, approved.approved, explicit_candidate=explicit)
             self._approved_handoffs.pop(source_id, None)
+        with self._fence_lock:
+            fenced = source_id in self._fenced
+        if fenced:
+            # The runtime stop gave up joining this worker: never open or
+            # resume capture for it; its stop_source() cleans up.
+            session.controller.fence_stopping(self.HEALTH_SETTLE_SECONDS)
+            session.close()
+            return False
         try:
             session.configure(enabled=source.enabled,
                               profile=capture_profile(source.desired_capture_profile))
@@ -525,6 +577,69 @@ class LocalUvcAdapter:
         return self.store.approved_elsewhere(source.id, controller.approved,
                                              serial_ambiguous=controller.serial_ambiguous)
 
+    def fence_stopping(self, source_ids, timeout):
+        """Durably lower sources whose workers outlived a stop's join bound.
+
+        Called by the stopping runtime, off the source workers, before it
+        releases the pinned database (Issue #194). The effective stall window
+        of a slow profile can exceed the join bound, so the watchdog may not
+        have lowered a blocked worker's ``online`` claim yet; once the pin is
+        released no write can do it any more. Each live session is lowered to
+        ``offline`` in memory (``ReconnectController.fence_stopping``); every
+        fenced source's writer is first fenced to ``offline`` (with no
+        profile), so the durable row is lowered even when a controller's
+        transition lock cannot be taken within the budget, and no late
+        ``online`` staged afterwards can override it. The writes and
+        notifications are handed to the background threads and awaited for
+        at most ``timeout`` in total. The workers keep their
+        descriptors and close them when they return; a fenced session never
+        reports ``online`` again. Returns True when every source was fenced
+        and its health is durable.
+        """
+        deadline = time.monotonic() + timeout
+        source_ids = tuple(source_ids)
+        with self._fence_lock:
+            self._fenced.update(source_ids)
+            sessions = [(source_id, self.sessions.get(source_id)) for source_id in source_ids]
+        fenced = True
+        writers = []
+        # Every writer is fenced and its write handed off first, before any
+        # transition lock is requested: a lock held past the budget (e.g. a
+        # slow state callback inside ``capture_ready``) then neither delays
+        # the other sources' writes nor leaves this source without a staged
+        # conservative row, and no later ``online`` stage can override it.
+        for source_id, _session in sessions:
+            writer = self._writer(source_id)
+            writer.fence(health_state=SourceHealthState.OFFLINE,
+                         negotiated_capture_profile=None, image_quality_state="unknown")
+            try:
+                writer.flush(blocking=False)
+            except Exception:
+                # The values stay staged and the source unpersisted.
+                fenced = False
+            writers.append((source_id, writer))
+        controllers = []
+        for (_source_id, session), (_writer_id, writer) in zip(sessions, writers):
+            if session is None:
+                continue
+            controllers.append(session.controller)
+            if not session.controller.fence_stopping(max(0.0, deadline - time.monotonic())):
+                # The in-memory state is lowered by the lock holder itself
+                # (``capture_ready`` re-checks the stop flag); the durable row
+                # is already fenced offline above.
+                fenced = False
+            try:
+                writer.flush(blocking=False)
+            except Exception:
+                fenced = False
+        for controller in controllers:
+            if not controller.settle_delivery(max(0.0, deadline - time.monotonic())):
+                fenced = False
+        for _source_id, writer in writers:
+            writer.settle(max(0.0, deadline - time.monotonic()))
+        return fenced and not any(self.health_unpersisted(source_id)
+                                  for source_id, _writer in writers)
+
     def stop_source(self, source_id):
         """Stop one source on the same serialized worker that polls it.
 
@@ -550,10 +665,22 @@ class LocalUvcAdapter:
             # A failed release deliberately leaves the recovery marker durable.
             failures.append(error)
         self._approved_handoffs.pop(source_id, None)
+        deadline = time.monotonic() + self.HEALTH_SETTLE_SECONDS
+        # The close transition was handed to the controller's delivery
+        # thread; wait (inside the supervisor's join bound) until it has
+        # reached the runtime's sink queue, so the runtime's final sink
+        # settle cannot decide idle before it (Issue #195 item 3).
+        if not session.controller.settle_delivery(self.HEALTH_SETTLE_SECONDS):
+            # Still queued after the retries: keep it visible (the service
+            # reports it as undeliverable) instead of losing it silently.
+            left = session.controller.undelivered
+            if left:
+                with self._undelivered_lock:
+                    self._undelivered[source_id] = self._undelivered.get(source_id, 0) + left
         with self._writers_lock:
             writer = self._writers.get(source_id)
         if writer is not None:
-            writer.settle(self.HEALTH_SETTLE_SECONDS)
+            writer.settle(max(0.0, deadline - time.monotonic()))
         if failures:
             raise failures[0]
         return True

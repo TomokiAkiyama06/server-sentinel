@@ -70,7 +70,9 @@ class LocalUvcConfiguration:
             # ``online`` only by the watchdog once the stall window elapsed;
             # a shorter bound would release the pin first, so the lowered
             # state could never become durable and the registry would keep
-            # ``online`` (Issue #173).
+            # ``online`` (Issue #173). A slow profile can still widen the
+            # window past this bound; the runtime stop then lowers such a
+            # source durably itself before the release (Issue #194).
             raise ConfigurationError("local UVC worker timing is out of range")
 
 
