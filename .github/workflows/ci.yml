@@ -126,7 +126,8 @@ jobs:
     # runs the dependency-free ring ledger restart tests with networking disabled.
     needs: repository
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # Includes building the Debian 12 image (base image pull) before the tests.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -172,7 +173,7 @@ jobs:
   ci:
     name: CI
     if: ${{ always() }}
-    needs: [repository, components, web-browser]
+    needs: [repository, components, agent-ring-sqlite-340, web-browser]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -180,8 +181,10 @@ jobs:
         env:
           REPOSITORY_RESULT: ${{ needs.repository.result }}
           COMPONENT_RESULT: ${{ needs.components.result }}
+          AGENT_RING_SQLITE_340_RESULT: ${{ needs.agent-ring-sqlite-340.result }}
           WEB_BROWSER_RESULT: ${{ needs.web-browser.result }}
         run: |
           test "$REPOSITORY_RESULT" = success
           test "$COMPONENT_RESULT" = success
+          test "$AGENT_RING_SQLITE_340_RESULT" = success
           test "$WEB_BROWSER_RESULT" = success
