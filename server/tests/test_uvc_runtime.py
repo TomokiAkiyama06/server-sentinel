@@ -1433,6 +1433,106 @@ class StopFollowUpTests(RuntimeFixture):
         self.assertIsNot(runtime.status().sources[0].camera_state, CameraState.ONLINE)
 
 
+class FencePinTests(RuntimeFixture):
+    """Issue #204 item 1 (Codex P2 on PR #201)."""
+
+    def _blocked_online_write(self, registry):
+        """Make the next ``online`` health write block after its connection.
+
+        Models a write already inside SQLite/storage when the stop runs: it
+        commits later through the connection it had, without a new pin check.
+        """
+        gate, entered = threading.Event(), threading.Event()
+        armed = threading.Event()
+        self.addCleanup(gate.set)
+        original = registry.update_source_health
+        unpinned = CameraRegistry(self.database)
+
+        def update(source_id, **values):
+            if armed.is_set() and values.get("health_state") is SourceHealthState.ONLINE:
+                armed.clear()
+                entered.set()
+                gate.wait(10)
+                return unpinned.update_source_health(source_id, **values)
+            return original(source_id, **values)
+
+        return patch.object(registry, "update_source_health", side_effect=update), \
+            armed, entered, gate
+
+    def _pinned_runtime(self, source):
+        pinned = PinnedDatabase(Database(self.database.path))
+        registry = CameraRegistry(pinned, reservation=ToggleAdmission())
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), poll_timeout_seconds=0.05,
+                                  retry_delay_seconds=0.05, join_timeout_seconds=0.5,
+                                  frame_stall_seconds=0.25, frame_stall_reopen_seconds=30.0),
+            registry, on_frame=self.on_frame, discovery=self.discovery,
+            capture_factory=self.captures,
+        )
+        self.addCleanup(runtime.stop)
+        self.addCleanup(pinned.release)
+        return pinned, registry, runtime
+
+    def test_fence_behind_a_blocked_online_write_keeps_the_pin_until_durable(self):
+        source = self.source(desired_capture_profile=CaptureProfile(640, 480, 1, "MJPG"))
+        pinned, registry, runtime = self._pinned_runtime(source)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        blocked, armed, entered, gate = self._blocked_online_write(registry)
+        with blocked:
+            # The next last-seen refresh of the live worker blocks in its
+            # ``online`` write; the worker then outlives the join bound.
+            armed.set()
+            self.assertTrue(entered.wait(5))
+            with self.assertLogs("app.cameras.uvc.runtime", "ERROR"):
+                started = time.monotonic()
+                status = runtime.stop()
+            # The stop stays bounded: join + fence + sink settle.
+            self.assertLess(time.monotonic() - started, 5.0)
+            self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
+            self.assertEqual(1, status.health_fence_incomplete)
+            self.assertTrue(status.health_fence_pin_held)
+            self.assertTrue(pinned.pinned)
+            with self.assertLogs("app.cameras.uvc.runtime", "INFO") as logs:
+                # The earlier write commits ``online`` late; the fenced
+                # ``offline`` behind it still needs, and has, the pin.
+                gate.set()
+                self.assertTrue(wait_for(lambda: not pinned.pinned))
+            self.assertIn(Event.LOCAL_UVC_HEALTH_FENCE_PIN_RELEASED.value,
+                          "\n".join(logs.output))
+        self.assertIs(self.health(source.id), SourceHealthState.OFFLINE)
+        self.assertIsNone(self.registry.get_source(source.id).negotiated_capture_profile)
+        self.assertTrue(wait_for(lambda: not runtime.status().sources[0].worker_running))
+        status = runtime.status()
+        self.assertFalse(status.health_fence_pin_held)
+        self.assertIs(self.health(source.id), SourceHealthState.OFFLINE)
+
+    def test_kept_pin_is_released_when_the_fenced_write_fails(self):
+        # Storage refusing the fenced write (e.g. a hard stop during
+        # shutdown) must not keep the pin forever: no write is in flight
+        # any more, so nothing can land after the release.
+        source = self.source(desired_capture_profile=CaptureProfile(640, 480, 1, "MJPG"))
+        pinned, registry, runtime = self._pinned_runtime(source)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        blocked, armed, entered, gate = self._blocked_online_write(registry)
+        with blocked:
+            armed.set()
+            self.assertTrue(entered.wait(5))
+            with self.assertLogs("app.cameras.uvc.runtime", "ERROR"):
+                status = runtime.stop()
+            self.assertTrue(status.health_fence_pin_held)
+            registry.reservation.refuse = True
+            gate.set()
+            self.assertTrue(wait_for(lambda: not pinned.pinned))
+        status = runtime.status()
+        self.assertFalse(status.health_fence_pin_held)
+        self.assertFalse(status.sources[0].health_persisted)
+        self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
+
+
 class RestartDurabilityTests(RuntimeFixture):
     def test_clean_restart_reconnects_unique_serial_camera(self):
         source = self.source()

@@ -325,7 +325,13 @@ source's transition lock cannot be taken within that bound, no later `online`
 can override it, such a worker never reports `online` again, a write that does
 not finish leaves the source reported unpersisted, and an incomplete fence is
 counted (`health_fence_incomplete`) and logged (the stop is `stop_failed`
-either way). Camera-health
+either way). While a fenced source's health writer is still busy at that
+bound (an earlier `online` write may still commit), the stop keeps the
+database pin (`health_fence_pin_held`) instead of refusing the fenced
+`offline` queued behind it, and the writer releases the pin as soon as no
+fenced write is in flight; the stop itself does not wait longer. A write that
+never finishes before process exit can leave the row `online` until the next
+start, which writes it `offline` before any capture opens. Camera-health
 transitions reach the optional health sink only through a bounded, coalescing
 queue drained by one delivery thread, never on a capture worker or the
 watchdog; a sink call stalled past 5 s is reported (`health_sink_stalled`) and
