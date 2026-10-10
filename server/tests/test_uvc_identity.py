@@ -1,9 +1,12 @@
 """Synthetic identity/health transitions; no physical devices are opened."""
 
 from dataclasses import replace
+import threading
 import unittest
+from unittest import mock
 from uuid import UUID
 
+from app.cameras.uvc import identity
 from app.cameras.uvc.identity import (
     CameraState, DeviceEvidence, ReconnectController, match_reconnect, same_physical_camera,
 )
@@ -84,6 +87,46 @@ class IdentityTests(unittest.TestCase):
         self.control.reconcile([self.camera])
         self.control.capture_ready(self.camera)
         self.assertEqual(self.control.state, CameraState.ONLINE)
+
+    def test_stop_fence_between_ready_checks_cannot_be_overwritten_by_online(self):
+        # Issue #194 / PR #201: a stop fence that lands after capture_ready's
+        # checks began must never be overwritten by a late ``online``. The
+        # fence runs in another thread exactly while capture_ready validates
+        # the binding. It either takes the lock first (and capture_ready then
+        # refuses) or cannot take it until ``online`` is set (and then lowers
+        # it); a successful fence followed by ``online`` is the race.
+        self.control.reconcile([self.camera])
+        real = identity.same_live_instance
+        fence = {}
+
+        def interleave(first, second):
+            if not fence:
+                stopper = threading.Thread(
+                    target=lambda: fence.setdefault("ok", self.control.fence_stopping(0.2)))
+                stopper.start()
+                stopper.join(5)
+                fence["state"] = self.control.state
+            return real(first, second)
+
+        accepted = False
+        with mock.patch.object(identity, "same_live_instance", interleave):
+            try:
+                self.control.capture_ready(self.camera)
+                accepted = True
+            except ValueError:
+                pass
+        self.assertIn("ok", fence)
+        if fence["ok"]:
+            self.assertEqual(CameraState.OFFLINE, fence["state"])
+            self.assertFalse(accepted, "late capture_ready overwrote the stop fence")
+        else:
+            self.assertTrue(accepted)
+            self.assertTrue(self.control.fence_stopping(1.0))
+        self.assertEqual(CameraState.OFFLINE, self.control.state)
+        self.assertEqual("capture_service_stopping", self.events[-1].reason)
+        with self.assertRaises(ValueError):
+            self.control.capture_ready(self.camera)
+        self.assertEqual(CameraState.OFFLINE, self.control.state)
 
     def test_disabled_and_failed_capture_never_report_healthy(self):
         self.control.reconcile([self.camera])

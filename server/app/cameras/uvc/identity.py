@@ -403,14 +403,26 @@ class ReconnectController:
         self._transition(CameraState.DEGRADED, "owner_approved_pending_capture")
 
     def capture_ready(self, candidate):
-        if self._stopping:
-            # A late frame from a worker that outlived the stop's join bound
-            # must not raise the source back to ``online`` (Issue #194).
-            raise ValueError("capture service is stopping")
-        if (not self.enabled or self.requires_approval or candidate is None
-                or not same_live_instance(self.bound, candidate)):
-            raise ValueError("capture has no approved binding")
-        self._transition(CameraState.ONLINE, "video_capture_ready")
+        # The stop fence and the binding are checked and ``online`` is set
+        # under one hold of the transition lock: checking ``_stopping``
+        # before taking the lock would let a concurrent ``fence_stopping``
+        # lower the source in between and then be overwritten by this late
+        # ``online`` (check-then-act race, Issue #194). Persisting and
+        # delivery still run after the lock is released.
+        with self.lock:
+            if self._stopping:
+                # A late frame from a worker that outlived the stop's join
+                # bound must not raise the source back to ``online``.
+                raise ValueError("capture service is stopping")
+            if (not self.enabled or self.requires_approval or candidate is None
+                    or not same_live_instance(self.bound, candidate)):
+                raise ValueError("capture has no approved binding")
+            changed = self._set_state(CameraState.ONLINE, "video_capture_ready")
+        try:
+            if changed:
+                self._flush()
+        finally:
+            self._deliver()
 
     def frame_stalled(self, candidate, *, only_online=False, blocking=True,
                       confirm=None, capture_lost=False):
