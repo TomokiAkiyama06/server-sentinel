@@ -377,6 +377,17 @@ a checked schema version; it is not recreated when an incompatible/corrupt
 ledger is found. New ledger files use mode 0600 and symlinks/special files are
 refused. The instance serializes operations and verifies directory/file identity.
 
+Every open runs the full `PRAGMA integrity_check` and refuses the ledger with
+`ledger_integrity_failure` unless the only result row is `ok`. `quick_check` is
+not used: it skips the index-versus-table comparison, and SQLite 3.40.x
+(Debian 12 / Raspberry Pi OS bookworm ship 3.40.1) falsely reports
+`NULL value in protection.incident` for every row of the WITHOUT ROWID
+`protection` table, whose `PRIMARY KEY(segment, incident)` order differs from its
+column order (Issue #191). The ledger and its tests are verified on SQLite
+3.40.1 (Debian 12), 3.45.1 (Ubuntu 24.04, CI) and 3.46.1; CI runs the Agent
+unit tests in the Debian 12 `Dockerfile.ci` image as well as on Ubuntu 24.04.
+Older SQLite releases are unverified.
+
 A segment's interval, SHA-256 and `writing` state are committed before its media
 write. Only after the store fsyncs it does the ledger mark it `stored`. On restart,
 owned segment size/hash verification distinguishes a complete interrupted write

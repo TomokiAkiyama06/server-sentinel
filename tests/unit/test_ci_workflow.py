@@ -76,6 +76,22 @@ class CIWorkflowTests(unittest.TestCase):
             encoding="utf-8")
         self.assertIn('REQUIRE_ROOT = "CA_SEPARATION_REQUIRE_ROOT"', test)
 
+    def test_agent_ring_ledger_runs_against_debian_12_sqlite(self):
+        # Issue #191: SQLite 3.40.x is covered by the pinned Debian 12 image,
+        # and the job fails rather than silently testing another version.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        start = workflow.find("\n  agent-ring-sqlite-340:\n")
+        self.assertNotEqual(-1, start, "Debian 12 SQLite job is missing")
+        end = workflow.find("\n  web-browser:\n", start)
+        self.assertNotEqual(-1, end)
+        job = workflow[start:end]
+        self.assertIn("docker build --file agent/Dockerfile.ci --tag agent-sqlite-340 agent", job)
+        self.assertIn('sqlite3.sqlite_version.startswith("3.40.")', job)
+        self.assertIn("--network=none agent-sqlite-340", job)
+        self.assertIn("python -m unittest -v tests.test_ring tests.test_ring_variable_sizes", job)
+        dockerfile = (ROOT / "agent/Dockerfile.ci").read_text(encoding="utf-8")
+        self.assertRegex(dockerfile, r"^FROM python:[0-9.]+-slim-bookworm@sha256:[0-9a-f]{64}\n")
+
 
 if __name__ == "__main__":
     unittest.main()

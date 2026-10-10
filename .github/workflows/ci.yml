@@ -119,6 +119,27 @@ jobs:
       - name: Scan available component build output
         run: python scripts/ci/repository_guard.py
 
+  agent-ring-sqlite-340:
+    name: Agent ring ledger on Debian 12 SQLite 3.40
+    # Issue #191: SQLite 3.40.x (Debian 12 / Raspberry Pi OS bookworm) behaves
+    # differently from Ubuntu 24.04's 3.45. The pinned Debian 12 smoke image
+    # runs the dependency-free ring ledger tests with networking disabled.
+    needs: repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Build the pinned Debian 12 Agent image
+        run: docker build --file agent/Dockerfile.ci --tag agent-sqlite-340 agent
+      - name: Run ring ledger tests against the image's system SQLite
+        run: |
+          docker run --rm --pull=never --network=none agent-sqlite-340 \
+            python -c 'import sqlite3, sys; print(sqlite3.sqlite_version); sys.exit(not sqlite3.sqlite_version.startswith("3.40."))'
+          docker run --rm --pull=never --network=none agent-sqlite-340 \
+            python -m unittest -v tests.test_ring tests.test_ring_variable_sizes
+
   web-browser:
     name: Dashboard browser smoke
     needs: repository
