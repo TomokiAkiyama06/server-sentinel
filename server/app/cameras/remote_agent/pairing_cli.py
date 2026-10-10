@@ -77,8 +77,17 @@ deployment CA expiry (``ca_not_after=``) and the same fixed
 trust-warning words as the local ``capture_trust_warning`` on stderr (#127):
 ``deployment_ca_expiring`` from 30 days before the CA stops covering a
 397-day node leaf, ``deployment_ca_validity_insufficient`` once it no longer
-does, and ``listener_certificate_expiring`` from 30 days before the listener
-certificate expires. A warning does not change the exit status.
+does, ``deployment_ca_expired`` after the CA's expiry,
+``listener_certificate_expiring`` from 30 days before the listener
+certificate expires and ``listener_certificate_expired`` after it. A warning
+does not change the exit status. ``rotate-listener`` and ``approve`` print
+the CA state as soon as the CA child has answered, before the leaf validity
+is checked against the CA, so a run refused with
+``deployment_ca_validity_insufficient`` still shows ``ca_not_after`` and the
+warning (and keeps its refusal exit status). The listener expiry is taken
+from the certificate already verified or issued in the same run, never
+re-read after an irreversible step, so a later read failure cannot turn a
+completed command into a non-zero exit.
 """
 from __future__ import annotations
 
@@ -117,7 +126,7 @@ from .node_ca import (
     _CLOCK_SKEW_ALLOWANCE, DEFAULT_NODE_VALIDITY, MAX_CA_VALIDITY, MAX_CSR_BYTES,
     MAX_LEAF_VALIDITY, AuthorityValidityExceeded, CaptureAuthorityError, DeploymentTrust,
     PrivateDirectory, _certificate_pem, listener_material, main_server_name,
-    main_server_not_after, new_listener_key, public_key_digest, publish_public_certificate,
+    new_listener_key, public_key_digest, publish_public_certificate,
     complete_interrupted_rotation, complete_listener_credential,
     clear_interrupted_listener_write, rotate_listener_credential, valid_server_name,
     write_listener_credential,
@@ -645,15 +654,28 @@ def _report_trust_expiry(authority: DeploymentTrust, *,
     refused. Public dates and fixed words only, on stderr, so each command's
     stdout stays exactly its documented result line(s).
     """
-    now = _utc_now()
+    _report_ca_expiry(authority)
+    _report_listener_expiry(listener_not_after)
+
+
+def _report_ca_expiry(authority: DeploymentTrust) -> None:
+    """The CA half of ``_report_trust_expiry``; needs only the public CA certificate.
+
+    Printed before any check that can refuse for the CA's remaining validity
+    (Codex P2 on PR #167), since that refusal is when the Owner needs it.
+    """
     ca_not_after = authority.not_valid_after.isoformat(timespec="seconds")
     print(f"serversentinel-pairing: ca_not_after={ca_not_after}", file=sys.stderr)
-    reason = ca_expiry_reason(now, authority.not_valid_after)
+    reason = ca_expiry_reason(_utc_now(), authority.not_valid_after)
     if reason is not None:
         print(f"serversentinel-pairing: warning: {reason} ca_not_after={ca_not_after} "
               "(replacing the CA needs a new init and re-pairing every Agent)",
               file=sys.stderr)
-    reason = listener_expiry_reason(now, listener_not_after)
+
+
+def _report_listener_expiry(listener_not_after: datetime.datetime | None) -> None:
+    """The listener half of ``_report_trust_expiry``, from an in-memory expiry."""
+    reason = listener_expiry_reason(_utc_now(), listener_not_after)
     if reason is not None:
         print(f"serversentinel-pairing: warning: {reason} "
               f"listener_not_after={listener_not_after.isoformat(timespec='seconds')} "
@@ -802,6 +824,9 @@ def command_rotate_listener(args) -> int:
         raise CliRefused("listener_directory_must_differ")
     with _separated(args) as separation:
         trust = separation.hello()
+        # Before the rotation checks the new leaf against the CA, so a run
+        # refused with deployment_ca_validity_insufficient still shows it.
+        _report_ca_expiry(trust)
         separation.drop()
         listener = _directory(args.listener_dir)
 
@@ -825,7 +850,7 @@ def command_rotate_listener(args) -> int:
     else:
         print(f"listener rotated: not_after={expiry}")
     print("restart the capture ingest listener to load the new certificate")
-    _report_trust_expiry(trust, listener_not_after=rotation.not_after)
+    _report_listener_expiry(rotation.not_after)
     return 0
 
 
@@ -841,7 +866,7 @@ def command_export_bundle(args) -> int:
     trust = DeploymentTrust.load_public(listener_directory)
     # A bundle is only exported for a listener certificate this CA issued,
     # so mixed-up deployments fail here, not later at the Agent's TLS check.
-    trust.verify_listener_certificate(listener_directory)
+    listener_certificate = trust.verify_listener_certificate(listener_directory)
     server_name = main_server_name(listener_directory)
     host, port = args.endpoint
     bundle = trust.export_trust_bundle(server_name=server_name, endpoint_host=host,
@@ -849,7 +874,9 @@ def command_export_bundle(args) -> int:
     _write_public_file(args.output, bundle.content)
     # Public: the Owner compares this full digest on the capture host.
     print(f"trust_bundle_sha256={bundle.sha256}")
-    _report_trust_expiry(trust, listener_not_after=main_server_not_after(listener_directory))
+    # From the certificate verified above: the bundle is already written, so
+    # nothing here may read the directory again and fail (PR #167 review).
+    _report_trust_expiry(trust, listener_not_after=listener_certificate.not_valid_after_utc)
     return 0
 
 
@@ -968,6 +995,8 @@ def command_approve(args) -> int:
         config = EnrollmentListenerConfig(host, port, reserved=tuple(reserved))
         with _separated(args) as separation:
             trust = separation.hello()
+            # Shown before the check below can refuse (Codex P2 on PR #167).
+            _report_ca_expiry(trust)
             # Refuse before any approval when the CA can no longer cover a
             # node leaf; the code would otherwise be burned by a failed issuance.
             trust.check_leaf_validity(DEFAULT_NODE_VALIDITY)
@@ -985,8 +1014,7 @@ def command_approve(args) -> int:
             listener = EnrollmentListener(config, _enrollment_context(listener_directory),
                                           limits=EnrollmentLimits())
             publish_public_certificate(listener_directory, trust.ca_certificate_pem())
-            _report_trust_expiry(trust,
-                                 listener_not_after=listener_certificate.not_valid_after_utc)
+            _report_listener_expiry(listener_certificate.not_valid_after_utc)
             csr, digest = parse_enrollment_request(
                 _read_public_file(args.request, MAX_REQUEST_FILE_BYTES))
             with _ledger(args.database) as ledger:

@@ -269,6 +269,41 @@ class ListenerRotationTests(ListenerLifecycleHarness):
         self.assertIn("refused: deployment_ca_validity_insufficient", stderr)
         self.assertEqual(before, self.snapshot(listener))
 
+    def test_rotation_validity_range_is_checked_before_an_interrupted_rotation_is_recovered(self):
+        # PR #167 review suggestion 2: the range of ``validity`` is checked
+        # before the lock, so an out-of-range value never completes (or
+        # discards) the staged files of an interrupted rotation.
+        authority, listener = self.fresh()
+        self.init(authority, listener)
+        real_replace = PrivateDirectory.replace_with
+
+        def stop_after_key(directory, staged, name):
+            if name == "main-server-certificate.pem":
+                raise node_ca.CaptureAuthorityError("issuer material could not be replaced")
+            return real_replace(directory, staged, name)
+        with patch.object(PrivateDirectory, "replace_with", stop_after_key):
+            status, _stdout, _stderr = self.rotate(authority, listener)
+        self.assertEqual(2, status)
+        self.assertTrue((listener / "main-server-certificate.pem.next").exists())
+        before = self.snapshot(listener)
+        ca = DeploymentAuthority.load(PrivateDirectory(authority),
+                                      deployment_id_of(PrivateDirectory(authority)))
+        for bad in (0 * DAY, -DAY, 398 * DAY, None, 30):
+            with self.subTest(validity=bad), self.assertRaises(node_ca.CaptureAuthorityError):
+                ca.rotate_main_server_credential(PrivateDirectory(listener), validity=bad)
+            self.assertEqual(before, self.snapshot(listener))
+        for bad in ("0", "398"):
+            with self.subTest(days=bad):
+                status, stdout, stderr = self.rotate(authority, listener,
+                                                     "--server-validity-days", bad)
+                self.assertEqual(2, status)
+                self.assertEqual("", stdout)
+                self.assertIn("refused: certificate_validity_rejected", stderr)
+                self.assertEqual(before, self.snapshot(listener))
+        status, stdout, stderr = self.rotate(authority, listener)
+        self.assertEqual(0, status, stderr)
+        self.assertIn("listener rotation completed (interrupted run)", stdout)
+
     def test_rotation_validity_range_is_still_checked_before_anything_changes(self):
         authority, listener = self.fresh()
         self.init(authority, listener)
@@ -647,6 +682,104 @@ class TrustExpiryReportTests(ListenerLifecycleHarness):
         self.assertIn("warning: deployment_ca_validity_insufficient", stderr)
         self.assertIn("warning: listener_certificate_expiring listener_not_after=", stderr)
         self.assertNotIn("PRIVATE KEY", stderr)
+
+    def test_refused_rotation_still_prints_the_ca_state_first(self):
+        # Codex P2 on PR #167 (Issue #127): the refusal is exactly when the
+        # Owner needs the CA expiry, so it is printed before the CA coverage
+        # check, and the refusal exit status is kept.
+        authority, listener = self.fresh()
+        self.init(authority, listener, "--ca-validity-days", "100", "--server-validity-days", "30")
+        before = self.snapshot(listener)
+        status, stdout, stderr = self.rotate(authority, listener)
+        self.assertEqual(2, status)
+        self.assertEqual("", stdout)
+        self.assertEqual(1, stderr.count("serversentinel-pairing: ca_not_after="))
+        warning = stderr.index("warning: deployment_ca_validity_insufficient ca_not_after=")
+        self.assertLess(stderr.index("ca_not_after="), warning)
+        self.assertLess(warning, stderr.index("refused: deployment_ca_validity_insufficient"))
+        self.assertEqual(before, self.snapshot(listener))
+        # A successful rotation prints the CA state once, the new leaf's
+        # expiry warning after the rotation.
+        status, stdout, stderr = self.rotate(authority, listener, "--server-validity-days", "20")
+        self.assertEqual(0, status, stderr)
+        self.assertEqual(1, stderr.count("serversentinel-pairing: ca_not_after="))
+        self.assertLess(stderr.index("ca_not_after="),
+                        stderr.index("warning: listener_certificate_expiring listener_not_after="))
+
+    def approve(self, authority, listener, request):
+        database = self.root / f"state-{uuid4()}.sqlite3"
+
+        class Terminal:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def write(self, text):
+                raise AssertionError("nothing may be shown")
+
+            def read_line(self):
+                raise AssertionError("no confirmation may be requested")
+
+            def close(self):
+                pass
+        with patch.object(pairing_cli, "ControllingTerminal", Terminal):
+            status, stdout, stderr = run_cli(
+                "approve", "--database", str(database), "--authority-dir", str(authority),
+                "--listener-dir", str(listener), "--request", str(request),
+                "--listen", "127.0.0.1:18443")
+        self.assertFalse(database.exists())
+        return status, stdout, stderr
+
+    def test_refused_approve_still_prints_the_ca_state_first(self):
+        authority, listener = self.fresh()
+        self.init(authority, listener, "--ca-validity-days", "100", "--server-validity-days", "30")
+        status, stdout, stderr = self.approve(authority, listener, self.root / "unused.json")
+        self.assertEqual(2, status)
+        self.assertEqual("", stdout)
+        self.assertEqual(1, stderr.count("serversentinel-pairing: ca_not_after="))
+        warning = stderr.index("warning: deployment_ca_validity_insufficient ca_not_after=")
+        self.assertLess(warning, stderr.index("refused: deployment_ca_validity_insufficient"))
+
+    def test_approve_prints_ca_and_listener_warnings_before_reading_the_request(self):
+        # PR #167 review suggestion 2: approve's warning output. 420 days of
+        # CA still cover a node leaf; the 20-day listener leaf is expiring.
+        authority, listener = self.fresh()
+        self.init(authority, listener, "--ca-validity-days", "420", "--server-validity-days", "20")
+        request = self.root / f"request-{uuid4()}.json"
+        request.write_bytes(b"{}")
+        status, stdout, stderr = self.approve(authority, listener, request)
+        self.assertEqual(2, status)
+        self.assertEqual("", stdout)
+        self.assertEqual(1, stderr.count("serversentinel-pairing: ca_not_after="))
+        ca_warning = stderr.index("warning: deployment_ca_expiring ca_not_after=")
+        listener_warning = stderr.index(
+            "warning: listener_certificate_expiring listener_not_after=")
+        refusal = stderr.index("refused: enrollment_request_rejected")
+        self.assertLess(ca_warning, listener_warning)
+        self.assertLess(listener_warning, refusal)
+        self.assertNotIn("PRIVATE KEY", stderr)
+
+    def test_export_bundle_succeeds_when_the_listener_changes_after_the_bundle_is_written(self):
+        # PR #167 review suggestion 1: the listener expiry is taken from the
+        # certificate the bundle was verified against, not re-read after the
+        # irreversible write, so a later change cannot turn success into exit 2.
+        authority, listener = self.fresh()
+        self.init(authority, listener, "--server-validity-days", "20")
+        expected = self.certificate(listener).not_valid_after_utc.isoformat(timespec="seconds")
+        output = self.root / f"bundle-{uuid4()}.json"
+        real_write = pairing_cli._write_public_file
+
+        def write_then_change(path, content):
+            real_write(path, content)
+            (listener / "main-server-certificate.pem").write_bytes(b"not a certificate")
+        with patch.object(pairing_cli, "_write_public_file", write_then_change):
+            status, stdout, stderr = run_cli(
+                "export-bundle", "--listener-dir", str(listener),
+                "--endpoint", "10.0.0.5:8443", "--output", str(output))
+        self.assertEqual(0, status, stderr)
+        self.assertRegex(stdout, r"^trust_bundle_sha256=[0-9a-f]{64}\n$")
+        self.assertTrue(output.exists())
+        self.assertIn(f"warning: listener_certificate_expiring listener_not_after={expected}",
+                      stderr)
 
 
 class EnrollmentListenerRebindTests(ListenerLifecycleHarness):

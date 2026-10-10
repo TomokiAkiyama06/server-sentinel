@@ -771,8 +771,13 @@ monitor yet (#14/#15). Until then `init`, `rotate-listener`, `export-bundle`
 and `approve` print `serversentinel-pairing: ca_not_after=<UTC time>` on
 stderr, plus `serversentinel-pairing: warning: deployment_ca_expiring` (or
 `deployment_ca_validity_insufficient` / `deployment_ca_expired`) and
-`listener_certificate_expiring` with the same 30-day lead as the monitor;
-a warning does not change the exit status or stdout.
+`listener_certificate_expiring` (or `listener_certificate_expired`) with the
+same 30-day lead as the monitor; a warning does not change the exit status or
+stdout. `rotate-listener` and `approve` print the CA line and its warning
+before checking the CA's remaining validity, so a run refused
+`deployment_ca_validity_insufficient` still shows `ca_not_after=` (and still
+exits 2). The listener expiry is taken from the certificate verified or issued
+in the same run, so `export-bundle` exits 0 once the bundle is written.
 Replacing an expiring CA means a new `init` and re-pairing every Agent; plan
 it before the CA has 397 days left.
 

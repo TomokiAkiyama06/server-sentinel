@@ -1769,12 +1769,6 @@ def main_server_name(directory: PrivateDirectory) -> str:
         _load_certificate(directory, _SERVER_CERTIFICATE, "listener material is invalid"))
 
 
-def main_server_not_after(directory: PrivateDirectory) -> datetime.datetime:
-    """When the Main listener certificate in ``directory`` expires (public)."""
-    return _load_certificate(directory, _SERVER_CERTIFICATE,
-                             "listener material is invalid").not_valid_after_utc
-
-
 def listener_material(directory: PrivateDirectory) -> MainServerCredential:
     """Validate and return the Main ingest server certificate/key paths.
 
