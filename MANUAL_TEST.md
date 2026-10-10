@@ -722,9 +722,11 @@ only by synthetic tests (`server/tests/test_release.py`,
     `--ca-validity-days 100 --server-validity-days 30`: `rotate-listener`
     with the default validity and `approve` refuse
     `deployment_ca_validity_insufficient` before any approval or code is
-    shown; `rotate-listener --server-validity-days 30` succeeds. `init` and
-    `rotate-listener` print `ca_not_after=` and
-    `warning: deployment_ca_validity_insufficient` on stderr (and
+    shown; `rotate-listener --server-validity-days 30` succeeds. `init`,
+    `rotate-listener` and `approve` print `ca_not_after=` and
+    `warning: deployment_ca_validity_insufficient` on stderr -- the refused
+    `rotate-listener` and `approve` runs too, before their `refused:` line
+    and still exiting 2 -- (and
     `listener_certificate_expiring` when the listener leaf has 30 days or
     less), with stdout unchanged; a CA with 398 to 426 days left warns
     `deployment_ca_expiring` instead. A node
