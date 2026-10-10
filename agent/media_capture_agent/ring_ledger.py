@@ -135,7 +135,14 @@ class Ledger:
                 "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'").fetchall()}
             if indexes != {"segment_time", "protection_incident"}:
                 raise RingRefused("unsupported_ledger_format")
-            if self.connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            # Full integrity_check, not quick_check: it also verifies that
+            # every index matches its table, and SQLite 3.40.x quick_check
+            # falsely reports "NULL value in protection.incident" for each
+            # row of a WITHOUT ROWID table whose PRIMARY KEY order differs
+            # from column order (Issue #191). Any result but one "ok" row
+            # refuses the ledger.
+            result = [row[0] for row in self.connection.execute("PRAGMA integrity_check").fetchall()]
+            if result != ["ok"]:
                 raise RingRefused("ledger_integrity_failure")
         except (OSError, sqlite3.Error) as exc:
             self.close()

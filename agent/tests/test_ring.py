@@ -1318,6 +1318,40 @@ class RingTests(unittest.TestCase):
         # A refused ledger never touches the media it cannot account for.
         self.assertEqual(len(self.store.list_segments()), 10)
 
+    def test_ledger_index_that_disagrees_with_its_table_is_refused(self):
+        # quick_check never compares index content with its table, so this
+        # inconsistency passes it; the full integrity_check refuses it.
+        self.warm()
+        self.ring.close()
+        with sqlite3.connect(self.settings.runtime_root / "ring.sqlite3") as connection:
+            connection.execute("PRAGMA writable_schema = ON")
+            connection.execute("UPDATE sqlite_master SET sql = "
+                               "'CREATE INDEX segment_time ON segments(source, start)' "
+                               "WHERE name = 'segment_time'")
+        with sqlite3.connect(self.settings.runtime_root / "ring.sqlite3") as connection:
+            self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
+        connection.close()
+        with self.assertRaisesRegex(RingRefused, "ledger_integrity_failure"):
+            DiskRing(self.settings, self.store, ledger_maximum_bytes=LEDGER_BYTES,
+                     authority=AllowControls())
+        self.assertEqual(len(self.store.list_segments()), 10)
+
+    def test_protection_membership_reopens_on_every_supported_sqlite(self):
+        # Issue #191: protection is WITHOUT ROWID with PRIMARY KEY(segment,
+        # incident) in the opposite order to its columns. SQLite 3.40.x
+        # quick_check reports a false "NULL value in protection.incident"
+        # for each such row, which refused every restart with protection.
+        self.warm()
+        self.loss()
+        self.finish()
+        rows = self.ring.db.execute("SELECT incident, segment FROM protection").fetchall()
+        self.assertGreater(len(rows), 0)
+        self.assertTrue(all(row[0] is not None and row[1] is not None for row in rows))
+        self.restart()
+        self.assertEqual(self.ring.db.execute("SELECT count(*) FROM protection").fetchone()[0],
+                         len(rows))
+        self.assertEqual(self.ring.db.execute("SELECT count(*) FROM incidents").fetchone()[0], 1)
+
     def test_admission_statements_do_not_grow_with_retained_rows(self):
         self.ring.close()
         self.quota.capacity = 4 * 1024 * 1024 * 1024
