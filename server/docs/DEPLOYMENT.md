@@ -1233,7 +1233,11 @@ the clone-detection floor and is a change; backup state is excluded), and each
 invitation's redemption and revocation state, principal revision and
 deployment generation bindings (and whether that generation is still
 current), issue and expiry times, redemption attempt count and a keyed digest
-of its secret digest (so a replaced enrollment binding is a change). Keyed digests
+of its secret digest (so a replaced enrollment binding is a change). A
+database not yet migrated by `access_webauthn_migration` is read with the
+value that migration writes into every existing row (backup eligibility and
+attempt count 0), so the same credential or invitation verifies unchanged
+across it (#114). Keyed digests
 are HMAC-SHA-256 under a random salt drawn for each baseline and stored in it,
 so the raw values are never written and a digest cannot be matched across
 baselines; whoever holds a baseline can still test a guessed value, so keep it
@@ -1501,10 +1505,15 @@ intact. The required invariants are:
   linked segment. Such a segment never explains a cursor advance. The
   publications since the record are every `ready` catalog row of the source
   starting at or after the source cursor recorded at record time, whatever
-  its `spool` flag (`release_source()` clears it on linked segments too); a
+  its `spool` flag (`release_source()` clears it on linked segments too). A
   publication whose catalog row was removed together with its link is not
-  visible to this rule and is caught only through the stream / sequence
-  markers of the segments around it. A segment published at record time
+  visible to this rule; the latest one is still named by the source cursor
+  (#161): when the cursor end has advanced since the record and lies inside
+  the window (after its start, at or before its target end) of such a
+  recording that is still active or was stopped early, a `ready` catalog row
+  of the source ending exactly there must still exist (`changed` otherwise).
+  An earlier removed publication is caught only through the stream /
+  sequence markers of the segments around it. A segment published at record time
   (linked or in the ready spool), or one starting behind the source cursor
   recorded then, is never `pending` afterwards (`RecordingStore._recover()`
   deletes every pending row with its file at the next start:
@@ -1563,7 +1572,8 @@ Out of scope, and not claimed by a passing verification:
 
 Not judged: for a recording that closed at its own deadline or was
 interrupted by a restart, a lost link to a segment published after its
-latest linked segment, because a lagging source may legitimately publish an
+latest linked segment (also when the segment left the catalog with it, and
+the cursor rule above therefore does not apply either), because a lagging source may legitimately publish an
 overlapping segment after that close, which the store does not link. Its
 link is required only if a later linked segment shows it was published
 while the recording was active. A recording stopped early and then closed by
