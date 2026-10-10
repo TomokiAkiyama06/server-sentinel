@@ -122,8 +122,15 @@ class LocalUvcRuntimeStatus:
     health_sink_stalled: bool = False
     # Pending events with no delivery thread to deliver them, because
     # starting that thread failed; the service is then ``degraded`` and the
-    # start is retried (Issue #195 item 5).
+    # start is retried (Issue #195 item 5). It also counts camera
+    # transitions a source controller could not hand to this delivery
+    # because its own handoff thread could not be started.
     health_sink_undeliverable: int = 0
+    # Stops whose durable ``offline`` fence of a worker that outlived the
+    # join bound did not complete within ``HEALTH_FENCE_SECONDS`` (Issue
+    # #194): a transition lock or health write did not finish in time. The
+    # stop is ``stop_failed`` and the rows were fenced conservatively.
+    health_fence_incomplete: int = 0
 
 
 class _HealthSinkDelivery:
@@ -303,6 +310,7 @@ class LocalUvcRuntime:
         self._adapter_open = False
         self._database_pinned = False
         self._stop_cleanup_failed = False
+        self._health_fence_incomplete = 0
 
     # -- health events -------------------------------------------------
     def _health(self, event: HealthEvent) -> None:
@@ -515,10 +523,24 @@ class LocalUvcRuntime:
         # A hung optional sink, or events no delivery thread can deliver,
         # means health notifications are not being delivered: never report
         # that as a healthy service.
+        if self._adapter_delivery()[1] > 0:
+            return True
         if self._sink_delivery is None:
             return False
         snapshot = self._sink_delivery.snapshot()
         return bool(snapshot[3] or snapshot[4])
+
+    def _adapter_delivery(self) -> tuple[int, int]:
+        """(failures, undelivered) of the source controllers' delivery."""
+        check = getattr(self.adapter, "health_delivery", None)
+        if not callable(check):
+            return 0, 0
+        try:
+            failures, undelivered = check()
+        except Exception:
+            # Cannot tell: never report that as fully delivered.
+            return 1, 1
+        return failures, undelivered
 
     def _health_unpersisted(self, source_id: UUID) -> bool:
         check = getattr(self.adapter, "health_unpersisted", None)
@@ -639,11 +661,16 @@ class LocalUvcRuntime:
         if not live:
             return
         try:
-            fence(live, HEALTH_FENCE_SECONDS)
+            complete = fence(live, HEALTH_FENCE_SECONDS) is True
         except Exception:
-            # Counted by the unpersisted/STOP_FAILED state; text may carry
-            # private details.
-            pass
+            # Text may carry private details; counted below.
+            complete = False
+        if not complete:
+            # Never ignored: the stop is already ``stop_failed``; the count
+            # and a fixed, value-free event make the incomplete fence
+            # visible. The rows were fenced conservatively (never online).
+            self._health_fence_incomplete += 1
+            logging.getLogger(__name__).error(Event.LOCAL_UVC_HEALTH_FENCE_INCOMPLETE)
 
     def reapprove(self, owner_administration, actor_context, source_id: UUID, candidate):
         """Run the audited Owner approval with that source's worker stopped.
@@ -704,15 +731,22 @@ class LocalUvcRuntime:
                 self._sink_delivery.resume()
                 (pending, coalesced, delivery_failures, stalled,
                  undeliverable) = self._sink_delivery.snapshot()
+            # Transitions a source controller could not hand off at all
+            # (its delivery thread failed to start) are undeliverable too.
+            controller_failures, controller_undelivered = self._adapter_delivery()
+            delivery_failures += controller_failures
+            undeliverable += controller_undelivered
             state = self._state
             if state in (LocalUvcRuntimeState.RUNNING, LocalUvcRuntimeState.DEGRADED):
                 # A worker thread that died later is not hidden behind the
                 # state computed at start.
                 state = self._aggregate(sink_stalled=stalled or undeliverable > 0)
                 self._state = state
+            fence_incomplete = self._health_fence_incomplete
         with self._events_lock:
             dropped, sink_failures = self._events_dropped, self._sink_failures
             suppressed = self.health_logs_suppressed
         sink_failures += delivery_failures
         return LocalUvcRuntimeStatus(state, tuple(sources), dropped, sink_failures, suppressed,
-                                     pending, coalesced, stalled, undeliverable)
+                                     pending, coalesced, stalled, undeliverable,
+                                     fence_incomplete)

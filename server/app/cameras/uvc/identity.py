@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
 import threading
+import time
 from uuid import UUID
 
 
@@ -213,11 +214,17 @@ class ReconnectController:
         self._handoff_lock = threading.Lock()
         self._handoff_running = False
         self._handoff_pending = False
-        # Set while no handoff thread is running, so a stop can wait until
-        # every handed-off event has reached ``notify`` (Issue #195 item 3).
+        # Set only while no handoff thread is running and no handed-off
+        # event is left behind, so a stop can wait until every handed-off
+        # event has reached ``notify`` (Issue #195 item 3). A handoff thread
+        # that could not be started leaves it clear (never idle with an
+        # event still queued); ``settle_delivery`` retries it.
         self._handoff_idle = threading.Event()
         self._handoff_idle.set()
         self.delivery_failures = 0
+        # Failed handoff thread starts (thread-resource exhaustion); counted
+        # only, the events stay queued and are reported by ``undelivered``.
+        self.delivery_start_failures = 0
         # Set once the capture service is stopping while this controller's
         # worker is still alive (Issue #194): the source is lowered to
         # ``offline`` and may never be raised to ``online`` again.
@@ -251,9 +258,19 @@ class ReconnectController:
         if not blocking:
             self._handoff()
             return
+        try:
+            self._drain_outbox(None)
+        finally:
+            # Events a failed handoff start left queued are delivered here
+            # too; the delivery is idle again once nothing is left.
+            self._mark_idle_if_drained()
+
+    def _drain_outbox(self, timeout):
+        """Deliver queued events in this thread; False if the lock timed out."""
         while self._outbox:
-            if not self._delivery.acquire(blocking=blocking):
-                return
+            if not (self._delivery.acquire() if timeout is None
+                    else self._delivery.acquire(timeout=max(0.0, timeout))):
+                return False
             try:
                 while True:
                     try:
@@ -263,15 +280,30 @@ class ReconnectController:
                     self.notify(event)
             finally:
                 self._delivery.release()
+        return True
+
+    def _mark_idle_if_drained(self):
+        with self._handoff_lock:
+            if not self._handoff_running and not self._outbox:
+                self._handoff_idle.set()
 
     def _handoff(self):
+        """Hand the queue to a delivery thread; never raises.
+
+        A thread that cannot be started (thread-resource exhaustion) leaves
+        the events queued and the delivery not idle: the failure is counted,
+        ``undelivered`` reports the events, and the next blocking delivery or
+        ``settle_delivery`` retries, so the final offline event is never
+        dropped silently.
+        """
         with self._handoff_lock:
             if self._handoff_running:
                 # The running thread re-checks the queue before it exits.
                 self._handoff_pending = True
-                return
+                return True
             if not self._outbox:
-                return
+                self._handoff_idle.set()
+                return True
             self._handoff_running = True
             self._handoff_pending = False
             self._handoff_idle.clear()
@@ -282,18 +314,56 @@ class ReconnectController:
         except BaseException:
             with self._handoff_lock:
                 self._handoff_running = False
-                self._handoff_idle.set()
-            raise
+                self.delivery_start_failures += 1
+            return False
+        return True
+
+    @property
+    def undelivered(self):
+        """Queued events no delivery thread is delivering (a failed start)."""
+        with self._handoff_lock:
+            if self._handoff_running or self._handoff_idle.is_set():
+                return 0
+            return len(self._outbox)
+
+    def resume_delivery(self):
+        """Retry a failed handoff start without blocking (status reads)."""
+        if self.notify is not None and self.undelivered:
+            self._handoff()
+
+    # Interval at which ``settle_delivery`` re-checks a running handoff.
+    SETTLE_POLL_SECONDS = 0.05
 
     def settle_delivery(self, timeout):
-        """Wait at most ``timeout`` for the handoff thread; True when idle.
+        """Wait at most ``timeout`` until every queued event reached ``notify``.
 
-        Once idle, every event handed off so far has been passed to
-        ``notify`` (which only enqueues for the runtime's sink delivery), so
-        a stop that waits here before settling that delivery cannot miss the
-        final offline notification.
+        Returns True when idle. Once idle, every event handed off so far has
+        been passed to ``notify`` (which only enqueues for the runtime's sink
+        delivery), so a stop that waits here before settling that delivery
+        cannot miss the final offline notification. A handoff thread that
+        could not be started is retried; if it still cannot start, the
+        stopping caller delivers the queue itself (``notify`` never blocks),
+        bounded by ``timeout``. False leaves the events queued and reported
+        by ``undelivered``.
         """
-        return self._handoff_idle.wait(timeout)
+        deadline = time.monotonic() + timeout
+        while not self._handoff_idle.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            with self._handoff_lock:
+                running = self._handoff_running
+            if not running and not self._handoff():
+                try:
+                    self._drain_outbox(remaining)
+                except Exception:
+                    # Counted only: exception text may carry private details.
+                    # The failed attempt consumed one event.
+                    self.delivery_failures += 1
+                self._mark_idle_if_drained()
+                continue
+            self._handoff_idle.wait(min(remaining, self.SETTLE_POLL_SECONDS))
+        return self._handoff_idle.is_set()
 
     def _drain_handoff(self):
         while True:
@@ -423,6 +493,24 @@ class ReconnectController:
                 self._flush()
         finally:
             self._deliver()
+        if self._stopping:
+            # A stop fence set the flag while this call held the lock (e.g.
+            # inside a slow state callback) and could not take the lock in
+            # time. Its writer fence already keeps the durable row offline;
+            # lower the in-memory ``online`` it could not lower itself.
+            self._lower_for_stop()
+            raise ValueError("capture service is stopping")
+
+    def _lower_for_stop(self):
+        with self.lock:
+            changed = (not self._finished
+                       and self.state in (CameraState.ONLINE, CameraState.DEGRADED)
+                       and self._set_state(CameraState.OFFLINE, "capture_service_stopping"))
+        try:
+            if changed:
+                self._flush(blocking=False)
+        finally:
+            self._deliver(blocking=False)
 
     def frame_stalled(self, candidate, *, only_online=False, blocking=True,
                       confirm=None, capture_lost=False):
@@ -556,12 +644,17 @@ class ReconnectController:
         and descriptor stay with the worker, which closes them when it
         returns; from now on ``capture_ready`` refuses, so a late frame can
         never raise the source back to ``online``. Returns False when the
-        lock could not be taken in time.
+        lock could not be taken in time; the stop flag is set before the lock
+        is requested, so even then a ``capture_ready`` holding the lock
+        lowers its own late ``online`` once it releases it (the caller keeps
+        the durable row offline with its writer fence meanwhile).
         """
+        # A plain attribute store, atomic without the lock; capture_ready
+        # reads it under the lock and again after releasing it.
+        self._stopping = True
         if not self.lock.acquire(timeout=timeout):
             return False
         try:
-            self._stopping = True
             if self._finished:
                 return True
             # Manual intervention and offline are already non-online and
