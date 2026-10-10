@@ -3206,15 +3206,26 @@ def _missing_trailing_publication(base: dict, now: dict, context: dict) -> bool:
     still names it: _publish() sets the cursor end to the end of the latest
     publication, and append() refuses a segment without a positive duration,
     so a cursor end inside ``(start_ms, target_end_ms]`` belongs to a
-    publication overlapping the window. When the cursor advanced since the
-    record and the recording was certainly active while that publication was
-    made (still active now, or stopped early: finish() closes a stop only
-    once the cursor reaches it), _publish() linked it and finish() kept the
-    link, and _trim() deletes only unlinked rows; the segment ending at the
-    cursor end must therefore still be catalogued. A recording closed at its
-    own deadline or interrupted by a restart is not judged (a lagging source
-    may publish after that close, unlinked, and the spool may evict it). Not
-    checked when the baseline kept no cursors or the current one is unread.
+    publication overlapping the window. A cursor end beyond the target end
+    belongs to one append() linked exactly when it starts before the target
+    end (``start_ms < target_end_ms``, its linking rule): a removed row's
+    start is not known, but append() admits it only at or after the end of
+    every earlier publication (the recorded cursor end and each publication
+    still catalogued since), so it is judged unless that bound already
+    reaches the target end. An early stop's legitimate trim (finish() drops
+    the links of segments starting at or after the stop, then _trim() may
+    remove their rows) is therefore never judged when the segment before it
+    reaches the stop; a removed latest segment behind a time gap across the
+    target end fails closed (DEPLOYMENT.md limits). When the cursor advanced
+    since the record and the recording was certainly active while that
+    publication was made (still active now, or stopped early: finish()
+    closes a stop only once the cursor reaches it), _publish() linked it and
+    finish() kept the link, and _trim() deletes only unlinked rows; the
+    segment ending at the cursor end must therefore still be catalogued. A
+    recording closed at its own deadline or interrupted by a restart is not
+    judged (a lagging source may publish after that close, unlinked, and the
+    spool may evict it). Not checked when the baseline kept no cursors or the
+    current one is unread.
     """
     cursors, current = context.get("cursors"), context.get("current_cursors")
     if cursors is None or current is None:
@@ -3228,10 +3239,19 @@ def _missing_trailing_publication(base: dict, now: dict, context: dict) -> bool:
     if recorded is not None and not (isinstance(recorded, list) and len(recorded) == 3
                                      and _int(recorded[2]) and end > recorded[2]):
         return False  # not advanced since the record (or malformed: reported elsewhere)
-    if not now["start_ms"] < end <= now["target_end_ms"]:
-        return False
+    if not now["start_ms"] < end:
+        return False  # wholly before the window: never linked
     published = _published_since_record(now["source_id"], context)
-    return published is not None and not any(item[1] == end for item in published)
+    if published is None or any(item[1] == end for item in published):
+        return False  # still catalogued: _unlinked_publication() checks its link
+    if end <= now["target_end_ms"]:
+        return True
+    # Straddling the target end, or wholly after it: append() linked it iff
+    # it started before the target end, and it started at or after the end
+    # of every earlier publication.
+    floor = max([item[1] for item in published if item[1] < end]
+                + ([recorded[2]] if recorded is not None else []), default=None)
+    return floor is None or floor < now["target_end_ms"]
 
 
 def _prior_publication(first: dict, now: dict, context: dict) -> tuple:

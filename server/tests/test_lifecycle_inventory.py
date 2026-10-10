@@ -5884,6 +5884,88 @@ class LifecycleInventoryTests(unittest.TestCase):
                 self.assertEqual(code, inventory.EXIT_PRESERVED,
                                  report["sections"]["recordings"])
 
+    def test_a_cursor_named_publication_straddling_the_target_end_cannot_vanish(self):
+        # Codex P1 (#161): append() links a segment starting before the
+        # target end (start_ms < target_end_ms) even when it ends after it, so
+        # a removed cursor-named segment straddling the end is lost evidence
+        # for a recording active at record time that is still active or was
+        # stopped early. A segment an early stop legitimately trimmed (it
+        # starts at or after the stop, right behind the previous one) or one
+        # wholly after the target end may leave with its row.
+        import zlib
+        from app.media.recording import Segment
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+
+        def scenario(label, prepare):
+            runtime = Runtime(self.base / f"straddle-{label}")
+            saved, self.runtime = self.runtime, runtime
+            try:
+                runtime.seed()
+                connection = sqlite3.connect(runtime.database, isolation_level=None)
+                self.addCleanup(connection.close)
+                store = self._recording_store(connection)
+                base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+                source, stream_id = uuid4(), uuid4()
+
+                def put(sequence, start, end):
+                    return store.append(Segment(source, stream_id, sequence, base + start,
+                                                base + end, "synthetic", "deflate", payload))
+                put(0, 0, 10_000)
+                # Target end: base + 50,000.
+                recording = store.start_manual(source, base + 10_000, duration_ms=40_000)
+                code, baseline = self.record(f"straddle-{label}.json")
+                self.assertEqual(code, inventory.EXIT_PRESERVED)
+                lost = prepare(store, put, recording, base)
+                code, report, _ = self.verify(baseline)
+                self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+                runtime.execute("DELETE FROM recording_links WHERE segment_id=?", (str(lost),))
+                runtime.execute("DELETE FROM recording_segments WHERE id=?", (str(lost),))
+                (runtime.root / "recordings" / (lost.hex + ".seg")).unlink()
+                code, report, _ = self.verify(baseline)
+                return code, report, recording
+            finally:
+                self.runtime = saved
+
+        def active(store, put, recording, base):
+            put(1, 10_000, 30_000)
+            # Spans 40,000-60,000 across the target end at 50,000: linked.
+            return put(2, 40_000, 60_000)
+
+        def stopped(store, put, recording, base):
+            put(1, 10_000, 20_000)
+            last = put(2, 20_000, 40_000)
+            # The stop at 30,000 lies inside the last segment; the cursor
+            # reached it, so finish() closes now and keeps that link.
+            store.finish(recording, stop_ms=base + 30_000)
+            return last
+
+        def trimmed(store, put, recording, base):
+            put(1, 10_000, 20_000)
+            put(2, 20_000, 30_000)
+            trimmed = put(3, 30_000, 40_000)
+            # finish() drops the link of the segment starting at the stop;
+            # its unlinked row may then leave the catalog.
+            store.finish(recording, stop_ms=base + 30_000)
+            return trimmed
+
+        def after(store, put, recording, base):
+            put(1, 10_000, 30_000)
+            put(2, 30_000, 50_000)
+            # Starts at the target end: never linked, may leave the spool.
+            return put(3, 50_000, 60_000)
+
+        for label, prepare in (("active", active), ("stopped", stopped)):
+            with self.subTest(label):
+                code, report, recording = scenario(label, prepare)
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertEqual(report["sections"]["recordings"]["failed"],
+                                 [{"id": str(recording), "reason": "changed"}])
+        for label, prepare in (("trimmed", trimmed), ("after", after)):
+            with self.subTest(label):
+                code, report, _ = scenario(label, prepare)
+                self.assertEqual(code, inventory.EXIT_PRESERVED,
+                                 report["sections"]["recordings"])
+
     def test_publications_outside_a_stopped_window_need_no_link(self):
         # finish() drops the links of segments wholly outside the stopped
         # window, so those stay catalogued without a link and still verify.

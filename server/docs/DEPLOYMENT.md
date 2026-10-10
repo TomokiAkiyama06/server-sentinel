@@ -1512,6 +1512,17 @@ intact. The required invariants are:
   the window (after its start, at or before its target end) of such a
   recording that is still active or was stopped early, a `ready` catalog row
   of the source ending exactly there must still exist (`changed` otherwise).
+  A cursor end beyond the target end belongs to a segment `append()` linked
+  exactly when it started before the target end (`start_ms < target_end_ms`,
+  e.g. one spanning the end); its removed row's start is unknown, but
+  `append()` admitted it only at or after the end of every earlier
+  publication (the recorded cursor end and every publication still
+  catalogued since), so the same row is required unless that bound already
+  reaches the target end. A segment an early stop trimmed (starting at or
+  after the stop right behind the previous one) may therefore leave; a
+  removed latest segment behind a time gap across the target end (only an
+  oversize spool eviction removes the latest unlinked segment) fails closed
+  as `changed`.
   An earlier removed publication is caught only through the stream /
   sequence markers of the segments around it. A segment published at record time
   (linked or in the ready spool), or one starting behind the source cursor
