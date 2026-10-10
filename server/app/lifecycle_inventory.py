@@ -2017,6 +2017,13 @@ _PRESENCE_AUDIT_ACTIONS = frozenset({
     "hint_set", "override_cancelled", "override_expired", "override_set",
     "timeline_gap_cleared"})
 _DELIVERY_STATES = frozenset({"pending", "submitting"}) | _DELIVERY_RESULTS
+# The access_credentials columns access_webauthn_migration adds, with the
+# value it writes into every existing row (NOT NULL DEFAULT 0, else NULL).
+_WEBAUTHN_CREDENTIAL_DEFAULTS = {"backup_eligible": 0, "backup_state": 0,
+                                 "inconsistency_reason": None, "inconsistent_at_us": None,
+                                 "label": None, "last_used_at_us": None}
+
+
 _RECORDING_STATUSES = frozenset({"active", "complete", "gapped", "interrupted", "deleting"})
 
 
@@ -2182,7 +2189,10 @@ def _domain_errors(connection, tables) -> list:
             bad("access_principals", str(row["id"]))
     for row in rows("access_credentials", "SELECT * FROM access_credentials"):
         try:
-            valid = bool(AccessStore._credential(row))
+            # A row stored before access_webauthn_migration is read with the
+            # values that migration gives it (#114).
+            valid = bool(AccessStore._credential(
+                {**_WEBAUTHN_CREDENTIAL_DEFAULTS, **{key: row[key] for key in row.keys()}}))
         except Exception:
             valid = False
         if not valid:
@@ -2652,8 +2662,11 @@ def _access(connection, tables, salt: str) -> dict | None:
     credential_columns = _columns(connection, "access_credentials")
     consistent = (" AND inconsistent_at_us IS NULL"
                   if "inconsistent_at_us" in credential_columns else "")
+    # A column access_webauthn_migration adds is read as the default that
+    # migration writes into every existing row (NOT NULL DEFAULT 0), so a
+    # baseline recorded before it matches the same row after it (#114).
     eligible = ("backup_eligible" if "backup_eligible" in credential_columns
-                else "NULL AS backup_eligible")
+                else "0 AS backup_eligible")
     generation = None
     if "access_deployment_state" in tables:
         generation = connection.execute(
@@ -2690,7 +2703,7 @@ def _access(connection, tables, salt: str) -> dict | None:
     # secret digest itself is never written, only a keyed digest of it, so a
     # replaced enrollment binding is a change.
     attempts = ("attempt_count" if "attempt_count" in _columns(connection, "access_invitations")
-                else "NULL AS attempt_count")
+                else "0 AS attempt_count")
     invitations = {row["id"]: {
         "principal_id": row["principal_id"],
         "redeemed": row["redeemed_at_us"] is not None,
@@ -3184,6 +3197,63 @@ def _unlinked_publication(base: dict, now: dict, context: dict) -> bool:
                for start, end, _, _, segment_id in published)
 
 
+@_fail_closed(True)
+def _missing_trailing_publication(base: dict, now: dict, context: dict) -> bool:
+    """Whether the publication the source cursor names left with its link (#161).
+
+    _unlinked_publication() sees only publications still catalogued; one
+    removed together with its link and file leaves no row. The source cursor
+    still names it: _publish() sets the cursor end to the end of the latest
+    publication, and append() refuses a segment without a positive duration,
+    so a cursor end inside ``(start_ms, target_end_ms]`` belongs to a
+    publication overlapping the window. A cursor end beyond the target end
+    belongs to one append() linked exactly when it starts before the target
+    end (``start_ms < target_end_ms``, its linking rule): a removed row's
+    start is not known, but append() admits it only at or after the end of
+    every earlier publication (the recorded cursor end and each publication
+    still catalogued since), so it is judged unless that bound already
+    reaches the target end. An early stop's legitimate trim (finish() drops
+    the links of segments starting at or after the stop, then _trim() may
+    remove their rows) is therefore never judged when the segment before it
+    reaches the stop; a removed latest segment behind a time gap across the
+    target end fails closed (DEPLOYMENT.md limits). When the cursor advanced
+    since the record and the recording was certainly active while that
+    publication was made (still active now, or stopped early: finish()
+    closes a stop only once the cursor reaches it), _publish() linked it and
+    finish() kept the link, and _trim() deletes only unlinked rows; the
+    segment ending at the cursor end must therefore still be catalogued. A
+    recording closed at its own deadline or interrupted by a restart is not
+    judged (a lagging source may publish after that close, unlinked, and the
+    spool may evict it). Not checked when the baseline kept no cursors or the
+    current one is unread.
+    """
+    cursors, current = context.get("cursors"), context.get("current_cursors")
+    if cursors is None or current is None:
+        return False
+    if not (now["status"] == "active" or now["target_end_ms"] < base["target_end_ms"]):
+        return False
+    cursor, recorded = current.get(now["source_id"]), cursors.get(now["source_id"])
+    if not (isinstance(cursor, list) and len(cursor) == 3 and _int(cursor[2])):
+        return False  # a missing or malformed cursor is cursor_regressed / invalid_value
+    end = cursor[2]
+    if recorded is not None and not (isinstance(recorded, list) and len(recorded) == 3
+                                     and _int(recorded[2]) and end > recorded[2]):
+        return False  # not advanced since the record (or malformed: reported elsewhere)
+    if not now["start_ms"] < end:
+        return False  # wholly before the window: never linked
+    published = _published_since_record(now["source_id"], context)
+    if published is None or any(item[1] == end for item in published):
+        return False  # still catalogued: _unlinked_publication() checks its link
+    if end <= now["target_end_ms"]:
+        return True
+    # Straddling the target end, or wholly after it: append() linked it iff
+    # it started before the target end, and it started at or after the end
+    # of every earlier publication.
+    floor = max([item[1] for item in published if item[1] < end]
+                + ([recorded[2]] if recorded is not None else []), default=None)
+    return floor is None or floor < now["target_end_ms"]
+
+
 def _prior_publication(first: dict, now: dict, context: dict) -> tuple:
     """The cursor ``first`` was published after: ``(known, (stream, sequence, end) | None)``.
 
@@ -3296,10 +3366,12 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
     # store links and finish() keeps).
     rewrites = list(result["declared_rewrites"])
     # Every recording active at record time, changed or not: each overlapping
-    # publication since the record that the store linked is still linked.
+    # publication since the record that the store linked is still linked,
+    # including the latest one the source cursor names (#161).
     for key, base in sorted(baseline.items()):
         if (base["status"] == "active" and key in current
-                and _unlinked_publication(base, current[key], context or {})):
+                and (_unlinked_publication(base, current[key], context or {})
+                     or _missing_trailing_publication(base, current[key], context or {}))):
             preserved = [other for other in preserved if other != key]
             in_progress = [other for other in in_progress if other != key]
             without = [other for other in without if other != key]
