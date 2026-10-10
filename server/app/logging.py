@@ -34,6 +34,9 @@ class Event(StrEnum):
     SESSION_REVOCATION_MARKER_UNSAVED = "session_revocation_marker_unsaved"
     SESSION_REVOCATION_MARKER_SAVED = "session_revocation_marker_saved"
     REQUEST_DENIED = "request_denied"
+    CAPTURE_CONTINUITY_RELEASED_EVICTED = "capture_continuity_released_evicted"
+    CAPTURE_CONTINUITY_ACK_NODE_MISMATCH = "capture_continuity_ack_node_mismatch"
+    CAPTURE_CONTINUITY_ACK_UNKNOWN_SOURCE = "capture_continuity_ack_unknown_source"
     UNSTRUCTURED = "unstructured_redacted"
 
 

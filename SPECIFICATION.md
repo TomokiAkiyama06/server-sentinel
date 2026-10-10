@@ -841,7 +841,10 @@ position (and it carries no noted loss or uncommitted attempt), after which
 the durable watermark applies. These entries are hard-bounded (deployment
 setting); when full, the oldest is evicted and that source falls back to its
 durable watermark on reactivation, which can repeat an envelope or a gap report
-but never hides loss. A unit behind loss already recorded (below the first
+but never hides loss. Each such eviction, and each ignored durable
+acknowledgement (watermark for another node, or an unknown source), is never
+silent: it is counted in value-free operator diagnostics for health/status
+exposure and logged rate-limited without node/source identity. A unit behind loss already recorded (below the first
 refused unit that showed a skip or restart) is acknowledged as `duplicate`
 and never admitted, so media never contradicts the recorded gap. An in-epoch
 capture clock regression is measured against the committed unit and the

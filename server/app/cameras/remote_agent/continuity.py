@@ -38,6 +38,7 @@ from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+import logging
 from threading import Lock
 from typing import Callable, Iterator
 from uuid import UUID, uuid4
@@ -45,6 +46,7 @@ from uuid import UUID, uuid4
 from app.cameras.remote_agent.ingest import (
     AgentAction, AgentIngestQueue, AgentMessage, IngestAuthorizer, IngestOutcome,
 )
+from app.logging import Event
 
 _MAXIMUM_COUNTER = 2 ** 63 - 1
 # Only an ingest refusal that no retry of the same unit can ever satisfy is
@@ -229,6 +231,32 @@ class SourceContinuity:
     backpressured: bool
 
 
+@dataclass(frozen=True)
+class ContinuityDiagnostics:
+    """Operator-facing continuity counters for health/status exposure.
+
+    Carries counts only: no node, source, sequence or capture-time value, so
+    it can be shown wherever the value-free logging policy allows a count.
+    ``released_evictions`` counts released-source continuity entries evicted
+    because ``maximum_released_sources`` was full (each such source falls
+    back to its durable watermark on reactivation).  The two ignored
+    acknowledgement counters count ``acknowledge_persisted`` calls that
+    changed nothing because the watermark names another node, or because
+    the source is neither tracked nor released.
+    """
+
+    released_sources: int
+    maximum_released_sources: int
+    released_evictions: int
+    ignored_acknowledgements_node_mismatch: int
+    ignored_acknowledgements_unknown_source: int
+
+
+def _first_or_doubling(count: int) -> bool:
+    """Rate limit: log the first occurrence and every doubling after it."""
+    return count & (count - 1) == 0
+
+
 @dataclass
 class AuthorizationChange:
     """Result of a fenced authorization change; filled only when it commits."""
@@ -378,6 +406,13 @@ class ContinuityTracker:
         # acknowledgement; bounded by ``maximum_released_sources`` and outside
         # the active-source slot limit.  Insertion order is eviction order.
         self._released: dict[UUID, _Source] = {}
+        # Value-free operator counters (``diagnostics``); never reset.
+        self._released_evictions = 0
+        self._ack_node_mismatches = 0
+        self._ack_unknown_sources = 0
+        # Rate-limited log records decided under the lock and emitted after it
+        # is released; at most one per distinct event, so bounded.
+        self._pending_logs: dict[Event, int] = {}
         # Monotonic across forget/re-enrollment; never reused for any node.
         self._generation = 0
         self._instance = uuid4()
@@ -418,15 +453,38 @@ class ContinuityTracker:
                     and not isinstance(deactivated_source, UUID))):
             raise ValueError("invalid agent authorization change")
         change = AuthorizationChange()
+        try:
+            with self._lock:
+                with self._ingest.authorization_change(revoked_node=revoked_node):
+                    yield change
+                released = []
+                if revoked_node is not None:
+                    released.extend(self._forget_node_locked(revoked_node))
+                if deactivated_source is not None:
+                    released.extend(self._forget_source_locked(deactivated_source))
+                change.released_gaps = tuple(released)
+        finally:
+            self._emit_logs()
+
+    def _note_log_locked(self, event: Event, level: int, count: int) -> None:
+        if _first_or_doubling(count):
+            self._pending_logs[event] = level
+
+    def _emit_logs(self) -> None:
+        """Emit rate-limited records outside the lock (value-free events only)."""
         with self._lock:
-            with self._ingest.authorization_change(revoked_node=revoked_node):
-                yield change
-            released = []
-            if revoked_node is not None:
-                released.extend(self._forget_node_locked(revoked_node))
-            if deactivated_source is not None:
-                released.extend(self._forget_source_locked(deactivated_source))
-            change.released_gaps = tuple(released)
+            pending, self._pending_logs = self._pending_logs, {}
+        logger = logging.getLogger(__name__)
+        for event, level in pending.items():
+            logger.log(level, event)
+
+    def diagnostics(self) -> ContinuityDiagnostics:
+        """Value-free counters for an operator health/status surface."""
+        with self._lock:
+            return ContinuityDiagnostics(
+                len(self._released), self.limits.maximum_released_sources,
+                self._released_evictions, self._ack_node_mismatches,
+                self._ack_unknown_sources)
 
     def open_session(self, node_id: UUID) -> AgentSession:
         """Grant a new session to an already mTLS-authenticated node identity.
@@ -1038,8 +1096,13 @@ class ContinuityTracker:
             while len(self._released) >= self.limits.maximum_released_sources:
                 # Hard bound: the oldest entry falls back to its durable
                 # watermark (a possible duplicate envelope or repeated gap
-                # report on reactivation, never unreported loss).
+                # report on reactivation, never unreported loss).  Counted
+                # and logged (rate-limited, no identity) so the operator
+                # notices that the durable consumer is not acknowledging.
                 del self._released[next(iter(self._released))]
+                self._released_evictions += 1
+                self._note_log_locked(Event.CAPTURE_CONTINUITY_RELEASED_EVICTED,
+                                      logging.WARNING, self._released_evictions)
             self._released[source_id] = released
         return gaps
 
@@ -1052,21 +1115,38 @@ class ContinuityTracker:
         lets a released source's kept continuity be dropped once the durable
         watermark covers it, because only then does a reactivated source
         resume from that watermark without enqueueing a unit twice.  An
-        acknowledgement for another node or an unknown source is ignored.
+        acknowledgement for another node or an unknown source changes nothing;
+        it is counted (``diagnostics``) and logged rate-limited without any
+        identity.  A node mismatch indicates a consumer/contract defect and
+        is a warning; an unknown source is expected after a source was
+        forgotten, evicted or already durably covered, so it is debug only.
         """
         if not isinstance(source_id, UUID) or not isinstance(mark, CommittedWatermark):
             raise ValueError("invalid durable persistence acknowledgement")
-        with self._lock:
-            state = self._sources.get(source_id) or self._released.get(source_id)
-            if state is None or state.node_id != mark.node_id:
-                return
-            position = (mark.capture_epoch, mark.sequence)
-            if (state.durable_sequence is None
-                    or position > (state.durable_epoch, state.durable_sequence)):
-                state.durable_epoch, state.durable_sequence = position
-            if (self._released.get(source_id) is state
-                    and self._durably_covered(state)):
-                del self._released[source_id]
+        try:
+            with self._lock:
+                self._acknowledge_locked(source_id, mark)
+        finally:
+            self._emit_logs()
+
+    def _acknowledge_locked(self, source_id: UUID, mark: CommittedWatermark) -> None:
+        state = self._sources.get(source_id) or self._released.get(source_id)
+        if state is None:
+            self._ack_unknown_sources += 1
+            self._note_log_locked(Event.CAPTURE_CONTINUITY_ACK_UNKNOWN_SOURCE,
+                                  logging.DEBUG, self._ack_unknown_sources)
+            return
+        if state.node_id != mark.node_id:
+            self._ack_node_mismatches += 1
+            self._note_log_locked(Event.CAPTURE_CONTINUITY_ACK_NODE_MISMATCH,
+                                  logging.WARNING, self._ack_node_mismatches)
+            return
+        position = (mark.capture_epoch, mark.sequence)
+        if (state.durable_sequence is None
+                or position > (state.durable_epoch, state.durable_sequence)):
+            state.durable_epoch, state.durable_sequence = position
+        if self._released.get(source_id) is state and self._durably_covered(state):
+            del self._released[source_id]
 
     def _forget_node_locked(self, node_id: UUID) -> tuple[GapEvent, ...]:
         self._nodes.pop(node_id, None)
@@ -1093,8 +1173,11 @@ class ContinuityTracker:
         """
         if not isinstance(source_id, UUID):
             raise ValueError("invalid agent source identity")
-        with self._lock:
-            return self._forget_source_locked(source_id)
+        try:
+            with self._lock:
+                return self._forget_source_locked(source_id)
+        finally:
+            self._emit_logs()
 
     def forget_node(self, node_id: UUID) -> tuple[GapEvent, ...]:
         """Drop state after durable revocation/removal; returns undrained gaps.
