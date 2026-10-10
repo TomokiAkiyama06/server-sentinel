@@ -15,11 +15,15 @@
     },
     {
       "path": "web/tests/browser.mjs",
-      "sha256": "sha256:6aaf0116f2934d826de28fb35e9931af6d795a21b73dc78a00a95724ca48c8fa"
+      "sha256": "sha256:ec446bfd4874c06018c63e13ffbf32d8e9893d935019470994b86956c6839343"
     },
     {
       "path": "web/tests/chrome.mjs",
-      "sha256": "sha256:291f2743dec3f117281cf62566f9551deadda0b7c90a71ab757e3d2f8142b266"
+      "sha256": "sha256:4f9cd65ca8a25f204f34ed063fae34bca02777a5ad02a5771b3b82557d8633eb"
+    },
+    {
+      "path": "web/tests/chrome.test.mjs",
+      "sha256": "sha256:c52e0f5f038de7f18cd22899a275d40a1963bab262c6b39c14e4cc754b252f86"
     },
     {
       "path": "web/tests/compile.mjs",

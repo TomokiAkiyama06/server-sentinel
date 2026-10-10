@@ -189,8 +189,7 @@ async function scenario(viewport, { production = false, status = 200, session = 
 }
 
 try {
-  const version = await browser.command('Browser.getVersion');
-  process.stdout.write(`Browser execution: ${version.product}\n`);
+  process.stdout.write(`Browser execution: ${browser.version.product}\n`);
   for (const { name, ...viewport } of sizes) {
     for (const optIn of [false, true]) {
       await scenario(viewport, { production: true, optIn }, async (page, requests) => {

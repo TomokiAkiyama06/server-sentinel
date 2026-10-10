@@ -292,7 +292,11 @@ npm run preview
 404 responses for all API/unknown paths. It is a local development tool.
 Browser tests require installed Chrome (`google-chrome` by default;
 `SERVERSENTINEL_BROWSER_EXECUTABLE` overrides its path). Absence fails the test;
-no browser is downloaded. Tests execute the built production bundle and a
+no browser is downloaded. Startup waits for a bounded DevTools readiness
+probe (`Browser.getVersion`, 20 s per launch, at most 3 launches with a fresh
+profile each); a missing executable is not retried, each retry is logged, and
+the final failure reports every attempt's exit status and Chrome stderr tail.
+Commands after readiness are never retried. Tests execute the built production bundle and a
 separate synthetic harness.
 
 Node tests cover API failure/redirect/path restrictions, independent permissions,
