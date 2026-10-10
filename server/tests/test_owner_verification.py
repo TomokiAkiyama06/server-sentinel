@@ -19,6 +19,7 @@ import threading
 from app.detection.owner.contracts import (Comparison, DenyOwner, FaceCandidate, ModelProvenance,
                                            Operation, OwnerError, Verdict, VerificationReason)
 from app.detection.owner.service import OwnerVerificationService
+from app.detection.owner import store as owner_store
 from app.detection.owner.store import _MIGRATIONS, EnrollmentStatus, OwnerTemplateStore
 from app.audit.runtime import AuditRetentionRuntime
 from app.detection.quality import Execution, QualityGate
@@ -170,6 +171,48 @@ class OwnerTests(TestCase):
                 self.store._db.execute("ROLLBACK TO broken")
                 self.store._db.execute("RELEASE broken")
         self.assertIsNotNone(self.store._load_for_verification())
+
+    def test_read_model_refuses_broken_unenrolled_rows(self):
+        # #195: an unenrolled row (no template) goes through the same reader,
+        # so a broken generation or leftover provenance is refused instead of
+        # being reported as "not enrolled" or reaching Verification as a
+        # ValueError.
+        self.assertIsNone(self.store._load_for_verification())
+        for assignment, value in (("generation=?", -1), ("generation=?", "synthetic"),
+                                  ("generation=?", 1.5), ("provenance=?", "{"),
+                                  ("provenance=?", '{"synthetic": true}')):
+            with self.subTest(assignment, value=value):
+                self.store._db.execute("SAVEPOINT broken")
+                self.store._db.execute(f"UPDATE owner_template SET {assignment}", (value,))
+                with self.assertRaisesRegex(OwnerError, "PRIVATE_TEMPLATE_STATE_INVALID"):
+                    self.store._load_for_verification()
+                with self.assertRaisesRegex(OwnerError, "PRIVATE_TEMPLATE_STATE_INVALID"):
+                    owner_store.read_template_row(*self.store._db.execute(
+                        "SELECT generation,template,provenance FROM owner_template").fetchone(),
+                        max_bytes=owner_store.MAX_TEMPLATE_BYTES_CEILING)
+                if assignment == "generation=?":
+                    with self.assertRaisesRegex(OwnerError, "PRIVATE_TEMPLATE_STATE_INVALID"):
+                        self.service.verify(self.candidate, self.gate, self.decision)
+                self.store._db.execute("ROLLBACK TO broken")
+                self.store._db.execute("RELEASE broken")
+        self.assertIsNone(self.store._load_for_verification())
+        # A missing singleton row is invalid, not "not enrolled".
+        self.store._db.execute("SAVEPOINT missing")
+        self.store._db.execute("DELETE FROM owner_template")
+        with self.assertRaisesRegex(OwnerError, "PRIVATE_TEMPLATE_STATE_INVALID"):
+            self.store._load_for_verification()
+        self.store._db.execute("ROLLBACK TO missing")
+        self.store._db.execute("RELEASE missing")
+
+    def test_delete_clears_an_enrolled_row_with_broken_provenance(self):
+        # status() checks only the generation, so the Owner can still delete
+        # a template whose provenance no longer loads.
+        self.enroll()
+        self.store._db.execute("UPDATE owner_template SET provenance=?", ("{",))
+        with self.assertRaisesRegex(OwnerError, "PRIVATE_TEMPLATE_STATE_INVALID"):
+            self.store._load_for_verification()
+        self.assertEqual(self.store.delete(expected_generation=1, at=NOW), EnrollmentStatus(False, 2))
+        self.assertIsNone(self.store._load_for_verification())
 
     def test_private_audit_retention_is_bounded_and_preserves_template(self):
         retention_now = datetime.now(timezone.utc)

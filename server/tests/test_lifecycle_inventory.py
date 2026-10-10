@@ -11,9 +11,12 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import ssl
 import stat
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import traceback
 import unittest
@@ -6270,6 +6273,80 @@ class LifecycleInventoryTests(unittest.TestCase):
                         self.assertEqual(code, inventory.EXIT_FAILED)
                         self.assertIn(expected, report["sections"]["recordings"]["failed"])
         self.runtime.database.write_bytes(original)
+
+
+class DocumentedCommandTests(unittest.TestCase):
+    """Issue #192: the DEPLOYMENT.md commands run as written.
+
+    The documented block is executed against a synthetic installation
+    (``releases/<version>`` with this checkout's ``app`` and the test
+    interpreter standing in for its venv interpreter), with only the
+    installation root, the placeholders and ``sudo`` substituted, from a
+    hostile working directory and environment that offer their own ``app``.
+    """
+
+    INSTALL_ROOT = "/opt/server-sentinel-main"
+
+    def documented_block(self) -> str:
+        text = (Path(__file__).resolve().parents[1] / "docs" / "DEPLOYMENT.md").read_text()
+        section = text[text.index("## Preservation inventory across update and rollback"):]
+        blocks = re.findall(r"```sh\n(.*?)```", section, re.S)
+        self.assertTrue(blocks)
+        block = blocks[0]
+        self.assertIn("-m app.lifecycle_inventory", block)
+        return block
+
+    def test_documented_record_and_verify_commands_import_the_release(self):
+        block = self.documented_block()
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            runtime = Runtime(base)
+            notes = base / "notes"
+            notes.mkdir(mode=0o700)
+            installation = base / "installation"
+            release = installation / "releases" / "1.0.0"
+            (release / "venv/bin").mkdir(parents=True)
+            (release / "venv/bin/python").symlink_to(sys.executable)
+            (release / "app").symlink_to(Path(inventory.__file__).resolve().parent)
+            (installation / "current").symlink_to("releases/1.0.0")
+            hostile = base / "hostile"
+            (hostile / "app").mkdir(parents=True)
+            (hostile / "app/__init__.py").write_text("raise SystemExit('HOSTILE')\n")
+            (hostile / "app/lifecycle_inventory.py").write_text("raise SystemExit('HOSTILE')\n")
+            script = (block.replace(self.INSTALL_ROOT, str(installation))
+                      .replace("sudo ", "")
+                      .replace("<runtime_root>", str(runtime.root))
+                      .replace("<private-notes-dir>", str(notes)))
+            self.assertNotIn("<", script)
+            commands = [command for command in script.split("\n\n") if command.strip()]
+            setup = "\n".join(command for command in commands
+                              if "app.lifecycle_inventory" not in command)
+            runs = [command for command in commands if "app.lifecycle_inventory" in command]
+            self.assertEqual([" record " in run or " verify " in run for run in runs], [True, True])
+            environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                           "PYTHONPATH": str(hostile), "PYTHONSAFEPATH": "",
+                           "PYTHONUSERBASE": str(hostile), "HOME": str(hostile)}
+            # The setup (cd), then each command, as an administrator would
+            # paste them. An empty synthetic runtime: record writes a baseline
+            # and verify a report, both reporting empty coverage (exit 3).
+            for command, written in zip(runs, ("before-update.json", "after-update.json")):
+                with self.subTest(written):
+                    result = subprocess.run(
+                        ["sh", "-c", setup + "\n" + command],
+                        cwd=hostile, env=environment, capture_output=True, text=True,
+                        timeout=120)
+                    output = result.stdout + result.stderr
+                    self.assertNotIn("HOSTILE", output)
+                    self.assertNotIn("ModuleNotFoundError", output)
+                    self.assertNotIn("lifecycle inventory refused", output)
+                    self.assertEqual(result.returncode, inventory.EXIT_EMPTY, output)
+                    self.assertTrue((notes / written).is_file())
+
+    def test_documented_commands_do_not_use_isolated_mode(self):
+        # -I implies -P, so -m would not add the release directory.
+        block = self.documented_block()
+        self.assertNotRegex(block, r"python[^\n]* -I\b")
+
 
 if __name__ == "__main__":
     unittest.main()

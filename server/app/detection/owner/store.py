@@ -47,14 +47,17 @@ def read_template_row(generation, template, provenance, *, max_bytes: int) -> _T
 
     Raises PRIVATE_TEMPLATE_STATE_INVALID for any row the store never
     writes: a generation that is not a non-negative integer, a template that
-    is not a non-empty BLOB within ``max_bytes``, or provenance that does not
-    load as ModelProvenance. Shared with the read-only lifecycle inventory so
-    both judge the same row the same way.
+    is not a non-empty BLOB within ``max_bytes``, provenance that does not
+    load as ModelProvenance, or an unenrolled row (no template) that still
+    carries provenance (the store clears both together). Shared with the
+    read-only lifecycle inventory so both judge the same row the same way.
     """
     try:
         if type(generation) is not int or generation < 0:
             raise OwnerError("PRIVATE_TEMPLATE_STATE_INVALID")
         if template is None:
+            if provenance is not None:
+                raise OwnerError("PRIVATE_TEMPLATE_STATE_INVALID")
             return None
         data = json.loads(provenance)
         data["review_id"] = UUID(data["review_id"])
@@ -360,7 +363,12 @@ class OwnerTemplateStore:
         self._check()
         try:
             row = self._db.execute("SELECT generation,template IS NOT NULL AS enrolled FROM owner_template WHERE singleton=1").fetchone()
-            if row is None:
+            # The generation is checked as read_template_row() checks it, so
+            # a broken one is refused here instead of reaching a caller (for
+            # example a Verification, which would raise ValueError on it).
+            # The template and provenance are not judged here: delete() reads
+            # the status too and must not be blocked by them.
+            if row is None or type(row["generation"]) is not int or row["generation"] < 0:
                 raise OwnerError("PRIVATE_TEMPLATE_STATE_INVALID")
             return EnrollmentStatus(bool(row["enrolled"]), row["generation"])
         except sqlite3.Error:
@@ -374,8 +382,12 @@ class OwnerTemplateStore:
         self._check()
         try:
             row = self._db.execute("SELECT generation,template,provenance FROM owner_template WHERE singleton=1").fetchone()
-            if row is None or row["template"] is None:
-                return None
+            # Every row goes through the shared read model, also an
+            # unenrolled one, so a broken generation or leftover provenance
+            # is refused before None ("not enrolled") is returned (#195). A
+            # missing singleton row is invalid, as status() treats it.
+            if row is None:
+                raise OwnerError("PRIVATE_TEMPLATE_STATE_INVALID")
             return read_template_row(row["generation"], row["template"], row["provenance"],
                                      max_bytes=self._max_bytes)
         except sqlite3.Error:

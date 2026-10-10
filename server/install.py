@@ -760,6 +760,14 @@ def _place_pairing_wrapper(root: Path, existing: bytes | None) -> bool:
     The new file is written under a temporary name that only root can write
     (created ``0700`` with ``O_EXCL``/``O_NOFOLLOW``, then owned by root and
     made ``0755``) and atomically renamed over the old one.
+
+    When this call created the wrapper (none was there before) and anything
+    after the rename fails -- the directory fsync in particular -- the new
+    wrapper is removed before the error propagates, as ``_create_unit`` does:
+    the caller only learns that a wrapper was created from the return value,
+    so its recovery could not remove it otherwise (Issue #195). A wrapper that
+    replaced an installer-generated one is kept: the old one is already gone
+    and the new one follows ``current`` like it did.
     """
     encoded = render_pairing_wrapper(root).encode("utf-8")
     if existing == encoded:
@@ -767,6 +775,7 @@ def _place_pairing_wrapper(root: Path, existing: bytes | None) -> bool:
     path = PAIRING_WRAPPER
     temporary = path.with_name("." + path.name + ".new")
     temporary.unlink(missing_ok=True)
+    renamed = False
     try:
         descriptor = os.open(
             temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, 0o700)
@@ -777,9 +786,12 @@ def _place_pairing_wrapper(root: Path, existing: bytes | None) -> bool:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        renamed = True
         _fsync_directory(path.parent)
     except BaseException:
         temporary.unlink(missing_ok=True)
+        if renamed and existing is None:
+            path.unlink(missing_ok=True)
         raise
     return existing is None
 
