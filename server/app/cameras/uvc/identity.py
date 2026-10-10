@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
 import threading
+import time
 from uuid import UUID
 
 
@@ -213,7 +214,21 @@ class ReconnectController:
         self._handoff_lock = threading.Lock()
         self._handoff_running = False
         self._handoff_pending = False
+        # Set only while no handoff thread is running and no handed-off
+        # event is left behind, so a stop can wait until every handed-off
+        # event has reached ``notify`` (Issue #195 item 3). A handoff thread
+        # that could not be started leaves it clear (never idle with an
+        # event still queued); ``settle_delivery`` retries it.
+        self._handoff_idle = threading.Event()
+        self._handoff_idle.set()
         self.delivery_failures = 0
+        # Failed handoff thread starts (thread-resource exhaustion); counted
+        # only, the events stay queued and are reported by ``undelivered``.
+        self.delivery_start_failures = 0
+        # Set once the capture service is stopping while this controller's
+        # worker is still alive (Issue #194): the source is lowered to
+        # ``offline`` and may never be raised to ``online`` again.
+        self._stopping = False
 
     def _persist(self):
         if self.store is not None:
@@ -243,9 +258,19 @@ class ReconnectController:
         if not blocking:
             self._handoff()
             return
+        try:
+            self._drain_outbox(None)
+        finally:
+            # Events a failed handoff start left queued are delivered here
+            # too; the delivery is idle again once nothing is left.
+            self._mark_idle_if_drained()
+
+    def _drain_outbox(self, timeout):
+        """Deliver queued events in this thread; False if the lock timed out."""
         while self._outbox:
-            if not self._delivery.acquire(blocking=blocking):
-                return
+            if not (self._delivery.acquire() if timeout is None
+                    else self._delivery.acquire(timeout=max(0.0, timeout))):
+                return False
             try:
                 while True:
                     try:
@@ -255,17 +280,33 @@ class ReconnectController:
                     self.notify(event)
             finally:
                 self._delivery.release()
+        return True
+
+    def _mark_idle_if_drained(self):
+        with self._handoff_lock:
+            if not self._handoff_running and not self._outbox:
+                self._handoff_idle.set()
 
     def _handoff(self):
+        """Hand the queue to a delivery thread; never raises.
+
+        A thread that cannot be started (thread-resource exhaustion) leaves
+        the events queued and the delivery not idle: the failure is counted,
+        ``undelivered`` reports the events, and the next blocking delivery or
+        ``settle_delivery`` retries, so the final offline event is never
+        dropped silently.
+        """
         with self._handoff_lock:
             if self._handoff_running:
                 # The running thread re-checks the queue before it exits.
                 self._handoff_pending = True
-                return
+                return True
             if not self._outbox:
-                return
+                self._handoff_idle.set()
+                return True
             self._handoff_running = True
             self._handoff_pending = False
+            self._handoff_idle.clear()
         thread = threading.Thread(target=self._drain_handoff, daemon=True,
                                   name="serversentinel-local-uvc-health-delivery")
         try:
@@ -273,7 +314,56 @@ class ReconnectController:
         except BaseException:
             with self._handoff_lock:
                 self._handoff_running = False
-            raise
+                self.delivery_start_failures += 1
+            return False
+        return True
+
+    @property
+    def undelivered(self):
+        """Queued events no delivery thread is delivering (a failed start)."""
+        with self._handoff_lock:
+            if self._handoff_running or self._handoff_idle.is_set():
+                return 0
+            return len(self._outbox)
+
+    def resume_delivery(self):
+        """Retry a failed handoff start without blocking (status reads)."""
+        if self.notify is not None and self.undelivered:
+            self._handoff()
+
+    # Interval at which ``settle_delivery`` re-checks a running handoff.
+    SETTLE_POLL_SECONDS = 0.05
+
+    def settle_delivery(self, timeout):
+        """Wait at most ``timeout`` until every queued event reached ``notify``.
+
+        Returns True when idle. Once idle, every event handed off so far has
+        been passed to ``notify`` (which only enqueues for the runtime's sink
+        delivery), so a stop that waits here before settling that delivery
+        cannot miss the final offline notification. A handoff thread that
+        could not be started is retried; if it still cannot start, the
+        stopping caller delivers the queue itself (``notify`` never blocks),
+        bounded by ``timeout``. False leaves the events queued and reported
+        by ``undelivered``.
+        """
+        deadline = time.monotonic() + timeout
+        while not self._handoff_idle.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            with self._handoff_lock:
+                running = self._handoff_running
+            if not running and not self._handoff():
+                try:
+                    self._drain_outbox(remaining)
+                except Exception:
+                    # Counted only: exception text may carry private details.
+                    # The failed attempt consumed one event.
+                    self.delivery_failures += 1
+                self._mark_idle_if_drained()
+                continue
+            self._handoff_idle.wait(min(remaining, self.SETTLE_POLL_SECONDS))
+        return self._handoff_idle.is_set()
 
     def _drain_handoff(self):
         while True:
@@ -287,6 +377,7 @@ class ReconnectController:
             with self._handoff_lock:
                 if not self._handoff_pending and not self._outbox:
                     self._handoff_running = False
+                    self._handoff_idle.set()
                     return
                 self._handoff_pending = False
 
@@ -382,10 +473,44 @@ class ReconnectController:
         self._transition(CameraState.DEGRADED, "owner_approved_pending_capture")
 
     def capture_ready(self, candidate):
-        if (not self.enabled or self.requires_approval or candidate is None
-                or not same_live_instance(self.bound, candidate)):
-            raise ValueError("capture has no approved binding")
-        self._transition(CameraState.ONLINE, "video_capture_ready")
+        # The stop fence and the binding are checked and ``online`` is set
+        # under one hold of the transition lock: checking ``_stopping``
+        # before taking the lock would let a concurrent ``fence_stopping``
+        # lower the source in between and then be overwritten by this late
+        # ``online`` (check-then-act race, Issue #194). Persisting and
+        # delivery still run after the lock is released.
+        with self.lock:
+            if self._stopping:
+                # A late frame from a worker that outlived the stop's join
+                # bound must not raise the source back to ``online``.
+                raise ValueError("capture service is stopping")
+            if (not self.enabled or self.requires_approval or candidate is None
+                    or not same_live_instance(self.bound, candidate)):
+                raise ValueError("capture has no approved binding")
+            changed = self._set_state(CameraState.ONLINE, "video_capture_ready")
+        try:
+            if changed:
+                self._flush()
+        finally:
+            self._deliver()
+        if self._stopping:
+            # A stop fence set the flag while this call held the lock (e.g.
+            # inside a slow state callback) and could not take the lock in
+            # time. Its writer fence already keeps the durable row offline;
+            # lower the in-memory ``online`` it could not lower itself.
+            self._lower_for_stop()
+            raise ValueError("capture service is stopping")
+
+    def _lower_for_stop(self):
+        with self.lock:
+            changed = (not self._finished
+                       and self.state in (CameraState.ONLINE, CameraState.DEGRADED)
+                       and self._set_state(CameraState.OFFLINE, "capture_service_stopping"))
+        try:
+            if changed:
+                self._flush(blocking=False)
+        finally:
+            self._deliver(blocking=False)
 
     def frame_stalled(self, candidate, *, only_online=False, blocking=True,
                       confirm=None, capture_lost=False):
@@ -504,6 +629,43 @@ class ReconnectController:
                 self._flush(blocking=False)
         finally:
             self._deliver(blocking=False)
+
+    def fence_stopping(self, timeout):
+        """Lower the source to ``offline`` for a stop its worker outlived.
+
+        Called from the stopping thread, not the source worker, while that
+        worker is still alive past the join bound (Issue #194). An ``online``
+        or ``degraded`` source becomes ``offline``
+        (``capture_service_stopping``). It changes
+        in-memory state only, under the transition lock (taken with
+        ``timeout`` so a stop can never wait unboundedly): the transition is
+        staged for the health writer, which the caller flushes, and its
+        notification is handed to the background delivery thread. The binding
+        and descriptor stay with the worker, which closes them when it
+        returns; from now on ``capture_ready`` refuses, so a late frame can
+        never raise the source back to ``online``. Returns False when the
+        lock could not be taken in time; the stop flag is set before the lock
+        is requested, so even then a ``capture_ready`` holding the lock
+        lowers its own late ``online`` once it releases it (the caller keeps
+        the durable row offline with its writer fence meanwhile).
+        """
+        # A plain attribute store, atomic without the lock; capture_ready
+        # reads it under the lock and again after releasing it.
+        self._stopping = True
+        if not self.lock.acquire(timeout=timeout):
+            return False
+        try:
+            if self._finished:
+                return True
+            # Manual intervention and offline are already non-online and
+            # keep their reason.
+            changed = (self.state in (CameraState.ONLINE, CameraState.DEGRADED)
+                       and self._set_state(CameraState.OFFLINE, "capture_service_stopping"))
+        finally:
+            self.lock.release()
+        if changed:
+            self._deliver(blocking=False)
+        return True
 
     def shutdown(self):
         """Release recovery marker only after capture is closed and state durable."""

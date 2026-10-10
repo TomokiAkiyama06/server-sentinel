@@ -35,6 +35,7 @@ from app.cameras.uvc.runtime import (
     LocalUvcDependencies, LocalUvcRuntime, LocalUvcRuntimeState, SourceRuntimeState,
 )
 from app.deployment import Deployment
+from app.logging import Event
 from app.main import create_app, run_to_completion
 from app.monitoring.runtime import MonitoringDependencies, RuntimeState
 from app.settings import ConfigurationError, Settings
@@ -302,7 +303,7 @@ class RuntimeLifecycleTests(RuntimeFixture):
             # Alternate the stalled flag on every read.
             stalled = len(reads) % 2 == 1
             reads.append(stalled)
-            return 0, 0, 0, stalled
+            return 0, 0, 0, stalled, 0
 
         with patch.object(runtime._sink_delivery, "snapshot", flipping_snapshot):
             observed = []
@@ -1165,6 +1166,271 @@ class RuntimeLifecycleTests(RuntimeFixture):
         delivered = self.frame_count(source.id) - before
         self.assertGreater(delivered, 5)
         self.assertLessEqual(len(writes), 1)
+
+
+class StopFollowUpTests(RuntimeFixture):
+    """Issue #194 and Issue #195 items 3 and 5."""
+
+    def test_slow_profile_blocked_worker_is_durably_offline_before_pin_release(self):
+        # Issue #194: at 1 fps the effective stall window is 10 frame
+        # intervals (10 s), far beyond the 0.5 s join bound, so the watchdog
+        # cannot lower the blocked worker before the stop releases the pin.
+        # The runtime itself must make the source durably non-online first.
+        source = self.source(desired_capture_profile=CaptureProfile(640, 480, 1, "MJPG"))
+        pinned = PinnedDatabase(Database(self.database.path))
+        registry = CameraRegistry(pinned, reservation=ToggleAdmission())
+        states = []
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), poll_timeout_seconds=0.05,
+                                  retry_delay_seconds=0.05, join_timeout_seconds=0.5,
+                                  frame_stall_seconds=0.25, frame_stall_reopen_seconds=30.0),
+            registry, on_frame=self.on_frame, discovery=self.discovery,
+            capture_factory=self.captures, on_camera_state=states.append,
+        )
+        self.addCleanup(runtime.stop)
+        self.addCleanup(pinned.release)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        block = threading.Event()
+        self.addCleanup(block.set)
+        self.captures.block = block
+        self.assertTrue(self.captures.blocked.wait(5))
+        status = runtime.stop()
+        self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
+        self.assertFalse(pinned.pinned)
+        self.assertTrue(status.sources[0].worker_running)
+        self.assertIs(self.health(source.id), SourceHealthState.OFFLINE)
+        self.assertIsNone(self.registry.get_source(source.id).negotiated_capture_profile)
+        self.assertIs(CameraState.OFFLINE, status.sources[0].camera_state)
+        self.assertEqual("capture_service_stopping", states[-1].reason)
+        fenced_at = len(states)
+        # A late frame from the released worker never raises it back online.
+        self.captures.block = None
+        block.set()
+        self.assertTrue(wait_for(lambda: not runtime.status().sources[0].worker_running))
+        self.assertTrue(all(capture.closed for capture in self.captures.instances))
+        self.assertNotIn(CameraState.ONLINE, [event.state for event in states[fenced_at:]])
+        self.assertIsNot(runtime.status().sources[0].camera_state, CameraState.ONLINE)
+        self.assertIs(self.health(source.id), SourceHealthState.OFFLINE)
+
+    def test_late_frame_after_fence_never_reports_online(self):
+        # Issue #194: once fenced, every later transition of that worker
+        # stays non-online in memory and in every staged write.
+        source = self.source(desired_capture_profile=CaptureProfile(640, 480, 1, "MJPG"))
+        states = []
+        runtime = self.runtime(source.id, on_camera_state=states.append,
+                               configuration_timing=dict(frame_stall_reopen_seconds=30.0))
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        block = threading.Event()
+        self.addCleanup(block.set)
+        self.captures.block = block
+        self.assertTrue(self.captures.blocked.wait(5))
+        self.assertTrue(runtime.adapter.fence_stopping((source.id,), 1.0))
+        self.assertIs(self.health(source.id), SourceHealthState.OFFLINE)
+        fenced_at = len(states)
+        self.captures.block = None
+        block.set()
+        # The worker keeps polling (it was not asked to stop) but never
+        # opens or resumes capture for the fenced source again.
+        time.sleep(0.3)
+        self.assertNotIn(CameraState.ONLINE, [event.state for event in states[fenced_at:]])
+        self.assertIs(self.health(source.id), SourceHealthState.OFFLINE)
+        self.assertTrue(all(capture.closed for capture in self.captures.instances))
+
+    def test_final_offline_notification_reaches_the_sink_before_stop_returns(self):
+        # Issue #195 item 3 (Codex on #188): the close transition is handed
+        # to the controller's delivery thread. stop() must not settle the
+        # sink before that thread has enqueued it.
+        from app.cameras.uvc import identity as identity_module
+
+        source = self.source()
+        delivered = []
+        runtime = self.runtime(source.id, health_sink=delivered.append)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        self.assertTrue(wait_for(lambda: runtime.status().health_sink_pending == 0))
+        original = identity_module.ReconnectController._drain_handoff
+
+        def slow_drain(controller):
+            time.sleep(0.3)
+            return original(controller)
+
+        with patch.object(identity_module.ReconnectController, "_drain_handoff", slow_drain):
+            status = runtime.stop()
+            reasons = [event.reason for event in delivered]
+        self.assertIs(status.state, LocalUvcRuntimeState.STOPPED)
+        self.assertIn("video_capture_closed", reasons)
+        self.assertEqual(0, status.health_sink_pending)
+
+    def _failing_sink_thread_start(self, armed):
+        original = threading.Thread.start
+
+        def start(thread):
+            if armed.is_set() and thread.name == "serversentinel-local-uvc-health-sink":
+                raise RuntimeError("synthetic: can't start new thread")
+            return original(thread)
+
+        return patch.object(threading.Thread, "start", start)
+
+    def test_sink_thread_start_failure_keeps_events_pending_and_retries(self):
+        # Issue #195 item 5 (Codex on #188): a failed Thread.start() used to
+        # mark the delivery idle with the event still pending, so settle()
+        # succeeded and nothing ever delivered it.
+        delivered = []
+        delivery = runtime_module._HealthSinkDelivery(
+            delivered.append, max_pending=8, monotonic=time.monotonic, stall_seconds=5.0)
+        event = runtime_module.HealthEvent(uuid4(), CameraState.OFFLINE, "video_capture_closed")
+        armed = threading.Event()
+        armed.set()
+        with self._failing_sink_thread_start(armed):
+            delivery.submit(event)
+            self.assertFalse(delivery.settle(0.05))
+            pending, _coalesced, failures, stalled, undeliverable = delivery.snapshot()
+            self.assertEqual((1, 1), (pending, undeliverable))
+            # The submit and the settle each retried the start once.
+            self.assertEqual(2, failures)
+            self.assertFalse(stalled)
+            armed.clear()
+            self.assertTrue(delivery.settle(2.0))
+        self.assertEqual([event], delivered)
+        self.assertEqual(0, delivery.snapshot()[4])
+
+    def test_sink_thread_start_failure_degrades_the_service_until_delivered(self):
+        source = self.source()
+        delivered = []
+        runtime = self.runtime(source.id, health_sink=delivered.append)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        self.assertTrue(wait_for(lambda: runtime.status().health_sink_pending == 0
+                                 and runtime.status().state is LocalUvcRuntimeState.RUNNING))
+        armed = threading.Event()
+        armed.set()
+        with self._failing_sink_thread_start(armed):
+            # Drop to offline and back: the transitions cannot be delivered.
+            self.discovery.devices = []
+            self.assertTrue(self.wait_health(source.id, SourceHealthState.OFFLINE))
+            self.discovery.devices = [self.camera]
+            self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+            self.assertTrue(wait_for(lambda: runtime.status().health_sink_undeliverable > 0))
+            status = runtime.status()
+            self.assertIs(status.state, LocalUvcRuntimeState.DEGRADED)
+            self.assertGreater(status.health_sink_failures, 0)
+            armed.clear()
+            # status() retries the delivery thread; the events then arrive.
+            self.assertTrue(wait_for(lambda: runtime.status().health_sink_undeliverable == 0
+                                     and runtime.status().health_sink_pending == 0))
+        self.assertIs(runtime.status().state, LocalUvcRuntimeState.RUNNING)
+        self.assertIn("video_capture_failed", [event.reason for event in delivered])
+        self.assertEqual("video_capture_ready", delivered[-1].reason)
+
+
+    def _failing_handoff_start(self):
+        original = threading.Thread.start
+
+        def start(thread):
+            if thread.name == "serversentinel-local-uvc-health-delivery":
+                raise RuntimeError("synthetic: can't start new thread")
+            return original(thread)
+
+        return patch.object(threading.Thread, "start", start)
+
+    def test_final_offline_notification_survives_handoff_thread_start_failure(self):
+        # PR #201 (Codex): with the controller's handoff thread unable to
+        # start, the close transition used to be dropped while the stop's
+        # settle_delivery() reported idle.
+        source = self.source()
+        delivered = []
+        runtime = self.runtime(source.id, health_sink=delivered.append)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        self.assertTrue(wait_for(lambda: runtime.status().health_sink_pending == 0))
+        with self._failing_handoff_start():
+            status = runtime.stop()
+        self.assertIs(status.state, LocalUvcRuntimeState.STOPPED)
+        self.assertIn("video_capture_closed", [event.reason for event in delivered])
+        self.assertEqual(0, status.health_sink_undeliverable)
+        self.assertEqual(0, status.health_sink_pending)
+
+    def test_handoff_start_failure_is_reported_undeliverable_until_retried(self):
+        # The watchdog lowers a blocked worker without blocking, through the
+        # controller's handoff thread. If that thread cannot start the event
+        # must stay visible (degraded, undeliverable) and be retried.
+        source = self.source()
+        delivered = []
+        runtime = self.runtime(source.id, health_sink=delivered.append,
+                               configuration_timing=dict(frame_stall_seconds=0.25,
+                                                         frame_stall_reopen_seconds=30.0))
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        self.assertTrue(wait_for(lambda: runtime.status().health_sink_pending == 0
+                                 and runtime.status().state is LocalUvcRuntimeState.RUNNING))
+        block = threading.Event()
+        self.addCleanup(block.set)
+        with self._failing_handoff_start():
+            self.captures.block = block
+            self.assertTrue(self.captures.blocked.wait(5))
+            self.assertTrue(wait_for(lambda: runtime.status().health_sink_undeliverable > 0))
+            status = runtime.status()
+            self.assertIs(status.state, LocalUvcRuntimeState.DEGRADED)
+            self.assertGreater(status.health_sink_failures, 0)
+            self.assertNotIn("video_frame_stalled", [event.reason for event in delivered])
+        # status() retries the handoff; the stall notification then arrives.
+        self.assertTrue(wait_for(lambda: runtime.status().health_sink_undeliverable == 0
+                                 and "video_frame_stalled"
+                                 in [event.reason for event in delivered]))
+
+    def test_fence_lock_timeout_still_leaves_the_stopped_source_durably_offline(self):
+        # PR #201 (Codex): capture_ready holds the transition lock inside a
+        # slow state callback with ``online`` already staged. The stop fence
+        # cannot take the lock within its budget; it used to stage nothing,
+        # flush that staged ``online`` durably and ignore the failure.
+        source = self.source()
+        armed, entered, gate = threading.Event(), threading.Event(), threading.Event()
+        states = []
+
+        def on_state(event):
+            states.append(event)
+            if armed.is_set() and event.state is CameraState.ONLINE:
+                entered.set()
+                gate.wait(10)
+
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), poll_timeout_seconds=0.05,
+                                  retry_delay_seconds=0.05, join_timeout_seconds=0.5,
+                                  frame_stall_seconds=0.25, frame_stall_reopen_seconds=30.0),
+            self.registry, on_frame=self.on_frame, discovery=self.discovery,
+            capture_factory=self.captures, on_camera_state=on_state,
+        )
+        self.addCleanup(runtime.stop)
+        self.addCleanup(gate.set)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        armed.set()
+        self.discovery.devices = []
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.OFFLINE))
+        self.discovery.devices = [self.camera]
+        self.assertTrue(entered.wait(5))
+        with self.assertLogs("app.cameras.uvc.runtime", "ERROR") as logs:
+            status = runtime.stop()
+        self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
+        self.assertEqual(1, status.health_fence_incomplete)
+        self.assertIn(Event.LOCAL_UVC_HEALTH_FENCE_INCOMPLETE.value, "\n".join(logs.output))
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.OFFLINE))
+        self.assertIsNone(self.registry.get_source(source.id).negotiated_capture_profile)
+        gate.set()
+        self.assertTrue(wait_for(lambda: not runtime.status().sources[0].worker_running))
+        time.sleep(0.2)
+        # The late ``online`` never becomes durable, nor stays in memory.
+        self.assertIs(self.health(source.id), SourceHealthState.OFFLINE)
+        self.assertIsNot(runtime.status().sources[0].camera_state, CameraState.ONLINE)
 
 
 class RestartDurabilityTests(RuntimeFixture):

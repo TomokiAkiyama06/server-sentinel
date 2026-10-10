@@ -25,6 +25,7 @@ class Event(StrEnum):
     LOCAL_UVC_STARTUP_FAILED = "local_uvc_startup_failed"
     LOCAL_UVC_STOPPED = "local_uvc_stopped"
     LOCAL_UVC_STOP_FAILED = "local_uvc_stop_failed"
+    LOCAL_UVC_HEALTH_FENCE_INCOMPLETE = "local_uvc_health_fence_incomplete"
     LOCAL_UVC_SOURCE_HEALTH_CHANGED = "local_uvc_source_health_changed"
     HUMAN_LISTENER_ACTIVATION_INVALID = "human_listener_activation_invalid"
     TIMELINE_FACT_QUARANTINED = "timeline_fact_quarantined"
