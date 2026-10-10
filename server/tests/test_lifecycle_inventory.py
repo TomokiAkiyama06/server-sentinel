@@ -538,6 +538,55 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertIn({"id": changed, "reason": "changed"},
                       report["sections"]["access_invitations"]["failed"])
 
+    def test_access_rows_recorded_before_the_webauthn_migration_verify_after_it(self):
+        # #114: a baseline recorded before access_webauthn_migration has no
+        # backup_eligible / attempt_count columns; the migration then writes
+        # its default 0 into every existing row. The same credential and
+        # invitation must verify unchanged across that migration.
+        earlier = APPLICATION_MIGRATIONS[:next(
+            index for index, item in enumerate(APPLICATION_MIGRATIONS)
+            if item.name == "human_access_webauthn")]
+        self.runtime = Runtime(self.base / "before-webauthn", earlier)
+        owner = self.runtime.principal("owner", ())
+        live = self.runtime.principal("invited_user", ("live:view",), status="invited")
+        self.runtime.execute(
+            "INSERT INTO access_credentials (credential_id, principal_id, public_key, algorithm, "
+            "sign_count, enrolled_at_us, revoked_at_us) VALUES (?, ?, X'00', -7, 0, 1, NULL)",
+            (CREDENTIAL_ID, owner))
+        invitation = str(uuid4())
+        self.runtime.execute(
+            "INSERT INTO access_invitations (id, secret_digest, principal_id, principal_revision, "
+            "deployment_generation, issued_at_us, expires_at_us, redeemed_at_us, revoked_at_us) "
+            "VALUES (?, ?, ?, 0, 0, 1, 2, NULL, NULL)",
+            (invitation, bytes(reversed(SECRET_DIGEST)), live))
+        with mock.patch.object(inventory, "APPLICATION_MIGRATIONS", earlier):
+            output = self.notes / "before-webauthn.json"
+            code, _, stderr = run("record", "--runtime-root", str(self.runtime.root),
+                                  "--output", str(output))
+        # Only the access rows are seeded: the other coverage stays empty.
+        self.assertEqual(code, inventory.EXIT_EMPTY, stderr)
+        self.assertTrue(output.exists())
+        baseline = output
+        with closing(Database(self.runtime.database).connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        code, report, _ = self.verify(baseline)
+        sections = report["sections"]
+        self.assertEqual(sections["access_principals"]["failed"], [])
+        self.assertIn(owner, sections["access_principals"]["preserved"])
+        self.assertEqual(sections["access_invitations"]["failed"], [])
+        self.assertIn(invitation, sections["access_invitations"]["preserved"])
+        self.assertEqual(code, inventory.EXIT_EMPTY, sections)
+        # A value other than the migration default is still a change.
+        self.runtime.execute("UPDATE access_invitations SET attempt_count=1 WHERE id=?",
+                             (invitation,))
+        self.runtime.execute("UPDATE access_credentials SET backup_eligible=1")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": invitation, "reason": "changed"},
+                      report["sections"]["access_invitations"]["failed"])
+        self.assertIn({"id": owner, "reason": "changed"},
+                      report["sections"]["access_principals"]["failed"])
+
     def test_camera_source_configuration_and_approval_are_preserved_privately(self):
         self.runtime.seed()
         serial, device = "synthetic-serial-marker-0001", "/dev/synthetic-video-marker"
@@ -5752,6 +5801,170 @@ class LifecycleInventoryTests(unittest.TestCase):
                 self.assertEqual(code, inventory.EXIT_FAILED)
                 self.assertEqual(report["sections"]["recordings"]["failed"],
                                  [{"id": str(recording), "reason": "changed"}])
+
+    def test_the_publication_the_cursor_names_cannot_vanish_with_its_link(self):
+        # #161 (1a): a publication since the record removed together with its
+        # link, catalog row and file is invisible to the catalogued-publication
+        # rule, but the source cursor still names its end. Inside the window
+        # of a recording certainly active then (still active, or stopped
+        # early at that end), the row ending there must still be catalogued.
+        import zlib
+        from app.media.recording import Segment
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+
+        def scenario(label, prepare):
+            runtime = Runtime(self.base / f"trailing-{label}")
+            saved, self.runtime = self.runtime, runtime
+            try:
+                runtime.seed()
+                connection = sqlite3.connect(runtime.database, isolation_level=None)
+                self.addCleanup(connection.close)
+                store = self._recording_store(connection)
+                base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+                source, stream_id = uuid4(), uuid4()
+
+                def put(sequence, start, end):
+                    return store.append(Segment(source, stream_id, sequence, base + start,
+                                                base + end, "synthetic", "deflate", payload))
+                put(0, 0, 10_000)
+                recording = store.start_manual(source, base + 10_000, duration_ms=40_000)
+                code, baseline = self.record(f"trailing-{label}.json")
+                self.assertEqual(code, inventory.EXIT_PRESERVED)
+                lost = prepare(store, put, recording, base)
+                code, report, _ = self.verify(baseline)
+                self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+                runtime.execute("DELETE FROM recording_links WHERE segment_id=?", (str(lost),))
+                runtime.execute("DELETE FROM recording_segments WHERE id=?", (str(lost),))
+                (runtime.root / "recordings" / (lost.hex + ".seg")).unlink()
+                if label == "interrupted":
+                    # The restart: startup recovery ends the active row.
+                    store.close()
+                    reopened = sqlite3.connect(runtime.database, isolation_level=None)
+                    self.addCleanup(reopened.close)
+                    self._recording_store(reopened)
+                code, report, _ = self.verify(baseline)
+                return code, report, recording
+            finally:
+                self.runtime = saved
+
+        def active(store, put, recording, base):
+            put(1, 10_000, 20_000)
+            return put(2, 20_000, 30_000)
+
+        def stopped(store, put, recording, base):
+            put(1, 10_000, 20_000)
+            last = put(2, 20_000, 30_000)
+            # The cursor reached the stop, so finish() closes it now.
+            store.finish(recording, stop_ms=base + 30_000)
+            return last
+
+        def deadline(store, put, recording, base):
+            # Closed at its own deadline: a lagging source may publish an
+            # overlapping segment after that close, unlinked, which the
+            # spool may evict. Not judged (DEPLOYMENT.md).
+            put(1, 10_000, 20_000)
+            last = put(2, 20_000, 30_000)
+            store.finish(recording)
+            return last
+
+        def interrupted(store, put, recording, base):
+            # Interrupted by a restart after the loss: equally not judged.
+            put(1, 10_000, 20_000)
+            return put(2, 20_000, 30_000)
+
+        for label, prepare in (("active", active), ("stopped", stopped)):
+            with self.subTest(label):
+                code, report, recording = scenario(label, prepare)
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertEqual(report["sections"]["recordings"]["failed"],
+                                 [{"id": str(recording), "reason": "changed"}])
+        for label, prepare in (("deadline", deadline), ("interrupted", interrupted)):
+            with self.subTest(label):
+                code, report, _ = scenario(label, prepare)
+                self.assertEqual(code, inventory.EXIT_PRESERVED,
+                                 report["sections"]["recordings"])
+
+    def test_a_cursor_named_publication_straddling_the_target_end_cannot_vanish(self):
+        # Codex P1 (#161): append() links a segment starting before the
+        # target end (start_ms < target_end_ms) even when it ends after it, so
+        # a removed cursor-named segment straddling the end is lost evidence
+        # for a recording active at record time that is still active or was
+        # stopped early. A segment an early stop legitimately trimmed (it
+        # starts at or after the stop, right behind the previous one) or one
+        # wholly after the target end may leave with its row.
+        import zlib
+        from app.media.recording import Segment
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+
+        def scenario(label, prepare):
+            runtime = Runtime(self.base / f"straddle-{label}")
+            saved, self.runtime = self.runtime, runtime
+            try:
+                runtime.seed()
+                connection = sqlite3.connect(runtime.database, isolation_level=None)
+                self.addCleanup(connection.close)
+                store = self._recording_store(connection)
+                base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+                source, stream_id = uuid4(), uuid4()
+
+                def put(sequence, start, end):
+                    return store.append(Segment(source, stream_id, sequence, base + start,
+                                                base + end, "synthetic", "deflate", payload))
+                put(0, 0, 10_000)
+                # Target end: base + 50,000.
+                recording = store.start_manual(source, base + 10_000, duration_ms=40_000)
+                code, baseline = self.record(f"straddle-{label}.json")
+                self.assertEqual(code, inventory.EXIT_PRESERVED)
+                lost = prepare(store, put, recording, base)
+                code, report, _ = self.verify(baseline)
+                self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+                runtime.execute("DELETE FROM recording_links WHERE segment_id=?", (str(lost),))
+                runtime.execute("DELETE FROM recording_segments WHERE id=?", (str(lost),))
+                (runtime.root / "recordings" / (lost.hex + ".seg")).unlink()
+                code, report, _ = self.verify(baseline)
+                return code, report, recording
+            finally:
+                self.runtime = saved
+
+        def active(store, put, recording, base):
+            put(1, 10_000, 30_000)
+            # Spans 40,000-60,000 across the target end at 50,000: linked.
+            return put(2, 40_000, 60_000)
+
+        def stopped(store, put, recording, base):
+            put(1, 10_000, 20_000)
+            last = put(2, 20_000, 40_000)
+            # The stop at 30,000 lies inside the last segment; the cursor
+            # reached it, so finish() closes now and keeps that link.
+            store.finish(recording, stop_ms=base + 30_000)
+            return last
+
+        def trimmed(store, put, recording, base):
+            put(1, 10_000, 20_000)
+            put(2, 20_000, 30_000)
+            trimmed = put(3, 30_000, 40_000)
+            # finish() drops the link of the segment starting at the stop;
+            # its unlinked row may then leave the catalog.
+            store.finish(recording, stop_ms=base + 30_000)
+            return trimmed
+
+        def after(store, put, recording, base):
+            put(1, 10_000, 30_000)
+            put(2, 30_000, 50_000)
+            # Starts at the target end: never linked, may leave the spool.
+            return put(3, 50_000, 60_000)
+
+        for label, prepare in (("active", active), ("stopped", stopped)):
+            with self.subTest(label):
+                code, report, recording = scenario(label, prepare)
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertEqual(report["sections"]["recordings"]["failed"],
+                                 [{"id": str(recording), "reason": "changed"}])
+        for label, prepare in (("trimmed", trimmed), ("after", after)):
+            with self.subTest(label):
+                code, report, _ = scenario(label, prepare)
+                self.assertEqual(code, inventory.EXIT_PRESERVED,
+                                 report["sections"]["recordings"])
 
     def test_publications_outside_a_stopped_window_need_no_link(self):
         # finish() drops the links of segments wholly outside the stopped
