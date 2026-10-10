@@ -1743,6 +1743,47 @@ class PairingWrapperTests(unittest.TestCase):
             self.perform(arguments)
         self.assertEqual(self.wrapper.read_text(), expected)
 
+    def test_failed_wrapper_directory_fsync_leaves_no_created_wrapper_behind(self):
+        # Issue #195: the rename succeeded but the directory fsync failed, so
+        # the caller never learned that the wrapper was created.
+        real_fsync = install._fsync_directory
+
+        def fail_for_wrapper(path):
+            if Path(path) == self.wrapper.parent:
+                raise OSError("synthetic fsync failure")
+            real_fsync(path)
+
+        arguments = self.arguments("install", "1.0.0")
+        with patch("install._fsync_directory", side_effect=fail_for_wrapper):
+            with self.assertRaises(OSError):
+                self.perform(arguments)
+        self.assertFalse(self.wrapper.exists())
+        self.assertEqual(list(self.wrapper.parent.iterdir()), [])
+        self.assertFalse(self.unit.exists())
+        self.assertFalse((self.installation / "releases/1.0.0").exists())
+        # The retry is not refused and places the wrapper.
+        self.perform(arguments)
+        self.assertEqual(self.wrapper.read_text(), install.render_pairing_wrapper(self.installation))
+
+    def test_failed_wrapper_directory_fsync_keeps_a_replaced_wrapper(self):
+        # A wrapper that replaced an installer-generated one stays: the old
+        # one is already gone and the new one follows "current".
+        stale = install.render_pairing_wrapper(self.root / "elsewhere")
+        self.wrapper.write_text(stale)
+        self.wrapper.chmod(0o755)
+        real_fsync = install._fsync_directory
+
+        def fail_for_wrapper(path):
+            if Path(path) == self.wrapper.parent:
+                raise OSError("synthetic fsync failure")
+            real_fsync(path)
+
+        with patch("install._fsync_directory", side_effect=fail_for_wrapper):
+            with self.assertRaises(OSError):
+                self.perform(self.arguments("install", "1.0.0"))
+        self.assertEqual(self.wrapper.read_text(), install.render_pairing_wrapper(self.installation))
+        self.assertEqual(list(self.wrapper.parent.iterdir()), [self.wrapper])
+
     def test_failed_update_keeps_a_wrapper_that_runs_the_restored_release(self):
         self.perform(self.arguments("install", "1.0.0"))
         self.wrapper.unlink()
