@@ -843,10 +843,11 @@ instead of switching to a release that could not start:
 The configuration is never rewritten by the installer.
 
 The two releases make contradicting demands on the same configuration file,
-so between editing it and a completed switch neither release can start from
-it: the running (old) release refuses the edited configuration, and when
-`_switch` fails, its restart of the release that was running before fails
-too (Issue #183). Therefore:
+so no configuration is accepted by both of them. Between editing it and a
+completed switch, the edited configuration is accepted only by the release
+being switched to, which is not running yet: the running (old) release
+refuses it, and when `_switch` fails, its restart of the release that was
+running before fails too (Issue #183). Therefore:
 
 - run the same `update` / `rollback` command immediately after editing the
   configuration, with nothing restarting the service in between;
@@ -1034,13 +1035,26 @@ history must then equal that release's full migration list. It opens the state d
 with `query_only`), never creates or migrates it, and only reads segment files:
 
 ```sh
-sudo /opt/server-sentinel-main/current/venv/bin/python -I -m app.lifecycle_inventory \
+cd /opt/server-sentinel-main/current
+
+sudo venv/bin/python -E -s -m app.lifecycle_inventory \
   record --runtime-root <runtime_root> --output <private-notes-dir>/before-update.json
 
-sudo /opt/server-sentinel-main/current/venv/bin/python -I -m app.lifecycle_inventory \
+sudo venv/bin/python -E -s -m app.lifecycle_inventory \
   verify --runtime-root <runtime_root> --baseline <private-notes-dir>/before-update.json \
   --report <private-notes-dir>/after-update.json
 ```
+
+Run both from the release directory as shown (Issue #192). `-m` puts the
+working directory, and only it, first on `sys.path`, so the release's own
+`app` package is imported; `-E` ignores `PYTHONPATH`, `PYTHONHOME` and every
+other `PYTHON*` variable and `-s` the user site directory. `-I` cannot be
+used here: it also implies `-P`, which keeps `-m` from adding the working
+directory, so `app` would not be importable (`ModuleNotFoundError`). The
+working directory is the physical release directory that `current` named at
+the `cd`, so a later switch of `current` does not mix two releases into one
+run; `cd` again after an update or rollback. Every path argument must be
+absolute (the tool refuses a relative one).
 
 When the deployment configures the separate private Owner-template store, add
 `--owner-template-root <owner-template-root>` to both commands. A baseline
@@ -1059,9 +1073,11 @@ always fails verification. Likewise a camera source whose stored UVC approval
 evidence the service could not load always fails as
 `unreadable_approval_evidence`.
 
-When the rolled-back release predates this tool, run the same commands with
-the newer release's interpreter under `releases/<version>/venv/bin/python`;
-both only read the runtime tree.
+When the rolled-back release predates this tool, run the same commands from
+the newer release's directory instead (`cd
+/opt/server-sentinel-main/releases/<version>`, then the same `sudo
+venv/bin/python -E -s -m app.lifecycle_inventory ...`); both only read the
+runtime tree.
 
 `record` stores, keyed by stable logical ID: each recording's source, status,
 starred flag, catalog start, target end and ended boundaries (recorded
