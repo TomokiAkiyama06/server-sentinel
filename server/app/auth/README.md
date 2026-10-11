@@ -548,10 +548,13 @@ OpenAPI or error handler is reachable):
 | `POST /api/auth/authentication` | the assertion itself (rate-limited) | `204`, `Set-Cookie: __Host-session=…; Path=/; Secure; HttpOnly; SameSite=Strict` |
 | `GET /api/session` | session (`SESSION`) | `{"csrf": …, "role": …, "permissions": […]}` of the caller only |
 | `POST /api/auth/sign-out` | session (`SESSION`) + exact `Origin` + `X-CSRF-Token` | `204`, `Set-Cookie: __Host-session=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict` |
+| `POST /api/auth/step-up/options` | Owner session (`OWNER_READ`) + exact `Origin` + `X-CSRF-Token` (step-up rate limit) | `PasskeyCeremonies.begin_step_up()` request options (S3, below) |
+| `POST /api/auth/step-up` | the same, and the assertion of the session's own credential (step-up rate limit) | `204`, no body, no cookie (S3, below) |
 
 The session route grants nothing and returns only the caller's own role,
 permissions (the Owner holds both) and CSRF token. With sign-out it is the
-only route a session reaches in this phase, so a `live:view`-only or
+only route a non-Owner session reaches in this phase (the step-up routes
+are Owner-only), so a `live:view`-only or
 `recordings:view`-only person reaches nothing they lack. Bodies are bounded (1 KiB options, 64 KiB assertion or registration), JSON
 with duplicate members is refused, and a ceremony refusal never sets a cookie.
 
@@ -905,6 +908,13 @@ grant to the session id read in the same gated transaction.
 
 ### Owner step-up (Issue #10 phase 2, S3)
 
+Owner decisions (2026-10-12, PR #236). (1) The step-up routes stay
+`OWNER_READ`: only an Owner session, fresh or stale, reaches them; every
+other caller gets the generic `404`. (2) Step-up has its own rate-limit
+bucket, separate from sign-in and redemption (below). (3) A session whose
+last verification was on another boot, or that has no recorded boot pair
+(established before migration 23), is stale and must step up (fail closed).
+
 Routes. `POST /api/auth/step-up/options` (empty body or `{}`) and `POST
 /api/auth/step-up` (the JSON assertion, at most 64 KiB) are mounted with the
 `OWNER_READ` requirement, exact `Origin` and `X-CSRF-Token`. `OWNER_READ`,
@@ -912,9 +922,17 @@ not `OWNER_OP`, so that a stale Owner can reach them (refreshing is their
 point); not `SESSION`, so that a non-Owner is refused inside the
 authorization transaction, before the idle touch commits: a non-Owner, an
 uninvited caller and anyone without a valid session get the generic `404`
-and learn nothing about step-up. Each request is charged to the sign-in
-limiter before its body is read (SPECIFICATION: repeated failed step-ups are
-rate-limited), then authorized by `_authorize` inside `admit(epoch)`, and the
+and learn nothing about step-up. Each request is charged to the step-up
+limiter (`rate_limit.step_up_rate_limiter`, `HumanAccess.step_up_limiter`:
+per verified proxy identity a burst of 5 and one more every 12 seconds, no
+global bucket, the same shape as redemption) before its body is parsed and
+before any gate or SQLite work (SPECIFICATION: repeated failed step-ups are
+rate-limited); a refusal there is counted by the limiter
+(`human_request_rate_limited`), not by `refused_step_ups`. It is a separate
+object with separate buckets, and `HumanAccess` refuses to be built when one
+`SourceRateLimiter` object would serve two of sign-in, redemption and
+step-up, so a sign-in flood cannot stop the Owner's step-up and a step-up
+flood never spends the sign-in buckets. The request is then authorized by `_authorize` inside `admit(epoch)`, and the
 ceremony step (`PasskeyCeremonies.begin_step_up` / `finish_step_up`) receives
 that same epoch: before it consumes or verifies anything the gate's current
 epoch must still equal it, and its commit runs inside a second
@@ -970,8 +988,22 @@ passing its user verification is present now; it cannot tell who that is
 when a credential is deliberately lent, and it does not end the session: a
 stale Owner session left open still serves `OWNER_READ` and every non-Owner
 operation until its idle or absolute lifetime ends or it is signed out.
-Under the shared login the sign-in limiter's per-source bucket is the room's,
-so step-up attempts and sign-ins of everyone behind it share it.
+Under the shared login the step-up limiter's per-source bucket is the room's:
+it is charged before authorization, so anyone behind the shared login can
+spend it and delay the Owner's step-up (availability only, never access),
+but it no longer shares a bucket with sign-in or redemption.
+
+Clock slewing. The one-second allowance in `step_up_fresh` covers the
+instant between the two reads of a pair, not a slew rate: chrony's default
+`maxslewrate` is 83333 ppm (up to 25 s over five minutes), not ntpd's
+500 ppm. `clock_gettime(2)` documents `CLOCK_MONOTONIC`, and so
+`CLOCK_BOOTTIME`, as following adjtime/NTP adjustments, so a slew should move
+both clocks together and only a step (chrony `makestep`, a manual set, a
+kernel leap second) separate them. Should a chrony slew back nevertheless
+separate them by more than a second, a just-verified session turns stale:
+the Owner operation answers `403 step_up_required` and the Owner steps up
+again (fail closed, availability only; it never lengthens the window).
+MANUAL_TEST records the observation on the real host.
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 

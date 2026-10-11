@@ -57,12 +57,14 @@ WebSocket and error path gets the same generic denial):
 The four ceremony routes run before a credential exists (AUTH-013). Each is
 rate-limited per verified proxy identity before the request body is parsed
 and before the ceremony takes any gate or SQLite lock (Issue #181); the
-sign-in routes also globally; the two step-up routes are charged to the
-sign-in limiter the same way (SPECIFICATION: repeated failed step-ups are
-rate-limited). Redemption uses its own, stricter limiter with
+sign-in routes also globally. Redemption uses its own, stricter limiter with
 no global bucket (Owner decisions D4 and 2026-10-11), so a redemption flood
 never spends the sign-in buckets and one source cannot stop another's
-redemption. A redemption refused after the limiter is counted, value-free
+redemption. The two step-up routes are charged the same way, before the body
+is read, to a third limiter of the same shape (Owner decision 2026-10-12;
+SPECIFICATION: repeated failed step-ups are rate-limited), so a sign-in flood
+cannot stop the Owner's step-up and a step-up flood never spends the sign-in
+buckets. A redemption refused after the limiter is counted, value-free
 (``HumanAccess.refused_redemptions``, logged as
 ``invitation_redemption_refused`` on the first refusal and each time the
 count doubles), never with the code, identity or reason; a refused step-up
@@ -116,7 +118,7 @@ from app.storage.database import Database, PinnedDatabase
 from .invitation_code import InvalidInvitationCode, parse_invitation_code
 from .model import Credential
 from .passkeys import DeviceBoundCredentialRequired, PasskeyCeremonies, SessionGrant
-from .rate_limit import SourceRateLimiter, redemption_rate_limiter
+from .rate_limit import SourceRateLimiter, redemption_rate_limiter, step_up_rate_limiter
 from .reservation import HostnameReservationCheck, HumanAccessClosed
 from .reservation_store import ListenerExceptionStore, ReservationSessionRevocation
 from .session_binding import canonical_identity
@@ -492,9 +494,9 @@ class HumanAccess:
     Refuses construction unless the deployment explicitly enabled it, the
     session gate is a ``HostnameReservationCheck`` with every opening input
     configured (resolver, socket owners, own sockets, unprivileged port
-    start, session revoker), the two rate limiters are distinct
-    ``SourceRateLimiter`` objects (sign-in and, per Owner decision D4,
-    invitation redemption), the ceremonies use exactly that gate and this
+    start, session revoker), the three rate limiters are distinct
+    ``SourceRateLimiter`` objects (sign-in, invitation redemption per Owner
+    decision D4, and Owner step-up per Owner decision 2026-10-12), the ceremonies use exactly that gate and this
     audited access store with a session-binding key, and the relying party
     is the reserved https origin. A missing or substituted gate is never
     accepted (Issue #181 item 3). The gate's session revoker must be a
@@ -525,6 +527,7 @@ class HumanAccess:
                  ceremonies: PasskeyCeremonies, reservation: HostnameReservationCheck,
                  rate_limiter: SourceRateLimiter | None = None,
                  redemption_limiter: SourceRateLimiter | None = None,
+                 step_up_limiter: SourceRateLimiter | None = None,
                  tick_seconds: float = DEFAULT_TICK_SECONDS):
         if not isinstance(configuration, HumanAccessConfiguration) or configuration.enabled is not True:
             raise HumanAccessUnavailable()
@@ -548,12 +551,14 @@ class HumanAccess:
         origin, host = reserved_origin(reservation)
         if ceremonies.rp.origin != origin or ceremonies.rp.rp_id != reservation.config.hostname:
             raise HumanAccessUnavailable()
-        if rate_limiter is not None and not isinstance(rate_limiter, SourceRateLimiter):
+        limiters = [limiter for limiter in (rate_limiter, redemption_limiter, step_up_limiter)
+                    if limiter is not None]
+        if any(not isinstance(limiter, SourceRateLimiter) for limiter in limiters):
             raise HumanAccessUnavailable()
-        if redemption_limiter is not None and (not isinstance(redemption_limiter, SourceRateLimiter)
-                                               or redemption_limiter is rate_limiter):
-            # Separate buckets (D4): one shared object would let a redemption
-            # flood starve sign-in.
+        if len({id(limiter) for limiter in limiters}) != len(limiters):
+            # Separate buckets (D4, Owner decision 2026-10-12): one shared
+            # object would let a flood on one route spend another route's
+            # buckets, the Owner's step-up included.
             raise HumanAccessUnavailable()
         if (isinstance(tick_seconds, bool) or not isinstance(tick_seconds, (int, float))
                 or not 0 < tick_seconds <= 300):
@@ -564,6 +569,7 @@ class HumanAccess:
         self.reservation = reservation
         self.rate_limiter = rate_limiter or SourceRateLimiter()
         self.redemption_limiter = redemption_limiter or redemption_rate_limiter()
+        self.step_up_limiter = step_up_limiter or step_up_rate_limiter()
         self.origin = origin
         self.host = host
         self.tick_seconds = float(tick_seconds)
@@ -933,6 +939,10 @@ class HumanSurface:
         if not self.access.redemption_limiter.allow(identity):
             raise _Denied()
 
+    def _limit_step_up(self, identity: str) -> None:
+        if not self.access.step_up_limiter.allow(identity):
+            raise _Denied()
+
     async def _body(self, request: _Request, *, json_required: bool) -> bytes:
         limit = request.route.body_limit
         content_type = _single(request.headers, b"content-type")
@@ -1101,7 +1111,7 @@ class HumanSurface:
     async def _begin_step_up(self, request: _Request) -> None:
         """An Owner session's step-up challenge (Issue #10 phase 2 S3, AUTH-008).
 
-        Order: the sign-in limiter (before the body is read), an empty body,
+        Order: the step-up limiter (before the body is read), an empty body,
         ``_authorize`` with ``OWNER_READ`` and the CSRF header inside
         ``admit(epoch)``, then ``PasskeyCeremonies.begin_step_up`` with that
         same epoch, which stores the challenge (bound to this session, at most
@@ -1112,7 +1122,7 @@ class HumanSurface:
         served (refreshing is the point); a non-Owner, a close, ``stop()`` or
         a failed tick in between is the generic denial.
         """
-        self._limit(request.identity)
+        self._limit_step_up(request.identity)
         body = await self._body(request, json_required=False)
         if body not in (b"", b"{}"):
             raise _Denied()
@@ -1142,7 +1152,7 @@ class HumanSurface:
         touch is the only write, as for any authenticated request); it is
         counted value-free (``note_refused_step_up``).
         """
-        self._limit(request.identity)
+        self._limit_step_up(request.identity)
         try:
             credential = _json_object(await self._body(request, json_required=True))
             authorized = await self._authorize(request, Requirement.OWNER_READ)

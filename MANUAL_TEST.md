@@ -1689,10 +1689,21 @@ authenticator):
   clock is behind the session's last activity); restore the clock, step up
   again and confirm it works; reboot the host after a step-up and confirm the
   next Owner operation asks for a step-up again;
-- [ ] repeat the step-up quickly many times: after the sign-in burst it is
-  refused with the generic denial before any work, with one value-free
-  `human_request_rate_limited` event; record that everyone behind the shared
-  login shares this limit with sign-in.
+- [ ] repeat the step-up quickly many times: after a burst of 5 it is
+  refused with the generic denial before any work (one more every 12
+  seconds), with one value-free `human_request_rate_limited` event; while it
+  is refused, sign-in from the same shared login still works, and after
+  exhausting the sign-in burst the Owner can still step up (separate buckets,
+  Owner decision 2026-10-12); record that everyone behind the shared login
+  shares the step-up bucket;
+- [ ] on a disposable host running chrony (NTP reachable), record
+  `chronyc tracking` and `maxslewrate`, step up, then make chrony slew the
+  wall clock back by a few seconds (for example a local reference offset,
+  never `makestep`) and repeat an Owner operation every few seconds for five
+  minutes: record whether the session stayed fresh (expected: a slew moves
+  `CLOCK_BOOTTIME` too) or turned stale early (`403 step_up_required`, fail
+  closed, availability only); either way confirm a new step-up works and the
+  window never exceeds five minutes.
 
 ### Uninvited ordinary Tailnet member
 

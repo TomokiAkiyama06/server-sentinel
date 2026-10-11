@@ -1756,16 +1756,20 @@ Implementation (Issue #10 phase 2 S3, Owner decision D3): `POST
 `rpId`, `timeout`, `userVerification: "required"` and `allowCredentials`
 holding exactly the session's credential; `POST /api/auth/step-up` (the JSON
 assertion) answers `204` with no body. Both require an Owner session
-(`OWNER_READ`, fresh or stale), the exact `Origin` and `X-CSRF-Token`, are
-charged to the sign-in limiter before the body is read, and commit under the
+(`OWNER_READ`, fresh or stale; Owner decision 2026-10-12), the exact `Origin`
+and `X-CSRF-Token`, are charged before the body is read to their own
+per-source limiter (Owner decision 2026-10-12: keyed by the verified proxy
+identity, burst 5, one per 12 seconds, no global bucket, never the sign-in or
+redemption limiter object), and commit under the
 epoch their authorization took; a non-Owner or anyone without a valid session
 gets the generic `404`. A new options request replaces the session's pending
 step-up challenge. "Fresh" is exactly five minutes from the verification time
 read inside the commit transaction (sign-in or step-up), on the wall clock and
 on `CLOCK_BOOTTIME` of the same boot, with the wall clock lagging the
 monotonic clock by at most one second: a wall clock stepped back after the
-verification, a reboot, a session without a recorded pair and an unreadable
-boot clock are stale (fail closed), and a step-up is refused while the boot
+verification, a reboot, a session without a recorded pair (established
+before migration 23) and an unreadable boot clock are stale (fail closed,
+Owner decision 2026-10-12), and a step-up is refused while the boot
 clock cannot be read. Refused finishes are counted value-free
 (`owner_step_up_refused` logged on the first and each doubling). No `OWNER_OP`
 route is mounted until S4.

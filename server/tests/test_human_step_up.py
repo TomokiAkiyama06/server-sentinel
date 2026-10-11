@@ -23,15 +23,18 @@ from uuid import UUID
 from app.auth import human_surface as surface_module
 from app.auth.boot_clock import STEP_UP_ROLLBACK_TOLERANCE, BootInstant, step_up_fresh
 from app.auth.human_surface import (
-    ROUTES, STEP_UP_OPTIONS_PATH, STEP_UP_PATH, Route, match_route,
+    ROUTES, HumanAccess, HumanAccessConfiguration, HumanAccessUnavailable, STEP_UP_OPTIONS_PATH, STEP_UP_PATH, Route, match_route,
 )
 from app.auth.model import AccessValidationError, Permission
-from app.auth.rate_limit import SourceRateLimiter
+from app.auth.passkeys import PasskeyCeremonies
+from app.auth.rate_limit import SourceRateLimiter, step_up_rate_limiter
 from app.auth.store import OWNER_STEP_UP_FRESHNESS, Requirement, SessionView, StepUpRequired
 from app.logging import Event, SafeJsonFormatter
 
 from tests.test_human_gated_authorization import GENERIC, STEP_UP, GatedFixture
-from tests.test_human_surface import HOST, LAN, ORIGIN, OTHER_LOGIN, VIEWER, call, header, payload, status
+from tests.test_human_surface import (
+    AUTHENTICATION_OPTIONS_PATH, HOST, LAN, ORIGIN, OTHER_LOGIN, VIEWER, call, header, payload, status,
+)
 from tests.test_invitation_redemption import OTHER_BOOT, BootClock
 from tests.test_webauthn_ceremonies import waiting
 from tests.webauthn_fakes import SyntheticAuthenticator, b64
@@ -53,8 +56,10 @@ class StepUpFixture(GatedFixture):
         # A synthetic boot clock that moves only when a test says so.
         self.boot = BootClock()
         self.store._boot_clock = self.boot
-        # A roomy sign-in limiter unless a test exercises the limit itself.
+        # Roomy sign-in and step-up limiters unless a test exercises a limit.
         self.access.rate_limiter = SourceRateLimiter(
+            per_source_capacity=1000, global_capacity=None, monotonic=self.limit_clock)
+        self.access.step_up_limiter = SourceRateLimiter(
             per_source_capacity=1000, global_capacity=None, monotonic=self.limit_clock)
 
     def elapse(self, **delta):
@@ -514,11 +519,17 @@ class ClosedAccessTests(StepUpFixture):
                 def finish(*args, **kwargs):
                     interrupt()
                     return real_finish(*args, **kwargs)
+                self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
                 with patch.object(self.ceremonies, "finish_step_up", side_effect=finish):
                     result = await self.finish(cookie, csrf, assertion)
+                # Refused before anything is consumed (``_step_up_epoch``):
+                # the pending challenge is still stored, not spent by the
+                # refused request.
+                self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
                 await self.restart()
                 self.assertEqual(result, GENERIC)
                 self.assertEqual(self.unchanged_state(cookie), before)
+                self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
         self.assertEqual(await self.owner_operation(cookie, csrf), STEP_UP)
         self.assertEqual(status(await self.step_up(cookie, csrf, key)), 204)
 
@@ -564,21 +575,105 @@ class ClosedAccessTests(StepUpFixture):
 
 
 class RateLimitAndHygieneTests(StepUpFixture):
-    async def test_step_up_routes_are_charged_to_the_sign_in_limiter_before_any_work(self):
+    async def test_step_up_routes_are_charged_to_their_own_limiter_before_any_work(self):
         _, key, _, cookie, csrf = await self.owner_session()
-        self.access.rate_limiter = SourceRateLimiter(per_source_capacity=2, global_capacity=None,
-                                                     monotonic=self.limit_clock)
+        self.access.step_up_limiter = SourceRateLimiter(per_source_capacity=2, global_capacity=None,
+                                                        monotonic=self.limit_clock)
         self.elapse(minutes=6)
         begun = await self.begin(cookie, csrf)
         assertion = key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST, tamper=True)
         self.assertEqual(await self.finish(cookie, csrf, assertion), GENERIC)
         rows = self.session_rows()
-        with patch.object(self.store, "session_may_be_current", side_effect=AssertionError("no work")):
+        refused = self.access.refused_step_ups
+        signin_limited = self.access.rate_limiter.limited
+        # Record (never raise: ``_authorize`` turns any exception into the
+        # generic denial, which would hide work done after the limiter).
+        work = []
+        real_body = self.surface._body
+        real_current = self.store.session_may_be_current
+
+        async def body(*args, **kwargs):
+            work.append("body")
+            return await real_body(*args, **kwargs)
+
+        def current(*args, **kwargs):
+            work.append("session")
+            return real_current(*args, **kwargs)
+
+        with patch.object(self.surface, "_body", side_effect=body), \
+                patch.object(self.store, "session_may_be_current", side_effect=current), \
+                patch.object(self.ceremonies, "begin_step_up") as begin_ceremony, \
+                patch.object(self.ceremonies, "finish_step_up") as finish_ceremony:
             self.assertEqual(await self.begin(cookie, csrf), GENERIC)
             self.assertEqual(await self.finish(cookie, csrf, assertion), GENERIC)
+        self.assertEqual(work, [])
+        begin_ceremony.assert_not_called()
+        finish_ceremony.assert_not_called()
+        self.assertEqual(self.access.step_up_limiter.limited, 2)
+        # Neither the sign-in limiter nor the refusal counter saw them.
+        self.assertEqual(self.access.rate_limiter.limited, signin_limited)
+        self.assertEqual(self.access.refused_step_ups, refused)
         self.assertEqual(self.session_rows(), rows)
         self.limit_clock.value += 60
         self.assertEqual(status(await self.step_up(cookie, csrf, key)), 204)
+
+    async def test_a_sign_in_flood_does_not_block_the_owner_step_up(self):
+        """Owner decision 2026-10-12: separate buckets per route."""
+        _, key, _, cookie, csrf = await self.owner_session()
+        self.access.rate_limiter = SourceRateLimiter(per_source_capacity=3, monotonic=self.limit_clock)
+        self.access.step_up_limiter = step_up_rate_limiter(monotonic=self.limit_clock)
+        self.elapse(minutes=6)
+        for _ in range(3):
+            self.assertEqual(status(await call(self.surface, "POST", AUTHENTICATION_OPTIONS_PATH)), 200)
+        # The sign-in bucket of this source (the shared login) is empty.
+        self.assertEqual(await call(self.surface, "POST", AUTHENTICATION_OPTIONS_PATH), GENERIC)
+        self.assertEqual(self.access.rate_limiter.limited, 1)
+        self.assertEqual(status(await self.step_up(cookie, csrf, key)), 204)
+        self.assertEqual(self.access.step_up_limiter.limited, 0)
+        self.assertEqual(self.access.rate_limiter.limited, 1)
+
+    async def test_a_step_up_flood_does_not_spend_the_sign_in_bucket(self):
+        _, key, _, cookie, csrf = await self.owner_session()
+        _, viewer_key, _ = self.enroll((Permission.LIVE_VIEW,))
+        self.access.rate_limiter = SourceRateLimiter(per_source_capacity=2, monotonic=self.limit_clock)
+        self.access.step_up_limiter = step_up_rate_limiter(monotonic=self.limit_clock)
+        self.elapse(minutes=6)
+        for _ in range(5):
+            self.assertEqual(status(await self.begin(cookie, csrf)), 200)
+        for _ in range(3):
+            self.assertEqual(await self.begin(cookie, csrf), GENERIC)
+        self.assertEqual(self.access.step_up_limiter.limited, 3)
+        # Two sign-in requests (options and finish) fit the sign-in bucket of
+        # capacity 2 only if the flood spent none of it.
+        await self.sign_in(viewer_key)
+        self.assertEqual(self.access.rate_limiter.limited, 0)
+        # The step-up bucket refills at one per 12 seconds.
+        self.limit_clock.value += 11
+        self.assertEqual(await self.begin(cookie, csrf), GENERIC)
+        self.limit_clock.value += 13
+        self.assertEqual(status(await self.step_up(cookie, csrf, key)), 204)
+
+    def test_one_limiter_object_cannot_serve_two_routes(self):
+        default = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+                              ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
+                                                           clock=self.ceremony_clock),
+                              reservation=self.check)
+        limiter = default.step_up_limiter
+        self.assertEqual((limiter.per_source_capacity, limiter.per_source_refill_seconds,
+                          limiter.global_capacity), (5, 12.0, None))
+        self.assertEqual(len({id(default.rate_limiter), id(default.redemption_limiter), id(limiter)}), 3)
+        shared = SourceRateLimiter()
+        other = SourceRateLimiter()
+        for limiters in ({"rate_limiter": shared, "step_up_limiter": shared},
+                         {"redemption_limiter": shared, "step_up_limiter": shared},
+                         {"rate_limiter": shared, "redemption_limiter": other, "step_up_limiter": shared},
+                         {"step_up_limiter": object()}):
+            with self.subTest(limiters=sorted(limiters)):
+                ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
+                                               clock=self.ceremony_clock)
+                with self.assertRaises(HumanAccessUnavailable):
+                    HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+                                ceremonies=ceremonies, reservation=self.check, **limiters)
 
     async def test_every_refusal_is_byte_identical(self):
         _, key, _, cookie, csrf = await self.owner_session()

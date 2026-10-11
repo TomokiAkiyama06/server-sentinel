@@ -25,7 +25,8 @@ with its in-transaction user-verification time, and an ``OWNER_OP`` request is
 fresh only on the same boot, with both clocks inside the window and no
 detected wall-clock step back. Unlike an invitation, a step-up is cheap to
 repeat, so another boot, a missing pair or an unreadable clock is stale (fail
-closed) rather than left to the wall clock.
+closed) rather than left to the wall clock (Owner decision 2026-10-12, PR
+#236: a reboot, or a session established before migration 23, is stale).
 
 Every refusal is the caller's generic denial; nothing here carries a value.
 """
@@ -47,9 +48,17 @@ _BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 CLOCK_ROLLBACK_TOLERANCE = timedelta(seconds=30)
 _TOLERANCE_US = CLOCK_ROLLBACK_TOLERANCE // timedelta(microseconds=1)
 # Step-up freshness: both readings come from one in-transaction pair at each
-# end, so only the instant between two reads and NTP slewing (at most 500 ppm,
-# 0.15 s over five minutes) separate them; one second leaves room for both and
-# detects any larger step back.
+# end, and one second is the allowance for the instant between the two reads
+# of a pair; any larger lag of the wall clock behind the monotonic one makes
+# the session stale. The slew rate is not bounded here: chrony's default
+# ``maxslewrate`` is 83333 ppm (25 s over five minutes), not ntpd's 500 ppm.
+# clock_gettime(2) documents CLOCK_MONOTONIC (and so CLOCK_BOOTTIME) as
+# following adjtime/NTP adjustments, so a slew should move both clocks
+# together and only a step (chrony ``makestep``, a manual set, a kernel leap
+# second) separate them; if a slew back ever did separate them by more than a
+# second, a just-verified session turns stale. Every such case fails closed:
+# availability only (the Owner steps up again), never a longer window.
+# MANUAL_TEST "Issue #10 phase 2 S3" records the observation on the host.
 STEP_UP_ROLLBACK_TOLERANCE = timedelta(seconds=1)
 _STEP_UP_TOLERANCE_US = STEP_UP_ROLLBACK_TOLERANCE // timedelta(microseconds=1)
 

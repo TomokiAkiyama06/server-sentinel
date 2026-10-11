@@ -37,6 +37,12 @@ It is a separate object with separate buckets, so a redemption flood never
 spends the sign-in buckets and a sign-in flood never spends the redemption
 ones. It comes on top of the per-code attempt bound
 (``store.MAX_REDEMPTION_ATTEMPTS``).
+
+The Owner step-up routes (Issue #10 phase 2 S3) use a third, separate
+instance (``step_up_rate_limiter``, Owner decision 2026-10-12): the same
+shape as redemption (per source a burst of 5 and one more every 12 seconds,
+no global bucket), so a sign-in flood cannot stop the Owner from stepping up
+and a step-up flood never spends the sign-in buckets.
 """
 
 from __future__ import annotations
@@ -186,5 +192,20 @@ def redemption_rate_limiter(*, max_sources: int = 256,
     """The separate, stricter limiter for invitation redemption (D4); per source only."""
     return SourceRateLimiter(per_source_capacity=REDEMPTION_PER_SOURCE_CAPACITY,
                              per_source_refill_seconds=REDEMPTION_PER_SOURCE_REFILL_SECONDS,
+                             global_capacity=None,
+                             max_sources=max_sources, monotonic=monotonic)
+
+
+# Owner decision 2026-10-12 (PR #236): the step-up routes get their own
+# per-source bucket, the same shape as redemption, with no global bucket.
+STEP_UP_PER_SOURCE_CAPACITY = 5
+STEP_UP_PER_SOURCE_REFILL_SECONDS = 12.0
+
+
+def step_up_rate_limiter(*, max_sources: int = 256,
+                         monotonic: Callable[[], float] = time.monotonic) -> SourceRateLimiter:
+    """The separate limiter for the Owner step-up routes; per source only."""
+    return SourceRateLimiter(per_source_capacity=STEP_UP_PER_SOURCE_CAPACITY,
+                             per_source_refill_seconds=STEP_UP_PER_SOURCE_REFILL_SECONDS,
                              global_capacity=None,
                              max_sources=max_sources, monotonic=monotonic)
