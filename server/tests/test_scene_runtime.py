@@ -28,7 +28,7 @@ from app.detection.roi import Calibration, CalibrationArchive, CriticalKind
 from app.detection.roi.runtime import (
     CALIBRATION_RETRY_NS, ArchiveCalibrationProvider, CalibrationUnavailable, PackedLumaLayout,
     SceneMonitoringConfiguration, SceneMonitoringDependencies, SceneMonitoringRuntime,
-    SceneRuntimeState, SceneSourceBinding, SceneSourceState,
+    SceneRuntimeState, SceneSourceBinding, SceneSourceState, _CriticalPump,
 )
 from app.main import create_app
 from app.settings import Settings
@@ -851,6 +851,240 @@ class SceneRuntimeReviewRegressionTests(unittest.TestCase):
         self.assertEqual(0.01, SceneMonitoringDependencies(tick_seconds=0.01).tick_seconds)
 
 
+class SteppingClock(Clock):
+    """Synthetic clock that can advance on every read once `step` is set."""
+
+    def __init__(self):
+        super().__init__()
+        self.step = 0
+
+    def __call__(self):
+        self.value += self.step
+        return self.value
+
+
+class GatedRecorder(Recorder):
+    """Synthetic recorder whose every call blocks until released."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Semaphore(0)
+        self.gates = [threading.Event() for _ in range(8)]
+        self.calls = 0
+
+    def __call__(self, observation):
+        with self.lock:
+            index = self.calls
+            self.calls += 1
+        self.entered.release()
+        self.gates[index].wait(10)
+        super().__call__(observation)
+
+    def release_all(self):
+        for gate in self.gates:
+            gate.set()
+
+
+class SceneRuntimeFollowUpRegressionTests(unittest.TestCase):
+    """Regressions for the #213 review findings on ff4b36c."""
+
+    def test_stale_source_lowers_source_and_runtime_until_a_fresh_sample(self):
+        # Codex P2 (#213): without a frame evaluated within maximum_gap_ns
+        # the source is lowered (not only its conclusions) and the runtime
+        # is DEGRADED, until a fresh sample recovers it.
+        harness = Harness()
+        harness.runtime.start()
+        harness.frame()
+        self.assertIs(SceneSourceState.ACTIVE, harness.frame().state)
+        self.assertIs(SceneRuntimeState.RUNNING, harness.runtime.status().state)
+        harness.clock.value += policy().maximum_gap_ns + 1
+        stale = harness.source()
+        self.assertIs(SceneSourceState.DEGRADED, stale.state)
+        self.assertEqual("observation_stale", stale.reason)
+        self.assertEqual(Observation.UNKNOWN, stale.movement)
+        self.assertIs(SceneRuntimeState.DEGRADED, harness.runtime.status().state)
+        recovered = harness.frame()
+        self.assertIs(SceneSourceState.ACTIVE, recovered.state)
+        self.assertIs(SceneRuntimeState.RUNNING, harness.runtime.status().state)
+
+    def test_bound_source_that_never_receives_a_sample_is_lowered(self):
+        harness = Harness()
+        harness.runtime.start()
+        harness.runtime.step()
+        self.assertEqual("awaiting_sample", harness.source().reason)
+        self.assertIs(SceneRuntimeState.RUNNING, harness.runtime.status().state)
+        harness.clock.value += policy().maximum_gap_ns + 1
+        self.assertIs(SceneSourceState.DEGRADED, harness.source().state)
+        self.assertEqual("observation_stale", harness.source().reason)
+        self.assertIs(SceneRuntimeState.DEGRADED, harness.runtime.status().state)
+
+    def test_replacement_first_frame_inside_interval_still_retires_old_stream(self):
+        # Codex P2 (#213): B's first frame is sampled out, yet A is retired,
+        # so delayed A frames are refused instead of accepted as continuous.
+        harness = Harness(binding(OTHER, SourceType.REMOTE_AGENT))
+        harness.runtime.start()
+        first, second = uuid4(), uuid4()
+
+        def offer(stream, advance, luma=None):
+            harness.clock.value += advance
+            offered = harness.runtime.offer_luma(OTHER, stream_id=stream, width=WIDTH,
+                                                 height=HEIGHT, pixels=luma or pixels())
+            harness.runtime.step()
+            return offered
+
+        self.assertTrue(offer(first, INTERVAL))
+        self.assertTrue(offer(first, INTERVAL))
+        self.assertFalse(offer(second, 1))
+        self.assertEqual(1, harness.source(OTHER).sampled_out)
+        for _ in range(3):
+            self.assertFalse(offer(first, INTERVAL, MOVED))
+        source = harness.source(OTHER)
+        self.assertEqual(3, source.stale_rejected)
+        self.assertEqual(2, source.accepted)
+        self.assertEqual([], harness.recorder.items)
+        self.assertTrue(offer(second, INTERVAL))
+        self.assertTrue(offer(second, INTERVAL, MOVED))
+        self.assertTrue(offer(second, INTERVAL, MOVED))
+        self.assertEqual([CriticalKind.SERVER_MOVEMENT], harness.recorder.kinds())
+
+    def test_dead_delivery_thread_makes_runtime_unavailable(self):
+        # Claude (#213): the runtime itself reports UNAVAILABLE when its
+        # delivery thread is gone, not only the application watcher.
+        harness = Harness(threaded=True)
+        harness.runtime.start()
+        self.addCleanup(harness.runtime.stop, 1.0)
+        self.assertIs(SceneRuntimeState.RUNNING, harness.runtime.status().state)
+
+        def broken():
+            raise RuntimeError("synthetic delivery failure")
+
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            harness.runtime._pump.deliver = broken
+            for luma in (None, None, MOVED, MOVED):
+                harness.frame(luma)
+            self.assertTrue(wait_for(lambda: not harness.runtime.status().delivery_running))
+        self.assertTrue(any("scene_critical_undelivered" in line for line in logs.output))
+        status = harness.runtime.status()
+        self.assertIs(SceneRuntimeState.UNAVAILABLE, status.state)
+        self.assertTrue(status.worker_running)
+        self.assertEqual(1, status.critical_pending)
+
+    def test_pump_starts_no_recorder_call_after_close_with_two_staged(self):
+        # Claude (#213): both observations are staged before the first call
+        # blocks; after close the second is never offered to the recorder.
+        source = Harness(binding(), binding(OTHER))
+        source.runtime.start()
+        for luma in (None, None, MOVED, MOVED):
+            source.frame(luma)
+            source.frame(luma, OTHER)
+        observations = list(source.recorder.items)
+        self.assertEqual(2, len(observations))
+        recorder = BlockingRecorder()
+        self.addCleanup(recorder.release.set)
+        pump = _CriticalPump(capacity=8, recorder=recorder, clock=Clock(), tick_seconds=0.01,
+                             threaded=True)
+        self.assertTrue(pump.submit(observations))
+        pump.start()
+        self.assertTrue(recorder.entered.wait(5))
+        self.assertIsNotNone(pump.close(0.1))
+        recorder.release.set()
+        self.assertTrue(wait_for(lambda: not pump.snapshot().running))
+        self.assertEqual(1, recorder.calls)
+        self.assertEqual(1, pump.snapshot().pending)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            self.assertFalse(pump.submit(observations[1:]))
+        self.assertEqual(1, pump.snapshot().refused)
+        self.assertEqual(1, recorder.calls)
+
+    def test_worker_outliving_stop_cannot_stage_or_republish(self):
+        # Claude (#213): after a worker join timeout (STOP_FAILED) the late
+        # confirmation is refused and counted, and nothing is republished.
+        harness = Harness(threaded=True)
+        harness.runtime.start()
+        for luma in (None, None, MOVED):
+            harness.frame(luma)
+        detector = harness.runtime._contexts[SOURCE].detector
+        inspect = detector.inspect
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def blocked(*args, **kwargs):
+            entered.set()
+            release.wait(10)
+            return inspect(*args, **kwargs)
+
+        detector.inspect = blocked
+        harness.clock.value += INTERVAL
+        harness.runtime.on_uvc_frame(SOURCE, VideoFrame(yuyv(MOVED), 50, 0.0))
+        self.assertTrue(entered.wait(5))
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            stopped = harness.runtime.stop(timeout=0.1)
+            self.assertIs(SceneRuntimeState.STOP_FAILED, stopped.state)
+            self.assertTrue(stopped.worker_running)
+            release.set()
+            self.assertTrue(wait_for(lambda: not harness.runtime.status().worker_running))
+        self.assertTrue(any("scene_critical_undelivered" in line for line in logs.output))
+        status = harness.runtime.status()
+        self.assertIs(SceneRuntimeState.STOP_FAILED, status.state)
+        self.assertEqual(1, status.critical_refused)
+        self.assertEqual(0, status.critical_pending)
+        self.assertEqual([], harness.recorder.items)
+        source = status.sources[0]
+        self.assertIs(SceneSourceState.INACTIVE, source.state)
+        self.assertEqual("stopped", source.reason)
+        self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN), (source.movement, source.tamper))
+
+    def test_every_distinct_stalled_call_is_logged(self):
+        # Claude (#213): a second stalled call is reported even when no
+        # non-stalled moment was observed in between.
+        recorder = GatedRecorder()
+        self.addCleanup(recorder.release_all)
+        harness = Harness(binding(), binding(OTHER), recorder=recorder, threaded=True,
+                          stall_ns=1_000)
+        harness.clock = SteppingClock()
+        harness.clock.value = 1_000
+        harness.runtime._deps = replace(harness.runtime._deps, monotonic_ns=harness.clock)
+        harness.runtime._pump.clock = harness.clock
+        harness.runtime.start()
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        self.assertTrue(recorder.entered.acquire(timeout=5))
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma, OTHER)
+
+        def stalls(logs):
+            return sum("scene_critical_recorder_stalled" in line for line in logs.output)
+
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            harness.clock.step = 1_000
+            self.assertTrue(wait_for(lambda: stalls(logs) == 1))
+            recorder.gates[0].set()
+            self.assertTrue(recorder.entered.acquire(timeout=5))
+            self.assertTrue(wait_for(lambda: stalls(logs) == 2))
+            harness.runtime.stop(timeout=0.1)
+        # The call still in flight at stop had exceeded the stall bound.
+        self.assertEqual(3, stalls(logs))
+        self.assertFalse(any("scene_critical_in_flight_at_stop" in line for line in logs.output))
+
+    def test_call_in_flight_at_stop_is_not_reported_as_stalled(self):
+        # Claude (#213): a call merely in flight at stop (not past the stall
+        # bound) is reported with its own event, not as a stall.
+        recorder = BlockingRecorder()
+        self.addCleanup(recorder.release.set)
+        harness = Harness(recorder=recorder, threaded=True)
+        harness.runtime.start()
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        self.assertTrue(recorder.entered.wait(5))
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            stopped = harness.runtime.stop(timeout=0.1)
+        self.assertIs(SceneRuntimeState.STOP_FAILED, stopped.state)
+        self.assertTrue(stopped.critical_in_flight)
+        self.assertFalse(stopped.recorder_stalled)
+        self.assertTrue(any("scene_critical_in_flight_at_stop" in line for line in logs.output))
+        self.assertFalse(any("scene_critical_recorder_stalled" in line for line in logs.output))
+
+
 class SyntheticYuyvCapture:
     """Synthetic capture producing generated YUYV frames for one device."""
 
@@ -909,10 +1143,10 @@ class SceneApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         return predicate()
 
-    def _scene_application(self, recorder):
+    def _scene_application(self, recorder, gap_ns=10_000_000_000):
         from tests.test_uvc_runtime import synthetic_admission
         remote = binding(OTHER, SourceType.REMOTE_AGENT, sample_interval_ns=1)
-        rules = policy(maximum_gap_ns=10_000_000_000, confirmation_ns=1)
+        rules = policy(maximum_gap_ns=gap_ns, confirmation_ns=1)
         return create_app(
             self.settings, storage_reservation=synthetic_admission,
             scene_monitoring=SceneMonitoringConfiguration((remote,), critical_capacity=2),
@@ -987,6 +1221,38 @@ class SceneApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
                     is SceneRuntimeState.UNAVAILABLE))
             del runtime.status
         self.assertTrue(any("scene_monitoring_unavailable" in line for line in logs.output))
+
+    async def test_application_scene_state_reports_dead_delivery_thread(self):
+        # Claude (#213): a delivery thread that is gone delivers nothing.
+        application = self._scene_application(Recorder())
+        async with asyncio.timeout(20), application.router.lifespan_context(application):
+            runtime = application.state.scene_monitoring
+            real = runtime.status
+            with self.assertLogs("app.main", level="ERROR") as logs:
+                runtime.status = lambda: replace(real(), delivery_running=False)
+                self.assertTrue(await self._until(
+                    lambda: application.state.scene_monitoring_state
+                    is SceneRuntimeState.UNAVAILABLE))
+            del runtime.status
+        self.assertTrue(any("scene_monitoring_unavailable" in line for line in logs.output))
+
+    async def test_application_scene_state_degrades_when_samples_stop(self):
+        # Codex P2 (#213): no sample within the calibrated gap is DEGRADED
+        # at the application level too, until a fresh sample recovers it.
+        application = self._scene_application(Recorder(), gap_ns=1_000_000_000)
+        stream = uuid4()
+        async with asyncio.timeout(20), application.router.lifespan_context(application):
+            runtime = application.state.scene_monitoring
+            await self._offer(runtime, stream, pixels())
+            self.assertTrue(await self._until(
+                lambda: application.state.scene_monitoring_state is SceneRuntimeState.RUNNING))
+            self.assertTrue(await self._until(
+                lambda: application.state.scene_monitoring_state is SceneRuntimeState.DEGRADED))
+            self.assertEqual("observation_stale", runtime.status().sources[0].reason)
+            await self._offer(runtime, stream, pixels())
+            self.assertTrue(await self._until(
+                lambda: application.state.scene_monitoring_state is SceneRuntimeState.RUNNING))
+        self.assertIs(SceneRuntimeState.STOPPED, application.state.scene_monitoring_state)
 
     async def test_application_scene_state_reports_unreadable_status(self):
         application = self._scene_application(Recorder())

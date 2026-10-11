@@ -134,46 +134,65 @@ critical staging has no room is held (the source reports
 `critical_backpressure`, samples after it are not evaluated ahead of it) and is
 handed to the detector once staging drains, so a loss correlated with a scene
 shift is never turned into a per-source fault that drops the tamper evidence.
-A camera loss (any of those states) lowers the source to `degraded`
+A camera loss (every non-`online` state: `offline`,
+`manual_intervention_required` and `degraded`) lowers the source to `degraded`
 (`source_unavailable`) until a new evaluated sample establishes recovery; a
-camera-state `online` alone is not a recovery.
+camera-state `online` alone is not a recovery. A source with no sample
+evaluated within the calibration's `maximum_gap_ns` (frames stopped, or a bound
+source that never received one) is also lowered to `degraded`
+(`observation_stale`) and its conclusions are `unknown`, until a fresh
+evaluated sample recovers it.
 
 `offer_luma()` refuses a producer stream id that this source has already
 replaced (`stale_rejected`): delayed frames of an old stream are stale imagery
 and are never re-admitted under a fresh runtime stream identity, which would
-defeat the detector's retired-stream refusal. The retired history holds at
-most `RETIRED_PRODUCER_LIMIT` ids per source and is never evicted from; when
-it is full a further replacement stream is refused and the source reports
-`stream_history_exhausted` until the runtime is restarted.
+defeat the detector's retired-stream refusal. The stream transition is
+recorded before the sampling decision, so a replacement stream's first frame
+retires the old stream even when that frame is itself sampled out. The retired
+history holds at most `RETIRED_PRODUCER_LIMIT` (1024) ids per source and is
+never evicted from; when it is full a further replacement stream is refused and
+the source reports `stream_history_exhausted` until the runtime is restarted.
 
 The default sample interval
-is a conservative 1 sample/s per source (`tick_seconds` must be between 0.01
-and 60 s). Critical staging is bounded and in memory. The durable recorder is
+is a conservative 1 sample/s per source, evaluated by one worker thread for
+all sources (`tick_seconds` must be between 0.01 and 60 s). Critical staging is bounded and in memory. The durable recorder is
 called only on a dedicated `scene-critical-delivery` thread, one observation
 at a time: the scene worker only stages a whole batch, so a recorder that
 blocks (stalled storage) never stops sampling or detection on any source.
 Staging then fills and further confirmations are explicit
 `critical_backpressure`; a call in flight longer than `recorder_stall_ns`
 (default 5 s) sets `recorder_stalled`, makes the runtime `degraded` and logs
-`scene_critical_recorder_stalled` once per stall. At shutdown the final worker
+`scene_critical_recorder_stalled` once for every distinct stalled call. At
+shutdown the final worker
 pass first hands every loss still queued in a capture slot to its detector
 (after a sample captured before that loss, at most one of each per source; a
 sample after the loss is dropped), then retries held losses; the delivery
 thread then makes one final pass. The worker and the delivery thread are each
-bounded by the stop timeout: a recorder call still in flight is reported as
-`stop_failed` with `critical_in_flight`, and no further recorder call starts
-after that. Observations the recorder has not accepted stay counted in
+bounded by the stop timeout (default 5 s each, so a stop takes up to about
+10 s): a recorder call still in flight is reported as `stop_failed` with
+`critical_in_flight`, and no further recorder call starts after that. At stop,
+`scene_critical_recorder_stalled` is logged only for a call that actually
+exceeded `recorder_stall_ns`; a call merely in flight logs
+`scene_critical_in_flight_at_stop`. Once stopped, staging refuses new
+observations: a worker that outlived its stop bound cannot stage into it (each
+refused observation is counted in `critical_refused` and logged) and cannot
+republish a conclusion; every source stays `inactive` and `unknown`.
+Observations the recorder has not accepted stay counted in
 `critical_pending`, losses that still had no staging room in `losses_held`,
 and losses lost to a per-source fault (while running or during the shutdown
 drain) in `losses_failed`; all are logged (`scene_critical_undelivered`) and
 are not persisted. After a worker failure the final pass still stages that
 evidence, but every source stays withdrawn as `worker_failed`. The runtime is
 `degraded` while evidence is undelivered, a loss is held, the recorder is
-stalled, or any source is `degraded`. The Main application's
-`scene_monitoring_state` follows the runtime status while it runs (those
-conditions are `degraded`; a failed or dead worker or delivery thread, or an
-unreadable status, is `unavailable`). No route reads the runtime status
-before #10.
+stalled, or any source is `degraded`. Because `critical_pending` counts every
+staged observation until the recorder accepts it, the runtime briefly reports
+`degraded` during normal delivery of each confirmation as well; that is
+expected and returns to `running` once the recorder accepts it. The runtime
+status itself reports `unavailable` when its worker or delivery thread is no
+longer running. The Main application's `scene_monitoring_state` follows the
+runtime status while it runs (those conditions are `degraded`; a failed or dead
+worker or delivery thread, or an unreadable status, is `unavailable`). No route
+reads the runtime status before #10.
 
 `server/tests/test_detector_roi.py` generates all pixel inputs in memory for
 local and remote-agent calibration, relative movement, global camera motion,

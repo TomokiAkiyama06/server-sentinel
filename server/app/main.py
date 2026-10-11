@@ -263,11 +263,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
         async def watch_scene_monitoring() -> None:
             # The application snapshot follows the live runtime, like the UVC
             # watcher: critical backpressure (DEGRADED), its recovery, or a
-            # failed/dead worker (UNAVAILABLE) is reflected here instead of
+            # failed/dead worker or delivery thread (UNAVAILABLE, which the
+            # runtime status itself derives) is reflected here instead of
             # the startup result staying RUNNING until shutdown. A recorder
-            # call stalled in flight, a camera loss or a lowered source is
-            # DEGRADED. Shutdown cancels this task before stop() writes the
-            # final state.
+            # call stalled in flight, a camera loss, a stale source or any
+            # other lowered source is DEGRADED. Shutdown cancels this task
+            # before stop() writes the final state.
             live = (SceneRuntimeState.RUNNING, SceneRuntimeState.DEGRADED)
             while application.state.scene_monitoring_state in live:
                 await asyncio.sleep(scene_runtime.refresh_interval_seconds)
@@ -280,10 +281,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
                     state, lost = SceneRuntimeState.UNAVAILABLE, True
                 if lost:
                     # A worker or delivery thread that is gone (or a status
-                    # that cannot be read) evaluates or delivers nothing. A
-                    # worker failure the runtime caught already logged itself
-                    # and reports UNAVAILABLE directly.
+                    # that cannot be read) evaluates or delivers nothing.
                     state = SceneRuntimeState.UNAVAILABLE
+                if state is SceneRuntimeState.UNAVAILABLE:
+                    # Logged once: the loop ends on a non-live state.
                     logging.getLogger(__name__).error(Event.SCENE_MONITORING_UNAVAILABLE)
                 application.state.scene_monitoring_state = state
 

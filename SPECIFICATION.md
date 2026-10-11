@@ -1037,17 +1037,30 @@ the runtime status and logged (staging is in memory only): staged
 observations in `critical_pending`, losses still without staging room in
 `losses_held`, and losses lost to a per-source fault (while running or in the
 shutdown drain) in `losses_failed`. A camera loss (`offline`,
-`manual_intervention_required` or `degraded`) lowers the source to `degraded`
-until a new evaluated sample establishes recovery. A decoded-sample producer
+`manual_intervention_required` or `degraded`, that is every non-`online`
+state) lowers the source to `degraded` until a new evaluated sample
+establishes recovery. A source with no sample evaluated within the
+calibration's `maximum_gap_ns` (including a bound source that never received
+one) is likewise `degraded` (`observation_stale`) with `unknown` conclusions
+until a fresh evaluated sample recovers it. A decoded-sample producer
 stream that has been replaced is refused as stale imagery on the capture side
-(`stale_rejected`) and never re-admitted under a new runtime identity; when the
-bounded retired-stream history is full, further replacement streams are
-refused (`stream_history_exhausted`) rather than forgetting one. The runtime
-reports `degraded` while staging holds undelivered evidence, a loss is held, a
-recorder call is stalled, or any source is `degraded`. Shutdown is bounded: a
-worker or recorder call still running after its bound is reported as
-`stop_failed` (with `critical_in_flight`), and the delivery thread then starts
-no further recorder call. After a worker failure the final pass still stages
+(`stale_rejected`) and never re-admitted under a new runtime identity; the
+transition is recorded even when the replacement stream's first frame is
+sampled out. When the bounded retired-stream history (1024 ids per source) is
+full, further replacement streams are refused (`stream_history_exhausted`)
+rather than forgetting one. The runtime reports `degraded` while staging holds
+undelivered evidence, a loss is held, a recorder call is stalled, or any source
+is `degraded`; since every staged observation counts until the recorder
+accepts it, normal delivery of a confirmation also shows `degraded` briefly.
+The runtime status reports `unavailable` when its worker or delivery thread is
+no longer running. Shutdown is bounded (worker and delivery each by the stop
+timeout, so up to about 10 s by default): a worker or recorder call still
+running after its bound is reported as `stop_failed` (with
+`critical_in_flight`), and the delivery thread then starts no further recorder
+call; a call that exceeded the stall bound is logged as stalled, one merely in
+flight separately. After stop, staging refuses observations from a worker that
+outlived its bound (counted in `critical_refused` and logged) and no
+conclusion is republished. After a worker failure the final pass still stages
 evidence for queued losses but every source stays withdrawn
 (`worker_failed`). The application scene state follows the runtime status
 while running, so these conditions report `degraded`, and a failed or dead
