@@ -29,38 +29,6 @@
     "review_document": "RTDETR_RUNTIME_AUDIT.md"
   },
   {
-    "name": "numpy",
-    "version": "2.3.5",
-    "license": "BSD-3-Clause; bundled BSD/MIT/Zlib, GPL-3.0-or-later WITH GCC-exception-3.1, LGPL-2.1-or-later",
-    "requires_python": ">=3.11",
-    "requires_dist": [],
-    "project_urls": [
-      "homepage, https://numpy.org",
-      "documentation, https://numpy.org/doc/",
-      "source, https://github.com/numpy/numpy",
-      "download, https://pypi.org/project/numpy/#files",
-      "tracker, https://github.com/numpy/numpy/issues",
-      "release notes, https://numpy.org/doc/stable/release"
-    ],
-    "wheel": "numpy-2.3.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-    "sha256": "0d8163f43acde9a73c2a33605353a4f1bc4798745a8b1d73183b28e5b435ae28",
-    "download_url": "https://files.pythonhosted.org/packages/b6/23/2a1b231b8ff672b4c450dac27164a8b2ca7d9b7144f9c02d2396518352eb/numpy-2.3.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-    "release_metadata_url": "https://pypi.org/pypi/numpy/2.3.5/json",
-    "license_files": [
-      "numpy/_core/include/numpy/random/LICENSE.txt",
-      "numpy/ma/LICENSE",
-      "numpy/random/LICENSE.md",
-      "numpy-2.3.5.dist-info/LICENSE.txt"
-    ],
-    "license_sha256": {
-      "numpy/_core/include/numpy/random/LICENSE.txt": "fbc539f47d0cf83bc61378080fb873d5c14630126cacbfe754035c3926daa5ec",
-      "numpy/ma/LICENSE": "05f3b88351988ecfad10abe92c0c50e5875c6452d5009a0084cc291551ffcca6",
-      "numpy/random/LICENSE.md": "103166b62b80443afb9eb3488e052ea06be0cff566b908f199e561fde49af19f",
-      "numpy-2.3.5.dist-info/LICENSE.txt": "2046a3130e50b11c01659b3a0d963e6ae0b7436ff8e89cbcfd9e87bc6112d595"
-    },
-    "review_document": "RTDETR_RUNTIME_AUDIT.md"
-  },
-  {
     "name": "flatbuffers",
     "version": "25.12.19",
     "license": "Apache-2.0 (upstream notice; wheel omits LICENSE)",

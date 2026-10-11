@@ -12,7 +12,7 @@ Audited 2026-09-20. This supplies model-license/provenance and exact Linux CPyth
 
 ## Exact Python distribution closure
 
-`../requirements-detector.lock` has five exact wheel hashes: ONNX Runtime1.28.0, NumPy2.3.5, flatbuffers25.12.19, packaging25.0, protobuf6.33.5. Each wheel was fetched directly from PyPI distribution metadata, SHA256 checked, and retained under wheels/. The four latter distributions declare no runtime dependencies; ORT requires only these four without extras. Do not install symbolic/quantization/training extras, Transformers, HF Hub, OpenCV, Torch, or a model downloader.
+`../requirements-detector.lock` originally had five exact wheel hashes: ONNX Runtime1.28.0, NumPy2.3.5, flatbuffers25.12.19, packaging25.0, protobuf6.33.5. Since Issue #217 (2026-10-11) the same NumPy 2.3.5 wheel is pinned in the base `../requirements.lock` (a ROI runtime dependency, see `DEPENDENCIES.md`) and the detector lock keeps the other four; install both locks together. Each wheel was fetched directly from PyPI distribution metadata, SHA256 checked, and retained under wheels/. The four latter distributions declare no runtime dependencies; ORT requires only these four without extras. Do not install symbolic/quantization/training extras, Transformers, HF Hub, OpenCV, Torch, or a model downloader.
 
 Licenses: ORT MIT; flatbuffers Apache-2.0; packaging Apache-2.0 OR BSD-2-Clause; protobuf BSD-3-Clause. NumPy is BSD-3-Clause with additional bundled licenses described below. Copy full installed notices, not only top-level metadata. Flatbuffers wheel omits a LICENSE file, so preserve the upstream v25.12.19 LICENSE (saved flatbuffers-LICENSE) with distribution notices.
 

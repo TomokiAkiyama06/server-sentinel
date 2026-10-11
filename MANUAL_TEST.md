@@ -1139,9 +1139,8 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
 
 - [ ] a local UVC source negotiated as uncompressed `YUYV` or `GREY` reaches the
   scene worker at the configured sample interval (default 1 sample/s) without
-  delaying preview or capture; an `MJPG` layout cannot be bound (no reviewed
-  decoder), and a camera whose frames do not match the bound layout stays
-  `unknown` (`frame_unusable`);
+  delaying preview or capture, and a camera whose frames do not match the
+  bound layout stays `unknown` (`frame_unusable`);
 - [ ] with no stored, re-bindable calibration the source stays inactive and
   `unknown` (`calibration_provider_unconfigured` /
   `calibration_reference_unavailable`), and no critical event is produced;
@@ -1150,6 +1149,43 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   neutral wording, in every presence state;
 - [ ] unplugging the camera right after a camera shift yields one
   `source_loss_after_scene_shift` tamper, while an unplug alone stays `unknown`.
+
+### Issue #217 MJPG decoder on real C960 frames (pending physical execution)
+
+`MjpgLumaLayout` (simplejpeg 1.9.0, Owner decision 2026-10-11) is verified only
+with synthetic, generated JPEGs in a network-less container
+(`server/tests/test_scene_mjpg.py`). Real camera frames show a real room: keep
+any captured frame in memory or in a private, non-repository temporary
+directory, delete it after the check, and record only the aggregate numbers
+below (no image, no hash of an image, no host/serial values). On the Main host
+with each EMEET C960 negotiated as `MJPG` (1080p30 and 720p30), still to do:
+
+- [ ] **DHT presence**: for at least 300 consecutive frames per camera, whether
+  every frame carries `DHT` segments or none does (UVC MJPG often omits them
+  and relies on the standard tables); all frames must pass the pre-check
+  (`inspect_frame`) either way;
+- [ ] **bytes after `EOI`**: per camera, the distribution (min / median / max)
+  of bytes between the `EOI` marker and the V4L2 `bytesused` end, and what
+  they contain (zeros, `0xFF`, other). Set `maximum_trailing_bytes` from this
+  (the code default 8192 is provisional) and confirm no real frame is refused
+  as `trailing_bytes_exceeded` / `trailing_marker`;
+- [ ] **other pre-check refusals**: count of real frames refused by any
+  pre-check or strict-decode reason over 10 minutes per camera (expected 0
+  apart from genuine transfer errors; a systematic refusal means the camera's
+  MJPG differs from the reviewed shape and must be reported, not relaxed
+  silently);
+- [ ] **decode time**: median / p95 / max wall time of `MjpgLumaLayout.luma()`
+  at the configured reference scale on real frames, with 1 and with 4 sources
+  at 1 sample/s, while other sessions' GPU benchmarks run; confirm it stays far
+  below the 250 ms per-frame bound and that capture/preview frame rates are
+  unchanged;
+- [ ] **systemd sandbox**: inside the real `server-sentinel.service` unit (its
+  `ProtectSystem=`, `SystemCallFilter=`, `MemoryDenyWriteExecute=` if added,
+  and non-root user), the simplejpeg and numpy wheels import, the version check
+  passes (the source does not report `frame_decoder_unavailable`) and a real
+  frame decodes; check the journal for `SIGSYS`/seccomp denials;
+- [ ] a camera unplugged mid-frame or a USB transfer error yields
+  `frame_undecodable` (`unknown`), never `ABSENT` movement or tamper.
 
 ## F. Camera tamper and source health
 

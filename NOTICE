@@ -2,5 +2,9 @@ ServerSentinel
 
 This product includes software developed by ServerSentinel contributors.
 
+This software is based in part on the work of the Independent JPEG Group
+(libjpeg-turbo, statically linked into the simplejpeg Python wheel used for MJPG
+decoding on the Main Server; see server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md).
+
 Development/CI tooling is listed in THIRD_PARTY_NOTICES.md. Runtime dependencies
 and model artifacts require separate review before introduction.

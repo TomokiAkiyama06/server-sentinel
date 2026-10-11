@@ -47,6 +47,26 @@ The adoption PR must do all of the following; until it does, MJPG stays
 
 The decoder-independent rules below still apply in full.
 
+### License gate record for the adoption (Issue #217)
+
+For item 3 the Owner approved `IJG` **for this component only**, as an exact
+entry in `license/owner-approvals.json`, not as an allowlist extension:
+
+| Field | Value |
+| --- | --- |
+| `component_id` | `pypi:simplejpeg@1.9.0` |
+| `license` | `MIT AND IJG AND BSD-3-Clause AND Zlib` (simplejpeg's own MIT plus the statically linked libjpeg-turbo 3.1.2) |
+| `upstream` | `https://pypi.org/project/simplejpeg/1.9.0/` |
+| `approved_by` / `approved_on` | `repository-owner` / `2026-10-11` |
+| `decision` | this document |
+
+`IJG` stays outside `scripts/ci/license_gate.py`'s permissive allowlist, so any
+other component carrying IJG terms needs its own Owner approval. NumPy 2.3.5 is
+recorded as `BSD-3-Clause` (allowlisted) with its bundled terms as obligations.
+The exact pins, audits and notices are in `server/requirements.lock`,
+`server/docs/wheel-audit.json`, `server/docs/DEPENDENCIES.md` ("Issue #217
+addition"), `server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md` and `NOTICE`.
+
 ## Question
 
 The Main host's EMEET C960 cameras are captured as `MJPG`. PR #213 reads only

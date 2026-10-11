@@ -47,6 +47,7 @@ from .calibration import CalibrationArchive, CalibrationRecord
 from .contracts import Calibration, CriticalObservation
 from .delivery import MAXIMUM_BATCH, CriticalRecorder
 from .detector import SceneDetector
+from .mjpg import MjpgFrameRejected, MjpgLumaLayout
 
 
 MAXIMUM_SOURCES = 4
@@ -139,10 +140,11 @@ class ArchiveCalibrationProvider:
 class PackedLumaLayout:
     """Exact uncompressed capture layout whose luma plane can be sampled.
 
-    Only packed `GREY` and `YUYV` are reviewed here: their luma is read by
-    byte slicing with no image library. A compressed format (for example
-    `MJPG`) needs a reviewed decoder and is refused. Frames whose length does
-    not match this exact unpadded layout are refused per frame.
+    Only packed `GREY` and `YUYV` are read here: their luma is read by byte
+    slicing with no image library. `MJPG` uses the reviewed decoder in
+    `MjpgLumaLayout` (Issue #217); any other compressed format is refused.
+    Frames whose length does not match this exact unpadded layout are refused
+    per frame.
     """
 
     width: int
@@ -155,6 +157,9 @@ class PackedLumaLayout:
                 raise ValueError("invalid capture dimensions")
         if self.pixel_format not in PACKED_FORMATS:
             raise ValueError("capture pixel format has no reviewed luma reader")
+
+    def available(self) -> bool:
+        return True
 
     def compatible(self, width: int, height: int) -> bool:
         return self.width % width == 0 and self.height % height == 0
@@ -176,6 +181,20 @@ class PackedLumaLayout:
         return bytes(output)
 
 
+CAPTURE_LAYOUTS = (PackedLumaLayout, MjpgLumaLayout)
+
+
+def capture_luma_layout(width: int, height: int, pixel_format: str):
+    """The reviewed luma reader for a negotiated local UVC format.
+
+    Pass the driver-negotiated profile, never the requested one. A format with
+    no reviewed reader raises `ValueError`, so that source cannot be bound.
+    """
+    if pixel_format == MjpgLumaLayout.pixel_format:
+        return MjpgLumaLayout(width, height)
+    return PackedLumaLayout(width, height, pixel_format)
+
+
 def _policy(value, detector):
     if not isinstance(value, DetectorQualityPolicy) or value.detector != detector:
         raise ValueError("a detector-specific quality policy is required")
@@ -191,9 +210,10 @@ class SceneSourceBinding:
     # for the other. Neither is supplied by default.
     movement_quality: DetectorQualityPolicy = field(repr=False)
     tamper_quality: DetectorQualityPolicy = field(repr=False)
-    # Required for raw local UVC frames; None for producers that already
+    # Required for raw local UVC frames (packed luma or reviewed MJPG
+    # decoding, see `capture_luma_layout`); None for producers that already
     # supply decoded grayscale samples (`offer_luma`).
-    layout: PackedLumaLayout | None = None
+    layout: PackedLumaLayout | MjpgLumaLayout | None = None
     sample_interval_ns: int = DEFAULT_SAMPLE_INTERVAL_NS
 
     def __post_init__(self):
@@ -203,7 +223,7 @@ class SceneSourceBinding:
             raise ValueError("invalid scene source type")
         _policy(self.movement_quality, "server_roi")
         _policy(self.tamper_quality, "camera_tamper")
-        if self.layout is not None and not isinstance(self.layout, PackedLumaLayout):
+        if self.layout is not None and not isinstance(self.layout, CAPTURE_LAYOUTS):
             raise ValueError("invalid capture layout")
         if self.source_type is SourceType.LOCAL_UVC and self.layout is None:
             raise ValueError("local UVC scene detection requires its capture layout")
@@ -1069,6 +1089,10 @@ class SceneMonitoringRuntime:
             elif binding.layout is not None and not binding.layout.compatible(
                     reference.width, reference.height):
                 reason = "capture_layout_incompatible"
+            elif binding.layout is not None and not binding.layout.available():
+                # The reviewed MJPG decoder (exact simplejpeg / numpy pins) is
+                # not installed: nothing can be decoded, so nothing is bound.
+                reason = "frame_decoder_unavailable"
             else:
                 try:
                     detector = SceneDetector(calibration)
@@ -1199,6 +1223,12 @@ class SceneMonitoringRuntime:
                 pixels, width, height = item.data, item.width, item.height
             frame = GrayFrame(context.binding.source_id, item.stream_id, item.sequence,
                               width, height, pixels)
+        except MjpgFrameRejected:
+            # Pre-check refusal, decoder error or warning, post-check
+            # mismatch, undecoded band or slow decode: unknown, never "no
+            # movement" / "no tamper".
+            self._end_episode(context, item, "frame_undecodable", "unusable")
+            return
         except Exception:
             self._end_episode(context, item, "frame_unusable", "unusable")
             return

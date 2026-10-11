@@ -1032,9 +1032,14 @@ sampling or detection: staging fills and further confirmations become explicit
 `critical_backpressure`, and a recorder call in flight longer than the stall
 bound reports the runtime `degraded` (`recorder_stalled`).
 Without a stored calibration whose reference frame can be re-bound, a source
-stays inactive and `unknown`; no baseline is taken from live frames. Only
-uncompressed `GREY`/`YUYV` local capture is read; compressed capture stays
-`unknown` until a reviewed decoder exists. Poor quality, undecodable frames,
+stays inactive and `unknown`; no baseline is taken from live frames. Local
+capture is read as uncompressed `GREY`/`YUYV` or, since Issue #217 (Owner
+decision 2026-10-11), as `MJPG` through the reviewed simplejpeg decoder on the
+scene worker: a structural pre-check (SOI, one baseline scan ending in a single
+EOI, bounded padding, SOF dimensions equal to the negotiated format within a
+pixel budget) runs before decoding, decoding is strict, and any refusal,
+decoder error, mid-grey undecoded band or slow decode is `unknown`
+(`frame_undecodable`); other compressed formats stay `unknown`. Poor quality, undecodable frames,
 backpressure, camera loss and stale conclusions are `unknown`, never a
 negative. A camera loss that arrives while staging has no room is held as
 backpressure and processed after staging drains, never dropped as a

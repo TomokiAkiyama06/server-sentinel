@@ -12,7 +12,7 @@ not certify accuracy and does not approve deployment or redistribution.
 | Source code | Apache-2.0 (Megvii-BaseDetection/YOLOX, tag 0.3.0 = `419778480ab6ec0590e5d3831b3afb3b46ab2aa3`). No YOLOX source is copied into ServerSentinel; the adapter independently implements the documented ONNX interface. |
 | Official pretrained weights | **License unclear.** No weights-specific license grant was found in the release, README, model zoo or ONNX docs; upstream [Issue #1865](https://github.com/Megvii-BaseDetection/YOLOX/issues/1865) asking exactly this was still open with zero comments on 2026-09-30. Not claimed Apache-2.0. |
 | Training data | COCO 2017 (per upstream model zoo). See "COCO implications" below. |
-| Runtime | Existing reviewed `onnxruntime==1.28.0` / `numpy==2.3.5` CPU closure (`requirements-detector.lock`). **No new dependency.** |
+| Runtime | Existing reviewed `onnxruntime==1.28.0` / `numpy==2.3.5` CPU closure (`requirements-detector.lock`; NumPy is pinned in `requirements.lock` since Issue #217). **No new dependency.** |
 | GPU | Evaluation-only measurement with `onnxruntime-gpu==1.28.0` in an **uncommitted scratch venv** (Owner approval for evaluation only, 2026-09-30). Its NVIDIA CUDA/cuDNN wheels are under NVIDIA proprietary EULAs and are **not** in any repository lock or the license allowlist. Production stays CPU-only. See "GPU evaluation runtime" below. |
 | Weights in repo | None. Downloaded only to a local scratch directory for measurement. |
 

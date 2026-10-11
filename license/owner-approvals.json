@@ -11,6 +11,17 @@
       "approved_by": "repository-owner",
       "approved_on": "2026-09-30",
       "decision": "docs/decisions/2026-09-30-cryptography-dependency.md"
+    },
+    {
+      "component_id": "pypi:simplejpeg@1.9.0",
+      "name": "simplejpeg",
+      "version": "1.9.0",
+      "kind": "source",
+      "license": "MIT AND IJG AND BSD-3-Clause AND Zlib",
+      "upstream": "https://pypi.org/project/simplejpeg/1.9.0/",
+      "approved_by": "repository-owner",
+      "approved_on": "2026-10-11",
+      "decision": "docs/decisions/2026-10-11-mjpg-decoder-survey.md"
     }
   ]
 }

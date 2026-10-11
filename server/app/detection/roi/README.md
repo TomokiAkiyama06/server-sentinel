@@ -125,9 +125,40 @@ It fails closed:
   cannot take a full batch), a camera-state loss, or a conclusion older than the
   calibrated sampling gap is `unknown`, never "no movement" or "no tamper".
 
-Only packed uncompressed `GREY`/`YUYV` capture is read (nearest-sample luma
-decimation by byte slicing to the reference size). `MJPG` needs a reviewed
-decoder and is refused. A local `offline` or `manual_intervention_required`
+`capture_luma_layout()` picks the reader for the driver-negotiated format.
+Packed uncompressed `GREY`/`YUYV` is read by nearest-sample luma decimation
+(byte slicing) to the reference size. `MJPG` is read by `MjpgLumaLayout`
+(`mjpg.py`, Issue #217, Owner decision 2026-10-11: simplejpeg 1.9.0 with
+statically linked libjpeg-turbo 3.1.2 and numpy 2.3.5), only on the scene
+worker, never on a capture thread:
+
+- a pure-Python pre-check runs before any native code sees the bytes: `SOI`
+  first, a bounded marker count and payload size, exactly one baseline or
+  extended-sequential Huffman `SOF` whose width/height equal the negotiated
+  format and fit the 3840x2160 pixel budget (a decompression-bomb header is
+  refused before the decoder allocates), one interleaved scan ending in a
+  single `EOI`, and at most `maximum_trailing_bytes` (provisionally 8192) of
+  padding after it with no further `SOI`/`EOI`;
+- decoding uses simplejpeg `strict=True` (libjpeg warnings such as a premature
+  end of data or extraneous bytes raise) to luma with the accurate integer IDCT
+  and libjpeg DCT scaling to the smallest power of two (1/8 to 1) whose output
+  decimates exactly to the reference, then nearest-sample decimation;
+- the decoded shape and type are checked, a decode whose trailing MCUs (one
+  MCU row's worth, in scan order) are all exactly 128 — the band libjpeg leaves
+  after stopping a scan early — is refused, and so is a decode slower than
+  250 ms.
+
+Every refusal is `frame_undecodable` (counted in `unusable`, the episode ends,
+movement and tamper are `unknown`), and a missing or differently versioned
+decoder keeps the source inactive (`frame_decoder_unavailable`). Decode success
+does not prove integrity: a bit flip that keeps the entropy-coded syntax valid
+gives locally wrong pixels that no check here detects. A calibration reference
+for an `MJPG` source must be produced through the same reader (same decoder,
+scale and decimation); the Owner calibration route (#10) does not exist yet.
+Real EMEET C960 frames (DHT presence, bytes after `EOI`, decode time, decoding
+inside the systemd sandbox) are still to be checked (`MANUAL_TEST.md`).
+
+A local `offline` or `manual_intervention_required`
 camera state is a trusted source loss and can correlate with a just-tracked
 scene shift; other states only end confirmation. A loss that arrives while
 critical staging has no room is held (the source reports

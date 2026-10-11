@@ -8,7 +8,7 @@ FastAPI 0.141.1 + Uvicorn 0.53.0, both WITHOUT extras. Do not use `fastapi[stand
 FastAPI >= current release requires Pydantic >=2.9; using Pydantic v1 would require deliberately selecting older FastAPI.
 Latest stable package wheels are compatible with Python 3.12; local Python 3.14 x86_64 and Linux Python 3.12 aarch64 pydantic-core wheels were also downloaded and hash verified.
 
-`../requirements.lock` and `../requirements-ci.lock` contain the 16 runtime / 2 development packages with exact SHA256 hashes of downloaded wheels; `../requirements-ci.lock` additionally includes the optional Issue #20 detector lock's 5 packages described at the end of this document. Only the three selected pydantic-core native wheels, the three selected cffi native wheels and the two selected cryptography abi3 wheels are permitted by these 18 reviewed base packages. `wheel-audit.json` records their 23 permitted artifacts individually, including each native wheel's filename, SHA256, release metadata URL, download URL, dependencies, and included license-file hashes. The CPython 3.12 aarch64 and CPython 3.14 x86_64 wheels' MIT license bytes match the CPython 3.12 x86_64 wheel; the same source-version Rust dependency audit and accompanying notices apply. An offline CI check requires exact agreement between every permitted lock hash and the 28 artifacts of the 2 audit inventories, `wheel-audit.json` plus `detector-wheel-audit.json`.
+`../requirements.lock` and `../requirements-ci.lock` contain the 18 runtime / 2 development packages with exact SHA256 hashes of downloaded wheels; `../requirements-ci.lock` additionally includes the optional Issue #20 detector lock's 4 packages described at the end of this document. Only the three selected pydantic-core native wheels, the three selected cffi native wheels, the two selected cryptography abi3 wheels, the three selected NumPy native wheels and the three selected simplejpeg native wheels are permitted by these 20 reviewed base packages. `wheel-audit.json` records their 29 permitted artifacts individually, including each native wheel's filename, SHA256, release metadata URL, download URL, dependencies, and included license-file hashes. The CPython 3.12 aarch64 and CPython 3.14 x86_64 wheels' MIT license bytes match the CPython 3.12 x86_64 wheel; the same source-version Rust dependency audit and accompanying notices apply. An offline CI check requires exact agreement between every permitted lock hash and the 33 artifacts of the 2 audit inventories, `wheel-audit.json` plus `detector-wheel-audit.json`.
 
 | Package | Exact version | Declared license |
 |---|---|---|
@@ -21,11 +21,13 @@ Latest stable package wheels are compatible with Python 3.12; local Python 3.14 
 | fastapi | 0.141.1 | MIT |
 | h11 | 0.16.0 | MIT |
 | idna | 3.20 | BSD-3-Clause |
+| numpy | 2.3.5 | BSD-3-Clause (bundled terms: see Issue #217 addition) |
 | pycodestyle | 2.14.0 | MIT |
 | pycparser | 3.0 | BSD-3-Clause |
 | pydantic | 2.13.5 | MIT |
 | pydantic-core | 2.46.5 | MIT |
 | pyflakes | 3.4.0 | MIT |
+| simplejpeg | 1.9.0 | MIT AND IJG AND BSD-3-Clause AND Zlib (Owner approval 2026-10-11) |
 | starlette | 1.6.0 | BSD-3-Clause |
 | typing-extensions | 4.16.0 | PSF-2.0 |
 | typing-inspection | 0.4.4 | MIT |
@@ -66,6 +68,22 @@ The Owner approved the Python `cryptography` package on 2026-09-30 (given for Is
 
 Static review found no telemetry or network client code in cryptography or cffi; they are local cryptographic/FFI libraries. This is not a network test.
 
+## Issue #217 addition: `simplejpeg` and `numpy` (2026-10-11)
+
+The Owner adopted simplejpeg as the Main-host MJPG decoder for ROI movement and camera tamper on 2026-10-11 (Option B of `../../docs/decisions/2026-10-11-mjpg-decoder-survey.md`), with NumPy as a ROI runtime dependency. Only `app/detection/roi/mjpg.py` imports them, and only on the scene worker thread. No other package is added.
+
+| Package | Exact version | Artifacts | Declared license |
+|---|---|---|---|
+| simplejpeg | 1.9.0 | cp312 x86_64, cp314 x86_64, cp312 aarch64 (`manylinux2014` / `manylinux_2_28`) | MIT; statically linked libjpeg-turbo 3.1.2: IJG AND BSD-3-Clause AND Zlib |
+| numpy | 2.3.5 | cp312 x86_64, cp314 x86_64, cp312 aarch64 (`manylinux_2_27` / `manylinux_2_28`) | BSD-3-Clause; bundled OpenBLAS / LAPACK (BSD), libgfortran (GPL-3.0-or-later WITH GCC-exception-3.1), libquadmath (LGPL-2.1-or-later, x86_64 only) |
+
+- Provenance: each wheel was downloaded from the URL in its PyPI release metadata into a scratch directory, its SHA-256 compared with the PyPI JSON digest (all six matched the survey's table), and its `METADATA`, `RECORD`, license files and native libraries inspected without executing them. `wheel-audit.json` records every artifact. Release dates (simplejpeg 2025-10-10, NumPy 2025-11-16) are before the audit date and the PyPI release metadata reports no known vulnerabilities; this is not an independent CVE audit.
+- simplejpeg wheels contain only `simplejpeg/__init__.py`, the type stub, one extension module (`_jpeg.*.so`, about 1.1 MB on x86_64, 1.0 MB on aarch64) and one license file. The extension embeds `libjpeg-turbo version 3.1.2 (build 20251010)` and dynamically needs only glibc (`libc`, `libpthread`, and the dynamic loader on x86_64); there is no auditwheel `.libs` directory. A static string search found no socket, URL-opening or update code (the only URL is NumPy's C-API troubleshooting link). It declares `numpy>=1.19.3`; NumPy 2.3.5 satisfies it and requires Python >= 3.11. Its libjpeg-turbo is upstream 3.1.2, so libjpeg-turbo fixes arrive only with a new simplejpeg release (single maintainer).
+- NumPy 2.3.5 cp312 x86_64 is the same artifact the detector lock already pinned (`RTDETR_RUNTIME_AUDIT.md`); it moves from `../requirements-detector.lock` into `../requirements.lock`, which now carries the cp314 x86_64 and cp312 aarch64 wheels too. The four NumPy license files are byte-identical across the three wheels. Both x86_64 wheels bundle `libscipy_openblas64_`, `libgfortran` and `libquadmath` under `numpy.libs/`; the aarch64 wheel bundles `libscipy_openblas64_` (aarch64 build) and `libgfortran` only.
+- Notice obligations: libjpeg-turbo binary distribution requires the product documentation to state "This software is based in part on the work of the Independent JPEG Group" (IJG clause 2, recorded in `../../NOTICE`) and, because simplejpeg uses the TurboJPEG API, the Modified (3-clause) BSD License text. The simplejpeg wheel's license file reproduces libjpeg-turbo's `LICENSE.md` (with the BSD text) and `README.ijg`; it is preserved verbatim with the standard zlib License text (libjpeg-turbo SIMD code) and the NumPy notices in `BACKEND_THIRD_PARTY_LICENSE_TEXTS.md` under "Issue #217 additions". The names of the IJG and The libjpeg-turbo Project are not used for endorsement. NumPy's GCC runtime exception and LGPL obligations described in `RTDETR_RUNTIME_AUDIT.md` now apply to every Main Server deployment that redistributes the wheelhouse.
+- License gate status: `MIT AND IJG AND BSD-3-Clause AND Zlib` is outside the permissive allowlist and is covered by the exact Owner approval record for `pypi:simplejpeg@1.9.0` in `license/owner-approvals.json` (approved 2026-10-11, decision `docs/decisions/2026-10-11-mjpg-decoder-survey.md`). `IJG` is **not** added to the gate's allowlist, so any other IJG-licensed component still needs its own approval. NumPy stays `BSD-3-Clause` (allowlisted), with its bundled terms recorded as obligations.
+- Runtime use: decoding runs on the existing single scene worker at most once per second per source; a header whose dimensions differ from the negotiated V4L2 format is refused before the decoder is called. Real C960 frames and the systemd sandbox are not yet verified (`../../MANUAL_TEST.md`).
+
 ## Official Python container
 
 Pin: `docker.io/library/python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e`.
@@ -91,4 +109,4 @@ Concrete material base components include glibc LGPL-2.1+, GCC runtime under its
 
 This recipe is compatible unmodified OS aggregation, not a linked GPL application dependency. It does not grant an exception for a future linked GPL app/model dependency or a binary-image publication with incomplete corresponding source.
 
-The optional Issue #20 detector runtime has a separate Linux x86_64 / CPython 3.12-only [hash lock](../requirements-detector.lock) and [exact native/model audit](RTDETR_RUNTIME_AUDIT.md), covering 5 packages in 5 artifacts: ONNX Runtime, NumPy and protobuf as Linux x86_64 native wheels, flatbuffers and packaging as pure-Python wheels. Its narrower platform scope does not alter the base backend lock, but `../requirements-ci.lock` includes it so CI exercises the optional adapter without model weights, which narrows that CI lock itself to Linux x86_64 / CPython 3.12.
+The optional Issue #20 detector runtime has a separate Linux x86_64 / CPython 3.12-only [hash lock](../requirements-detector.lock) and [exact native/model audit](RTDETR_RUNTIME_AUDIT.md), covering 4 packages in 4 artifacts: ONNX Runtime and protobuf as Linux x86_64 native wheels, flatbuffers and packaging as pure-Python wheels. NumPy 2.3.5, which ONNX Runtime requires, is pinned in the base `../requirements.lock` since Issue #217; install both locks together. Its narrower platform scope does not alter the base backend lock, but `../requirements-ci.lock` includes it so CI exercises the optional adapter without model weights, which narrows that CI lock itself to Linux x86_64 / CPython 3.12.
