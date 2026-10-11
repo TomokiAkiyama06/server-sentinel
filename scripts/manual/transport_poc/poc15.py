@@ -13,7 +13,6 @@ Subcommands:
   holder     capture-host camera holder (product UvcCapture, video only)
   matrix     run the scenario matrix (role both|main|agent)
   summarize  evaluate G1-G6 and secondary metrics from JSONL
-  srt-check  report whether the system ffmpeg provides srt (no network)
 """
 import argparse
 import os
@@ -50,7 +49,7 @@ def build_parser():
 
     r = commands.add_parser("receiver")
     r.add_argument("--candidate", required=True,
-                   choices=("a_framed", "b_chunked", "b_segment", "srt_ffmpeg"))
+                   choices=("a_framed", "b_chunked", "b_segment"))
     r.add_argument("--bind", required=True, help="explicit IP literal; never a wildcard")
     r.add_argument("--port", type=int, required=True)
     r.add_argument("--materials", required=True)
@@ -63,12 +62,10 @@ def build_parser():
                    help="AgentIngestQueue maximum_queued_messages")
     r.add_argument("--fast", action="store_true")
     r.add_argument("--no-ss", action="store_true", help="skip ss -tmi sampling")
-    r.add_argument("--srt-passphrase-file")
-    r.add_argument("--srt-node", default="good")
 
     s = commands.add_parser("sender")
     s.add_argument("--candidate", required=True,
-                   choices=("a_framed", "b_chunked", "b_segment", "srt_ffmpeg"))
+                   choices=("a_framed", "b_chunked", "b_segment"))
     s.add_argument("--host", required=True)
     s.add_argument("--port", type=int, required=True)
     s.add_argument("--node-dir", required=True)
@@ -86,7 +83,6 @@ def build_parser():
                    help="declare that the holder frames come from real cameras")
     s.add_argument("--route-probe", action="store_true")
     s.add_argument("--fast", action="store_true")
-    s.add_argument("--srt-passphrase-file")
 
     p = commands.add_parser("proxy")
     p.add_argument("--listen", required=True)
@@ -142,9 +138,6 @@ def build_parser():
                    help="holder JSONL; its CPU is added to real-camera Agent CPU")
     y.add_argument("--two-host", action="store_true",
                    help="inputs come from two hosts: Main-clock windows are not compared")
-
-    c = commands.add_parser("srt-check")
-    c.add_argument("--ffmpeg", default="ffmpeg")
     return parser
 
 
@@ -169,18 +162,6 @@ def _receiver(args):
                                      maximum_queued_messages=args.max_queue,
                                      ss_sampling=not args.no_ss)
     materials.require_outside_repository(args.out)
-    if args.candidate == "srt_ffmpeg":
-        from transport_poc import srt_adapter
-        ffmpeg = srt_adapter.require_srt()
-        passphrase = srt_adapter.read_passphrase(args.srt_passphrase_file)
-        writer = records.JsonlWriter(args.out, run_id=args.run_id, role="receiver")
-        state = materials.private_directory(args.state, exist_ok=True)
-        instance = receiver.Receiver(config, args.materials, state, writer)
-        node = materials.load_deployment(args.materials)["nodes"][args.srt_node]
-        url = srt_adapter.srt_url(args.bind, args.port, mode="listener", passphrase=passphrase)
-        srt_adapter.run_receiver(instance, node, ffmpeg, url)
-        writer.close()
-        return 0
     return receiver.run(config, args.materials, args.state, args.out, args.run_id)
 
 
@@ -194,16 +175,6 @@ def _sender(args):
         width=args.profile[0], height=args.profile[1], fast=args.fast,
         holder_socket=args.holder_socket, real_inputs=args.real_inputs,
         route_probe=args.route_probe)
-    if args.candidate == "srt_ffmpeg":
-        from transport_poc import srt_adapter
-        ffmpeg = srt_adapter.require_srt()
-        passphrase = srt_adapter.read_passphrase(args.srt_passphrase_file)
-        writer = records.JsonlWriter(args.out, run_id=args.run_id, role="sender")
-        instance = sender.Sender(config, args.node_dir, sender.next_epoch(args.epoch_file), writer)
-        url = srt_adapter.srt_url(args.host, args.port, mode="caller", passphrase=passphrase)
-        srt_adapter.run_sender(instance, ffmpeg, url, args.seconds)
-        writer.close()
-        return 0
     return sender.run(config, args.node_dir, args.epoch_file, args.out, args.run_id,
                       args.seconds)
 
@@ -265,17 +236,11 @@ def _summarize(args):
     return 0
 
 
-def _srt_check(args):
-    from transport_poc import srt_adapter
-    print("srt_available" if srt_adapter.srt_available(args.ffmpeg) else "unavailable")
-    return 0
-
-
 def main(argv=None):
     args = build_parser().parse_args(argv)
     handler = {"materials": _materials, "receiver": _receiver, "sender": _sender,
                "proxy": _proxy, "holder": _holder, "matrix": _matrix,
-               "summarize": _summarize, "srt-check": _srt_check}[args.command]
+               "summarize": _summarize}[args.command]
     return handler(args)
 
 

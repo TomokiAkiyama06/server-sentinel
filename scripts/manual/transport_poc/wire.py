@@ -218,29 +218,3 @@ class ChunkDecoder:
         rest = bytes(self._buffer)
         self._buffer.clear()
         return rest
-
-
-# -- JPEG comment envelope (optional SRT adapter) -----------------------------
-
-_COM_TAG = b"POC15\x00"
-
-
-def embed_envelope(jpeg, source_index, epoch, sequence, capture_ns):
-    """Insert the envelope as a JPEG COM segment right after SOI."""
-    if not jpeg.startswith(b"\xff\xd8"):
-        raise ValueError("not a JPEG frame")
-    body = _COM_TAG + struct.pack(">BQQQ", source_index, epoch, sequence, capture_ns)
-    segment = b"\xff\xfe" + struct.pack(">H", len(body) + 2) + body
-    return jpeg[:2] + segment + jpeg[2:]
-
-
-def extract_envelope(jpeg):
-    """Return ((source_index, epoch, sequence, capture_ns), payload) or raise."""
-    if not jpeg.startswith(b"\xff\xd8\xff\xfe"):
-        raise ProtocolError("envelope segment missing")
-    (length,) = struct.unpack(">H", jpeg[4:6])
-    body = jpeg[6:4 + length]
-    if length != len(_COM_TAG) + 25 + 2 or not body.startswith(_COM_TAG):
-        raise ProtocolError("bad envelope segment")
-    envelope = struct.unpack(">BQQQ", body[len(_COM_TAG):])
-    return envelope, jpeg[:2] + jpeg[4 + length:]

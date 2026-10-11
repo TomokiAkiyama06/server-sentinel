@@ -27,7 +27,7 @@ for path in (str(HARNESS), str(AGENT)):
         sys.path.insert(0, path)
 
 from transport_poc import (holder, materials, matrix, proxy, records,  # noqa: E402
-                           sender, srt_adapter, summarize, wire)
+                           sender, summarize, wire)
 
 RUN = "r20261011t000000ab"
 
@@ -118,13 +118,6 @@ class WireTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(wire.ProtocolError):
                     wire.ChunkDecoder(8).feed(bad)
-
-    def test_jpeg_comment_envelope(self):
-        frame = b"\xff\xd8\xff\xdbpayload\xff\xd9"
-        embedded = wire.embed_envelope(frame, 3, 4, 5, 6)
-        self.assertEqual(((3, 4, 5, 6), frame), wire.extract_envelope(embedded))
-        with self.assertRaises(wire.ProtocolError):
-            wire.extract_envelope(frame)
 
     def test_source_ids_are_deterministic_per_node(self):
         node = uuid4()
@@ -326,12 +319,41 @@ class SummarizerTests(unittest.TestCase):
     def test_negative_authentication_accepts_nothing(self):
         orchestrator, receiver, sender_rows = _base("auth_unpaired")
         end = {"kind": "end", "t_ns": 9, "accepted": 0}
+        refused = {"kind": "auth_refused", "t_ns": 2, "reason": "capture_node_not_admitted"}
+        attempt = [{"kind": "start", "t_ns": 0}, {"kind": "connect", "t_ns": 1, "connection": 1}]
         self.run_dir("auth_unpaired-a_framed", orchestrator=orchestrator,
-                     receiver=receiver + [end], sender_rows=sender_rows)
+                     receiver=receiver + [refused, end], sender_rows=sender_rows + attempt)
         self.assertEqual("pass", self.report()["auth_unpaired"]["g1"])
         _write(self.root / "auth_unpaired-a_framed", "receiver",
-               receiver + [{**end, "accepted": 1}])
+               receiver + [refused, {**end, "accepted": 1}])
         self.assertEqual("fail", self.report()["auth_unpaired"]["g1"])
+
+    def test_negative_authentication_requires_attempt_and_refusal(self):
+        orchestrator, receiver, sender_rows = _base("auth_other_ca")
+        end = {"kind": "end", "t_ns": 9, "accepted": 0}
+        refused = {"kind": "auth_refused", "t_ns": 2, "reason": "tls_handshake_failed"}
+        start = {"kind": "start", "t_ns": 0}
+        attempt = {"kind": "connect", "t_ns": 1, "connection": 1}
+        directory = self.root / "auth_other_ca-a_framed"
+        # zero accepted, but the sender never attempted a connection
+        self.run_dir("auth_other_ca-a_framed", orchestrator=orchestrator,
+                     receiver=receiver + [refused, end], sender_rows=sender_rows + [start])
+        self.assertEqual("fail", self.report()["auth_other_ca"]["g1"])
+        # an attempt, but no Main-side authentication refusal
+        _write(directory, "receiver", receiver + [end])
+        _write(directory, "sender", sender_rows + [start, attempt])
+        self.assertEqual("fail", self.report()["auth_other_ca"]["g1"])
+        # a resource-bound refusal is not an authentication result
+        _write(directory, "receiver", receiver + [{**refused, "reason": "connection_limit"}, end])
+        self.assertEqual("fail", self.report()["auth_other_ca"]["g1"])
+        # the Agent-side run is missing entirely: incomplete, never pass
+        (directory / "sender.jsonl").unlink()
+        _write(directory, "receiver", receiver + [refused, end])
+        self.assertEqual("unmeasured", self.report()["auth_other_ca"]["g1"])
+        _write(directory, "sender", sender_rows + [start, attempt])
+        row = self.report()["auth_other_ca"]
+        self.assertEqual(("pass", 1, 1), (row["g1"], row["connect_attempts"],
+                                          row["auth_refusal_evidence"]))
 
     def test_bounds(self):
         orchestrator, receiver, sender_rows = _base("normal")
@@ -369,6 +391,98 @@ class SummarizerTests(unittest.TestCase):
                receiver + [{**gap, "to_capture_ns": 700 * second}])
         self.assertEqual("fail", self.report()["outage_5s"]["g5"])
 
+    def test_main_side_outage_requires_agent_detection(self):
+        second = 10**9
+        for scenario, actions in (
+                ("slow_stop_10s", [("sigstop", 10), ("sigcont", 20)]),
+                ("main_restart", [("restart_receiver", 10), ("ready", 12)])):
+            with self.subTest(scenario=scenario):
+                orchestrator, receiver, sender_rows = _base(scenario)
+                orchestrator = orchestrator + [
+                    {"kind": "action", "t_ns": at * second, "action": action,
+                     "duration_ns": 0} for action, at in actions]
+                start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": 5 * second}
+                name = f"{scenario}-a_framed"
+                # neither side detects anything and there is no durable gap
+                self.run_dir(name, orchestrator=orchestrator, receiver=receiver,
+                             sender_rows=sender_rows + [start])
+                self.assertEqual("fail", self.report()[scenario]["g5"])
+                loss = {"kind": "loss_detected", "t_ns": 15 * second, "source": 0,
+                        "idle_ns": 5 * second, "connection": 1,
+                        "last_committed_capture_ns": 9 * second}
+                _write(self.root / name, "sender", sender_rows + [start, loss])
+                row = self.report()[scenario]
+                self.assertEqual("pass", row["g5"])
+                self.assertEqual((1, 1), (row["main_outages"], row["agent_loss_episodes"]))
+                # detection later than the 15 s threshold on the Agent clock
+                _write(self.root / name, "sender",
+                       sender_rows + [start, {**loss, "idle_ns": 16 * second}])
+                self.assertEqual("fail", self.report()[scenario]["g5"])
+                # a loss outside the outage window does not count for it
+                _write(self.root / name, "sender",
+                       sender_rows + [start, {**loss, "t_ns": 2 * second}])
+                self.assertEqual("fail", self.report()[scenario]["g5"])
+                # two hosts: no clock comparison, one Agent episode per outage
+                _write(self.root / name, "sender", sender_rows + [start, {**loss, "t_ns": 1}])
+                runs = summarize.summarize([self.root], single_host=False)["runs"]
+                self.assertEqual("pass", runs[0]["g5"])
+                # the Main-side orchestrator record is missing: incomplete
+                _write(self.root / name, "orchestrator-both", orchestrator[:1])
+                self.assertEqual("unmeasured", self.report()[scenario]["g5"])
+                for path in (self.root / name).iterdir():
+                    path.unlink()
+
+    def test_capacity_requires_cpu_cap_on_both_sides(self):
+        orchestrator, receiver, sender_rows = _base("capacity_4", sources=4)
+        durable = [{"kind": "durable", "t_ns": 9, "source": index, "epoch": 1,
+                    "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0}
+                   for index in range(4)]
+        ends = [{"kind": "end", "t_ns": 9, "source": index, "accepted": 10, "rejected": 0,
+                 "drops": 0} for index in range(4)]
+        receiver_end = {"kind": "end", "t_ns": 9, "accepted": 40, "backpressured": 0,
+                        "rate_limited": 0, "cpu_quota_us": 200000, "cpu_period_us": 100000}
+        metric = {"kind": "metric", "t_ns": 9, "payload_bytes": 100,
+                  "cpu_quota_us": 100000, "cpu_period_us": 100000}
+        name = "capacity_4-a_framed"
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver + durable + [receiver_end],
+                     sender_rows=sender_rows + ends + [metric])
+        self.assertEqual("pass", self.report()["capacity_4"]["g6"])
+        _write(self.root / name, "sender",
+               sender_rows + ends + [{**metric, "cpu_quota_us": None}])
+        row = self.report()["capacity_4"]
+        self.assertEqual(("fail", True, False), (row["g6"], row["cpu_capped"],
+                                                 row["agent_cpu_capped"]))
+        _write(self.root / name, "sender", sender_rows + ends + [metric])
+        _write(self.root / name, "receiver",
+               receiver + durable + [{**receiver_end, "cpu_quota_us": None}])
+        self.assertEqual("fail", self.report()["capacity_4"]["g6"])
+
+    def test_agent_cpu_uses_counter_deltas(self):
+        orchestrator, receiver, sender_rows = _base("normal", sources=2)
+        # 10 s process / 4 s child CPU consumed before the first sample; then
+        # 1 s process + 1 s child over 4 s wall -> 0.5 core / 2 sources.
+        for index, row in enumerate(sender_rows):
+            row.update(cpu_seconds=10.0 + 0.25 * index, child_cpu_seconds=4.0 + 0.25 * index)
+        self.run_dir("normal-a_framed", orchestrator=orchestrator, receiver=receiver,
+                     sender_rows=sender_rows)
+        self.assertEqual(0.25, self.report()["normal"]["agent_cpu_per_source"])
+
+    def test_cgroup_quota_uses_tightest_ancestor(self):
+        root = self.root / "cg"
+        leaf = root / "user.slice" / "ss-poc15-main.scope"
+        leaf.mkdir(parents=True)
+        (root / "cpu.max").write_text("max 100000\n")
+        (root / "user.slice" / "cpu.max").write_text("150000 100000\n")
+        (leaf / "cpu.max").write_text("max 100000\n")
+        cgroup = self.root / "cgroup"
+        cgroup.write_text("0::/user.slice/ss-poc15-main.scope\n")
+        self.assertEqual((150000, 100000), records.cgroup_cpu_quota(root, cgroup))
+        (leaf / "cpu.max").write_text("200000 50000\n")  # 4 cores: looser than parent
+        self.assertEqual((150000, 100000), records.cgroup_cpu_quota(root, cgroup))
+        (root / "user.slice" / "cpu.max").write_text("max 100000\n")
+        (leaf / "cpu.max").write_text("max 100000\n")
+        self.assertEqual((None, None), records.cgroup_cpu_quota(root, cgroup))
+
     def test_fifth_source_refused(self):
         orchestrator, receiver, sender_rows = _base("fifth_refused", sources=5)
         durable = [{"kind": "durable", "t_ns": 9, "source": index, "epoch": 1,
@@ -392,34 +506,6 @@ class SummarizerTests(unittest.TestCase):
         report = summarize.summarize([self.root])
         self.assertEqual("unmeasured", report["candidates"][0]["secondary_packet_loss"])
         self.assertIn("a_framed", summarize.render(report))
-
-
-class SrtTests(unittest.TestCase):
-    def test_refuses_without_ffmpeg_srt(self):
-        with mock.patch("shutil.which", return_value=None):
-            self.assertFalse(srt_adapter.srt_available())
-            with self.assertRaises(srt_adapter.SrtUnavailable):
-                srt_adapter.require_srt()
-
-    def test_detects_srt_in_both_directions(self):
-        both = "Supported file protocols:\nInput:\n  file\n  srt\nOutput:\n  file\n  srt\n"
-        input_only = "Supported file protocols:\nInput:\n  srt\nOutput:\n  file\n"
-        for text, expected in ((both, True), (input_only, False)):
-            run = mock.Mock(return_value=mock.Mock(stdout=text))
-            with mock.patch("shutil.which", return_value="/usr/bin/ffmpeg"):
-                self.assertEqual(expected, srt_adapter.srt_available(run=run))
-
-    def test_passphrase_file_must_be_private(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "pass"
-            path.write_text("abcdefghijk")
-            os.chmod(path, 0o644)
-            with self.assertRaises(srt_adapter.SrtUnavailable):
-                srt_adapter.read_passphrase(path)
-            os.chmod(path, 0o600)
-            self.assertEqual("abcdefghijk", srt_adapter.read_passphrase(path))
-        argv = srt_adapter.receiver_argv("ffmpeg", "srt://x")
-        self.assertIn("-an", argv)
 
 
 class MiscTests(unittest.TestCase):
@@ -536,7 +622,7 @@ class LoopbackMatrixTests(unittest.TestCase):
             records.read_jsonl(path)  # every stored value is numeric or a token
 
 
-_CASES = (RecordTests, WireTests, ProxyTests, SummarizerTests, SrtTests, MiscTests,
+_CASES = (RecordTests, WireTests, ProxyTests, SummarizerTests, MiscTests,
           LoopbackMatrixTests)
 
 if os.environ.get("POC15_HARNESS_CHILD") != "1":

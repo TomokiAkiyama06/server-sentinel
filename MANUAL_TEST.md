@@ -1206,7 +1206,7 @@ QUIC / WebRTC はこのハーネスの対象外です。
 Date / tester:
 ServerSentinel Git commit (harness HEAD):
 Main host（粗い値のみ）/ capture host（粗い値のみ）:
-Candidate(s): a_framed / b_chunked / b_segment / srt_ffmpeg（ffmpeg srt の有無）
+Candidate(s): a_framed / b_chunked / b_segment
 Sources: n=  real cameras=  synthetic (gst / builtin)=
 Profile / bitrate:
 CPU cap (Main CPUQuota / capture CPUQuota):

@@ -28,6 +28,15 @@ DISCONNECT_SCENARIOS = {"outage_5s", "outage_120s", "rst", "slow_stop_10s", "slo
 COMM_LOSS_SCENARIOS = {"outage_1s", "outage_5s", "outage_120s", "rst", "slow_stop_10s",
                        "slow_stop_60s", "main_restart"}
 NEGATIVE_SCENARIOS = {"auth_unpaired", "auth_other_ca", "auth_revoked"}
+# Main-side outages (orchestrator sigstop / restart_receiver windows): the Agent
+# must detect each one itself, on its own clock.
+MAIN_OUTAGE_SCENARIOS = {"slow_stop_10s", "slow_stop_60s", "main_restart"}
+# Main-side refusal reasons that are an authentication / admission decision
+# (``connection_limit`` is a resource bound, not an authentication result).
+AUTH_REFUSAL_REASONS = {
+    "tls_handshake_failed", "tls_session_failed", "capture_node_not_admitted",
+    "capture_node_certificate_invalid", "capture_node_certificate_missing",
+    "tls_version_refused", "unauthorized"}
 
 
 def load_runs(directories):
@@ -97,7 +106,7 @@ class RunSummary:
         if not self.receiver:
             return "unmeasured"
         if self.scenario in NEGATIVE_SCENARIOS:
-            return _verdict(accepted == 0 and sender_accepted == 0)
+            return self._g1_negative(accepted, sender_accepted, sessions)
         if self.scenario == "route_probe":
             probes = _kind(self.sender, "route_probe")
             return _verdict(bool(probes) and all(p["reason"] in ("not_found", "peer_closed")
@@ -116,6 +125,23 @@ class RunSummary:
             # media accepted afterwards; positive control: media before it.
             return _verdict(frozen and accepted > 0 and (delay is None or delay <= 3 * SECOND))
         return _verdict(sessions > 0)
+
+    def _g1_negative(self, accepted, sender_accepted, sessions):
+        """Zero accepted media only counts with evidence that auth was exercised.
+
+        Requires the Agent-side run (``start``), at least one connection attempt
+        and a Main-side authentication refusal; a sender that never ran or never
+        connected must not certify the negative test.
+        """
+        attempts = len(_kind(self.sender, "connect"))
+        refusals = [r for r in _kind(self.receiver, "auth_refused")
+                    if r.get("reason") in AUTH_REFUSAL_REASONS]
+        self.metrics.update(connect_attempts=attempts, auth_refusal_evidence=len(refusals))
+        if accepted or sender_accepted or sessions:
+            return "fail"
+        if not _kind(self.sender, "start"):
+            return "unmeasured"  # Agent side missing: the test is incomplete
+        return _verdict(attempts > 0 and bool(refusals))
 
     # -- G2 -----------------------------------------------------------------
     def g2(self):
@@ -279,7 +305,48 @@ class RunSummary:
         return _verdict(records.percentiles(times)[95] <= RECONNECT_P95_NS)
 
     # -- G5 -----------------------------------------------------------------
-    def g5(self, loss_timeout_ns):
+    def _main_outage_detection(self, losses, single_host):
+        """Agent loss detection for each Main-side stop/restart, on the Agent clock.
+
+        Each loss episode (one per Agent connection) carries ``idle_ns``: Agent
+        clock time from the last bytes received from Main to the detection.
+        That bounds the detection delay without comparing host clocks. On a
+        single host the episode must also fall in its window.
+        """
+        if self.scenario not in MAIN_OUTAGE_SCENARIOS:
+            return "not_applicable"
+        windows = [(start, end) for start, end, origin in self._impairment_windows()
+                   if origin == "main"]
+        if not windows:
+            return "unmeasured"  # Main-side orchestrator record missing
+        episodes = {}
+        for loss in losses:
+            key = loss.get("connection", loss["t_ns"])
+            if key not in episodes:
+                episodes[key] = loss
+        delays = [loss.get("idle_ns") for loss in episodes.values()]
+        matched = 0
+        if single_host:
+            used = set()
+            for start, end in windows:
+                hit = next((key for key, loss in sorted(episodes.items(),
+                                                        key=lambda kv: kv[1]["t_ns"])
+                            if key not in used and start <= loss["t_ns"] <= end + DETECTION_NS),
+                           None)
+                if hit is not None:
+                    used.add(hit)
+                    matched += 1
+                    delays.append(episodes[hit]["t_ns"] - start)
+        else:
+            matched = min(len(episodes), len(windows))
+        self.metrics.update(main_outages=len(windows), agent_loss_episodes=len(episodes),
+                            agent_main_outage_detect_max_ns=max(
+                                (d for d in delays if d is not None), default=None))
+        if matched < len(windows) or any(d is None or d > DETECTION_NS for d in delays):
+            return "fail"
+        return "pass"
+
+    def g5(self, loss_timeout_ns, single_host=True):
         if self.scenario not in COMM_LOSS_SCENARIOS:
             gaps = _kind(self.receiver, "durable_gap")
             self.metrics.update(unprotected_gap_units=sum(g["missing_units"] or 0 for g in gaps))
@@ -308,6 +375,11 @@ class RunSummary:
                                    for start, end in main_windows)]
         if detections and any(value > DETECTION_NS for value in detections):
             ok = False
+        main_outage = self._main_outage_detection(losses, single_host)
+        if main_outage == "unmeasured":
+            return "unmeasured"
+        if main_outage == "fail":
+            ok = False
         if any(value > DETECTION_NS for value in main_detect):
             ok = False
         uncovered = 0
@@ -332,15 +404,21 @@ class RunSummary:
             return "unmeasured"
         durable_sources = {item["source"] for item in _kind(self.receiver, "durable")
                            if item["units"] > 0}
+        metric = _last(self.sender, "metric") or {}
         backpressured = _sum_end(self.receiver, "backpressured")
         rate_limited = _sum_end(self.receiver, "rate_limited")
         drops = sum(item.get("drops", 0) for item in _kind(self.sender, "end"))
         end = _last(self.receiver, "end") or {}
         self.metrics.update(backpressured=backpressured, rate_limited=rate_limited,
-                            sender_drops=drops, cpu_capped=end.get("cpu_quota_us") is not None)
+                            sender_drops=drops,
+                            cpu_capped=end.get("cpu_quota_us") is not None,
+                            agent_cpu_capped=metric.get("cpu_quota_us") is not None)
         healthy = {0, 1, 2, 3} <= durable_sources and backpressured == 0 and rate_limited == 0
         if self.scenario == "capacity_4":
-            return _verdict(healthy and drops == 0)
+            # "4 sources under a CPU limit": both sides must have run capped.
+            capped = (end.get("cpu_quota_us") is not None
+                      and metric.get("cpu_quota_us") is not None)
+            return _verdict(healthy and drops == 0 and capped)
         fifth = [item for item in _kind(self.sender, "end") if item.get("source") == 4]
         refused = bool(fifth) and fifth[0]["accepted"] == 0 and fifth[0]["rejected"] > 0
         return _verdict({0, 1, 2, 3} <= durable_sources and 4 not in durable_sources and refused)
@@ -365,7 +443,9 @@ class RunSummary:
             first = sender_samples[0]
             wall = (last["t_ns"] - first["t_ns"]) / SECOND
             if wall > 0 and self.n_sources:
-                cpu = (last["cpu_seconds"] + last["child_cpu_seconds"]) / wall
+                cpu = (last["cpu_seconds"] - first["cpu_seconds"]
+                       + last.get("child_cpu_seconds", 0.0)
+                       - first.get("child_cpu_seconds", 0.0)) / wall
                 result["agent_cpu_per_source"] = round(cpu / self.n_sources, 4)
         for item in _kind(self.sender, "latency"):
             if item["metric"] == "capture":
@@ -374,7 +454,7 @@ class RunSummary:
 
     def evaluate(self, *, rss_limit, loss_timeout_ns, single_host):
         self.gates = {"g1": self.g1(), "g2": self.g2(), "g3": self.g3(rss_limit),
-                      "g4": self.g4(single_host), "g5": self.g5(loss_timeout_ns),
+                      "g4": self.g4(single_host), "g5": self.g5(loss_timeout_ns, single_host),
                       "g6": self.g6()}
         self.metrics.update(self.secondary())
         return self

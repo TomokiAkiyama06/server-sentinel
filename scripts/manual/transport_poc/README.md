@@ -27,9 +27,9 @@ ADR-0007 Validation 表へ記入し、未実施の構成を検証済みと書か
 | `a_framed` | TLS 1.3 mTLS 上の length-prefixed frame stream。source ごと stop-and-wait、1 s heartbeat |
 | `b_chunked` | 同じ frame を HTTP/1.1 chunked の長寿命 `POST /poc15/v1/stream` で送受信 |
 | `b_segment` | 1 s ごとの `PUT /poc15/v1/segment`（body = frame 列、response = ack 列、keep-alive） |
-| `srt_ffmpeg` | **任意**。system `ffmpeg -protocols` が input/output とも `srt` を持つ場合だけ動き、無ければ拒否。passphrase 方式で ADR-0006 の相互証明書認証ではないため G1 は設計上 `fail`。passphrase は ffmpeg の argv（同一 host の process 一覧）に見えるので使い捨てのみ。UDP のため proxy impairment は `unmeasured`。**未実行・未検証** |
 
-QUIC / WebRTC は今回対象外です。TCP の packet loss / jitter は root の `netem` が必要なため
+QUIC / WebRTC は今回対象外です。SRT は passphrase 方式で ADR-0006 の相互証明書認証を
+満たせず G1 を通らないため、Owner 判断（2026-10-11）で候補から外しました。TCP の packet loss / jitter は root の `netem` が必要なため
 測定せず、summary は常に `unmeasured` と出します。
 
 ## ポートと bind（試験専用。`0.0.0.0` は使わない）
@@ -38,13 +38,13 @@ QUIC / WebRTC は今回対象外です。TCP の packet loss / jitter は root �
 | --- | --- |
 | Main receiver `a_framed` | `<MAIN_LAN_IP>:47200/tcp` |
 | Main receiver `b_chunked` / `b_segment` | `<MAIN_LAN_IP>:47201/tcp` |
-| Main receiver `srt_ffmpeg` | `<MAIN_LAN_IP>:47203/udp` |
 | capture host の impairment proxy | `127.0.0.1:47210`（A）/ `47211`（B chunked）/ `47212`（B segment）。47213–47214 は予備 |
 
 `<MAIN_LAN_IP>` は private LAN の IP literal（Tailscale 範囲は product validation が拒否）。
 実 IP / hostname / 経路は repository・Issue・PR に書かず、私的な手元記録にのみ残します。
 receiver は product の bind 検証を通した上で `SO_REUSEADDR` 付きで bind します（product の
-`open_ingest_listener` には無く、TIME_WAIT 中の Main 再起動で再 bind できないため。PR の未決事項参照）。
+`open_ingest_listener` には無く、TIME_WAIT 中の Main 再起動で再 bind できないため。product 側の対応は
+Issue #223 で追跡）。
 
 ## 安全規則
 
@@ -68,8 +68,7 @@ receiver は product の bind 検証を通した上で `SO_REUSEADDR` 付きで 
 uname -r; nproc; free -m; python3 --version
 systemd-run --version | head -1; systemctl --user is-system-running
 ss -ltnu '( sport >= :47200 and sport <= :47214 )'   # 何も表示されないこと
-command -v ss gst-launch-1.0 ffmpeg
-python3 scripts/manual/transport_poc/poc15.py srt-check   # srt_available / unavailable
+command -v ss gst-launch-1.0
 cat /sys/fs/cgroup/user.slice/cpu.max 2>/dev/null
 ```
 
@@ -182,13 +181,13 @@ python3 scripts/manual/transport_poc/poc15.py summarize --two-host MAIN_OUT/<RUN
 
 | gate | 判定 |
 | --- | --- |
-| G1 | mTLS 相互認証。否定試験（未 activation / 別 CA / 失効 / 接続中失効）で受理 media 0、`route_probe` は 404 か切断 |
+| G1 | mTLS 相互認証。否定試験（未 activation / 別 CA / 失効 / 接続中失効）で受理 media 0、`route_probe` は 404 か切断。未 activation / 別 CA / 失効は sender の接続試行 ≥ 1 と Main 側の認証拒否記録（`auth_refused`、`connection_limit` を除く）が両方必要で、sender 記録が無ければ `unmeasured`、試行か拒否記録が無ければ `fail` |
 | G2 | epoch 内の報告 gap = durable stand-in から算出した実欠落（完全一致）、capture 再起動は範囲不明 gap、重複 commit 0 |
 | G3 | receiver queue ≤ 設定上限、kernel send queue（`TIOCOUTQ`、`ss -tmi` があれば skmem）≤ 2×SO_SNDBUF + 64 KiB、VmHWM ≤ 上限、warmup 後の RSS 増加 ≤ max(16 MiB, 10 %)、proxy 保持 ≤ 64 KiB |
 | G4 | 切断を伴う impairment から手動操作なしで再接続、p95 ≤ 10 s（2 host で Main 側 action の場合は Agent 時計で切断→初回受理） |
-| G5 | 無音断の検知 ≤ 15 s（Agent / Main とも）、Main の未 commit 区間（Agent capture 時刻）⊆ Agent 保護区間 [T−600 s, T+600 s] |
-| G6 | 4 source で backpressure / rate limit / sender drop 0、5 source 目は拒否 |
-| 副次 | soak 30 分で予期しない切断 0、overhead ≤ 10 %（proxy の上り byte / payload）、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %、latency p95 ≤ 1 s（参考） |
+| G5 | 無音断の検知 ≤ 15 s（Agent / Main とも）、Main の未 commit 区間（Agent capture 時刻）⊆ Agent 保護区間 [T−600 s, T+600 s]。Main 側停止（`slow_stop_10s` / `slow_stop_60s` / `main_restart`）は停止ごとに Agent の loss 検知が必要で、遅延は Agent 時計で最後の受信からの経過（`idle_ns`）≤ 15 s。Main 側 orchestrator 記録が無ければ `unmeasured` |
+| G6 | 4 source で backpressure / rate limit / sender drop 0、かつ Main / Agent とも cgroup v2 `cpu.max` の CPU 上限下で実行（`capacity_4`、上限が無ければ `fail`）。5 source 目は拒否 |
+| 副次 | soak 30 分で予期しない切断 0、overhead ≤ 10 %（proxy の上り byte / payload）、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %（最初の sample からの差分で算出）、latency p95 ≤ 1 s（参考） |
 
 すべての比較は 1 host の時計内、または envelope の Agent capture 時刻と Agent 自身の
 loss 時刻の比較だけで行い、host 間の時計差を使いません。

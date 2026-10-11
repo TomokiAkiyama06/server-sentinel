@@ -21,7 +21,7 @@ import time
 RUN_ID_PATTERN = re.compile(r"r[0-9]{8}t[0-9]{6}[0-9a-f]{0,8}")
 KEY_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,47}")
 
-CANDIDATES = ("a_framed", "b_chunked", "b_segment", "srt_ffmpeg")
+CANDIDATES = ("a_framed", "b_chunked", "b_segment")
 SCENARIOS = (
     "normal", "outage_1s", "outage_5s", "outage_120s", "rst", "bandwidth_cap",
     "slow_stop_10s", "slow_stop_60s", "slow_drain", "main_restart",
@@ -195,22 +195,38 @@ def descendant_cpu_seconds(pid=None):
     return sum(process_cpu_seconds(child) or 0.0 for child in descendant_pids(pid))
 
 
-def cgroup_cpu_quota():
-    """(quota_us, period_us) of this process's cgroup v2 ``cpu.max``; None if unlimited."""
+def cgroup_cpu_quota(root=Path("/sys/fs/cgroup"), cgroup_file="/proc/self/cgroup"):
+    """Tightest (quota_us, period_us) of cgroup v2 ``cpu.max`` on this process's path.
+
+    A ``systemd-run --scope -p CPUQuota=`` cap sits on the leaf, a container cap
+    on an ancestor; the effective limit is the smallest quota/period ratio from
+    the leaf up to the root. ``(None, None)`` if every level is unlimited.
+    """
     try:
-        with open("/proc/self/cgroup", encoding="ascii") as stream:
+        with open(cgroup_file, encoding="ascii") as stream:
             for line in stream:
                 if line.startswith("0::"):
                     relative = line.strip()[3:]
                     break
             else:
                 return None, None
-        with open(Path("/sys/fs/cgroup") / relative.lstrip("/") / "cpu.max",
-                  encoding="ascii") as stream:
-            quota, period = stream.read().split()
-        return (None if quota == "max" else int(quota)), int(period)
     except (OSError, ValueError):
         return None, None
+    best = (None, None)
+    directory = Path(root) / relative.lstrip("/")
+    while True:
+        try:
+            with open(directory / "cpu.max", encoding="ascii") as stream:
+                quota, period = stream.read().split()
+            if quota != "max":
+                quota, period = int(quota), int(period)
+                if best[0] is None or quota * best[1] < best[0] * period:
+                    best = (quota, period)
+        except (OSError, ValueError):
+            pass
+        if directory == Path(root) or Path(root) not in directory.parents:
+            return best
+        directory = directory.parent
 
 
 def socket_queues(sock):

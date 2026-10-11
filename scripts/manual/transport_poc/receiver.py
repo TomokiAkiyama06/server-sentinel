@@ -32,7 +32,7 @@ class ReceiverConfig:
                  maximum_queued_bytes=64 * 1024 * 1024, rate_per_second=900,
                  stale_after_s=None, idle_timeout_s=None, admission_check_s=1.0,
                  maximum_segment_bytes=48 * 1024 * 1024, ss_sampling=True):
-        if candidate not in ("a_framed", "b_chunked", "b_segment", "srt_ffmpeg"):
+        if candidate not in ("a_framed", "b_chunked", "b_segment"):
             raise ValueError("unknown receiver candidate")
         self.candidate = candidate
         self.bind_host, self.port, self.human_port = bind_host, port, human_port
@@ -182,12 +182,8 @@ class Receiver:
         listener_config = IngestListenerConfig(bind_host=config.bind_host, port=config.port,
                                                human_host=config.bind_host,
                                                human_port=config.human_port)
-        if config.candidate == "srt_ffmpeg":
-            # The SRT adapter receives through ffmpeg (UDP); no TLS listener.
-            self.listener, self.port = None, config.port
-        else:
-            self.listener = _open_listener(listener_config, open_ingest_listener)
-            self.port = self.listener.getsockname()[1]
+        self.listener = _open_listener(listener_config, open_ingest_listener)
+        self.port = self.listener.getsockname()[1]
         self.node_index = {node: label for label, node in deployment["nodes"].items()}
         self.source_index = {}
         for node in deployment["nodes"].values():

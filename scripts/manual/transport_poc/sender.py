@@ -118,6 +118,7 @@ class Sender:
         self.children = []
         self.stale_acks = 0
         self._first_accept_pending = False
+        self.last_inbound = time.monotonic()
 
     # -- media sources --------------------------------------------------------
     def _offer(self, index, capture_ns, payload):
@@ -268,6 +269,7 @@ class Sender:
         self.connections += 1
         self.connected = True
         self._first_accept_pending = True
+        self.last_inbound = time.monotonic()
         return connection
 
     def run(self, seconds):
@@ -312,7 +314,9 @@ class Sender:
             if reason not in ("loss_timeout", "shutdown") and not self.stop.is_set():
                 # Any unexpected disconnect is a Main-communication loss for the
                 # Agent's T-600 s/T+600 s protection, not only a silent timeout.
-                self._loss(0)
+                # The delay is measured on the Agent clock from the last bytes
+                # received from Main (an upper bound on detection delay).
+                self._loss(int((time.monotonic() - self.last_inbound) * 1e9))
             if reason == "loss_timeout":
                 backoff = self.config.backoff_initial
             if not self.stop.is_set() and time.monotonic() < deadline:
@@ -325,6 +329,7 @@ class Sender:
     def _loss(self, idle_ns):
         for state in self.sources:
             self.writer.write("loss_detected", source=state.index, idle_ns=idle_ns,
+                              connection=self.connections,
                               last_committed_capture_ns=state.last_committed_capture_ns)
 
     def _session_stream(self, connection, deadline):
@@ -378,7 +383,7 @@ class Sender:
                         break
                     if not data:
                         return "peer_closed"
-                    last_inbound = time.monotonic()
+                    last_inbound = self.last_inbound = time.monotonic()
                     if chunked and head is not None:
                         head += data
                         if b"\r\n\r\n" not in head:
@@ -440,6 +445,7 @@ class Sender:
                 self.payload_bytes += sum(len(unit.payload) for _, unit in units)
                 self._sample_socket(connection)
                 acks, response = self._read_segment_response(connection, response)
+                self.last_inbound = time.monotonic()
             except (socket.timeout, TimeoutError):
                 self._restore(units)
                 self._loss(int((time.monotonic() - started) * 1e9))
@@ -563,8 +569,10 @@ class Sender:
     def _finish(self):
         for child in self.children:
             child.terminate()
+        quota, period = records.cgroup_cpu_quota()
         self.writer.write("metric", payload_bytes=self.payload_bytes, wire_bytes=self.wire_bytes,
-                          connections=self.connections, stale_acks=self.stale_acks)
+                          connections=self.connections, stale_acks=self.stale_acks,
+                          cpu_quota_us=quota, cpu_period_us=period)
         for state in self.sources:
             self.writer.write("end", source=state.index, epoch=self.epoch,
                               generated=state.next_sequence, drops=state.drops,
