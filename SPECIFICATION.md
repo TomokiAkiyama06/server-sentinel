@@ -1524,7 +1524,8 @@ principal_session
 - created_at
 - last_seen_at
 - idle_expires_at / absolute_expires_at (server-enforced)
-- last_user_verification_at (freshness source for owner step-up)
+- last_user_verification_at (freshness source for owner step-up), with the
+  kernel boot id and CLOCK_BOOTTIME read in the same transaction (migration 23)
 - revoked_at
 
 principal_permission
@@ -1750,6 +1751,51 @@ or revoked still receives the generic response below and learns nothing about
 owner routes. Repeated failed step-ups are rate-limited and logged without
 credential material, and a stale session never partially applies an operation.
 
+Implementation (Issue #10 phase 2 S3, Owner decision D3): `POST
+/api/auth/step-up/options` (empty body or `{}`) returns only `challenge`,
+`rpId`, `timeout`, `userVerification: "required"` and `allowCredentials`
+holding exactly the session's credential; `POST /api/auth/step-up` (the JSON
+assertion) answers `204` with no body. Both require an Owner session
+(`OWNER_READ`, fresh or stale; Owner decision 2026-10-12), the exact `Origin`
+and `X-CSRF-Token`, are charged before the body is read to their own
+per-source limiter (Owner decision 2026-10-12: keyed by the verified proxy
+identity, burst 5, one per 12 seconds, no global bucket, never the sign-in or
+redemption limiter object), and commit under the
+epoch their authorization took; a non-Owner or anyone without a valid session
+gets the generic `404`. Neither step-up route extends the session: their
+authorization makes every session check (idle and absolute expiry, identity
+binding, CSRF, Owner role) but commits no idle touch, and only a successful
+step-up moves `last_seen` and the idle expiry, in the transaction that
+refreshes the verification time (PR #236 review). Repeated options requests
+or failed finishes therefore cannot keep an unattended Owner session alive
+past its 30-minute idle limit. A new options request replaces the session's pending
+step-up challenge. "Fresh" is exactly five minutes from the verification time
+read inside the commit transaction (sign-in or step-up), on the wall clock and
+on `CLOCK_BOOTTIME` of the same boot, with the wall clock lagging the
+monotonic clock by at most one second: a wall clock stepped back after the
+verification, a reboot, a session without a recorded pair (established
+before migration 23) and an unreadable boot clock are stale (fail closed,
+Owner decision 2026-10-12), and a step-up is refused while the boot
+clock cannot be read. A finish refused by the session gate (stop, failed
+check tick or close/reopen during verification) is a no-op that leaves the
+challenge pending, a credential finding (BE change, counter regression)
+included; every other refusal after the client data parsed spends the
+challenge. A successful step-up deletes the challenge in the SQLite transaction
+that refreshes the session (a refused commit rolls the deletion back and the
+refusal then spends it on its own). A credential finding commits inside one
+gate admission and one SQLite transaction that first deletes this session's
+pending step-up challenge and writes the finding and its audit record only if
+that DELETE removed the unexpired row; the Owner is notified only after that
+commit, so one challenge yields at most one finding and notification. If the
+DELETE removes nothing (a concurrent finish of the same answer spent it first
+and may have advanced the counter, or a new options request replaced it), nothing is recorded or
+notified and the finish is refused. If the transaction fails, the deletion
+rolls back with the finding, and the challenge is spent on its own under a new
+gate admission: it stays single use, and the unchanged stored credential lets
+the next assertion detect the finding again. Refused finishes are counted value-free
+(`owner_step_up_refused` logged on the first and each doubling). No `OWNER_OP`
+route is mounted until S4.
+
 Exactly two HTTP routes run before a credential exists, and the pair is closed.
 Owner bootstrap is not a third one: it is a local action on the host that feeds
 the same redemption route.
@@ -1957,8 +2003,9 @@ session on an `OWNER_OP` route (Owner decision D3). Sign-out invalidates the
 server-side session and its binding with a `sign_out_principal` audit record
 holding only the principal's logical UUID (D7); it ends that session, not the
 credential, and is refused while human access is closed. Invitation
-redemption, step-up and all live/recording/timeline/admin routes are later
-phases. Details: `server/app/auth/README.md`.
+redemption (S2) and the Owner step-up (S3, §11.5 above) are mounted; all
+live/recording/timeline/admin routes are later phases. Details:
+`server/app/auth/README.md`.
 
 ## 12. Dashboard UI
 

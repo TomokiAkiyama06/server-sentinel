@@ -48,7 +48,11 @@ WebSocket and error path gets the same generic denial):
 - ``POST /api/auth/authentication/options``: begin a passkey sign-in;
 - ``POST /api/auth/authentication``: finish it and set the ``__Host-`` cookie;
 - ``GET /api/session``: the caller's own role, permissions and CSRF token;
-- ``POST /api/auth/sign-out``: end the caller's own session (CSRF).
+- ``POST /api/auth/sign-out``: end the caller's own session (CSRF);
+- ``POST /api/auth/step-up/options``: an Owner session's step-up challenge
+  (CSRF, Issue #10 phase 2 S3);
+- ``POST /api/auth/step-up``: verify it and refresh the session's user
+  verification (CSRF); ``204`` with no body.
 
 The four ceremony routes run before a credential exists (AUTH-013). Each is
 rate-limited per verified proxy identity before the request body is parsed
@@ -56,16 +60,26 @@ and before the ceremony takes any gate or SQLite lock (Issue #181); the
 sign-in routes also globally. Redemption uses its own, stricter limiter with
 no global bucket (Owner decisions D4 and 2026-10-11), so a redemption flood
 never spends the sign-in buckets and one source cannot stop another's
-redemption. A redemption refused after the limiter is counted, value-free
+redemption. The two step-up routes are charged the same way, before the body
+is read, to a third limiter of the same shape (Owner decision 2026-10-12;
+SPECIFICATION: repeated failed step-ups are rate-limited), so a sign-in flood
+cannot stop the Owner's step-up and a step-up flood never spends the sign-in
+buckets. A redemption refused after the limiter is counted, value-free
 (``HumanAccess.refused_redemptions``, logged as
 ``invitation_redemption_refused`` on the first refusal and each time the
-count doubles), never with the code, identity or reason. An invitation code travels
+count doubles), never with the code, identity or reason; a refused step-up
+finish is counted the same way (``HumanAccess.refused_step_ups``, logged as
+``owner_step_up_refused``). An invitation code travels
 only in the request body and is decoded strictly
 (``invitation_code.parse_invitation_code``) before the gate; a code that does
 not parse never reaches SQLite. Session routes are not charged; a forged or
 stale cookie is refused by a read-only token lookup before the gate or any
 SQLite write lock. No live, recording, timeline, event, administration,
-health or version route is mounted here.
+health or version route is mounted here, and no ``OWNER_OP`` route yet (S4):
+the step-up routes require ``OWNER_READ`` (an Owner session, fresh or stale),
+so a non-Owner gets the generic denial inside the authorization transaction.
+Neither step-up route commits an idle touch: only a successful step-up
+extends the session's idle expiry (PR #236 review).
 
 Every refusal is the generic, non-branding not-found response used by the
 closed surface: no product/version header, no cookie, ``no-store``; an
@@ -105,7 +119,7 @@ from app.storage.database import Database, PinnedDatabase
 from .invitation_code import InvalidInvitationCode, parse_invitation_code
 from .model import Credential
 from .passkeys import DeviceBoundCredentialRequired, PasskeyCeremonies, SessionGrant
-from .rate_limit import SourceRateLimiter, redemption_rate_limiter
+from .rate_limit import SourceRateLimiter, redemption_rate_limiter, step_up_rate_limiter
 from .reservation import HostnameReservationCheck, HumanAccessClosed
 from .reservation_store import ListenerExceptionStore, ReservationSessionRevocation
 from .session_binding import canonical_identity
@@ -122,6 +136,8 @@ SESSION_PATH = "/api/session"
 SIGN_OUT_PATH = "/api/auth/sign-out"
 REGISTRATION_OPTIONS_PATH = "/api/auth/registration/options"
 REGISTRATION_PATH = "/api/auth/registration"
+STEP_UP_OPTIONS_PATH = "/api/auth/step-up/options"
+STEP_UP_PATH = "/api/auth/step-up"
 MAX_OPTIONS_BODY = 1024
 MAX_ASSERTION_BODY = 64 * 1024
 MAX_REGISTRATION_BODY = 64 * 1024
@@ -273,6 +289,14 @@ ROUTES: tuple[Route, ...] = (
           mutating=False, csrf=False, body_limit=0),
     Route("POST", _exact(SIGN_OUT_PATH), Requirement.SESSION, "_sign_out",
           mutating=True, csrf=True, body_limit=MAX_EMPTY_BODY),
+    # S3: OWNER_READ, not OWNER_OP, so a stale Owner can refresh, and not
+    # SESSION, so a non-Owner is refused inside the authorization. Both
+    # authorize with touch=False: only a successful step-up extends the
+    # idle expiry (accept_assertion, PR #236 review).
+    Route("POST", _exact(STEP_UP_OPTIONS_PATH), Requirement.OWNER_READ, "_begin_step_up",
+          mutating=True, csrf=True, body_limit=MAX_EMPTY_BODY),
+    Route("POST", _exact(STEP_UP_PATH), Requirement.OWNER_READ, "_finish_step_up",
+          mutating=True, csrf=True, body_limit=MAX_ASSERTION_BODY),
 )
 
 
@@ -473,9 +497,9 @@ class HumanAccess:
     Refuses construction unless the deployment explicitly enabled it, the
     session gate is a ``HostnameReservationCheck`` with every opening input
     configured (resolver, socket owners, own sockets, unprivileged port
-    start, session revoker), the two rate limiters are distinct
-    ``SourceRateLimiter`` objects (sign-in and, per Owner decision D4,
-    invitation redemption), the ceremonies use exactly that gate and this
+    start, session revoker), the three rate limiters are distinct
+    ``SourceRateLimiter`` objects (sign-in, invitation redemption per Owner
+    decision D4, and Owner step-up per Owner decision 2026-10-12), the ceremonies use exactly that gate and this
     audited access store with a session-binding key, and the relying party
     is the reserved https origin. A missing or substituted gate is never
     accepted (Issue #181 item 3). The gate's session revoker must be a
@@ -506,6 +530,7 @@ class HumanAccess:
                  ceremonies: PasskeyCeremonies, reservation: HostnameReservationCheck,
                  rate_limiter: SourceRateLimiter | None = None,
                  redemption_limiter: SourceRateLimiter | None = None,
+                 step_up_limiter: SourceRateLimiter | None = None,
                  tick_seconds: float = DEFAULT_TICK_SECONDS):
         if not isinstance(configuration, HumanAccessConfiguration) or configuration.enabled is not True:
             raise HumanAccessUnavailable()
@@ -529,12 +554,14 @@ class HumanAccess:
         origin, host = reserved_origin(reservation)
         if ceremonies.rp.origin != origin or ceremonies.rp.rp_id != reservation.config.hostname:
             raise HumanAccessUnavailable()
-        if rate_limiter is not None and not isinstance(rate_limiter, SourceRateLimiter):
+        limiters = [limiter for limiter in (rate_limiter, redemption_limiter, step_up_limiter)
+                    if limiter is not None]
+        if any(not isinstance(limiter, SourceRateLimiter) for limiter in limiters):
             raise HumanAccessUnavailable()
-        if redemption_limiter is not None and (not isinstance(redemption_limiter, SourceRateLimiter)
-                                               or redemption_limiter is rate_limiter):
-            # Separate buckets (D4): one shared object would let a redemption
-            # flood starve sign-in.
+        if len({id(limiter) for limiter in limiters}) != len(limiters):
+            # Separate buckets (D4, Owner decision 2026-10-12): one shared
+            # object would let a flood on one route spend another route's
+            # buckets, the Owner's step-up included.
             raise HumanAccessUnavailable()
         if (isinstance(tick_seconds, bool) or not isinstance(tick_seconds, (int, float))
                 or not 0 < tick_seconds <= 300):
@@ -545,6 +572,7 @@ class HumanAccess:
         self.reservation = reservation
         self.rate_limiter = rate_limiter or SourceRateLimiter()
         self.redemption_limiter = redemption_limiter or redemption_rate_limiter()
+        self.step_up_limiter = step_up_limiter or step_up_rate_limiter()
         self.origin = origin
         self.host = host
         self.tick_seconds = float(tick_seconds)
@@ -562,6 +590,9 @@ class HumanAccess:
         # redemption requests that passed the limiter were refused. No code,
         # identity, invitation or reason is kept.
         self.refused_redemptions = 0
+        # The same for refused step-up finishes (SPECIFICATION: logged
+        # without credential material): a count only.
+        self.refused_step_ups = 0
         self._refusal_lock = threading.Lock()
         self.gate = ServingGate(self)
         # Last: everything above validated, so a refused composition leaves
@@ -575,6 +606,14 @@ class HumanAccess:
             count = self.refused_redemptions
         if count & (count - 1) == 0:
             logging.getLogger(__name__).warning(Event.INVITATION_REDEMPTION_REFUSED)
+
+    def note_refused_step_up(self) -> None:
+        """Count one refused step-up finish; log the value-free event at 1, 2, 4, 8, ..."""
+        with self._refusal_lock:
+            self.refused_step_ups += 1
+            count = self.refused_step_ups
+        if count & (count - 1) == 0:
+            logging.getLogger(__name__).warning(Event.OWNER_STEP_UP_REFUSED)
 
     def bind_storage_admission(self, admission: Callable, *, database: Database) -> None:
         """Admit every write of this composition through ``admission``.
@@ -853,7 +892,8 @@ class HumanSurface:
         request = _Request(scope, receive, send, headers, identity, route, query)
         await getattr(self, route.handler)(request)
 
-    async def _authorize(self, request: _Request, requirement: Requirement) -> _Authorized:
+    async def _authorize(self, request: _Request, requirement: Requirement, *,
+                         touch: bool = True) -> _Authorized:
         """Authorize a session-bearing request inside the gate.
 
         Order: the cookie's form; a read-only token pre-check that takes no
@@ -863,7 +903,8 @@ class HumanSurface:
         CSRF header compared in that transaction for a CSRF route. Any
         refusal is ``_Denied``; only ``StepUpRequired`` on ``OWNER_OP`` is
         ``_StepUp``. The store releases the gate before its denial
-        bookkeeping.
+        bookkeeping. ``touch=False`` (the step-up routes only) makes the same
+        checks without committing the idle touch.
         """
         if requirement is Requirement.PRE_CREDENTIAL or requirement is not request.route.requirement:
             raise _Denied()
@@ -882,7 +923,7 @@ class HumanSurface:
                 raise _Denied()
             session = await asyncio.to_thread(
                 access.store.authorize_request, token, request.identity, requirement,
-                admit=lambda: access.admit(epoch), csrf=csrf)
+                admit=lambda: access.admit(epoch), csrf=csrf, touch=touch)
         except StepUpRequired:
             if requirement is Requirement.OWNER_OP:
                 raise _StepUp() from None
@@ -901,6 +942,10 @@ class HumanSurface:
 
     def _limit_redemption(self, identity: str) -> None:
         if not self.access.redemption_limiter.allow(identity):
+            raise _Denied()
+
+    def _limit_step_up(self, identity: str) -> None:
+        if not self.access.step_up_limiter.allow(identity):
             raise _Denied()
 
     async def _body(self, request: _Request, *, json_required: bool) -> bytes:
@@ -1065,6 +1110,80 @@ class HumanSurface:
         await request.send({"type": "http.response.start", "status": 204, "headers": [
             (b"cache-control", b"no-store"),
             (b"set-cookie", _CLEARED_COOKIE),
+        ]})
+        await request.send({"type": "http.response.body", "body": b""})
+
+    async def _begin_step_up(self, request: _Request) -> None:
+        """An Owner session's step-up challenge (Issue #10 phase 2 S3, AUTH-008).
+
+        Order: the step-up limiter (before the body is read), an empty body,
+        ``_authorize`` with ``OWNER_READ`` and the CSRF header inside
+        ``admit(epoch)``, then ``PasskeyCeremonies.begin_step_up`` with that
+        same epoch, which stores the challenge (bound to this session, at most
+        one per session) inside a second ``admit(epoch)``. The response is
+        only the ceremony's request options: the challenge, the relying-party
+        id, the timeout, ``userVerification: "required"`` and the session's
+        own credential as the single allowed credential. A stale Owner is
+        served (refreshing is the point); a non-Owner, a close, ``stop()`` or
+        a failed tick in between is the generic denial.
+
+        The authorization is read-only for the session's lifetime
+        (``touch=False``, PR #236 review): requesting a challenge is not
+        evidence of the Owner's presence, so it neither moves ``last_seen``
+        nor extends the idle expiry. Only a successful finish does, in
+        ``accept_assertion``'s transaction. Otherwise a loop of options plus
+        failed finishes would renew an unattended Owner session up to its
+        absolute expiry.
+        """
+        self._limit_step_up(request.identity)
+        body = await self._body(request, json_required=False)
+        if body not in (b"", b"{}"):
+            raise _Denied()
+        authorized = await self._authorize(request, Requirement.OWNER_READ, touch=False)
+        token = session_token(request.headers)
+        try:
+            options = await asyncio.to_thread(self.access.ceremonies.begin_step_up, token, request.identity,
+                                              epoch=authorized.epoch)
+        except Exception:
+            raise _Denied() from None
+        await self._json(request.send, 200, options)
+
+    async def _finish_step_up(self, request: _Request) -> None:
+        """Verify the step-up assertion and refresh the session's verification.
+
+        Same order as ``_begin_step_up``, with the strict JSON assertion as
+        the body. ``PasskeyCeremonies.finish_step_up`` consumes the session's
+        challenge, verifies type, challenge, exact origin, rpId hash, UP, UV,
+        signature, counter and backup flags, refuses any credential other
+        than the one that created this session (another person's passkey at
+        the same workstation included), and commits the new verification
+        time with its boot pair and a ``verify_principal_step_up`` audit
+        record inside ``admit(epoch)``. Success is ``204`` with no body; the
+        Owner operation is then retried by the client and re-checked
+        server-side. The authorization makes every session check (idle and
+        absolute expiry, identity binding, CSRF, Owner role) but commits no
+        idle touch (``touch=False``, PR #236 review); the idle expiry moves
+        only with a successful step-up, inside ``accept_assertion``'s
+        transaction under the same ``admit(epoch)``. Every refusal is the
+        generic denial and changes no verification time, counter, idle
+        expiry or audit record (a spent challenge aside); it is counted
+        value-free (``note_refused_step_up``).
+        """
+        self._limit_step_up(request.identity)
+        try:
+            credential = _json_object(await self._body(request, json_required=True))
+            authorized = await self._authorize(request, Requirement.OWNER_READ, touch=False)
+            token = session_token(request.headers)
+            try:
+                await asyncio.to_thread(self.access.ceremonies.finish_step_up, token, request.identity,
+                                        credential, epoch=authorized.epoch)
+            except Exception:
+                raise _Denied() from None
+        except _Denied:
+            self.access.note_refused_step_up()
+            raise
+        await request.send({"type": "http.response.start", "status": 204, "headers": [
+            (b"cache-control", b"no-store"),
         ]})
         await request.send({"type": "http.response.body", "body": b""})
 

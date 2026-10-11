@@ -112,8 +112,21 @@ class SessionGrant:
         return f"SessionGrant(principal_id={self.principal_id}, session_id={self.session_id})"
 
 
+@dataclass(frozen=True)
+class _Finding:
+    """A credential finding detected by a verified assertion, not yet recorded."""
+
+    kind: CredentialFinding
+    principal_id: UUID
+    credential_id: bytes
+
+
 def _digest(challenge: bytes) -> bytes:
     return hashlib.sha256(challenge).digest()
+
+
+# ``epoch`` default of the step-up steps: take the gate epoch at the start.
+_CURRENT_EPOCH = object()
 
 
 class PasskeyCeremonies:
@@ -166,6 +179,17 @@ class PasskeyCeremonies:
 
     def _timeout_ms(self) -> int:
         return int(self.challenge_lifetime.total_seconds() * 1000)
+
+    def _record_finding(self, finding: _Finding) -> None:
+        """Commit a credential finding: the credential mark (with its session
+        invalidation) or the counter-regression record, each with its audit
+        record. The caller decides under which gate this runs; the Owner
+        notification (``_report``) is sent only after it committed."""
+        if finding.kind is CredentialFinding.BACKUP_ELIGIBILITY_CHANGED:
+            self.store.mark_credential_inconsistent(finding.credential_id, finding.principal_id,
+                                                    at=self._now())
+        else:
+            self.store.record_sign_count_regression(finding.principal_id)
 
     def _report(self, kind: CredentialFinding, principal_id: UUID) -> None:
         if self.findings is None:
@@ -277,7 +301,15 @@ class PasskeyCeremonies:
                 "allowCredentials": []}
 
     def _verified_assertion(self, credential: Mapping, claims: webauthn.AssertionClaims,
-                            *, require_user_handle: bool) -> tuple[Principal, Credential, webauthn.VerifiedAssertion]:
+                            *, require_user_handle: bool
+                            ) -> tuple[Principal, Credential, webauthn.VerifiedAssertion, _Finding | None]:
+        """Verify the signature against the stored credential; write nothing.
+
+        A changed backup eligibility or a counter that does not advance is
+        returned as a finding instead of being recorded here (PR #236
+        review), so each caller commits it under the gate it needs; with a
+        finding the assertion must be refused.
+        """
         subject = self.store.assertion_subject(claims.credential_id)
         if subject is None:
             raise CeremonyDenied()
@@ -291,16 +323,12 @@ class PasskeyCeremonies:
             raise CeremonyDenied()
         verified = webauthn.verify_assertion(credential, self.rp, claims.challenge,
                                              stored.public_key, stored.algorithm)
-        at = self._now()
+        finding = None
         if verified.backup_eligible != stored.backup_eligible:
-            self.store.mark_credential_inconsistent(stored.credential_id, principal.id, at=at)
-            self._report(CredentialFinding.BACKUP_ELIGIBILITY_CHANGED, principal.id)
-            raise CeremonyDenied()
-        if not webauthn.sign_count_advances(stored.sign_count, verified.sign_count):
-            self.store.record_sign_count_regression(principal.id)
-            self._report(CredentialFinding.SIGN_COUNT_REGRESSION, principal.id)
-            raise CeremonyDenied()
-        return principal, stored, verified
+            finding = _Finding(CredentialFinding.BACKUP_ELIGIBILITY_CHANGED, principal.id, stored.credential_id)
+        elif not webauthn.sign_count_advances(stored.sign_count, verified.sign_count):
+            finding = _Finding(CredentialFinding.SIGN_COUNT_REGRESSION, principal.id, stored.credential_id)
+        return principal, stored, verified, finding
 
     def finish_authentication(self, proxy_identity: str, credential: Mapping) -> SessionGrant:
         """Verify an assertion and establish a credential-bound session.
@@ -319,7 +347,15 @@ class PasskeyCeremonies:
                 raise CeremonyDenied()
             claims = webauthn.assertion_claims(credential, self.rp)
             self.store.consume_challenge(_digest(claims.challenge), "authentication")
-            principal, stored, verified = self._verified_assertion(credential, claims, require_user_handle=True)
+            principal, stored, verified, finding = self._verified_assertion(
+                credential, claims, require_user_handle=True)
+            if finding is not None:
+                # Sign-in keeps its behaviour: the challenge is already
+                # consumed and the finding is recorded at once, so a cloned
+                # or re-provisioned credential is never lost to a close.
+                self._record_finding(finding)
+                self._report(finding.kind, finding.principal_id)
+                raise CeremonyDenied()
             token = self._random(SESSION_TOKEN_BYTES)
             if not isinstance(token, bytes) or len(token) != SESSION_TOKEN_BYTES:
                 raise CeremonyDenied()
@@ -370,13 +406,39 @@ class PasskeyCeremonies:
             raise ValueError("a session gate is required")
         self.session_gate = gate
 
-    def begin_step_up(self, token: bytes, proxy_identity: str) -> dict:
-        """Issue a challenge bound to this Owner session and its own credential only."""
+    def _step_up_epoch(self, epoch: object) -> int:
+        """The gate epoch a step-up step commits under; generic denial when closed.
+
+        ``epoch`` is the one the HTTP route already authorized the request
+        under (``HumanSurface._authorize``), so the authorization and the
+        ceremony's commit sit inside the same ``admit(epoch)`` window: a close,
+        reopen or ``stop()`` in between refuses the step. Without it the
+        epoch is taken now. Either way the gate's current epoch must equal it
+        before anything is consumed or verified.
+        """
+        current = self.session_gate.epoch()
+        if epoch is _CURRENT_EPOCH:
+            epoch = current
+        if (epoch is None or isinstance(epoch, bool) or not isinstance(epoch, int)
+                or current != epoch):
+            # Closed, or closed/reopened or stopped since the request's
+            # authorization: refuse before consuming or verifying anything.
+            # The final ``admit(epoch)`` check still runs at the commit.
+            raise CeremonyDenied()
+        return epoch
+
+    def begin_step_up(self, token: bytes, proxy_identity: str, *, epoch: object = _CURRENT_EPOCH) -> dict:
+        """Issue a challenge bound to this Owner session and its own credential only.
+
+        The options carry only what the ceremony needs: the challenge, the
+        relying-party id, the timeout, ``userVerification: "required"`` and
+        the session's own credential as the single allowed credential. A
+        non-Owner, stale-cookie or otherwise invalid session gets the generic
+        denial and stores nothing; a new challenge replaces the session's
+        previous pending one.
+        """
         try:
-            epoch = self.session_gate.epoch()
-            if epoch is None:
-                # Closed: refuse before consuming or verifying anything.
-                raise CeremonyDenied()
+            epoch = self._step_up_epoch(epoch)
             challenge = self._challenge()
             with self.session_gate.admit(epoch):
                 credential_id = self.store.begin_step_up(token, proxy_identity, _digest(challenge),
@@ -387,35 +449,116 @@ class PasskeyCeremonies:
                 "timeout": self._timeout_ms(), "userVerification": "required",
                 "allowCredentials": [{"type": "public-key", "id": webauthn.b64url_encode(credential_id)}]}
 
-    def finish_step_up(self, token: bytes, proxy_identity: str, credential: Mapping) -> None:
+    def finish_step_up(self, token: bytes, proxy_identity: str, credential: Mapping, *,
+                       epoch: object = _CURRENT_EPOCH) -> None:
         """Refresh the session's verification time, or change nothing and deny.
 
         The assertion must come from the credential that created this session.
         A valid assertion by any other credential — including someone else's
         passkey at the same workstation — is refused and leaves the session's
-        verification time untouched.
+        verification time untouched. The new verification time and its boot
+        pair are read inside the commit transaction (``accept_assertion``),
+        so the five-minute window starts when the refresh commits.
+
+        The pending challenge is only read (``pending_step_up_challenge``)
+        before verification. It is deleted in the very transaction that
+        refreshes the session, inside ``admit(epoch)`` (PR #236 review): a
+        ``stop()``, failed check tick or close/reopen after
+        ``_step_up_epoch`` refuses that admission and rolls nothing forward,
+        so a step-up refused by the session gate is a no-op and leaves the
+        challenge pending. An assertion whose envelope or client data does not
+        parse (``assertion_claims``) consumes nothing, as before. Any other
+        refusal (bad signature, user verification missing, another credential
+        or session, an expired or unknown challenge, a refused commit) spends
+        the challenge: it is consumed in its own transaction, again inside
+        ``admit(epoch)``, so it is single use exactly as before; only if the
+        gate refuses that consumption too does it stay pending until expiry.
+
+        A verified assertion with a credential finding (changed backup
+        eligibility, or a counter that does not advance) is refused too. Its
+        writes commit inside ``admit(epoch)`` in one SQLite transaction
+        (``record_step_up_finding``) that first deletes this session's
+        pending step-up challenge and then writes the finding — the
+        credential mark with its session invalidation, or the regression
+        record, and their audit records — only if that DELETE removed the
+        unexpired row. If it removed nothing (a concurrent finish of the same
+        assertion spent the challenge first and may have advanced the
+        counter), nothing is recorded and nobody is notified; the step-up is
+        refused. The Owner notification is sent only after a commit that
+        recorded the finding. A gate refusal there records nothing, notifies
+        nothing and leaves the challenge pending, like any other gate refusal.
+        A failed transaction (for example a refused storage admission) rolls
+        back the DELETE with the finding; the challenge is then spent on its
+        own under a new ``admit(epoch)``, so it stays single use, and the
+        unchanged stored credential lets the next assertion detect the
+        finding again (PR #236 review).
         """
+        # First: a close after this point refuses the commit (Issue #144).
         try:
-            # First: a close after this point refuses the commit (Issue #144).
-            epoch = self.session_gate.epoch()
-            if epoch is None:
-                # Closed: refuse before consuming or verifying anything.
-                raise CeremonyDenied()
+            epoch = self._step_up_epoch(epoch)
+        except Exception:
+            raise CeremonyDenied() from None
+        digest = None
+        gate_refused = False
+        spent = False
+        try:
             at = self._now()
             claims = webauthn.assertion_claims(credential, self.rp)
-            consumed = self.store.consume_challenge(_digest(claims.challenge), "step_up")
+            digest = _digest(claims.challenge)
+            bound_session = self.store.pending_step_up_challenge(digest)
             session = self.store.current_session(token, proxy_identity, at=at)
-            if (session is None or consumed.session_id != session.session_id
+            if (session is None or bound_session is None or bound_session != session.session_id
                     or claims.credential_id != session.credential_id):
                 raise CeremonyDenied()
-            principal, stored, verified = self._verified_assertion(credential, claims, require_user_handle=False)
+            principal, stored, verified, finding = self._verified_assertion(
+                credential, claims, require_user_handle=False)
             if principal.id != session.principal_id:
                 raise CeremonyDenied()
+            if finding is not None:
+                # Signature verification ran outside the lock. Inside
+                # ``admit(epoch)`` one SQLite transaction deletes this
+                # session's pending challenge first and records the finding
+                # only if that DELETE removed it (PR #236 review): a
+                # concurrent finish of the same assertion that already spent
+                # the challenge — and may have advanced the counter this
+                # attempt compared against — records and notifies nothing. A
+                # gate refusal records nothing and leaves the challenge
+                # pending; the notification follows the commit. A failed
+                # transaction rolls back both; the challenge is then spent on
+                # its own below (``spent`` stays False).
+                gate_refused = True
+                with self.session_gate.admit(epoch):
+                    gate_refused = False
+                    recorded = self.store.record_step_up_finding(
+                        digest, session.session_id,
+                        backup_eligibility_changed=finding.kind is CredentialFinding.BACKUP_ELIGIBILITY_CHANGED,
+                        credential_id=finding.credential_id, principal_id=finding.principal_id)
+                    spent = True
+                if recorded:
+                    self._report(finding.kind, finding.principal_id)
+                raise CeremonyDenied()
+            gate_refused = True
             with self.session_gate.admit(epoch):
+                gate_refused = False
                 self.store.accept_assertion(
                     stored.credential_id, principal.id, proxy_identity,
                     expected_sign_count=stored.sign_count, sign_count=verified.sign_count,
                     backup_state=verified.backup_state,
-                    step_up_session_id=session.session_id)
+                    step_up_session_id=session.session_id, step_up_challenge=digest)
         except Exception:
+            if digest is not None and not gate_refused and not spent:
+                self._spend_step_up_challenge(digest, epoch)
             raise CeremonyDenied() from None
+
+    def _spend_step_up_challenge(self, digest: bytes, epoch: int) -> None:
+        """Consume a refused step-up's challenge under ``admit(epoch)``; best effort.
+
+        Lock order gate -> storage admission -> SQLite, as at every commit. A
+        gate refusal here consumes nothing; the challenge then expires
+        unused (a close that revokes sessions deletes it at once).
+        """
+        try:
+            with self.session_gate.admit(epoch):
+                self.store.consume_challenge(digest, "step_up")
+        except Exception:
+            pass

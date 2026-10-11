@@ -45,7 +45,8 @@ including system health, version, schema and framework documentation. Issue
 #10 phase 1 adds a human route foundation that only an explicitly enabled,
 fully validated composition can open (passkey sign-in and the caller's own
 session description), and phase 2 S1 adds gated authorization, a per-session
-CSRF token and sign-out to it (see `server/app/auth/README.md`); the
+CSRF token and sign-out to it, S2 invitation redemption and S3 the Owner
+step-up routes (see `server/app/auth/README.md`); the
 production entry points do not build one yet. Its
 documented launcher accepts only loopback bind settings, disables proxy-header
 parsing and access logs, and removes the server product header. The authorization
@@ -308,8 +309,9 @@ and dashboard assets stay closed — the backend shell denies them, including
 application assets, health/version/schema and SPA/error fallbacks — until
 Issue #10 implements and tests both records; the remaining work is listed in
 `server/app/auth/README.md`. Phase 1 mounts only the authentication ceremony
-and a session self-description behind an explicit composition, and phase 2 S1
-adds only sign-out; neither makes any of the conditions below optional.
+and a session self-description behind an explicit composition, phase 2 S1
+adds only sign-out, S2 invitation redemption and S3 the Owner step-up; none
+makes any of the conditions below optional.
 Every session route commits its authorization inside the reservation gate
 (`admit(epoch)`), every Owner mutation does too (Owner decision D6), and a
 request already in flight when the composition stops or a periodic check
@@ -493,6 +495,8 @@ Accepted disclosure: the authentication options step (`POST /api/auth/authentica
 Owner-only operations additionally require a user verification newer than a bounded freshness window, so a stale or unattended owner session cannot revoke users, change retention/security settings or delete recordings; a failed or cancelled step-up performs nothing and reveals nothing.
 
 The step-up is bound to the session's own credential: the challenge allows only `principal_session.credential_id`, and an assertion from any other registered credential is refused without touching the session's verification time. A route that accepts any valid passkey here lets whoever is standing at a shared workstation refresh someone else's stale owner session with their own credential, which is the attack this binding exists to stop.
+
+Issue #10 phase 2 S3 implements this as `POST /api/auth/step-up/options` and `POST /api/auth/step-up`: both need an Owner session (`OWNER_READ`, so a stale Owner can refresh and a non-Owner gets the generic denial before anything is written), the exact `Origin` and the session's `X-CSRF-Token` (Owner decision 2026-10-12: they stay Owner-only), are charged before any body parse, gate or SQLite work to their own per-source rate limiter (Owner decision 2026-10-12: burst 5, one per 12 seconds, no global bucket, a `SourceRateLimiter` object `HumanAccess` refuses to share with sign-in or redemption, so a sign-in flood cannot stop the Owner's step-up and a step-up flood never spends the sign-in bucket), and commit under the same gate epoch as their authorization. The window is five minutes from the verification time read inside the commit transaction, measured on both the wall clock and the kernel's monotonic `CLOCK_BOOTTIME` of the same boot (migration 23): a wall clock stepped back after a verification makes the session stale rather than extending the window, and a reboot, a session without a recorded boot pair (established before migration 23) or an unreadable boot clock is stale (fail closed, Owner decision 2026-10-12). Any lag of the wall clock behind the monotonic clock beyond a one-second read allowance is stale too; slews should move both clocks together, and if a chrony slew back (default `maxslewrate` 83333 ppm) ever separated them, a just-verified session would need another step-up (availability only). Only a stale but otherwise valid Owner session on an Owner operation gets `403 {"detail":"step_up_required"}` (Owner decision D3); refused step-ups are counted and logged value-free (`owner_step_up_refused`). Step-up shows that whoever holds the session's credential passed its user verification just now; it cannot tell a deliberately lent credential from its holder, and a stale Owner session left open on an unattended machine keeps serving everything that is not an Owner operation until it expires or is signed out. No Owner operation route is mounted yet (S4).
 
 ## Capture-node pairing
 

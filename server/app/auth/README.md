@@ -127,10 +127,11 @@ verifier's `http://localhost` support is not reachable from any human route.
 
 Not implemented yet, and required before routes open in production:
 
-- the remaining HTTP routes: Owner step-up, and every live, recording,
-  timeline, event and administration route (later Issue #10 phases, #19).
-  Sign-out and the CSRF token exist since phase 2 S1, invitation redemption
-  and the local bootstrap/recovery command since S2 (below);
+- the remaining HTTP routes: every live, recording, timeline, event and
+  administration route, including every `OWNER_OP` route (later Issue #10
+  phases, #19). Sign-out and the CSRF token exist since phase 2 S1,
+  invitation redemption and the local bootstrap/recovery command since S2,
+  and the Owner step-up routes since S3 (below);
 - the Owner's invitation route (S4): until then the only runtime issuer of
   an enrollment code is the local command, which covers the Owner only;
 - the deployment-file key and production composition that build the
@@ -329,7 +330,10 @@ rate limiting are described in "Human route foundation" below (Issue #181,
 local entries outside the gate and must not be reached from a human route.
 Every human authorization commits its idle-expiry touch (`last_seen`) inside
 `admit(epoch)`: `authorize_request` on the routes and `authorize_owner(admit=...)`
-for an Owner operation (Issue #10 phase 2 S1, #228). Only the expiry sweep, and
+for an Owner operation (Issue #10 phase 2 S1, #228). The two step-up routes
+are the exception: they authorize with `authorize_request(touch=False)`, the
+same checks without the touch, and only a successful step-up touches the
+session, inside `accept_assertion` (Owner step-up, below). Only the expiry sweep, and
 the bare `authorize()` that fixtures call without `admit`, write outside the
 gate. Neither ever makes a session valid: revocation advances the authorization
 generation and invalidates every row in one transaction, so a write committed
@@ -547,10 +551,13 @@ OpenAPI or error handler is reachable):
 | `POST /api/auth/authentication` | the assertion itself (rate-limited) | `204`, `Set-Cookie: __Host-session=…; Path=/; Secure; HttpOnly; SameSite=Strict` |
 | `GET /api/session` | session (`SESSION`) | `{"csrf": …, "role": …, "permissions": […]}` of the caller only |
 | `POST /api/auth/sign-out` | session (`SESSION`) + exact `Origin` + `X-CSRF-Token` | `204`, `Set-Cookie: __Host-session=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict` |
+| `POST /api/auth/step-up/options` | Owner session (`OWNER_READ`) + exact `Origin` + `X-CSRF-Token` (step-up rate limit) | `PasskeyCeremonies.begin_step_up()` request options (S3, below) |
+| `POST /api/auth/step-up` | the same, and the assertion of the session's own credential (step-up rate limit) | `204`, no body, no cookie (S3, below) |
 
 The session route grants nothing and returns only the caller's own role,
 permissions (the Owner holds both) and CSRF token. With sign-out it is the
-only route a session reaches in this phase, so a `live:view`-only or
+only route a non-Owner session reaches in this phase (the step-up routes
+are Owner-only), so a `live:view`-only or
 `recordings:view`-only person reaches nothing they lack. Bodies are bounded (1 KiB options, 64 KiB assertion or registration), JSON
 with duplicate members is refused, and a ceremony refusal never sets a cookie.
 
@@ -710,8 +717,9 @@ The single exception is an otherwise valid Owner session on an `OWNER_OP`
 route whose user verification is stale: it gets the fixed `403
 {"detail":"step_up_required"}`. That outcome is decided under the gate with
 the epoch unchanged, never for a non-owner, a wrong CSRF token, another proxy
-identity or a closed gate. S1 mounts no `OWNER_OP` route; the mapping is
-exercised through a synthetic route in the tests.
+identity or a closed gate. No `OWNER_OP` route is mounted yet (S4 adds the
+Owner's permission management); the mapping, and its resolution through the
+S3 step-up routes, is exercised through a synthetic route in the tests.
 
 CSRF (Owner decision D2). `SessionBindingKey` derives a CSRF subkey from the
 deployment's session-binding key under its own domain label, and a session's
@@ -900,6 +908,160 @@ commits `authorize_owner` inside `admit(epoch)` (#228 item 5), so the Owner
 decision, its idle touch and `StepUpRequired` are all made while access stayed
 open. `live_access.authorize_live_access` requires `admit` and binds the live
 grant to the session id read in the same gated transaction.
+
+### Owner step-up (Issue #10 phase 2, S3)
+
+Owner decisions (2026-10-12, PR #236). (1) The step-up routes stay
+`OWNER_READ`: only an Owner session, fresh or stale, reaches them; every
+other caller gets the generic `404`. (2) Step-up has its own rate-limit
+bucket, separate from sign-in and redemption (below). (3) A session whose
+last verification was on another boot, or that has no recorded boot pair
+(established before migration 23), is stale and must step up (fail closed).
+
+Routes. `POST /api/auth/step-up/options` (empty body or `{}`) and `POST
+/api/auth/step-up` (the JSON assertion, at most 64 KiB) are mounted with the
+`OWNER_READ` requirement, exact `Origin` and `X-CSRF-Token`. `OWNER_READ`,
+not `OWNER_OP`, so that a stale Owner can reach them (refreshing is their
+point); not `SESSION`, so that a non-Owner is refused inside the
+authorization transaction: a non-Owner, an
+uninvited caller and anyone without a valid session get the generic `404`
+and learn nothing about step-up. Each request is charged to the step-up
+limiter (`rate_limit.step_up_rate_limiter`, `HumanAccess.step_up_limiter`:
+per verified proxy identity a burst of 5 and one more every 12 seconds, no
+global bucket, the same shape as redemption) before its body is parsed and
+before any gate or SQLite work (SPECIFICATION: repeated failed step-ups are
+rate-limited); a refusal there is counted by the limiter
+(`human_request_rate_limited`), not by `refused_step_ups`. It is a separate
+object with separate buckets, and `HumanAccess` refuses to be built when one
+`SourceRateLimiter` object would serve two of sign-in, redemption and
+step-up, so a sign-in flood cannot stop the Owner's step-up and a step-up
+flood never spends the sign-in buckets. The request is then authorized by `_authorize` inside `admit(epoch)`, and the
+ceremony step (`PasskeyCeremonies.begin_step_up` / `finish_step_up`) receives
+that same epoch: before it consumes or verifies anything the gate's current
+epoch must still equal it, and its commit runs inside a second
+`admit(epoch)`, so a close, a close/reopen cycle, `stop()` or a failed tick
+between the authorization and the commit refuses the step and writes
+nothing.
+
+Options. The response is only the WebAuthn request options:
+`challenge`, `rpId`, `timeout`, `userVerification: "required"` and
+`allowCredentials` holding exactly the session's own credential. The
+challenge is bound to the session (`access_webauthn_challenges.session_id`),
+expires with the challenge lifetime, and a new options request replaces the
+session's pending one, so a session holds at most one and cannot fill the
+bounded challenge table that sign-in shares.
+
+Finish. The assertion is verified like a sign-in (type, challenge, exact
+origin, rpId hash, UP, UV, signature, counter, BE/BS), and it must come from
+the credential that created the session: an assertion from any other
+credential — another person's passkey at the same workstation, or the Owner's
+own second passkey — is refused and changes nothing. The commit
+(`accept_assertion(step_up_session_id=...)`) re-checks that the session is
+the Owner's, current and bound to this proxy identity, and records the new
+verification time with the kernel boot id and `CLOCK_BOOTTIME` read in the
+same transaction, with a `verify_principal_step_up` audit record (actor
+`owner`, the principal's logical UUID only). Success is `204` with no body
+and no cookie; the client then retries the Owner operation, which is
+re-checked server-side. A cancelled, failed or refused step-up changes no
+verification time, counter, backup state, idle expiry or audit record; the
+only write is a consumed challenge. The one exception is a credential finding
+(below).
+
+Idle expiry (PR #236 review). Both step-up routes authorize with
+`authorize_request(touch=False)`: every session check runs (idle and absolute
+expiry at the in-gate request time, proxy-identity binding, CSRF, Owner role),
+but `last_seen` and `idle_expires_at` are not written. Only a successful
+step-up moves them, in `accept_assertion`'s transaction under the same
+`admit(epoch)` (lock order gate -> storage admission -> SQLite). The options
+route is read-only too: requesting a challenge proves nobody's presence, and
+an options-plus-failed-finish loop would otherwise renew an unattended Owner
+session until its 12-hour absolute expiry (AGENTS.md: idle and absolute
+limits; a failed step-up changes nothing).
+
+Challenge consumption (PR #236 review). Before verification the pending
+challenge is only read (`AccessStore.pending_step_up_challenge`). A successful
+step-up deletes it in the commit transaction itself
+(`accept_assertion(step_up_challenge=...)`, inside `admit(epoch)`, lock order
+gate -> storage admission -> SQLite), so a refused commit rolls the deletion
+back. A step-up refused by the session gate — `stop()`, a failed check tick or
+a close/reopen after the epoch check — is therefore a no-op: the challenge
+stays pending until it is answered or expires (a close that revokes sessions
+deletes it). An assertion whose envelope or client data (type, origin) does
+not parse is refused before its challenge is known and consumes nothing, as
+before. Every other refusal (bad signature, missing UP/UV, rpId hash, counter
+or BE/BS, another credential or session, an unknown or expired challenge, a
+commit refused inside its transaction) spends the challenge through `consume_challenge` in its own transaction, again inside
+`admit(epoch)`, so it stays single use; only when the gate refuses that
+consumption too is it left to expire. A verified assertion with a credential
+finding (backup eligibility changed: the credential is marked inconsistent and
+its sessions end; or a counter that does not advance: a regression record)
+is refused too, but `_verified_assertion` only returns the finding, signature
+verification staying outside the lock. Inside `admit(epoch)` (gate -> storage
+admission -> SQLite) a single SQLite transaction,
+`AccessStore.record_step_up_finding`, first deletes this session's pending
+step-up challenge (`challenge_digest`, ceremony `step_up` and `session_id` all
+match) and writes the finding and its audit record only if that DELETE
+removed the row and it was still inside its issue-to-expiry window. If it
+removed nothing — a concurrent finish of the same assertion spent the
+challenge first, and its `accept_assertion` may have advanced the counter this
+attempt compared against (5 -> 7 read as 7 -> 7), or a racing finish of the
+same regressing answer recorded the finding first (one challenge yields at
+most one finding and one notification), or a new options request replaced
+the challenge after the pending read — or the removed row had
+expired, nothing else is written: no mark, no regression record, no audit
+record and no Owner notification, and the finish is refused. The Owner
+notification is sent only after a commit that recorded the finding. A gate
+refusal there records, invalidates and notifies nothing and leaves the
+challenge pending. If the transaction itself fails (for example a refused
+storage admission or a SQLite error), the DELETE rolls back with the finding;
+the refusal then spends the challenge through `consume_challenge` under a new
+`admit(epoch)` (the gate lock is not reentrant, so this runs after the first
+admission is released), so the challenge stays single use while the unchanged
+stored credential lets the next assertion detect the finding again; if the
+gate refuses that consumption too, it expires unused. Sign-in
+(`finish_authentication`) keeps recording a finding at once: its challenge is
+already consumed before verification. Each refused finish increments the value-free
+`HumanAccess.refused_step_ups`, and `owner_step_up_refused` is logged on the
+first refusal and each power of two, with no token, CSRF token, challenge,
+credential, identity or reason.
+
+Freshness (ADR-0003: five minutes; `boot_clock.step_up_fresh`, migration 23).
+An `OWNER_OP` request is fresh only when the session's last user verification
+(sign-in or step-up) has a recorded boot pair from the same boot and both
+`0 <= now - verified < 5 minutes` on the wall clock and on `CLOCK_BOOTTIME`,
+the wall clock not lagging the monotonic one by more than one second. So it
+is stale at exactly five minutes after the in-transaction verification time;
+a wall clock stepped back after the verification makes it stale (fail closed)
+instead of stretching the window, and one stepped behind the session's last
+activity refuses every request of that session until the clock passes it
+again; a wall clock stepped forward ends the window early; a reboot, a
+session without a pair (established before migration 23, or while the boot
+clock was unreadable) and an unreadable boot clock are stale. A step-up while
+the boot clock cannot be read is refused, since it could never make the
+session fresh. A stale Owner gets `403 {"detail":"step_up_required"}` on an
+`OWNER_OP` route (D3); everyone else the generic `404`.
+
+Limits. Step-up proves that the person holding the session's credential and
+passing its user verification is present now; it cannot tell who that is
+when a credential is deliberately lent, and it does not end the session: a
+stale Owner session left open still serves `OWNER_READ` and every non-Owner
+operation until its idle or absolute lifetime ends or it is signed out.
+Under the shared login the step-up limiter's per-source bucket is the room's:
+it is charged before authorization, so anyone behind the shared login can
+spend it and delay the Owner's step-up (availability only, never access),
+but it no longer shares a bucket with sign-in or redemption.
+
+Clock slewing. The one-second allowance in `step_up_fresh` covers the
+instant between the two reads of a pair, not a slew rate: chrony's default
+`maxslewrate` is 83333 ppm (up to 25 s over five minutes), not ntpd's
+500 ppm. `clock_gettime(2)` documents `CLOCK_MONOTONIC`, and so
+`CLOCK_BOOTTIME`, as following adjtime/NTP adjustments, so a slew should move
+both clocks together and only a step (chrony `makestep`, a manual set, a
+kernel leap second) separate them. Should a chrony slew back nevertheless
+separate them by more than a second, a just-verified session turns stale:
+the Owner operation answers `403 step_up_required` and the Owner steps up
+again (fail closed, availability only; it never lengthens the window).
+MANUAL_TEST records the observation on the real host.
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 

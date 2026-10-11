@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 from app.audit.model import ActorCategory, AuditAction, AuditOutcome, TargetKind
 from app.audit.store import AuditStorageError, AuditStore
 from app.storage.database import Database
-from .boot_clock import BootInstant, invitation_clock_valid, read_boot_instant
+from .boot_clock import BootInstant, invitation_clock_valid, read_boot_instant, step_up_fresh
 from .invitation_code import INVITATION_LIFETIME, MAX_INVITATION_LIFETIME, valid_invitation_lifetime
 from .model import AccessValidationError, Credential, Permission, Principal, PrincipalRole, PrincipalStatus, utc_time
 from .session_binding import SessionBindingKey, canonical_identity
@@ -675,6 +675,7 @@ class AccessStore:
 
     def establish_session_on(self, connection, principal_id: UUID, credential_id: bytes, token: bytes, *,
                              proxy_identity: str, at: datetime, verified_at: datetime | None = None,
+                             verified_boot: BootInstant | None = None,
                              idle_lifetime: timedelta = IDLE_LIFETIME,
                              absolute_lifetime: timedelta = ABSOLUTE_LIFETIME) -> UUID:
         """Create an opaque session bound to one principal and one credential.
@@ -682,6 +683,9 @@ class AccessStore:
         Lifetimes default to the ADR-0003 accepted values (30 minutes idle,
         12 hours absolute). Only the token digest is stored, and of the
         proxy identity only its keyed binding (never the raw value).
+        ``verified_boot`` is the boot pair read with ``verified_at`` (Owner
+        step-up freshness, ``app.auth.boot_clock.step_up_fresh``); without it
+        the session is never fresh for an Owner operation.
         """
         if not isinstance(principal_id, UUID) or not isinstance(credential_id, bytes):
             raise AccessValidationError("session subject is invalid")
@@ -693,16 +697,20 @@ class AccessStore:
         verified = None if verified_at is None else _us(utc_time(verified_at))
         if verified is not None and verified != _us(at):
             raise AccessValidationError("session verification time is invalid")
+        if verified_boot is not None and (verified is None or not isinstance(verified_boot, BootInstant)):
+            raise AccessValidationError("session verification time is invalid")
+        boot_id = None if verified_boot is None else verified_boot.boot_id
+        boottime = None if verified_boot is None else verified_boot.boottime_us
         row = connection.execute("SELECT p.status, p.authorization_revision, c.revoked_at_us, c.inconsistent_at_us FROM access_principals p JOIN access_credentials c ON c.principal_id=p.id WHERE p.id=? AND c.credential_id=?", (str(principal_id), credential_id)).fetchone()
         if (row is None or row["status"] != PrincipalStatus.ACTIVE.value or row["revoked_at_us"] is not None
                 or row["inconsistent_at_us"] is not None):
             raise AccessValidationError("session subject is unavailable")
         generation = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
         self._end_expired_sessions_on(connection, at)
-        connection.execute("INSERT INTO access_sessions (id, token_digest, principal_id, credential_id, principal_revision, deployment_generation, established_at_us, last_seen_at_us, idle_lifetime_us, idle_expires_at_us, absolute_expires_at_us, invalidated_at_us, last_user_verification_at_us, external_identity_binding) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+        connection.execute("INSERT INTO access_sessions (id, token_digest, principal_id, credential_id, principal_revision, deployment_generation, established_at_us, last_seen_at_us, idle_lifetime_us, idle_expires_at_us, absolute_expires_at_us, invalidated_at_us, last_user_verification_at_us, external_identity_binding, last_user_verification_boot_id, last_user_verification_boottime_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
                            (str(session_id), token_digest, str(principal_id), credential_id, row["authorization_revision"], generation,
                             _us(at), _us(at), _duration_us(idle_lifetime), _us(at + idle_lifetime), _us(at + absolute_lifetime), verified,
-                            binding))
+                            binding, boot_id, boottime))
         return session_id
 
     @staticmethod
@@ -837,6 +845,25 @@ class AccessStore:
             self._record_binding_mismatch(mismatch, at)
             raise
 
+    def _verification_stale(self, row, at: datetime, freshness: timedelta) -> bool:
+        """Whether a session's last user verification is too old for an Owner operation.
+
+        Stale unless the verification lies between the session's
+        establishment and now and is fresher than ``freshness`` on both the
+        wall clock and ``CLOCK_BOOTTIME`` of the same boot, with no detected
+        wall-clock step back (``app.auth.boot_clock.step_up_fresh``). The
+        boot pair is read here, inside the caller's transaction, right after
+        ``at``. A session without a recorded pair (established before
+        migration 23, or while the boot clock was unreadable) is stale.
+        """
+        verified = row["last_user_verification_at_us"]
+        if verified is None or not row["established_at_us"] <= verified:
+            return True
+        return not step_up_fresh(
+            verified_us=verified, verified_boot_id=row["last_user_verification_boot_id"],
+            verified_boottime_us=row["last_user_verification_boottime_us"],
+            now_us=_us(at), now=self._boot_instant(), freshness_us=_duration_us(freshness))
+
     @staticmethod
     def _granted_on(connection, row) -> frozenset:
         """The principal's current permissions; the Owner holds every one."""
@@ -882,6 +909,7 @@ class AccessStore:
                           admit: Callable[[], ContextManager],
                           freshness: timedelta = OWNER_STEP_UP_FRESHNESS,
                           csrf: object = None,
+                          touch: bool = True,
                           now: datetime | None = None) -> SessionView:
         """Authorize one human request against ``requirement`` inside the gate.
 
@@ -900,12 +928,25 @@ class AccessStore:
         transaction before the idle touch, so a refused mutation does not
         extend the session.
 
+        ``touch=False`` runs the very same checks (idle and absolute expiry
+        included, at the in-gate request time) but commits no idle touch: the
+        session's ``last_seen`` and idle expiry stay as they are. The Owner
+        step-up routes use it (PR #236 review): only a successful step-up
+        moves the idle expiry, inside ``accept_assertion``'s transaction under
+        the same ``admit(epoch)``, so repeated failed or abandoned step-ups
+        cannot keep an unattended Owner session alive (AGENTS.md: sessions
+        end at both an idle and an absolute limit; a failed step-up changes
+        nothing).
+
         Returns a ``SessionView`` with the role, the authorization revision
         and the permissions read in the same transaction. Every refusal is
         the same generic ``AccessValidationError``, except that an otherwise
-        valid Owner session whose last user verification is older than
-        ``freshness`` (or not between its establishment and now) gets
-        ``StepUpRequired`` for ``OWNER_OP`` only (Owner decision D3). That
+        valid Owner session whose last user verification is not fresh gets
+        ``StepUpRequired`` for ``OWNER_OP`` only (Owner decision D3). Fresh
+        means newer than ``freshness`` (ADR-0003: five minutes, so stale at
+        exactly five minutes) on both the wall clock and ``CLOCK_BOOTTIME``
+        of the same boot, with no detected wall-clock step back, and not
+        before the session's establishment (``_verification_stale``). That
         outcome is decided under the gate with the epoch unchanged; the
         session's idle touch commits before it is raised.
         """
@@ -915,6 +956,8 @@ class AccessStore:
             raise AccessValidationError("access is unavailable")
         if not isinstance(freshness, timedelta) or freshness <= timedelta(0):
             raise AccessValidationError("freshness window is invalid")
+        if not isinstance(touch, bool):
+            raise AccessValidationError("access is unavailable")
         binding = self._session_binding
 
         def decide(connection, row, at):
@@ -928,11 +971,9 @@ class AccessStore:
                 raise AccessValidationError("access is unavailable")
             if csrf is not None and (binding is None or not binding.csrf_matches(UUID(row["id"]), csrf)):
                 raise AccessValidationError("access is unavailable")
-            verified = row["last_user_verification_at_us"]
-            stale = requirement is Requirement.OWNER_OP and (
-                verified is None or not row["established_at_us"] <= verified <= _us(at)
-                or _us(at) - verified >= _duration_us(freshness))
-            self._touch_session_on(connection, row, at)
+            stale = requirement is Requirement.OWNER_OP and self._verification_stale(row, at, freshness)
+            if touch:
+                self._touch_session_on(connection, row, at)
             view = SessionView(UUID(row["id"]), UUID(row["principal_id"]), bytes(row["credential_id"]),
                                role=PrincipalRole(row["role"]),
                                authorization_revision=row["authorization_revision"],
@@ -1087,9 +1128,12 @@ class AccessStore:
 
         Anything that is not a currently valid Owner session receives the
         generic denial. Only an authenticated Owner session whose last user
-        verification is older than ``freshness`` (ADR-0003: five minutes), or
-        not between the session's establishment and now, receives the distinct
-        ``StepUpRequired``. A stale session never performs the operation.
+        verification is not fresh (``_verification_stale``: older than
+        ``freshness``, ADR-0003 five minutes, on the wall clock or on
+        ``CLOCK_BOOTTIME``, another boot, a detected wall-clock step back, or
+        not between the session's establishment and now) receives the
+        distinct ``StepUpRequired``. A stale session never performs the
+        operation.
 
         ``admit`` is the reservation session gate (Issue #228 item 5): the
         same gated pattern as ``authorize_request`` (gate -> storage
@@ -1104,10 +1148,8 @@ class AccessStore:
         def decide(connection, row, at):
             if row["role"] != PrincipalRole.OWNER.value:
                 raise AccessValidationError("access is unavailable")
+            stale = self._verification_stale(row, at, freshness)
             self._touch_session_on(connection, row, at)
-            verified = row["last_user_verification_at_us"]
-            stale = (verified is None or not row["established_at_us"] <= verified <= _us(at)
-                     or _us(at) - verified >= _duration_us(freshness))
             return self._principal(row), stale
 
         principal, stale = self._authorize_gated(token, proxy_identity, decide, now=now, admit=admit)
@@ -1334,6 +1376,8 @@ class AccessStore:
 
         The returned id is the only entry of the challenge's allowed-credential
         list; ``accept_assertion`` refuses an assertion from any other credential.
+        A pending step-up challenge of the same session is replaced, so each
+        session holds at most one.
         The session is judged current at a time read inside the transaction
         (see ``_in_transaction_time``); ``at`` pins it for tests only.
         """
@@ -1347,6 +1391,11 @@ class AccessStore:
                 row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
                 if row is None or row["role"] != PrincipalRole.OWNER.value:
                     raise AccessValidationError("access is unavailable")
+                # One outstanding step-up challenge per session: a new begin
+                # replaces the previous one, so a session cannot fill the
+                # bounded challenge table that sign-in also uses.
+                connection.execute("DELETE FROM access_webauthn_challenges WHERE ceremony='step_up' AND session_id=?",
+                                   (row["id"],))
                 self._insert_challenge_on(connection, digest, "step_up", at, lifetime, session_id=row["id"])
                 return bytes(row["credential_id"])
         except AccessValidationError:
@@ -1355,6 +1404,27 @@ class AccessStore:
             self._end_expired_sessions_after_denial(at)
             self._record_binding_mismatch(mismatch, at)
             raise
+
+    def pending_step_up_challenge(self, digest: bytes, *, at: datetime | None = None) -> UUID | None:
+        """The session a pending, unexpired step-up challenge is bound to; read only.
+
+        Nothing is deleted: ``accept_assertion`` deletes the challenge in the
+        transaction that refreshes the session (PR #236 review), a credential
+        finding spends it in the transaction that records the finding
+        (``record_step_up_finding``), and any other refused step-up spends it
+        through ``consume_challenge``. The window is checked
+        at a time read inside the transaction; ``at`` pins it for tests only.
+        """
+        pinned = None if at is None else utc_time(at)
+        if not isinstance(digest, bytes) or len(digest) != 32:
+            return None
+        with self._transaction() as connection:
+            now = self._in_transaction_time(pinned)
+            row = connection.execute("SELECT session_id, issued_at_us, expires_at_us FROM access_webauthn_challenges WHERE challenge_digest=? AND ceremony='step_up'",
+                                     (digest,)).fetchone()
+        if row is None or row["session_id"] is None or not row["issued_at_us"] <= _us(now) < row["expires_at_us"]:
+            return None
+        return UUID(row["session_id"])
 
     def current_session(self, token: object, proxy_identity: object, *, at: datetime) -> SessionView | None:
         """Lookup of a currently valid session; records no activity.
@@ -1396,15 +1466,23 @@ class AccessStore:
     def accept_assertion(self, credential_id: bytes, principal_id: UUID, proxy_identity: str, *,
                          expected_sign_count: int, sign_count: int, backup_state: bool,
                          at: datetime | None = None,
-                         token: bytes | None = None, step_up_session_id: UUID | None = None) -> UUID:
+                         token: bytes | None = None, step_up_session_id: UUID | None = None,
+                         step_up_challenge: bytes | None = None) -> UUID:
         """Commit a verified assertion: counter, backup state, last use and its session effect.
 
         With ``token`` a new session is established (sign-in); with
         ``step_up_session_id`` that session's user-verification time is
-        refreshed, but only when the session was created by this very
-        credential. The counter update is conditional on the value the
-        signature was checked against, so two racing assertions cannot both
-        advance it. The audit record commits in the same transaction.
+        refreshed, but only when the session is an Owner's, was created by
+        this very credential, and the boot clock can be read (a step-up that
+        could never make the session fresh is refused rather than reported
+        as done). A step-up also requires ``step_up_challenge``, the digest of
+        that session's pending, unexpired step-up challenge, which is deleted
+        in this same transaction: a refused commit rolls the deletion back,
+        and a challenge is never spent by a refresh that did not happen
+        (PR #236 review). The verification time is recorded with the boot id and
+        ``CLOCK_BOOTTIME`` read in the same transaction. The counter update
+        is conditional on the value the signature was checked against, so
+        two racing assertions cannot both advance it. The audit record commits in the same transaction.
 
         The credential selected the principal; the proxy identity is only
         recorded as the principal's last observed value and, for a new
@@ -1419,11 +1497,18 @@ class AccessStore:
         """
         if (token is None) == (step_up_session_id is None):
             raise AccessValidationError("access is unavailable")
+        if (step_up_challenge is not None) != (step_up_session_id is not None) or (
+                step_up_challenge is not None
+                and (not isinstance(step_up_challenge, bytes) or len(step_up_challenge) != 32)):
+            raise AccessValidationError("access is unavailable")
         pinned = None if at is None else utc_time(at)
         identity = _identity(proxy_identity)
 
         def write(connection, mark):
             at = self._in_transaction_time(pinned)
+            # Read as one pair with ``at``: the verification time of a new
+            # session or a step-up is fresh only on both clocks.
+            instant = self._boot_instant()
             row = connection.execute("SELECT c.sign_count, c.revoked_at_us, c.inconsistent_at_us, c.backup_eligible, p.role, p.status FROM access_credentials c JOIN access_principals p ON p.id=c.principal_id WHERE c.credential_id=? AND c.principal_id=?",
                                      (credential_id, str(principal_id))).fetchone()
             if (row is None or row["status"] != PrincipalStatus.ACTIVE.value or row["revoked_at_us"] is not None
@@ -1437,13 +1522,15 @@ class AccessStore:
             actor = ActorCategory.OWNER if row["role"] == PrincipalRole.OWNER.value else ActorCategory.INVITED_USER
             if token is not None:
                 session_id = self.establish_session_on(connection, principal_id, credential_id, token,
-                                                       proxy_identity=identity, at=at, verified_at=at)
+                                                       proxy_identity=identity, at=at, verified_at=at,
+                                                       verified_boot=instant)
                 action = AuditAction.AUTHENTICATE_PRINCIPAL
             else:
                 session = connection.execute("SELECT s.*, p.authorization_revision FROM access_sessions s JOIN access_principals p ON p.id=s.principal_id WHERE s.id=?",
                                              (str(step_up_session_id),)).fetchone()
                 state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
-                if (session is None or session["principal_id"] != str(principal_id)
+                if (instant is None or row["role"] != PrincipalRole.OWNER.value
+                        or session is None or session["principal_id"] != str(principal_id)
                         or bytes(session["credential_id"]) != credential_id or session["invalidated_at_us"] is not None
                         or session["principal_revision"] != session["authorization_revision"]
                         or session["deployment_generation"] != state
@@ -1452,7 +1539,14 @@ class AccessStore:
                         or self._session_binding is None
                         or not self._session_binding.matches(session["external_identity_binding"], identity)):
                     raise AccessValidationError("access is unavailable")
-                connection.execute("UPDATE access_sessions SET last_user_verification_at_us=? WHERE id=?", (_us(at), session["id"]))
+                # Spent only by this commit: a refusal below rolls it back.
+                challenge = connection.execute("DELETE FROM access_webauthn_challenges WHERE challenge_digest=? AND ceremony='step_up' AND session_id=? RETURNING issued_at_us, expires_at_us",
+                                               (step_up_challenge, session["id"])).fetchone()
+                if challenge is None or not challenge["issued_at_us"] <= _us(at) < challenge["expires_at_us"]:
+                    raise AccessValidationError("access is unavailable")
+                connection.execute("UPDATE access_sessions SET last_user_verification_at_us=?, last_user_verification_boot_id=?, "
+                                   "last_user_verification_boottime_us=? WHERE id=?",
+                                   (_us(at), instant.boot_id, instant.boottime_us, session["id"]))
                 self._touch_session_on(connection, session, at)
                 session_id = step_up_session_id
                 action = AuditAction.VERIFY_PRINCIPAL_STEP_UP
@@ -1473,32 +1567,77 @@ class AccessStore:
         audit record carries only the principal's logical UUID.
         """
         at = utc_time(at)
+        self._audited_write(lambda connection, mark: self._mark_credential_inconsistent_on(
+            connection, mark, credential_id, principal_id, at))
 
-        def write(connection, mark):
-            changed = connection.execute("UPDATE access_credentials SET inconsistency_reason='backup_eligibility_changed', inconsistent_at_us=? WHERE credential_id=? AND principal_id=? AND inconsistent_at_us IS NULL AND revoked_at_us IS NULL",
-                                         (_us(at), credential_id, str(principal_id))).rowcount
-            if changed != 1:
-                return
-            connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
-            mark()
-            self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
-                                 action=AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
-                                 target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
-                                 outcome=AuditOutcome.SUCCEEDED)
-
-        self._audited_write(write)
+    def _mark_credential_inconsistent_on(self, connection, mark, credential_id: bytes, principal_id: UUID,
+                                         at: datetime) -> None:
+        changed = connection.execute("UPDATE access_credentials SET inconsistency_reason='backup_eligibility_changed', inconsistent_at_us=? WHERE credential_id=? AND principal_id=? AND inconsistent_at_us IS NULL AND revoked_at_us IS NULL",
+                                     (_us(at), credential_id, str(principal_id))).rowcount
+        if changed != 1:
+            return
+        connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
+        mark()
+        self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
+                             action=AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
+                             target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
+                             outcome=AuditOutcome.SUCCEEDED)
 
     def record_sign_count_regression(self, principal_id: UUID) -> None:
         """Record a refused assertion whose signature counter regressed."""
+        self._audited_write(lambda connection, mark: self._record_sign_count_regression_on(
+            connection, mark, principal_id))
+
+    def _record_sign_count_regression_on(self, connection, mark, principal_id: UUID) -> None:
+        mark()
+        self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
+                             action=AuditAction.DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION,
+                             target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
+                             outcome=AuditOutcome.FAILED)
+
+    def record_step_up_finding(self, digest: bytes, session_id: UUID, *, backup_eligibility_changed: bool,
+                               credential_id: bytes, principal_id: UUID,
+                               at: datetime | None = None) -> bool:
+        """Spend a step-up challenge and record its credential finding in one transaction.
+
+        The finding of a refused step-up (a changed backup eligibility, or a
+        counter that did not advance) is recorded only by the attempt that
+        actually deletes this session's pending, unexpired step-up challenge
+        (``challenge_digest``, ceremony ``step_up`` and ``session_id`` all
+        match): the DELETE runs first, and the finding's writes — the
+        credential mark with its session invalidation, or the regression
+        record, each with its audit record — follow in the same SQLite
+        transaction (PR #236 review). Returns ``True`` only then.
+
+        When the DELETE removes nothing (a concurrent finish of the same
+        assertion already spent the challenge, and its ``accept_assertion``
+        may have advanced the counter this attempt compared against), or the
+        removed challenge is outside its issue-to-expiry window, nothing else
+        is written and ``False`` is returned: no finding, no audit record, no
+        notification. A failure rolls back the DELETE together with the
+        finding; the caller then spends the challenge on its own, so it stays
+        single use while the unchanged stored credential lets the next
+        assertion detect the finding again. ``at`` pins the commit time for
+        tests only.
+        """
+        pinned = None if at is None else utc_time(at)
+        if (not isinstance(digest, bytes) or len(digest) != 32 or not isinstance(session_id, UUID)
+                or not isinstance(credential_id, bytes) or not isinstance(principal_id, UUID)):
+            raise AccessValidationError("access is unavailable")
 
         def write(connection, mark):
-            mark()
-            self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
-                                 action=AuditAction.DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION,
-                                 target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
-                                 outcome=AuditOutcome.FAILED)
+            now = self._in_transaction_time(pinned)
+            row = connection.execute("DELETE FROM access_webauthn_challenges WHERE challenge_digest=? AND ceremony='step_up' AND session_id=? RETURNING issued_at_us, expires_at_us",
+                                     (digest, str(session_id))).fetchone()
+            if row is None or not row["issued_at_us"] <= _us(now) < row["expires_at_us"]:
+                return False
+            if backup_eligibility_changed:
+                self._mark_credential_inconsistent_on(connection, mark, credential_id, principal_id, now)
+            else:
+                self._record_sign_count_regression_on(connection, mark, principal_id)
+            return True
 
-        self._audited_write(write)
+        return self._audited_write(write)
 
     @staticmethod
     def _permissions(values: Iterable[Permission]) -> tuple[Permission, ...]:

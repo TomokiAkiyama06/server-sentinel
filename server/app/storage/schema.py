@@ -3,7 +3,7 @@
 from app.audit.schema import audit_migration
 from app.auth.schema import (
     access_invitation_clock_migration, access_migration, access_shared_identity_migration,
-    access_webauthn_migration,
+    access_step_up_clock_migration, access_webauthn_migration,
 )
 from app.cameras.remote_agent.schema import (
     PAIRING_MIGRATION, pairing_renewal_certificate_migration, pairing_renewal_migration,
@@ -62,4 +62,7 @@ APPLICATION_MIGRATIONS = (
     # PR #234 review (Issue #10 phase 2 S2): invitation clock continuity
     # (boot id + CLOCK_BOOTTIME) and the non-secret invitation lookup key.
     access_invitation_clock_migration(22),
+    # Issue #10 phase 2 S3: the boot id + CLOCK_BOOTTIME of each session's
+    # user verification, so the Owner step-up window holds on both clocks.
+    access_step_up_clock_migration(23),
 )

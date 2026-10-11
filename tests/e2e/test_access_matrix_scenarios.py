@@ -18,7 +18,10 @@ Two layers are exercised:
   store's conditional single-use redemption with the S2 code format: a code
   of no matrix identity, an expired, revoked or generation-stale code and a
   replayed one are refused alike, and redemption grants nothing by itself),
-  the ``live:view`` validator and the
+  the S3 Owner step-up rows (no matrix identity gets a step-up challenge or
+  ``step_up_required``; only a stale Owner session gets the latter, another
+  person's credential cannot refresh it, and a wall clock stepped back keeps
+  it stale), the ``live:view`` validator and the
   historical timeline gate. The timeline ``access`` port is a test adapter
   that calls ``AccessStore.authorize`` with ``recordings:view``; the
   production route adapter does not exist yet. The reservation gate is a
@@ -38,10 +41,11 @@ import unittest
 from uuid import UUID, uuid4
 
 from app.audit.store import AuditStore
+from app.auth.boot_clock import BootInstant
 from app.auth.live_access import BoundLiveAccess, authorize_live_access, live_view_validator
 from app.auth.model import AccessValidationError, Permission
 from app.auth.session_binding import SessionBindingKey
-from app.auth.store import AccessStore, Requirement
+from app.auth.store import AccessStore, Requirement, StepUpRequired
 from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
 from app.media.live.sessions import LiveAccess
 from app.presence.access import AccessDenied
@@ -61,12 +65,15 @@ from tests.e2e.harness import (
 
 
 LIVE, RECORDINGS = Permission.LIVE_VIEW, Permission.RECORDINGS_VIEW
+# A synthetic kernel boot id; CLOCK_BOOTTIME follows the harness monotonic clock.
+SYNTHETIC_BOOT_ID = "0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0"
 GENERIC_DENIAL = "access is unavailable"
 
 # Human, admin and media paths a future dashboard could expose. None is mounted.
 HUMAN_PATHS = (
     "/", "/health", "/version", "/login", "/enroll", "/api/auth/assert",
     "/api/auth/registration/options", "/api/auth/registration",
+    "/api/auth/step-up/options", "/api/auth/step-up",
     "/api/live/" + str(UUID(int=101)), "/api/sources", "/api/timeline",
     "/api/recordings", "/api/recordings/" + str(UUID(int=7)),
     "/api/recordings/" + str(UUID(int=7)) + "/download",
@@ -87,6 +94,7 @@ class Identity:
         self.token = token if token is not None else secrets.token_bytes(32)
         self.principal = None
         self.session_id = None
+        self.credential_id = None
 
     def headers(self):
         return [(b"cookie", b"serversentinel_session=" + self.token.hex().encode("ascii"))]
@@ -178,8 +186,10 @@ class AccessMatrixScenarios(unittest.TestCase):
         # Owner-only mutations use the unaudited fixture mode; the audited
         # Owner boundary is covered by server/tests/test_access_pairing_audit.py.
         self.store = AccessStore(self.database, clock=self.clock.utcnow, audit=self.audit,
-                                 unaudited_writes=True, session_binding=SessionBindingKey.generate())
+                                 unaudited_writes=True, session_binding=SessionBindingKey.generate(),
+                                 boot_clock=self.boot_instant)
         self.gate = OpenGate()
+        self.step_up_digests = {}
         self.identities = {
             "live_only": self.member("live_only", (LIVE,)),
             "recordings_only": self.member("recordings_only", (RECORDINGS,)),
@@ -199,12 +209,16 @@ class AccessMatrixScenarios(unittest.TestCase):
         self.identities["spoofed_header"] = Identity(
             "spoofed_header", self.identities["both"].external_identity)
 
+    def boot_instant(self):
+        return BootInstant(SYNTHETIC_BOOT_ID, 10_000_000 + int(self.clock.monotonic() * 1_000_000))
+
     def member(self, name, permissions):
         identity = Identity(name, f"synthetic-{name.replace('_', '-')}@example.invalid")
         principal = self.store.invite("Synthetic " + name, permissions)
         secret = secrets.token_bytes(32)
         self.store.issue_enrollment(principal.id, secret, self.clock.utcnow() + timedelta(minutes=10))
         credential_id = secrets.token_bytes(32)
+        identity.credential_id = credential_id
         self.store.enroll_credential(secret, identity.external_identity, credential_id,
                                      b"synthetic-public-key-" + name.encode("ascii"), -7, 0)
         identity.session_id = self.store.establish_session(
@@ -366,6 +380,102 @@ class AccessMatrixScenarios(unittest.TestCase):
         self.assertEqual(before + 1, self.audit_rows())
         # Another member behind the same shared login keeps working.
         self.assertTrue(self.outcome(live_only, LIVE))
+
+    def owner(self):
+        """The Owner, signed in through the store's assertion commit (the
+        ceremony's signature verification is covered with software
+        authenticators in ``server/tests/test_human_step_up.py``)."""
+        identity = Identity("owner", "synthetic-owner@example.invalid")
+        principal = self.store.bootstrap_owner("Synthetic owner")
+        secret = secrets.token_bytes(32)
+        self.store.issue_enrollment(principal.id, secret, self.clock.utcnow() + timedelta(minutes=10))
+        identity.credential_id = secrets.token_bytes(32)
+        self.store.enroll_credential(secret, identity.external_identity, identity.credential_id,
+                                     b"synthetic-public-key-owner", -7, 0)
+        identity.session_id = self.store.accept_assertion(
+            identity.credential_id, principal.id, identity.external_identity,
+            expected_sign_count=0, sign_count=0, backup_state=False, token=identity.token)
+        identity.principal = principal
+        return identity
+
+    def step_up_challenge(self, identity):
+        digest = secrets.token_bytes(32)
+        try:
+            self.store.begin_step_up(identity.token, identity.external_identity, digest,
+                                     lifetime=timedelta(minutes=5))
+        except AccessValidationError as error:
+            self.assertEqual(GENERIC_DENIAL, str(error))
+            return False
+        self.step_up_digests[identity.token] = digest
+        return True
+
+    def step_up_commit(self, session_holder, credential_id, principal_id):
+        # The holder's pending step-up challenge, or one that was never issued.
+        digest = self.step_up_digests.get(session_holder.token, secrets.token_bytes(32))
+        try:
+            self.store.accept_assertion(credential_id, principal_id, session_holder.external_identity,
+                                        expected_sign_count=0, sign_count=0, backup_state=False,
+                                        step_up_session_id=session_holder.session_id,
+                                        step_up_challenge=digest)
+        except AccessValidationError as error:
+            self.assertEqual(GENERIC_DENIAL, str(error))
+            return False
+        return True
+
+    def assert_stale(self, identity):
+        with self.assertRaises(StepUpRequired):
+            self.store.authorize_request(identity.token, identity.external_identity, Requirement.OWNER_OP,
+                                         admit=self.admit)
+
+    def step_up_audits(self):
+        return [item for item in self.audit.list_records() if item.action.value == "verify_principal_step_up"]
+
+    def test_step_up_rows(self):
+        owner = self.owner()
+        self.assertIsNotNone(self.request(owner, Requirement.OWNER_OP))
+        self.clock.advance(5 * 60)
+        self.assert_stale(owner)
+        # A stale Owner still passes OWNER_READ, the step-up routes' requirement.
+        self.assertIsNotNone(self.request(owner, Requirement.OWNER_READ))
+        with closing(self.database.connect()) as connection:
+            challenges = connection.execute("SELECT count(*) FROM access_webauthn_challenges").fetchone()[0]
+        for name, identity in self.identities.items():
+            with self.subTest(identity=name):
+                # Never step_up_required, never a step-up challenge.
+                self.assertIsNone(self.request(identity, Requirement.OWNER_OP))
+                self.assertFalse(self.step_up_challenge(identity))
+        # The Owner's stale cookie under another member's login is the generic denial.
+        both = self.identities["both"]
+        self.assertIsNone(self.request(Identity("borrowed", both.external_identity, owner.token),
+                                       Requirement.OWNER_OP))
+        self.assertFalse(self.step_up_challenge(Identity("borrowed", both.external_identity, owner.token)))
+        with closing(self.database.connect()) as connection:
+            self.assertEqual(challenges, connection.execute(
+                "SELECT count(*) FROM access_webauthn_challenges").fetchone()[0])
+        # Another person's credential cannot refresh the stale Owner session,
+        # under either principal, even with the Owner's pending challenge;
+        # nor can a member refresh their own session.
+        self.assertTrue(self.step_up_challenge(owner))
+        self.assertFalse(self.step_up_commit(owner, both.credential_id, both.principal.id))
+        self.assertFalse(self.step_up_commit(owner, both.credential_id, owner.principal.id))
+        self.assertFalse(self.step_up_commit(both, both.credential_id, both.principal.id))
+        self.assert_stale(owner)
+        self.assertEqual([], self.step_up_audits())
+        # The Owner's own credential refreshes it with that same challenge (the
+        # refused commits rolled back without spending it), audited with the
+        # logical UUID only; the challenge is spent by this commit alone.
+        self.assertTrue(self.step_up_commit(owner, owner.credential_id, owner.principal.id))
+        self.assertFalse(self.step_up_commit(owner, owner.credential_id, owner.principal.id))
+        self.assertIsNotNone(self.request(owner, Requirement.OWNER_OP))
+        (record,) = self.step_up_audits()
+        self.assertEqual((record.actor_category.value, record.target_logical_id, record.outcome.value),
+                         ("owner", owner.principal.id, "succeeded"))
+        # Two minutes pass while the wall clock is stepped back by one: stale.
+        self.clock.advance(120)
+        self.clock.shift_wall(-60)
+        self.assert_stale(owner)
+        # Members are unaffected by any of it.
+        self.assertTrue(self.outcome(self.identities["live_only"], LIVE))
 
     def redemption(self, secret, identity):
         """Both redemption steps at the store (the ceremony's signature
