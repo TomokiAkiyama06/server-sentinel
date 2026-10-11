@@ -259,6 +259,12 @@ def _write(directory, name, rows, run_id=RUN):
 _LATE = 10**15  # after every synthetic event
 
 
+def _holder(samples, *, start=0, end=_LATE + 10):
+    """One complete holder execution: ``start``, samples, ``end`` (capture clock)."""
+    return ([{"kind": "start", "t_ns": start, "sources": 1, "fps": 30}, *samples,
+             {"kind": "end", "t_ns": end, "frames": 100}])
+
+
 def _complete(orchestrator, processes, *, side="both", codes=None):
     """The orchestrator records of one finished execution: a spawn and a zero
     exit per child (``codes`` overrides), then ``end`` for the side."""
@@ -328,9 +334,12 @@ def _finished_sender(rows, sources=1, receiver=()):
     Without explicit ``end`` rows, one per durable row of ``receiver`` is added
     that accounts for every unit up to its last durable sequence (no drops).
     """
-    rows = list(rows)
+    # Like the real sender, every start declares its fps (tests that probe a
+    # missing or mismatched fps set the key explicitly, None to omit it).
+    rows = [{"fps": 30, **row} if row["kind"] == "start" else row for row in rows]
+    rows = [{k: v for k, v in row.items() if not (k == "fps" and v is None)} for row in rows]
     if not any(row["kind"] == "start" for row in rows):
-        rows.insert(0, {"kind": "start", "t_ns": 0, "n_sources": sources})
+        rows.insert(0, {"kind": "start", "t_ns": 0, "n_sources": sources, "fps": 30})
     if not any(row["kind"] == "end" for row in rows):
         durable = [row for row in receiver if row["kind"] == "durable" and row["source"] >= 0]
         rows += [_sender_end(row["source"], row["epoch"], row["max_sequence"] + 1, row["units"])
@@ -648,10 +657,10 @@ class SummarizerTests(unittest.TestCase):
                            {"kind": "impairment_end", "t_ns": at * second,
                             "impairment": "reset", "duration_ns": 0, "rate_bytes": 0}]
         start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": 2 * second}
-        close_1 = {"kind": "closed", "t_ns": int(12.5 * second), "reason": "peer_closed"}
-        accept_1 = {"kind": "first_accept", "t_ns": 13 * second, "connection": 2, "source": 0}
-        close_2 = {"kind": "closed", "t_ns": int(13.5 * second), "reason": "peer_closed"}
-        accept_2 = {"kind": "first_accept", "t_ns": 14 * second, "connection": 3, "source": 0}
+        close_1 = {"kind": "closed", "t_ns": int(10.5 * second), "reason": "peer_closed"}
+        accept_1 = {"kind": "first_accept", "t_ns": 11 * second, "connection": 2, "source": 0}
+        close_2 = {"kind": "closed", "t_ns": int(12.5 * second), "reason": "peer_closed"}
+        accept_2 = {"kind": "first_accept", "t_ns": 13 * second, "connection": 3, "source": 0}
         self.run_dir("rst-a_framed", orchestrator=orchestrator, receiver=receiver,
                      sender_rows=sender_rows + [start, close_1, accept_1],
                      proxy_rows=proxy_rows)
@@ -666,6 +675,19 @@ class SummarizerTests(unittest.TestCase):
         # two disconnects but a single accepted unit: the second never reconnected
         self.rewrite("rst-a_framed", "sender",
                      sender_rows + [start, close_1, close_2, accept_2])
+        self.assertEqual("fail", self.report()["rst"]["g4"])
+        # both close/accept pairs after the second reset: the first reset's
+        # window ends where the second starts, so it has no episode of its own
+        late_close = {**close_1, "t_ns": int(12.2 * second)}
+        late_accept = {**accept_1, "t_ns": int(12.4 * second)}
+        self.rewrite("rst-a_framed", "sender",
+                     sender_rows + [start, late_close, late_accept, close_2, accept_2])
+        row = self.report()["rst"]
+        self.assertEqual(("fail", 1), (row["g4"], row["reconnects"]))
+        # the first reset's close is in its window, but its first accepted
+        # unit only came after the second reset started: not its own reconnect
+        self.rewrite("rst-a_framed", "sender", sender_rows + [
+            start, close_1, {**accept_1, "t_ns": int(12.2 * second)}, close_2, accept_2])
         self.assertEqual("fail", self.report()["rst"]["g4"])
 
     def test_loss_before_the_first_durable_unit_is_counted(self):
@@ -688,7 +710,8 @@ class SummarizerTests(unittest.TestCase):
         self.rewrite("normal-a_framed", "sender", sender_rows + [end])
         self.assertEqual("fail", self.report()["normal"]["g2"])
 
-    def _revoked_live(self, *, action=True, revoked_accepted=40, after=(40, 40), retry=True):
+    def _revoked_live(self, *, action=True, revoked_accepted=40, after=(40, 40), retry=True,
+                      sender_extra=()):
         second = 10**9
         orchestrator, receiver, sender_rows = _base("auth_revoked_live")
         if action:
@@ -703,14 +726,17 @@ class SummarizerTests(unittest.TestCase):
                  for index, value in enumerate(after)]
         rows += [{"kind": "session_open", "t_ns": second, "connection": 1, "generation": 1},
                  {"kind": "end", "t_ns": 9 * second, "accepted": 40}]
+        if retry is True:
+            retry = {"kind": "auth_refused", "t_ns": 6 * second,
+                     "reason": "capture_node_not_admitted"}
         if retry:
-            rows.append({"kind": "auth_refused", "t_ns": 6 * second,
-                         "reason": "capture_node_not_admitted"})
+            rows.append(retry)
         self.run_dir("auth_revoked_live-a_framed", orchestrator=orchestrator, receiver=rows,
-                     sender_rows=sender_rows)
+                     sender_rows=sender_rows + list(sender_extra))
         return self.report()["auth_revoked_live"]["g1"]
 
     def test_revoked_live_requires_complete_evidence(self):
+        second = 10**9
         self.assertEqual("pass", self._revoked_live())
         # samples after detection agree with each other but not with the count
         # at the decision: media was accepted after the revocation
@@ -724,6 +750,16 @@ class SummarizerTests(unittest.TestCase):
         self.assertEqual("unmeasured", self._revoked_live(after=()))
         # no refused re-admission after the revocation
         self.assertEqual("fail", self._revoked_live(retry=False))
+        # a sender connect is written before the TLS attempt: on one host it
+        # is no evidence that Main refused the revoked node
+        connect = {"kind": "connect", "t_ns": 6 * second, "connection": 2}
+        self.assertEqual("fail", self._revoked_live(retry=False, sender_extra=[connect]))
+        # a refusal before the revocation decision, or for a resource bound
+        # (not an authentication result), does not count either
+        self.assertEqual("fail", self._revoked_live(retry={
+            "kind": "auth_refused", "t_ns": 3 * second, "reason": "capture_node_not_admitted"}))
+        self.assertEqual("fail", self._revoked_live(retry={
+            "kind": "auth_refused", "t_ns": 6 * second, "reason": "connection_limit"}))
 
     def test_send_queue_gate_uses_queued_bytes_not_buffer_limit(self):
         orchestrator, receiver, sender_rows = _base("normal")
@@ -856,17 +892,66 @@ class SummarizerTests(unittest.TestCase):
         sample = {"kind": "sample", "t_ns": 1, "frames": 100, "queue_drops": 0,
                   "forward_drops": 1, "cpu_seconds": 0.1, "child_cpu_seconds": 0.0}
         path = self.root / "holder.jsonl"  # a file at the top level is not a run
-        _write(self.root, "holder", [sample, {**sample, "t_ns": 2}])
+        _write(self.root, "holder", _holder([sample, {**sample, "t_ns": 2}]))
         holder = summarize.summarize([self.root], holder_files=[path])["holder"]
-        self.assertEqual(("pass", 1), (holder["holder_verdict"],
-                                       holder["holder_forward_drops_allowed"]))
-        _write(self.root, "holder", [{**sample, "forward_drops": 2}])
+        self.assertEqual(("pass", 1, 1), (holder["holder_verdict"],
+                                          holder["holder_forward_drops_allowed"],
+                                          holder["holder_runs_matched"]))
+        _write(self.root, "holder", _holder([{**sample, "forward_drops": 2}]))
         holder = summarize.summarize([self.root], holder_files=[path])["holder"]
         self.assertEqual("fail", holder["holder_verdict"])
-        _write(self.root, "holder", [{**sample, "queue_drops": 1}])
+        _write(self.root, "holder", _holder([{**sample, "queue_drops": 1}]))
         report = summarize.summarize([self.root], holder_files=[path])
         self.assertEqual("fail", report["holder"]["holder_verdict"])
         self.assertIn("holder: fail", summarize.render(report))
+
+    def test_holder_file_must_be_one_complete_execution_of_the_run(self):
+        orchestrator, receiver, sender_rows = _base("normal")
+        self.run_dir("normal-a_framed", orchestrator=[{**orchestrator[0], "inputs": "real"}],
+                     receiver=receiver, sender_rows=sender_rows)
+        sample = {"kind": "sample", "t_ns": 1, "frames": 100, "queue_drops": 0,
+                  "forward_drops": 0, "cpu_seconds": 0.1, "child_cpu_seconds": 0.0}
+        path = self.root / "holder.jsonl"
+        other = self.root / "other.jsonl"
+
+        def verdict(paths=(path,)):
+            return summarize.summarize([self.root], holder_files=list(paths))[
+                "holder"]["holder_verdict"]
+
+        _write(self.root, "holder", _holder([sample]))
+        self.assertEqual("pass", verdict())
+        # a holder that crashed / was killed (no end) or never logged its start
+        _write(self.root, "holder", _holder([sample])[:-1])
+        self.assertEqual("fail", verdict())
+        _write(self.root, "holder", _holder([sample])[1:])
+        self.assertEqual("fail", verdict())
+        # stale: the file of another run (run_id matches no real-input run)
+        _write(self.root, "holder", _holder([sample]), run_id="r20261010t000000ab")
+        self.assertEqual("unmeasured", verdict())
+        # two executions appended to one file (same path reused across runs)
+        _write(self.root, "holder", _holder([sample]) + _holder([sample]))
+        self.assertEqual("fail", verdict())
+        _write(self.root, "holder", _holder([sample]))
+        with open(path, "a", encoding="ascii") as stream:
+            for row in _holder([sample]):
+                stream.write(json.dumps({"run_id": "r20261010t000000ab", **row}) + "\n")
+        self.assertEqual("fail", verdict())
+        # two files claiming the same run
+        _write(self.root, "holder", _holder([sample]))
+        _write(self.root, "other", _holder([sample]))
+        self.assertEqual("fail", verdict((path, other)))
+        # the holder stopped before the run's last sender record
+        _write(self.root, "holder", _holder([sample], end=2))
+        self.assertEqual("fail", verdict())
+        # no samples: forwarding health unknown
+        _write(self.root, "holder", _holder([]))
+        self.assertEqual("unmeasured", verdict())
+        # a second real-input run without a holder record of its own
+        _write(self.root / "outage_5s-a_framed", "orchestrator-both", _complete(
+            [{**orchestrator[0], "inputs": "real", "scenario": "outage_5s"}],
+            ("receiver", "proxy", "sender")), run_id="r20261010t000000ab")
+        _write(self.root, "holder", _holder([sample]))
+        self.assertEqual("unmeasured", verdict())
 
     def test_report_is_numeric_and_renders(self):
         orchestrator, receiver, sender_rows = _base("normal")
@@ -1089,7 +1174,7 @@ class SummarizerTests(unittest.TestCase):
         # the holder allowance counts this real run regardless of file order
         sample = {"kind": "sample", "t_ns": 1, "frames": 100, "queue_drops": 0,
                   "forward_drops": 1, "cpu_seconds": 0.1, "child_cpu_seconds": 0.0}
-        _write(self.root, "holder", [sample])
+        _write(self.root, "holder", _holder([sample]))
         holder = summarize.summarize([self.root], holder_files=[self.root / "holder.jsonl"])
         self.assertEqual(("pass", 1), (holder["holder"]["holder_verdict"],
                                        holder["holder"]["holder_forward_drops_allowed"]))
@@ -1226,14 +1311,32 @@ class SummarizerTests(unittest.TestCase):
         # trailing units neither dropped nor held: vanished silently
         row = run()
         self.assertEqual(("fail", 10), (row["g2"], row["unexplained_loss_units"]))
-        # drops the Agent recorded that appear neither as Main gaps nor in the tail
+        # drops the Agent recorded that appear neither as Main gaps nor in the
+        # tail: the named sequences are Main's durable units
         row = run(generated=100, drops=5, ranges=[("drop", 20, 24)])
-        self.assertEqual(("fail", 5), (row["g2"], row["unexplained_drop_units"]))
+        self.assertEqual(("fail", 5), (row["g2"], row["durable_named_units"]))
         # ... unless those units had been sent unacknowledged (Main may hold them)
         self.assertEqual("pass", run(generated=100, drops=5, drops_sent=5,
                                      ranges=[("drop", 20, 24)])["g2"])
         # ranges that do not describe the counts
         self.assertEqual("fail", run(drops=10, ranges=[("drop", 100, 105)])["g2"])
+        # Claude review of 1dbbd1d (H3): a range beyond the generated units
+        # cannot explain a lost tail (5 units 105..109 vanished)
+        self.assertEqual("fail", run(drops=10, ranges=[("drop", 110, 119)])["g2"])
+        self.assertEqual("fail", run(drops=10, ranges=[("drop", 100, 104),
+                                                       ("drop", 110, 114)])["g2"])
+        # (H4) the same 5-unit range written twice while 10 tail units are lost
+        self.assertEqual("fail", run(drops=10, ranges=[("drop", 100, 104),
+                                                       ("drop", 100, 104)])["g2"])
+        # a unit named both dropped and residual is still one unit
+        self.assertEqual("fail", run(drops=5, residual=5, ranges=[
+            ("drop", 100, 104), ("residual", 104, 108)])["g2"])
+        # only a sent-unacknowledged unit may be durable on Main
+        self.assertEqual("fail", run(drops=15, drops_sent=2, ranges=[
+            ("drop", 30, 34), ("drop", 100, 109)])["g2"])
+        # a refused unit is never durable, whatever was sent
+        self.assertEqual("fail", run(drops=10, rejected=1, drops_sent=5, ranges=[
+            ("rejected", 30, 30), ("drop", 100, 109)])["g2"])
         self.assertEqual("fail", run(drops=10, ranges=[("drop", 100, 109)],
                                      unit_ranges=2)["g2"])
         # an interior drop is Main's reported gap
@@ -1244,6 +1347,12 @@ class SummarizerTests(unittest.TestCase):
                      sender_rows=[start] + sender_rows + [_sender_end(
                          0, 1, 100, 95, drops=5, ranges=[("drop", 11, 15)])])
         self.assertEqual("pass", self.report()["normal"]["g2"])
+        # (I1, Claude review of 1dbbd1d) the same counts, but the drop range
+        # names durable sequences 30..34 instead of Main's gap 11..15
+        self.rewrite(name, "sender", [start] + sender_rows + [_sender_end(
+            0, 1, 100, 95, drops=5, ranges=[("drop", 30, 34)])])
+        row = self.report()["normal"]
+        self.assertEqual(("fail", 5), (row["g2"], row["durable_named_units"]))
         # a sender end without the accounting counts cannot be reconciled
         legacy = {"kind": "end", "t_ns": 9, "source": 0, "epoch": 1, "accepted": 100,
                   "drops": 0}
@@ -1256,6 +1365,38 @@ class SummarizerTests(unittest.TestCase):
                      sender_rows=[start] + sender_rows + [_sender_end(0, 2, 0, 0)])
         row = self.report()["normal"]
         self.assertEqual(("unmeasured", "unmeasured"), (row["g2"], row["drop_accounting"]))
+
+    def test_declared_fps_is_one_value(self):
+        """Claude review of 1dbbd1d: production is scored against the fps the
+        sender declared, so every record of it must agree."""
+        second = 10**9
+        orchestrator, receiver, sender_rows = _base("normal")
+        orchestrator = [{**orchestrator[0], "duration_ns": 8 * second, "fps": 30}]
+        name = "normal-a_framed"
+        durable = self._durable(1, units=240)
+
+        def production(start_fps=30, end_fps=30, generated=240, orchestrator_fps=30,
+                       **end_fields):
+            end = _sender_end(0, 1, generated, generated, **{
+                **_produced(generated, fps=end_fps), "produce_ns": 8 * second,
+                **end_fields})
+            start = {"kind": "start", "t_ns": 0, "n_sources": 1, "fps": start_fps}
+            self.run_dir(name, orchestrator=[{**orchestrator[0], "fps": orchestrator_fps}],
+                         receiver=receiver + durable, sender_rows=[start] + sender_rows + [end])
+            return self.report()["normal"]["production"]
+
+        self.assertEqual("pass", production())
+        # the end row claims another rate than the start
+        self.assertEqual("fail", production(end_fps=10, generated=60))
+        # the sender declared 1 fps (7 units in 8 s pass at 1 fps) but the
+        # orchestrator ran the scenario at 30 fps
+        self.assertEqual("fail", production(start_fps=1, end_fps=1, generated=7))
+        # a sender start without its fps
+        self.assertEqual("unmeasured", production(start_fps=None))
+        # continuity fields: missing is unmeasured, None only with no units
+        for field in ("last_offer_age_ns", "max_offer_gap_ns", "first_offer_delay_ns"):
+            with self.subTest(field=field):
+                self.assertEqual("unmeasured", production(**{field: None}))
 
     def test_mid_epoch_drops_never_explain_a_lost_tail(self):
         """Claude review of 85d91b3: drops / refusals already reported by Main

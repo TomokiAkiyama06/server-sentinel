@@ -127,9 +127,10 @@ def approve_all(capture, source_ids):
 
 
 class Holder:
-    def __init__(self, capture, source_ids, socket_dir, writer):
+    def __init__(self, capture, source_ids, socket_dir, writer, *, fps=None):
         self.capture = capture
         self.source_ids = source_ids
+        self.fps = fps  # camera profile rate, recorded for the summarizer
         self.writer = writer
         self.stop = threading.Event()
         directory = materials.private_directory(socket_dir, exist_ok=True)
@@ -152,7 +153,7 @@ class Holder:
         selector.register(self.listener, selectors.EVENT_READ)
         next_poll = next_sample = 0.0
         cpu0 = records.process_cpu_seconds()
-        self.writer.write("start", sources=len(self.source_ids))
+        self.writer.write("start", sources=len(self.source_ids), fps=self.fps)
         try:
             while not self.stop.is_set() and time.monotonic() < deadline:
                 now = time.monotonic()
@@ -214,7 +215,7 @@ def run(args, writer):
                                         gst=args.gst, dev_checkout_helper=args.dev_checkout_helper)
     if args.approve:
         approve_all(capture, source_ids)
-    holder = Holder(capture, source_ids, args.socket_dir, writer)
+    holder = Holder(capture, source_ids, args.socket_dir, writer, fps=fps)
     signal.signal(signal.SIGTERM, lambda *_: holder.stop.set())
     holder.run(args.seconds)
     return 0

@@ -1227,6 +1227,10 @@ Total run time today (≤ 3 h):
 - [ ] 1 / 2 / 3 / 4 source の各構成を候補ごとに実行した（`normal` / `sources_2` / `sources_3` / `capacity_4`、summary の `*_missing_source_counts` が 0）、全 run の `integrity` が `pass`（別実行の記録の混入・子 process の異常終了なし）;
 - [ ] 副次: 30 分 soak（full matrix とは別の日に実行）で予期しない切断 0、overhead ≤ 10 %、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %、latency p95（参考）;
 - [ ] cleanup checklist を完了（使い捨て CA / ledger / node 鍵 / holder state を削除、`ss-poc15-*` scope なし）;
+- [ ] ADR-0007 へ転記する前に、Claude と Owner が全 run の生 JSONL 記録（各 run directory の
+  orchestrator / receiver / sender / proxy と holder の記録。summary だけではない）を確認し、
+  summary の判定が記録と食い違わないこと（想定外の `fail` / `unmeasured`、記録の欠落・混在、
+  不自然な時刻や件数が無いこと）を確かめ、確認した run id と確認者を記録した;
 - [ ] 結果を ADR-0007 Validation 表へ転記し、real / synthetic の内訳と未測定項目を明記した。
 
 ### LAN baseline measurement (2026-09-30, Issue #15; no transport candidate yet)

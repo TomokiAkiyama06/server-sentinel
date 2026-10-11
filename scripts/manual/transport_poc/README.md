@@ -145,14 +145,16 @@ synthetic（`--source-kind gst` / `builtin`）の run では両側とも付け�
 両側の申告が食い違う run は `unmeasured` にします。
 
 capture host（実カメラ。holder は 1 process で全カメラを保持）。holder の `--out` の親 directory
-は holder 起動前に作る（holder は作らない）:
+は holder 起動前に作る（holder は作らない）。holder は run ごとに 1 つ起動し、記録は run ごとの
+別ファイル（`holder-<RUN_ID>.jsonl`、agent と同じ `--run-id`）にする（記録は追記されるので、
+同じファイルを別の run で再利用すると集計で `fail`）:
 
 ```sh
 install -d -m 700 ~/poc15/out
 timeout -k 30 20m systemd-run --user --scope --unit=ss-poc15-holder -p CPUQuota=100% -p MemoryMax=512M \
   python3 scripts/manual/transport_poc/poc15.py holder --state-dir ~/poc15/holder-state \
   --socket-dir ~/poc15/holder-sock --sources 1 --profile 1280x720@30 --approve \
-  --seconds 1100 --out ~/poc15/out/holder.jsonl --run-id <RUN_ID>
+  --seconds 1100 --out ~/poc15/out/holder-<RUN_ID>.jsonl --run-id <RUN_ID>
 timeout -k 30 15m systemd-run --user --scope --unit=ss-poc15-agent -p CPUQuota=100% -p MemoryMax=512M \
   python3 scripts/manual/transport_poc/poc15.py matrix --role agent --upstream-host <MAIN_LAN_IP> \
   --node-root ~/poc15/nodes --materials ~/poc15/nodes --state ~/poc15/state --out ~/poc15/out \
@@ -215,7 +217,7 @@ holder は接続済みの実カメラ数しか供給しないため（現状 1 �
 
 ```sh
 python3 scripts/manual/transport_poc/poc15.py summarize --two-host MAIN_OUT/<RUN_ID> AGENT_OUT/<RUN_ID> \
-  --holder AGENT_OUT/holder.jsonl --json ~/poc15/summary.json
+  --holder AGENT_OUT/holder-<RUN_ID>.jsonl --json ~/poc15/summary.json
 ```
 
 （両 host の `out/<RUN_ID>` は数値 JSONL だけなので 1 か所に集めてよい。`--role main` /
@@ -235,6 +237,12 @@ summary の各 run 行と候補行には `fast`（CI 用の短縮 timing で実�
 `fast` は 1 run でも短縮 timing なら `true`、全 run が full timing のときだけ `false`
 （`fast_runs` は短縮 timing の run 数）。ADR-0007 へ転記する結果は全 run が `fast: false`
 （`--fast` なし）でなければならない。
+
+**転記前の生記録レビュー（必須）**: 実 LAN の結果を ADR-0007 へ転記する前に、Claude と Owner が
+全 run の生 JSONL 記録（各 run directory の orchestrator / receiver / sender / proxy と holder の
+記録。summary だけではない）を確認し、summary の判定が記録と食い違わないこと（想定外の `fail` /
+`unmeasured`、記録の欠落・混在、不自然な時刻や件数が無いこと）を確かめ、確認した run id と確認者を
+MANUAL_TEST §G の記録へ残す。summarizer の `pass` だけを根拠に転記しない。
 
 候補ごとの G1〜G6 は、その gate に必要な scenario（G1: `auth_*` 4 種 + `route_probe`、
 G2: `normal` / `capture_restart` / 通信断 7 種、G3: `normal` / `slow_drain` / `bandwidth_cap` /
@@ -264,17 +272,28 @@ summarizer は `producer_failed` があれば `fail`、さらに sender の `end
 時計）で、`generated` ≥ 0.8 × 申告 fps ×（生成時間 − 3 s）、最初の unit が生成開始から 3 s 以内、
 unit 間の最長空白と最後の unit から生成終了までが 2 s 以内、source ごとの生成時間の合計が予定
 duration −（epoch 数 × 2 s）以上であることを要求し、満たさなければ `fail`（記録が無ければ
-`unmeasured`）です。実 camera では申告 fps（`--fps`）を camera profile と一致させてください。
+`unmeasured`。`first_offer_delay_ns` / `last_offer_age_ns` / `max_offer_gap_ns` が無い、または
+unit を生成した source で `null` の場合も `unmeasured`）です。申告 fps は sender の `start` と全 `end`、
+Agent 側 orchestrator の `start`（`--fps`）で 1 つの値に一致しなければ `fail`（sender `start` に無ければ
+`unmeasured`）。実 camera では申告 fps（`--fps`）を camera profile と一致させてください（`--holder` を
+渡すと holder の profile fps と sender の申告 fps が食い違う run は holder 判定が `fail`）。
 低照度で camera の frame rate が下がった run は、連続生成として扱われず `fail` になります。
-`--holder` を渡すと holder の `queue_drops` = 0 と
-`forward_drops` ≤ sender process 数（real 入力の run 数 + `restart_sender` 数）も判定します。
+`--holder`（real 入力の run ごとに 1 ファイル、複数回指定可）を渡すと holder の `queue_drops` = 0 と
+`forward_drops` ≤ その run の sender process 数（1 + `restart_sender` 数）も run ごとに判定します。
+holder ファイルは 1 回の holder 実行の完全な記録でなければ使いません: 全記録の `run_id` が 1 種類で
+集計対象の real 入力 run の `run_id` と一致し、`start` と `end` が 1 つずつ、capture host の時計で
+その run の最初の sender 記録より前に開始し最後の sender 記録より後に終了していること。別実行の
+記録の混在・`start` / `end` の欠落（holder の異常終了や実行中のファイル）・同じ run の holder
+ファイルの重複・run を覆っていない holder は `fail`、どの real 入力 run とも `run_id` が一致しない
+（古い・別 run の）ファイル、sample の無いファイル、holder ファイルの無い real 入力 run は
+`unmeasured` です。holder の CPU は検証済みの同じ run の holder 記録からだけ Agent CPU に加算します。
 
 | gate | 判定 |
 | --- | --- |
-| G1 | mTLS 相互認証。否定試験（未 activation / 別 CA / 失効 / 接続中失効）で受理 media 0、`route_probe` は 404 か切断。未 activation / 別 CA / 失効は sender の接続試行 ≥ 1 と Main 側の認証拒否記録（`auth_refused`、`connection_limit` を除く）が両方必要で、sender 記録が無ければ `unmeasured`、試行か拒否記録が無ければ `fail`。接続中失効は Main 側 orchestrator の `revoke` 記録（無ければ `unmeasured`）、receiver の `revoked`、その後の receiver sample ≥ 1（無ければ `unmeasured`）がすべて `revoked` 時点の受理数と一致、`revoked` 後の再接続拒否（Main の `auth_refused`、1 host では sender の `connect` も可）が必要 |
-| G2 | sender の `start` と `end` 記録が必要（否定認証と `route_probe` 以外。無ければ `unmeasured`）。epoch 内の報告 gap = durable stand-in から算出した実欠落（完全一致）。実欠落は epoch の起点（sequence 0）から数え、最初の durable unit より前の欠落も含む（capture 再起動後の epoch の先頭は範囲不明 gap）。Agent が受理を得た epoch に durable 記録が無ければ不一致。capture 再起動は範囲不明 gap、重複 commit 0。さらに sender の `end`（source・epoch ごとに `generated` / `drops` / `drops_sent` / `residual` / `residual_sent` / `unit_ranges`）と `unit_range` 記録（drop / 拒否 / 終了時保持の sequence 範囲）で Agent 側の unit 収支を照合する: 最後の durable sequence より後の unit（backpressure で末尾が落ちると Main には gap が出ない）は、その sequence より**後**の drop / 拒否 / 保持中（`residual`）の unit と 1 対 1 で一致しなければ `fail`（記録の無い消失。例: Main が ack した後に失った末尾。epoch 途中の drop・拒否は Main の gap として報告済みなので末尾の説明に使わない）、それ以前の `drops` は Main がその epoch で報告した gap（送信後未 ack の unit は Main が持ちうるので余裕に含める）に収まらなければ `fail`（説明のつかない drop）、範囲と件数が食い違えば `fail`、`end` に収支や範囲が無い・durable 記録のある epoch に `end` が無いなら `unmeasured`。最後の receiver が停止時に受理済み unit を破棄した（`end` の `discarded_at_stop` > 0。後続の receiver が gap を報告できない）場合も `fail`。末尾の drop 数は `agent_accounted_tail_units`（Agent 側で計上した欠落） |
+| G1 | mTLS 相互認証。否定試験（未 activation / 別 CA / 失効 / 接続中失効）で受理 media 0、`route_probe` は 404 か切断。未 activation / 別 CA / 失効は sender の接続試行 ≥ 1 と Main 側の認証拒否記録（`auth_refused`、`connection_limit` を除く）が両方必要で、sender 記録が無ければ `unmeasured`、試行か拒否記録が無ければ `fail`。接続中失効は Main 側 orchestrator の `revoke` 記録（無ければ `unmeasured`）、receiver の `revoked`、その後の receiver sample ≥ 1（無ければ `unmeasured`）がすべて `revoked` 時点の受理数と一致、`revoked` 後の再接続拒否として、`revoked` より後の Main の `auth_refused`（認証理由。`connection_limit` を除く）が 1 host・2 host とも必要で、無ければ `fail`（Main の記録が無ければ `unmeasured`）。sender の `connect` は TLS 試行の前に書かれるので拒否の証拠にしない |
+| G2 | sender の `start` と `end` 記録が必要（否定認証と `route_probe` 以外。無ければ `unmeasured`）。epoch 内の報告 gap = durable stand-in から算出した実欠落（完全一致）。実欠落は epoch の起点（sequence 0）から数え、最初の durable unit より前の欠落も含む（capture 再起動後の epoch の先頭は範囲不明 gap）。Agent が受理を得た epoch に durable 記録が無ければ不一致。capture 再起動は範囲不明 gap、重複 commit 0。さらに sender の `end`（source・epoch ごとに `generated` / `drops` / `drops_sent` / `residual` / `residual_sent` / `unit_ranges`）と `unit_range` 記録（drop / 拒否 / 終了時保持の sequence 範囲）で Agent 側の unit 収支を照合する: 最後の durable sequence より後の unit（backpressure で末尾が落ちると Main には gap が出ない）は、その sequence より**後**の drop / 拒否 / 保持中（`residual`）の unit と件数が一致しなければ `fail`（`unit_range` は sequence の集合として扱い、各範囲は [0, `generated`) 内、範囲同士は重複しないこと（同じ範囲の二重記録や drop と residual の重複で欠落を二重に説明しない）、drop / residual の sequence が Main の durable sequence（報告 gap の外）と重なるのは送信済み未 ack の `drops_sent` + `residual_sent` 件まで、拒否 unit は durable と重ならないこと。違反は `fail`）（記録の無い消失。例: Main が ack した後に失った末尾。epoch 途中の drop・拒否は Main の gap として報告済みなので末尾の説明に使わない）、それ以前の `drops` は Main がその epoch で報告した gap（送信後未 ack の unit は Main が持ちうるので余裕に含める）に収まらなければ `fail`（説明のつかない drop）、範囲と件数が食い違えば `fail`、`end` に収支や範囲が無い・durable 記録のある epoch に `end` が無いなら `unmeasured`。最後の receiver が停止時に受理済み unit を破棄した（`end` の `discarded_at_stop` > 0。後続の receiver が gap を報告できない）場合も `fail`。末尾の drop 数は `agent_accounted_tail_units`（Agent 側で計上した欠落） |
 | G3 | receiver と sender の両方の sample が必要（片方でも無ければ `unmeasured`）。receiver queue ≤ 設定上限、sender pending ≤ 上限、kernel send queue の滞留 byte（`TIOCOUTQ`、`ss -tmi` があれば skmem `w`）≤ 2×SO_SNDBUF + 64 KiB、VmHWM ≤ 上限、warmup 後の RSS 増加 ≤ max(16 MiB, 10 %)（sample < 4 なら `unmeasured`）。skmem `tb` は送信 buffer の上限値で、SO_SNDBUF 設定前に kernel が拡大しうるため記録のみ。実入力の run で `ss` が無い（socket を 1 つも報告した sample が無い）なら `unmeasured`。proxy 保持量は 1 回の `recv()` buffer で構造的に有界なので記録のみ |
-| G4 | 切断を伴う impairment から手動操作なしで再接続、p95 ≤ 10 s（2 host で Main 側 action の場合は Agent 時計で切断→初回受理。初回受理を挟まない連続した切断は 1 episode）。切断と初回受理は impairment ごとに 1 組ずつ対応させ（同じ記録を複数回使わない）、必要な再接続数は予定された reset / Main 再起動と、Agent loss timeout + 1 s 以上の blackhole / SIGSTOP の数だけで決まる（scenario 名による追加要求はない） |
+| G4 | 切断を伴う impairment から手動操作なしで再接続、p95 ≤ 10 s（2 host で Main 側 action の場合は Agent 時計で切断→初回受理。初回受理を挟まない連続した切断は 1 episode）。切断と初回受理は impairment ごとに 1 組ずつ対応させ（同じ記録を複数回使わない）、各 impairment の対応範囲は次に予定された impairment の開始で打ち切る（切断は [開始, min(終了 + 30 s, 次の開始))、初回受理は次の開始より前。後の impairment の後に起きた切断・受理を前の impairment の再接続として数えない）、必要な再接続数は予定された reset / Main 再起動と、Agent loss timeout + 1 s 以上の blackhole / SIGSTOP の数だけで決まる（scenario 名による追加要求はない） |
 | G5 | 無音断の検知 ≤ 15 s（Agent / Main とも）、Main の未 commit 区間（Agent capture 時刻）⊆ Agent 保護区間 [T−600 s, T+600 s]。proxy blackhole は予定数の `impairment_start` 記録が必要（`proxy.jsonl` が無ければ `unmeasured`、不足は `fail`）、Main の stale 閾値以上の blackhole には source ごとに Main の `interrupted`（最後の受信から ≤ 15 s）が必要。Main 側停止（`slow_stop_10s` / `slow_stop_60s` / `main_restart`）は停止ごとに Agent の loss 検知が必要で、遅延は Agent 時計で最後の受信からの経過（`idle_ns`）≤ 15 s。Main 側 orchestrator 記録が無ければ `unmeasured`。予定された proxy reset はそれぞれ Agent 時計で 15 s 以内の `loss_detected` が必要（`proxy.jsonl` が無ければ `unmeasured`）。`loss_detected` は source ごとに出るが connection 単位で 1 episode とし、reset / 長い blackhole ごとに別の episode を 1 つずつ消費する（1 回の検知を 2 つの reset に使わない）。対応づけの範囲は [impairment 開始, min(開始 + 15 s, 次に予定された impairment の開始)) で、後の impairment の後に出た検知は前の impairment の検知として数えない（最後の impairment は開始 + 15 s まで）。1 host の Main 側停止と Main の `interrupted` の照合も同様に次の window の開始で打ち切る。Main の `interrupted` は最後の `session_close` 以前のものだけを数える（sender 終了後の stale 判定は障害検知ではない） |
 | G6 | 4 source で backpressure / rate limit / sender drop 0（4 source すべての sender `end` 記録が必要、1 つも無ければ `unmeasured`）、かつ Main / Agent とも cgroup v2 `cpu.max` の CPU 上限下で実行（`capacity_4`、上限が無ければ `fail`）。5 source 目は active-source 上限（`source_capacity`）で拒否 |
 | 副次 | soak 30 分で予期しない切断 0、overhead ≤ 10 %（proxy の上り byte / payload）、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %（最初の sample からの差分で算出）、latency p95 ≤ 1 s（参考） |

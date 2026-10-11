@@ -180,6 +180,7 @@ class Orchestrator:
         writer.write("start", scenario=name, candidate=candidate, n_sources=n_sources,
                      inputs="real" if self.args.real_inputs else "synthetic",
                      fast=bool(self.args.fast), side=role, duration_ns=int(duration * 1e9),
+                     fps=self.args.fps,
                      node=node if node in records.TOKENS else "other")
         if role == "both" and name == "auth_revoked_live":
             materials.replace_loopback_node(self.args.materials, "revoked_live")

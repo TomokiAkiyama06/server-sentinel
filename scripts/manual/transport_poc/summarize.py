@@ -79,6 +79,8 @@ PRODUCTION_STARTUP_NS = 3 * SECOND
 PRODUCTION_GAP_NS = 2 * SECOND
 PRODUCTION_COVERAGE_SLACK_NS = 2 * SECOND
 PRODUCTION_FIELDS = ("fps", "produce_ns", "generated")
+# Continuity fields: None only for a source that generated nothing.
+PRODUCTION_CONTINUITY_FIELDS = ("first_offer_delay_ns", "last_offer_age_ns", "max_offer_gap_ns")
 # Scenarios that deliver no media on purpose (no production requirement).
 NO_MEDIA_SCENARIOS = NEGATIVE_SCENARIOS | {"route_probe"}
 
@@ -243,8 +245,11 @@ class RunSummary:
         whose sender ``end`` rows (one per epoch) show too few generated units
         for the declared fps, a late first unit, a pause longer than
         ``PRODUCTION_GAP_NS``, or production time that does not cover the
-        scheduled duration. ``unmeasured``: the scheduled duration or the
-        production fields are not on record. ``not_applicable``: scenarios
+        scheduled duration, or a declared fps that differs between the sender
+        start / end rows and the Agent-side orchestrator start.
+        ``unmeasured``: the scheduled duration, the production or continuity
+        fields (None only where nothing was generated) or the sender's
+        declared fps are not on record. ``not_applicable``: scenarios
         without media on purpose.
         """
         if self.scenario in NO_MEDIA_SCENARIOS:
@@ -258,12 +263,28 @@ class RunSummary:
         ends = [e for e in _kind(self.sender, "end") if e.get("epoch") is not None]
         if len(durations) != 1 or None in durations or not ends or not isinstance(
                 self.n_sources, int) or any(
-                    not isinstance(e.get(f), int) or isinstance(e.get(f), bool)
-                    for e in ends for f in PRODUCTION_FIELDS):
+                    not _is_int(e.get(f)) for e in ends for f in PRODUCTION_FIELDS) or any(
+                    not (_is_int(e.get(f)) or (e.get(f) is None and f in e
+                                               and e["generated"] == 0))
+                    for e in ends for f in PRODUCTION_CONTINUITY_FIELDS):
             self.metrics.update(production="unmeasured")
             return "unmeasured"
         duration = next(iter(durations))
         verdict = "pass"
+        # One declared frame rate: every sender start and end, and the
+        # Agent-side orchestrator start when it records one. A rate that
+        # differs between them would score production against the wrong fps.
+        rates = {e["fps"] for e in ends}
+        rates |= {item.get("fps") for item in _kind(self.sender, "start")}
+        rates |= {item["fps"] for item in _kind(self.orchestrator, "start")
+                  if item.get("side") in ("both", "agent") and "fps" in item}
+        self.metrics.update(declared_fps=next(iter(rates)) if len(rates) == 1 else None)
+        if len(rates - {None}) > 1:
+            self.metrics.update(production="fail")
+            return "fail"
+        if None in rates:
+            self.metrics.update(production="unmeasured")
+            return "unmeasured"  # a sender start without its fps
         covered, epochs = defaultdict(int), defaultdict(int)
         shortfall = 0
         for end in ends:
@@ -325,7 +346,7 @@ class RunSummary:
                 if last is None or item["t_ns"] <= last]
 
     # -- G1 -----------------------------------------------------------------
-    def g1(self, single_host=True):
+    def g1(self):
         accepted = _sum_end(self.receiver, "accepted")
         sender_accepted = sum(item.get("accepted", 0) for item in _kind(self.sender, "end"))
         sessions = len(_kind(self.receiver, "session_open"))
@@ -341,18 +362,21 @@ class RunSummary:
             return _verdict(bool(probes) and all(p["reason"] in ("not_found", "peer_closed")
                                                  for p in probes) and accepted == 0)
         if self.scenario == "auth_revoked_live":
-            return self._g1_revoked_live(accepted, single_host)
+            return self._g1_revoked_live(accepted)
         return _verdict(sessions > 0)
 
-    def _g1_revoked_live(self, accepted, single_host):
+    def _g1_revoked_live(self, accepted):
         """Revocation of a connected node: detected, then nothing accepted.
 
         Evidence required: the Main-side orchestrator ``revoke`` action (else
         ``unmeasured``), the receiver ``revoked`` decision, at least one
         receiver sample after it whose accepted count equals the count at the
         decision (else ``unmeasured``: nothing was observed afterwards), and a
-        refused re-admission after it (Main ``auth_refused``; on one host a
-        sender ``connect`` also counts). Positive control: media before it.
+        refused re-admission after it: a Main ``auth_refused`` with an
+        authentication reason (``AUTH_REFUSAL_REASONS``) recorded after the
+        ``revoked`` decision, on one host and on two (a sender ``connect`` is
+        written before the TLS attempt and proves no refusal; absent: ``fail``).
+        Positive control: media before it.
         """
         action = [a for a in _kind(self.orchestrator, "action") if a.get("action") == "revoke"]
         revoked = _kind(self.receiver, "revoked")
@@ -371,8 +395,6 @@ class RunSummary:
         after = [s for s in samples if s["t_ns"] > detected]
         retried = any(r["t_ns"] > detected and r.get("reason") in AUTH_REFUSAL_REASONS
                       for r in _kind(self.receiver, "auth_refused"))
-        if single_host:
-            retried = retried or any(c["t_ns"] > detected for c in _kind(self.sender, "connect"))
         self.metrics.update(revocation_detect_ns=delay, revoked_samples_after=len(after),
                             revoked_retry_refused=retried)
         if baseline is None or not after:
@@ -383,7 +405,7 @@ class RunSummary:
         if not frozen or accepted <= 0 or baseline <= 0 or delay > 3 * SECOND:
             return "fail"
         if not retried:
-            return "fail" if self.sender else "unmeasured"
+            return "fail"  # Main records are present (g1) but no refusal after revocation
         return "pass"
 
     def _g1_negative(self, accepted, sender_accepted, sessions):
@@ -505,7 +527,16 @@ class RunSummary:
           of that epoch (slack: units sent before the drop or the shutdown,
           which Main may hold), else the drop record is unexplained: ``fail``;
         * ranges that disagree with the counts: ``fail``; an ``end`` without
-          the counts or ranges cannot be reconciled: ``unmeasured``.
+          the counts or ranges cannot be reconciled: ``unmeasured``;
+        * the ranges are sequence sets: each must lie in ``[0, generated)``
+          and no sequence may appear in two ranges (a range written twice, or
+          a drop also reported as residual, never explains two lost units);
+          ``fail`` otherwise;
+        * a dropped, refused or residual sequence can be durable on Main only
+          if it was sent before it was dropped or at shutdown: refused units
+          never, and at most ``drops_sent + residual_sent`` dropped/residual
+          units may be Main's durable sequences (in ``[min_sequence, top]``
+          and outside Main's reported gaps); more: ``fail``.
         """
         fields = ("generated", "drops", "drops_sent", "residual", "residual_sent",
                   "unit_ranges")
@@ -521,6 +552,13 @@ class RunSummary:
         ranges = defaultdict(list)
         for item in _kind(self.sender, "unit_range"):
             ranges[(item.get("source"), item.get("epoch"))].append(item)
+        missing = defaultdict(list)  # Main's reported missing ranges per epoch
+        for gap in _kind(self.receiver, "gap"):
+            if isinstance(gap.get("before_sequence"), int):
+                after = gap.get("after_sequence")
+                missing[(gap["source"], gap["epoch"])].append(
+                    (after + 1 if isinstance(after, int) else 0, gap["before_sequence"]))
+        overlapping = 0
         for end in ends:
             if any(not isinstance(end.get(f), int) or isinstance(end.get(f), bool)
                    for f in fields):
@@ -535,18 +573,36 @@ class RunSummary:
             mine = ranges.get(key, [])
             total = {"drop": 0, "rejected": 0, "residual": 0}
             after = dict(total)
+            seen = {}
             for item in mine:
                 first, last = item.get("first_sequence"), item.get("last_sequence")
                 if (item.get("range_kind") not in total or not isinstance(first, int)
-                        or not isinstance(last, int) or not 0 <= first <= last):
-                    total = None
+                        or not isinstance(last, int)
+                        or not 0 <= first <= last < end["generated"]):
+                    total = None  # malformed, or beyond what was generated
                     break
+                units = range(first, last + 1)
+                if any(sequence in seen for sequence in units):
+                    total = None  # one sequence named twice
+                    break
+                seen.update(dict.fromkeys(units, item["range_kind"]))
                 total[item["range_kind"]] += last - first + 1
                 after[item["range_kind"]] += max(0, last - max(first, top + 1) + 1)
             if total is None or len(mine) != end["unit_ranges"] or (
                     total["drop"], total["rejected"], total["residual"]) != (
                     end["drops"], end.get("rejected") or 0, end["residual"]):
                 verdict = "fail"  # the ranges do not describe these counts
+                continue
+            # Named sequences that are Main's durable units.
+            low = row["min_sequence"] if row else 0
+            holes = missing.get(key, [])
+            durable_named = [kind for sequence, kind in seen.items()
+                             if low <= sequence <= top
+                             and not any(a <= sequence < b for a, b in holes)]
+            sendable = end["drops_sent"] + end["residual_sent"]
+            if "rejected" in durable_named or len(durable_named) > sendable:
+                overlapping += len(durable_named)
+                verdict = "fail"  # a "lost" unit that Main holds durably
                 continue
             tail = end["generated"] - 1 - top
             drops_total += end["drops"]
@@ -565,6 +621,7 @@ class RunSummary:
                             agent_accounted_tail_units=tail_drops,
                             unexplained_loss_units=unexplained_loss,
                             unexplained_drop_units=unexplained_drops,
+                            durable_named_units=overlapping,
                             drop_accounting=verdict)
         return verdict
 
@@ -705,17 +762,25 @@ class RunSummary:
                     episodes.append(t)
             windows = [(t, t, "agent") for t in episodes]
         # Each window takes its own disconnect and its own first accepted unit
-        # after it: one close/accept episode never counts for two windows.
+        # after it: one close/accept episode never counts for two windows. Like
+        # the G5 detections, a window ends at the next impairment start (any
+        # kind, same clock as the windows): a close or accept that happened
+        # after a later impairment never serves an earlier one.
+        marks = set(self._impairment_starts()) | {start for start, _end, _o in windows}
         used_closes, used_accepts = set(), set()
         times = []
         for start, end, _origin in windows:
+            limit = _window_limit(start, end + 30 * SECOND, marks)
+            later = [mark for mark in marks if mark > start]
+            accept_limit = min(later) if later else None
             close = next((i for i, t in enumerate(closes)
-                          if i not in used_closes and start <= t <= end + 30 * SECOND), None)
+                          if i not in used_closes and start <= t < limit), None)
             if close is None:
                 continue
             used_closes.add(close)
             accept = next((i for i, t in enumerate(accepts)
-                           if i not in used_accepts and t >= max(end, closes[close])), None)
+                           if i not in used_accepts and t >= max(end, closes[close])
+                           and (accept_limit is None or t < accept_limit)), None)
             if accept is None:
                 self.metrics.update(reconnect_missing=True)
                 return "fail"
@@ -981,7 +1046,7 @@ class RunSummary:
 
     def evaluate(self, *, rss_limit, loss_timeout_ns, single_host):
         single_host = single_host and not self.two_host
-        self.gates = {"g1": self.g1(single_host), "g2": self.g2(), "g3": self.g3(rss_limit),
+        self.gates = {"g1": self.g1(), "g2": self.g2(), "g3": self.g3(rss_limit),
                       "g4": self.g4(single_host), "g5": self.g5(loss_timeout_ns, single_host),
                       "g6": self.g6()}
         # A run that is not one complete execution never passes: a crash or
@@ -1000,6 +1065,10 @@ class RunSummary:
                             inputs_consistent=self.inputs_consistent,
                             exercised_sources=self.exercised_sources())
         return self
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _loss_episodes(losses):
@@ -1049,51 +1118,104 @@ def _match_episodes(starts, episodes, within=None, bounds=()):
     return delays
 
 
-def holder_cpu_rate(paths):
+def _holder_rate(samples):
     """Mean CPU cores used by the camera holder (process + pipelines) over its run.
 
     Live-descendant sampling misses a pipeline that exited between samples, so
     this is a lower bound for restarted pipelines.
     """
-    rates = []
-    for path in paths:
-        samples = _kind(records.read_jsonl(path), "sample")
-        if len(samples) >= 2:
-            first, last = samples[0], samples[-1]
-            wall = (last["t_ns"] - first["t_ns"]) / SECOND
-            cpu = (last["cpu_seconds"] - first["cpu_seconds"]
-                   + last.get("child_cpu_seconds", 0.0) - first.get("child_cpu_seconds", 0.0))
-            if wall > 0:
-                rates.append(cpu / wall)
-    return sum(rates) if rates else None
+    if len(samples) < 2:
+        return None
+    first, last = samples[0], samples[-1]
+    wall = (last["t_ns"] - first["t_ns"]) / SECOND
+    cpu = (last["cpu_seconds"] - first["cpu_seconds"]
+           + last.get("child_cpu_seconds", 0.0) - first.get("child_cpu_seconds", 0.0))
+    return cpu / wall if wall > 0 else None
 
 
-def holder_check(paths, summaries):
-    """Holder forwarding health over the real-input runs it served.
+def _run_id(summary):
+    return next(iter(summary.run_ids)) if len(summary.run_ids) == 1 else None
 
-    ``queue_drops`` (camera frames the holder could not take in time) must be
-    0. ``forward_drops`` counts sender disconnects seen by the holder; each
-    sender process exit (one per real-input run, plus each ``restart_sender``)
-    accounts for at most one, anything beyond that is a forwarding failure.
+
+def load_holders(paths, summaries):
+    """Validate ``--holder`` files against the real-input runs they served.
+
+    A holder file counts only as the record of one complete holder execution
+    for one real-input run: every record carries the same ``run_id``, which is
+    the ``run_id`` of a real-input run in this report, exactly one ``start``
+    and one ``end`` (``end`` after ``start``), and on the capture host's clock
+    the holder ran from before the run's first sender record to after its last
+    one. ``fail``: records of more than one execution, a missing ``start`` /
+    ``end`` (a crashed or still-running holder), a second file for the same
+    run, a holder that did not cover its run, or a camera profile rate
+    (holder ``start`` ``fps``) that differs from the sender's declared fps.
+    ``unmeasured``: a file whose ``run_id`` matches no real-input run (stale
+    or from another run), a file without samples or without the profile
+    rate, or a real-input run without a holder file.
+
+    Returns ``(rates, row)``: holder CPU cores per run id (valid holders only)
+    and the report row (None without ``--holder``).
     """
     if not paths:
-        return None
-    frames = queue_drops = forward_drops = 0
+        return {}, None
+    real = {}
+    for summary in summaries:
+        if summary.inputs == "real":
+            real[_run_id(summary)] = summary
+    verdicts, rates, seen = [], {}, set()
+    frames = queue_drops = forward_drops = allowed = 0
     for path in paths:
-        samples = _kind(records.read_jsonl(path), "sample")
-        if not samples:
-            return {"holder_verdict": "unmeasured"}
+        rows = records.read_jsonl(path)
+        ids = {row.get("run_id") for row in rows}
+        starts, ends = _kind(rows, "start"), _kind(rows, "end")
+        if (len(ids) != 1 or None in ids or len(starts) != 1 or len(ends) != 1
+                or ends[0]["t_ns"] < starts[0]["t_ns"]):
+            verdicts.append("fail")  # merged executions, or a partial file
+            continue
+        run_id = next(iter(ids))
+        if run_id in seen:
+            verdicts.append("fail")  # two holder files for one run
+            continue
+        seen.add(run_id)
+        summary = real.get(run_id)
+        samples = _kind(rows, "sample")
+        if summary is None or not samples:
+            verdicts.append("unmeasured")  # stale / unrelated file, or no samples
+            continue
+        times = [row["t_ns"] for row in summary.sender if "t_ns" in row]
+        if not times or starts[0]["t_ns"] > min(times) or ends[0]["t_ns"] < max(times):
+            verdicts.append("fail" if times else "unmeasured")
+            continue
+        # The camera profile rate the holder captured at is the rate the
+        # sender must have declared (production is scored against it).
+        declared = {item.get("fps") for item in _kind(summary.sender, "start")}
+        if starts[0].get("fps") is None or None in declared:
+            verdicts.append("unmeasured")
+            continue
+        if declared != {starts[0]["fps"]}:
+            verdicts.append("fail")
+            continue
         last = samples[-1]
+        run_allowed = 1 + sum(1 for a in _kind(summary.orchestrator, "action")
+                              if a.get("action") == "restart_sender")
         frames += last.get("frames") or 0
         queue_drops += last.get("queue_drops") or 0
         forward_drops += last.get("forward_drops") or 0
-    real = [s for s in summaries if s.inputs == "real"]
-    allowed = len(real) + sum(1 for s in real for a in _kind(s.orchestrator, "action")
-                              if a.get("action") == "restart_sender")
-    return {"holder_frames": frames, "holder_queue_drops": queue_drops,
-            "holder_forward_drops": forward_drops, "holder_forward_drops_allowed": allowed,
-            "holder_verdict": _verdict(frames > 0 and queue_drops == 0
-                                       and forward_drops <= allowed)}
+        allowed += run_allowed
+        verdicts.append(_verdict((last.get("frames") or 0) > 0
+                                 and (last.get("queue_drops") or 0) == 0
+                                 and (last.get("forward_drops") or 0) <= run_allowed))
+        rate = _holder_rate(samples)
+        if rate is not None:
+            rates[run_id] = rate
+    if set(real) - seen:
+        verdicts.append("unmeasured")  # a real-input run without its holder record
+    return rates, {"holder_files": len(paths), "holder_real_runs": len(real),
+                   "holder_runs_matched": len(set(real) & seen),
+                   "holder_frames": frames, "holder_queue_drops": queue_drops,
+                   "holder_forward_drops": forward_drops,
+                   "holder_forward_drops_allowed": allowed,
+                   "holder_verdict": _combine(verdicts)}
 
 
 def _candidate_gate(items, gate):
@@ -1116,7 +1238,6 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
     """Gate report. Runs recorded by ``--role main`` / ``--role agent`` are
     always evaluated as two-host (no cross-host clock comparison)."""
     runs = load_runs(directories)
-    holder_rate = holder_cpu_rate(holder_files)
     summaries = []
     for name, roles in sorted(runs.items()):
         summary = RunSummary(name, roles)
@@ -1124,12 +1245,16 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
         loss_timeout = start.get("loss_timeout_ns") or 5 * SECOND
         summary.evaluate(rss_limit=rss_limit, loss_timeout_ns=loss_timeout,
                          single_host=single_host)
+        summaries.append(summary)
+    # Only a validated holder record of the same run adds its CPU to that run.
+    holder_rates, holder = load_holders(holder_files, summaries)
+    for summary in summaries:
+        holder_rate = holder_rates.get(_run_id(summary))
         if (summary.inputs == "real" and holder_rate is not None and summary.n_sources
                 and "agent_cpu_per_source" in summary.metrics):
             summary.metrics["agent_cpu_per_source"] = round(
                 summary.metrics["agent_cpu_per_source"] + holder_rate / summary.n_sources, 4)
             summary.metrics["holder_cpu_included"] = True
-        summaries.append(summary)
     by_candidate = defaultdict(list)
     for summary in summaries:
         by_candidate[summary.candidate].append(summary)
@@ -1180,7 +1305,6 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
             "overhead_max": max(overhead) if overhead else None,
             "latency_p95_max_ns": max(latency) if latency else None,
             **{"secondary_" + k: v for k, v in secondary.items()}})
-    holder = holder_check(holder_files, summaries)
     if holder is not None:
         report["holder"] = holder
     for row in report["runs"] + report["candidates"] + ([holder] if holder else []):
