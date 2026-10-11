@@ -15,7 +15,7 @@ from collections import defaultdict
 import json
 from pathlib import Path
 
-from . import records
+from . import matrix, records
 
 SECOND = 1_000_000_000
 PROTECTED_NS = 600 * SECOND
@@ -37,6 +37,22 @@ AUTH_REFUSAL_REASONS = {
     "tls_handshake_failed", "tls_session_failed", "capture_node_not_admitted",
     "capture_node_certificate_invalid", "capture_node_certificate_missing",
     "tls_version_refused", "unauthorized"}
+# A candidate verdict covers only the scenarios that ran: a gate whose required
+# scenarios are not all present is ``unmeasured`` (unless one already failed).
+REQUIRED_SCENARIOS = {
+    "g1": NEGATIVE_SCENARIOS | {"auth_revoked_live", "route_probe"},
+    "g2": {"normal", "capture_restart"} | COMM_LOSS_SCENARIOS,
+    "g3": {"normal", "slow_drain", "bandwidth_cap", "outage_120s", "slow_stop_60s",
+           "capacity_4"},
+    "g4": set(DISCONNECT_SCENARIOS),
+    "g5": set(COMM_LOSS_SCENARIOS),
+    "g6": {"capacity_4", "fifth_refused"},
+}
+GATES = ("g1", "g2", "g3", "g4", "g5", "g6")
+# Impairments after which the Agent must have dropped the connection (G4):
+# always for reset / restart, and for a silent window only when it is longer
+# than the Agent loss timeout by a full second (no borderline expectation).
+LOSS_MARGIN_NS = SECOND
 
 
 def load_runs(directories):
@@ -68,6 +84,11 @@ def _verdict(ok):
     return "pass" if ok else "fail"
 
 
+def _bound(ok):
+    """A bound check: None (the value could not be read) is ``unmeasured``."""
+    return "unmeasured" if ok is None else _verdict(ok)
+
+
 def _combine(verdicts):
     verdicts = [v for v in verdicts if v not in ("not_applicable",)]
     if not verdicts:
@@ -92,11 +113,25 @@ class RunSummary:
         self.candidate = start.get("candidate") or name.rsplit("-", 1)[-1]
         self.n_sources = start.get("n_sources")
         self.inputs = start.get("inputs", "synthetic")
+        sides = {item.get("side") for item in _kind(self.orchestrator, "start")}
+        # A ``--role main`` / ``--role agent`` record means two hosts (two clocks).
+        self.two_host = bool(sides & {"main", "agent"})
+        self.fast = start.get("fast")
         self.metrics = {}
         self.gates = {}
 
+    def plan(self):
+        """The deterministic schedule this run executed, or None if unknown."""
+        if self.fast is None or self.scenario not in matrix.SCENARIOS:
+            return None
+        return matrix.timing(self.scenario, bool(self.fast))
+
+    def stale_after_ns(self):
+        ready = [r for r in _kind(self.receiver, "ready") if r.get("stale_after_ns")]
+        return ready[0]["stale_after_ns"] if ready else None
+
     # -- G1 -----------------------------------------------------------------
-    def g1(self):
+    def g1(self, single_host=True):
         accepted = _sum_end(self.receiver, "accepted")
         sender_accepted = sum(item.get("accepted", 0) for item in _kind(self.sender, "end"))
         sessions = len(_kind(self.receiver, "session_open"))
@@ -112,19 +147,50 @@ class RunSummary:
             return _verdict(bool(probes) and all(p["reason"] in ("not_found", "peer_closed")
                                                  for p in probes) and accepted == 0)
         if self.scenario == "auth_revoked_live":
-            revoked = _kind(self.receiver, "revoked")
-            action = [a for a in _kind(self.orchestrator, "action") if a.get("action") == "revoke"]
-            if not revoked:
-                return "fail"
-            detected = revoked[0]["t_ns"]
-            after = [s for s in _kind(self.receiver, "sample") if s["t_ns"] >= detected]
-            frozen = (not after) or all(s["accepted"] == after[0]["accepted"] for s in after)
-            delay = None if not action else detected - action[0]["t_ns"]
-            self.metrics.update(revocation_detect_ns=delay)
-            # Detection within admission check interval + one sample, and no
-            # media accepted afterwards; positive control: media before it.
-            return _verdict(frozen and accepted > 0 and (delay is None or delay <= 3 * SECOND))
+            return self._g1_revoked_live(accepted, single_host)
         return _verdict(sessions > 0)
+
+    def _g1_revoked_live(self, accepted, single_host):
+        """Revocation of a connected node: detected, then nothing accepted.
+
+        Evidence required: the Main-side orchestrator ``revoke`` action (else
+        ``unmeasured``), the receiver ``revoked`` decision, at least one
+        receiver sample after it whose accepted count equals the count at the
+        decision (else ``unmeasured``: nothing was observed afterwards), and a
+        refused re-admission after it (Main ``auth_refused``; on one host a
+        sender ``connect`` also counts). Positive control: media before it.
+        """
+        action = [a for a in _kind(self.orchestrator, "action") if a.get("action") == "revoke"]
+        revoked = _kind(self.receiver, "revoked")
+        if not action:
+            return "unmeasured"  # the revocation itself is not on record
+        if not revoked:
+            return "fail"
+        detected = revoked[0]["t_ns"]
+        delay = detected - action[0]["t_ns"]
+        samples = _kind(self.receiver, "sample")
+        baseline = revoked[0].get("accepted")
+        if baseline is None:  # older record: last count observed before detection
+            before = [s["accepted"] for s in samples
+                      if s["t_ns"] < detected and s.get("accepted") is not None]
+            baseline = before[-1] if before else None
+        after = [s for s in samples if s["t_ns"] > detected]
+        retried = any(r["t_ns"] > detected and r.get("reason") in AUTH_REFUSAL_REASONS
+                      for r in _kind(self.receiver, "auth_refused"))
+        if single_host:
+            retried = retried or any(c["t_ns"] > detected for c in _kind(self.sender, "connect"))
+        self.metrics.update(revocation_detect_ns=delay, revoked_samples_after=len(after),
+                            revoked_retry_refused=retried)
+        if baseline is None or not after:
+            return "unmeasured"
+        frozen = all(s.get("accepted") == baseline for s in after)
+        # Detection within admission check interval + one sample, and no
+        # media accepted afterwards; positive control: media before it.
+        if not frozen or accepted <= 0 or baseline <= 0 or delay > 3 * SECOND:
+            return "fail"
+        if not retried:
+            return "fail" if self.sender else "unmeasured"
+        return "pass"
 
     def _g1_negative(self, accepted, sender_accepted, sessions):
         """Zero accepted media only counts with evidence that auth was exercised.
@@ -153,8 +219,16 @@ class RunSummary:
         gaps = _kind(self.receiver, "gap")
         exact = True
         actual_total = reported_total = duplicates = 0
+        restart_starts = {(g["source"], g["epoch"], g["before_sequence"])
+                          for g in gaps if g["reason"] == "capture_restart"}
         for (source, epoch), row in durable.items():
-            actual = row["max_sequence"] - row["min_sequence"] + 1 - row["units"]
+            # Every epoch starts at sequence 0, so units lost before the first
+            # durable one are loss too (the tracker reports them as a leading
+            # sequence_skip). After a capture restart the leading extent is
+            # the unknown-extent capture_restart gap instead.
+            origin = (row["min_sequence"] if (source, epoch, row["min_sequence"]) in restart_starts
+                      else 0)
+            actual = row["max_sequence"] - origin + 1 - row["units"]
             reported = 0
             for gap in gaps:
                 if (gap["source"], gap["epoch"]) != (source, epoch):
@@ -170,6 +244,13 @@ class RunSummary:
             actual_total += actual
             reported_total += reported
             exact = exact and actual == reported
+        # Sender evidence: an epoch the Agent got accepted units for but that
+        # has no durable row lost them all, with no exact count on record.
+        unrecorded = [(e["source"], e["epoch"]) for e in _kind(self.sender, "end")
+                      if e.get("epoch") is not None and (e.get("accepted") or 0) > 0
+                      and (e["source"], e["epoch"]) not in durable]
+        if unrecorded:
+            exact = False
         restarts_ok = True
         epochs_by_source = defaultdict(set)
         for source, epoch in durable:
@@ -185,6 +266,7 @@ class RunSummary:
             restarts_ok = False
         self.metrics.update(actual_missing=actual_total, reported_missing=reported_total,
                             durable_duplicates=duplicates, capture_restart_gaps=len(restart_gaps),
+                            epochs_without_durable=len(unrecorded),
                             lossless=actual_total == 0 and reported_total == 0)
         if not durable and self.scenario not in NEGATIVE_SCENARIOS | {"route_probe"}:
             return "fail"
@@ -199,54 +281,63 @@ class RunSummary:
         warm = values[len(values) // 4]
         return max(values[len(values) // 4:]) - warm, warm
 
+    def _g3_side(self, samples, side, rss_limit, *, require_ss):
+        """Bound checks of one side's samples; returns per-check verdicts.
+
+        The kernel send queue is the queued byte count: ``TIOCOUTQ`` (always)
+        and, when ``ss -tmi`` ran, skmem ``w`` (wmem_queued). skmem ``tb`` is
+        the buffer *limit*, which Linux may expand before SO_SNDBUF is applied
+        to a freshly connected socket; it is recorded but not gated. Without
+        ``ss`` the skmem check is ``unmeasured`` for real-input runs (the
+        runbook requires ``ss``) and skipped for synthetic loopback runs.
+        """
+        last = samples[-1]
+        limit = 2 * last["sndbuf"] + OUTQ_SLACK
+        max_outq = max(s["max_outq"] for s in samples)
+        ss_measured = any(s.get("ss_sockets") is not None for s in samples)
+        ss_w = max((s.get("ss_w") or 0) for s in samples)
+        ss_tb = max((s.get("ss_tb") or 0) for s in samples)
+        hwm_values = [s["hwm_bytes"] for s in samples if s.get("hwm_bytes") is not None]
+        growth = self._growth(samples)
+        self.metrics.update({
+            f"{side}_max_outq": max_outq, f"{side}_hwm": max(hwm_values, default=None),
+            f"{side}_ss_measured": ss_measured, f"{side}_ss_w": ss_w if ss_measured else None,
+            f"{side}_ss_tb": ss_tb if ss_measured else None,
+            f"{side}_rss_growth": None if growth is None else growth[0]})
+        verdicts = [_verdict(max_outq <= limit),
+                    _bound(None if not hwm_values else max(hwm_values) <= rss_limit),
+                    _bound(None if growth is None
+                           else growth[0] <= max(GROWTH_BYTES, growth[1] // 10))]
+        if ss_measured:
+            verdicts.append(_verdict(ss_w <= limit))
+        elif require_ss:
+            verdicts.append("unmeasured")
+        return verdicts
+
     def g3(self, rss_limit):
-        verdicts = []
+        if self.scenario == "route_probe":
+            return "not_applicable"  # one request, no media flow to bound
         rsamples = _kind(self.receiver, "sample")
         ssamples = _kind(self.sender, "sample")
-        if rsamples:
-            last = rsamples[-1]
-            max_q = max(s["max_queued_messages"] for s in rsamples)
-            max_b = max(s["max_queued_bytes"] for s in rsamples)
-            max_outq = max(s["max_outq"] for s in rsamples)
-            hwm = max(s.get("hwm_bytes") or 0 for s in rsamples)
-            ss_tb = max((s.get("ss_tb") or 0) for s in rsamples)
-            ss_wq = max((s.get("ss_w") or 0) for s in rsamples)
-            growth = self._growth(rsamples)
-            self.metrics.update(receiver_max_queue=max_q, receiver_max_queue_bytes=max_b,
-                                receiver_max_outq=max_outq, receiver_hwm=hwm,
-                                receiver_ss_tb=ss_tb or None, receiver_ss_w=ss_wq or None,
-                                receiver_rss_growth=None if growth is None else growth[0])
-            verdicts.append(max_q <= last["limit_queued_messages"]
-                            and max_b <= last["limit_queued_bytes"]
-                            and max_outq <= 2 * last["sndbuf"] + OUTQ_SLACK
-                            and (not ss_tb or ss_tb <= 2 * last["sndbuf"] + OUTQ_SLACK)
-                            and hwm <= rss_limit
-                            and (growth is None or growth[0] <= max(GROWTH_BYTES,
-                                                                    growth[1] // 10)))
-        if ssamples:
-            last = ssamples[-1]
-            max_pending = max(s["max_pending"] for s in ssamples)
-            max_outq = max(s["max_outq"] for s in ssamples)
-            sender_tb = max((s.get("ss_tb") or 0) for s in ssamples)
-            hwm = max(s.get("hwm_bytes") or 0 for s in ssamples)
-            growth = self._growth(ssamples)
-            self.metrics.update(sender_max_pending=max_pending, sender_max_outq=max_outq,
-                                sender_hwm=hwm, sender_ss_tb=sender_tb or None,
-                                sender_rss_growth=None if growth is None else growth[0])
-            verdicts.append(max_pending <= last["pending_limit"]
-                            and max_outq <= 2 * last["sndbuf"] + OUTQ_SLACK
-                            and (not sender_tb or sender_tb <= 2 * last["sndbuf"] + OUTQ_SLACK)
-                            and hwm <= rss_limit
-                            and (growth is None or growth[0] <= max(GROWTH_BYTES,
-                                                                    growth[1] // 10)))
         psamples = _kind(self.proxy, "sample")
         if psamples:
-            held = max(s["max_held"] for s in psamples)
-            self.metrics.update(proxy_max_held=held)
-            verdicts.append(held <= psamples[-1]["buffer_bytes"])
-        if not verdicts:
-            return "unmeasured"
-        return _verdict(all(verdicts))
+            # Structural, not gated: the proxy holds at most one recv() buffer.
+            self.metrics.update(proxy_max_held=max(s["max_held"] for s in psamples))
+        if not rsamples or not ssamples:
+            return "unmeasured"  # both ends are required
+        require_ss = self.inputs == "real"
+        last = rsamples[-1]
+        max_q = max(s["max_queued_messages"] for s in rsamples)
+        max_b = max(s["max_queued_bytes"] for s in rsamples)
+        self.metrics.update(receiver_max_queue=max_q, receiver_max_queue_bytes=max_b)
+        verdicts = [_verdict(max_q <= last["limit_queued_messages"]
+                             and max_b <= last["limit_queued_bytes"])]
+        verdicts += self._g3_side(rsamples, "receiver", rss_limit, require_ss=require_ss)
+        max_pending = max(s["max_pending"] for s in ssamples)
+        self.metrics.update(sender_max_pending=max_pending)
+        verdicts.append(_verdict(max_pending <= ssamples[-1]["pending_limit"]))
+        verdicts += self._g3_side(ssamples, "sender", rss_limit, require_ss=require_ss)
+        return _combine(verdicts)
 
     # -- G4 -----------------------------------------------------------------
     def _impairment_windows(self):
@@ -273,36 +364,67 @@ class RunSummary:
                 restart_at = None
         return windows
 
+    def _loss_timeout_ns(self):
+        start = _last(self.sender, "start") or {}
+        return start.get("loss_timeout_ns")
+
+    def _required_disconnects(self):
+        """Scheduled impairments that must each produce one reconnect (G4)."""
+        plan = self.plan()
+        loss_timeout = self._loss_timeout_ns()
+        if plan is None or loss_timeout is None:
+            return None
+        required = 0
+        for item in plan.get("proxy", []) + plan.get("actions", []):
+            action, length = item[1], (item[2] if len(item) > 2 else 0)
+            if action in ("reset", "restart_receiver"):
+                required += 1
+            elif (action in ("blackhole", "sigstop")
+                  and length * SECOND >= loss_timeout + LOSS_MARGIN_NS):
+                required += 1
+        return required
+
     def g4(self, single_host):
         if self.scenario not in DISCONNECT_SCENARIOS:
             return "not_applicable"
         if not self.sender:
             return "unmeasured"
-        windows = self._impairment_windows()
-        closes = _kind(self.sender, "closed")
-        accepts = _kind(self.sender, "first_accept")
+        windows = sorted(self._impairment_windows())
+        closes = sorted(c["t_ns"] for c in _kind(self.sender, "closed")
+                        if c["reason"] != "shutdown")
+        accepts = sorted(a["t_ns"] for a in _kind(self.sender, "first_accept"))
         if any(origin == "main" for *_, origin in windows) and not single_host:
             # Main-side windows use the Main clock; measure on the Agent clock
             # from each unexpected disconnect to the next accepted unit.
-            windows = [(c["t_ns"], c["t_ns"], "agent") for c in closes
-                       if c["reason"] != "shutdown"]
+            windows = [(t, t, "agent") for t in closes]
+        # Each window takes its own disconnect and its own first accepted unit
+        # after it: one close/accept episode never counts for two windows.
+        used_closes, used_accepts = set(), set()
         times = []
         for start, end, _origin in windows:
-            disconnected = any(start <= c["t_ns"] <= end + 30 * SECOND for c in closes)
-            if not disconnected:
+            close = next((i for i, t in enumerate(closes)
+                          if i not in used_closes and start <= t <= end + 30 * SECOND), None)
+            if close is None:
                 continue
-            after = [a["t_ns"] for a in accepts if a["t_ns"] >= end]
-            if not after:
+            used_closes.add(close)
+            accept = next((i for i, t in enumerate(accepts)
+                           if i not in used_accepts and t >= max(end, closes[close])), None)
+            if accept is None:
                 self.metrics.update(reconnect_missing=True)
                 return "fail"
-            times.append(after[0] - end)
+            used_accepts.add(accept)
+            times.append(accepts[accept] - end)
         self.reconnect_samples = times
-        self.metrics.update(reconnects=len(times),
+        required = self._required_disconnects()
+        self.metrics.update(reconnects=len(times), reconnects_required=required,
                             reconnect_p95_ns=records.percentiles(times)[95])
-        if not times:
-            return "fail" if self.scenario in {"outage_5s", "outage_120s", "rst",
-                                               "main_restart"} else "pass"
-        return _verdict(records.percentiles(times)[95] <= RECONNECT_P95_NS)
+        if required is not None and len(times) < required:
+            return "fail"  # a scheduled disconnect has no reconnect episode
+        if not times and self.scenario in {"outage_5s", "outage_120s", "rst", "main_restart"}:
+            return "fail"
+        if times and records.percentiles(times)[95] > RECONNECT_P95_NS:
+            return "fail"
+        return "unmeasured" if required is None else "pass"
 
     # -- G5 -----------------------------------------------------------------
     def _main_outage_detection(self, losses, single_host):
@@ -346,6 +468,58 @@ class RunSummary:
             return "fail"
         return "pass"
 
+    def _silent_outage_evidence(self, single_host):
+        """Scheduled proxy blackholes ran, and Main flagged each long one.
+
+        Every scheduled blackhole needs its ``impairment_start`` record (the
+        Agent-side ``proxy.jsonl``; absent: ``unmeasured``, fewer: ``fail``).
+        Each blackhole at least as long as the Main stale threshold must show
+        Main's own detection: an ``interrupted`` record per source with
+        ``since_last_rx_ns`` <= 15 s (on one host also inside the window + 15
+        s; on two hosts one per window and source, without clock comparison).
+        """
+        plan = self.plan()
+        if plan is None:
+            return "unmeasured"
+        scheduled = [item for item in plan.get("proxy", []) if item[1] == "blackhole"]
+        if not scheduled:
+            return "pass"
+        if not self.proxy:
+            return "unmeasured"
+        starts = [item for item in self.proxy if item["kind"] == "impairment_start"
+                  and item["impairment"] == "blackhole"]
+        stale = self.stale_after_ns()
+        self.metrics.update(blackholes_scheduled=len(scheduled), blackholes_recorded=len(starts))
+        if len(starts) < len(scheduled):
+            return "fail"
+        if stale is None:
+            return "unmeasured"  # Main-side threshold not on record
+        windows = [(start, end) for start, end, origin in self._impairment_windows()
+                   if origin == "proxy" and end - start >= stale]
+        sources = sorted({d["source"] for d in _kind(self.receiver, "durable")
+                          if d["source"] >= 0})
+        interrupted = [i for i in _kind(self.receiver, "interrupted")
+                       if i.get("since_last_rx_ns") is not None
+                       and i["since_last_rx_ns"] <= DETECTION_NS]
+        matched = 0
+        for source in sources:
+            mine = sorted((i["t_ns"] for i in interrupted if i.get("source") == source))
+            if not single_host:
+                matched += min(len(mine), len(windows))
+                continue
+            used = set()
+            for start, end in windows:
+                hit = next((k for k, t in enumerate(mine)
+                            if k not in used and start <= t <= end + DETECTION_NS), None)
+                if hit is not None:
+                    used.add(hit)
+                    matched += 1
+        required = len(windows) * len(sources)
+        self.metrics.update(main_detect_required=required, main_detect_matched=matched)
+        if not sources and windows:
+            return "fail"
+        return _verdict(matched >= required)
+
     def g5(self, loss_timeout_ns, single_host=True):
         if self.scenario not in COMM_LOSS_SCENARIOS:
             gaps = _kind(self.receiver, "durable_gap")
@@ -354,6 +528,7 @@ class RunSummary:
         if not self.sender or not self.receiver:
             return "unmeasured"
         losses = _kind(self.sender, "loss_detected")
+        proxy_evidence = self._silent_outage_evidence(single_host)
         ok = True
         detections = []
         for item in self.proxy:
@@ -376,10 +551,6 @@ class RunSummary:
         if detections and any(value > DETECTION_NS for value in detections):
             ok = False
         main_outage = self._main_outage_detection(losses, single_host)
-        if main_outage == "unmeasured":
-            return "unmeasured"
-        if main_outage == "fail":
-            ok = False
         if any(value > DETECTION_NS for value in main_detect):
             ok = False
         uncovered = 0
@@ -394,7 +565,8 @@ class RunSummary:
         self.metrics.update(agent_detect_max_ns=max(detections) if detections else None,
                             main_detect_max_ns=max(main_detect) if main_detect else None,
                             uncovered_durable_gaps=uncovered)
-        return _verdict(ok and uncovered == 0)
+        # A failed check fails the gate even when other evidence is missing.
+        return _combine([proxy_evidence, main_outage, _verdict(ok and uncovered == 0)])
 
     # -- G6 -----------------------------------------------------------------
     def g6(self):
@@ -414,13 +586,23 @@ class RunSummary:
                             cpu_capped=end.get("cpu_quota_us") is not None,
                             agent_cpu_capped=metric.get("cpu_quota_us") is not None)
         healthy = {0, 1, 2, 3} <= durable_sources and backpressured == 0 and rate_limited == 0
+        ends = {item.get("source"): item for item in _kind(self.sender, "end")}
+        if not ends or not end:
+            return "unmeasured"  # no per-source totals: drops cannot be read as 0
         if self.scenario == "capacity_4":
-            # "4 sources under a CPU limit": both sides must have run capped.
+            # "4 sources under a CPU limit": both sides must have run capped,
+            # and every source's sender totals must be on record.
             capped = (end.get("cpu_quota_us") is not None
                       and metric.get("cpu_quota_us") is not None)
-            return _verdict(healthy and drops == 0 and capped)
-        fifth = [item for item in _kind(self.sender, "end") if item.get("source") == 4]
-        refused = bool(fifth) and fifth[0]["accepted"] == 0 and fifth[0]["rejected"] > 0
+            all_ends = {0, 1, 2, 3} <= set(ends)
+            return _verdict(healthy and all_ends and drops == 0 and capped)
+        fifth = ends.get(4)
+        if fifth is None:
+            return "fail"
+        if "rejected_source_capacity" not in fifth:
+            return "unmeasured"  # the refusal reason is not on record
+        refused = (fifth["accepted"] == 0 and fifth["rejected"] > 0
+                   and fifth["rejected_source_capacity"] == fifth["rejected"])
         return _verdict({0, 1, 2, 3} <= durable_sources and 4 not in durable_sources and refused)
 
     # -- secondary ----------------------------------------------------------
@@ -453,7 +635,8 @@ class RunSummary:
         return result
 
     def evaluate(self, *, rss_limit, loss_timeout_ns, single_host):
-        self.gates = {"g1": self.g1(), "g2": self.g2(), "g3": self.g3(rss_limit),
+        single_host = single_host and not self.two_host
+        self.gates = {"g1": self.g1(single_host), "g2": self.g2(), "g3": self.g3(rss_limit),
                       "g4": self.g4(single_host), "g5": self.g5(loss_timeout_ns, single_host),
                       "g6": self.g6()}
         self.metrics.update(self.secondary())
@@ -479,7 +662,46 @@ def holder_cpu_rate(paths):
     return sum(rates) if rates else None
 
 
+def holder_check(paths, summaries):
+    """Holder forwarding health over the real-input runs it served.
+
+    ``queue_drops`` (camera frames the holder could not take in time) must be
+    0. ``forward_drops`` counts sender disconnects seen by the holder; each
+    sender process exit (one per real-input run, plus each ``restart_sender``)
+    accounts for at most one, anything beyond that is a forwarding failure.
+    """
+    if not paths:
+        return None
+    frames = queue_drops = forward_drops = 0
+    for path in paths:
+        samples = _kind(records.read_jsonl(path), "sample")
+        if not samples:
+            return {"holder_verdict": "unmeasured"}
+        last = samples[-1]
+        frames += last.get("frames") or 0
+        queue_drops += last.get("queue_drops") or 0
+        forward_drops += last.get("forward_drops") or 0
+    real = [s for s in summaries if s.inputs == "real"]
+    allowed = len(real) + sum(1 for s in real for a in _kind(s.orchestrator, "action")
+                              if a.get("action") == "restart_sender")
+    return {"holder_frames": frames, "holder_queue_drops": queue_drops,
+            "holder_forward_drops": forward_drops, "holder_forward_drops_allowed": allowed,
+            "holder_verdict": _verdict(frames > 0 and queue_drops == 0
+                                       and forward_drops <= allowed)}
+
+
+def _candidate_gate(items, gate):
+    """Combine run verdicts; missing required scenarios make it ``unmeasured``."""
+    verdict = _combine([s.gates[gate] for s in items])
+    missing = REQUIRED_SCENARIOS[gate] - {s.scenario for s in items}
+    if missing and verdict != "fail":
+        verdict = "unmeasured"
+    return verdict, len(missing)
+
+
 def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, holder_files=()):
+    """Gate report. Runs recorded by ``--role main`` / ``--role agent`` are
+    always evaluated as two-host (no cross-host clock comparison)."""
     runs = load_runs(directories)
     holder_rate = holder_cpu_rate(holder_files)
     summaries = []
@@ -503,8 +725,11 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
         report["runs"].append({"scenario": summary.scenario, "candidate": summary.candidate,
                                "inputs": summary.inputs, **summary.gates, **summary.metrics})
     for candidate, items in sorted(by_candidate.items()):
-        gates = {gate: _combine([s.gates[gate] for s in items])
-                 for gate in ("g1", "g2", "g3", "g4", "g5", "g6")}
+        gates, missing = {}, {}
+        for gate in GATES:
+            gates[gate], missing[gate + "_missing_scenarios"] = _candidate_gate(items, gate)
+        unprotected = [s.metrics["unprotected_gap_units"] for s in items
+                       if "unprotected_gap_units" in s.metrics]
         reconnects = [t for s in items for t in getattr(s, "reconnect_samples", [])]
         soak = [s for s in items if s.scenario == "soak"]
         overhead = [s.metrics["overhead_ratio"] for s in items
@@ -524,12 +749,19 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
             "packet_loss": "unmeasured", "jitter": "unmeasured",
         }
         report["candidates"].append({
-            "candidate": candidate, "runs": len(items), **gates,
+            "candidate": candidate, "runs": len(items), **gates, **missing,
+            # Durable stand-in gaps in scenarios without a communication loss
+            # (e.g. slow_drain backpressure): not protected by the Agent's
+            # loss window, so they are listed rather than hidden.
+            "unprotected_gap_units": sum(unprotected) if unprotected else None,
             "reconnect_p95_ns": records.percentiles(reconnects)[95],
             "overhead_max": max(overhead) if overhead else None,
             "latency_p95_max_ns": max(latency) if latency else None,
             **{"secondary_" + k: v for k, v in secondary.items()}})
-    for row in report["runs"] + report["candidates"]:
+    holder = holder_check(holder_files, summaries)
+    if holder is not None:
+        report["holder"] = holder
+    for row in report["runs"] + report["candidates"] + ([holder] if holder else []):
         records.validate_record(row)
     return report
 
@@ -540,12 +772,22 @@ def _seconds(value):
 
 def render(report):
     gates = ("g1", "g2", "g3", "g4", "g5", "g6")
-    lines = ["candidate   G1   G2   G3   G4   G5   G6   reconnect_p95_s  overhead  soak"]
+    lines = ["candidate   G1   G2   G3   G4   G5   G6   reconnect_p95_s  overhead  soak"
+             "        unprotected_gap_units"]
     for row in report["candidates"]:
         overhead = "-" if row["overhead_max"] is None else f"{row['overhead_max']:.4f}"
         lines.append(f"{row['candidate']:<11} " + " ".join(f"{row[g][:4]:<4}" for g in gates)
                      + f" {_seconds(row['reconnect_p95_ns']):>15}  {overhead:>8}"
-                     + f"  {row['secondary_soak']}")
+                     + f"  {row['secondary_soak']:<11} {row['unprotected_gap_units']}")
+        missing = [g for g in gates if row.get(g + "_missing_scenarios")]
+        if missing:
+            lines.append("  required scenarios missing for: " + ", ".join(missing))
+    if "holder" in report:
+        holder = report["holder"]
+        lines.append(f"holder: {holder['holder_verdict']} (queue_drops "
+                     f"{holder.get('holder_queue_drops')}, forward_drops "
+                     f"{holder.get('holder_forward_drops')}/"
+                     f"{holder.get('holder_forward_drops_allowed')})")
     lines.append("")
     lines.append("scenario            candidate   G1   G2   G3   G4   G5   G6  missing(rep/act)")
     for row in report["runs"]:

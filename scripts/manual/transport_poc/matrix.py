@@ -199,6 +199,9 @@ class Orchestrator:
                     spec.get("route_probe", False)), wait_ready=False,
                     stderr_path=state_dir / "sender.stderr")
             started = time.monotonic()
+            if role == "main":
+                # Operator cue for a two-host run: start the capture side now.
+                print("ready", name, candidate, flush=True)
             actions = sorted(plan.get("actions", []))
             for at, action, length in actions:
                 if (role == "main" and action not in MAIN_ACTIONS) or (

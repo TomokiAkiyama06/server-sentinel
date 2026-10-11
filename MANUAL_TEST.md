@@ -1174,7 +1174,8 @@ Record:
 ### Agent-to-Main transport PoC (Issue #15, ADR-0007 — pending physical execution)
 
 Synthetic continuity tests do not verify any transport. For each candidate
-(WebRTC, SRT, QUIC, authenticated HTTP/WebSocket streaming) on the real Main
+(WebRTC, QUIC, authenticated HTTP/WebSocket streaming; SRT was dropped by the
+Owner decision of 2026-10-11, see ADR-0007) on the real Main
 Server, capture node and UVC camera over the private LAN, and for 1, 2, 3 and 4
 sources (record which sources are real cameras and which are synthetic input):
 
@@ -1215,9 +1216,9 @@ Total run time today (≤ 3 h):
 ```
 
 - [ ] step 0 inventory を両 host で取得し、47200–47214 が未使用であることを確認した;
-- [ ] G1: `auth_unpaired` / `auth_other_ca` / `auth_revoked` / `auth_revoked_live` で受理 media 0、`route_probe` で human route なし;
+- [ ] G1: `auth_unpaired` / `auth_other_ca` / `auth_revoked` / `auth_revoked_live` で受理 media 0、`route_probe` でハーネス receiver に human route なし（製品の human/admin API は上の transport PoC 項目で別途確認）;
 - [ ] G2: 各 impairment 後の報告 gap が実欠落と一致（epoch 内は完全一致、capture 再起動は範囲不明）、重複 commit 0;
-- [ ] G3: receiver queue / kernel send buffer（`ss -tmi`）/ VmHWM が設定上限内で warmup 後に増加しない;
+- [ ] G3: receiver queue / kernel send queue の滞留 byte（`TIOCOUTQ` と `ss -tmi` の skmem `w`）/ VmHWM が設定上限内で warmup 後に増加しない;
 - [ ] G4: 手動操作なしで再接続し p95 ≤ 10 s;
 - [ ] G5: 無音断の検知 ≤ 15 s、Main の未 commit 区間が Agent 保護区間 [T−600 s, T+600 s] に含まれる;
 - [ ] G6: CPU 制限下の 4 source で backpressure 0、5 source 目は拒否;

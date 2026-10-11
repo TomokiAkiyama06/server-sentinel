@@ -246,7 +246,11 @@ class Receiver:
 
     def serve_with(self, loop):
         """Run ``loop`` with the consumer and sampler workers, then finish."""
-        self._event("ready", port=self.port)
+        # The Main-side stale threshold lets the summarizer decide which
+        # silent outages Main itself must flag as interrupted (G5).
+        self._event("ready", port=self.port,
+                    stale_after_ns=int(self.config.stale_after_s * 1e9),
+                    admission_check_ns=int(self.config.admission_check_s * 1e9))
         print("ready", flush=True)
         threads = [threading.Thread(target=self._consume, daemon=True),
                    threading.Thread(target=self._sample, daemon=True)]
@@ -366,7 +370,12 @@ class Receiver:
         # rest on an authorization read before this point.
         with self.tracker.authorization_change(revoked_node=node):
             self.authorizer.remove(node)
-        self._event("revoked", node=token(self.node_index.get(node, "other")))
+        # The accepted count at the decision is the baseline that every later
+        # sample must equal (G1 auth_revoked_live: nothing accepted after it).
+        with self._lock:
+            accepted = self.counts.get("accepted", 0)
+        self._event("revoked", node=token(self.node_index.get(node, "other")),
+                    accepted=accepted)
         return False
 
     def _run_session(self, session, grant, node):

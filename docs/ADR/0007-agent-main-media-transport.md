@@ -164,23 +164,27 @@ LAN by itself.
 
 SRT is dropped from the PoC candidate set (Owner decision, 2026-10-11): its
 passphrase-based encryption gives no mutual certificate identity (ADR-0006)
-and cannot satisfy G1, so the harness has no SRT adapter and the SRT column
-below is not measured.
+and cannot satisfy G1, so the harness has no SRT adapter and the table below
+has no SRT column.
 
 Real hardware (not done): MANUAL_TEST.md §G "Agent-to-Main transport PoC".
 Record per candidate, for 1, 2, 3 and 4 sources (state real vs synthetic
 inputs for each):
 
-| Measurement | WebRTC | SRT | QUIC | HTTP/WS |
-| --- | --- | --- | --- | --- |
-| Reconnect time after 1–5 s link loss | | | | |
-| Gap reported vs actual after reconnect | | | | |
-| Max sender / receiver queue depth, slow consumer | | | | |
-| Behaviour under sustained packet loss / added jitter | | | | |
-| LAN glass-to-glass latency (informational) | | | | |
-| CPU / GPU / VRAM, Main and Agent | | | | |
-| Bitrate | | | | |
-| Codec/container and recording-extraction impact | | | | |
+The harness candidates are `a_framed` (TLS 1.3 mTLS framed stream),
+`b_chunked` (mTLS HTTP/1.1 chunked upload) and `b_segment` (mTLS HTTP/1.1
+1 s segment upload); WebRTC and QUIC are not in the harness and SRT is dropped.
+
+| Measurement | a_framed | b_chunked | b_segment | WebRTC (not in harness) | QUIC (not in harness) |
+| --- | --- | --- | --- | --- | --- |
+| Reconnect time after 1–5 s link loss | | | | | |
+| Gap reported vs actual after reconnect | | | | | |
+| Max sender / receiver queue depth, slow consumer | | | | | |
+| Behaviour under sustained packet loss / added jitter | | | | | |
+| LAN glass-to-glass latency (informational) | | | | | |
+| CPU / GPU / VRAM, Main and Agent | | | | | |
+| Bitrate | | | | | |
+| Codec/container and recording-extraction impact | | | | | |
 
 ## Follow-up
 

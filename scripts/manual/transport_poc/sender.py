@@ -59,6 +59,7 @@ class SourceState:
         self.max_pending = 0
         self.last_committed_capture_ns = None
         self.counts = {name: 0 for name in wire.OUTCOMES}
+        self.rejected_source_capacity = 0
         self.sent = 0
 
 
@@ -202,6 +203,8 @@ class Sender:
                 self.stale_acks += 1
                 return
             state.counts[outcome] += 1
+            if outcome == "rejected" and reason == "source_capacity":
+                state.rejected_source_capacity += 1
             if outcome in ("accepted", "duplicate", "rejected"):
                 state.inflight = None
                 state.backoff = 0.02
@@ -498,12 +501,15 @@ class Sender:
         results = {}
         for parsed in acks:
             if parsed[0] == wire.ACK:
-                results[(parsed[1], parsed[3])] = parsed[4]
+                results[(parsed[1], parsed[3])] = (parsed[4], parsed[5])
         retry = []
         now = time.monotonic_ns()
         for state, unit in units:
-            outcome = results.get((state.source_id, unit.sequence), "not_processed")
+            outcome, reason = results.get((state.source_id, unit.sequence),
+                                          ("not_processed", "none"))
             state.counts[outcome] += 1
+            if outcome == "rejected" and reason == "source_capacity":
+                state.rejected_source_capacity += 1
             if outcome in ("accepted", "duplicate"):
                 self.latency_rtt.add(now - unit.sent_ns)
                 self.latency_capture.add(now - unit.capture_ns)
@@ -576,7 +582,9 @@ class Sender:
         for state in self.sources:
             self.writer.write("end", source=state.index, epoch=self.epoch,
                               generated=state.next_sequence, drops=state.drops,
-                              max_pending=state.max_pending, sent=state.sent, **state.counts)
+                              max_pending=state.max_pending, sent=state.sent,
+                              rejected_source_capacity=state.rejected_source_capacity,
+                              **state.counts)
         for name, reservoir in (("rtt", self.latency_rtt), ("capture", self.latency_capture)):
             points = records.percentiles(reservoir.values)
             self.writer.write("latency", metric=name, samples=reservoir.seen, p50_ns=points[50],

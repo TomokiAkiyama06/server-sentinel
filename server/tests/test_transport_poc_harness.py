@@ -258,11 +258,13 @@ def _write(directory, name, rows):
 
 def _base(scenario, candidate="a_framed", sources=1):
     orchestrator = [{"kind": "start", "t_ns": 0, "scenario": scenario, "candidate": candidate,
-                     "n_sources": sources, "inputs": "synthetic"}]
+                     "n_sources": sources, "inputs": "synthetic", "fast": True,
+                     "side": "both"}]
     sample = {"kind": "sample", "max_queued_messages": 3, "max_queued_bytes": 100,
               "limit_queued_messages": 10, "limit_queued_bytes": 1000, "max_outq": 10,
               "sndbuf": 1000, "hwm_bytes": 10, "rss_bytes": 10, "accepted": 5}
-    receiver = [{**sample, "t_ns": index} for index in range(5)]
+    receiver = [{"kind": "ready", "t_ns": 0, "port": 1, "stale_after_ns": 2 * 10**9}]
+    receiver += [{**sample, "t_ns": index} for index in range(5)]
     sender_sample = {"kind": "sample", "max_pending": 2, "pending_limit": 4, "max_outq": 1,
                      "sndbuf": 1000, "hwm_bytes": 10, "rss_bytes": 10, "payload_bytes": 100,
                      "cpu_seconds": 0.1, "child_cpu_seconds": 0.0}
@@ -360,7 +362,7 @@ class SummarizerTests(unittest.TestCase):
         self.run_dir("normal-a_framed", orchestrator=orchestrator, receiver=receiver,
                      sender_rows=sender_rows)
         self.assertEqual("pass", self.report()["normal"]["g3"])
-        receiver[2]["max_queued_messages"] = 11
+        receiver[3]["max_queued_messages"] = 11
         _write(self.root / "normal-a_framed", "receiver", receiver)
         self.assertEqual("fail", self.report()["normal"]["g3"])
 
@@ -378,6 +380,11 @@ class SummarizerTests(unittest.TestCase):
                   {"kind": "first_accept", "t_ns": 16 * second, "connection": 2, "source": 0}]
         gap = {"kind": "durable_gap", "t_ns": 1, "source": 0, "epoch": 1, "missing_units": 4,
                "from_capture_ns": 10 * second, "to_capture_ns": 15 * second}
+        receiver = receiver + [
+            {"kind": "durable", "t_ns": 30 * second, "source": 0, "epoch": 1,
+             "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0},
+            {"kind": "interrupted", "t_ns": 13 * second, "source": 0,
+             "since_last_rx_ns": 3 * second}]
         self.run_dir("outage_5s-a_framed", orchestrator=orchestrator, receiver=receiver + [gap],
                      sender_rows=sender_rows + events, proxy_rows=proxy_rows)
         row = self.report()["outage_5s"]
@@ -489,7 +496,8 @@ class SummarizerTests(unittest.TestCase):
                     "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0}
                    for index in range(4)]
         ends = [{"kind": "end", "t_ns": 9, "source": index, "accepted": 0 if index == 4 else 10,
-                 "rejected": 10 if index == 4 else 0, "drops": 0} for index in range(5)]
+                 "rejected": 10 if index == 4 else 0, "drops": 0,
+                 "rejected_source_capacity": 10 if index == 4 else 0} for index in range(5)]
         receiver_end = {"kind": "end", "t_ns": 9, "accepted": 40, "backpressured": 0,
                         "rate_limited": 0, "cpu_quota_us": 200000}
         self.run_dir("fifth_refused-a_framed", orchestrator=orchestrator,
@@ -498,6 +506,239 @@ class SummarizerTests(unittest.TestCase):
         _write(self.root / "fifth_refused-a_framed", "receiver", receiver + durable + [
             {**durable[0], "source": 4}, receiver_end])
         self.assertEqual("fail", self.report()["fifth_refused"]["g6"])
+        # refused for another reason than the active-source limit
+        _write(self.root / "fifth_refused-a_framed", "receiver",
+               receiver + durable + [receiver_end])
+        _write(self.root / "fifth_refused-a_framed", "sender", sender_rows + ends[:4] + [
+            {**ends[4], "rejected_source_capacity": 0}])
+        self.assertEqual("fail", self.report()["fifth_refused"]["g6"])
+        # the reason was not recorded at all
+        fifth = {k: v for k, v in ends[4].items() if k != "rejected_source_capacity"}
+        _write(self.root / "fifth_refused-a_framed", "sender", sender_rows + ends[:4] + [fifth])
+        self.assertEqual("unmeasured", self.report()["fifth_refused"]["g6"])
+
+    # -- regressions for the PR #222 review ------------------------------------
+    def test_reconnect_episodes_are_matched_once_per_window(self):
+        second = 10**9
+        orchestrator, receiver, sender_rows = _base("rst")
+        proxy_rows = []
+        for at in (10, 12):
+            proxy_rows += [{"kind": "impairment_start", "t_ns": at * second,
+                            "impairment": "reset", "duration_ns": 0, "rate_bytes": 0},
+                           {"kind": "impairment_end", "t_ns": at * second,
+                            "impairment": "reset", "duration_ns": 0, "rate_bytes": 0}]
+        start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": 2 * second}
+        close_1 = {"kind": "closed", "t_ns": int(12.5 * second), "reason": "peer_closed"}
+        accept_1 = {"kind": "first_accept", "t_ns": 13 * second, "connection": 2, "source": 0}
+        close_2 = {"kind": "closed", "t_ns": int(13.5 * second), "reason": "peer_closed"}
+        accept_2 = {"kind": "first_accept", "t_ns": 14 * second, "connection": 3, "source": 0}
+        self.run_dir("rst-a_framed", orchestrator=orchestrator, receiver=receiver,
+                     sender_rows=sender_rows + [start, close_1, accept_1],
+                     proxy_rows=proxy_rows)
+        # one close/accept episode cannot serve both scheduled resets
+        row = self.report()["rst"]
+        self.assertEqual(("fail", 1, 2), (row["g4"], row["reconnects"],
+                                          row["reconnects_required"]))
+        _write(self.root / "rst-a_framed", "sender",
+               sender_rows + [start, close_1, accept_1, close_2, accept_2])
+        row = self.report()["rst"]
+        self.assertEqual(("pass", 2), (row["g4"], row["reconnects"]))
+        # two disconnects but a single accepted unit: the second never reconnected
+        _write(self.root / "rst-a_framed", "sender",
+               sender_rows + [start, close_1, close_2, accept_2])
+        self.assertEqual("fail", self.report()["rst"]["g4"])
+
+    def test_loss_before_the_first_durable_unit_is_counted(self):
+        orchestrator, receiver, sender_rows = _base("normal")
+        durable = {"kind": "durable", "t_ns": 9, "source": 0, "epoch": 1, "min_sequence": 5,
+                   "max_sequence": 99, "units": 95, "duplicates": 0}
+        self.run_dir("normal-a_framed", orchestrator=orchestrator, receiver=receiver + [durable],
+                     sender_rows=sender_rows)
+        row = self.report()["normal"]
+        self.assertEqual(("fail", 5, 0), (row["g2"], row["actual_missing"],
+                                          row["reported_missing"]))
+        leading = {"kind": "gap", "t_ns": 5, "source": 0, "epoch": 1, "reason": "sequence_skip",
+                   "after_sequence": None, "before_sequence": 5, "missing_units": 5}
+        _write(self.root / "normal-a_framed", "receiver", receiver + [leading, durable])
+        row = self.report()["normal"]
+        self.assertEqual(("pass", 5, 5), (row["g2"], row["actual_missing"],
+                                          row["reported_missing"]))
+        # Agent evidence: an epoch with accepted units but no durable row at all
+        end = {"kind": "end", "t_ns": 9, "source": 0, "epoch": 2, "accepted": 3}
+        _write(self.root / "normal-a_framed", "sender", sender_rows + [end])
+        self.assertEqual("fail", self.report()["normal"]["g2"])
+
+    def _revoked_live(self, *, action=True, revoked_accepted=40, after=(40, 40), retry=True):
+        second = 10**9
+        orchestrator, receiver, sender_rows = _base("auth_revoked_live")
+        if action:
+            orchestrator = orchestrator + [{"kind": "action", "t_ns": 3 * second,
+                                            "action": "revoke", "duration_ns": 0}]
+        rows = [receiver[0], {**receiver[1], "t_ns": 2 * second, "accepted": 30}]
+        revoked = {"kind": "revoked", "t_ns": 4 * second, "node": "revoked_live"}
+        if revoked_accepted is not None:
+            revoked["accepted"] = revoked_accepted
+        rows.append(revoked)
+        rows += [{**receiver[1], "t_ns": (5 + index) * second, "accepted": value}
+                 for index, value in enumerate(after)]
+        rows += [{"kind": "session_open", "t_ns": second, "connection": 1, "generation": 1},
+                 {"kind": "end", "t_ns": 9 * second, "accepted": 40}]
+        if retry:
+            rows.append({"kind": "auth_refused", "t_ns": 6 * second,
+                         "reason": "capture_node_not_admitted"})
+        self.run_dir("auth_revoked_live-a_framed", orchestrator=orchestrator, receiver=rows,
+                     sender_rows=sender_rows)
+        return self.report()["auth_revoked_live"]["g1"]
+
+    def test_revoked_live_requires_complete_evidence(self):
+        self.assertEqual("pass", self._revoked_live())
+        # samples after detection agree with each other but not with the count
+        # at the decision: media was accepted after the revocation
+        self.assertEqual("fail", self._revoked_live(after=(41, 41)))
+        # older record without the count: the last pre-detection sample is used
+        self.assertEqual("fail", self._revoked_live(revoked_accepted=None, after=(40, 40)))
+        self.assertEqual("pass", self._revoked_live(revoked_accepted=None, after=(30, 30)))
+        # the revoke action is not on record: incomplete, never pass
+        self.assertEqual("unmeasured", self._revoked_live(action=False))
+        # nothing observed after the decision: "frozen" would be vacuous
+        self.assertEqual("unmeasured", self._revoked_live(after=()))
+        # no refused re-admission after the revocation
+        self.assertEqual("fail", self._revoked_live(retry=False))
+
+    def test_send_queue_gate_uses_queued_bytes_not_buffer_limit(self):
+        orchestrator, receiver, sender_rows = _base("normal")
+        # skmem tb (limit, kernel-expanded before SO_SNDBUF) is not a queue
+        for row in sender_rows:
+            row.update(ss_sockets=1, ss_tb=2_626_560, ss_w=900)
+        name = "normal-a_framed"
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver, sender_rows=sender_rows)
+        row = self.report()["normal"]
+        self.assertEqual(("pass", 2_626_560, True), (row["g3"], row["sender_ss_tb"],
+                                                     row["sender_ss_measured"]))
+        sender_rows[2]["ss_w"] = 2 * 1000 + 64 * 1024 + 1
+        _write(self.root / name, "sender", sender_rows)
+        self.assertEqual("fail", self.report()["normal"]["g3"])
+        # without ss: synthetic loopback relies on TIOCOUTQ; a real run is incomplete
+        for row in sender_rows:
+            for key in ("ss_sockets", "ss_tb", "ss_w"):
+                row.pop(key)
+        _write(self.root / name, "sender", sender_rows)
+        self.assertEqual("pass", self.report()["normal"]["g3"])
+        _write(self.root / name, "orchestrator-both", [{**orchestrator[0], "inputs": "real"}])
+        self.assertEqual("unmeasured", self.report()["normal"]["g3"])
+        _write(self.root / name, "orchestrator-both", orchestrator)
+        # too few samples for the warmup comparison, or one side missing
+        _write(self.root / name, "sender", sender_rows[:3])
+        self.assertEqual("unmeasured", self.report()["normal"]["g3"])
+        (self.root / name / "sender.jsonl").unlink()
+        self.assertEqual("unmeasured", self.report()["normal"]["g3"])
+
+    def test_silent_outage_needs_proxy_and_main_detection(self):
+        second = 10**9
+        orchestrator, receiver, sender_rows = _base("outage_5s")
+        proxy_rows = [{"kind": "impairment_start", "t_ns": 10 * second, "impairment": "blackhole",
+                       "duration_ns": 3 * second, "rate_bytes": 0},
+                      {"kind": "impairment_end", "t_ns": 13 * second, "impairment": "blackhole",
+                       "duration_ns": 3 * second, "rate_bytes": 0}]
+        events = [{"kind": "start", "t_ns": 0, "loss_timeout_ns": int(1.5 * second)},
+                  {"kind": "loss_detected", "t_ns": 12 * second, "source": 0, "idle_ns": 1,
+                   "last_committed_capture_ns": 10 * second},
+                  {"kind": "closed", "t_ns": 12 * second, "reason": "loss_timeout"},
+                  {"kind": "first_accept", "t_ns": 14 * second, "connection": 2, "source": 0}]
+        durable = {"kind": "durable", "t_ns": 30 * second, "source": 0, "epoch": 1,
+                   "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0}
+        flagged = {"kind": "interrupted", "t_ns": 12 * second, "source": 0,
+                   "since_last_rx_ns": 2 * second}
+        name = "outage_5s-a_framed"
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver + [durable, flagged],
+                     sender_rows=sender_rows + events, proxy_rows=proxy_rows)
+        self.assertEqual("pass", self.report()["outage_5s"]["g5"])
+        # Main never flagged the silent outage itself
+        _write(self.root / name, "receiver", receiver + [durable])
+        self.assertEqual("fail", self.report()["outage_5s"]["g5"])
+        # Main flagged it, but later than 15 s after the last received unit
+        _write(self.root / name, "receiver",
+               receiver + [durable, {**flagged, "since_last_rx_ns": 16 * second}])
+        self.assertEqual("fail", self.report()["outage_5s"]["g5"])
+        # two hosts: one Main detection per window and source, no clock comparison
+        _write(self.root / name, "receiver", receiver + [durable, {**flagged, "t_ns": 1}])
+        runs = summarize.summarize([self.root], single_host=False)["runs"]
+        self.assertEqual("pass", runs[0]["g5"])
+        _write(self.root / name, "receiver", receiver + [durable, flagged])
+        # the Agent-side proxy record is missing: incomplete, never pass
+        (self.root / name / "proxy.jsonl").unlink()
+        self.assertEqual("unmeasured", self.report()["outage_5s"]["g5"])
+        # fewer blackholes recorded than scheduled
+        _write(self.root / name, "proxy", [{"kind": "sample", "t_ns": 1, "max_held": 0,
+                                            "buffer_bytes": 65536}])
+        self.assertEqual("fail", self.report()["outage_5s"]["g5"])
+
+    def test_capacity_needs_every_sender_total(self):
+        orchestrator, receiver, sender_rows = _base("capacity_4", sources=4)
+        durable = [{"kind": "durable", "t_ns": 9, "source": index, "epoch": 1,
+                    "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0}
+                   for index in range(4)]
+        ends = [{"kind": "end", "t_ns": 9, "source": index, "accepted": 10, "rejected": 0,
+                 "drops": 0} for index in range(4)]
+        receiver_end = {"kind": "end", "t_ns": 9, "accepted": 40, "backpressured": 0,
+                        "rate_limited": 0, "cpu_quota_us": 200000, "cpu_period_us": 100000}
+        metric = {"kind": "metric", "t_ns": 9, "payload_bytes": 100,
+                  "cpu_quota_us": 100000, "cpu_period_us": 100000}
+        name = "capacity_4-a_framed"
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver + durable + [receiver_end],
+                     sender_rows=sender_rows + ends[:3] + [metric])
+        self.assertEqual("fail", self.report()["capacity_4"]["g6"])
+        _write(self.root / name, "sender", sender_rows + [metric])
+        self.assertEqual("unmeasured", self.report()["capacity_4"]["g6"])
+
+    def test_candidate_verdict_requires_every_gate_scenario(self):
+        orchestrator, receiver, sender_rows = _base("normal")
+        self.run_dir("normal-a_framed", orchestrator=orchestrator, receiver=receiver,
+                     sender_rows=sender_rows)
+        report = summarize.summarize([self.root])
+        self.assertEqual("pass", report["runs"][0]["g3"])
+        candidate = report["candidates"][0]
+        self.assertEqual("unmeasured", candidate["g3"])
+        self.assertEqual(len(summarize.REQUIRED_SCENARIOS["g3"]) - 1,
+                         candidate["g3_missing_scenarios"])
+        self.assertIn("required scenarios missing", summarize.render(report))
+        # a failure is still reported as a failure
+        receiver[3]["max_queued_messages"] = 11
+        _write(self.root / "normal-a_framed", "receiver", receiver)
+        self.assertEqual("fail", summarize.summarize([self.root])["candidates"][0]["g3"])
+
+    def test_two_host_records_are_never_compared_across_clocks(self):
+        second = 10**9
+        orchestrator, receiver, sender_rows = _base("slow_stop_10s")
+        main = [{**orchestrator[0], "side": "main"},
+                {"kind": "action", "t_ns": 10 * second, "action": "sigstop", "duration_ns": 0},
+                {"kind": "action", "t_ns": 20 * second, "action": "sigcont", "duration_ns": 0}]
+        start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": 5 * second}
+        # Agent-clock loss far outside the Main-clock window: fine on two hosts
+        loss = {"kind": "loss_detected", "t_ns": 900 * second, "source": 0,
+                "idle_ns": 5 * second, "connection": 1, "last_committed_capture_ns": 1}
+        self.run_dir("slow_stop_10s-a_framed", orchestrator=main, receiver=receiver,
+                     sender_rows=sender_rows + [start, loss])
+        self.assertEqual("pass", self.report()["slow_stop_10s"]["g5"])
+
+    def test_holder_forwarding_is_checked(self):
+        orchestrator, receiver, sender_rows = _base("normal")
+        self.run_dir("normal-a_framed", orchestrator=[{**orchestrator[0], "inputs": "real"}],
+                     receiver=receiver, sender_rows=sender_rows)
+        sample = {"kind": "sample", "t_ns": 1, "frames": 100, "queue_drops": 0,
+                  "forward_drops": 1, "cpu_seconds": 0.1, "child_cpu_seconds": 0.0}
+        path = self.root / "holder.jsonl"  # a file at the top level is not a run
+        _write(self.root, "holder", [sample, {**sample, "t_ns": 2}])
+        holder = summarize.summarize([self.root], holder_files=[path])["holder"]
+        self.assertEqual(("pass", 1), (holder["holder_verdict"],
+                                       holder["holder_forward_drops_allowed"]))
+        _write(self.root, "holder", [{**sample, "forward_drops": 2}])
+        holder = summarize.summarize([self.root], holder_files=[path])["holder"]
+        self.assertEqual("fail", holder["holder_verdict"])
+        _write(self.root, "holder", [{**sample, "queue_drops": 1}])
+        report = summarize.summarize([self.root], holder_files=[path])
+        self.assertEqual("fail", report["holder"]["holder_verdict"])
+        self.assertIn("holder: fail", summarize.render(report))
 
     def test_report_is_numeric_and_renders(self):
         orchestrator, receiver, sender_rows = _base("normal")
@@ -610,11 +851,13 @@ class LoopbackMatrixTests(unittest.TestCase):
         runs = {(row["scenario"], row["candidate"]): row for row in report["runs"]}
         for key, row in runs.items():
             with self.subTest(run=key):
-                self.assertEqual("pass", row["g1"])
-                self.assertEqual("pass", row["g2"])
-                self.assertEqual("pass", row["g3"])
-                self.assertIn(row["g4"], ("pass", "not_applicable"))
-                self.assertIn(row["g5"], ("pass", "not_applicable"))
+                # The whole row (numbers and tokens only) explains a failure.
+                detail = json.dumps(row, sort_keys=True)
+                self.assertEqual("pass", row["g1"], detail)
+                self.assertEqual("pass", row["g2"], detail)
+                self.assertEqual("pass", row["g3"], detail)
+                self.assertIn(row["g4"], ("pass", "not_applicable"), detail)
+                self.assertIn(row["g5"], ("pass", "not_applicable"), detail)
         self.assertGreater(runs[("outage_5s", "a_framed")]["reported_missing"], 0)
         self.assertEqual(0, runs[("auth_other_ca", "a_framed")]["receiver_accepted"])
         self.assertGreater(runs[("normal", "b_segment")]["receiver_accepted"], 0)
