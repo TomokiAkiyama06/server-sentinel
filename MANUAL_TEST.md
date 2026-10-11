@@ -1525,10 +1525,17 @@ Once a deployment can enable them, on the Main Server with a synthetic
 - [ ] enter the same code again, a mistyped code, and a code after its
   lifetime (24 hours, or the deployment's `invitation_lifetime_hours`): each is
   the generic denial, identical to an uninvited caller's;
-- [ ] issue a code, set the Main Server's wall clock back by two hours (then
-  restore it), and enter the code: it is the generic denial (clock rollback
-  on the same boot); issue another code, reboot the host and redeem it within
-  its lifetime: it works (the wall clock decides after a reboot);
+- [ ] issue a code, set the Main Server's wall clock back by two hours, enter
+  the code while the clock is still set back: it is the generic denial (clock
+  rollback on the same boot); only then restore the clock. Issue another code,
+  reboot the host and redeem it within its lifetime: it works (the wall clock
+  decides after a reboot);
+- [ ] issue a code, lower `"invitation_lifetime_hours"` and restart the
+  service: the code already issued keeps its original expiry (intended);
+- [ ] with the optional `"invitation_lifetime_hours"` set, run `rollback` to an
+  installed release that predates the key: the installer refuses before any
+  change, naming no configuration value, and `current`, `previous` and the
+  unit are unchanged; remove the key and the same `rollback` proceeds;
 - [ ] submit a few wrong codes and confirm the application log holds
   `invitation_redemption_refused` (first refusal, then at 2, 4, 8, ...) with no
   code, identity or reason;

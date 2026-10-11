@@ -27,6 +27,7 @@ from app.auth.invitation_code import (
     format_invitation_code, invitation_lifetime, new_invitation_code, parse_invitation_code,
 )
 from app.auth.model import Permission
+from app.auth import webauthn
 from app.auth.passkeys import PasskeyCeremonies
 from app.auth.rate_limit import (
     REDEMPTION_PER_SOURCE_CAPACITY, REDEMPTION_PER_SOURCE_REFILL_SECONDS,
@@ -609,6 +610,14 @@ class InvitationClockTests(RedemptionFixture):
         self.assertFalse(invitation_clock_valid(**base, now_us=24 * hour, now=same(11 * hour)))
         self.assertFalse(invitation_clock_valid(**base, now_us=23 * hour, now=same(34 * hour)))
         self.assertFalse(invitation_clock_valid(**base, now_us=hour, now=same(10 * hour - 1)))
+        # Inside the 30 s tolerance only the monotonic lifetime ends the code
+        # (PR #234 review): a 2-hour code, the boot clock 2 hours on, the
+        # wall clock 10 s short of its expiry, is refused; 1 us earlier it holds.
+        short = dict(base, expires_us=2 * hour)
+        wall = 2 * hour - 10_000_000
+        self.assertLess(2 * hour - wall, tolerance)
+        self.assertFalse(invitation_clock_valid(**short, now_us=wall, now=same(12 * hour)))
+        self.assertTrue(invitation_clock_valid(**short, now_us=wall, now=same(12 * hour - 1)))
         self.assertTrue(invitation_clock_valid(**base, now_us=hour, now=BootInstant(OTHER_BOOT, 0)))
         self.assertFalse(invitation_clock_valid(**base, now_us=-1, now=BootInstant(OTHER_BOOT, 0)))
         self.assertFalse(invitation_clock_valid(**base, now_us=hour, now=None))
@@ -715,6 +724,49 @@ class RefusalRecordTests(RedemptionFixture):
         # A success is not a refusal.
         self.assertEqual(status((await self.redeem(code))[1]), 204)
         self.assertEqual(self.access.refused_redemptions, 5)
+
+    async def test_the_device_bound_409_is_counted_and_logged_without_values(self):
+        # Codex P2 on PR #234: the fixed 409 is a refused redemption too.
+        self.ceremonies.require_device_bound = True
+        _, code = self.invite()
+        with self.assertLogs("app.auth.human_surface", "WARNING") as logs:
+            _, refused = await self.redeem(code, SyntheticAuthenticator(backup_eligible=True))
+        self.assertEqual(status(refused), 409)
+        self.assertEqual(self.access.refused_redemptions, 1)
+        self.assertEqual([record.getMessage() for record in logs.records],
+                         ["invitation_redemption_refused"])
+        text = repr([record.__dict__ for record in logs.records])
+        for value in (code, VIEWER):
+            self.assertNotIn(value, text)
+        # A device-bound authenticator then redeems; no further refusal.
+        self.assertEqual(status((await self.redeem(code))[1]), 204)
+        self.assertEqual(self.access.refused_redemptions, 1)
+
+
+class ExcludedCredentialTests(RedemptionFixture):
+    """PR #234 review: excludeCredentials lists only the usable credentials."""
+
+    async def test_only_the_active_credential_is_excluded(self):
+        principal, code = self.invite()
+        self.assertEqual(status((await self.redeem(code))[1]), 204)
+        for _ in range(2):
+            self.elapse(seconds=1)
+            secret, code = new_invitation_code()
+            self.store.issue_enrollment(principal.id, secret, self.ceremony_clock() + INVITATION_LIFETIME)
+            self.assertEqual(status((await self.redeem(code))[1]), 204)
+        with closing(self.database.connect()) as connection:
+            active, revoked, inconsistent = [bytes(row[0]) for row in connection.execute(
+                "SELECT credential_id FROM access_credentials WHERE principal_id=? ORDER BY enrolled_at_us",
+                (str(principal.id),))]
+        with self.store._transaction(write=True) as connection:
+            self.store.revoke_credential_on(connection, principal.id, revoked, at=self.ceremony_clock())
+        self.store.mark_credential_inconsistent(inconsistent, principal.id, at=self.ceremony_clock())
+        secret, code = new_invitation_code()
+        self.store.issue_enrollment(principal.id, secret, self.ceremony_clock() + INVITATION_LIFETIME)
+        begun = await self.options(code)
+        self.assertEqual(status(begun), 200)
+        self.assertEqual(payload(begun)["excludeCredentials"],
+                         [{"type": "public-key", "id": webauthn.b64url_encode(active)}])
 
 
 class DeviceBoundOrderTests(RedemptionFixture):

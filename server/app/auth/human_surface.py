@@ -983,6 +983,9 @@ class HumanSurface:
                 enrolled = await asyncio.to_thread(self.access.ceremonies.finish_registration,
                                                    secret, request.identity, credential, label=label)
             except DeviceBoundCredentialRequired:
+                # A refused redemption too (AUTH-013): counted and logged
+                # value-free like every other refusal, then its own 409.
+                self.access.note_refused_redemption()
                 await send_device_bound_required(request.send)
                 return
             except Exception:

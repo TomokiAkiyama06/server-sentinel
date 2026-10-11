@@ -54,6 +54,9 @@ class Runner:
         # a value (exit 0), an ``(exit code, output)`` pair, or an exception.
         # By default no unit file and not running.
         self.socket_state = {"LoadState": "not-found", "ActiveState": "inactive"}
+        # Releases whose own ``--check`` predates ``invitation_lifetime_hours``
+        # and refuses it as an unknown key (PR #234).
+        self.lifetime_unaware = set()
 
     def _check_foreign_account_access(self, options) -> None:
         if options.get("user") is None:
@@ -87,6 +90,10 @@ class Runner:
                 raise value
             code, output = value if isinstance(value, tuple) else (0, value + "\n")
             return SimpleNamespace(returncode=code, stdout=output)
+        if "--check" in arguments and Path(options["cwd"]).name in self.lifetime_unaware:
+            config = Path(arguments[arguments.index("--config") + 1])
+            if "invitation_lifetime_hours" in json.loads(config.read_text()):
+                raise subprocess.CalledProcessError(1, arguments)
         if arguments[:2] == ["systemctl", "restart"] and self.fail_version:
             current = os.readlink(self.root / "current")
             if current == "releases/" + self.fail_version:
@@ -625,6 +632,45 @@ class ReleaseLifecycleTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ConfigurationError) as refused:
                 load(invitation_lifetime_hours=value)
             self.assertNotIn(repr(value), str(refused.exception))
+
+    def test_rollback_runs_the_target_release_check_and_refuses_before_any_change(self):
+        # Review of PR #234: a rollback target from before
+        # ``invitation_lifetime_hours`` refuses it as an unknown key, so the
+        # rollback runs that release's own --check first, like update does.
+        self.perform(self.arguments("install", "1.0.0"))
+        self.perform(self.arguments("update", "1.1.0"))
+        self.runner.lifetime_unaware.add("1.0.0")
+        base = json.loads(self.config.read_text())
+        self.config.write_text(json.dumps({**base, "invitation_lifetime_hours": 73}))
+        state = (os.readlink(self.installation / "current"),
+                 os.readlink(self.installation / "previous"), self.unit.read_text())
+        restarts = len([c for c, _ in self.runner.calls if c[:2] == ["systemctl", "restart"]])
+        for version in (None, "1.0.0"):
+            with self.subTest(version=version), self.assertRaises(
+                    install.ActivationBoundaryRefused) as refused:
+                self.perform(self.arguments("rollback", version))
+            message = str(refused.exception)
+            for phrase in ("before any change", "releases/1.0.0", "\"invitation_lifetime_hours\"",
+                           str(self.config), "remove every setting that release predates",
+                           "rerun the same command (rollback"):
+                self.assertIn(phrase, message)
+            self.assertNotIn("73", message.replace(str(self.config), ""))  # value-free
+            self.assertEqual(state, (os.readlink(self.installation / "current"),
+                                     os.readlink(self.installation / "previous"),
+                                     self.unit.read_text()))
+        self.assertEqual(restarts, len([c for c, _ in self.runner.calls
+                                        if c[:2] == ["systemctl", "restart"]]))
+        checks = [(arguments, options) for arguments, options in self.runner.calls
+                  if "--check" in arguments
+                  and Path(options["cwd"]) == self.installation / "releases/1.0.0"]
+        self.assertTrue(checks)
+        for arguments, options in checks:
+            self.assertEqual(arguments[0], str(self.installation / "releases/1.0.0/venv/bin/python"))
+            self.assertEqual((options["user"], options["extra_groups"]), (self.uid, []))
+        # With the key removed, the same rollback proceeds.
+        self.config.write_text(json.dumps(base))
+        self.perform(self.arguments("rollback"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
 
     def test_single_path_directives_are_rendered_without_command_line_quoting(self):
         account = pwd.getpwuid(self.uid)

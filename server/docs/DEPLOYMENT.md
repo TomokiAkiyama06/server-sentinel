@@ -885,6 +885,17 @@ clock back never extends a code; after a reboot the wall clock decides. A host
 where `/proc/sys/kernel/random/boot_id` or `CLOCK_BOOTTIME` cannot be read
 issues no code (`invitation_clock_unavailable`).
 
+- Each code keeps the expiry computed when it was issued. Lowering
+  `"invitation_lifetime_hours"` later does not shorten codes already issued
+  (intended); it applies to codes issued afterwards. To end a code early, run
+  `recover` (for the Owner) or, with Issue #10 S4, revoke the invitation.
+- The stepped-back check tolerates 30 seconds. When a wall clock that was
+  running fast at issuance is later pulled back by more than 30 seconds (for
+  example by NTP after a boot without time sync), a legitimate code is
+  refused as if the clock had been set back. Issue a new code: `recover` for
+  the Owner, or (Issue #10 S4) a new invitation. Keep time synchronised before
+  issuing codes.
+
 - The command asks on the controlling terminal for the Owner's display name
   (for `recover`: a new one, or empty to keep it) and for a typed
   confirmation (`BOOTSTRAP` or `RECOVER`). It takes nothing secret from its
@@ -899,8 +910,8 @@ issues no code (`invitation_clock_unavailable`).
   otherwise; use `recover`). `recover` needs an existing Owner
   (`owner_not_configured`).
 - After the change is committed, the code
-  (`XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`, 160 bits, valid 24 hours,
-  single use) is written to the controlling terminal only; standard output
+  (`XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`, 160 bits, single use, valid
+  for the configured `"invitation_lifetime_hours"`, 24 hours by default) is written to the controlling terminal only; standard output
   gets `owner bootstrapped|recovered: principal_id=<uuid>
   code_expires_at=<UTC time>`. Do not paste the code into a ticket, chat,
   file or shell history; type it once into the browser at the reserved origin
@@ -963,6 +974,21 @@ running before fails too (Issue #183). Therefore:
   only then start the old release again (`sudo systemctl restart
   server-sentinel.service`). Then fix the cause and repeat the edit and the
   command.
+
+**`invitation_lifetime_hours` across rollback (Issue #10 phase 2 S2, PR
+#234).** The optional key is accepted only by releases that include it; an
+earlier release refuses it as an unknown key and could not start. Before a
+rollback changes anything, the installer runs the target release's own
+deployment check (`python -m app.deployment --check`, as the service account
+with that release's interpreter and code, exactly as `update` does for the
+staged release) and refuses the rollback when that release rejects the current
+configuration. The refusal names no configuration value. Before rolling back
+to a release that predates the key, remove `"invitation_lifetime_hours"` from
+the deployment configuration (note its value), then run the same `rollback`
+again. When returning to a release that has the key, switch first, then add
+the entry back and restart the service (`sudo systemctl restart
+server-sentinel.service`); until then the 24-hour default applies to newly
+issued codes.
 
 Run the separately downloaded installer only after verifying its published
 SHA-256. Global arguments precede the operation:
