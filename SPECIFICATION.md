@@ -1012,6 +1012,19 @@ movement and a camera tamper, so local critical staging always admits a whole
 batch rather than refusing evidence a caller could never resubmit.
 A later runtime must durably handle a confirmed critical observation
 for evidence preservation and configured notifications in every presence state.
+The Issue #205 `SceneMonitoringRuntime` (`server/app/detection/roi/runtime.py`)
+wires this core into the Main application: capture callbacks hand it at most one
+pending sample per source at a bounded sample interval (default 1 sample/s),
+and a single worker runs the per-source `server_roi` and `camera_tamper`
+quality gates and the detector, with per-source failure isolation. Confirmed
+observations go through bounded `CriticalDelivery` staging to an injected
+durable recorder (`CriticalTimelineRecorder`); without it no detector runs.
+Without a stored calibration whose reference frame can be re-bound, a source
+stays inactive and `unknown`; no baseline is taken from live frames. Only
+uncompressed `GREY`/`YUYV` local capture is read; compressed capture stays
+`unknown` until a reviewed decoder exists. Poor quality, undecodable frames,
+backpressure, camera loss and stale conclusions are `unknown`, never a
+negative.
 Synthetic tests do not establish physical-camera, lighting, pose, or
 source-health behavior.
 

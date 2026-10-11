@@ -95,6 +95,45 @@ deferred through the timeline staging. A later
 runtime owns recording preservation and configured notifications, which must
 remain armed in every presence state.
 
+## Main runtime wiring (Issue #205)
+
+`runtime.py` provides `SceneMonitoringRuntime`, which `app.main.create_app()`
+builds when the embedder passes `scene_monitoring` (a
+`SceneMonitoringConfiguration` of 1 to 4 `SceneSourceBinding`s). Local UVC
+frames reach it through the same frame and camera-state callbacks as the
+preview hub; a source whose frames are decoded elsewhere (a future
+remote-agent decoder) uses `offer_luma()` with the same pipeline. Capture
+threads only make a sampling decision and hold at most one pending sample per
+source; a newer sample replaces it and the replacement is counted. Decoding,
+the two detector-specific `QualityGate`s (`server_roi` for movement,
+`camera_tamper` for tamper) and `SceneDetector` run on one worker thread, and a
+failure in one source makes only that source `unknown` (retried after the
+calibration retry interval).
+
+It fails closed:
+
+- without an injected durable `CriticalRecorder` (in Main,
+  `CriticalTimelineRecorder`) the runtime is `unavailable` and no detector runs;
+- without a calibration provider, a stored record, or a re-bindable reference
+  frame (`ArchiveCalibrationProvider` never re-bases a stored calibration on a
+  live frame; the Owner calibration route is #10), the source stays inactive
+  and `unknown`;
+- a calibration whose source, type or profile differ, whose `maximum_gap_ns`
+  does not exceed the sample interval, whose reference exceeds a quality pixel
+  budget, or that the capture layout cannot decimate to, is refused;
+- poor/unknown quality, an undecodable frame, critical backpressure (staging
+  cannot take a full batch), a camera-state loss, or a conclusion older than the
+  calibrated sampling gap is `unknown`, never "no movement" or "no tamper".
+
+Only packed uncompressed `GREY`/`YUYV` capture is read (nearest-sample luma
+decimation by byte slicing to the reference size). `MJPG` needs a reviewed
+decoder and is refused. A local `offline` or `manual_intervention_required`
+camera state is a trusted source loss and can correlate with a just-tracked
+scene shift; other states only end confirmation. The default sample interval
+is a conservative 1 sample/s per source. Critical staging is in memory: at
+shutdown, observations the recorder has not accepted are counted and logged as
+`scene_critical_undelivered`. No route reads the runtime status before #10.
+
 `server/tests/test_detector_roi.py` generates all pixel inputs in memory for
 local and remote-agent calibration, relative movement, global camera motion,
 temporary ROI occlusion, dark-scene tamper, persistent unmatched scenes,
@@ -102,5 +141,7 @@ ambiguous and low-margin registration, refused foreign-source and
 retired-stream samples,
 frame-progression watermarks, the unmatched-path comparison budget,
 source-loss correlation, quality isolation, media-free calibration history,
-and failed critical delivery. Hardware,
+and failed critical delivery. `server/tests/test_scene_runtime.py` drives the
+runtime with generated YUYV and grayscale samples, including the application
+lifespan with a synthetic UVC capture. Hardware,
 lighting, camera pose, and source-health integration are not verified here.
