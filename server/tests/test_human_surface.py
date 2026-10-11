@@ -27,10 +27,10 @@ from app.auth.model import Permission
 from app.auth.passkeys import PasskeyCeremonies
 from app.auth.rate_limit import SourceRateLimiter
 from app.auth.reservation import DAILY_SECONDS
-from app.auth.reservation_store import ReservationSessionRevocation
+from app.auth.reservation_store import ListenerExceptionStoreError, ReservationSessionRevocation
 from app.auth.session_binding import SessionBindingKey
 from app.audit import AuditStore
-from app.auth.store import AccessStore
+from app.auth.store import AccessStorageError, AccessStore
 from app.auth.webauthn import RelyingParty
 from app.main import create_app
 from app.settings import Settings
@@ -155,7 +155,7 @@ class HumanSurfaceFixture(unittest.IsolatedAsyncioTestCase):
                                   ceremonies=self.ceremonies, reservation=self.check,
                                   rate_limiter=self.limiter)
         self.admission = SyntheticAdmission()
-        self.access.bind_storage_admission(self.admission)
+        self.access.bind_storage_admission(self.admission, database=self.database)
         self.inner = InnerApplication()
         self.surface = HumanSurface(self.inner, self.access)
         self.codes = iter(bytes([index]) * 32 for index in range(1, 200))
@@ -617,8 +617,48 @@ class RateLimitTests(HumanSurfaceFixture):
         self.assertFalse(self.store.session_may_be_current(b"short"))
         self.assertFalse(self.store.session_may_be_current("not bytes"))
         self.assertFalse(self.store.session_may_be_current(bytes(32)))
-        with patch.object(Database, "connect", side_effect=OSError("unavailable")):
+        with patch.object(Database, "connect", side_effect=OSError("unavailable")), \
+                patch.object(Database, "connect_read_only", side_effect=OSError("unavailable")):
             self.assertFalse(self.store.session_may_be_current(bytes(32)))
+
+    async def test_lost_database_is_never_recreated_by_a_cookie(self):
+        """Codex PR #219: the filesystem holding the database disappeared and
+        only the mount-point directory remains. A well-formed (even formerly
+        valid) cookie is denied and no fallback database is created there."""
+        _, authenticator, credential = self.enroll()
+        cookie = await self.sign_in(authenticator)
+        expected = await self.denial()
+        self.database.path.unlink()
+        self.assertTrue(self.database.path.parent.is_dir())
+        admitted = self.admission.admitted
+        self.assertFalse(self.store.session_may_be_current(secrets.token_bytes(32)))
+        self.assertEqual(await call(self.surface, "GET", SESSION_PATH, cookie=cookie), expected)
+        self.assertEqual(self.admission.admitted, admitted)
+        # Every other unadmitted read of the access state fails instead of creating.
+        with self.assertRaises(AccessStorageError):
+            self.store.assertion_subject(credential.credential_id)
+        with self.assertRaises(AccessStorageError):
+            self.store.credentials_for(credential.principal_id)
+        with self.assertRaises(ListenerExceptionStoreError):
+            self.revoker.exposure_pending()
+        self.assertEqual(sorted(self.database.path.parent.iterdir()), [])
+
+    def test_read_only_connection_refuses_wal_and_missing_files(self):
+        wal = Database(self.temporary / "wal.sqlite3")
+        with closing(wal.connect()) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("CREATE TABLE synthetic(value)")
+        before = sorted(path.name for path in self.temporary.iterdir())
+        with self.assertRaises(ValueError):
+            wal.connect_read_only()
+        missing = Database(self.temporary / "missing" / "state.sqlite3")
+        with self.assertRaises(ValueError):
+            missing.connect_read_only()
+        (self.temporary / "missing").mkdir()
+        with self.assertRaises(Exception):
+            missing.connect_read_only()
+        self.assertEqual(sorted(path.name for path in self.temporary.iterdir()), sorted(before + ["missing"]))
+        self.assertEqual(list((self.temporary / "missing").iterdir()), [])
 
 
 class SourceRateLimiterTests(unittest.TestCase):
@@ -772,15 +812,43 @@ class StorageAdmissionTests(HumanSurfaceFixture):
 
     def test_binding_refuses_another_reservation(self):
         with self.assertRaises(HumanAccessUnavailable):
-            self.access.bind_storage_admission(SyntheticAdmission())
+            self.access.bind_storage_admission(SyntheticAdmission(), database=self.database)
         with self.assertRaises(HumanAccessUnavailable):
-            self.access.bind_storage_admission(None)
-        self.access.bind_storage_admission(self.admission)
+            self.access.bind_storage_admission(None, database=self.database)
+        self.access.bind_storage_admission(self.admission, database=self.database)
         self.assertTrue(self.access.storage_admitted)
         # create_app binds its own admission and refuses a store wired elsewhere.
         with self.assertRaises(HumanAccessUnavailable):
             create_app(Settings(self.temporary), database=self.database, human_access=self.access)
         self.assertIs(self.audit.reservation, self.admission)
+
+
+    def test_binding_refuses_an_access_store_on_another_database(self):
+        """Codex PR #219: the application's admission verifies its own
+        database; a composition whose access store writes elsewhere is
+        refused instead of being admitted against the wrong filesystem."""
+        other_database = Database(self.temporary / "other.sqlite3")
+        with closing(other_database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        audit = AuditStore(other_database, clock=self.ceremony_clock)
+        store = AccessStore(other_database, clock=self.ceremony_clock, audit=audit,
+                            session_binding=SessionBindingKey.generate())
+        check, _, _, _ = checker(clock=self.clock, session_revoker=ReservationSessionRevocation(store))
+        access = HumanAccess(HumanAccessConfiguration(enabled=True), store=store,
+                             ceremonies=PasskeyCeremonies(store, self.rp, session_gate=check),
+                             reservation=check)
+        for database in (self.database, None):
+            with self.subTest(database=database), self.assertRaises(HumanAccessUnavailable):
+                access.bind_storage_admission(self.admission, database=database)
+        for reservation in (None, self.admission):
+            with self.subTest(reservation=reservation), self.assertRaises(HumanAccessUnavailable):
+                create_app(Settings(self.temporary), database=self.database, human_access=access,
+                           storage_reservation=reservation)
+        self.assertIsNone(audit.reservation)
+        self.assertFalse(access.storage_admitted)
+        # The same composition over its own database binds.
+        access.bind_storage_admission(self.admission, database=Database(other_database.path))
+        self.assertTrue(access.storage_admitted)
 
 
 class ApplicationCompositionTests(HumanSurfaceFixture):

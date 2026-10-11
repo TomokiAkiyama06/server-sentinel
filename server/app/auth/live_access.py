@@ -42,7 +42,7 @@ def authorize_live_access(access_store: AccessStore, token: bytes, proxy_identit
                           *, now: datetime | None = None) -> BoundLiveAccess:
     """Authorize ``live:view`` for a human request and bind it to its session."""
     principal = access_store.authorize(token, proxy_identity, Permission.LIVE_VIEW, now=now)
-    with closing(access_store.database.connect()) as connection:
+    with closing(access_store.database.connect_read_only()) as connection:
         row = connection.execute(
             "SELECT id FROM access_sessions WHERE token_digest=? AND principal_id=?",
             (_digest(token), str(principal.id)),
@@ -75,7 +75,7 @@ def live_view_validator(database: Database, *,
             return False
         try:
             at = _us(utc_time(current()))
-            with closing(database.connect()) as connection:
+            with closing(database.connect_read_only()) as connection:
                 connection.execute("BEGIN")
                 row = connection.execute(
                     "SELECT p.role, p.status, p.authorization_revision, s.principal_revision,"

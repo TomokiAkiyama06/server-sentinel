@@ -183,7 +183,11 @@ class AccessStore:
         rows, session touches and expiry sweeps cannot spend the hard
         filesystem reserve or grow the rollback journal at
         ``STORAGE_HARD_STOP``. A refused admission is an
-        ``AccessStorageError`` and nothing is written. Reads never reserve.
+        ``AccessStorageError`` and nothing is written. Reads never reserve,
+        and therefore never create: a read opens the existing database file
+        ``mode=ro`` (``Database.connect_read_only``), so a request that reaches
+        a read after the verified filesystem disappeared cannot create a
+        fallback database at the path; the read fails (a denial) instead.
         """
         with ExitStack() as admission:
             reservation = self.audit.reservation if write and self.audit is not None else None
@@ -194,7 +198,10 @@ class AccessStore:
                     raise AccessStorageError("access state operation failed") from None
             connection = None
             try:
-                connection = self.database.connect()
+                try:
+                    connection = self.database.connect() if write else self.database.connect_read_only()
+                except ValueError:
+                    raise AccessStorageError("access state operation failed") from None
                 connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
                 yield connection
                 connection.execute("COMMIT")
@@ -586,7 +593,10 @@ class AccessStore:
         It takes no session gate lock and no SQLite write lock; the deferred
         read still takes SQLite's SHARED lock (rollback journal) while it
         runs, so it can contend with writers for at most the SQLite timeout,
-        and a failure there is a denial (fail-closed).
+        and a failure there is a denial (fail-closed). It opens the existing
+        database ``mode=ro`` and never creates one: with the verified
+        filesystem gone and the mount-point directory left behind, a
+        well-formed cookie gets a denial, not a fallback ``state.sqlite3``.
 
         ``True`` only when a session row with this token digest exists, is not
         invalidated and has not passed its idle or absolute expiry; it grants

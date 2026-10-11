@@ -336,13 +336,13 @@ application data only when every one of these server-side conditions holds:
   `docs/INITIAL_ISSUES.md` require that no route demand one where the
   deployment supplies none.
   The current access-layer code requires one on every ceremony and session
-  check only as an interim constraint until the routes are built (Owner
-  decision, 2026-09-30); whether a path such as a strictly local
-  `http://localhost` Owner may run without one is still undecided in
-  `server/app/auth/README.md`. Either way the per-person credential above is
-  always required, and the binding is a consistency signal, never an
-  authorization input: a Tailscale login or proxy identity header alone
-  authorizes nothing.
+  check (Owner decision, 2026-09-30). There is no strictly local
+  `http://localhost` Owner route and none runs without a proxy identity
+  (Owner decision, 2026-10-11, recorded in `server/app/auth/README.md`): the
+  Owner signs in through the reserved `https` origin like every other person.
+  The per-person credential above is always required, and the binding is a
+  consistency signal, never an authorization input: a Tailscale login or
+  proxy identity header alone authorizes nothing.
 - **Reserved secure-context origin.** The dashboard is served from its
   reserved origin over a secure context, and the latest startup/daily
   reservation check passed. That check detects; it does not prevent (below).
@@ -462,7 +462,7 @@ Consequences to keep in mind while reviewing code:
 - no fingerprint or face template reaches ServerSentinel: it never leaves the authenticator. Credential records are not an identity or biometric database;
 - relying-party checks only hold if the dashboard owns its browser origin, with no other application sharing it, as AUTH-012 requires; a co-hosted application on that origin would put the credential within its reach;
 - reserving the origin is a deployment obligation, described above and in ADR-0003. The startup and daily check closes human access and notifies the Owner when it sees anything else answering on that name (listening sockets and proxy routes only; kernel forwarding to the reserved address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF `sk_lookup`, IPVS) is verified by the operator), which bounds the exposure window rather than preventing the bind: a process binding between two checks collects credentials and cookies for that origin until the next one;
-- the origin must be a secure context (HTTPS, or `http://localhost` for a strictly local browser). Browsers withhold WebAuthn otherwise, so plain HTTP on a non-loopback host is not a usable human path;
+- the origin must be a secure context (HTTPS, or `http://localhost` for a strictly local browser). Browsers withhold WebAuthn otherwise, so plain HTTP on a non-loopback host is not a usable human path. The current human composition accepts only the reserved `https` origin; no `http://localhost` Owner route exists (Owner decision, 2026-10-11);
 - the pending challenge lives server-side for one bounded, single-use ceremony and is then dropped;
 - the signature counter persists as `principal_credential.sign_count` and advances only on an accepted assertion. The comparison applies whenever the stored or the received counter is non-zero, and the received value must be strictly greater: a received 0 after a stored non-zero is a regression, not an exemption. A regression refuses the assertion and notifies the Owner as a possible cloned authenticator. Only a stored-and-received 0 is exempt, which is the ordinary passkey case;
 - a retained proxy identity is bounded: the principal keeps at most the last observed raw value, owner-visible, cleared on revocation or deletion and kept out of diagnostic exports, with longer history in the audit log. A session stores only a deployment-keyed HMAC binding for constant-time equality checks; it is cleared with session invalidation, never displayed and excluded from diagnostics/exports. The key is a 32-byte file in the data directory, created once with mode `0600`, refused (not replaced) when its ownership, mode, link count or size is wrong, and never logged, exported or stored in the database;

@@ -145,6 +145,38 @@ class Database:
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
+    def connect_read_only(self) -> sqlite3.Connection:
+        """A ``mode=ro`` connection that never creates the database file.
+
+        ``connect()`` creates a missing file, so a read reached by an
+        unauthenticated request after the verified filesystem disappeared
+        (the mount-point directory left behind on the root filesystem) would
+        create a fallback database there without any storage admission.
+        SQLite's ``mode=ro`` opens an existing file or fails; there is no
+        check-then-create window. A rollback-journal read creates no file
+        beside the database. A WAL database is refused (the application never
+        enables WAL): SQLite could create ``-wal``/``-shm`` sidecars for it
+        even read-only. The header is checked after the open but before any
+        statement touches the file, through the process-held descriptor.
+        """
+        if not self.path.is_absolute() or not self.path.parent.is_dir() or self.path.is_symlink():
+            raise ValueError("database location is unavailable")
+        connection = sqlite3.connect(
+            "file:" + quote(str(self.path)) + "?mode=ro", uri=True,
+            timeout=5, isolation_level=None,
+        )
+        try:
+            header = read_database_prefix(self.path, 20)
+            if header is None or (len(header) == 20 and header[:16] == b"SQLite format 3\x00"
+                                  and 2 in (header[18], header[19])):
+                raise ValueError("database location is unavailable")
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
 
 class PinnedDatabase:
     """Open only the database file pinned under a storage admission.

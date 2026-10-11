@@ -60,6 +60,7 @@ from typing import Callable
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.logging import Event
+from app.storage.database import Database
 from .passkeys import PasskeyCeremonies, SessionGrant
 from .rate_limit import SourceRateLimiter
 from .reservation import HostnameReservationCheck
@@ -248,17 +249,23 @@ class HumanAccess:
         self.tick_seconds = float(tick_seconds)
         self._storage_admission = None
 
-    def bind_storage_admission(self, admission: Callable) -> None:
+    def bind_storage_admission(self, admission: Callable, *, database: Database) -> None:
         """Admit every write of this composition through ``admission``.
 
         Binds the access store's audit store (shared with the session
         revoker) to the application's storage admission, the one that admits
-        audit writes. Refuses a non-callable admission, an audit store already
-        wired to another reservation, and rebinding to a different admission.
+        audit writes. ``database`` is the database that admission verifies
+        (the application's own): an access store on any other database is
+        refused, since that admission would check one filesystem's identity
+        and reserve while the writes land on another. Also refuses a
+        non-callable admission, an audit store already wired to another
+        reservation, and rebinding to a different admission.
         """
-        if not callable(admission):
+        if not callable(admission) or not isinstance(database, Database):
             raise HumanAccessUnavailable()
         audit = self.store.audit
+        if self.store.database != database or audit.database != database:
+            raise HumanAccessUnavailable()
         if self._storage_admission is not None and self._storage_admission is not admission:
             raise HumanAccessUnavailable()
         if audit.reservation is not None and audit.reservation is not admission:

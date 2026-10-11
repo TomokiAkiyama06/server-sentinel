@@ -544,9 +544,28 @@ storage policy (or the embedder's injected reservation), a store already
 wired to a different reservation is refused, and until it is bound every
 request gets the generic denial. A refused admission (unbound policy,
 `STORAGE_HARD_STOP`, replaced filesystem) is a denial and writes nothing.
+`create_app` also refuses a composition whose `AccessStore` (and its audit
+store) uses a database other than the application's own, since the
+application's admission verifies only that database's filesystem and
+reserve. Reads of the access state never take an admission and therefore
+never create a database: they open the existing file `mode=ro`
+(`Database.connect_read_only`), so a request after the verified filesystem
+disappeared (mount-point directory left behind) is denied instead of creating
+a fallback `state.sqlite3`.
 The reservation check's session revoker must be a
 `ReservationSessionRevocation` of exactly the composition's `AccessStore`,
 so an exposure revokes the sessions this surface authorizes.
+
+Consequence for the Owner to confirm (open item): sign-in writes a challenge
+row and a session, and every session check writes (idle touch, expiry
+sweep). So while storage admission is refused or unbound
+(`STORAGE_HARD_STOP`, a lost or replaced recording filesystem, a deployment
+without storage thresholds, or a monitoring runtime that has not started),
+all human access is denied, the Owner's included: no one can sign in, and an
+already signed-in session is denied on its next request. Storage recovery
+therefore has to be done on the Main Server host itself, not through the
+dashboard. No exception path for the Owner exists; adding one would need an
+Owner decision.
 
 Rate limiting (Issue #181 item 4, `rate_limit.py`). Both ceremony routes are
 charged to a per-source token bucket and a global one before the ceremony
