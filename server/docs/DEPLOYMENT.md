@@ -213,7 +213,9 @@ the stop is `stop_failed`). If the source's health writer is then still busy
 stop keeps the database pin (`health_fence_pin_held`) without waiting longer,
 so the fenced `offline` queued behind that write can still be written; the
 pin is released (`local_uvc_health_fence_pin_released`) as soon as no fenced
-write is in flight. If that write never finishes before the process exits,
+write is in flight. A joined source whose handed-off health write (for
+example a watchdog `degraded`) is still stalled at that point keeps the pin
+the same way, so its closing `offline` can still be written. If that write never finishes before the process exits,
 the row can stay `online` until the next start, which writes it `offline`
 before any capture opens. The local UVC stop as a whole can take up to
 `join_timeout_seconds` + 1 s for the frame-progress watchdog join + 1 s for

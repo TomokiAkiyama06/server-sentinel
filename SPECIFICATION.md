@@ -329,7 +329,10 @@ either way). While a fenced source's health writer is still busy at that
 bound (an earlier `online` write may still commit), the stop keeps the
 database pin (`health_fence_pin_held`) instead of refusing the fenced
 `offline` queued behind it, and the writer releases the pin as soon as no
-fenced write is in flight; the stop itself does not wait longer. A write that
+fenced write is in flight; the stop itself does not wait longer. The same
+applies to a source whose worker was joined: a handed-off health write (for
+example a watchdog `degraded`) still stalled when the stop releases the pin
+keeps it, so the closing `offline` staged behind that write is not refused. A write that
 never finishes before process exit can leave the row `online` until the next
 start, which writes it `offline` before any capture opens. Camera-health
 transitions reach the optional health sink only through a bounded, coalescing
@@ -849,8 +852,12 @@ setting); when full, the oldest is evicted and that source falls back to its
 durable watermark on reactivation, which can repeat an envelope or a gap report
 but never hides loss. Each such eviction, and each ignored durable
 acknowledgement (watermark for another node, or an unknown source), is never
-silent: it is counted in value-free operator diagnostics for health/status
-exposure and logged rate-limited without node/source identity. A unit behind loss already recorded (below the first
+silent: it is counted in value-free operator diagnostics (the tracker's
+`diagnostics()` counters, intended for a health/status surface but not yet
+wired to one; that exposure comes with the listener/route integration of
+#14/#15) and logged rate-limited without node/source identity (the first
+occurrence, every doubling, and at least once per 60 s while it keeps
+recurring; every qualifying occurrence keeps its own record). A unit behind loss already recorded (below the first
 refused unit that showed a skip or restart) is acknowledged as `duplicate`
 and never admitted, so media never contradicts the recorded gap. An in-epoch
 capture clock regression is measured against the committed unit and the

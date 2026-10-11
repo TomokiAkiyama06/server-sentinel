@@ -289,8 +289,11 @@ reactivation stays a `duplicate` and the same loss is never reported twice
 (leaving the ingest queue is not durability). Evicting such an entry because the
 bound is full, and an `acknowledge_persisted` call that is ignored (watermark
 for another node, or a source neither tracked nor released), are counted in the
-value-free `diagnostics()` counters for a health/status surface and logged
-rate-limited (first and every doubling) as identity-free events
+value-free `diagnostics()` counters (meant for a health/status surface, which
+is not wired yet; that comes with #14/#15) and logged rate-limited (first,
+every doubling, and at least once per 60 s while the condition keeps
+recurring; concurrent qualifying occurrences each keep their record) as
+identity-free events
 (`capture_continuity_released_evicted` / `capture_continuity_ack_node_mismatch`
 warning, `capture_continuity_ack_unknown_source` debug). A late unit behind loss already
 recorded from a refused unit is acknowledged as `duplicate`, never admitted. The

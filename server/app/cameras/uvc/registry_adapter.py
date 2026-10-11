@@ -63,8 +63,11 @@ class _HealthWriter:
     when the fence was set did not carry it and may still commit afterwards;
     ``busy`` stays True until no write is in flight or handed off, so the
     stopping runtime keeps the database pin until the fenced values were
-    written after it (Issue #204). ``settled`` is called, with no lock of
-    this writer held, whenever a fenced writer may have stopped being busy.
+    written after it (Issue #204). The same holds for a source that was not
+    fenced (its worker was joined): a handed-off write still stalled at the
+    stop, with the closing ``offline`` staged behind it, keeps the pin too
+    (Issue #211 item 3). ``settled`` is called, with no lock of this writer
+    held, whenever the writer may have stopped being busy.
     """
 
     def __init__(self, write, mark, settled=None):
@@ -145,8 +148,9 @@ class _HealthWriter:
 
     def notify_settled(self):
         # Never called with a lock of this writer held: the callback reads
-        # ``busy`` and may release the runtime's database pin.
-        if self._settled is not None and self.fenced and not self.busy:
+        # ``busy`` and may release the runtime's database pin. Fenced or
+        # not: a stop may keep the pin for any writer still busy.
+        if self._settled is not None and not self.busy:
             try:
                 self._settled()
             except Exception:
@@ -340,19 +344,23 @@ class LocalUvcAdapter:
             listener()
 
     def fence_pending(self):
-        """True while a fenced source's health write is still in flight.
+        """True while any source's health write is still in flight.
 
         A write that began before the stop fence did not carry the fenced
         ``offline`` and may still commit ``online``; the fenced values are
-        written right after it, which needs the database pin. Once no fenced
-        writer is busy, either the fenced row is durable or its write failed
-        (counted unpersisted), and no earlier write can land any more.
+        written right after it, which needs the database pin. The same
+        applies to a source whose worker was joined (not fenced): a
+        handed-off write (e.g. a watchdog ``degraded``) still stalled at the
+        stop has the closing ``offline`` staged behind it, and releasing the
+        pin would refuse that write and leave the earlier state durable
+        (Issue #211 item 3). Once no writer is busy, every staged row is
+        durable or its write failed (counted unpersisted), and no earlier
+        write can land any more. It adds no wait beyond the write that is
+        already in flight: the stop never waits for it.
         """
-        with self._fence_lock:
-            fenced = tuple(self._fenced)
         with self._writers_lock:
-            writers = [self._writers.get(source_id) for source_id in fenced]
-        return any(writer is not None and writer.busy for writer in writers)
+            writers = tuple(self._writers.values())
+        return any(writer.busy for writer in writers)
 
     def _write_health(self, source_id, **values):
         """Persist one health observation and track whether it was durable."""

@@ -214,13 +214,17 @@ class ReconnectController:
         self._handoff_lock = threading.Lock()
         self._handoff_running = False
         self._handoff_pending = False
-        # Set only while no handoff thread is running and no handed-off
-        # event is left behind, so a stop can wait until every handed-off
-        # event has reached ``notify`` (Issue #195 item 3). A handoff thread
+        # Set only while no handoff thread is running, no handed-off event
+        # is left behind and no transition is inside ``emit``, so a stop can
+        # wait until every handed-off event has reached ``notify`` (Issue
+        # #195 item 3, Issue #211 item 1). A handoff thread
         # that could not be started leaves it clear (never idle with an
         # event still queued); ``settle_delivery`` retries it.
         self._handoff_idle = threading.Event()
         self._handoff_idle.set()
+        # Transitions inside ``emit`` whose event is not queued yet; they
+        # keep the delivery non-idle too (Issue #211 item 1).
+        self._emitting = 0
         self.delivery_failures = 0
         # Failed handoff thread starts (thread-resource exhaustion); counted
         # only, the events stay queued and are reported by ``undelivered``.
@@ -241,10 +245,33 @@ class ReconnectController:
         self.state, self._reason = state, reason
         if changed:
             event = HealthEvent(self.source_id, state, reason)
-            self.emit(event)
-            if self.notify is not None:
+            if self.notify is None:
+                self.emit(event)
+                return changed
+            # The delivery is not idle from before ``emit`` until the event
+            # is queued (Issue #211 item 1): ``emit`` may be slow (a state
+            # callback holding the transition lock past a stop fence's
+            # budget), and a stop settling the delivery meanwhile must not
+            # see an idle handoff and an empty queue and finish before this
+            # event exists. Once queued, the event keeps the delivery
+            # non-idle until it reached ``notify``.
+            with self._handoff_lock:
+                self._emitting += 1
+                self._handoff_idle.clear()
+            try:
+                self.emit(event)
                 self._outbox.append(event)
+            finally:
+                with self._handoff_lock:
+                    self._emitting -= 1
+                    if self._idle_locked():
+                        # ``emit`` raised: nothing was queued.
+                        self._handoff_idle.set()
         return changed
+
+    def _idle_locked(self):
+        """No delivery work left; the caller holds ``self._handoff_lock``."""
+        return not self._handoff_running and not self._emitting and not self._outbox
 
     def _deliver(self, blocking=True):
         """Hand queued events to ``notify`` outside the transition lock.
@@ -284,7 +311,7 @@ class ReconnectController:
 
     def _mark_idle_if_drained(self):
         with self._handoff_lock:
-            if not self._handoff_running and not self._outbox:
+            if self._idle_locked():
                 self._handoff_idle.set()
 
     def _handoff(self):
@@ -302,7 +329,10 @@ class ReconnectController:
                 self._handoff_pending = True
                 return True
             if not self._outbox:
-                self._handoff_idle.set()
+                if not self._emitting:
+                    self._handoff_idle.set()
+                # A transition still inside ``emit`` delivers or hands off
+                # its own event once queued.
                 return True
             self._handoff_running = True
             self._handoff_pending = False
@@ -324,8 +354,9 @@ class ReconnectController:
 
         That is after a failed handoff start, and also in the short window
         in which a caller has queued an event but not yet delivered or
-        handed it off (``_set_state`` does not clear the idle flag), so a
-        queued event is never reported as delivered (Issue #204).
+        handed it off, so a queued event is never reported as delivered
+        (Issue #204). An event still inside ``emit`` is not queued yet and
+        not counted here, but it keeps ``settle_delivery`` waiting.
         """
         with self._handoff_lock:
             if self._handoff_running:
@@ -353,9 +384,10 @@ class ReconnectController:
         by ``undelivered``.
         """
         deadline = time.monotonic() + timeout
-        # The outbox is checked too: an event queued by ``_set_state`` but
-        # not yet delivered or handed off leaves the idle flag set (Issue
-        # #204), so the flag alone could report it delivered.
+        # The outbox is checked too (Issue #204), and a transition still
+        # inside ``emit`` keeps the delivery non-idle until its event is
+        # queued (Issue #211 item 1), so a slow state callback cannot make
+        # a stop settle before the final event exists.
         while not self._delivered():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -376,7 +408,8 @@ class ReconnectController:
 
     def _delivered(self):
         with self._handoff_lock:
-            return self._handoff_idle.is_set() and not self._outbox
+            return (self._handoff_idle.is_set() and not self._outbox
+                    and not self._emitting)
 
     def _drain_handoff(self):
         while True:
@@ -390,7 +423,8 @@ class ReconnectController:
             with self._handoff_lock:
                 if not self._handoff_pending and not self._outbox:
                     self._handoff_running = False
-                    self._handoff_idle.set()
+                    if not self._emitting:
+                        self._handoff_idle.set()
                     return
                 self._handoff_pending = False
 
