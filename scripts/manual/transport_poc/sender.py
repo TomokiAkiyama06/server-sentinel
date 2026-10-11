@@ -56,11 +56,19 @@ class SourceState:
         self.backoff = 0.02
         self.next_sequence = 0
         self.drops = 0
+        # Drops of a unit that had been sent without an acknowledgement: Main
+        # may or may not hold it, so it is not certain loss (G2 accounting).
+        self.drops_sent = 0
         self.max_pending = 0
         self.last_committed_capture_ns = None
         self.counts = {name: 0 for name in wire.OUTCOMES}
         self.rejected_source_capacity = 0
         self.sent = 0
+
+    def drop(self, unit):
+        self.drops += 1
+        if unit.sent_ns is not None:
+            self.drops_sent += 1
 
 
 class SenderConfig:
@@ -128,8 +136,8 @@ class Sender:
         state = self.sources[index]
         with self.lock:
             if len(state.pending) >= state.pending_limit:
-                state.pending.popleft()  # live edge wins; the skipped unit is exact loss
-                state.drops += 1
+                # live edge wins; the skipped unit is exact loss
+                state.drop(state.pending.popleft())
             state.pending.append(Unit(state.next_sequence, capture_ns, payload))
             state.next_sequence += 1
             state.max_pending = max(state.max_pending, len(state.pending))
@@ -234,8 +242,7 @@ class Sender:
                     state.pending.appendleft(state.inflight)
                     state.inflight = None
                     while len(state.pending) > state.pending_limit:
-                        state.pending.popleft()
-                        state.drops += 1
+                        state.drop(state.pending.popleft())
 
     def _next_units(self, *, stop_and_wait=True, limit=None):
         now = time.monotonic()
@@ -494,8 +501,7 @@ class Sender:
                 mine = [unit for owner, unit in units if owner is state]
                 state.pending.extendleft(reversed(mine))
                 while len(state.pending) > state.pending_limit:
-                    state.pending.popleft()
-                    state.drops += 1
+                    state.drop(state.pending.popleft())
 
     def _apply_segment_acks(self, units, acks):
         results = {}
@@ -579,12 +585,23 @@ class Sender:
         self.writer.write("metric", payload_bytes=self.payload_bytes, wire_bytes=self.wire_bytes,
                           connections=self.connections, stale_acks=self.stale_acks,
                           cpu_quota_us=quota, cpu_period_us=period)
-        for state in self.sources:
+        # One consistent snapshot per source: sequences 0..generated-1 are each
+        # durable at Main, dropped here (``drops``), refused (``rejected``) or
+        # still held at shutdown (``residual``; ``residual_sent`` of them were
+        # sent without an acknowledgement). The summarizer reconciles this.
+        with self.lock:
+            totals = [(state, state.next_sequence, state.drops, state.drops_sent,
+                       len(state.pending) + (state.inflight is not None),
+                       sum(1 for unit in [*state.pending, state.inflight]
+                           if unit is not None and unit.sent_ns is not None),
+                       dict(state.counts)) for state in self.sources]
+        for state, generated, drops, drops_sent, residual, residual_sent, counts in totals:
             self.writer.write("end", source=state.index, epoch=self.epoch,
-                              generated=state.next_sequence, drops=state.drops,
+                              generated=generated, drops=drops, drops_sent=drops_sent,
+                              residual=residual, residual_sent=residual_sent,
                               max_pending=state.max_pending, sent=state.sent,
                               rejected_source_capacity=state.rejected_source_capacity,
-                              **state.counts)
+                              **counts)
         for name, reservoir in (("rtt", self.latency_rtt), ("capture", self.latency_capture)):
             points = records.percentiles(reservoir.values)
             self.writer.write("latency", metric=name, samples=reservoir.seen, p50_ns=points[50],

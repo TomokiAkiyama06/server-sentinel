@@ -176,6 +176,12 @@ The harness candidates are `a_framed` (TLS 1.3 mTLS framed stream),
 `b_chunked` (mTLS HTTP/1.1 chunked upload) and `b_segment` (mTLS HTTP/1.1
 1 s segment upload); WebRTC and QUIC are not in the harness and SRT is dropped.
 
+Transcribe only summaries in which every run has `fast: false` (full timing;
+`fast_runs` 0 on the candidate row): `--fast` results are CI smoke durations,
+not measurements. For two-host runs, state that the Main-side stop/restart
+and Main stale-detection checks of G5 are matched by count only (no
+cross-host clock comparison, so no per-window attribution).
+
 | Measurement | a_framed | b_chunked | b_segment | WebRTC (not in harness) | QUIC (not in harness) |
 | --- | --- | --- | --- | --- | --- |
 | Reconnect time after 1–5 s link loss | | | | | |

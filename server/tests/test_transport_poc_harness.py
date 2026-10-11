@@ -283,13 +283,28 @@ def _finished_receiver(rows):
     return rows
 
 
-def _finished_sender(rows, sources=1):
-    """Sender rows with one ``start`` / ``metric`` and at least one ``end``."""
+_ACCOUNTED = {"drops": 0, "drops_sent": 0, "residual": 0, "residual_sent": 0}
+
+
+def _sender_end(source, epoch, generated, accepted, **fields):
+    """A sender ``end`` with complete unit accounting (G2 drop reconciliation)."""
+    return {"kind": "end", "t_ns": _LATE, "source": source, "epoch": epoch,
+            "generated": generated, "accepted": accepted, **_ACCOUNTED, **fields}
+
+
+def _finished_sender(rows, sources=1, receiver=()):
+    """Sender rows with one ``start`` / ``metric`` and at least one ``end``.
+
+    Without explicit ``end`` rows, one per durable row of ``receiver`` is added
+    that accounts for every unit up to its last durable sequence (no drops).
+    """
     rows = list(rows)
     if not any(row["kind"] == "start" for row in rows):
         rows.insert(0, {"kind": "start", "t_ns": 0, "n_sources": sources})
     if not any(row["kind"] == "end" for row in rows):
-        rows.append({"kind": "end", "t_ns": _LATE, "source": 0, "epoch": 1, "accepted": 0})
+        durable = [row for row in receiver if row["kind"] == "durable" and row["source"] >= 0]
+        rows += [_sender_end(row["source"], row["epoch"], row["max_sequence"] + 1, row["units"])
+                 for row in durable] or [_sender_end(0, 1, 0, 0)]
     if not any(row["kind"] == "metric" for row in rows):
         rows.append({"kind": "metric", "t_ns": _LATE, "payload_bytes": 0})
     return rows
@@ -344,13 +359,16 @@ class SummarizerTests(unittest.TestCase):
             _write(directory, "orchestrator-both", _complete(orchestrator, (
                 "receiver", "proxy", "sender")))
         _write(directory, "receiver", _finished_receiver(receiver))
-        _write(directory, "sender", _finished_sender(sender_rows, sources))
+        _write(directory, "sender", _finished_sender(sender_rows, sources, receiver))
         _write(directory, "proxy", _finished_proxy(proxy_rows))
 
     def rewrite(self, name, role, rows):
         """Replace one file of a run, keeping its completion records."""
-        finish = {"receiver": _finished_receiver, "sender": _finished_sender,
-                  "proxy": _finished_proxy}[role]
+        if role == "sender":
+            receiver = records.read_jsonl(self.root / name / "receiver.jsonl")
+            _write(self.root / name, role, _finished_sender(rows, receiver=receiver))
+            return
+        finish = {"receiver": _finished_receiver, "proxy": _finished_proxy}[role]
         _write(self.root / name, role, finish(rows))
 
     def report(self):
@@ -1113,6 +1131,138 @@ class SummarizerTests(unittest.TestCase):
         self.rewrite(name, "sender", [start] + sender_rows + losses)
         (self.root / name / "proxy.jsonl").unlink()
         self.assertEqual("unmeasured", self.report()["rst"]["g5"])
+
+    # -- regressions for the PR #222 review (head 30e17ff) ---------------------
+    def test_one_loss_episode_never_covers_two_resets(self):
+        second = 10**9
+        orchestrator, receiver, sender_rows = _base("rst", sources=2)
+        proxy_rows = []
+        for at in (10, 12):
+            proxy_rows += [{"kind": "impairment_start", "t_ns": at * second,
+                            "impairment": "reset", "duration_ns": 0, "rate_bytes": 0},
+                           {"kind": "impairment_end", "t_ns": at * second,
+                            "impairment": "reset", "duration_ns": 0, "rate_bytes": 0}]
+        start = {"kind": "start", "t_ns": 0, "n_sources": 2, "loss_timeout_ns": 2 * second}
+
+        def loss(at, connection, source):
+            return {"kind": "loss_detected", "t_ns": at, "source": source, "idle_ns": 1,
+                    "connection": connection, "last_committed_capture_ns": 1}
+
+        # one connection lost after the second reset, recorded once per source:
+        # within 15 s of both resets, but it is one episode
+        after_second = [loss(12 * second + 1, 1, 0), loss(12 * second + 2, 1, 1)]
+        name = "rst-a_framed"
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver + self._durable(2),
+                     sender_rows=[start] + sender_rows + after_second, proxy_rows=proxy_rows)
+        self.assertEqual("fail", self.report()["rst"]["g5"])
+        # one episode per reset (each recorded for both sources) passes
+        both = [loss(10 * second + 1, 1, 0), loss(10 * second + 2, 1, 1),
+                loss(12 * second + 1, 2, 0), loss(12 * second + 2, 2, 1)]
+        self.rewrite(name, "sender", [start] + sender_rows + both)
+        self.assertEqual("pass", self.report()["rst"]["g5"])
+        # matching consumes episodes in time order, one each
+        self.assertEqual([1, None], summarize._match_episodes([10, 12], [11], 15))
+        self.assertEqual([1, 9], summarize._match_episodes([12, 10], [11, 21]))
+        self.assertEqual([5, 7], summarize._loss_episodes(
+            [{"t_ns": 7, "connection": 2}, {"t_ns": 6, "connection": 1},
+             {"t_ns": 5, "connection": 1}]))
+
+    def test_sender_drops_are_reconciled_with_main(self):
+        orchestrator, receiver, sender_rows = _base("normal")
+        name = "normal-a_framed"
+        durable = self._durable(1, units=100)  # sequences 0..99, contiguous: no gap at Main
+        start = {"kind": "start", "t_ns": 0, "n_sources": 1}
+
+        def run(**fields):
+            end = _sender_end(0, 1, fields.pop("generated", 110), 100, **fields)
+            self.run_dir(name, orchestrator=orchestrator, receiver=receiver + durable,
+                         sender_rows=[start] + sender_rows + [end])
+            return self.report()["normal"]
+
+        # ten trailing units dropped by backpressure: no gap reaches Main, but
+        # the Agent accounted for them
+        row = run(drops=10)
+        self.assertEqual(("pass", "pass", 10, False),
+                         (row["g2"], row["drop_accounting"], row["agent_accounted_tail_units"],
+                          row["lossless"]))
+        # still held at shutdown (not lost) is fine too
+        self.assertEqual("pass", run(residual=10)["g2"])
+        # trailing units neither dropped nor held: vanished silently
+        row = run()
+        self.assertEqual(("fail", 10), (row["g2"], row["unexplained_loss_units"]))
+        # drops the Agent recorded that appear neither as Main gaps nor in the tail
+        row = run(generated=100, drops=5)
+        self.assertEqual(("fail", 5), (row["g2"], row["unexplained_drop_units"]))
+        # ... unless those units had been sent unacknowledged (Main may hold them)
+        self.assertEqual("pass", run(generated=100, drops=5, drops_sent=5)["g2"])
+        # an interior drop is Main's reported gap
+        gap = {"kind": "gap", "t_ns": 5, "source": 0, "epoch": 1, "reason": "sequence_skip",
+               "after_sequence": 10, "before_sequence": 16, "missing_units": 5}
+        interior = [{**durable[0], "units": 95}]
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver + interior + [gap],
+                     sender_rows=[start] + sender_rows + [_sender_end(0, 1, 100, 95, drops=5)])
+        self.assertEqual("pass", self.report()["normal"]["g2"])
+        # a sender end without the accounting counts cannot be reconciled
+        legacy = {"kind": "end", "t_ns": 9, "source": 0, "epoch": 1, "accepted": 100,
+                  "drops": 0}
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver + durable,
+                     sender_rows=[start] + sender_rows + [legacy])
+        row = self.report()["normal"]
+        self.assertEqual(("unmeasured", "unmeasured"), (row["g2"], row["drop_accounting"]))
+        # durable units of an epoch the Agent gave no totals for
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver + durable,
+                     sender_rows=[start] + sender_rows + [_sender_end(0, 2, 0, 0)])
+        row = self.report()["normal"]
+        self.assertEqual(("unmeasured", "unmeasured"), (row["g2"], row["drop_accounting"]))
+
+    def test_sender_records_its_unit_accounting(self):
+        state = sender.SourceState(0, uuid4(), 2)
+        unsent = sender.Unit(1, 1, b"x")
+        sent = sender.Unit(2, 2, b"x")
+        sent.sent_ns = 5
+        state.drop(unsent)
+        state.drop(sent)
+        self.assertEqual((2, 1), (state.drops, state.drops_sent))
+
+    def test_sides_must_declare_the_same_run(self):
+        second = 10**9
+        orchestrator, receiver, sender_rows = _base("slow_stop_10s")
+        orchestrator[0]["duration_ns"] = 9 * second
+        main = [orchestrator[0],
+                {"kind": "action", "t_ns": 10 * second, "action": "sigstop", "duration_ns": 0},
+                {"kind": "action", "t_ns": 20 * second, "action": "sigcont", "duration_ns": 0}]
+        start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": 5 * second}
+        loss = {"kind": "loss_detected", "t_ns": 900 * second, "source": 0,
+                "idle_ns": 5 * second, "connection": 1, "last_committed_capture_ns": 1}
+        name = "slow_stop_10s-a_framed"
+        self.run_dir(name, orchestrator=main, receiver=receiver + self._durable(1),
+                     sender_rows=sender_rows + [start, loss], two_host=True)
+        report = summarize.summarize([self.root])
+        row = report["runs"][0]
+        self.assertEqual(("pass", "pass", True), (row["integrity"], row["g5"], row["fast"]))
+        candidate = report["candidates"][0]
+        self.assertEqual((True, 1), (candidate["fast"], candidate["fast_runs"]))
+        self.assertIn("fast (CI) timing runs: 1 of 1", summarize.render(report))
+        path = self.root / name / "orchestrator-agent.jsonl"
+        original = records.read_jsonl(path)
+        for field, value in (("fast", False), ("duration_ns", 12 * second),
+                             ("scenario", "slow_stop_60s"), ("candidate", "b_chunked")):
+            with self.subTest(field=field):
+                _write(self.root / name, "orchestrator-agent",
+                       [{**item, field: value} if item["kind"] == "start" else item
+                        for item in original])
+                row = summarize.summarize([self.root])["runs"][0]
+                self.assertEqual("unmeasured", row["integrity"])
+                self.assertNotIn("pass", [row[g] for g in summarize.GATES])
+        # every run on full timing: the candidate is not marked fast
+        for item in (path, self.root / name / "orchestrator-main.jsonl"):
+            rows = records.read_jsonl(item)
+            _write(self.root / name, item.stem,
+                   [{**r, "fast": False} if r["kind"] == "start" else r for r in rows])
+        report = summarize.summarize([self.root])
+        self.assertEqual((False, 0), (report["candidates"][0]["fast"],
+                                      report["candidates"][0]["fast_runs"]))
+        self.assertNotIn("fast (CI)", summarize.render(report))
 
 
 class MiscTests(unittest.TestCase):
