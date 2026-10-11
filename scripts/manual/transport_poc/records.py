@@ -23,7 +23,8 @@ KEY_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,47}")
 
 CANDIDATES = ("a_framed", "b_chunked", "b_segment")
 SCENARIOS = (
-    "normal", "outage_1s", "outage_5s", "outage_120s", "rst", "bandwidth_cap",
+    "normal", "sources_2", "sources_3", "outage_1s", "outage_5s", "outage_120s", "rst",
+    "bandwidth_cap",
     "slow_stop_10s", "slow_stop_60s", "slow_drain", "main_restart",
     "capture_restart", "capacity_4", "fifth_refused", "auth_unpaired",
     "auth_other_ca", "auth_revoked", "auth_revoked_live", "route_probe", "soak",
@@ -37,7 +38,7 @@ TOKENS = frozenset((
     "start", "end", "sample", "event", "gap", "durable", "gate", "metric",
     "session_open", "session_close", "auth_refused", "interrupted", "revoked",
     "connect", "connect_failed", "loss_detected", "first_accept", "closed",
-    "impairment_start", "impairment_end", "action", "exit", "epoch_start",
+    "impairment_start", "impairment_end", "action", "spawn", "exit", "epoch_start",
     "latency", "route_probe", "committed_gap", "rtt", "capture", "unavailable", "ready",
     "durable_duplicate", "durable_gap",
     # impairments / actions

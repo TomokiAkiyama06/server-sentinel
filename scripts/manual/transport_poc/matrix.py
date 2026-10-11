@@ -32,6 +32,10 @@ def _scenario(name, full, fast, **options):
 # orchestrator actions [[offset, action, duration]].
 SCENARIOS = dict((
     _scenario("normal", {"duration": 300}, {"duration": 8}),
+    # 2- and 3-source topologies (1 is ``normal``, 4 is ``capacity_4``): every
+    # 1-4 source count must be exercised before G2/G3/G6 can pass.
+    _scenario("sources_2", {"duration": 120}, {"duration": 8}, sources=2),
+    _scenario("sources_3", {"duration": 120}, {"duration": 8}, sources=3),
     _scenario("outage_1s",
               {"duration": 110, "proxy": [[20, "blackhole", 1], [50, "blackhole", 1],
                                           [80, "blackhole", 1]]},
@@ -183,17 +187,20 @@ class Orchestrator:
         started = time.monotonic()
         try:
             if role in ("both", "main"):
+                writer.write("spawn", process="receiver", side=role)
                 children["receiver"] = Child("receiver", self.receiver_argv(
                     candidate, receiver_port, out_dir, state_dir, drain_rate,
                     plan.get("queue", 240)), wait_ready=True,
                     stderr_path=state_dir / "receiver.stderr")
             if role in ("both", "agent"):
+                writer.write("spawn", process="proxy", side=role)
                 children["proxy"] = Child("proxy", self._argv(
                     "proxy", "--listen", f"127.0.0.1:{proxy_port}",
                     "--upstream", f"{self.args.upstream_host}:{upstream_port}",
                     "--schedule", json.dumps(schedule), "--seconds", duration + 10,
                     "--out", out_dir / "proxy.jsonl", "--run-id", self.run_id), wait_ready=True,
                     stderr_path=state_dir / "proxy.stderr")
+                writer.write("spawn", process="sender", side=role)
                 children["sender"] = Child("sender", self.sender_argv(
                     candidate, proxy_port, out_dir, state_dir, node, n_sources, duration,
                     spec.get("route_probe", False)), wait_ready=False,
@@ -221,8 +228,9 @@ class Orchestrator:
                 if key in children:
                     code = children[key].stop(15)
                     writer.write("exit", process=key if key in records.TOKENS else "other",
-                                 code=code)
-        writer.write("end", scenario=name, candidate=candidate,
+                                 code=code, side=role)
+        # Written only when every child stopped: a run without ``end`` crashed.
+        writer.write("end", scenario=name, candidate=candidate, side=role,
                      wall_ns=int((time.monotonic() - started) * 1e9))
         writer.close()
         return out_dir
@@ -248,13 +256,17 @@ class Orchestrator:
             # Abrupt stop (SIGUSR1): the receiver discards its unpersisted
             # queue like a crash, then the new process resumes from the
             # durable watermark.
-            children["receiver"].stop(15, sig=signal.SIGUSR1)
+            code = children["receiver"].stop(15, sig=signal.SIGUSR1)
+            writer.write("exit", process="receiver", code=code, side=self.args.role)
+            writer.write("spawn", process="receiver", side=self.args.role)
             children["receiver"] = Child("receiver", self.receiver_argv(
                 candidate, receiver_port, out_dir, state_dir, drain_rate), wait_ready=True,
                     stderr_path=state_dir / "receiver.stderr")
             writer.write("action", action="ready", duration_ns=0)
         elif action == "restart_sender":
-            children["sender"].stop(15)
+            code = children["sender"].stop(15)
+            writer.write("exit", process="sender", code=code, side=self.args.role)
+            writer.write("spawn", process="sender", side=self.args.role)
             children["sender"] = Child("sender", self.sender_argv(
                 candidate, proxy_port, out_dir, state_dir, node, n_sources, remaining,
                 spec.get("route_probe", False)), wait_ready=False,

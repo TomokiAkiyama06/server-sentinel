@@ -13,7 +13,8 @@ boundary), #16 (Agent ring buffer), #17 (recording).
 Issue #15 requires a PoC comparison of WebRTC, SRT, QUIC and authenticated
 HTTP streaming, ranked by (1) stability, (2) reconnect, (3) accurate gap
 reporting, (4) bounded buffering/backpressure, (5) authenticated encryption,
-(6) resource usage, (7) latency. Authenticated encryption is a mandatory
+(6) resource usage, (7) latency. (SRT was later dropped from the PoC candidate set by the
+Owner on 2026-10-11; see the Measurement harness section.) Authenticated encryption is a mandatory
 invariant for every candidate regardless of its rank. Near-real-time is the
 goal, but stability and reconnect take priority over any particular latency.
 

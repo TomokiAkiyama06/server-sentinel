@@ -1222,6 +1222,7 @@ Total run time today (≤ 3 h):
 - [ ] G4: 手動操作なしで再接続し p95 ≤ 10 s;
 - [ ] G5: 無音断の検知 ≤ 15 s、Main の未 commit 区間が Agent 保護区間 [T−600 s, T+600 s] に含まれる;
 - [ ] G6: CPU 制限下の 4 source で backpressure 0、5 source 目は拒否;
+- [ ] 1 / 2 / 3 / 4 source の各構成を候補ごとに実行した（`normal` / `sources_2` / `sources_3` / `capacity_4`、summary の `*_missing_source_counts` が 0）、全 run の `integrity` が `pass`（別実行の記録の混入・子 process の異常終了なし）;
 - [ ] 副次: 30 分 soak で予期しない切断 0、overhead ≤ 10 %、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %、latency p95（参考）;
 - [ ] cleanup checklist を完了（使い捨て CA / ledger / node 鍵 / holder state を削除、`ss-poc15-*` scope なし）;
 - [ ] 結果を ADR-0007 Validation 表へ転記し、real / synthetic の内訳と未測定項目を明記した。

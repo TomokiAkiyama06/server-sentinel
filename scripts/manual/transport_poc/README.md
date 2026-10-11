@@ -134,9 +134,14 @@ Main:
 CUDA_VISIBLE_DEVICES= timeout -k 30 15m systemd-run --user --scope --unit=ss-poc15-main \
   -p CPUQuota=200% -p MemoryMax=1G nice -n 10 ionice -c 3 \
   python3 scripts/manual/transport_poc/poc15.py matrix --role main --bind <MAIN_LAN_IP> \
-  --materials "$R" --state ~/poc15/state --out ~/poc15/out \
+  --materials "$R" --state ~/poc15/state --out ~/poc15/out --real-inputs \
   --candidates a_framed --scenarios outage_5s --run-id <RUN_ID>
 ```
+
+`--real-inputs` は capture host が holder（実カメラ）を使う run では Main 側にも必ず付け、
+synthetic（`--source-kind gst` / `builtin`）の run では両側とも付けない。集計は片側でも
+`real` と記録されていれば real として判定し（`ss` 必須、holder の Agent CPU を加算）、
+両側の申告が食い違う run は `unmeasured` にします。
 
 capture host（実カメラ。holder は 1 process で全カメラを保持）。holder の `--out` の親 directory
 は holder 起動前に作る（holder は作らない）:
@@ -163,16 +168,17 @@ real / synthetic の内訳を記録に明記します。
 
 `--role agent` の `--materials` は capture host 側では使われない（node bundle は `--node-root`）。
 
-`capacity_4` / `fifth_refused` は 4 / 5 source を必要とし、holder は接続済みの実カメラ数しか
-供給しないため（現状 1 台）、この 2 scenario は `--source-kind gst`（synthetic）で実行し、
-記録の real camera 数は 0 とする。実カメラ 1 台 + synthetic 3 本の混在はこのハーネスでは
+`sources_2` / `sources_3` / `capacity_4` / `fifth_refused` は 2 / 3 / 4 / 5 source を必要とし、
+holder は接続済みの実カメラ数しか供給しないため（現状 1 台）、これらの scenario は
+`--source-kind gst`（synthetic）で実行し、記録の real camera 数は 0 とする。実カメラ 1 台 + synthetic 3 本の混在はこのハーネスでは
 作れない（sender の media source は 1 種類）。
 
 ### scenario（決定的、full / `--fast`）
 
 | scenario | 内容（full） |
 | --- | --- |
-| `normal` | 5 分無障害 |
+| `normal` | 5 分無障害（1 source） |
+| `sources_2` / `sources_3` | 2 / 3 source で 2 分無障害（1〜4 source の各構成を測るため。1 は `normal`、4 は `capacity_4`） |
 | `outage_1s` / `outage_5s` / `outage_120s` | proxy blackhole（無音の読み停止）1 s×3 / 5 s×3 / 120 s×1 |
 | `rst` | 全接続を RST ×3 |
 | `bandwidth_cap` | 公称 bitrate の 50 % へ 180 s 制限 |
@@ -199,16 +205,29 @@ python3 scripts/manual/transport_poc/poc15.py summarize --two-host MAIN_OUT/<RUN
 G2: `normal` / `capture_restart` / 通信断 7 種、G3: `normal` / `slow_drain` / `bandwidth_cap` /
 `outage_120s` / `slow_stop_60s` / `capacity_4`、G4: 切断 6 種、G5: 通信断 7 種、G6:
 `capacity_4` / `fifth_refused`）が全部そろって初めて `pass` になり、欠けていれば `unmeasured`
-（どれかが `fail` なら `fail`）です。`--holder` を渡すと holder の `queue_drops` = 0 と
+（どれかが `fail` なら `fail`）です。さらに G2 / G3 / G6 は、1 / 2 / 3 / 4 source の各構成が
+少なくとも 1 run ずつ完全な実行として記録されていること（orchestrator と sender の申告 source 数が
+一致し、その数の source が durable stand-in に到達）が必要で、欠けた構成があれば `unmeasured`
+（summary の `<gate>_missing_source_counts`）です。既定の matrix（`--sources 1`）は `normal`（1）/
+`sources_2` / `sources_3` / `capacity_4` で 4 構成を測ります。`--sources` を変えると `normal` 等の
+source 数も変わるので、既定のまま実行してください。
+
+各 run は、1 回の実行の完全な記録でなければ判定に使いません（`integrity`）。merge した全記録の
+`run_id` が 1 種類、side（`both`、または `main` と `agent`）ごとに orchestrator の `start` と `end`
+が 1 つずつ、起動した子 process（`spawn`）ごとに exit code 0 の `exit`、process ごとに開始と完了の
+記録（receiver / proxy は `ready` と `end`、sender は `start` と `metric`）が起動数と同数であること。
+違反（別実行の記録の混入、同じ `run_id` での再実行の追記、子 process の異常終了、orchestrator の
+途中終了）は全 gate `fail`、片側の記録や process file の欠落、両側の入力申告・source 数の不一致は
+`unmeasured` になります。`--holder` を渡すと holder の `queue_drops` = 0 と
 `forward_drops` ≤ sender process 数（real 入力の run 数 + `restart_sender` 数）も判定します。
 
 | gate | 判定 |
 | --- | --- |
 | G1 | mTLS 相互認証。否定試験（未 activation / 別 CA / 失効 / 接続中失効）で受理 media 0、`route_probe` は 404 か切断。未 activation / 別 CA / 失効は sender の接続試行 ≥ 1 と Main 側の認証拒否記録（`auth_refused`、`connection_limit` を除く）が両方必要で、sender 記録が無ければ `unmeasured`、試行か拒否記録が無ければ `fail`。接続中失効は Main 側 orchestrator の `revoke` 記録（無ければ `unmeasured`）、receiver の `revoked`、その後の receiver sample ≥ 1（無ければ `unmeasured`）がすべて `revoked` 時点の受理数と一致、`revoked` 後の再接続拒否（Main の `auth_refused`、1 host では sender の `connect` も可）が必要 |
-| G2 | epoch 内の報告 gap = durable stand-in から算出した実欠落（完全一致）。実欠落は epoch の起点（sequence 0）から数え、最初の durable unit より前の欠落も含む（capture 再起動後の epoch の先頭は範囲不明 gap）。Agent が受理を得た epoch に durable 記録が無ければ不一致。capture 再起動は範囲不明 gap、重複 commit 0 |
-| G3 | receiver と sender の両方の sample が必要（片方でも無ければ `unmeasured`）。receiver queue ≤ 設定上限、sender pending ≤ 上限、kernel send queue の滞留 byte（`TIOCOUTQ`、`ss -tmi` があれば skmem `w`）≤ 2×SO_SNDBUF + 64 KiB、VmHWM ≤ 上限、warmup 後の RSS 増加 ≤ max(16 MiB, 10 %)（sample < 4 なら `unmeasured`）。skmem `tb` は送信 buffer の上限値で、SO_SNDBUF 設定前に kernel が拡大しうるため記録のみ。実入力の run で `ss` が無ければ `unmeasured`。proxy 保持量は 1 回の `recv()` buffer で構造的に有界なので記録のみ |
-| G4 | 切断を伴う impairment から手動操作なしで再接続、p95 ≤ 10 s（2 host で Main 側 action の場合は Agent 時計で切断→初回受理）。切断と初回受理は impairment ごとに 1 組ずつ対応させ（同じ記録を複数回使わない）、予定された reset / Main 再起動と、Agent loss timeout + 1 s 以上の blackhole / SIGSTOP にはそれぞれ再接続が必要 |
-| G5 | 無音断の検知 ≤ 15 s（Agent / Main とも）、Main の未 commit 区間（Agent capture 時刻）⊆ Agent 保護区間 [T−600 s, T+600 s]。proxy blackhole は予定数の `impairment_start` 記録が必要（`proxy.jsonl` が無ければ `unmeasured`、不足は `fail`）、Main の stale 閾値以上の blackhole には source ごとに Main の `interrupted`（最後の受信から ≤ 15 s）が必要。Main 側停止（`slow_stop_10s` / `slow_stop_60s` / `main_restart`）は停止ごとに Agent の loss 検知が必要で、遅延は Agent 時計で最後の受信からの経過（`idle_ns`）≤ 15 s。Main 側 orchestrator 記録が無ければ `unmeasured` |
+| G2 | sender の `start` と `end` 記録が必要（否定認証と `route_probe` 以外。無ければ `unmeasured`）。epoch 内の報告 gap = durable stand-in から算出した実欠落（完全一致）。実欠落は epoch の起点（sequence 0）から数え、最初の durable unit より前の欠落も含む（capture 再起動後の epoch の先頭は範囲不明 gap）。Agent が受理を得た epoch に durable 記録が無ければ不一致。capture 再起動は範囲不明 gap、重複 commit 0 |
+| G3 | receiver と sender の両方の sample が必要（片方でも無ければ `unmeasured`）。receiver queue ≤ 設定上限、sender pending ≤ 上限、kernel send queue の滞留 byte（`TIOCOUTQ`、`ss -tmi` があれば skmem `w`）≤ 2×SO_SNDBUF + 64 KiB、VmHWM ≤ 上限、warmup 後の RSS 増加 ≤ max(16 MiB, 10 %)（sample < 4 なら `unmeasured`）。skmem `tb` は送信 buffer の上限値で、SO_SNDBUF 設定前に kernel が拡大しうるため記録のみ。実入力の run で `ss` が無い（socket を 1 つも報告した sample が無い）なら `unmeasured`。proxy 保持量は 1 回の `recv()` buffer で構造的に有界なので記録のみ |
+| G4 | 切断を伴う impairment から手動操作なしで再接続、p95 ≤ 10 s（2 host で Main 側 action の場合は Agent 時計で切断→初回受理。初回受理を挟まない連続した切断は 1 episode）。切断と初回受理は impairment ごとに 1 組ずつ対応させ（同じ記録を複数回使わない）、必要な再接続数は予定された reset / Main 再起動と、Agent loss timeout + 1 s 以上の blackhole / SIGSTOP の数だけで決まる（scenario 名による追加要求はない） |
+| G5 | 無音断の検知 ≤ 15 s（Agent / Main とも）、Main の未 commit 区間（Agent capture 時刻）⊆ Agent 保護区間 [T−600 s, T+600 s]。proxy blackhole は予定数の `impairment_start` 記録が必要（`proxy.jsonl` が無ければ `unmeasured`、不足は `fail`）、Main の stale 閾値以上の blackhole には source ごとに Main の `interrupted`（最後の受信から ≤ 15 s）が必要。Main 側停止（`slow_stop_10s` / `slow_stop_60s` / `main_restart`）は停止ごとに Agent の loss 検知が必要で、遅延は Agent 時計で最後の受信からの経過（`idle_ns`）≤ 15 s。Main 側 orchestrator 記録が無ければ `unmeasured`。予定された proxy reset はそれぞれ Agent 時計で 15 s 以内の `loss_detected` が必要（`proxy.jsonl` が無ければ `unmeasured`）。Main の `interrupted` は最後の `session_close` 以前のものだけを数える（sender 終了後の stale 判定は障害検知ではない） |
 | G6 | 4 source で backpressure / rate limit / sender drop 0（4 source すべての sender `end` 記録が必要、1 つも無ければ `unmeasured`）、かつ Main / Agent とも cgroup v2 `cpu.max` の CPU 上限下で実行（`capacity_4`、上限が無ければ `fail`）。5 source 目は active-source 上限（`source_capacity`）で拒否 |
 | 副次 | soak 30 分で予期しない切断 0、overhead ≤ 10 %（proxy の上り byte / payload）、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %（最初の sample からの差分で算出）、latency p95 ≤ 1 s（参考） |
 
