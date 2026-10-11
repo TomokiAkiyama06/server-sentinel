@@ -982,10 +982,29 @@ consumption too is it left to expire. A verified assertion with a credential
 finding (backup eligibility changed: the credential is marked inconsistent and
 its sessions end; or a counter that does not advance: a regression record)
 is refused too, but `_verified_assertion` only returns the finding, signature
-verification staying outside the lock: the finding's writes and audit record
-commit inside the same `admit(epoch)` that spends the challenge, and the Owner
-notification is sent after that commit, so a gate refusal there records,
-invalidates and notifies nothing and leaves the challenge pending. Sign-in
+verification staying outside the lock. Inside `admit(epoch)` (gate -> storage
+admission -> SQLite) a single SQLite transaction,
+`AccessStore.record_step_up_finding`, first deletes this session's pending
+step-up challenge (`challenge_digest`, ceremony `step_up` and `session_id` all
+match) and writes the finding and its audit record only if that DELETE
+removed the row and it was still inside its issue-to-expiry window. If it
+removed nothing — a concurrent finish of the same assertion spent the
+challenge first, and its `accept_assertion` may have advanced the counter this
+attempt compared against (5 -> 7 read as 7 -> 7), or a racing finish of the
+same regressing answer recorded the finding first (one challenge yields at
+most one finding and one notification), or a new options request replaced
+the challenge after the pending read — or the removed row had
+expired, nothing else is written: no mark, no regression record, no audit
+record and no Owner notification, and the finish is refused. The Owner
+notification is sent only after a commit that recorded the finding. A gate
+refusal there records, invalidates and notifies nothing and leaves the
+challenge pending. If the transaction itself fails (for example a refused
+storage admission or a SQLite error), the DELETE rolls back with the finding;
+the refusal then spends the challenge through `consume_challenge` under a new
+`admit(epoch)` (the gate lock is not reentrant, so this runs after the first
+admission is released), so the challenge stays single use while the unchanged
+stored credential lets the next assertion detect the finding again; if the
+gate refuses that consumption too, it expires unused. Sign-in
 (`finish_authentication`) keeps recording a finding at once: its challenge is
 already consumed before verification. Each refused finish increments the value-free
 `HumanAccess.refused_step_ups`, and `owner_step_up_refused` is logged on the

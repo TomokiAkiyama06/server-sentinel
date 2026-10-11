@@ -475,13 +475,23 @@ class PasskeyCeremonies:
         gate refuses that consumption too does it stay pending until expiry.
 
         A verified assertion with a credential finding (changed backup
-        eligibility, or a counter that does not advance) is refused too, but
-        its writes — the credential mark with its session invalidation, or
-        the regression record, and their audit records — commit only inside
-        ``admit(epoch)``, in the same admission that spends the challenge;
-        the Owner notification is sent after that commit. A gate refusal
-        there records nothing, notifies nothing and leaves the challenge
-        pending, like any other gate refusal (PR #236 review).
+        eligibility, or a counter that does not advance) is refused too. Its
+        writes commit inside ``admit(epoch)`` in one SQLite transaction
+        (``record_step_up_finding``) that first deletes this session's
+        pending step-up challenge and then writes the finding — the
+        credential mark with its session invalidation, or the regression
+        record, and their audit records — only if that DELETE removed the
+        unexpired row. If it removed nothing (a concurrent finish of the same
+        assertion spent the challenge first and may have advanced the
+        counter), nothing is recorded and nobody is notified; the step-up is
+        refused. The Owner notification is sent only after a commit that
+        recorded the finding. A gate refusal there records nothing, notifies
+        nothing and leaves the challenge pending, like any other gate refusal.
+        A failed transaction (for example a refused storage admission) rolls
+        back the DELETE with the finding; the challenge is then spent on its
+        own under a new ``admit(epoch)``, so it stays single use, and the
+        unchanged stored credential lets the next assertion detect the
+        finding again (PR #236 review).
         """
         # First: a close after this point refuses the commit (Issue #144).
         try:
@@ -505,24 +515,27 @@ class PasskeyCeremonies:
             if principal.id != session.principal_id:
                 raise CeremonyDenied()
             if finding is not None:
-                # Signature verification ran outside the lock; the finding's
-                # writes (credential mark with session invalidation, or the
-                # regression record, each with its audit record) and the
-                # challenge spend commit together inside ``admit(epoch)``
-                # (PR #236 review). A gate refusal records nothing and leaves
-                # the challenge pending; the notification follows the commit.
+                # Signature verification ran outside the lock. Inside
+                # ``admit(epoch)`` one SQLite transaction deletes this
+                # session's pending challenge first and records the finding
+                # only if that DELETE removed it (PR #236 review): a
+                # concurrent finish of the same assertion that already spent
+                # the challenge — and may have advanced the counter this
+                # attempt compared against — records and notifies nothing. A
+                # gate refusal records nothing and leaves the challenge
+                # pending; the notification follows the commit. A failed
+                # transaction rolls back both; the challenge is then spent on
+                # its own below (``spent`` stays False).
                 gate_refused = True
                 with self.session_gate.admit(epoch):
                     gate_refused = False
+                    recorded = self.store.record_step_up_finding(
+                        digest, session.session_id,
+                        backup_eligibility_changed=finding.kind is CredentialFinding.BACKUP_ELIGIBILITY_CHANGED,
+                        credential_id=finding.credential_id, principal_id=finding.principal_id)
                     spent = True
-                    try:
-                        self._record_finding(finding)
-                    finally:
-                        try:
-                            self.store.consume_challenge(digest, "step_up")
-                        except Exception:
-                            pass
-                self._report(finding.kind, finding.principal_id)
+                if recorded:
+                    self._report(finding.kind, finding.principal_id)
                 raise CeremonyDenied()
             gate_refused = True
             with self.session_gate.admit(epoch):

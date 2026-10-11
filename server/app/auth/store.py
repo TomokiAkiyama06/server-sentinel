@@ -1395,8 +1395,10 @@ class AccessStore:
         """The session a pending, unexpired step-up challenge is bound to; read only.
 
         Nothing is deleted: ``accept_assertion`` deletes the challenge in the
-        transaction that refreshes the session (PR #236 review), and a refused
-        step-up spends it through ``consume_challenge``. The window is checked
+        transaction that refreshes the session (PR #236 review), a credential
+        finding spends it in the transaction that records the finding
+        (``record_step_up_finding``), and any other refused step-up spends it
+        through ``consume_challenge``. The window is checked
         at a time read inside the transaction; ``at`` pins it for tests only.
         """
         pinned = None if at is None else utc_time(at)
@@ -1551,32 +1553,77 @@ class AccessStore:
         audit record carries only the principal's logical UUID.
         """
         at = utc_time(at)
+        self._audited_write(lambda connection, mark: self._mark_credential_inconsistent_on(
+            connection, mark, credential_id, principal_id, at))
 
-        def write(connection, mark):
-            changed = connection.execute("UPDATE access_credentials SET inconsistency_reason='backup_eligibility_changed', inconsistent_at_us=? WHERE credential_id=? AND principal_id=? AND inconsistent_at_us IS NULL AND revoked_at_us IS NULL",
-                                         (_us(at), credential_id, str(principal_id))).rowcount
-            if changed != 1:
-                return
-            connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
-            mark()
-            self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
-                                 action=AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
-                                 target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
-                                 outcome=AuditOutcome.SUCCEEDED)
-
-        self._audited_write(write)
+    def _mark_credential_inconsistent_on(self, connection, mark, credential_id: bytes, principal_id: UUID,
+                                         at: datetime) -> None:
+        changed = connection.execute("UPDATE access_credentials SET inconsistency_reason='backup_eligibility_changed', inconsistent_at_us=? WHERE credential_id=? AND principal_id=? AND inconsistent_at_us IS NULL AND revoked_at_us IS NULL",
+                                     (_us(at), credential_id, str(principal_id))).rowcount
+        if changed != 1:
+            return
+        connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
+        mark()
+        self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
+                             action=AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
+                             target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
+                             outcome=AuditOutcome.SUCCEEDED)
 
     def record_sign_count_regression(self, principal_id: UUID) -> None:
         """Record a refused assertion whose signature counter regressed."""
+        self._audited_write(lambda connection, mark: self._record_sign_count_regression_on(
+            connection, mark, principal_id))
+
+    def _record_sign_count_regression_on(self, connection, mark, principal_id: UUID) -> None:
+        mark()
+        self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
+                             action=AuditAction.DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION,
+                             target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
+                             outcome=AuditOutcome.FAILED)
+
+    def record_step_up_finding(self, digest: bytes, session_id: UUID, *, backup_eligibility_changed: bool,
+                               credential_id: bytes, principal_id: UUID,
+                               at: datetime | None = None) -> bool:
+        """Spend a step-up challenge and record its credential finding in one transaction.
+
+        The finding of a refused step-up (a changed backup eligibility, or a
+        counter that did not advance) is recorded only by the attempt that
+        actually deletes this session's pending, unexpired step-up challenge
+        (``challenge_digest``, ceremony ``step_up`` and ``session_id`` all
+        match): the DELETE runs first, and the finding's writes — the
+        credential mark with its session invalidation, or the regression
+        record, each with its audit record — follow in the same SQLite
+        transaction (PR #236 review). Returns ``True`` only then.
+
+        When the DELETE removes nothing (a concurrent finish of the same
+        assertion already spent the challenge, and its ``accept_assertion``
+        may have advanced the counter this attempt compared against), or the
+        removed challenge is outside its issue-to-expiry window, nothing else
+        is written and ``False`` is returned: no finding, no audit record, no
+        notification. A failure rolls back the DELETE together with the
+        finding; the caller then spends the challenge on its own, so it stays
+        single use while the unchanged stored credential lets the next
+        assertion detect the finding again. ``at`` pins the commit time for
+        tests only.
+        """
+        pinned = None if at is None else utc_time(at)
+        if (not isinstance(digest, bytes) or len(digest) != 32 or not isinstance(session_id, UUID)
+                or not isinstance(credential_id, bytes) or not isinstance(principal_id, UUID)):
+            raise AccessValidationError("access is unavailable")
 
         def write(connection, mark):
-            mark()
-            self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
-                                 action=AuditAction.DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION,
-                                 target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
-                                 outcome=AuditOutcome.FAILED)
+            now = self._in_transaction_time(pinned)
+            row = connection.execute("DELETE FROM access_webauthn_challenges WHERE challenge_digest=? AND ceremony='step_up' AND session_id=? RETURNING issued_at_us, expires_at_us",
+                                     (digest, str(session_id))).fetchone()
+            if row is None or not row["issued_at_us"] <= _us(now) < row["expires_at_us"]:
+                return False
+            if backup_eligibility_changed:
+                self._mark_credential_inconsistent_on(connection, mark, credential_id, principal_id, now)
+            else:
+                self._record_sign_count_regression_on(connection, mark, principal_id)
+            return True
 
-        self._audited_write(write)
+        return self._audited_write(write)
 
     @staticmethod
     def _permissions(values: Iterable[Permission]) -> tuple[Permission, ...]:
