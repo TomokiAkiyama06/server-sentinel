@@ -395,10 +395,19 @@ class RuntimeLifecycleTests(RuntimeFixture):
 
         self.discovery.devices = []
         self.assertTrue(self.wait_health(source.id, SourceHealthState.OFFLINE))
+        # Camera offline is distinct from capture service health. The
+        # ``offline`` row becomes visible when the first unplug write
+        # commits, but the source stays ``health_unpersisted`` (service
+        # ``degraded``, by design) until every write staged behind it is
+        # durable too (Issue #229), so wait for that bounded instead of
+        # sampling the instant the row appears.
+        self.assertTrue(wait_for(
+            lambda: runtime.status().state is LocalUvcRuntimeState.RUNNING))
         status = runtime.status()
-        # Camera offline is distinct from capture service health.
         self.assertIs(status.state, LocalUvcRuntimeState.RUNNING)
+        self.assertTrue(status.sources[0].health_persisted)
         self.assertTrue(status.sources[0].worker_running)
+        self.assertIs(self.health(source.id), SourceHealthState.OFFLINE)
         self.assertTrue(wait_for(
             lambda: CameraState.OFFLINE in [event.state for event in events]))
         self.assertTrue(all(event.source_id == source.id for event in events))
@@ -459,7 +468,10 @@ class RuntimeLifecycleTests(RuntimeFixture):
         time.sleep(0.2)
         self.assertEqual(frames, self.frame_count(source.id))
         self.assertIs(self.health(source.id), SourceHealthState.MANUAL_INTERVENTION_REQUIRED)
-        self.assertIs(runtime.status().state, LocalUvcRuntimeState.RUNNING)
+        # Bounded wait, as above (Issue #229): a write still staged behind
+        # the visible row keeps the service ``degraded`` until it is durable.
+        self.assertTrue(wait_for(
+            lambda: runtime.status().state is LocalUvcRuntimeState.RUNNING))
 
         # Only an explicit, audited Owner selection restores capture.
         runtime.reapprove(self.admin, "synthetic-owner", source.id, returned)
