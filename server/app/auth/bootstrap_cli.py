@@ -3,8 +3,15 @@
 Commands (``python -m app.auth.bootstrap_cli``), run as the service account
 that owns the application database, never as root and never with ``sudo``::
 
-    python -m app.auth.bootstrap_cli bootstrap --database <state.sqlite3>
-    python -m app.auth.bootstrap_cli recover --database <state.sqlite3>
+    python -m app.auth.bootstrap_cli bootstrap --config <deployment.json>
+    python -m app.auth.bootstrap_cli recover --config <deployment.json>
+
+``--config`` is the deployment configuration the service itself runs with
+(``app.deployment.Deployment.load``, the same validation as the launcher):
+the command takes the application database (``<state directory>/state.sqlite3``)
+and the deployment's invitation lifetime (``invitation_lifetime_hours``,
+default 24 hours, at most 7 days; Owner decision 2026-10-11) from it, and
+refuses unless it runs as the configuration's service account.
 
 ``bootstrap`` creates the single Owner principal (only when no Owner exists)
 and issues exactly one enrollment authorization for it. ``recover`` advances
@@ -30,16 +37,21 @@ request.
 Authority and inputs. The local administrative boundary is the host itself:
 whoever can run this as the service account can already read and write the
 application database. The command reads nothing secret from its arguments or
-the environment (only ``--database``, a path); the Owner's display name and
+the environment (only ``--config``, a path); the Owner's display name and
 the confirmation word are read from the controlling terminal, never inferred
 from the local user name, an environment variable or a Tailscale login.
 
 Output. The code is generated here from the CSPRNG (``invitation_code``,
-160 bits, 24 hours, single use), stored only as its digest, and written only
-to the controlling terminal (``/dev/tty``), after the commit; never to
-stdout, stderr, a log, a file, the database or the audit log. Without a
-controlling terminal the command refuses before any change. Standard output
-gets only the Owner's logical UUID and the expiry.
+160 bits, the deployment's lifetime, single use), stored only as its digest
+(with its non-secret lookup key and the boot id plus ``CLOCK_BOOTTIME`` of
+issuance, ``app.auth.boot_clock``), and written only to the controlling
+terminal (``/dev/tty``), after the commit; never to stdout, stderr, a log, a
+file, the database or the audit log. Without a controlling terminal the
+command refuses before any change. Standard output gets only the Owner's
+logical UUID and the expiry. If writing the code to the terminal fails after
+the commit, the command exits ``2`` with ``committed_code_not_shown``: the
+change is committed but the code is lost, so run ``recover`` (also after a
+``bootstrap``; the Owner then exists) to issue a new one.
 
 Database. The path must be canonical and name the existing database file, a
 regular file with one link owned by this account and not group/other
@@ -56,7 +68,7 @@ identity): ``bootstrap`` records ``invite_principal`` and
 ``issue_principal_invitation``; ``recover`` records
 ``invalidate_human_sessions``, ``revoke_principal_credential`` (when a
 credential was revoked) and ``issue_principal_invitation``. A refusal changes
-nothing and records nothing.
+nothing and records nothing, except ``committed_code_not_shown`` (above).
 
 Exit status: ``0`` issued, ``2`` refused (a fixed word on stderr).
 """
@@ -75,14 +87,15 @@ from uuid import UUID, uuid4
 
 from app.audit.model import ActorCategory, AuditAction, AuditOutcome, TargetKind
 from app.audit.store import AuditStore
+from app.deployment import Deployment, _runtime_roots
 from app.local_admin import (
     CliRefused, ControllingTerminal, _existing_database, _LedgerDatabaseChanged,
     _require_current_schema,
 )
-from .invitation_code import INVITATION_LIFETIME, new_invitation_code
+from .invitation_code import new_invitation_code
 from .model import AccessValidationError, utc_time
 from .reservation_store import HUMAN_SESSIONS_ID
-from .store import AccessStore, OwnerAlreadyConfigured, OwnerNotConfigured
+from .store import AccessStore, InvitationClockUnavailable, OwnerAlreadyConfigured, OwnerNotConfigured
 
 
 PROG = "python -m app.auth.bootstrap_cli"
@@ -100,7 +113,7 @@ def bootstrap_owner(store: AccessStore, display_name: str, secret: bytes, *,
     """Create the Owner and its one authorization with their audit records; one transaction."""
     audit = store.audit
     at = utc_time(at)
-    expires_at = at + INVITATION_LIFETIME
+    expires_at = store.invitation_expiry(at)
     owner = uuid4()
     with audit.transaction(write=True) as connection:
         store.bootstrap_owner_on(connection, owner, display_name, secret, expires_at, at=at)
@@ -114,7 +127,7 @@ def recover_owner(store: AccessStore, secret: bytes, *, at: datetime,
     """Recover the Owner (see ``AccessStore.recover_owner_on``) with its audit records."""
     audit = store.audit
     at = utc_time(at)
-    expires_at = at + INVITATION_LIFETIME
+    expires_at = store.invitation_expiry(at)
     with audit.transaction(write=True) as connection:
         owner, _, revoked = store.recover_owner_on(connection, secret, expires_at, at=at,
                                                    display_name=display_name)
@@ -148,12 +161,23 @@ def _confirm(terminal: ControllingTerminal, prompt: str, word: str) -> None:
 
 
 def _show_code(terminal: ControllingTerminal, code: str, expires_at: datetime) -> None:
-    terminal.write(
-        "\nOwner enrollment code (single use, valid until "
-        f"{expires_at.isoformat(timespec='seconds')}):\n\n    {code}\n\n"
-        "Open the reserved ServerSentinel origin in the browser you will use, enter\n"
-        "this code once and register your passkey with user verification. Do not\n"
-        "store or send the code anywhere else.\n")
+    try:
+        terminal.write(
+            "\nOwner enrollment code (single use, valid until "
+            f"{expires_at.isoformat(timespec='seconds')}):\n\n    {code}\n\n"
+            "Open the reserved ServerSentinel origin in the browser you will use, enter\n"
+            "this code once and register your passkey with user verification. Do not\n"
+            "store or send the code anywhere else.\n")
+    except Exception:
+        # Committed, but the code never reached the Owner: it is lost and only
+        # ``recover`` issues a new one (PR #234 review).
+        raise CliRefused("committed_code_not_shown") from None
+
+
+def _load_deployment(path: Path):
+    """The validated deployment configuration, exactly as the launcher loads it."""
+    code_root, install_root = _runtime_roots()
+    return Deployment.load(path, code_root=code_root, install_root=install_root)
 
 
 def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
@@ -162,9 +186,19 @@ def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
         # The service account, never root: root could create a database file
         # the service cannot use, and needs no part of this.
         raise CliRefused("run_as_service_account")
+    try:
+        deployment = _load_deployment(args.config)
+        settings = deployment.settings
+        service_uid = deployment.service_uid
+        database_path = settings.database_path
+        lifetime = settings.invitation_lifetime
+    except Exception:
+        raise CliRefused("deployment_configuration_rejected") from None
+    if os.geteuid() != service_uid:
+        raise CliRefused("run_as_service_account")
     terminal = terminal_factory()
     try:
-        database = _existing_database(args.database)
+        database = _existing_database(database_path)
         try:
             try:
                 with closing(database.connect()) as connection:
@@ -174,7 +208,10 @@ def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
             except Exception:
                 raise CliRefused("database_rejected" if database.rejected else "database_unavailable") from None
             audit = AuditStore(database, clock=clock)
-            store = AccessStore(database, clock=clock, audit=audit)
+            try:
+                store = AccessStore(database, clock=clock, audit=audit, invitation_lifetime=lifetime)
+            except AccessValidationError:
+                raise CliRefused("deployment_configuration_rejected") from None
             try:
                 configured = _owner_configured(store)
             except Exception:
@@ -188,7 +225,7 @@ def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
                 name = _display_name(terminal, "Owner display name (1-64 characters): ", optional=False)
                 _confirm(terminal,
                          f"Create the Owner and issue one enrollment code valid for "
-                         f"{int(INVITATION_LIFETIME.total_seconds() // 3600)} hours. "
+                         f"{int(lifetime.total_seconds() // 3600)} hours. "
                          f"Type {BOOTSTRAP_WORD} to confirm: ", BOOTSTRAP_WORD)
             else:
                 name = _display_name(terminal, "New Owner display name (empty keeps the current one): ",
@@ -208,6 +245,8 @@ def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
                 raise CliRefused("owner_already_configured") from None
             except OwnerNotConfigured:
                 raise CliRefused("owner_not_configured") from None
+            except InvitationClockUnavailable:
+                raise CliRefused("invitation_clock_unavailable") from None
             except AccessValidationError:
                 raise CliRefused("display_name_rejected") from None
             except Exception:
@@ -235,8 +274,8 @@ def _parser() -> argparse.ArgumentParser:
     for name, text in (("bootstrap", "create the Owner and issue its enrollment code"),
                        ("recover", "revoke every Owner credential and issue a new enrollment code")):
         command = commands.add_parser(name, help=text)
-        command.add_argument("--database", type=Path, required=True,
-                             help="the application's existing state database")
+        command.add_argument("--config", type=Path, required=True,
+                             help="the deployment configuration the service runs with")
     return parser
 
 

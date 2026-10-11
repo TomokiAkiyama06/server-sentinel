@@ -2421,10 +2421,19 @@ class LifecycleInventoryTests(unittest.TestCase):
         cases = {
             "appended invitation identity": (statement(
                 "INSERT INTO access_invitations VALUES ('x', ?, (SELECT id FROM "
-                "access_principals WHERE role='owner'), 0, 0, 1, 2, NULL, NULL, 0)",
+                "access_principals WHERE role='owner'), 0, 0, 1, 2, NULL, NULL, 0, NULL, NULL, NULL)",
                 (bytes(range(64, 96)),)), "access_invitations", lambda runtime: "x"),
             "invitation secret digest": (statement(
                 f"UPDATE access_invitations SET secret_digest=X'00' WHERE id=({open_invitation})"),
+                "access_invitations", lambda runtime: one(runtime, open_invitation)),
+            "invitation clock pair partly cleared": (statement(
+                "UPDATE access_invitations SET lookup_key=zeroblob(16), issued_boottime_us=5 "
+                f"WHERE id=({open_invitation})"),
+                "access_invitations", lambda runtime: one(runtime, open_invitation)),
+            "invitation boot id malformed": (statement(
+                "UPDATE access_invitations SET lookup_key=zeroblob(16), issued_boottime_us=5, "
+                "issued_boot_id='0F1E2D3C-4B5A-4968-8776-A5B4C3D2E1F0' "
+                f"WHERE id=({open_invitation})"),
                 "access_invitations", lambda runtime: one(runtime, open_invitation)),
             "invitation attempts": (statement(
                 f"UPDATE access_invitations SET attempt_count=6 WHERE id=({open_invitation})"),

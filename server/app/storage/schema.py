@@ -1,7 +1,10 @@
 """Ordered application schema; feature modules never import this catalog."""
 
 from app.audit.schema import audit_migration
-from app.auth.schema import access_migration, access_shared_identity_migration, access_webauthn_migration
+from app.auth.schema import (
+    access_invitation_clock_migration, access_migration, access_shared_identity_migration,
+    access_webauthn_migration,
+)
 from app.cameras.remote_agent.schema import (
     PAIRING_MIGRATION, pairing_renewal_certificate_migration, pairing_renewal_migration,
 )
@@ -56,4 +59,7 @@ APPLICATION_MIGRATIONS = (
     # Issues #121/#123: the staged renewal keeps its issued certificate so a
     # same-key retry is certificate-idempotent.
     pairing_renewal_certificate_migration(21),
+    # PR #234 review (Issue #10 phase 2 S2): invitation clock continuity
+    # (boot id + CLOCK_BOOTTIME) and the non-secret invitation lookup key.
+    access_invitation_clock_migration(22),
 )

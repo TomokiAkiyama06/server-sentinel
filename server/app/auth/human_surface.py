@@ -51,10 +51,15 @@ WebSocket and error path gets the same generic denial):
 - ``POST /api/auth/sign-out``: end the caller's own session (CSRF).
 
 The four ceremony routes run before a credential exists (AUTH-013). Each is
-rate-limited per verified proxy identity and globally before the request body
-is parsed and before the ceremony takes any gate or SQLite lock (Issue #181).
-Redemption uses its own, stricter limiter (Owner decision D4), so a
-redemption flood never spends the sign-in buckets. An invitation code travels
+rate-limited per verified proxy identity before the request body is parsed
+and before the ceremony takes any gate or SQLite lock (Issue #181); the
+sign-in routes also globally. Redemption uses its own, stricter limiter with
+no global bucket (Owner decisions D4 and 2026-10-11), so a redemption flood
+never spends the sign-in buckets and one source cannot stop another's
+redemption. A redemption refused after the limiter is counted, value-free
+(``HumanAccess.refused_redemptions``, logged as
+``invitation_redemption_refused`` on the first refusal and each time the
+count doubles), never with the code, identity or reason. An invitation code travels
 only in the request body and is decoded strictly
 (``invitation_code.parse_invitation_code``) before the gate; a code that does
 not parse never reaches SQLite. Session routes are not charged; a forged or
@@ -71,7 +76,9 @@ verification is stale gets ``403 {"detail":"step_up_required"}`` (Owner
 decision D3), and the holder of a valid invitation whose verified
 authenticator is backup eligible, in a deployment that requires device-bound
 credentials, gets ``409 {"detail":"device_bound_credential_required"}``
-(decided under the gate, ``PasskeyCeremonies.finish_registration``). Nothing
+(decided under the gate inside the redemption transaction, after the
+invitation proved valid and bound to the consumed challenge,
+``AccessStore.enroll_credential``). Nothing
 here logs a header, identity, token, CSRF token, invitation code, challenge
 or body.
 """
@@ -87,6 +94,7 @@ import ipaddress
 import json
 import logging
 import re
+import threading
 from typing import Callable, Iterator
 
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -550,10 +558,23 @@ class HumanAccess:
         self._state = HumanAccessState.NOT_STARTED
         self._check_failures = 0
         self._sweep_failures = 0
+        # Bounded, value-free health (AUTH-013, PR #234 review): how many
+        # redemption requests that passed the limiter were refused. No code,
+        # identity, invitation or reason is kept.
+        self.refused_redemptions = 0
+        self._refusal_lock = threading.Lock()
         self.gate = ServingGate(self)
         # Last: everything above validated, so a refused composition leaves
         # the ceremonies untouched.
         ceremonies.guard_session_gate(self.gate)
+
+    def note_refused_redemption(self) -> None:
+        """Count one refused redemption; log the value-free event at 1, 2, 4, 8, ..."""
+        with self._refusal_lock:
+            self.refused_redemptions += 1
+            count = self.refused_redemptions
+        if count & (count - 1) == 0:
+            logging.getLogger(__name__).warning(Event.INVITATION_REDEMPTION_REFUSED)
 
     def bind_storage_admission(self, admission: Callable, *, database: Database) -> None:
         """Admit every write of this composition through ``admission``.
@@ -921,15 +942,19 @@ class HumanSurface:
         refusal is the generic denial.
         """
         self._limit_redemption(request.identity)
-        body = _json_object(await self._body(request, json_required=True))
-        if set(body) != {"code"}:
-            raise _Denied()
-        secret = _invitation_secret(body["code"])
         try:
-            options = await asyncio.to_thread(self.access.ceremonies.begin_registration,
-                                              secret, request.identity)
-        except Exception:
-            raise _Denied() from None
+            body = _json_object(await self._body(request, json_required=True))
+            if set(body) != {"code"}:
+                raise _Denied()
+            secret = _invitation_secret(body["code"])
+            try:
+                options = await asyncio.to_thread(self.access.ceremonies.begin_registration,
+                                                  secret, request.identity)
+            except Exception:
+                raise _Denied() from None
+        except _Denied:
+            self.access.note_refused_redemption()
+            raise
         await self._json(request.send, 200, options)
 
     async def _finish_registration(self, request: _Request) -> None:
@@ -945,24 +970,28 @@ class HumanSurface:
         ``DeviceBoundCredentialRequired`` has its own fixed ``409``.
         """
         self._limit_redemption(request.identity)
-        body = _json_object(await self._body(request, json_required=True))
-        if not {"code", "credential"} <= set(body) <= {"code", "credential", "label"}:
-            raise _Denied()
-        secret = _invitation_secret(body["code"])
-        credential = body["credential"]
-        if not isinstance(credential, dict):
-            raise _Denied()
-        label = _label(body.get("label"))
         try:
-            enrolled = await asyncio.to_thread(self.access.ceremonies.finish_registration,
-                                               secret, request.identity, credential, label=label)
-        except DeviceBoundCredentialRequired:
-            await send_device_bound_required(request.send)
-            return
-        except Exception:
-            raise _Denied() from None
-        if not isinstance(enrolled, Credential):
-            raise _Denied()
+            body = _json_object(await self._body(request, json_required=True))
+            if not {"code", "credential"} <= set(body) <= {"code", "credential", "label"}:
+                raise _Denied()
+            secret = _invitation_secret(body["code"])
+            credential = body["credential"]
+            if not isinstance(credential, dict):
+                raise _Denied()
+            label = _label(body.get("label"))
+            try:
+                enrolled = await asyncio.to_thread(self.access.ceremonies.finish_registration,
+                                                   secret, request.identity, credential, label=label)
+            except DeviceBoundCredentialRequired:
+                await send_device_bound_required(request.send)
+                return
+            except Exception:
+                raise _Denied() from None
+            if not isinstance(enrolled, Credential):
+                raise _Denied()
+        except _Denied:
+            self.access.note_refused_redemption()
+            raise
         await request.send({"type": "http.response.start", "status": 204, "headers": [
             (b"cache-control", b"no-store"),
         ]})

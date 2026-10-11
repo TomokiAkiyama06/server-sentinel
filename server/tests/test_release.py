@@ -600,6 +600,32 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertEqual(release.stat().st_mode & 0o777, 0o755)
         self.assertEqual((self.installation / "releases").stat().st_mode & 0o777, 0o755)
 
+    def test_invitation_lifetime_hours_is_optional_and_validated(self):
+        # Owner decision 2026-10-11 (PR #234): default 24 hours, whole hours
+        # from 1 to 168 (7 days), anything else refuses the configuration.
+        code_root = self.root / "code"
+        code_root.mkdir()
+        base = json.loads(self.config.read_text())
+
+        def load(**extra):
+            self.config.write_text(json.dumps({**base, **extra}))
+            with patch("app.deployment.ADMINISTRATOR_UID", self.uid), patch(
+                    "app.deployment._approved_filesystem_device",
+                    side_effect=self.approved_device_lookup()), patch(
+                    "app.deployment.os.path.ismount", return_value=True), patch(
+                    "app.deployment._operating_system_root_device",
+                    return_value=self.runtime.stat().st_dev + 1):
+                return Deployment.load(self.config, code_root=code_root)
+
+        self.assertEqual(load().settings.invitation_lifetime.total_seconds(), 24 * 3600)
+        self.assertEqual(load(invitation_lifetime_hours=1).settings.invitation_lifetime.total_seconds(), 3600)
+        self.assertEqual(load(invitation_lifetime_hours=168).settings.invitation_lifetime.total_seconds(),
+                         168 * 3600)
+        for value in (0, 169, -1, 24.0, "24", True, None):
+            with self.subTest(value=value), self.assertRaises(ConfigurationError) as refused:
+                load(invitation_lifetime_hours=value)
+            self.assertNotIn(repr(value), str(refused.exception))
+
     def test_single_path_directives_are_rendered_without_command_line_quoting(self):
         account = pwd.getpwuid(self.uid)
         code_root = self.root / "code"

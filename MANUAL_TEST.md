@@ -1514,19 +1514,31 @@ Once a deployment can enable them, on the Main Server with a synthetic
   controlling terminal (for example `systemd-run` or `cron`): it refuses with
   `controlling_terminal_required` and changes nothing; run it as root: it
   refuses with `run_as_service_account`; run `bootstrap` a second time: it
-  refuses with `owner_already_configured`;
+  refuses with `owner_already_configured`; set
+  `"invitation_lifetime_hours": 2` and confirm the console code's expiry is two
+  hours after issuance;
 - [ ] in a real browser at the reserved `https` origin, enter the console
   code once, register a passkey (user verification is prompted), and
   confirm the registration response is `204` with no cookie and no application
   data, that the code is in no URL, browser history entry or server log, and
   that the Owner then signs in and `GET /api/session` reports `owner`;
-- [ ] enter the same code again, a mistyped code, and a code after 24 hours:
-  each is the generic denial, identical to an uninvited caller's;
+- [ ] enter the same code again, a mistyped code, and a code after its
+  lifetime (24 hours, or the deployment's `invitation_lifetime_hours`): each is
+  the generic denial, identical to an uninvited caller's;
+- [ ] issue a code, set the Main Server's wall clock back by two hours (then
+  restore it), and enter the code: it is the generic denial (clock rollback
+  on the same boot); issue another code, reboot the host and redeem it within
+  its lifetime: it works (the wall clock decides after a reboot);
+- [ ] submit a few wrong codes and confirm the application log holds
+  `invitation_redemption_refused` (first refusal, then at 2, 4, 8, ...) with no
+  code, identity or reason;
 - [ ] submit a dozen wrong codes quickly from one browser: after the burst of
   5 they are refused before the server does any work (one value-free
   `human_request_rate_limited` log event), a correct code is refused too until
   12 seconds pass, and sign-in for another person keeps working meanwhile;
-  record that people sharing one Tailscale login share this limit;
+  record that people sharing one Tailscale login share this limit, and that
+  another Tailscale login's redemption is not slowed (no global redemption
+  bucket);
 - [ ] in two browsers, open the registration with the same valid code and
   finish both at once: exactly one credential is registered and the other
   gets the generic denial;
@@ -1536,8 +1548,9 @@ Once a deployment can enable them, on the Main Server with a synthetic
 - [ ] run `recover` while the Owner and an invitee are signed in and an
   invitation is pending: both sessions end on their next request, the pending
   invitation and the old Owner passkey (on every synced device) no longer
-  work, the new console code registers a replacement Owner passkey, and the
-  audit log holds `invalidate_human_sessions`, `revoke_principal_credential`
+  work, the new console code registers a replacement Owner passkey (on the
+  same synced authenticator that held the revoked one, which must not refuse
+  it as already registered), and the audit log holds `invalidate_human_sessions`, `revoke_principal_credential`
   and `issue_principal_invitation`; recordings and capture nodes are
   unchanged.
 

@@ -11,7 +11,9 @@ therefore:
   (``0-9 A-Z`` without ``I``, ``L``, ``O`` and ``U``, so ``0``/``O`` and
   ``1``/``I``/``L`` cannot be confused), in eight groups of four joined by
   ``-``: ``XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX``;
-- valid for 24 hours (``INVITATION_LIFETIME``, D5) and single use.
+- valid for the deployment's invitation lifetime (default 24 hours,
+  ``INVITATION_LIFETIME``, D5; configurable per deployment up to 7 days,
+  ``MAX_INVITATION_LIFETIME``, Owner decision 2026-10-11) and single use.
 
 ``parse_invitation_code`` is strict: only that exact canonical form is
 accepted (upper case, the hyphens exactly at the group boundaries, nothing
@@ -23,13 +25,20 @@ fixed message and never carries the input.
 
 from __future__ import annotations
 
-from datetime import timedelta
 import re
 import secrets
 from typing import Callable
 
+from app import settings
 
-INVITATION_LIFETIME = timedelta(hours=24)
+
+# Owner decision 2026-10-11: the lifetime is a deployment setting, default
+# 24 hours, at most 7 days, in whole hours from 1 (defined in ``app.settings``
+# so the standard-library-only installer validates it too).
+INVITATION_LIFETIME = settings.INVITATION_LIFETIME
+MAX_INVITATION_LIFETIME = settings.MAX_INVITATION_LIFETIME
+invitation_lifetime = settings.invitation_lifetime
+valid_invitation_lifetime = settings.valid_invitation_lifetime
 CODE_BYTES = 20
 GROUP = 4
 ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"

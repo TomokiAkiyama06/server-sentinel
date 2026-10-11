@@ -14,8 +14,9 @@ that is the key. In the shared-Tailscale-account deployment every person
 presents the same login, so the per-source bucket is shared by the room: a
 holder of the shared login who floods the route can delay sign-in for the
 others (availability), never gain access (an Owner-reviewable trade-off, see
-``server/app/auth/README.md``). A global bucket bounds the total rate across
-all sources.
+``server/app/auth/README.md``). The sign-in limiter also has a global bucket
+bounding the total rate across all sources; it is optional
+(``global_capacity=None``) and the redemption limiter has none.
 
 Memory is bounded: at most ``max_sources`` buckets, keyed by a SHA-256 digest of
 the identity rather than the identity itself. When the table is full, the
@@ -29,7 +30,9 @@ identity, digest, path or count.
 
 Invitation redemption (Issue #10 phase 2 S2, Owner decision D4) uses its own,
 stricter instance (``redemption_rate_limiter``): per source a burst of 5 and
-one more every 12 seconds, and a global bucket of 10 refilled every 6 seconds.
+one more every 12 seconds, and no global bucket (Owner decision 2026-10-11,
+PR #234 review: a global bucket would let one Tailnet member drain it and
+stop every other source, the Owner's recovery included, from redeeming).
 It is a separate object with separate buckets, so a redemption flood never
 spends the sign-in buckets and a sign-in flood never spends the redemption
 ones. It comes on top of the per-code attempt bound
@@ -63,15 +66,21 @@ class _Bucket:
 
 
 class SourceRateLimiter:
-    """Token buckets per source plus one global bucket; thread safe."""
+    """Token buckets per source plus an optional global bucket; thread safe.
+
+    ``global_capacity=None`` means no global bucket: only the per-source
+    buckets (and their bounded table) limit requests.
+    """
 
     def __init__(self, *, per_source_capacity: int = 20, per_source_refill_seconds: float = 3.0,
-                 global_capacity: int = 120, global_refill_seconds: float = 0.5,
+                 global_capacity: int | None = 120, global_refill_seconds: float = 0.5,
                  max_sources: int = 256, log_interval_seconds: float = 60.0,
                  monotonic: Callable[[], float] = time.monotonic):
-        for value in (per_source_capacity, global_capacity, max_sources):
+        for value in (per_source_capacity, max_sources):
             if type(value) is not int or value < 1:
                 raise ValueError("rate limit configuration is invalid")
+        if global_capacity is not None and (type(global_capacity) is not int or global_capacity < 1):
+            raise ValueError("rate limit configuration is invalid")
         for value in (per_source_refill_seconds, global_refill_seconds, log_interval_seconds):
             if not _positive(value):
                 raise ValueError("rate limit configuration is invalid")
@@ -114,7 +123,7 @@ class SourceRateLimiter:
             return len(self._sources)
 
     def allow(self, source: str) -> bool:
-        """Consume one token for ``source`` and the global bucket, or refuse.
+        """Consume one token for ``source`` (and the global bucket, if any), or refuse.
 
         A refusal consumes nothing. An unusable source key or clock refuses.
         """
@@ -125,9 +134,11 @@ class SourceRateLimiter:
             now = self._now()
             if now is None:
                 return self._refuse_locked(None)
-            if self._global is None:
-                self._global = _Bucket(float(self.global_capacity), now)
-            self._refill(self._global, now, self.global_capacity, self.global_refill_seconds)
+            limited_globally = self.global_capacity is not None
+            if limited_globally:
+                if self._global is None:
+                    self._global = _Bucket(float(self.global_capacity), now)
+                self._refill(self._global, now, self.global_capacity, self.global_refill_seconds)
             bucket = self._sources.get(key)
             if bucket is None:
                 if len(self._sources) >= self.max_sources:
@@ -143,10 +154,11 @@ class SourceRateLimiter:
             else:
                 self._sources.move_to_end(key)
                 self._refill(bucket, now, self.per_source_capacity, self.per_source_refill_seconds)
-            if bucket.tokens < 1 or self._global.tokens < 1:
+            if bucket.tokens < 1 or (limited_globally and self._global.tokens < 1):
                 return self._refuse_locked(now)
             bucket.tokens -= 1
-            self._global.tokens -= 1
+            if limited_globally:
+                self._global.tokens -= 1
             return True
 
     def _refuse(self, now: float | None) -> bool:
@@ -164,19 +176,15 @@ class SourceRateLimiter:
 
 
 # Owner decision D4 (2026-10-11): per source burst 5, one per 12 seconds.
+# No global redemption bucket (Owner decision 2026-10-11, PR #234 review).
 REDEMPTION_PER_SOURCE_CAPACITY = 5
 REDEMPTION_PER_SOURCE_REFILL_SECONDS = 12.0
-# Global cap across every source (implementation bound): burst 10, then one
-# every 6 seconds (at most 10 per minute sustained).
-REDEMPTION_GLOBAL_CAPACITY = 10
-REDEMPTION_GLOBAL_REFILL_SECONDS = 6.0
 
 
 def redemption_rate_limiter(*, max_sources: int = 256,
                             monotonic: Callable[[], float] = time.monotonic) -> SourceRateLimiter:
-    """The separate, stricter limiter for invitation redemption (D4)."""
+    """The separate, stricter limiter for invitation redemption (D4); per source only."""
     return SourceRateLimiter(per_source_capacity=REDEMPTION_PER_SOURCE_CAPACITY,
                              per_source_refill_seconds=REDEMPTION_PER_SOURCE_REFILL_SECONDS,
-                             global_capacity=REDEMPTION_GLOBAL_CAPACITY,
-                             global_refill_seconds=REDEMPTION_GLOBAL_REFILL_SECONDS,
+                             global_capacity=None,
                              max_sources=max_sources, monotonic=monotonic)

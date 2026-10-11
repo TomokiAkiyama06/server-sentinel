@@ -43,6 +43,9 @@ from tests.webauthn_fakes import ORIGIN, RP_ID, OpenGate, SyntheticAuthenticator
 SHARED = "synthetic-lab-shared@example.invalid"
 ELSEWHERE = "synthetic-elsewhere@example.invalid"
 NEW_SESSION_COLUMNS = ("external_identity_binding", "binding_mismatch_audited_at_us", "binding_mismatch_suppressed")
+# Added after this migration by access_invitation_clock_migration (PR #234
+# review); NULL for every row that existed before it.
+LATER_INVITATION_COLUMNS = ("lookup_key", "issued_boot_id", "issued_boottime_us")
 ALICE_CODE = b"a" * 32
 BOB_CODE = b"b" * 32
 
@@ -609,7 +612,7 @@ class SharedIdentityMigrationTests(unittest.TestCase):
         result = {}
         for table in self.TABLES:
             columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")
-                       if row[1] not in NEW_SESSION_COLUMNS]
+                       if row[1] not in NEW_SESSION_COLUMNS + LATER_INVITATION_COLUMNS]
             result[table] = sorted(tuple(row) for row in connection.execute(
                 f"SELECT rowid, {', '.join(columns)} FROM {table}"))
         return result
@@ -618,6 +621,9 @@ class SharedIdentityMigrationTests(unittest.TestCase):
         with closing(self.database.connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
             after = self.read(connection)
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM access_invitations WHERE lookup_key IS NOT NULL "
+                "OR issued_boot_id IS NOT NULL OR issued_boottime_us IS NOT NULL").fetchone()[0], 0)
             self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")

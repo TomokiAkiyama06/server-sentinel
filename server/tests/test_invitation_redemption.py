@@ -8,6 +8,7 @@ browser, Tailscale, proxy or real authenticator is involved.
 """
 
 import asyncio
+from contextlib import closing
 from datetime import timedelta
 import json
 import logging
@@ -15,22 +16,24 @@ import secrets
 import unittest
 from unittest.mock import patch
 
+from app.auth.boot_clock import CLOCK_ROLLBACK_TOLERANCE, BootInstant, invitation_clock_valid
 from app.auth.bootstrap_cli import bootstrap_owner
 from app.auth.human_surface import (
     AUTHENTICATION_OPTIONS_PATH, REGISTRATION_OPTIONS_PATH, REGISTRATION_PATH, SESSION_PATH,
     HumanAccess, HumanAccessConfiguration, HumanAccessUnavailable,
 )
 from app.auth.invitation_code import (
-    ALPHABET, CODE_BYTES, DISPLAY_LENGTH, INVITATION_LIFETIME, InvalidInvitationCode,
-    format_invitation_code, new_invitation_code, parse_invitation_code,
+    ALPHABET, CODE_BYTES, DISPLAY_LENGTH, INVITATION_LIFETIME, MAX_INVITATION_LIFETIME, InvalidInvitationCode,
+    format_invitation_code, invitation_lifetime, new_invitation_code, parse_invitation_code,
 )
 from app.auth.model import Permission
 from app.auth.passkeys import PasskeyCeremonies
 from app.auth.rate_limit import (
-    REDEMPTION_GLOBAL_CAPACITY, REDEMPTION_PER_SOURCE_CAPACITY, REDEMPTION_PER_SOURCE_REFILL_SECONDS,
+    REDEMPTION_PER_SOURCE_CAPACITY, REDEMPTION_PER_SOURCE_REFILL_SECONDS,
     SourceRateLimiter, redemption_rate_limiter,
 )
-from app.auth.store import MAX_REDEMPTION_ATTEMPTS
+from app.auth.store import MAX_REDEMPTION_ATTEMPTS, AccessStore, InvitationClockUnavailable
+from app.auth.model import AccessValidationError
 
 from tests.test_hostname_reservation import Clock
 from tests.test_human_surface import (
@@ -79,12 +82,38 @@ class InvitationCodeTests(unittest.TestCase):
             new_invitation_code(lambda size: b"short")
 
 
+BOOT = "0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0"
+OTHER_BOOT = "1f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0"
+
+
+class BootClock:
+    """A synthetic boot id and ``CLOCK_BOOTTIME`` (microseconds)."""
+
+    def __init__(self):
+        self.boot_id = BOOT
+        self.us = 5_000_000_000
+        self.available = True
+
+    def __call__(self):
+        return BootInstant(self.boot_id, self.us) if self.available else None
+
+    def advance(self, **delta):
+        self.us += timedelta(**delta) // timedelta(microseconds=1)
+
+
 class RedemptionFixture(HumanSurfaceFixture):
     def setUp(self):
         super().setUp()
         # A roomy limiter unless a test exercises the D4 values themselves.
         self.access.redemption_limiter = SourceRateLimiter(
-            per_source_capacity=1000, global_capacity=1000, monotonic=self.limit_clock)
+            per_source_capacity=1000, global_capacity=None, monotonic=self.limit_clock)
+        self.boot = BootClock()
+        self.store._boot_clock = self.boot
+
+    def elapse(self, **delta):
+        """Both clocks move together, as on a host whose wall clock is not stepped."""
+        self.ceremony_clock.advance(**delta)
+        self.boot.advance(**delta)
 
     def invite(self, permissions=(Permission.LIVE_VIEW,), *, lifetime=INVITATION_LIFETIME):
         principal = self.store.invite("Synthetic invitee", permissions)
@@ -174,7 +203,7 @@ class RedemptionTests(RedemptionFixture):
             self.assertEqual(status(await self.options(exhausted)), 200)
         _, generation = self.invite()
         self.revoker.revoke_all_human_sessions()
-        self.ceremony_clock.advance(minutes=2)
+        self.elapse(minutes=2)
         unknown = new_invitation_code()[1]
         bodies = {
             "unknown": {"code": unknown}, "expired": {"code": expired}, "redeemed": {"code": redeemed},
@@ -420,15 +449,40 @@ class RedemptionRateLimitTests(RedemptionFixture):
         self.assertEqual(status(await self.options(code)), 200)
         self.assertEqual(await self.options(code), expected)
 
-    async def test_global_cap_bounds_many_sources(self):
+    async def test_no_global_bucket_lets_one_source_stop_another(self):
+        # Owner decision 2026-10-11 (Codex P1 on PR #234): only the per-source
+        # bucket. Many sources each spending their whole burst never refuse a
+        # fresh source, the Owner redeeming a recovery code included.
         expected = await self.denial()
-        for index in range(REDEMPTION_GLOBAL_CAPACITY):
-            self.assertEqual(await self.options("x", identity=f"synthetic-{index}@example.invalid"), expected)
-        limited = self.access.redemption_limiter.limited
+        limiter = self.access.redemption_limiter
+        self.assertIsNone(limiter.global_capacity)
+        for index in range(40):
+            for _ in range(REDEMPTION_PER_SOURCE_CAPACITY):
+                self.assertEqual(await self.options("x", identity=f"synthetic-{index}@example.invalid"),
+                                 expected)
+        self.assertEqual(limiter.limited, 0)
         _, code = self.invite()
-        self.assertEqual(await self.options(code, identity="synthetic-new@example.invalid"), expected)
-        self.assertEqual(self.access.redemption_limiter.limited, limited + 1)
-        self.assertLessEqual(self.access.redemption_limiter.sources(), 256)
+        self.assertEqual(status(await self.options(code, identity="synthetic-new@example.invalid")), 200)
+        self.assertEqual(limiter.limited, 0)
+        self.assertLessEqual(limiter.sources(), 256)
+        # Each source is still bounded by its own bucket.
+        self.assertEqual(await self.options(code, identity="synthetic-0@example.invalid"), expected)
+        self.assertEqual(limiter.limited, 1)
+
+    async def test_the_limiter_is_charged_before_either_body_is_parsed(self):
+        # A request whose body would be refused anyway still spends a token,
+        # so the limiter cannot be moved behind the body checks unnoticed.
+        expected = await self.denial()
+        limiter = self.access.redemption_limiter
+        for path in (REGISTRATION_PATH, REGISTRATION_OPTIONS_PATH):
+            with self.subTest(path=path):
+                self.redemption_clock.value += 10 * REDEMPTION_PER_SOURCE_REFILL_SECONDS
+                for _ in range(REDEMPTION_PER_SOURCE_CAPACITY):
+                    self.assertEqual(await call(self.surface, "POST", path, body=b"{"), expected)
+                before = limiter.limited
+                _, code = self.invite()
+                self.assertEqual(await self.options(code), expected)
+                self.assertEqual(limiter.limited, before + 1)
 
     async def test_sign_in_flood_does_not_spend_redemption(self):
         for _ in range(self.limiter.per_source_capacity + 3):
@@ -447,7 +501,9 @@ class CompositionTests(RedemptionFixture):
         limiter = fresh.redemption_limiter
         self.assertIsNot(limiter, fresh.rate_limiter)
         self.assertEqual((limiter.per_source_capacity, limiter.per_source_refill_seconds,
-                          limiter.global_capacity), (5, 12.0, REDEMPTION_GLOBAL_CAPACITY))
+                          limiter.global_capacity), (5, 12.0, None))
+        # Sign-in keeps its global bucket.
+        self.assertEqual(fresh.rate_limiter.global_capacity, 120)
         shared = SourceRateLimiter()
         ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
                                        clock=self.ceremony_clock)
@@ -457,6 +513,231 @@ class CompositionTests(RedemptionFixture):
         with self.assertRaises(HumanAccessUnavailable):
             HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store, ceremonies=ceremonies,
                         reservation=self.check, redemption_limiter=object())
+
+
+class InvitationClockTests(RedemptionFixture):
+    """Owner decision 2026-10-11 (Codex P1 on PR #234): a wall clock stepped
+    back after issuance must not extend a code."""
+
+    async def test_a_consistent_clock_redeems(self):
+        _, code = self.invite()
+        self.elapse(hours=23, minutes=59)
+        self.assertEqual(status((await self.redeem(code))[1]), 204)
+
+    async def test_a_wall_clock_rollback_on_the_same_boot_refuses(self):
+        expected = await self.denial()
+        _, code = self.invite()
+        # 25 hours really passed (monotonic), but the wall clock was stepped
+        # back so it reads only 23 hours later: still "inside" the wall window.
+        self.boot.advance(hours=25)
+        self.ceremony_clock.advance(hours=23)
+        self.assertEqual(await self.options(code), expected)
+        # A rollback inside the lifetime is refused as well (detected rollback).
+        principal, code = self.invite()
+        self.boot.advance(hours=2)
+        self.ceremony_clock.advance(hours=1)
+        self.assertEqual(await self.options(code), expected)
+        self.assertEqual(self.count(
+            f"SELECT attempt_count FROM access_invitations WHERE principal_id='{principal.id}'"), 0)
+
+    async def test_finish_rechecks_the_clock(self):
+        expected = await self.denial()
+        _, code = self.invite()
+        begun = await self.options(code)
+        self.assertEqual(status(begun), 200)
+        credential = SyntheticAuthenticator().register(payload(begun), origin=ORIGIN, rp_id=HOST)
+        self.boot.advance(minutes=2)  # the wall clock does not move: stepped back by 2 minutes
+        self.assertEqual(await self.finish(code, credential), expected)
+        self.assertEqual(self.count("SELECT count(*) FROM access_credentials"), 0)
+
+    async def test_monotonic_elapsed_beyond_the_lifetime_or_negative_refuses(self):
+        expected = await self.denial()
+        _, code = self.invite(lifetime=timedelta(hours=2))
+        self.boot.advance(hours=2)
+        self.ceremony_clock.advance(hours=1, minutes=59)
+        self.assertEqual(await self.options(code), expected)
+        _, code = self.invite()
+        self.boot.us -= 1  # same boot, monotonic reading before issuance
+        self.assertEqual(await self.options(code), expected)
+
+    async def test_after_a_reboot_the_wall_clock_window_decides(self):
+        expected = await self.denial()
+        _, code = self.invite()
+        _, late = self.invite()
+        self.boot.boot_id, self.boot.us = OTHER_BOOT, 1_000_000
+        self.ceremony_clock.advance(hours=1)
+        self.assertEqual(status((await self.redeem(code))[1]), 204)
+        self.ceremony_clock.advance(hours=23)
+        self.assertEqual(await self.options(late), expected)
+
+    async def test_an_unverifiable_clock_refuses(self):
+        expected = await self.denial()
+        principal, code = self.invite()
+        self.boot.available = False
+        self.assertEqual(await self.options(code), expected)
+        self.boot.available = True
+        # A row issued before the boot pair existed (NULL) is unverifiable.
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE access_invitations SET issued_boot_id=NULL, issued_boottime_us=NULL")
+            connection.commit()
+        self.assertEqual(await self.options(code), expected)
+        self.assertEqual(self.count(
+            f"SELECT attempt_count FROM access_invitations WHERE principal_id='{principal.id}'"), 0)
+        # Without the boot clock nothing is issued at all.
+        self.boot.available = False
+        invitee = self.store.invite("Synthetic invitee", (Permission.LIVE_VIEW,))
+        with self.assertRaises(InvitationClockUnavailable):
+            self.store.issue_enrollment(invitee.id, secrets.token_bytes(20),
+                                        self.ceremony_clock() + timedelta(hours=1))
+        self.assertEqual(self.count(
+            f"SELECT count(*) FROM access_invitations WHERE principal_id='{invitee.id}'"), 0)
+
+    def test_the_clock_rule_itself(self):
+        hour = 3_600_000_000
+        base = dict(issued_us=0, expires_us=24 * hour, issued_boot_id=BOOT, issued_boottime_us=10 * hour,
+                    max_lifetime_us=MAX_INVITATION_LIFETIME // timedelta(microseconds=1))
+        tolerance = CLOCK_ROLLBACK_TOLERANCE // timedelta(microseconds=1)
+
+        def same(us):
+            return BootInstant(BOOT, us)
+
+        self.assertTrue(invitation_clock_valid(**base, now_us=hour, now=same(11 * hour)))
+        self.assertTrue(invitation_clock_valid(**base, now_us=hour - tolerance, now=same(11 * hour)))
+        self.assertFalse(invitation_clock_valid(**base, now_us=hour - tolerance - 1, now=same(11 * hour)))
+        # A wall clock stepped forward only ends the code earlier.
+        self.assertTrue(invitation_clock_valid(**base, now_us=20 * hour, now=same(11 * hour)))
+        self.assertFalse(invitation_clock_valid(**base, now_us=24 * hour, now=same(11 * hour)))
+        self.assertFalse(invitation_clock_valid(**base, now_us=23 * hour, now=same(34 * hour)))
+        self.assertFalse(invitation_clock_valid(**base, now_us=hour, now=same(10 * hour - 1)))
+        self.assertTrue(invitation_clock_valid(**base, now_us=hour, now=BootInstant(OTHER_BOOT, 0)))
+        self.assertFalse(invitation_clock_valid(**base, now_us=-1, now=BootInstant(OTHER_BOOT, 0)))
+        self.assertFalse(invitation_clock_valid(**base, now_us=hour, now=None))
+        self.assertFalse(invitation_clock_valid(**dict(base, issued_boot_id=None), now_us=hour,
+                                                now=same(11 * hour)))
+        self.assertFalse(invitation_clock_valid(**dict(base, issued_boottime_us=True), now_us=hour,
+                                                now=same(11 * hour)))
+        self.assertFalse(invitation_clock_valid(**dict(base, expires_us=8 * 24 * hour), now_us=hour,
+                                                now=BootInstant(OTHER_BOOT, 0)))
+
+
+class InvitationLifetimeTests(RedemptionFixture):
+    def test_the_lifetime_is_validated_and_bounds_issuance(self):
+        self.assertEqual(invitation_lifetime(1), timedelta(hours=1))
+        self.assertEqual(invitation_lifetime(168), MAX_INVITATION_LIFETIME)
+        for value in (0, 169, -1, 24.0, "24", True, None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                invitation_lifetime(value)
+        for value in (timedelta(0), timedelta(days=7, microseconds=1), 24):
+            with self.subTest(value=value), self.assertRaises(AccessValidationError):
+                AccessStore(self.database, invitation_lifetime=value)
+        short = AccessStore(self.database, clock=self.ceremony_clock, unaudited_writes=True,
+                            invitation_lifetime=timedelta(hours=2), boot_clock=self.boot)
+        self.assertEqual(short.invitation_expiry(self.ceremony_clock()), self.ceremony_clock() + timedelta(hours=2))
+        invitee = short.invite("Synthetic invitee", (Permission.LIVE_VIEW,))
+        with self.assertRaises(AccessValidationError):
+            short.issue_enrollment(invitee.id, secrets.token_bytes(20),
+                                   self.ceremony_clock() + timedelta(hours=2, seconds=1))
+        short.issue_enrollment(invitee.id, secrets.token_bytes(20), self.ceremony_clock() + timedelta(hours=2))
+        # The default store never issues beyond 24 hours.
+        with self.assertRaises(AccessValidationError):
+            self.store.issue_enrollment(invitee.id, secrets.token_bytes(20),
+                                        self.ceremony_clock() + timedelta(hours=24, seconds=1))
+
+
+class ConstantTimeLookupTests(RedemptionFixture):
+    """AUTH-013 (Codex P2 on PR #234): the stored digest is compared with
+    ``hmac.compare_digest``; SQLite only ever compares the lookup key."""
+
+    async def test_the_digest_is_compared_in_constant_time(self):
+        expected = await self.denial()
+        _, code = self.invite()
+        with patch("app.auth.store.hmac.compare_digest", side_effect=lambda a, b: a == b) as compared:
+            self.assertEqual(status(await self.options(code)), 200)
+        self.assertEqual(compared.call_count, 1)
+        # A row found by its lookup key whose digest differs is refused.
+        principal, code = self.invite()
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE access_invitations SET secret_digest=zeroblob(32) WHERE principal_id=?",
+                               (str(principal.id),))
+            connection.commit()
+        self.assertEqual(await self.options(code), expected)
+        # A row without a lookup key (issued before it existed) is never found.
+        principal, code = self.invite()
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE access_invitations SET lookup_key=NULL WHERE principal_id=?",
+                               (str(principal.id),))
+            connection.commit()
+        self.assertEqual(await self.options(code), expected)
+        self.assertEqual(self.count("SELECT count(*) FROM access_credentials"), 0)
+
+    def test_neither_redemption_query_compares_the_secret_digest_in_sql(self):
+        statements = []
+        original = type(self.database).connect
+
+        def tracing(database, *args, **kwargs):
+            connection = original(database, *args, **kwargs)
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        _, code = self.invite()
+        secret = parse_invitation_code(code)
+        with patch.object(type(self.database), "connect", tracing):
+            with self.assertRaises(AccessValidationError):
+                self.store.enroll_credential(secrets.token_bytes(20), VIEWER, b"c" * 16, b"k", -7, 0)
+            self.store.begin_registration(secret, VIEWER, b"d" * 32, at=self.ceremony_clock(),
+                                          lifetime=timedelta(minutes=5))
+        self.assertTrue(statements)
+        self.assertFalse([item for item in statements if "secret_digest=" in item.replace(" ", "")])
+        self.assertTrue([item for item in statements if "lookup_key=" in item.replace(" ", "")])
+
+
+class RefusalRecordTests(RedemptionFixture):
+    """AUTH-013 (Codex P2 on PR #234): refused attempts are recorded value-free."""
+
+    async def test_refusals_are_counted_and_logged_without_values(self):
+        expected = await self.denial()
+        _, code = self.invite()
+        unknown = new_invitation_code()[1]
+        with self.assertLogs("app.auth.human_surface", "WARNING") as logs:
+            for body in ({"code": unknown}, {"code": unknown.lower()}, {}, {"code": code, "extra": 1}):
+                self.assertEqual(await call(self.surface, "POST", REGISTRATION_OPTIONS_PATH,
+                                            body=json.dumps(body).encode()), expected)
+            self.assertEqual(await self.finish(unknown, {"id": "x"}), expected)
+        self.assertEqual(self.access.refused_redemptions, 5)
+        # Power-of-two throttled: the 1st and 2nd and 4th refusals log.
+        self.assertEqual([record.getMessage() for record in logs.records],
+                         ["invitation_redemption_refused"] * 3)
+        text = repr([record.__dict__ for record in logs.records])
+        for value in (code, unknown, unknown.lower(), VIEWER):
+            self.assertNotIn(value, text)
+        # The extra member was refused before the ceremony: no attempt counted.
+        self.assertEqual(self.count("SELECT attempt_count FROM access_invitations"), 0)
+        # A success is not a refusal.
+        self.assertEqual(status((await self.redeem(code))[1]), 204)
+        self.assertEqual(self.access.refused_redemptions, 5)
+
+
+class DeviceBoundOrderTests(RedemptionFixture):
+    """PR #234 review: the 409 only after the invitation is re-validated."""
+
+    async def test_the_409_needs_a_still_valid_invitation_bound_to_the_challenge(self):
+        self.ceremonies.require_device_bound = True
+        expected = await self.denial()
+        _, first = self.invite()
+        _, second = self.invite()
+        begun = await self.options(first)
+        credential = SyntheticAuthenticator(backup_eligible=True).register(payload(begun), origin=ORIGIN,
+                                                                           rp_id=HOST)
+        # Another valid code than the one the challenge was bound to.
+        self.assertEqual(await self.finish(second, credential), expected)
+        # The invitation expired between the two steps.
+        _, code = self.invite(lifetime=timedelta(minutes=3))
+        begun = await self.options(code)
+        credential = SyntheticAuthenticator(backup_eligible=True).register(payload(begun), origin=ORIGIN,
+                                                                           rp_id=HOST)
+        self.elapse(minutes=4)
+        self.assertEqual(await self.finish(code, credential), expected)
+        self.assertEqual(self.count("SELECT count(*) FROM access_credentials"), 0)
 
 
 if __name__ == "__main__":

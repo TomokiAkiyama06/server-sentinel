@@ -76,6 +76,9 @@ defaults):
 }
 ```
 
+The optional `"invitation_lifetime_hours"` (an integer from 1 to 168, default
+24) sets the invitation code lifetime; see "Owner bootstrap and recovery".
+
 `capture_ca_directory` is required (Owner decision 2026-10-07, Issue #109):
 it is either the absolute path of the capture-node CA directory on this host
 or an explicit `null` when this host keeps no capture-node CA. A configuration
@@ -858,11 +861,29 @@ checkout):
 ```sh
 cd /opt/server-sentinel-main/current
 sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
-  bootstrap --database <runtime_root>/state/state.sqlite3
+  bootstrap --config /etc/server-sentinel/deployment.json
 # later, only to recover the Owner:
 sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
-  recover --database <runtime_root>/state/state.sqlite3
+  recover --config /etc/server-sentinel/deployment.json
 ```
+
+`--config` is the deployment configuration the service runs with. The command
+validates it exactly as the launcher does, takes the database
+(`<runtime_root>/state/state.sqlite3`) and the invitation lifetime from it, and
+refuses unless it runs as the configuration's `service_uid`
+(`deployment_configuration_rejected`, `run_as_service_account`).
+
+Invitation lifetime (Owner decision 2026-10-11): the optional top-level key
+`"invitation_lifetime_hours"` sets how long every invitation code stays valid,
+the console Owner code and (later) Owner-issued invitations alike: an integer
+from `1` to `168` (7 days); absent means `24`. Any other value refuses the
+configuration (the service and `--check` do not start). Each code also
+records the kernel boot id and the monotonic boot clock at issuance: on the
+same boot a code is refused once that much monotonic time has passed, and
+whenever the wall clock is found stepped back since issuance, so setting the
+clock back never extends a code; after a reboot the wall clock decides. A host
+where `/proc/sys/kernel/random/boot_id` or `CLOCK_BOOTTIME` cannot be read
+issues no code (`invitation_clock_unavailable`).
 
 - The command asks on the controlling terminal for the Owner's display name
   (for `recover`: a new one, or empty to keep it) and for a typed
@@ -891,8 +912,17 @@ sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
   passkey on every device it synced to. Recordings, other people's
   passkeys and permissions, and capture nodes are kept.
 - A lost or expired code is replaced only by running `recover`; an
-  unredeemed code leaves human access closed for the Owner. Refusals change
-  nothing and print one fixed word (`... refused: <word>`, exit 2).
+  unredeemed code leaves human access closed for the Owner. Refusals print one
+  fixed word (`... refused: <word>`, exit 2) and change nothing, with one
+  exception: `committed_code_not_shown` means the change was committed but
+  writing the code to the terminal failed, so the code is lost. Run `recover`
+  to issue a replacement (also after `bootstrap`: the Owner now exists, so
+  `bootstrap` refuses with `owner_already_configured`).
+- After a `recover`, once signed in again, review the principals, their
+  permissions and credentials and the security audit log: anyone who held
+  the Owner session before the recovery may have invited people or changed
+  grants (Owner-issued invitations arrive with Issue #10 S4), and `recover`
+  keeps every other principal as it is.
 - The rows written are bounded (one principal or principal update, one
   invitation, two or three audit records) and do not pass the running
   service's storage admission; do not run it while the state filesystem is at

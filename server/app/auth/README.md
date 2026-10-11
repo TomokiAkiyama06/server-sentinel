@@ -756,7 +756,10 @@ echoes it.
   code, in the same conditional update), inside `admit(epoch)`. `200` with
   the creation options: the reserved rp id (also its name), the invitee's own
   display name and principal handle, the challenge, the algorithms,
-  `excludeCredentials`, `residentKey: required`, `userVerification:
+  `excludeCredentials` (only the principal's usable credentials: not revoked
+  and not marked inconsistent, so after `recover` an authenticator still
+  holding the revoked Owner passkey under the same user handle can replace
+  it), `residentKey: required`, `userVerification:
   required` and `attestation: "none"`. No camera, recording, timeline,
   product or deployment data.
 - `POST /api/auth/registration`, body `{"code", "credential", "label"?}`
@@ -780,18 +783,52 @@ the exact `Origin`, the JSON content type and the single-use challenge bound
 to the invitation are what bind the two steps to the reserved origin.
 
 Codes (Owner decision D5, `invitation_code.py`): 20 bytes (160 bits) from
-`secrets.token_bytes`, stored as SHA-256 of all 20 bytes and looked up by
-that digest; shown as 32 Crockford base32 characters (no `I`, `L`, `O`, `U`)
-in eight groups of four, `XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`; valid for
-24 hours (`INVITATION_LIFETIME`) and single use. The server accepts only that
-exact canonical form; the Web page (S5/S6) normalizes typed input (case,
+`secrets.token_bytes`, stored as SHA-256 of all 20 bytes; shown as 32
+Crockford base32 characters (no `I`, `L`, `O`, `U`) in eight groups of four,
+`XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`; single use. The server accepts only
+that exact canonical form; the Web page (S5/S6) normalizes typed input (case,
 spaces, aliases) before sending it.
+
+Constant-time comparison (AUTH-013, PR #234 review). A row is located by
+`lookup_key`, a domain-separated SHA-256 of the secret truncated to 128 bits
+(`store._lookup_key`), and its stored `secret_digest` is then compared with
+`hmac.compare_digest`. SQLite's index comparison only ever sees the lookup
+key, which reveals neither the secret nor its verification digest. A row
+issued before the lookup key existed (migration 22) has none and is never
+found: issue it again.
+
+Lifetime (Owner decisions D5 and 2026-10-11). The deployment key
+`invitation_lifetime_hours` (integer 1-168, default 24, `Settings.invitation_lifetime`,
+validated by `invitation_code.invitation_lifetime`) is the lifetime of every
+invitation, the console Owner code and future Owner-issued ones alike.
+`AccessStore(invitation_lifetime=...)` refuses to issue an invitation whose
+expiry lies further ahead (and never beyond 7 days); `invitation_expiry(at)`
+is what the bootstrap command uses.
+
+Clock continuity (Owner decision 2026-10-11, `boot_clock.py`). At issuance
+`issue_enrollment_on` records the kernel boot id
+(`/proc/sys/kernel/random/boot_id`) and `CLOCK_BOOTTIME` next to the
+wall-clock issue and expiry times; if either cannot be read it issues nothing
+(`InvitationClockUnavailable`). Both redemption steps read them again before
+their transaction and require, besides the wall-clock window: on the same
+boot, a monotonic elapsed time that is `>= 0` and below the lifetime, and a
+wall-clock elapsed time that does not lag it by more than 30 seconds (the
+allowance for the gap between the two readings; NTP slews both clocks
+together, so only a step separates them). A wall clock stepped back is
+therefore refused rather than extending the code; one stepped forward only
+ends the code earlier. After a reboot the readings are not comparable and the
+wall-clock window decides (a rollback across a reboot is not detectable). A
+row without the pair, or a host where it cannot be read now, is refused. Every
+refusal is the generic denial.
 
 Rate limit (Owner decision D4, `rate_limit.redemption_rate_limiter`): a
 separate `SourceRateLimiter` keyed by the verified proxy identity: per
-source a burst of 5 and one more every 12 seconds, plus a global bucket of 10
-refilled every 6 seconds, with at most 256 source buckets (SHA-256 keyed,
-fail closed when full). It is charged before the body is parsed and before
+source a burst of 5 and one more every 12 seconds, with at most 256 source
+buckets (SHA-256 keyed, fail closed when full), and no global bucket (Owner
+decision 2026-10-11, Codex review of PR #234: a global bucket would let one
+Tailnet member drain it and stop every other source, the Owner redeeming a
+recovery code included). The total is bounded by the per-source buckets, the
+bounded source table and the per-code attempt limit. It is charged before the body is parsed and before
 any gate or SQLite work, so a flood of guesses costs no lock and no write. It
 never spends the sign-in buckets, and a sign-in flood never spends it;
 `HumanAccess` refuses one object for both. Both steps are charged, so a
@@ -804,8 +841,21 @@ request, a failed verification, a wrong shape and a closed gate all get the
 generic `404`, byte for byte. The one distinct outcome is `409
 {"detail":"device_bound_credential_required"}`: only for a valid invitation
 whose verified authenticator is backup eligible where the deployment requires
-device-bound credentials, decided under the gate; the invitation stays
-unredeemed. A refused attempt writes no audit record.
+device-bound credentials, decided under the gate inside the redemption
+transaction (`AccessStore.enroll_credential(require_device_bound=...)`) only
+after the invitation the body code names proved valid on both clocks and is
+the one the consumed challenge was bound to (otherwise the generic `404`);
+the invitation stays unredeemed.
+
+Refusal record (AUTH-013, Codex review of PR #234). A refused attempt writes
+no audit record, so unauthenticated guesses cannot grow the audit table.
+Instead every redemption request refused after the limiter (shape, code
+format, unknown or invalid code, failed verification) increments the
+value-free counter `HumanAccess.refused_redemptions`, and the event
+`invitation_redemption_refused` is logged on the first refusal and each time
+the count reaches a power of two. Neither carries the code, an identity, the
+invitation or the reason. Requests refused by the limiter are counted by the
+limiter (`human_request_rate_limited`). The response stays the generic `404`.
 
 In-flight requests after stop (Issue #228 item 1). The composition installs a
 `ServingGate` around the reservation (`PasskeyCeremonies.guard_session_gate`),
@@ -835,7 +885,7 @@ grant to the session id read in the same gated transaction.
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 
-`python -m app.auth.bootstrap_cli bootstrap|recover --database <path>`
+`python -m app.auth.bootstrap_cli bootstrap|recover --config <deployment.json>`
 (Issue #10 phase 2 S2), run as the service account; the deployment steps are
 in `server/docs/DEPLOYMENT.md`. Owner decision (2026-10-11): they do not go
 through the server gate, and the deployment authorization generation (its
@@ -867,7 +917,8 @@ What they do:
   `access_one_owner` index refuses a concurrent second one). It reads the
   Owner's display name and the confirmation word `BOOTSTRAP` from the
   controlling terminal, then in one transaction creates the Owner `invited`
-  with no credential, issues one 24-hour code under the current generation and
+  with no credential, issues one code (the deployment's invitation lifetime)
+  under the current generation and
   appends `invite_principal` and `issue_principal_invitation` (actor `owner`,
   the local administrative boundary as for the pairing CLI; target the
   Owner's logical UUID).
@@ -883,17 +934,28 @@ What they do:
   `revoke_principal_credential` (when one was revoked) and
   `issue_principal_invitation`. The Owner keeps its logical UUID. Recordings,
   other principals' grants and credentials, and capture nodes are untouched.
-- Both refuse as root, refuse without a controlling terminal (`/dev/tty`)
-  before any change, read nothing secret from arguments or the environment,
-  pin the existing database file (canonical path, regular file with one link
+- Both load `--config` exactly as the launcher does (`Deployment.load`) and
+  take the database and the invitation lifetime from it
+  (`deployment_configuration_rejected` otherwise), refuse unless running as
+  its `service_uid` (and as root), refuse without a controlling terminal
+  (`/dev/tty`) before any change, refuse when the boot clock cannot be read
+  (`invitation_clock_unavailable`), read nothing secret from arguments or the
+  environment, pin the existing database file (canonical path, regular file with one link
   owned by the running account, not group/other writable; never created or
   migrated) and re-verify it before each commit. The code is written only to
   the controlling terminal, after the commit; stdout gets the Owner's logical
-  UUID and the expiry. A refusal changes nothing and records nothing.
+  UUID and the expiry. A refusal changes nothing and records nothing, except
+  `committed_code_not_shown`: the commit happened but writing the code to the
+  terminal failed, so the code is lost; `recover` (also after `bootstrap`)
+  issues a replacement.
+- After a `recover` the Owner reviews principals, grants, credentials and the
+  audit log: whoever held the Owner session before may have invited others
+  (S4 onward), and `recover` leaves other principals as they are.
 
 Limits: the writes are a few bounded rows and are not admitted through the
 running server's storage policy (as for the pairing CLI). If writing the code
-to the terminal fails after the commit, the code is lost; run `recover`. The
+to the terminal fails after the commit, the code is lost
+(`committed_code_not_shown`); run `recover`. The
 running server's in-memory state does not change: it sees the new generation
 on its next request. The low-level `establish_session` / `issue_enrollment`
 wrappers stay unreachable from any human route.

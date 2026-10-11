@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import secrets
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from uuid import UUID
@@ -24,12 +25,16 @@ from app.audit.store import AuditStore
 from app.auth import bootstrap_cli
 from app.auth.invitation_code import INVITATION_LIFETIME, parse_invitation_code
 from app.auth.model import AccessValidationError, Permission
+from app.auth.passkeys import PasskeyCeremonies
 from app.auth.session_binding import SessionBindingKey
 from app.auth.store import AccessStore
+from app.auth.webauthn import RelyingParty
 from app.local_admin import ControllingTerminal
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
+
+from tests.webauthn_fakes import ORIGIN, RP_ID, OpenGate, SyntheticAuthenticator, b64
 
 
 NOW = datetime(2026, 10, 11, 9, 0, tzinfo=timezone.utc)
@@ -86,13 +91,28 @@ class BootstrapCliTests(unittest.TestCase):
         self.clock = lambda: NOW
         self.store = AccessStore(self.database, clock=self.clock, audit=AuditStore(self.database, clock=self.clock),
                                  unaudited_writes=True, session_binding=SessionBindingKey.generate())
+        # The deployment configuration the command loads (``--config``):
+        # ``Deployment.load`` itself is covered by the deployment tests; here
+        # it is replaced by what it yields.
+        self.config = self.root / "deployment.json"
+        self.lifetime = INVITATION_LIFETIME
+        self.service_uid = os.geteuid()
+        self.loaded = []
+
+    def deployment(self, path):
+        def load(config):
+            self.loaded.append(config)
+            return SimpleNamespace(service_uid=self.service_uid, settings=SimpleNamespace(
+                database_path=path, invitation_lifetime=self.lifetime))
+        return load
 
     def run_cli(self, command, *lines, console=None, path=None, terminal_factory=None):
         console = console or Console(self)
         console.type(*lines)
         stdout, stderr = io.StringIO(), io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
-            code = bootstrap_cli.main([command, "--database", str(path or self.path)],
+        with redirect_stdout(stdout), redirect_stderr(stderr), \
+                patch.object(bootstrap_cli, "_load_deployment", self.deployment(path or self.path)):
+            code = bootstrap_cli.main([command, "--config", str(self.config)],
                                       terminal_factory=terminal_factory or console.factory,
                                       clock=self.clock)
         return code, stdout.getvalue(), stderr.getvalue(), console.output()
@@ -201,7 +221,9 @@ class BootstrapCliTests(unittest.TestCase):
 
     def test_nothing_secret_is_taken_from_arguments(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            bootstrap_cli.main(["bootstrap", "--database", str(self.path), "--code", "0000"])
+            bootstrap_cli.main(["bootstrap", "--config", str(self.config), "--code", "0000"])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            bootstrap_cli.main(["bootstrap", "--database", str(self.path)])
         self.assertEqual(self.rows("SELECT count(*) FROM access_principals"), [(0,)])
 
     def test_recover_revokes_owner_credentials_ends_sessions_and_voids_invitations(self):
@@ -259,6 +281,114 @@ class BootstrapCliTests(unittest.TestCase):
         self.assertNotIn("revoke_principal_credential", [row[1] for row in self.rows(AUDIT)])
         # Two outstanding Owner invitations never coexist: the first was revoked.
         self.assertEqual(self.rows("SELECT count(*) FROM access_invitations WHERE revoked_at_us IS NULL"), [(1,)])
+
+    def test_the_lifetime_comes_from_the_deployment_configuration(self):
+        # Owner decision 2026-10-11: configurable per deployment (here 2 hours).
+        self.lifetime = timedelta(hours=2)
+        code, stdout, stderr, terminal = self.run_cli("bootstrap", "Synthetic Owner", "BOOTSTRAP")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(self.loaded, [self.config])
+        self.assertIn("valid for 2 hours", terminal)
+        self.assertIn("code_expires_at=" + (NOW + timedelta(hours=2)).isoformat(timespec="seconds"), stdout)
+        ((issued, expires),) = self.rows("SELECT issued_at_us, expires_at_us FROM access_invitations")
+        self.assertEqual(expires - issued, 2 * 3600 * 1_000_000)
+        code, stdout, stderr, _ = self.run_cli("recover", "", "RECOVER")
+        self.assertEqual(code, 0)
+        self.assertIn("code_expires_at=" + (NOW + timedelta(hours=2)).isoformat(timespec="seconds"), stdout)
+
+    def test_refuses_an_unusable_deployment_configuration_or_another_account(self):
+        def broken(config):
+            raise ValueError("synthetic configuration failure")
+
+        console = Console(self)
+        console.type("Synthetic Owner", "BOOTSTRAP")
+        stderr = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(stderr), \
+                patch.object(bootstrap_cli, "_load_deployment", broken):
+            code = bootstrap_cli.main(["bootstrap", "--config", str(self.config)],
+                                      terminal_factory=console.factory, clock=self.clock)
+        self.assertEqual(code, 2)
+        self.assertIn("refused: deployment_configuration_rejected", stderr.getvalue())
+        self.assertEqual(console.opened, 0)
+        for lifetime in (timedelta(days=8), timedelta(0)):
+            with self.subTest(lifetime=lifetime):
+                self.lifetime = lifetime
+                code, _, stderr, terminal = self.run_cli("bootstrap", "Synthetic Owner", "BOOTSTRAP")
+                self.assertEqual(code, 2)
+                self.assertIn("refused: deployment_configuration_rejected", stderr)
+        self.lifetime = INVITATION_LIFETIME
+        self.service_uid = os.geteuid() + 1
+        code, _, stderr, _ = self.run_cli("bootstrap", "Synthetic Owner", "BOOTSTRAP")
+        self.assertEqual(code, 2)
+        self.assertIn("refused: run_as_service_account", stderr)
+        self.assertEqual(self.rows("SELECT count(*) FROM access_principals"), [(0,)])
+        self.assertEqual(self.rows(AUDIT), [])
+
+    def test_refuses_to_issue_without_the_boot_clock(self):
+        with patch("app.auth.store.read_boot_instant", return_value=None), \
+                patch.object(AccessStore.__init__, "__kwdefaults__",
+                             dict(AccessStore.__init__.__kwdefaults__, boot_clock=lambda: None)):
+            code, stdout, stderr, terminal = self.run_cli("bootstrap", "Synthetic Owner", "BOOTSTRAP")
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("refused: invitation_clock_unavailable", stderr)
+        self.assertIsNone(CODE.search(terminal))
+        self.assertEqual(self.rows("SELECT count(*) FROM access_principals"), [(0,)])
+        self.assertEqual(self.rows(AUDIT), [])
+
+    def test_a_code_lost_after_the_commit_is_reported_and_recover_replaces_it(self):
+        console = Console(self)
+        terminal = console.factory()
+        writes = []
+        original = terminal.write
+
+        def write(text):
+            writes.append(text)
+            if "Owner enrollment code" in text:
+                raise bootstrap_cli.CliRefused("controlling_terminal_unavailable")
+            original(text)
+
+        terminal.write = write
+        code, stdout, stderr, output = self.run_cli("bootstrap", "Synthetic Owner", "BOOTSTRAP",
+                                                    console=console, terminal_factory=lambda: terminal)
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("refused: committed_code_not_shown", stderr)
+        self.assertIsNone(CODE.search(output + stderr))
+        # Committed: the Owner exists with one (lost) authorization.
+        self.assertEqual(self.rows("SELECT role, status FROM access_principals"), [("owner", "invited")])
+        self.assertEqual(self.rows("SELECT count(*) FROM access_invitations WHERE revoked_at_us IS NULL"), [(1,)])
+        # ``recover`` (not ``bootstrap``) issues a replacement and voids the lost one.
+        code, _, stderr, _ = self.run_cli("bootstrap", "Synthetic Owner", "BOOTSTRAP")
+        self.assertIn("refused: owner_already_configured", stderr)
+        code, _, _, output = self.run_cli("recover", "", "RECOVER")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(CODE.findall(output)), 1)
+        self.assertEqual(self.rows("SELECT count(*) FROM access_invitations WHERE revoked_at_us IS NULL"), [(1,)])
+
+    def test_recovery_registration_does_not_exclude_the_revoked_owner_passkey(self):
+        # PR #234 review (重要): the revoked passkey may still be in a synced
+        # keychain under the same user handle; excluding it would make that
+        # authenticator refuse the replacement registration.
+        rp = RelyingParty(RP_ID, ORIGIN)
+        ceremonies = PasskeyCeremonies(self.store, rp, session_gate=OpenGate(), clock=self.clock)
+        owner, display, _ = self.bootstrap()
+        first = SyntheticAuthenticator()
+        options = ceremonies.begin_registration(parse_invitation_code(display), IDENTITY)
+        self.assertEqual(options["excludeCredentials"], [])
+        enrolled = ceremonies.finish_registration(parse_invitation_code(display), IDENTITY,
+                                                  first.register(options))
+        code, _, _, terminal = self.run_cli("recover", "", "RECOVER")
+        self.assertEqual(code, 0)
+        (new_display,) = CODE.findall(terminal)
+        options = ceremonies.begin_registration(parse_invitation_code(new_display), IDENTITY)
+        # The same user handle: the authenticator replaces its old passkey.
+        self.assertEqual(options["user"]["id"], b64(owner.bytes))
+        self.assertEqual(options["excludeCredentials"], [])
+        self.assertEqual(self.rows("SELECT count(*) FROM access_credentials WHERE revoked_at_us IS NOT NULL"),
+                         [(1,)])
+        replacement = ceremonies.finish_registration(parse_invitation_code(new_display), IDENTITY,
+                                                     SyntheticAuthenticator().register(options))
+        self.assertEqual(replacement.principal_id, owner)
+        self.assertNotEqual(replacement.credential_id, enrolled.credential_id)
 
 
 if __name__ == "__main__":

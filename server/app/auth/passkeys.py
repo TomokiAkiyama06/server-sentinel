@@ -68,7 +68,7 @@ from uuid import UUID
 
 from . import webauthn
 from .model import AccessValidationError, Credential, CredentialStatus, Principal, PrincipalStatus, utc_time
-from .store import AccessStore, MAX_CHALLENGE_LIFETIME, StepUpRequired
+from .store import AccessStore, DeviceBoundCredentialRequired, MAX_CHALLENGE_LIFETIME, StepUpRequired
 
 
 DEFAULT_CHALLENGE_LIFETIME = timedelta(minutes=5)
@@ -80,18 +80,6 @@ class CeremonyDenied(AccessValidationError):
 
     def __init__(self) -> None:
         super().__init__("access is unavailable")
-
-
-class DeviceBoundCredentialRequired(AccessValidationError):
-    """A verified backup-eligible registration refused by deployment policy.
-
-    Reached only by someone who holds a valid invitation and completed a
-    verified ceremony, so the Web client may show an actionable message. The
-    invitation stays unredeemed.
-    """
-
-    def __init__(self) -> None:
-        super().__init__("device_bound_credential_required")
 
 
 class CredentialFinding(str, Enum):
@@ -246,14 +234,16 @@ class PasskeyCeremonies:
                 # The distinct, actionable outcome is chosen only under the
                 # gate with the epoch unchanged (PR #174 review): a close, or
                 # a close/revoke/reopen cycle, during verification yields the
-                # generic denial instead.
-                if self.require_device_bound and verified.backup_eligible:
-                    raise DeviceBoundCredentialRequired()
+                # generic denial instead. The store decides it inside the
+                # redemption transaction, only after the invitation the body
+                # code names proved valid and is the one this challenge was
+                # bound to (PR #234 review); otherwise the generic denial.
                 return self.store.enroll_credential(
                     enrollment_secret, proxy_identity, verified.credential_id, verified.public_key,
                     verified.algorithm, verified.sign_count, now=at,
                     backup_eligible=verified.backup_eligible, backup_state=verified.backup_state,
-                    label=label, invitation_id=consumed.invitation_id)
+                    label=label, invitation_id=consumed.invitation_id,
+                    require_device_bound=self.require_device_bound is True)
         except DeviceBoundCredentialRequired:
             raise
         except Exception:
