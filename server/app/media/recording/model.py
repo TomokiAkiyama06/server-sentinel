@@ -6,6 +6,11 @@ from uuid import UUID
 import re
 
 
+# The hard ceiling Limits admits for pre_roll_ms and max_segment_ms (20 min).
+# Shared with the lifecycle inventory, which must judge the same bound.
+MAX_LIMIT_DURATION_MS = 1_200_000
+
+
 class RecordingError(RuntimeError):
     """Stable non-sensitive failure category suitable for an internal health event."""
 
@@ -25,7 +30,8 @@ class Limits:
         values = vars(self).values()
         if any(type(value) is not int or value <= 0 for value in values):
             raise ValueError("invalid recording limits")
-        if self.pre_roll_ms > 1_200_000 or self.max_segment_ms > 1_200_000:
+        if (self.pre_roll_ms > MAX_LIMIT_DURATION_MS
+                or self.max_segment_ms > MAX_LIMIT_DURATION_MS):
             raise ValueError("recording duration exceeds maximum")
 
 
