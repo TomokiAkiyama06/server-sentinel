@@ -35,7 +35,14 @@ It mirrors the isolated inference worker (`app.detection.foundation.isolation`):
   more frame. After `failing_after` consecutive child
   failures the decoder reports `failing`, which lowers the source to
   `degraded`; one successful exchange (or a refusal by a healthy child) clears
-  it.
+  it. The restart after the backoff is unconditional and never gives up: a
+  child that can never start (for example the address-space cap is too small
+  or the reviewed pair cannot be imported) is respawned, a fresh python +
+  numpy process each time, at most once per `maximum_backoff_ns` (30 s by
+  default) for as long as the decoder is open, while it keeps reporting
+  `failing` (the source stays `degraded`). This is deliberate: a transient
+  cause recovers without an operator, and the bounded cost is one short-lived
+  child start per 30 s per source.
 
 The parent never unpickles or evaluates child output: a reply is a length-
 prefixed byte message whose type, request id and exact pixel count are

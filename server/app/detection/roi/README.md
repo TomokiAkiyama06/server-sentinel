@@ -193,7 +193,12 @@ process:
   After 3 consecutive child failures the source is `degraded`
   (`frame_decoder_failing`, which also lowers the runtime) and
   `scene_frame_decoder_failing` is logged once (value-free);
-  one successful exchange clears it (`scene_frame_decoder_recovered`). A
+  one successful exchange clears it (`scene_frame_decoder_recovered`). The
+  restart after the backoff never gives up: a child that can never start
+  (address-space cap too small, the reviewed pair not importable) is respawned
+  as a fresh python + numpy process at most once per 30 s per source, for as
+  long as the source is bound, while the source keeps reporting `degraded`
+  (`frame_decoder_failing`). A
   refusal by a healthy child (strict decode error, shape mismatch, band) is not
   a child failure. One source's child failing, hanging, starting slowly or
   not being reaped never refuses another source's frames and never delays

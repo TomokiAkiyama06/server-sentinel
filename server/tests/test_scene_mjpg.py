@@ -147,6 +147,18 @@ def best_of(count, function):
     return min(durations)
 
 
+def reference_scan_seconds(data):
+    """One run of the former per-byte scan over `data`: the cost the C-level
+    pre-check replaced, measured in this process on this machine (scheduling
+    noise only ever makes it look slower, never the fix faster)."""
+    started = time.perf_counter()
+    try:
+        reference_entropy_end(data, scan_start(data))
+    except MjpgFrameRejected:
+        pass
+    return time.perf_counter() - started
+
+
 def alive(pid):
     """True while `pid` is a live (not zombie) process."""
     try:
@@ -408,6 +420,10 @@ class MjpgPrecheckTests(DecoderCase):
         largest budget (16.8 MB); the former loop took seconds here."""
         width, height = 3840, 2160
         budget = frame_byte_budget(width, height, 0)
+        # The former scan of the plain `FF 00` frame at the budget, timed
+        # here: absolute timings vary with the runner (shared CI cores were
+        # about 5x slower than the test container), the ratio does not.
+        reference = reference_scan_seconds(stuffed(width, height))
         variants = {
             "accepted": (stuffed(width, height), None),
             "marker_at_the_end": (stuffed(width, height, ending=b"\xff\x01\xff\xd9"),
@@ -430,8 +446,15 @@ class MjpgPrecheckTests(DecoderCase):
                     else:
                         self.assertIsNone(reason)
 
-                # Measured at about 20 ms in the CPU-limited test container.
-                self.assertLess(best_of(3, check), 0.05)
+                # Measured at 10-20 ms in the CPU-limited test container
+                # and about 60-110 ms on a GitHub runner, where the former
+                # per-pair loop took 50-200x as long. A regression to any
+                # per-pair or per-byte Python loop fails the ratio; the
+                # absolute bound keeps the check well inside the 1 s
+                # sampling interval of the shared scene worker.
+                elapsed = best_of(3, check)
+                self.assertLess(elapsed * 5, reference, (elapsed, reference))
+                self.assertLess(elapsed, 0.5)
 
     def test_trailing_padding_is_bounded(self):
         layout = MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, maximum_trailing_bytes=64)
@@ -641,7 +664,9 @@ class MjpgDecoderProcessTests(DecoderCase):
         decoder = self.decoder(start=False)
         started = time.monotonic()
         self.assertEqual("decoder_starting", self.refused(decoder))
-        self.assertLess(time.monotonic() - started, 0.1)
+        # `decoder_starting` itself shows the frame did not wait for the
+        # child; the bound only catches a blocking start (generous for CI).
+        self.assertLess(time.monotonic() - started, 1.0)
         self.assertEqual("running", settle(decoder))
         self.assertEqual(WIDTH * HEIGHT, len(self.layout.luma(self.frame, WIDTH, HEIGHT, decoder)))
         # Asking again while a child runs never starts a second one.
@@ -663,7 +688,8 @@ class MjpgDecoderProcessTests(DecoderCase):
         # During the backoff a frame is refused at once, never waited on.
         started = time.monotonic()
         self.assertEqual("decoder_unavailable", self.refused(decoder))
-        self.assertLess(time.monotonic() - started, 0.1)
+        # The fake clock never advances here: a waiting refusal never returns.
+        self.assertLess(time.monotonic() - started, 1.0)
         self.assertIsNone(decoder.pid)
         clock.value = 100
         # The supervisor starts the replacement when the backoff ends, without
@@ -755,14 +781,15 @@ class MjpgDecoderProcessTests(DecoderCase):
         for _ in range(3):
             reason, elapsed = self.timed_refusal(decoder)
             self.assertEqual("decoder_starting", reason)
-            self.assertLess(elapsed, 0.1)
+            # Far below the 5 s start timeout a waiting refusal would take.
+            self.assertLess(elapsed, 1.0)
         self.assertTrue(wait_for(lambda: decoder.pid is not None))
         pid = decoder.pid
         self.assertTrue(alive(pid))
         # A stop during the hung start does not wait for the start timeout.
         started = time.monotonic()
         self.assertTrue(decoder.close(1.0))
-        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertLess(time.monotonic() - started, 2.5)
         self.assertFalse(alive(pid))
         self.assertEqual((0, 0), (decoder.status().starts, decoder.status().start_failures))
 
@@ -771,20 +798,23 @@ class MjpgDecoderProcessTests(DecoderCase):
         decoder = self.decoder(MjpgDecoderLimits(frame_timeout_ns=300_000_000),
                                behaviour="hang", clock=clock)
         process = decoder._process
-        with mock.patch.object(mjpg_worker, "_REAP_TIMEOUT_S", 0.2), \
+        with mock.patch.object(mjpg_worker, "_REAP_TIMEOUT_S", 1.5), \
                 mock.patch.object(process, "wait",
                                   side_effect=subprocess.TimeoutExpired("child", 0)):
             reason, elapsed = self.timed_refusal(decoder)
             self.assertEqual("decoder_timeout", reason)
-            # The reap runs on the supervisor, not in the refused exchange.
-            self.assertLess(elapsed, 1.0)
-            self.assertTrue(wait_for(lambda: decoder.status().state == "reap_failed"))
+            # The reap runs on the supervisor, not in the refused exchange:
+            # the 0.3 s frame deadline plus a 1.5 s reap would exceed this.
+            self.assertLess(elapsed, 1.5)
+            self.assertTrue(wait_for(lambda: decoder.status().state == "reap_failed",
+                                     timeout=20))
             clock.value += 10 ** 12
             with mock.patch.object(mjpg_worker.subprocess, "Popen") as popen:
                 for _ in range(3):
                     reason, elapsed = self.timed_refusal(decoder)
                     self.assertEqual("decoder_unavailable", reason)
-                    self.assertLess(elapsed, 0.1)
+                    # Below the 1.5 s reap a waiting refusal would take.
+                    self.assertLess(elapsed, 1.0)
                 decoder.prepare()
                 time.sleep(0.3)
                 popen.assert_not_called()
@@ -832,7 +862,8 @@ class MjpgDecoderProcessTests(DecoderCase):
         started = time.monotonic()
         decoder.retire()
         self.assertEqual("closed", settle(decoder))
-        self.assertLess(time.monotonic() - started, 2.0)
+        # Far below the 30 s start timeout a waiting retire would take.
+        self.assertLess(time.monotonic() - started, 5.0)
         self.assertTrue(wait_for(lambda: not alive(pid)))
         self.assertIsNone(decoder.pid)
         self.assertEqual("decoder_unavailable", self.refused(decoder))
@@ -1223,8 +1254,9 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
             started = time.monotonic()
             harness.frame(source=OTHER, advance=0)  # one worker cycle, both sources
             cycles.append(time.monotonic() - started)
-        # A synchronous start would hold the cycle for the 5 s start timeout.
-        self.assertLess(max(cycles), 1.0)
+        # A synchronous start would hold the cycle for the 5 s start timeout
+        # (and end it as a start failure, not `decoder_starting`).
+        self.assertLess(max(cycles), 2.5)
         hung, other = harness.source(), harness.source(OTHER)
         self.assertEqual(("frame_undecodable", (("decoder_starting", 3),), Observation.UNKNOWN),
                          (hung.reason, hung.undecodable_reasons, hung.movement))
@@ -1248,16 +1280,20 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         harness.start()
         hostile = (stuffed(3840, 2160, ending=b"\xff\x01\xff\xd9"),
                    stuffed(3840, 2160, ending=b"\xff\x00"))
+        reference = reference_scan_seconds(hostile[0])
         cycles = []
         for index in range(4):
             harness.queue(data=hostile[index % 2])
             started = time.monotonic()
             harness.frame(source=OTHER, advance=0)  # one worker cycle, both sources
             cycles.append(time.monotonic() - started)
-        # The former per-pair loop held each cycle for seconds; the C-level
-        # scan of 16.8 MB takes about 20 ms, the other source's decode a few.
-        self.assertLess(min(cycles), 0.25)
-        self.assertLess(statistics.median(cycles), 0.5)
+        # The former per-pair loop held each cycle for about as long as
+        # `reference` (seconds); the C-level scan of 16.8 MB takes 10-100 ms
+        # depending on the runner, the other source's decode a few. The
+        # ratio does not depend on the runner's speed; the median keeps the
+        # cycle inside the 1 s sampling interval.
+        self.assertLess(min(cycles) * 5, reference, (cycles, reference))
+        self.assertLess(statistics.median(cycles), 1.0)
         hostile_source, other = harness.source(), harness.source(OTHER)
         self.assertEqual((("missing_eoi", 2), ("scan_invalid", 2)),
                          hostile_source.undecodable_reasons)
@@ -1407,9 +1443,10 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
                 durations.append(time.perf_counter() - before)
             rounds.append(time.perf_counter() - started)
         # Generous bounds for a shared CI core; measured values are a few ms
-        # per frame. One round must fit well inside the 1 s sampling interval.
-        self.assertLess(statistics.median(durations), 0.1)
-        self.assertLess(max(rounds), 0.5)
+        # per frame. Every round of four frames must fit inside the 1 s
+        # sampling interval.
+        self.assertLess(statistics.median(durations), 0.2)
+        self.assertLess(max(rounds), 1.0)
         self.assertEqual([1] * 4, [decoder.status().starts for decoder in decoders])
         # The runtime with four MJPG sources evaluates each through its child.
         sources = (SOURCE, OTHER, THIRD, FOURTH)

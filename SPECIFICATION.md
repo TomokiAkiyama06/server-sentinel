@@ -1059,7 +1059,10 @@ reply is `unknown` (`frame_undecodable`, counted per fixed reason in
 exponential backoff during which frames are refused without waiting (the
 supervisor starts it when the backoff ends, without waiting for a frame), and
 repeated child failures lower the source (and the runtime) to `degraded`
-(`frame_decoder_failing`, logged value-free). A missing or differently
+(`frame_decoder_failing`, logged value-free). The restart never gives up: a
+child that can never start (address-space cap, import failure) is respawned at
+most once per 30 s per source for as long as the source is bound, while the
+source stays `degraded`. A missing or differently
 versioned decoder keeps the source inactive (`frame_decoder_unavailable`).
 `stop()` kills and reaps every decode child within the scene stop bounds.
 Decode success does not prove frame integrity. `capture_luma_layout()` must be
