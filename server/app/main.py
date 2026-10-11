@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.auth.boundary import DenyAll, HumanAuthorizer
+from app.auth.human_surface import HumanAccess, HumanSurface, send_generic_denial
 from app.audit import (
     AuditStore, DenyAllOwners, OwnerAuditService, OwnerAuthorizer,
     UnboundStorageAdmission,
@@ -18,6 +19,7 @@ from app.audit.runtime import AuditRetentionRuntime
 from app.cameras.registry import CameraRegistry
 from app.cameras.uvc.config import LocalUvcConfiguration
 from app.cameras.uvc.runtime import LocalUvcDependencies, LocalUvcRuntime, LocalUvcRuntimeState
+from app.completion import run_to_completion
 from app.detection.roi.runtime import (
     SceneMonitoringConfiguration, SceneMonitoringDependencies, SceneMonitoringRuntime,
     SceneRuntimeState,
@@ -61,10 +63,12 @@ class RuntimeStorageAdmission:
 
 
 class ClosedHumanSurface:
-    """Keep every HTTP and WebSocket path closed until Issues #6/#10 land.
+    """Keep every HTTP and WebSocket path closed (the default).
 
     This intentionally does not read paths, query parameters, request bodies or
-    identity headers. Replacing an injected authorizer cannot open any route.
+    identity headers. Replacing an injected authorizer cannot open any route;
+    only a validated ``HumanAccess`` composition replaces this surface (Issue
+    #10 phase 1, ``app.auth.human_surface``).
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -72,47 +76,11 @@ class ClosedHumanSurface:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
-            body = b'{"detail":"Not Found"}'
-            await send({"type": "http.response.start", "status": 404, "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-                (b"cache-control", b"no-store"),
-            ]})
-            await send({"type": "http.response.body", "body": body})
+            await send_generic_denial(send)
         elif scope["type"] == "websocket":
             await send({"type": "websocket.close", "code": 1008})
         else:
             await self.app(scope, receive, send)
-
-
-async def run_to_completion(awaitable):
-    """Finish a cleanup step even when the awaiting task is cancelled.
-
-    Cancelling an ASGI lifespan (shutdown timeout, embedder cancellation)
-    must not abandon a stop thread or skip the cleanup after it, so the step
-    runs as its own task and every cancellation of the caller is deferred
-    until it finishes. The caller's cancellation is re-raised afterwards.
-    """
-    task = asyncio.ensure_future(awaitable)
-    cancelled = False
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            # Recorded even when the step finished in the same loop turn as
-            # the caller's cancellation, so that cancellation is never lost.
-            # If the step itself was cancelled, re-raising is its result too.
-            cancelled = True
-        except BaseException:
-            # The step failed. Before any cancellation this is its result;
-            # after one, the recorded cancellation still wins below.
-            if not cancelled:
-                raise
-    if cancelled:
-        if not task.cancelled():
-            task.exception()  # Retrieved; the caller's cancellation wins.
-        raise asyncio.CancelledError
-    return task.result()
 
 
 def create_app(settings: Settings, *, database: Database | None = None,
@@ -128,7 +96,13 @@ def create_app(settings: Settings, *, database: Database | None = None,
                local_uvc_dependencies: LocalUvcDependencies | None = None,
                scene_monitoring: SceneMonitoringConfiguration | None = None,
                scene_monitoring_dependencies: SceneMonitoringDependencies | None = None,
-               ) -> FastAPI:
+               human_access: HumanAccess | None = None) -> FastAPI:
+    # Closed unless the embedder passes a validated composition: it exists
+    # only when the deployment explicitly enabled human access and the
+    # hostname reservation check is fully configured. No deployment-file key
+    # builds one yet, so `python -m app` / `app.deployment` stay closed.
+    if human_access is not None and not isinstance(human_access, HumanAccess):
+        raise TypeError("human access composition is invalid")
     store = database or Database(settings.database_path)
     # Local UVC capture is driven only by the deployment's list of approved
     # logical sources. Frames go to a bounded preview hub that retains nothing
@@ -193,6 +167,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
         if monitoring is not None and monitoring.storage_configured else None
     )
     audit_store = AuditStore(store, reservation=storage_reservation or runtime_admission)
+    if human_access is not None:
+        # Human-access writes (challenges, sessions, revocation) are admitted
+        # exactly like audit writes; an unbound runtime admission refuses them.
+        # That admission verifies this application's database only, so an
+        # access store on any other database is refused here.
+        human_access.bind_storage_admission(storage_reservation or runtime_admission, database=store)
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(
@@ -229,6 +209,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
         monitoring_task = None
         cleanup_task = None
         uvc_watch_task = None
+        human_task = None
         scene_watch_task = None
 
         uvc_lifecycle = {"deferred": None, "stopping": False}
@@ -395,6 +376,21 @@ def create_app(settings: Settings, *, database: Database | None = None,
 
         async def shutdown() -> None:
             uvc_lifecycle["stopping"] = True
+            if human_task is not None:
+                # Requests are denied from here on and run() starts no
+                # further step. The check's startup/tick and the expiry sweep
+                # run on worker threads that cancelling cannot stop; run()
+                # defers the cancellation until the in-flight call returns
+                # (bounded by the check's enumeration timeout, plus for a
+                # write at most one in-flight monitoring job ahead of it in
+                # the storage admission, which has no timeout of its own,
+                # plus the SQLite busy timeout), so no verdict or
+                # revocation/expiry write lands after the admission below is
+                # unbound or the monitoring runtime is stopped.
+                human_access.stop()
+                human_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await human_task
             if scene_watch_task is not None:
                 scene_watch_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -465,6 +461,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
             await start_local_uvc()
             if local_uvc_runtime is not None:
                 uvc_watch_task = asyncio.create_task(watch_local_uvc())
+            if human_access is not None:
+                # The reservation check starts closed; its startup and
+                # periodic checks run here, off the request path.
+                human_task = asyncio.create_task(human_access.run())
             application.state.ready = True
             cleanup_task = asyncio.create_task(audit_retention.run())
             logging.getLogger(__name__).info(Event.STARTED)
@@ -511,6 +511,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
         else SceneRuntimeState.UNCONFIGURED
     )
     application.state.diagnostic_export_endpoint = diagnostic_export_endpoint
-    # Do not include human routers before approved permission enforcement.
-    application.add_middleware(ClosedHumanSurface)
+    application.state.human_access = human_access
+    # No FastAPI human router is ever included: the surface below answers
+    # every HTTP/WebSocket request itself, before any router or error handler.
+    if human_access is None:
+        application.add_middleware(ClosedHumanSurface)
+    else:
+        application.add_middleware(HumanSurface, access=human_access)
     return application

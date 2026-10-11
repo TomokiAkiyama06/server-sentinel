@@ -310,6 +310,8 @@ Starred recordings are excluded from automatic deletion but count toward disk us
 ### STORE-006 Filesystem safety reserve
 Preserve a hard filesystem safety reserve independent of normal recording allocation. Reclaim eligible unstarred recordings first, then suppress ordinary/manual recording under `STORAGE_PRESSURE`; bounded critical evidence may use only a safe allowance; refuse writes before crossing the hard reserve under `STORAGE_HARD_STOP`; recover with hysteresis.
 
+Human access under a storage refusal (Owner decision 2026-10-11, fail closed): human sign-in and every session check write to the Main Server's state database through the same storage admission, so under `STORAGE_HARD_STOP`, when the verified recording filesystem is lost or replaced, or while the storage admission is otherwise refused or unbound (for example a deployment without storage thresholds, or before the monitoring runtime has started), all human access is denied, the Owner's included. No one can sign in, and an already signed-in session is denied on its next request. There is no Owner exception path through the dashboard: storage is recovered over SSH on the Main Server host itself. Spending the hard reserve or writing to an unverified filesystem to keep the dashboard reachable is not permitted.
+
 ## 11. Host hardware integrity and recording-health requirements
 
 ### INTEGRITY-001 Owner-approved hardware baseline
@@ -405,6 +407,8 @@ Only the owner (or a future explicitly defined privileged role) may add/revoke u
 These operations shall additionally require a user verification newer than a bounded freshness window, so an older or unattended session cannot perform them on its own. A step-up that fails, is cancelled, or is declined shall leave the operation unperformed, change no state, and disclose nothing beyond the generic failure.
 
 The step-up shall be bound to the session: the challenge is issued for that session and accepts only the still-active credential the session was created with. An assertion from any other credential, including a valid credential belonging to a different person at the same workstation, shall be refused and shall not refresh the session's verification time. Otherwise a non-owner could use their own passkey to revive a stale owner session and run a privileged operation.
+
+These operations are unavailable through the dashboard while human access is denied by a storage refusal (STORE-006); the Owner then recovers over SSH on the Main Server host (Owner decision 2026-10-11).
 
 ### AUTH-009 Session lifetime and clock safety
 Server-side human sessions have a 30-minute idle lifetime and a 12-hour absolute lifetime. Authorized activity may renew the configured idle lifetime but never the absolute lifetime. A time before session establishment or before the last accepted activity invalidates authorization; restart or clock uncertainty shall fail closed rather than extend a session.

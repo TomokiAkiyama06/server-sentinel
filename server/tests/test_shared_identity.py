@@ -27,7 +27,7 @@ from uuid import UUID, uuid4
 from app.auth.model import AccessValidationError, Permission, PrincipalStatus
 from app.auth.passkeys import PasskeyCeremonies
 from app.auth.session_binding import KEY_BYTES, SessionBindingKey, SessionBindingKeyError, _create_key
-from app.auth.store import BINDING_MISMATCH_AUDIT_INTERVAL, AccessStore, _us
+from app.auth.store import BINDING_MISMATCH_AUDIT_INTERVAL, AccessStorageError, AccessStore, _us
 from app.auth.webauthn import RelyingParty
 from app.audit.store import AuditStore
 from app.diagnostics.export import DiagnosticField
@@ -344,10 +344,16 @@ class BindingMismatchAuditTests(CeremonyTestCase):
         self.assertEqual(self.store.authorize(self.grant.token, SHARED, Permission.LIVE_VIEW).id, self.principal.id)
 
     def test_reservation_refusal_is_counted_as_undelivered(self):
+        # The authorization transaction is itself an admitted write; admit
+        # it and refuse every later write, so the mismatch audit is refused.
+        admitted = []
+
         @contextmanager
         def refused():
-            raise RuntimeError("synthetic storage hard stop")
-            yield  # pragma: no cover
+            if admitted:
+                raise RuntimeError("synthetic storage hard stop")
+            admitted.append(True)
+            yield
 
         self.audit.reservation = refused
         self.deny()
@@ -360,6 +366,21 @@ class BindingMismatchAuditTests(CeremonyTestCase):
         self.deny()
         self.assertEqual(self.mismatches(), [self.MISMATCH])
         self.assertEqual(self.store.undelivered_audit_records, 1)
+
+    def test_refused_admission_denies_authorization_without_writing(self):
+        @contextmanager
+        def refused():
+            raise RuntimeError("synthetic storage hard stop")
+            yield  # pragma: no cover
+
+        before = self.database.path.read_bytes()
+        self.audit.reservation = refused
+        with self.assertRaises(AccessStorageError):
+            self.store.authorize(self.grant.token, SHARED, Permission.LIVE_VIEW)
+        self.assertEqual(self.database.path.read_bytes(), before)
+        self.audit.reservation = None
+        self.assertEqual(self.store.authorize(self.grant.token, SHARED, Permission.LIVE_VIEW).id,
+                         self.principal.id)
 
     def test_nothing_is_recorded_without_an_otherwise_current_session(self):
         for token in (b"x" * 32, b""):

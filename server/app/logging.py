@@ -38,6 +38,8 @@ class Event(StrEnum):
     SCENE_CRITICAL_RECORDER_STALLED = "scene_critical_recorder_stalled"
     SCENE_CRITICAL_IN_FLIGHT_AT_STOP = "scene_critical_in_flight_at_stop"
     HUMAN_LISTENER_ACTIVATION_INVALID = "human_listener_activation_invalid"
+    HUMAN_REQUEST_RATE_LIMITED = "human_request_rate_limited"
+    HUMAN_ACCESS_CHECK_FAILED = "human_access_check_failed"
     TIMELINE_FACT_QUARANTINED = "timeline_fact_quarantined"
     TIMELINE_FLUSH_FAILING = "timeline_flush_failing"
     TIMELINE_FLUSH_RECOVERED = "timeline_flush_recovered"

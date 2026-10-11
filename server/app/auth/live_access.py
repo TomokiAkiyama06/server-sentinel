@@ -17,6 +17,7 @@ not bound to a human access session is refused.  Any storage error denies.
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import sqlite3
 from typing import Callable
 from uuid import UUID
 
@@ -42,11 +43,16 @@ def authorize_live_access(access_store: AccessStore, token: bytes, proxy_identit
                           *, now: datetime | None = None) -> BoundLiveAccess:
     """Authorize ``live:view`` for a human request and bind it to its session."""
     principal = access_store.authorize(token, proxy_identity, Permission.LIVE_VIEW, now=now)
-    with closing(access_store.database.connect()) as connection:
-        row = connection.execute(
-            "SELECT id FROM access_sessions WHERE token_digest=? AND principal_id=?",
-            (_digest(token), str(principal.id)),
-        ).fetchone()
+    try:
+        # Read-only and non-creating: a lost or replaced database is a denial.
+        with closing(access_store.database.connect_read_only()) as connection:
+            row = connection.execute(
+                "SELECT id FROM access_sessions WHERE token_digest=? AND principal_id=?",
+                (_digest(token), str(principal.id)),
+            ).fetchone()
+    except (ValueError, OSError, sqlite3.Error):
+        # The same generic denial as every other refusal; no storage detail.
+        raise AccessValidationError("access is unavailable") from None
     if row is None:
         raise AccessValidationError("access is unavailable")
     return BoundLiveAccess(principal.id, principal.authorization_revision, UUID(row["id"]))
@@ -75,7 +81,7 @@ def live_view_validator(database: Database, *,
             return False
         try:
             at = _us(utc_time(current()))
-            with closing(database.connect()) as connection:
+            with closing(database.connect_read_only()) as connection:
                 connection.execute("BEGIN")
                 row = connection.execute(
                     "SELECT p.role, p.status, p.authorization_revision, s.principal_revision,"

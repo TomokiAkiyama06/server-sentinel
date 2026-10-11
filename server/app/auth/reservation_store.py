@@ -113,11 +113,11 @@ class ListenerExceptionStore:
 
     def load(self) -> frozenset:
         try:
-            with closing(self.database.connect()) as connection:
+            with closing(self.database.connect_read_only()) as connection:
                 row = connection.execute(
                     "SELECT value FROM application_metadata WHERE key=?", (STORE_KEY,)
                 ).fetchone()
-        except sqlite3.Error:
+        except (sqlite3.Error, ValueError):
             raise ListenerExceptionStoreError("LISTENER_EXCEPTIONS_UNREADABLE") from None
         return frozenset() if row is None else decode(row[0])
 
@@ -159,10 +159,10 @@ class ReservationSessionRevocation:
     def exposure_pending(self) -> bool:
         """Raise when unreadable; the caller then treats revocation as required."""
         try:
-            with closing(self.access_store.database.connect()) as connection:
+            with closing(self.access_store.database.connect_read_only()) as connection:
                 row = connection.execute("SELECT value FROM application_metadata WHERE key=?",
                                          (REVOCATION_PENDING_KEY,)).fetchone()
-        except sqlite3.Error:
+        except (sqlite3.Error, ValueError):
             raise ListenerExceptionStoreError("REVOCATION_STATE_UNREADABLE") from None
         if row is None:
             return False

@@ -147,7 +147,8 @@ Defaults:
 - manual recording maximum: **20 minutes**;
 - starred recordings are protected from automatic deletion;
 - recording allocation and a hard filesystem safety reserve are separate;
-- explicit `STORAGE_PRESSURE` and `STORAGE_HARD_STOP` states prevent unsafe writes.
+- explicit `STORAGE_PRESSURE` and `STORAGE_HARD_STOP` states prevent unsafe writes;
+- human sign-in and every session check write, so at `STORAGE_HARD_STOP`, on a lost/replaced recording filesystem, or while storage admission is unbound, all dashboard access is denied, the Owner's included, and storage is recovered over SSH on the Main Server host (fail closed; Owner decision 2026-10-11, REQUIREMENTS.md STORE-006; details in `server/app/auth/README.md`).
 
 Compressed media should be buffered/recorded where practical rather than retaining large decoded frame histories in RAM.
 

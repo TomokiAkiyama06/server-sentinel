@@ -1369,7 +1369,7 @@ The research-room Tailnet is shared, so run these with two people (or two browse
   it, and that the key does not appear in logs, the database or a diagnostic
   export;
 - [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding;
-- [ ] the dashboard origin is reserved for ServerSentinel and is a secure context (HTTPS, or `http://localhost` for a strictly local browser); confirm WebAuthn registration and sign-in actually work there, and record that an ordinary-HTTP non-loopback origin makes them impossible;
+- [ ] the dashboard origin is reserved for ServerSentinel and is a secure context (HTTPS; the human composition accepts only the reserved `https` origin and there is no `http://localhost` Owner route, Owner decision 2026-10-11); confirm WebAuthn registration and sign-in actually work there, and record that an ordinary-HTTP non-loopback origin makes them impossible;
 - [ ] the startup and daily reservation check enumerates the real listeners and every proxy route for the whole name across all schemes and ports, and closes human access and notifies the Owner on any other answer it can see; confirm separately (kernel forwarding step) that no DNAT/REDIRECT/TPROXY/`sk_lookup`/IPVS forwarding reaches the reserved address, and record that this bounds rather than prevents, so a process binding between checks can collect credentials until the next check;
 - [ ] the first owner redeems a console-displayed single-use authorization once from a browser at the reserved origin, and it cannot be redeemed again;
 - [ ] record the configured entropy of enrollment codes and bootstrap authorizations and confirm it meets the stated minimum; guessing attempts against a wrong code are rate-limited and give the same generic response;
@@ -1413,13 +1413,50 @@ secure-context origin, using synthetic test identities (`*.invalid`):
 - [ ] open the dashboard at `https://<reserved-host>:<other-port>`, and at an
   origin that is not the reserved one, and confirm that neither a ceremony
   started there nor its response completes;
-- [ ] with `http://localhost` on the Main Server's own browser, confirm the
-  local owner ceremony works, and confirm a plain-HTTP non-loopback origin
-  cannot use WebAuthn at all;
+- [ ] confirm there is no `http://localhost` Owner route (Owner decision,
+  2026-10-11): from the Main Server's own browser, `http://localhost` and
+  `http://127.0.0.1` on every Main Server port reach no ceremony and get only
+  the generic denial or a refused connection, and the Owner signs in through
+  the reserved `https` origin like everyone else. Also confirm a plain-HTTP
+  non-loopback origin cannot use WebAuthn at all;
 - [ ] inspect the database after these runs. It holds only credential ids,
   COSE public keys, counters, BE/BS flags, labels and timestamps, plus the
   SHA-256 digests of challenges still pending. It holds no raw challenge,
   client data, signature or biometric data. Logs contain none of these either.
+
+### Issue #10 phase 1 human route foundation (pending)
+
+`server/app/auth/human_surface.py` is verified only with a synthetic ASGI driver
+(`server/tests/test_human_surface.py`): no socket, Tailscale Serve, browser or
+real authenticator has exercised it, and no production entry point builds the
+composition yet. Once a deployment can enable it, verify on the Main Server
+with synthetic `*.invalid` identities:
+
+- [ ] through the installed Tailscale Serve, record the `Host` header and peer
+  address the loopback upstream actually receives; the surface requires exactly
+  one `Host` equal to the reserved `<hostname>[:<port>]` and a loopback peer,
+  so a Serve that rewrites `Host` keeps every route denied (fail closed);
+- [ ] record whether the installed Serve replaces a client-supplied
+  `Tailscale-User-Login` and how it forwards a duplicate; the surface refuses a
+  repeated, comma-joined or encoded login;
+- [ ] from another LAN host, send requests with a forged `Tailscale-User-Login`
+  and `X-Forwarded-For: 127.0.0.1` to every Main Server address and port and
+  confirm none reaches the human upstream (it binds loopback only) and every
+  response is the generic denial or a refused connection;
+- [ ] sign in with a passkey at the reserved origin and confirm
+  `GET /api/session` returns only the caller's own role and permissions, that
+  the cookie is `__Host-session` with `Secure; HttpOnly; SameSite=Strict` and
+  no `Domain`, and that every other path (live, recordings, events, timeline,
+  health, version, download) is the generic denial for both a `live:view`-only
+  and a `recordings:view`-only person;
+- [ ] repeat sign-in attempts quickly and confirm they are refused with the
+  generic denial after the burst, that one value-free
+  `human_request_rate_limited` log event appears, and that sign-in works again
+  after a short wait; record that people sharing one Tailscale login share
+  this limit;
+- [ ] stop the reservation check from passing (for example remove the Serve
+  mapping) and confirm sign-in and the session route are denied until it
+  passes again.
 
 ### Uninvited ordinary Tailnet member
 

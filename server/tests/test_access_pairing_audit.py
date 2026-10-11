@@ -28,6 +28,8 @@ from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
+from tests.webauthn_fakes import OpenGate
+
 
 NOW = datetime(2026, 9, 21, tzinfo=timezone.utc)
 IDENTITY = "synthetic-viewer@example.invalid"
@@ -117,7 +119,7 @@ class AccessAuditTests(_Base):
         super().setUp()
         self.access = AccessStore(self.database, clock=lambda: NOW, audit=self.audit,
                                   session_binding=SessionBindingKey.generate())
-        self.admin = AccessAdministration(self.service, self.access, session_gate=None)
+        self.admin = AccessAdministration(self.service, self.access, session_gate=OpenGate())
 
     def invite_and_redeem(self, permissions=(Permission.LIVE_VIEW,)):
         principal = self.admin.invite(OWNER_CONTEXT, DISPLAY, permissions)
@@ -196,7 +198,7 @@ class AccessAuditTests(_Base):
             self.access.authorize(TOKEN, IDENTITY, Permission.RECORDINGS_VIEW)
 
     def test_plain_permission_error_is_classified_without_its_detail(self):
-        admin = AccessAdministration(OwnerAuditService(self.audit, PlainDenial()), self.access, session_gate=None)
+        admin = AccessAdministration(OwnerAuditService(self.audit, PlainDenial()), self.access, session_gate=OpenGate())
         with self.assertRaises(OwnerAuthorizationError):
             admin.invite(OWNER_CONTEXT, DISPLAY, ())
         self.assertEqual(self.records()[-1].actor_category, ActorCategory.UNAUTHENTICATED)
@@ -318,11 +320,19 @@ class AccessAuditTests(_Base):
         other = Database(Path(self.temporary.name) / "other.sqlite3")
         with self.assertRaises(ValueError):
             AccessAdministration(OwnerAuditService(AuditStore(other), SyntheticOwnerAuthorizer()),
-                                 self.access, session_gate=None)
+                                 self.access, session_gate=OpenGate())
         with self.assertRaises(ValueError):
             AccessAdministration(self.service, self.access, session_gate=object())
         with self.assertRaises(AccessValidationError):
             AccessStore(self.database, audit=AuditStore(other))
+
+    def test_administration_refuses_a_missing_session_gate(self):
+        # Issue #181 item 3: no composition may issue enrollment
+        # authorizations outside the reservation check's gate.
+        with self.assertRaises(ValueError):
+            AccessAdministration(self.service, self.access, session_gate=None)
+        with self.assertRaises(TypeError):
+            AccessAdministration(self.service, self.access)
 
 
 class PairingAuditTests(_Base):

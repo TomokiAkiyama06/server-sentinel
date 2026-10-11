@@ -41,7 +41,11 @@ Mandatory adapters and human authorization remain unwired; this module adds no
 recording playback/download route. See `server/app/media/recording/README.md`.
 
 The current backend foundation denies every human HTTP/WebSocket route,
-including system health, version, schema and framework documentation. Its
+including system health, version, schema and framework documentation. Issue
+#10 phase 1 adds a human route foundation that only an explicitly enabled,
+fully validated composition can open (passkey sign-in and the caller's own
+session description; see `server/app/auth/README.md`); the production entry
+points do not build one yet. Its
 documented launcher accepts only loopback bind settings, disables proxy-header
 parsing and access logs, and removes the server product header. The authorization
 adapter remains deny-all until the #6/#10 gates are met. Newly created SQLite
@@ -302,7 +306,9 @@ Accepting the two records does not open human access by itself. Human routes
 and dashboard assets stay closed — the backend shell denies them, including
 application assets, health/version/schema and SPA/error fallbacks — until
 Issue #10 implements and tests both records; the remaining work is listed in
-`server/app/auth/README.md`. Once they are open, a human request receives
+`server/app/auth/README.md`. Phase 1 mounts only the authentication ceremony
+and a session self-description behind an explicit composition; it does not
+make any of the conditions below optional. Once they are open, a human request receives
 application data only when every one of these server-side conditions holds:
 
 - **Network gate.** The request arrived over the Owner-managed private network
@@ -330,13 +336,13 @@ application data only when every one of these server-side conditions holds:
   `docs/INITIAL_ISSUES.md` require that no route demand one where the
   deployment supplies none.
   The current access-layer code requires one on every ceremony and session
-  check only as an interim constraint until the routes are built (Owner
-  decision, 2026-09-30); whether a path such as a strictly local
-  `http://localhost` Owner may run without one is still undecided in
-  `server/app/auth/README.md`. Either way the per-person credential above is
-  always required, and the binding is a consistency signal, never an
-  authorization input: a Tailscale login or proxy identity header alone
-  authorizes nothing.
+  check (Owner decision, 2026-09-30). There is no strictly local
+  `http://localhost` Owner route and none runs without a proxy identity
+  (Owner decision, 2026-10-11, recorded in `server/app/auth/README.md`): the
+  Owner signs in through the reserved `https` origin like every other person.
+  The per-person credential above is always required, and the binding is a
+  consistency signal, never an authorization input: a Tailscale login or
+  proxy identity header alone authorizes nothing.
 - **Reserved secure-context origin.** The dashboard is served from its
   reserved origin over a secure context, and the latest startup/daily
   reservation check passed. That check detects; it does not prevent (below).
@@ -456,7 +462,7 @@ Consequences to keep in mind while reviewing code:
 - no fingerprint or face template reaches ServerSentinel: it never leaves the authenticator. Credential records are not an identity or biometric database;
 - relying-party checks only hold if the dashboard owns its browser origin, with no other application sharing it, as AUTH-012 requires; a co-hosted application on that origin would put the credential within its reach;
 - reserving the origin is a deployment obligation, described above and in ADR-0003. The startup and daily check closes human access and notifies the Owner when it sees anything else answering on that name (listening sockets and proxy routes only; kernel forwarding to the reserved address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF `sk_lookup`, IPVS) is verified by the operator), which bounds the exposure window rather than preventing the bind: a process binding between two checks collects credentials and cookies for that origin until the next one;
-- the origin must be a secure context (HTTPS, or `http://localhost` for a strictly local browser). Browsers withhold WebAuthn otherwise, so plain HTTP on a non-loopback host is not a usable human path;
+- the origin must be a secure context (HTTPS, or `http://localhost` for a strictly local browser). Browsers withhold WebAuthn otherwise, so plain HTTP on a non-loopback host is not a usable human path. The current human composition accepts only the reserved `https` origin; no `http://localhost` Owner route exists (Owner decision, 2026-10-11);
 - the pending challenge lives server-side for one bounded, single-use ceremony and is then dropped;
 - the signature counter persists as `principal_credential.sign_count` and advances only on an accepted assertion. The comparison applies whenever the stored or the received counter is non-zero, and the received value must be strictly greater: a received 0 after a stored non-zero is a regression, not an exemption. A regression refuses the assertion and notifies the Owner as a possible cloned authenticator. Only a stored-and-received 0 is exempt, which is the ordinary passkey case;
 - a retained proxy identity is bounded: the principal keeps at most the last observed raw value, owner-visible, cleared on revocation or deletion and kept out of diagnostic exports, with longer history in the audit log. A session stores only a deployment-keyed HMAC binding for constant-time equality checks; it is cleared with session invalidation, never displayed and excluded from diagnostics/exports. The key is a 32-byte file in the data directory, created once with mode `0600`, refused (not replaced) when its ownership, mode, link count or size is wrong, and never logged, exported or stored in the database;
@@ -469,6 +475,8 @@ Residual limits are documented, not claimed away: a credential its holder delibe
 Enrollment codes and owner bootstrap authorizations are bearer authorizations reachable by everyone holding the shared account, so they are CSPRNG-generated with at least 128 bits of entropy, stored only as a hash, compared in constant time, short-lived, single-use and rate-limited per code and per source. Single use and the attempt counter are enforced in one conditional transaction, so racing redemptions of the same code cannot both register a credential and concurrent guesses cannot outrun the limit. A code short enough to guess is a finding regardless of the lifetime and rate limits around it.
 
 Two HTTP routes necessarily run before a credential exists, and the pair is closed: invitation redemption against a valid short-lived single-use enrollment code, and the authentication route. Owner bootstrap adds no third route — it is a privileged local action on the Main Server that issues a single-use, short-lived enrollment authorization shown only on the console, redeemed once from a browser at the reserved origin through that same redemption route, never a remote first-visitor route. They return no application data, redemption is rate-limited and succeeds at most once, an absent/unknown/expired/redeemed code gets the same generic response as an uninvited person, and enrollment codes never reach logs. Every other human route requires a verified credential and an active session.
+
+Accepted disclosure: the authentication options step (`POST /api/auth/authentication/options`) answers `200` with a fresh challenge and the `rpId` to any caller on the trusted proxy path while access is open, because discoverable-credential sign-in needs it before any credential is presented; it therefore differs from the generic denial and reveals that a relying party answers at the reserved name, but returns no principal, credential or application data. The origin, trusted-path, reservation and rate-limit checks bound who reaches it and how often; they do not hide it.
 
 Owner-only operations additionally require a user verification newer than a bounded freshness window, so a stale or unattended owner session cannot revoke users, change retention/security settings or delete recordings; a failed or cancelled step-up performs nothing and reveals nothing.
 

@@ -1130,6 +1130,9 @@ class HostnameReservationCheck:
     The idle-expiry touch in ``AccessStore.authorize()`` /
     ``authorize_owner()`` stays outside the gate: revocation advances the
     authorization generation, so a touch never makes a revoked session valid.
+    The human surface's session read (``AccessStore.authorize_session``)
+    commits its touch inside ``admit(epoch)``, so a request refused for a
+    close after its epoch never extends the session (Codex PR #219).
 
     Lock order (outermost first): ``exception_change_lock`` ->
     ``_check_lock`` -> ``_session_gate_lock`` -> the SQLite write lock
@@ -1276,6 +1279,20 @@ class HostnameReservationCheck:
         """
         return self._in_gate_process() and self._verdict.open
 
+    @property
+    def opening_configured(self) -> bool:
+        """Whether every input a passing check needs was supplied.
+
+        A check without the hostname resolver, the socket owner resolver
+        (mandatory, Owner decision 2026-10-05), its own socket table, the
+        unprivileged port start or the session revoker can never open access.
+        The human route composition refuses such a check at construction
+        instead of mounting routes that stay closed for a reason nobody sees.
+        """
+        return (self._resolver is not None and self._socket_owners is not None
+                and self._own_sockets is not None and self._port_start is not None
+                and self.session_revoker is not None)
+
     def _in_gate_process(self) -> bool:
         """True only in the process that built the gate (Issue #181).
 
@@ -1313,6 +1330,19 @@ class HostnameReservationCheck:
         verification and no other lock of this check. In any process other
         than the one that built the gate it raises ``HumanAccessClosed``
         without taking the lock (Issue #181).
+
+        Every human data route must commit its authorization inside this
+        block, after taking ``epoch()`` (as ``AccessStore.authorize_session``
+        does). Reading ``access_open`` is not enough. A commit inside the
+        block may wait for the storage admission (up to one in-flight
+        monitoring job plus the SQLite busy timeout), and a closing check
+        waits for this lock, so ``access_open`` stays True for that long.
+        After the close, the check's enumerations (each under its
+        enumeration timeout) delay the exposure decision, its session
+        revocation and the Owner fault further. A route authorized by a bare
+        ``AccessStore.authorize()`` outside the gate could keep serving
+        through that window. Only an epoch-checked commit here is refused
+        once the close has run.
         """
         if not self._in_gate_process():
             raise HumanAccessClosed()

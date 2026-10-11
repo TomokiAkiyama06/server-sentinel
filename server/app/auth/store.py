@@ -1,11 +1,11 @@
 """Transactional local authorization state; WebAuthn verification lives in ``webauthn.py``."""
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import sqlite3
-from typing import Callable, Iterable
+from typing import Callable, ContextManager, Iterable
 from uuid import UUID, uuid4
 
 from app.audit.model import ActorCategory, AuditAction, AuditOutcome, TargetKind
@@ -176,23 +176,46 @@ class AccessStore:
 
     @contextmanager
     def _transaction(self, write: bool = False):
-        connection = None
-        try:
-            connection = self.database.connect()
-            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            yield connection
-            connection.execute("COMMIT")
-        except sqlite3.Error:
-            if connection is not None and connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise AccessStorageError("access state operation failed") from None
-        except BaseException:
-            if connection is not None and connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
-        finally:
-            if connection is not None:
-                connection.close()
+        """One SQLite transaction; a write is admitted like an audit write.
+
+        A write with an audit store holds that store's storage reservation
+        (the Main storage policy once bound) through commit, so challenge
+        rows, session touches and expiry sweeps cannot spend the hard
+        filesystem reserve or grow the rollback journal at
+        ``STORAGE_HARD_STOP``. A refused admission is an
+        ``AccessStorageError`` and nothing is written. Reads never reserve,
+        and therefore never create: a read opens the existing database file
+        ``mode=ro`` (``Database.connect_read_only``), so a request that reaches
+        a read after the verified filesystem disappeared cannot create a
+        fallback database at the path; the read fails (a denial) instead.
+        """
+        with ExitStack() as admission:
+            reservation = self.audit.reservation if write and self.audit is not None else None
+            if reservation is not None:
+                try:
+                    admission.enter_context(reservation())
+                except Exception:
+                    raise AccessStorageError("access state operation failed") from None
+            connection = None
+            try:
+                try:
+                    connection = self.database.connect() if write else self.database.connect_read_only()
+                except ValueError:
+                    raise AccessStorageError("access state operation failed") from None
+                connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                yield connection
+                connection.execute("COMMIT")
+            except sqlite3.Error:
+                if connection is not None and connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise AccessStorageError("access state operation failed") from None
+            except BaseException:
+                if connection is not None and connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                if connection is not None:
+                    connection.close()
 
     @contextmanager
     def _audited_transaction(self):
@@ -563,6 +586,103 @@ class AccessStore:
                 raise AccessValidationError("access is unavailable")
             self._touch_session_on(connection, row, at)
             return principal
+
+    def session_may_be_current(self, token: object, *, now: datetime | None = None) -> bool:
+        """Read-only pre-check of a presented session token.
+
+        It takes no session gate lock and no SQLite write lock; the deferred
+        read still takes SQLite's SHARED lock (rollback journal) while it
+        runs, so it can contend with writers for at most the SQLite timeout,
+        and a failure there is a denial (fail-closed). It opens the existing
+        database ``mode=ro`` and never creates one: with the verified
+        filesystem gone and the mount-point directory left behind, a
+        well-formed cookie gets a denial, not a fallback ``state.sqlite3``.
+
+        ``True`` only when a session row with this token digest exists, is not
+        invalidated and has not passed its idle or absolute expiry; it grants
+        nothing and says nothing about the principal, credential, generation
+        or proxy-identity binding, which ``authorize_session`` still checks.
+        ``False`` (also for a malformed token or a storage failure) means the
+        full check would deny anyway without a binding-mismatch audit, so the
+        human surface refuses such a request before taking the session gate or
+        any SQLite write lock: a flood of forged, well-formed cookies costs one
+        deferred read transaction each and never writes (Issue #181 item 4).
+        An expired row it skips is left to the periodic expiry sweep.
+        """
+        try:
+            at = utc_time(self._clock() if now is None else now)
+            digest = _digest(token)
+        except Exception:
+            return False
+        try:
+            with self._transaction() as connection:
+                row = connection.execute(
+                    "SELECT 1 FROM access_sessions WHERE token_digest=? AND invalidated_at_us IS NULL "
+                    "AND idle_expires_at_us > ? AND absolute_expires_at_us > ?",
+                    (digest, _us(at), _us(at))).fetchone()
+        except Exception:
+            return False
+        return row is not None
+
+    def authorize_session(self, token: bytes, proxy_identity: str, *,
+                          now: datetime | None = None,
+                          admit: Callable[[], ContextManager] | None = None
+                          ) -> tuple[Principal, frozenset]:
+        """Authorize a request that needs a current session but no permission.
+
+        Exactly the session checks of ``authorize`` (current, unrevoked
+        principal and credential, generation, lifetimes, keyed proxy-identity
+        binding, idle touch), returning the principal with its current
+        permissions read in the same transaction. The Owner holds every
+        permission. Every refusal is the same generic denial. Used only by
+        the session self-description route, which grants nothing.
+
+        ``admit``, when given, returns the reservation session gate
+        (``HostnameReservationCheck.admit(epoch)``). It is entered before the
+        write transaction (lock order: gate -> storage admission -> SQLite
+        write lock) and held through its commit, so the authorization and
+        its idle touch commit only while access stayed open since the
+        request's epoch; a refusal by the gate (``HumanAccessClosed``)
+        propagates before anything is read or written. The denial
+        bookkeeping (expiry sweep, binding-mismatch audit) runs after the
+        gate is released (Codex PR #219).
+
+        The request time is read after the gate, the storage admission and
+        the write transaction have been entered. Concurrent reads of the same
+        session commit their idle touch in this order, so a request that
+        waited for an earlier one is never refused because its time precedes
+        that request's ``last_seen`` (Claude review, PR #219).
+        """
+        at = None
+        mismatch: list = []
+        try:
+            with ExitStack() as gate:
+                if admit is not None:
+                    gate.enter_context(admit())
+                connection = gate.enter_context(self._transaction(write=True))
+                at = utc_time(self._clock() if now is None else now)
+                self._end_expired_sessions_on(connection, at)
+                row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
+                if row is None:
+                    raise AccessValidationError("access is unavailable")
+                principal = self._principal(row)
+                if principal.role is PrincipalRole.OWNER:
+                    granted = frozenset(Permission)
+                else:
+                    known = {item.value: item for item in Permission}
+                    granted = frozenset(
+                        known[value] for (value,) in connection.execute(
+                            "SELECT permission FROM access_principal_permissions WHERE principal_id=?",
+                            (row["principal_id"],)).fetchall()
+                        if value in known)
+                self._touch_session_on(connection, row, at)
+                return principal, granted
+        except AccessValidationError:
+            if at is None:
+                at = utc_time(self._clock() if now is None else now)
+            self._end_expired_sessions_after_denial(at)
+            self._record_binding_mismatch(mismatch, at)
+            raise
 
     def authorize_owner(self, token: bytes, proxy_identity: str, *, now: datetime | None = None,
                         freshness: timedelta = OWNER_STEP_UP_FRESHNESS) -> Principal:
