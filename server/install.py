@@ -819,16 +819,29 @@ def _require_release_accepts_configuration(args, release: Path, target: str,
     rollback switches to an already installed release, which may predate a
     key the current configuration uses (for example the optional
     ``invitation_lifetime_hours``, PR #234) and would then refuse to start.
-    Run that release's own check first. The message names no configuration
-    value; the installer never rewrites the administrator configuration.
+    Run that release's own check first. A check that could not run or did
+    not finish (a missing interpreter, a timeout) is refused with its own
+    message: it says nothing about the configuration, so the steps differ.
+    Neither message names a configuration value; the installer never
+    rewrites the administrator configuration.
     """
+    rerun = "rollback" + (f" --version {args.version}" if args.version else "")
     try:
         _run_release_check(args, release, account, runner)
-    except (OSError, subprocess.SubprocessError):
+    except subprocess.CalledProcessError:
         pass
+    except (OSError, subprocess.SubprocessError):
+        raise ActivationBoundaryRefused(
+            "ServerSentinel release operation refused before any change: the own check of\n"
+            f"release {target} (python -m app.deployment --check) could not be run or did not\n"
+            "finish, so whether that release accepts the current deployment configuration is\n"
+            "unknown.\n"
+            "As the Owner:\n"
+            f"  1. confirm that {release / 'venv/bin/python'} exists and that the host is not\n"
+            "     overloaded\n"
+            f"  2. rerun the same command ({rerun})\n") from None
     else:
         return
-    rerun = "rollback" + (f" --version {args.version}" if args.version else "")
     raise ActivationBoundaryRefused(
         "ServerSentinel release operation refused before any change: release "
         f"{target} refused the current deployment configuration in its own check\n"

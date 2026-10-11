@@ -809,12 +809,16 @@ Clock continuity (Owner decision 2026-10-11, `boot_clock.py`). At issuance
 `issue_enrollment_on` records the kernel boot id
 (`/proc/sys/kernel/random/boot_id`) and `CLOCK_BOOTTIME` next to the
 wall-clock issue and expiry times; if either cannot be read it issues nothing
-(`InvitationClockUnavailable`). Both redemption steps read them again before
-their transaction and require, besides the wall-clock window: on the same
-boot, a monotonic elapsed time that is `>= 0` and below the lifetime, and a
-wall-clock elapsed time that does not lag it by more than 30 seconds (the
-allowance for the gap between the two readings; NTP slews both clocks
-together, so only a step separates them). A wall clock stepped back is
+(`InvitationClockUnavailable`). Both redemption steps read them again, each
+time as one pair with the wall-clock reading they are compared with (options:
+taken together just before its transaction; finish: taken together inside the
+redemption transaction, after every gate, storage-admission and lock wait, so
+a slow commit path is never read as a rollback, PR #234 review), and require,
+besides the wall-clock window: on the same boot, a monotonic elapsed time that
+is `>= 0` and below the lifetime, and a wall-clock elapsed time that does not
+lag it by more than 30 seconds (the allowance for the instant between the two
+reads of a pair; NTP slews both clocks together, so only a step separates
+them). A wall clock stepped back is
 therefore refused rather than extending the code; one stepped forward only
 ends the code earlier. After a reboot the readings are not comparable and the
 wall-clock window decides (a rollback across a reboot is not detectable). A

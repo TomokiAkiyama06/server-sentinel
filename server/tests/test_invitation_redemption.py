@@ -551,6 +551,54 @@ class InvitationClockTests(RedemptionFixture):
         self.assertEqual(await self.finish(code, credential), expected)
         self.assertEqual(self.count("SELECT count(*) FROM access_credentials"), 0)
 
+    async def test_a_long_wait_before_the_commit_is_not_a_rollback(self):
+        """Codex P2 on PR #234: the finish path captured its wall-clock time
+        before ``session_gate.admit()`` and read the boot clock after it, so
+        a wait over 30 s (e.g. behind storage admission) looked like a wall
+        clock stepped back and refused a valid code. Both clocks are now read
+        as one pair inside the redemption transaction."""
+        principal, code = self.invite()
+        begun = await self.options(code)
+        self.assertEqual(status(begun), 200)
+        credential = SyntheticAuthenticator().register(payload(begun), origin=ORIGIN, rp_id=HOST)
+        admit = self.check.admit
+
+        def slow_admit(epoch):
+            # Real time passes while waiting: both clocks move together, by
+            # far more than the rollback tolerance.
+            self.elapse(minutes=5)
+            return admit(epoch)
+
+        with patch.object(self.check, "admit", slow_admit):
+            response = await self.finish(code, credential)
+        self.assertEqual(status(response), 204)
+        self.assertEqual(self.count("SELECT count(*) FROM access_credentials"), 1)
+        # The stored time is the in-transaction reading, not the early one.
+        self.assertEqual(self.count("SELECT enrolled_at_us FROM access_credentials"),
+                         self.count(f"SELECT redeemed_at_us FROM access_invitations "
+                                    f"WHERE principal_id='{principal.id}'"))
+        self.assertEqual(self.count(f"SELECT attempt_count FROM access_invitations "
+                                    f"WHERE principal_id='{principal.id}'"), 1)
+
+    async def test_a_rollback_during_the_wait_is_still_refused(self):
+        expected = await self.denial()
+        _, code = self.invite()
+        begun = await self.options(code)
+        self.assertEqual(status(begun), 200)
+        credential = SyntheticAuthenticator().register(payload(begun), origin=ORIGIN, rp_id=HOST)
+        admit = self.check.admit
+
+        def slow_admit_with_step(epoch):
+            # Five minutes pass, and the wall clock is also stepped back by
+            # them: it reads the same time while the boot clock moved on.
+            self.boot.advance(minutes=5)
+            return admit(epoch)
+
+        with patch.object(self.check, "admit", slow_admit_with_step):
+            self.assertEqual(await self.finish(code, credential), expected)
+        self.assertEqual(self.count("SELECT count(*) FROM access_credentials"), 0)
+        self.assertEqual(self.count(REDEEMED), 0)
+
     async def test_monotonic_elapsed_beyond_the_lifetime_or_negative_refuses(self):
         expected = await self.denial()
         _, code = self.invite(lifetime=timedelta(hours=2))

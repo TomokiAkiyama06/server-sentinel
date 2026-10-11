@@ -982,7 +982,12 @@ rollback changes anything, the installer runs the target release's own
 deployment check (`python -m app.deployment --check`, as the service account
 with that release's interpreter and code, exactly as `update` does for the
 staged release) and refuses the rollback when that release rejects the current
-configuration. The refusal names no configuration value. Before rolling back
+configuration. When that check could not run or did not finish (the release's
+interpreter is missing, or the check timed out), the rollback is refused with a
+separate message that says so instead, because nothing is known about the
+configuration then: confirm the release's `venv/bin/python` exists and the host
+is not overloaded, then run the same `rollback` again. Neither refusal names a
+configuration value. Before rolling back
 to a release that predates the key, remove `"invitation_lifetime_hours"` from
 the deployment configuration (note its value), then run the same `rollback`
 again. When returning to a release that has the key, switch first, then add

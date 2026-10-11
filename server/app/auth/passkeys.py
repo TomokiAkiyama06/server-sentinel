@@ -238,9 +238,12 @@ class PasskeyCeremonies:
                 # redemption transaction, only after the invitation the body
                 # code names proved valid and is the one this challenge was
                 # bound to (PR #234 review); otherwise the generic denial.
+                # No ``now``: the store samples the wall and boot clocks as
+                # one pair inside its transaction, so a wait for the gate or
+                # storage admission is not read as a clock rollback.
                 return self.store.enroll_credential(
                     enrollment_secret, proxy_identity, verified.credential_id, verified.public_key,
-                    verified.algorithm, verified.sign_count, now=at,
+                    verified.algorithm, verified.sign_count,
                     backup_eligible=verified.backup_eligible, backup_state=verified.backup_state,
                     label=label, invitation_id=consumed.invitation_id,
                     require_device_bound=self.require_device_bound is True)

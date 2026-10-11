@@ -32,9 +32,10 @@ import time
 
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 _BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-# Allowance for the gap between the caller's wall-clock reading and the
-# store's boot-clock reading (lock waits), not for clock steps: NTP slews both
-# clocks together, so only a step separates them.
+# Allowance for the instant between the two reads of one wall/boot pair (the
+# store samples them together, never across a lock or admission wait), not
+# for clock steps: NTP slews both clocks together, so only a step separates
+# them.
 CLOCK_ROLLBACK_TOLERANCE = timedelta(seconds=30)
 _TOLERANCE_US = CLOCK_ROLLBACK_TOLERANCE // timedelta(microseconds=1)
 

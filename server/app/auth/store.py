@@ -551,7 +551,12 @@ class AccessStore:
         ``DeviceBoundCredentialRequired``, decided here only after the
         invitation proved valid (and the one the challenge was bound to);
         nothing is written. Validity includes the boot-clock check
-        (``app.auth.boot_clock``), read before the transaction.
+        (``app.auth.boot_clock``): the wall-clock and boot-clock readings it
+        compares are taken as one pair inside the redemption transaction,
+        after every gate, storage-admission and lock wait, so a slow commit
+        path is never mistaken for a wall clock stepped back (PR #234
+        review). ``now`` pins the wall reading for deterministic tests only;
+        a ceremony passes none.
 
         A rejected redemption writes nothing, so an unauthenticated caller
         presenting unknown or stale codes cannot grow the audit table. When a
@@ -565,12 +570,12 @@ class AccessStore:
             raise AccessValidationError("enrollment is unavailable")
         if type(require_device_bound) is not bool:
             raise AccessValidationError("enrollment is unavailable")
-        # Read next to the caller's wall-clock reading, before any lock wait.
-        instant = self._boot_instant()
-        credential = Credential(credential_id, UUID(int=0), public_key, algorithm, sign_count,
-                                utc_time(self._clock() if now is None else now),
-                                backup_eligible=backup_eligible, backup_state=backup_state, label=label)
-        at = credential.enrolled_at
+        pinned = None if now is None else utc_time(now)
+        # Validate the credential fields before any transaction; the stored
+        # row is rebuilt with the principal and the in-transaction time.
+        Credential(credential_id, UUID(int=0), public_key, algorithm, sign_count,
+                   pinned if pinned is not None else utc_time(self._clock()),
+                   backup_eligible=backup_eligible, backup_state=backup_state, label=label)
         # Only a matched, valid invitation reaches the append; ordinary
         # unmatched or stale attempts never touch audit health.
         audit_attempted = False
@@ -579,10 +584,14 @@ class AccessStore:
                 row = self._invitation_row_on(connection, enrollment_secret,
                                               "i.*, p.role, p.status, p.authorization_revision")
                 state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
+                # One pair, sampled together here where the decision is made
+                # (PR #234 review): a wait before this point moves both.
+                at = pinned if pinned is not None else utc_time(self._clock())
+                instant = self._boot_instant()
                 if (not self._redeemable(row, state, at, instant)
                         or (invitation_id is not None and row["id"] != str(invitation_id))):
                     raise AccessValidationError("enrollment is unavailable")
-                if require_device_bound and credential.backup_eligible:
+                if require_device_bound and backup_eligible:
                     raise DeviceBoundCredentialRequired()
                 principal_id = UUID(row["principal_id"])
                 credential = Credential(credential_id, principal_id, public_key, algorithm, sign_count, at,
