@@ -170,6 +170,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
         if monitoring is not None and monitoring.storage_configured else None
     )
     audit_store = AuditStore(store, reservation=storage_reservation or runtime_admission)
+    if human_access is not None:
+        # Human-access writes (challenges, sessions, revocation) are admitted
+        # exactly like audit writes; an unbound runtime admission refuses them.
+        human_access.bind_storage_admission(storage_reservation or runtime_admission)
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(

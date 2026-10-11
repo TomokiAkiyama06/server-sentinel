@@ -119,6 +119,12 @@ deployment explicitly enabled, behind a fully configured reservation check.
   in the same transaction as their effect. As with redemption, an attempt that
   matches no credential writes nothing.
 
+No path runs without a trusted-proxy identity: one is required on every
+ceremony and session check (Owner decision, 2026-09-30), and there is no
+strictly local `http://localhost` Owner path (Owner decision, 2026-10-11).
+The human composition accepts only the reserved `https` origin; the
+verifier's `http://localhost` support is not reachable from any human route.
+
 Not implemented yet, and required before routes open in production:
 
 - the remaining HTTP routes: invitation redemption (registration), Owner
@@ -126,10 +132,6 @@ Not implemented yet, and required before routes open in production:
   event and administration route (later Issue #10 phases, #19);
 - per-source rate limiting of invitation redemption (the authentication
   ceremony is limited in phase 1; redemption keeps its per-code bound);
-- the decision whether any path (for example a strictly local
-  `http://localhost` Owner) may run without a trusted-proxy identity; one is
-  required on every ceremony and session check (Owner decision, 2026-09-30),
-  and the phase 1 composition accepts only the reserved `https` origin;
 - the deployment-file key and production composition that build the
   `HostnameReservationCheck` (Serve status source, `SockDiagOwners`,
   `GetaddrinfoResolver`), load the session-binding key with
@@ -524,6 +526,28 @@ this phase, so a `live:view`-only or `recordings:view`-only person reaches
 nothing they lack. Bodies are bounded (1 KiB options, 64 KiB assertion), JSON
 with duplicate members is refused, and a ceremony refusal never sets a cookie.
 
+Accepted disclosure: `POST /api/auth/authentication/options` answers `200`
+with a fresh challenge and the `rpId` to any caller on the trusted proxy path
+while access is open, before any credential is presented. Discoverable-
+credential sign-in cannot work otherwise, so this differs from the generic
+denial on purpose. It reveals that a ServerSentinel relying party answers at
+the reserved name; it does not identify anyone and returns no principal,
+credential or application data. The origin, trusted-path, reservation and
+rate-limit checks bound who reaches it and how often; they do not hide it
+from a holder of the shared login.
+
+Storage admission and session revocation binding. Every human-access write
+(challenge rows, session creation and touches, expiry sweeps, the
+reservation revocation) is admitted through the same storage admission as
+audit writes: `create_app` binds the composition's audit store to the Main
+storage policy (or the embedder's injected reservation), a store already
+wired to a different reservation is refused, and until it is bound every
+request gets the generic denial. A refused admission (unbound policy,
+`STORAGE_HARD_STOP`, replaced filesystem) is a denial and writes nothing.
+The reservation check's session revoker must be a
+`ReservationSessionRevocation` of exactly the composition's `AccessStore`,
+so an exposure revokes the sessions this surface authorizes.
+
 Rate limiting (Issue #181 item 4, `rate_limit.py`). Both ceremony routes are
 charged to a per-source token bucket and a global one before the ceremony
 takes the gate or any SQLite lock, so a flood cannot hold the gate lock that
@@ -532,8 +556,9 @@ the only source attribute the backend can trust (the peer is always the
 loopback proxy and forwarded headers are client-controlled). In the shared
 Tailscale account every person presents the same login, so the per-source
 bucket is shared by the room: a holder of the shared login can delay others'
-sign-in (availability only, never access). Defaults: 20 requests burst and one
-every 3 s per source, 120 burst and two per second globally, at most 256
+sign-in (availability only, never access). The Owner accepted this keying and
+the defaults below as is (Owner decision, 2026-10-11). Defaults: 20 requests
+burst and one every 3 s per source, 120 burst and two per second globally, at most 256
 source buckets (an identity digest, never the value; a full table evicts only
 a refilled bucket and otherwise refuses). A refused request gets the generic
 denial and at most one value-free `human_request_rate_limited` event per
@@ -548,14 +573,20 @@ transaction) and `admit()`, so a flood of random 43-character cookies by a
 holder of the shared login neither takes the gate lock nor writes. An expired
 row skipped this way is cleared by the periodic sweep instead of the denied
 request. Forged-cookie denials are not charged to the bucket either, so they
-cannot delay sign-in or a current session's reads; whether to also bound
-their read-only lookups is an Owner trade-off left open.
+cannot delay sign-in or a current session's reads, and their read-only
+lookups are not bounded further (Owner decision, 2026-10-11, accepted as is).
+The lookup takes no gate lock and no SQLite write lock, but its read still
+takes SQLite's SHARED lock (rollback journal), so a forged-cookie flood can
+still contend with writers; that contention is bounded by the SQLite busy
+timeout, and a lookup or write that fails under it is a fail-closed denial,
+never access.
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 
-The local bootstrap/recovery commands are not built yet. Proposed rationale,
-pending Owner confirmation: they do not go through the server gate, and the
-deployment authorization generation is what keeps them safe.
+The local bootstrap/recovery commands are not built yet. Owner decision
+(2026-10-11): they do not go through the server gate, and the deployment
+authorization generation (its revocation by advancing) is what keeps them
+safe.
 
 - They cannot use the gate: it lives in the serving process's memory, and in
   any other process the pid guard reports it closed, so a command that called
@@ -577,6 +608,6 @@ deployment authorization generation is what keeps them safe.
   the same transaction, so it needs no gate to end sessions; the serving
   process sees the new generation on the next request.
 
-Until the Owner confirms this, the commands stay unimplemented and the
-low-level `establish_session` / `issue_enrollment` wrappers stay unreachable
-from any human route.
+Until the commands are implemented under this decision, the low-level
+`establish_session` / `issue_enrollment` wrappers stay unreachable from any
+human route.

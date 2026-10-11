@@ -63,6 +63,7 @@ from app.logging import Event
 from .passkeys import PasskeyCeremonies, SessionGrant
 from .rate_limit import SourceRateLimiter
 from .reservation import HostnameReservationCheck
+from .reservation_store import ReservationSessionRevocation
 from .session_binding import canonical_identity
 from .store import AccessStore
 
@@ -200,7 +201,16 @@ class HumanAccess:
     start, session revoker), the ceremonies use exactly that gate and this
     audited access store with a session-binding key, and the relying party
     is the reserved https origin. A missing or substituted gate is never
-    accepted (Issue #181 item 3).
+    accepted (Issue #181 item 3). The gate's session revoker must be a
+    ``ReservationSessionRevocation`` of exactly this store, so a revocation
+    after an exposure invalidates the sessions this surface authorizes and
+    not another database's.
+
+    Every human-access write is admitted through the application's storage
+    admission: ``create_app`` binds it with ``bind_storage_admission`` (the
+    Main storage policy, or the embedder's injected reservation), and until
+    it is bound every request is denied. An audit store already wired to a
+    different reservation is refused rather than silently rebound.
     """
 
     def __init__(self, configuration: HumanAccessConfiguration, *, store: AccessStore,
@@ -213,6 +223,9 @@ class HumanAccess:
             raise HumanAccessUnavailable()
         if (not isinstance(store, AccessStore) or store.audit is None
                 or not store.session_binding_configured):
+            raise HumanAccessUnavailable()
+        revoker = reservation.session_revoker
+        if not isinstance(revoker, ReservationSessionRevocation) or revoker.access_store is not store:
             raise HumanAccessUnavailable()
         if (not isinstance(ceremonies, PasskeyCeremonies) or ceremonies.store is not store
                 or ceremonies.session_gate is not reservation):
@@ -233,6 +246,31 @@ class HumanAccess:
         self.origin = origin
         self.host = host
         self.tick_seconds = float(tick_seconds)
+        self._storage_admission = None
+
+    def bind_storage_admission(self, admission: Callable) -> None:
+        """Admit every write of this composition through ``admission``.
+
+        Binds the access store's audit store (shared with the session
+        revoker) to the application's storage admission, the one that admits
+        audit writes. Refuses a non-callable admission, an audit store already
+        wired to another reservation, and rebinding to a different admission.
+        """
+        if not callable(admission):
+            raise HumanAccessUnavailable()
+        audit = self.store.audit
+        if self._storage_admission is not None and self._storage_admission is not admission:
+            raise HumanAccessUnavailable()
+        if audit.reservation is not None and audit.reservation is not admission:
+            raise HumanAccessUnavailable()
+        audit.reservation = admission
+        self._storage_admission = admission
+
+    @property
+    def storage_admitted(self) -> bool:
+        """Whether writes go through the bound storage admission."""
+        admission = self._storage_admission
+        return admission is not None and self.store.audit.reservation is admission
 
     async def run(self, *, sleep: Callable = asyncio.sleep) -> None:
         """Startup check, then the periodic check tick and expiry sweep.
@@ -310,7 +348,7 @@ class HumanSurface:
             raise _Denied()
 
     def _open(self) -> None:
-        if not self.access.reservation.access_open:
+        if not self.access.storage_admitted or not self.access.reservation.access_open:
             raise _Denied()
 
     async def _http(self, scope: Scope, receive: Receive, send: Send) -> None:

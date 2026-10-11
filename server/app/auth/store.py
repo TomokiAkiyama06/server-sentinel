@@ -1,6 +1,6 @@
 """Transactional local authorization state; WebAuthn verification lives in ``webauthn.py``."""
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -176,23 +176,39 @@ class AccessStore:
 
     @contextmanager
     def _transaction(self, write: bool = False):
-        connection = None
-        try:
-            connection = self.database.connect()
-            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            yield connection
-            connection.execute("COMMIT")
-        except sqlite3.Error:
-            if connection is not None and connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise AccessStorageError("access state operation failed") from None
-        except BaseException:
-            if connection is not None and connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
-        finally:
-            if connection is not None:
-                connection.close()
+        """One SQLite transaction; a write is admitted like an audit write.
+
+        A write with an audit store holds that store's storage reservation
+        (the Main storage policy once bound) through commit, so challenge
+        rows, session touches and expiry sweeps cannot spend the hard
+        filesystem reserve or grow the rollback journal at
+        ``STORAGE_HARD_STOP``. A refused admission is an
+        ``AccessStorageError`` and nothing is written. Reads never reserve.
+        """
+        with ExitStack() as admission:
+            reservation = self.audit.reservation if write and self.audit is not None else None
+            if reservation is not None:
+                try:
+                    admission.enter_context(reservation())
+                except Exception:
+                    raise AccessStorageError("access state operation failed") from None
+            connection = None
+            try:
+                connection = self.database.connect()
+                connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                yield connection
+                connection.execute("COMMIT")
+            except sqlite3.Error:
+                if connection is not None and connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise AccessStorageError("access state operation failed") from None
+            except BaseException:
+                if connection is not None and connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            finally:
+                if connection is not None:
+                    connection.close()
 
     @contextmanager
     def _audited_transaction(self):
@@ -565,7 +581,12 @@ class AccessStore:
             return principal
 
     def session_may_be_current(self, token: object, *, now: datetime | None = None) -> bool:
-        """Lock-free, read-only pre-check of a presented session token.
+        """Read-only pre-check of a presented session token.
+
+        It takes no session gate lock and no SQLite write lock; the deferred
+        read still takes SQLite's SHARED lock (rollback journal) while it
+        runs, so it can contend with writers for at most the SQLite timeout,
+        and a failure there is a denial (fail-closed).
 
         ``True`` only when a session row with this token digest exists, is not
         invalidated and has not passed its idle or absolute expiry; it grants

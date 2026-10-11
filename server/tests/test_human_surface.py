@@ -7,7 +7,7 @@ socket, browser, Tailscale or real authenticator is involved.
 """
 
 import asyncio
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import timedelta
 import json
 import logging
@@ -20,7 +20,8 @@ from unittest.mock import patch
 from app.auth import reservation as reservation_module
 from app.auth.human_surface import (
     AUTHENTICATION_OPTIONS_PATH, AUTHENTICATION_PATH, SESSION_COOKIE, SESSION_PATH,
-    HumanAccess, HumanAccessConfiguration, HumanAccessUnavailable, HumanSurface,
+    HumanAccess, HumanAccessConfiguration, HumanAccessUnavailable, HumanSurface, _Denied,
+    proxy_identity,
 )
 from app.auth.model import Permission
 from app.auth.passkeys import PasskeyCeremonies
@@ -54,6 +55,21 @@ UNMOUNTED = ("/health", "/version", "/openapi.json", "/docs", "/api/live/1", "/a
              "/api/recordings", "/api/recordings/1/playback", "/api/recordings/1/download",
              "/api/events", "/api/timeline", "/api/access/invitations", "/diagnostics/export",
              "/api/auth/registration", "/api/session/", "/", "/index.html")
+
+
+class SyntheticAdmission:
+    """Synthetic storage admission that counts writes and can refuse them."""
+
+    def __init__(self):
+        self.admitted = 0
+        self.refusing = False
+
+    @contextmanager
+    def __call__(self):
+        if self.refusing:
+            raise RuntimeError("STORAGE_HARD_STOP")
+        self.admitted += 1
+        yield
 
 
 class InnerApplication:
@@ -138,6 +154,8 @@ class HumanSurfaceFixture(unittest.IsolatedAsyncioTestCase):
         self.access = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
                                   ceremonies=self.ceremonies, reservation=self.check,
                                   rate_limiter=self.limiter)
+        self.admission = SyntheticAdmission()
+        self.access.bind_storage_admission(self.admission)
         self.inner = InnerApplication()
         self.surface = HumanSurface(self.inner, self.access)
         self.codes = iter(bytes([index]) * 32 for index in range(1, 200))
@@ -394,6 +412,34 @@ class TrustedProxyPathTests(HumanSurfaceFixture):
                                     identity=identity, headers=extra)
                 self.assertEqual(result, expected)
 
+    def test_proxy_identity_refuses_comma_joined_values_and_encoded_words(self):
+        def headers(value):
+            return [(b"tailscale-user-login", value.encode())]
+
+        self.assertEqual(proxy_identity(headers(VIEWER)), VIEWER)
+        for value in (VIEWER + "," + OTHER_LOGIN, VIEWER + ",", "," + VIEWER,
+                      "=?utf-8?q?synthetic?=@example.invalid", "synthetic=?@example.invalid",
+                      "synthetic@example.invalid=?"):
+            with self.subTest(value=value), self.assertRaises(_Denied):
+                proxy_identity(headers(value))
+
+    async def test_ambiguous_identity_is_refused_before_the_ceremony(self):
+        expected = await self.denial()
+        with patch.object(self.ceremonies, "begin_authentication",
+                          side_effect=AssertionError("must not begin")) as begin, \
+                patch.object(self.ceremonies, "finish_authentication",
+                             side_effect=AssertionError("must not finish")) as finish:
+            for identity in (VIEWER + "," + OTHER_LOGIN, "=?utf-8?q?synthetic?=@example.invalid"):
+                with self.subTest(identity=identity):
+                    self.assertEqual(await call(self.surface, "POST", AUTHENTICATION_OPTIONS_PATH,
+                                                identity=identity), expected)
+                    self.assertEqual(await call(self.surface, "POST", AUTHENTICATION_PATH,
+                                                identity=identity, body=b'{"id": "x"}'), expected)
+        begin.assert_not_called()
+        finish.assert_not_called()
+        self.assertEqual(self.limiter.sources(), 0)
+        self.assertEqual(self.count("SELECT count(*) FROM access_webauthn_challenges"), 0)
+
     async def test_session_cookie_with_another_proxy_identity_is_refused(self):
         _, authenticator, _ = self.enroll()
         cookie = await self.sign_in(authenticator)
@@ -481,11 +527,19 @@ class RateLimitTests(HumanSurfaceFixture):
         for _ in range(self.limiter.per_source_capacity):
             self.assertEqual(status(await call(self.surface, "POST", AUTHENTICATION_OPTIONS_PATH)), 200)
         stored = self.count("SELECT count(*) FROM access_webauthn_challenges")
+        limited = self.limiter.limited
         with patch.object(self.ceremonies, "begin_authentication",
-                          side_effect=AssertionError("limited before the gate")), \
+                          side_effect=AssertionError("limited before the gate")) as begin, \
+                patch.object(self.ceremonies, "finish_authentication",
+                             side_effect=AssertionError("limited before the gate")) as finish, \
                 self.assertLogs("app.auth.rate_limit", "WARNING") as logs:
             self.assertEqual(await call(self.surface, "POST", AUTHENTICATION_OPTIONS_PATH), expected)
-            self.assertEqual(await call(self.surface, "POST", AUTHENTICATION_PATH, body=b"{}"), expected)
+            # A well-formed JSON object would otherwise reach the ceremony.
+            self.assertEqual(await call(self.surface, "POST", AUTHENTICATION_PATH,
+                                        body=b'{"id": "synthetic"}'), expected)
+        begin.assert_not_called()
+        finish.assert_not_called()
+        self.assertEqual(self.limiter.limited, limited + 2)
         self.assertEqual(self.count("SELECT count(*) FROM access_webauthn_challenges"), stored)
         # Value-free: one event, no identity or digest in the record.
         self.assertEqual(len(logs.records), 1)
@@ -658,6 +712,76 @@ class CompositionTests(HumanSurfaceFixture):
         with self.assertRaises(TypeError):
             create_app(Settings(self.temporary), human_access=object())
 
+    def test_session_revoker_must_revoke_this_store(self):
+        other_database = Database(self.temporary / "other.sqlite3")
+        with closing(other_database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        other_store = AccessStore(other_database, audit=AuditStore(other_database),
+                                  session_binding=SessionBindingKey.generate())
+        same_database = AccessStore(self.database, audit=AuditStore(self.database),
+                                    session_binding=SessionBindingKey.generate())
+        same_audit = AccessStore(self.database, audit=self.audit,
+                                 session_binding=SessionBindingKey.generate())
+        for name, revoker in (("other database", ReservationSessionRevocation(other_store)),
+                              ("other store", ReservationSessionRevocation(same_database)),
+                              ("same audit", ReservationSessionRevocation(same_audit))):
+            with self.subTest(revoker=name):
+                check, _, _, _ = checker(clock=self.clock, session_revoker=revoker)
+                self.assertTrue(check.opening_configured)
+                ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=check)
+                with self.assertRaises(HumanAccessUnavailable):
+                    self.compose(ceremonies=ceremonies, reservation=check)
+
+
+class StorageAdmissionTests(HumanSurfaceFixture):
+    async def test_unbound_composition_denies_every_route_and_writes_nothing(self):
+        _, authenticator, _ = self.enroll()
+        cookie = await self.sign_in(authenticator)
+        expected = await self.denial()
+        audit = AuditStore(self.database, clock=self.ceremony_clock)
+        store = AccessStore(self.database, clock=self.ceremony_clock, audit=audit,
+                            session_binding=self.store._session_binding)
+        revoker = ReservationSessionRevocation(store)
+        check, _, _, _ = checker(clock=self.clock, session_revoker=revoker)
+        self.assertTrue(check.startup().open)
+        access = HumanAccess(HumanAccessConfiguration(enabled=True), store=store,
+                             ceremonies=PasskeyCeremonies(store, self.rp, session_gate=check),
+                             reservation=check)
+        self.assertFalse(access.storage_admitted)
+        surface = HumanSurface(self.inner, access)
+        before = self.database.path.read_bytes()
+        self.assertEqual(await call(surface, "POST", AUTHENTICATION_OPTIONS_PATH), expected)
+        self.assertEqual(await call(surface, "GET", SESSION_PATH, cookie=cookie), expected)
+        self.assertEqual(self.database.path.read_bytes(), before)
+
+    async def test_refused_admission_denies_sign_in_and_session_writes(self):
+        _, authenticator, _ = self.enroll()
+        cookie = await self.sign_in(authenticator)
+        expected = await self.denial()
+        stored = self.count("SELECT count(*) FROM access_webauthn_challenges")
+        before = self.database.path.read_bytes()
+        self.admission.refusing = True
+        self.assertEqual(await call(self.surface, "POST", AUTHENTICATION_OPTIONS_PATH), expected)
+        self.assertEqual(await call(self.surface, "GET", SESSION_PATH, cookie=cookie), expected)
+        self.assertEqual(self.count("SELECT count(*) FROM access_webauthn_challenges"), stored)
+        self.assertEqual(self.database.path.read_bytes(), before)
+        self.admission.refusing = False
+        admitted = self.admission.admitted
+        self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=cookie)), 200)
+        self.assertGreater(self.admission.admitted, admitted)
+
+    def test_binding_refuses_another_reservation(self):
+        with self.assertRaises(HumanAccessUnavailable):
+            self.access.bind_storage_admission(SyntheticAdmission())
+        with self.assertRaises(HumanAccessUnavailable):
+            self.access.bind_storage_admission(None)
+        self.access.bind_storage_admission(self.admission)
+        self.assertTrue(self.access.storage_admitted)
+        # create_app binds its own admission and refuses a store wired elsewhere.
+        with self.assertRaises(HumanAccessUnavailable):
+            create_app(Settings(self.temporary), database=self.database, human_access=self.access)
+        self.assertIs(self.audit.reservation, self.admission)
+
 
 class ApplicationCompositionTests(HumanSurfaceFixture):
     async def test_application_runs_the_check_and_serves_only_after_it_opens(self):
@@ -667,7 +791,9 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
         ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=check, clock=self.ceremony_clock)
         access = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
                              ceremonies=ceremonies, reservation=check, tick_seconds=0.01)
-        application = create_app(Settings(self.temporary), database=self.database, human_access=access)
+        application = create_app(Settings(self.temporary), database=self.database, human_access=access,
+                                 storage_reservation=self.admission)
+        self.assertTrue(access.storage_admitted)
         before = await call(application, "POST", AUTHENTICATION_OPTIONS_PATH)
         self.assertEqual(before, await self.denial())
         logging.disable(logging.CRITICAL)
