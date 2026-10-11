@@ -35,8 +35,11 @@ error path gets the same generic denial):
 
 The two ceremony routes run before a credential exists. They are
 rate-limited per verified proxy identity and globally before the ceremony
-takes any gate or SQLite lock (Issue #181). No live, recording, timeline,
-event, administration, health or version route is mounted here.
+takes any gate or SQLite lock (Issue #181). The session read is not
+charged; a forged or stale cookie is refused by a read-only token lookup
+before the gate or any SQLite write lock (see ``_session``). No live,
+recording, timeline, event, administration, health or version route is
+mounted here.
 
 Every refusal is the generic, non-branding not-found response used by the
 closed surface: no product/version header, no cookie, ``no-store``. Nothing
@@ -392,6 +395,16 @@ class HumanSurface:
     async def _session(self, identity, headers, receive, send) -> None:
         token = session_token(headers)
         reservation = self.access.reservation
+        # A well-formed but unknown, invalidated or expired token is refused
+        # by a read-only lookup before the gate lock or any SQLite write lock
+        # is taken (Issue #181 item 4): only a token that names a live session
+        # row pays for epoch -> authorize -> admit.
+        try:
+            known = await asyncio.to_thread(self.access.store.session_may_be_current, token)
+        except Exception:
+            raise _Denied() from None
+        if known is not True:
+            raise _Denied()
         try:
             # The epoch is taken before authorization, and admit() confirms
             # access stayed open (no close, revocation or reopen) until the

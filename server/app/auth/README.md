@@ -537,8 +537,19 @@ every 3 s per source, 120 burst and two per second globally, at most 256
 source buckets (an identity digest, never the value; a full table evicts only
 a refilled bucket and otherwise refuses). A refused request gets the generic
 denial and at most one value-free `human_request_rate_limited` event per
-minute. Session reads are not charged; a request without a well-formed
-`__Host-session` cookie is denied before any storage access.
+minute. Session reads are not charged. A request without a well-formed
+`__Host-session` cookie is denied before any storage access, and a
+well-formed cookie whose token names no live session row (unknown, forged,
+invalidated or past its idle/absolute expiry) is denied by a read-only
+lookup (`AccessStore.session_may_be_current`, one deferred read transaction)
+before the session gate lock or any SQLite write lock is taken. Only a token
+that names a live row goes through epoch, `authorize_session` (write
+transaction) and `admit()`, so a flood of random 43-character cookies by a
+holder of the shared login neither takes the gate lock nor writes. An expired
+row skipped this way is cleared by the periodic sweep instead of the denied
+request. Forged-cookie denials are not charged to the bucket either, so they
+cannot delay sign-in or a current session's reads; whether to also bound
+their read-only lookups is an Owner trade-off left open.
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 

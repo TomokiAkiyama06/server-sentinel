@@ -564,6 +564,35 @@ class AccessStore:
             self._touch_session_on(connection, row, at)
             return principal
 
+    def session_may_be_current(self, token: object, *, now: datetime | None = None) -> bool:
+        """Lock-free, read-only pre-check of a presented session token.
+
+        ``True`` only when a session row with this token digest exists, is not
+        invalidated and has not passed its idle or absolute expiry; it grants
+        nothing and says nothing about the principal, credential, generation
+        or proxy-identity binding, which ``authorize_session`` still checks.
+        ``False`` (also for a malformed token or a storage failure) means the
+        full check would deny anyway without a binding-mismatch audit, so the
+        human surface refuses such a request before taking the session gate or
+        any SQLite write lock: a flood of forged, well-formed cookies costs one
+        deferred read transaction each and never writes (Issue #181 item 4).
+        An expired row it skips is left to the periodic expiry sweep.
+        """
+        try:
+            at = utc_time(self._clock() if now is None else now)
+            digest = _digest(token)
+        except Exception:
+            return False
+        try:
+            with self._transaction() as connection:
+                row = connection.execute(
+                    "SELECT 1 FROM access_sessions WHERE token_digest=? AND invalidated_at_us IS NULL "
+                    "AND idle_expires_at_us > ? AND absolute_expires_at_us > ?",
+                    (digest, _us(at), _us(at))).fetchone()
+        except Exception:
+            return False
+        return row is not None
+
     def authorize_session(self, token: bytes, proxy_identity: str, *,
                           now: datetime | None = None) -> tuple[Principal, frozenset]:
         """Authorize a request that needs a current session but no permission.

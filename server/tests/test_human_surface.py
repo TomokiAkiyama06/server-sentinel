@@ -12,6 +12,7 @@ from datetime import timedelta
 import json
 import logging
 from pathlib import Path
+import secrets
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -502,6 +503,68 @@ class RateLimitTests(HumanSurfaceFixture):
         cookie = await self.sign_in(authenticator)
         for _ in range(self.limiter.per_source_capacity * 2):
             self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=cookie)), 200)
+
+    async def test_forged_session_cookies_never_take_the_gate_or_write(self):
+        # Issue #181 item 4 on the session route: well-formed random cookies
+        # (and stale ones) from a holder of the shared login are refused by
+        # a read-only lookup, never taking the gate lock or a write lock.
+        _, authenticator, _ = self.enroll()
+        invalidated = await self.sign_in(authenticator)
+        with self.store._transaction(write=True) as connection:
+            connection.execute("UPDATE access_sessions SET invalidated_at_us=last_seen_at_us, "
+                               "external_identity_binding=NULL")
+        expired = await self.sign_in(authenticator)
+        expected = await self.denial()
+        # Past the idle lifetime with no sweep yet: the row is still present
+        # and not invalidated.
+        self.ceremony_clock.advance(minutes=31)
+        self.assertEqual(self.count("SELECT count(*) FROM access_sessions WHERE invalidated_at_us IS NULL"), 1)
+        real_lock = self.check._session_gate_lock
+        gate = {"taken": 0}
+
+        class CountingLock:
+            def __enter__(self):
+                gate["taken"] += 1
+                return real_lock.__enter__()
+
+            def __exit__(self, *exc):
+                return real_lock.__exit__(*exc)
+
+            def __getattr__(self, name):
+                return getattr(real_lock, name)
+
+        original_transaction = self.store._transaction
+        writes = []
+
+        def counting_transaction(write=False):
+            if write:
+                writes.append(True)
+            return original_transaction(write=write)
+
+        before = (self.database.path.read_bytes(), self.limiter.limited, self.limiter.sources())
+        forged = [SESSION_COOKIE + "=" + secrets.token_urlsafe(32) for _ in range(200)]
+        with patch.object(self.check, "_session_gate_lock", CountingLock()), \
+                patch.object(self.store, "_transaction", side_effect=counting_transaction), \
+                patch.object(self.store, "authorize_session",
+                             side_effect=AssertionError("denied before authorization")), \
+                patch.object(self.store, "end_expired_sessions",
+                             side_effect=AssertionError("denied without a write")):
+            for cookie in forged + [expired, invalidated]:
+                self.assertEqual(await call(self.surface, "GET", SESSION_PATH, cookie=cookie), expected)
+        self.assertEqual(gate["taken"], 0)
+        self.assertEqual(writes, [])
+        self.assertEqual((self.database.path.read_bytes(), self.limiter.limited, self.limiter.sources()),
+                         before)
+        # Sign-in and a live session are unaffected by the flood.
+        live = await self.sign_in(authenticator)
+        self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=live)), 200)
+
+    def test_session_pre_check_is_read_only_and_fails_closed(self):
+        self.assertFalse(self.store.session_may_be_current(b"short"))
+        self.assertFalse(self.store.session_may_be_current("not bytes"))
+        self.assertFalse(self.store.session_may_be_current(bytes(32)))
+        with patch.object(Database, "connect", side_effect=OSError("unavailable")):
+            self.assertFalse(self.store.session_may_be_current(bytes(32)))
 
 
 class SourceRateLimiterTests(unittest.TestCase):
