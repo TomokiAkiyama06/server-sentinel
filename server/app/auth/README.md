@@ -127,10 +127,11 @@ verifier's `http://localhost` support is not reachable from any human route.
 
 Not implemented yet, and required before routes open in production:
 
-- the remaining HTTP routes: Owner step-up, and every live, recording,
-  timeline, event and administration route (later Issue #10 phases, #19).
-  Sign-out and the CSRF token exist since phase 2 S1, invitation redemption
-  and the local bootstrap/recovery command since S2 (below);
+- the remaining HTTP routes: every live, recording, timeline, event and
+  administration route, including every `OWNER_OP` route (later Issue #10
+  phases, #19). Sign-out and the CSRF token exist since phase 2 S1,
+  invitation redemption and the local bootstrap/recovery command since S2,
+  and the Owner step-up routes since S3 (below);
 - the Owner's invitation route (S4): until then the only runtime issuer of
   an enrollment code is the local command, which covers the Owner only;
 - the deployment-file key and production composition that build the
@@ -710,8 +711,9 @@ The single exception is an otherwise valid Owner session on an `OWNER_OP`
 route whose user verification is stale: it gets the fixed `403
 {"detail":"step_up_required"}`. That outcome is decided under the gate with
 the epoch unchanged, never for a non-owner, a wrong CSRF token, another proxy
-identity or a closed gate. S1 mounts no `OWNER_OP` route; the mapping is
-exercised through a synthetic route in the tests.
+identity or a closed gate. No `OWNER_OP` route is mounted yet (S4 adds the
+Owner's permission management); the mapping, and its resolution through the
+S3 step-up routes, is exercised through a synthetic route in the tests.
 
 CSRF (Owner decision D2). `SessionBindingKey` derives a CSRF subkey from the
 deployment's session-binding key under its own domain label, and a session's
@@ -900,6 +902,76 @@ commits `authorize_owner` inside `admit(epoch)` (#228 item 5), so the Owner
 decision, its idle touch and `StepUpRequired` are all made while access stayed
 open. `live_access.authorize_live_access` requires `admit` and binds the live
 grant to the session id read in the same gated transaction.
+
+### Owner step-up (Issue #10 phase 2, S3)
+
+Routes. `POST /api/auth/step-up/options` (empty body or `{}`) and `POST
+/api/auth/step-up` (the JSON assertion, at most 64 KiB) are mounted with the
+`OWNER_READ` requirement, exact `Origin` and `X-CSRF-Token`. `OWNER_READ`,
+not `OWNER_OP`, so that a stale Owner can reach them (refreshing is their
+point); not `SESSION`, so that a non-Owner is refused inside the
+authorization transaction, before the idle touch commits: a non-Owner, an
+uninvited caller and anyone without a valid session get the generic `404`
+and learn nothing about step-up. Each request is charged to the sign-in
+limiter before its body is read (SPECIFICATION: repeated failed step-ups are
+rate-limited), then authorized by `_authorize` inside `admit(epoch)`, and the
+ceremony step (`PasskeyCeremonies.begin_step_up` / `finish_step_up`) receives
+that same epoch: before it consumes or verifies anything the gate's current
+epoch must still equal it, and its commit runs inside a second
+`admit(epoch)`, so a close, a close/reopen cycle, `stop()` or a failed tick
+between the authorization and the commit refuses the step and writes
+nothing.
+
+Options. The response is only the WebAuthn request options:
+`challenge`, `rpId`, `timeout`, `userVerification: "required"` and
+`allowCredentials` holding exactly the session's own credential. The
+challenge is bound to the session (`access_webauthn_challenges.session_id`),
+expires with the challenge lifetime, and a new options request replaces the
+session's pending one, so a session holds at most one and cannot fill the
+bounded challenge table that sign-in shares.
+
+Finish. The assertion is verified like a sign-in (type, challenge, exact
+origin, rpId hash, UP, UV, signature, counter, BE/BS), and it must come from
+the credential that created the session: an assertion from any other
+credential — another person's passkey at the same workstation, or the Owner's
+own second passkey — is refused and changes nothing. The commit
+(`accept_assertion(step_up_session_id=...)`) re-checks that the session is
+the Owner's, current and bound to this proxy identity, and records the new
+verification time with the kernel boot id and `CLOCK_BOOTTIME` read in the
+same transaction, with a `verify_principal_step_up` audit record (actor
+`owner`, the principal's logical UUID only). Success is `204` with no body
+and no cookie; the client then retries the Owner operation, which is
+re-checked server-side. A cancelled, failed or refused step-up changes no
+verification time, counter, backup state or audit record; the only write is
+the authorization's idle touch, as for any authenticated request, and a
+consumed challenge. Each refused finish increments the value-free
+`HumanAccess.refused_step_ups`, and `owner_step_up_refused` is logged on the
+first refusal and each power of two, with no token, CSRF token, challenge,
+credential, identity or reason.
+
+Freshness (ADR-0003: five minutes; `boot_clock.step_up_fresh`, migration 23).
+An `OWNER_OP` request is fresh only when the session's last user verification
+(sign-in or step-up) has a recorded boot pair from the same boot and both
+`0 <= now - verified < 5 minutes` on the wall clock and on `CLOCK_BOOTTIME`,
+the wall clock not lagging the monotonic one by more than one second. So it
+is stale at exactly five minutes after the in-transaction verification time;
+a wall clock stepped back after the verification makes it stale (fail closed)
+instead of stretching the window, and one stepped behind the session's last
+activity refuses every request of that session until the clock passes it
+again; a wall clock stepped forward ends the window early; a reboot, a
+session without a pair (established before migration 23, or while the boot
+clock was unreadable) and an unreadable boot clock are stale. A step-up while
+the boot clock cannot be read is refused, since it could never make the
+session fresh. A stale Owner gets `403 {"detail":"step_up_required"}` on an
+`OWNER_OP` route (D3); everyone else the generic `404`.
+
+Limits. Step-up proves that the person holding the session's credential and
+passing its user verification is present now; it cannot tell who that is
+when a credential is deliberately lent, and it does not end the session: a
+stale Owner session left open still serves `OWNER_READ` and every non-Owner
+operation until its idle or absolute lifetime ends or it is signed out.
+Under the shared login the sign-in limiter's per-source bucket is the room's,
+so step-up attempts and sign-ins of everyone behind it share it.
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 

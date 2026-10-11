@@ -40,6 +40,7 @@ from tests.test_hostname_reservation import Clock
 from tests.test_human_surface import (
     HOST, ORIGIN, OTHER_LOGIN, VIEWER, HumanSurfaceFixture, call, header, payload, status,
 )
+from tests.test_webauthn_ceremonies import waiting
 from tests.webauthn_fakes import SyntheticAuthenticator
 
 
@@ -595,6 +596,42 @@ class InvitationClockTests(RedemptionFixture):
             return admit(epoch)
 
         with patch.object(self.check, "admit", slow_admit_with_step):
+            self.assertEqual(await self.finish(code, credential), expected)
+        self.assertEqual(self.count("SELECT count(*) FROM access_credentials"), 0)
+        self.assertEqual(self.count(REDEEMED), 0)
+
+    async def registered(self, code):
+        begun = await self.options(code)
+        self.assertEqual(status(begun), 200)
+        return SyntheticAuthenticator().register(payload(begun), origin=ORIGIN, rp_id=HOST)
+
+    async def test_finish_reads_the_clock_pair_after_the_storage_admission_wait(self):
+        """Issue #235 item 1: the wait is injected into the redemption's own
+        storage admission (``_audited_transaction``), not only the gate, so
+        ``enroll_credential`` reading its wall/boot pair before that wait
+        (a regression) would refuse this valid code after a five-minute wait."""
+        principal, code = self.invite()
+        credential = await self.registered(code)
+        with waiting(self.store, "_audited_transaction", lambda: self.elapse(minutes=5)):
+            response = await self.finish(code, credential)
+        self.assertEqual(status(response), 204)
+        after_wait = (self.ceremony_clock() - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1)
+        self.assertEqual(self.count("SELECT enrolled_at_us FROM access_credentials"), after_wait)
+        self.assertEqual(self.count(f"SELECT redeemed_at_us FROM access_invitations "
+                                    f"WHERE principal_id='{principal.id}'"), after_wait)
+
+    async def test_finish_refuses_an_expiry_or_rollback_during_the_storage_admission_wait(self):
+        expected = await self.denial()
+        # The invitation expires while the redemption waits for admission.
+        _, code = self.invite(lifetime=timedelta(hours=1))
+        self.elapse(minutes=58)
+        credential = await self.registered(code)
+        with waiting(self.store, "_audited_transaction", lambda: self.elapse(minutes=3)):
+            self.assertEqual(await self.finish(code, credential), expected)
+        # The wall clock is stepped back by the five minutes the wait took.
+        _, code = self.invite()
+        credential = await self.registered(code)
+        with waiting(self.store, "_audited_transaction", lambda: self.boot.advance(minutes=5)):
             self.assertEqual(await self.finish(code, credential), expected)
         self.assertEqual(self.count("SELECT count(*) FROM access_credentials"), 0)
         self.assertEqual(self.count(REDEEMED), 0)

@@ -2595,6 +2595,16 @@ def _access_row_errors(connection, tables) -> list:
             idle, absolute = row["idle_lifetime_us"], row["absolute_expires_at_us"]
             binding = row["external_identity_binding"] if "external_identity_binding" in keys else None
             credential = row["credential_id"]
+            # Migration 23 (Issue #10 phase 2 S3): the boot pair of the last
+            # user verification is absent together (before it, or an
+            # unreadable boot clock) or present, well formed and next to a
+            # verification time.
+            boot_id = row["last_user_verification_boot_id"] if "last_user_verification_boot_id" in keys else None
+            boottime = (row["last_user_verification_boottime_us"]
+                        if "last_user_verification_boottime_us" in keys else None)
+            verified = row["last_user_verification_at_us"] if "last_user_verification_at_us" in keys else None
+            verification_clock_ok = ((boot_id is None and boottime is None)
+                                     or (verified is not None and valid_boot_id(boot_id) and _int(boottime)))
             try:
                 valid = (_canonical_uuid(row["id"]) and lineage(row)
                          and isinstance(row["token_digest"], bytes) and len(row["token_digest"]) == 32
@@ -2611,6 +2621,7 @@ def _access_row_errors(connection, tables) -> list:
                          # session current at that time.
                          and optional("invalidated_at_us", 0)
                          and optional("last_user_verification_at_us", established)
+                         and verification_clock_ok
                          and optional("binding_mismatch_audited_at_us", established)
                          and ("binding_mismatch_suppressed" not in keys
                               or _int(row["binding_mismatch_suppressed"]))

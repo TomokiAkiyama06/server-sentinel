@@ -1638,6 +1638,62 @@ Once a deployment can enable them, on the Main Server with a synthetic
   and `issue_principal_invitation`; recordings and capture nodes are
   unchanged.
 
+### Issue #10 phase 2 S3 Owner step-up (pending)
+
+Verified only with the synthetic ASGI driver, software authenticators and a
+synthetic boot clock (`server/tests/test_human_step_up.py`,
+`tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve,
+real authenticator or real clock step has exercised it, no production entry
+point mounts the human routes yet, and no Owner operation route exists until
+S4 (the `403 step_up_required` contract is exercised through a synthetic
+route in the tests). Once S4 mounts an Owner operation and a deployment can
+enable the routes, on a shared machine (one OS account and browser profile,
+the shared Tailscale login, a synthetic `*.invalid` Owner and a synthetic
+`*.invalid` invitee, each with their own passkey on a separate roaming
+authenticator):
+
+- [ ] two people at one workstation, Owner session left stale: the Owner
+  signs in, performs one Owner operation, and walks away without signing
+  out; after more than five minutes the invitee, at the same browser
+  profile, starts an Owner operation: it answers `403
+  {"detail":"step_up_required"}` and does nothing; the invitee completes the
+  step-up prompt with the invitee's own passkey (presented through the
+  browser's "use another device/security key" choice): the step-up is the
+  generic denial, the operation still answers `403`, the audit log has no new
+  `verify_principal_step_up` record, and the Owner's session verification
+  time is unchanged; record that the browser may refuse to offer a
+  credential outside `allowCredentials` at all, which is the same outcome;
+- [ ] the Owner returns and completes the step-up with the Owner's own
+  passkey (user verification prompted): `204`, one `verify_principal_step_up`
+  record with the Owner's logical UUID only, and the retried operation runs;
+  record that the stale Owner session served every non-Owner request to
+  whoever sat at the machine meanwhile (residual: a session left unlocked on
+  an unattended machine), and that signing out before leaving is the
+  mitigation;
+- [ ] wait exactly past five minutes after the step-up and confirm the next
+  Owner operation answers `403` again;
+- [ ] cancel the step-up prompt, decline user verification, and let the
+  prompt time out: each leaves the operation undone, the session's
+  verification time unchanged and no audit record, and the application log
+  shows `owner_step_up_refused` (first refusal, then at 2, 4, 8, ...) with no
+  token, challenge, credential or identity;
+- [ ] send the step-up requests without `X-CSRF-Token`, with another
+  session's token, without `Origin` and from another origin: each is the
+  generic denial; as the invitee (non-Owner) call both step-up routes with
+  the invitee's own valid session and CSRF token: the generic denial;
+- [ ] stop the reservation check from passing between the options and the
+  finish request: the finish is the generic denial and nothing is refreshed;
+- [ ] right after a step-up, step the Main Server's wall clock back by two
+  minutes (on a disposable host, with NTP stopped) and retry an Owner
+  operation: it is not served as fresh (`403`, or the generic denial while the
+  clock is behind the session's last activity); restore the clock, step up
+  again and confirm it works; reboot the host after a step-up and confirm the
+  next Owner operation asks for a step-up again;
+- [ ] repeat the step-up quickly many times: after the sign-in burst it is
+  refused with the generic denial before any work, with one value-free
+  `human_request_rate_limited` event; record that everyone behind the shared
+  login shares this limit with sign-in.
+
 ### Uninvited ordinary Tailnet member
 
 - [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;

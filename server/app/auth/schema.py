@@ -166,3 +166,21 @@ def access_invitation_clock_migration(version: int) -> Migration:
         "ALTER TABLE access_invitations ADD COLUMN issued_boottime_us INTEGER CHECK(issued_boottime_us IS NULL OR issued_boottime_us >= 0)",
         "CREATE UNIQUE INDEX access_invitations_lookup ON access_invitations(lookup_key) WHERE lookup_key IS NOT NULL",
     ))
+
+
+def access_step_up_clock_migration(version: int) -> Migration:
+    """Owner step-up freshness on both clocks (Issue #10 phase 2 S3).
+
+    ``last_user_verification_boot_id`` / ``last_user_verification_boottime_us``
+    record the kernel boot id and ``CLOCK_BOOTTIME`` read together with the
+    session's in-transaction user-verification time (sign-in or step-up,
+    ``app.auth.boot_clock.step_up_fresh``), so a wall clock stepped back after
+    a verification cannot stretch the five-minute step-up window. Both are
+    absent or present together. Existing sessions keep ``NULL`` and are
+    therefore stale for an Owner operation until the Owner steps up once;
+    nothing else about them changes and nothing is deleted.
+    """
+    return Migration(version, "human_access_step_up_clock", (
+        "ALTER TABLE access_sessions ADD COLUMN last_user_verification_boot_id TEXT CHECK(last_user_verification_boot_id IS NULL OR length(last_user_verification_boot_id) = 36)",
+        "ALTER TABLE access_sessions ADD COLUMN last_user_verification_boottime_us INTEGER CHECK(last_user_verification_boottime_us IS NULL OR last_user_verification_boottime_us >= 0)",
+    ))

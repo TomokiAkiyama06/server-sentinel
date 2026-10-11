@@ -423,6 +423,21 @@ class AuthenticationTests(CeremonyTestCase):
         established = self.count("SELECT established_at_us FROM access_sessions WHERE id=?", str(grant.session_id))
         self.assertEqual(established, microseconds(self.clock()))
 
+    def test_authentication_challenge_times_are_read_inside_the_transaction(self):
+        """Issue #235 item 2: ``issue_authentication_challenge`` reads its
+        issue and expiry times after the storage admission and lock wait."""
+        with waiting(self.store, "_transaction", lambda: self.clock.advance(minutes=3)):
+            request = self.ceremonies.begin_authentication()
+        with closing(self.database.connect()) as connection:
+            issued, expires = connection.execute(
+                "SELECT issued_at_us, expires_at_us FROM access_webauthn_challenges "
+                "WHERE ceremony='authentication'").fetchone()
+        self.assertEqual(issued, microseconds(self.clock()))
+        self.assertEqual(expires - issued, self.ceremonies.challenge_lifetime // timedelta(microseconds=1))
+        # The whole window is usable from the post-wait time on.
+        self.clock.advance(minutes=4)
+        self.assertIsNotNone(self.ceremonies.finish_authentication(VIEWER, self.authenticator.assertion(request)))
+
     def test_failed_attempt_burns_its_challenge(self):
         request = self.ceremonies.begin_authentication()
         self.assertGenericDenial(lambda: self.ceremonies.finish_authentication(

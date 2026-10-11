@@ -2447,6 +2447,17 @@ class LifecycleInventoryTests(unittest.TestCase):
             "session token digest": (statement("UPDATE access_sessions SET token_digest=X'00'"),
                                      "security_state", lambda runtime: "access_sessions:"
                                      + one(runtime, "SELECT id FROM access_sessions")),
+            # Migration 23: the verification boot pair is all or nothing.
+            "session verification boot pair partly set": (statement(
+                "UPDATE access_sessions SET last_user_verification_boot_id=NULL, "
+                "last_user_verification_boottime_us=5"),
+                "security_state", lambda runtime: "access_sessions:"
+                + one(runtime, "SELECT id FROM access_sessions")),
+            "session verification boot id malformed": (statement(
+                "UPDATE access_sessions SET last_user_verification_boottime_us=5, "
+                "last_user_verification_boot_id='0F1E2D3C-4B5A-4968-8776-A5B4C3D2E1F0'"),
+                "security_state", lambda runtime: "access_sessions:"
+                + one(runtime, "SELECT id FROM access_sessions")),
             "grant principal": (statement(
                 "INSERT INTO access_principal_permissions VALUES ('x', 'live:view')"),
                 "access_principals", lambda runtime: "x"),

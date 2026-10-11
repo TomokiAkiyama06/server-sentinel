@@ -116,6 +116,10 @@ def _digest(challenge: bytes) -> bytes:
     return hashlib.sha256(challenge).digest()
 
 
+# ``epoch`` default of the step-up steps: take the gate epoch at the start.
+_CURRENT_EPOCH = object()
+
+
 class PasskeyCeremonies:
     def __init__(self, store: AccessStore, relying_party: webauthn.RelyingParty, *,
                  session_gate: SessionGate,
@@ -370,13 +374,39 @@ class PasskeyCeremonies:
             raise ValueError("a session gate is required")
         self.session_gate = gate
 
-    def begin_step_up(self, token: bytes, proxy_identity: str) -> dict:
-        """Issue a challenge bound to this Owner session and its own credential only."""
+    def _step_up_epoch(self, epoch: object) -> int:
+        """The gate epoch a step-up step commits under; generic denial when closed.
+
+        ``epoch`` is the one the HTTP route already authorized the request
+        under (``HumanSurface._authorize``), so the authorization and the
+        ceremony's commit sit inside the same ``admit(epoch)`` window: a close,
+        reopen or ``stop()`` in between refuses the step. Without it the
+        epoch is taken now. Either way the gate's current epoch must equal it
+        before anything is consumed or verified.
+        """
+        current = self.session_gate.epoch()
+        if epoch is _CURRENT_EPOCH:
+            epoch = current
+        if (epoch is None or isinstance(epoch, bool) or not isinstance(epoch, int)
+                or current != epoch):
+            # Closed, or closed/reopened or stopped since the request's
+            # authorization: refuse before consuming or verifying anything.
+            # The final ``admit(epoch)`` check still runs at the commit.
+            raise CeremonyDenied()
+        return epoch
+
+    def begin_step_up(self, token: bytes, proxy_identity: str, *, epoch: object = _CURRENT_EPOCH) -> dict:
+        """Issue a challenge bound to this Owner session and its own credential only.
+
+        The options carry only what the ceremony needs: the challenge, the
+        relying-party id, the timeout, ``userVerification: "required"`` and
+        the session's own credential as the single allowed credential. A
+        non-Owner, stale-cookie or otherwise invalid session gets the generic
+        denial and stores nothing; a new challenge replaces the session's
+        previous pending one.
+        """
         try:
-            epoch = self.session_gate.epoch()
-            if epoch is None:
-                # Closed: refuse before consuming or verifying anything.
-                raise CeremonyDenied()
+            epoch = self._step_up_epoch(epoch)
             challenge = self._challenge()
             with self.session_gate.admit(epoch):
                 credential_id = self.store.begin_step_up(token, proxy_identity, _digest(challenge),
@@ -387,20 +417,20 @@ class PasskeyCeremonies:
                 "timeout": self._timeout_ms(), "userVerification": "required",
                 "allowCredentials": [{"type": "public-key", "id": webauthn.b64url_encode(credential_id)}]}
 
-    def finish_step_up(self, token: bytes, proxy_identity: str, credential: Mapping) -> None:
+    def finish_step_up(self, token: bytes, proxy_identity: str, credential: Mapping, *,
+                       epoch: object = _CURRENT_EPOCH) -> None:
         """Refresh the session's verification time, or change nothing and deny.
 
         The assertion must come from the credential that created this session.
         A valid assertion by any other credential — including someone else's
         passkey at the same workstation — is refused and leaves the session's
-        verification time untouched.
+        verification time untouched. The new verification time and its boot
+        pair are read inside the commit transaction (``accept_assertion``),
+        so the five-minute window starts when the refresh commits.
         """
         try:
             # First: a close after this point refuses the commit (Issue #144).
-            epoch = self.session_gate.epoch()
-            if epoch is None:
-                # Closed: refuse before consuming or verifying anything.
-                raise CeremonyDenied()
+            epoch = self._step_up_epoch(epoch)
             at = self._now()
             claims = webauthn.assertion_claims(credential, self.rp)
             consumed = self.store.consume_challenge(_digest(claims.challenge), "step_up")

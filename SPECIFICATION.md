@@ -1524,7 +1524,8 @@ principal_session
 - created_at
 - last_seen_at
 - idle_expires_at / absolute_expires_at (server-enforced)
-- last_user_verification_at (freshness source for owner step-up)
+- last_user_verification_at (freshness source for owner step-up), with the
+  kernel boot id and CLOCK_BOOTTIME read in the same transaction (migration 23)
 - revoked_at
 
 principal_permission
@@ -1750,6 +1751,25 @@ or revoked still receives the generic response below and learns nothing about
 owner routes. Repeated failed step-ups are rate-limited and logged without
 credential material, and a stale session never partially applies an operation.
 
+Implementation (Issue #10 phase 2 S3, Owner decision D3): `POST
+/api/auth/step-up/options` (empty body or `{}`) returns only `challenge`,
+`rpId`, `timeout`, `userVerification: "required"` and `allowCredentials`
+holding exactly the session's credential; `POST /api/auth/step-up` (the JSON
+assertion) answers `204` with no body. Both require an Owner session
+(`OWNER_READ`, fresh or stale), the exact `Origin` and `X-CSRF-Token`, are
+charged to the sign-in limiter before the body is read, and commit under the
+epoch their authorization took; a non-Owner or anyone without a valid session
+gets the generic `404`. A new options request replaces the session's pending
+step-up challenge. "Fresh" is exactly five minutes from the verification time
+read inside the commit transaction (sign-in or step-up), on the wall clock and
+on `CLOCK_BOOTTIME` of the same boot, with the wall clock lagging the
+monotonic clock by at most one second: a wall clock stepped back after the
+verification, a reboot, a session without a recorded pair and an unreadable
+boot clock are stale (fail closed), and a step-up is refused while the boot
+clock cannot be read. Refused finishes are counted value-free
+(`owner_step_up_refused` logged on the first and each doubling). No `OWNER_OP`
+route is mounted until S4.
+
 Exactly two HTTP routes run before a credential exists, and the pair is closed.
 Owner bootstrap is not a third one: it is a local action on the host that feeds
 the same redemption route.
@@ -1957,8 +1977,9 @@ session on an `OWNER_OP` route (Owner decision D3). Sign-out invalidates the
 server-side session and its binding with a `sign_out_principal` audit record
 holding only the principal's logical UUID (D7); it ends that session, not the
 credential, and is refused while human access is closed. Invitation
-redemption, step-up and all live/recording/timeline/admin routes are later
-phases. Details: `server/app/auth/README.md`.
+redemption (S2) and the Owner step-up (S3, §11.5 above) are mounted; all
+live/recording/timeline/admin routes are later phases. Details:
+`server/app/auth/README.md`.
 
 ## 12. Dashboard UI
 

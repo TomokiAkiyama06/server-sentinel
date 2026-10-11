@@ -42,6 +42,7 @@ class Event(StrEnum):
     HUMAN_LISTENER_ACTIVATION_INVALID = "human_listener_activation_invalid"
     HUMAN_REQUEST_RATE_LIMITED = "human_request_rate_limited"
     INVITATION_REDEMPTION_REFUSED = "invitation_redemption_refused"
+    OWNER_STEP_UP_REFUSED = "owner_step_up_refused"
     HUMAN_ACCESS_CHECK_FAILED = "human_access_check_failed"
     HUMAN_ACCESS_SWEEP_FAILED = "human_access_sweep_failed"
     HUMAN_ACCESS_RUN_FAILED = "human_access_run_failed"

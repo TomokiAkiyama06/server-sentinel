@@ -46,6 +46,9 @@ NEW_SESSION_COLUMNS = ("external_identity_binding", "binding_mismatch_audited_at
 # Added after this migration by access_invitation_clock_migration (PR #234
 # review); NULL for every row that existed before it.
 LATER_INVITATION_COLUMNS = ("lookup_key", "issued_boot_id", "issued_boottime_us")
+# Added by access_step_up_clock_migration (Issue #10 phase 2 S3); NULL for
+# every session that existed before it.
+LATER_SESSION_COLUMNS = ("last_user_verification_boot_id", "last_user_verification_boottime_us")
 ALICE_CODE = b"a" * 32
 BOB_CODE = b"b" * 32
 
@@ -612,7 +615,7 @@ class SharedIdentityMigrationTests(unittest.TestCase):
         result = {}
         for table in self.TABLES:
             columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")
-                       if row[1] not in NEW_SESSION_COLUMNS + LATER_INVITATION_COLUMNS]
+                       if row[1] not in NEW_SESSION_COLUMNS + LATER_INVITATION_COLUMNS + LATER_SESSION_COLUMNS]
             result[table] = sorted(tuple(row) for row in connection.execute(
                 f"SELECT rowid, {', '.join(columns)} FROM {table}"))
         return result
@@ -624,6 +627,9 @@ class SharedIdentityMigrationTests(unittest.TestCase):
             self.assertEqual(connection.execute(
                 "SELECT count(*) FROM access_invitations WHERE lookup_key IS NOT NULL "
                 "OR issued_boot_id IS NOT NULL OR issued_boottime_us IS NOT NULL").fetchone()[0], 0)
+            self.assertEqual(connection.execute(
+                "SELECT count(*) FROM access_sessions WHERE last_user_verification_boot_id IS NOT NULL "
+                "OR last_user_verification_boottime_us IS NOT NULL").fetchone()[0], 0)
             self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
             self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
