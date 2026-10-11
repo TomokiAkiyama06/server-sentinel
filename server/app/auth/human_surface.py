@@ -9,8 +9,9 @@ yet, so the production entry points keep every human path closed.
 When enabled, every HTTP request passes, server-side and in this order:
 
 1. the route table (``ROUTES``): an exact method, a strict path pattern over
-   the decoded path (whose raw form must be the same, so no percent-encoded
-   variant matches), and a strict per-route query allowlist; an unmatched
+   the decoded path (whose raw form must be present and the same, so no
+   percent-encoded variant matches and a server that omits ``raw_path``
+   matches nothing, Issue #232), and a strict per-route query allowlist; an unmatched
    request still passes the checks below before its denial, so a refusal
    never says which check failed;
 2. the dedicated, reserved, secure-context origin: exactly one ``Host`` equal
@@ -40,24 +41,39 @@ When enabled, every HTTP request passes, server-side and in this order:
 Mounted routes (and nothing else; every other method, path, query string,
 WebSocket and error path gets the same generic denial):
 
+- ``POST /api/auth/registration/options``: begin redeeming an invitation
+  (body ``{"code"}``);
+- ``POST /api/auth/registration``: finish it (body ``{"code", "credential",
+  "label"?}``); ``204`` with no body and no cookie;
 - ``POST /api/auth/authentication/options``: begin a passkey sign-in;
 - ``POST /api/auth/authentication``: finish it and set the ``__Host-`` cookie;
 - ``GET /api/session``: the caller's own role, permissions and CSRF token;
 - ``POST /api/auth/sign-out``: end the caller's own session (CSRF).
 
-The two ceremony routes run before a credential exists. They are
-rate-limited per verified proxy identity and globally before the ceremony
-takes any gate or SQLite lock (Issue #181). Session routes are not charged; a
-forged or stale cookie is refused by a read-only token lookup before the gate
-or any SQLite write lock. No live, recording, timeline, event,
-administration, health or version route is mounted here.
+The four ceremony routes run before a credential exists (AUTH-013). Each is
+rate-limited per verified proxy identity and globally before the request body
+is parsed and before the ceremony takes any gate or SQLite lock (Issue #181).
+Redemption uses its own, stricter limiter (Owner decision D4), so a
+redemption flood never spends the sign-in buckets. An invitation code travels
+only in the request body and is decoded strictly
+(``invitation_code.parse_invitation_code``) before the gate; a code that does
+not parse never reaches SQLite. Session routes are not charged; a forged or
+stale cookie is refused by a read-only token lookup before the gate or any
+SQLite write lock. No live, recording, timeline, event, administration,
+health or version route is mounted here.
 
 Every refusal is the generic, non-branding not-found response used by the
-closed surface: no product/version header, no cookie, ``no-store``. The one
-exception is an otherwise valid Owner session on an ``OWNER_OP`` route whose
-user verification is stale: it gets the fixed ``403
-{"detail":"step_up_required"}`` (Owner decision D3). Nothing here logs a
-header, identity, token, CSRF token, challenge or body.
+closed surface: no product/version header, no cookie, ``no-store``; an
+absent, malformed, unknown, expired, redeemed, revoked or generation-stale
+invitation code gets exactly that response. Two fixed exceptions exist: an
+otherwise valid Owner session on an ``OWNER_OP`` route whose user
+verification is stale gets ``403 {"detail":"step_up_required"}`` (Owner
+decision D3), and the holder of a valid invitation whose verified
+authenticator is backup eligible, in a deployment that requires device-bound
+credentials, gets ``409 {"detail":"device_bound_credential_required"}``
+(decided under the gate, ``PasskeyCeremonies.finish_registration``). Nothing
+here logs a header, identity, token, CSRF token, invitation code, challenge
+or body.
 """
 
 from __future__ import annotations
@@ -78,8 +94,10 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from app.completion import run_to_completion
 from app.logging import Event
 from app.storage.database import Database, PinnedDatabase
-from .passkeys import PasskeyCeremonies, SessionGrant
-from .rate_limit import SourceRateLimiter
+from .invitation_code import InvalidInvitationCode, parse_invitation_code
+from .model import Credential
+from .passkeys import DeviceBoundCredentialRequired, PasskeyCeremonies, SessionGrant
+from .rate_limit import SourceRateLimiter, redemption_rate_limiter
 from .reservation import HostnameReservationCheck, HumanAccessClosed
 from .reservation_store import ListenerExceptionStore, ReservationSessionRevocation
 from .session_binding import canonical_identity
@@ -94,8 +112,12 @@ AUTHENTICATION_OPTIONS_PATH = "/api/auth/authentication/options"
 AUTHENTICATION_PATH = "/api/auth/authentication"
 SESSION_PATH = "/api/session"
 SIGN_OUT_PATH = "/api/auth/sign-out"
+REGISTRATION_OPTIONS_PATH = "/api/auth/registration/options"
+REGISTRATION_PATH = "/api/auth/registration"
 MAX_OPTIONS_BODY = 1024
 MAX_ASSERTION_BODY = 64 * 1024
+MAX_REGISTRATION_BODY = 64 * 1024
+MAX_LABEL = 64
 MAX_EMPTY_BODY = 2
 MAX_QUERY_BYTES = 512
 MAX_QUERY_VALUE = 128
@@ -104,6 +126,7 @@ DEFAULT_TICK_SECONDS = 30.0
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
 _DENIAL_BODY = b'{"detail":"Not Found"}'
 _STEP_UP_BODY = b'{"detail":"step_up_required"}'
+_DEVICE_BOUND_BODY = b'{"detail":"device_bound_credential_required"}'
 # Clears the session cookie with the attributes it was set with.
 _CLEARED_COOKIE = (SESSION_COOKIE + "=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict").encode()
 
@@ -125,6 +148,11 @@ async def send_generic_denial(send: Send) -> None:
 async def send_step_up_required(send: Send) -> None:
     """The fixed step-up response for a stale Owner on an ``OWNER_OP`` route (D3)."""
     await _fixed_json(send, 403, _STEP_UP_BODY)
+
+
+async def send_device_bound_required(send: Send) -> None:
+    """The fixed response to a valid invitation's backup-eligible registration."""
+    await _fixed_json(send, 409, _DEVICE_BOUND_BODY)
 
 
 class HumanAccessUnavailable(ValueError):
@@ -225,6 +253,10 @@ def _exact(path: str) -> re.Pattern:
 
 
 ROUTES: tuple[Route, ...] = (
+    Route("POST", _exact(REGISTRATION_OPTIONS_PATH), Requirement.PRE_CREDENTIAL, "_begin_registration",
+          mutating=True, csrf=False, body_limit=MAX_OPTIONS_BODY),
+    Route("POST", _exact(REGISTRATION_PATH), Requirement.PRE_CREDENTIAL, "_finish_registration",
+          mutating=True, csrf=False, body_limit=MAX_REGISTRATION_BODY),
     Route("POST", _exact(AUTHENTICATION_OPTIONS_PATH), Requirement.PRE_CREDENTIAL, "_begin_authentication",
           mutating=True, csrf=False, body_limit=MAX_OPTIONS_BODY),
     Route("POST", _exact(AUTHENTICATION_PATH), Requirement.PRE_CREDENTIAL, "_finish_authentication",
@@ -239,20 +271,23 @@ ROUTES: tuple[Route, ...] = (
 def match_route(scope: Scope, routes: tuple[Route, ...] = None) -> Route | None:
     """The route for this method and path, or ``None``.
 
-    The raw path, when the server supplies it, must be exactly the decoded
-    path, so a percent-encoded or otherwise re-encoded spelling of a mounted
-    path matches nothing.
+    The raw path must be present and exactly the decoded path, so a
+    percent-encoded or otherwise re-encoded spelling of a mounted path
+    matches nothing. A server that does not supply ``raw_path`` matches
+    nothing either (fail closed, Issue #232): the decoded path alone cannot
+    show whether it was percent-encoded.
     """
     method, path = scope.get("method"), scope.get("path")
     if not isinstance(method, str) or not isinstance(path, str):
         return None
     raw = scope.get("raw_path")
-    if raw is not None:
-        try:
-            if raw != path.encode("ascii"):
-                return None
-        except UnicodeEncodeError:
+    if not isinstance(raw, bytes):
+        return None
+    try:
+        if raw != path.encode("ascii"):
             return None
+    except UnicodeEncodeError:
+        return None
     for route in ROUTES if routes is None else routes:
         if route.method == method and route.path.fullmatch(path):
             return route
@@ -365,6 +400,35 @@ def _reject_constant(_value):
     raise ValueError("non-finite number")
 
 
+def _json_object(body: bytes) -> dict:
+    """A strict JSON object: no duplicate member, no NaN/Infinity, else denial."""
+    try:
+        value = json.loads(body, object_pairs_hook=_no_duplicates, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):
+        raise _Denied() from None
+    if not isinstance(value, dict):
+        raise _Denied()
+    return value
+
+
+def _invitation_secret(value: object) -> bytes:
+    """The invitation code's secret; a code that does not parse is a denial."""
+    try:
+        return parse_invitation_code(value)
+    except InvalidInvitationCode:
+        raise _Denied() from None
+
+
+def _label(value: object) -> str | None:
+    """An optional credential label, checked as ``Credential`` checks it (and no DEL)."""
+    if value is None:
+        return None
+    if (not isinstance(value, str) or not 1 <= len(value) <= MAX_LABEL
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        raise _Denied()
+    return value
+
+
 class ServingGate:
     """The reservation session gate, also closed while the composition is stopped.
 
@@ -401,7 +465,9 @@ class HumanAccess:
     Refuses construction unless the deployment explicitly enabled it, the
     session gate is a ``HostnameReservationCheck`` with every opening input
     configured (resolver, socket owners, own sockets, unprivileged port
-    start, session revoker), the ceremonies use exactly that gate and this
+    start, session revoker), the two rate limiters are distinct
+    ``SourceRateLimiter`` objects (sign-in and, per Owner decision D4,
+    invitation redemption), the ceremonies use exactly that gate and this
     audited access store with a session-binding key, and the relying party
     is the reserved https origin. A missing or substituted gate is never
     accepted (Issue #181 item 3). The gate's session revoker must be a
@@ -431,6 +497,7 @@ class HumanAccess:
     def __init__(self, configuration: HumanAccessConfiguration, *, store: AccessStore,
                  ceremonies: PasskeyCeremonies, reservation: HostnameReservationCheck,
                  rate_limiter: SourceRateLimiter | None = None,
+                 redemption_limiter: SourceRateLimiter | None = None,
                  tick_seconds: float = DEFAULT_TICK_SECONDS):
         if not isinstance(configuration, HumanAccessConfiguration) or configuration.enabled is not True:
             raise HumanAccessUnavailable()
@@ -456,6 +523,11 @@ class HumanAccess:
             raise HumanAccessUnavailable()
         if rate_limiter is not None and not isinstance(rate_limiter, SourceRateLimiter):
             raise HumanAccessUnavailable()
+        if redemption_limiter is not None and (not isinstance(redemption_limiter, SourceRateLimiter)
+                                               or redemption_limiter is rate_limiter):
+            # Separate buckets (D4): one shared object would let a redemption
+            # flood starve sign-in.
+            raise HumanAccessUnavailable()
         if (isinstance(tick_seconds, bool) or not isinstance(tick_seconds, (int, float))
                 or not 0 < tick_seconds <= 300):
             raise HumanAccessUnavailable()
@@ -464,6 +536,7 @@ class HumanAccess:
         self.ceremonies = ceremonies
         self.reservation = reservation
         self.rate_limiter = rate_limiter or SourceRateLimiter()
+        self.redemption_limiter = redemption_limiter or redemption_rate_limiter()
         self.origin = origin
         self.host = host
         self.tick_seconds = float(tick_seconds)
@@ -805,6 +878,10 @@ class HumanSurface:
         if not self.access.rate_limiter.allow(identity):
             raise _Denied()
 
+    def _limit_redemption(self, identity: str) -> None:
+        if not self.access.redemption_limiter.allow(identity):
+            raise _Denied()
+
     async def _body(self, request: _Request, *, json_required: bool) -> bytes:
         limit = request.route.body_limit
         content_type = _single(request.headers, b"content-type")
@@ -833,16 +910,67 @@ class HumanSurface:
             raise _Denied() from None
         await self._json(request.send, 200, options)
 
-    async def _finish_authentication(self, request: _Request) -> None:
-        self._limit(request.identity)
-        body = await self._body(request, json_required=True)
+    async def _begin_registration(self, request: _Request) -> None:
+        """Creation options for a valid invitation code (AUTH-013, D4, D5).
+
+        Order: the redemption limiter (before the body is parsed and before
+        any gate or SQLite work), the strict body ``{"code": <canonical
+        code>}``, the code's strict decoding, then
+        ``PasskeyCeremonies.begin_registration``, which binds a challenge to
+        the invitation and counts the per-code attempt inside the gate. Every
+        refusal is the generic denial.
+        """
+        self._limit_redemption(request.identity)
+        body = _json_object(await self._body(request, json_required=True))
+        if set(body) != {"code"}:
+            raise _Denied()
+        secret = _invitation_secret(body["code"])
         try:
-            credential = json.loads(body, object_pairs_hook=_no_duplicates,
-                                    parse_constant=_reject_constant)
-        except (ValueError, RecursionError):
+            options = await asyncio.to_thread(self.access.ceremonies.begin_registration,
+                                              secret, request.identity)
+        except Exception:
             raise _Denied() from None
+        await self._json(request.send, 200, options)
+
+    async def _finish_registration(self, request: _Request) -> None:
+        """Verify the registration and redeem the invitation (single use).
+
+        Same order as ``_begin_registration``.
+        ``PasskeyCeremonies.finish_registration`` consumes the challenge,
+        verifies the registration (type, challenge, exact origin, rpId hash,
+        UP and UV, attestation, algorithm, BE/BS) and commits the credential,
+        the redemption and its audit record in one conditional transaction
+        inside ``admit(epoch)``. Success is ``204`` with no body and no
+        cookie: the invited person signs in afterwards like anyone else. Only
+        ``DeviceBoundCredentialRequired`` has its own fixed ``409``.
+        """
+        self._limit_redemption(request.identity)
+        body = _json_object(await self._body(request, json_required=True))
+        if not {"code", "credential"} <= set(body) <= {"code", "credential", "label"}:
+            raise _Denied()
+        secret = _invitation_secret(body["code"])
+        credential = body["credential"]
         if not isinstance(credential, dict):
             raise _Denied()
+        label = _label(body.get("label"))
+        try:
+            enrolled = await asyncio.to_thread(self.access.ceremonies.finish_registration,
+                                               secret, request.identity, credential, label=label)
+        except DeviceBoundCredentialRequired:
+            await send_device_bound_required(request.send)
+            return
+        except Exception:
+            raise _Denied() from None
+        if not isinstance(enrolled, Credential):
+            raise _Denied()
+        await request.send({"type": "http.response.start", "status": 204, "headers": [
+            (b"cache-control", b"no-store"),
+        ]})
+        await request.send({"type": "http.response.body", "body": b""})
+
+    async def _finish_authentication(self, request: _Request) -> None:
+        self._limit(request.identity)
+        credential = _json_object(await self._body(request, json_required=True))
         try:
             grant = await asyncio.to_thread(self.access.ceremonies.finish_authentication,
                                             request.identity, credential)
@@ -879,12 +1007,18 @@ class HumanSurface:
     async def _sign_out(self, request: _Request) -> None:
         """End the caller's own session (Owner decision D7).
 
-        Exact ``Origin`` and ``X-CSRF-Token`` are required. The invalidation
-        and its ``sign_out_principal`` audit record commit inside the same
-        ``admit(epoch)`` as the authorization; while access is closed or the
+        Exact ``Origin`` and ``X-CSRF-Token`` are required. Two separate
+        gated commits run with the same epoch (Issue #232 item 3):
+        ``_authorize`` commits the authorization and its idle touch inside
+        one ``admit(epoch)``, then ``AccessStore.sign_out`` commits the
+        invalidation together with its ``sign_out_principal`` audit record
+        inside a second ``admit(epoch)``. A close, revocation or ``stop()``
+        between the two refuses the second, and a change that ended the
+        session in between makes it the generic denial; the race is harmless
+        because sign-out only removes access. While access is closed or the
         composition is stopped the sign-out is the generic denial and changes
-        nothing (accepted). Success clears the cookie with ``Max-Age=0`` and
-        the attributes it was set with.
+        nothing (accepted, D7). Success clears the cookie with ``Max-Age=0``
+        and the attributes it was set with.
         """
         body = await self._body(request, json_required=False)
         if body not in (b"", b"{}"):

@@ -61,7 +61,7 @@ EXPOSED = proc(("127.0.0.1", 8080, "0A"), ("100.64.0.10", 8443, "0A"))
 UNMOUNTED = ("/health", "/version", "/openapi.json", "/docs", "/api/live/1", "/api/sources",
              "/api/recordings", "/api/recordings/1/playback", "/api/recordings/1/download",
              "/api/events", "/api/timeline", "/api/access/invitations", "/diagnostics/export",
-             "/api/auth/registration", "/api/session/", "/", "/index.html")
+             "/api/auth/registration/", "/api/auth/registration/options/", "/api/session/", "/", "/index.html")
 
 
 class SyntheticAdmission:

@@ -410,8 +410,16 @@ class RouteTableTests(GatedFixture):
         self.assertEqual(encoded, GENERIC)
         self.assertIsNone(match_route({"method": "GET", "path": "/api/session", "raw_path": b"/api/session/"}))
         self.assertIsNone(match_route({"method": "GET", "path": "/api/séssion", "raw_path": None}))
-        self.assertIsNotNone(match_route({"method": "GET", "path": SESSION_PATH, "raw_path": None}))
+        self.assertIsNotNone(match_route({"method": "GET", "path": SESSION_PATH, "raw_path": SESSION_PATH.encode()}))
+        # Issue #232 item 2: without raw_path nothing matches (fail closed).
+        self.assertIsNone(match_route({"method": "GET", "path": SESSION_PATH, "raw_path": None}))
+        self.assertIsNone(match_route({"method": "GET", "path": SESSION_PATH}))
+        self.assertIsNone(match_route({"method": "GET", "path": SESSION_PATH, "raw_path": SESSION_PATH}))
+        self.assertEqual(await self.raw_call(SESSION_PATH, None, cookie), GENERIC)
+        self.assertEqual(await self.raw_call(SESSION_PATH, self.OMIT, cookie), GENERIC)
         self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=cookie)), 200)
+
+    OMIT = object()
 
     async def raw_call(self, path, raw_path, cookie):
         sent = []
@@ -422,6 +430,8 @@ class RouteTableTests(GatedFixture):
                         (b"tailscale-user-login", VIEWER.encode()), (b"cookie", cookie.encode())],
             "client": ("127.0.0.1", 40000), "server": ("127.0.0.1", 8080),
         }
+        if raw_path is self.OMIT:
+            del scope["raw_path"]
 
         async def receive():
             return {"type": "http.request", "body": b"", "more_body": False}

@@ -840,6 +840,64 @@ afterwards. The full Agent-side procedure and its refusal words are in
 [`agent/pairing/README.md`](../../agent/pairing/README.md); the real-LAN
 checks are MANUAL_TEST §B step 15 (not yet executed on real hosts).
 
+### Owner bootstrap and recovery (Issue #10 phase 2 S2)
+
+The first Owner, and an Owner who lost every passkey, get a single-use
+enrollment code from a local command on the Main Server (ADR-0003). There is
+no bootstrap web page or route: the code is redeemed through the ordinary
+invitation redemption at the reserved origin. No production entry point
+mounts the human routes yet, so until a deployment can enable them a code
+issued here cannot be redeemed (MANUAL_TEST §J, pending).
+
+Run it **as the service account** that owns the application database, from
+an interactive SSH or console session of an administrator, with the installed
+release's interpreter and that release directory as the working directory
+(there is no wrapper for this command; never run it as root, and never from a
+checkout):
+
+```sh
+cd /opt/server-sentinel-main/current
+sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
+  bootstrap --database <runtime_root>/state/state.sqlite3
+# later, only to recover the Owner:
+sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
+  recover --database <runtime_root>/state/state.sqlite3
+```
+
+- The command asks on the controlling terminal for the Owner's display name
+  (for `recover`: a new one, or empty to keep it) and for a typed
+  confirmation (`BOOTSTRAP` or `RECOVER`). It takes nothing secret from its
+  arguments or the environment, and refuses without a controlling terminal
+  (`controlling_terminal_required`, for example from a pipe, cron or a unit),
+  as root (`run_as_service_account`), and for a database path that is not the
+  canonical path of the existing database file owned by the running account
+  (`database_path_rejected`, `database_not_found`, `database_rejected`,
+  `database_schema_outdated`/`_unsupported`: it never creates or migrates a
+  database).
+- `bootstrap` works only while no Owner exists (`owner_already_configured`
+  otherwise; use `recover`). `recover` needs an existing Owner
+  (`owner_not_configured`).
+- After the change is committed, the code
+  (`XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`, 160 bits, valid 24 hours,
+  single use) is written to the controlling terminal only; standard output
+  gets `owner bootstrapped|recovered: principal_id=<uuid>
+  code_expires_at=<UTC time>`. Do not paste the code into a ticket, chat,
+  file or shell history; type it once into the browser at the reserved origin
+  and register a passkey with user verification on an authenticator you
+  control, then sign in.
+- `recover` ends every human session at once (the running service sees it on
+  the next request; no restart is needed), voids every pending invitation
+  (the Owner issues them again after signing in), and revokes every Owner
+  passkey on every device it synced to. Recordings, other people's
+  passkeys and permissions, and capture nodes are kept.
+- A lost or expired code is replaced only by running `recover`; an
+  unredeemed code leaves human access closed for the Owner. Refusals change
+  nothing and print one fixed word (`... refused: <word>`, exit 2).
+- The rows written are bounded (one principal or principal update, one
+  invitation, two or three audit records) and do not pass the running
+  service's storage admission; do not run it while the state filesystem is at
+  its hard stop.
+
 ## Install, update, and rollback
 
 **`capture_ca_directory` across update and rollback (Issue #109).**

@@ -35,6 +35,20 @@ class StepUpRequired(AccessValidationError):
         super().__init__("step_up_required")
 
 
+class OwnerAlreadyConfigured(AccessValidationError):
+    """Local bootstrap refused: an Owner principal already exists."""
+
+    def __init__(self) -> None:
+        super().__init__("owner is already configured")
+
+
+class OwnerNotConfigured(AccessValidationError):
+    """Local recovery refused: no Owner principal exists yet."""
+
+    def __init__(self) -> None:
+        super().__init__("owner is not configured")
+
+
 # ADR-0003 accepted parameters (Owner approval recorded 2026-09-21).
 IDLE_LIFETIME = timedelta(minutes=30)
 ABSOLUTE_LIFETIME = timedelta(hours=12)
@@ -296,6 +310,72 @@ class AccessStore:
                                (str(owner.id), owner.external_identity, owner.display_name, owner.role.value,
                                 owner.status.value, owner.authorization_revision, _us(owner.created_at)))
         return owner
+
+    @staticmethod
+    def owner_configured_on(connection) -> bool:
+        """Whether an Owner principal row exists (whatever its status)."""
+        return connection.execute("SELECT 1 FROM access_principals WHERE role='owner'").fetchone() is not None
+
+    def bootstrap_owner_on(self, connection, principal_id: UUID, display_name: str, secret: bytes,
+                           expires_at: datetime, *, at: datetime) -> UUID:
+        """Create the single Owner with one enrollment authorization (ADR-0003 steps 3-4).
+
+        Local bootstrap only (``app.auth.bootstrap_cli``), on a caller-owned
+        write transaction that also carries its audit records. The Owner is
+        created ``invited`` with no credential; redeeming the authorization
+        through the ordinary redemption route registers its first credential
+        and makes it ``active``. Refused with ``OwnerAlreadyConfigured`` when
+        any Owner row exists (the ``access_one_owner`` index refuses a
+        concurrent second one as well). Returns the invitation id.
+        """
+        if not isinstance(principal_id, UUID):
+            raise AccessValidationError("principal identity is invalid")
+        name = _display(display_name)
+        at = utc_time(at)
+        if self.owner_configured_on(connection):
+            raise OwnerAlreadyConfigured()
+        connection.execute("INSERT INTO access_principals VALUES (?, NULL, ?, ?, ?, 0, ?, NULL)",
+                           (str(principal_id), name, PrincipalRole.OWNER.value,
+                            PrincipalStatus.INVITED.value, _us(at)))
+        return self.issue_enrollment_on(connection, principal_id, secret, expires_at, at=at)
+
+    def recover_owner_on(self, connection, secret: bytes, expires_at: datetime, *, at: datetime,
+                         display_name: str | None = None) -> tuple[UUID, UUID, int]:
+        """Local Owner recovery on a caller-owned write transaction (ADR-0003).
+
+        In one transaction: advance the deployment authorization generation,
+        which ends every human session, deletes every pending challenge and
+        voids every outstanding enrollment authorization (the Owner's and
+        every invitee's; a pending invitation must be issued again,
+        ``invalidate_all_sessions_on``); revoke every credential of the Owner
+        principal (credential-scoped: a synced passkey stops on every device
+        it exists on) and its pending invitations; clear its last observed
+        proxy identity; advance its authorization revision; set it
+        ``invited`` (optionally renamed); and issue exactly one new
+        enrollment authorization under the new generation. The Owner keeps
+        its logical UUID (the ``access_one_owner`` index allows one Owner
+        row); recordings, grants of other principals and capture nodes are
+        untouched. Returns ``(owner id, invitation id, credentials revoked)``.
+        Refused with ``OwnerNotConfigured`` when no Owner exists.
+        """
+        at = utc_time(at)
+        name = None if display_name is None else _display(display_name)
+        row = connection.execute("SELECT id FROM access_principals WHERE role='owner'").fetchone()
+        if row is None:
+            raise OwnerNotConfigured()
+        owner = UUID(row["id"])
+        self.invalidate_all_sessions_on(connection, at=at)
+        revoked = connection.execute(
+            "UPDATE access_credentials SET revoked_at_us=? WHERE principal_id=? AND revoked_at_us IS NULL",
+            (_us(at), str(owner))).rowcount
+        connection.execute("UPDATE access_invitations SET revoked_at_us=? WHERE principal_id=? "
+                           "AND redeemed_at_us IS NULL AND revoked_at_us IS NULL", (_us(at), str(owner)))
+        connection.execute("UPDATE access_principals SET status=?, revoked_at_us=NULL, external_identity=NULL, "
+                           "display_name=COALESCE(?, display_name), "
+                           "authorization_revision=authorization_revision+1 WHERE id=?",
+                           (PrincipalStatus.INVITED.value, name, str(owner)))
+        invitation = self.issue_enrollment_on(connection, owner, secret, expires_at, at=at)
+        return owner, invitation, revoked
 
     def invite(self, display_name: str, permissions: Iterable[Permission], *, now: datetime | None = None) -> Principal:
         self._require_unaudited_writes()

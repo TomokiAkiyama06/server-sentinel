@@ -26,6 +26,14 @@ source is refused, which fails closed instead of growing.
 Logging is value-free: a limited request writes at most one
 ``human_request_rate_limited`` event per ``log_interval_seconds``, with no
 identity, digest, path or count.
+
+Invitation redemption (Issue #10 phase 2 S2, Owner decision D4) uses its own,
+stricter instance (``redemption_rate_limiter``): per source a burst of 5 and
+one more every 12 seconds, and a global bucket of 10 refilled every 6 seconds.
+It is a separate object with separate buckets, so a redemption flood never
+spends the sign-in buckets and a sign-in flood never spends the redemption
+ones. It comes on top of the per-code attempt bound
+(``store.MAX_REDEMPTION_ATTEMPTS``).
 """
 
 from __future__ import annotations
@@ -153,3 +161,22 @@ class SourceRateLimiter:
             # Value-free: no identity, digest, path or count.
             logging.getLogger(__name__).warning(Event.HUMAN_REQUEST_RATE_LIMITED)
         return False
+
+
+# Owner decision D4 (2026-10-11): per source burst 5, one per 12 seconds.
+REDEMPTION_PER_SOURCE_CAPACITY = 5
+REDEMPTION_PER_SOURCE_REFILL_SECONDS = 12.0
+# Global cap across every source (implementation bound): burst 10, then one
+# every 6 seconds (at most 10 per minute sustained).
+REDEMPTION_GLOBAL_CAPACITY = 10
+REDEMPTION_GLOBAL_REFILL_SECONDS = 6.0
+
+
+def redemption_rate_limiter(*, max_sources: int = 256,
+                            monotonic: Callable[[], float] = time.monotonic) -> SourceRateLimiter:
+    """The separate, stricter limiter for invitation redemption (D4)."""
+    return SourceRateLimiter(per_source_capacity=REDEMPTION_PER_SOURCE_CAPACITY,
+                             per_source_refill_seconds=REDEMPTION_PER_SOURCE_REFILL_SECONDS,
+                             global_capacity=REDEMPTION_GLOBAL_CAPACITY,
+                             global_refill_seconds=REDEMPTION_GLOBAL_REFILL_SECONDS,
+                             max_sources=max_sources, monotonic=monotonic)

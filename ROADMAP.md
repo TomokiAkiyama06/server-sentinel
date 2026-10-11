@@ -28,7 +28,7 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
   today (ADR-0005, `REQUIREMENTS.md` DIST-005)
 - [ ] versioned Main Server install / update / rollback lifecycle (#47)
 - [ ] first-run setup wizard and resumable initial configuration flow (#48)
-- [ ] deployment-owner authorization/bootstrap implementation — ADR-0003 and ADR-0004 Accepted; WebAuthn ceremony core (unmounted) in progress, route mounting and remaining Issue #10 gates pending
+- [ ] deployment-owner authorization/bootstrap implementation — ADR-0003 and ADR-0004 Accepted; WebAuthn ceremony core, sign-in/session/sign-out (phase 1, S1), invitation redemption and the local Owner bootstrap/recovery command (S2) exist behind a composition no production entry point builds yet; step-up, Owner administration and the remaining Issue #10 gates pending
 - [ ] trusted Tailscale/private-proxy identity boundary
 
 ## Phase 2 — Camera Source + Capture Node platform

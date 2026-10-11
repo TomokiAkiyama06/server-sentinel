@@ -1,9 +1,9 @@
 """Per-person WebAuthn/passkey ceremonies for Issue #10 (ADR-0004, ADR-0003).
 
 ``PasskeyCeremonies`` composes the pure verifier in ``webauthn.py`` with the
-transactional state in ``AccessStore``. It registers no HTTP route: human route
-mounting stays closed until the remaining Issue #10 gates pass. A future route
-passes in the request body, the trusted-proxy identity (supplementary only) and
+transactional state in ``AccessStore``. It registers no HTTP route itself:
+``human_surface.py`` passes in the request body (the invitation code decoded
+by ``invitation_code``), the trusted-proxy identity (supplementary only) and
 the session cookie value, and maps the results to responses.
 
 Invariants enforced here:

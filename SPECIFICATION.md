@@ -1765,6 +1765,22 @@ the same generic response as an uninvited person, and logs record the attempt
 without the raw code. Every other human/media route requires a verified
 credential and an active session.
 
+Implementation (Issue #10 phase 2 S2, Owner decisions D4/D5 of 2026-10-11):
+`POST /api/auth/registration/options` (body `{"code"}`) and `POST
+/api/auth/registration` (body `{"code", "credential", "label"?}`, `204` with no
+body and no cookie). A code is 160 CSPRNG bits shown as 32 Crockford base32
+characters in eight groups of four (`XXXX-XXXX-…`), checked by the SHA-256 of
+all 160 bits, valid 24 hours (a fixed value in this release, not yet a
+deployment key) and single use; the server accepts only the exact canonical
+form. Redemption has its own per-source limiter keyed by the verified proxy
+identity (burst 5, one per 12 seconds) plus a global bucket (burst 10, one per
+6 seconds), charged before the body is parsed or any lock is taken, on top
+of the per-code bound of 5 attempts. Every refusal is the generic `404`; the
+only other answer is the fixed `409 {"detail":"device_bound_credential_required"}`
+for a valid invitation under a device-bound deployment policy. The local
+bootstrap/recovery command is `python -m app.auth.bootstrap_cli
+bootstrap|recover` (`server/app/auth/README.md`, `server/docs/DEPLOYMENT.md`).
+
 Unauthorized users get no ServerSentinel deployment metadata, camera names/counts, thumbnails, event details, or recordings. For an uninvited identity, prefer a generic/non-branding denial such as a not-found-style response and do not expose product/version headers, API schema, health details, or other ServerSentinel fingerprints. This does not claim that the underlying Tailscale node/service is network-invisible when Tailnet policy is unchanged.
 
 ### 11.6 Browser-only recording access
