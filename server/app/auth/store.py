@@ -1391,6 +1391,25 @@ class AccessStore:
             self._record_binding_mismatch(mismatch, at)
             raise
 
+    def pending_step_up_challenge(self, digest: bytes, *, at: datetime | None = None) -> UUID | None:
+        """The session a pending, unexpired step-up challenge is bound to; read only.
+
+        Nothing is deleted: ``accept_assertion`` deletes the challenge in the
+        transaction that refreshes the session (PR #236 review), and a refused
+        step-up spends it through ``consume_challenge``. The window is checked
+        at a time read inside the transaction; ``at`` pins it for tests only.
+        """
+        pinned = None if at is None else utc_time(at)
+        if not isinstance(digest, bytes) or len(digest) != 32:
+            return None
+        with self._transaction() as connection:
+            now = self._in_transaction_time(pinned)
+            row = connection.execute("SELECT session_id, issued_at_us, expires_at_us FROM access_webauthn_challenges WHERE challenge_digest=? AND ceremony='step_up'",
+                                     (digest,)).fetchone()
+        if row is None or row["session_id"] is None or not row["issued_at_us"] <= _us(now) < row["expires_at_us"]:
+            return None
+        return UUID(row["session_id"])
+
     def current_session(self, token: object, proxy_identity: object, *, at: datetime) -> SessionView | None:
         """Lookup of a currently valid session; records no activity.
 
@@ -1431,7 +1450,8 @@ class AccessStore:
     def accept_assertion(self, credential_id: bytes, principal_id: UUID, proxy_identity: str, *,
                          expected_sign_count: int, sign_count: int, backup_state: bool,
                          at: datetime | None = None,
-                         token: bytes | None = None, step_up_session_id: UUID | None = None) -> UUID:
+                         token: bytes | None = None, step_up_session_id: UUID | None = None,
+                         step_up_challenge: bytes | None = None) -> UUID:
         """Commit a verified assertion: counter, backup state, last use and its session effect.
 
         With ``token`` a new session is established (sign-in); with
@@ -1439,7 +1459,11 @@ class AccessStore:
         refreshed, but only when the session is an Owner's, was created by
         this very credential, and the boot clock can be read (a step-up that
         could never make the session fresh is refused rather than reported
-        as done). The verification time is recorded with the boot id and
+        as done). A step-up also requires ``step_up_challenge``, the digest of
+        that session's pending, unexpired step-up challenge, which is deleted
+        in this same transaction: a refused commit rolls the deletion back,
+        and a challenge is never spent by a refresh that did not happen
+        (PR #236 review). The verification time is recorded with the boot id and
         ``CLOCK_BOOTTIME`` read in the same transaction. The counter update
         is conditional on the value the signature was checked against, so
         two racing assertions cannot both advance it. The audit record commits in the same transaction.
@@ -1456,6 +1480,10 @@ class AccessStore:
         not refreshed; ``at`` pins it for tests only.
         """
         if (token is None) == (step_up_session_id is None):
+            raise AccessValidationError("access is unavailable")
+        if (step_up_challenge is not None) != (step_up_session_id is not None) or (
+                step_up_challenge is not None
+                and (not isinstance(step_up_challenge, bytes) or len(step_up_challenge) != 32)):
             raise AccessValidationError("access is unavailable")
         pinned = None if at is None else utc_time(at)
         identity = _identity(proxy_identity)
@@ -1494,6 +1522,11 @@ class AccessStore:
                         or _us(at) >= session["idle_expires_at_us"] or _us(at) >= session["absolute_expires_at_us"]
                         or self._session_binding is None
                         or not self._session_binding.matches(session["external_identity_binding"], identity)):
+                    raise AccessValidationError("access is unavailable")
+                # Spent only by this commit: a refusal below rolls it back.
+                challenge = connection.execute("DELETE FROM access_webauthn_challenges WHERE challenge_digest=? AND ceremony='step_up' AND session_id=? RETURNING issued_at_us, expires_at_us",
+                                               (step_up_challenge, session["id"])).fetchone()
+                if challenge is None or not challenge["issued_at_us"] <= _us(at) < challenge["expires_at_us"]:
                     raise AccessValidationError("access is unavailable")
                 connection.execute("UPDATE access_sessions SET last_user_verification_at_us=?, last_user_verification_boot_id=?, "
                                    "last_user_verification_boottime_us=? WHERE id=?",

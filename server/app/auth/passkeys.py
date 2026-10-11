@@ -427,25 +427,62 @@ class PasskeyCeremonies:
         verification time untouched. The new verification time and its boot
         pair are read inside the commit transaction (``accept_assertion``),
         so the five-minute window starts when the refresh commits.
+
+        The pending challenge is only read (``pending_step_up_challenge``)
+        before verification. It is deleted in the very transaction that
+        refreshes the session, inside ``admit(epoch)`` (PR #236 review): a
+        ``stop()``, failed check tick or close/reopen after
+        ``_step_up_epoch`` refuses that admission and rolls nothing forward,
+        so a step-up refused by the session gate is a no-op and leaves the
+        challenge pending. An assertion whose envelope or client data does not
+        parse (``assertion_claims``) consumes nothing, as before. Any other
+        refusal (bad signature, user verification missing, another credential
+        or session, an expired or unknown challenge, a refused commit) spends
+        the challenge: it is consumed in its own transaction, again inside
+        ``admit(epoch)``, so it is single use exactly as before; only if the
+        gate refuses that consumption too does it stay pending until expiry.
         """
+        # First: a close after this point refuses the commit (Issue #144).
         try:
-            # First: a close after this point refuses the commit (Issue #144).
             epoch = self._step_up_epoch(epoch)
+        except Exception:
+            raise CeremonyDenied() from None
+        digest = None
+        gate_refused = False
+        try:
             at = self._now()
             claims = webauthn.assertion_claims(credential, self.rp)
-            consumed = self.store.consume_challenge(_digest(claims.challenge), "step_up")
+            digest = _digest(claims.challenge)
+            bound_session = self.store.pending_step_up_challenge(digest)
             session = self.store.current_session(token, proxy_identity, at=at)
-            if (session is None or consumed.session_id != session.session_id
+            if (session is None or bound_session is None or bound_session != session.session_id
                     or claims.credential_id != session.credential_id):
                 raise CeremonyDenied()
             principal, stored, verified = self._verified_assertion(credential, claims, require_user_handle=False)
             if principal.id != session.principal_id:
                 raise CeremonyDenied()
+            gate_refused = True
             with self.session_gate.admit(epoch):
+                gate_refused = False
                 self.store.accept_assertion(
                     stored.credential_id, principal.id, proxy_identity,
                     expected_sign_count=stored.sign_count, sign_count=verified.sign_count,
                     backup_state=verified.backup_state,
-                    step_up_session_id=session.session_id)
+                    step_up_session_id=session.session_id, step_up_challenge=digest)
         except Exception:
+            if digest is not None and not gate_refused:
+                self._spend_step_up_challenge(digest, epoch)
             raise CeremonyDenied() from None
+
+    def _spend_step_up_challenge(self, digest: bytes, epoch: int) -> None:
+        """Consume a refused step-up's challenge under ``admit(epoch)``; best effort.
+
+        Lock order gate -> storage admission -> SQLite, as at every commit. A
+        gate refusal here consumes nothing; the challenge then expires
+        unused (a close that revokes sessions deletes it at once).
+        """
+        try:
+            with self.session_gate.admit(epoch):
+                self.store.consume_challenge(digest, "step_up")
+        except Exception:
+            pass

@@ -962,7 +962,23 @@ and no cookie; the client then retries the Owner operation, which is
 re-checked server-side. A cancelled, failed or refused step-up changes no
 verification time, counter, backup state or audit record; the only write is
 the authorization's idle touch, as for any authenticated request, and a
-consumed challenge. Each refused finish increments the value-free
+consumed challenge.
+
+Challenge consumption (PR #236 review). Before verification the pending
+challenge is only read (`AccessStore.pending_step_up_challenge`). A successful
+step-up deletes it in the commit transaction itself
+(`accept_assertion(step_up_challenge=...)`, inside `admit(epoch)`, lock order
+gate -> storage admission -> SQLite), so a refused commit rolls the deletion
+back. A step-up refused by the session gate — `stop()`, a failed check tick or
+a close/reopen after the epoch check — is therefore a no-op: the challenge
+stays pending until it is answered or expires (a close that revokes sessions
+deletes it). An assertion whose envelope or client data (type, origin) does
+not parse is refused before its challenge is known and consumes nothing, as
+before. Every other refusal (bad signature, missing UP/UV, rpId hash, counter
+or BE/BS, another credential or session, an unknown or expired challenge, a
+commit refused inside its transaction) spends the challenge through `consume_challenge` in its own transaction, again inside
+`admit(epoch)`, so it stays single use; only when the gate refuses that
+consumption too is it left to expire. Each refused finish increments the value-free
 `HumanAccess.refused_step_ups`, and `owner_step_up_refused` is logged on the
 first refusal and each power of two, with no token, CSRF token, challenge,
 credential, identity or reason.

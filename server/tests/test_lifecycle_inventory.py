@@ -2589,8 +2589,9 @@ class LifecycleInventoryTests(unittest.TestCase):
         access.begin_step_up(owner_token, identity, challenge, at=clock[0],
                              lifetime=timedelta(minutes=5))
         tick(seconds=4)
-        access.consume_challenge(challenge, "step_up", at=clock[0])
-        assertion(owner.id, owner_credential, step_up_session_id=owner_session)
+        # The refresh deletes its own challenge in the commit transaction.
+        assertion(owner.id, owner_credential, step_up_session_id=owner_session,
+                  step_up_challenge=challenge)
         # A principal whose credential turns inconsistent, then is revoked
         # with a second, still open invitation.
         gone = access.invite("Synthetic revoked viewer",

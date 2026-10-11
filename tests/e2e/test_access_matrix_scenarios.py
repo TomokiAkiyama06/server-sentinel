@@ -189,6 +189,7 @@ class AccessMatrixScenarios(unittest.TestCase):
                                  unaudited_writes=True, session_binding=SessionBindingKey.generate(),
                                  boot_clock=self.boot_instant)
         self.gate = OpenGate()
+        self.step_up_digests = {}
         self.identities = {
             "live_only": self.member("live_only", (LIVE,)),
             "recordings_only": self.member("recordings_only", (RECORDINGS,)),
@@ -398,19 +399,24 @@ class AccessMatrixScenarios(unittest.TestCase):
         return identity
 
     def step_up_challenge(self, identity):
+        digest = secrets.token_bytes(32)
         try:
-            self.store.begin_step_up(identity.token, identity.external_identity, secrets.token_bytes(32),
+            self.store.begin_step_up(identity.token, identity.external_identity, digest,
                                      lifetime=timedelta(minutes=5))
         except AccessValidationError as error:
             self.assertEqual(GENERIC_DENIAL, str(error))
             return False
+        self.step_up_digests[identity.token] = digest
         return True
 
     def step_up_commit(self, session_holder, credential_id, principal_id):
+        # The holder's pending step-up challenge, or one that was never issued.
+        digest = self.step_up_digests.get(session_holder.token, secrets.token_bytes(32))
         try:
             self.store.accept_assertion(credential_id, principal_id, session_holder.external_identity,
                                         expected_sign_count=0, sign_count=0, backup_state=False,
-                                        step_up_session_id=session_holder.session_id)
+                                        step_up_session_id=session_holder.session_id,
+                                        step_up_challenge=digest)
         except AccessValidationError as error:
             self.assertEqual(GENERIC_DENIAL, str(error))
             return False
@@ -447,15 +453,19 @@ class AccessMatrixScenarios(unittest.TestCase):
             self.assertEqual(challenges, connection.execute(
                 "SELECT count(*) FROM access_webauthn_challenges").fetchone()[0])
         # Another person's credential cannot refresh the stale Owner session,
-        # under either principal; nor can a member refresh their own session.
+        # under either principal, even with the Owner's pending challenge;
+        # nor can a member refresh their own session.
+        self.assertTrue(self.step_up_challenge(owner))
         self.assertFalse(self.step_up_commit(owner, both.credential_id, both.principal.id))
         self.assertFalse(self.step_up_commit(owner, both.credential_id, owner.principal.id))
         self.assertFalse(self.step_up_commit(both, both.credential_id, both.principal.id))
         self.assert_stale(owner)
         self.assertEqual([], self.step_up_audits())
-        # The Owner's own credential refreshes it, audited with the logical UUID only.
-        self.assertTrue(self.step_up_challenge(owner))
+        # The Owner's own credential refreshes it with that same challenge (the
+        # refused commits rolled back without spending it), audited with the
+        # logical UUID only; the challenge is spent by this commit alone.
         self.assertTrue(self.step_up_commit(owner, owner.credential_id, owner.principal.id))
+        self.assertFalse(self.step_up_commit(owner, owner.credential_id, owner.principal.id))
         self.assertIsNotNone(self.request(owner, Requirement.OWNER_OP))
         (record,) = self.step_up_audits()
         self.assertEqual((record.actor_category.value, record.target_logical_id, record.outcome.value),

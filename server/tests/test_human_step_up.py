@@ -252,7 +252,8 @@ class OtherPersonTests(StepUpFixture):
         with self.assertRaises(AccessValidationError):
             self.store.accept_assertion(credential.credential_id, view.principal_id, VIEWER,
                                         expected_sign_count=0, sign_count=0, backup_state=False,
-                                        step_up_session_id=view.session_id)
+                                        step_up_session_id=view.session_id,
+                                        step_up_challenge=secrets.token_bytes(32))
         self.assertEqual(self.verification(viewer), before)
 
 
@@ -532,6 +533,80 @@ class ClosedAccessTests(StepUpFixture):
                 self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
         self.assertEqual(await self.owner_operation(cookie, csrf), STEP_UP)
         self.assertEqual(status(await self.step_up(cookie, csrf, key)), 204)
+
+    async def test_a_gate_refusal_after_the_epoch_check_spends_no_challenge(self):
+        """PR #236 review: an interruption between ``_step_up_epoch()`` and the
+        final ``admit(epoch)`` refuses the step-up as a no-op; the pending
+        challenge stays stored and the same assertion succeeds later."""
+        _, key, _, cookie, csrf = await self.owner_session()
+        self.elapse(minutes=6)
+        real_epoch = self.ceremonies._step_up_epoch
+
+        def stop():
+            self.access.stop()
+
+        def fail_tick():
+            # What run() does when a periodic tick raises.
+            self.access._serving = False
+
+        def cycle():
+            # Closes without an exposure (nothing revoked) and reopens.
+            self.close_access()
+            self.reopen_access()
+
+        for name, interrupt, restart in (("stop", stop, True), ("tick failure", fail_tick, True),
+                                         ("close/reopen", cycle, False)):
+            with self.subTest(interrupt=name):
+                begun = await self.begin(cookie, csrf)
+                assertion = key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST)
+                before = self.unchanged_state(cookie)
+                self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
+                fired = []
+
+                def epoch_then_interrupt(*args, **kwargs):
+                    epoch = real_epoch(*args, **kwargs)
+                    fired.append(True)
+                    interrupt()
+                    return epoch
+
+                with patch.object(self.ceremonies, "_step_up_epoch", side_effect=epoch_then_interrupt):
+                    result = await self.finish(cookie, csrf, assertion)
+                self.assertEqual(fired, [True])
+                self.assertEqual(result, GENERIC)
+                # Nothing changed: the challenge is still pending, the session
+                # unverified, the counter and the audit untouched.
+                self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
+                self.assertEqual(self.unchanged_state(cookie), before)
+                if restart:
+                    await self.restart()
+                self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
+                self.assertEqual(await self.owner_operation(cookie, csrf), STEP_UP)
+                # The refused request was a no-op: the same answer now commits.
+                self.assertEqual(status(await self.finish(cookie, csrf, assertion)), 204)
+                self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+                self.elapse(minutes=6)
+
+    async def test_a_genuinely_failed_step_up_spends_its_challenge(self):
+        """Single use as before: a bad signature, another session's challenge
+        context or a commit refused inside its transaction spends the challenge."""
+        _, key, _, cookie, csrf = await self.owner_session()
+        self.elapse(minutes=6)
+        before = self.unchanged_state(cookie)
+        begun = payload(await self.begin(cookie, csrf))
+        self.assertEqual(await self.finish(
+            cookie, csrf, key.assertion(begun, origin=ORIGIN, rp_id=HOST, tamper=True)), GENERIC)
+        self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+        self.assertEqual(await self.finish(
+            cookie, csrf, key.assertion(begun, origin=ORIGIN, rp_id=HOST)), GENERIC)
+        self.assertEqual(self.unchanged_state(cookie), before)
+        # Refused inside the commit transaction (no readable boot clock): the
+        # deletion rolls back with it, then the refusal spends the challenge.
+        begun = payload(await self.begin(cookie, csrf))
+        with patch.object(self.store, "_boot_instant", return_value=None):
+            self.assertEqual(await self.finish(
+                cookie, csrf, key.assertion(begun, origin=ORIGIN, rp_id=HOST)), GENERIC)
+        self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+        self.assertEqual(self.unchanged_state(cookie), before)
 
     async def test_the_ceremony_commits_under_the_authorization_epoch(self):
         """A close/reopen cycle between the authorization and the ceremony
