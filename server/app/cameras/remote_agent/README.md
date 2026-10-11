@@ -202,7 +202,9 @@ descriptor SQLite opened must be the pinned inode, checked via `/proc/self/fd`);
 `deployment_ca_validity_insufficient` before any
 approval when the CA can no longer cover a 397-day node leaf. The bootstrap
 listener sets `SO_REUSEADDR` (never `SO_REUSEPORT`) so a re-run binds while the
-previous run's connections are in TIME_WAIT. `init` validates
+previous run's connections are in TIME_WAIT; the ingest listener
+(`open_ingest_listener`) does the same, before bind, so a restarted Main
+rebinds at once and agents can reconnect (Issue #223). `init` validates
 the server name, both validity periods and both destination directories before
 it writes the write-once CA, and removes what it created if listener issuance
 still fails, so a corrected rerun works without manual secret-file cleanup.

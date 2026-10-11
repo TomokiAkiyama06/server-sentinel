@@ -286,6 +286,13 @@ def open_ingest_listener(config: IngestListenerConfig) -> socket.socket:
     family = socket.AF_INET6 if ipaddress.ip_address(config.bind_host).version == 6 else socket.AF_INET
     listener = socket.socket(family, socket.SOCK_STREAM)
     try:
+        # SO_REUSEADDR lets Main rebind right after a restart while the previous
+        # process's capture connections sit in TIME_WAIT, so agents can
+        # reconnect at once (Issue #223). It must be set before bind. On Linux
+        # it never lets a second socket bind a port that is already listening,
+        # so it does not enable port hijacking; SO_REUSEPORT, which would, is
+        # deliberately not set.
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((config.bind_host, config.port))
         listener.listen(config.backlog)
     except OSError:
