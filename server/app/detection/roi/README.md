@@ -152,6 +152,13 @@ retires the old stream even when that frame is itself sampled out. The retired
 history holds at most `RETIRED_PRODUCER_LIMIT` (1024) ids per source and is
 never evicted from; when it is full a further replacement stream is refused and
 the source reports `stream_history_exhausted` until the runtime is restarted.
+The refused replacement also shows that the current stream is stale, so from
+then on no sample of that source is admitted at all (its pending sample is
+dropped), and its conclusions are `unknown` (`stream_history_exhausted`).
+A calibration refresh request (`request_calibration_refresh()`) is deferred
+while a held loss or a loss just taken from the capture slot is still to be
+handed to the current detector, so the refresh never discards the scene-shift
+state a loss must be correlated with; it runs on the next pass.
 
 The default sample interval
 is a conservative 1 sample/s per source, evaluated by one worker thread for
@@ -189,7 +196,16 @@ staged observation until the recorder accepts it, the runtime briefly reports
 `degraded` during normal delivery of each confirmation as well; that is
 expected and returns to `running` once the recorder accepts it. The runtime
 status itself reports `unavailable` when its worker or delivery thread is no
-longer running. The Main application's `scene_monitoring_state` follows the
+longer running (outside `stop()`, where both end by design); every source is
+then reported `inactive` and `unknown` (`worker_unavailable` /
+`delivery_unavailable`) without changing the stored results, and
+`scene_monitoring_unavailable` is logged once by the runtime. If the worker
+thread cannot be started after the delivery thread started, `start()` closes
+the delivery thread within a bounded wait (5 s), keeps no unstarted thread,
+reports `unavailable` (`worker_start_failed`) and raises; a later `stop()`
+does not fail on it. A worker that outlived its stop bound and then fails
+leaves the `stop_failed` state and the `stopped` reasons unchanged. The Main
+application's `scene_monitoring_state` follows the
 runtime status while it runs (those conditions are `degraded`; a failed or dead
 worker or delivery thread, or an unreadable status, is `unavailable`). No route
 reads the runtime status before #10.

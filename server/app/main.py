@@ -282,9 +282,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 if lost:
                     # A worker or delivery thread that is gone (or a status
                     # that cannot be read) evaluates or delivers nothing.
+                    # Logged once here (the loop ends on a non-live state); an
+                    # `unavailable` the runtime status reports itself was
+                    # already logged by the runtime and is not logged again.
                     state = SceneRuntimeState.UNAVAILABLE
-                if state is SceneRuntimeState.UNAVAILABLE:
-                    # Logged once: the loop ends on a non-live state.
                     logging.getLogger(__name__).error(Event.SCENE_MONITORING_UNAVAILABLE)
                 application.state.scene_monitoring_state = state
 

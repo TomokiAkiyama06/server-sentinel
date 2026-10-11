@@ -704,9 +704,10 @@ class SceneRuntimeReviewRegressionTests(unittest.TestCase):
             for stream in streams[:3]:
                 self.assertTrue(offer(stream))
                 harness.runtime.step()
-            # A fourth stream would mean forgetting a retired one: refused.
+            # A fourth stream would mean forgetting a retired one: refused,
+            # and the current stream is then refused too (until restart).
             self.assertFalse(offer(streams[3]))
-            self.assertTrue(offer(streams[2]))
+            self.assertFalse(offer(streams[2]))
         status = harness.runtime.status()
         self.assertIs(SceneSourceState.DEGRADED, status.sources[0].state)
         self.assertEqual("stream_history_exhausted", status.sources[0].reason)
@@ -1085,6 +1086,249 @@ class SceneRuntimeFollowUpRegressionTests(unittest.TestCase):
         self.assertFalse(any("scene_critical_recorder_stalled" in line for line in logs.output))
 
 
+class SceneRuntimeThirdReviewRegressionTests(unittest.TestCase):
+    """Regressions for the #213 review findings on 36da242."""
+
+    def test_history_exhaustion_refuses_the_previous_stream_too(self):
+        # Codex P2 (#213): after the refused replacement, frames of the
+        # previous producer stream are stale as well and never confirm.
+        harness = Harness(binding(OTHER, SourceType.REMOTE_AGENT))
+        harness.runtime.start()
+        streams = [uuid4() for _ in range(4)]
+
+        def offer(stream, luma=None, step=True):
+            harness.clock.value += INTERVAL
+            offered = harness.runtime.offer_luma(OTHER, stream_id=stream, width=WIDTH,
+                                                 height=HEIGHT, pixels=luma or pixels())
+            if step:
+                harness.runtime.step()
+            return offered
+
+        with mock.patch("app.detection.roi.runtime.RETIRED_PRODUCER_LIMIT", 2):
+            for stream in streams[:3]:
+                self.assertTrue(offer(stream))
+            self.assertTrue(offer(streams[2]))
+            self.assertEqual(Observation.ABSENT, harness.source(OTHER).movement)
+            # A sample of the current stream pending when the replacement
+            # arrives is dropped, not evaluated.
+            self.assertTrue(offer(streams[2], MOVED, step=False))
+            self.assertFalse(offer(streams[3]))
+            accepted = harness.source(OTHER).accepted
+            for _ in range(4):
+                self.assertFalse(offer(streams[2], MOVED))
+        self.assertEqual([], harness.recorder.items)
+        source = harness.source(OTHER)
+        self.assertEqual(accepted, source.accepted)
+        self.assertEqual(5, source.stale_rejected)
+        self.assertIs(SceneSourceState.DEGRADED, source.state)
+        self.assertEqual("stream_history_exhausted", source.reason)
+        self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN), (source.movement, source.tamper))
+        self.assertEqual("stream_history_exhausted", source.movement_reason)
+        self.assertIs(SceneRuntimeState.DEGRADED, harness.runtime.status().state)
+
+    def test_calibration_refresh_waits_for_a_loss_taken_from_the_slot(self):
+        # Codex P2 (#213): a refresh racing with a queued loss must not replace
+        # the detector before the loss is correlated with the scene shift.
+        calls = []
+
+        def calibrations(item):
+            calls.append(item.source_id)
+            return calibration_for(item)
+
+        harness = Harness(calibrations=calibrations)
+        harness.runtime.start()
+        harness.frame()
+        harness.frame()
+        self.assertEqual("global_scene_shift", harness.frame(SHIFTED).tamper_reason)
+        self.assertEqual(1, len(calls))
+        harness.clock.value += 5
+        harness.runtime.on_uvc_health(HealthEvent(SOURCE, CameraState.OFFLINE, "synthetic_unplug"))
+        harness.runtime.request_calibration_refresh()
+        harness.runtime.step()
+        self.assertEqual([CriticalKind.CAMERA_TAMPER], harness.recorder.kinds())
+        self.assertEqual("source_loss_after_scene_shift", harness.recorder.items[0].reason)
+        self.assertEqual(1, len(calls))
+        # The deferred refresh runs on the next pass.
+        harness.runtime.step()
+        self.assertEqual(2, len(calls))
+        self.assertEqual("awaiting_sample", harness.source().reason)
+
+    def test_worker_start_failure_rolls_back_the_delivery_thread(self):
+        # Codex P2 (#213): a worker thread that cannot be started leaves no
+        # delivery thread running and no unstarted thread for stop() to join.
+        harness = Harness(threaded=True)
+        original = threading.Thread.start
+
+        def start(thread):
+            if thread.name == "scene-monitoring":
+                raise RuntimeError("synthetic thread exhaustion")
+            return original(thread)
+
+        with mock.patch.object(threading.Thread, "start", start):
+            with self.assertRaises(RuntimeError):
+                harness.runtime.start()
+        status = harness.runtime.status()
+        self.assertIs(SceneRuntimeState.UNAVAILABLE, status.state)
+        self.assertFalse(status.worker_running)
+        self.assertFalse(status.delivery_running)
+        self.assertEqual("worker_start_failed", status.sources[0].reason)
+        self.assertIsNone(harness.runtime._thread)
+        self.assertFalse(harness.runtime._pump._thread.is_alive())
+        harness.runtime.on_uvc_frame(SOURCE, VideoFrame(yuyv(pixels()), 1, 0.0))
+        self.assertEqual(0, harness.source().accepted)
+        stopped = harness.runtime.stop(timeout=1.0)
+        self.assertIs(SceneRuntimeState.UNAVAILABLE, stopped.state)
+        self.assertFalse(stopped.delivery_running)
+
+    def test_delivery_thread_start_failure_retains_no_thread(self):
+        harness = Harness(threaded=True)
+        original = threading.Thread.start
+
+        def start(thread):
+            if thread.name == "scene-critical-delivery":
+                raise RuntimeError("synthetic thread exhaustion")
+            return original(thread)
+
+        with mock.patch.object(threading.Thread, "start", start):
+            with self.assertRaises(RuntimeError):
+                harness.runtime.start()
+        self.assertIsNone(harness.runtime._pump._thread)
+        self.assertIsNone(harness.runtime._thread)
+        self.assertIs(SceneRuntimeState.UNAVAILABLE, harness.runtime.stop(timeout=1.0).state)
+
+    def test_dead_delivery_thread_masks_every_published_conclusion(self):
+        # Claude (#213): a runtime-derived UNAVAILABLE presents no conclusion
+        # as current, without changing the stored results; logged once.
+        harness = Harness(binding(), binding(OTHER), threaded=True)
+        harness.runtime.start()
+        self.addCleanup(harness.runtime.stop, 1.0)
+        harness.frame()
+        self.assertEqual(Observation.ABSENT, harness.frame().movement)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            harness.runtime._pump.close(1.0)
+            first = harness.runtime.status()
+            second = harness.runtime.status()
+        self.assertEqual(1, sum("scene_monitoring_unavailable" in line for line in logs.output))
+        for status in (first, second):
+            self.assertIs(SceneRuntimeState.UNAVAILABLE, status.state)
+            for source in status.sources:
+                self.assertIs(SceneSourceState.INACTIVE, source.state)
+                self.assertEqual("delivery_unavailable", source.reason)
+                self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN),
+                                 (source.movement, source.tamper))
+                self.assertEqual("delivery_unavailable", source.movement_reason)
+        self.assertEqual(Observation.ABSENT, harness.runtime._published[SOURCE].movement)
+
+    def test_dead_worker_thread_masks_every_published_conclusion(self):
+        harness = Harness(threaded=True)
+        harness.runtime.start()
+        self.addCleanup(harness.runtime.stop, 1.0)
+        harness.frame()
+        self.assertEqual(Observation.ABSENT, harness.frame().movement)
+
+        def exits():
+            # Leaves the worker without the failure path (not an Exception).
+            raise SystemExit
+
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            harness.runtime._cycle = exits
+            harness.runtime.request_calibration_refresh()
+            self.assertTrue(wait_for(lambda: not harness.runtime.status().worker_running))
+        self.assertEqual(1, sum("scene_monitoring_unavailable" in line for line in logs.output))
+        status = harness.runtime.status()
+        self.assertIs(SceneRuntimeState.UNAVAILABLE, status.state)
+        source = status.sources[0]
+        self.assertEqual("worker_unavailable", source.reason)
+        self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN), (source.movement, source.tamper))
+
+    def test_stopping_window_is_not_reported_unavailable(self):
+        # Claude (#213): between the worker ending and the delivery thread
+        # closing, stop() in progress is not a lost thread.
+        recorder = BlockingRecorder()
+        self.addCleanup(recorder.release.set)
+        harness = Harness(recorder=recorder, threaded=True)
+        harness.runtime.start()
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        self.assertTrue(recorder.entered.wait(5))
+        result = {}
+        stopper = threading.Thread(target=lambda: result.update(
+            status=harness.runtime.stop(timeout=5.0)))
+        stopper.start()
+        self.addCleanup(stopper.join, 10)
+        self.assertTrue(wait_for(lambda: not harness.runtime.status().worker_running))
+        self.assertTrue(stopper.is_alive())
+        during = harness.runtime.status()
+        self.assertIsNot(SceneRuntimeState.UNAVAILABLE, during.state)
+        self.assertTrue(during.delivery_running)
+        recorder.release.set()
+        stopper.join(10)
+        self.assertIs(SceneRuntimeState.STOPPED, result["status"].state)
+        self.assertEqual([CriticalKind.SERVER_MOVEMENT], recorder.kinds())
+
+    def test_worker_failing_after_outliving_stop_keeps_stop_failed(self):
+        # Claude (#213): a worker that outlived its stop bound and then
+        # raises neither becomes UNAVAILABLE nor rewrites the stop reasons.
+        harness = Harness(threaded=True)
+        harness.runtime.start()
+        harness.frame()
+        harness.frame()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def broken():
+            entered.set()
+            release.wait(10)
+            raise RuntimeError("synthetic late worker failure")
+
+        harness.runtime._cycle = broken
+        harness.runtime.request_calibration_refresh()
+        self.assertTrue(entered.wait(5))
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            stopped = harness.runtime.stop(timeout=0.1)
+            self.assertIs(SceneRuntimeState.STOP_FAILED, stopped.state)
+            release.set()
+            self.assertTrue(wait_for(lambda: not harness.runtime.status().worker_running))
+        status = harness.runtime.status()
+        self.assertIs(SceneRuntimeState.STOP_FAILED, status.state)
+        source = status.sources[0]
+        self.assertIs(SceneSourceState.INACTIVE, source.state)
+        self.assertEqual("stopped", source.reason)
+        self.assertEqual("stopped", source.movement_reason)
+
+    def test_late_final_pass_after_stop_rewrites_nothing(self):
+        # Claude (#213): a final worker pass that runs after stop() withdrew
+        # every source does not republish `worker_failed` over `stopped`.
+        harness = Harness(recorder=False)
+        self.assertIs(SceneRuntimeState.UNAVAILABLE, harness.runtime.start().state)
+        stopped = harness.runtime.stop()
+        self.assertIs(SceneRuntimeState.UNAVAILABLE, stopped.state)
+        harness.runtime._finish()
+        source = harness.runtime.status().sources[0]
+        self.assertEqual("stopped", source.reason)
+        self.assertEqual("stopped", source.movement_reason)
+
+    def test_refused_late_observation_is_reported_by_stop(self):
+        # Claude (#213): an observation refused after staging closed is part
+        # of stop's undelivered report even when nothing else is undelivered.
+        source = Harness()
+        source.runtime.start()
+        for luma in (None, None, MOVED, MOVED):
+            source.frame(luma)
+        observation = source.recorder.items[0]
+        harness = Harness()
+        harness.runtime.start()
+        harness.runtime._pump.close(0)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            self.assertFalse(harness.runtime._pump.submit([observation]))
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            status = harness.runtime.stop()
+        self.assertEqual(1, status.critical_refused)
+        self.assertEqual((0, 0, 0), (status.critical_pending, status.losses_held,
+                                     status.losses_failed))
+        self.assertTrue(any("scene_critical_undelivered" in line for line in logs.output))
+
+
 class SyntheticYuyvCapture:
     """Synthetic capture producing generated YUYV frames for one device."""
 
@@ -1286,6 +1530,33 @@ class SceneApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
                     lambda: application.state.scene_monitoring_state
                     is SceneRuntimeState.UNAVAILABLE))
         self.assertIs(SceneRuntimeState.UNAVAILABLE, application.state.scene_monitoring_state)
+
+    async def test_runtime_reported_unavailability_is_logged_once(self):
+        # Claude (#213): the runtime already logs its own unavailability; the
+        # application watcher does not log it a second time.
+        for case in ("worker_failure", "dead_delivery"):
+            with self.subTest(case=case):
+                application = self._scene_application(Recorder())
+                async with asyncio.timeout(20), application.router.lifespan_context(application):
+                    runtime = application.state.scene_monitoring
+
+                    def broken():
+                        raise RuntimeError("synthetic worker failure")
+
+                    with self.assertLogs("app", level="ERROR") as logs:
+                        if case == "worker_failure":
+                            runtime._cycle = broken
+                            runtime.request_calibration_refresh()
+                        else:
+                            runtime._pump.close(1.0)
+                        self.assertTrue(await self._until(
+                            lambda: application.state.scene_monitoring_state
+                            is SceneRuntimeState.UNAVAILABLE))
+                        for _ in range(5):
+                            runtime.status()
+                            await asyncio.sleep(0.02)
+                self.assertEqual(1, sum("scene_monitoring_unavailable" in line
+                                        for line in logs.output), logs.output)
 
     async def test_local_uvc_frames_reach_scene_detector_and_stop_cleanly(self):
         from tests.test_uvc_runtime import synthetic_admission

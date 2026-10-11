@@ -68,6 +68,9 @@ MINIMUM_TICK_SECONDS = 0.01
 MAXIMUM_TICK_SECONDS = 60.0
 # A recorder call in flight longer than this is reported as stalled.
 DEFAULT_RECORDER_STALL_NS = 5 * 1_000_000_000
+# Bound on closing an already started delivery thread when the worker thread
+# cannot be started.
+START_ROLLBACK_TIMEOUT_SECONDS = 5.0
 PACKED_FORMATS = {"GREY": 1, "YUYV": 2}
 
 
@@ -453,8 +456,11 @@ class _CriticalPump:
         if self.threaded:
             thread = threading.Thread(target=self._run, name="scene-critical-delivery",
                                       daemon=True)
-            self._thread = thread
+            # Retained only once started: a thread that could not be started
+            # is never joined (`close()`) nor reported as a dead thread.
             thread.start()
+            with self._lock:
+                self._thread = thread
 
     @property
     def remaining(self):
@@ -603,6 +609,9 @@ class SceneMonitoringRuntime:
         # `status()` derives DEGRADED from the live conditions.
         self._accepting = False
         self._stopping = False
+        # SCENE_MONITORING_UNAVAILABLE is logged once, by the runtime, whether
+        # the worker failed or `status()` found a thread gone.
+        self._unavailable_logged = False
         self._state = SceneRuntimeState.CONFIGURED
         self._thread = None
 
@@ -628,14 +637,34 @@ class SceneMonitoringRuntime:
                 return self._status_locked()
             # Both threads are started before RUNNING becomes visible, so
             # `status()` never reads a not-yet-started thread as dead.
-            self._pump.start()
-            if self._threaded:
-                thread = threading.Thread(target=self._run, name="scene-monitoring",
-                                          daemon=True)
-                self._thread = thread
-                thread.start()
-            self._state = SceneRuntimeState.RUNNING
-            self._accepting = True
+            failed = False
+            try:
+                self._pump.start()
+                if self._threaded:
+                    thread = threading.Thread(target=self._run, name="scene-monitoring",
+                                              daemon=True)
+                    thread.start()
+                    # Retained only once started, so `stop()` never joins an
+                    # unstarted thread.
+                    self._thread = thread
+            except Exception:
+                # Partial start: nothing evaluates and nothing is current. The
+                # caller reports the startup failure.
+                failed = True
+                self._state = SceneRuntimeState.UNAVAILABLE
+                self._unavailable_logged = True
+                for published in self._published.values():
+                    published.state = SceneSourceState.INACTIVE
+                    published.reason = "worker_start_failed"
+                    self._withdraw(published, "worker_start_failed")
+            else:
+                self._state = SceneRuntimeState.RUNNING
+                self._accepting = True
+        if failed:
+            # A delivery thread that did start is closed within a bounded
+            # wait (it has nothing staged), so it is not left running.
+            self._pump.close(START_ROLLBACK_TIMEOUT_SECONDS)
+            raise RuntimeError("scene monitoring threads could not be started")
         return self.status()
 
     def stop(self, timeout: float = 5.0) -> SceneRuntimeStatus:
@@ -794,6 +823,12 @@ class SceneMonitoringRuntime:
     def _accept_locked(self, slot, now, observed_at, data, producer_stream, width, height):
         if not self._accepting:
             return False
+        if slot.history_exhausted:
+            # Terminal until restart: the refused replacement showed that the
+            # current producer stream is stale too, so no further sample of
+            # this source is admitted.
+            slot.stale_rejected += 1
+            return False
         replacing = producer_stream != slot.minted_for
         if replacing and producer_stream in slot.retired_producers:
             # A producer stream this source already replaced: its frames are
@@ -805,8 +840,13 @@ class SceneMonitoringRuntime:
         if replacing and slot.minted_for is not None and (
                 len(slot.retired_producers) >= RETIRED_PRODUCER_LIMIT):
             # Admitting another stream would mean forgetting a retired one.
+            # The arrival of a replacement also means the current stream is
+            # stale: its pending sample is dropped and nothing more of this
+            # source is admitted until the runtime is restarted.
             slot.history_exhausted = True
             slot.stale_rejected += 1
+            if slot.sample is not None:
+                slot.sample.data, slot.sample = None, None
             return False
         # The stream transition is recorded before the sampling decision: a
         # replacement stream's first frame retires the old stream even when
@@ -852,13 +892,19 @@ class SceneMonitoringRuntime:
             # more samples are accepted, so nothing reads as current.
             with self._lock:
                 self._accepting = False
+                # After stop() the lifecycle is final (STOPPED/STOP_FAILED):
+                # the late failure is logged as a failure, not as a transition.
+                log = not self._unavailable_logged and not self._withdrawn
+                if log:
+                    self._unavailable_logged = True
                 if not self._withdrawn:
                     self._state = SceneRuntimeState.UNAVAILABLE
                     for published in self._published.values():
                         published.state = SceneSourceState.INACTIVE
                         published.reason = "worker_failed"
                         self._withdraw(published, "worker_failed")
-            logging.getLogger(__name__).error(Event.SCENE_MONITORING_UNAVAILABLE)
+            logging.getLogger(__name__).error(
+                Event.SCENE_MONITORING_UNAVAILABLE if log else Event.SCENE_SOURCE_FAILED)
         finally:
             self._finish()
 
@@ -923,8 +969,10 @@ class SceneMonitoringRuntime:
                 sample, loss = slot.sample, slot.loss
                 slot.sample = slot.loss = None
                 # A calibration refresh would discard the detector's scene
-                # shift state, so it waits until a held loss is processed.
-                refresh = context.refresh and context.held_loss is None
+                # shift state, so it waits until a held loss and a loss just
+                # taken from the slot are processed (the next pass at the
+                # latest for the latter).
+                refresh = context.refresh and context.held_loss is None and loss is None
                 if refresh:
                     context.refresh = False
             context.unprocessed_loss = loss
@@ -1168,10 +1216,31 @@ class SceneMonitoringRuntime:
     # -- status ------------------------------------------------------------
     def status(self) -> SceneRuntimeStatus:
         with self._lock:
-            return self._status_locked()
+            status = self._status_locked()
+            log = (status.state is SceneRuntimeState.UNAVAILABLE
+                   and not self._unavailable_logged)
+            if log:
+                self._unavailable_logged = True
+        if log:
+            # A thread found gone while running: reported once, by the runtime.
+            logging.getLogger(__name__).error(Event.SCENE_MONITORING_UNAVAILABLE)
+        return status
 
     def _status_locked(self):
         now = self._deps.monotonic_ns()
+        thread = self._thread
+        snapshot = self._pump.snapshot()
+        worker_running = thread is not None and thread.is_alive()
+        delivery_running = snapshot.running
+        lost = None
+        if (self._state is SceneRuntimeState.RUNNING and self._threaded and not self._stopping
+                and not (worker_running and delivery_running)):
+            # A worker or delivery thread that is gone evaluates or delivers
+            # nothing: never reported as running or merely degraded, and no
+            # published conclusion is presented as current (fail closed; the
+            # stored results are not changed). During `stop()` both threads
+            # end by design and are not read as lost.
+            lost = "worker_unavailable" if not worker_running else "delivery_unavailable"
         sources = []
         for source_id, slot in self._slots.items():
             published = self._published[source_id]
@@ -1194,10 +1263,17 @@ class SceneMonitoringRuntime:
                 # stopped, worker stalled): the source is lowered, not only
                 # its conclusions, until a fresh evaluated sample recovers it.
                 state, reason = SceneSourceState.DEGRADED, "observation_stale"
-            if slot.history_exhausted and self._state is SceneRuntimeState.RUNNING:
-                # New producer streams are refused; a later conclusion from
-                # the current one may still appear, but the source is lowered.
-                state, reason = SceneSourceState.DEGRADED, "stream_history_exhausted"
+            if slot.history_exhausted:
+                # No sample of this source is admitted any more, so nothing it
+                # concluded is current; the source is lowered while running.
+                movement = tamper = Observation.UNKNOWN
+                movement_reason = tamper_reason = "stream_history_exhausted"
+                if self._state is SceneRuntimeState.RUNNING:
+                    state, reason = SceneSourceState.DEGRADED, "stream_history_exhausted"
+            if lost is not None:
+                state, reason = SceneSourceState.INACTIVE, lost
+                movement = tamper = Observation.UNKNOWN
+                movement_reason = tamper_reason = lost
             sources.append(SceneSourceStatus(
                 source_id, slot.binding.source_type, state, reason,
                 movement, tamper, movement_reason, tamper_reason,
@@ -1205,20 +1281,11 @@ class SceneMonitoringRuntime:
                 published.evaluated, published.unusable, published.backpressured,
                 published.failures, slot.stale_rejected,
             ))
-        thread = self._thread
         # A reference read of worker-owned state; a snapshot, never a decision.
         held = sum(context.held_loss is not None for context in self._contexts.values())
-        snapshot = self._pump.snapshot()
-        pending, since, delivery_running = (snapshot.pending, snapshot.in_flight_since,
-                                            snapshot.running)
+        pending, since = snapshot.pending, snapshot.in_flight_since
         stalled = since is not None and now - since >= self._deps.recorder_stall_ns
-        worker_running = thread is not None and thread.is_alive()
-        state = self._state
-        if state is SceneRuntimeState.RUNNING and self._threaded and not (
-                worker_running and delivery_running):
-            # A worker or delivery thread that is gone evaluates or delivers
-            # nothing: never reported as running or merely degraded.
-            state = SceneRuntimeState.UNAVAILABLE
+        state = SceneRuntimeState.UNAVAILABLE if lost is not None else self._state
         if state is SceneRuntimeState.RUNNING and (
                 pending or held or stalled
                 or any(item.state is SceneSourceState.DEGRADED for item in sources)):

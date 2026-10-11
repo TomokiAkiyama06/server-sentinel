@@ -1048,12 +1048,17 @@ stream that has been replaced is refused as stale imagery on the capture side
 transition is recorded even when the replacement stream's first frame is
 sampled out. When the bounded retired-stream history (1024 ids per source) is
 full, further replacement streams are refused (`stream_history_exhausted`)
-rather than forgetting one. The runtime reports `degraded` while staging holds
+rather than forgetting one; from then on no sample of that source is admitted
+until restart and its conclusions are `unknown`. A calibration refresh waits
+until a held or just-dequeued camera loss has been handed to the current
+detector. The runtime reports `degraded` while staging holds
 undelivered evidence, a loss is held, a recorder call is stalled, or any source
 is `degraded`; since every staged observation counts until the recorder
 accepts it, normal delivery of a confirmation also shows `degraded` briefly.
 The runtime status reports `unavailable` when its worker or delivery thread is
-no longer running. Shutdown is bounded (worker and delivery each by the stop
+no longer running (outside shutdown), with every source `inactive` and
+`unknown`, and logs it once; a worker thread that cannot be started rolls back
+the delivery thread within a bounded wait. Shutdown is bounded (worker and delivery each by the stop
 timeout, so up to about 10 s by default): a worker or recorder call still
 running after its bound is reported as `stop_failed` (with
 `critical_in_flight`), and the delivery thread then starts no further recorder
