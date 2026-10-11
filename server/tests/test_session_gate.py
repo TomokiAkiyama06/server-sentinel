@@ -8,10 +8,13 @@ with events and a probe lock, not with timing.
 
 from contextlib import closing
 from datetime import timedelta
+import os
 from pathlib import Path
+import sys
 import tempfile
 import threading
 import unittest
+import warnings
 from unittest.mock import patch
 
 from app.audit import AuditStore, OwnerAuditService
@@ -19,6 +22,7 @@ from app.audit.integration import AccessAdministration, ReservationAdministratio
 from app.audit.model import AuditAction, AuditOutcome
 from app.auth.model import AccessValidationError, Permission
 from app.auth import passkeys as passkeys_module
+from app.auth import reservation as reservation_module
 from app.auth.passkeys import CeremonyDenied, DeviceBoundCredentialRequired, PasskeyCeremonies
 from app.auth.reservation import (
     DAILY_SECONDS, CheckKind, HumanAccessClosed, Reason,
@@ -548,6 +552,125 @@ class MarkerUnsavedLogTests(SessionGateFixture):
         with self.assertLogs("app.auth.reservation", "WARNING") as logs:
             self.check._check(CheckKind.RETRY)
         self.assertEqual([record.msg.value for record in logs.records], ["session_revocation_marker_saved"])
+
+
+class ProcessGuardTests(SessionGateFixture):
+    """Issue #181: every session gate entry fails closed outside the process that built it."""
+
+    def other_process(self):
+        # A fork child sees a different pid; the gate's copied verdict says open.
+        return patch.object(reservation_module.os, "getpid", return_value=os.getpid() + 1)
+
+    def challenges(self):
+        with closing(self.database.connect()) as connection:
+            return connection.execute("SELECT count(*) FROM access_webauthn_challenges").fetchone()[0]
+
+    def test_gate_entries_fail_closed_in_another_process(self):
+        epoch = self.check.epoch()
+        self.assertIsNotNone(epoch)
+        self.assertTrue(self.check.verdict.open)
+        with self.other_process():
+            self.assertFalse(self.check.access_open)
+            self.assertIsNone(self.check.epoch())
+            for stale in (epoch, None):
+                with self.subTest(epoch=stale), self.assertRaises(HumanAccessClosed):
+                    with self.check.admit(stale):
+                        self.fail("admitted in another process")
+        # The building process is unaffected.
+        self.assertTrue(self.check.access_open)
+        self.assertEqual(self.check.epoch(), epoch)
+        with self.check.admit(epoch):
+            pass
+
+    def test_gate_entries_do_not_wait_for_an_inherited_lock(self):
+        # A fork child may inherit the gate lock held by a parent thread that
+        # does not exist there: the entries refuse before taking it.
+        epoch = self.check.epoch()
+        held = threading.Lock()
+        held.acquire()
+        self.addCleanup(held.release)
+
+        def entries():
+            results = [self.check.access_open, self.check.epoch()]
+            try:
+                with self.check.admit(epoch):
+                    results.append("admitted")
+            except HumanAccessClosed:
+                results.append("closed")
+            return results
+
+        with self.other_process(), patch.object(self.check, "_session_gate_lock", held):
+            worker, box = self.thread(entries)
+            worker.join(WAIT)
+        self.assertFalse(worker.is_alive(), "a gate entry waited for the inherited lock")
+        self.assertNotIn("error", box)
+        self.assertEqual(box["value"], [False, None, "closed"])
+
+    def test_ceremonies_in_another_process_are_denied_without_effects(self):
+        _, authenticator = self.enroll()
+        assertion = self.assertion(authenticator)
+        challenges = self.challenges()
+        sessions = self.live_sessions()
+        with self.other_process(), patch.object(self.access, "assertion_subject") as subject:
+            with self.assertRaises(CeremonyDenied):
+                self.ceremonies.begin_authentication()
+            with self.assertRaises(CeremonyDenied):
+                self.ceremonies.finish_authentication(VIEWER, assertion)
+        subject.assert_not_called()
+        self.assertEqual(self.challenges(), challenges)
+        self.assertEqual(self.live_sessions(), sessions)
+        # Back in the building process the same assertion still logs in.
+        grant = self.ceremonies.finish_authentication(VIEWER, assertion)
+        self.assertTrue(self.valid(grant))
+
+    def test_invitation_in_another_process_is_a_failed_operation(self):
+        admin = AccessAdministration(self.service, self.access, session_gate=self.check)
+        principal = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
+        expires = self.ceremony_clock() + timedelta(minutes=30)
+        with self.other_process(), self.assertRaises(HumanAccessClosed):
+            admin.issue_invitation(OWNER_SESSION, principal.id, b"c" * 32, expires)
+        issued = [record.outcome for record in self.audit.list_records()
+                  if record.action is AuditAction.ISSUE_PRINCIPAL_INVITATION]
+        self.assertEqual(issued, [AuditOutcome.FAILED])
+        with closing(self.database.connect()) as connection:
+            count = connection.execute("SELECT count(*) FROM access_invitations WHERE principal_id=?",
+                                       (str(principal.id),)).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    @unittest.skipUnless(hasattr(os, "fork") and sys.platform.startswith("linux"), "needs os.fork on Linux")
+    def test_real_fork_child_cannot_pass_the_gate(self):
+        epoch = self.check.epoch()
+        self.assertIsNotNone(epoch)
+        read_end, write_end = os.pipe()
+        with warnings.catch_warnings():
+            # Python warns about fork() in a process with threads; the child
+            # only touches the gate and leaves with os._exit().
+            warnings.simplefilter("ignore", DeprecationWarning)
+            pid = os.fork()
+        if pid == 0:  # pragma: no cover - runs in the child
+            code = 1
+            try:
+                os.close(read_end)
+                results = [str(self.check.access_open), str(self.check.epoch())]
+                try:
+                    with self.check.admit(epoch):
+                        results.append("admitted")
+                except HumanAccessClosed:
+                    results.append("closed")
+                os.write(write_end, ",".join(results).encode())
+                code = 0
+            finally:
+                os._exit(code)
+        os.close(write_end)
+        with os.fdopen(read_end, "rb") as reader:
+            reported = reader.read().decode()
+        _, status = os.waitpid(pid, 0)
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+        self.assertEqual(reported, "False,None,closed")
+        # The parent's gate is unaffected.
+        self.assertTrue(self.check.access_open)
+        with self.check.admit(epoch):
+            pass
 
 
 class GateLockOrderTests(SessionGateFixture):

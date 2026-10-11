@@ -299,7 +299,15 @@ work: the SQLite write transactions, their storage admission (the audit
 store's free-space reservation) and the identifier-free marker log event. The verdict lives in the check's memory, so the check and every
 session-establishing path must run in one process (the backend runs a single
 `uvicorn.Server` from `app.systemd.build_server`, without worker processes); a
-second serving process would have no gate. The low-level
+second serving process would have no gate. The check records `os.getpid()` when
+it is built and every gate entry compares it before taking any lock (Issue
+#181): in another process, such as a `fork()` child holding a copy of an open
+verdict that no check closes, `access_open` is false, `epoch()` reports closed
+(`None`, so callers keep their closed-at-start denial or failed audited
+operation) and `admit()` raises `HumanAccessClosed`. This fails closed; it is
+not a multi-process mode. Whether a future local bootstrap/recovery command
+goes through the gate, and per-source rate limiting, are decided when the
+human routes are wired (Issue #181, #10). The low-level
 `AccessStore.establish_session` / `issue_enrollment` wrappers are fixture and
 local entries outside the gate and must not be reached from a human route.
 Two session writes stay outside the gate on purpose: the idle-expiry touch

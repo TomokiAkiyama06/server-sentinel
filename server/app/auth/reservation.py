@@ -1141,6 +1141,19 @@ class HostnameReservationCheck:
     in this object's memory, so the gate and every session-establishing path
     must share one process.
 
+    That single process is enforced, not only assumed (Issue #181): the
+    constructor records ``os.getpid()``, and every session gate entry
+    compares it before taking any lock. In another process (a ``fork()``
+    child, which inherits a copy of the verdict that no check of the parent
+    ever closes, and possibly a gate lock held by a thread that does not
+    exist there), ``access_open`` is False, ``epoch()`` returns ``None``
+    (closed) and ``admit()`` raises ``HumanAccessClosed``. ``epoch()``
+    reports closed rather than raising so its callers keep their
+    closed-at-start path (an immediate generic denial, or a failed
+    operation with its audit record), whose ``admit(None)`` raises in turn.
+    The check is fail closed, not a supported multi-process mode: a
+    separate process needs its own gate.
+
     Every check also re-resolves the hostname through ``resolver``; a missing
     resolver or a failed or timed-out resolution keeps access closed without
     requiring revocation; an answer that differs from ``reserved_addresses``
@@ -1187,6 +1200,9 @@ class HostnameReservationCheck:
         # commit a verdict, and by every ``admit()`` commit. Innermost of the
         # check's locks; see the class docstring for the lock order.
         self._session_gate_lock = threading.Lock()
+        # The process the gate belongs to (Issue #181): every gate entry
+        # fails closed in any other process.
+        self._gate_pid = os.getpid()
         # Advanced (under the gate lock) every time an open verdict closes;
         # ``admit()`` refuses a request whose epoch changed (PR #174 review).
         self._epoch = 0
@@ -1255,9 +1271,18 @@ class HostnameReservationCheck:
         A request-time read only: a commit that creates a session, updates its
         user-verification time, or creates or redeems an enrollment
         authorization goes through ``admit()`` instead, which
-        re-checks under the gate lock (Issue #144).
+        re-checks under the gate lock (Issue #144). False in any process
+        other than the one that built the gate (Issue #181).
         """
-        return self._verdict.open
+        return self._in_gate_process() and self._verdict.open
+
+    def _in_gate_process(self) -> bool:
+        """True only in the process that built the gate (Issue #181).
+
+        Compared before any lock is taken: a ``fork()`` child may inherit
+        the gate lock held by a parent thread that does not exist there.
+        """
+        return os.getpid() == self._gate_pid
 
     def epoch(self) -> int | None:
         """The gate epoch at the start of a request; ``None`` while access is closed.
@@ -1265,7 +1290,11 @@ class HostnameReservationCheck:
         Taken before the request reads or verifies anything its commit relies
         on (a challenge, a credential, an Owner authorization), so a close
         anywhere between that point and the commit is seen by ``admit()``.
+        Also ``None`` in any process other than the one that built the gate
+        (Issue #181).
         """
+        if not self._in_gate_process():
+            return None
         with self._session_gate_lock:
             return self._epoch if self._verdict.open else None
 
@@ -1281,8 +1310,12 @@ class HostnameReservationCheck:
         with, or follow, a check closing access or revoking sessions. The
         caller enters it before opening its SQLite write transaction and
         keeps only that local commit inside: no network I/O, no WebAuthn
-        verification and no other lock of this check.
+        verification and no other lock of this check. In any process other
+        than the one that built the gate it raises ``HumanAccessClosed``
+        without taking the lock (Issue #181).
         """
+        if not self._in_gate_process():
+            raise HumanAccessClosed()
         with self._session_gate_lock:
             if (not self._verdict.open or type(epoch) is not int or epoch != self._epoch):
                 raise HumanAccessClosed()
