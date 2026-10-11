@@ -59,12 +59,13 @@ from typing import Callable
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from app.completion import run_to_completion
 from app.logging import Event
-from app.storage.database import Database
+from app.storage.database import Database, PinnedDatabase
 from .passkeys import PasskeyCeremonies, SessionGrant
 from .rate_limit import SourceRateLimiter
 from .reservation import HostnameReservationCheck
-from .reservation_store import ReservationSessionRevocation
+from .reservation_store import ListenerExceptionStore, ReservationSessionRevocation
 from .session_binding import canonical_identity
 from .store import AccessStore
 
@@ -205,7 +206,10 @@ class HumanAccess:
     accepted (Issue #181 item 3). The gate's session revoker must be a
     ``ReservationSessionRevocation`` of exactly this store, so a revocation
     after an exposure invalidates the sessions this surface authorizes and
-    not another database's.
+    not another database's. A stored listener-exception source, when the
+    gate has one, must be a ``ListenerExceptionStore`` on that same database:
+    the exceptions the check applies are the ones the audited Owner path
+    commits next to this store's sessions, never another database's.
 
     Every human-access write is admitted through the application's storage
     admission: ``create_app`` binds it with ``bind_storage_admission`` (the
@@ -231,6 +235,12 @@ class HumanAccess:
         if (not isinstance(ceremonies, PasskeyCeremonies) or ceremonies.store is not store
                 or ceremonies.session_gate is not reservation):
             raise HumanAccessUnavailable()
+        exceptions = reservation.exception_store
+        if exceptions is not None and not (
+                isinstance(exceptions, ListenerExceptionStore)
+                and isinstance(exceptions.database, (Database, PinnedDatabase))
+                and exceptions.database.path == store.database.path):
+            raise HumanAccessUnavailable()
         origin, host = reserved_origin(reservation)
         if ceremonies.rp.origin != origin or ceremonies.rp.rp_id != reservation.config.hostname:
             raise HumanAccessUnavailable()
@@ -248,6 +258,7 @@ class HumanAccess:
         self.host = host
         self.tick_seconds = float(tick_seconds)
         self._storage_admission = None
+        self._stopped = False
 
     def bind_storage_admission(self, admission: Callable, *, database: Database) -> None:
         """Admit every write of this composition through ``admission``.
@@ -279,6 +290,19 @@ class HumanAccess:
         admission = self._storage_admission
         return admission is not None and self.store.audit.reservation is admission
 
+    @property
+    def stopped(self) -> bool:
+        """True from ``stop()`` until the next ``run()``: every request is denied."""
+        return self._stopped
+
+    def stop(self) -> None:
+        """Deny every later request; called first by the application shutdown.
+
+        The application then cancels ``run()`` and waits for it, before it
+        unbinds the storage admission or stops the monitoring runtime.
+        """
+        self._stopped = True
+
     async def run(self, *, sleep: Callable = asyncio.sleep) -> None:
         """Startup check, then the periodic check tick and expiry sweep.
 
@@ -286,20 +310,31 @@ class HumanAccess:
         closed; ``end_expired_sessions()`` clears expired rows even when no
         request arrives. A failure is logged without values and access stays
         as the check left it (closed on any doubt).
+
+        Each of them runs on a worker thread that cancellation cannot stop,
+        so a cancellation (application shutdown) is deferred until the
+        in-flight call has returned and is re-raised afterwards: no verdict
+        is published and no session-revocation, marker or expiry write
+        happens after ``run()`` has ended, so after the shutdown has moved on
+        to unbinding the storage admission. The wait is bounded by the call
+        itself: every enumeration of the check runs under the check's
+        enumeration timeout, and every SQLite write under the database busy
+        timeout. Cancellation during the sleep between ticks ends at once.
         """
+        self._stopped = False
         log = logging.getLogger(__name__)
         try:
-            await asyncio.to_thread(self.reservation.startup)
+            await run_to_completion(asyncio.to_thread(self.reservation.startup))
         except Exception:
             log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
         while True:
             await sleep(self.tick_seconds)
             try:
-                await asyncio.to_thread(self.reservation.tick)
+                await run_to_completion(asyncio.to_thread(self.reservation.tick))
             except Exception:
                 log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
             try:
-                await asyncio.to_thread(self.store.end_expired_sessions)
+                await run_to_completion(asyncio.to_thread(self.store.end_expired_sessions))
             except Exception:
                 log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
 
@@ -355,7 +390,8 @@ class HumanSurface:
             raise _Denied()
 
     def _open(self) -> None:
-        if not self.access.storage_admitted or not self.access.reservation.access_open:
+        if (self.access.stopped or not self.access.storage_admitted
+                or not self.access.reservation.access_open):
             raise _Denied()
 
     async def _http(self, scope: Scope, receive: Receive, send: Send) -> None:

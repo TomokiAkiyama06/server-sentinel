@@ -154,10 +154,23 @@ class Database:
         create a fallback database there without any storage admission.
         SQLite's ``mode=ro`` opens an existing file or fails; there is no
         check-then-create window. A rollback-journal read creates no file
-        beside the database. A WAL database is refused (the application never
-        enables WAL): SQLite could create ``-wal``/``-shm`` sidecars for it
-        even read-only. The header is checked after the open but before any
-        statement touches the file, through the process-held descriptor.
+        beside the database.
+
+        A WAL database is refused (the application never enables WAL): SQLite
+        could create ``-wal``/``-shm`` sidecars for it even read-only. Two
+        checks, on two different objects:
+
+        - before any statement, the header of the file the *path* names now,
+          read through the process-held descriptor; this refuses a WAL file
+          before SQLite reads it, so no sidecar is created for it;
+        - after a first read transaction on the connection itself,
+          ``PRAGMA journal_mode`` of the file the *connection* actually opened
+          (as ``app.presence.service`` does). The path is resolved separately
+          by ``sqlite3.connect`` and by the header read, so a file swapped in
+          between them is caught here; that read of a swapped-in WAL file may
+          already have created its sidecars before the refusal.
+
+        The returned connection is outside any transaction.
         """
         if not self.path.is_absolute() or not self.path.parent.is_dir() or self.path.is_symlink():
             raise ValueError("database location is unavailable")
@@ -169,6 +182,14 @@ class Database:
             header = read_database_prefix(self.path, 20)
             if header is None or (len(header) == 20 and header[:16] == b"SQLite format 3\x00"
                                   and 2 in (header[18], header[19])):
+                raise ValueError("database location is unavailable")
+            connection.execute("BEGIN")
+            try:
+                connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+                mode = connection.execute("PRAGMA journal_mode").fetchone()
+            finally:
+                connection.execute("ROLLBACK")
+            if mode is None or str(mode[0]).lower() == "wal":
                 raise ValueError("database location is unavailable")
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")

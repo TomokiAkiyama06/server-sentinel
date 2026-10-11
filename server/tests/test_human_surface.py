@@ -13,9 +13,13 @@ import json
 import logging
 from pathlib import Path
 import secrets
+import sqlite3
 import tempfile
+import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 from app.auth import reservation as reservation_module
 from app.auth.human_surface import (
@@ -23,11 +27,14 @@ from app.auth.human_surface import (
     HumanAccess, HumanAccessConfiguration, HumanAccessUnavailable, HumanSurface, _Denied,
     proxy_identity,
 )
-from app.auth.model import Permission
+from app.auth.live_access import BoundLiveAccess, authorize_live_access, live_view_validator
+from app.auth.model import AccessValidationError, Permission
 from app.auth.passkeys import PasskeyCeremonies
 from app.auth.rate_limit import SourceRateLimiter
 from app.auth.reservation import DAILY_SECONDS
-from app.auth.reservation_store import ListenerExceptionStoreError, ReservationSessionRevocation
+from app.auth.reservation_store import (
+    ListenerExceptionStore, ListenerExceptionStoreError, ReservationSessionRevocation,
+)
 from app.auth.session_binding import SessionBindingKey
 from app.audit import AuditStore
 from app.auth.store import AccessStorageError, AccessStore
@@ -63,13 +70,19 @@ class SyntheticAdmission:
     def __init__(self):
         self.admitted = 0
         self.refusing = False
+        # Admissions currently held (entered and not yet exited).
+        self.held = 0
 
     @contextmanager
     def __call__(self):
         if self.refusing:
             raise RuntimeError("STORAGE_HARD_STOP")
         self.admitted += 1
-        yield
+        self.held += 1
+        try:
+            yield
+        finally:
+            self.held -= 1
 
 
 class InnerApplication:
@@ -660,6 +673,75 @@ class RateLimitTests(HumanSurfaceFixture):
         self.assertEqual(sorted(path.name for path in self.temporary.iterdir()), sorted(before + ["missing"]))
         self.assertEqual(list((self.temporary / "missing").iterdir()), [])
 
+    def test_read_only_connection_checks_the_journal_mode_of_the_file_it_opened(self):
+        """Claude review PR #219: the header is read from the path, the
+        connection opens the path separately; a WAL file swapped in between
+        is refused by the connection's own ``PRAGMA journal_mode``."""
+        wal = Database(self.temporary / "swapped.sqlite3")
+        with closing(wal.connect()) as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("CREATE TABLE synthetic(value)")
+        rollback_header = self.database.path.read_bytes()[:20]
+        with patch("app.storage.database.read_database_prefix", return_value=rollback_header), \
+                self.assertRaises(ValueError):
+            wal.connect_read_only()
+        with closing(self.database.connect_read_only()) as connection:
+            self.assertFalse(connection.in_transaction)
+            self.assertEqual(connection.execute("SELECT count(*) FROM access_sessions").fetchone()[0], 0)
+
+    def test_exception_store_and_live_access_reads_never_create_a_missing_database(self):
+        """Claude review PR #219: the listener-exception load and both live
+        access reads are denials on a lost database and create nothing."""
+        lost = self.temporary / "lost"
+        lost.mkdir()
+        missing = Database(lost / "state.sqlite3")
+        with self.assertRaises(ListenerExceptionStoreError):
+            ListenerExceptionStore(missing).load()
+        validate = live_view_validator(missing)
+        self.assertFalse(validate(BoundLiveAccess(uuid4(), 1, uuid4()), uuid4()))
+        store = AccessStore(missing, audit=AuditStore(missing), session_binding=SessionBindingKey.generate())
+        principal = SimpleNamespace(id=uuid4(), authorization_revision=1)
+        with patch.object(store, "authorize", return_value=principal):
+            with self.assertRaises(AccessValidationError) as raised:
+                authorize_live_access(store, secrets.token_bytes(32), VIEWER)
+        self.assertEqual(str(raised.exception), "access is unavailable")
+        self.assertEqual(list(lost.iterdir()), [])
+        # A storage fault on an existing database is the same generic denial.
+        with patch.object(self.store, "authorize", return_value=principal), \
+                patch.object(Database, "connect_read_only", side_effect=sqlite3.OperationalError("busy")):
+            with self.assertRaises(AccessValidationError):
+                authorize_live_access(self.store, secrets.token_bytes(32), VIEWER)
+
+    async def test_storage_admission_is_held_at_every_commit(self):
+        """Claude review PR #219: every human-access write commits while its
+        storage admission is still held (releasing it before COMMIT would let
+        the commit grow the journal past a hard stop)."""
+        original = Database.connect
+        commits = []
+
+        def traced(database):
+            connection = original(database)
+            writing = []
+
+            def trace(statement):
+                word = statement.strip().upper()
+                if word.startswith("BEGIN IMMEDIATE"):
+                    writing.append(True)
+                elif word.startswith("COMMIT") and writing:
+                    commits.append(self.admission.held)
+
+            connection.set_trace_callback(trace)
+            return connection
+
+        _, authenticator, _ = self.enroll()
+        with patch.object(Database, "connect", traced):
+            cookie = await self.sign_in(authenticator)
+            self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=cookie)), 200)
+            self.store.end_expired_sessions()
+        # Challenge, session creation, the session read's touch and the sweep.
+        self.assertGreaterEqual(len(commits), 4)
+        self.assertTrue(all(held >= 1 for held in commits), commits)
+
 
 class SourceRateLimiterTests(unittest.TestCase):
     def test_global_bucket_bounds_all_sources(self):
@@ -772,6 +854,35 @@ class CompositionTests(HumanSurfaceFixture):
                 with self.assertRaises(HumanAccessUnavailable):
                     self.compose(ceremonies=ceremonies, reservation=check)
 
+    def test_listener_exception_store_must_use_this_database(self):
+        """Claude review PR #219: the gate's stored exceptions come from the
+        composition's own database, never another one."""
+        other_database = Database(self.temporary / "other.sqlite3")
+        with closing(other_database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+
+        class Source:
+            database = self.database
+
+            def load(self):
+                return frozenset()
+
+        for name, source in (("other database", ListenerExceptionStore(other_database)),
+                             ("not a store", Source())):
+            with self.subTest(source=name):
+                check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker,
+                                         exception_store=source)
+                ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=check)
+                with self.assertRaises(HumanAccessUnavailable):
+                    self.compose(ceremonies=ceremonies, reservation=check)
+        for name, database in (("same database", Database(self.database.path)), ("none", None)):
+            with self.subTest(source=name):
+                source = None if database is None else ListenerExceptionStore(database)
+                check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker,
+                                         exception_store=source)
+                ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=check)
+                self.assertIsInstance(self.compose(ceremonies=ceremonies, reservation=check), HumanAccess)
+
 
 class StorageAdmissionTests(HumanSurfaceFixture):
     async def test_unbound_composition_denies_every_route_and_writes_nothing(self):
@@ -883,6 +994,83 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
                 self.assertEqual(await call(application, "GET", path, cookie=cookie),
                                  await self.denial())
         self.assertFalse(application.routes)
+
+    async def test_cancelled_run_waits_for_the_in_flight_check(self):
+        """Codex PR #219 (P2): cancelling ``run()`` cannot stop the check's
+        worker thread, so the cancellation waits until the call returned."""
+        started, release, order = threading.Event(), threading.Event(), []
+
+        def blocking_startup():
+            started.set()
+            release.wait(10)
+            order.append("check returned")
+
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        with patch.object(self.check, "startup", side_effect=blocking_startup):
+            task = asyncio.create_task(self.access.run())
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.sleep(0.2)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        order.append("run ended")
+        self.assertEqual(order, ["check returned", "run ended"])
+
+    async def test_shutdown_denies_requests_and_waits_for_the_check_before_moving_on(self):
+        """Codex PR #219 (P2): the lifespan shutdown does not move on (to
+        unbinding the storage admission, stopping the monitoring runtime)
+        while a reservation check thread can still publish a verdict or
+        write a revocation, and every request during shutdown is denied."""
+        self.enroll()
+        check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker)
+        ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=check, clock=self.ceremony_clock)
+        access = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+                             ceremonies=ceremonies, reservation=check, tick_seconds=0.01)
+        application = create_app(Settings(self.temporary), database=self.database, human_access=access,
+                                 storage_reservation=self.admission)
+        started, release, order = threading.Event(), threading.Event(), []
+        real_tick = check.tick
+
+        def blocking_tick():
+            started.set()
+            release.wait(10)
+            result = real_tick()
+            order.append("check returned")
+            return result
+
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+        async def lifecycle():
+            async with application.router.lifespan_context(application):
+                for _ in range(500):
+                    if check.access_open:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(check.access_open)
+                with patch.object(check, "tick", side_effect=blocking_tick):
+                    while not started.is_set():
+                        await asyncio.sleep(0.01)
+            order.append("lifespan stopped")
+
+        task = asyncio.create_task(lifecycle())
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        # Still blocked in the check: the shutdown has not moved on, and the
+        # surface already denies although the check's verdict is open.
+        await asyncio.sleep(0.2)
+        self.assertFalse(task.done())
+        self.assertTrue(access.stopped)
+        self.assertTrue(check.access_open)
+        self.assertEqual(await call(application, "POST", AUTHENTICATION_OPTIONS_PATH),
+                         await self.denial())
+        release.set()
+        await task
+        self.assertEqual(order, ["check returned", "lifespan stopped"])
 
 
 if __name__ == "__main__":

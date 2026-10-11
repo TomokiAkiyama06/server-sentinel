@@ -554,18 +554,42 @@ disappeared (mount-point directory left behind) is denied instead of creating
 a fallback `state.sqlite3`.
 The reservation check's session revoker must be a
 `ReservationSessionRevocation` of exactly the composition's `AccessStore`,
-so an exposure revokes the sessions this surface authorizes.
+so an exposure revokes the sessions this surface authorizes, and its stored
+listener-exception source, when it has one, must be a
+`ListenerExceptionStore` on that same database.
 
-Consequence for the Owner to confirm (open item): sign-in writes a challenge
-row and a session, and every session check writes (idle touch, expiry
-sweep). So while storage admission is refused or unbound
+Storage lockout (Owner decision, 2026-10-11: accepted, fail closed). Sign-in
+writes a challenge row and a session, and every session check writes (idle
+touch, expiry sweep). So while storage admission is refused or unbound
 (`STORAGE_HARD_STOP`, a lost or replaced recording filesystem, a deployment
 without storage thresholds, or a monitoring runtime that has not started),
 all human access is denied, the Owner's included: no one can sign in, and an
-already signed-in session is denied on its next request. Storage recovery
-therefore has to be done on the Main Server host itself, not through the
-dashboard. No exception path for the Owner exists; adding one would need an
-Owner decision.
+already signed-in session is denied on its next request. Recovery is done
+over SSH on the Main Server host itself, not through the dashboard. No
+exception path for the Owner exists, by that decision.
+
+Admission latency (availability only). The storage admission runs on the
+monitoring runtime's single owning worker (`RuntimeStorageAdmission`), so
+every admitted write of this surface, which includes every sign-in step,
+every `GET /api/session` that reaches `authorize_session` and every
+`AccessStore.authorize()` (the idle touch is a write in both), waits in that
+worker's queue behind any long monitoring job (a storage evaluation,
+recording self-test step or retention batch), and while it holds the
+admission through commit the worker is parked for it. Such a wait can delay a
+human request (the admission has no timeout of its own); it never grants
+access, and a request that cannot be admitted is the generic denial. The
+read-only pre-check (`session_may_be_current`) takes no admission.
+
+Shutdown. `create_app`'s shutdown first calls `HumanAccess.stop()` (every later
+request is denied), then cancels `HumanAccess.run()` and waits for it before
+unbinding the storage admission or stopping the monitoring runtime. The
+check's `startup()`/`tick()` and the expiry sweep run on worker threads that
+cancellation cannot stop, so `run()` defers the cancellation until the
+in-flight call returns (`app.completion.run_to_completion`): no verdict is
+published and no marker, revocation or expiry write happens after the
+admission is unbound. That wait is bounded by the call itself (each
+enumeration under the check's enumeration timeout, each SQLite write under the
+busy timeout).
 
 Rate limiting (Issue #181 item 4, `rate_limit.py`). Both ceremony routes are
 charged to a per-source token bucket and a global one before the ceremony
