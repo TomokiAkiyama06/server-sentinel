@@ -1226,5 +1226,121 @@ class StoreFreshnessTests(StepUpFixture):
         self.assertIsInstance(view.session_id, UUID)
 
 
+class IdleExpiryTests(StepUpFixture):
+    """Codex review on PR #236: the step-up routes never extend a session's
+    idle expiry; only a successful step-up does (AGENTS.md: sessions end at
+    an idle and an absolute limit, and a failed step-up changes nothing)."""
+
+    def idle(self, cookie):
+        digest = hashlib.sha256(self.token(cookie)).digest()
+        with closing(self.database.connect()) as connection:
+            return tuple(connection.execute(
+                "SELECT last_seen_at_us, idle_expires_at_us FROM access_sessions WHERE token_digest=?",
+                (digest,)).fetchone())
+
+    async def test_repeated_failed_step_ups_do_not_renew_the_idle_expiry(self):
+        _, key, _, cookie, csrf = await self.owner_session()
+        self.elapse(minutes=6)
+        idle = self.idle(cookie)
+        before = self.unchanged_state(cookie)
+        # A loop of options plus failed finishes (user verification declined),
+        # well inside the 30-minute idle window each time.
+        for _ in range(4):
+            self.elapse(minutes=5)
+            begun = await self.begin(cookie, csrf)
+            self.assertEqual(status(begun), 200)
+            assertion = key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST, uv=False)
+            self.assertEqual(await self.finish(cookie, csrf, assertion), GENERIC)
+            self.assertEqual(self.idle(cookie), idle)
+        # A begin without a finish (cancelled) does not touch either.
+        self.assertEqual(status(await self.begin(cookie, csrf)), 200)
+        self.assertEqual(self.idle(cookie), idle)
+        self.assertEqual(self.unchanged_state(cookie), before)
+        # The session still ends at its original idle expiry.
+        self.elapse(minutes=4)
+        self.assertGreaterEqual(microseconds(self.ceremony_clock()), idle[1])
+        self.assertEqual(await self.begin(cookie, csrf), GENERIC)
+
+    async def test_a_successful_step_up_renews_the_idle_expiry(self):
+        _, key, _, cookie, csrf = await self.owner_session()
+        self.elapse(minutes=20)
+        idle = self.idle(cookie)
+        begun = await self.begin(cookie, csrf)
+        self.assertEqual(self.idle(cookie), idle)
+        self.elapse(minutes=1)
+        assertion = key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST)
+        self.assertEqual(status(await self.finish(cookie, csrf, assertion)), 204)
+        now = microseconds(self.ceremony_clock())
+        self.assertEqual(self.idle(cookie), (now, now + 30 * 60 * 1_000_000))
+        # Past the old idle expiry the session is still current: stale for
+        # an Owner operation (step_up_required, not the generic denial).
+        self.elapse(minutes=15)
+        self.assertGreater(microseconds(self.ceremony_clock()), idle[1])
+        self.assertEqual(await self.owner_operation(cookie, csrf), STEP_UP)
+
+    async def test_authorize_request_without_touch_makes_the_same_checks(self):
+        _, _, _, cookie, _ = await self.owner_session()
+        token = self.token(cookie)
+        self.elapse(minutes=10)
+        idle = self.idle(cookie)
+        view = self.store.authorize_request(token, VIEWER, Requirement.OWNER_READ,
+                                            admit=self.gated(), touch=False)
+        self.assertIsInstance(view, SessionView)
+        self.assertEqual(self.idle(cookie), idle)
+        for bad in (None, 0, "no"):
+            with self.subTest(touch=bad), self.assertRaises(AccessValidationError):
+                self.store.authorize_request(token, VIEWER, Requirement.OWNER_READ,
+                                             admit=self.gated(), touch=bad)
+        with self.assertRaises(AccessValidationError):
+            self.store.authorize_request(token, OTHER_LOGIN, Requirement.OWNER_READ,
+                                         admit=self.gated(), touch=False)
+        # Idle expiry is still enforced without the touch.
+        self.elapse(minutes=21)
+        with self.assertRaises(AccessValidationError):
+            self.store.authorize_request(token, VIEWER, Requirement.OWNER_READ,
+                                         admit=self.gated(), touch=False)
+
+
+class StepUpFindingStoreTests(StepUpFixture):
+    """Claude review suggestions on PR #236: ``record_step_up_finding``'s
+    session and expiry conditions, at the store."""
+
+    async def prepared(self):
+        owner, key, credential, cookie, csrf = await self.owner_session()
+        self.elapse(minutes=6)
+        begun = await self.begin(cookie, csrf)
+        digest = hashlib.sha256(unb64(payload(begun)["challenge"])).digest()
+        view = self.store.current_session(self.token(cookie), VIEWER, at=self.ceremony_clock())
+        return owner, credential, digest, view
+
+    async def test_a_challenge_of_another_session_is_neither_spent_nor_recorded(self):
+        owner, credential, digest, view = await self.prepared()
+        before = self.finding_state()
+        recorded = self.store.record_step_up_finding(
+            digest, UUID(int=view.session_id.int ^ 1), backup_eligibility_changed=False,
+            credential_id=credential.credential_id, principal_id=owner.id)
+        self.assertFalse(recorded)
+        self.assertEqual(self.finding_state(), before)
+        self.assertEqual(self.store.pending_step_up_challenge(digest), view.session_id)
+        # Its own session spends it and records the finding once.
+        self.assertTrue(self.store.record_step_up_finding(
+            digest, view.session_id, backup_eligibility_changed=False,
+            credential_id=credential.credential_id, principal_id=owner.id))
+        self.assertIsNone(self.store.pending_step_up_challenge(digest))
+        self.assertIn(("detect_principal_credential_sign_count_regression", 1), self.finding_state()[2])
+
+    async def test_an_expired_challenge_records_nothing(self):
+        owner, credential, digest, view = await self.prepared()
+        before = self.finding_state()
+        self.elapse(minutes=5)
+        for changed in (False, True):
+            with self.subTest(backup_eligibility_changed=changed):
+                self.assertFalse(self.store.record_step_up_finding(
+                    digest, view.session_id, backup_eligibility_changed=changed,
+                    credential_id=credential.credential_id, principal_id=owner.id))
+                self.assertEqual(self.finding_state(), before)
+        self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

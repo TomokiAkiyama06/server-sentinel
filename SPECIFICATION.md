@@ -1762,7 +1762,13 @@ per-source limiter (Owner decision 2026-10-12: keyed by the verified proxy
 identity, burst 5, one per 12 seconds, no global bucket, never the sign-in or
 redemption limiter object), and commit under the
 epoch their authorization took; a non-Owner or anyone without a valid session
-gets the generic `404`. A new options request replaces the session's pending
+gets the generic `404`. Neither step-up route extends the session: their
+authorization makes every session check (idle and absolute expiry, identity
+binding, CSRF, Owner role) but commits no idle touch, and only a successful
+step-up moves `last_seen` and the idle expiry, in the transaction that
+refreshes the verification time (PR #236 review). Repeated options requests
+or failed finishes therefore cannot keep an unattended Owner session alive
+past its 30-minute idle limit. A new options request replaces the session's pending
 step-up challenge. "Fresh" is exactly five minutes from the verification time
 read inside the commit transaction (sign-in or step-up), on the wall clock and
 on `CLOCK_BOOTTIME` of the same boot, with the wall clock lagging the

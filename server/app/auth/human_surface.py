@@ -77,8 +77,9 @@ stale cookie is refused by a read-only token lookup before the gate or any
 SQLite write lock. No live, recording, timeline, event, administration,
 health or version route is mounted here, and no ``OWNER_OP`` route yet (S4):
 the step-up routes require ``OWNER_READ`` (an Owner session, fresh or stale),
-so a non-Owner gets the generic denial inside the authorization transaction,
-before any idle touch.
+so a non-Owner gets the generic denial inside the authorization transaction.
+Neither step-up route commits an idle touch: only a successful step-up
+extends the session's idle expiry (PR #236 review).
 
 Every refusal is the generic, non-branding not-found response used by the
 closed surface: no product/version header, no cookie, ``no-store``; an
@@ -289,7 +290,9 @@ ROUTES: tuple[Route, ...] = (
     Route("POST", _exact(SIGN_OUT_PATH), Requirement.SESSION, "_sign_out",
           mutating=True, csrf=True, body_limit=MAX_EMPTY_BODY),
     # S3: OWNER_READ, not OWNER_OP, so a stale Owner can refresh, and not
-    # SESSION, so a non-Owner is refused before the idle touch commits.
+    # SESSION, so a non-Owner is refused inside the authorization. Both
+    # authorize with touch=False: only a successful step-up extends the
+    # idle expiry (accept_assertion, PR #236 review).
     Route("POST", _exact(STEP_UP_OPTIONS_PATH), Requirement.OWNER_READ, "_begin_step_up",
           mutating=True, csrf=True, body_limit=MAX_EMPTY_BODY),
     Route("POST", _exact(STEP_UP_PATH), Requirement.OWNER_READ, "_finish_step_up",
@@ -889,7 +892,8 @@ class HumanSurface:
         request = _Request(scope, receive, send, headers, identity, route, query)
         await getattr(self, route.handler)(request)
 
-    async def _authorize(self, request: _Request, requirement: Requirement) -> _Authorized:
+    async def _authorize(self, request: _Request, requirement: Requirement, *,
+                         touch: bool = True) -> _Authorized:
         """Authorize a session-bearing request inside the gate.
 
         Order: the cookie's form; a read-only token pre-check that takes no
@@ -899,7 +903,8 @@ class HumanSurface:
         CSRF header compared in that transaction for a CSRF route. Any
         refusal is ``_Denied``; only ``StepUpRequired`` on ``OWNER_OP`` is
         ``_StepUp``. The store releases the gate before its denial
-        bookkeeping.
+        bookkeeping. ``touch=False`` (the step-up routes only) makes the same
+        checks without committing the idle touch.
         """
         if requirement is Requirement.PRE_CREDENTIAL or requirement is not request.route.requirement:
             raise _Denied()
@@ -918,7 +923,7 @@ class HumanSurface:
                 raise _Denied()
             session = await asyncio.to_thread(
                 access.store.authorize_request, token, request.identity, requirement,
-                admit=lambda: access.admit(epoch), csrf=csrf)
+                admit=lambda: access.admit(epoch), csrf=csrf, touch=touch)
         except StepUpRequired:
             if requirement is Requirement.OWNER_OP:
                 raise _StepUp() from None
@@ -1121,12 +1126,20 @@ class HumanSurface:
         own credential as the single allowed credential. A stale Owner is
         served (refreshing is the point); a non-Owner, a close, ``stop()`` or
         a failed tick in between is the generic denial.
+
+        The authorization is read-only for the session's lifetime
+        (``touch=False``, PR #236 review): requesting a challenge is not
+        evidence of the Owner's presence, so it neither moves ``last_seen``
+        nor extends the idle expiry. Only a successful finish does, in
+        ``accept_assertion``'s transaction. Otherwise a loop of options plus
+        failed finishes would renew an unattended Owner session up to its
+        absolute expiry.
         """
         self._limit_step_up(request.identity)
         body = await self._body(request, json_required=False)
         if body not in (b"", b"{}"):
             raise _Denied()
-        authorized = await self._authorize(request, Requirement.OWNER_READ)
+        authorized = await self._authorize(request, Requirement.OWNER_READ, touch=False)
         token = session_token(request.headers)
         try:
             options = await asyncio.to_thread(self.access.ceremonies.begin_step_up, token, request.identity,
@@ -1147,15 +1160,19 @@ class HumanSurface:
         time with its boot pair and a ``verify_principal_step_up`` audit
         record inside ``admit(epoch)``. Success is ``204`` with no body; the
         Owner operation is then retried by the client and re-checked
-        server-side. Every refusal is the generic denial and changes no
-        verification time, counter or audit record (the authorization's idle
-        touch is the only write, as for any authenticated request); it is
-        counted value-free (``note_refused_step_up``).
+        server-side. The authorization makes every session check (idle and
+        absolute expiry, identity binding, CSRF, Owner role) but commits no
+        idle touch (``touch=False``, PR #236 review); the idle expiry moves
+        only with a successful step-up, inside ``accept_assertion``'s
+        transaction under the same ``admit(epoch)``. Every refusal is the
+        generic denial and changes no verification time, counter, idle
+        expiry or audit record (a spent challenge aside); it is counted
+        value-free (``note_refused_step_up``).
         """
         self._limit_step_up(request.identity)
         try:
             credential = _json_object(await self._body(request, json_required=True))
-            authorized = await self._authorize(request, Requirement.OWNER_READ)
+            authorized = await self._authorize(request, Requirement.OWNER_READ, touch=False)
             token = session_token(request.headers)
             try:
                 await asyncio.to_thread(self.access.ceremonies.finish_step_up, token, request.identity,

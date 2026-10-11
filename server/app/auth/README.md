@@ -330,7 +330,10 @@ rate limiting are described in "Human route foundation" below (Issue #181,
 local entries outside the gate and must not be reached from a human route.
 Every human authorization commits its idle-expiry touch (`last_seen`) inside
 `admit(epoch)`: `authorize_request` on the routes and `authorize_owner(admit=...)`
-for an Owner operation (Issue #10 phase 2 S1, #228). Only the expiry sweep, and
+for an Owner operation (Issue #10 phase 2 S1, #228). The two step-up routes
+are the exception: they authorize with `authorize_request(touch=False)`, the
+same checks without the touch, and only a successful step-up touches the
+session, inside `accept_assertion` (Owner step-up, below). Only the expiry sweep, and
 the bare `authorize()` that fixtures call without `admit`, write outside the
 gate. Neither ever makes a session valid: revocation advances the authorization
 generation and invalidates every row in one transaction, so a write committed
@@ -920,7 +923,7 @@ Routes. `POST /api/auth/step-up/options` (empty body or `{}`) and `POST
 `OWNER_READ` requirement, exact `Origin` and `X-CSRF-Token`. `OWNER_READ`,
 not `OWNER_OP`, so that a stale Owner can reach them (refreshing is their
 point); not `SESSION`, so that a non-Owner is refused inside the
-authorization transaction, before the idle touch commits: a non-Owner, an
+authorization transaction: a non-Owner, an
 uninvited caller and anyone without a valid session get the generic `404`
 and learn nothing about step-up. Each request is charged to the step-up
 limiter (`rate_limit.step_up_rate_limiter`, `HumanAccess.step_up_limiter`:
@@ -960,9 +963,20 @@ same transaction, with a `verify_principal_step_up` audit record (actor
 `owner`, the principal's logical UUID only). Success is `204` with no body
 and no cookie; the client then retries the Owner operation, which is
 re-checked server-side. A cancelled, failed or refused step-up changes no
-verification time, counter, backup state or audit record; the only write is
-the authorization's idle touch, as for any authenticated request, and a
-consumed challenge. The one exception is a credential finding (below).
+verification time, counter, backup state, idle expiry or audit record; the
+only write is a consumed challenge. The one exception is a credential finding
+(below).
+
+Idle expiry (PR #236 review). Both step-up routes authorize with
+`authorize_request(touch=False)`: every session check runs (idle and absolute
+expiry at the in-gate request time, proxy-identity binding, CSRF, Owner role),
+but `last_seen` and `idle_expires_at` are not written. Only a successful
+step-up moves them, in `accept_assertion`'s transaction under the same
+`admit(epoch)` (lock order gate -> storage admission -> SQLite). The options
+route is read-only too: requesting a challenge proves nobody's presence, and
+an options-plus-failed-finish loop would otherwise renew an unattended Owner
+session until its 12-hour absolute expiry (AGENTS.md: idle and absolute
+limits; a failed step-up changes nothing).
 
 Challenge consumption (PR #236 review). Before verification the pending
 challenge is only read (`AccessStore.pending_step_up_challenge`). A successful

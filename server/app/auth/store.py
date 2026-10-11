@@ -909,6 +909,7 @@ class AccessStore:
                           admit: Callable[[], ContextManager],
                           freshness: timedelta = OWNER_STEP_UP_FRESHNESS,
                           csrf: object = None,
+                          touch: bool = True,
                           now: datetime | None = None) -> SessionView:
         """Authorize one human request against ``requirement`` inside the gate.
 
@@ -926,6 +927,16 @@ class AccessStore:
         (constant time, Owner decision D2). It is checked inside the same
         transaction before the idle touch, so a refused mutation does not
         extend the session.
+
+        ``touch=False`` runs the very same checks (idle and absolute expiry
+        included, at the in-gate request time) but commits no idle touch: the
+        session's ``last_seen`` and idle expiry stay as they are. The Owner
+        step-up routes use it (PR #236 review): only a successful step-up
+        moves the idle expiry, inside ``accept_assertion``'s transaction under
+        the same ``admit(epoch)``, so repeated failed or abandoned step-ups
+        cannot keep an unattended Owner session alive (AGENTS.md: sessions
+        end at both an idle and an absolute limit; a failed step-up changes
+        nothing).
 
         Returns a ``SessionView`` with the role, the authorization revision
         and the permissions read in the same transaction. Every refusal is
@@ -945,6 +956,8 @@ class AccessStore:
             raise AccessValidationError("access is unavailable")
         if not isinstance(freshness, timedelta) or freshness <= timedelta(0):
             raise AccessValidationError("freshness window is invalid")
+        if not isinstance(touch, bool):
+            raise AccessValidationError("access is unavailable")
         binding = self._session_binding
 
         def decide(connection, row, at):
@@ -959,7 +972,8 @@ class AccessStore:
             if csrf is not None and (binding is None or not binding.csrf_matches(UUID(row["id"]), csrf)):
                 raise AccessValidationError("access is unavailable")
             stale = requirement is Requirement.OWNER_OP and self._verification_stale(row, at, freshness)
-            self._touch_session_on(connection, row, at)
+            if touch:
+                self._touch_session_on(connection, row, at)
             view = SessionView(UUID(row["id"]), UUID(row["principal_id"]), bytes(row["credential_id"]),
                                role=PrincipalRole(row["role"]),
                                authorization_revision=row["authorization_revision"],
