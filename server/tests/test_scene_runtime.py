@@ -43,6 +43,7 @@ from tests.test_uvc_runtime import FAST, Discovery, PermitOwner, wait_for
 
 INTERVAL = 10
 OTHER = UUID(int=901)
+THIRD = UUID(int=902)
 
 
 def quality(detector, **rule):
@@ -397,6 +398,68 @@ class SceneRuntimeIsolationTests(unittest.TestCase):
         self.assertEqual(0, status.critical_pending)
         self.assertEqual(1, status.critical_accepted)
         self.assertEqual([CriticalKind.SERVER_MOVEMENT], harness.recorder.kinds())
+
+    def _loss_backpressure_harness(self):
+        """Three sources, staging nearly full of undelivered movement evidence,
+        and two scene shifts awaiting a correlated trusted loss."""
+        harness = Harness(binding(), binding(OTHER), binding(THIRD), capacity=3)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        for luma, moved in ((None, None), (None, MOVED), (SHIFTED, MOVED)):
+            harness.frame(luma, OTHER, advance=0)
+            harness.frame(luma, THIRD, advance=0)
+            # The second confirmed movement leaves room for one item only.
+            harness.frame(moved)
+        self.assertEqual("global_scene_shift", harness.source(OTHER).tamper_reason)
+        self.assertEqual("global_scene_shift", harness.source(THIRD).tamper_reason)
+        self.assertEqual(2, harness.runtime.status().critical_pending)
+        harness.clock.value += 5
+        for source in (OTHER, THIRD):
+            harness.runtime.on_uvc_health(HealthEvent(source, CameraState.OFFLINE, "synthetic_unplug"))
+        harness.runtime.step()
+        return harness
+
+    def test_correlated_loss_waits_for_staging_instead_of_failing(self):
+        harness = self._loss_backpressure_harness()
+        status = harness.runtime.status()
+        self.assertEqual(3, status.critical_pending)
+        waiting = harness.source(THIRD)
+        self.assertEqual(0, waiting.failures)
+        self.assertIs(SceneSourceState.DEGRADED, waiting.state)
+        self.assertEqual("critical_backpressure", waiting.reason)
+        self.assertEqual(Observation.UNKNOWN, waiting.tamper)
+        # A sample after the loss is not evaluated ahead of the held loss.
+        harness.frame(None, THIRD)
+        self.assertEqual("critical_backpressure", harness.source(THIRD).reason)
+        self.assertEqual(0, harness.source(THIRD).evaluated - 3)
+        # A calibration refresh would discard the shift state; it waits.
+        harness.runtime.request_calibration_refresh(THIRD)
+        harness.runtime.step()
+        self.assertEqual("critical_backpressure", harness.source(THIRD).reason)
+        harness.recorder.fail = False
+        harness.runtime.step()
+        harness.runtime.step()
+        tampers = [item for item in harness.recorder.items
+                   if item.kind is CriticalKind.CAMERA_TAMPER]
+        self.assertEqual({OTHER, THIRD}, {item.source_id for item in tampers})
+        self.assertTrue(all(item.reason == "source_loss_after_scene_shift" for item in tampers))
+        status = harness.runtime.status()
+        self.assertEqual(0, status.critical_pending)
+        # Two movements and two tampers, including one accepted on submit.
+        self.assertEqual(4, status.critical_accepted)
+        self.assertEqual(0, harness.source(THIRD).failures)
+
+    def test_held_correlated_loss_is_drained_at_stop(self):
+        harness = self._loss_backpressure_harness()
+        harness.recorder.fail = False
+        status = harness.runtime.stop()
+        self.assertEqual(0, status.critical_pending)
+        tampers = [item.source_id for item in harness.recorder.items
+                   if item.kind is CriticalKind.CAMERA_TAMPER]
+        self.assertEqual(sorted((OTHER, THIRD)), sorted(tampers))
+        self.assertEqual(Observation.UNKNOWN, harness.source(THIRD).tamper)
 
     def test_stop_withdraws_conclusions_and_reports_undelivered(self):
         harness = Harness()

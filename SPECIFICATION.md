@@ -1024,7 +1024,9 @@ stays inactive and `unknown`; no baseline is taken from live frames. Only
 uncompressed `GREY`/`YUYV` local capture is read; compressed capture stays
 `unknown` until a reviewed decoder exists. Poor quality, undecodable frames,
 backpressure, camera loss and stale conclusions are `unknown`, never a
-negative.
+negative. A camera loss that arrives while staging has no room is held as
+backpressure and processed after staging drains, never dropped as a
+per-source failure.
 Synthetic tests do not establish physical-camera, lighting, pose, or
 source-health behavior.
 

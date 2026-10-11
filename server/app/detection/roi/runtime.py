@@ -52,6 +52,8 @@ MAXIMUM_SOURCES = 4
 DEFAULT_SAMPLE_INTERVAL_NS = 1_000_000_000
 DEFAULT_CRITICAL_CAPACITY = 4 * MAXIMUM_BATCH * MAXIMUM_SOURCES
 CALIBRATION_RETRY_NS = 60 * 1_000_000_000
+# `SceneDetector.source_lost` confirms at most one CAMERA_TAMPER observation.
+LOSS_BATCH = 1
 PACKED_FORMATS = {"GREY": 1, "YUYV": 2}
 
 
@@ -342,6 +344,11 @@ class _Context:
         self.movement_gate = self.tamper_gate = None
         self.resolved_ns = None
         self.refresh = True
+        # A trusted or untrusted loss that could not be handed to the detector
+        # because critical staging had no room. It is kept (not converted to
+        # a failure) until staging drains, so a loss correlated with a scene
+        # shift is never dropped as evidence.
+        self.held_loss = None
 
 
 class SceneMonitoringRuntime:
@@ -580,7 +587,8 @@ class SceneMonitoringRuntime:
             return self._pending_critical
 
     def _finish(self):
-        if self._retry():
+        held = self._drain_held_losses()
+        if self._retry() or held:
             # Staging is in memory only; the count stays visible in status.
             logging.getLogger(__name__).error(Event.SCENE_CRITICAL_UNDELIVERED)
 
@@ -591,8 +599,11 @@ class SceneMonitoringRuntime:
                 slot = self._slots[source_id]
                 sample, loss = slot.sample, slot.loss
                 slot.sample = slot.loss = None
-                refresh = context.refresh
-                context.refresh = False
+                # A calibration refresh would discard the detector's scene
+                # shift state, so it waits until a held loss is processed.
+                refresh = context.refresh and context.held_loss is None
+                if refresh:
+                    context.refresh = False
             try:
                 if refresh or context.detector is None and (
                         context.resolved_ns is None
@@ -661,20 +672,83 @@ class SceneMonitoringRuntime:
             published.maximum_gap_ns = calibration.policy.maximum_gap_ns
             self._withdraw(published, "awaiting_sample")
 
+    @staticmethod
+    def _merge_loss(held, loss):
+        # Same rule as the capture side: keep the first trusted loss.
+        if held is None or loss is None:
+            return held or loss
+        return loss if loss.trusted and not held.trusted else held
+
+    def _loss_admissible(self):
+        self._retry()
+        return self._delivery.remaining >= LOSS_BATCH
+
     def _process(self, context, sample, loss):
         detector = context.detector
         if detector is None:
+            context.held_loss = None
             return
-        items = [item for item in (loss, sample) if item is not None]
+        held, context.held_loss = context.held_loss, None
+        items = [item for item in (self._merge_loss(held, loss), sample) if item is not None]
         items.sort(key=lambda item: item.monotonic_ns)
         for item in items:
-            if isinstance(item, _Loss):
-                result = detector.source_lost(monotonic_ns=item.monotonic_ns,
-                                              observed_at=item.observed_at,
-                                              health_signal_trusted=item.trusted)
+            if context.held_loss is not None:
+                # A sample after a held loss is never evaluated ahead of it:
+                # it would end the episode and move the detector's clock past
+                # the loss, so the correlation could no longer be confirmed.
+                item.data = None
+                self._backpressure(context)
+            elif isinstance(item, _Loss):
+                if not self._loss_admissible():
+                    # Explicit backpressure: the loss is held, never turned
+                    # into a per-source fault that would discard the detector.
+                    context.held_loss = item
+                    self._backpressure(context, count=item is not held)
+                    continue
+                result = context.detector.source_lost(monotonic_ns=item.monotonic_ns,
+                                                      observed_at=item.observed_at,
+                                                      health_signal_trusted=item.trusted)
                 self._handle(context, result, item.monotonic_ns, reason="source_unavailable")
             else:
                 self._evaluate(context, item)
+
+    def _backpressure(self, context, *, count=True):
+        with self._lock:
+            published = self._published[context.binding.source_id]
+            if count:
+                published.backpressured += 1
+            published.state, published.reason = SceneSourceState.DEGRADED, "critical_backpressure"
+            self._withdraw(published, "critical_backpressure")
+
+    def _drain_held_losses(self):
+        """Hand held losses to their detectors at shutdown when room allows.
+
+        Returns how many remain unprocessed (in memory only, like staging).
+        """
+        remaining = 0
+        for context in self._contexts.values():
+            loss = context.held_loss
+            if loss is None:
+                continue
+            try:
+                if context.detector is None or not self._loss_admissible():
+                    remaining += 1
+                    continue
+                context.held_loss = None
+                result = context.detector.source_lost(monotonic_ns=loss.monotonic_ns,
+                                                      observed_at=loss.observed_at,
+                                                      health_signal_trusted=loss.trusted)
+                if result.critical:
+                    self._submit(result.critical)
+            except Exception:
+                context.held_loss = None
+                remaining += 1
+        return remaining
+
+    def _submit(self, critical):
+        state = self._delivery.submit(critical)
+        with self._lock:
+            self._sync_delivery(state)
 
     def _end_episode(self, context, item, reason, counter):
         # A sample this runtime could not evaluate still ends the episode, so
@@ -720,7 +794,7 @@ class SceneMonitoringRuntime:
 
     def _handle(self, context, result, monotonic_ns, *, reason):
         if result.critical:
-            self._delivery.submit(result.critical)
+            self._submit(result.critical)
         exhausted = result.movement_reason == "stream_history_exhausted"
         if exhausted:
             # The detector latched; a fresh detector from the same trusted
@@ -740,7 +814,7 @@ class SceneMonitoringRuntime:
         logging.getLogger(__name__).error(Event.SCENE_SOURCE_FAILED)
         # Rebind from the trusted provider after the retry interval, so a
         # deterministic fault cannot repeat (and log) on every sample.
-        context.detector = None
+        context.detector = context.held_loss = None
         context.resolved_ns = self._deps.monotonic_ns()
         with self._lock:
             published = self._published[context.binding.source_id]

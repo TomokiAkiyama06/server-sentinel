@@ -129,10 +129,15 @@ Only packed uncompressed `GREY`/`YUYV` capture is read (nearest-sample luma
 decimation by byte slicing to the reference size). `MJPG` needs a reviewed
 decoder and is refused. A local `offline` or `manual_intervention_required`
 camera state is a trusted source loss and can correlate with a just-tracked
-scene shift; other states only end confirmation. The default sample interval
+scene shift; other states only end confirmation. A loss that arrives while
+critical staging has no room is held (the source reports
+`critical_backpressure`, samples after it are not evaluated ahead of it) and is
+handed to the detector once staging drains, so a loss correlated with a scene
+shift is never turned into a per-source fault that drops the tamper evidence.
+The default sample interval
 is a conservative 1 sample/s per source. Critical staging is in memory: at
 shutdown, observations the recorder has not accepted are counted and logged as
-`scene_critical_undelivered`. No route reads the runtime status before #10.
+`scene_critical_undelivered`, together with any loss still held. No route reads the runtime status before #10.
 
 `server/tests/test_detector_roi.py` generates all pixel inputs in memory for
 local and remote-agent calibration, relative movement, global camera motion,
