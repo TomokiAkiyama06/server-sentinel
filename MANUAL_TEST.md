@@ -1132,6 +1132,25 @@ Per configured server source:
 - [ ] camera movement is distinguished from server-only movement where practical;
 - [ ] one event can link evidence from other active sources.
 
+### Issue #205 Main runtime wiring (pending physical execution)
+
+The `SceneMonitoringRuntime` wiring is verified only with synthetic, generated
+frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
+
+- [ ] a local UVC source negotiated as uncompressed `YUYV` or `GREY` reaches the
+  scene worker at the configured sample interval (default 1 sample/s) without
+  delaying preview or capture; an `MJPG` layout cannot be bound (no reviewed
+  decoder), and a camera whose frames do not match the bound layout stays
+  `unknown` (`frame_unusable`);
+- [ ] with no stored, re-bindable calibration the source stays inactive and
+  `unknown` (`calibration_provider_unconfigured` /
+  `calibration_reference_unavailable`), and no critical event is produced;
+- [ ] Main-host CPU of the scene worker at 1 to 4 sources while GPU benchmarks run;
+- [ ] a confirmed movement/tamper reaches the presence critical timeline with
+  neutral wording, in every presence state;
+- [ ] unplugging the camera right after a camera shift yields one
+  `source_loss_after_scene_shift` tamper, while an unplug alone stays `unknown`.
+
 ## F. Camera tamper and source health
 
 - [ ] move/rotate camera mount;
