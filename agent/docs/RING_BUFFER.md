@@ -156,18 +156,31 @@ therefore predicts refusal by simulating the sources' next appends.
   segment is credited once it ages out only for a source whose next interval
   is known (not overdue) and outside any retained incident.
 - **Recent real allocations.** For each source the last eight stored
-  segments' real allocations give a mean `m`, a sample variance `v`, a
-  minimum and a maximum `c` in whole allocation units (`c` never above
+  segments' real allocations, each rounded up to whole allocation units
+  (`f_frsize`), give a mean `m` and a sample variance `v`; the unrounded
+  allocations give a minimum and a maximum `c` in whole allocation units (`c` never above
   `round_up(max_segment)`, where `max_segment` is the source's largest
   bounded segment). With fewer than four stored segments `m = c` and `v = 0`
   (a spread from so few samples is not trusted); without history
   `m = c = round_up(max_segment)`. A simulated append that ages out is
-  credited the source's smallest recent allocation.
+  credited the source's smallest recent allocation (unrounded, so reclaim is
+  never over-credited). Rounding each sample before `m` and `v` matters only
+  where `st_blocks * 512` is not a multiple of `f_frsize`: free space is
+  consumed in whole units, and rounding only the batch total could charge up
+  to about `n - 1` units less than `n` appends consume (Claude review of
+  PR #143). Where every allocation is already whole units (ext4) it changes
+  nothing.
 - **Charge `C(t)`** (Issue #130). All simulated appends at or before `t`,
   `n_s` of each source `s`, are charged together:
   `C(t) = min(sum(n_s * c_s), round_up(ceil(sum(n_s * m_s)) + sum(ceil(2 * n_s * sqrt(v_s)))))`,
   the mean of their total plus two standard deviations of that total, never
-  above every append at its source's recent maximum. The deviation of the
+  above every append at its source's recent maximum. Rounding never lowers
+  `C(t)` below the exact value: the summed mean is rounded up to whole bytes
+  once, each source's deviation term is rounded up to whole bytes on its own
+  (exactly, by integer square root), and their sum is rounded up to whole
+  allocation units (pinned by
+  `test_batch_charge_rounding_is_pinned_and_never_below_the_exact_charge`).
+  The deviation of the
   total is bounded as if every append were perfectly correlated
   (`sum(n_s * sqrt(v_s))`, deviations add): synchronized sources filming the
   same scene and temporally correlated VBR within one source make the
@@ -216,6 +229,21 @@ therefore predicts refusal by simulating the sources' next appends.
   segments. Every real refusal in those runs (9, 1 and 5) was preceded by a
   hard stop; with spikes, 1 of 17 refusals followed only the maximum-bitrate
   pressure, as with the pre-#130 charge, and none followed a healthy status.
+- **Premise of "no more hard stops than before Issue #130".** `C(t)` is never
+  above the pre-#130 charge `sum(n_s * c_s)`, and the credits `R(t)` do not
+  depend on which charge is used, so the hard stop can only be read in fewer
+  states than before. The simulated-append credit path is, in addition,
+  practically unused: the FIFO window is at least `PRE` (duration mode accepts
+  only `>= 600 s`; capacity mode ages out at `PRE`) and every cadence is at
+  most `PRE` (`SegmentProfile` refuses a longer one), so the simulation ends
+  at `latest <= now + max cadence <= now + PRE <= now + window`. A simulated
+  append ages out within it only when it is written at exactly `now`, the
+  window equals `PRE`, and another source's next append is a full `PRE`
+  cadence away. Its credit is the source's smallest recent allocation, never
+  more than that append's share of the charge. The comparison with the
+  pre-#130 charge and the measured trade-off above rely on these bounds; a
+  change that allows a window below `PRE` or a cadence above `PRE` must
+  revisit the simulated credit before relying on them.
 - **`STORAGE_PRESSURE / segment_write_at_risk_at_maximum_bitrate`** (writes
   would be refused only if the bitrate rose to the bound). The same
   simulation with every append charged `round_up(max_segment)`, that is

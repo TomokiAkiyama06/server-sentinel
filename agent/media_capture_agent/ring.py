@@ -373,7 +373,10 @@ class DiskRing:
         With fewer than ``MINIMUM_SPREAD_SAMPLES`` the mean is the cap and the
         variance zero, so a short or absent history is charged its recent
         maximum (the bound without history). ``at_bound`` charges every
-        append its bound.
+        append its bound. The mean and variance are taken over the samples
+        each rounded up to whole allocation units (never under-charging an
+        append on a filesystem whose 512-byte block counts are not whole
+        ``f_frsize`` units); the credit is the unrounded smallest sample.
         """
         recent = {}
         for source, profile in self.profiles.items():
@@ -385,13 +388,22 @@ class DiskRing:
                 recent[source] = (Fraction(bound), Fraction(0), bound, bound)
                 continue
             cap = min(bound, round_up(max(sizes), unit))
+            credit = min(cap, min(sizes))
             count = len(sizes)
             if count < MINIMUM_SPREAD_SAMPLES:
-                recent[source] = (Fraction(cap), Fraction(0), min(cap, min(sizes)), cap)
+                recent[source] = (Fraction(cap), Fraction(0), credit, cap)
                 continue
+            # Free space is consumed in whole allocation units, but
+            # ``st_blocks * 512`` need not be a multiple of ``f_frsize`` on
+            # every filesystem. The charge statistics therefore use each
+            # sample rounded up to whole units, so a batch of appends is never
+            # charged below the sum of its per-append unit-rounded sizes
+            # (Issue #130). The credit stays the unrounded smallest sample, so
+            # reclaim is never over-credited.
+            sizes = [round_up(size, unit) for size in sizes]
             mean = Fraction(sum(sizes), count)
             variance = sum((size - mean) ** 2 for size in sizes) / (count - 1)
-            recent[source] = (min(mean, Fraction(cap)), variance, min(cap, min(sizes)), cap)
+            recent[source] = (min(mean, Fraction(cap)), variance, credit, cap)
         return recent
 
     @staticmethod
@@ -408,9 +420,18 @@ class DiskRing:
         undercharge a correlated batch. One spread over the whole batch, not
         one recent maximum per append, still keeps the sample maximum's excess
         over ``mean + DEVIATION_FACTOR * deviation`` from compounding across
-        sources and chained appends into a false hard stop. Each source's
-        term is rounded up to whole bytes, so the result never falls below
-        the exact bound.
+        sources and chained appends into a false hard stop.
+
+        Rounding never lowers the charge below the exact rational value
+        ``sum(count * mean) + DEVIATION_FACTOR * sum(count * sqrt(variance))``:
+        the summed mean is rounded up to whole bytes once, each source's
+        deviation term is rounded up to whole bytes separately (exactly, via
+        an integer square root), and their sum is rounded up to whole
+        allocation units. The per-append rounding to whole allocation units
+        happens earlier, on each sample (``_recent_allocations``), so every
+        mean is a mean of whole-unit allocations and a batch is never charged
+        below its appends' unit-rounded mean; the cap is a whole number of
+        units per append.
         """
         mean, deviation, cap = Fraction(0), 0, 0
         for count, (append_mean, append_variance, _credit, append_cap) in appends:

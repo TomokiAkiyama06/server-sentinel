@@ -173,6 +173,79 @@ class VariableSegmentSizeTests(unittest.TestCase):
         fixed = (Fraction(7 * unit), Fraction(0), 7 * unit, 7 * unit)
         self.assertEqual(14 * unit, DiskRing._batch_charge([(2, fixed)], unit))
 
+    def test_batch_charge_rounding_is_pinned_and_never_below_the_exact_charge(self):
+        unit = 4096
+        # The summed mean is rounded up to whole bytes once: two means of
+        # 10 units plus half a byte need 20 units plus one byte, so 21 units.
+        half = (Fraction(20 * unit + 1, 2), Fraction(0), 10 * unit, 11 * unit)
+        self.assertEqual(21 * unit, DiskRing._batch_charge([(1, half), (1, half)], unit))
+        # Each source's deviation term is rounded up to whole bytes on its
+        # own: 2 * sqrt(1/16) = 0.5 byte becomes 1 byte per source, so means
+        # of 10 units - 1 byte and 10 units need 20 units + 1 byte, that is
+        # 21 units (one rounding of the summed 1-byte deviation would give
+        # exactly 20 units).
+        low = (Fraction(10 * unit - 1), Fraction(1, 16), 9 * unit, 11 * unit)
+        high = (Fraction(10 * unit), Fraction(1, 16), 9 * unit, 11 * unit)
+        self.assertEqual(21 * unit, DiskRing._batch_charge([(1, low), (1, high)], unit))
+        # Whole-unit means with no spread are charged exactly, not a unit more.
+        exact = (Fraction(10 * unit), Fraction(0), 10 * unit, 10 * unit)
+        self.assertEqual(30 * unit, DiskRing._batch_charge([(3, exact)], unit))
+        # Seeded property: a whole number of units, never below the exact
+        # rational charge, never above every append at its recent maximum.
+        sizes = random.Random(130)
+        for _ in range(300):
+            appends = []
+            for _source in range(sizes.randint(1, 4)):
+                cap = sizes.randint(1, 64) * unit
+                mean = Fraction(sizes.randint(1, cap), sizes.randint(1, 7))
+                variance = Fraction(sizes.randint(0, (cap // 2) ** 2), sizes.randint(1, 7))
+                appends.append((sizes.randint(0, 6), (min(mean, Fraction(cap)), variance, 1, cap)))
+            charge = DiskRing._batch_charge(appends, unit)
+            cap = sum(count * recent[3] for count, recent in appends)
+            self.assertEqual(0, charge % unit)
+            self.assertLessEqual(charge, cap)
+            if charge < cap:
+                mean = sum(count * recent[0] for count, recent in appends)
+                # charge - mean >= 2 * sum(count * sqrt(variance)), checked
+                # in exact arithmetic from below with each root rounded down.
+                floor = sum(math.isqrt(math.floor(recent[1] * (2 * count) ** 2)) for count, recent in appends)
+                self.assertGreaterEqual(charge, mean + floor)
+
+    def test_recent_allocations_round_each_sample_up_to_whole_units(self):
+        # ``st_blocks * 512`` need not be a multiple of ``f_frsize``: a
+        # 30-unit-and-512-byte allocation consumes 31 whole units of free
+        # space. Two sources with eight such samples each must be charged
+        # 62 units per batch, not round_up(60 units + 1024 bytes) = 61 units
+        # (Claude review of PR #143). The credit stays the unrounded sample.
+        _settings, _quota, store, ring = self.ring()
+        unit = store.allocation_unit
+        profiles = tuple(SegmentProfile(UUID(int=1420 + index), 34000, 17000, 60 * SECOND, 100)
+                         for index in range(2))
+        ring.configure(RingConfig("duration", 600), profiles, now_us=T0, clock_trusted=True)
+        for index in range(8):
+            end = T0 - (7 - index) * 60 * SECOND
+            for profile in profiles:
+                ring.append(profile.source_id, end - 60 * SECOND, end, b"\x5a" * (30 * unit),
+                            now_us=end, clock_trusted=True)
+        # Every other sample of each source sits exactly on a unit boundary:
+        # rounding it is a no-op, so the rounded history has no spread.
+        allocations = {}
+        for profile in profiles:
+            rows = ring.db.execute("SELECT id FROM segments WHERE source=? ORDER BY end",
+                                   (str(profile.source_id),)).fetchall()
+            for position, row in enumerate(rows):
+                allocations[UUID(row[0])] = 30 * unit + (512 if position % 2 == 0 else unit)
+        recent = ring._recent_allocations(allocations, unit)
+        for profile in profiles:
+            self.assertEqual((Fraction(31 * unit), Fraction(0), 30 * unit + 512, 31 * unit),
+                             recent[profile.source_id])
+        self.assertEqual(62 * unit, ring._batch_charge([(1, recent[profile.source_id]) for profile in profiles],
+                                                       unit))
+        # Whole-unit allocations (ext4-like) are unchanged by the rounding.
+        whole = {identifier: 30 * unit for identifier in allocations}
+        self.assertEqual((Fraction(30 * unit), Fraction(0), 30 * unit, 30 * unit),
+                         ring._recent_allocations(whole, unit)[profiles[0].source_id])
+
     def test_one_large_recent_segment_no_longer_reads_hard_stop_while_typical_writes_fit(self):
         # Each source's recent history: seven 30-unit segments and one
         # 50-unit segment. Charging both next appends the recent maximum
@@ -203,7 +276,16 @@ class VariableSegmentSizeTests(unittest.TestCase):
             return ring.status(now_us=T0, clock_trusted=True)
 
         status = available(94)
-        self.assertEqual("STORAGE_PRESSURE", status["state"])
+        # Pressure, not a hard stop. The earlier pressure reason
+        # ``post_loss_headroom_reduced`` takes precedence in the status, so
+        # pin the next-write simulation itself: not refused at the recent
+        # real bitrate, refused at the maximum bitrate (the reason
+        # ``segment_write_at_risk_at_maximum_bitrate`` would report).
+        self.assertEqual(("STORAGE_PRESSURE", "post_loss_headroom_reduced"),
+                         (status["state"], status["reason"]))
+        budget = ring._budget(ring.profiles, T0, clock_trusted=True)
+        self.assertFalse(ring._next_write_refused(T0, budget, clock_trusted=True))
+        self.assertTrue(ring._next_write_refused(T0, budget, clock_trusted=True, at_bound=True))
         with legacy_charge():
             legacy = ring.status(now_us=T0, clock_trusted=True)
         self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
