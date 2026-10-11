@@ -1080,7 +1080,9 @@ class RunSummary:
         received a Main reply sent after the window started: the last
         heartbeat echo the Agent received on it (``last_echo_ns``) must be
         older than every echo the receiver returned on it after the window
-        start (``heartbeat_ack``). Echo values are Agent clock readings and
+        start (``heartbeat_ack``, recorded only after the reply was written).
+        Every session's ``last_echo_ns`` must appear among that session's
+        ``heartbeat_ack`` echoes, or the result is unmeasured. Echo values are Agent clock readings and
         are only compared with each other; ``heartbeat_ack`` times only with
         the Main windows. Bytes the receiver drains after SIGCONT (sent
         before the Agent dropped the connection) are not evidence either
@@ -1110,8 +1112,11 @@ class RunSummary:
         for item in _kind(self.receiver, "heartbeat_ack"):
             if _is_int(item.get("session")) and _is_int(item.get("echo_ns")):
                 replies.setdefault(item["session"], []).append((item["t_ns"], item["echo_ns"]))
-        if echoes and not replies:
-            return None  # the Agent saw replies Main has no record of
+        for session, echo in echoes.items():
+            if echo not in {value for _, value in replies.get(session, ())}:
+                # The Agent received a reply on this session that Main has no
+                # (successfully sent) record of: its Main clock time is unknown.
+                return None
         # A session ends at its close, or at the end of its receiver process
         # (an abruptly stopped receiver may not write every close; the
         # orchestrator's ``exit`` is written once the process is gone).

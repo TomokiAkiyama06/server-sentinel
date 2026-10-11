@@ -28,8 +28,8 @@ for path in (str(HARNESS), str(AGENT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from transport_poc import (holder, materials, matrix, proxy, records,  # noqa: E402
-                           sender, summarize, wire)
+from transport_poc import (holder, materials, matrix, proxy, receiver,  # noqa: E402
+                           records, sender, summarize, wire)
 
 RUN = "r20261011t000000ab"
 
@@ -2229,6 +2229,12 @@ class SummarizerTests(unittest.TestCase):
                     check(end + 3, alive, 111 * second, ("fail", "fail"))
                     # the Agent's echoes have no Main-side record at all
                     check(end + 1, [], 108 * second, ("unmeasured", "unmeasured"))
+                # per session: the Agent's last echo on session 11 (108) has no
+                # sent-reply record on that session -- only earlier echoes, or
+                # the same echo on another session -- so its Main time is unknown
+                check(end + 1, before[:-1], 108 * second, ("unmeasured", "unmeasured"))
+                other = [dict(item, session=99, connection=9) for item in before]
+                check(end + 1, other, 108 * second, ("unmeasured", "unmeasured"))
                 # sender records from before the echo evidence: not correlated
                 sessions = _session(11, 1, end + 1, 1) + _session(12, end + 2, 90, 2)
                 old = [{key: value for key, value in row.items() if key != "last_echo_ns"}
@@ -2317,6 +2323,100 @@ class SenderProducerTests(unittest.TestCase):
             self.assertGreaterEqual(row["produce_ns"], 1_900_000_000)
             self.assertGreater(row["generated"], 30)
             self.assertLess(row["max_offer_gap_ns"], 10**9)
+
+
+class ReceiverHeartbeatAckTests(unittest.TestCase):
+    """``heartbeat_ack`` (Main clock evidence for G4/G5) is written only after
+    the reply carrying the echo was sent, for every candidate: a record taken
+    before the send (e.g. before a SIGSTOP that delays it past SIGCONT, or
+    while a segment body is still being read) would predate the moment the
+    Agent could receive the echo and let a surviving session pass."""
+
+    class Connection:
+        def __init__(self, chunks, log, fail=None):
+            self.chunks, self.log, self.fail = list(chunks), log, fail
+
+        def settimeout(self, _value):
+            pass
+
+        def fileno(self):
+            raise ValueError("fake socket")
+
+        def recv(self, _size):
+            return self.chunks.pop(0) if self.chunks else b""
+
+        def sendall(self, data):
+            if self.fail is not None and wire.heartbeat_ack_frame(7) in data:
+                raise self.fail
+            self.log.append(("send", bytes(data)))
+
+    class Writer:
+        def __init__(self, log):
+            self.log = log
+
+        def write(self, kind, **fields):
+            self.log.append(("event", kind, fields))
+
+    def _receiver(self, candidate, log):
+        config = receiver.ReceiverConfig(candidate=candidate, bind_host="127.0.0.1", port=0)
+        config.admission_check_s = config.idle_timeout_s = 10**6
+        instance = object.__new__(receiver.Receiver)
+        instance.config, instance.writer = config, self.Writer(log)
+        instance.stop, instance._lock = threading.Event(), threading.Lock()
+        instance.bytes_in = instance.max_outq = instance.max_inq = 0
+        instance.tracker = mock.Mock(heartbeat=mock.Mock(return_value=True))
+        return instance
+
+    @staticmethod
+    def _chunks(candidate):
+        first = wire.hello_frame(5) + wire.heartbeat_frame(7)
+        second = wire.heartbeat_frame(8)
+        if candidate == "a_framed":
+            return [first, second]
+        if candidate == "b_chunked":
+            return [wire.request_head("POST", wire.STREAM_PATH) + wire.chunk(first),
+                    wire.chunk(second) + wire.LAST_CHUNK]
+        # the second heartbeat arrives in a later read of the same segment body
+        head = wire.request_head("PUT", wire.SEGMENT_PATH,
+                                 content_length=len(first) + len(second))
+        return [head + first, second]
+
+    def _run(self, candidate, fail=None):
+        log = []
+        instance = self._receiver(candidate, log)
+        connection = self.Connection(self._chunks(candidate), log, fail)
+        session = mock.Mock(connection=connection)
+        state = {"last_rx": time.monotonic(), "checked": time.monotonic(),
+                 "connection": 1, "session": None}
+        try:
+            reason = instance._run_session(session, object(), state)
+        except OSError:
+            reason = "tls_session_failed"
+        return log, reason
+
+    def test_ack_recorded_only_after_its_reply_was_sent(self):
+        for candidate in ("a_framed", "b_chunked", "b_segment"):
+            with self.subTest(candidate=candidate):
+                log, _ = self._run(candidate)
+                acks = [index for index, item in enumerate(log)
+                        if item[0] == "event" and item[1] == "heartbeat_ack"]
+                self.assertEqual([7, 8], [log[index][2]["echo_ns"] for index in acks])
+                for index in acks:
+                    echo = wire.heartbeat_ack_frame(log[index][2]["echo_ns"])
+                    sent = [position for position, item in enumerate(log)
+                            if item[0] == "send" and echo in item[1]]
+                    self.assertTrue(sent and sent[0] < index, (candidate, log))
+                    self.assertEqual(5, log[index][2]["session"])
+
+    def test_failed_reply_send_records_no_ack(self):
+        for candidate in ("a_framed", "b_chunked", "b_segment"):
+            for failure in (socket.timeout("send"), OSError("reset")):
+                with self.subTest(candidate=candidate, failure=type(failure).__name__):
+                    log, reason = self._run(candidate, fail=failure)
+                    self.assertIn(reason, ("send_failed", "tls_session_failed"))
+                    echoes = [item[2]["echo_ns"] for item in log
+                              if item[0] == "event" and item[1] == "heartbeat_ack"]
+                    self.assertNotIn(7, echoes)
 
 
 class MiscTests(unittest.TestCase):

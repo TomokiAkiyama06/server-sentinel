@@ -442,7 +442,13 @@ class Receiver:
         self._event("session_hello", connection=state["connection"], session=session)
 
     def _handle_bodies(self, bodies, grant, state, *, segment_blocked=None):
+        """Process ``bodies``; returns ``(reply bytes, heartbeat echoes)``.
+
+        The echoes are recorded (``_record_acks``) by the caller only after
+        the reply carrying them was written, never before.
+        """
         replies = []
+        echoes = []
         for body in bodies:
             parsed = wire.parse_body(body)
             if parsed[0] == wire.HELLO:
@@ -464,17 +470,27 @@ class Receiver:
             elif parsed[0] == wire.HEARTBEAT:
                 if not self.tracker.heartbeat(grant):
                     raise _Close("superseded")
-                # Main clock time of each reply and the opaque echo value (an
-                # Agent clock reading, only ever compared with other echo
-                # values): the Agent records the last echo it received, so a
-                # connection that kept receiving Main replies after a Main
-                # stop is told apart from one the Agent dropped (G4/G5).
-                self._event("heartbeat_ack", connection=state["connection"],
-                            session=state["session"], echo_ns=parsed[1])
+                echoes.append(parsed[1])
                 replies.append(wire.heartbeat_ack_frame(parsed[1]))
             else:
                 raise wire.ProtocolError("unexpected frame from agent")
-        return b"".join(replies)
+        return b"".join(replies), echoes
+
+    def _record_acks(self, state, echoes):
+        """Record heartbeat replies once they have been written to the socket.
+
+        Main clock time of each reply and the opaque echo value (an Agent
+        clock reading, only ever compared with other echo values): the Agent
+        records the last echo it received, so a connection that kept
+        receiving Main replies after a Main stop is told apart from one the
+        Agent dropped (G4/G5). The record is written only after ``_send``
+        returned, so its time is never earlier than the moment the Agent
+        could have received the echo (a SIGSTOP between the two makes it
+        later, i.e. more conservative); a failed send records nothing.
+        """
+        for echo in echoes:
+            self._event("heartbeat_ack", connection=state["connection"],
+                        session=state["session"], echo_ns=echo)
 
     def _session_a(self, session, grant, state):
         reader = wire.FrameReader(self.config.maximum_message_bytes + wire.MEDIA_HEADER_BYTES)
@@ -494,9 +510,10 @@ class Receiver:
                     self._event("route_probe", reason="protocol_error",
                                 session=state["session"])
                 raise
-            reply = self._handle_bodies(bodies, grant, state)
+            reply, echoes = self._handle_bodies(bodies, grant, state)
             if reply:
                 self._send(session, reply)
+            self._record_acks(state, echoes)
 
     def _send(self, session, data):
         try:
@@ -541,9 +558,10 @@ class Receiver:
                 bodies = []
                 for piece in decoder.feed(data):
                     bodies.extend(reader.feed(piece))
-                reply = self._handle_bodies(bodies, grant, state)
+                reply, echoes = self._handle_bodies(bodies, grant, state)
                 if reply:
                     self._send(session, wire.chunk(reply))
+                self._record_acks(state, echoes)
                 if decoder.finished:
                     self._send(session, wire.LAST_CHUNK)
                     raise _Close("peer_closed")
@@ -567,14 +585,17 @@ class Receiver:
             reader = wire.FrameReader(maximum)
             blocked = set()
             replies = []
+            echoes = []
             remaining = length
             data = bytes(pending[:remaining])
             pending = bytearray(pending[remaining:])
             while True:
                 remaining -= len(data)
                 if data:
-                    replies.append(self._handle_bodies(reader.feed(data), grant, state,
-                                                       segment_blocked=blocked))
+                    reply, more = self._handle_bodies(reader.feed(data), grant, state,
+                                                      segment_blocked=blocked)
+                    replies.append(reply)
+                    echoes.extend(more)
                 if remaining <= 0:
                     break
                 data = self._recv(session, state) or b""
@@ -585,6 +606,7 @@ class Receiver:
                 raise wire.ProtocolError("segment ended inside a frame")
             reply = b"".join(replies)
             self._send(session, wire.response_head(200, content_length=len(reply)) + reply)
+            self._record_acks(state, echoes)
 
     # -- consumer (durable-recording stand-in) ------------------------------
     def _consume(self):
