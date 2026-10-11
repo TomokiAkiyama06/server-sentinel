@@ -111,8 +111,11 @@ def reserved_origin(check: HostnameReservationCheck) -> tuple[str, str]:
     """``(origin, host header)`` for the reserved name; https only.
 
     The default port is omitted, as browsers serialize it. ``http://localhost``
-    is not offered here: whether a strictly local Owner path may run without
-    the trusted proxy is an open Owner decision, so it stays unavailable.
+    is never offered here: the Owner decision of 2026-10-11 rejected any
+    strictly local ``http://localhost`` Owner route (and any path without a
+    trusted-proxy identity), so the Owner signs in through this reserved
+    ``https`` origin like every other person (``SECURITY.md``,
+    ``server/app/auth/README.md``).
     """
     config = check.config
     authority = config.hostname if config.port == 443 else f"{config.hostname}:{config.port}"

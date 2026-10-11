@@ -182,7 +182,10 @@ class RelyingParty:
 
     ``origin`` must be a secure context: ``https://<host>[:port]``, or
     ``http://localhost[:port]`` for a strictly local browser, because browsers
-    expose WebAuthn only there. The relying-party id must equal the origin's
+    expose WebAuthn only there. The ``http://localhost`` form is verifier
+    support only: the human composition builds only the reserved ``https``
+    origin, and there is no ``http://localhost`` Owner route (Owner decision,
+    2026-10-11). The relying-party id must equal the origin's
     host: ServerSentinel reserves the whole hostname (ADR-0003), so a
     registrable parent domain is never used as the id.
     """

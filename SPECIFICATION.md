@@ -1652,7 +1652,9 @@ credentials and cookies for that origin until the next check.
 The origin must also be a secure context — HTTPS, or `http://localhost` for a
 strictly local browser — because browsers expose WebAuthn only there. Plain
 HTTP on a non-loopback host leaves every human route unreachable in practice,
-since nobody can register or authenticate.
+since nobody can register or authenticate. The current human composition
+accepts only the reserved `https` origin; there is no `http://localhost` Owner
+route (Owner decision, 2026-10-11, see `SECURITY.md`).
 
 Initial non-owner permissions:
 
