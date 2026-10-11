@@ -1037,7 +1037,9 @@ capture is read as uncompressed `GREY`/`YUYV` or, since Issue #217 (Owner
 decision 2026-10-11), as `MJPG` through the reviewed simplejpeg decoder: a
 structural pre-check in the Main process (flat byte buffer, SOI, one baseline
 scan ending in a single EOI, bounded padding, SOF dimensions equal to the
-negotiated format within a pixel budget) runs on the scene worker before any
+negotiated format within a pixel budget, a payload of at most 2 bytes per
+negotiated pixel plus 256 KiB, entropy data checked with C-level byte
+operations so its cost is linear in that bound) runs on the scene worker before any
 native code sees the bytes, and the strict decode itself runs only in a
 separate, per-source, resident decode child process (Owner decision
 2026-10-11 on PR #225), never in the Main process. The child is started by
@@ -1054,7 +1056,8 @@ decode error, decoded-shape mismatch or mid-grey undecoded band, and any child
 crash, kill (including OOM), exit, timeout (the child is killed) or malformed
 reply is `unknown` (`frame_undecodable`, counted per fixed reason in
 `undecodable_reasons`); a replacement child starts only after a bounded
-exponential backoff during which frames are refused without waiting, and
+exponential backoff during which frames are refused without waiting (the
+supervisor starts it when the backoff ends, without waiting for a frame), and
 repeated child failures lower the source (and the runtime) to `degraded`
 (`frame_decoder_failing`, logged value-free). A missing or differently
 versioned decoder keeps the source inactive (`frame_decoder_unavailable`).

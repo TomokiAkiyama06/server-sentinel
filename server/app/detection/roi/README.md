@@ -137,20 +137,27 @@ process:
 
 - a pure-Python pre-check in Main runs before any native code sees the bytes:
   a flat byte buffer (a non-contiguous or multi-dimensional `memoryview` is
-  refused), `SOI` first, a bounded marker count and payload size, exactly one
+  refused), `SOI` first, a bounded marker count, a payload of at most
+  2 bytes per negotiated pixel plus 256 KiB for marker segments and the
+  trailing padding (never above 32 MiB; `frame_byte_budget`), exactly one
   baseline or extended-sequential Huffman `SOF` whose width/height equal the
   negotiated format and fit the 3840x2160 pixel budget (a decompression-bomb
   header is refused before the decoder allocates), one interleaved scan ending
   in a single `EOI`, and at most `maximum_trailing_bytes` (provisionally 8192)
-  of padding after it with no further `SOI`/`EOI`. Only the validated bytes up
-  to `EOI` are sent to the child;
+  of padding after it with no further `SOI`/`EOI`. The entropy-coded data is
+  checked with C-level `bytes.find` / `bytes.translate` in 1 MiB chunks, so
+  even a frame at the budget made entirely of `FF 00` stuffing costs a few
+  tens of milliseconds at 4K on the shared scene worker, never one Python
+  iteration per byte. Only the validated bytes up to `EOI` are sent to the
+  child;
 - each MJPG source has its own resident decode child (`mjpg_worker.py`
   supervising `mjpg_child.py`), started with fork+exec of the service's
   interpreter (`python -I -B`, no `preexec_fn`) by that source's own
   supervisor thread (`mjpg-decoder`, kept until stop, so the child's
   parent-death signal is tied to a thread that outlives it), requested
-  without waiting when the source is bound and again by a frame after a
-  failure, with an explicit minimal environment (only
+  without waiting when the source is bound and started again by the
+  supervisor itself as soon as the restart backoff after a failure ends (or
+  by a frame, whichever comes first), with an explicit minimal environment (only
   `LC_ALL=C` and one BLAS/OpenMP thread), stdio on `/dev/null` and only one
   private `AF_UNIX` socketpair end inherited. Before importing simplejpeg or
   numpy the child sets `no_new_privs`, a parent-death `SIGKILL` (and checks

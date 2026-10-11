@@ -14,8 +14,11 @@ the scene runtime maps to `unknown`, never to "no movement" or "no tamper":
    negotiated V4L2 format and fit the pixel budget (a decompression-bomb
    header is refused before the decoder allocates anything); exactly one
    interleaved scan followed by a single `EOI`; at most a bounded number of
-   padding bytes after it; a bounded total size and marker count. Only the
-   validated bytes up to `EOI` are sent to the child;
+   padding bytes after it; a total size bounded by the negotiated resolution
+   (`frame_byte_budget`) and a bounded marker count. The entropy-coded data is
+   scanned with C-level byte operations, so its cost is linear in that budget
+   and never one Python iteration per stuffed byte. Only the validated bytes
+   up to `EOI` are sent to the child;
 2. decode in the child with simplejpeg `strict=True` (libjpeg-turbo warnings
    such as a premature end of the entropy-coded data or extraneous bytes
    become errors) straight to luma (`GRAY`), using libjpeg's DCT scaling to
@@ -57,6 +60,18 @@ from .mjpg_worker import (CHILD, NUMPY_VERSION, SIMPLEJPEG_VERSION, DecodeReques
 MAXIMUM_DECODE_PIXELS = 3840 * 2160
 # Upper bound for a whole MJPG payload, independent of the pixel budget.
 MAXIMUM_FRAME_BYTES = 32 * 1024 * 1024
+# Per-format payload budget (`frame_byte_budget`): at most
+# `MAXIMUM_BYTES_PER_PIXEL` bytes per negotiated pixel, plus
+# `HEADER_ALLOWANCE_BYTES` for the marker segments and the configured trailing
+# padding, never above `MAXIMUM_FRAME_BYTES`. Two bytes per pixel is the size
+# of the same frame as uncompressed YUYV, which UVC devices commonly report as
+# the MJPG `dwMaxVideoFrameSize`; a baseline frame from a camera encoder stays
+# far below it (MANUAL_TEST.md records the real C960 sizes). A larger payload
+# is refused (`frame_too_large`, so `unknown`) before it is scanned, which
+# bounds the pre-check work on the shared scene worker by the negotiated
+# resolution rather than by the 32 MiB cap.
+MAXIMUM_BYTES_PER_PIXEL = 2
+HEADER_ALLOWANCE_BYTES = 256 * 1024
 # Padding a UVC payload may carry after `EOI`. Provisional until real C960
 # frames are measured (MANUAL_TEST.md, Issue #217); a deployment can lower it
 # or raise it up to `MAXIMUM_TRAILING_LIMIT`.
@@ -72,6 +87,16 @@ SUPPORTED_SOF = frozenset({0xC0, 0xC1})  # baseline / extended sequential, Huffm
 OTHER_SOF = frozenset({0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF})
 APPLICATION = frozenset(range(0xE0, 0xF0))
 RESTART = frozenset(range(0xD0, 0xD8))
+# Entropy-coded data scan (`_entropy_end`): every byte is mapped to its class,
+# 0xFF -> 0xFF, a byte that may follow 0xFF inside the scan (`00` stuffing or
+# an `RST` marker) -> 0x00, anything else -> 0x01, so a forbidden pair is
+# found with one C-level `bytes.find`. Fill bytes (0xFF 0xFF) stay 0xFF 0xFF.
+_ENTROPY_CLASSES = bytes(0xFF if value == 0xFF else 0x00 if value == 0x00 or value in RESTART
+                         else 0x01 for value in range(256))
+_FORBIDDEN_PAIR = b"\xff\x01"
+# Bytes translated at a time, so the scan never holds a second copy of a
+# whole frame.
+_SCAN_CHUNK_BYTES = 1024 * 1024
 
 REASONS = frozenset({
     "frame_type_invalid", "frame_too_large", "missing_soi", "marker_invalid",
@@ -107,6 +132,14 @@ class JpegStructure:
     trailing: int
 
 
+def frame_byte_budget(width: int, height: int,
+                      maximum_trailing: int = DEFAULT_TRAILING_BYTES) -> int:
+    """Largest payload accepted for a `width` x `height` negotiated format."""
+    return min(MAXIMUM_FRAME_BYTES,
+               MAXIMUM_BYTES_PER_PIXEL * width * height + HEADER_ALLOWANCE_BYTES
+               + maximum_trailing)
+
+
 def _u16(data, offset):
     return (data[offset] << 8) | data[offset + 1]
 
@@ -117,7 +150,7 @@ def inspect_frame(data: bytes, *, width: int, height: int,
     if type(data) is not bytes:
         raise MjpgFrameRejected("frame_type_invalid")
     size = len(data)
-    if size > MAXIMUM_FRAME_BYTES:
+    if size > frame_byte_budget(width, height, maximum_trailing):
         raise MjpgFrameRejected("frame_too_large")
     if size < 4 or data[0] != 0xFF or data[1] != SOI:
         raise MjpgFrameRejected("missing_soi")
@@ -222,23 +255,30 @@ def _scan_header(data, body, length, components):
 
 
 def _entropy_end(data, position):
-    """Index just after the `EOI` that ends the single scan."""
+    """Index just after the `EOI` that ends the single scan.
+
+    Inside the scan a 0xFF byte may only be followed by `00` (stuffing), an
+    `RST` marker or another 0xFF (fill); the first `FF D9` ends the scan, and
+    any other marker before it (a second scan, tables, a new image) refuses
+    the frame. The work is C-level (`bytes.find` / `bytes.translate`, in
+    bounded chunks) and linear in the frame size, which `frame_byte_budget`
+    bounds: dense `FF 00` stuffing costs no Python iteration per byte.
+    """
     size = len(data)
-    while True:
-        found = data.find(b"\xff", position)
-        if found < 0 or found + 1 >= size:
-            raise MjpgFrameRejected("missing_eoi")
-        following = data[found + 1]
-        if following == 0x00 or following in RESTART:
-            position = found + 2
-        elif following == 0xFF:
-            position = found + 1
-        elif following == EOI:
-            return found + 2
-        else:
-            # Another segment after the scan (a second scan, tables, a new
-            # image): not a single-scan UVC frame.
+    eoi = data.find(b"\xff\xd9", position)
+    limit = size if eoi < 0 else eoi
+    start = position
+    while start < limit:
+        stop = min(start + _SCAN_CHUNK_BYTES, limit)
+        # One byte past the chunk, so a pair across the boundary is checked;
+        # in the last chunk that byte is the 0xFF of `EOI` (a fill pair).
+        if data[start:stop + 1].translate(_ENTROPY_CLASSES).find(_FORBIDDEN_PAIR) >= 0:
+            # Another segment after the scan: not a single-scan UVC frame.
             raise MjpgFrameRejected("scan_invalid")
+        start = stop
+    if eoi < 0:
+        raise MjpgFrameRejected("missing_eoi")
+    return eoi + 2
 
 
 def decoder_available() -> bool:
@@ -310,7 +350,7 @@ class MjpgLumaLayout:
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise MjpgFrameRejected("frame_type_invalid")
         view = memoryview(data)
-        if view.nbytes > MAXIMUM_FRAME_BYTES:
+        if view.nbytes > frame_byte_budget(self.width, self.height, self.maximum_trailing_bytes):
             raise MjpgFrameRejected("frame_too_large")
         if type(data) is bytes:
             buffer = data

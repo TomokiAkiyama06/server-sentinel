@@ -30,7 +30,9 @@ It mirrors the isolated inference worker (`app.detection.foundation.isolation`):
   scene runtime maps it to `unknown`, never to "no movement" / "no tamper");
 * a replacement is started only after a bounded exponential backoff and only
   once the previous child has been reaped; until then frames are refused
-  immediately (never waited on). After `failing_after` consecutive child
+  immediately (never waited on). When the backoff ends the supervisor starts
+  the replacement on its own, so recovery does not wait for (and refuse) one
+  more frame. After `failing_after` consecutive child
   failures the decoder reports `failing`, which lowers the source to
   `degraded`; one successful exchange (or a refusal by a healthy child) clears
   it.
@@ -70,6 +72,10 @@ _REAP_RETRY_S = 0.5
 # Slice of the supervisor's waits on a child (ready message, reaping): a
 # retire or stop is noticed within it, never only after a whole start timeout.
 _SLICE_S = 0.05
+# Longest single wait of the supervisor for a backoff to end. The backoff is
+# measured on the injected clock, so the supervisor re-reads it at least this
+# often (and at most every `_SLICE_S`) instead of trusting one long sleep.
+_BACKOFF_POLL_S = 1.0
 # The child's environment: nothing from the service environment (which may
 # carry deployment values) is inherited. One BLAS / OpenMP thread keeps the
 # numpy import inside the address-space limit and creates no thread.
@@ -220,7 +226,8 @@ class MjpgDecoderProcess:
     ready child under the per-frame deadline, or refuses the frame at once
     (`decoder_starting` while a start is under way, `decoder_unavailable`
     during the backoff, a reap or after `retire()`) and, when the backoff
-    allows, asks the supervisor for a child. `prepare()` asks for a child
+    allows, asks the supervisor for a child; the supervisor also starts the
+    replacement on its own once the backoff ends. `prepare()` asks for a child
     without a frame (non-blocking); `retire()` forbids further starts
     (shutdown); `kill()` signals the child without waiting and may be called
     from any thread; `close()` stops the supervisor and kills and reaps the
@@ -276,7 +283,7 @@ class MjpgDecoderProcess:
                 state = "reaping"
             elif self._retired:
                 state = "closed"
-            elif self._retry_at is not None:
+            elif self._backing_off_locked():
                 state = "backoff"
             else:
                 state = "stopped"
@@ -423,8 +430,7 @@ class MjpgDecoderProcess:
             if not self._stopping:
                 self._supervisor_locked()
             return "decoder_unavailable"
-        if (self._retired or self._stopping
-                or (self._retry_at is not None and self._clock() < self._retry_at)):
+        if self._retired or self._stopping or self._backing_off_locked():
             return "decoder_unavailable"
         if not self._supervisor_locked():
             self._failed_locked("start")
@@ -479,13 +485,32 @@ class MjpgDecoderProcess:
     def _cancelled(self) -> bool:
         return self._retired or self._stopping
 
+    def _backing_off_locked(self) -> bool:
+        return self._retry_at is not None and self._clock() < self._retry_at
+
+    def _due_restart_locked(self):
+        """None when no replacement is pending; otherwise the seconds left
+        in the backoff (0 when a replacement may start now)."""
+        if (self._phase != _IDLE or self._retry_at is None or self._reap_failed
+                or self._cancelled()):
+            return None
+        return max(0, self._retry_at - self._clock()) / 1e9
+
     # -- supervisor thread ------------------------------------------------
     def _supervise(self) -> None:
         try:
             while True:
                 with self._state:
                     while not self._stopping and self._phase not in (_STARTING, _DYING):
-                        self._state.wait()
+                        due = self._due_restart_locked()
+                        if due is None:
+                            self._state.wait()
+                        elif due <= 0:
+                            # The backoff after a failure has ended: start
+                            # the replacement now, not at the next frame.
+                            self._phase = _STARTING
+                        else:
+                            self._state.wait(min(max(due, _SLICE_S), _BACKOFF_POLL_S))
                     if self._stopping:
                         # `close()` reaps whatever is left.
                         return
@@ -504,6 +529,12 @@ class MjpgDecoderProcess:
                     self._failed_locked("start")
 
     def _start(self) -> None:
+        with self._state:
+            if self._cancelled():
+                # A retire or stop that came after this start was requested:
+                # nothing is spawned.
+                self._start_abandoned_locked()
+                return
         try:
             parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         except OSError:
@@ -543,6 +574,7 @@ class MjpgDecoderProcess:
         with self._state:
             if ready and not self._cancelled():
                 self._connection, self._phase = parent, _READY
+                self._retry_at = None
                 self._starts += 1
                 self._state.notify_all()
                 return

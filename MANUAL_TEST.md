@@ -1171,6 +1171,11 @@ with each EMEET C960 negotiated as `MJPG` (1080p30 and 720p30), still to do:
   they contain (zeros, `0xFF`, other). Set `maximum_trailing_bytes` from this
   (the code default 8192 is provisional) and confirm no real frame is refused
   as `trailing_bytes_exceeded` / `trailing_marker`;
+- [ ] **frame size against the byte budget**: per camera and profile, the
+  distribution (min / median / max) of `bytesused` over at least 300 frames,
+  in a lit and in a dark, noisy scene, compared with `frame_byte_budget`
+  (2 bytes per negotiated pixel plus 256 KiB and the trailing bound); no real
+  frame may be refused as `frame_too_large`;
 - [ ] **other pre-check refusals**: count of real frames refused by any
   pre-check or strict-decode reason over 10 minutes per camera, from the
   source status `undecodable_reasons` (expected 0 apart from genuine transfer
