@@ -1082,11 +1082,11 @@ class RunSummary:
         older than every echo the receiver returned on it after the window
         start (``heartbeat_ack``, recorded only after the reply was written).
         Every session's ``last_echo_ns`` must appear among that session's
-        ``heartbeat_ack`` echoes, or the result is unmeasured. Echo values are Agent clock readings and
-        are only compared with each other; ``heartbeat_ack`` times only with
-        the Main windows. Bytes the receiver drains after SIGCONT (sent
-        before the Agent dropped the connection) are not evidence either
-        way. Returns ``[(window, session or None)]`` in window order, or
+        ``heartbeat_ack`` echoes, or the result is unmeasured. Echo values
+        are Agent clock readings and are only compared with each other;
+        ``heartbeat_ack`` times only with the Main windows. Bytes the
+        receiver drains after SIGCONT (sent before the Agent dropped the
+        connection) are not evidence either way. Returns ``[(window, session or None)]`` in window order, or
         None when the records carry no nonces or no echo evidence.
         """
         windows = sorted((start, end) for start, end, origin in self._impairment_windows()

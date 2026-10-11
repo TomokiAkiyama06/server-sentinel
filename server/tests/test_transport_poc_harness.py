@@ -2335,6 +2335,7 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
     class Connection:
         def __init__(self, chunks, log, fail=None):
             self.chunks, self.log, self.fail = list(chunks), log, fail
+            self.on_recv = None
 
         def settimeout(self, _value):
             pass
@@ -2343,6 +2344,8 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
             raise ValueError("fake socket")
 
         def recv(self, _size):
+            if self.on_recv is not None:
+                self.on_recv(len(self.chunks))
             return self.chunks.pop(0) if self.chunks else b""
 
         def sendall(self, data):
@@ -2381,10 +2384,17 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
                                  content_length=len(first) + len(second))
         return [head + first, second]
 
-    def _run(self, candidate, fail=None):
+    def _run(self, candidate, fail=None, stop_before_last=False):
         log = []
         instance = self._receiver(candidate, log)
         connection = self.Connection(self._chunks(candidate), log, fail)
+        if stop_before_last:
+            # The stop arrives while the session thread is inside its read:
+            # the last chunk (heartbeat 8) is read after ``stop`` was set.
+            def on_recv(left):
+                if left == 1:
+                    instance.stop.set()
+            connection.on_recv = on_recv
         session = mock.Mock(connection=connection)
         state = {"last_rx": time.monotonic(), "checked": time.monotonic(),
                  "connection": 1, "session": None}
@@ -2417,6 +2427,32 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
                     echoes = [item[2]["echo_ns"] for item in log
                               if item[0] == "event" and item[1] == "heartbeat_ack"]
                     self.assertNotIn(7, echoes)
+
+
+    def test_no_reply_or_ack_once_stop_is_set(self):
+        # A heartbeat read after SIGUSR1/SIGTERM set ``stop`` is never
+        # answered nor recorded: an answer from a stopping Main would reach
+        # the Agent inside the outage window (false G4/G5 survivor).
+        for candidate in ("a_framed", "b_chunked", "b_segment"):
+            with self.subTest(candidate=candidate):
+                log, reason = self._run(candidate, stop_before_last=True)
+                # b_chunked leaves its loop before processing the late chunk
+                self.assertIn(reason, ("shutdown", "peer_closed"))
+                echoes = [item[2]["echo_ns"] for item in log
+                          if item[0] == "event" and item[1] == "heartbeat_ack"]
+                self.assertNotIn(8, echoes)
+                self.assertFalse([item for item in log if item[0] == "send"
+                                  and wire.heartbeat_ack_frame(8) in item[1]], log)
+
+    def test_send_refused_once_stop_is_set(self):
+        log = []
+        instance = self._receiver("a_framed", log)
+        connection = self.Connection([], log)
+        instance.stop.set()
+        with self.assertRaises(receiver._Close) as raised:
+            instance._send(mock.Mock(connection=connection), b"reply")
+        self.assertEqual("shutdown", raised.exception.reason)
+        self.assertEqual([], log)
 
 
 class MiscTests(unittest.TestCase):
@@ -2648,8 +2684,8 @@ class LoopbackMatrixTests(unittest.TestCase):
         self.assertNotIn("pass", [alone[g] for g in ("g1", "g2", "g3", "g4", "g5")])
 
 
-_CASES = (RecordTests, WireTests, ProxyTests, SummarizerTests, SenderProducerTests, MiscTests,
-          LoopbackMatrixTests)
+_CASES = (RecordTests, WireTests, ProxyTests, SummarizerTests, SenderProducerTests,
+          ReceiverHeartbeatAckTests, MiscTests, LoopbackMatrixTests)
 
 if os.environ.get("POC15_HARNESS_CHILD") != "1":
     # Earlier tests in the same interpreter may install process-wide audit

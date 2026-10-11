@@ -393,7 +393,8 @@ class Receiver:
         if data is None and now - state["last_rx"] > self.config.idle_timeout_s:
             raise _Close("timeout")
         if data == b"":
-            raise _Close("peer_closed")
+            # an abrupt stop shuts the connection down under this read
+            raise _Close("shutdown" if self.stop.is_set() else "peer_closed")
         return data
 
     def _still_admitted(self, session):
@@ -516,6 +517,16 @@ class Receiver:
             self._record_acks(state, echoes)
 
     def _send(self, session, data):
+        """Write ``data``, or nothing once the receiver is stopping.
+
+        After ``stop`` is set (SIGUSR1 / SIGTERM) Main sends no further reply:
+        a session thread still inside its read loop must not answer a
+        heartbeat after the orchestrator recorded the stop, or the Agent
+        would see a Main reply from inside the outage window (a false
+        survivor for G4/G5, and not what a stopped Main does).
+        """
+        if self.stop.is_set():
+            raise _Close("shutdown")
         try:
             session.connection.sendall(data)
         except socket.timeout:
@@ -776,6 +787,19 @@ def _abort(connection):
         pass
 
 
+def _shutdown(connection):
+    """Shut the TCP connection down under any TLS in progress (signal-safe).
+
+    The plain ``socket.shutdown`` is used on purpose: ``SSLSocket.shutdown``
+    drops the TLS object another thread may be writing through. The session
+    thread then fails its next read or write and closes the socket itself.
+    """
+    try:
+        socket.socket.shutdown(connection, socket.SHUT_RDWR)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def run(config, materials_root, state_dir, out_path, run_id):
     writer = records.JsonlWriter(out_path, run_id=run_id, role="receiver")
     state_dir = materials.private_directory(state_dir, exist_ok=True)
@@ -783,6 +807,10 @@ def run(config, materials_root, state_dir, out_path, run_id):
     def abrupt(*_):
         receiver.abrupt = True
         receiver.stop.set()
+        # A crash ends every connection at once, not after the accept loop's
+        # next timeout. No lock here: the interrupted main thread may hold it.
+        for connection in list(receiver._connections.values()):
+            _shutdown(connection)
     signal.signal(signal.SIGTERM, lambda *_: receiver.stop.set())
     signal.signal(signal.SIGINT, lambda *_: receiver.stop.set())
     signal.signal(signal.SIGUSR1, abrupt)
