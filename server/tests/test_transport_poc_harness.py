@@ -283,13 +283,43 @@ def _finished_receiver(rows):
     return rows
 
 
-_ACCOUNTED = {"drops": 0, "drops_sent": 0, "residual": 0, "residual_sent": 0}
+_ACCOUNTED = {"drops": 0, "drops_sent": 0, "residual": 0, "residual_sent": 0,
+              "unit_ranges": 0}
 
 
-def _sender_end(source, epoch, generated, accepted, **fields):
-    """A sender ``end`` with complete unit accounting (G2 drop reconciliation)."""
-    return {"kind": "end", "t_ns": _LATE, "source": source, "epoch": epoch,
-            "generated": generated, "accepted": accepted, **_ACCOUNTED, **fields}
+def _produced(generated, fps=30):
+    """Production fields of a source that generated ``generated`` units
+    continuously at ``fps`` (sender ``end``)."""
+    return {"fps": fps, "produce_ns": generated * 10**9 // fps, "first_offer_delay_ns": 0,
+            "last_offer_age_ns": 0, "max_offer_gap_ns": 10**9 // fps}
+
+
+def _sender_end(source, epoch, generated, accepted, *, ranges=(), **fields):
+    """A sender ``end`` with complete unit accounting (G2 drop reconciliation).
+
+    ``ranges``: ``(range_kind, first, last)`` sequence runs; ``_finished_sender``
+    writes them as ``unit_range`` records before the ``end``.
+    """
+    end = {"kind": "end", "t_ns": _LATE, "source": source, "epoch": epoch,
+           "generated": generated, "accepted": accepted, **_ACCOUNTED,
+           **_produced(generated), "unit_ranges": len(ranges), **fields}
+    if ranges:
+        end["ranges"] = list(ranges)
+    return end
+
+
+def _expand_ranges(rows):
+    out = []
+    for row in rows:
+        if row.get("kind") == "end" and "ranges" in row:
+            row = dict(row)
+            for kind, first, last in row.pop("ranges"):
+                out.append({"kind": "unit_range", "t_ns": row["t_ns"] - 1,
+                            "source": row["source"], "epoch": row["epoch"],
+                            "range_kind": kind, "first_sequence": first,
+                            "last_sequence": last})
+        out.append(row)
+    return out
 
 
 def _finished_sender(rows, sources=1, receiver=()):
@@ -307,7 +337,7 @@ def _finished_sender(rows, sources=1, receiver=()):
                  for row in durable] or [_sender_end(0, 1, 0, 0)]
     if not any(row["kind"] == "metric" for row in rows):
         rows.append({"kind": "metric", "t_ns": _LATE, "payload_bytes": 0})
-    return rows
+    return _expand_ranges(rows)
 
 
 def _finished_proxy(rows):
@@ -320,9 +350,10 @@ def _finished_proxy(rows):
 
 
 def _base(scenario, candidate="a_framed", sources=1):
+    # duration_ns 0: no production coverage required unless a test sets one
     orchestrator = [{"kind": "start", "t_ns": 0, "scenario": scenario, "candidate": candidate,
                      "n_sources": sources, "inputs": "synthetic", "fast": True,
-                     "side": "both"}]
+                     "side": "both", "duration_ns": 0}]
     sample = {"kind": "sample", "max_queued_messages": 3, "max_queued_bytes": 100,
               "limit_queued_messages": 10, "limit_queued_bytes": 1000, "max_outq": 10,
               "sndbuf": 1000, "hwm_bytes": 10, "rss_bytes": 10, "accepted": 5}
@@ -531,8 +562,9 @@ class SummarizerTests(unittest.TestCase):
         durable = [{"kind": "durable", "t_ns": 9, "source": index, "epoch": 1,
                     "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0}
                    for index in range(4)]
-        ends = [{"kind": "end", "t_ns": 9, "source": index, "accepted": 10, "rejected": 0,
-                 "drops": 0} for index in range(4)]
+        ends = [{"kind": "end", "t_ns": 9, "source": index, "epoch": 1, "accepted": 10,
+                 "rejected": 0, "drops": 0, "generated": 10, **_produced(10)}
+                for index in range(4)]
         receiver_end = {"kind": "end", "t_ns": 9, "accepted": 40, "backpressured": 0,
                         "rate_limited": 0, "cpu_quota_us": 200000, "cpu_period_us": 100000}
         metric = {"kind": "metric", "t_ns": 9, "payload_bytes": 100,
@@ -582,9 +614,10 @@ class SummarizerTests(unittest.TestCase):
         durable = [{"kind": "durable", "t_ns": 9, "source": index, "epoch": 1,
                     "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0}
                    for index in range(4)]
-        ends = [{"kind": "end", "t_ns": 9, "source": index, "accepted": 0 if index == 4 else 10,
-                 "rejected": 10 if index == 4 else 0, "drops": 0,
-                 "rejected_source_capacity": 10 if index == 4 else 0} for index in range(5)]
+        ends = [{"kind": "end", "t_ns": 9, "source": index, "epoch": 1,
+                 "accepted": 0 if index == 4 else 10, "rejected": 10 if index == 4 else 0,
+                 "drops": 0, "rejected_source_capacity": 10 if index == 4 else 0,
+                 "generated": 10, **_produced(10)} for index in range(5)]
         receiver_end = {"kind": "end", "t_ns": 9, "accepted": 40, "backpressured": 0,
                         "rate_limited": 0, "cpu_quota_us": 200000}
         self.run_dir("fifth_refused-a_framed", orchestrator=orchestrator,
@@ -767,8 +800,9 @@ class SummarizerTests(unittest.TestCase):
         durable = [{"kind": "durable", "t_ns": 9, "source": index, "epoch": 1,
                     "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0}
                    for index in range(4)]
-        ends = [{"kind": "end", "t_ns": 9, "source": index, "accepted": 10, "rejected": 0,
-                 "drops": 0} for index in range(4)]
+        ends = [{"kind": "end", "t_ns": 9, "source": index, "epoch": 1, "accepted": 10,
+                 "rejected": 0, "drops": 0, "generated": 10, **_produced(10)}
+                for index in range(4)]
         receiver_end = {"kind": "end", "t_ns": 9, "accepted": 40, "backpressured": 0,
                         "rate_limited": 0, "cpu_quota_us": 200000, "cpu_period_us": 100000}
         metric = {"kind": "metric", "t_ns": 9, "payload_bytes": 100,
@@ -932,8 +966,9 @@ class SummarizerTests(unittest.TestCase):
 
     def _g6_runs(self):
         orchestrator, receiver, sender_rows = _base("capacity_4", sources=4)
-        ends = [{"kind": "end", "t_ns": 9, "source": index, "accepted": 10, "rejected": 0,
-                 "drops": 0} for index in range(4)]
+        ends = [{"kind": "end", "t_ns": 9, "source": index, "epoch": 1, "accepted": 10,
+                 "rejected": 0, "drops": 0, "generated": 10, **_produced(10)}
+                for index in range(4)]
         receiver_end = {"kind": "end", "t_ns": 9, "accepted": 40, "backpressured": 0,
                         "rate_limited": 0, "cpu_quota_us": 200000, "cpu_period_us": 100000}
         metric = {"kind": "metric", "t_ns": 9, "payload_bytes": 100,
@@ -943,9 +978,10 @@ class SummarizerTests(unittest.TestCase):
                      sender_rows=[{"kind": "start", "t_ns": 0, "n_sources": 4}]
                      + sender_rows + ends + [metric])
         orchestrator, receiver, sender_rows = _base("fifth_refused", sources=5)
-        ends = [{"kind": "end", "t_ns": 9, "source": index, "accepted": 0 if index == 4 else 10,
-                 "rejected": 10 if index == 4 else 0, "drops": 0,
-                 "rejected_source_capacity": 10 if index == 4 else 0} for index in range(5)]
+        ends = [{"kind": "end", "t_ns": 9, "source": index, "epoch": 1,
+                 "accepted": 0 if index == 4 else 10, "rejected": 10 if index == 4 else 0,
+                 "drops": 0, "rejected_source_capacity": 10 if index == 4 else 0,
+                 "generated": 10, **_produced(10)} for index in range(5)]
         self.run_dir("fifth_refused-a_framed", orchestrator=orchestrator,
                      receiver=receiver + self._durable(4) + [receiver_end],
                      sender_rows=[{"kind": "start", "t_ns": 0, "n_sources": 5}]
@@ -1181,26 +1217,32 @@ class SummarizerTests(unittest.TestCase):
 
         # ten trailing units dropped by backpressure: no gap reaches Main, but
         # the Agent accounted for them
-        row = run(drops=10)
+        row = run(drops=10, ranges=[("drop", 100, 109)])
         self.assertEqual(("pass", "pass", 10, False),
                          (row["g2"], row["drop_accounting"], row["agent_accounted_tail_units"],
                           row["lossless"]))
         # still held at shutdown (not lost) is fine too
-        self.assertEqual("pass", run(residual=10)["g2"])
+        self.assertEqual("pass", run(residual=10, ranges=[("residual", 100, 109)])["g2"])
         # trailing units neither dropped nor held: vanished silently
         row = run()
         self.assertEqual(("fail", 10), (row["g2"], row["unexplained_loss_units"]))
         # drops the Agent recorded that appear neither as Main gaps nor in the tail
-        row = run(generated=100, drops=5)
+        row = run(generated=100, drops=5, ranges=[("drop", 20, 24)])
         self.assertEqual(("fail", 5), (row["g2"], row["unexplained_drop_units"]))
         # ... unless those units had been sent unacknowledged (Main may hold them)
-        self.assertEqual("pass", run(generated=100, drops=5, drops_sent=5)["g2"])
+        self.assertEqual("pass", run(generated=100, drops=5, drops_sent=5,
+                                     ranges=[("drop", 20, 24)])["g2"])
+        # ranges that do not describe the counts
+        self.assertEqual("fail", run(drops=10, ranges=[("drop", 100, 105)])["g2"])
+        self.assertEqual("fail", run(drops=10, ranges=[("drop", 100, 109)],
+                                     unit_ranges=2)["g2"])
         # an interior drop is Main's reported gap
         gap = {"kind": "gap", "t_ns": 5, "source": 0, "epoch": 1, "reason": "sequence_skip",
                "after_sequence": 10, "before_sequence": 16, "missing_units": 5}
         interior = [{**durable[0], "units": 95}]
         self.run_dir(name, orchestrator=orchestrator, receiver=receiver + interior + [gap],
-                     sender_rows=[start] + sender_rows + [_sender_end(0, 1, 100, 95, drops=5)])
+                     sender_rows=[start] + sender_rows + [_sender_end(
+                         0, 1, 100, 95, drops=5, ranges=[("drop", 11, 15)])])
         self.assertEqual("pass", self.report()["normal"]["g2"])
         # a sender end without the accounting counts cannot be reconciled
         legacy = {"kind": "end", "t_ns": 9, "source": 0, "epoch": 1, "accepted": 100,
@@ -1215,6 +1257,56 @@ class SummarizerTests(unittest.TestCase):
         row = self.report()["normal"]
         self.assertEqual(("unmeasured", "unmeasured"), (row["g2"], row["drop_accounting"]))
 
+    def test_mid_epoch_drops_never_explain_a_lost_tail(self):
+        """Claude review of 85d91b3: drops / refusals already reported by Main
+        as interior gaps must not also explain trailing units that vanished."""
+        orchestrator, receiver, sender_rows = _base("normal")
+        name = "normal-a_framed"
+        start = {"kind": "start", "t_ns": 0, "n_sources": 1}
+
+        def g2(generated, top, interior, reason="sequence_skip", receiver_end=None, **end):
+            # Main holds 0..top except ``interior`` units after sequence 9
+            durable = [{"kind": "durable", "t_ns": 9, "source": 0, "epoch": 1,
+                        "min_sequence": 0, "max_sequence": top,
+                        "units": top + 1 - interior, "duplicates": 0}]
+            gaps = [{"kind": "gap", "t_ns": 5, "source": 0, "epoch": 1, "reason": reason,
+                     "after_sequence": 9, "before_sequence": 10 + interior,
+                     "missing_units": interior}] if interior else []
+            extra = [receiver_end] if receiver_end else []
+            self.run_dir(name, orchestrator=orchestrator,
+                         receiver=receiver + durable + gaps + extra,
+                         sender_rows=[start] + sender_rows + [_sender_end(
+                             0, 1, generated, top + 1 - interior, **end)])
+            return self.report()["normal"]
+
+        mid = [("drop", 10, 103)]
+        # slow_stop_60s shape: 94 mid drops (Main gap) and 50 trailing units
+        # acknowledged by Main and then lost
+        row = g2(250, 199, 94, drops=94, ranges=mid)
+        self.assertEqual(("fail", "fail", 50), (row["g2"], row["drop_accounting"],
+                                                row["unexplained_loss_units"]))
+        # the same mid drops with the tail genuinely dropped at the live edge
+        row = g2(250, 199, 94, drops=144, ranges=mid + [("drop", 200, 249)])
+        self.assertEqual(("pass", 50), (row["g2"], row["agent_accounted_tail_units"]))
+        # outage_120s shape: 100 mid drops cannot cover 100 lost trailing units
+        self.assertEqual("fail", g2(400, 299, 100, drops=100,
+                                    ranges=[("drop", 10, 109)])["g2"])
+        # normal: 3 mid ingest refusals (Main gap) and 3 trailing units lost
+        refused = g2(103, 99, 3, reason="ingest_refused", rejected=3,
+                     ranges=[("rejected", 10, 12)])
+        self.assertEqual("fail", refused["g2"])
+        # more accounted after Main's last sequence than units exist (slow_drain
+        # "drops -2"): the records are inconsistent
+        self.assertEqual("fail", g2(100, 97, 0, drops=4, ranges=[("drop", 96, 99)])["g2"])
+        # Main's last receiver accepted units and then discarded them at stop
+        end = {"kind": "end", "t_ns": _LATE + 5, "accepted": 100, "discarded_at_stop": 7}
+        row = g2(100, 99, 0, receiver_end=end)
+        self.assertEqual(("fail", 7), (row["g2"], row["final_discarded_at_stop"]))
+        self.assertEqual("pass", g2(100, 99, 0, receiver_end={**end, "discarded_at_stop": 0})[
+            "g2"])
+        # (an abrupt stop earlier in the run is reported by the restarted
+        # receiver: main_restart in the loopback matrix tests)
+
     def test_sender_records_its_unit_accounting(self):
         state = sender.SourceState(0, uuid4(), 2)
         unsent = sender.Unit(1, 1, b"x")
@@ -1222,12 +1314,15 @@ class SummarizerTests(unittest.TestCase):
         sent.sent_ns = 5
         state.drop(unsent)
         state.drop(sent)
-        self.assertEqual((2, 1), (state.drops, state.drops_sent))
+        state.drop(sender.Unit(7, 7, b"x"))
+        state.reject(sender.Unit(3, 3, b"x"))
+        self.assertEqual((3, 1), (state.drops, state.drops_sent))
+        self.assertEqual(([[1, 2], [7, 7]], [[3, 3]]), (state.drop_ranges, state.reject_ranges))
+        self.assertEqual([[1, 3], [5, 5]], sender.sequence_ranges([5, 3, 1, 2]))
 
     def test_sides_must_declare_the_same_run(self):
         second = 10**9
         orchestrator, receiver, sender_rows = _base("slow_stop_10s")
-        orchestrator[0]["duration_ns"] = 9 * second
         main = [orchestrator[0],
                 {"kind": "action", "t_ns": 10 * second, "action": "sigstop", "duration_ns": 0},
                 {"kind": "action", "t_ns": 20 * second, "action": "sigcont", "duration_ns": 0}]
@@ -1263,6 +1358,184 @@ class SummarizerTests(unittest.TestCase):
         self.assertEqual((False, 0), (report["candidates"][0]["fast"],
                                       report["candidates"][0]["fast_runs"]))
         self.assertNotIn("fast (CI)", summarize.render(report))
+
+    # -- regressions for the PR #222 review (head 85d91b3) ---------------------
+    def test_sources_must_produce_continuously_for_the_run(self):
+        second = 10**9
+        orchestrator, receiver, sender_rows = _base("sources_2", sources=2)
+        orchestrator[0]["duration_ns"] = 10 * second
+        durable = self._durable(2, units=300)
+        start = {"kind": "start", "t_ns": 0, "n_sources": 2, "fps": 30}
+        name = "sources_2-a_framed"
+
+        def run(*ends, extra=()):
+            self.run_dir(name, orchestrator=orchestrator, receiver=receiver + durable,
+                         sender_rows=[start] + sender_rows + list(extra) + list(ends))
+            return self.report()["sources_2"]
+
+        full = [_sender_end(source, 1, 300, 300) for source in range(2)]
+        row = run(*full)
+        self.assertEqual(("pass", "pass", 2), (row["integrity"], row["production"],
+                                               row["exercised_sources"]))
+        # source 1 hit EOF after a few frames but some reached Main: the sender
+        # recorded producer_failed (and exited non-zero)
+        failed = {"kind": "producer_failed", "t_ns": 2 * second, "source": 1, "reason": "eof"}
+        row = run(*full, extra=[failed])
+        self.assertEqual(("fail", "fail", None), (row["integrity"], row["production"],
+                                                  row["exercised_sources"]))
+        self.assertNotIn("pass", [row[g] for g in summarize.GATES])
+        # no producer_failed record, but source 1 produced for 2 s of 10 s
+        row = run(full[0], _sender_end(1, 1, 60, 60))
+        self.assertEqual(("fail", 1), (row["production"], row["production_uncovered_sources"]))
+        # ran the whole time but generated far fewer units than the declared fps
+        slow = _sender_end(1, 1, 50, 50, produce_ns=10 * second)
+        row = run(full[0], slow)
+        self.assertEqual("fail", row["production"])
+        self.assertGreater(row["production_shortfall_units"], 0)
+        # a long pause, or a producer that stopped well before the run ended
+        for field in ("max_offer_gap_ns", "last_offer_age_ns", "first_offer_delay_ns"):
+            with self.subTest(field=field):
+                stalled = _sender_end(1, 1, 300, 300, **{field: 5 * second})
+                self.assertEqual("fail", run(full[0], stalled)["production"])
+        # a source with no end at all
+        self.assertEqual("fail", run(full[0])["production"])
+        # production fields not on record: cannot be assessed, never a pass
+        legacy = [{k: v for k, v in end.items() if k != "produce_ns"} for end in full]
+        row = run(*legacy)
+        self.assertEqual(("unmeasured", "unmeasured"), (row["integrity"], row["production"]))
+        # capture restart: two epochs per source together cover the run
+        epochs = [_sender_end(source, epoch, 150, 150) for source in range(2)
+                  for epoch in (1, 2)]
+        self.assertEqual("pass", run(*epochs)["production"])
+
+    def test_loss_episode_never_matches_across_a_later_impairment(self):
+        second = 10**9
+
+        def reset(at, kind="reset", length=0):
+            return [{"kind": "impairment_start", "t_ns": at, "impairment": kind,
+                     "duration_ns": length, "rate_bytes": 0},
+                    {"kind": "impairment_end", "t_ns": at + length, "impairment": kind,
+                     "duration_ns": length, "rate_bytes": 0}]
+
+        def loss(at, connection):
+            return {"kind": "loss_detected", "t_ns": at, "source": 0, "idle_ns": 1,
+                    "connection": connection, "last_committed_capture_ns": 1}
+
+        orchestrator, receiver, sender_rows = _base("rst")
+        start = {"kind": "start", "t_ns": 0, "n_sources": 1, "loss_timeout_ns": 2 * second}
+        proxy_rows = reset(10 * second) + reset(13 * second)
+        name = "rst-a_framed"
+
+        def g5(*losses):
+            self.run_dir(name, orchestrator=orchestrator, receiver=receiver + self._durable(1),
+                         sender_rows=[start] + sender_rows + list(losses),
+                         proxy_rows=proxy_rows)
+            return self.report()["rst"]["g5"]
+
+        self.assertEqual("pass", g5(loss(10 * second + 5, 1), loss(13 * second + 5, 2)))
+        # two episodes, both after the second reset: within 15 s of the first
+        # reset, but the first reset was never detected before the next began
+        self.assertEqual("fail", g5(loss(13 * second + 5, 1), loss(14 * second, 2)))
+        # the last window still ends 15 s after the last reset
+        self.assertEqual("fail", g5(loss(10 * second + 5, 1), loss(29 * second, 2)))
+        # unit level: [start_i, min(start_i + within, start_{i+1}))
+        match = summarize._match_episodes
+        self.assertEqual([None, 1], match([10, 12], [13, 14], 15))
+        self.assertEqual([1, 1], match([10, 12], [11, 13], 15))
+        self.assertEqual([None], match([10], [12], 15, bounds=[11]))  # other impairment
+        self.assertEqual([None], match([10], [26], 15))
+        self.assertEqual([15], match([10], [25], 15))
+        # blackholes: an episode after the next blackhole began is not the earlier one's
+        orchestrator, receiver, sender_rows = _base("outage_5s")
+        start = {**start, "loss_timeout_ns": int(1.5 * second)}
+        proxy_rows = reset(10 * second, "blackhole", 3 * second) + reset(
+            20 * second, "blackhole", 3 * second)
+        name = "outage_5s-a_framed"
+        # Main flagged both blackholes itself (only the Agent matching is under test)
+        flagged = [{"kind": "interrupted", "t_ns": at * second, "source": 0,
+                    "since_last_rx_ns": 2 * second} for at in (12, 22)]
+        late = [loss(21 * second, 1), loss(22 * second, 2)]
+        self.run_dir(name, orchestrator=orchestrator,
+                     receiver=receiver + self._durable(1) + flagged,
+                     sender_rows=[start] + sender_rows + late, proxy_rows=proxy_rows)
+        self.assertEqual("fail", self.report()["outage_5s"]["g5"])
+        self.rewrite(name, "sender", [start] + sender_rows + [loss(12 * second, 1),
+                                                              loss(22 * second, 2)])
+        row = self.report()["outage_5s"]
+        self.assertEqual(("pass", 2 * second), (row["g5"], row["agent_detect_max_ns"]))
+
+
+class SenderProducerTests(unittest.TestCase):
+    """A producer that ends while the run is still going is fatal for the sender."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="poc15-")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        materials.init(self.root / "m")
+        with socket.socket() as probe:  # a closed loopback port: Main unreachable
+            probe.bind(("127.0.0.1", 0))
+            self.port = probe.getsockname()[1]
+
+    def run_sender(self, source_kind, seconds=6.0, **config):
+        config = sender.SenderConfig(candidate="a_framed", host="127.0.0.1", port=self.port,
+                                     n_sources=2, source_kind=source_kind, fps=30,
+                                     frame_bytes=2000, fast=True, **config)
+        out = self.root / f"{source_kind}-{seconds}-{time.monotonic_ns()}.jsonl"
+        writer = records.JsonlWriter(out, run_id=RUN, role="sender")
+        instance = sender.Sender(config, self.root / "m" / "nodes" / "good", 1, writer)
+        started = time.monotonic()
+        code = instance.run(seconds)
+        elapsed = time.monotonic() - started
+        writer.close()
+        instance.wake_r.close()
+        instance.wake_w.close()
+        return code, elapsed, records.read_jsonl(out)
+
+    def test_early_eof_of_gst_producer_is_fatal(self):
+        # a stand-in "gst-launch" that exits at once: immediate EOF on stdout
+        code, elapsed, rows = self.run_sender("gst", gst="/bin/true")
+        failed = [row for row in rows if row["kind"] == "producer_failed"]
+        self.assertEqual(1, code)
+        self.assertLess(elapsed, 5.0)  # stopped early, not at the deadline
+        # the first producer to end stops the sender (the other may then end
+        # as part of that shutdown, which is not a second failure)
+        self.assertTrue(failed)
+        self.assertLessEqual({row["source"] for row in failed}, {0, 1})
+        self.assertEqual({"eof"}, {row["reason"] for row in failed})
+        ends = [row for row in rows if row["kind"] == "end"]
+        self.assertEqual(2, len(ends))
+        self.assertTrue(all(row["generated"] == 0 and row["first_offer_delay_ns"] is None
+                            for row in ends))
+
+    def test_producer_exception_is_fatal_and_normal_runs_exit_zero(self):
+        calls = []
+
+        def few_then_raise(instance, index):
+            for number in range(3):
+                instance._offer(index, time.monotonic_ns(), b"\xff\xd8%d\xff\xd9" % number)
+            calls.append(index)
+            if index == 1:
+                raise RuntimeError("producer broke")
+            original(instance, index)
+
+        original = sender.Sender._builtin
+        with mock.patch.object(sender.Sender, "_builtin", few_then_raise):
+            code, elapsed, rows = self.run_sender("builtin")
+        failed = [row for row in rows if row["kind"] == "producer_failed"]
+        self.assertEqual((1, [1], ["exception"]), (code, [r["source"] for r in failed],
+                                                    [r["reason"] for r in failed]))
+        self.assertLess(elapsed, 5.0)
+        # a healthy producer stops only with the sender: exit 0, production on record
+        code, elapsed, rows = self.run_sender("builtin", seconds=2.0)
+        self.assertEqual(0, code)
+        self.assertFalse([row for row in rows if row["kind"] == "producer_failed"])
+        ends = [row for row in rows if row["kind"] == "end"]
+        self.assertEqual(2, len(ends))
+        for row in ends:
+            self.assertGreaterEqual(row["produce_ns"], 1_900_000_000)
+            self.assertGreater(row["generated"], 30)
+            self.assertLess(row["max_offer_gap_ns"], 10**9)
 
 
 class MiscTests(unittest.TestCase):
@@ -1419,7 +1692,7 @@ class LoopbackMatrixTests(unittest.TestCase):
         self.assertNotIn("pass", [alone[g] for g in ("g1", "g2", "g3", "g4", "g5")])
 
 
-_CASES = (RecordTests, WireTests, ProxyTests, SummarizerTests, MiscTests,
+_CASES = (RecordTests, WireTests, ProxyTests, SummarizerTests, SenderProducerTests, MiscTests,
           LoopbackMatrixTests)
 
 if os.environ.get("POC15_HARNESS_CHILD") != "1":

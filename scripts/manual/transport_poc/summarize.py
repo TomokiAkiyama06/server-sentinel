@@ -67,6 +67,20 @@ SIDE_PROCESSES = {"both": ("receiver", "proxy", "sender"), "main": ("receiver",)
 LOSS_MARGIN_NS = SECOND
 # Orchestrator ``start`` fields every side must declare identically (one run).
 RUN_FIELDS = ("n_sources", "fast", "duration_ns", "scenario", "candidate")
+# Continuous production (sender ``end`` per source and epoch, sender clock):
+# generated units >= PRODUCTION_RATE_TOLERANCE x declared fps x (production
+# time - PRODUCTION_STARTUP_NS); the first unit within PRODUCTION_STARTUP_NS of
+# the producers starting; no pause between units, nor between the last unit
+# and the end of production, longer than PRODUCTION_GAP_NS; and per source the
+# production time of all its epochs covers the scheduled duration up to
+# PRODUCTION_COVERAGE_SLACK_NS per epoch (process start / capture restart).
+PRODUCTION_RATE_TOLERANCE = 0.8
+PRODUCTION_STARTUP_NS = 3 * SECOND
+PRODUCTION_GAP_NS = 2 * SECOND
+PRODUCTION_COVERAGE_SLACK_NS = 2 * SECOND
+PRODUCTION_FIELDS = ("fps", "produce_ns", "generated")
+# Scenarios that deliver no media on purpose (no production requirement).
+NO_MEDIA_SCENARIOS = NEGATIVE_SCENARIOS | {"route_probe"}
 
 
 def load_runs(directories):
@@ -166,10 +180,11 @@ class RunSummary:
         orchestrator start or end for a side, a side that started but has no
         end (the orchestrator crashed), a spawned child without an exit record
         or with a non-zero exit code, or a process file without exactly one
-        start and one completion record per spawn. ``unmeasured``: a whole
-        side or process file is absent, or the sides disagree on the declared
-        inputs or on any of ``RUN_FIELDS`` (source count, fast/full timing,
-        scheduled duration, scenario, candidate).
+        start and one completion record per spawn, or media production that
+        was not continuous (``production``). ``unmeasured``: a whole side or
+        process file is absent, the sides disagree on the declared inputs or
+        on any of ``RUN_FIELDS`` (source count, fast/full timing, scheduled
+        duration, scenario, candidate), or production cannot be assessed.
         """
         if len(self.run_ids) != 1 or None in self.run_ids:
             return "fail"
@@ -211,6 +226,68 @@ class RunSummary:
             elif not (len(_kind(items, opened)) == len(_kind(items, closed))
                       == spawns[process]):
                 return "fail"
+        if "sender" in expected:
+            production = self.production()
+            if production == "fail":
+                return "fail"
+            if production == "unmeasured":
+                verdict = "unmeasured"
+        return verdict
+
+    def production(self):
+        """Every declared source produced media continuously for the run.
+
+        A durable unit only proves that a source started; a producer that hit
+        EOF or raised after a few frames must not count as an exercised source
+        or as a passing run. ``fail``: a ``producer_failed`` record, or a source
+        whose sender ``end`` rows (one per epoch) show too few generated units
+        for the declared fps, a late first unit, a pause longer than
+        ``PRODUCTION_GAP_NS``, or production time that does not cover the
+        scheduled duration. ``unmeasured``: the scheduled duration or the
+        production fields are not on record. ``not_applicable``: scenarios
+        without media on purpose.
+        """
+        if self.scenario in NO_MEDIA_SCENARIOS:
+            return "not_applicable"
+        failed = _kind(self.sender, "producer_failed")
+        self.metrics.update(producer_failures=len(failed))
+        if failed:
+            self.metrics.update(production="fail")
+            return "fail"
+        durations = {item.get("duration_ns") for item in _kind(self.orchestrator, "start")}
+        ends = [e for e in _kind(self.sender, "end") if e.get("epoch") is not None]
+        if len(durations) != 1 or None in durations or not ends or not isinstance(
+                self.n_sources, int) or any(
+                    not isinstance(e.get(f), int) or isinstance(e.get(f), bool)
+                    for e in ends for f in PRODUCTION_FIELDS):
+            self.metrics.update(production="unmeasured")
+            return "unmeasured"
+        duration = next(iter(durations))
+        verdict = "pass"
+        covered, epochs = defaultdict(int), defaultdict(int)
+        shortfall = 0
+        for end in ends:
+            source, produced = end.get("source"), end["produce_ns"]
+            covered[source] += produced
+            epochs[source] += 1
+            expected = int(PRODUCTION_RATE_TOLERANCE * end["fps"]
+                           * max(0, produced - PRODUCTION_STARTUP_NS) / SECOND)
+            if end["generated"] < expected:
+                shortfall += expected - end["generated"]
+                verdict = "fail"
+            first = end.get("first_offer_delay_ns")
+            if produced > PRODUCTION_STARTUP_NS and (
+                    first is None or first > PRODUCTION_STARTUP_NS
+                    or (end.get("last_offer_age_ns") or 0) > PRODUCTION_GAP_NS
+                    or (end.get("max_offer_gap_ns") or 0) > PRODUCTION_GAP_NS):
+                verdict = "fail"
+        uncovered = [source for source in range(self.n_sources)
+                     if covered.get(source, 0) < duration
+                     - PRODUCTION_COVERAGE_SLACK_NS * max(1, epochs.get(source, 0))]
+        if uncovered:
+            verdict = "fail"
+        self.metrics.update(production=verdict, production_shortfall_units=shortfall,
+                            production_uncovered_sources=len(uncovered))
         return verdict
 
     def exercised_sources(self):
@@ -218,7 +295,8 @@ class RunSummary:
 
         Declared identically by every orchestrator and sender start, and
         observed: exactly that many distinct sources reached the durable
-        stand-in.
+        stand-in, and every one of them produced continuously for the run
+        (``production``), not just long enough for one durable unit.
         """
         if self.scenario in NON_TOPOLOGY_SCENARIOS:
             return None
@@ -230,6 +308,8 @@ class RunSummary:
         if len(declared) != 1:
             return None
         count = next(iter(declared))
+        if self.production() != "pass":
+            return None  # a source that stopped early is not exercised
         return count if count == len(observed) else None
 
     def _live_interrupted(self):
@@ -394,7 +474,14 @@ class RunSummary:
                                       and not self.metrics.get("agent_dropped_units")))
         if not durable and self.scenario not in NEGATIVE_SCENARIOS | {"route_probe"}:
             return "fail"
-        return _combine([_verdict(exact and restarts_ok and duplicates == 0), accounting])
+        # Units the *last* receiver instance accepted and then discarded at its
+        # stop are lost with no later instance to report the gap. (An abrupt
+        # stop during the run is reported by the restarted receiver.)
+        receiver_ends = sorted(_kind(self.receiver, "end"), key=lambda item: item["t_ns"])
+        discarded = (receiver_ends[-1].get("discarded_at_stop") or 0) if receiver_ends else 0
+        self.metrics.update(final_discarded_at_stop=discarded)
+        return _combine([_verdict(exact and restarts_ok and duplicates == 0 and discarded == 0),
+                         accounting])
 
     def _drop_accounting(self, durable, reported_by_epoch):
         """Reconcile the Agent's own unit accounting with what reached Main.
@@ -403,18 +490,25 @@ class RunSummary:
         (backpressure at the live edge) never reach Main, so Main reports no
         gap for them. Every sender ``end`` (one per source and epoch) states
         ``generated`` units (sequences 0..generated-1), ``drops`` (``drops_sent``
-        of them had been sent without an acknowledgement), ``rejected`` and
-        the ``residual`` still held at shutdown (``residual_sent`` of them
-        sent). Per epoch, with ``tail`` = generated - 1 - max durable sequence:
+        of them had been sent without an acknowledgement), ``rejected``, the
+        ``residual`` still held at shutdown (``residual_sent`` of them sent) and
+        ``unit_ranges``: how many ``unit_range`` records name *which* sequences
+        were dropped, refused or still held. Per epoch, with ``top`` = Main's
+        max durable sequence and ``tail`` = generated - 1 - top:
 
-        * tail units that are neither residual nor refused must be recorded
-          drops (Agent-accounted loss), else they vanished silently: ``fail``;
-        * the remaining drops must fall inside Main's reported gaps of that
-          epoch (slack: units sent before the drop or the shutdown, which Main
-          may hold), else the drop record is unexplained: ``fail``;
-        * an ``end`` without these counts cannot be reconciled: ``unmeasured``.
+        * every tail unit must be a dropped, refused or residual unit whose
+          sequence is after ``top`` (counted from the ranges, so drops in the
+          middle of the epoch, which Main already reports as gaps, never
+          explain a lost trailing unit); otherwise it vanished silently, e.g.
+          acknowledged by Main and then lost: ``fail``;
+        * the drops at or before ``top`` must fall inside Main's reported gaps
+          of that epoch (slack: units sent before the drop or the shutdown,
+          which Main may hold), else the drop record is unexplained: ``fail``;
+        * ranges that disagree with the counts: ``fail``; an ``end`` without
+          the counts or ranges cannot be reconciled: ``unmeasured``.
         """
-        fields = ("generated", "drops", "drops_sent", "residual", "residual_sent")
+        fields = ("generated", "drops", "drops_sent", "residual", "residual_sent",
+                  "unit_ranges")
         tail_drops = unexplained_loss = unexplained_drops = drops_total = 0
         verdict = "pass"
         ends = [e for e in _kind(self.sender, "end") if e.get("epoch") is not None]
@@ -424,6 +518,9 @@ class RunSummary:
             # no totals, two totals for one epoch, or durable units of an
             # epoch the Agent gave no totals for
             verdict = "unmeasured"
+        ranges = defaultdict(list)
+        for item in _kind(self.sender, "unit_range"):
+            ranges[(item.get("source"), item.get("epoch"))].append(item)
         for end in ends:
             if any(not isinstance(end.get(f), int) or isinstance(end.get(f), bool)
                    for f in fields):
@@ -435,15 +532,31 @@ class RunSummary:
             if top >= end["generated"]:
                 verdict = "fail"  # Main holds a sequence the Agent never generated
                 continue
+            mine = ranges.get(key, [])
+            total = {"drop": 0, "rejected": 0, "residual": 0}
+            after = dict(total)
+            for item in mine:
+                first, last = item.get("first_sequence"), item.get("last_sequence")
+                if (item.get("range_kind") not in total or not isinstance(first, int)
+                        or not isinstance(last, int) or not 0 <= first <= last):
+                    total = None
+                    break
+                total[item["range_kind"]] += last - first + 1
+                after[item["range_kind"]] += max(0, last - max(first, top + 1) + 1)
+            if total is None or len(mine) != end["unit_ranges"] or (
+                    total["drop"], total["rejected"], total["residual"]) != (
+                    end["drops"], end.get("rejected") or 0, end["residual"]):
+                verdict = "fail"  # the ranges do not describe these counts
+                continue
             tail = end["generated"] - 1 - top
-            needed = max(0, tail - end["residual"] - (end.get("rejected") or 0))
             drops_total += end["drops"]
-            if needed > end["drops"]:
-                unexplained_loss += needed - end["drops"]
+            silent = tail - after["drop"] - after["rejected"] - after["residual"]
+            if silent != 0:
+                unexplained_loss += abs(silent)
                 verdict = "fail"
                 continue
-            tail_drops += needed
-            rest = end["drops"] - needed
+            tail_drops += after["drop"]
+            rest = end["drops"] - after["drop"]
             room = reported_by_epoch.get(key, 0) + end["drops_sent"] + end["residual_sent"]
             if rest > room:
                 unexplained_drops += rest - room
@@ -547,6 +660,10 @@ class RunSummary:
                 restart_at = None
         return windows
 
+    def _impairment_starts(self):
+        """Every proxy impairment start (any kind), on the Agent clock."""
+        return [item["t_ns"] for item in self.proxy if item["kind"] == "impairment_start"]
+
     def _loss_timeout_ns(self):
         start = _last(self.sender, "start") or {}
         return start.get("loss_timeout_ns")
@@ -631,17 +748,19 @@ class RunSummary:
             return "unmeasured"  # Main-side orchestrator record missing
         episodes = {}
         for loss in losses:
-            key = loss.get("connection", loss["t_ns"])
+            key = (loss.get("epoch"), loss.get("connection", loss["t_ns"]))
             if key not in episodes:
                 episodes[key] = loss
         delays = [loss.get("idle_ns") for loss in episodes.values()]
         matched = 0
         if single_host:
             used = set()
+            starts = [start for start, _ in windows]
             for start, end in windows:
+                limit = _window_limit(start, end + DETECTION_NS, starts)
                 hit = next((key for key, loss in sorted(episodes.items(),
                                                         key=lambda kv: kv[1]["t_ns"])
-                            if key not in used and start <= loss["t_ns"] <= end + DETECTION_NS),
+                            if key not in used and start <= loss["t_ns"] < limit),
                            None)
                 if hit is not None:
                     used.add(hit)
@@ -697,8 +816,9 @@ class RunSummary:
                 continue
             used = set()
             for start, end in windows:
+                limit = _window_limit(start, end + DETECTION_NS, self._impairment_starts())
                 hit = next((k for k, t in enumerate(mine)
-                            if k not in used and start <= t <= end + DETECTION_NS), None)
+                            if k not in used and start <= t < limit), None)
                 if hit is not None:
                     used.add(hit)
                     matched += 1
@@ -723,7 +843,9 @@ class RunSummary:
         blackholes = [item["t_ns"] for item in self.proxy
                       if item["kind"] == "impairment_start" and item["impairment"] == "blackhole"
                       and item["duration_ns"] >= loss_timeout_ns]
-        for delay in _match_episodes(blackholes, _loss_episodes(losses)):
+        # Like resets: an episode only counts before the next impairment starts.
+        for delay in _match_episodes(blackholes, _loss_episodes(losses), DETECTION_NS,
+                                     self._impairment_starts()):
             if delay is None:
                 ok = False
             else:
@@ -781,8 +903,10 @@ class RunSummary:
         verdict = "pass"
         # One ``loss_detected`` per source per connection: each reset must
         # take its own connection's episode, so one detection after the last
-        # reset never satisfies an earlier one too.
-        for delay in _match_episodes(starts, _loss_episodes(losses), DETECTION_NS):
+        # reset never satisfies an earlier one too, and only an episode before
+        # the next scheduled impairment starts counts for a reset.
+        for delay in _match_episodes(starts, _loss_episodes(losses), DETECTION_NS,
+                                     self._impairment_starts()):
             if delay is None:
                 verdict = "fail"
             else:
@@ -879,27 +1003,44 @@ class RunSummary:
 
 
 def _loss_episodes(losses):
-    """Earliest Agent ``loss_detected`` time per connection, ascending.
+    """Earliest Agent ``loss_detected`` time per (sender epoch, connection), ascending.
 
     The sender writes one record per source for each lost connection; they
-    are one detection episode.
+    are one detection episode. A restarted sender (new epoch) counts its
+    connections from 1 again, so the epoch is part of the key.
     """
     episodes = {}
     for loss in losses:
-        key = loss.get("connection", ("t", loss["t_ns"]))
+        key = (loss.get("epoch"), loss.get("connection", ("t", loss["t_ns"])))
         episodes[key] = min(episodes.get(key, loss["t_ns"]), loss["t_ns"])
     return sorted(episodes.values())
 
 
-def _match_episodes(starts, episodes, within=None):
+def _window_limit(start, last, marks):
+    """Exclusive end of a matching window opened at ``start`` whose own
+    (inclusive) end is ``last``: the next scheduled impairment start after
+    ``start`` when it comes first, else ``last + 1``."""
+    later = [mark for mark in marks if mark > start]
+    return min(min(later), last + 1) if later else last + 1
+
+
+def _match_episodes(starts, episodes, within=None, bounds=()):
     """Consume one episode per impairment start (in time order): the earliest
-    unused episode at or after it (and within ``within`` ns, if given). Returns
-    the delay per start, None where no episode is left for it."""
+    unused episode in ``[start, min(start + within, next start))``, where
+    ``next start`` is the first of ``starts`` / ``bounds`` (every scheduled
+    impairment) after it. A detection after a later impairment never
+    satisfies an earlier one; the last window ends at ``start + within``
+    (inclusive; open without ``within``). Returns the delay per start, None
+    where no episode is left for it."""
     used = [False] * len(episodes)
     delays = []
+    marks = sorted(set(starts) | set(bounds))
     for at in sorted(starts):
+        later = [mark for mark in marks if mark > at]
+        limit = later[0] if later else None
         hit = next((k for k, t in enumerate(episodes)
-                    if not used[k] and t >= at and (within is None or t - at <= within)), None)
+                    if not used[k] and t >= at and (within is None or t - at <= within)
+                    and (limit is None or t < limit)), None)
         if hit is None:
             delays.append(None)
         else:
@@ -1077,12 +1218,13 @@ def render(report):
                      f"{holder.get('holder_forward_drops_allowed')})")
     lines.append("")
     lines.append("scenario            candidate   G1   G2   G3   G4   G5   G6  missing(rep/act)"
-                 "  integrity")
+                 "  integrity   drop_acct   production  fast")
     for row in report["runs"]:
         lines.append(f"{row['scenario']:<19} {row['candidate']:<11} "
                      + " ".join(f"{row[g][:4]:<4}" for g in gates)
                      + f"  {row.get('reported_missing')}/{row.get('actual_missing')}"
-                     + f"  {row.get('integrity')}")
+                     + f"  {row.get('integrity')!s:<11} {row.get('drop_accounting')!s:<11}"
+                     + f" {row.get('production')!s:<11} {row.get('fast')}")
     return "\n".join(lines)
 
 

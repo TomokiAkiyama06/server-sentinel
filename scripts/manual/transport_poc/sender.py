@@ -20,6 +20,11 @@ Media sources: ``builtin`` (generated pseudo-JPEG byte strings, no image
 content), ``gst`` (``videotestsrc`` + ``jpegenc`` synthetic MJPEG), and
 ``holder`` (real camera frames from ``holder.py`` over a local unix socket,
 memory only). Measurements are numeric JSONL only.
+
+A producer that stops while the run is still going (``gst-launch`` EOF, a
+holder socket EOF, or an exception in a producer thread) is fatal: the
+sender writes ``producer_failed`` for the sources it fed, stops, and exits
+non-zero, so the run can never pass on media that stopped early.
 """
 from collections import deque
 import json
@@ -59,16 +64,50 @@ class SourceState:
         # Drops of a unit that had been sent without an acknowledgement: Main
         # may or may not hold it, so it is not certain loss (G2 accounting).
         self.drops_sent = 0
+        # Sequence runs of dropped / refused units (G2 tail reconciliation).
+        self.drop_ranges, self.reject_ranges = [], []
         self.max_pending = 0
         self.last_committed_capture_ns = None
         self.counts = {name: 0 for name in wire.OUTCOMES}
         self.rejected_source_capacity = 0
         self.sent = 0
+        # Production continuity (sender monotonic clock): when the producer
+        # handed over its first and last unit and the longest pause between
+        # two consecutive units. The summarizer requires continuous
+        # production over the whole run, not just "some unit reached Main".
+        self.first_offer_ns = self.last_offer_ns = None
+        self.max_offer_gap_ns = 0
 
     def drop(self, unit):
         self.drops += 1
         if unit.sent_ns is not None:
             self.drops_sent += 1
+        _extend_range(self.drop_ranges, unit.sequence)
+
+    def reject(self, unit):
+        _extend_range(self.reject_ranges, unit.sequence)
+
+
+def _extend_range(ranges, sequence):
+    """Append ``sequence`` to a list of ``[first, last]`` sequence runs.
+
+    Drop-oldest and refusals hit consecutive sequences, so a run stays a
+    handful of ranges; the summarizer needs *which* sequences were dropped or
+    refused (only those after Main's last durable sequence explain the tail),
+    not just how many.
+    """
+    if ranges and ranges[-1][1] + 1 == sequence:
+        ranges[-1][1] = sequence
+    else:
+        ranges.append([sequence, sequence])
+
+
+def sequence_ranges(sequences):
+    """Sorted ``[first, last]`` runs of a set of sequences."""
+    ranges = []
+    for sequence in sorted(sequences):
+        _extend_range(ranges, sequence)
+    return ranges
 
 
 class SenderConfig:
@@ -128,13 +167,21 @@ class Sender:
         self.stale_acks = 0
         self._first_accept_pending = False
         self.last_inbound = time.monotonic()
+        self.producer_failed = False
+        self.produce_started_ns = self.produce_stopped_ns = None
 
     # -- media sources --------------------------------------------------------
     def _offer(self, index, capture_ns, payload):
         if index >= len(self.sources):
             return
         state = self.sources[index]
+        now = time.monotonic_ns()
         with self.lock:
+            if state.last_offer_ns is None:
+                state.first_offer_ns = now
+            else:
+                state.max_offer_gap_ns = max(state.max_offer_gap_ns, now - state.last_offer_ns)
+            state.last_offer_ns = now
             if len(state.pending) >= state.pending_limit:
                 # live edge wins; the skipped unit is exact loss
                 state.drop(state.pending.popleft())
@@ -190,16 +237,44 @@ class Sender:
         finally:
             connection.close()
 
+    def _produce(self, target, arguments, indexes):
+        """Run one producer; its end before the sender stops is fatal.
+
+        A producer returns only at EOF (``gst-launch`` exited, the holder
+        closed its socket) or after ``stop``; an exception ends it too. Either
+        while the run is still going means the media stopped early: record
+        ``producer_failed`` for each source it fed and stop the sender, which
+        then exits non-zero.
+        """
+        reason = "eof"
+        try:
+            target(*arguments)
+        except Exception:  # noqa: BLE001 - any producer error is a failed run
+            reason = "exception"
+        if self.stop.is_set():
+            return  # normal shutdown (deadline or SIGTERM)
+        self.producer_failed = True
+        for index in indexes:
+            self.writer.write("producer_failed", source=index, reason=reason)
+        self.stop.set()
+        try:
+            self.wake_w.send(b"x")
+        except (BlockingIOError, OSError):
+            pass
+
     def start_sources(self):
         kind = self.config.source_kind
+        everything = [state.index for state in self.sources]
         if kind == "holder":
-            targets = [(self._holder, ())]
+            targets = [(self._holder, (), everything)]
         elif kind == "gst":
-            targets = [(self._gst, (state.index,)) for state in self.sources]
+            targets = [(self._gst, (state.index,), [state.index]) for state in self.sources]
         else:
-            targets = [(self._builtin, (state.index,)) for state in self.sources]
-        for target, arguments in targets:
-            threading.Thread(target=target, args=arguments, daemon=True).start()
+            targets = [(self._builtin, (state.index,), [state.index]) for state in self.sources]
+        self.produce_started_ns = time.monotonic_ns()
+        for target, arguments, indexes in targets:
+            threading.Thread(target=self._produce, args=(target, arguments, indexes),
+                             daemon=True).start()
 
     # -- acknowledgements -----------------------------------------------------
     def _ack(self, source_id, epoch, sequence, outcome, reason):
@@ -211,6 +286,8 @@ class Sender:
                 self.stale_acks += 1
                 return
             state.counts[outcome] += 1
+            if outcome == "rejected":
+                state.reject(unit)
             if outcome == "rejected" and reason == "source_capacity":
                 state.rejected_source_capacity += 1
             if outcome in ("accepted", "duplicate", "rejected"):
@@ -332,13 +409,16 @@ class Sender:
             if not self.stop.is_set() and time.monotonic() < deadline:
                 self.stop.wait(backoff)
                 backoff = min(self.config.backoff_max, backoff * 2)
+        self.produce_stopped_ns = time.monotonic_ns()
         self.stop.set()
         sampler.join(timeout=3)
         self._finish()
+        return 1 if self.producer_failed else 0
 
     def _loss(self, idle_ns):
         for state in self.sources:
-            self.writer.write("loss_detected", source=state.index, idle_ns=idle_ns,
+            self.writer.write("loss_detected", source=state.index, epoch=self.epoch,
+                              idle_ns=idle_ns,
                               connection=self.connections,
                               last_committed_capture_ns=state.last_committed_capture_ns)
 
@@ -514,6 +594,8 @@ class Sender:
             outcome, reason = results.get((state.source_id, unit.sequence),
                                           ("not_processed", "none"))
             state.counts[outcome] += 1
+            if outcome == "rejected":
+                state.reject(unit)
             if outcome == "rejected" and reason == "source_capacity":
                 state.rejected_source_capacity += 1
             if outcome in ("accepted", "duplicate"):
@@ -589,23 +671,53 @@ class Sender:
         # durable at Main, dropped here (``drops``), refused (``rejected``) or
         # still held at shutdown (``residual``; ``residual_sent`` of them were
         # sent without an acknowledgement). The summarizer reconciles this.
+        started = self.produce_started_ns
+        stopped = self.produce_stopped_ns or time.monotonic_ns()
         with self.lock:
             totals = [(state, state.next_sequence, state.drops, state.drops_sent,
                        len(state.pending) + (state.inflight is not None),
                        sum(1 for unit in [*state.pending, state.inflight]
                            if unit is not None and unit.sent_ns is not None),
-                       dict(state.counts)) for state in self.sources]
-        for state, generated, drops, drops_sent, residual, residual_sent, counts in totals:
-            self.writer.write("end", source=state.index, epoch=self.epoch,
+                       dict(state.counts), self._production(state, started, stopped),
+                       {"drop": [list(item) for item in state.drop_ranges],
+                        "rejected": [list(item) for item in state.reject_ranges],
+                        "residual": sequence_ranges(
+                            unit.sequence for unit in [*state.pending, state.inflight]
+                            if unit is not None)})
+                      for state in self.sources]
+        for (state, generated, drops, drops_sent, residual, residual_sent, counts,
+             production, ranges) in totals:
+            # Which sequences were dropped, refused or still held: one record
+            # per run, then ``unit_ranges`` in ``end`` says how many to expect.
+            written = 0
+            for what, runs in ranges.items():
+                for first, last in runs:
+                    self.writer.write("unit_range", source=state.index, epoch=self.epoch,
+                                      range_kind=what, first_sequence=first,
+                                      last_sequence=last)
+                    written += 1
+            self.writer.write("end", source=state.index, epoch=self.epoch, unit_ranges=written,
                               generated=generated, drops=drops, drops_sent=drops_sent,
                               residual=residual, residual_sent=residual_sent,
                               max_pending=state.max_pending, sent=state.sent,
                               rejected_source_capacity=state.rejected_source_capacity,
-                              **counts)
+                              **production, **counts)
         for name, reservoir in (("rtt", self.latency_rtt), ("capture", self.latency_capture)):
             points = records.percentiles(reservoir.values)
             self.writer.write("latency", metric=name, samples=reservoir.seen, p50_ns=points[50],
                               p95_ns=points[95], p99_ns=points[99], max_ns=reservoir.maximum)
+
+
+    def _production(self, state, started, stopped):
+        """Production continuity of one source over this process's run."""
+        if started is None:
+            return {"fps": self.config.fps, "produce_ns": 0, "first_offer_delay_ns": None,
+                    "last_offer_age_ns": None, "max_offer_gap_ns": None}
+        first, last = state.first_offer_ns, state.last_offer_ns
+        return {"fps": self.config.fps, "produce_ns": max(0, stopped - started),
+                "first_offer_delay_ns": None if first is None else max(0, first - started),
+                "last_offer_age_ns": None if last is None else max(0, stopped - last),
+                "max_offer_gap_ns": state.max_offer_gap_ns}
 
 
 def _close(connection):
@@ -638,6 +750,6 @@ def run(config, node_dir, epoch_file, out_path, run_id, seconds):
     sender = Sender(config, node_dir, next_epoch(epoch_file), writer)
     signal.signal(signal.SIGTERM, lambda *_: sender.stop.set())
     signal.signal(signal.SIGINT, lambda *_: sender.stop.set())
-    sender.run(seconds)
+    code = sender.run(seconds)
     writer.close()
-    return 0
+    return code
