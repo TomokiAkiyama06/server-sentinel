@@ -35,6 +35,18 @@ failure behaviour that must map to `unknown`) before choosing one.
   (`sof_huge_dims`, decompression bomb), empty input, random bytes, and
   `SOI`+`EOI` only. A near-black synthetic frame (`ok_dark`) checks that a dark
   but valid frame decodes (darkness is the quality gate's job, not the decoder's).
+  The first `entropy bit flips` variant is a **single sample** (about 41 bytes
+  XOR `0x5A` from the middle of the scan).
+- Follow-up variants (added after review) derived from the same `ok` frame:
+  the scan cut at 25 / 50 / 75 / 95 % and **re-terminated with `EOI`**
+  (`trunc_eoi_*`, the shape a UVC packet loss can leave once the payload is
+  re-framed), 16 extraneous bytes inserted before the `DQT` or `SOS` marker, and
+  **30 bit-flip samples** (1, 4 or 16 single-bit flips at random offsets inside
+  the entropy-coded data, Python `random` seed 217, 10 samples each). Each
+  decode ran in a forked child as above; GStreamer ran one `gst-launch-1.0`
+  process per frame. For returned frames the probe also counted the trailing
+  rows of the 1/4 grayscale decode whose luma is constant (a "uniform bottom
+  band", which libjpeg leaves when it stops decoding the scan early).
 - All decoding ran inside `docker run --cpus=1 --network none --memory=2g` as an
   unprivileged uid, with `python -I`. Candidate wheels and the Debian
   `libturbojpeg0` package were downloaded into a scratch directory as untrusted
@@ -138,25 +150,59 @@ or no output). `silent` means a frame was returned as if valid.
 | --- | --- | --- | --- | --- | --- |
 | `ok`, `ok_dark`, `no_dht` | decoded | decoded | decoded | decoded | decoded |
 | truncated 50 % / no EOI | raises `OSError: image file is truncated` | raises `Premature end of JPEG file` | **silent** (Python `warnings.warn` only) | returns `None` | **silent**: full-size frame emitted, no bus message, exit 0 |
-| entropy bit flips | raises `OSError: broken data stream` | raises `Bogus DAC index` | **silent** (warning only) | **silent** (libjpeg warning on stderr only) | frame dropped: no output, no bus message, exit 0 |
+| entropy bit flips (1 sample; see the 30-sample table below) | raises `OSError: broken data stream` | raises `Bogus DAC index` | **silent** (warning only) | **silent** (libjpeg warning on stderr only) | frame dropped: no output, no bus message, exit 0 |
 | SOF dims 1920x1080 on 720p scan | **silent** 1920x1080 frame | raises `premature end of data segment` | **silent** (warning only) | **silent** 1920x1080 frame | **silent** 1920x1080 frame (caps renegotiated) |
 | SOF dims 65500x65500 | raises `DecompressionBombError` | full-size: **process OOM-killed** (no pixel limit); 1/4: raises | full-size: **process OOM-killed**; 1/4: **silent** 16375x16375 | full-size: raises (`CV_IO_MAX_IMAGE_PIXELS`); 1/4: **silent** 16375x16375 | pipeline `ERROR` (negotiation), pipeline must be restarted |
 | empty / random bytes / SOI+EOI only | raises `UnidentifiedImageError` | raises | raises `OSError` | raises / `None` | no output (empty and random: exit 0; SOI+EOI: exit 1 "No valid frames decoded") |
+| scan cut at 25/50/75/95 % and re-terminated with `EOI` | **silent** (all 4; uniform bottom band) | raises `premature end of data segment` (all 4) | **silent** (Python warning, all 4) | **silent** (all 4) | **silent**: full-size frame emitted, exit 0 (all 4) |
+| 16 extraneous bytes before `DQT` / before `SOS` | **silent** (both) | raises `16 extraneous bytes before marker` (both) | **silent** (Python warnings, both) | **silent** (both) | **silent**: frame emitted, exit 0 (both) |
+
+The Ubuntu `python3-pil` 12.1.1 gave exactly the same result as the 12.3.0
+wheel on every follow-up variant.
+
+**Pillow does not report libjpeg warnings.** libjpeg-turbo signals the
+recoverable corruptions above (premature end of the entropy-coded segment,
+extraneous bytes before a marker, most bad Huffman codes) as *warnings* and
+keeps decoding; Pillow has no API that turns them into errors. Pillow's
+`ImageFile.LOAD_TRUNCATED_IMAGES` (default `False`) only governs the case where
+the **input bytes run out** before the decoder finishes (`image file is
+truncated`); it has no effect once the frame ends with `EOI`. Pillow therefore
+raises only for that input exhaustion, for errors libjpeg treats as fatal, for
+the decompression-bomb limit and for unidentifiable data. The single
+`entropy bit flips` sample in the first table happened to hit a fatal error and
+is not representative, as the 30-sample run shows:
+
+| 30 bit-flip samples (10 each with 1 / 4 / 16 flipped bits) | signalled failure (1 / 4 / 16 bits) | returned silently | of the silent ones: uniform bottom band in the 1/4 gray decode |
+| --- | --- | --- | --- |
+| Pillow (wheel & Ubuntu) | 2 of 30 (0 / 1 / 1), `broken data stream` | 28 | 7 |
+| simplejpeg `strict=True` | 15 of 30 (1 / 6 / 8) | 15 | 3 |
+| PyTurboJPEG 2.5.0 | 0 (a Python warning in exactly the 15 samples simplejpeg rejected) | 30 | 8 |
+| OpenCV `imdecode` | 0 | 30 | 8 |
+| GStreamer jpegdec (per-frame process) | 2 of 30 frames dropped silently (exit 0, no output), same samples as Pillow | 28 emitted | 7 (full-size GRAY8) |
+
+Of the 28 samples Pillow returned silently, simplejpeg rejected 13 and 3 more
+showed a uniform bottom band; the remaining 12 decoded to locally wrong pixels
+with neither a warning nor a band. The results depend on where the flips land,
+so these counts describe this sample set, not a rate to expect from real
+cameras.
 
 `TJFLAG_STOPONWARNING` did not turn PyTurboJPEG's warnings into exceptions in
-this test; `simplejpeg` with `strict=False` behaves like PyTurboJPEG (every
-recoverable corruption is returned as a frame). A bit flip that does not break
-the entropy-coded syntax (for example inside a coefficient) produces wrong
-pixels that **no decoder can detect**; decode success therefore never proves
-frame integrity, and the scene quality gate remains responsible for implausible
-content.
+this test; its warnings are ordinary Python `warnings`, so a `warnings` filter
+set to `error` around the call would turn them into exceptions (inferred from
+the recorded warnings, not run separately). `simplejpeg` with `strict=False`
+behaves like PyTurboJPEG without such a filter (every recoverable corruption is
+returned as a frame). A bit flip that does not break the entropy-coded syntax
+(for example inside a coefficient) produces wrong pixels that **no decoder can
+detect**, and even simplejpeg's strict mode returned 3 banded frames without a
+warning; decode success therefore never proves frame integrity, and the scene
+quality gate remains responsible for implausible content.
 
 ### License, license gate, pinning and packaging
 
 | Candidate | Own license | Material bundled / required native code | License gate fit (`scripts/ci/license_gate.py`) | Hash pinning | Non-root / sandbox notes |
 | --- | --- | --- | --- | --- | --- |
-| Pillow wheel | `MIT-CMU` (HPND-style) | 18 bundled shared libraries and statically linked code: libjpeg-turbo (`IJG AND BSD-3-Clause AND Zlib`), FreeType (`FTL` / GPL-2.0 dual), HarfBuzz (MIT), libtiff (`libtiff`), libwebp (BSD-3-Clause), OpenJPEG (BSD-2-Clause), Little CMS (MIT), libavif (BSD-2-Clause), libpng (`Libpng`), libxcb/libXau (`X11`), zlib-ng 2.3.3 (Zlib), brotli, zstd, xz; the SBOM also lists libimagequant (GPL-3.0-or-later) and FriBiDi (LGPL-2.1-or-later), which are **not** shipped in the wheel (FriBiDi is only loaded at runtime if the OS provides it) | `MIT-CMU`, `IJG`, `FTL`, `libtiff`, `Libpng`, `X11` are **not** in the permissive allowlist: needs an Owner decision (allowlist extension or exact approvals) and a native-library audit like `server/docs/wheel-audit.json` | Yes: one wheel, `--require-hashes` | Pure in-process, no device or network access. Must open with `Image.open(fp, formats=["JPEG"])` so only the JPEG plugin parses camera bytes. No numpy needed (`Image.tobytes()` yields luma bytes). |
-| simplejpeg | MIT | libjpeg-turbo 3.1.2 statically linked (`IJG AND BSD-3-Clause AND Zlib`); requires numpy (BSD-3-Clause, bundles OpenBLAS / gfortran runtime, already reviewed for the optional detector lock) | MIT is allowlisted; `IJG` is not; numpy would move from the optional detector lock into the ROI runtime | Yes: two wheels | Smallest native surface (one 1 MB extension). Single maintainer; latest release 2025-10-10 with libjpeg-turbo 3.1.2, so upstream libjpeg-turbo fixes arrive only with a new simplejpeg release. |
+| Pillow wheel | `MIT-CMU` (HPND-style) | 18 bundled shared libraries and statically linked code: libjpeg-turbo (`IJG AND BSD-3-Clause AND Zlib`), FreeType (`FTL` / GPL-2.0 dual), HarfBuzz (MIT), libtiff (`libtiff`), libwebp (BSD-3-Clause), OpenJPEG (BSD-2-Clause), Little CMS (MIT), libavif (BSD-2-Clause), libpng (`Libpng`), libxcb/libXau (`X11`), zlib-ng 2.3.3 (Zlib), brotli, zstd, xz; the SBOM also lists libimagequant (GPL-3.0-or-later) and FriBiDi (LGPL-2.1-or-later), which are **not** shipped in the wheel (FriBiDi is only loaded at runtime if the OS provides it) | `MIT-CMU`, `IJG`, `FTL`, `libtiff`, `Libpng`, `X11` are **not** in the permissive allowlist: needs an Owner decision (allowlist extension or exact approvals) and a native-library audit like `server/docs/wheel-audit.json` | Yes, `--require-hashes`, but one native wheel **per supported runtime**: only the cp312 x86-64 wheel was examined; cp314 x86-64 and cp312 aarch64 (both supported by `server/pyproject.toml` and the backend lock) need their own hashed and audited wheels | Pure in-process, no device or network access. Must open with `Image.open(fp, formats=["JPEG"])` so only the JPEG plugin parses camera bytes. No numpy needed (`Image.tobytes()` yields luma bytes). |
+| simplejpeg | MIT | libjpeg-turbo 3.1.2 statically linked (`IJG AND BSD-3-Clause AND Zlib`); requires numpy (BSD-3-Clause, bundles OpenBLAS / gfortran runtime, already reviewed for the optional detector lock) | MIT is allowlisted; `IJG` is not; numpy would move from the optional detector lock into the ROI runtime | Yes, two packages, each with one native wheel per supported runtime (cp312 x86-64 examined; cp314 x86-64 and cp312 aarch64 not) | Smallest native surface (one 1 MB extension). Single maintainer; latest release 2025-10-10 with libjpeg-turbo 3.1.2, so upstream libjpeg-turbo fixes arrive only with a new simplejpeg release. |
 | PyTurboJPEG 2.5.0 | MIT (pure Python, `ctypes`) | Requires `libturbojpeg.so` **3.x**; Ubuntu on the Main host ships libjpeg-turbo 2.1.5 and has no `libturbojpeg` installed, so a non-distribution library would be needed (PyTurboJPEG 1.x would be needed for 2.x) | Python part allowlisted; the shared library is outside pip, so the gate cannot pin or review it | Python wheel yes; native library no | Recoverable corruption is a Python warning, not an error (see above); no default pixel limit on full-size decode. **Not recommended.** |
 | OpenCV headless | Apache-2.0 | About 150 MB of extracted code including FFmpeg (LGPL-2.1-or-later), OpenSSL 1.1.1k (upstream end-of-life), OpenBLAS + libgfortran, libvpx, libaom, statically linked Intel IPP ICV (Intel Simplified Software License) and more | Many non-allowlisted bundled licenses; LGPL and proprietary-licensed IPP need Owner review | Yes, but one huge wheel | Large parser surface for a JPEG-only need; silent success on corrupt data. **Not recommended.** |
 | GStreamer `jpegdec` | LGPL-2.1-or-later (gst-plugins-good), with system libjpeg-turbo8 (`IJG AND BSD-3-Clause AND Zlib`) | Operator-installed OS packages; nothing bundled | Outside the pip/npm gate, same as the Agent's operator-installed GStreamer; running an unmodified distribution package as a separate program places no license obligation on ServerSentinel code (see `agent/docs/DEPENDENCIES.md`), but adopting it on Main needs the Owner decision that precedent requires | No: apt package version only, updated by the distribution | Main's capture path does not use GStreamer today (direct V4L2 `mmap`), so this is a new runtime component on Main. Best fit is a separate `gst-launch-1.0` process confined like the Agent's Landlock-sandboxed capture child; PyGObject in the release venv is not an option (LGPL OS package, not in the venv). Per-frame output must be matched to input by the caller because a corrupt frame is dropped silently. |
@@ -179,11 +225,17 @@ rules, to be implemented and tested in the adoption PR:
    map to `unknown` for that sample, with the existing gap accounting.
 2. **Pre-validate before decoding**: `SOI` at the start, `EOI` at the end, a
    bounded byte size, and SOF width/height equal to the negotiated V4L2 format.
-   This alone catches the truncation, dimension-mismatch and decompression-bomb
-   cases where some decoders were silent or were OOM-killed.
-3. **Treat warnings as errors** (simplejpeg `strict=True`; Pillow without
-   `LOAD_TRUNCATED_IMAGES`) and **post-check** the decoded size against the
-   expected (scaled) size.
+   This catches the truncation without `EOI`, dimension-mismatch and
+   decompression-bomb cases where some decoders were silent or were
+   OOM-killed. It does **not** catch a scan cut short and re-terminated with
+   `EOI`, extraneous bytes before a marker, or bit flips.
+3. **Treat decoder warnings as errors where the binding exposes them**
+   (simplejpeg `strict=True`; PyTurboJPEG under a `warnings` filter set to
+   `error`) and **post-check** the decoded size against the expected (scaled)
+   size. Pillow, OpenCV and GStreamer expose no libjpeg warnings at all
+   (`LOAD_TRUNCATED_IMAGES` left at `False` only rejects input that runs out
+   before `EOI`), so with them a warning-level corruption arrives as a normal
+   frame and must be handled by rule 7 or by the Owner decision below.
 4. **Decode in an isolated worker** with an address-space limit, not in the
    process that holds sessions and the database, because a native parser reads
    camera-supplied bytes and a swapped or faulty camera can feed it arbitrary
@@ -196,37 +248,57 @@ rules, to be implemented and tested in the adoption PR:
 6. **Account frames in and out.** With a streaming decoder (GStreamer) a
    silently dropped frame must not shift the association between later frames
    and their timestamps.
+7. **Post-decode plausibility check maps to `unknown`.** A decoded frame whose
+   bottom rows are one flat value (the band libjpeg leaves after stopping early)
+   or which is otherwise implausible must be reported as `unknown` by the
+   quality gate, not compared against the ROI reference. This is needed for
+   every candidate (even simplejpeg's strict mode returned 3 banded frames
+   without a warning) and is the only detection path for warning-level
+   corruption with Pillow. It is a heuristic: a legitimately flat scene can
+   trigger it (fail-closed to `unknown`), and locally wrong pixels without a
+   band are not detected by any rule here.
 
 ## Options and recommendation (for the Owner)
 
-- **Option A — Pillow wheel (recommended).** Actively maintained, ships the
-  newest libjpeg-turbo of the candidates (3.1.4.1), needs no numpy, raises on
-  truncation and bit flips and has a built-in decompression-bomb limit. Costs:
-  an Owner decision on `MIT-CMU`, `IJG`, `FTL`, `libtiff`, `Libpng` and `X11`, a
-  native-library audit of the 18 bundled libraries, the IJG notice, and the
-  SOF-dimension pre-check (rule 2) for the one silent case observed.
-- **Option B — simplejpeg.** Strictest default failure behaviour and the
-  smallest native surface (MIT + statically linked libjpeg-turbo). Costs: an
-  Owner decision on `IJG`, numpy as a ROI runtime dependency, an explicit
-  header-dimension check (full-size decode of a bomb header was OOM-killed), and
-  a single-maintainer project whose libjpeg-turbo updates lag upstream.
+- **Option A — Pillow wheel (recommended on maintenance and packaging, not on
+  failure behaviour).** Actively maintained, ships the newest libjpeg-turbo of
+  the candidates (3.1.4.1), needs no numpy and has a built-in
+  decompression-bomb limit. It raises only when the input runs out before `EOI`
+  and on fatal libjpeg errors (2 of 30 bit-flip samples); it returns
+  `EOI`-terminated mid-scan truncations, extraneous bytes and most bit flips as
+  normal frames, because it does not expose libjpeg warnings. Costs: an Owner
+  decision on `MIT-CMU`, `IJG`, `FTL`, `libtiff`, `Libpng` and `X11`, a
+  native-library audit of the 18 bundled libraries for every supported runtime
+  wheel, the IJG notice, the SOF-dimension pre-check (rule 2), and a decision
+  on how warning-level corruption is detected (decision 6 below).
+- **Option B — simplejpeg.** Strictest failure behaviour observed: it rejected
+  every `EOI`-terminated truncation, both extraneous-byte frames and 15 of 30
+  bit-flip samples, and it has the smallest native surface (MIT + statically
+  linked libjpeg-turbo). Costs: an Owner decision on `IJG`, numpy as a ROI
+  runtime dependency, an explicit header-dimension check (full-size decode of a
+  bomb header was OOM-killed), wheels and audits for every supported runtime,
+  the rule-7 plausibility check (it still returned 3 banded frames), and a
+  single-maintainer project whose libjpeg-turbo updates lag upstream.
 - **Option C — GStreamer `jpegdec` in a sandboxed per-frame process.** No new
   pip dependency and an existing Agent precedent for an operator-installed,
   Landlock-confined `gst-launch-1.0`. Costs: an LGPL OS dependency on Main that
   cannot be hash-pinned, about 4 % of one core at 4 sources from process
   start-up, and the most silent failure modes (truncated frames emitted as
-  valid, corrupt frames dropped without a message), which rules 2 and 6 must
-  fully cover.
+  valid, corrupt frames dropped without a message, no warnings), which rules 2,
+  6 and 7 must cover.
 - **Not recommended:** OpenCV (large mixed-license bundle including LGPL
   FFmpeg, an end-of-life OpenSSL and proprietary IPP; silent decoding of corrupt
   data) and PyTurboJPEG (needs a non-distribution libjpeg-turbo 3.x on the Main
-  host; corruption is reported only as Python warnings).
+  host; corruption is reported only as Python warnings, which the caller must
+  promote to errors itself).
 - **Keep the status quo** (MJPG stays `unknown`): always available; ROI and
   tamper stay unarmed for the C960 sources, which must stay visible to the Owner
   as degraded rather than healthy.
 
-Within A-C the measured CPU and latency are equivalent at 1 frame/s/source; the
-recommendation rests on maintenance, failure behaviour and license review cost.
+Within A-C the measured CPU and latency are equivalent at 1 frame/s/source. The
+recommendation of A rests on maintenance, packaging (no numpy) and update
+cadence; on failure behaviour B is clearly stronger, so the choice between A and
+B is a trade-off for the Owner rather than a clear win for A.
 
 ## Decisions requested from the Owner
 
@@ -240,6 +312,20 @@ recommendation rests on maintenance, failure behaviour and license review cost.
    the Main host (the Agent precedent explicitly requires this decision).
 5. Whether remote-agent sources should later decode on the Agent instead
    (`offer_luma()` path in PR #213); this survey covers Main-host decoding only.
+6. For A (and for C, which also exposes no warnings): how warning-level
+   corruption is detected. Possible answers:
+   (a) rely on the rule-7 plausibility check in the quality gate (uniform
+   bottom band and similar checks mapped to `unknown`) and accept that locally
+   wrong pixels without a band are not detected;
+   (b) add a path that does report warnings, for example choosing B, or running
+   libjpeg-turbo's `djpeg` as the isolated worker and treating its warning exit
+   status as failure (not evaluated in this survey: `djpeg` is not installed on
+   the Main host and would be another operator-installed component);
+   (c) both (a) and (b).
+   Until this is decided no decoder is adopted, so MJPG stays `unknown`.
+7. For A or B: whether the decoder runtime is narrowed to the surveyed CPython
+   3.12 x86-64, or wheels for every supported runtime (CPython 3.14 x86-64 and
+   CPython 3.12 aarch64 as well) are pinned and audited.
 
 ## Not verified
 
@@ -249,4 +335,10 @@ recommendation rests on maintenance, failure behaviour and license review cost.
 - Behaviour inside the actual `server-sentinel.service` systemd sandbox was not
   exercised; only an unprivileged, network-less container was used.
 - Only one candidate version each was examined; versions and hashes above are
-  survey evidence, not pins.
+  survey evidence, not pins. Only CPython 3.12 x86-64 wheels were examined; the
+  CPython 3.14 x86-64 and CPython 3.12 aarch64 wheels, their bundled libraries
+  and their behaviour were not.
+- The corrupt-frame variants are synthetic and few (one bit-flip sample in the
+  first table, 30 in the follow-up). How real UVC transfer errors on the C960
+  damage MJPG payloads (dropped packets, re-framing, extraneous bytes) and how
+  often a uniform-band check would fire on real scenes were not measured.
