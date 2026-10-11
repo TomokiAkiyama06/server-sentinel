@@ -871,5 +871,97 @@ class DuplicateApprovalTests(UvcRegistryFixture):
         self.assertIn("identity_not_unique", [event.reason for event in self.events])
         self.assertEqual([], self.frames)
 
+
+class StopFenceTests(UvcRegistryFixture):
+    """Issue #204 item 2 (mutations M10 and M12 of PR #201) and item 1."""
+
+    def test_fence_stays_on_top_of_a_later_online_stage(self):
+        # M10: a stage after the fence must keep the fenced values on top.
+        from app.cameras.uvc.registry_adapter import _HealthWriter
+
+        writes, marks = [], []
+        writer = _HealthWriter(lambda **values: writes.append(values), marks.append)
+        writer.fence(health_state=SourceHealthState.OFFLINE, negotiated_capture_profile=None)
+        writer.stage(health_state=SourceHealthState.ONLINE,
+                     negotiated_capture_profile=CaptureProfile(640, 480, 10, "MJPG"),
+                     image_quality_state="unknown")
+        self.assertTrue(writer.flush())
+        self.assertEqual([{"health_state": SourceHealthState.OFFLINE,
+                           "negotiated_capture_profile": None,
+                           "image_quality_state": "unknown"}], writes)
+        # A failed write is retried with the fence still on top.
+        failing = [True]
+
+        def write(**values):
+            if failing.pop(0) if failing else False:
+                raise RuntimeError("synthetic refused write")
+            writes.append(values)
+
+        writer = _HealthWriter(write, marks.append)
+        writer.stage(health_state=SourceHealthState.ONLINE)
+        writer.fence(health_state=SourceHealthState.OFFLINE)
+        with self.assertRaises(RuntimeError):
+            writer.flush()
+        writer.stage(health_state=SourceHealthState.ONLINE)
+        self.assertTrue(writer.flush())
+        self.assertIs(SourceHealthState.OFFLINE, writes[-1]["health_state"])
+
+    def test_poll_after_the_fence_opens_no_capture(self):
+        # M12: once a stop fenced the source, a late poll of its outliving
+        # worker must not open (or resume) a capture.
+        opened = []
+
+        def factory(candidate, profile, *, verify_identity):
+            capture = SyntheticCapture(candidate, profile, verify_identity=verify_identity)
+            opened.append(capture)
+            return capture
+
+        self.adapter.capture_factory = factory
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(self.database), PermitAnyOwner()), self.registry,
+        )
+        admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.assertTrue(self.adapter.fence_stopping((self.source.id,), 1.0))
+        for _ in range(3):
+            self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.assertEqual([], opened)
+        self.assertEqual([], self.frames)
+        self.assertEqual(SourceHealthState.OFFLINE,
+                         self.registry.get_source(self.source.id).health_state)
+
+    def test_writer_reports_busy_until_an_earlier_write_and_the_fence_finish(self):
+        # Issue #204 item 1: the stop keeps the pin while a write that began
+        # before the fence may still commit; ``settled`` reports the end.
+        from app.cameras.uvc.registry_adapter import _HealthWriter
+
+        gate, entered = threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+        writes, settled = [], []
+
+        def write(**values):
+            if values.get("health_state") is SourceHealthState.ONLINE:
+                entered.set()
+                gate.wait(10)
+            writes.append(values["health_state"])
+
+        writer = _HealthWriter(write, lambda unpersisted: None,
+                               settled=lambda: settled.append(writer.busy))
+        writer.stage(health_state=SourceHealthState.ONLINE)
+        worker = threading.Thread(target=writer.flush)
+        worker.start()
+        self.assertTrue(entered.wait(5))
+        writer.fence(health_state=SourceHealthState.OFFLINE)
+        writer.flush(blocking=False)
+        self.assertFalse(writer.settle(0.1))
+        self.assertTrue(writer.busy)
+        self.assertEqual([], settled)
+        gate.set()
+        worker.join(5)
+        self.assertTrue(writer.settle(5))
+        self.assertFalse(writer.busy)
+        self.assertEqual([SourceHealthState.ONLINE, SourceHealthState.OFFLINE], writes)
+        self.assertIn(False, settled)
+
+
 if __name__ == "__main__":
     unittest.main()

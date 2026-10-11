@@ -185,6 +185,19 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(0, control.undelivered)
         self.assertTrue(control.settle_delivery(0.0))
 
+    def test_event_queued_before_its_delivery_is_never_reported_delivered(self):
+        # Issue #204 item 2.3: ``_set_state`` queues an event without
+        # clearing the idle flag. Until the caller delivers or hands it off,
+        # settle_delivery() must not report idle nor undelivered report 0.
+        control, notified = self._notifying_controller()
+        with control.lock:
+            control._set_state(CameraState.OFFLINE, "video_capture_closed")
+        self.assertEqual(1, control.undelivered)
+        self.assertNotIn("video_capture_closed", [event.reason for event in notified])
+        self.assertTrue(control.settle_delivery(1.0))
+        self.assertEqual("video_capture_closed", notified[-1].reason)
+        self.assertEqual(0, control.undelivered)
+
     def test_stop_fence_that_times_out_still_refuses_a_late_online(self):
         # PR #201 (Codex): a fence that cannot take the transition lock in
         # time (capture_ready inside a slow state callback) used to leave no

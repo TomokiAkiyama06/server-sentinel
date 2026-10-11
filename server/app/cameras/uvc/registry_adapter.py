@@ -59,12 +59,20 @@ class _HealthWriter:
     ``fence`` pins values (a stopping runtime's conservative ``offline``)
     that every later stage, and any retried failed write, keeps on top, so
     no late transition staged by a worker that outlived the stop can make
-    ``online`` durable again (Issue #194).
+    ``online`` durable again (Issue #194). A write that was already in flight
+    when the fence was set did not carry it and may still commit afterwards;
+    ``busy`` stays True until no write is in flight or handed off, so the
+    stopping runtime keeps the database pin until the fenced values were
+    written after it (Issue #204). ``settled`` is called, with no lock of
+    this writer held, whenever a fenced writer may have stopped being busy.
     """
 
-    def __init__(self, write, mark):
+    def __init__(self, write, mark, settled=None):
         self._write = write
         self._mark = mark
+        self._settled = settled
+        # Blocking flushes running (waiting for or holding ``_io``).
+        self._flushing = 0
         self._staged_lock = threading.Lock()
         self._io = threading.Lock()
         self._staged = None
@@ -111,6 +119,7 @@ class _HealthWriter:
             with self._handoff_lock:
                 self._handoff_running = False
                 self._idle.set()
+            self.notify_settled()
             raise
 
     def settle(self, timeout):
@@ -119,6 +128,29 @@ class _HealthWriter:
         A write still hung afterwards leaves the source marked unpersisted.
         """
         return self._idle.wait(timeout)
+
+    @property
+    def busy(self):
+        """True while a write is in flight, waiting, or handed off."""
+        with self._handoff_lock:
+            if self._handoff_running:
+                return True
+        with self._staged_lock:
+            return self._flushing > 0
+
+    @property
+    def fenced(self):
+        with self._staged_lock:
+            return self._fence is not None
+
+    def notify_settled(self):
+        # Never called with a lock of this writer held: the callback reads
+        # ``busy`` and may release the runtime's database pin.
+        if self._settled is not None and self.fenced and not self.busy:
+            try:
+                self._settled()
+            except Exception:
+                pass
 
     def _drain_handoff(self):
         while True:
@@ -132,8 +164,9 @@ class _HealthWriter:
                 if not self._handoff_pending:
                     self._handoff_running = False
                     self._idle.set()
-                    return
+                    break
                 self._handoff_pending = False
+        self.notify_settled()
 
     def flush(self, *, blocking=True):
         if not blocking:
@@ -144,6 +177,16 @@ class _HealthWriter:
                     self._mark(True)
             self._handoff()
             return False
+        with self._staged_lock:
+            self._flushing += 1
+        try:
+            return self._flush_blocking()
+        finally:
+            with self._staged_lock:
+                self._flushing -= 1
+            self.notify_settled()
+
+    def _flush_blocking(self):
         while True:
             self._io.acquire()
             try:
@@ -250,6 +293,11 @@ class LocalUvcAdapter:
         # fence is fenced as well.
         self._fence_lock = threading.Lock()
         self._fenced = set()
+        # Called (with no adapter lock held) whenever a fenced source's
+        # health writer may have become idle, so a stopping runtime that
+        # kept the database pin for an unfinished fence can release it
+        # (Issue #204). Set by ``on_fence_settled``.
+        self._fence_listener = None
         # Health events a stopped session's controller could not hand to
         # ``publish`` before its stop gave up waiting (Issue #195 item 5):
         # counted per source so they stay visible after the session is gone.
@@ -278,8 +326,33 @@ class LocalUvcAdapter:
                         else:
                             self._unpersisted.discard(source_id)
 
-                writer = self._writers[source_id] = _HealthWriter(write, mark)
+                writer = self._writers[source_id] = _HealthWriter(
+                    write, mark, settled=self._fence_settled)
             return writer
+
+    def on_fence_settled(self, listener):
+        """Register the stopping runtime's pin-release check (Issue #204)."""
+        self._fence_listener = listener
+
+    def _fence_settled(self):
+        listener = self._fence_listener
+        if listener is not None:
+            listener()
+
+    def fence_pending(self):
+        """True while a fenced source's health write is still in flight.
+
+        A write that began before the stop fence did not carry the fenced
+        ``offline`` and may still commit ``online``; the fenced values are
+        written right after it, which needs the database pin. Once no fenced
+        writer is busy, either the fenced row is durable or its write failed
+        (counted unpersisted), and no earlier write can land any more.
+        """
+        with self._fence_lock:
+            fenced = tuple(self._fenced)
+        with self._writers_lock:
+            writers = [self._writers.get(source_id) for source_id in fenced]
+        return any(writer is not None and writer.busy for writer in writers)
 
     def _write_health(self, source_id, **values):
         """Persist one health observation and track whether it was durable."""
@@ -681,6 +754,8 @@ class LocalUvcAdapter:
             writer = self._writers.get(source_id)
         if writer is not None:
             writer.settle(max(0.0, deadline - time.monotonic()))
+            # The worker's cleanup is done: re-check a pin kept for a fence.
+            writer.notify_settled()
         if failures:
             raise failures[0]
         return True

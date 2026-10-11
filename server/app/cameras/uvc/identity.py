@@ -320,9 +320,15 @@ class ReconnectController:
 
     @property
     def undelivered(self):
-        """Queued events no delivery thread is delivering (a failed start)."""
+        """Queued events no delivery thread is delivering.
+
+        That is after a failed handoff start, and also in the short window
+        in which a caller has queued an event but not yet delivered or
+        handed it off (``_set_state`` does not clear the idle flag), so a
+        queued event is never reported as delivered (Issue #204).
+        """
         with self._handoff_lock:
-            if self._handoff_running or self._handoff_idle.is_set():
+            if self._handoff_running:
                 return 0
             return len(self._outbox)
 
@@ -347,7 +353,10 @@ class ReconnectController:
         by ``undelivered``.
         """
         deadline = time.monotonic() + timeout
-        while not self._handoff_idle.is_set():
+        # The outbox is checked too: an event queued by ``_set_state`` but
+        # not yet delivered or handed off leaves the idle flag set (Issue
+        # #204), so the flag alone could report it delivered.
+        while not self._delivered():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -363,7 +372,11 @@ class ReconnectController:
                 self._mark_idle_if_drained()
                 continue
             self._handoff_idle.wait(min(remaining, self.SETTLE_POLL_SECONDS))
-        return self._handoff_idle.is_set()
+        return self._delivered()
+
+    def _delivered(self):
+        with self._handoff_lock:
+            return self._handoff_idle.is_set() and not self._outbox
 
     def _drain_handoff(self):
         while True:

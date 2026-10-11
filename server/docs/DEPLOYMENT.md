@@ -205,7 +205,17 @@ make a blocked worker's lowered state durable first. A profile slower than
 `10 / frame_stall_seconds` fps widens the stall window to 10 frame intervals
 beyond the join bound; the stop then lowers such a still-blocked source to
 `offline` itself (waiting at most 1 s for that write) before releasing the
-database, so the registry is not left `online` either way. The local UVC stop as a whole can take up to
+database. A fenced write that does not finish within that bound leaves the
+source reported unpersisted, and the incomplete fence is counted
+(`health_fence_incomplete`) and logged (`local_uvc_health_fence_incomplete`;
+the stop is `stop_failed`). If the source's health writer is then still busy
+(for example blocked in an earlier `online` write that may still commit), the
+stop keeps the database pin (`health_fence_pin_held`) without waiting longer,
+so the fenced `offline` queued behind that write can still be written; the
+pin is released (`local_uvc_health_fence_pin_released`) as soon as no fenced
+write is in flight. If that write never finishes before the process exits,
+the row can stay `online` until the next start, which writes it `offline`
+before any capture opens. The local UVC stop as a whole can take up to
 `join_timeout_seconds` + 1 s for the frame-progress watchdog join + 1 s for
 pending health-sink deliveries (62 s at the 60 s maximum), and the remaining
 shutdown steps (monitoring runtime, audit retention) follow it. The installed

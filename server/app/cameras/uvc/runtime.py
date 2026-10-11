@@ -53,7 +53,10 @@ HEALTH_SINK_STALL_SECONDS = 5.0
 HEALTH_SINK_SETTLE_SECONDS = 1.0
 # A stop whose workers outlived the join bound waits at most this long for
 # their sources' ``offline`` rows to become durable before it releases the
-# pinned database (Issue #194).
+# pinned database (Issue #194). A fence still waiting behind an earlier
+# health write after this bound keeps the pin, without delaying the stop,
+# until that write and the fence behind it are no longer in flight (Issue
+# #204).
 HEALTH_FENCE_SECONDS = 1.0
 
 
@@ -131,6 +134,12 @@ class LocalUvcRuntimeStatus:
     # #194): a transition lock or health write did not finish in time. The
     # stop is ``stop_failed`` and the rows were fenced conservatively.
     health_fence_incomplete: int = 0
+    # True while a stop keeps the database pin because a fenced source's
+    # health write was still in flight at its bound (Issue #204): an earlier
+    # ``online`` write may still commit, and the fenced ``offline`` behind it
+    # needs the pin. Released, off the stop, as soon as no fenced write is in
+    # flight; the stop itself stays bounded.
+    health_fence_pin_held: bool = False
 
 
 class _HealthSinkDelivery:
@@ -311,6 +320,10 @@ class LocalUvcRuntime:
         self._database_pinned = False
         self._stop_cleanup_failed = False
         self._health_fence_incomplete = 0
+        # Guards the database pin, which a health writer thread may release
+        # after the stop returned (Issue #204). Never held while waiting.
+        self._pin_lock = threading.Lock()
+        self._pin_held_for_fence = False
 
     # -- health events -------------------------------------------------
     def _health(self, event: HealthEvent) -> None:
@@ -569,6 +582,11 @@ class LocalUvcRuntime:
         worker is still alive is lowered to ``offline`` durably by the stop
         itself (bounded by ``HEALTH_FENCE_SECONDS``), because a slow
         profile's stall window can outlast the join bound (Issue #194).
+        If such a source's health writer is still busy at that bound (for
+        example blocked in an earlier ``online`` write), the pin is kept
+        (``health_fence_pin_held``) instead of refusing the fenced write
+        queued behind it, and the writer releases it as soon as no fenced
+        write is in flight (Issue #204); this stop does not wait for that.
         Pending health-sink deliveries get at most
         ``HEALTH_SINK_SETTLE_SECONDS`` after the teardown.
         """
@@ -618,8 +636,9 @@ class LocalUvcRuntime:
                     failed = True
                     self._fence_live_workers()
             # Drop the held database pin; a worker that outlived the join
-            # bound then fails closed instead of reading storage.
-            if self._database_pinned and not self._release_database():
+            # bound then fails closed instead of reading storage. A fenced
+            # write still in flight keeps it until that write ends.
+            if not self._release_database_unless_fencing():
                 failed = True
             for source_id, state in tuple(self._sources.items()):
                 if state is not SourceRuntimeState.REJECTED:
@@ -634,6 +653,46 @@ class LocalUvcRuntime:
             # Outside the runtime lock: a hung sink delays only this return.
             self._sink_delivery.settle(HEALTH_SINK_SETTLE_SECONDS)
         return self.status()
+
+    def _fence_pending(self) -> bool:
+        pending = getattr(self.adapter, "fence_pending", None)
+        if not callable(pending):
+            return False
+        try:
+            return pending() is True
+        except Exception:
+            # Cannot tell: keep the pin (a later stop() or write re-checks).
+            return True
+
+    def _release_database_unless_fencing(self) -> bool:
+        """Release the pin unless a fenced health write is still in flight.
+
+        Such a write may be an ``online`` that began before the fence and
+        commits after it; releasing the pin then would refuse the fenced
+        ``offline`` right behind it and leave the stopped source durably
+        ``online`` (Issue #204). The pin is then kept and released by
+        ``_fence_settled`` once no fenced write is in flight, without making
+        this stop wait. Returns False only when a release failed.
+        """
+        with self._pin_lock:
+            if not self._database_pinned:
+                self._pin_held_for_fence = False
+                return True
+            if self._fence_pending():
+                self._pin_held_for_fence = True
+                return True
+            self._pin_held_for_fence = False
+            return self._release_database()
+
+    def _fence_settled(self) -> None:
+        """Health-writer callback: release a pin a stop kept for a fence."""
+        with self._pin_lock:
+            if not self._pin_held_for_fence or self._fence_pending():
+                return
+            self._pin_held_for_fence = False
+            if not self._release_database():
+                return
+        logging.getLogger(__name__).info(Event.LOCAL_UVC_HEALTH_FENCE_PIN_RELEASED)
 
     def _fence_live_workers(self) -> None:
         """Durably lower sources whose worker outlived the join bound.
@@ -660,6 +719,9 @@ class LocalUvcRuntime:
                 live.append(source_id)
         if not live:
             return
+        listen = getattr(self.adapter, "on_fence_settled", None)
+        if callable(listen):
+            listen(self._fence_settled)
         try:
             complete = fence(live, HEALTH_FENCE_SECONDS) is True
         except Exception:
@@ -743,10 +805,12 @@ class LocalUvcRuntime:
                 state = self._aggregate(sink_stalled=stalled or undeliverable > 0)
                 self._state = state
             fence_incomplete = self._health_fence_incomplete
+            with self._pin_lock:
+                pin_held = self._pin_held_for_fence
         with self._events_lock:
             dropped, sink_failures = self._events_dropped, self._sink_failures
             suppressed = self.health_logs_suppressed
         sink_failures += delivery_failures
         return LocalUvcRuntimeStatus(state, tuple(sources), dropped, sink_failures, suppressed,
                                      pending, coalesced, stalled, undeliverable,
-                                     fence_incomplete)
+                                     fence_incomplete, pin_held)

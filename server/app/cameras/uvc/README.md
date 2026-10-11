@@ -144,7 +144,11 @@ requires approval holds nothing. A duplicate that predates this check (or an
 older duplicate re-enabled later) makes every conflicting source
 `manual_intervention_required` (`approval_conflict`) without changing either
 approval, so capture never depends on startup order; the Owner disables or
-reapproves one of them. A supervisor drives
+reapproves one of them. If the other source was approved as a duplicate-serial
+twin (`serial_ambiguous`), it stays `requires_approval` after the conflict
+clears (once the conflict closed its live binding, a shared serial cannot
+prove which twin returned) and must be
+reapproved as well. A supervisor drives
 `poll_source()` in each source's worker and serializes operations on that source.
 The injected frame callback can feed an authorized preview or later media
 pipeline; actual browser viewing remains a downstream task. Discovery and
@@ -239,7 +243,17 @@ requested, so even when the lock cannot be taken in time (for example a
 fenced `offline`, and that `capture_ready` lowers its own late `online` and
 refuses once it releases the lock. Such an incomplete fence is never
 ignored: it is counted (`health_fence_incomplete`) and logged with the fixed
-event `local_uvc_health_fence_incomplete` (the stop is `stop_failed`). A
+event `local_uvc_health_fence_incomplete` (the stop is `stop_failed`). If a
+fenced source's health writer is still busy then (for example blocked in an
+earlier `online` write that did not carry the fence and may still commit),
+the stop keeps the database pin (`health_fence_pin_held`) rather than
+refusing the fenced `offline` queued behind that write (Issue #204). The
+writer releases the pin, off the stop and logged as
+`local_uvc_health_fence_pin_released`, as soon as no fenced write is in
+flight: the fenced row is then durable, or its write failed and the source
+stays reported unpersisted. A later `stop()` re-checks it as well. The stop
+itself stays bounded; a write that never returns keeps the pin until process
+exit, and the next start writes the row `offline` before any capture opens. A
 fenced controller refuses `capture_ready`, so a late frame from that worker
 never reports `online` again, and the adapter opens no capture for a fenced
 source; the worker still closes its descriptor and releases its session when
@@ -266,7 +280,9 @@ transition to that queue. If that controller thread cannot be started either,
 its events stay queued (never reported idle), the start is retried on the
 next delivery, every `status()` and the stop, and the stop then hands the
 queue over itself; events still left are counted in
-`health_sink_undeliverable` (the service is `degraded`). `stop()` then waits at most
+`health_sink_undeliverable` (the service is `degraded`). That count stays for
+the rest of the runtime's lifetime (fail closed), so the service then stays
+`degraded` until the capture service is restarted. `stop()` then waits at most
 `HEALTH_SINK_SETTLE_SECONDS` (1 s) for pending deliveries. The adapter refreshes `last_seen_at`
 at most once per second and does not rewrite an unchanged offline state for an
 unapproved source, so polling does not become a steady SQLite write load.
