@@ -103,11 +103,13 @@ from app.cameras.registry.repository import CameraRegistry
 from app.media.recording.store import RecordingStore
 from app.cameras.uvc.persistence import ApprovalStore
 from app.detection.owner import store as owner_store
+from app.detection.roi.calibration import COLUMNS as ROI_COLUMNS, decode_history_row
 from app.detection.owner.contracts import Operation
 from app.integrity.model import Component, Finding, Inventory, Kind, State
 from app.media.health.service import HealthState, Stage as HealthStage
 from app.media.recording.model import Limits as RecordingLimits, Segment
 from app.notifications.service import NotificationKind
+from app.monitoring.config import RECORDING_LIMIT_FIELDS
 from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.delivery import ActionResult
 from app.presence.models import (InvalidObservation, Observation, PresenceState,
@@ -2391,7 +2393,10 @@ def _status_domain_errors(connection, tables) -> list:
       ``stream_discontinuity``;
     - roi_calibration_history: CalibrationArchive.append() admits only the
       next version under the identifier of the first one, so every source /
-      profile holds versions 1..n under one identifier;
+      profile holds versions 1..n under one identifier, and every row must
+      read back through decode_history_row(), the function
+      CalibrationArchive.load() uses (decodable metadata whose embedded
+      source / profile / version / identifier is the row key);
     - notification_events: NotificationEventStore.get() parses the event
       UUID, the kind and the time (written as UTC ISO text, which
       count_since() and expire() compare as text);
@@ -2416,9 +2421,12 @@ def _status_domain_errors(connection, tables) -> list:
             bad("recording_source_discontinuities", f"marker:{row[0]}:{row[1]}:{row[2]}")
     histories: dict = {}
     for row in rows("roi_calibration_history",
-                    "SELECT source_id, profile_id, version, identifier "
-                    "FROM roi_calibration_history"):
+                    f"SELECT {', '.join(ROI_COLUMNS)} FROM roi_calibration_history"):
         histories.setdefault((str(row[0]), str(row[1])), []).append((row[2], row[3]))
+        try:
+            decode_history_row(row)
+        except Exception:
+            bad("roi_calibration_history", f"{row[0]}/{row[1]}/{row[2]}")
     for (source, profile), versions in sorted(histories.items()):
         numbers = sorted((item[0] for item in versions), key=_row_order)
         if (not (_canonical_uuid(source) and _canonical_uuid(profile))
@@ -3815,7 +3823,8 @@ def _future_times(current: dict, limit: datetime) -> dict:
     Presence clocks, tombstones, unresolved-marker times, the override start,
     the timeline gap and Owner-release audit times; pending integrity rows
     and overflow slots; security/admin, integrity, storage-state and
-    Owner-template audit times; pairing audit times. An override expiry is
+    Owner-template audit times; pairing audit times; notification event
+    times. An override expiry is
     legitimately in the future and PresenceService sets no longest
     duration, so it is not bounded.
     """
@@ -3868,6 +3877,14 @@ def _future_times(current: dict, limit: datetime) -> dict:
         late("owner_template", f"audit:{row_id}", _utc_instant(value))
     for row in (current.get("security_state") or {}).get("pairing_audit") or ():
         late("security_state", f"pairing_audit:{row[0]}", _epoch_instant(1000)(row[3]))
+    # A notification time beyond the verify time would be counted by every
+    # later count_since() and kept by expire() until then plus the retention
+    # (#132). A malformed one is already a notification_events invalid_value.
+    for event_id, value in sorted((current.get("notification_events") or {}).items()):
+        moment = (_utc_instant(value[1]) if isinstance(value, list) and len(value) == 3
+                  else None)
+        if moment is not None:
+            late("notification_events", event_id, moment)
     return found
 
 
@@ -4025,30 +4042,58 @@ def _compare_migrations(baseline: list | None, current: list | None) -> dict:
 _NOT_RECORDED = {"status": "not_recorded", "failed": []}
 
 
-def _marker_trimmed(marker, spool: dict | None) -> bool:
-    """Whether RecordingStore could have removed a source pre-roll marker.
+# RecordingStore._trim()'s duration cutoff. Main builds its recording limits
+# from RECORDING_LIMIT_FIELDS (monitoring configuration), which does not
+# include pre_roll_ms, so every Main store runs with the Limits default. Were
+# it ever made configurable, the largest value Limits admits is used instead:
+# a marker is then accepted as trimmed only where any configuration trims it
+# (a legitimate trim under a shorter window fails loudly, never the reverse).
+_PRE_ROLL_MS = (RecordingLimits.__dataclass_fields__["pre_roll_ms"].default
+                if "pre_roll_ms" not in RECORDING_LIMIT_FIELDS else 1_200_000)
 
-    _trim() deletes a marker ending at or before T = (latest segment end of
-    its source) - pre_roll_ms and, in the same transaction, clears the spool
-    flag of every segment of the source ending at or before T;
-    release_source() deletes every marker of the source and unspools all its
-    segments. Either way no ready spool segment of the source ends at or
-    before the marker's end afterwards, and a later publication starts past
-    the cursor, beyond it. So a marker may leave only once no such segment
-    remains in the current ready spool; the deployment's pre_roll_ms is not
-    needed.
+
+def _marker_trimmed(marker, spool: dict | None, cursor_rows: dict | None) -> bool:
+    """Whether RecordingStore itself removed a source pre-roll marker.
+
+    Only two paths delete one:
+
+    - _trim() deletes a marker whose end is at or before T = (latest
+      segment end of its source) - pre_roll_ms, its duration cutoff. Its
+      byte / count eviction unspools segments but never deletes a marker,
+      so an evicted spool alone is no evidence. _publish() sets the source
+      cursor end to the end of the latest publication and append() runs
+      _trim() right after it (or _recover() at the next start), with that
+      segment still catalogued: the marker leaves exactly once the cursor
+      end reaches ``end + pre_roll_ms``. The cursor end is compared with
+      its recorded value and the catalog elsewhere (cursor_regressed /
+      cursor_changed / invalid_value).
+    - release_source() deletes every marker of the source and leaves its
+      cursor inactive (only a later publication sets it active again, which
+      the first rule then judges).
+
+    Both also clear the spool flag of every segment of the source ending at
+    or before the marker's end in the same transaction (a later publication
+    starts past the cursor, beyond it), so a ready spool segment of the
+    source still ending there is a loss either way.
     """
     source, end = marker[0], marker[2]
-    if spool is None or not _int(end):
+    if spool is None or cursor_rows is None or not _int(end):
         return False
-    return not any(item.get("source_id") == source
-                   and (not _int(item.get("end_ms")) or item["end_ms"] <= end)
-                   for item in spool.values())
+    if any(item.get("source_id") == source
+           and (not _int(item.get("end_ms")) or item["end_ms"] <= end)
+           for item in spool.values()):
+        return False
+    cursor = cursor_rows.get(source)
+    if not isinstance(cursor, dict):
+        return False
+    released = cursor.get("active") == 0
+    trimmed = _int(cursor.get("end_ms")) and cursor["end_ms"] >= end + _PRE_ROLL_MS
+    return bool(released or trimmed)
 
 
 def _compare_source_discontinuities(baseline: list | None, current: list | None,
-                                    spool: dict | None) -> dict:
-    """Recorded markers stay, except those the spool trim or a release removed."""
+                                    spool: dict | None, cursor_rows: dict | None) -> dict:
+    """Recorded markers stay, except those the duration trim or a release removed."""
     if not baseline:
         return {"status": "empty", "failed": [], "preserved_rows": 0,
                 "appended": [_row_order(item) for item in current or ()]}
@@ -4061,7 +4106,7 @@ def _compare_source_discontinuities(baseline: list | None, current: list | None,
         if remaining[key]:
             remaining[key] -= 1
             preserved += 1
-        elif _marker_trimmed(item, spool):
+        elif _marker_trimmed(item, spool, cursor_rows):
             trimmed.append(key)
         else:
             failed.append({"id": f"marker:{item[0]}:{item[1]}:{item[2]}", "reason": "missing"})
@@ -4192,7 +4237,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
         "recording_source_discontinuities": (
             _compare_source_discontinuities(baseline["recording_source_discontinuities"],
                                             current.get("recording_source_discontinuities"),
-                                            current.get("spool_segments"))
+                                            current.get("spool_segments"),
+                                            current.get("recording_source_cursor_rows"))
             if "recording_source_discontinuities" in baseline else dict(_NOT_RECORDED)),
         "roi_calibration_history": (
             _compare_keyed(baseline["roi_calibration_history"],

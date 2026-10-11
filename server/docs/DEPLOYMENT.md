@@ -1303,24 +1303,37 @@ the tables #132 added:
 
 - `recording_source_discontinuities` (the per-source pre-roll gap markers a
   new event recording copies): every recorded marker stays, unless the
-  recording store could have removed it: its spool trim deletes a marker
-  together with the spool flag of every segment of the source ending at or
-  before it, and `release_source()` drops all markers and the spool of a
-  source. A marker is therefore accepted as gone (`trimmed`, never
+  recording store itself removed it. Only two paths do: the spool trim's
+  duration cutoff deletes a marker ending at or before the source's latest
+  segment end minus `pre_roll_ms` (its byte / segment-count eviction never
+  deletes a marker), and `release_source()` drops all markers of a source and
+  leaves its cursor inactive. Main cannot configure `pre_roll_ms` (it is not
+  among the `recording_limits` fields), so the code default of 30 seconds
+  applies. A marker is therefore accepted as gone (`trimmed`, never
   preserved) only when no ready spool segment of its source ends at or
-  before the marker's end; otherwise it is `missing`. New markers are
-  `appended`; each current marker must carry a source UUID, `start <= end`
-  and the reason `stream_discontinuity`;
+  before the marker's end and either the source cursor end has reached the
+  marker's end plus `pre_roll_ms` (a later publication moved the cutoff past
+  it) or the cursor is inactive (released); otherwise it is `missing`, even
+  when the capacity eviction has already emptied the spool before it. New
+  markers are `appended`; each current marker must carry a source UUID,
+  `start <= end` and the reason `stream_discontinuity`;
 - `roi_calibration_history`: append-only, every version kept as a keyed
   digest of its identifier and metadata (never the values); a rewritten or
   removed version fails, and each source / profile must hold versions 1..n
-  under one identifier, as `CalibrationArchive.append()` admits them;
+  under one identifier, as `CalibrationArchive.append()` admits them. Every
+  current row, recorded or appended, must also read back through the
+  archive's own row decoder (`decode_history_row()`, which
+  `CalibrationArchive.load()` uses): metadata that does not decode, or whose
+  embedded source / profile / version / identifier differs from the row key,
+  is `invalid_value`;
 - `notification_events`, every kind (not only the hardware-integrity alerts
   the pending-alert rule above reads): kind, time and confirmed flag never
   change, and a row may leave only through the service's 90-day retention
   (`at` older than verify time minus 90 days, compared as the stored UTC
   text; listed as `retention_expired`). Each current row must have an event
-  UUID, a known kind and a UTC time;
+  UUID, a known kind and a UTC time no more than the 5-minute clock-skew
+  allowance beyond the verify time (`future_time`: a later time would be
+  counted by every daily summary and kept past its retention);
 - `integrity_status` and `recording_health_status`: a row present at record
   time must still exist; each current row must parse as the service reads it
   back, and `integrity_status.delivery_blocked` must be set exactly while an
