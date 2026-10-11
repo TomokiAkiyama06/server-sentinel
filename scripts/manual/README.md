@@ -14,3 +14,9 @@ a production runtime root.
   registry holds none, `?` for a field the driver did not report) comes from the
   registry row already read each second; it opens no extra device and never
   touches `/dev/snd` (`MANUAL_TEST.md` P-5, Issue #193).
+- `transport_poc/` — Issue #15 Agent–Main media transport PoC measurement
+  harness (`MANUAL_TEST.md` section G): disposable mTLS materials, a Main-side
+  receiver on the product ingest admission/continuity/queue code, a
+  capture-side sender, a loopback impairment proxy, a camera holder and a
+  G1–G6 summarizer. Payloads are hashed and discarded; measurement output is
+  numeric JSONL only. Runbook (Japanese): `transport_poc/README.md`.

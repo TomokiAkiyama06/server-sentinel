@@ -1193,6 +1193,38 @@ codec/container and recording-extraction impact, and the exact dependency
 versions/licences. Enter the results in the ADR-0007 validation table; do not
 attach private addresses, credentials or real footage.
 
+### 実機記録テンプレート: Issue #15 transport PoC 計測ハーネス（未実施）
+
+手順は [`scripts/manual/transport_poc/README.md`](scripts/manual/transport_poc/README.md)
+（step 0 の read-only inventory、使い捨て materials、1 scenario ずつの実行、kill switch
+`systemctl --user stop 'ss-poc15-*'`、1 日 3 時間上限、cleanup checklist）。ハーネスの PR
+時点の確認は同一 host の loopback・synthetic 入力だけで、以下は**どれも実機では未実施**です。
+TCP の packet loss / jitter は root の `netem` を使わないため `unmeasured` のまま残し、
+QUIC / WebRTC はこのハーネスの対象外です。
+
+```text
+Date / tester:
+ServerSentinel Git commit (harness HEAD):
+Main host（粗い値のみ）/ capture host（粗い値のみ）:
+Candidate(s): a_framed / b_chunked / b_segment / srt_ffmpeg（ffmpeg srt の有無）
+Sources: n=  real cameras=  synthetic (gst / builtin)=
+Profile / bitrate:
+CPU cap (Main CPUQuota / capture CPUQuota):
+Run id(s):
+Total run time today (≤ 3 h):
+```
+
+- [ ] step 0 inventory を両 host で取得し、47200–47214 が未使用であることを確認した;
+- [ ] G1: `auth_unpaired` / `auth_other_ca` / `auth_revoked` / `auth_revoked_live` で受理 media 0、`route_probe` で human route なし;
+- [ ] G2: 各 impairment 後の報告 gap が実欠落と一致（epoch 内は完全一致、capture 再起動は範囲不明）、重複 commit 0;
+- [ ] G3: receiver queue / kernel send buffer（`ss -tmi`）/ VmHWM が設定上限内で warmup 後に増加しない;
+- [ ] G4: 手動操作なしで再接続し p95 ≤ 10 s;
+- [ ] G5: 無音断の検知 ≤ 15 s、Main の未 commit 区間が Agent 保護区間 [T−600 s, T+600 s] に含まれる;
+- [ ] G6: CPU 制限下の 4 source で backpressure 0、5 source 目は拒否;
+- [ ] 副次: 30 分 soak で予期しない切断 0、overhead ≤ 10 %、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %、latency p95（参考）;
+- [ ] cleanup checklist を完了（使い捨て CA / ledger / node 鍵 / holder state を削除、`ss-poc15-*` scope なし）;
+- [ ] 結果を ADR-0007 Validation 表へ転記し、real / synthetic の内訳と未測定項目を明記した。
+
 ### LAN baseline measurement (2026-09-30, Issue #15; no transport candidate yet)
 
 This is a baseline of the private LAN path from the remote capture node to the

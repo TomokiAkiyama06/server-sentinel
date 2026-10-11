@@ -156,6 +156,12 @@ exact/unknown gaps, stale sessions, bounded backpressure and gap coalescing,
 1–4 sources with a fifth refused, stale/clock-regression fail-closed,
 revocation, concurrency, and a deterministic synthetic impairment run.
 
+Measurement harness (Issue #15): `scripts/manual/transport_poc/` runs the
+same impairment matrix and G1–G6 gates for TLS 1.3 mTLS framed streaming and
+mTLS HTTP/1.1 chunked / 1 s segment upload (SRT only through a system ffmpeg
+that provides it). It has run only as a synthetic loopback on one host; it
+selects no candidate and measures nothing on a real LAN by itself.
+
 Real hardware (not done): MANUAL_TEST.md §G "Agent-to-Main transport PoC".
 Record per candidate, for 1, 2, 3 and 4 sources (state real vs synthetic
 inputs for each):
