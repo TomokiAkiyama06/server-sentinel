@@ -135,9 +135,16 @@ critical staging has no room is held (the source reports
 handed to the detector once staging drains, so a loss correlated with a scene
 shift is never turned into a per-source fault that drops the tamper evidence.
 The default sample interval
-is a conservative 1 sample/s per source. Critical staging is in memory: at
-shutdown, observations the recorder has not accepted are counted and logged as
-`scene_critical_undelivered`, together with any loss still held. No route reads the runtime status before #10.
+is a conservative 1 sample/s per source. Critical staging is in memory. At
+shutdown the final worker pass first hands every loss still queued in a capture
+slot to its detector (after a sample captured before that loss, at most one of
+each per source), then retries held losses and staging. Observations the
+recorder has not accepted stay counted in `critical_pending`, losses that still
+had no staging room in `losses_held`; both are logged as
+`scene_critical_undelivered` and are not persisted. The Main application's
+`scene_monitoring_state` follows the runtime status while it runs (critical
+backpressure is `degraded`, a failed or dead worker `unavailable`). No route
+reads the runtime status before #10.
 
 `server/tests/test_detector_roi.py` generates all pixel inputs in memory for
 local and remote-agent calibration, relative movement, global camera motion,

@@ -3,6 +3,7 @@
 Every pixel is generated in memory; no camera, real scene or person is used.
 """
 
+import asyncio
 from contextlib import closing
 from dataclasses import replace
 import tempfile
@@ -113,7 +114,8 @@ class Recorder:
 
 
 class Harness:
-    def __init__(self, *bindings, recorder=True, calibrations="default", capacity=None):
+    def __init__(self, *bindings, recorder=True, calibrations="default", capacity=None,
+                 threaded=False):
         self.clock = Clock()
         self.recorder = Recorder() if recorder else None
         if calibrations == "default":
@@ -123,17 +125,28 @@ class Harness:
         self.runtime = SceneMonitoringRuntime(
             self.configuration,
             SceneMonitoringDependencies(recorder=self.recorder, calibrations=calibrations,
-                                        monotonic_ns=self.clock, utcnow=lambda: NOW),
-            threaded=False)
+                                        monotonic_ns=self.clock, utcnow=lambda: NOW,
+                                        tick_seconds=0.01),
+            threaded=threaded)
+        self.threaded = threaded
         self.sequence = {}
 
     def frame(self, luma=None, source=SOURCE, advance=INTERVAL):
         self.clock.value += advance
         number = self.sequence.get(source, 0) + 1
         self.sequence[source] = number
+        before = self._handled(source)
         self.runtime.on_uvc_frame(source, VideoFrame(yuyv(luma or pixels()), number, 0.0))
-        self.runtime.step()
+        if self.threaded:
+            # The worker consumed this sample once one of its outcomes counted.
+            assert wait_for(lambda: self._handled(source) > before)
+        else:
+            self.runtime.step()
         return self.source(source)
+
+    def _handled(self, source):
+        item = self.source(source)
+        return item.evaluated + item.unusable + item.backpressured + item.failures
 
     def source(self, source=SOURCE):
         return next(item for item in self.runtime.status().sources if item.source_id == source)
@@ -399,6 +412,18 @@ class SceneRuntimeIsolationTests(unittest.TestCase):
         self.assertEqual(1, status.critical_accepted)
         self.assertEqual([CriticalKind.SERVER_MOVEMENT], harness.recorder.kinds())
 
+    def test_observations_accepted_on_submit_are_counted(self):
+        # Codex P2 (#213): CriticalDelivery.submit() delivers immediately when
+        # the recorder accepts; those identifiers must be counted.
+        harness = Harness()
+        harness.runtime.start()
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        status = harness.runtime.status()
+        self.assertEqual([CriticalKind.SERVER_MOVEMENT], harness.recorder.kinds())
+        self.assertEqual(0, status.critical_pending)
+        self.assertEqual(1, status.critical_accepted)
+
     def _loss_backpressure_harness(self):
         """Three sources, staging nearly full of undelivered movement evidence,
         and two scene shifts awaiting a correlated trusted loss."""
@@ -460,6 +485,103 @@ class SceneRuntimeIsolationTests(unittest.TestCase):
                    if item.kind is CriticalKind.CAMERA_TAMPER]
         self.assertEqual(sorted((OTHER, THIRD)), sorted(tampers))
         self.assertEqual(Observation.UNKNOWN, harness.source(THIRD).tamper)
+
+    def test_loss_queued_just_before_stop_is_processed(self):
+        # Codex P1 (#213): a trusted loss still in its capture slot at stop()
+        # (not yet moved into the worker's held loss) must reach the detector.
+        harness = Harness()
+        harness.runtime.start()
+        harness.frame()
+        harness.frame()
+        self.assertEqual("global_scene_shift", harness.frame(SHIFTED).tamper_reason)
+        harness.clock.value += 5
+        harness.runtime.on_uvc_health(HealthEvent(SOURCE, CameraState.OFFLINE, "synthetic_unplug"))
+        status = harness.runtime.stop()
+        self.assertEqual([CriticalKind.CAMERA_TAMPER], harness.recorder.kinds())
+        self.assertEqual("source_loss_after_scene_shift", harness.recorder.items[0].reason)
+        self.assertEqual(0, status.critical_pending)
+        self.assertEqual(0, status.losses_held)
+        self.assertEqual(1, status.critical_accepted)
+
+    def test_loss_queued_at_stop_without_room_is_counted_and_logged(self):
+        harness = Harness(binding(), binding(OTHER), binding(THIRD), capacity=3)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        for luma, moved in ((None, None), (None, MOVED), (SHIFTED, MOVED)):
+            harness.frame(luma, OTHER, advance=0)
+            harness.frame(luma, THIRD, advance=0)
+            harness.frame(moved)
+        harness.clock.value += 5
+        for source in (OTHER, THIRD):
+            harness.runtime.on_uvc_health(HealthEvent(source, CameraState.OFFLINE, "synthetic_unplug"))
+        # Both losses are still queued in their slots; the recorder is down.
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            status = harness.runtime.stop()
+        self.assertTrue(any("scene_critical_undelivered" in line for line in logs.output))
+        # One loss fit the last staging slot; the other is held, not dropped.
+        self.assertEqual(3, status.critical_pending)
+        self.assertEqual(1, status.losses_held)
+        self.assertEqual([], harness.recorder.kinds())
+        self.assertEqual(0, sum(item.failures for item in status.sources))
+
+    def test_sample_before_queued_loss_is_evaluated_at_stop(self):
+        harness = Harness()
+        harness.runtime.start()
+        harness.frame()
+        harness.frame()
+        self.assertEqual("global_scene_shift", harness.frame(SHIFTED).tamper_reason)
+        # A sample showing the reference scene again is queued before the
+        # loss; it ends the shift, so the loss must not confirm a tamper.
+        harness.clock.value += INTERVAL
+        harness.runtime.on_uvc_frame(SOURCE, VideoFrame(yuyv(pixels()), 4, 0.0))
+        harness.clock.value += 5
+        harness.runtime.on_uvc_health(HealthEvent(SOURCE, CameraState.OFFLINE, "synthetic_unplug"))
+        harness.runtime.stop()
+        self.assertEqual([], harness.recorder.kinds())
+
+    def test_held_loss_keeps_the_first_trusted_loss(self):
+        harness = self._loss_backpressure_harness()
+        self.assertEqual(1, harness.runtime.status().losses_held)
+        # Replug and unplug again, outside the shift correlation window. The
+        # later loss must not replace the held one, or the tamper is lost.
+        harness.runtime.on_uvc_health(HealthEvent(THIRD, CameraState.ONLINE, "synthetic_replug"))
+        harness.clock.value += 100
+        harness.runtime.on_uvc_health(HealthEvent(THIRD, CameraState.OFFLINE, "synthetic_unplug"))
+        harness.runtime.step()
+        self.assertEqual(1, harness.runtime.status().losses_held)
+        harness.recorder.fail = False
+        harness.runtime.step()
+        harness.runtime.step()
+        tampers = [item.source_id for item in harness.recorder.items
+                   if item.kind is CriticalKind.CAMERA_TAMPER]
+        self.assertEqual(sorted((OTHER, THIRD)), sorted(tampers))
+        self.assertEqual(0, harness.runtime.status().losses_held)
+
+    def test_threaded_worker_reprocesses_held_loss_on_tick(self):
+        harness = Harness(binding(), binding(OTHER), binding(THIRD), capacity=3, threaded=True)
+        harness.runtime.start()
+        self.addCleanup(harness.runtime.stop)
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        for luma, moved in ((None, None), (None, MOVED), (SHIFTED, MOVED)):
+            harness.frame(luma, OTHER, advance=0)
+            harness.frame(luma, THIRD, advance=0)
+            harness.frame(moved)
+        self.assertEqual("global_scene_shift", harness.source(THIRD).tamper_reason)
+        harness.clock.value += 5
+        for source in (OTHER, THIRD):
+            harness.runtime.on_uvc_health(HealthEvent(source, CameraState.OFFLINE, "synthetic_unplug"))
+        self.assertTrue(wait_for(lambda: harness.runtime.status().losses_held == 1))
+        # No further frame arrives: only the worker's idle tick retries.
+        harness.recorder.fail = False
+        self.assertTrue(wait_for(lambda: sorted(
+            item.source_id for item in harness.recorder.items
+            if item.kind is CriticalKind.CAMERA_TAMPER) == sorted((OTHER, THIRD))))
+        self.assertTrue(wait_for(lambda: harness.runtime.status().losses_held == 0))
+        self.assertEqual(0, harness.runtime.status().critical_pending)
 
     def test_stop_withdraws_conclusions_and_reports_undelivered(self):
         harness = Harness()
@@ -525,6 +647,70 @@ class SceneApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
                               application.state.scene_monitoring_state)
                 self.assertIsNone(application.state.scene_monitoring)
         self.assertTrue(any("scene_monitoring_unconfigured" in line for line in logs.output))
+
+    async def _until(self, predicate, timeout=5.0):
+        # The application watcher is an asyncio task: yield to the loop.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            await asyncio.sleep(0.01)
+        return predicate()
+
+    def _scene_application(self, recorder):
+        from tests.test_uvc_runtime import synthetic_admission
+        remote = binding(OTHER, SourceType.REMOTE_AGENT, sample_interval_ns=1)
+        rules = policy(maximum_gap_ns=10_000_000_000, confirmation_ns=1)
+        return create_app(
+            self.settings, storage_reservation=synthetic_admission,
+            scene_monitoring=SceneMonitoringConfiguration((remote,), critical_capacity=2),
+            scene_monitoring_dependencies=SceneMonitoringDependencies(
+                recorder=recorder, calibrations=lambda value: calibration_for(value, rules=rules),
+                tick_seconds=0.01),
+        )
+
+    async def test_application_scene_state_follows_backpressure_and_recovery(self):
+        # Codex P2 (#213): the application snapshot must not stay RUNNING
+        # while critical staging is backpressured.
+        recorder = Recorder()
+        recorder.fail = True
+        application = self._scene_application(recorder)
+        stream = uuid4()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.scene_monitoring
+            self.assertIs(SceneRuntimeState.RUNNING, application.state.scene_monitoring_state)
+            for luma in (pixels(), pixels(), MOVED, MOVED):
+                evaluated = runtime.status().sources[0].evaluated
+                await asyncio.sleep(0.002)
+                self.assertTrue(runtime.offer_luma(OTHER, stream_id=stream, width=WIDTH,
+                                                   height=HEIGHT, pixels=luma))
+                self.assertTrue(await self._until(
+                    lambda: runtime.status().sources[0].evaluated > evaluated))
+            self.assertEqual(1, runtime.status().critical_pending)
+            self.assertTrue(await self._until(
+                lambda: application.state.scene_monitoring_state is SceneRuntimeState.DEGRADED))
+            recorder.fail = False
+            self.assertTrue(await self._until(
+                lambda: application.state.scene_monitoring_state is SceneRuntimeState.RUNNING))
+        self.assertIs(SceneRuntimeState.STOPPED, application.state.scene_monitoring_state)
+        self.assertEqual([CriticalKind.SERVER_MOVEMENT], recorder.kinds())
+
+    async def test_application_scene_state_reports_worker_failure(self):
+        application = self._scene_application(Recorder())
+        async with application.router.lifespan_context(application):
+            runtime = application.state.scene_monitoring
+            self.assertIs(SceneRuntimeState.RUNNING, application.state.scene_monitoring_state)
+
+            def broken():
+                raise RuntimeError("synthetic worker failure")
+
+            with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+                runtime._cycle = broken
+                runtime.request_calibration_refresh()
+                self.assertTrue(await self._until(
+                    lambda: application.state.scene_monitoring_state
+                    is SceneRuntimeState.UNAVAILABLE))
+        self.assertIs(SceneRuntimeState.UNAVAILABLE, application.state.scene_monitoring_state)
 
     async def test_local_uvc_frames_reach_scene_detector_and_stop_cleanly(self):
         from tests.test_uvc_runtime import synthetic_admission

@@ -229,6 +229,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
         monitoring_task = None
         cleanup_task = None
         uvc_watch_task = None
+        scene_watch_task = None
 
         uvc_lifecycle = {"deferred": None, "stopping": False}
 
@@ -258,6 +259,29 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 logging.INFO if status.state is SceneRuntimeState.RUNNING else logging.ERROR,
                 Event.SCENE_MONITORING_STARTED if status.state is SceneRuntimeState.RUNNING
                 else Event.SCENE_MONITORING_UNAVAILABLE)
+
+        async def watch_scene_monitoring() -> None:
+            # The application snapshot follows the live runtime, like the UVC
+            # watcher: critical backpressure (DEGRADED), its recovery, or a
+            # failed/dead worker (UNAVAILABLE) is reflected here instead of
+            # the startup result staying RUNNING until shutdown. Shutdown
+            # cancels this task before stop() writes the final state.
+            live = (SceneRuntimeState.RUNNING, SceneRuntimeState.DEGRADED)
+            while application.state.scene_monitoring_state in live:
+                await asyncio.sleep(scene_runtime.refresh_interval_seconds)
+                try:
+                    status = await asyncio.to_thread(scene_runtime.status)
+                    state = status.state
+                    lost = state in live and not status.worker_running
+                except Exception:
+                    state, lost = SceneRuntimeState.UNAVAILABLE, True
+                if lost:
+                    # A worker that is gone (or a status that cannot be read)
+                    # evaluates nothing. A worker failure the runtime caught
+                    # already logged itself and reports UNAVAILABLE directly.
+                    state = SceneRuntimeState.UNAVAILABLE
+                    logging.getLogger(__name__).error(Event.SCENE_MONITORING_UNAVAILABLE)
+                application.state.scene_monitoring_state = state
 
         async def stop_scene_monitoring() -> None:
             if scene_runtime is None:
@@ -365,6 +389,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
 
         async def shutdown() -> None:
             uvc_lifecycle["stopping"] = True
+            if scene_watch_task is not None:
+                scene_watch_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await scene_watch_task
             if uvc_watch_task is not None:
                 uvc_watch_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -426,6 +454,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 logging.getLogger(__name__).error(Event.AUDIT_RETENTION_DEGRADED)
             # Before capture, so the first frames already reach the detector.
             await start_scene_monitoring()
+            if scene_runtime is not None:
+                scene_watch_task = asyncio.create_task(watch_scene_monitoring())
             await start_local_uvc()
             if local_uvc_runtime is not None:
                 uvc_watch_task = asyncio.create_task(watch_local_uvc())

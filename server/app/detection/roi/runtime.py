@@ -275,6 +275,10 @@ class SceneRuntimeStatus:
     critical_pending: int
     critical_accepted: int
     worker_running: bool
+    # Camera losses waiting for critical staging room. After `stop()` this is
+    # how many could not be handed to their detector (in memory only, never
+    # persisted), alongside `critical_pending`.
+    losses_held: int = 0
 
 
 @dataclass
@@ -387,6 +391,11 @@ class SceneMonitoringRuntime:
     def source_ids(self) -> tuple[UUID, ...]:
         return self.configuration.source_ids
 
+    @property
+    def refresh_interval_seconds(self) -> float:
+        """How often an embedder should re-read `status()` (worker tick)."""
+        return self._deps.tick_seconds
+
     # -- lifecycle -----------------------------------------------------
     def start(self) -> SceneRuntimeStatus:
         with self._lock:
@@ -410,8 +419,9 @@ class SceneMonitoringRuntime:
         with self._lock:
             self._accepting = False
             self._stopping = True
-            for slot in self._slots.values():
-                slot.sample = slot.loss = None
+            # A loss queued just before shutdown (possibly correlated with a
+            # scene shift) stays in its slot: the final worker pass
+            # (`_finish`) hands it to the detector before slots are cleared.
             self._wake.notify_all()
             thread = self._thread
         if thread is not None:
@@ -426,6 +436,10 @@ class SceneMonitoringRuntime:
         elif self._state in (SceneRuntimeState.RUNNING, SceneRuntimeState.DEGRADED):
             self._finish()
         with self._lock:
+            for slot in self._slots.values():
+                if slot.sample is not None:
+                    slot.sample.data = None
+                slot.sample = slot.loss = None
             if self._state is not SceneRuntimeState.UNAVAILABLE:
                 self._state = SceneRuntimeState.STOPPED
             for published in self._published.values():
@@ -587,10 +601,37 @@ class SceneMonitoringRuntime:
             return self._pending_critical
 
     def _finish(self):
+        lost = self._process_queued_losses()
         held = self._drain_held_losses()
-        if self._retry() or held:
-            # Staging is in memory only; the count stays visible in status.
+        if self._retry() or held or lost:
+            # Staging is in memory only; the counts stay visible in status.
             logging.getLogger(__name__).error(Event.SCENE_CRITICAL_UNDELIVERED)
+
+    def _process_queued_losses(self):
+        """Final pass over losses still queued in capture slots at shutdown.
+
+        Bounded: at most one loss and one earlier sample per source. A sample
+        captured before the loss is evaluated first, exactly as a normal pass
+        would, so it can still end an episode instead of being skipped; a
+        sample after the loss (or with no loss) is dropped. Returns how many
+        losses failed on a per-source fault and could not be processed.
+        """
+        failed = 0
+        for source_id, context in self._contexts.items():
+            with self._lock:
+                slot = self._slots[source_id]
+                sample, loss = slot.sample, slot.loss
+                slot.sample = slot.loss = None
+            if sample is not None and (loss is None or sample.monotonic_ns > loss.monotonic_ns):
+                sample.data, sample = None, None
+            if loss is None:
+                continue
+            try:
+                self._process(context, sample, loss)
+            except Exception:
+                failed += 1
+                self._fault(context)
+        return failed
 
     def _cycle(self):
         now = self._deps.monotonic_ns()
@@ -855,6 +896,8 @@ class SceneMonitoringRuntime:
                 published.failures,
             ))
         thread = self._thread
+        # A reference read of worker-owned state; a snapshot, never a decision.
+        held = sum(context.held_loss is not None for context in self._contexts.values())
         return SceneRuntimeStatus(self._state, tuple(sources), self._pending_critical,
                                   self._accepted_critical,
-                                  thread is not None and thread.is_alive())
+                                  thread is not None and thread.is_alive(), held)

@@ -1026,7 +1026,11 @@ uncompressed `GREY`/`YUYV` local capture is read; compressed capture stays
 backpressure, camera loss and stale conclusions are `unknown`, never a
 negative. A camera loss that arrives while staging has no room is held as
 backpressure and processed after staging drains, never dropped as a
-per-source failure.
+per-source failure; a loss still queued at shutdown is processed by the final
+worker pass, and any loss or observation that remains undelivered is counted
+in the runtime status and logged (staging is in memory only). The application
+scene state follows the runtime status while running, so critical backpressure
+reports `degraded` and a failed worker `unavailable`.
 Synthetic tests do not establish physical-camera, lighting, pose, or
 source-health behavior.
 
