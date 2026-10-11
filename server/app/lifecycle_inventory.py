@@ -107,7 +107,8 @@ from app.detection.roi.calibration import COLUMNS as ROI_COLUMNS, decode_history
 from app.detection.owner.contracts import Operation
 from app.integrity.model import Component, Finding, Inventory, Kind, State
 from app.media.health.service import HealthState, Stage as HealthStage
-from app.media.recording.model import Limits as RecordingLimits, Segment
+from app.media.recording.model import (
+    MAX_LIMIT_DURATION_MS, Limits as RecordingLimits, Segment)
 from app.notifications.service import NotificationKind
 from app.monitoring.config import RECORDING_LIMIT_FIELDS
 from app.monitoring.runtime import EVENT_NAMESPACE
@@ -3239,7 +3240,7 @@ def _trimmed_by_stop(base: dict, now: dict, dropped: list) -> bool:
 # 20-minute segment ceiling Limits itself enforces and no byte ceiling (the
 # deployment's stricter recording_limits are not read here).
 _SEGMENT_BOUNDS = RecordingLimits(pre_roll_bytes=1, max_segment_bytes=2**63 - 1,
-                                  max_segment_ms=1_200_000, max_active_recordings=1,
+                                  max_segment_ms=MAX_LIMIT_DURATION_MS, max_active_recordings=1,
                                   max_spool_segments=1, max_segments_per_recording=1)
 
 
@@ -4049,7 +4050,7 @@ _NOT_RECORDED = {"status": "not_recorded", "failed": []}
 # a marker is then accepted as trimmed only where any configuration trims it
 # (a legitimate trim under a shorter window fails loudly, never the reverse).
 _PRE_ROLL_MS = (RecordingLimits.__dataclass_fields__["pre_roll_ms"].default
-                if "pre_roll_ms" not in RECORDING_LIMIT_FIELDS else 1_200_000)
+                if "pre_roll_ms" not in RECORDING_LIMIT_FIELDS else MAX_LIMIT_DURATION_MS)
 
 
 def _marker_trimmed(marker, spool: dict | None, cursor_rows: dict | None) -> bool:

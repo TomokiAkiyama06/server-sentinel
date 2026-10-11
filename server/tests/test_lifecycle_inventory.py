@@ -6904,12 +6904,105 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(code, inventory.EXIT_PRESERVED, section)
         self.assertEqual(len(section["trimmed"]), 1)
 
+    def test_a_ready_spool_segment_ending_at_the_marker_rules_out_a_trim(self):
+        # #221: the real trim and a release both clear the spool flag of every
+        # segment of the source ending at or before the marker end, so one
+        # still ready there means the marker was lost, even with the cursor
+        # past the cutoff or inactive.
+        from app.media.recording import Segment
+        self.runtime.seed()
+        store, source, second, base, payload = self._marker_source()
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            db.row_factory = sqlite3.Row
+            old = dict(db.execute(
+                "SELECT * FROM recording_segments WHERE source_id=? AND end_ms=?",
+                (str(source), base + 10_000)).fetchone())
+        _, baseline = self.record()
+        marker_id = f"marker:{source}:{base + 10_000}:{base + 10_000}"
+        # The real trim: the cursor reaches marker end + 30 s and the marker,
+        # with the segment before it, leaves.
+        store.append(Segment(source, second, 1, base + 20_000, base + 45_000,
+                             "synthetic", "deflate", payload))
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM recording_source_discontinuities").fetchone()[0], 0)
+            self.assertIsNone(db.execute("SELECT 1 FROM recording_segments WHERE id=?",
+                                         (old["id"],)).fetchone())
+        code, report, _ = self.verify(baseline)
+        section = report["sections"]["recording_source_discontinuities"]
+        self.assertEqual((code, len(section["trimmed"])), (inventory.EXIT_PRESERVED, 1),
+                         section)
+
+        def restore_old_segment():
+            columns = ", ".join(old)
+            self.runtime.execute(
+                f"INSERT INTO recording_segments ({columns}) VALUES "
+                f"({', '.join('?' for _ in old)})",
+                tuple(dict(old, spool=1).values()))
+
+        # A migration putting the segment before the marker back into the
+        # ready spool: the cursor alone would accept the trim.
+        restore_old_segment()
+        code, report, _ = self.verify(baseline)
+        section = report["sections"]["recording_source_discontinuities"]
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual((section["status"], section["failed"], section["trimmed"]),
+                         ("failed", [{"id": marker_id, "reason": "missing"}], []))
+        # The same with the source released (cursor inactive).
+        self.runtime.execute("UPDATE recording_source_cursors SET active=0 WHERE source_id=?",
+                             (str(source),))
+        code, report, _ = self.verify(baseline)
+        section = report["sections"]["recording_source_discontinuities"]
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual((section["failed"], section["trimmed"]),
+                         ([{"id": marker_id, "reason": "missing"}], []))
+
+    def test_marker_trim_rule_requires_no_ready_spool_segment_up_to_its_end(self):
+        # #221: the spool condition of _marker_trimmed() on its own, with a
+        # cursor that would otherwise accept the trim (past the cutoff, or
+        # released).
+        source, other, end = str(uuid4()), str(uuid4()), 1_000_000
+        marker = (source, end, end, "stream_discontinuity")
+        past = {source: {"active": 1, "end_ms": end + inventory._PRE_ROLL_MS}}
+        released = {source: {"active": 0, "end_ms": end + 1}}
+        for cursor_rows in (past, released):
+            with self.subTest(cursor=cursor_rows[source]):
+                self.assertTrue(inventory._marker_trimmed(marker, {}, cursor_rows))
+                # Later spool segments and other sources do not matter.
+                self.assertTrue(inventory._marker_trimmed(marker, {
+                    "a": {"source_id": source, "end_ms": end + 1},
+                    "b": {"source_id": other, "end_ms": end}}, cursor_rows))
+                for spool_end in (end, end - 1, None, True):
+                    with self.subTest(spool_end=spool_end):
+                        self.assertFalse(inventory._marker_trimmed(marker, {
+                            "a": {"source_id": source, "end_ms": spool_end}}, cursor_rows))
+        # The cursor still short of the cutoff.
+        self.assertFalse(inventory._marker_trimmed(
+            marker, {}, {source: {"active": 1, "end_ms": end + inventory._PRE_ROLL_MS - 1}}))
+
     def test_pre_roll_cutoff_is_the_store_default_main_cannot_configure(self):
         from app.media.recording.model import Limits
         from app.monitoring.config import RECORDING_LIMIT_FIELDS
         self.assertNotIn("pre_roll_ms", RECORDING_LIMIT_FIELDS)
         self.assertEqual(inventory._PRE_ROLL_MS,
                          Limits(1, 1, 1, 1, 1, 1).pre_roll_ms)
+
+    def test_duration_ceiling_is_the_one_limits_enforces(self):
+        # #221: the inventory's fallback pre-roll cutoff and its segment
+        # bounds use the ceiling Limits.__post_init__ enforces, not a copy.
+        from app.media.recording import model
+        ceiling = model.MAX_LIMIT_DURATION_MS
+        self.assertIs(inventory.MAX_LIMIT_DURATION_MS, ceiling)
+        self.assertEqual(inventory._SEGMENT_BOUNDS.max_segment_ms, ceiling)
+        smallest = dict(pre_roll_bytes=1, max_segment_bytes=1, max_segment_ms=1,
+                        max_active_recordings=1, max_spool_segments=1,
+                        max_segments_per_recording=1)
+        for field in ("pre_roll_ms", "max_segment_ms"):
+            with self.subTest(field=field):
+                limits = model.Limits(**dict(smallest, **{field: ceiling}))
+                self.assertEqual(getattr(limits, field), ceiling)
+                with self.assertRaisesRegex(ValueError, "exceeds maximum"):
+                    model.Limits(**dict(smallest, **{field: ceiling + 1}))
 
     def test_roi_rows_must_read_back_through_the_archive(self):
         # Codex P1: an appended version with the right number and identifier

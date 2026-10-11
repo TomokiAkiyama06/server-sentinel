@@ -1316,8 +1316,14 @@ the tables #132 added:
   before the marker's end and either the source cursor end has reached the
   marker's end plus `pre_roll_ms` (a later publication moved the cutoff past
   it) or the cursor is inactive (released); otherwise it is `missing`, even
-  when the capacity eviction has already emptied the spool before it. New
-  markers are `appended`; each current marker must carry a source UUID,
+  when the capacity eviction has already emptied the spool before it. Only
+  the cursor at verify time is evidence, not the release itself: if a source
+  is released by `release_source()` and then re-enabled and published again
+  before `verify` (which sets its cursor active again) with the cursor end
+  still short of the marker's end plus 30 seconds, the legitimately released
+  marker is reported `missing`. That is a loud failure, never a silent
+  acceptance; the current Main never calls `release_source()`. New markers
+  are `appended`; each current marker must carry a source UUID,
   `start <= end` and the reason `stream_discontinuity`;
 - `roi_calibration_history`: append-only, every version kept as a keyed
   digest of its identifier and metadata (never the values); a rewritten or
@@ -1395,9 +1401,10 @@ offset, or otherwise formatted, is never accepted as evidence. The same holds
 for every such time present now, recorded or new (presence clocks,
 tombstones, unresolved markers, the override, the timeline gap, pending
 integrity rows and overflow slots), since the service compares them again
-(`invalid_time`), and none of them, nor any audit or pairing audit time,
-may lie more than 5 minutes (the clock-skew allowance) beyond the verify
-time (`future_time`): a far-future control clock would refuse every later
+(`invalid_time`), and none of them, nor any audit, pairing audit or
+notification event time (`notification_events`, above), may lie more than
+5 minutes (the clock-skew allowance) beyond the verify time
+(`future_time`): a far-future control clock would refuse every later
 Owner control operation. A time that does not parse (wrong type, malformed,
 negative or out of range) is `invalid_time`, never skipped, and never stops
 `verify` from writing its report. Values the services parse again that no
