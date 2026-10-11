@@ -456,6 +456,77 @@ class CaptureMtlsTests(CaptureTlsHarness):
         self.assertEqual([False] * 4, results)
 
 
+class IngestListenerRebindTests(unittest.TestCase):
+    """Issue #223: Main rebinds ingest at once after a restart, never sharing a live port."""
+
+    @staticmethod
+    def config(port):
+        return IngestListenerConfig(bind_host="127.0.0.1", port=port,
+                                    human_host="127.0.0.1", human_port=8000)
+
+    @staticmethod
+    def free_port():
+        with socket.create_server(("127.0.0.1", 0)) as probe:
+            return probe.getsockname()[1]
+
+    def test_restart_rebinds_while_the_previous_connection_is_in_time_wait(self):
+        port = self.free_port()
+        with open_ingest_listener(self.config(port)) as first:
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+                accepted, _ = first.accept()
+                accepted.close()  # Main closes first, so its side enters TIME_WAIT
+                client.recv(1)
+        # Precondition: the TIME_WAIT entry is really there, so a socket without
+        # SO_REUSEADDR (the pre-#223 listener) cannot rebind the port.
+        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as plain:
+            with self.assertRaises(OSError):
+                plain.bind(("127.0.0.1", port))
+        with open_ingest_listener(self.config(port)) as second:
+            self.assertEqual(("127.0.0.1", port), second.getsockname())
+
+    def test_reuseaddr_never_lets_a_second_listener_take_a_live_port(self):
+        port = self.free_port()
+        with open_ingest_listener(self.config(port)) as first:
+            self.assertTrue(first.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR))
+            self.assertFalse(first.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT))
+            with self.assertRaises(IngestConfigurationError) as raised:
+                open_ingest_listener(self.config(port))
+            self.assertEqual("ingest_listener_bind_failed", raised.exception.reason)
+            # Nor can a plain socket that also sets SO_REUSEADDR.
+            with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as intruder:
+                intruder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                with self.assertRaises(OSError):
+                    intruder.bind(("127.0.0.1", port))
+
+    def test_reuseaddr_is_set_before_bind_and_reuseport_never(self):
+        calls = []
+
+        class Recorder:
+            def __init__(self, family, kind):
+                calls.append(("socket", family, kind))
+
+            def setsockopt(self, level, option, value):
+                calls.append(("setsockopt", level, option, value))
+
+            def bind(self, address):
+                calls.append(("bind", address))
+
+            def listen(self, backlog):
+                calls.append(("listen",))
+
+            def close(self):
+                calls.append(("close",))
+
+        with mock.patch("app.cameras.remote_agent.ingest_tls.socket.socket", Recorder):
+            open_ingest_listener(self.config(7443))
+        self.assertEqual([
+            ("socket", socket.AF_INET, socket.SOCK_STREAM),
+            ("setsockopt", socket.SOL_SOCKET, socket.SO_REUSEADDR, 1),
+            ("bind", ("127.0.0.1", 7443)),
+            ("listen",),
+        ], calls)
+
+
 class CaptureRenewalTests(CaptureTlsHarness):
     """Automatic renewal (Owner decision 2026-09-30) over a real admitted session."""
 
