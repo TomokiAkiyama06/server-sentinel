@@ -1130,6 +1130,9 @@ class HostnameReservationCheck:
     The idle-expiry touch in ``AccessStore.authorize()`` /
     ``authorize_owner()`` stays outside the gate: revocation advances the
     authorization generation, so a touch never makes a revoked session valid.
+    The human surface's session read (``AccessStore.authorize_session``)
+    commits its touch inside ``admit(epoch)``, so a request refused for a
+    close after its epoch never extends the session (Codex PR #219).
 
     Lock order (outermost first): ``exception_change_lock`` ->
     ``_check_lock`` -> ``_session_gate_lock`` -> the SQLite write lock

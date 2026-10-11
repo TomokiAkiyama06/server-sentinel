@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import hashlib
 import sqlite3
-from typing import Callable, Iterable
+from typing import Callable, ContextManager, Iterable
 from uuid import UUID, uuid4
 
 from app.audit.model import ActorCategory, AuditAction, AuditOutcome, TargetKind
@@ -625,7 +625,9 @@ class AccessStore:
         return row is not None
 
     def authorize_session(self, token: bytes, proxy_identity: str, *,
-                          now: datetime | None = None) -> tuple[Principal, frozenset]:
+                          now: datetime | None = None,
+                          admit: Callable[[], ContextManager] | None = None
+                          ) -> tuple[Principal, frozenset]:
         """Authorize a request that needs a current session but no permission.
 
         Exactly the session checks of ``authorize`` (current, unrevoked
@@ -634,11 +636,24 @@ class AccessStore:
         permissions read in the same transaction. The Owner holds every
         permission. Every refusal is the same generic denial. Used only by
         the session self-description route, which grants nothing.
+
+        ``admit``, when given, returns the reservation session gate
+        (``HostnameReservationCheck.admit(epoch)``). It is entered before the
+        write transaction (lock order: gate -> storage admission -> SQLite
+        write lock) and held through its commit, so the authorization and
+        its idle touch commit only while access stayed open since the
+        request's epoch; a refusal by the gate (``HumanAccessClosed``)
+        propagates before anything is read or written. The denial
+        bookkeeping (expiry sweep, binding-mismatch audit) runs after the
+        gate is released (Codex PR #219).
         """
         at = utc_time(self._clock() if now is None else now)
         mismatch: list = []
         try:
-            with self._transaction(write=True) as connection:
+            with ExitStack() as gate:
+                if admit is not None:
+                    gate.enter_context(admit())
+                connection = gate.enter_context(self._transaction(write=True))
                 self._end_expired_sessions_on(connection, at)
                 row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
                 if row is None:

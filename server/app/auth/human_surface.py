@@ -19,8 +19,8 @@ When enabled, every HTTP request passes, server-side and in this order:
    A request from any other peer is refused before its identity header is
    read, so a LAN client cannot spoof it;
 3. the hostname reservation verdict (``access_open``, pid-guarded), and for
-   every commit or authorization the gate epoch, re-checked with ``admit()``
-   (Issue #144/#181);
+   every commit or authorization the gate epoch, re-checked by ``admit()``
+   held around the commit itself (Issue #144/#181);
 4. the per-person WebAuthn credential: a session established by a
    user-verified assertion of the person's own passkey. The proxy identity
    is supplementary (ADR-0004 §1): it must be present and reproduce the
@@ -292,7 +292,12 @@ class HumanAccess:
 
     @property
     def stopped(self) -> bool:
-        """True from ``stop()`` until the next ``run()``: every request is denied."""
+        """Every request is denied while this is True.
+
+        True from ``stop()``, and from the start of ``run()`` until its
+        startup check has returned (Codex PR #219): a restarted lifespan never
+        serves on the verdict a previous lifespan left behind.
+        """
         return self._stopped
 
     def stop(self) -> None:
@@ -320,15 +325,25 @@ class HumanAccess:
         itself: every enumeration of the check runs under the check's
         enumeration timeout, and every SQLite write under the database busy
         timeout. Cancellation during the sleep between ticks ends at once.
+
+        Requests stay denied (``stopped``) from the start of ``run()`` until
+        ``startup()`` has returned, so a restarted lifespan never serves on
+        the verdict the previous lifespan left behind while listeners or
+        routes may have changed (Codex PR #219). ``startup()`` closes access
+        before it re-evaluates; once it has returned, the verdict it
+        published (open or closed) is current. A ``startup()`` that raises
+        may have failed before it closed the old verdict, so requests stay
+        denied and ``startup()`` (not ``tick()``) is retried on every tick
+        until it returns.
         """
-        self._stopped = False
+        self._stopped = True
         log = logging.getLogger(__name__)
-        try:
-            await run_to_completion(asyncio.to_thread(self.reservation.startup))
-        except Exception:
-            log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
+        started = await self._startup(log)
         while True:
             await sleep(self.tick_seconds)
+            if not started:
+                started = await self._startup(log)
+                continue
             try:
                 await run_to_completion(asyncio.to_thread(self.reservation.tick))
             except Exception:
@@ -337,6 +352,16 @@ class HumanAccess:
                 await run_to_completion(asyncio.to_thread(self.store.end_expired_sessions))
             except Exception:
                 log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
+
+    async def _startup(self, log) -> bool:
+        """Run the startup check; requests are served again only after it returned."""
+        try:
+            await run_to_completion(asyncio.to_thread(self.reservation.startup))
+        except Exception:
+            log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
+            return False
+        self._stopped = False
+        return True
 
 
 class HumanSurface:
@@ -487,20 +512,19 @@ class HumanSurface:
         if known is not True:
             raise _Denied()
         try:
-            # The epoch is taken before authorization, and admit() confirms
-            # access stayed open (no close, revocation or reopen) until the
-            # answer was decided (Issue #144).
+            # The epoch is taken before authorization, and the authorization
+            # transaction, idle-session touch included, commits inside
+            # admit(epoch): a close, revocation or reopen after the epoch
+            # refuses the request before anything is read or written, so a
+            # denied request never extends a session (Issue #144, Codex
+            # PR #219). Lock order: gate -> storage admission -> SQLite write
+            # lock; the denial bookkeeping runs after the gate is released.
             epoch = await asyncio.to_thread(reservation.epoch)
             if epoch is None:
                 raise _Denied()
             principal, permissions = await asyncio.to_thread(
-                self.access.store.authorize_session, token, identity)
-
-            def confirm():
-                with reservation.admit(epoch):
-                    pass
-
-            await asyncio.to_thread(confirm)
+                self.access.store.authorize_session, token, identity,
+                admit=lambda: reservation.admit(epoch))
         except Exception:
             raise _Denied() from None
         await self._json(send, 200, {

@@ -46,7 +46,7 @@ from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
 from tests.asgi import request
-from tests.test_hostname_reservation import HOST, Clock, checker, proc
+from tests.test_hostname_reservation import HOST, Clock, Resolver, checker, proc
 from tests.test_webauthn_ceremonies import Clock as CeremonyClock
 from tests.webauthn_fakes import ORIGIN as OTHER_ORIGIN, OpenGate, SyntheticAuthenticator
 
@@ -499,39 +499,93 @@ class ReservationGateTests(HumanSurfaceFixture):
             self.assertEqual(await call(self.surface, "POST", AUTHENTICATION_OPTIONS_PATH), expected)
         self.assertEqual(self.count("SELECT count(*) FROM access_webauthn_challenges"), challenges)
 
-    async def test_pid_guard_refuses_the_gate_confirmation_after_authorization(self):
-        # The fork happens between the request-time verdict and admit():
-        # authorization ran, but the gate refuses to confirm it.
+    def session_times(self):
+        with closing(self.database.connect()) as connection:
+            return connection.execute(
+                "SELECT last_seen_at_us, idle_expires_at_us FROM access_sessions").fetchall()
+
+    async def test_pid_guard_refuses_authorization_after_the_epoch(self):
+        # The fork happens between the epoch and the authorization: the gate
+        # refuses it before the session is read or touched.
         _, authenticator, _ = self.enroll()
         cookie = await self.sign_in(authenticator)
-        original = self.store.authorize_session
+        before = [tuple(row) for row in self.session_times()]
+        self.ceremony_clock.advance(minutes=5)
+        original = self.check.epoch
         patcher = patch.object(self.check, "_gate_pid", reservation_module.os.getpid() + 1)
         self.addCleanup(patcher.stop)
 
-        def forked(*args, **kwargs):
-            result = original(*args, **kwargs)
+        def forked():
+            result = original()
             patcher.start()
             return result
 
-        with patch.object(self.store, "authorize_session", side_effect=forked):
+        with patch.object(self.check, "epoch", side_effect=forked):
             result = await call(self.surface, "GET", SESSION_PATH, cookie=cookie)
+        patcher.stop()
         self.assertEqual(result, await self.denial())
+        self.assertEqual([tuple(row) for row in self.session_times()], before)
 
-    async def test_check_closing_during_authorization_denies_the_answer(self):
+    async def test_close_between_epoch_and_authorization_commits_no_idle_touch(self):
+        """Codex PR #219 (P2): a check that closes access (without an
+        exposure, so without revoking sessions) after the request took its
+        epoch refuses the request before the idle touch commits, so the
+        denied request does not extend the session, also after reopening."""
         _, authenticator, _ = self.enroll()
         cookie = await self.sign_in(authenticator)
-        original = self.store.authorize_session
+        before = [tuple(row) for row in self.session_times()]
+        self.ceremony_clock.advance(minutes=5)
+        original = self.check.epoch
+        resolver = self.check._resolver
+        authorized = []
+        real_authorize = self.store.authorize_session
 
-        def close_meanwhile(*args, **kwargs):
-            result = original(*args, **kwargs)
-            self.files.files["tcp"] = EXPOSED
+        def close_after_epoch():
+            epoch = original()
+            resolver.answer = OSError("synthetic resolver failure")
             self.clock.value += DAILY_SECONDS
             self.assertFalse(self.check.tick().open)
-            return result
+            return epoch
 
-        with patch.object(self.store, "authorize_session", side_effect=close_meanwhile):
+        def authorize(*args, **kwargs):
+            authorized.append(True)
+            return real_authorize(*args, **kwargs)
+
+        with patch.object(self.check, "epoch", side_effect=close_after_epoch), \
+                patch.object(self.store, "authorize_session", side_effect=authorize):
             result = await call(self.surface, "GET", SESSION_PATH, cookie=cookie)
         self.assertEqual(result, await self.denial())
+        self.assertEqual(authorized, [True])
+        # Nothing was written: no idle touch, no session revoked.
+        self.assertEqual([tuple(row) for row in self.session_times()], before)
+        self.assertEqual(self.count("SELECT count(*) FROM access_sessions WHERE invalidated_at_us IS NOT NULL"), 0)
+        # Reopened without an exposure: the session is still current, with
+        # the idle expiry it had before the denied request.
+        resolver.answer = Resolver().answer
+        self.clock.value += DAILY_SECONDS
+        self.assertTrue(self.check.tick().open)
+        self.assertEqual([tuple(row) for row in self.session_times()], before)
+        self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=cookie)), 200)
+
+    async def test_authorization_commits_while_the_gate_is_held(self):
+        # The idle touch commits inside admit(epoch): a check closing access
+        # cannot publish its close until the transaction has committed.
+        _, authenticator, _ = self.enroll()
+        cookie = await self.sign_in(authenticator)
+        held = []
+        real_transaction = self.store._transaction
+
+        @contextmanager
+        def observed(write=False):
+            with real_transaction(write) as connection:
+                if write:
+                    held.append(self.check._session_gate_lock.locked())
+                yield connection
+
+        with patch.object(self.store, "_transaction", side_effect=observed):
+            result = await call(self.surface, "GET", SESSION_PATH, cookie=cookie)
+        self.assertEqual(status(result), 200)
+        self.assertEqual(held, [True])
 
 
 class RateLimitTests(HumanSurfaceFixture):
@@ -1071,6 +1125,102 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
         release.set()
         await task
         self.assertEqual(order, ["check returned", "lifespan stopped"])
+
+
+    async def test_restarted_run_denies_until_its_startup_check_returned(self):
+        """Codex PR #219 (P2): a restarted lifespan keeps every request
+        denied from the start of ``run()`` until ``startup()`` returned,
+        although the reservation still holds the previous open verdict."""
+        _, authenticator, _ = self.enroll()
+        cookie = await self.sign_in(authenticator)
+        expected = await self.denial()
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+        async def short(_seconds):
+            await asyncio.sleep(0.01)
+
+        # First lifespan, then shutdown: the open verdict stays behind.
+        task = asyncio.create_task(self.access.run(sleep=short))
+        while self.access.stopped:
+            await asyncio.sleep(0.01)
+        self.access.stop()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(self.check.access_open)
+
+        started, release = threading.Event(), threading.Event()
+        real_startup = self.check.startup
+
+        def blocking_startup():
+            started.set()
+            release.wait(10)
+            return real_startup()
+
+        with patch.object(self.check, "startup", side_effect=blocking_startup):
+            task = asyncio.create_task(self.access.run(sleep=short))
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            # In the window before startup() closed and re-evaluated the
+            # gate: the stale open verdict serves nothing.
+            self.assertTrue(self.check.access_open)
+            self.assertTrue(self.access.stopped)
+            self.assertEqual(await call(self.surface, "GET", SESSION_PATH, cookie=cookie), expected)
+            self.assertEqual(await call(self.surface, "POST", AUTHENTICATION_OPTIONS_PATH), expected)
+            release.set()
+            while self.access.stopped:
+                await asyncio.sleep(0.01)
+        self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=cookie)), 200)
+        self.access.stop()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_failed_startup_keeps_denying_and_is_retried(self):
+        """A ``startup()`` that raises may not have closed the previous
+        verdict: requests stay denied and ``startup()`` is retried (not
+        ``tick()``) until it returns."""
+        _, authenticator, _ = self.enroll()
+        cookie = await self.sign_in(authenticator)
+        expected = await self.denial()
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        attempts, ticks = [], []
+        real_startup = self.check.startup
+
+        def failing_startup():
+            attempts.append(True)
+            if len(attempts) < 3:
+                raise RuntimeError("synthetic startup failure")
+            return real_startup()
+
+        sleeps = asyncio.Queue()
+
+        async def stepped(_seconds):
+            await sleeps.get()
+
+        with patch.object(self.check, "startup", side_effect=failing_startup), \
+                patch.object(self.check, "tick", side_effect=lambda: ticks.append(True)):
+            task = asyncio.create_task(self.access.run(sleep=stepped))
+            for expected_attempts in (1, 2):
+                while len(attempts) < expected_attempts or not sleeps.empty():
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.05)
+                self.assertEqual(len(attempts), expected_attempts)
+                self.assertTrue(self.access.stopped)
+                self.assertTrue(self.check.access_open)
+                self.assertEqual(await call(self.surface, "GET", SESSION_PATH, cookie=cookie), expected)
+                sleeps.put_nowait(None)
+            while self.access.stopped:
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(ticks, [])
+            self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=cookie)), 200)
+            self.access.stop()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
 
 
 if __name__ == "__main__":

@@ -505,9 +505,12 @@ Every HTTP request passes, in this order, before any handler runs:
    `Tailscale-User-Login` (printable ASCII, no space, no comma-joined value, no
    RFC 2047 encoded word);
 3. the reservation verdict (`access_open`, pid-guarded);
-4. for the session route, the gate epoch, `AccessStore.authorize_session`
-   (credential-backed session, binding, lifetimes, revocation) and `admit(epoch)`
-   confirming access stayed open until the answer was decided; the ceremonies
+4. for the session route, the gate epoch, then `AccessStore.authorize_session`
+   (credential-backed session, binding, lifetimes, revocation, idle touch)
+   committed inside `admit(epoch)`, so access stayed open from the epoch to
+   the commit and a request refused by a close in between writes nothing (no
+   idle touch extends the session; lock order gate -> storage admission ->
+   SQLite, denial bookkeeping after the gate is released); the ceremonies
    take the epoch and `admit()` themselves.
 
 Mounted routes, and nothing else (every other method, path, query string,
@@ -558,7 +561,8 @@ so an exposure revokes the sessions this surface authorizes, and its stored
 listener-exception source, when it has one, must be a
 `ListenerExceptionStore` on that same database.
 
-Storage lockout (Owner decision, 2026-10-11: accepted, fail closed). Sign-in
+Storage lockout (Owner decision, 2026-10-11: accepted, fail closed; the
+product requirement is REQUIREMENTS.md STORE-006). Sign-in
 writes a challenge row and a session, and every session check writes (idle
 touch, expiry sweep). So while storage admission is refused or unbound
 (`STORAGE_HARD_STOP`, a lost or replaced recording filesystem, a deployment
@@ -578,7 +582,18 @@ recording self-test step or retention batch), and while it holds the
 admission through commit the worker is parked for it. Such a wait can delay a
 human request (the admission has no timeout of its own); it never grants
 access, and a request that cannot be admitted is the generic denial. The
+commits made inside `admit(epoch)` (the ceremony commits and the
+`authorize_session` transaction of `GET /api/session`) wait for that
+admission while holding the session gate, so a check's close can wait behind
+them as well (availability only): a commit that wins this race committed
+while access was still open, before the close, and any revocation that close
+requires covers it (Issue #144). The
 read-only pre-check (`session_may_be_current`) takes no admission.
+
+Startup. `HumanAccess.run()` denies every request (`stopped`) from its start
+until the check's `startup()` has returned, so a restarted lifespan never
+serves on the verdict the previous lifespan left behind. A `startup()` that
+raises keeps requests denied and is retried on each tick until it returns.
 
 Shutdown. `create_app`'s shutdown first calls `HumanAccess.stop()` (every later
 request is denied), then cancels `HumanAccess.run()` and waits for it before
