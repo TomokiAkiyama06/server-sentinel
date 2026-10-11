@@ -16,10 +16,17 @@ owned by the service account, is refused when its ownership, mode, link count or
 size is wrong, and is never logged, displayed, exported, put in diagnostics or
 stored in the database. It is unrelated to Tailscale administrative
 credentials.
+
+The same key also yields the per-session CSRF token (Owner decision D2,
+2026-10-11): ``HMAC-SHA-256(subkey, domain || session id)`` under a subkey
+derived from the binding key with its own domain label, so a CSRF token can
+never equal a proxy-identity binding and neither reveals the key. The token
+is compared in constant time.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import os
@@ -27,11 +34,18 @@ from pathlib import Path
 import re
 import secrets
 import stat
+from uuid import UUID
 
 
 KEY_BYTES = 32
 BINDING_BYTES = 32
 _DOMAIN = b"serversentinel/session-proxy-identity-binding/v1\x00"
+# Owner decision D2 (2026-10-11): a CSRF subkey derived from the binding key
+# with its own domain label, and the token over a second domain label.
+_CSRF_SUBKEY_DOMAIN = b"serversentinel/csrf-token-subkey/v1\x00"
+_CSRF_TOKEN_DOMAIN = b"serversentinel/csrf-token/v1\x00"
+CSRF_TOKEN_BYTES = 32
+_CSRF_TEXT = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
 class SessionBindingKeyError(RuntimeError):
@@ -57,12 +71,13 @@ def canonical_identity(value: object) -> str | None:
 class SessionBindingKey:
     """Holds the deployment-local HMAC key; never reveals it."""
 
-    __slots__ = ("_key",)
+    __slots__ = ("_key", "_csrf_key")
 
     def __init__(self, key: bytes):
         if not isinstance(key, bytes) or len(key) != KEY_BYTES:
             raise SessionBindingKeyError()
         self._key = key
+        self._csrf_key = hmac.new(key, _CSRF_SUBKEY_DOMAIN, hashlib.sha256).digest()
 
     @classmethod
     def generate(cls) -> "SessionBindingKey":
@@ -99,6 +114,27 @@ class SessionBindingKey:
         if len(stored) != BINDING_BYTES:
             return False
         return hmac.compare_digest(stored, fresh)
+
+    # --- per-session CSRF token (Owner decision D2) ---
+
+    def csrf_token(self, session_id: UUID) -> str:
+        """The session's CSRF token: unpadded base64url of 32 HMAC bytes.
+
+        Deterministic for one session, so it needs no storage; it reveals
+        neither the key nor the session id, and a token of one session never
+        validates another.
+        """
+        if not isinstance(session_id, UUID):
+            raise ValueError("session identity is invalid")
+        digest = hmac.new(self._csrf_key, _CSRF_TOKEN_DOMAIN + session_id.bytes, hashlib.sha256).digest()
+        return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+    def csrf_matches(self, session_id: object, presented: object) -> bool:
+        """Constant-time comparison of a presented token with the session's."""
+        if not isinstance(session_id, UUID) or not isinstance(presented, str) \
+                or not _CSRF_TEXT.fullmatch(presented):
+            return False
+        return hmac.compare_digest(presented.encode("ascii"), self.csrf_token(session_id).encode("ascii"))
 
     # --- durable deployment key ---
 

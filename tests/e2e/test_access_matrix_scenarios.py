@@ -13,15 +13,19 @@ Two layers are exercised:
   consults the authorizer, so no application information reaches anyone
   while human routes stay closed (Issues #6/#10);
 * the production grant state behind future routes: ``AccessStore.authorize``,
-  the ``live:view`` validator and the historical timeline gate. The timeline
-  ``access`` port is a test adapter that calls ``AccessStore.authorize`` with
-  ``recordings:view``; the production route adapter does not exist yet.
+  the gated ``AccessStore.authorize_request`` (with its CSRF comparison and
+  ``sign_out``, Issue #10 phase 2 S1), the ``live:view`` validator and the
+  historical timeline gate. The timeline ``access`` port is a test adapter
+  that calls ``AccessStore.authorize`` with ``recordings:view``; the
+  production route adapter does not exist yet. The reservation gate is a
+  synthetic always-open one here; the real gate is covered by
+  ``server/tests/test_human_surface.py`` and ``test_session_gate.py``.
 
 This is not browser, Tailscale, proxy or WebAuthn ceremony acceptance.
 """
 
 import asyncio
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import timedelta
 from pathlib import Path
 import secrets
@@ -33,7 +37,7 @@ from app.audit.store import AuditStore
 from app.auth.live_access import BoundLiveAccess, authorize_live_access, live_view_validator
 from app.auth.model import AccessValidationError, Permission
 from app.auth.session_binding import SessionBindingKey
-from app.auth.store import AccessStore
+from app.auth.store import AccessStore, Requirement
 from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
 from app.media.live.sessions import LiveAccess
 from app.presence.access import AccessDenied
@@ -81,6 +85,22 @@ class Identity:
 
     def headers(self):
         return [(b"cookie", b"serversentinel_session=" + self.token.hex().encode("ascii"))]
+
+
+class OpenGate:
+    """Synthetic always-open reservation gate (``epoch()``/``admit()``)."""
+
+    def __init__(self):
+        self.admitted = 0
+
+    def epoch(self):
+        return 0
+
+    @contextmanager
+    def admit(self, epoch):
+        assert epoch == 0
+        self.admitted += 1
+        yield
 
 
 class RecordingPermit:
@@ -154,6 +174,7 @@ class AccessMatrixScenarios(unittest.TestCase):
         # Owner boundary is covered by server/tests/test_access_pairing_audit.py.
         self.store = AccessStore(self.database, clock=self.clock.utcnow, audit=self.audit,
                                  unaudited_writes=True, session_binding=SessionBindingKey.generate())
+        self.gate = OpenGate()
         self.identities = {
             "live_only": self.member("live_only", (LIVE,)),
             "recordings_only": self.member("recordings_only", (RECORDINGS,)),
@@ -246,13 +267,15 @@ class AccessMatrixScenarios(unittest.TestCase):
         bound = {}
         for name in ("live_only", "both"):
             identity = self.identities[name]
-            bound[name] = authorize_live_access(self.store, identity.token, identity.external_identity)
+            bound[name] = authorize_live_access(self.store, identity.token, identity.external_identity,
+                                                admit=self.admit)
             self.assertTrue(validator(bound[name], source), name)
         for name in ("recordings_only", "revoked", "uninvited", "agent_credential", "spoofed_header"):
             identity = self.identities[name]
             with self.subTest(identity=name), \
                     self.assertRaisesRegex(AccessValidationError, f"^{GENERIC_DENIAL}$"):
-                authorize_live_access(self.store, identity.token, identity.external_identity)
+                authorize_live_access(self.store, identity.token, identity.external_identity,
+                                      admit=self.admit)
         recordings_only = self.identities["recordings_only"]
         live_only = self.identities["live_only"]
         copied = (
@@ -273,6 +296,71 @@ class AccessMatrixScenarios(unittest.TestCase):
         self.assertTrue(validator(bound["live_only"], source))
         self.store.revoke_principal(live_only.principal.id)
         self.assertFalse(validator(bound["live_only"], source))
+
+    def admit(self):
+        return self.gate.admit(self.gate.epoch())
+
+    def request(self, identity, requirement, csrf=None):
+        try:
+            return self.store.authorize_request(identity.token, identity.external_identity, requirement,
+                                                admit=self.admit, csrf=csrf)
+        except AccessValidationError as error:
+            self.assertEqual(GENERIC_DENIAL, str(error))
+            return None
+
+    def test_gated_requirements_follow_the_same_matrix(self):
+        expected = {
+            "uninvited": (False, False, False), "live_only": (True, True, False),
+            "recordings_only": (True, False, True), "both": (True, True, True),
+            "revoked": (False, False, False), "agent_credential": (False, False, False),
+            "spoofed_header": (False, False, False),
+        }
+        for name, outcome in expected.items():
+            identity = self.identities[name]
+            with self.subTest(identity=name):
+                self.assertEqual(outcome, tuple(
+                    self.request(identity, requirement) is not None
+                    for requirement in (Requirement.SESSION, Requirement.LIVE, Requirement.RECORDINGS)))
+                # No member is the Owner: both Owner requirements are the generic denial.
+                for requirement in (Requirement.OWNER_READ, Requirement.OWNER_OP):
+                    self.assertIsNone(self.request(identity, requirement))
+
+    def test_csrf_token_is_per_session_and_never_crosses_members(self):
+        tokens = {name: self.store.csrf_token(self.identities[name].session_id)
+                  for name in ("live_only", "recordings_only", "both")}
+        self.assertEqual(len(set(tokens.values())), 3)
+        for name, token in tokens.items():
+            identity = self.identities[name]
+            with self.subTest(identity=name):
+                self.assertIsNotNone(self.request(identity, Requirement.SESSION, csrf=token))
+                for other, foreign in tokens.items():
+                    if other != name:
+                        self.assertIsNone(self.request(identity, Requirement.SESSION, csrf=foreign))
+                for malformed in ("", "A" * 43, token + "A", token[:-1]):
+                    self.assertIsNone(self.request(identity, Requirement.SESSION, csrf=malformed))
+        # A CSRF token never stands in for a session.
+        spoofed = self.identities["spoofed_header"]
+        self.assertIsNone(self.request(spoofed, Requirement.SESSION, csrf=tokens["both"]))
+
+    def test_sign_out_ends_only_the_callers_session_with_an_audit_record(self):
+        both, live_only = self.identities["both"], self.identities["live_only"]
+        before = self.audit_rows()
+        session = self.request(both, Requirement.SESSION, csrf=self.store.csrf_token(both.session_id))
+        self.store.sign_out(session, admit=self.admit)
+        self.assertEqual(before + 1, self.audit_rows())
+        (record,) = [item for item in self.audit.list_records() if item.action.value == "sign_out_principal"]
+        self.assertEqual((record.actor_category.value, record.target_logical_id, record.outcome.value),
+                         ("invited_user", both.principal.id, "succeeded"))
+        # The old cookie, presented again ("Back" or a copied value), is refused for every grant.
+        for requirement in (Requirement.SESSION, Requirement.LIVE, Requirement.RECORDINGS):
+            self.assertIsNone(self.request(both, requirement))
+        for permission in (LIVE, RECORDINGS):
+            self.assertFalse(self.outcome(both, permission))
+        with self.assertRaises(AccessValidationError):
+            self.store.sign_out(session, admit=self.admit)
+        self.assertEqual(before + 1, self.audit_rows())
+        # Another member behind the same shared login keeps working.
+        self.assertTrue(self.outcome(live_only, LIVE))
 
     def test_historical_timeline_requires_recordings_view_only(self):
         presence = PresenceService(

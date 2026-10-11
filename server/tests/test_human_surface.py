@@ -17,7 +17,6 @@ import secrets
 import sqlite3
 import tempfile
 import threading
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -254,7 +253,10 @@ class SignInAndSessionTests(HumanSurfaceFixture):
         cookie = await self.sign_in(authenticator)
         result = await call(self.surface, "GET", SESSION_PATH, cookie=cookie, origin=None)
         self.assertEqual(status(result), 200)
-        self.assertEqual(payload(result), {"permissions": ["live:view"], "role": "invited_user"})
+        body = payload(result)
+        self.assertEqual(sorted(body), ["csrf", "permissions", "role"])
+        self.assertEqual((body["permissions"], body["role"]), (["live:view"], "invited_user"))
+        self.assertRegex(body["csrf"], r"^[A-Za-z0-9_-]{43}$")
         self.assertEqual(header(result, b"cache-control"), [b"no-store"])
         self.assertEqual(header(result, b"server"), [])
 
@@ -262,8 +264,8 @@ class SignInAndSessionTests(HumanSurfaceFixture):
         _, authenticator, _ = self.enroll(owner=True)
         cookie = await self.sign_in(authenticator)
         result = await call(self.surface, "GET", SESSION_PATH, cookie=cookie)
-        self.assertEqual(payload(result), {"permissions": ["live:view", "recordings:view"],
-                                           "role": "owner"})
+        body = payload(result)
+        self.assertEqual((body["permissions"], body["role"]), (["live:view", "recordings:view"], "owner"))
 
     async def test_finish_sets_only_a_host_only_strict_session_cookie_and_no_data(self):
         _, authenticator, _ = self.enroll()
@@ -427,7 +429,7 @@ class TrustedProxyPathTests(HumanSurfaceFixture):
         _, authenticator, _ = self.enroll()
         cookie = await self.sign_in(authenticator)
         expected = await self.denial()
-        with patch.object(self.store, "authorize_session",
+        with patch.object(self.store, "authorize_request",
                           side_effect=AssertionError("must not authorize")) as authorize, \
                 patch("app.auth.human_surface.proxy_identity",
                       side_effect=AssertionError("must not read the header")) as read:
@@ -533,7 +535,7 @@ class ReservationGateTests(HumanSurfaceFixture):
         # A fork child: the running pid differs from the one the gate
         # recorded (patched on the gate, not on the process-wide os module).
         with patch.object(self.check, "_gate_pid", reservation_module.os.getpid() + 1), \
-                patch.object(self.store, "authorize_session",
+                patch.object(self.store, "authorize_request",
                              side_effect=AssertionError("must not authorize")):
             self.assertEqual(await call(self.surface, "GET", SESSION_PATH, cookie=cookie), expected)
             self.assertEqual(await call(self.surface, "POST", AUTHENTICATION_OPTIONS_PATH), expected)
@@ -578,7 +580,7 @@ class ReservationGateTests(HumanSurfaceFixture):
         original = self.check.epoch
         resolver = self.check._resolver
         authorized = []
-        real_authorize = self.store.authorize_session
+        real_authorize = self.store.authorize_request
 
         def close_after_epoch():
             epoch = original()
@@ -592,7 +594,7 @@ class ReservationGateTests(HumanSurfaceFixture):
             return real_authorize(*args, **kwargs)
 
         with patch.object(self.check, "epoch", side_effect=close_after_epoch), \
-                patch.object(self.store, "authorize_session", side_effect=authorize):
+                patch.object(self.store, "authorize_request", side_effect=authorize):
             result = await call(self.surface, "GET", SESSION_PATH, cookie=cookie)
         self.assertEqual(result, await self.denial())
         self.assertEqual(authorized, [True])
@@ -776,7 +778,7 @@ class RateLimitTests(HumanSurfaceFixture):
         forged = [SESSION_COOKIE + "=" + secrets.token_urlsafe(32) for _ in range(200)]
         with patch.object(self.check, "_session_gate_lock", CountingLock()), \
                 patch.object(self.store, "_transaction", side_effect=counting_transaction), \
-                patch.object(self.store, "authorize_session",
+                patch.object(self.store, "authorize_request",
                              side_effect=AssertionError("denied before authorization")), \
                 patch.object(self.store, "end_expired_sessions",
                              side_effect=AssertionError("denied without a write")):
@@ -863,18 +865,29 @@ class RateLimitTests(HumanSurfaceFixture):
             ListenerExceptionStore(missing).load()
         validate = live_view_validator(missing)
         self.assertFalse(validate(BoundLiveAccess(uuid4(), 1, uuid4()), uuid4()))
-        store = AccessStore(missing, audit=AuditStore(missing), session_binding=SessionBindingKey.generate())
-        principal = SimpleNamespace(id=uuid4(), authorization_revision=1)
-        with patch.object(store, "authorize", return_value=principal):
-            with self.assertRaises(AccessValidationError) as raised:
-                authorize_live_access(store, secrets.token_bytes(32), VIEWER)
+        # The live authorization is one gated write transaction: on a lost
+        # filesystem the storage admission refuses it before anything opens.
+        refusing = SyntheticAdmission()
+        refusing.refusing = True
+        lost_audit = AuditStore(missing)
+        lost_audit.reservation = refusing
+        store = AccessStore(missing, audit=lost_audit, session_binding=SessionBindingKey.generate())
+        epoch = self.check.epoch()
+        with self.assertRaises(AccessValidationError) as raised:
+            authorize_live_access(store, secrets.token_bytes(32), VIEWER,
+                                  admit=lambda: self.check.admit(epoch))
         self.assertEqual(str(raised.exception), "access is unavailable")
         self.assertEqual(list(lost.iterdir()), [])
-        # A storage fault on an existing database is the same generic denial.
-        with patch.object(self.store, "authorize", return_value=principal), \
-                patch.object(Database, "connect_read_only", side_effect=sqlite3.OperationalError("busy")):
-            with self.assertRaises(AccessValidationError):
-                authorize_live_access(self.store, secrets.token_bytes(32), VIEWER)
+        # A storage fault or a closed gate on an existing database is the same generic denial.
+        with patch.object(Database, "connect", side_effect=sqlite3.OperationalError("busy")):
+            with self.assertRaises(AccessValidationError) as raised:
+                authorize_live_access(self.store, secrets.token_bytes(32), VIEWER,
+                                      admit=lambda: self.check.admit(epoch))
+        self.assertEqual(str(raised.exception), "access is unavailable")
+        with self.assertRaises(AccessValidationError) as raised:
+            authorize_live_access(self.store, secrets.token_bytes(32), VIEWER,
+                                  admit=lambda: self.check.admit(None))
+        self.assertEqual(str(raised.exception), "access is unavailable")
 
     async def test_storage_admission_is_held_at_every_commit(self):
         """Claude review PR #219: every human-access write commits while its

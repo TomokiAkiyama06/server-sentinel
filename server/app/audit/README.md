@@ -63,6 +63,9 @@ mutations: principal invitation (`invite_principal`), invitation issue
 Each commits in the same SQLite transaction as its record, a non-Owner
 (including an invited `live:view` / `recordings:view` principal or a
 capture-node credential) is refused with a `denied` record and nothing runs,
+every one of them commits inside the reservation gate's `admit(epoch)` with
+the epoch taken before the Owner authorization (Owner decision D6, so a close
+in between is a `failed` record and changes nothing),
 and the plain `AccessStore` wrappers refuse with `UnauditedAccessWriteError`
 outside explicit fixture use. Invitation redemption
 (`redeem_principal_invitation`) is not an Owner operation: `AccessStore`
@@ -74,7 +77,10 @@ rolled-back outcome is counted in `AccessStore`'s own `audit_delivery_failed` /
 `undelivered_audit_records` health rather than appended separately. The WebAuthn
 ceremony (`app/auth/passkeys.py`) follows the same rule. A successful sign-in
 (`authenticate_principal`) and Owner step-up (`verify_principal_step_up`) commit
-their records with the session effect. A verified assertion whose backup
+their records with the session effect, as does a sign-out
+(`sign_out_principal`, actor `owner` or `invited_user`, target the principal's
+logical UUID only; Owner decision D7), which commits inside the reservation
+gate with the session invalidation. A verified assertion whose backup
 eligibility changed records `mark_principal_credential_inconsistent` (actor
 `system`) with the credential marking and session revocation. A counter
 regression records `detect_principal_credential_sign_count_regression` (actor

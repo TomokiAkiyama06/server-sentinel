@@ -1,8 +1,9 @@
 """Transactional local authorization state; WebAuthn verification lives in ``webauthn.py``."""
 
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 import hashlib
 import sqlite3
 from typing import Callable, ContextManager, Iterable
@@ -57,11 +58,49 @@ class RegistrationSubject:
     excluded_credential_ids: tuple[bytes, ...]
 
 
+class Requirement(Enum):
+    """What a human route requires of its caller (Issue #10 phase 2, S1).
+
+    ``PRE_CREDENTIAL`` marks the sign-in ceremony routes, which run before a
+    session exists and gate themselves inside ``PasskeyCeremonies``; it is
+    never satisfied by ``authorize_request``. Every other requirement needs a
+    currently valid, credential-backed session:
+
+    - ``SESSION``: nothing more (session self-description, sign-out);
+    - ``LIVE`` / ``RECORDINGS``: the Owner, or a person holding ``live:view``
+      / ``recordings:view``; each is checked on its own, so one never
+      implies the other (historical timeline/events belong to
+      ``RECORDINGS``);
+    - ``OWNER_READ``: the Owner, without step-up freshness;
+    - ``OWNER_OP``: the Owner with a user verification fresher than the
+      step-up window (ADR-0003, AUTH-008). Only this requirement can end in
+      ``StepUpRequired``, and only for an otherwise valid Owner session.
+    """
+
+    PRE_CREDENTIAL = "pre_credential"
+    SESSION = "session"
+    LIVE = "live"
+    RECORDINGS = "recordings"
+    OWNER_READ = "owner_read"
+    OWNER_OP = "owner_op"
+
+
 @dataclass(frozen=True)
 class SessionView:
+    """A currently valid session as one authorization saw it.
+
+    ``credential_id`` is opaque WebAuthn material and is left out of
+    ``repr``; ``role``, ``authorization_revision`` and ``permissions`` are
+    set by ``authorize_request`` (the Owner holds every permission) and are
+    ``None``/empty from the read-only ``current_session`` lookup.
+    """
+
     session_id: UUID
     principal_id: UUID
-    credential_id: bytes
+    credential_id: bytes = field(repr=False)
+    role: PrincipalRole | None = None
+    authorization_revision: int | None = None
+    permissions: frozenset = frozenset()
 
 
 @dataclass(frozen=True)
@@ -556,36 +595,209 @@ class AccessStore:
         next_idle = min(_us(at) + row["idle_lifetime_us"], row["absolute_expires_at_us"])
         connection.execute("UPDATE access_sessions SET last_seen_at_us=?, idle_expires_at_us=? WHERE id=?", (_us(at), next_idle, row["id"]))
 
-    def authorize(self, token: bytes, proxy_identity: str, permission: Permission, *, now: datetime | None = None) -> Principal:
+    def _authorize_gated(self, token: object, proxy_identity: object, decide, *,
+                         now: datetime | None, admit: Callable[[], ContextManager] | None):
+        """Run ``decide(connection, row, at)`` on a currently valid session.
+
+        Lock order: the session gate (``admit()``, when given) -> the storage
+        admission -> the SQLite write lock, all held through the commit. The
+        request time is read after all three were entered, so concurrent
+        requests of one session commit their idle touch in order and none is
+        refused for preceding another's ``last_seen`` (Claude review, PR
+        #219). A refusal by the gate (``HumanAccessClosed``) propagates before
+        anything is read or written. Every other refusal is the generic
+        ``AccessValidationError``; its rolled-back expiry sweep and any
+        binding-mismatch audit run after the gate has been released (Codex
+        PR #219), so denial bookkeeping never holds the gate.
+        """
+        at = None
+        mismatch: list = []
+        try:
+            with ExitStack() as gate:
+                if admit is not None:
+                    gate.enter_context(admit())
+                connection = gate.enter_context(self._transaction(write=True))
+                at = utc_time(self._clock() if now is None else now)
+                self._end_expired_sessions_on(connection, at)
+                row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
+                if row is None:
+                    raise AccessValidationError("access is unavailable")
+                return decide(connection, row, at)
+        except AccessValidationError:
+            if at is None:
+                at = utc_time(self._clock() if now is None else now)
+            self._end_expired_sessions_after_denial(at)
+            self._record_binding_mismatch(mismatch, at)
+            raise
+
+    @staticmethod
+    def _granted_on(connection, row) -> frozenset:
+        """The principal's current permissions; the Owner holds every one."""
+        if row["role"] == PrincipalRole.OWNER.value:
+            return frozenset(Permission)
+        known = {item.value: item for item in Permission}
+        return frozenset(
+            known[value] for (value,) in connection.execute(
+                "SELECT permission FROM access_principal_permissions WHERE principal_id=?",
+                (row["principal_id"],)).fetchall()
+            if value in known)
+
+    def authorize(self, token: bytes, proxy_identity: str, permission: Permission, *,
+                  now: datetime | None = None,
+                  admit: Callable[[], ContextManager] | None = None) -> Principal:
         """Authorize one request; every refusal is the same generic denial.
 
         A proxy identity that does not reproduce the session binding is
         refused for this request only; the session itself is left as it is
         (see the auth README for this Owner-reviewable choice).
+
+        ``admit``, when given, is the reservation session gate
+        (``admit(epoch)``) held around the whole authorization transaction
+        (see ``_authorize_gated``). Human routes never call this: they go
+        through ``authorize_request``, whose gate is mandatory. Without
+        ``admit`` the authorization can commit after a reservation check
+        closed access, so the bare form is for fixtures only.
         """
         if not isinstance(permission, Permission):
             raise AccessValidationError("permission is invalid")
-        at = utc_time(self._clock() if now is None else now)
-        mismatch: list = []
-        try:
-            return self._authorize(token, proxy_identity, permission, at, mismatch)
-        except AccessValidationError:
-            self._end_expired_sessions_after_denial(at)
-            self._record_binding_mismatch(mismatch, at)
-            raise
 
-    def _authorize(self, token, proxy_identity, permission, at, mismatch) -> Principal:
-        with self._transaction(write=True) as connection:
-            self._end_expired_sessions_on(connection, at)
-            row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
-            if row is None:
-                raise AccessValidationError("access is unavailable")
+        def decide(connection, row, at):
             granted = connection.execute("SELECT 1 FROM access_principal_permissions WHERE principal_id=? AND permission=?", (row["principal_id"], permission.value)).fetchone() is not None
             principal = self._principal(row)
             if principal.role is not PrincipalRole.OWNER and not granted:
                 raise AccessValidationError("access is unavailable")
             self._touch_session_on(connection, row, at)
             return principal
+
+        return self._authorize_gated(token, proxy_identity, decide, now=now, admit=admit)
+
+    def authorize_request(self, token: object, proxy_identity: object, requirement: Requirement, *,
+                          admit: Callable[[], ContextManager],
+                          freshness: timedelta = OWNER_STEP_UP_FRESHNESS,
+                          csrf: object = None,
+                          now: datetime | None = None) -> SessionView:
+        """Authorize one human request against ``requirement`` inside the gate.
+
+        ``admit`` is mandatory: the reservation session gate
+        (``admit(epoch)``, epoch taken before this call) is held around the
+        whole transaction, so the authorization and its idle touch commit
+        only while human access stayed open since the request's epoch (Issue
+        #144); a close in between refuses before anything is read or
+        written. The session checks are exactly those of ``authorize``
+        (current, unrevoked principal and credential, authorization revision
+        and deployment generation, idle and absolute lifetimes, keyed
+        proxy-identity binding).
+
+        ``csrf``, when not ``None``, must equal the session's CSRF token
+        (constant time, Owner decision D2). It is checked inside the same
+        transaction before the idle touch, so a refused mutation does not
+        extend the session.
+
+        Returns a ``SessionView`` with the role, the authorization revision
+        and the permissions read in the same transaction. Every refusal is
+        the same generic ``AccessValidationError``, except that an otherwise
+        valid Owner session whose last user verification is older than
+        ``freshness`` (or not between its establishment and now) gets
+        ``StepUpRequired`` for ``OWNER_OP`` only (Owner decision D3). That
+        outcome is decided under the gate with the epoch unchanged; the
+        session's idle touch commits before it is raised.
+        """
+        if not isinstance(requirement, Requirement) or requirement is Requirement.PRE_CREDENTIAL:
+            raise AccessValidationError("access is unavailable")
+        if not callable(admit):
+            raise AccessValidationError("access is unavailable")
+        if not isinstance(freshness, timedelta) or freshness <= timedelta(0):
+            raise AccessValidationError("freshness window is invalid")
+        binding = self._session_binding
+
+        def decide(connection, row, at):
+            owner = row["role"] == PrincipalRole.OWNER.value
+            granted = self._granted_on(connection, row)
+            if requirement is Requirement.LIVE and Permission.LIVE_VIEW not in granted:
+                raise AccessValidationError("access is unavailable")
+            if requirement is Requirement.RECORDINGS and Permission.RECORDINGS_VIEW not in granted:
+                raise AccessValidationError("access is unavailable")
+            if requirement in (Requirement.OWNER_READ, Requirement.OWNER_OP) and not owner:
+                raise AccessValidationError("access is unavailable")
+            if csrf is not None and (binding is None or not binding.csrf_matches(UUID(row["id"]), csrf)):
+                raise AccessValidationError("access is unavailable")
+            verified = row["last_user_verification_at_us"]
+            stale = requirement is Requirement.OWNER_OP and (
+                verified is None or not row["established_at_us"] <= verified <= _us(at)
+                or _us(at) - verified >= _duration_us(freshness))
+            self._touch_session_on(connection, row, at)
+            view = SessionView(UUID(row["id"]), UUID(row["principal_id"]), bytes(row["credential_id"]),
+                               role=PrincipalRole(row["role"]),
+                               authorization_revision=row["authorization_revision"],
+                               permissions=granted)
+            return view, stale
+
+        view, stale = self._authorize_gated(token, proxy_identity, decide, now=now, admit=admit)
+        if stale:
+            raise StepUpRequired()
+        return view
+
+    def csrf_token(self, session_id: UUID) -> str:
+        """The session's CSRF token (Owner decision D2); never stored or logged.
+
+        ``HMAC-SHA-256`` under a subkey derived from the session-binding key
+        with its own domain label (``SessionBindingKey.csrf_token``). Without
+        the binding key there is no session and no token.
+        """
+        if self._session_binding is None or not isinstance(session_id, UUID):
+            raise AccessValidationError("access is unavailable")
+        return self._session_binding.csrf_token(session_id)
+
+    @staticmethod
+    def end_session_on(connection, session_id: UUID, at: datetime) -> int:
+        """Invalidate one session and clear its binding on a caller-owned transaction.
+
+        Returns the number of rows changed: ``1`` when the session was still
+        valid, ``0`` when it was already invalidated or never existed.
+        """
+        if not isinstance(session_id, UUID):
+            raise AccessValidationError("session identity is invalid")
+        return connection.execute(
+            "UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL "
+            "WHERE id=? AND invalidated_at_us IS NULL",
+            (_us(utc_time(at)), str(session_id))).rowcount
+
+    def sign_out(self, session: SessionView, *, admit: Callable[[], ContextManager],
+                 now: datetime | None = None) -> None:
+        """End the caller's own session with its audit record (Owner decision D7).
+
+        ``session`` must come from ``authorize_request`` in the same request,
+        and ``admit`` must be that request's ``admit(epoch)``: the
+        invalidation and its ``sign_out_principal`` record (actor ``owner`` or
+        ``invited_user``, target the principal's logical UUID only, never a
+        token, session id, credential id or identity) commit together inside
+        the gate (lock order gate -> storage admission -> SQLite). While human
+        access is closed the sign-out is refused like every other request and
+        changes nothing (accepted, D7); an emergency revocation uses the local
+        command over SSH (D6). A session that is no longer valid at the commit
+        is the generic denial and records nothing. A failed append rolls the
+        sign-out back and is counted in ``audit_delivery_failed``.
+        """
+        if (not isinstance(session, SessionView) or not isinstance(session.role, PrincipalRole)
+                or not callable(admit)):
+            raise AccessValidationError("access is unavailable")
+        actor = ActorCategory.OWNER if session.role is PrincipalRole.OWNER else ActorCategory.INVITED_USER
+
+        def write(connection, mark):
+            at = utc_time(self._clock() if now is None else now)
+            row = connection.execute("SELECT principal_id FROM access_sessions WHERE id=? AND invalidated_at_us IS NULL",
+                                     (str(session.session_id),)).fetchone()
+            if row is None or row["principal_id"] != str(session.principal_id):
+                raise AccessValidationError("access is unavailable")
+            if self.end_session_on(connection, session.session_id, at) != 1:
+                raise AccessValidationError("access is unavailable")
+            mark()
+            self.audit.append_on(connection, actor_category=actor, action=AuditAction.SIGN_OUT_PRINCIPAL,
+                                 target_kind=TargetKind.PRINCIPAL, target_logical_id=session.principal_id,
+                                 outcome=AuditOutcome.SUCCEEDED)
+
+        with admit():
+            self._audited_write(write)
 
     def session_may_be_current(self, token: object, *, now: datetime | None = None) -> bool:
         """Read-only pre-check of a presented session token.
@@ -634,8 +846,9 @@ class AccessStore:
         principal and credential, generation, lifetimes, keyed proxy-identity
         binding, idle touch), returning the principal with its current
         permissions read in the same transaction. The Owner holds every
-        permission. Every refusal is the same generic denial. Used only by
-        the session self-description route, which grants nothing.
+        permission. Every refusal is the same generic denial. The human
+        surface uses ``authorize_request(..., Requirement.SESSION)``, whose
+        gate is mandatory; this form remains for embedders and tests.
 
         ``admit``, when given, returns the reservation session gate
         (``HostnameReservationCheck.admit(epoch)``). It is entered before the
@@ -653,39 +866,16 @@ class AccessStore:
         waited for an earlier one is never refused because its time precedes
         that request's ``last_seen`` (Claude review, PR #219).
         """
-        at = None
-        mismatch: list = []
-        try:
-            with ExitStack() as gate:
-                if admit is not None:
-                    gate.enter_context(admit())
-                connection = gate.enter_context(self._transaction(write=True))
-                at = utc_time(self._clock() if now is None else now)
-                self._end_expired_sessions_on(connection, at)
-                row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
-                if row is None:
-                    raise AccessValidationError("access is unavailable")
-                principal = self._principal(row)
-                if principal.role is PrincipalRole.OWNER:
-                    granted = frozenset(Permission)
-                else:
-                    known = {item.value: item for item in Permission}
-                    granted = frozenset(
-                        known[value] for (value,) in connection.execute(
-                            "SELECT permission FROM access_principal_permissions WHERE principal_id=?",
-                            (row["principal_id"],)).fetchall()
-                        if value in known)
-                self._touch_session_on(connection, row, at)
-                return principal, granted
-        except AccessValidationError:
-            if at is None:
-                at = utc_time(self._clock() if now is None else now)
-            self._end_expired_sessions_after_denial(at)
-            self._record_binding_mismatch(mismatch, at)
-            raise
+        def decide(connection, row, at):
+            granted = self._granted_on(connection, row)
+            self._touch_session_on(connection, row, at)
+            return self._principal(row), granted
+
+        return self._authorize_gated(token, proxy_identity, decide, now=now, admit=admit)
 
     def authorize_owner(self, token: bytes, proxy_identity: str, *, now: datetime | None = None,
-                        freshness: timedelta = OWNER_STEP_UP_FRESHNESS) -> Principal:
+                        freshness: timedelta = OWNER_STEP_UP_FRESHNESS,
+                        admit: Callable[[], ContextManager] | None = None) -> Principal:
         """Authorize an AUTH-008 owner operation with fresh user verification.
 
         Anything that is not a currently valid Owner session receives the
@@ -693,26 +883,28 @@ class AccessStore:
         verification is older than ``freshness`` (ADR-0003: five minutes), or
         not between the session's establishment and now, receives the distinct
         ``StepUpRequired``. A stale session never performs the operation.
+
+        ``admit`` is the reservation session gate (Issue #228 item 5): the
+        same gated pattern as ``authorize_request`` (gate -> storage
+        admission -> SQLite, request time read inside), so the decision,
+        ``StepUpRequired`` included, is made while access stayed open since
+        the request's epoch. ``PasskeyCeremonies.authorize_owner_operation``
+        always passes it.
         """
         if not isinstance(freshness, timedelta) or freshness <= timedelta(0):
             raise AccessValidationError("freshness window is invalid")
-        at = utc_time(self._clock() if now is None else now)
-        mismatch: list = []
-        try:
-            with self._transaction(write=True) as connection:
-                self._end_expired_sessions_on(connection, at)
-                row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
-                if row is None or row["role"] != PrincipalRole.OWNER.value:
-                    raise AccessValidationError("access is unavailable")
-                self._touch_session_on(connection, row, at)
-                principal = self._principal(row)
-                verified = row["last_user_verification_at_us"]
-        except AccessValidationError:
-            self._end_expired_sessions_after_denial(at)
-            self._record_binding_mismatch(mismatch, at)
-            raise
-        if (verified is None or not row["established_at_us"] <= verified <= _us(at)
-                or _us(at) - verified >= _duration_us(freshness)):
+
+        def decide(connection, row, at):
+            if row["role"] != PrincipalRole.OWNER.value:
+                raise AccessValidationError("access is unavailable")
+            self._touch_session_on(connection, row, at)
+            verified = row["last_user_verification_at_us"]
+            stale = (verified is None or not row["established_at_us"] <= verified <= _us(at)
+                     or _us(at) - verified >= _duration_us(freshness))
+            return self._principal(row), stale
+
+        principal, stale = self._authorize_gated(token, proxy_identity, decide, now=now, admit=admit)
+        if stale:
             raise StepUpRequired()
         return principal
 

@@ -44,8 +44,9 @@ The current backend foundation denies every human HTTP/WebSocket route,
 including system health, version, schema and framework documentation. Issue
 #10 phase 1 adds a human route foundation that only an explicitly enabled,
 fully validated composition can open (passkey sign-in and the caller's own
-session description; see `server/app/auth/README.md`); the production entry
-points do not build one yet. Its
+session description), and phase 2 S1 adds gated authorization, a per-session
+CSRF token and sign-out to it (see `server/app/auth/README.md`); the
+production entry points do not build one yet. Its
 documented launcher accepts only loopback bind settings, disables proxy-header
 parsing and access logs, and removes the server product header. The authorization
 adapter remains deny-all until the #6/#10 gates are met. Newly created SQLite
@@ -307,8 +308,19 @@ and dashboard assets stay closed — the backend shell denies them, including
 application assets, health/version/schema and SPA/error fallbacks — until
 Issue #10 implements and tests both records; the remaining work is listed in
 `server/app/auth/README.md`. Phase 1 mounts only the authentication ceremony
-and a session self-description behind an explicit composition; it does not
-make any of the conditions below optional. Once they are open, a human request receives
+and a session self-description behind an explicit composition, and phase 2 S1
+adds only sign-out; neither makes any of the conditions below optional.
+Every session route commits its authorization inside the reservation gate
+(`admit(epoch)`), every Owner mutation does too (Owner decision D6), and a
+request already in flight when the composition stops or a periodic check
+fails is refused at that commit (Issue #228). A mutating session route also
+needs the exact `Origin` and an `X-CSRF-Token` equal to the session's
+HMAC-derived token (Owner decision D2); the token is never stored, logged or
+put in a URL. Sign-out invalidates the server-side session (the old cookie,
+also through the Back button, is refused afterwards) and is audited with the
+principal's logical UUID only (D7); it ends one session, not the credential,
+which a synced passkey may hold on several devices. Revoking that credential
+is what ends it everywhere. Once they are open, a human request receives
 application data only when every one of these server-side conditions holds:
 
 - **Network gate.** The request arrived over the Owner-managed private network

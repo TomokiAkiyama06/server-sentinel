@@ -195,15 +195,18 @@ class AccessAdministration:
     This class registers no route.
 
     ``session_gate`` is mandatory (Issue #181): runtime wiring passes the
-    ``HostnameReservationCheck``, and ``None`` or an object without
-    ``epoch()``/``admit()`` is refused at construction, so no composition can
-    issue an enrollment authorization outside the gate. Issuing one takes the
-    gate epoch before Owner authorization and commits inside ``admit(epoch)``
-    before the write transaction opens, so it cannot land after a
-    reservation check has closed access, even if access has reopened since,
-    and so cannot rest on an Owner authorization that such a check revoked
-    (Issue #144, PR #174 review); a closed gate is a failed operation with
-    its ``failed`` record. Fixtures that exercise no reservation pass a
+    ``HostnameReservationCheck`` (or the human composition's wrapper of it),
+    and ``None`` or an object without ``epoch()``/``admit()`` is refused at
+    construction. Every mutation (invitation, invitation issue, grant change,
+    principal revocation and credential revocation; Owner decision D6,
+    2026-10-11) takes the gate epoch before Owner authorization and commits
+    inside ``admit(epoch)`` before the write transaction opens, so it cannot
+    land after a reservation check has closed access, even if access has
+    reopened since, and so cannot rest on an Owner authorization that such a
+    check revoked (Issue #144, PR #174 review). A closed gate is a failed
+    operation with its ``failed`` record and changes nothing. While human
+    access is closed, an emergency revocation is done over SSH with the local
+    command instead (D6). Fixtures that exercise no reservation pass a
     synthetic always-open gate explicitly.
     """
 
@@ -212,20 +215,18 @@ class AccessAdministration:
             raise ValueError("access audit must share the access database")
         if not (callable(getattr(session_gate, "admit", None))
                 and callable(getattr(session_gate, "epoch", None))):
-            # Mandatory (Issue #181): ``None`` would issue enrollment
-            # authorizations outside the reservation check's gate.
+            # Mandatory (Issue #181): ``None`` would commit Owner mutations
+            # outside the reservation check's gate.
             raise ValueError("session gate is invalid")
         self.service = service
         self.access = access_store
         self.session_gate = session_gate
 
-    def _execute(self, actor_context, action, principal_id, operation, *, gated=False):
-        reservation = None
-        if gated:
-            # The epoch is taken before authorization; the gate is entered
-            # after it and held until the commit: gate lock before the SQLite
-            # write lock (the check's lock order).
-            reservation = partial(self.session_gate.admit, self.session_gate.epoch())
+    def _execute(self, actor_context, action, principal_id, operation):
+        # The epoch is taken before authorization; the gate is entered after
+        # it and held until the commit: gate lock before the SQLite write
+        # lock (the check's lock order).
+        reservation = partial(self.session_gate.admit, self.session_gate.epoch())
         return self.service.execute_transactional(
             actor_context, action=action, target_kind=TargetKind.PRINCIPAL,
             target_logical_id=principal_id,
@@ -249,7 +250,6 @@ class AccessAdministration:
             lambda connection, at: self.access.issue_enrollment_on(
                 connection, principal_id, secret, expires_at, at=at,
             ),
-            gated=True,
         )
 
     def set_permissions(self, actor_context, principal_id, permissions):
@@ -269,6 +269,7 @@ class AccessAdministration:
         )
 
     def revoke_credential(self, actor_context, principal_id, credential_id):
+        """Credential-scoped: a synced passkey is revoked on every device it exists on."""
         return self._execute(
             actor_context, AuditAction.REVOKE_PRINCIPAL_CREDENTIAL, principal_id,
             lambda connection, at: self.access.revoke_credential_on(

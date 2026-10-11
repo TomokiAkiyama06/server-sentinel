@@ -27,6 +27,7 @@ from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.test_uvc_runtime import PermitOwner, RuntimeFixture, wait_for
+from tests.webauthn_fakes import OpenGate
 from app.audit import OwnerAuditService
 from app.audit.integration import OwnerAdministration
 from app.cameras.registry import SourceHealthState
@@ -60,7 +61,8 @@ class AccessFixture:
         token = bytes([self._next]) * 24
         self.store.establish_session(principal_id, credential, token, proxy_identity=identity)
         self.tokens[principal_id] = (token, identity, credential)
-        return authorize_live_access(self.store, token, identity)
+        # Synthetic always-open reservation gate (the real one: test_human_surface).
+        return authorize_live_access(self.store, token, identity, admit=lambda: OpenGate().admit(0))
 
     def principal(self, permissions):
         identity = f"viewer-{self._next + 1}@example.invalid"
@@ -224,7 +226,8 @@ class LiveViewEnforcementTests(unittest.TestCase):
         viewer = self.access.principal((Permission.LIVE_VIEW,))
         token, identity, _credential = self.access.tokens[viewer.principal_id]
         refreshed = NOW + timedelta(minutes=2)
-        authorize_live_access(self.access.store, token, identity, now=refreshed)
+        authorize_live_access(self.access.store, token, identity, now=refreshed,
+                              admit=lambda: OpenGate().admit(0))
         regressed = AuthorizedLocalPreview(
             self.hub, LIMITS,
             live_view_validator(self.database, clock=lambda: NOW + timedelta(minutes=1)),
