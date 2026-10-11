@@ -590,21 +590,29 @@ while access was still open, before the close, and any revocation that close
 requires covers it (Issue #144). The
 read-only pre-check (`session_may_be_current`) takes no admission.
 
-Startup. `HumanAccess.run()` denies every request (`stopped`) from its start
-until the check's `startup()` has returned, so a restarted lifespan never
-serves on the verdict the previous lifespan left behind. A `startup()` that
-raises keeps requests denied and is retried on each tick until it returns.
+Startup. A `HumanAccess` serves requests only while a `run()` of the current
+lifespan holds (Codex PR #219): every request is denied (`stopped`) from
+construction, so a composition whose lifespan never runs (disabled or not yet
+started) serves nothing, and from the start of each `run()` until the check's
+`startup()` has returned, so a restarted lifespan never serves on the verdict
+the previous lifespan left behind. A `startup()` or periodic `tick()` that
+raises may have failed before it closed the previous verdict (for example a
+raising clock read), so requests are denied again and `startup()` is retried
+on each tick until it returns. Requests are denied again once `run()` ends,
+since nothing re-checks the verdict after that.
 
 Shutdown. `create_app`'s shutdown first calls `HumanAccess.stop()` (every later
-request is denied), then cancels `HumanAccess.run()` and waits for it before
-unbinding the storage admission or stopping the monitoring runtime. The
-check's `startup()`/`tick()` and the expiry sweep run on worker threads that
-cancellation cannot stop, so `run()` defers the cancellation until the
-in-flight call returns (`app.completion.run_to_completion`): no verdict is
-published and no marker, revocation or expiry write happens after the
-admission is unbound. That wait is bounded by the call itself (each
-enumeration under the check's enumeration timeout, each SQLite write under the
-busy timeout).
+request is denied and `run()` starts no further startup, tick or sweep), then
+cancels `HumanAccess.run()` and waits for it before unbinding the storage
+admission or stopping the monitoring runtime. The check's `startup()`/`tick()`
+and the expiry sweep run on worker threads that cancellation cannot stop, so
+`run()` defers the cancellation until the in-flight call returns
+(`app.completion.run_to_completion`): no verdict is published and no marker,
+revocation or expiry write happens after the admission is unbound. That wait
+is bounded by the one in-flight call: the check's enumeration timeout for each
+enumeration, plus, for a write, at most one in-flight monitoring job ahead of
+it in the storage admission (the Main storage policy admission waits for the
+monitoring worker without a timeout of its own), plus the SQLite busy timeout.
 
 Rate limiting (Issue #181 item 4, `rate_limit.py`). Both ceremony routes are
 charged to a per-source token bucket and a global one before the ceremony

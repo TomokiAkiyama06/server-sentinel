@@ -216,6 +216,10 @@ class HumanAccess:
     Main storage policy, or the embedder's injected reservation), and until
     it is bound every request is denied. An audit store already wired to a
     different reservation is refused rather than silently rebound.
+
+    A new composition denies every request (``stopped``) until a ``run()``
+    of the application lifespan has completed its startup check (Codex
+    PR #219), so a composition whose lifespan never runs serves nothing.
     """
 
     def __init__(self, configuration: HumanAccessConfiguration, *, store: AccessStore,
@@ -258,7 +262,11 @@ class HumanAccess:
         self.host = host
         self.tick_seconds = float(tick_seconds)
         self._storage_admission = None
-        self._stopped = False
+        # Denied until a run() of this lifespan has completed its startup
+        # check (Codex PR #219): a composition that was never run, or whose
+        # lifespan is disabled, serves nothing.
+        self._serving = False
+        self._halted = False
 
     def bind_storage_admission(self, admission: Callable, *, database: Database) -> None:
         """Admit every write of this composition through ``admission``.
@@ -294,64 +302,85 @@ class HumanAccess:
     def stopped(self) -> bool:
         """Every request is denied while this is True.
 
-        True from ``stop()``, and from the start of ``run()`` until its
-        startup check has returned (Codex PR #219): a restarted lifespan never
-        serves on the verdict a previous lifespan left behind.
+        True from construction until a ``run()`` has completed its startup
+        check, from ``stop()``, after ``run()`` has ended, and from a failed
+        periodic check until the retried startup check has returned (Codex
+        PR #219): requests are served only on a verdict this lifespan's
+        ``run()`` published and keeps checking.
         """
-        return self._stopped
+        return self._halted or not self._serving
 
     def stop(self) -> None:
         """Deny every later request; called first by the application shutdown.
 
-        The application then cancels ``run()`` and waits for it, before it
-        unbinds the storage admission or stops the monitoring runtime.
+        ``run()`` starts no further check or sweep after this. The application
+        then cancels ``run()`` and waits for it, before it unbinds the storage
+        admission or stops the monitoring runtime.
         """
-        self._stopped = True
+        self._halted = True
+        self._serving = False
 
     async def run(self, *, sleep: Callable = asyncio.sleep) -> None:
         """Startup check, then the periodic check tick and expiry sweep.
 
         ``tick()`` runs the daily check and the five-minute retries while
         closed; ``end_expired_sessions()`` clears expired rows even when no
-        request arrives. A failure is logged without values and access stays
-        as the check left it (closed on any doubt).
+        request arrives. A failure is logged without values.
 
-        Each of them runs on a worker thread that cancellation cannot stop,
-        so a cancellation (application shutdown) is deferred until the
-        in-flight call has returned and is re-raised afterwards: no verdict
-        is published and no session-revocation, marker or expiry write
-        happens after ``run()`` has ended, so after the shutdown has moved on
-        to unbinding the storage admission. The wait is bounded by the call
-        itself: every enumeration of the check runs under the check's
-        enumeration timeout, and every SQLite write under the database busy
-        timeout. Cancellation during the sleep between ticks ends at once.
+        Requests are served only while this lifespan's checks hold (Codex
+        PR #219). They are denied (``stopped``) from the start of ``run()``
+        until ``startup()`` has returned, so a restarted lifespan never serves
+        on the verdict the previous lifespan left behind while listeners or
+        routes may have changed: ``startup()`` closes access before it
+        re-evaluates, and once it has returned the verdict it published (open
+        or closed) is current. A ``startup()`` or ``tick()`` that raises may
+        have failed before it closed the previous verdict, so requests are
+        denied again and ``startup()`` (not ``tick()``) is retried on every
+        tick until it returns. Requests are denied again once ``run()`` ends,
+        since nothing re-checks the verdict after that.
 
-        Requests stay denied (``stopped``) from the start of ``run()`` until
-        ``startup()`` has returned, so a restarted lifespan never serves on
-        the verdict the previous lifespan left behind while listeners or
-        routes may have changed (Codex PR #219). ``startup()`` closes access
-        before it re-evaluates; once it has returned, the verdict it
-        published (open or closed) is current. A ``startup()`` that raises
-        may have failed before it closed the old verdict, so requests stay
-        denied and ``startup()`` (not ``tick()``) is retried on every tick
-        until it returns.
+        After ``stop()``, ``run()`` starts no further startup, tick or sweep
+        and returns. Each of them runs on a worker thread that cancellation
+        cannot stop, so a cancellation (application shutdown) is deferred
+        until the in-flight call has returned and is re-raised afterwards: no
+        verdict is published and no session-revocation, marker or expiry
+        write happens after ``run()`` has ended, so after the shutdown has
+        moved on to unbinding the storage admission. That wait is bounded by
+        the one in-flight call: the check's enumeration timeout for each
+        enumeration, plus, for a write, at most one in-flight monitoring job
+        ahead of it in the storage admission (which waits for that job
+        without a timeout of its own), plus the SQLite busy timeout.
+        Cancellation during the sleep between ticks ends at once.
         """
-        self._stopped = True
+        self._halted = False
+        self._serving = False
         log = logging.getLogger(__name__)
-        started = await self._startup(log)
-        while True:
-            await sleep(self.tick_seconds)
-            if not started:
-                started = await self._startup(log)
-                continue
-            try:
-                await run_to_completion(asyncio.to_thread(self.reservation.tick))
-            except Exception:
-                log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
-            try:
-                await run_to_completion(asyncio.to_thread(self.store.end_expired_sessions))
-            except Exception:
-                log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
+        try:
+            started = await self._startup(log)
+            while True:
+                await sleep(self.tick_seconds)
+                if self._halted:
+                    return
+                if not started:
+                    started = await self._startup(log)
+                    continue
+                try:
+                    await run_to_completion(asyncio.to_thread(self.reservation.tick))
+                except Exception:
+                    # The tick may have failed before it closed the gate (a
+                    # raising clock, an unexpected fault): fail closed until
+                    # a startup check has re-evaluated it (Codex PR #219).
+                    self._serving = False
+                    started = False
+                    log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
+                if self._halted:
+                    return
+                try:
+                    await run_to_completion(asyncio.to_thread(self.store.end_expired_sessions))
+                except Exception:
+                    log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
+        finally:
+            self._serving = False
 
     async def _startup(self, log) -> bool:
         """Run the startup check; requests are served again only after it returned."""
@@ -360,7 +389,8 @@ class HumanAccess:
         except Exception:
             log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
             return False
-        self._stopped = False
+        # Still denied after a stop() during the check (``stopped``).
+        self._serving = True
         return True
 
 

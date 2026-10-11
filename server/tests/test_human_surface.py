@@ -7,7 +7,7 @@ socket, browser, Tailscale or real authenticator is involved.
 """
 
 import asyncio
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from datetime import timedelta
 import json
 import logging
@@ -172,6 +172,36 @@ class HumanSurfaceFixture(unittest.IsolatedAsyncioTestCase):
         self.inner = InnerApplication()
         self.surface = HumanSurface(self.inner, self.access)
         self.codes = iter(bytes([index]) * 32 for index in range(1, 200))
+
+    async def asyncSetUp(self):
+        # Requests are served only while a run() of this lifespan holds
+        # (Codex PR #219); the periodic tick never fires here.
+        self.serving = []
+        self.addAsyncCleanup(self.stop_serving)
+        await self.start_serving()
+
+    async def start_serving(self, access=None):
+        access = access or self.access
+
+        async def idle(_seconds):
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(access.run(sleep=idle))
+        self.serving.append((access, task))
+        for _ in range(500):
+            if not access.stopped or task.done():
+                break
+            await asyncio.sleep(0.01)
+        self.assertFalse(access.stopped)
+
+    async def stop_serving(self):
+        """End every run() started by ``start_serving`` (the shutdown order)."""
+        while self.serving:
+            access, task = self.serving.pop()
+            access.stop()
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
 
     def tearDown(self):
         self.assertEqual(self.inner.calls, 0)
@@ -954,6 +984,7 @@ class StorageAdmissionTests(HumanSurfaceFixture):
                              reservation=check)
         self.assertFalse(access.storage_admitted)
         surface = HumanSurface(self.inner, access)
+        await self.start_serving(access)
         before = self.database.path.read_bytes()
         self.assertEqual(await call(surface, "POST", AUTHENTICATION_OPTIONS_PATH), expected)
         self.assertEqual(await call(surface, "GET", SESSION_PATH, cookie=cookie), expected)
@@ -1061,6 +1092,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
 
         logging.disable(logging.CRITICAL)
         self.addCleanup(logging.disable, logging.NOTSET)
+        await self.stop_serving()
         with patch.object(self.check, "startup", side_effect=blocking_startup):
             task = asyncio.create_task(self.access.run())
             while not started.is_set():
@@ -1070,7 +1102,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
             self.assertFalse(task.done())
             release.set()
             with self.assertRaises(asyncio.CancelledError):
-                await task
+                await asyncio.wait_for(task, 10)
         order.append("run ended")
         self.assertEqual(order, ["check returned", "run ended"])
 
@@ -1140,6 +1172,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
         async def short(_seconds):
             await asyncio.sleep(0.01)
 
+        await self.stop_serving()
         # First lifespan, then shutdown: the open verdict stays behind.
         task = asyncio.create_task(self.access.run(sleep=short))
         while self.access.stopped:
@@ -1200,6 +1233,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
         async def stepped(_seconds):
             await sleeps.get()
 
+        await self.stop_serving()
         with patch.object(self.check, "startup", side_effect=failing_startup), \
                 patch.object(self.check, "tick", side_effect=lambda: ticks.append(True)):
             task = asyncio.create_task(self.access.run(sleep=stepped))
@@ -1222,6 +1256,252 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
+
+    async def test_a_composition_that_never_ran_denies_every_route(self):
+        """Codex PR #219 (P2): before ``run()`` (lifespan disabled or not yet
+        started) every request gets the generic denial, although the
+        reservation is open and the storage admission is bound."""
+        _, authenticator, _ = self.enroll()
+        cookie = await self.sign_in(authenticator)
+        expected = await self.denial()
+        ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
+                                       clock=self.ceremony_clock)
+        access = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+                             ceremonies=ceremonies, reservation=self.check)
+        access.bind_storage_admission(self.admission, database=self.database)
+        self.assertTrue(self.check.access_open)
+        self.assertTrue(access.storage_admitted)
+        self.assertTrue(access.stopped)
+        surface = HumanSurface(self.inner, access)
+        stored = self.count("SELECT count(*) FROM access_webauthn_challenges")
+        self.assertEqual(await call(surface, "POST", AUTHENTICATION_OPTIONS_PATH), expected)
+        self.assertEqual(await call(surface, "GET", SESSION_PATH, cookie=cookie), expected)
+        self.assertEqual(self.count("SELECT count(*) FROM access_webauthn_challenges"), stored)
+        # An application whose lifespan never runs serves nothing either.
+        application = create_app(Settings(self.temporary), database=self.database, human_access=access,
+                                 storage_reservation=self.admission)
+        self.assertEqual(await call(application, "GET", SESSION_PATH, cookie=cookie), expected)
+        # Served only once this composition's own run() completed startup().
+        await self.start_serving(access)
+        self.assertEqual(status(await call(surface, "GET", SESSION_PATH, cookie=cookie)), 200)
+
+    async def test_ended_run_denies_even_without_stop(self):
+        """Nothing re-checks the verdict once ``run()`` has ended, so its end
+        denies every request even when ``stop()`` was not called."""
+        _, authenticator, _ = self.enroll()
+        cookie = await self.sign_in(authenticator)
+        expected = await self.denial()
+        await self.stop_serving()
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+        async def idle(_seconds):
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(self.access.run(sleep=idle))
+        for _ in range(500):
+            if not self.access.stopped:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=cookie)), 200)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        self.assertTrue(self.check.access_open)
+        self.assertTrue(self.access.stopped)
+        self.assertEqual(await call(self.surface, "GET", SESSION_PATH, cookie=cookie), expected)
+
+    async def _failed_tick_case(self, *, fail_tick):
+        """Drive ``run()`` step by step; ``fail_tick()`` makes the next tick
+        raise before it closes the gate and returns its undo."""
+        _, authenticator, _ = self.enroll()
+        cookie = await self.sign_in(authenticator)
+        expected = await self.denial()
+        await self.stop_serving()
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        startups = []
+        real_startup = self.check.startup
+        sleeps, sleeping = asyncio.Queue(), []
+
+        def counted_startup():
+            startups.append(True)
+            return real_startup()
+
+        async def stepped(_seconds):
+            sleeping.append(True)
+            await sleeps.get()
+
+        async def next_sleep(count):
+            for _ in range(1000):
+                if len(sleeping) >= count:
+                    return
+                await asyncio.sleep(0.01)
+            self.fail("run() did not reach its next sleep")
+
+        with patch.object(self.check, "startup", side_effect=counted_startup):
+            task = asyncio.create_task(self.access.run(sleep=stepped))
+            await next_sleep(1)
+            self.assertFalse(self.access.stopped)
+            self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=cookie)), 200)
+            # The failing tick raises while the previous open verdict stands.
+            undo = fail_tick()
+            sleeps.put_nowait(None)
+            await next_sleep(2)
+            undo()
+            self.assertTrue(self.check.access_open)
+            self.assertTrue(self.access.stopped)
+            self.assertEqual(await call(self.surface, "GET", SESSION_PATH, cookie=cookie), expected)
+            self.assertEqual(await call(self.surface, "POST", AUTHENTICATION_OPTIONS_PATH), expected)
+            self.assertEqual(len(startups), 1)
+            # The next step is a startup check (not a tick); access returns
+            # only once it has returned.
+            sleeps.put_nowait(None)
+            await next_sleep(3)
+            self.assertEqual(len(startups), 2)
+            self.assertFalse(self.access.stopped)
+            self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=cookie)), 200)
+            self.access.stop()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+
+    async def test_raising_tick_denies_until_a_startup_check_returned(self):
+        """Codex PR #219 (P2): a ``tick()`` that raises before closing the
+        gate fails closed and goes back to the startup-retry state."""
+        def fail_tick():
+            patcher = patch.object(self.check, "tick", side_effect=RuntimeError("synthetic tick failure"))
+            patcher.start()
+            return patcher.stop
+
+        await self._failed_tick_case(fail_tick=fail_tick)
+
+    async def test_raising_monotonic_clock_denies_until_a_startup_check_returned(self):
+        """Codex PR #219 (P2): the real ``tick()`` raises on its clock read,
+        before it closes the gate; requests are denied until ``startup()``
+        has re-evaluated it."""
+        real = self.check._monotonic
+        state = {"raise": False}
+
+        def clock():
+            if state["raise"]:
+                state["raise"] = False
+                raise RuntimeError("synthetic clock failure")
+            return real()
+
+        self.check._monotonic = clock
+
+        def fail_tick():
+            state["raise"] = True
+            return lambda: self.assertFalse(state["raise"])
+
+        await self._failed_tick_case(fail_tick=fail_tick)
+
+    async def test_stop_starts_no_further_check_or_sweep(self):
+        """``run()`` checks ``stop()`` before each step: after it, no startup
+        verdict is served and no tick or sweep starts, also when the
+        cancellation has not arrived."""
+        await self.stop_serving()
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        calls = []
+        real_startup = self.check.startup
+        started, release = threading.Event(), threading.Event()
+
+        def counted_startup():
+            calls.append("startup")
+            return real_startup()
+
+        def blocking_tick():
+            calls.append("tick")
+            started.set()
+            release.wait(10)
+
+        sleeps = asyncio.Queue()
+
+        async def stepped(_seconds):
+            await sleeps.get()
+
+        async def until_serving():
+            for _ in range(500):
+                if not self.access.stopped:
+                    return
+                await asyncio.sleep(0.01)
+            self.fail("run() did not serve")
+
+        with patch.object(self.check, "startup", side_effect=counted_startup), \
+                patch.object(self.check, "tick", side_effect=blocking_tick), \
+                patch.object(self.store, "end_expired_sessions", side_effect=lambda: calls.append("sweep")):
+            # stop() during the sleep: the tick after it never starts.
+            task = asyncio.create_task(self.access.run(sleep=stepped))
+            await until_serving()
+            self.access.stop()
+            sleeps.put_nowait(None)
+            await asyncio.wait_for(task, 10)
+            self.assertEqual(calls, ["startup"])
+            # stop() during the tick: the sweep after it never starts.
+            calls.clear()
+            task = asyncio.create_task(self.access.run(sleep=stepped))
+            await until_serving()
+            sleeps.put_nowait(None)
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            self.access.stop()
+            release.set()
+            await asyncio.wait_for(task, 10)
+            self.assertEqual(calls, ["startup", "tick"])
+            # stop() during the startup check: it never opens access.
+            calls.clear()
+            gate = threading.Event()
+
+            def blocking_startup():
+                calls.append("startup")
+                gate.wait(10)
+                return real_startup()
+
+            with patch.object(self.check, "startup", side_effect=blocking_startup):
+                task = asyncio.create_task(self.access.run(sleep=stepped))
+                while not calls:
+                    await asyncio.sleep(0.01)
+                self.access.stop()
+                gate.set()
+                await asyncio.sleep(0.1)
+                self.assertTrue(self.access.stopped)
+                sleeps.put_nowait(None)
+                await asyncio.wait_for(task, 10)
+            self.assertEqual(calls, ["startup"])
+            self.assertTrue(self.access.stopped)
+
+    async def test_cancelled_run_waits_for_the_in_flight_sweep(self):
+        """The expiry sweep is deferred-cancelled like the check: no expiry
+        write lands after ``run()`` has ended."""
+        await self.stop_serving()
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        started, release, order = threading.Event(), threading.Event(), []
+
+        def blocking_sweep():
+            started.set()
+            release.wait(10)
+            order.append("sweep returned")
+
+        async def short(_seconds):
+            await asyncio.sleep(0.01)
+
+        with patch.object(self.check, "tick", return_value=None), \
+                patch.object(self.store, "end_expired_sessions", side_effect=blocking_sweep):
+            task = asyncio.create_task(self.access.run(sleep=short))
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+            self.access.stop()
+            task.cancel()
+            await asyncio.sleep(0.2)
+            self.assertFalse(task.done())
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10)
+        order.append("run ended")
+        self.assertEqual(order, ["sweep returned", "run ended"])
 
 if __name__ == "__main__":
     unittest.main()
