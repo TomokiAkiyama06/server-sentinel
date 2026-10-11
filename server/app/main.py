@@ -264,21 +264,25 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # The application snapshot follows the live runtime, like the UVC
             # watcher: critical backpressure (DEGRADED), its recovery, or a
             # failed/dead worker (UNAVAILABLE) is reflected here instead of
-            # the startup result staying RUNNING until shutdown. Shutdown
-            # cancels this task before stop() writes the final state.
+            # the startup result staying RUNNING until shutdown. A recorder
+            # call stalled in flight, a camera loss or a lowered source is
+            # DEGRADED. Shutdown cancels this task before stop() writes the
+            # final state.
             live = (SceneRuntimeState.RUNNING, SceneRuntimeState.DEGRADED)
             while application.state.scene_monitoring_state in live:
                 await asyncio.sleep(scene_runtime.refresh_interval_seconds)
                 try:
                     status = await asyncio.to_thread(scene_runtime.status)
                     state = status.state
-                    lost = state in live and not status.worker_running
+                    lost = state in live and not (status.worker_running
+                                                  and status.delivery_running)
                 except Exception:
                     state, lost = SceneRuntimeState.UNAVAILABLE, True
                 if lost:
-                    # A worker that is gone (or a status that cannot be read)
-                    # evaluates nothing. A worker failure the runtime caught
-                    # already logged itself and reports UNAVAILABLE directly.
+                    # A worker or delivery thread that is gone (or a status
+                    # that cannot be read) evaluates or delivers nothing. A
+                    # worker failure the runtime caught already logged itself
+                    # and reports UNAVAILABLE directly.
                     state = SceneRuntimeState.UNAVAILABLE
                     logging.getLogger(__name__).error(Event.SCENE_MONITORING_UNAVAILABLE)
                 application.state.scene_monitoring_state = state

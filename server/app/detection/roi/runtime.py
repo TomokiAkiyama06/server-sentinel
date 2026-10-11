@@ -4,8 +4,11 @@
 `SceneDetector` per configured source, behind that source's own
 detector-specific quality gates, and hands every confirmed critical
 observation to the injected durable `CriticalRecorder` (in the Main runtime,
-`app.presence.adapters.CriticalTimelineRecorder`) through bounded
-`CriticalDelivery` staging.
+`app.presence.adapters.CriticalTimelineRecorder`) through bounded critical
+staging. The recorder is only ever called on a dedicated delivery thread, so a
+stalled recorder (for example on stalled storage) never blocks sampling or
+detection: staging fills, new confirmations are refused as explicit
+backpressure, and a call in flight longer than the stall bound is reported.
 
 Capture threads only take a cheap, non-blocking sample decision: at most one
 pending sample per source is held (a newer one replaces it and the replacement
@@ -28,6 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -40,8 +44,8 @@ from app.detection.foundation import GrayFrame, Observation
 from app.detection.quality import DetectorQualityPolicy, Execution, QualityGate
 from app.logging import Event
 from .calibration import CalibrationArchive, CalibrationRecord
-from .contracts import Calibration
-from .delivery import MAXIMUM_BATCH, CriticalDelivery, CriticalRecorder
+from .contracts import Calibration, CriticalObservation
+from .delivery import MAXIMUM_BATCH, CriticalRecorder
 from .detector import SceneDetector
 
 
@@ -54,6 +58,16 @@ DEFAULT_CRITICAL_CAPACITY = 4 * MAXIMUM_BATCH * MAXIMUM_SOURCES
 CALIBRATION_RETRY_NS = 60 * 1_000_000_000
 # `SceneDetector.source_lost` confirms at most one CAMERA_TAMPER observation.
 LOSS_BATCH = 1
+# Producer stream identities a decoded-sample source has replaced. Frames from
+# one of them are stale imagery and are refused on the capture side. The set
+# is never evicted from: once it is full a further replacement stream is
+# refused (the source reports `stream_history_exhausted`) instead of
+# forgetting a retired identity.
+RETIRED_PRODUCER_LIMIT = 1024
+MINIMUM_TICK_SECONDS = 0.01
+MAXIMUM_TICK_SECONDS = 60.0
+# A recorder call in flight longer than this is reported as stalled.
+DEFAULT_RECORDER_STALL_NS = 5 * 1_000_000_000
 PACKED_FORMATS = {"GREY": 1, "YUYV": 2}
 
 
@@ -229,6 +243,20 @@ class SceneMonitoringDependencies:
     utcnow: Callable[[], datetime] = _utcnow
     tick_seconds: float = 0.5
     calibration_retry_ns: int = CALIBRATION_RETRY_NS
+    recorder_stall_ns: int = DEFAULT_RECORDER_STALL_NS
+
+    def __post_init__(self):
+        tick = self.tick_seconds
+        if (type(tick) not in (int, float) or not math.isfinite(tick)
+                or not MINIMUM_TICK_SECONDS <= tick <= MAXIMUM_TICK_SECONDS):
+            # A zero, negative or tiny tick would spin the worker and delivery
+            # threads; a huge one would hide state changes for too long.
+            raise ValueError("invalid scene monitoring tick")
+        for value in (self.calibration_retry_ns, self.recorder_stall_ns):
+            if type(value) is not int or value <= 0:
+                raise ValueError("invalid scene monitoring interval")
+        if not callable(self.monotonic_ns) or not callable(self.utcnow):
+            raise ValueError("invalid scene monitoring clock")
 
 
 class SceneRuntimeState(StrEnum):
@@ -266,6 +294,9 @@ class SceneSourceStatus:
     unusable: int
     backpressured: int
     failures: int
+    # Decoded samples refused because their producer stream was already
+    # replaced (stale imagery) or the retired-stream history is full.
+    stale_rejected: int = 0
 
 
 @dataclass(frozen=True)
@@ -279,6 +310,14 @@ class SceneRuntimeStatus:
     # how many could not be handed to their detector (in memory only, never
     # persisted), alongside `critical_pending`.
     losses_held: int = 0
+    # Camera losses that could not be handed to their detector because the
+    # source faulted or a shutdown drain failed (logged and counted here).
+    losses_failed: int = 0
+    # A recorder call is in progress on the delivery thread, and whether it
+    # has been in flight longer than `recorder_stall_ns`.
+    critical_in_flight: bool = False
+    recorder_stalled: bool = False
+    delivery_running: bool = False
 
 
 @dataclass
@@ -314,9 +353,12 @@ class _Slot:
     sequence: int = -1
     last_accepted_ns: int | None = None
     last_uvc_sequence: int | None = None
+    retired_producers: set = field(default_factory=set)
+    history_exhausted: bool = False
     accepted: int = 0
     sampled_out: int = 0
     replaced: int = 0
+    stale_rejected: int = 0
 
 
 @dataclass
@@ -353,6 +395,140 @@ class _Context:
         # a failure) until staging drains, so a loss correlated with a scene
         # shift is never dropped as evidence.
         self.held_loss = None
+        # A loss taken from the capture slot (merged with a held one) that has
+        # not yet been handed to the detector and staged. A fault while it is
+        # set means that loss is lost, and it is counted.
+        self.unprocessed_loss = None
+
+
+class _CriticalPump:
+    """Bounded in-memory critical staging, delivered off the scene worker.
+
+    `submit()` never calls the recorder on a threaded pump: it only stages a
+    whole batch (or raises `BufferError`, which callers avoid by checking
+    `remaining` first). The delivery thread calls the recorder one observation
+    at a time and records when each call started, so a call that does not
+    return is visible as in flight instead of wedging detection. An item stays
+    staged and counted until the recorder accepts it. After `close()` no
+    further recorder call starts; a call already in flight is reported, never
+    waited on without bound. An unthreaded pump (tests driving `step()`)
+    delivers on the caller instead.
+    """
+
+    def __init__(self, *, capacity, recorder, clock, tick_seconds, threaded):
+        self.capacity, self.recorder, self.clock = capacity, recorder, clock
+        self.tick_seconds, self.threaded = tick_seconds, threaded
+        self._lock = threading.Lock()
+        self._wake = threading.Condition(self._lock)
+        self._pending = {}
+        self._accepted = 0
+        self._in_flight_since = None
+        self._stopping = self._closed = False
+        self._thread = None
+
+    def start(self):
+        if self.threaded:
+            thread = threading.Thread(target=self._run, name="scene-critical-delivery",
+                                      daemon=True)
+            self._thread = thread
+            thread.start()
+
+    @property
+    def remaining(self):
+        with self._lock:
+            return self.capacity - len(self._pending)
+
+    def snapshot(self):
+        """(pending, accepted, in-flight start ns or None, thread alive)."""
+        with self._lock:
+            thread = self._thread
+            return (len(self._pending), self._accepted, self._in_flight_since,
+                    thread is not None and thread.is_alive())
+
+    def submit(self, observations):
+        if any(not isinstance(item, CriticalObservation) or not item.confirmed
+               for item in observations):
+            raise ValueError("only confirmed critical observations may be submitted")
+        new = {item.identifier: item for item in observations}
+        with self._lock:
+            if len(set(new) - set(self._pending)) > self.capacity - len(self._pending):
+                raise BufferError("critical staging is full")
+            self._pending.update(new)
+            self._wake.notify_all()
+        self.kick()
+
+    def kick(self):
+        """Deliver now on an unthreaded pump; a threaded pump delivers on its
+        own thread after every submit and retries refusals on its tick."""
+        if not self.threaded:
+            self.deliver()
+
+    def deliver(self):
+        """Offer every staged observation to the recorder once.
+
+        Returns True when the recorder refused one (retry after a tick).
+        """
+        if self.recorder is None:
+            return False
+        with self._lock:
+            items = tuple(self._pending.items())
+        refused = False
+        for identifier, observation in items:
+            with self._lock:
+                if self._closed:
+                    return refused
+                if identifier not in self._pending:
+                    continue
+                self._in_flight_since = self.clock()
+            try:
+                self.recorder(observation)
+                accepted = True
+            except Exception:
+                accepted = False
+            with self._lock:
+                self._in_flight_since = None
+                if accepted:
+                    if self._pending.pop(identifier, None) is not None:
+                        self._accepted += 1
+                else:
+                    refused = True
+        return refused
+
+    def _run(self):
+        retry_wait = False
+        try:
+            while True:
+                with self._lock:
+                    if self._closed:
+                        return
+                    final = self._stopping
+                    if not final and (not self._pending or retry_wait):
+                        retry_wait = False
+                        self._wake.wait(self.tick_seconds)
+                        continue
+                retry_wait = self.deliver()
+                if final:
+                    return
+        except Exception:
+            # Staged items stay counted; the dead thread is visible in status.
+            logging.getLogger(__name__).error(Event.SCENE_CRITICAL_UNDELIVERED)
+
+    def close(self, timeout):
+        """Final bounded delivery pass, then no further recorder call.
+
+        Returns True if a recorder call is still in flight.
+        """
+        with self._lock:
+            self._stopping = True
+            self._wake.notify_all()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+        elif not self.threaded:
+            self.deliver()
+        with self._lock:
+            self._closed = True
+            return self._in_flight_since is not None
 
 
 class SceneMonitoringRuntime:
@@ -378,10 +554,14 @@ class SceneMonitoringRuntime:
         self._slots = {item.source_id: _Slot(item) for item in configuration.bindings}
         self._published = {item.source_id: _Published() for item in configuration.bindings}
         self._contexts = {item.source_id: _Context(item) for item in configuration.bindings}
-        self._delivery = CriticalDelivery(capacity=configuration.critical_capacity,
-                                          recorder=dependencies.recorder)
-        self._pending_critical = 0
-        self._accepted_critical = 0
+        self._pump = _CriticalPump(capacity=configuration.critical_capacity,
+                                   recorder=dependencies.recorder,
+                                   clock=dependencies.monotonic_ns,
+                                   tick_seconds=dependencies.tick_seconds, threaded=threaded)
+        self._losses_failed = 0
+        self._stall_logged = False
+        # Lifecycle only (CONFIGURED/RUNNING/UNAVAILABLE/STOPPED/STOP_FAILED);
+        # `status()` derives DEGRADED from the live conditions.
         self._accepting = False
         self._stopping = False
         self._state = SceneRuntimeState.CONFIGURED
@@ -409,6 +589,7 @@ class SceneMonitoringRuntime:
                 return self._status_locked()
             self._state = SceneRuntimeState.RUNNING
             self._accepting = True
+        self._pump.start()
         if self._threaded:
             thread = threading.Thread(target=self._run, name="scene-monitoring", daemon=True)
             self._thread = thread
@@ -416,6 +597,12 @@ class SceneMonitoringRuntime:
         return self.status()
 
     def stop(self, timeout: float = 5.0) -> SceneRuntimeStatus:
+        """Stop the worker, then the delivery thread, each bounded by `timeout`.
+
+        A worker or recorder call still running after its bound is reported
+        as `STOP_FAILED` (with `critical_in_flight`), never waited on; the
+        delivery thread then starts no further recorder call.
+        """
         with self._lock:
             self._accepting = False
             self._stopping = True
@@ -424,27 +611,36 @@ class SceneMonitoringRuntime:
             # (`_finish`) hands it to the detector before slots are cleared.
             self._wake.notify_all()
             thread = self._thread
+        worker_alive = False
         if thread is not None:
             thread.join(timeout)
-            if thread.is_alive():
-                with self._lock:
-                    self._state = SceneRuntimeState.STOP_FAILED
-                    for published in self._published.values():
-                        self._withdraw(published, "stopped")
-                logging.getLogger(__name__).error(Event.SCENE_MONITORING_STOP_FAILED)
-                return self.status()
-        elif self._state in (SceneRuntimeState.RUNNING, SceneRuntimeState.DEGRADED):
+            worker_alive = thread.is_alive()
+        elif self._state is SceneRuntimeState.RUNNING:
             self._finish()
+        # The final worker pass has staged what it could; one bounded final
+        # delivery pass follows.
+        in_flight = self._pump.close(timeout)
+        log = logging.getLogger(__name__)
         with self._lock:
             for slot in self._slots.values():
                 if slot.sample is not None:
                     slot.sample.data = None
                 slot.sample = slot.loss = None
-            if self._state is not SceneRuntimeState.UNAVAILABLE:
+            if worker_alive or in_flight:
+                self._state = SceneRuntimeState.STOP_FAILED
+            elif self._state is not SceneRuntimeState.UNAVAILABLE:
                 self._state = SceneRuntimeState.STOPPED
             for published in self._published.values():
                 self._withdraw(published, "stopped")
-        return self.status()
+            status = self._status_locked()
+        if in_flight:
+            log.error(Event.SCENE_CRITICAL_RECORDER_STALLED)
+        if worker_alive or in_flight:
+            log.error(Event.SCENE_MONITORING_STOP_FAILED)
+        if status.critical_pending or status.losses_held or status.losses_failed:
+            # Staging is in memory only; the counts stay visible in status.
+            log.error(Event.SCENE_CRITICAL_UNDELIVERED)
+        return status
 
     def step(self) -> None:
         """Run one worker pass on the calling thread (unthreaded runtimes)."""
@@ -545,11 +741,27 @@ class SceneMonitoringRuntime:
     def _accept_locked(self, slot, now, observed_at, data, producer_stream, width, height):
         if not self._accepting:
             return False
+        replacing = producer_stream != slot.minted_for
+        if replacing and producer_stream in slot.retired_producers:
+            # A producer stream this source already replaced: its frames are
+            # stale imagery. Minting it a fresh runtime identity would defeat
+            # the detector's retired-stream refusal, so it is refused here,
+            # before it can displace a live sample or move the sampling clock.
+            slot.stale_rejected += 1
+            return False
+        if replacing and slot.minted_for is not None and (
+                len(slot.retired_producers) >= RETIRED_PRODUCER_LIMIT):
+            # Admitting another stream would mean forgetting a retired one.
+            slot.history_exhausted = True
+            slot.stale_rejected += 1
+            return False
         if (slot.last_accepted_ns is not None
                 and now - slot.last_accepted_ns < slot.binding.sample_interval_ns):
             slot.sampled_out += 1
             return False
-        if slot.new_stream or producer_stream != slot.minted_for:
+        if replacing and slot.minted_for is not None:
+            slot.retired_producers.add(slot.minted_for)
+        if slot.new_stream or replacing:
             # Runtime-minted stream identity, never a calibration reference
             # stream, so a producer cannot resume a pre-calibration sequence.
             slot.stream_id, slot.sequence = uuid4(), -1
@@ -591,21 +803,33 @@ class SceneMonitoringRuntime:
         finally:
             self._finish()
 
-    def _retry(self):
+    def _kick(self):
+        """Let staging progress (inline when unthreaded) and report a
+        recorder call stalled in flight, once per stall."""
         try:
-            state = self._delivery.retry()
+            self._pump.kick()
         except Exception:
-            state = None
-        with self._lock:
-            self._sync_delivery(state)
-            return self._pending_critical
+            pass
+        _, _, since, _ = self._pump.snapshot()
+        stalled = since is not None and (
+            self._deps.monotonic_ns() - since >= self._deps.recorder_stall_ns)
+        if stalled and not self._stall_logged:
+            logging.getLogger(__name__).error(Event.SCENE_CRITICAL_RECORDER_STALLED)
+        self._stall_logged = stalled
 
     def _finish(self):
-        lost = self._process_queued_losses()
-        held = self._drain_held_losses()
-        if self._retry() or held or lost:
-            # Staging is in memory only; the counts stay visible in status.
-            logging.getLogger(__name__).error(Event.SCENE_CRITICAL_UNDELIVERED)
+        # Also runs after a worker failure: evidence for a loss queued before
+        # the failure is still handed to its detector and staged.
+        self._process_queued_losses()
+        self._drain_held_losses()
+        self._kick()
+        with self._lock:
+            if self._state is SceneRuntimeState.UNAVAILABLE:
+                # The final pass may have published results; a failed worker
+                # still reports nothing as current.
+                for published in self._published.values():
+                    published.state, published.reason = SceneSourceState.INACTIVE, "worker_failed"
+                    self._withdraw(published, "worker_failed")
 
     def _process_queued_losses(self):
         """Final pass over losses still queued in capture slots at shutdown.
@@ -613,10 +837,9 @@ class SceneMonitoringRuntime:
         Bounded: at most one loss and one earlier sample per source. A sample
         captured before the loss is evaluated first, exactly as a normal pass
         would, so it can still end an episode instead of being skipped; a
-        sample after the loss (or with no loss) is dropped. Returns how many
-        losses failed on a per-source fault and could not be processed.
+        sample after the loss (or with no loss) is dropped. A loss lost to a
+        per-source fault is counted in `losses_failed`.
         """
-        failed = 0
         for source_id, context in self._contexts.items():
             with self._lock:
                 slot = self._slots[source_id]
@@ -626,12 +849,11 @@ class SceneMonitoringRuntime:
                 sample.data, sample = None, None
             if loss is None:
                 continue
+            context.unprocessed_loss = loss
             try:
                 self._process(context, sample, loss)
             except Exception:
-                failed += 1
                 self._fault(context)
-        return failed
 
     def _cycle(self):
         now = self._deps.monotonic_ns()
@@ -645,6 +867,7 @@ class SceneMonitoringRuntime:
                 refresh = context.refresh and context.held_loss is None
                 if refresh:
                     context.refresh = False
+            context.unprocessed_loss = loss
             try:
                 if refresh or context.detector is None and (
                         context.resolved_ns is None
@@ -655,15 +878,7 @@ class SceneMonitoringRuntime:
                 # Per-source isolation: this source becomes unknown and its
                 # episode ends; other sources keep running.
                 self._fault(context)
-        self._retry()
-
-    def _sync_delivery(self, state):
-        if state is not None:
-            self._accepted_critical += len(state.accepted)
-        self._pending_critical = self._delivery.capacity - self._delivery.remaining
-        if self._state in (SceneRuntimeState.RUNNING, SceneRuntimeState.DEGRADED):
-            self._state = (SceneRuntimeState.DEGRADED if self._pending_critical
-                           else SceneRuntimeState.RUNNING)
+        self._kick()
 
     def _bind(self, context, now):
         context.resolved_ns = now
@@ -721,16 +936,19 @@ class SceneMonitoringRuntime:
         return loss if loss.trusted and not held.trusted else held
 
     def _loss_admissible(self):
-        self._retry()
-        return self._delivery.remaining >= LOSS_BATCH
+        self._kick()
+        return self._pump.remaining >= LOSS_BATCH
 
     def _process(self, context, sample, loss):
         detector = context.detector
         if detector is None:
-            context.held_loss = None
+            # Inactive source: there is no tracked scene to correlate with.
+            context.held_loss = context.unprocessed_loss = None
             return
         held, context.held_loss = context.held_loss, None
-        items = [item for item in (self._merge_loss(held, loss), sample) if item is not None]
+        merged = self._merge_loss(held, loss)
+        context.unprocessed_loss = merged
+        items = [item for item in (merged, sample) if item is not None]
         items.sort(key=lambda item: item.monotonic_ns)
         for item in items:
             if context.held_loss is not None:
@@ -743,13 +961,14 @@ class SceneMonitoringRuntime:
                 if not self._loss_admissible():
                     # Explicit backpressure: the loss is held, never turned
                     # into a per-source fault that would discard the detector.
-                    context.held_loss = item
+                    context.held_loss, context.unprocessed_loss = item, None
                     self._backpressure(context, count=item is not held)
                     continue
                 result = context.detector.source_lost(monotonic_ns=item.monotonic_ns,
                                                       observed_at=item.observed_at,
                                                       health_signal_trusted=item.trusted)
                 self._handle(context, result, item.monotonic_ns, reason="source_unavailable")
+                context.unprocessed_loss = None
             else:
                 self._evaluate(context, item)
 
@@ -764,16 +983,16 @@ class SceneMonitoringRuntime:
     def _drain_held_losses(self):
         """Hand held losses to their detectors at shutdown when room allows.
 
-        Returns how many remain unprocessed (in memory only, like staging).
+        A loss that still has no room stays held (counted in `losses_held`);
+        one whose detector fails is counted in `losses_failed` and logged.
+        Both are in memory only, like staging.
         """
-        remaining = 0
         for context in self._contexts.values():
             loss = context.held_loss
             if loss is None:
                 continue
             try:
                 if context.detector is None or not self._loss_admissible():
-                    remaining += 1
                     continue
                 context.held_loss = None
                 result = context.detector.source_lost(monotonic_ns=loss.monotonic_ns,
@@ -783,13 +1002,12 @@ class SceneMonitoringRuntime:
                     self._submit(result.critical)
             except Exception:
                 context.held_loss = None
-                remaining += 1
-        return remaining
+                logging.getLogger(__name__).error(Event.SCENE_SOURCE_FAILED)
+                with self._lock:
+                    self._losses_failed += 1
 
     def _submit(self, critical):
-        state = self._delivery.submit(critical)
-        with self._lock:
-            self._sync_delivery(state)
+        self._pump.submit(critical)
 
     def _end_episode(self, context, item, reason, counter):
         # A sample this runtime could not evaluate still ends the episode, so
@@ -804,8 +1022,8 @@ class SceneMonitoringRuntime:
 
     def _evaluate(self, context, item):
         reference = context.calibration.reference
-        self._retry()
-        if self._delivery.remaining < MAXIMUM_BATCH:
+        self._kick()
+        if self._pump.remaining < MAXIMUM_BATCH:
             # Undelivered evidence fills staging: do not evaluate (and risk
             # a confirmation that could not be staged); report backpressure.
             self._end_episode(context, item, "critical_backpressure", "backpressured")
@@ -845,7 +1063,11 @@ class SceneMonitoringRuntime:
             published = self._published[context.binding.source_id]
             if reason == "evaluated":
                 published.evaluated += 1
-            published.state, published.reason = SceneSourceState.ACTIVE, reason
+            # A camera loss lowers the source until a new evaluated sample
+            # establishes recovery; it is never presented as healthy.
+            published.state = (SceneSourceState.ACTIVE if reason == "evaluated"
+                               else SceneSourceState.DEGRADED)
+            published.reason = reason
             published.movement, published.tamper = result.movement, result.tamper
             published.movement_reason = result.movement_reason
             published.tamper_reason = result.tamper_reason
@@ -855,9 +1077,14 @@ class SceneMonitoringRuntime:
         logging.getLogger(__name__).error(Event.SCENE_SOURCE_FAILED)
         # Rebind from the trusted provider after the retry interval, so a
         # deterministic fault cannot repeat (and log) on every sample.
-        context.detector = context.held_loss = None
+        lost = context.held_loss is not None or context.unprocessed_loss is not None
+        context.detector = context.held_loss = context.unprocessed_loss = None
         context.resolved_ns = self._deps.monotonic_ns()
         with self._lock:
+            if lost:
+                # The loss (possibly correlated with a scene shift) can no
+                # longer reach a detector: counted, never silently dropped.
+                self._losses_failed += 1
             published = self._published[context.binding.source_id]
             published.failures += 1
             published.state, published.reason = SceneSourceState.DEGRADED, "scene_evaluation_failed"
@@ -888,16 +1115,32 @@ class SceneMonitoringRuntime:
                 # stalled, frames stopped) is no longer current: unknown.
                 movement = tamper = Observation.UNKNOWN
                 movement_reason = tamper_reason = "observation_stale"
+            state, reason = published.state, published.reason
+            if slot.history_exhausted and self._state is SceneRuntimeState.RUNNING:
+                # New producer streams are refused; a later conclusion from
+                # the current one may still appear, but the source is lowered.
+                state, reason = SceneSourceState.DEGRADED, "stream_history_exhausted"
             sources.append(SceneSourceStatus(
-                source_id, slot.binding.source_type, published.state, published.reason,
+                source_id, slot.binding.source_type, state, reason,
                 movement, tamper, movement_reason, tamper_reason,
                 published.calibration_version, slot.accepted, slot.sampled_out, slot.replaced,
                 published.evaluated, published.unusable, published.backpressured,
-                published.failures,
+                published.failures, slot.stale_rejected,
             ))
         thread = self._thread
         # A reference read of worker-owned state; a snapshot, never a decision.
         held = sum(context.held_loss is not None for context in self._contexts.values())
-        return SceneRuntimeStatus(self._state, tuple(sources), self._pending_critical,
-                                  self._accepted_critical,
-                                  thread is not None and thread.is_alive(), held)
+        pending, accepted, since, delivery_running = self._pump.snapshot()
+        stalled = since is not None and now - since >= self._deps.recorder_stall_ns
+        state = self._state
+        if state is SceneRuntimeState.RUNNING and (
+                pending or held or stalled
+                or any(item.state is SceneSourceState.DEGRADED for item in sources)):
+            # Undelivered evidence, a held loss, a stalled recorder call or a
+            # lowered source (camera loss, unusable frame, backpressure,
+            # fault) is never reported as healthy.
+            state = SceneRuntimeState.DEGRADED
+        return SceneRuntimeStatus(state, tuple(sources), pending, accepted,
+                                  thread is not None and thread.is_alive(), held,
+                                  self._losses_failed, since is not None, stalled,
+                                  delivery_running)

@@ -1017,8 +1017,13 @@ wires this core into the Main application: capture callbacks hand it at most one
 pending sample per source at a bounded sample interval (default 1 sample/s),
 and a single worker runs the per-source `server_roi` and `camera_tamper`
 quality gates and the detector, with per-source failure isolation. Confirmed
-observations go through bounded `CriticalDelivery` staging to an injected
-durable recorder (`CriticalTimelineRecorder`); without it no detector runs.
+observations go through bounded in-memory critical staging to an injected
+durable recorder (`CriticalTimelineRecorder`); without it no detector runs. The
+recorder is called only on a dedicated delivery thread, never on the scene
+worker, so a stalled recorder (for example on stalled storage) never blocks
+sampling or detection: staging fills and further confirmations become explicit
+`critical_backpressure`, and a recorder call in flight longer than the stall
+bound reports the runtime `degraded` (`recorder_stalled`).
 Without a stored calibration whose reference frame can be re-bound, a source
 stays inactive and `unknown`; no baseline is taken from live frames. Only
 uncompressed `GREY`/`YUYV` local capture is read; compressed capture stays
@@ -1027,10 +1032,26 @@ backpressure, camera loss and stale conclusions are `unknown`, never a
 negative. A camera loss that arrives while staging has no room is held as
 backpressure and processed after staging drains, never dropped as a
 per-source failure; a loss still queued at shutdown is processed by the final
-worker pass, and any loss or observation that remains undelivered is counted
-in the runtime status and logged (staging is in memory only). The application
-scene state follows the runtime status while running, so critical backpressure
-reports `degraded` and a failed worker `unavailable`.
+worker pass. Every loss or observation that remains undelivered is counted in
+the runtime status and logged (staging is in memory only): staged
+observations in `critical_pending`, losses still without staging room in
+`losses_held`, and losses lost to a per-source fault (while running or in the
+shutdown drain) in `losses_failed`. A camera loss (`offline`,
+`manual_intervention_required` or `degraded`) lowers the source to `degraded`
+until a new evaluated sample establishes recovery. A decoded-sample producer
+stream that has been replaced is refused as stale imagery on the capture side
+(`stale_rejected`) and never re-admitted under a new runtime identity; when the
+bounded retired-stream history is full, further replacement streams are
+refused (`stream_history_exhausted`) rather than forgetting one. The runtime
+reports `degraded` while staging holds undelivered evidence, a loss is held, a
+recorder call is stalled, or any source is `degraded`. Shutdown is bounded: a
+worker or recorder call still running after its bound is reported as
+`stop_failed` (with `critical_in_flight`), and the delivery thread then starts
+no further recorder call. After a worker failure the final pass still stages
+evidence for queued losses but every source stays withdrawn
+(`worker_failed`). The application scene state follows the runtime status
+while running, so these conditions report `degraded`, and a failed or dead
+worker or delivery thread, or an unreadable status, `unavailable`.
 Synthetic tests do not establish physical-camera, lighting, pose, or
 source-health behavior.
 
