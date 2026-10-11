@@ -154,11 +154,23 @@ never evicted from; when it is full a further replacement stream is refused and
 the source reports `stream_history_exhausted` until the runtime is restarted.
 The refused replacement also shows that the current stream is stale, so from
 then on no sample of that source is admitted at all (its pending sample is
-dropped), and its conclusions are `unknown` (`stream_history_exhausted`).
+dropped and counted in `stale_rejected`), and its conclusions are `unknown`
+(`stream_history_exhausted`). Because the detector never sees the refused
+stream restart, a camera loss timestamped at or after exhaustion is handed to
+it as untrusted and never confirms `source_loss_after_scene_shift`; a loss
+timestamped before exhaustion keeps its trust and may still correlate (Owner
+decision 2026-10-11). A sample still pending when its producer stream is
+replaced (the worker has not taken it yet) is discarded as stale imagery
+(`stale_rejected`), even when the replacement's first frame is sampled out.
 A calibration refresh request (`request_calibration_refresh()`) is deferred
 while a held loss or a loss just taken from the capture slot is still to be
 handed to the current detector, so the refresh never discards the scene-shift
-state a loss must be correlated with; it runs on the next pass.
+state a loss must be correlated with; it runs on the next pass. Under
+sustained losses (a loss on every pass) it can stay deferred; the source
+reports `refresh_pending` while it waits. When the refresh runs, a pending
+sample captured at or before the request is discarded (`refresh_discarded`),
+so a frame of the scene before the new calibration never becomes a
+temporal-confirmation sample of the refreshed detector.
 
 The default sample interval
 is a conservative 1 sample/s per source, evaluated by one worker thread for
@@ -203,8 +215,15 @@ then reported `inactive` and `unknown` (`worker_unavailable` /
 thread cannot be started after the delivery thread started, `start()` closes
 the delivery thread within a bounded wait (5 s), keeps no unstarted thread,
 reports `unavailable` (`worker_start_failed`) and raises; a later `stop()`
-does not fail on it. A worker that outlived its stop bound and then fails
-leaves the `stop_failed` state and the `stopped` reasons unchanged. The Main
+does not fail on it; a runtime without a durable recorder starts
+`unavailable` (`critical_recorder_unavailable`). In both cases the caller
+reports the outcome and `status()` does not log it again. A worker that
+outlived its stop bound and then fails leaves the `stop_failed` state and the
+`stopped` reasons unchanged (it logs `scene_source_failed`, not
+`scene_monitoring_unavailable`). A delivery thread that had already died
+before `stop()` has no call in flight, so the runtime ends `stopped`; what it
+left staged stays counted in `critical_pending` and
+`scene_critical_undelivered` is logged. The Main
 application's `scene_monitoring_state` follows the
 runtime status while it runs (those conditions are `degraded`; a failed or dead
 worker or delivery thread, or an unreadable status, is `unavailable`). No route

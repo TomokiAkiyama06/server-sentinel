@@ -1049,9 +1049,15 @@ transition is recorded even when the replacement stream's first frame is
 sampled out. When the bounded retired-stream history (1024 ids per source) is
 full, further replacement streams are refused (`stream_history_exhausted`)
 rather than forgetting one; from then on no sample of that source is admitted
-until restart and its conclusions are `unknown`. A calibration refresh waits
-until a held or just-dequeued camera loss has been handed to the current
-detector. The runtime reports `degraded` while staging holds
+until restart and its conclusions are `unknown`, and a camera loss timestamped
+at or after exhaustion is untrusted, so it never confirms
+`source_loss_after_scene_shift` (a loss timestamped before exhaustion may still
+correlate; Owner decision 2026-10-11). A sample still pending when its
+producer stream is replaced is discarded as stale (`stale_rejected`). A
+calibration refresh waits until a held or just-dequeued camera loss has been
+handed to the current detector (reported as `refresh_pending`, which sustained
+losses can prolong), and then discards a pending sample captured at or before
+the refresh request (`refresh_discarded`). The runtime reports `degraded` while staging holds
 undelivered evidence, a loss is held, a recorder call is stalled, or any source
 is `degraded`; since every staged observation counts until the recorder
 accepts it, normal delivery of a confirmation also shows `degraded` briefly.
@@ -1063,7 +1069,9 @@ timeout, so up to about 10 s by default): a worker or recorder call still
 running after its bound is reported as `stop_failed` (with
 `critical_in_flight`), and the delivery thread then starts no further recorder
 call; a call that exceeded the stall bound is logged as stalled, one merely in
-flight separately. After stop, staging refuses observations from a worker that
+flight separately. A delivery thread that had already died before stop has
+no call in flight, so the runtime ends `stopped` with what it left staged
+counted in `critical_pending` and logged as undelivered. After stop, staging refuses observations from a worker that
 outlived its bound (counted in `critical_refused` and logged) and no
 conclusion is republished. After a worker failure the final pass still stages
 evidence for queued losses but every source stays withdrawn

@@ -181,8 +181,10 @@ class SceneRuntimeFailClosedTests(unittest.TestCase):
         harness = Harness(recorder=False)
         status = harness.runtime.start()
         self.assertIs(SceneRuntimeState.UNAVAILABLE, status.state)
-        for _ in range(4):
-            source = harness.frame(MOVED)
+        # The caller logs the returned UNAVAILABLE; status() does not repeat it.
+        with self.assertNoLogs("app.detection.roi.runtime", level="ERROR"):
+            for _ in range(4):
+                source = harness.frame(MOVED)
         self.assertEqual(0, source.accepted)
         self.assertEqual("critical_recorder_unavailable", source.reason)
         self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN), (source.movement, source.tamper))
@@ -1109,8 +1111,9 @@ class SceneRuntimeThirdReviewRegressionTests(unittest.TestCase):
                 self.assertTrue(offer(stream))
             self.assertTrue(offer(streams[2]))
             self.assertEqual(Observation.ABSENT, harness.source(OTHER).movement)
+            evaluated = harness.source(OTHER).evaluated
             # A sample of the current stream pending when the replacement
-            # arrives is dropped, not evaluated.
+            # arrives is dropped (and counted), not evaluated.
             self.assertTrue(offer(streams[2], MOVED, step=False))
             self.assertFalse(offer(streams[3]))
             accepted = harness.source(OTHER).accepted
@@ -1119,7 +1122,9 @@ class SceneRuntimeThirdReviewRegressionTests(unittest.TestCase):
         self.assertEqual([], harness.recorder.items)
         source = harness.source(OTHER)
         self.assertEqual(accepted, source.accepted)
-        self.assertEqual(5, source.stale_rejected)
+        self.assertEqual(evaluated, source.evaluated)
+        # The refused replacement, the dropped pending sample and four frames.
+        self.assertEqual(6, source.stale_rejected)
         self.assertIs(SceneSourceState.DEGRADED, source.state)
         self.assertEqual("stream_history_exhausted", source.reason)
         self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN), (source.movement, source.tamper))
@@ -1167,7 +1172,9 @@ class SceneRuntimeThirdReviewRegressionTests(unittest.TestCase):
         with mock.patch.object(threading.Thread, "start", start):
             with self.assertRaises(RuntimeError):
                 harness.runtime.start()
-        status = harness.runtime.status()
+        # The caller reports the startup failure; status() does not log it.
+        with self.assertNoLogs("app.detection.roi.runtime", level="ERROR"):
+            status = harness.runtime.status()
         self.assertIs(SceneRuntimeState.UNAVAILABLE, status.state)
         self.assertFalse(status.worker_running)
         self.assertFalse(status.delivery_running)
@@ -1284,12 +1291,15 @@ class SceneRuntimeThirdReviewRegressionTests(unittest.TestCase):
         harness.runtime._cycle = broken
         harness.runtime.request_calibration_refresh()
         self.assertTrue(entered.wait(5))
-        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
             stopped = harness.runtime.stop(timeout=0.1)
             self.assertIs(SceneRuntimeState.STOP_FAILED, stopped.state)
             release.set()
             self.assertTrue(wait_for(lambda: not harness.runtime.status().worker_running))
-        status = harness.runtime.status()
+            status = harness.runtime.status()
+        # The late failure is a source failure, not a lifecycle transition.
+        self.assertFalse(any("scene_monitoring_unavailable" in line for line in logs.output))
+        self.assertTrue(any("scene_source_failed" in line for line in logs.output))
         self.assertIs(SceneRuntimeState.STOP_FAILED, status.state)
         source = status.sources[0]
         self.assertIs(SceneSourceState.INACTIVE, source.state)
@@ -1327,6 +1337,116 @@ class SceneRuntimeThirdReviewRegressionTests(unittest.TestCase):
         self.assertEqual((0, 0, 0), (status.critical_pending, status.losses_held,
                                      status.losses_failed))
         self.assertTrue(any("scene_critical_undelivered" in line for line in logs.output))
+
+
+class SceneRuntimeFourthReviewRegressionTests(unittest.TestCase):
+    """Regressions for the #213 review findings on 9a069a9."""
+
+    def _exhausted_after_shift(self, *, loss_before_exhaustion):
+        harness = Harness(binding(OTHER, SourceType.REMOTE_AGENT))
+        harness.runtime.start()
+        current, replacement = uuid4(), uuid4()
+
+        def offer(stream, luma=None):
+            harness.clock.value += INTERVAL
+            return harness.runtime.offer_luma(OTHER, stream_id=stream, width=WIDTH,
+                                              height=HEIGHT, pixels=luma or pixels())
+
+        for luma in (None, None, SHIFTED):
+            self.assertTrue(offer(current, luma))
+            harness.runtime.step()
+        self.assertEqual("global_scene_shift", harness.source(OTHER).tamper_reason)
+        if loss_before_exhaustion:
+            harness.clock.value += 1
+            harness.runtime.source_unavailable(OTHER, trusted=True)
+        with mock.patch("app.detection.roi.runtime.RETIRED_PRODUCER_LIMIT", 0):
+            # The replacement is refused: the detector never sees the restart.
+            self.assertFalse(offer(replacement))
+        self.assertTrue(harness.runtime._slots[OTHER].history_exhausted)
+        harness.clock.value += 5
+        harness.runtime.source_unavailable(OTHER, trusted=True)
+        harness.runtime.step()
+        return harness
+
+    def test_trusted_loss_after_history_exhaustion_never_confirms_tamper(self):
+        # Claude (#213) / Owner decision 2026-10-11: a loss after exhaustion
+        # is handed to the detector as untrusted.
+        harness = self._exhausted_after_shift(loss_before_exhaustion=False)
+        self.assertEqual([], harness.recorder.items)
+        source = harness.source(OTHER)
+        self.assertEqual(Observation.UNKNOWN, source.tamper)
+        self.assertEqual("stream_history_exhausted", source.tamper_reason)
+
+    def test_loss_timestamped_before_history_exhaustion_still_correlates(self):
+        harness = self._exhausted_after_shift(loss_before_exhaustion=True)
+        self.assertEqual([CriticalKind.CAMERA_TAMPER], harness.recorder.kinds())
+        self.assertEqual("source_loss_after_scene_shift", harness.recorder.items[0].reason)
+
+    def test_pending_sample_of_a_retired_producer_is_discarded(self):
+        # Codex P2 (#213): B replaces A inside the sampling interval while an
+        # A sample is pending; the A sample never completes a confirmation.
+        harness = Harness(binding(OTHER, SourceType.REMOTE_AGENT))
+        harness.runtime.start()
+        first, second = uuid4(), uuid4()
+
+        def offer(stream, luma, advance=INTERVAL):
+            harness.clock.value += advance
+            return harness.runtime.offer_luma(OTHER, stream_id=stream, width=WIDTH,
+                                              height=HEIGHT, pixels=luma)
+
+        for luma in (pixels(), pixels(), MOVED):
+            self.assertTrue(offer(first, luma))
+            harness.runtime.step()
+        evaluated = harness.source(OTHER).evaluated
+        self.assertTrue(offer(first, MOVED))
+        # Inside the interval: sampled out, but it retires A.
+        self.assertFalse(offer(second, pixels(), advance=1))
+        harness.runtime.step()
+        source = harness.source(OTHER)
+        self.assertEqual([], harness.recorder.items)
+        self.assertEqual(evaluated, source.evaluated)
+        self.assertEqual(1, source.stale_rejected)
+        self.assertEqual(1, source.sampled_out)
+        self.assertIsNone(harness.runtime._slots[OTHER].sample)
+
+    def test_sample_pending_before_a_calibration_refresh_is_discarded(self):
+        # Codex P2 (#213): a frame captured before the refresh request never
+        # becomes a temporal-confirmation sample of the refreshed detector.
+        harness = Harness()
+        harness.runtime.start()
+        harness.frame()
+        harness.frame()
+        harness.frame(MOVED)
+        harness.clock.value += INTERVAL
+        harness.runtime.on_uvc_frame(SOURCE, VideoFrame(yuyv(MOVED), 99, 0.0))
+        harness.runtime.request_calibration_refresh()
+        self.assertTrue(harness.source().refresh_pending)
+        harness.runtime.step()
+        source = harness.source()
+        self.assertFalse(source.refresh_pending)
+        self.assertEqual(1, source.refresh_discarded)
+        self.assertEqual("awaiting_sample", source.reason)
+        harness.frame(MOVED)
+        self.assertEqual([], harness.recorder.items)
+        # Frames after the refresh still confirm against the new calibration
+        # (the discarded sample left a sequence gap: quality recovers first).
+        for _ in range(4):
+            harness.frame(MOVED)
+        self.assertEqual([CriticalKind.SERVER_MOVEMENT], harness.recorder.kinds())
+
+    def test_refresh_deferred_by_sustained_losses_is_reported_pending(self):
+        harness = Harness()
+        harness.runtime.start()
+        harness.frame()
+        harness.runtime.request_calibration_refresh()
+        for _ in range(3):
+            harness.clock.value += 1
+            harness.runtime.source_unavailable(SOURCE, trusted=False)
+            harness.runtime.step()
+            self.assertTrue(harness.source().refresh_pending)
+        harness.runtime.step()
+        self.assertFalse(harness.source().refresh_pending)
+        self.assertEqual("awaiting_sample", harness.source().reason)
 
 
 class SyntheticYuyvCapture:

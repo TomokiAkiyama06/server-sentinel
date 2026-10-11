@@ -298,8 +298,17 @@ class SceneSourceStatus:
     backpressured: int
     failures: int
     # Decoded samples refused because their producer stream was already
-    # replaced (stale imagery) or the retired-stream history is full.
+    # replaced (stale imagery) or the retired-stream history is full, and
+    # pending samples discarded because their producer stream was retired
+    # (or found stale at history exhaustion) before they were evaluated.
     stale_rejected: int = 0
+    # Pending samples captured before a calibration refresh request, discarded
+    # instead of becoming the first sample of the refreshed detector.
+    refresh_discarded: int = 0
+    # A calibration refresh was requested and has not run yet. It is deferred
+    # while a camera loss is still to be handed to the current detector, so
+    # under sustained losses it can stay pending; this makes that visible.
+    refresh_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -335,6 +344,8 @@ class _Sample:
     data: object
     width: int | None = None
     height: int | None = None
+    # The producer stream the sample came from (None for local UVC capture).
+    producer: UUID | None = None
 
 
 @dataclass
@@ -361,6 +372,9 @@ class _Slot:
     last_uvc_sequence: int | None = None
     retired_producers: set = field(default_factory=set)
     history_exhausted: bool = False
+    # When the history was exhausted: a camera loss timestamped at or after
+    # it is handed to the detector as untrusted (Owner decision 2026-10-11).
+    exhausted_ns: int | None = None
     accepted: int = 0
     sampled_out: int = 0
     replaced: int = 0
@@ -387,6 +401,7 @@ class _Published:
     unusable: int = 0
     backpressured: int = 0
     failures: int = 0
+    refresh_discarded: int = 0
 
 
 class _Context:
@@ -399,6 +414,10 @@ class _Context:
         self.movement_gate = self.tamper_gate = None
         self.resolved_ns = None
         self.refresh = True
+        # Monotonic time of the latest refresh request: a pending sample
+        # captured at or before it is never evaluated by the refreshed
+        # detector (it may show the scene before the new calibration).
+        self.refresh_ns = None
         # A trusted or untrusted loss that could not be handed to the detector
         # because critical staging had no room. It is kept (not converted to
         # a failure) until staging drains, so a loss correlated with a scene
@@ -630,8 +649,11 @@ class SceneMonitoringRuntime:
             if self._state is not SceneRuntimeState.CONFIGURED:
                 raise RuntimeError("scene monitoring runtime cannot be restarted")
             if self._deps.recorder is None:
-                # Confirmed evidence would have nowhere durable to go.
+                # Confirmed evidence would have nowhere durable to go. The
+                # caller reports this result (the app logs it from the
+                # returned state), so `status()` does not log it again.
                 self._state = SceneRuntimeState.UNAVAILABLE
+                self._unavailable_logged = True
                 for published in self._published.values():
                     published.reason = "critical_recorder_unavailable"
                 return self._status_locked()
@@ -672,7 +694,10 @@ class SceneMonitoringRuntime:
 
         A worker or recorder call still running after its bound is reported
         as `STOP_FAILED` (with `critical_in_flight`), never waited on; the
-        delivery thread then starts no further recorder call.
+        delivery thread then starts no further recorder call. A delivery
+        thread that had already died before `stop()` has no call in flight,
+        so the runtime ends `STOPPED`; whatever it left staged stays counted
+        in `critical_pending` and `scene_critical_undelivered` is logged.
         """
         with self._lock:
             self._accepting = False
@@ -735,10 +760,12 @@ class SceneMonitoringRuntime:
 
     def request_calibration_refresh(self, source_id: UUID | None = None) -> None:
         """Re-resolve calibration on the worker (after an Owner save, #10)."""
+        now = self._deps.monotonic_ns()
         with self._lock:
             for key, context in self._contexts.items():
                 if source_id is None or key == source_id:
                     context.refresh = True
+                    context.refresh_ns = now
             self._wake.notify_all()
 
     # -- capture-side producers (never block, never raise) ---------------
@@ -793,6 +820,13 @@ class SceneMonitoringRuntime:
                 slot.last_uvc_sequence = None
                 if not self._accepting:
                     return
+                if slot.exhausted_ns is not None and now >= slot.exhausted_ns:
+                    # After history exhaustion the detector never sees the
+                    # refused stream restart, so its scene-shift state may be
+                    # from a stream it can no longer place: a later loss only
+                    # ends confirmation, never confirms tamper. A loss
+                    # timestamped before exhaustion keeps its trust.
+                    trusted = False
                 # Keep the first trusted loss since the last worker pass.
                 if slot.loss is None or trusted and not slot.loss.trusted:
                     slot.loss = _Loss(now, observed_at, trusted)
@@ -843,10 +877,11 @@ class SceneMonitoringRuntime:
             # The arrival of a replacement also means the current stream is
             # stale: its pending sample is dropped and nothing more of this
             # source is admitted until the runtime is restarted.
-            slot.history_exhausted = True
+            slot.history_exhausted, slot.exhausted_ns = True, now
             slot.stale_rejected += 1
             if slot.sample is not None:
                 slot.sample.data, slot.sample = None, None
+                slot.stale_rejected += 1
             return False
         # The stream transition is recorded before the sampling decision: a
         # replacement stream's first frame retires the old stream even when
@@ -854,6 +889,13 @@ class SceneMonitoringRuntime:
         # refused afterwards instead of being accepted as continuous.
         if replacing and slot.minted_for is not None:
             slot.retired_producers.add(slot.minted_for)
+            if slot.sample is not None and slot.sample.producer in slot.retired_producers:
+                # A sample of the stream just replaced, still pending (worker
+                # slow): stale imagery that must not complete a temporal
+                # confirmation after the switch, even when the replacement's
+                # first frame is itself sampled out.
+                slot.sample.data, slot.sample = None, None
+                slot.stale_rejected += 1
         if slot.new_stream or replacing:
             # Runtime-minted stream identity, never a calibration reference
             # stream, so a producer cannot resume a pre-calibration sequence.
@@ -870,7 +912,8 @@ class SceneMonitoringRuntime:
         slot.sequence += 1
         slot.last_accepted_ns = now
         slot.accepted += 1
-        slot.sample = _Sample(slot.stream_id, slot.sequence, now, observed_at, data, width, height)
+        slot.sample = _Sample(slot.stream_id, slot.sequence, now, observed_at, data, width, height,
+                              producer_stream)
         self._wake.notify_all()
         return True
 
@@ -972,9 +1015,19 @@ class SceneMonitoringRuntime:
                 # shift state, so it waits until a held loss and a loss just
                 # taken from the slot are processed (the next pass at the
                 # latest for the latter).
+                # Under sustained losses it can stay deferred; `status()`
+                # reports it as `refresh_pending`.
                 refresh = context.refresh and context.held_loss is None and loss is None
                 if refresh:
                     context.refresh = False
+                    if (sample is not None and context.refresh_ns is not None
+                            and sample.monotonic_ns <= context.refresh_ns):
+                        # Captured before the refresh request: it may show
+                        # the scene before the new calibration, so it never
+                        # becomes a temporal-confirmation sample of the
+                        # refreshed detector.
+                        sample.data, sample = None, None
+                        self._target_locked(source_id).refresh_discarded += 1
             context.unprocessed_loss = loss
             try:
                 if refresh or context.detector is None and (
@@ -1243,7 +1296,7 @@ class SceneMonitoringRuntime:
             lost = "worker_unavailable" if not worker_running else "delivery_unavailable"
         sources = []
         for source_id, slot in self._slots.items():
-            published = self._published[source_id]
+            published, context = self._published[source_id], self._contexts[source_id]
             movement, tamper = published.movement, published.tamper
             movement_reason, tamper_reason = published.movement_reason, published.tamper_reason
             stale = (published.evaluated_ns is None or published.maximum_gap_ns is None
@@ -1279,7 +1332,10 @@ class SceneMonitoringRuntime:
                 movement, tamper, movement_reason, tamper_reason,
                 published.calibration_version, slot.accepted, slot.sampled_out, slot.replaced,
                 published.evaluated, published.unusable, published.backpressured,
-                published.failures, slot.stale_rejected,
+                published.failures, slot.stale_rejected, published.refresh_discarded,
+                # An explicitly requested refresh not yet run (the initial
+                # bind is not a request).
+                context.refresh and context.refresh_ns is not None,
             ))
         # A reference read of worker-owned state; a snapshot, never a decision.
         held = sum(context.held_loss is not None for context in self._contexts.values())
