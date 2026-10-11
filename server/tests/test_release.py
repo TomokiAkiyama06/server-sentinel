@@ -54,6 +54,12 @@ class Runner:
         # a value (exit 0), an ``(exit code, output)`` pair, or an exception.
         # By default no unit file and not running.
         self.socket_state = {"LoadState": "not-found", "ActiveState": "inactive"}
+        # Releases whose own ``--check`` predates ``invitation_lifetime_hours``
+        # and refuses it as an unknown key (PR #234).
+        self.lifetime_unaware = set()
+        # Release name -> exception its own ``--check`` raises before it can
+        # decide anything (a missing interpreter, a timeout).
+        self.check_unrunnable = {}
 
     def _check_foreign_account_access(self, options) -> None:
         if options.get("user") is None:
@@ -87,6 +93,12 @@ class Runner:
                 raise value
             code, output = value if isinstance(value, tuple) else (0, value + "\n")
             return SimpleNamespace(returncode=code, stdout=output)
+        if "--check" in arguments and Path(options["cwd"]).name in self.check_unrunnable:
+            raise self.check_unrunnable[Path(options["cwd"]).name]
+        if "--check" in arguments and Path(options["cwd"]).name in self.lifetime_unaware:
+            config = Path(arguments[arguments.index("--config") + 1])
+            if "invitation_lifetime_hours" in json.loads(config.read_text()):
+                raise subprocess.CalledProcessError(1, arguments)
         if arguments[:2] == ["systemctl", "restart"] and self.fail_version:
             current = os.readlink(self.root / "current")
             if current == "releases/" + self.fail_version:
@@ -599,6 +611,123 @@ class ReleaseLifecycleTests(unittest.TestCase):
         release = self.installation / "releases/1.0.0"
         self.assertEqual(release.stat().st_mode & 0o777, 0o755)
         self.assertEqual((self.installation / "releases").stat().st_mode & 0o777, 0o755)
+
+    def test_invitation_lifetime_hours_is_optional_and_validated(self):
+        # Owner decision 2026-10-11 (PR #234): default 24 hours, whole hours
+        # from 1 to 168 (7 days), anything else refuses the configuration.
+        code_root = self.root / "code"
+        code_root.mkdir()
+        base = json.loads(self.config.read_text())
+
+        def load(**extra):
+            self.config.write_text(json.dumps({**base, **extra}))
+            with patch("app.deployment.ADMINISTRATOR_UID", self.uid), patch(
+                    "app.deployment._approved_filesystem_device",
+                    side_effect=self.approved_device_lookup()), patch(
+                    "app.deployment.os.path.ismount", return_value=True), patch(
+                    "app.deployment._operating_system_root_device",
+                    return_value=self.runtime.stat().st_dev + 1):
+                return Deployment.load(self.config, code_root=code_root)
+
+        self.assertEqual(load().settings.invitation_lifetime.total_seconds(), 24 * 3600)
+        self.assertEqual(load(invitation_lifetime_hours=1).settings.invitation_lifetime.total_seconds(), 3600)
+        self.assertEqual(load(invitation_lifetime_hours=168).settings.invitation_lifetime.total_seconds(),
+                         168 * 3600)
+        for value in (0, 169, -1, 24.0, "24", True, None):
+            with self.subTest(value=value), self.assertRaises(ConfigurationError) as refused:
+                load(invitation_lifetime_hours=value)
+            self.assertNotIn(repr(value), str(refused.exception))
+
+    def test_rollback_runs_the_target_release_check_and_refuses_before_any_change(self):
+        # Review of PR #234: a rollback target from before
+        # ``invitation_lifetime_hours`` refuses it as an unknown key, so the
+        # rollback runs that release's own --check first, like update does.
+        self.perform(self.arguments("install", "1.0.0"))
+        self.perform(self.arguments("update", "1.1.0"))
+        self.runner.lifetime_unaware.add("1.0.0")
+        base = json.loads(self.config.read_text())
+        self.config.write_text(json.dumps({**base, "invitation_lifetime_hours": 73}))
+        state = (os.readlink(self.installation / "current"),
+                 os.readlink(self.installation / "previous"), self.unit.read_text())
+        restarts = len([c for c, _ in self.runner.calls if c[:2] == ["systemctl", "restart"]])
+        reloads = self.daemon_reloads()
+        for version in (None, "1.0.0"):
+            with self.subTest(version=version), self.assertRaises(
+                    install.ActivationBoundaryRefused) as refused, patch(
+                    "install._replace_unit", wraps=install._replace_unit) as replace_unit:
+                self.perform(self.arguments("rollback", version))
+            # Refused before the unit file is touched or systemd reloaded
+            # (review of PR #234: a check after ``_replace_unit`` would
+            # write the unit and restore it, reloading twice).
+            replace_unit.assert_not_called()
+            self.assertEqual(reloads, self.daemon_reloads())
+            message = str(refused.exception)
+            for phrase in ("before any change", "releases/1.0.0", "\"invitation_lifetime_hours\"",
+                           str(self.config), "remove every setting that release predates",
+                           "rerun the same command (rollback"):
+                self.assertIn(phrase, message)
+            self.assertNotIn("73", message.replace(str(self.config), ""))  # value-free
+            self.assertEqual(state, (os.readlink(self.installation / "current"),
+                                     os.readlink(self.installation / "previous"),
+                                     self.unit.read_text()))
+        self.assertEqual(restarts, len([c for c, _ in self.runner.calls
+                                        if c[:2] == ["systemctl", "restart"]]))
+        checks = [(arguments, options) for arguments, options in self.runner.calls
+                  if "--check" in arguments
+                  and Path(options["cwd"]) == self.installation / "releases/1.0.0"]
+        self.assertTrue(checks)
+        for arguments, options in checks:
+            self.assertEqual(arguments[0], str(self.installation / "releases/1.0.0/venv/bin/python"))
+            self.assertEqual((options["user"], options["extra_groups"]), (self.uid, []))
+        # With the key removed, the same rollback proceeds.
+        self.config.write_text(json.dumps(base))
+        self.perform(self.arguments("rollback"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+
+    def daemon_reloads(self):
+        return len([c for c, _ in self.runner.calls if c[:2] == ["systemctl", "daemon-reload"]])
+
+    def test_a_target_check_that_could_not_run_is_refused_with_its_own_message(self):
+        # Review of PR #234: a check that could not run or did not finish
+        # says nothing about the configuration, so it is not reported as the
+        # release rejecting it (and the remove-the-setting steps do not apply).
+        self.perform(self.arguments("install", "1.0.0"))
+        self.perform(self.arguments("update", "1.1.0"))
+        base = json.loads(self.config.read_text())
+        self.config.write_text(json.dumps({**base, "invitation_lifetime_hours": 73}))
+        state = (os.readlink(self.installation / "current"),
+                 os.readlink(self.installation / "previous"), self.unit.read_text())
+        reloads = self.daemon_reloads()
+        python = self.installation / "releases/1.0.0/venv/bin/python"
+        for failure in (subprocess.TimeoutExpired(["python"], 30),
+                        FileNotFoundError(2, "No such file or directory"),
+                        PermissionError(13, "Permission denied")):
+            self.runner.check_unrunnable["1.0.0"] = failure
+            with self.subTest(failure=type(failure).__name__), self.assertRaises(
+                    install.ActivationBoundaryRefused) as refused, patch(
+                    "install._replace_unit", wraps=install._replace_unit) as replace_unit:
+                self.perform(self.arguments("rollback", "1.0.0"))
+            message = str(refused.exception)
+            for phrase in ("before any change", "releases/1.0.0", "could not be run or did not",
+                           str(python), "rerun the same command (rollback --version 1.0.0)"):
+                self.assertIn(phrase, message)
+            for phrase in ("refused the current deployment configuration", "invitation_lifetime_hours",
+                           "remove every setting"):
+                self.assertNotIn(phrase, message)
+            self.assertNotIn("73", message.replace(str(self.config), "").replace(str(python), ""))
+            replace_unit.assert_not_called()
+            self.assertEqual(reloads, self.daemon_reloads())
+            self.assertEqual(state, (os.readlink(self.installation / "current"),
+                                     os.readlink(self.installation / "previous"),
+                                     self.unit.read_text()))
+        # A check that runs and rejects the configuration keeps the
+        # configuration-specific message.
+        del self.runner.check_unrunnable["1.0.0"]
+        self.runner.lifetime_unaware.add("1.0.0")
+        with self.assertRaises(install.ActivationBoundaryRefused) as refused:
+            self.perform(self.arguments("rollback", "1.0.0"))
+        self.assertIn("refused the current deployment configuration", str(refused.exception))
+        self.assertNotIn("could not be run", str(refused.exception))
 
     def test_single_path_directives_are_rendered_without_command_line_quoting(self):
         account = pwd.getpwuid(self.uid)
@@ -1507,6 +1636,28 @@ class CaptureCaSettingBoundaryTests(unittest.TestCase):
         self.configure(present=True)
         self.perform(self.arguments("rollback", "1.1.0"))
         self.assertEqual("releases/1.1.0", os.readlink(self.installation / "current"))
+
+    def test_the_capture_ca_refusal_comes_before_the_target_release_check(self):
+        # Review of PR #234: a rollback target that both predates
+        # ``capture_ca_directory`` and would reject the configuration in its
+        # own check gets the cause-specific capture-CA refusal first, and
+        # that check never runs.
+        self.legacy_versions.add("1.0.0")
+        self.configure(present=False)
+        self.perform(self.arguments("install", "1.0.0"))
+        self.configure(present=True)
+        self.perform(self.arguments("update", "1.1.0"))
+        value = json.loads(self.config.read_text())
+        self.config.write_text(json.dumps({**value, "invitation_lifetime_hours": 48}))
+        self.runner.lifetime_unaware.add("1.0.0")
+        checks = len([call for call, options in self.runner.calls
+                      if "--check" in call and Path(options["cwd"]).name == "1.0.0"])
+        message = self.refused(self.arguments("rollback"), "predates the \"capture_ca_directory\"",
+                               "remove the \"capture_ca_directory\" entry")
+        self.assertNotIn("refused the current deployment configuration", message)
+        self.assertEqual(checks, len([call for call, options in self.runner.calls
+                                      if "--check" in call and Path(options["cwd"]).name == "1.0.0"]),
+                         "the target release's own --check never ran")
 
     def test_update_to_a_legacy_artifact_with_the_key_is_refused_before_its_check(self):
         self.perform(self.arguments("install", "1.0.0"))

@@ -1571,6 +1571,73 @@ roaming authenticators):
   still sign in on any device that holds it until the Owner revokes that
   credential.
 
+### Issue #10 phase 2 S2 console bootstrap, redemption and recovery (pending)
+
+Verified only with the synthetic ASGI driver, software authenticators and a
+pseudo-terminal (`server/tests/test_invitation_redemption.py`,
+`server/tests/test_bootstrap_cli.py`, `tests/e2e/test_access_matrix_scenarios.py`);
+no real terminal session, browser, Tailscale Serve or authenticator has
+exercised them, and no production entry point mounts the human routes yet.
+Once a deployment can enable them, on the Main Server with a synthetic
+`*.invalid` Owner name:
+
+- [ ] over SSH, run `bootstrap` as the service account
+  (`server/docs/DEPLOYMENT.md`, "Owner bootstrap and recovery"); confirm the
+  code appears only on that terminal, not in stdout redirected to a file,
+  journald, the application log, the audit log or the shell history, and
+  that the audit log holds `invite_principal` and
+  `issue_principal_invitation` with the Owner's logical UUID only;
+- [ ] run it again with stdin/stdout redirected and from a context without a
+  controlling terminal (for example `systemd-run` or `cron`): it refuses with
+  `controlling_terminal_required` and changes nothing; run it as root: it
+  refuses with `run_as_service_account`; run `bootstrap` a second time: it
+  refuses with `owner_already_configured`; set
+  `"invitation_lifetime_hours": 2` and confirm the console code's expiry is two
+  hours after issuance;
+- [ ] in a real browser at the reserved `https` origin, enter the console
+  code once, register a passkey (user verification is prompted), and
+  confirm the registration response is `204` with no cookie and no application
+  data, that the code is in no URL, browser history entry or server log, and
+  that the Owner then signs in and `GET /api/session` reports `owner`;
+- [ ] enter the same code again, a mistyped code, and a code after its
+  lifetime (24 hours, or the deployment's `invitation_lifetime_hours`): each is
+  the generic denial, identical to an uninvited caller's;
+- [ ] issue a code, set the Main Server's wall clock back by two hours, enter
+  the code while the clock is still set back: it is the generic denial (clock
+  rollback on the same boot); only then restore the clock. Issue another code,
+  reboot the host and redeem it within its lifetime: it works (the wall clock
+  decides after a reboot);
+- [ ] issue a code, lower `"invitation_lifetime_hours"` and restart the
+  service: the code already issued keeps its original expiry (intended);
+- [ ] with the optional `"invitation_lifetime_hours"` set, run `rollback` to an
+  installed release that predates the key: the installer refuses before any
+  change, naming no configuration value, and `current`, `previous` and the
+  unit are unchanged; remove the key and the same `rollback` proceeds;
+- [ ] submit a few wrong codes and confirm the application log holds
+  `invitation_redemption_refused` (first refusal, then at 2, 4, 8, ...) with no
+  code, identity or reason;
+- [ ] submit a dozen wrong codes quickly from one browser: after the burst of
+  5 they are refused before the server does any work (one value-free
+  `human_request_rate_limited` log event), a correct code is refused too until
+  12 seconds pass, and sign-in for another person keeps working meanwhile;
+  record that people sharing one Tailscale login share this limit, and that
+  another Tailscale login's redemption is not slowed (no global redemption
+  bucket);
+- [ ] in two browsers, open the registration with the same valid code and
+  finish both at once: exactly one credential is registered and the other
+  gets the generic denial;
+- [ ] with a deployment that requires device-bound credentials, try a synced
+  passkey: the fixed `device_bound_credential_required` response appears, the
+  code stays usable, and a device-bound authenticator then registers;
+- [ ] run `recover` while the Owner and an invitee are signed in and an
+  invitation is pending: both sessions end on their next request, the pending
+  invitation and the old Owner passkey (on every synced device) no longer
+  work, the new console code registers a replacement Owner passkey (on the
+  same synced authenticator that held the revoked one, which must not refuse
+  it as already registered), and the audit log holds `invalidate_human_sessions`, `revoke_principal_credential`
+  and `issue_principal_invitation`; recordings and capture nodes are
+  unchanged.
+
 ### Uninvited ordinary Tailnet member
 
 - [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;

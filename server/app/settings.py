@@ -1,10 +1,35 @@
 """Explicit deployment settings, with value-free validation errors."""
 
 from dataclasses import InitVar, dataclass, field
+from datetime import timedelta
 from ipaddress import ip_address
 import os
 from pathlib import Path
 from typing import Mapping
+
+
+# Invitation code lifetime (Owner decisions D5 and 2026-10-11): a deployment
+# setting, default 24 hours, at most 7 days, in whole hours from 1. Defined
+# here (standard library only) so the standalone installer, which bundles
+# this module, validates the key too; ``app.auth.invitation_code`` re-exports.
+INVITATION_LIFETIME = timedelta(hours=24)
+MAX_INVITATION_LIFETIME = timedelta(days=7)
+
+
+def invitation_lifetime(hours: object) -> timedelta:
+    """The validated deployment invitation lifetime for a whole number of hours.
+
+    ``1`` to ``168`` (7 days); anything else (a bool, a float, a string, out of
+    range) raises ``ValueError`` with a fixed message that carries no value.
+    """
+    if type(hours) is not int or not 1 <= hours <= MAX_INVITATION_LIFETIME // timedelta(hours=1):
+        raise ValueError("invitation lifetime is invalid")
+    return timedelta(hours=hours)
+
+
+def valid_invitation_lifetime(value: object) -> bool:
+    """Whether ``value`` is a usable lifetime: a ``timedelta`` in (0, 7 days]."""
+    return isinstance(value, timedelta) and timedelta(0) < value <= MAX_INVITATION_LIFETIME
 
 
 class ConfigurationError(ValueError):
@@ -25,6 +50,10 @@ class Settings:
     human_host: str = "127.0.0.1"
     human_port: int = 8000
     log_level: str = "INFO"
+    # Owner decision 2026-10-11: how long an invitation code stays valid,
+    # default 24 hours, at most 7 days (deployment key
+    # ``invitation_lifetime_hours``, whole hours 1-168).
+    invitation_lifetime: timedelta = INVITATION_LIFETIME
     source_root: InitVar[Path | None] = None
 
     def __post_init__(self, source_root: Path | None) -> None:
@@ -49,6 +78,8 @@ class Settings:
             raise ConfigurationError("human_port must be an integer from 1 to 65535")
         if not isinstance(self.log_level, str) or self.log_level not in {"INFO", "WARNING", "ERROR"}:
             raise ConfigurationError("log_level must be INFO, WARNING or ERROR")
+        if not valid_invitation_lifetime(self.invitation_lifetime):
+            raise ConfigurationError("invitation_lifetime_hours must be an integer from 1 to 168")
 
     @property
     def database_path(self) -> Path:

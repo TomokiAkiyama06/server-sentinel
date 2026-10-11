@@ -796,6 +796,68 @@ def _place_pairing_wrapper(root: Path, existing: bytes | None) -> bool:
     return existing is None
 
 
+def _run_release_check(args, release: Path, account: pwd.struct_passwd, runner) -> None:
+    """Run ``release``'s own deployment check against the current configuration.
+
+    It runs as the dedicated account with the release's own interpreter and
+    code, so it validates the configuration exactly as that release's
+    ``ExecStartPre`` would. A failure raises ``CalledProcessError``.
+    """
+    runner([
+        str(release / "venv/bin/python"), "-m", "app.deployment", "--config",
+        str(args.config), "--check",
+    ], check=True, timeout=30, user=account.pw_uid, group=account.pw_gid,
+       extra_groups=[], cwd=str(release), env={"PYTHONDONTWRITEBYTECODE": "1"},
+       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _require_release_accepts_configuration(args, release: Path, target: str,
+                                           account: pwd.struct_passwd, runner) -> None:
+    """Refuse, before anything changes, a rollback whose release rejects the configuration.
+
+    Update runs the staged release's own ``--check`` before switching; a
+    rollback switches to an already installed release, which may predate a
+    key the current configuration uses (for example the optional
+    ``invitation_lifetime_hours``, PR #234) and would then refuse to start.
+    Run that release's own check first. A check that could not run or did
+    not finish (a missing interpreter, a timeout) is refused with its own
+    message: it says nothing about the configuration, so the steps differ.
+    Neither message names a configuration value; the installer never
+    rewrites the administrator configuration.
+    """
+    rerun = "rollback" + (f" --version {args.version}" if args.version else "")
+    try:
+        _run_release_check(args, release, account, runner)
+    except subprocess.CalledProcessError:
+        pass
+    except (OSError, subprocess.SubprocessError):
+        raise ActivationBoundaryRefused(
+            "ServerSentinel release operation refused before any change: the own check of\n"
+            f"release {target} (python -m app.deployment --check) could not be run or did not\n"
+            "finish, so whether that release accepts the current deployment configuration is\n"
+            "unknown.\n"
+            "As the Owner:\n"
+            f"  1. confirm that {release / 'venv/bin/python'} exists and that the host is not\n"
+            "     overloaded\n"
+            f"  2. rerun the same command ({rerun})\n") from None
+    else:
+        return
+    raise ActivationBoundaryRefused(
+        "ServerSentinel release operation refused before any change: release "
+        f"{target} refused the current deployment configuration in its own check\n"
+        "(python -m app.deployment --check), so it could not start with it.\n"
+        "A common cause is a setting added after that release, which it refuses as an\n"
+        "unknown key, such as the optional \"invitation_lifetime_hours\".\n"
+        "To switch to it, as the Owner, in this order:\n"
+        f"  1. edit {args.config}: remove every setting that release predates (for\n"
+        "     \"invitation_lifetime_hours\" the default of 24 hours then applies; note\n"
+        "     the value)\n"
+        f"  2. rerun the same command ({rerun})\n"
+        "To return later to a release that has the setting: run update or rollback\n"
+        f"first, then add the entry back to {args.config} and restart the service\n"
+        "(server/docs/DEPLOYMENT.md, Install, update, and rollback).\n")
+
+
 def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
            render) -> tuple[str, str]:
     if not VERSION.fullmatch(args.version):
@@ -832,12 +894,7 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
                 "--require-hashes", "--only-binary=:all:", "--no-deps", "--no-cache-dir",
                 "--find-links", str(staging / "wheels"), "-r", str(staging / "requirements.lock"),
             ], check=True, timeout=300, cwd="/", env=root_environment)
-            runner([
-                str(staging / "venv/bin/python"), "-m", "app.deployment", "--config",
-                str(args.config), "--check",
-            ], check=True, timeout=30, user=account.pw_uid, group=account.pw_gid,
-               extra_groups=[], cwd=str(staging), env={"PYTHONDONTWRITEBYTECODE": "1"},
-               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _run_release_check(args, staging, account, runner)
             _replace_unit(staging / ".server-sentinel.service", unit_content, mode=0o444)
             staging.rename(final)
         except Exception:
@@ -1030,6 +1087,10 @@ def _execute_locked(args, runner) -> None:
             # A snapshot naming the socket would pull it back in on every
             # start of a release that cannot accept it.
             raise ValueError("installed service configuration differs")
+        # Like update's staging check: the target release validates the
+        # configuration itself, after the refusals above that name the cause.
+        _require_release_accepts_configuration(args, args.destination / target, target,
+                                               account, runner)
         restored = False
 
         def restore_unit() -> None:

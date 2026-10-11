@@ -32,6 +32,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from app import local_admin
 from app.cameras.remote_agent import issuer_process, node_ca, pairing_cli
 from app.cameras.remote_agent.enrollment import (
     ENROLLMENT_ALPN, EnrollmentConfigurationError, EnrollmentLimits, EnrollmentListener,
@@ -1143,7 +1144,7 @@ class PinnedDatabaseTests(ListenerLifecycleHarness):
             owner = pairing_cli.LocalConsoleOwner()
             grant = object()
             owner._grants.append(grant)
-            with patch.object(pairing_cli.sqlite3, "connect", swapping_connect):
+            with patch.object(sqlite3, "connect", swapping_connect):
                 with self.assertRaises(pairing_cli.PairingError):
                     ledger.revoke(owner, grant, node_id=uuid4())
             self.assertTrue(ledger.database.rejected)
@@ -1252,11 +1253,11 @@ class PinnedLedgerDescriptorTests(ListenerLifecycleHarness):
         database = existing_database(self.root)
         substitute = existing_database(self.root)
         opened_elsewhere = sqlite3.connect(
-            substitute, isolation_level=None, factory=pairing_cli._VerifiedConnection)
+            substitute, isolation_level=None, factory=local_admin._VerifiedConnection)
         self.addCleanup(opened_elsewhere.close)
         opened_elsewhere.execute("SELECT count(*) FROM sqlite_master").fetchone()
         with pairing_cli._ledger(database) as ledger:
-            with patch.object(pairing_cli.sqlite3, "connect", lambda *args, **kwargs: opened_elsewhere):
+            with patch.object(sqlite3, "connect", lambda *args, **kwargs: opened_elsewhere):
                 with self.assertRaises(sqlite3.DatabaseError):
                     ledger.database.connect()
             self.assertTrue(ledger.database.rejected)
@@ -1270,7 +1271,7 @@ class PinnedLedgerDescriptorTests(ListenerLifecycleHarness):
         database = existing_database(self.root)
         substitute = existing_database(self.root)
         opened_elsewhere = sqlite3.connect(
-            substitute, isolation_level=None, factory=pairing_cli._VerifiedConnection)
+            substitute, isolation_level=None, factory=local_admin._VerifiedConnection)
         self.addCleanup(opened_elsewhere.close)
         opened_elsewhere.execute("SELECT count(*) FROM sqlite_master").fetchone()
         with pairing_cli._ledger(database) as ledger:
@@ -1283,7 +1284,7 @@ class PinnedLedgerDescriptorTests(ListenerLifecycleHarness):
             self.assertEqual(ledger.database._identity, identity)
             self.assertNotEqual(ledger.database._descriptor, duplicate)
             self.assertIn(duplicate, held_descriptors())
-            with patch.object(pairing_cli.sqlite3, "connect", lambda *args, **kwargs: opened_elsewhere):
+            with patch.object(sqlite3, "connect", lambda *args, **kwargs: opened_elsewhere):
                 with self.assertRaises(sqlite3.DatabaseError):
                     ledger.database.connect()
             self.assertTrue(ledger.database.rejected)

@@ -1797,6 +1797,33 @@ the same generic response as an uninvited person, and logs record the attempt
 without the raw code. Every other human/media route requires a verified
 credential and an active session.
 
+Implementation (Issue #10 phase 2 S2, Owner decisions D4/D5 of 2026-10-11):
+`POST /api/auth/registration/options` (body `{"code"}`) and `POST
+/api/auth/registration` (body `{"code", "credential", "label"?}`, `204` with no
+body and no cookie). A code is 160 CSPRNG bits shown as 32 Crockford base32
+characters in eight groups of four (`XXXX-XXXX-…`), checked by the SHA-256 of
+all 160 bits (found by a separate non-secret lookup key, the digest compared
+with `hmac.compare_digest`) and single use; the server accepts only the exact
+canonical form. Its lifetime is the deployment key `invitation_lifetime_hours`
+(integer 1-168, default 24; Owner decision 2026-10-11). Each invitation also
+records the kernel boot id and `CLOCK_BOOTTIME` at issuance: on the same boot
+it is refused once the monotonic elapsed time reaches the lifetime, when that
+elapsed time is negative, and when the wall clock lags it by more than 30
+seconds (a rollback); after a reboot the wall-clock window decides; a row or
+host without the pair is refused (fail closed). Redemption has its own
+per-source limiter keyed by the verified proxy identity (burst 5, one per 12
+seconds) and no global bucket (Owner decision 2026-10-11), charged before the
+body is parsed or any lock is taken, on top of the per-code bound of 5
+attempts. A refusal after the limiter is counted value-free
+(`invitation_redemption_refused` logged on the first and each doubling).
+Every refusal is the generic `404`; the only other answer is the fixed `409
+{"detail":"device_bound_credential_required"}`, decided inside the
+redemption transaction only after the invitation proved valid and bound to
+the consumed challenge, under a device-bound deployment policy. The local
+bootstrap/recovery command is `python -m app.auth.bootstrap_cli
+bootstrap|recover --config <deployment.json>` (`server/app/auth/README.md`,
+`server/docs/DEPLOYMENT.md`).
+
 Unauthorized users get no ServerSentinel deployment metadata, camera names/counts, thumbnails, event details, or recordings. For an uninvited identity, prefer a generic/non-branding denial such as a not-found-style response and do not expose product/version headers, API schema, health details, or other ServerSentinel fingerprints. This does not claim that the underlying Tailscale node/service is network-invisible when Tailnet policy is unchanged.
 
 ### 11.6 Browser-only recording access

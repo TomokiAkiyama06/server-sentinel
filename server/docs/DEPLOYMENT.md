@@ -76,6 +76,9 @@ defaults):
 }
 ```
 
+The optional `"invitation_lifetime_hours"` (an integer from 1 to 168, default
+24) sets the invitation code lifetime; see "Owner bootstrap and recovery".
+
 `capture_ca_directory` is required (Owner decision 2026-10-07, Issue #109):
 it is either the absolute path of the capture-node CA directory on this host
 or an explicit `null` when this host keeps no capture-node CA. A configuration
@@ -840,6 +843,102 @@ afterwards. The full Agent-side procedure and its refusal words are in
 [`agent/pairing/README.md`](../../agent/pairing/README.md); the real-LAN
 checks are MANUAL_TEST §B step 15 (not yet executed on real hosts).
 
+### Owner bootstrap and recovery (Issue #10 phase 2 S2)
+
+The first Owner, and an Owner who lost every passkey, get a single-use
+enrollment code from a local command on the Main Server (ADR-0003). There is
+no bootstrap web page or route: the code is redeemed through the ordinary
+invitation redemption at the reserved origin. No production entry point
+mounts the human routes yet, so until a deployment can enable them a code
+issued here cannot be redeemed (MANUAL_TEST §J, pending).
+
+Run it **as the service account** that owns the application database, from
+an interactive SSH or console session of an administrator, with the installed
+release's interpreter and that release directory as the working directory
+(there is no wrapper for this command; never run it as root, and never from a
+checkout):
+
+```sh
+cd /opt/server-sentinel-main/current
+sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
+  bootstrap --config /etc/server-sentinel/deployment.json
+# later, only to recover the Owner:
+sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
+  recover --config /etc/server-sentinel/deployment.json
+```
+
+`--config` is the deployment configuration the service runs with. The command
+validates it exactly as the launcher does, takes the database
+(`<runtime_root>/state/state.sqlite3`) and the invitation lifetime from it, and
+refuses unless it runs as the configuration's `service_uid`
+(`deployment_configuration_rejected`, `run_as_service_account`).
+
+Invitation lifetime (Owner decision 2026-10-11): the optional top-level key
+`"invitation_lifetime_hours"` sets how long every invitation code stays valid,
+the console Owner code and (later) Owner-issued invitations alike: an integer
+from `1` to `168` (7 days); absent means `24`. Any other value refuses the
+configuration (the service and `--check` do not start). Each code also
+records the kernel boot id and the monotonic boot clock at issuance: on the
+same boot a code is refused once that much monotonic time has passed, and
+whenever the wall clock is found stepped back since issuance, so setting the
+clock back never extends a code; after a reboot the wall clock decides. A host
+where `/proc/sys/kernel/random/boot_id` or `CLOCK_BOOTTIME` cannot be read
+issues no code (`invitation_clock_unavailable`).
+
+- Each code keeps the expiry computed when it was issued. Lowering
+  `"invitation_lifetime_hours"` later does not shorten codes already issued
+  (intended); it applies to codes issued afterwards. To end a code early, run
+  `recover` (for the Owner) or, with Issue #10 S4, revoke the invitation.
+- The stepped-back check tolerates 30 seconds. When a wall clock that was
+  running fast at issuance is later pulled back by more than 30 seconds (for
+  example by NTP after a boot without time sync), a legitimate code is
+  refused as if the clock had been set back. Issue a new code: `recover` for
+  the Owner, or (Issue #10 S4) a new invitation. Keep time synchronised before
+  issuing codes.
+
+- The command asks on the controlling terminal for the Owner's display name
+  (for `recover`: a new one, or empty to keep it) and for a typed
+  confirmation (`BOOTSTRAP` or `RECOVER`). It takes nothing secret from its
+  arguments or the environment, and refuses without a controlling terminal
+  (`controlling_terminal_required`, for example from a pipe, cron or a unit),
+  as root (`run_as_service_account`), and for a database path that is not the
+  canonical path of the existing database file owned by the running account
+  (`database_path_rejected`, `database_not_found`, `database_rejected`,
+  `database_schema_outdated`/`_unsupported`: it never creates or migrates a
+  database).
+- `bootstrap` works only while no Owner exists (`owner_already_configured`
+  otherwise; use `recover`). `recover` needs an existing Owner
+  (`owner_not_configured`).
+- After the change is committed, the code
+  (`XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`, 160 bits, single use, valid
+  for the configured `"invitation_lifetime_hours"`, 24 hours by default) is written to the controlling terminal only; standard output
+  gets `owner bootstrapped|recovered: principal_id=<uuid>
+  code_expires_at=<UTC time>`. Do not paste the code into a ticket, chat,
+  file or shell history; type it once into the browser at the reserved origin
+  and register a passkey with user verification on an authenticator you
+  control, then sign in.
+- `recover` ends every human session at once (the running service sees it on
+  the next request; no restart is needed), voids every pending invitation
+  (the Owner issues them again after signing in), and revokes every Owner
+  passkey on every device it synced to. Recordings, other people's
+  passkeys and permissions, and capture nodes are kept.
+- A lost or expired code is replaced only by running `recover`; an
+  unredeemed code leaves human access closed for the Owner. Refusals print one
+  fixed word (`... refused: <word>`, exit 2) and change nothing, with one
+  exception: `committed_code_not_shown` means the change was committed but
+  writing the code to the terminal failed, so the code is lost. Run `recover`
+  to issue a replacement (also after `bootstrap`: the Owner now exists, so
+  `bootstrap` refuses with `owner_already_configured`).
+- After a `recover`, once signed in again, review the principals, their
+  permissions and credentials and the security audit log: anyone who held
+  the Owner session before the recovery may have invited people or changed
+  grants (Owner-issued invitations arrive with Issue #10 S4), and `recover`
+  keeps every other principal as it is.
+- The rows written are bounded (one principal or principal update, one
+  invitation, two or three audit records) and do not pass the running
+  service's storage admission; do not run it while the state filesystem is at
+  its hard stop.
+
 ## Install, update, and rollback
 
 **`capture_ca_directory` across update and rollback (Issue #109).**
@@ -875,6 +974,26 @@ running before fails too (Issue #183). Therefore:
   only then start the old release again (`sudo systemctl restart
   server-sentinel.service`). Then fix the cause and repeat the edit and the
   command.
+
+**`invitation_lifetime_hours` across rollback (Issue #10 phase 2 S2, PR
+#234).** The optional key is accepted only by releases that include it; an
+earlier release refuses it as an unknown key and could not start. Before a
+rollback changes anything, the installer runs the target release's own
+deployment check (`python -m app.deployment --check`, as the service account
+with that release's interpreter and code, exactly as `update` does for the
+staged release) and refuses the rollback when that release rejects the current
+configuration. When that check could not run or did not finish (the release's
+interpreter is missing, or the check timed out), the rollback is refused with a
+separate message that says so instead, because nothing is known about the
+configuration then: confirm the release's `venv/bin/python` exists and the host
+is not overloaded, then run the same `rollback` again. Neither refusal names a
+configuration value. Before rolling back
+to a release that predates the key, remove `"invitation_lifetime_hours"` from
+the deployment configuration (note its value), then run the same `rollback`
+again. When returning to a release that has the key, switch first, then add
+the entry back and restart the service (`sudo systemctl restart
+server-sentinel.service`); until then the 24-hour default applies to newly
+issued codes.
 
 Run the separately downloaded installer only after verifying its published
 SHA-256. Global arguments precede the operation:

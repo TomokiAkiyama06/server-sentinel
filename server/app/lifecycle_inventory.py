@@ -98,6 +98,7 @@ from app.cameras.remote_agent.pairing import (_MAX_KEY_BINDINGS_PER_NODE, Pairin
                                               _certificate_pem)
 from app.auth.model import Permission
 from app.auth.reservation_store import HUMAN_SESSIONS_ID, REVOCATION_PENDING_KEY
+from app.auth.boot_clock import valid_boot_id
 from app.auth.store import MAX_REDEMPTION_ATTEMPTS, AccessStore
 from app.cameras.registry.repository import CameraRegistry
 from app.media.recording.store import RecordingStore
@@ -2557,10 +2558,20 @@ def _access_row_errors(connection, tables) -> list:
             issued, expires = row["issued_at_us"], row["expires_at_us"]
             redeemed, revoked = row["redeemed_at_us"], row["revoked_at_us"]
             attempts = row["attempt_count"] if "attempt_count" in keys else 0
+            # PR #234 review: the lookup key and the boot pair of issuance
+            # are absent together (issued before that migration) or all
+            # present and well formed.
+            lookup = row["lookup_key"] if "lookup_key" in keys else None
+            boot_id = row["issued_boot_id"] if "issued_boot_id" in keys else None
+            boottime = row["issued_boottime_us"] if "issued_boottime_us" in keys else None
+            clock_ok = ((lookup is None and boot_id is None and boottime is None)
+                        or (isinstance(lookup, bytes) and len(lookup) == 16
+                            and valid_boot_id(boot_id) and _int(boottime)))
             valid = (_canonical_uuid(row["id"]) and lineage(row)
                      and isinstance(row["secret_digest"], bytes) and len(row["secret_digest"]) == 32
                      and _int(issued) and _int(expires) and issued < expires
                      and _int(attempts, 0, MAX_REDEMPTION_ATTEMPTS)
+                     and clock_ok
                      # Redemption needs an open, unexpired invitation;
                      # revocation only touches unredeemed ones, at the
                      # caller's clock reading with no floor (a wall clock

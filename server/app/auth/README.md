@@ -127,21 +127,19 @@ verifier's `http://localhost` support is not reachable from any human route.
 
 Not implemented yet, and required before routes open in production:
 
-- the remaining HTTP routes: invitation redemption (registration), Owner
-  step-up, and every live, recording, timeline, event and administration
-  route (later Issue #10 phases, #19). Sign-out and the CSRF token exist
-  since phase 2 S1 (below);
-- per-source rate limiting of invitation redemption (the authentication
-  ceremony is limited in phase 1; redemption keeps its per-code bound);
+- the remaining HTTP routes: Owner step-up, and every live, recording,
+  timeline, event and administration route (later Issue #10 phases, #19).
+  Sign-out and the CSRF token exist since phase 2 S1, invitation redemption
+  and the local bootstrap/recovery command since S2 (below);
+- the Owner's invitation route (S4): until then the only runtime issuer of
+  an enrollment code is the local command, which covers the Owner only;
 - the deployment-file key and production composition that build the
   `HostnameReservationCheck` (Serve status source, `SockDiagOwners`,
   `GetaddrinfoResolver`), load the session-binding key with
   `SessionBindingKey.load_or_create(Settings.session_binding_key_path)` and
   pass a `HumanAccess` to `create_app` (no production path builds one yet);
 - delivery of `CredentialFindingSink` and `ReservationFault` to the Owner
-  notification channel;
-- local owner bootstrap and recovery commands (see "Bootstrap and recovery
-  commands and the session gate" below for how they relate to the gate).
+  notification channel.
 
 Owner-only mutations — invitation, invitation issue, grant change, single
 credential revocation and principal revocation — are exposed as `*_on`
@@ -152,8 +150,9 @@ the gate epoch before the Owner authorization and commits inside
 `admit(epoch)` (Owner decision D6, 2026-10-11): while human access is closed,
 or after a close since the epoch, it is a failed operation with its `failed`
 record and changes nothing. An emergency revocation while access is closed is
-done over SSH with the local command (not built yet; see "Bootstrap and
-recovery commands"). The plain wrappers refuse
+done over SSH with a local command (Owner recovery exists since S2, see
+"Bootstrap and recovery commands"; a per-person local revocation command is
+not built yet). The plain wrappers refuse
 with `UnauditedAccessWriteError` unless the store is constructed with
 `unaudited_writes=True` for non-runtime fixtures. Invitation redemption
 (`enroll_credential`) records its own audit row in the redemption transaction
@@ -491,7 +490,7 @@ production path builds one yet. The assumed `tailscale serve status --json`
 shape is unverified against an installed Tailscale; unrecognised keys fail
 closed.
 
-## Human route foundation (Issue #10 phase 1, phase 2 S1)
+## Human route foundation (Issue #10 phase 1, phase 2 S1 and S2)
 
 `human_surface.py` replaces the closed surface only when `create_app` receives a
 `HumanAccess`. Constructing one requires `HumanAccessConfiguration(enabled=True)`,
@@ -507,7 +506,8 @@ Every HTTP request passes, in this order, before any handler runs:
 
 0. the route table (`ROUTES`, Issue #10 phase 2 S1): an exact method, a
    strict path pattern (`fullmatch` on the decoded path, whose raw form must be
-   identical, so a percent-encoded spelling matches nothing) and a strict
+   present and identical, so a percent-encoded spelling matches nothing and an
+   ASGI server that omits `raw_path` matches nothing either, Issue #232) and a strict
    per-route query allowlist (no S1 route accepts any parameter; an unknown,
    repeated, valueless, percent-encoded or over-long parameter, or a query
    longer than 512 bytes, is a denial). An unmatched request still passes the
@@ -541,6 +541,8 @@ OpenAPI or error handler is reachable):
 
 | Route | Credential | Result |
 |---|---|---|
+| `POST /api/auth/registration/options` | none; body `{"code"}` (redemption rate limit) | `PasskeyCeremonies.begin_registration()` creation options |
+| `POST /api/auth/registration` | the invitation code and the registration itself (redemption rate limit) | `204`, no body, no cookie; `409 {"detail":"device_bound_credential_required"}` only as described below |
 | `POST /api/auth/authentication/options` | none (rate-limited) | `PasskeyCeremonies.begin_authentication()` options |
 | `POST /api/auth/authentication` | the assertion itself (rate-limited) | `204`, `Set-Cookie: __Host-session=…; Path=/; Secure; HttpOnly; SameSite=Strict` |
 | `GET /api/session` | session (`SESSION`) | `{"csrf": …, "role": …, "permissions": […]}` of the caller only |
@@ -549,7 +551,7 @@ OpenAPI or error handler is reachable):
 The session route grants nothing and returns only the caller's own role,
 permissions (the Owner holds both) and CSRF token. With sign-out it is the
 only route a session reaches in this phase, so a `live:view`-only or
-`recordings:view`-only person reaches nothing they lack. Bodies are bounded (1 KiB options, 64 KiB assertion), JSON
+`recordings:view`-only person reaches nothing they lack. Bodies are bounded (1 KiB options, 64 KiB assertion or registration), JSON
 with duplicate members is refused, and a ceremony refusal never sets a cookie.
 
 Accepted disclosure: `POST /api/auth/authentication/options` answers `200`
@@ -724,8 +726,9 @@ proxy-identity binding, and never reaches a URL, log or audit record. The
 check does not rely on it.
 
 Sign-out (Owner decision D7). `POST /api/auth/sign-out` (empty body or `{}`)
-authorizes `SESSION` with the CSRF token, then `AccessStore.sign_out` commits,
-inside the same request's `admit(epoch)`, the invalidation of the session row,
+authorizes `SESSION` with the CSRF token (one `admit(epoch)`), then
+`AccessStore.sign_out` commits, inside a second, separate `admit(epoch)` with
+the same epoch (Issue #232 item 3), the invalidation of the session row,
 the clearing of its keyed binding and a `sign_out_principal` audit record
 (actor `owner` or `invited_user`, target the principal's logical UUID only;
 never a token, session id, credential id or identity). The response clears the
@@ -735,8 +738,142 @@ A failed audit append rolls the sign-out back (counted in
 `audit_delivery_failed`) and the request is denied. While human access is
 closed the sign-out is denied and changes nothing (accepted by D7); the
 session then ends by expiry, by revocation, or by the reservation's
-revocation on an exposure. Sign-out ends one session, not the credential: a
+revocation on an exposure. A close, revocation or `stop()` between the two
+commits refuses the second one, and a change that ended the session in
+between makes it the generic denial; the race is harmless because sign-out
+only removes access. Sign-out ends one session, not the credential: a
 synced passkey can sign in again from any device that holds it.
+
+### Invitation redemption (Issue #10 phase 2, S2)
+
+Two pre-credential routes redeem an invitation (AUTH-013). The code is in
+the JSON body only, never in a URL or query string, and the response never
+echoes it.
+
+- `POST /api/auth/registration/options`, body exactly `{"code": "<code>"}`:
+  `PasskeyCeremonies.begin_registration` binds a fresh registration challenge
+  to the invitation and counts one attempt (`MAX_REDEMPTION_ATTEMPTS` = 5 per
+  code, in the same conditional update), inside `admit(epoch)`. `200` with
+  the creation options: the reserved rp id (also its name), the invitee's own
+  display name and principal handle, the challenge, the algorithms,
+  `excludeCredentials` (only the principal's usable credentials: not revoked
+  and not marked inconsistent, so after `recover` an authenticator still
+  holding the revoked Owner passkey under the same user handle can replace
+  it), `residentKey: required`, `userVerification:
+  required` and `attestation: "none"`. No camera, recording, timeline,
+  product or deployment data.
+- `POST /api/auth/registration`, body `{"code", "credential", "label"?}`
+  (label: 1-64 characters, no control character):
+  `PasskeyCeremonies.finish_registration` consumes the challenge, verifies the
+  registration server-side (client data type `webauthn.create`, challenge,
+  exact origin, rp id hash, UP and UV, attestation `none` or `packed` self
+  attestation, algorithm, BE/BS) and commits the credential, the redemption
+  and its `redeem_principal_invitation` audit record in one conditional
+  transaction inside `admit(epoch)`. Of concurrent redemptions of one code
+  exactly one succeeds. Success is `204` with no body and no cookie: the
+  person then signs in like anyone else.
+
+Order: the route table, `Origin` (exact; required, as for every mutating
+route), the trusted-proxy path and the reservation verdict as for every route;
+then the redemption limiter, the `application/json` body (strict: no
+duplicate member, no extra member, no NaN), the strict decoding of the code
+(`invitation_code.parse_invitation_code`); only then the ceremony, which
+takes the gate and SQLite. There is no CSRF token before a session exists;
+the exact `Origin`, the JSON content type and the single-use challenge bound
+to the invitation are what bind the two steps to the reserved origin.
+
+Codes (Owner decision D5, `invitation_code.py`): 20 bytes (160 bits) from
+`secrets.token_bytes`, stored as SHA-256 of all 20 bytes; shown as 32
+Crockford base32 characters (no `I`, `L`, `O`, `U`) in eight groups of four,
+`XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`; single use. The server accepts only
+that exact canonical form; the Web page (S5/S6) normalizes typed input (case,
+spaces, aliases) before sending it.
+
+Constant-time comparison (AUTH-013, PR #234 review). A row is located by
+`lookup_key`, a domain-separated SHA-256 of the secret truncated to 128 bits
+(`store._lookup_key`), and its stored `secret_digest` is then compared with
+`hmac.compare_digest`. SQLite's index comparison only ever sees the lookup
+key, which reveals neither the secret nor its verification digest. A row
+issued before the lookup key existed (migration 22) has none and is never
+found: issue it again.
+
+Lifetime (Owner decisions D5 and 2026-10-11). The deployment key
+`invitation_lifetime_hours` (integer 1-168, default 24, `Settings.invitation_lifetime`,
+validated by `invitation_code.invitation_lifetime`) is the lifetime of every
+invitation, the console Owner code and future Owner-issued ones alike.
+`AccessStore(invitation_lifetime=...)` refuses to issue an invitation whose
+expiry lies further ahead (and never beyond 7 days); `invitation_expiry(at)`
+is what the bootstrap command uses.
+
+Clock continuity (Owner decision 2026-10-11, `boot_clock.py`). At issuance
+`issue_enrollment_on` records the kernel boot id
+(`/proc/sys/kernel/random/boot_id`) and `CLOCK_BOOTTIME` next to the
+wall-clock issue and expiry times; if either cannot be read it issues nothing
+(`InvitationClockUnavailable`). Both redemption steps (options and finish)
+read them again, each time as one pair with the wall-clock reading they are
+compared with, taken together inside the step's own transaction right before
+the decision, after every gate, storage-admission and lock wait (PR #234
+review): a slow commit path is never read as a rollback, and an invitation
+that expired, or a wall clock stepped back, during such a wait is refused
+(options then counts no attempt, stores no challenge and returns no display
+name). They require,
+besides the wall-clock window: on the same boot, a monotonic elapsed time that
+is `>= 0` and below the lifetime, and a wall-clock elapsed time that does not
+lag it by more than 30 seconds (the allowance for the instant between the two
+reads of a pair; NTP slews both clocks together, so only a step separates
+them). A wall clock stepped back is
+therefore refused rather than extending the code; one stepped forward only
+ends the code earlier. After a reboot the readings are not comparable and the
+wall-clock window decides (a rollback across a reboot is not detectable). A
+row without the pair, or a host where it cannot be read now, is refused. Every
+refusal is the generic denial.
+
+Decision time of the other ceremony steps (PR #234 review). The same rule
+applies to every store step a `PasskeyCeremonies` request commits:
+`issue_authentication_challenge`, `consume_challenge`, `begin_step_up` and
+`accept_assertion` read the wall clock inside their own transaction, after the
+storage admission and the SQLite write lock, so a challenge that expired, or
+an Owner session whose idle or absolute lifetime ended, during such a wait is
+refused rather than consumed or refreshed; stored times (challenge issue and
+expiry, last use, session start, step-up verification) are that same reading.
+The ceremonies pass no time to these steps; the `at`/`now` arguments pin the
+reading for deterministic tests and direct callers only.
+
+Rate limit (Owner decision D4, `rate_limit.redemption_rate_limiter`): a
+separate `SourceRateLimiter` keyed by the verified proxy identity: per
+source a burst of 5 and one more every 12 seconds, with at most 256 source
+buckets (SHA-256 keyed, fail closed when full), and no global bucket (Owner
+decision 2026-10-11, Codex review of PR #234: a global bucket would let one
+Tailnet member drain it and stop every other source, the Owner redeeming a
+recovery code included). The total is bounded by the per-source buckets, the
+bounded source table and the per-code attempt limit. It is charged before the body is parsed and before
+any gate or SQLite work, so a flood of guesses costs no lock and no write. It
+never spends the sign-in buckets, and a sign-in flood never spends it;
+`HumanAccess` refuses one object for both. Both steps are charged, so a
+person redeeming once uses two tokens. In the shared-account deployment the
+per-source bucket is the room's (an availability trade-off, as for sign-in).
+
+Refusals: an absent, malformed, unknown, expired, redeemed, revoked,
+attempt-exhausted, revision-stale or generation-stale code, a limited
+request, a failed verification, a wrong shape and a closed gate all get the
+generic `404`, byte for byte. The one distinct outcome is `409
+{"detail":"device_bound_credential_required"}`: only for a valid invitation
+whose verified authenticator is backup eligible where the deployment requires
+device-bound credentials, decided under the gate inside the redemption
+transaction (`AccessStore.enroll_credential(require_device_bound=...)`) only
+after the invitation the body code names proved valid on both clocks and is
+the one the consumed challenge was bound to (otherwise the generic `404`);
+the invitation stays unredeemed.
+
+Refusal record (AUTH-013, Codex review of PR #234). A refused attempt writes
+no audit record, so unauthenticated guesses cannot grow the audit table.
+Instead every redemption request refused after the limiter (shape, code
+format, unknown or invalid code, failed verification) increments the
+value-free counter `HumanAccess.refused_redemptions`, and the event
+`invitation_redemption_refused` is logged on the first refusal and each time
+the count reaches a power of two. Neither carries the code, an identity, the
+invitation or the reason. Requests refused by the limiter are counted by the
+limiter (`human_request_rate_limited`). The response stays the generic `404`.
 
 In-flight requests after stop (Issue #228 item 1). The composition installs a
 `ServingGate` around the reservation (`PasskeyCeremonies.guard_session_gate`),
@@ -766,10 +903,11 @@ grant to the session id read in the same gated transaction.
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 
-The local bootstrap/recovery commands are not built yet. Owner decision
-(2026-10-11): they do not go through the server gate, and the deployment
-authorization generation (its revocation by advancing) is what keeps them
-safe.
+`python -m app.auth.bootstrap_cli bootstrap|recover --config <deployment.json>`
+(Issue #10 phase 2 S2), run as the service account; the deployment steps are
+in `server/docs/DEPLOYMENT.md`. Owner decision (2026-10-11): they do not go
+through the server gate, and the deployment authorization generation (its
+revocation by advancing) is what keeps them safe.
 
 - They cannot use the gate: it lives in the serving process's memory, and in
   any other process the pid guard reports it closed, so a command that called
@@ -791,6 +929,51 @@ safe.
   the same transaction, so it needs no gate to end sessions; the serving
   process sees the new generation on the next request.
 
-Until the commands are implemented under this decision, the low-level
-`establish_session` / `issue_enrollment` wrappers stay unreachable from any
-human route.
+What they do:
+
+- `bootstrap` refuses unless no Owner principal exists (any status; the
+  `access_one_owner` index refuses a concurrent second one). It reads the
+  Owner's display name and the confirmation word `BOOTSTRAP` from the
+  controlling terminal, then in one transaction creates the Owner `invited`
+  with no credential, issues one code (the deployment's invitation lifetime)
+  under the current generation and
+  appends `invite_principal` and `issue_principal_invitation` (actor `owner`,
+  the local administrative boundary as for the pairing CLI; target the
+  Owner's logical UUID).
+- `recover` refuses unless an Owner exists. It reads an optional new display
+  name and the word `RECOVER`, then in one transaction
+  (`AccessStore.recover_owner_on`): advances the generation (every session
+  ends, every pending challenge is deleted, every outstanding invitation of
+  everyone is void and must be issued again), revokes every credential of the
+  Owner (credential-scoped: a synced passkey stops on every device it is on)
+  and its pending invitations, clears its last observed proxy identity,
+  advances its revision, sets it `invited` and issues one new code; it
+  appends `invalidate_human_sessions` (fixed human-sessions id),
+  `revoke_principal_credential` (when one was revoked) and
+  `issue_principal_invitation`. The Owner keeps its logical UUID. Recordings,
+  other principals' grants and credentials, and capture nodes are untouched.
+- Both load `--config` exactly as the launcher does (`Deployment.load`) and
+  take the database and the invitation lifetime from it
+  (`deployment_configuration_rejected` otherwise), refuse unless running as
+  its `service_uid` (and as root), refuse without a controlling terminal
+  (`/dev/tty`) before any change, refuse when the boot clock cannot be read
+  (`invitation_clock_unavailable`), read nothing secret from arguments or the
+  environment, pin the existing database file (canonical path, regular file with one link
+  owned by the running account, not group/other writable; never created or
+  migrated) and re-verify it before each commit. The code is written only to
+  the controlling terminal, after the commit; stdout gets the Owner's logical
+  UUID and the expiry. A refusal changes nothing and records nothing, except
+  `committed_code_not_shown`: the commit happened but writing the code to the
+  terminal failed, so the code is lost; `recover` (also after `bootstrap`)
+  issues a replacement.
+- After a `recover` the Owner reviews principals, grants, credentials and the
+  audit log: whoever held the Owner session before may have invited others
+  (S4 onward), and `recover` leaves other principals as they are.
+
+Limits: the writes are a few bounded rows and are not admitted through the
+running server's storage policy (as for the pairing CLI). If writing the code
+to the terminal fails after the commit, the code is lost
+(`committed_code_not_shown`); run `recover`. The
+running server's in-memory state does not change: it sees the new generation
+on its next request. The low-level `establish_session` / `issue_enrollment`
+wrappers stay unreachable from any human route.

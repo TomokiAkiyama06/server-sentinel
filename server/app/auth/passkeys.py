@@ -1,9 +1,9 @@
 """Per-person WebAuthn/passkey ceremonies for Issue #10 (ADR-0004, ADR-0003).
 
 ``PasskeyCeremonies`` composes the pure verifier in ``webauthn.py`` with the
-transactional state in ``AccessStore``. It registers no HTTP route: human route
-mounting stays closed until the remaining Issue #10 gates pass. A future route
-passes in the request body, the trusted-proxy identity (supplementary only) and
+transactional state in ``AccessStore``. It registers no HTTP route itself:
+``human_surface.py`` passes in the request body (the invitation code decoded
+by ``invitation_code``), the trusted-proxy identity (supplementary only) and
 the session cookie value, and maps the results to responses.
 
 Invariants enforced here:
@@ -68,7 +68,7 @@ from uuid import UUID
 
 from . import webauthn
 from .model import AccessValidationError, Credential, CredentialStatus, Principal, PrincipalStatus, utc_time
-from .store import AccessStore, MAX_CHALLENGE_LIFETIME, StepUpRequired
+from .store import AccessStore, DeviceBoundCredentialRequired, MAX_CHALLENGE_LIFETIME, StepUpRequired
 
 
 DEFAULT_CHALLENGE_LIFETIME = timedelta(minutes=5)
@@ -80,18 +80,6 @@ class CeremonyDenied(AccessValidationError):
 
     def __init__(self) -> None:
         super().__init__("access is unavailable")
-
-
-class DeviceBoundCredentialRequired(AccessValidationError):
-    """A verified backup-eligible registration refused by deployment policy.
-
-    Reached only by someone who holds a valid invitation and completed a
-    verified ceremony, so the Web client may show an actionable message. The
-    invitation stays unredeemed.
-    """
-
-    def __init__(self) -> None:
-        super().__init__("device_bound_credential_required")
 
 
 class CredentialFinding(str, Enum):
@@ -206,9 +194,11 @@ class PasskeyCeremonies:
                 raise CeremonyDenied()
             challenge = self._challenge()
             with self.session_gate.admit(epoch):
+                # No ``at``: the store reads the wall and boot clocks as one
+                # pair inside its transaction, after every wait (PR #234).
                 subject = self.store.begin_registration(
                     enrollment_secret, proxy_identity, _digest(challenge),
-                    at=self._now(), lifetime=self.challenge_lifetime)
+                    lifetime=self.challenge_lifetime)
         except Exception:
             raise CeremonyDenied() from None
         return {
@@ -234,9 +224,8 @@ class PasskeyCeremonies:
             if epoch is None:
                 # Closed: refuse before consuming or verifying anything.
                 raise CeremonyDenied()
-            at = self._now()
             challenge = webauthn.registration_challenge(credential, self.rp)
-            consumed = self.store.consume_challenge(_digest(challenge), "registration", at=at)
+            consumed = self.store.consume_challenge(_digest(challenge), "registration")
             verified = webauthn.verify_registration(credential, self.rp, challenge,
                                                     allowed_algorithms=self.allowed_algorithms)
         except Exception:
@@ -246,14 +235,19 @@ class PasskeyCeremonies:
                 # The distinct, actionable outcome is chosen only under the
                 # gate with the epoch unchanged (PR #174 review): a close, or
                 # a close/revoke/reopen cycle, during verification yields the
-                # generic denial instead.
-                if self.require_device_bound and verified.backup_eligible:
-                    raise DeviceBoundCredentialRequired()
+                # generic denial instead. The store decides it inside the
+                # redemption transaction, only after the invitation the body
+                # code names proved valid and is the one this challenge was
+                # bound to (PR #234 review); otherwise the generic denial.
+                # No ``now``: the store samples the wall and boot clocks as
+                # one pair inside its transaction, so a wait for the gate or
+                # storage admission is not read as a clock rollback.
                 return self.store.enroll_credential(
                     enrollment_secret, proxy_identity, verified.credential_id, verified.public_key,
-                    verified.algorithm, verified.sign_count, now=at,
+                    verified.algorithm, verified.sign_count,
                     backup_eligible=verified.backup_eligible, backup_state=verified.backup_state,
-                    label=label, invitation_id=consumed.invitation_id)
+                    label=label, invitation_id=consumed.invitation_id,
+                    require_device_bound=self.require_device_bound is True)
         except DeviceBoundCredentialRequired:
             raise
         except Exception:
@@ -274,7 +268,7 @@ class PasskeyCeremonies:
                 raise CeremonyDenied()
             challenge = self._challenge()
             with self.session_gate.admit(epoch):
-                self.store.issue_authentication_challenge(_digest(challenge), at=self._now(),
+                self.store.issue_authentication_challenge(_digest(challenge),
                                                           lifetime=self.challenge_lifetime)
         except Exception:
             raise CeremonyDenied() from None
@@ -323,9 +317,8 @@ class PasskeyCeremonies:
             if epoch is None:
                 # Closed: refuse before consuming or verifying anything.
                 raise CeremonyDenied()
-            at = self._now()
             claims = webauthn.assertion_claims(credential, self.rp)
-            self.store.consume_challenge(_digest(claims.challenge), "authentication", at=at)
+            self.store.consume_challenge(_digest(claims.challenge), "authentication")
             principal, stored, verified = self._verified_assertion(credential, claims, require_user_handle=True)
             token = self._random(SESSION_TOKEN_BYTES)
             if not isinstance(token, bytes) or len(token) != SESSION_TOKEN_BYTES:
@@ -334,7 +327,7 @@ class PasskeyCeremonies:
                 session_id = self.store.accept_assertion(
                     stored.credential_id, principal.id, proxy_identity,
                     expected_sign_count=stored.sign_count, sign_count=verified.sign_count,
-                    backup_state=verified.backup_state, at=self._now(), token=token)
+                    backup_state=verified.backup_state, token=token)
         except Exception:
             raise CeremonyDenied() from None
         return SessionGrant(principal.id, session_id, token)
@@ -387,7 +380,7 @@ class PasskeyCeremonies:
             challenge = self._challenge()
             with self.session_gate.admit(epoch):
                 credential_id = self.store.begin_step_up(token, proxy_identity, _digest(challenge),
-                                                         at=self._now(), lifetime=self.challenge_lifetime)
+                                                         lifetime=self.challenge_lifetime)
         except Exception:
             raise CeremonyDenied() from None
         return {"challenge": webauthn.b64url_encode(challenge), "rpId": self.rp.rp_id,
@@ -410,7 +403,7 @@ class PasskeyCeremonies:
                 raise CeremonyDenied()
             at = self._now()
             claims = webauthn.assertion_claims(credential, self.rp)
-            consumed = self.store.consume_challenge(_digest(claims.challenge), "step_up", at=at)
+            consumed = self.store.consume_challenge(_digest(claims.challenge), "step_up")
             session = self.store.current_session(token, proxy_identity, at=at)
             if (session is None or consumed.session_id != session.session_id
                     or claims.credential_id != session.credential_id):
@@ -422,7 +415,7 @@ class PasskeyCeremonies:
                 self.store.accept_assertion(
                     stored.credential_id, principal.id, proxy_identity,
                     expected_sign_count=stored.sign_count, sign_count=verified.sign_count,
-                    backup_state=verified.backup_state, at=self._now(),
+                    backup_state=verified.backup_state,
                     step_up_session_id=session.session_id)
         except Exception:
             raise CeremonyDenied() from None

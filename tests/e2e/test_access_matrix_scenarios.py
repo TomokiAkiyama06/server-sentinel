@@ -14,7 +14,11 @@ Two layers are exercised:
   while human routes stay closed (Issues #6/#10);
 * the production grant state behind future routes: ``AccessStore.authorize``,
   the gated ``AccessStore.authorize_request`` (with its CSRF comparison and
-  ``sign_out``, Issue #10 phase 2 S1), the ``live:view`` validator and the
+  ``sign_out``, Issue #10 phase 2 S1), invitation redemption rows (the
+  store's conditional single-use redemption with the S2 code format: a code
+  of no matrix identity, an expired, revoked or generation-stale code and a
+  replayed one are refused alike, and redemption grants nothing by itself),
+  the ``live:view`` validator and the
   historical timeline gate. The timeline ``access`` port is a test adapter
   that calls ``AccessStore.authorize`` with ``recordings:view``; the
   production route adapter does not exist yet. The reservation gate is a
@@ -62,6 +66,7 @@ GENERIC_DENIAL = "access is unavailable"
 # Human, admin and media paths a future dashboard could expose. None is mounted.
 HUMAN_PATHS = (
     "/", "/health", "/version", "/login", "/enroll", "/api/auth/assert",
+    "/api/auth/registration/options", "/api/auth/registration",
     "/api/live/" + str(UUID(int=101)), "/api/sources", "/api/timeline",
     "/api/recordings", "/api/recordings/" + str(UUID(int=7)),
     "/api/recordings/" + str(UUID(int=7)) + "/download",
@@ -361,6 +366,71 @@ class AccessMatrixScenarios(unittest.TestCase):
         self.assertEqual(before + 1, self.audit_rows())
         # Another member behind the same shared login keeps working.
         self.assertTrue(self.outcome(live_only, LIVE))
+
+    def redemption(self, secret, identity):
+        """Both redemption steps at the store (the ceremony's signature
+        verification is covered with software authenticators in
+        ``server/tests/test_invitation_redemption.py``)."""
+        try:
+            self.store.begin_registration(secret, identity, secrets.token_bytes(32),
+                                          at=self.clock.utcnow(), lifetime=timedelta(minutes=5))
+            return self.store.enroll_credential(secret, identity, secrets.token_bytes(32),
+                                                b"synthetic-public-key", -7, 0)
+        except AccessValidationError as error:
+            self.assertEqual(GENERIC_DENIAL, str(error))
+            return None
+
+    def test_invitation_redemption_rows(self):
+        from app.auth.invitation_code import (
+            INVITATION_LIFETIME, InvalidInvitationCode, new_invitation_code, parse_invitation_code,
+        )
+        before = self.audit_rows()
+        # Every matrix identity without a valid code of its own: refused, nothing written.
+        for name, identity in self.identities.items():
+            with self.subTest(identity=name):
+                unknown = parse_invitation_code(new_invitation_code()[1])
+                self.assertIsNone(self.redemption(unknown, identity.external_identity))
+        agent = self.identities["agent_credential"]
+        self.assertIsNone(self.redemption(agent.token, agent.external_identity))
+        # A malformed code never decodes, so it never reaches the store.
+        for value in ("", "0000-0000", new_invitation_code()[1].lower()):
+            with self.assertRaises(InvalidInvitationCode):
+                parse_invitation_code(value)
+        self.assertEqual(before, self.audit_rows())
+
+        def issued(principal, lifetime=INVITATION_LIFETIME):
+            secret, code = new_invitation_code()
+            self.store.issue_enrollment(principal.id, secret, self.clock.utcnow() + lifetime)
+            return parse_invitation_code(code)
+
+        viewer = self.identities["live_only"].external_identity
+        # Revoked principal, expired code and an advanced generation are refused.
+        revoked = self.store.invite("Synthetic revoked invitee", (LIVE,))
+        revoked_secret = issued(revoked)
+        self.store.revoke_principal(revoked.id)
+        expired = issued(self.store.invite("Synthetic late invitee", (LIVE,)), timedelta(seconds=1))
+        self.clock.advance(2)
+        invitee = self.store.invite("Synthetic invitee", (RECORDINGS,))
+        stale = issued(invitee)
+        with self.store.audit.transaction(write=True) as connection:
+            self.store.invalidate_all_sessions_on(connection, at=self.clock.utcnow())
+        for secret in (revoked_secret, expired, stale):
+            self.assertIsNone(self.redemption(secret, viewer))
+        # A fresh code redeems exactly once, under the shared login, and grants
+        # nothing until the person signs in with the registered credential.
+        fresh = issued(invitee)
+        credential = self.redemption(fresh, viewer)
+        self.assertIsNotNone(credential)
+        self.assertEqual(invitee.id, credential.principal_id)
+        self.assertIsNone(self.redemption(fresh, viewer))
+        self.assertIsNone(self.redemption(fresh, self.identities["both"].external_identity))
+        self.assertEqual(before + 1, self.audit_rows())
+        with closing(self.database.connect()) as connection:
+            self.assertEqual(0, connection.execute(
+                "SELECT count(*) FROM access_sessions WHERE principal_id=?", (str(invitee.id),)).fetchone()[0])
+        for permission in (LIVE, RECORDINGS):
+            with self.assertRaises(AccessValidationError):
+                self.store.authorize(fresh, viewer, permission)
 
     def test_historical_timeline_requires_recordings_view_only(self):
         presence = PresenceService(

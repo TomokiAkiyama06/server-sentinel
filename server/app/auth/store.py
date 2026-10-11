@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
+import hmac
 import sqlite3
 from typing import Callable, ContextManager, Iterable
 from uuid import UUID, uuid4
@@ -12,6 +13,8 @@ from uuid import UUID, uuid4
 from app.audit.model import ActorCategory, AuditAction, AuditOutcome, TargetKind
 from app.audit.store import AuditStorageError, AuditStore
 from app.storage.database import Database
+from .boot_clock import BootInstant, invitation_clock_valid, read_boot_instant
+from .invitation_code import INVITATION_LIFETIME, MAX_INVITATION_LIFETIME, valid_invitation_lifetime
 from .model import AccessValidationError, Credential, Permission, Principal, PrincipalRole, PrincipalStatus, utc_time
 from .session_binding import SessionBindingKey, canonical_identity
 
@@ -33,6 +36,47 @@ class StepUpRequired(AccessValidationError):
 
     def __init__(self) -> None:
         super().__init__("step_up_required")
+
+
+class OwnerAlreadyConfigured(AccessValidationError):
+    """Local bootstrap refused: an Owner principal already exists."""
+
+    def __init__(self) -> None:
+        super().__init__("owner is already configured")
+
+
+class OwnerNotConfigured(AccessValidationError):
+    """Local recovery refused: no Owner principal exists yet."""
+
+    def __init__(self) -> None:
+        super().__init__("owner is not configured")
+
+
+class InvitationClockUnavailable(AccessValidationError):
+    """Issuance refused: the boot id or ``CLOCK_BOOTTIME`` cannot be read.
+
+    Every invitation records both (``app.auth.boot_clock``); without them its
+    lifetime could not be checked against a wall-clock rollback, so none is
+    issued (fail closed).
+    """
+
+    def __init__(self) -> None:
+        super().__init__("invitation clock is unavailable")
+
+
+class DeviceBoundCredentialRequired(AccessValidationError):
+    """A verified backup-eligible registration refused by deployment policy.
+
+    Raised by ``enroll_credential`` only inside the redemption transaction,
+    after the invitation the presented code names proved valid and is the one
+    the consumed challenge was bound to, so only the holder of a valid
+    invitation who completed a verified ceremony sees it and the Web client
+    may show an actionable message. Nothing is written: the invitation stays
+    unredeemed.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("device_bound_credential_required")
 
 
 # ADR-0003 accepted parameters (Owner approval recorded 2026-09-21).
@@ -130,6 +174,24 @@ def _digest(secret: bytes) -> bytes:
     return hashlib.sha256(secret).digest()
 
 
+_LOOKUP_DOMAIN = b"serversentinel/invitation-lookup/v1\x00"
+_MAX_INVITATION_LIFETIME_US = MAX_INVITATION_LIFETIME // timedelta(microseconds=1)
+
+
+def _lookup_key(secret: bytes) -> bytes:
+    """The non-secret row locator of an invitation secret (PR #234 review).
+
+    A domain-separated SHA-256 of the secret truncated to 128 bits, unrelated
+    to ``secret_digest``: SQLite's (not constant-time) index comparison only
+    ever sees this value, and the stored ``secret_digest`` is then compared
+    with ``hmac.compare_digest`` (AUTH-013). Learning a lookup key through
+    timing reveals neither the secret nor its verification digest.
+    """
+    if not isinstance(secret, bytes) or not 16 <= len(secret) <= 4096:
+        raise AccessValidationError("secret is invalid")
+    return hashlib.sha256(_LOOKUP_DOMAIN + secret).digest()[:16]
+
+
 def _identity(value: object) -> str:
     """Validate a supplied trusted-proxy identity.
 
@@ -179,9 +241,15 @@ class AccessStore:
 
     def __init__(self, database: Database, *, clock: Callable[[], datetime] | None = None,
                  audit: AuditStore | None = None, unaudited_writes: bool = False,
-                 session_binding: SessionBindingKey | None = None):
+                 session_binding: SessionBindingKey | None = None,
+                 invitation_lifetime: timedelta = INVITATION_LIFETIME,
+                 boot_clock: Callable[[], BootInstant | None] = read_boot_instant):
         if type(unaudited_writes) is not bool:
             raise AccessValidationError("unaudited write mode is invalid")
+        # The deployment's invitation lifetime (Owner decision 2026-10-11:
+        # default 24 hours, at most 7 days); no invitation is issued for longer.
+        if not valid_invitation_lifetime(invitation_lifetime) or not callable(boot_clock):
+            raise AccessValidationError("invitation configuration is invalid")
         if session_binding is not None and not isinstance(session_binding, SessionBindingKey):
             raise AccessValidationError("session binding key is invalid")
         if audit is not None and (not isinstance(audit, AuditStore) or audit.database != database):
@@ -192,6 +260,8 @@ class AccessStore:
         self.unaudited_writes = unaudited_writes
         self._session_binding = session_binding
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self.invitation_lifetime = invitation_lifetime
+        self._boot_clock = boot_clock
         # Bounded health only: a matched invitation redemption whose audit
         # append or commit failed is counted here instead of being appended
         # separately, so unauthenticated attempts cannot grow the audit table.
@@ -212,6 +282,44 @@ class AccessStore:
 
     def now(self) -> datetime:
         return utc_time(self._clock())
+
+    def invitation_expiry(self, at: datetime) -> datetime:
+        """The expiry of an invitation issued at ``at`` under this deployment's lifetime."""
+        return utc_time(at) + self.invitation_lifetime
+
+    def _boot_instant(self) -> BootInstant | None:
+        try:
+            instant = self._boot_clock()
+        except Exception:
+            return None
+        return instant if isinstance(instant, BootInstant) else None
+
+    @staticmethod
+    def _invitation_row_on(connection, secret: bytes, columns: str):
+        """The invitation row whose secret this is, compared in constant time.
+
+        Located by the non-secret ``lookup_key``; the stored ``secret_digest``
+        is then compared with ``hmac.compare_digest`` (AUTH-013). Rows issued
+        before the lookup key existed have none and are never found.
+        """
+        row = connection.execute(
+            f"SELECT {columns} FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id "
+            "WHERE i.lookup_key=?", (_lookup_key(secret),)).fetchone()
+        if row is None or not hmac.compare_digest(bytes(row["secret_digest"]), _digest(secret)):
+            return None
+        return row
+
+    @staticmethod
+    def _redeemable(row, generation: int, at: datetime, now: BootInstant | None) -> bool:
+        """Every validity condition of an invitation row, on both clocks."""
+        return (row is not None and row["redeemed_at_us"] is None and row["revoked_at_us"] is None
+                and row["status"] != PrincipalStatus.REVOKED.value
+                and row["principal_revision"] == row["authorization_revision"]
+                and row["deployment_generation"] == generation
+                and invitation_clock_valid(
+                    issued_us=row["issued_at_us"], expires_us=row["expires_at_us"],
+                    issued_boot_id=row["issued_boot_id"], issued_boottime_us=row["issued_boottime_us"],
+                    now_us=_us(at), now=now, max_lifetime_us=_MAX_INVITATION_LIFETIME_US))
 
     @contextmanager
     def _transaction(self, write: bool = False):
@@ -297,6 +405,72 @@ class AccessStore:
                                 owner.status.value, owner.authorization_revision, _us(owner.created_at)))
         return owner
 
+    @staticmethod
+    def owner_configured_on(connection) -> bool:
+        """Whether an Owner principal row exists (whatever its status)."""
+        return connection.execute("SELECT 1 FROM access_principals WHERE role='owner'").fetchone() is not None
+
+    def bootstrap_owner_on(self, connection, principal_id: UUID, display_name: str, secret: bytes,
+                           expires_at: datetime, *, at: datetime) -> UUID:
+        """Create the single Owner with one enrollment authorization (ADR-0003 steps 3-4).
+
+        Local bootstrap only (``app.auth.bootstrap_cli``), on a caller-owned
+        write transaction that also carries its audit records. The Owner is
+        created ``invited`` with no credential; redeeming the authorization
+        through the ordinary redemption route registers its first credential
+        and makes it ``active``. Refused with ``OwnerAlreadyConfigured`` when
+        any Owner row exists (the ``access_one_owner`` index refuses a
+        concurrent second one as well). Returns the invitation id.
+        """
+        if not isinstance(principal_id, UUID):
+            raise AccessValidationError("principal identity is invalid")
+        name = _display(display_name)
+        at = utc_time(at)
+        if self.owner_configured_on(connection):
+            raise OwnerAlreadyConfigured()
+        connection.execute("INSERT INTO access_principals VALUES (?, NULL, ?, ?, ?, 0, ?, NULL)",
+                           (str(principal_id), name, PrincipalRole.OWNER.value,
+                            PrincipalStatus.INVITED.value, _us(at)))
+        return self.issue_enrollment_on(connection, principal_id, secret, expires_at, at=at)
+
+    def recover_owner_on(self, connection, secret: bytes, expires_at: datetime, *, at: datetime,
+                         display_name: str | None = None) -> tuple[UUID, UUID, int]:
+        """Local Owner recovery on a caller-owned write transaction (ADR-0003).
+
+        In one transaction: advance the deployment authorization generation,
+        which ends every human session, deletes every pending challenge and
+        voids every outstanding enrollment authorization (the Owner's and
+        every invitee's; a pending invitation must be issued again,
+        ``invalidate_all_sessions_on``); revoke every credential of the Owner
+        principal (credential-scoped: a synced passkey stops on every device
+        it exists on) and its pending invitations; clear its last observed
+        proxy identity; advance its authorization revision; set it
+        ``invited`` (optionally renamed); and issue exactly one new
+        enrollment authorization under the new generation. The Owner keeps
+        its logical UUID (the ``access_one_owner`` index allows one Owner
+        row); recordings, grants of other principals and capture nodes are
+        untouched. Returns ``(owner id, invitation id, credentials revoked)``.
+        Refused with ``OwnerNotConfigured`` when no Owner exists.
+        """
+        at = utc_time(at)
+        name = None if display_name is None else _display(display_name)
+        row = connection.execute("SELECT id FROM access_principals WHERE role='owner'").fetchone()
+        if row is None:
+            raise OwnerNotConfigured()
+        owner = UUID(row["id"])
+        self.invalidate_all_sessions_on(connection, at=at)
+        revoked = connection.execute(
+            "UPDATE access_credentials SET revoked_at_us=? WHERE principal_id=? AND revoked_at_us IS NULL",
+            (_us(at), str(owner))).rowcount
+        connection.execute("UPDATE access_invitations SET revoked_at_us=? WHERE principal_id=? "
+                           "AND redeemed_at_us IS NULL AND revoked_at_us IS NULL", (_us(at), str(owner)))
+        connection.execute("UPDATE access_principals SET status=?, revoked_at_us=NULL, external_identity=NULL, "
+                           "display_name=COALESCE(?, display_name), "
+                           "authorization_revision=authorization_revision+1 WHERE id=?",
+                           (PrincipalStatus.INVITED.value, name, str(owner)))
+        invitation = self.issue_enrollment_on(connection, owner, secret, expires_at, at=at)
+        return owner, invitation, revoked
+
     def invite(self, display_name: str, permissions: Iterable[Permission], *, now: datetime | None = None) -> Principal:
         self._require_unaudited_writes()
         at = utc_time(self._clock() if now is None else now)
@@ -330,26 +504,40 @@ class AccessStore:
 
     def issue_enrollment_on(self, connection, principal_id: UUID, secret: bytes, expires_at: datetime,
                             *, at: datetime) -> UUID:
-        """Persist a single-use invitation digest on a caller-owned transaction."""
+        """Persist a single-use invitation digest on a caller-owned transaction.
+
+        The expiry must lie within this deployment's invitation lifetime
+        (``invitation_lifetime``, at most 7 days). The row also records the
+        non-secret lookup key and the boot id plus ``CLOCK_BOOTTIME`` read
+        now (``app.auth.boot_clock``); when they cannot be read nothing is
+        issued (``InvitationClockUnavailable``). Applies to every invitation:
+        the local bootstrap/recovery command's and an Owner-issued one.
+        """
         if not isinstance(principal_id, UUID):
             raise AccessValidationError("principal identity is invalid")
         digest = _digest(secret)
+        lookup = _lookup_key(secret)
         at, expiry = utc_time(at), utc_time(expires_at)
-        if expiry <= at:
+        if expiry <= at or expiry - at > self.invitation_lifetime:
             raise AccessValidationError("enrollment expiry is invalid")
+        instant = self._boot_instant()
+        if instant is None:
+            raise InvitationClockUnavailable()
         invitation_id = uuid4()
         principal = connection.execute("SELECT * FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
         if principal is None or principal["status"] == PrincipalStatus.REVOKED.value:
             raise AccessValidationError("principal is unavailable")
         generation = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
-        connection.execute("INSERT INTO access_invitations (id, secret_digest, principal_id, principal_revision, deployment_generation, issued_at_us, expires_at_us, redeemed_at_us, revoked_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
-                           (str(invitation_id), digest, str(principal_id), principal["authorization_revision"], generation, _us(at), _us(expiry)))
+        connection.execute("INSERT INTO access_invitations (id, secret_digest, principal_id, principal_revision, deployment_generation, issued_at_us, expires_at_us, redeemed_at_us, revoked_at_us, lookup_key, issued_boot_id, issued_boottime_us) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)",
+                           (str(invitation_id), digest, str(principal_id), principal["authorization_revision"], generation, _us(at), _us(expiry),
+                            lookup, instant.boot_id, instant.boottime_us))
         return invitation_id
 
     def enroll_credential(self, enrollment_secret: bytes, proxy_identity: str, credential_id: bytes,
                           public_key: bytes, algorithm: int, sign_count: int, *, now: datetime | None = None,
                           backup_eligible: bool = False, backup_state: bool = False,
-                          label: str | None = None, invitation_id: UUID | None = None) -> Credential:
+                          label: str | None = None, invitation_id: UUID | None = None,
+                          require_device_bound: bool = False) -> Credential:
         """Redeem an invitation and record its audit row in the same transaction.
 
         Callers must have verified the WebAuthn registration first
@@ -359,33 +547,52 @@ class AccessStore:
         present, well-formed trusted-proxy identity but selects nothing: the
         enrollment secret alone names the invitation and so the person.
 
+        With ``require_device_bound`` a backup-eligible credential raises
+        ``DeviceBoundCredentialRequired``, decided here only after the
+        invitation proved valid (and the one the challenge was bound to);
+        nothing is written. Validity includes the boot-clock check
+        (``app.auth.boot_clock``): the wall-clock and boot-clock readings it
+        compares are taken as one pair inside the redemption transaction,
+        after every gate, storage-admission and lock wait, so a slow commit
+        path is never mistaken for a wall clock stepped back (PR #234
+        review). ``now`` pins the wall reading for deterministic tests only;
+        a ceremony passes none.
+
         A rejected redemption writes nothing, so an unauthenticated caller
         presenting unknown or stale codes cannot grow the audit table. When a
         matched redemption's audit append or commit fails, the rolled-back
         outcome is counted in ``audit_delivery_failed`` /
         ``undelivered_audit_records`` instead of being appended separately.
         """
-        digest = _digest(enrollment_secret)
+        _digest(enrollment_secret)
         _identity(proxy_identity)
         if invitation_id is not None and not isinstance(invitation_id, UUID):
             raise AccessValidationError("enrollment is unavailable")
-        credential = Credential(credential_id, UUID(int=0), public_key, algorithm, sign_count,
-                                utc_time(self._clock() if now is None else now),
-                                backup_eligible=backup_eligible, backup_state=backup_state, label=label)
-        at = credential.enrolled_at
+        if type(require_device_bound) is not bool:
+            raise AccessValidationError("enrollment is unavailable")
+        pinned = None if now is None else utc_time(now)
+        # Validate the credential fields before any transaction; the stored
+        # row is rebuilt with the principal and the in-transaction time.
+        Credential(credential_id, UUID(int=0), public_key, algorithm, sign_count,
+                   pinned if pinned is not None else utc_time(self._clock()),
+                   backup_eligible=backup_eligible, backup_state=backup_state, label=label)
         # Only a matched, valid invitation reaches the append; ordinary
         # unmatched or stale attempts never touch audit health.
         audit_attempted = False
         try:
             with self._audited_transaction() as connection:
-                row = connection.execute("SELECT i.*, p.role, p.status, p.authorization_revision FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id WHERE i.secret_digest=?", (digest,)).fetchone()
+                row = self._invitation_row_on(connection, enrollment_secret,
+                                              "i.*, p.role, p.status, p.authorization_revision")
                 state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
-                if (row is None or row["redeemed_at_us"] is not None or row["revoked_at_us"] is not None
-                        or row["status"] == PrincipalStatus.REVOKED.value
-                        or row["principal_revision"] != row["authorization_revision"]
-                        or row["deployment_generation"] != state or not row["issued_at_us"] <= _us(at) < row["expires_at_us"]
+                # One pair, sampled together here where the decision is made
+                # (PR #234 review): a wait before this point moves both.
+                at = pinned if pinned is not None else utc_time(self._clock())
+                instant = self._boot_instant()
+                if (not self._redeemable(row, state, at, instant)
                         or (invitation_id is not None and row["id"] != str(invitation_id))):
                     raise AccessValidationError("enrollment is unavailable")
+                if require_device_bound and backup_eligible:
+                    raise DeviceBoundCredentialRequired()
                 principal_id = UUID(row["principal_id"])
                 credential = Credential(credential_id, principal_id, public_key, algorithm, sign_count, at,
                                         backup_eligible=backup_eligible, backup_state=backup_state, label=label)
@@ -1028,14 +1235,30 @@ class AccessStore:
         connection.execute("INSERT INTO access_webauthn_challenges (challenge_digest, ceremony, invitation_id, session_id, issued_at_us, expires_at_us) VALUES (?, ?, ?, ?, ?, ?)",
                            (digest, ceremony, invitation_id, session_id, _us(at), _us(at + lifetime)))
 
-    def issue_authentication_challenge(self, digest: bytes, *, at: datetime, lifetime: timedelta) -> None:
-        """Store the digest of an unbound sign-in challenge (discoverable credentials)."""
-        at = utc_time(at)
+    def _in_transaction_time(self, pinned: datetime | None) -> datetime:
+        """The decision time of a ceremony step, read inside its transaction.
+
+        Called only after the storage admission and ``BEGIN IMMEDIATE`` were
+        entered, so nothing is decided with a time read before a wait for
+        either (PR #234 review). ``pinned`` is for deterministic tests and
+        direct callers only; ``PasskeyCeremonies`` passes none.
+        """
+        return pinned if pinned is not None else utc_time(self._clock())
+
+    def issue_authentication_challenge(self, digest: bytes, *, at: datetime | None = None,
+                                       lifetime: timedelta) -> None:
+        """Store the digest of an unbound sign-in challenge (discoverable credentials).
+
+        Its issue and expiry times are read inside the transaction (see
+        ``_in_transaction_time``); ``at`` pins them for tests only.
+        """
+        pinned = None if at is None else utc_time(at)
         with self._transaction(write=True) as connection:
-            self._insert_challenge_on(connection, digest, "authentication", at, lifetime)
+            self._insert_challenge_on(connection, digest, "authentication",
+                                      self._in_transaction_time(pinned), lifetime)
 
     def begin_registration(self, enrollment_secret: object, proxy_identity: object, digest: bytes, *,
-                           at: datetime, lifetime: timedelta) -> RegistrationSubject:
+                           at: datetime | None = None, lifetime: timedelta) -> RegistrationSubject:
         """Bind a registration challenge to one valid invitation and count the attempt.
 
         The invitation is not redeemed here. An absent, unknown, expired,
@@ -1043,41 +1266,60 @@ class AccessStore:
         the generic denial and writes nothing. The enrollment secret alone
         selects the invitation; the proxy identity must be present and
         well-formed but is not compared with anything.
+
+        Validity includes the boot-clock check (``app.auth.boot_clock``): the
+        wall-clock and boot-clock readings are taken as one pair inside the
+        transaction, after the storage-admission and lock waits and right
+        before the decision (PR #234 review, as in ``enroll_credential``), so
+        an invitation that expired, or a wall clock stepped back, during such
+        a wait is refused and nothing is written. The challenge's issue and
+        expiry times are that same reading. ``at`` pins the wall reading for
+        deterministic tests only; a ceremony passes none.
         """
-        at = utc_time(at)
+        pinned = None if at is None else utc_time(at)
         try:
-            secret_digest = _digest(enrollment_secret)
+            _digest(enrollment_secret)
             _identity(proxy_identity)
         except AccessValidationError:
             raise AccessValidationError("access is unavailable") from None
         with self._transaction(write=True) as connection:
-            row = connection.execute("SELECT i.*, p.display_name, p.status, p.authorization_revision FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id WHERE i.secret_digest=?", (secret_digest,)).fetchone()
+            row = self._invitation_row_on(connection, enrollment_secret,
+                                          "i.*, p.display_name, p.status, p.authorization_revision")
             state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
-            if (row is None or row["redeemed_at_us"] is not None or row["revoked_at_us"] is not None
-                    or row["status"] == PrincipalStatus.REVOKED.value
-                    or row["principal_revision"] != row["authorization_revision"]
-                    or row["deployment_generation"] != state or not row["issued_at_us"] <= _us(at) < row["expires_at_us"]):
+            # One pair, sampled together here where the decision is made.
+            at = self._in_transaction_time(pinned)
+            instant = self._boot_instant()
+            if not self._redeemable(row, state, at, instant):
                 raise AccessValidationError("access is unavailable")
             counted = connection.execute("UPDATE access_invitations SET attempt_count=attempt_count+1 WHERE id=? AND attempt_count < ? AND redeemed_at_us IS NULL",
                                          (row["id"], MAX_REDEMPTION_ATTEMPTS)).rowcount
             if counted != 1:
                 raise AccessValidationError("access is unavailable")
             self._insert_challenge_on(connection, digest, "registration", at, lifetime, invitation_id=row["id"])
+            # Only usable credentials (PR #234 review): after a recovery the
+            # Owner's revoked passkey may still sit in a synced keychain under
+            # the same user handle, and excluding it would make that
+            # authenticator refuse the replacement registration.
             excluded = tuple(bytes(item[0]) for item in connection.execute(
-                "SELECT credential_id FROM access_credentials WHERE principal_id=? ORDER BY enrolled_at_us", (row["principal_id"],)))
+                "SELECT credential_id FROM access_credentials WHERE principal_id=? AND revoked_at_us IS NULL "
+                "AND inconsistent_at_us IS NULL ORDER BY enrolled_at_us", (row["principal_id"],)))
             return RegistrationSubject(UUID(row["id"]), UUID(row["principal_id"]), row["display_name"], excluded)
 
-    def consume_challenge(self, digest: bytes, ceremony: str, *, at: datetime) -> ConsumedChallenge:
+    def consume_challenge(self, digest: bytes, ceremony: str, *, at: datetime | None = None) -> ConsumedChallenge:
         """Delete a pending challenge exactly once and return its binding.
 
         The challenge is removed whether or not the ceremony later verifies, so
         a failed attempt cannot be retried with it. A challenge used outside
-        its issue-to-expiry window, or for another ceremony, is refused.
+        its issue-to-expiry window, or for another ceremony, is refused. The
+        window is checked at a time read inside the transaction (see
+        ``_in_transaction_time``), so a challenge that expired during a lock
+        or admission wait is refused; ``at`` pins it for tests only.
         """
-        at = utc_time(at)
+        pinned = None if at is None else utc_time(at)
         if not isinstance(digest, bytes) or len(digest) != 32 or ceremony not in ("registration", "authentication", "step_up"):
             raise AccessValidationError("access is unavailable")
         with self._transaction(write=True) as connection:
+            at = self._in_transaction_time(pinned)
             row = connection.execute("DELETE FROM access_webauthn_challenges WHERE challenge_digest=? AND ceremony=? RETURNING invitation_id, session_id, issued_at_us, expires_at_us",
                                      (digest, ceremony)).fetchone()
             row = None if row is None else dict(row)
@@ -1087,16 +1329,20 @@ class AccessStore:
                                  None if row["session_id"] is None else UUID(row["session_id"]))
 
     def begin_step_up(self, token: object, proxy_identity: object, digest: bytes, *,
-                      at: datetime, lifetime: timedelta) -> bytes:
+                      at: datetime | None = None, lifetime: timedelta) -> bytes:
         """Bind a step-up challenge to a current Owner session and return its credential id.
 
         The returned id is the only entry of the challenge's allowed-credential
         list; ``accept_assertion`` refuses an assertion from any other credential.
+        The session is judged current at a time read inside the transaction
+        (see ``_in_transaction_time``); ``at`` pins it for tests only.
         """
-        at = utc_time(at)
+        pinned = None if at is None else utc_time(at)
+        at = None
         mismatch: list = []
         try:
             with self._transaction(write=True) as connection:
+                at = self._in_transaction_time(pinned)
                 self._end_expired_sessions_on(connection, at)
                 row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
                 if row is None or row["role"] != PrincipalRole.OWNER.value:
@@ -1104,6 +1350,8 @@ class AccessStore:
                 self._insert_challenge_on(connection, digest, "step_up", at, lifetime, session_id=row["id"])
                 return bytes(row["credential_id"])
         except AccessValidationError:
+            if at is None:
+                at = self._in_transaction_time(pinned)
             self._end_expired_sessions_after_denial(at)
             self._record_binding_mismatch(mismatch, at)
             raise
@@ -1146,7 +1394,8 @@ class AccessStore:
         return tuple(self._credential(row) for row in rows)
 
     def accept_assertion(self, credential_id: bytes, principal_id: UUID, proxy_identity: str, *,
-                         expected_sign_count: int, sign_count: int, backup_state: bool, at: datetime,
+                         expected_sign_count: int, sign_count: int, backup_state: bool,
+                         at: datetime | None = None,
                          token: bytes | None = None, step_up_session_id: UUID | None = None) -> UUID:
         """Commit a verified assertion: counter, backup state, last use and its session effect.
 
@@ -1161,13 +1410,20 @@ class AccessStore:
         recorded as the principal's last observed value and, for a new
         session, bound into it. A step-up must present the identity its
         session is bound to.
+
+        The commit time (last use, the new session's start and verification
+        time, the step-up verification time and the step-up session's expiry
+        checks) is read inside the transaction (see ``_in_transaction_time``),
+        so a session that expired during a lock or admission wait is refused,
+        not refreshed; ``at`` pins it for tests only.
         """
         if (token is None) == (step_up_session_id is None):
             raise AccessValidationError("access is unavailable")
-        at = utc_time(at)
+        pinned = None if at is None else utc_time(at)
         identity = _identity(proxy_identity)
 
         def write(connection, mark):
+            at = self._in_transaction_time(pinned)
             row = connection.execute("SELECT c.sign_count, c.revoked_at_us, c.inconsistent_at_us, c.backup_eligible, p.role, p.status FROM access_credentials c JOIN access_principals p ON p.id=c.principal_id WHERE c.credential_id=? AND c.principal_id=?",
                                      (credential_id, str(principal_id))).fetchone()
             if (row is None or row["status"] != PrincipalStatus.ACTIVE.value or row["revoked_at_us"] is not None

@@ -11,7 +11,7 @@ import stat
 from app.cameras.uvc.config import LocalUvcConfiguration, parse_local_uvc
 from app.detection.foundation.config import DetectionConfiguration, parse_detection
 from app.monitoring.config import MonitoringConfiguration, parse_monitoring
-from app.settings import ConfigurationError, Settings
+from app.settings import INVITATION_LIFETIME, ConfigurationError, Settings, invitation_lifetime
 
 
 MAX_CONFIGURATION_BYTES = 16 * 1024
@@ -337,7 +337,8 @@ class Deployment:
         }
         if (not allowed <= set(value)
                 or not set(value) <= allowed | {"monitoring", "local_uvc", "detection",
-                                                "capture_ca_directory"}
+                                                "capture_ca_directory",
+                                                "invitation_lifetime_hours"}
                 or type(value.get("service_uid")) is not int):
             raise ConfigurationError("invalid deployment configuration")
         # Required (Owner decision 2026-10-07, Issue #109): every configuration
@@ -406,10 +407,20 @@ class Deployment:
                     or directory_device != root_info.st_dev
                     or [os.major(directory_device), os.minor(directory_device)] != device):
                 raise ConfigurationError("runtime subdirectory escapes the approved filesystem")
+        # Optional (Owner decision 2026-10-11): whole hours from 1 to 168
+        # (7 days); absent means the 24-hour default.
+        if "invitation_lifetime_hours" in value:
+            try:
+                lifetime = invitation_lifetime(value["invitation_lifetime_hours"])
+            except ValueError:
+                raise ConfigurationError(
+                    "invitation_lifetime_hours must be an integer from 1 to 168") from None
+        else:
+            lifetime = INVITATION_LIFETIME
         settings = Settings(
             directories[0], human_host=value["human_host"],
             human_port=value["human_port"], log_level=value["log_level"],
-            source_root=code_root,
+            invitation_lifetime=lifetime, source_root=code_root,
         )
         monitoring = None
         if "monitoring" in value:

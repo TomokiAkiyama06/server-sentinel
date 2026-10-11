@@ -141,3 +141,28 @@ def access_shared_identity_migration(version: int) -> Migration:
     row-for-row plus ``foreign_key_check`` before the runner commits.
     """
     return Migration(version, "human_access_shared_identity", _shared_identity_statements())
+
+
+def access_invitation_clock_migration(version: int) -> Migration:
+    """Invitation clock continuity and a non-secret lookup key (PR #234 review).
+
+    ``issued_boot_id`` / ``issued_boottime_us`` record the kernel boot id and
+    ``CLOCK_BOOTTIME`` at issuance (``app.auth.boot_clock``), so a wall clock
+    stepped back after issuance cannot extend a code on the same boot (Owner
+    decision 2026-10-11). ``lookup_key`` is a domain-separated, truncated
+    SHA-256 of the secret, independent of ``secret_digest``: redemption finds
+    the row by it and then compares ``secret_digest`` with
+    ``hmac.compare_digest`` (AUTH-013 constant-time comparison), so SQLite
+    never compares the stored verification digest.
+
+    Existing rows keep ``NULL`` in all three: they are unreachable by
+    redemption (no lookup key) and unverifiable (no boot pair), so an
+    invitation outstanding at upgrade must be issued again. Nothing is
+    deleted.
+    """
+    return Migration(version, "human_access_invitation_clock", (
+        "ALTER TABLE access_invitations ADD COLUMN lookup_key BLOB CHECK(lookup_key IS NULL OR length(lookup_key) = 16)",
+        "ALTER TABLE access_invitations ADD COLUMN issued_boot_id TEXT CHECK(issued_boot_id IS NULL OR length(issued_boot_id) = 36)",
+        "ALTER TABLE access_invitations ADD COLUMN issued_boottime_us INTEGER CHECK(issued_boottime_us IS NULL OR issued_boottime_us >= 0)",
+        "CREATE UNIQUE INDEX access_invitations_lookup ON access_invitations(lookup_key) WHERE lookup_key IS NOT NULL",
+    ))
