@@ -164,6 +164,11 @@ class Sender:
         self.wake_r.setblocking(False)
         self.wake_w.setblocking(False)
         self.connections = 0
+        # Per-connection random nonce sent first on every connection (HELLO
+        # frame / route-probe header); the receiver records it, so the
+        # summarizer can tie this connection's loss, reconnect and probe to
+        # the Main-side session of the same run without comparing clocks.
+        self.session = None
         self.connected = False
         self.payload_bytes = self.wire_bytes = 0
         self.max_outq = 0
@@ -314,7 +319,7 @@ class Sender:
                     if self._first_accept_pending:
                         self._first_accept_pending = False
                         self.writer.write("first_accept", connection=self.connections,
-                                          source=state.index)
+                                          session=self.session, source=state.index)
             else:
                 # Transient refusal: put the unit back in front, retry later.
                 state.pending.appendleft(unit)
@@ -353,7 +358,8 @@ class Sender:
     def _connect(self):
         from media_capture_agent.node_tls import connect_to_main
         from media_capture_agent.pairing import PairingRefused
-        self.writer.write("connect", connection=self.connections + 1)
+        session = wire.new_session_nonce()
+        self.writer.write("connect", connection=self.connections + 1, session=session)
         try:
             connection = connect_to_main(self.context, server_name=self.server_name,
                                          host=self.config.host, port=self.config.port,
@@ -364,6 +370,7 @@ class Sender:
             return None
         connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.config.sndbuf)
         self.connections += 1
+        self.session = session
         self.connected = True
         self._first_accept_pending = True
         self.last_inbound = time.monotonic()
@@ -408,7 +415,8 @@ class Sender:
                 self.connected = False
                 _close(connection)
                 self._requeue_inflight()
-            self.writer.write("closed", connection=self.connections, reason=token(reason))
+            self.writer.write("closed", connection=self.connections, session=self.session,
+                              reason=token(reason))
             if reason not in ("loss_timeout", "shutdown") and not self.stop.is_set():
                 # Any unexpected disconnect is a Main-communication loss for the
                 # Agent's T-600 s/T+600 s protection, not only a silent timeout.
@@ -430,7 +438,7 @@ class Sender:
         for state in self.sources:
             self.writer.write("loss_detected", source=state.index, epoch=self.epoch,
                               idle_ns=idle_ns,
-                              connection=self.connections,
+                              connection=self.connections, session=self.session,
                               last_committed_capture_ns=state.last_committed_capture_ns)
 
     def _session_stream(self, connection, deadline):
@@ -442,6 +450,9 @@ class Sender:
         out = bytearray()
         if chunked:
             out += wire.request_head("POST", wire.STREAM_PATH)
+            out += wire.chunk(wire.hello_frame(self.session))
+        else:
+            out += wire.hello_frame(self.session)
         maximum = 4096
         reader = wire.FrameReader(maximum)
         decoder = wire.ChunkDecoder(maximum) if chunked else None
@@ -527,13 +538,15 @@ class Sender:
         connection.settimeout(self.config.loss_timeout_s)
         limit = max(1, int(self.config.fps * self.config.segment_seconds * 2))
         response = bytearray()
+        hello = wire.hello_frame(self.session)  # first frame of the first segment
         while not self.stop.is_set() and time.monotonic() < deadline:
             started = time.monotonic()
             units = self._next_units(stop_and_wait=False, limit=limit)
             with self.lock:
                 for state, unit in units:
                     state.inflight = None
-            body = bytearray(wire.heartbeat_frame(time.monotonic_ns()))
+            body = bytearray(hello + wire.heartbeat_frame(time.monotonic_ns()))
+            hello = b""
             for state, unit in units:
                 unit.sent_ns = time.monotonic_ns()
                 state.sent += 1
@@ -620,15 +633,25 @@ class Sender:
                 if self._first_accept_pending:
                     self._first_accept_pending = False
                     self.writer.write("first_accept", connection=self.connections,
-                                      source=state.index)
+                                      session=self.session, source=state.index)
             elif outcome != "rejected":
                 retry.append((state, unit))
         self._restore(retry)
 
     def _route_probe(self, connection):
-        """Ask the ingest listener for a human/dashboard route; expect 404 + close."""
+        """Ask the ingest listener for a human/dashboard route; expect 404 + close.
+
+        The probe carries this connection's session nonce (a HELLO frame
+        before the request on the framed candidate, a header on the HTTP
+        candidates) so the summarizer can require that this run's receiver
+        saw it, not a stale or unrelated listener on the same address.
+        """
         connection.settimeout(5)
-        connection.sendall(b"GET /api/v1/sources HTTP/1.1\r\nHost: ingest\r\n\r\n")
+        request = (f"GET /api/v1/sources HTTP/1.1\r\nHost: ingest\r\n"
+                   f"X-Poc15-Session: {self.session}\r\n\r\n").encode("ascii")
+        if self.config.candidate == "a_framed":
+            request = wire.hello_frame(self.session) + request
+        connection.sendall(request)
         try:
             reply = connection.recv(64)
         except (OSError, ssl.SSLError):
@@ -639,7 +662,7 @@ class Sender:
             result = "peer_closed"
         else:
             result = "other"
-        self.writer.write("route_probe", reason=result)
+        self.writer.write("route_probe", reason=result, session=self.session)
         return result
 
     # -- sampling ---------------------------------------------------------------

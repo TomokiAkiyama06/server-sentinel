@@ -95,6 +95,30 @@ class WireTests(unittest.TestCase):
         self.assertEqual((wire.ACK, source, 2, 7, "duplicate", "already_committed"), parsed[1])
         self.assertEqual((wire.HEARTBEAT, 5), parsed[2])
 
+    def test_hello_carries_the_session_nonce(self):
+        reader = wire.FrameReader(4096)
+        nonce = wire.new_session_nonce()
+        self.assertTrue(0 < nonce < 1 << 63)
+        bodies = reader.feed(wire.hello_frame(nonce) + wire.heartbeat_frame(5))
+        self.assertEqual([(wire.HELLO, nonce), (wire.HEARTBEAT, 5)],
+                         [wire.parse_body(body) for body in bodies])
+        for bad in (0, 1 << 63):
+            with self.assertRaises(ValueError):
+                wire.hello_frame(bad)
+        with self.assertRaises(wire.ProtocolError):
+            wire.parse_body(bytes([wire.HELLO]) + bytes(8))  # zero is not a nonce
+        self.assertEqual(42, wire.parse_session("42"))
+        for bad in (None, "", "0", "-1", "x", str(1 << 63)):
+            with self.assertRaises(wire.ProtocolError):
+                wire.parse_session(bad)
+        # an HTTP request after the HELLO: the complete frame before it is kept
+        reader = wire.FrameReader(4096)
+        with self.assertRaises(wire.ProtocolError) as raised:
+            reader.feed(wire.hello_frame(nonce) + b"GET /api/v1/sources HTTP/1.1\r\n")
+        self.assertEqual([(wire.HELLO, nonce)],
+                         [wire.parse_body(body) for body in raised.exception.bodies])
+        self.assertEqual(b"GET /", reader.peek(5))
+
     def test_pre_read_bounds(self):
         with self.assertRaises(wire.ProtocolError):
             wire.FrameReader(16).feed(b"GET / HTTP/1.1\r\n")
@@ -432,6 +456,17 @@ def _finished_proxy(rows):
     return rows
 
 
+def _session(nonce, opened_s, closed_s=None, connection=1):
+    """Receiver records of one Agent connection: its HELLO session nonce at
+    ``opened_s`` and (unless None) its close at ``closed_s`` (Main clock, s)."""
+    rows = [{"kind": "session_hello", "t_ns": opened_s * 10**9, "connection": connection,
+             "session": nonce}]
+    if closed_s is not None:
+        rows.append({"kind": "session_close", "t_ns": closed_s * 10**9,
+                     "connection": connection, "session": nonce, "reason": "peer_closed"})
+    return rows
+
+
 def _base(scenario, candidate="a_framed", sources=1):
     # duration_ns 0: no production coverage required unless a test sets one
     orchestrator = [{"kind": "start", "t_ns": 0, "scenario": scenario, "candidate": candidate,
@@ -624,12 +659,14 @@ class SummarizerTests(unittest.TestCase):
                      "duration_ns": 0} for action, at in actions]
                 start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": 5 * second}
                 name = f"{scenario}-a_framed"
+                # the Agent connection (session nonce 11) live across the outage
+                receiver = receiver + _session(11, 1, 25)
                 # neither side detects anything and there is no durable gap
                 self.run_dir(name, orchestrator=orchestrator, receiver=receiver,
                              sender_rows=sender_rows + [start])
                 self.assertEqual("fail", self.report()[scenario]["g5"])
                 loss = {"kind": "loss_detected", "t_ns": 15 * second, "source": 0,
-                        "idle_ns": 5 * second, "connection": 1,
+                        "idle_ns": 5 * second, "connection": 1, "session": 11,
                         "last_committed_capture_ns": 9 * second}
                 self.rewrite(name, "sender", sender_rows + [start, loss])
                 row = self.report()[scenario]
@@ -964,9 +1001,12 @@ class SummarizerTests(unittest.TestCase):
                 {"kind": "action", "t_ns": 20 * second, "action": "sigcont", "duration_ns": 0}]
         start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": 5 * second}
         # Agent-clock loss far outside the Main-clock window: fine on two hosts
+        # (the lost connection was live at the stop on the Main clock)
         loss = {"kind": "loss_detected", "t_ns": 900 * second, "source": 0,
-                "idle_ns": 5 * second, "connection": 1, "last_committed_capture_ns": 1}
-        self.run_dir("slow_stop_10s-a_framed", orchestrator=main, receiver=receiver,
+                "idle_ns": 5 * second, "connection": 1, "session": 11,
+                "last_committed_capture_ns": 1}
+        self.run_dir("slow_stop_10s-a_framed", orchestrator=main,
+                     receiver=receiver + _session(11, 1, 21),
                      sender_rows=sender_rows + [start, loss], two_host=True)
         self.assertEqual("pass", self.report()["slow_stop_10s"]["g5"])
         # only the Main-side directory was passed: the capture side is missing
@@ -1621,21 +1661,27 @@ class SummarizerTests(unittest.TestCase):
              "duration_ns": 0},
             {"kind": "action", "t_ns": 12 * second, "action": "ready", "duration_ns": 0}]
         start = {"kind": "start", "t_ns": 0, "n_sources": 1, "loss_timeout_ns": 5 * second}
-        # Agent clock: the stopping receiver drops the live connection, then
-        # accepts one more connection and drops it in _finish, then the new
-        # receiver accepts
-        burst = [{"kind": "closed", "t_ns": 500 * second, "reason": "peer_closed"},
-                 {"kind": "closed", "t_ns": 501 * second, "reason": "tls_session_failed"},
-                 {"kind": "first_accept", "t_ns": 503 * second, "connection": 3, "source": 0}]
+        # Agent clock: the stopping receiver drops the live connection (11),
+        # then accepts one more connection (12) and drops it in _finish, then
+        # the new receiver accepts (13)
+        lost = {"kind": "loss_detected", "t_ns": 500 * second, "source": 0, "idle_ns": 1,
+                "connection": 1, "session": 11, "last_committed_capture_ns": 1}
+        burst = [{"kind": "closed", "t_ns": 500 * second, "reason": "peer_closed",
+                  "session": 11},
+                 {"kind": "closed", "t_ns": 501 * second, "reason": "tls_session_failed",
+                  "session": 12},
+                 {"kind": "first_accept", "t_ns": 503 * second, "connection": 3, "source": 0,
+                  "session": 13}]
+        sessions = _session(11, 1) + _session(12, 11, 11, 2) + _session(13, 13, 30, 1)
+        receiver = receiver + self._durable(1) + sessions
         self.run_dir("main_restart-a_framed", orchestrator=orchestrator, two_host=True,
-                     receiver=receiver + self._durable(1),
-                     sender_rows=[start] + sender_rows + burst)
+                     receiver=receiver, sender_rows=[start] + sender_rows + [lost] + burst)
         row = self.report()["main_restart"]
         self.assertEqual(("pass", 1, 1), (row["g4"], row["reconnects"],
                                           row["reconnects_required"]))
-        # two separate episodes (an accept between them) still need two accepts
-        split = burst[:1] + [{**burst[2], "t_ns": 500 * second + 1}] + burst[1:2]
-        self.rewrite("main_restart-a_framed", "sender", [start] + sender_rows + split)
+        # the connection live at the restart has no accepted unit after it
+        self.rewrite("main_restart-a_framed", "sender",
+                     [start] + sender_rows + [lost] + burst[:2])
         self.assertEqual("fail", self.report()["main_restart"]["g4"])
 
     def test_every_scheduled_reset_needs_agent_loss_detection(self):
@@ -1878,9 +1924,11 @@ class SummarizerTests(unittest.TestCase):
                 {"kind": "action", "t_ns": 20 * second, "action": "sigcont", "duration_ns": 0}]
         start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": 5 * second}
         loss = {"kind": "loss_detected", "t_ns": 900 * second, "source": 0,
-                "idle_ns": 5 * second, "connection": 1, "last_committed_capture_ns": 1}
+                "idle_ns": 5 * second, "connection": 1, "session": 11,
+                "last_committed_capture_ns": 1}
         name = "slow_stop_10s-a_framed"
-        self.run_dir(name, orchestrator=main, receiver=receiver + self._durable(1),
+        self.run_dir(name, orchestrator=main,
+                     receiver=receiver + self._durable(1) + _session(11, 1, 21),
                      sender_rows=sender_rows + [start, loss], two_host=True)
         report = summarize.summarize([self.root])
         row = report["runs"][0]
@@ -2013,6 +2061,97 @@ class SummarizerTests(unittest.TestCase):
                                                               loss(22 * second, 2)])
         row = self.report()["outage_5s"]
         self.assertEqual(("pass", 2 * second), (row["g5"], row["agent_detect_max_ns"]))
+
+    # -- regressions for the PR #222 review (head 7749efa) ---------------------
+    def test_route_probe_must_reach_this_runs_receiver(self):
+        """A 404 / closed connection from a stale or unrelated listener on the
+        same address is not this run's refusal: the receiver must record the
+        probe's session nonce."""
+        orchestrator, receiver, sender_rows = _base("route_probe")
+        probe = {"kind": "route_probe", "t_ns": second_ns(1), "reason": "not_found",
+                 "session": 21}
+        seen = {"kind": "route_probe", "t_ns": second_ns(1), "candidate": "a_framed",
+                "reason": "protocol_error", "session": 21}
+        name = "route_probe-a_framed"
+        for two_host in (False, True):
+            with self.subTest(two_host=two_host):
+                # the probe went to another listener: this receiver saw nothing
+                self.run_dir(name, orchestrator=orchestrator, receiver=receiver,
+                             sender_rows=sender_rows + [probe], two_host=two_host)
+                row = self.report()["route_probe"]
+                self.assertEqual(("fail", 0), (row["g1"], row["route_probes_seen_by_receiver"]))
+                # this receiver refused a different connection's probe
+                self.rewrite(name, "receiver", receiver + [{**seen, "session": 22}])
+                self.assertEqual("fail", self.report()["route_probe"]["g1"])
+                # this receiver refused this probe
+                self.rewrite(name, "receiver", receiver + [seen])
+                self.assertEqual("pass", self.report()["route_probe"]["g1"])
+                # a probe record without its nonce cannot be tied to the receiver
+                self.rewrite(name, "sender", sender_rows + [
+                    {k: v for k, v in probe.items() if k != "session"}])
+                self.assertEqual("unmeasured", self.report()["route_probe"]["g1"])
+                for path in (self.root / name).iterdir():
+                    path.unlink()
+
+    def test_two_host_incidental_disconnect_is_not_main_outage_detection(self):
+        """Two hosts: an Agent loss on a connection that had already closed
+        before the scheduled Main stop/restart (Main clock) does not detect it;
+        only the loss of a connection live at the window's start does."""
+        second = 10**9
+        for scenario, actions in (
+                ("slow_stop_10s", [("sigstop", 10), ("sigcont", 20)]),
+                ("main_restart", [("restart_receiver", 10), ("ready", 12)])):
+            with self.subTest(scenario=scenario):
+                orchestrator, receiver, sender_rows = _base(scenario)
+                orchestrator = orchestrator + [
+                    {"kind": "action", "t_ns": at * second, "action": action,
+                     "duration_ns": 0} for action, at in actions]
+                # a short loss timeout: the (fast, 2 s) stop must also disconnect
+                start = {"kind": "start", "t_ns": 0, "n_sources": 1,
+                         "loss_timeout_ns": second // 2}
+
+                def lost(at, session, connection):
+                    return [{"kind": "loss_detected", "t_ns": at * second, "source": 0,
+                             "idle_ns": 2 * second, "connection": connection,
+                             "session": session, "last_committed_capture_ns": 1},
+                            {"kind": "closed", "t_ns": at * second, "reason": "peer_closed",
+                             "connection": connection, "session": session}]
+
+                def accept(at, session, connection):
+                    return [{"kind": "first_accept", "t_ns": at * second,
+                             "connection": connection, "source": 0, "session": session}]
+
+                # Main clock: connection 10 closed at 5 s (incidental), 11 opened at
+                # 6 s and was live when the outage started at 10 s
+                sessions = _session(10, 1, 5, 1) + _session(11, 6, 21, 2)
+                # Agent clock (unrelated offset): only connection 10's loss and the
+                # reconnect after it are on record; connection 11 never lost
+                incidental = [start] + sender_rows + accept(101, 10, 1) + lost(
+                    104, 10, 1) + accept(106, 11, 2)
+                name = f"{scenario}-a_framed"
+                self.run_dir(name, orchestrator=orchestrator, two_host=True,
+                             receiver=receiver + self._durable(1) + sessions,
+                             sender_rows=incidental)
+                row = self.report()[scenario]
+                self.assertEqual(("fail", "fail"), (row["g4"], row["g5"]))
+                # connection 11 lost at the outage and the Agent reconnected (12)
+                detected = incidental + lost(111, 11, 2) + accept(113, 12, 3)
+                self.rewrite(name, "receiver", receiver + self._durable(1) + sessions
+                             + _session(12, 22, 30, 3))
+                self.rewrite(name, "sender", detected)
+                row = self.report()[scenario]
+                self.assertEqual(("pass", "pass", 2 * second),
+                                 (row["g4"], row["g5"], row["reconnect_p95_ns"]))
+                # the receiver records carry no session nonces: not correlated
+                self.rewrite(name, "receiver", receiver + self._durable(1))
+                row = self.report()[scenario]
+                self.assertEqual(("unmeasured", "unmeasured"), (row["g4"], row["g5"]))
+                for path in (self.root / name).iterdir():
+                    path.unlink()
+
+
+def second_ns(value):
+    return value * 10**9
 
 
 class SenderProducerTests(unittest.TestCase):
@@ -2251,8 +2390,9 @@ class LoopbackMatrixTests(unittest.TestCase):
             bind="127.0.0.1", upstream_host="127.0.0.1", upstream_port=0,
             proxy_host="127.0.0.1", port_offset=_free_offset(), main_grace=0)
         orchestrator = matrix.Orchestrator(args, RUN)
-        out = orchestrator.run(["normal", "outage_5s", "auth_other_ca"], ["a_framed"])
-        orchestrator.run(["rst"], ["b_chunked"])
+        out = orchestrator.run(["normal", "outage_5s", "auth_other_ca", "route_probe"],
+                               ["a_framed"])
+        orchestrator.run(["rst", "route_probe"], ["b_chunked"])
         orchestrator.run(["normal"], ["b_segment"])
         report = summarize.summarize([out])
         runs = {(row["scenario"], row["candidate"]): row for row in report["runs"]}
@@ -2262,12 +2402,18 @@ class LoopbackMatrixTests(unittest.TestCase):
                 detail = json.dumps(row, sort_keys=True)
                 self.assertEqual("pass", row["g1"], detail)
                 self.assertEqual("pass", row["g2"], detail)
-                self.assertEqual("pass", row["g3"], detail)
+                # route_probe moves no media: no resource bound to assess
+                self.assertEqual("not_applicable" if key[0] == "route_probe" else "pass",
+                                 row["g3"], detail)
                 self.assertIn(row["g4"], ("pass", "not_applicable"), detail)
                 self.assertIn(row["g5"], ("pass", "not_applicable"), detail)
         self.assertGreater(runs[("outage_5s", "a_framed")]["reported_missing"], 0)
         self.assertEqual(0, runs[("auth_other_ca", "a_framed")]["receiver_accepted"])
         self.assertGreater(runs[("normal", "b_segment")]["receiver_accepted"], 0)
+        for candidate in ("a_framed", "b_chunked"):
+            # this run's receiver recorded each probe's session nonce
+            row = runs[("route_probe", candidate)]
+            self.assertEqual((1, 1), (row["route_probes"], row["route_probes_seen_by_receiver"]))
         for path in out.rglob("*.jsonl"):
             records.read_jsonl(path)  # every stored value is numeric or a token
         for row in runs.values():

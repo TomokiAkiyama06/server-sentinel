@@ -24,6 +24,8 @@ from . import materials, records, wire
 from .records import token
 
 source_ids = wire.source_ids
+# Request-line starts that mark an HTTP request sent to the framed listener.
+HTTP_METHODS = (b"GET /", b"POST ", b"PUT /", b"HEAD ")
 
 
 class ReceiverConfig:
@@ -355,8 +357,10 @@ class Receiver:
         self._event("session_open", connection=number, generation=grant.generation,
                     node=token(label) if label else "other")
         reason = "peer_closed"
+        state = {"last_rx": time.monotonic(), "checked": time.monotonic(),
+                 "connection": number, "session": None}
         try:
-            reason = self._run_session(session, grant, node)
+            reason = self._run_session(session, grant, state)
         except wire.ProtocolError:
             reason = "protocol_error"
         except (ssl.SSLError, OSError):
@@ -366,7 +370,8 @@ class Receiver:
             session.close()
             with self._lock:
                 self._connections.pop(number, None)
-            self._event("session_close", connection=number, reason=token(reason))
+            self._event("session_close", connection=number, session=state["session"],
+                        reason=token(reason))
 
     def _recv(self, session, state):
         """One bounded read with periodic admission/idle checks; None on timeout."""
@@ -407,10 +412,9 @@ class Receiver:
                     accepted=accepted)
         return False
 
-    def _run_session(self, session, grant, node):
+    def _run_session(self, session, grant, state):
         connection = session.connection
         connection.settimeout(0.5)
-        state = {"last_rx": time.monotonic(), "checked": time.monotonic()}
         try:
             if self.config.candidate == "a_framed":
                 self._session_a(session, grant, state)
@@ -430,10 +434,22 @@ class Receiver:
             if inq is not None:
                 self.max_inq = max(self.max_inq, inq)
 
-    def _handle_bodies(self, bodies, grant, *, segment_blocked=None):
+    def _hello(self, state, session):
+        """Record the sender's per-connection session nonce (first frame)."""
+        if state["session"] is not None:
+            raise wire.ProtocolError("second hello")
+        state["session"] = session
+        self._event("session_hello", connection=state["connection"], session=session)
+
+    def _handle_bodies(self, bodies, grant, state, *, segment_blocked=None):
         replies = []
         for body in bodies:
             parsed = wire.parse_body(body)
+            if parsed[0] == wire.HELLO:
+                self._hello(state, parsed[1])
+                continue
+            if state["session"] is None:
+                raise wire.ProtocolError("hello must come first")
             if parsed[0] == wire.MEDIA:
                 _, source, epoch, sequence, capture_ns, payload = parsed
                 if segment_blocked is not None and source in segment_blocked:
@@ -459,7 +475,19 @@ class Receiver:
             data = self._recv(session, state)
             if not data:
                 continue
-            reply = self._handle_bodies(reader.feed(data), grant)
+            try:
+                bodies = reader.feed(data)
+            except wire.ProtocolError as error:
+                if reader.peek(5) in HTTP_METHODS:
+                    # An HTTP request (route probe) on the framed listener is
+                    # refused; its HELLO, if it came first, names the probe.
+                    hello = [wire.parse_body(body) for body in getattr(error, "bodies", ())]
+                    if len(hello) == 1 and hello[0][0] == wire.HELLO:
+                        self._hello(state, hello[0][1])
+                    self._event("route_probe", reason="protocol_error",
+                                session=state["session"])
+                raise
+            reply = self._handle_bodies(bodies, grant, state)
             if reply:
                 self._send(session, reply)
 
@@ -481,15 +509,19 @@ class Receiver:
         start, headers = wire.parse_head(head)
         return start, headers, bytearray(rest)
 
-    def _route(self, session, start, method, path):
+    def _route(self, session, start, headers, method, path):
         if start[0] != method or start[1] != path or start[2:] != ["HTTP/1.1"]:
             self._send(session, wire.response_head(404, close=True))
-            self._event("route_probe", reason="not_found")
+            try:
+                probe = wire.parse_session(headers.get(wire.SESSION_HEADER))
+            except wire.ProtocolError:
+                probe = None
+            self._event("route_probe", reason="not_found", session=probe)
             raise _Close("not_found")
 
     def _session_b_chunked(self, session, grant, state):
         start, headers, rest = self._read_head(session, state, bytearray())
-        self._route(session, start, "POST", wire.STREAM_PATH)
+        self._route(session, start, headers, "POST", wire.STREAM_PATH)
         if headers.get("transfer-encoding") != "chunked" or "content-length" in headers:
             raise wire.ProtocolError("stream must be chunked")
         self._send(session, wire.response_head(200, chunked=True))
@@ -502,7 +534,7 @@ class Receiver:
                 bodies = []
                 for piece in decoder.feed(data):
                     bodies.extend(reader.feed(piece))
-                reply = self._handle_bodies(bodies, grant)
+                reply = self._handle_bodies(bodies, grant, state)
                 if reply:
                     self._send(session, wire.chunk(reply))
                 if decoder.finished:
@@ -515,7 +547,7 @@ class Receiver:
         maximum = self.config.maximum_message_bytes + wire.MEDIA_HEADER_BYTES
         while not self.stop.is_set():
             start, headers, pending = self._read_head(session, state, pending)
-            self._route(session, start, "PUT", wire.SEGMENT_PATH)
+            self._route(session, start, headers, "PUT", wire.SEGMENT_PATH)
             if "transfer-encoding" in headers:
                 raise wire.ProtocolError("segment must have a length")
             try:
@@ -534,7 +566,7 @@ class Receiver:
             while True:
                 remaining -= len(data)
                 if data:
-                    replies.append(self._handle_bodies(reader.feed(data), grant,
+                    replies.append(self._handle_bodies(reader.feed(data), grant, state,
                                                        segment_blocked=blocked))
                 if remaining <= 0:
                     break

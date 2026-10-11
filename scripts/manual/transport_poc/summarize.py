@@ -417,12 +417,32 @@ class RunSummary:
         if self.scenario in NEGATIVE_SCENARIOS:
             return self._g1_negative(accepted, sender_accepted, sessions)
         if self.scenario == "route_probe":
-            probes = _kind(self.sender, "route_probe")
-            return _verdict(bool(probes) and all(p["reason"] in ("not_found", "peer_closed")
-                                                 for p in probes) and accepted == 0)
+            return self._g1_route_probe(accepted)
         if self.scenario == "auth_revoked_live":
             return self._g1_revoked_live(accepted)
         return _verdict(sessions > 0)
+
+    def _g1_route_probe(self, accepted):
+        """The ingest listener of *this run* refused the human-route probe.
+
+        The sender's own result (404 or a closed connection) is not enough: a
+        stale or unrelated listener on the same address answers the same way.
+        Each probe carries its connection's session nonce, and this run's
+        receiver must have recorded a ``route_probe`` refusal with that nonce
+        (``fail`` otherwise; a probe record without a nonce is ``unmeasured``).
+        """
+        probes = _kind(self.sender, "route_probe")
+        seen = {item.get("session") for item in _kind(self.receiver, "route_probe")
+                if _is_int(item.get("session"))}
+        nonces = [probe.get("session") for probe in probes]
+        correlated = sum(1 for nonce in nonces if _is_int(nonce) and nonce in seen)
+        self.metrics.update(route_probes=len(probes), route_probes_seen_by_receiver=correlated)
+        if not probes or accepted != 0 or any(
+                p.get("reason") not in ("not_found", "peer_closed") for p in probes):
+            return "fail"
+        if any(not _is_int(nonce) for nonce in nonces):
+            return "unmeasured"  # older record: the probe cannot be tied to this receiver
+        return _verdict(correlated == len(probes))
 
     def _g1_revoked_live(self, accepted):
         """Revocation of a connected node: detected, then nothing accepted.
@@ -953,25 +973,27 @@ class RunSummary:
         closes = sorted(c["t_ns"] for c in _kind(self.sender, "closed")
                         if c["reason"] != "shutdown")
         accepts = sorted(a["t_ns"] for a in _kind(self.sender, "first_accept"))
+        times = []
+        used_accepts = set()
         if any(origin == "main" for *_, origin in windows) and not single_host:
-            # Main-side windows use the Main clock; measure on the Agent clock
-            # from each unexpected disconnect to the next accepted unit.
-            # Consecutive closes with no accepted unit between them are one
-            # episode (a stopping receiver may accept and drop one more
-            # connection before it exits).
-            episodes = []
-            for t in closes:
-                if not episodes or any(episodes[-1] < a <= t for a in accepts):
-                    episodes.append(t)
-            windows = [(t, t, "agent") for t in episodes]
+            # Main-side windows use the Main clock: each is tied to the Agent
+            # connection that was live when it started (session nonce, see
+            # ``_main_session_matches``) and its reconnect is measured on the
+            # Agent clock from that connection's close to the next accepted
+            # unit on a later connection. An unrelated disconnect never
+            # stands in for a scheduled one. Agent-clock (proxy) windows are
+            # matched below as on one host.
+            verdict = self._main_window_reconnects(times)
+            if verdict is not None:
+                return verdict
+            windows = [window for window in windows if window[2] != "main"]
         # Each window takes its own disconnect and its own first accepted unit
         # after it: one close/accept episode never counts for two windows. Like
         # the G5 detections, a window ends at the next impairment start (any
         # kind, same clock as the windows): a close or accept that happened
         # after a later impairment never serves an earlier one.
         marks = set(self._impairment_starts()) | {start for start, _end, _o in windows}
-        used_closes, used_accepts = set(), set()
-        times = []
+        used_closes = set()
         for start, end, _origin in windows:
             limit = _window_limit(start, end + 30 * SECOND, marks)
             later = [mark for mark in marks if mark > start]
@@ -998,6 +1020,99 @@ class RunSummary:
         if times and records.percentiles(times)[95] > RECONNECT_P95_NS:
             return "fail"
         return "unmeasured" if required is None else "pass"
+
+    def _main_window_reconnects(self, times):
+        """Two hosts: the reconnect time of each Main-side window, Agent clock.
+
+        Appends one time per window matched to a live session
+        (``_main_session_matches``): from that connection's ``closed`` to the
+        first accepted unit on a later connection, each accept used once.
+        Returns ``unmeasured`` when the records carry no session nonces,
+        ``fail`` when a matched connection has no later accepted unit, else
+        None (the caller checks the required count).
+        """
+        matches = self._main_session_matches()
+        if matches is None:
+            self.metrics.update(main_session_correlation=False)
+            return "unmeasured"
+        closed = {}
+        for item in _kind(self.sender, "closed"):
+            if _is_int(item.get("session")) and item.get("reason") != "shutdown":
+                closed.setdefault(item["session"], item["t_ns"])
+        accepts = sorted((a["t_ns"], a.get("session") or 0)
+                         for a in _kind(self.sender, "first_accept"))
+        used = set()
+        for _window, session in matches:
+            if session is None or session not in closed:
+                continue
+            at = closed[session]
+            accept = next((i for i, (t, other) in enumerate(accepts)
+                           if i not in used and t >= at and other != session), None)
+            if accept is None:
+                self.metrics.update(reconnect_missing=True)
+                return "fail"
+            used.add(accept)
+            times.append(accepts[accept][0] - at)
+        return None
+
+    def _main_session_matches(self):
+        """Two hosts: tie each Main-side stop/restart to an Agent loss episode.
+
+        Without comparing clocks: the receiver records each connection's
+        session nonce (``session_hello``, Main clock) and its close, so the
+        connections live when a window started (the orchestrator's action,
+        same Main clock) are known; only their loss can be that window's
+        detection. Each window needs the Agent ``loss_detected`` episode of
+        one of those sessions (the sender records carry the nonce), each
+        episode used once (maximum bipartite matching). An incidental
+        disconnect before the stop is on a session that had already closed,
+        so it never satisfies the window. Returns ``[(window, session or
+        None)]`` in window order, or None when the records carry no nonces.
+        """
+        windows = sorted((start, end) for start, end, origin in self._impairment_windows()
+                         if origin == "main")
+        hellos = {}
+        for item in _kind(self.receiver, "session_hello"):
+            if _is_int(item.get("session")):
+                hellos.setdefault(item["session"], item["t_ns"])
+        losses = _kind(self.sender, "loss_detected")
+        if not hellos or any(not _is_int(loss.get("session")) for loss in losses):
+            return None
+        # A session ends at its close, or at the end of its receiver process
+        # (an abruptly stopped receiver may not write every close).
+        ends = [item["t_ns"] for item in _kind(self.receiver, "end")]
+        closes = {}
+        for item in _kind(self.receiver, "session_close"):
+            if _is_int(item.get("session")):
+                closes.setdefault(item["session"], item["t_ns"])
+        episodes = {loss["session"] for loss in losses}
+        candidates = []
+        for start, _end in windows:
+            live = []
+            for session, opened in sorted(hellos.items(), key=lambda kv: kv[1]):
+                bounds = [t for t in ends if t >= opened]
+                if session in closes:
+                    bounds.append(closes[session])
+                if (session in episodes and opened <= start
+                        and (not bounds or min(bounds) >= start)):
+                    live.append(session)
+            candidates.append(live)
+        owner = {}
+
+        def assign(index, seen):
+            for session in candidates[index]:
+                if session in seen:
+                    continue
+                seen.add(session)
+                if session not in owner or assign(owner[session], seen):
+                    owner[session] = index
+                    return True
+            return False
+
+        for index in range(len(windows)):
+            assign(index, set())
+        chosen = {index: session for session, index in owner.items()}
+        return [(window, chosen.get(index)) for index, window in enumerate(windows)]
 
     # -- G5 -----------------------------------------------------------------
     def _main_outage_detection(self, losses, single_host):
@@ -1035,7 +1150,21 @@ class RunSummary:
                     matched += 1
                     delays.append(episodes[hit]["t_ns"] - start)
         else:
-            matched = min(len(episodes), len(windows))
+            # Two hosts: each window takes the loss episode of a connection
+            # that was live at the window's start (session nonce), never just
+            # any episode: an incidental disconnect before the stop is not
+            # its detection. Delay: that episode's ``idle_ns`` (Agent clock).
+            matches = self._main_session_matches()
+            if matches is None:
+                self.metrics.update(main_session_correlation=False)
+                return "unmeasured" if episodes else "fail"
+            first = {}
+            for loss in sorted(losses, key=lambda item: item["t_ns"]):
+                first.setdefault(loss["session"], loss)
+            for _window, session in matches:
+                if session is not None:
+                    matched += 1
+                    delays.append(first[session].get("idle_ns"))
         self.metrics.update(main_outages=len(windows), agent_loss_episodes=len(episodes),
                             agent_main_outage_detect_max_ns=max(
                                 (d for d in delays if d is not None), default=None))

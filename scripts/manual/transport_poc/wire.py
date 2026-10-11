@@ -10,17 +10,24 @@ Every frame is ``uint32 length`` followed by ``length`` bytes starting with a
 one-byte type. The media frame carries the ADR-0007 envelope
 ``(source_id, capture_epoch, sequence, capture_time_ns)``; the payload is
 opaque compressed video that the receiver only hashes and discards.
+
+The first frame the sender writes on every connection is ``HELLO`` with a
+per-connection random session nonce (``uint64``, never 0). Both sides record
+it, so the summarizer can tie an Agent-side connection (its loss, its route
+probe) to the Main-side session of the same run without comparing clocks.
 """
+import os
 import struct
 from uuid import UUID, uuid5
 
-MEDIA, HEARTBEAT, ACK, HEARTBEAT_ACK = 1, 2, 3, 4
+MEDIA, HEARTBEAT, ACK, HEARTBEAT_ACK, HELLO = 1, 2, 3, 4, 5
 _LENGTH = struct.Struct(">I")
 _MEDIA = struct.Struct(">B16sQQQ")
 _HEARTBEAT = struct.Struct(">BQ")
 _ACK = struct.Struct(">B16sQQBB")
 MEDIA_HEADER_BYTES = _MEDIA.size
 MAX_HEAD_BYTES = 8192
+SESSION_HEADER = "x-poc15-session"
 STREAM_PATH = "/poc15/v1/stream"
 SEGMENT_PATH = "/poc15/v1/segment"
 
@@ -60,6 +67,27 @@ def heartbeat_ack_frame(echo_ns):
     return frame(_HEARTBEAT.pack(HEARTBEAT_ACK, echo_ns))
 
 
+def new_session_nonce():
+    """A random, non-zero 63-bit per-connection session nonce."""
+    return (int.from_bytes(os.urandom(8), "big") >> 1) or 1
+
+
+def hello_frame(session):
+    if not 0 < session < 1 << 63:
+        raise ValueError("session nonce out of range")
+    return frame(_HEARTBEAT.pack(HELLO, session))
+
+
+def parse_session(value):
+    """A session nonce from its decimal header form; ``ProtocolError`` otherwise."""
+    if not isinstance(value, str) or not value.isdigit() or len(value) > 19:
+        raise ProtocolError("bad session nonce")
+    session = int(value)
+    if not 0 < session < 1 << 63:
+        raise ProtocolError("bad session nonce")
+    return session
+
+
 def ack_frame(source_id, epoch, sequence, outcome, reason):
     outcome_code = OUTCOMES.index(outcome)
     reason_code = REASONS.index(reason if reason in REASONS else "other")
@@ -76,10 +104,13 @@ def parse_body(body):
             raise ProtocolError("short media frame")
         _, source, epoch, sequence, capture_ns = _MEDIA.unpack_from(body)
         return MEDIA, UUID(bytes=source), epoch, sequence, capture_ns, body[_MEDIA.size:]
-    if kind in (HEARTBEAT, HEARTBEAT_ACK):
+    if kind in (HEARTBEAT, HEARTBEAT_ACK, HELLO):
         if len(body) != _HEARTBEAT.size:
             raise ProtocolError("bad heartbeat frame")
-        return kind, _HEARTBEAT.unpack(body)[1]
+        value = _HEARTBEAT.unpack(body)[1]
+        if kind == HELLO and not 0 < value < 1 << 63:
+            raise ProtocolError("bad session nonce")
+        return kind, value
     if kind == ACK:
         if len(body) != _ACK.size:
             raise ProtocolError("bad ack frame")
@@ -106,11 +137,19 @@ class FrameReader:
     def __len__(self):
         return len(self._buffer)
 
+    def peek(self, count):
+        """The first ``count`` unconsumed bytes (at a frame boundary)."""
+        return bytes(self._buffer[:count])
+
     def feed(self, data):
         self._buffer += data
         bodies = []
         while len(self._buffer) >= 4:
-            length = check_length(_LENGTH.unpack_from(self._buffer)[0], self.maximum_body)
+            try:
+                length = check_length(_LENGTH.unpack_from(self._buffer)[0], self.maximum_body)
+            except ProtocolError as error:
+                error.bodies = bodies  # complete frames before the violation
+                raise
             if len(self._buffer) < 4 + length:
                 break
             bodies.append(bytes(self._buffer[4:4 + length]))

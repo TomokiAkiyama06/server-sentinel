@@ -1223,7 +1223,7 @@ Total run time today (≤ 3 h):
 - [ ] G5: 無音断の検知 ≤ 15 s、Main の未 commit 区間が Agent 保護区間 [T−600 s, T+600 s] に含まれる;
 - [ ] G6: CPU 制限下の 4 source で backpressure 0、5 source 目は拒否;
 - [ ] 全 run が非 fast（`--fast` なし。summary の各 run 行と候補行の `fast` が `false`、`fast_runs` が 0）;
-- [ ] 2 host の run では G5 の Main 側停止・Main 検知が件数照合（window との時刻対応なし）であることを結果に併記した;
+- [ ] 2 host の run では G5 の Main `interrupted`（proxy blackhole）が件数照合（window との時刻対応なし）であることを結果に併記した（Main 側停止・再起動の Agent 検知と再接続は session nonce で対応付け済み）;
 - [ ] 1 / 2 / 3 / 4 source の各構成を候補ごとに実行した（`normal` / `sources_2` / `sources_3` / `capacity_4`、summary の `*_missing_source_counts` が 0）、全 run の `integrity` が `pass`（別実行の記録の混入・子 process の異常終了なし）;
 - [ ] 副次: 30 分 soak（full matrix とは別の日に実行）で予期しない切断 0、overhead ≤ 10 %、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %、latency p95（参考）;
 - [ ] cleanup checklist を完了（使い捨て CA / ledger / node 鍵 / holder state を削除、`ss-poc15-*` scope なし）;
