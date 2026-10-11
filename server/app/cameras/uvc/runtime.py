@@ -134,11 +134,13 @@ class LocalUvcRuntimeStatus:
     # #194): a transition lock or health write did not finish in time. The
     # stop is ``stop_failed`` and the rows were fenced conservatively.
     health_fence_incomplete: int = 0
-    # True while a stop keeps the database pin because a fenced source's
-    # health write was still in flight at its bound (Issue #204): an earlier
+    # True while a stop keeps the database pin because a source's health
+    # write was still in flight at its bound (Issue #204): an earlier
     # ``online`` write may still commit, and the fenced ``offline`` behind it
-    # needs the pin. Released, off the stop, as soon as no fenced write is in
-    # flight; the stop itself stays bounded.
+    # needs the pin. A joined (unfenced) source's stalled handed-off write
+    # keeps it the same way, for the closing ``offline`` staged behind it
+    # (Issue #211 item 3). Released, off the stop, as soon as no health write
+    # is in flight; the stop itself stays bounded.
     health_fence_pin_held: bool = False
 
 
@@ -571,6 +573,10 @@ class LocalUvcRuntime:
         that worker's own ``finally`` cleanup instead of being closed from this
         thread while a capture poll may still run; the durable active-session
         marker then conservatively requires Owner reapproval at next start.
+        That is unless the worker finishes its cleanup while the database pin
+        is still held (for example kept for a fenced health write, below):
+        its own shutdown then releases the marker as on a clean stop, and the
+        next start does not require reapproval for it.
         A frame-progress watchdog still inside a check after its bounded join
         likewise fails the stop and keeps the adapter open under that check.
 
@@ -587,6 +593,8 @@ class LocalUvcRuntime:
         (``health_fence_pin_held``) instead of refusing the fenced write
         queued behind it, and the writer releases it as soon as no fenced
         write is in flight (Issue #204); this stop does not wait for that.
+        A joined source's handed-off health write still stalled at that
+        point keeps the pin the same way (Issue #211 item 3).
         Pending health-sink deliveries get at most
         ``HEALTH_SINK_SETTLE_SECONDS`` after the teardown.
         """
@@ -636,8 +644,13 @@ class LocalUvcRuntime:
                     failed = True
                     self._fence_live_workers()
             # Drop the held database pin; a worker that outlived the join
-            # bound then fails closed instead of reading storage. A fenced
-            # write still in flight keeps it until that write ends.
+            # bound then fails closed instead of reading storage. A health
+            # write still in flight (fenced or not) keeps it until that write
+            # ends; the listener is registered before the check, so a write
+            # that ends right after it still releases the pin.
+            listen = getattr(self.adapter, "on_fence_settled", None)
+            if callable(listen):
+                listen(self._fence_settled)
             if not self._release_database_unless_fencing():
                 failed = True
             for source_id, state in tuple(self._sources.items()):
@@ -719,9 +732,6 @@ class LocalUvcRuntime:
                 live.append(source_id)
         if not live:
             return
-        listen = getattr(self.adapter, "on_fence_settled", None)
-        if callable(listen):
-            listen(self._fence_settled)
         try:
             complete = fence(live, HEALTH_FENCE_SECONDS) is True
         except Exception:

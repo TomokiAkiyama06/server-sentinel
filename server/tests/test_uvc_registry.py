@@ -963,5 +963,108 @@ class StopFenceTests(UvcRegistryFixture):
         self.assertIn(False, settled)
 
 
+    def test_failed_handoff_start_leaves_the_writer_idle_and_notifies_settled(self):
+        # Issue #211 item 2: a handoff thread that cannot be started must
+        # not leave the writer busy (the stop would keep the pin forever),
+        # and the pin-release check must still be told.
+        from app.cameras.uvc.registry_adapter import _HealthWriter
+
+        writes, marks, settled = [], [], []
+        writer = _HealthWriter(lambda **values: writes.append(values), marks.append,
+                               settled=lambda: settled.append(writer.busy))
+        writer.fence(health_state=SourceHealthState.OFFLINE)
+
+        def refuse(thread):
+            raise RuntimeError("synthetic thread exhaustion")
+
+        with patch.object(threading.Thread, "start", refuse):
+            with self.assertRaises(RuntimeError):
+                writer.flush(blocking=False)
+        self.assertFalse(writer.busy)
+        self.assertTrue(writer.settle(0.0))
+        self.assertEqual([False], settled)
+        self.assertEqual([], writes)
+        # The source stays unpersisted and the values staged for a retry.
+        self.assertEqual([True], marks)
+        self.assertTrue(writer.flush())
+        self.assertEqual([{"health_state": SourceHealthState.OFFLINE}], writes)
+        self.assertFalse(writer.busy)
+
+    def test_writer_counts_a_blocking_flush_busy_until_it_ends(self):
+        # Issue #211 item 2: ``busy`` counts blocking flushes (``_flushing``)
+        # while they wait for or hold the write, also when the write fails,
+        # and ``settled`` follows each one's end.
+        from app.cameras.uvc.registry_adapter import _HealthWriter
+
+        gate, entered = threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+        settled = []
+        failing = [True]
+
+        def write(**values):
+            entered.set()
+            gate.wait(10)
+            if failing.pop(0) if failing else False:
+                raise RuntimeError("synthetic refused write")
+
+        writer = _HealthWriter(write, lambda unpersisted: None,
+                               settled=lambda: settled.append(writer.busy))
+        writer.stage(health_state=SourceHealthState.DEGRADED)
+        errors = []
+
+        def flush():
+            try:
+                writer.flush()
+            except RuntimeError as error:
+                errors.append(error)
+
+        first = threading.Thread(target=flush)
+        first.start()
+        self.assertTrue(entered.wait(5))
+        # A second blocking flush waits for the first one's write lock.
+        writer.stage(health_state=SourceHealthState.OFFLINE)
+        second = threading.Thread(target=flush)
+        second.start()
+        self.assertTrue(writer.busy)
+        self.assertEqual([], settled)
+        gate.set()
+        first.join(5)
+        second.join(5)
+        self.assertEqual(1, len(errors))
+        self.assertFalse(writer.busy)
+        self.assertIn(False, settled)
+
+    def test_unfenced_writer_with_a_stalled_handoff_is_pending(self):
+        # Issue #211 item 3: a joined (unfenced) source's handed-off write
+        # still stalled at a stop keeps the pin, and its end is reported.
+        gate, entered = threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+        original = self.registry.update_source_health
+
+        def update(source_id, **values):
+            if values.get("health_state") is SourceHealthState.DEGRADED:
+                entered.set()
+                gate.wait(10)
+            return original(source_id, **values)
+
+        settled = []
+        self.adapter.on_fence_settled(lambda: settled.append(self.adapter.fence_pending()))
+        self.assertFalse(self.adapter.fence_pending())
+        writer = self.adapter._writer(self.source.id)
+        with patch.object(self.registry, "update_source_health", side_effect=update):
+            writer.stage(health_state=SourceHealthState.DEGRADED)
+            writer.flush(blocking=False)
+            self.assertTrue(entered.wait(5))
+            writer.stage(health_state=SourceHealthState.OFFLINE)
+            writer.flush(blocking=False)
+            self.assertTrue(self.adapter.fence_pending())
+            self.assertEqual([], settled)
+            gate.set()
+            self.assertTrue(writer.settle(5))
+        self.assertFalse(self.adapter.fence_pending())
+        self.assertIn(False, settled)
+        self.assertEqual(SourceHealthState.OFFLINE,
+                         self.registry.get_source(self.source.id).health_state)
+
 if __name__ == "__main__":
     unittest.main()

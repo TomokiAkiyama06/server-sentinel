@@ -13,7 +13,8 @@ from uuid import UUID
 from app.cameras.remote_agent.continuity import (
     AgentSession, CommittedWatermark, ContinuityDiagnostics, ContinuityLimits,
     ContinuityTracker, DeliveryOutcome,
-    GapReason, MediaUnitHeader, SourceFlow, _MAXIMUM_ATTEMPT_STEPS, _record_attempt,
+    GapReason, LOG_FLOOR_NS, MediaUnitHeader, SourceFlow, _MAXIMUM_ATTEMPT_STEPS,
+    _record_attempt,
 )
 from app.cameras.remote_agent.ingest import (
     AgentAction, AgentIngestQueue, AgentMessage, DenyIngestAuthorizer, IngestLimits,
@@ -2226,15 +2227,73 @@ CONTINUITY_LOGGER = "app.cameras.remote_agent.continuity"
 class ContinuityObservabilityTests(unittest.TestCase):
     """Issue #113: evictions and ignored acknowledgements are never silent."""
 
-    def _tracker(self, *, released=1):
+    def _tracker(self, *, released=1, log_clock=None):
         authorizer = Authorizer({(NODE, SOURCE), (NODE, OTHER_SOURCE)})
         clock = Clock()
         ingest = AgentIngestQueue(IngestLimits(8, 4, 32, 1000, 10 ** 12),
                                   authorizer, clock_ns=clock)
         tracker = ContinuityTracker(
             ContinuityLimits(4, 4, 100, maximum_released_sources=released), authorizer,
-            ingest, clock_ns=clock, committed_watermark=no_watermark)
+            ingest, clock_ns=clock, committed_watermark=no_watermark,
+            **({} if log_clock is None else {"log_clock_ns": log_clock}))
         return tracker, ingest, authorizer, tracker.open_session(NODE)
+
+    def test_qualifying_records_noted_before_one_emission_are_all_kept(self):
+        # Issue #211 item 5 (Codex P2 on PR #208): concurrent ignored
+        # acknowledgements can pass several doublings before any of them
+        # emits; each such record must survive, not be merged into one.
+        tracker, _, _, _ = self._tracker(released=4)
+        with tracker._lock:
+            for count in (1, 2, 3, 4):
+                tracker._note_log_locked(Event.CAPTURE_CONTINUITY_ACK_NODE_MISMATCH,
+                                         logging.WARNING, count)
+        with self.assertLogs(CONTINUITY_LOGGER, logging.DEBUG) as logged:
+            tracker._emit_logs()
+        self.assertEqual([Event.CAPTURE_CONTINUITY_ACK_NODE_MISMATCH] * 3,
+                         [record.msg for record in logged.records])
+        logger = logging.getLogger(CONTINUITY_LOGGER)
+        with self.assertNoLogs(logger, logging.DEBUG):
+            tracker._emit_logs()
+
+    def test_recurring_condition_is_logged_at_least_once_per_floor_interval(self):
+        # Issue #211 item 6: doubling alone spaces records exponentially;
+        # a recurring condition is still logged once per bounded interval.
+        log_clock = Clock()
+        tracker, _, _, _ = self._tracker(released=4, log_clock=log_clock)
+        mark = CommittedWatermark(NODE, 1, 0, 0)
+        with self.assertLogs(CONTINUITY_LOGGER, logging.DEBUG) as logged:
+            for _ in range(4):
+                tracker.acknowledge_persisted(SOURCE, mark)
+            # Counts 1, 2 and 4 logged; 3 suppressed.
+            self.assertEqual(3, len(logged.records))
+            log_clock.now += LOG_FLOOR_NS - 1
+            tracker.acknowledge_persisted(SOURCE, mark)
+            self.assertEqual(3, len(logged.records))
+            log_clock.now += 1
+            # Count 6: not a doubling, but the floor interval has passed.
+            tracker.acknowledge_persisted(SOURCE, mark)
+            self.assertEqual(4, len(logged.records))
+            tracker.acknowledge_persisted(SOURCE, mark)
+            self.assertEqual(4, len(logged.records))
+            log_clock.now += LOG_FLOOR_NS
+            tracker.acknowledge_persisted(SOURCE, mark)
+            # Count 8 is a doubling as well: still one record.
+            self.assertEqual(5, len(logged.records))
+        self.assertEqual({Event.CAPTURE_CONTINUITY_ACK_UNKNOWN_SOURCE},
+                         {record.msg for record in logged.records})
+        self.assertEqual(8, tracker.diagnostics().ignored_acknowledgements_unknown_source)
+        self.assertNotIn(str(SOURCE), self._formatted(logged.records))
+        self.assertNotIn(str(NODE), self._formatted(logged.records))
+
+    def test_failing_log_clock_never_fails_the_caller(self):
+        def broken():
+            raise OSError("synthetic clock failure")
+
+        tracker, _, _, _ = self._tracker(released=4, log_clock=broken)
+        with self.assertLogs(CONTINUITY_LOGGER, logging.DEBUG) as logged:
+            for _ in range(4):
+                tracker.acknowledge_persisted(SOURCE, CommittedWatermark(NODE, 1, 0, 0))
+        self.assertEqual(3, len(logged.records))
 
     @staticmethod
     def _release(tracker, ingest, authorizer, session, source, sequence, *, fenced):

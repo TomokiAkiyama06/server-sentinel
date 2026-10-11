@@ -1568,6 +1568,68 @@ class FencePinTests(RuntimeFixture):
         self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
 
 
+    def test_joined_source_with_a_stalled_handed_off_write_keeps_the_pin(self):
+        # Issue #211 item 3: the worker was joined (not fenced), but a
+        # handed-off ``degraded`` write was still stalled when the stop
+        # released the pin. The closing ``offline`` staged behind it was then
+        # refused and ``degraded`` stayed durable.
+        source = self.source()
+        pinned = PinnedDatabase(Database(self.database.path))
+        registry = CameraRegistry(pinned, reservation=ToggleAdmission())
+        self.addCleanup(pinned.release)
+        gate, entered, armed = threading.Event(), threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+        unpinned = CameraRegistry(self.database)
+        original = registry.update_source_health
+
+        def update(source_id, **values):
+            if values.get("health_state") is SourceHealthState.DEGRADED and not gate.is_set():
+                entered.set()
+                gate.wait(10)
+                # Already inside storage: commits through its own connection.
+                return unpinned.update_source_health(source_id, **values)
+            return original(source_id, **values)
+
+        class Adapter(LocalUvcAdapter):
+            def stop_source(self, source_id):
+                if not armed.is_set():
+                    return super().stop_source(source_id)
+                # Like a watchdog stall just before the stop: the write is
+                # handed off and blocks inside storage.
+                writer = self._writer(source_id)
+                writer.stage(health_state=SourceHealthState.DEGRADED)
+                writer.flush(blocking=False)
+                entered.wait(5)
+                return super().stop_source(source_id)
+
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), **FAST), registry,
+            on_frame=self.on_frame, discovery=self.discovery,
+            capture_factory=self.captures, adapter_factory=Adapter,
+        )
+        self.addCleanup(runtime.stop)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        with patch.object(registry, "update_source_health", side_effect=update):
+            armed.set()
+            status = runtime.stop()
+            self.assertTrue(entered.is_set())
+            self.assertIs(status.state, LocalUvcRuntimeState.STOPPED)
+            self.assertFalse(status.sources[0].worker_running)
+            self.assertTrue(status.health_fence_pin_held)
+            self.assertTrue(pinned.pinned)
+            with self.assertLogs("app.cameras.uvc.runtime", "INFO") as logs:
+                gate.set()
+                self.assertTrue(wait_for(lambda: not pinned.pinned))
+            self.assertIn(Event.LOCAL_UVC_HEALTH_FENCE_PIN_RELEASED.value,
+                          "\n".join(logs.output))
+        self.assertIs(self.health(source.id), SourceHealthState.OFFLINE)
+        status = runtime.status()
+        self.assertFalse(status.health_fence_pin_held)
+        self.assertTrue(status.sources[0].health_persisted)
+
+
 class RestartDurabilityTests(RuntimeFixture):
     def test_clean_restart_reconnects_unique_serial_camera(self):
         source = self.source()
