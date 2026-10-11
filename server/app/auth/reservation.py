@@ -1127,12 +1127,13 @@ class HostnameReservationCheck:
     completed while it was verifying (PR #174 review). Taking the lock again for decide +
     commit (``_after_evaluation`` with the marker, fallback and reopening
     revocations, together with publishing the verdict) is defense in depth.
-    The idle-expiry touch in ``AccessStore.authorize()`` /
-    ``authorize_owner()`` stays outside the gate: revocation advances the
-    authorization generation, so a touch never makes a revoked session valid.
-    The human surface's session read (``AccessStore.authorize_session``)
-    commits its touch inside ``admit(epoch)``, so a request refused for a
-    close after its epoch never extends the session (Codex PR #219).
+    Every human authorization commits its idle-expiry touch inside
+    ``admit(epoch)`` (``AccessStore.authorize_request`` on the human routes,
+    ``authorize_owner(admit=...)`` for an Owner operation; Issue #10 phase 2
+    S1, #228), so a request refused for a close after its epoch never
+    extends the session (Codex PR #219). A bare ``authorize()`` without
+    ``admit`` is for fixtures only; even there a touch never makes a revoked
+    session valid, since revocation advances the authorization generation.
 
     Lock order (outermost first): ``exception_change_lock`` ->
     ``_check_lock`` -> ``_session_gate_lock`` -> the SQLite write lock
@@ -1332,7 +1333,7 @@ class HostnameReservationCheck:
         without taking the lock (Issue #181).
 
         Every human data route must commit its authorization inside this
-        block, after taking ``epoch()`` (as ``AccessStore.authorize_session``
+        block, after taking ``epoch()`` (as ``AccessStore.authorize_request``
         does). Reading ``access_open`` is not enough. A commit inside the
         block may wait for the storage admission (up to one in-flight
         monitoring job plus the SQLite busy timeout), and a closing check

@@ -1,8 +1,9 @@
 """Server-side ``live:view`` validator for authorization-bound live sessions.
 
 A future human route resolves the caller with ``authorize_live_access`` (which
-runs ``AccessStore.authorize`` with ``Permission.LIVE_VIEW``) and receives a
-``BoundLiveAccess`` tied to that caller's human access session.  This validator
+runs ``AccessStore.authorize_request`` with ``Requirement.LIVE`` inside the
+request's reservation gate) and receives a ``BoundLiveAccess`` tied to that
+caller's human access session.  This validator
 is what ``LiveViewerSessions`` re-runs on every open and every media read, so a
 grant change, principal revocation, credential revocation (credential-scoped:
 a synced passkey is revoked wherever it exists, not on one device),
@@ -17,14 +18,13 @@ not bound to a human access session is refused.  Any storage error denies.
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import sqlite3
-from typing import Callable
+from typing import Callable, ContextManager
 from uuid import UUID
 
 from app.media.live.sessions import LiveAccess
 from app.storage.database import Database, PinnedDatabase
 from .model import AccessValidationError, Permission, PrincipalRole, PrincipalStatus, utc_time
-from .store import AccessStore, _digest, _us
+from .store import AccessStore, Requirement, _us
 
 
 @dataclass(frozen=True)
@@ -40,22 +40,24 @@ class BoundLiveAccess(LiveAccess):
 
 
 def authorize_live_access(access_store: AccessStore, token: bytes, proxy_identity: str,
-                          *, now: datetime | None = None) -> BoundLiveAccess:
-    """Authorize ``live:view`` for a human request and bind it to its session."""
-    principal = access_store.authorize(token, proxy_identity, Permission.LIVE_VIEW, now=now)
+                          *, admit: Callable[[], ContextManager],
+                          now: datetime | None = None) -> BoundLiveAccess:
+    """Authorize ``live:view`` for a human request and bind it to its session.
+
+    ``admit`` is the request's reservation session gate (``admit(epoch)``,
+    epoch taken before this call) and is mandatory: the authorization, its
+    idle touch and the session id it binds to are read and committed in one
+    transaction inside the gate (``AccessStore.authorize_request`` with
+    ``Requirement.LIVE``), so a close after the epoch refuses the request
+    and no later read can pick another session. Every refusal, a closed gate
+    or a storage fault included, is the same generic denial.
+    """
     try:
-        # Read-only and non-creating: a lost or replaced database is a denial.
-        with closing(access_store.database.connect_read_only()) as connection:
-            row = connection.execute(
-                "SELECT id FROM access_sessions WHERE token_digest=? AND principal_id=?",
-                (_digest(token), str(principal.id)),
-            ).fetchone()
-    except (ValueError, OSError, sqlite3.Error):
-        # The same generic denial as every other refusal; no storage detail.
+        view = access_store.authorize_request(token, proxy_identity, Requirement.LIVE, admit=admit, now=now)
+    except Exception:
+        # A refusal, a closed gate or a storage fault: no detail reaches the caller.
         raise AccessValidationError("access is unavailable") from None
-    if row is None:
-        raise AccessValidationError("access is unavailable")
-    return BoundLiveAccess(principal.id, principal.authorization_revision, UUID(row["id"]))
+    return BoundLiveAccess(view.principal_id, view.authorization_revision, view.session_id)
 
 
 def live_view_validator(database: Database, *,

@@ -1195,7 +1195,9 @@ its new baseline and its audit record in one transaction on the integrity
 store's connection, and no unaudited camera approval entry point is exposed.
 Human-access invitation, invitation issue, `live:view` / `recordings:view`
 grant change and principal/credential revocation run only through the audited
-`AccessAdministration` boundary; invitation redemption and capture-node
+`AccessAdministration` boundary, each committed inside the reservation gate
+(`admit(epoch)`, epoch taken before the Owner authorization; Owner decision
+D6, 2026-10-11); invitation redemption and capture-node
 pairing approval, redemption, activation and revocation append their record on
 the same transaction as the state change. Non-Owner attempts at Owner-only
 operations are recorded as `denied` and do not run; redemption attempts that
@@ -1858,9 +1860,10 @@ there; the authoritative per-person application credential is decided separately
 for Issue #6, by §11.8 and ADR-0004: a per-person WebAuthn credential, which is
 the credential that local bootstrap provisions and that a session is bound to.
 
-Issue #10 phase 1 (human route foundation) defines the first main-to-Web
-contract, opened only by an explicitly enabled composition behind a fully
-configured reservation check (no production entry point builds one yet):
+Issue #10 phase 1 (human route foundation) and phase 2 S1 (gated
+authorization, CSRF, sign-out) define the first main-to-Web contract, opened
+only by an explicitly enabled composition behind a fully configured
+reservation check (no production entry point builds one yet):
 
 ```text
 POST /api/auth/authentication/options -> pre-credential, rate-limited;
@@ -1868,15 +1871,35 @@ POST /api/auth/authentication/options -> pre-credential, rate-limited;
 POST /api/auth/authentication         -> pre-credential, rate-limited; 204 and
                                          __Host-session cookie, no data
 GET  /api/session                     -> credential-backed session; the caller's
-                                         own {"role", "permissions"} only
+                                         own {"csrf", "role", "permissions"} only
+POST /api/auth/sign-out               -> session + exact Origin + X-CSRF-Token;
+                                         204, the cookie cleared (Max-Age=0),
+                                         audited as sign_out_principal
 anything else                         -> generic not-found denial
 ```
 
-Every request first needs the reserved `Host`/`Origin` (absent `Origin` only for
-`GET /api/session`), a loopback transport peer and local address, exactly one
-canonical trusted-proxy login, and an open reservation verdict. Invitation
-redemption, step-up, sign-out and all live/recording/timeline/admin routes are
-later phases. Details: `server/app/auth/README.md`.
+Routes come from one table: an exact method, a strict path (no re-encoded
+spelling), a strict per-route query allowlist (no S1 route accepts a
+parameter) and a server-side requirement (`SESSION`, `LIVE`, `RECORDINGS`,
+`OWNER_READ`, `OWNER_OP`, or `PRE_CREDENTIAL` for the two ceremony routes).
+Every request first needs the reserved `Host`/`Origin` (absent `Origin` only
+for `GET /api/session`; every mutating route requires it), a loopback
+transport peer and local address, exactly one canonical trusted-proxy login,
+an open reservation verdict and a serving composition. A session route then
+takes the gate epoch and commits its authorization (and the request's later
+writes) inside `admit(epoch)`, so a close, or the composition stopping, after
+the epoch refuses it before anything is written. A mutating session route
+requires `X-CSRF-Token` equal to the session's token,
+`HMAC-SHA-256` under a subkey derived from the session-binding key with its
+own domain label (Owner decision D2), compared in constant time. Every
+refusal is the same generic denial, except the fixed
+`403 {"detail":"step_up_required"}` for an otherwise valid but stale Owner
+session on an `OWNER_OP` route (Owner decision D3). Sign-out invalidates the
+server-side session and its binding with a `sign_out_principal` audit record
+holding only the principal's logical UUID (D7); it ends that session, not the
+credential, and is refused while human access is closed. Invitation
+redemption, step-up and all live/recording/timeline/admin routes are later
+phases. Details: `server/app/auth/README.md`.
 
 ## 12. Dashboard UI
 

@@ -537,6 +537,95 @@ class SessionCommitRaceTests(SessionGateFixture):
             with self.subTest(gate=gate), self.assertRaises(ValueError):
                 self.ceremonies_for(gate)
 
+    # Owner decision D6 (2026-10-11): every Owner mutation commits inside the gate.
+
+    def access_state(self):
+        with closing(self.database.connect()) as connection:
+            return [tuple(tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY 1"))
+                    for table in ("access_principals", "access_principal_permissions", "access_invitations",
+                                  "access_credentials", "access_sessions")]
+
+    def owner_operations(self, admin):
+        viewer, _ = self.enroll()
+        credential_id = self.access.credentials_for(viewer.id)[0].credential_id
+        expires = self.ceremony_clock() + timedelta(minutes=30)
+        return {
+            AuditAction.INVITE_PRINCIPAL:
+                lambda: admin.invite(OWNER_SESSION, "Synthetic invitee", (Permission.LIVE_VIEW,)),
+            AuditAction.ISSUE_PRINCIPAL_INVITATION:
+                lambda: admin.issue_invitation(OWNER_SESSION, viewer.id, b"i" * 32, expires),
+            AuditAction.CHANGE_PRINCIPAL_PERMISSIONS:
+                lambda: admin.set_permissions(OWNER_SESSION, viewer.id, (Permission.RECORDINGS_VIEW,)),
+            AuditAction.REVOKE_PRINCIPAL_CREDENTIAL:
+                lambda: admin.revoke_credential(OWNER_SESSION, viewer.id, credential_id),
+            AuditAction.REVOKE_PRINCIPAL:
+                lambda: admin.revoke_principal(OWNER_SESSION, viewer.id),
+        }
+
+    def outcomes(self, action):
+        return [record.outcome for record in self.audit.list_records() if record.action is action]
+
+    def test_every_owner_mutation_is_refused_while_closed(self):
+        admin = AccessAdministration(self.service, self.access, session_gate=self.check)
+        operations = self.owner_operations(admin)
+        self.check._resolver.answer = OSError("synthetic resolver failure")
+        self.assertFalse(self.check._check(CheckKind.RETRY).open)
+        before = self.access_state()
+        for action, operation in operations.items():
+            with self.subTest(action=action), self.assertRaises(HumanAccessClosed):
+                operation()
+            self.assertEqual(self.outcomes(action), [AuditOutcome.FAILED])
+        self.assertEqual(self.access_state(), before)
+        # Reopened: each one commits with its success record.
+        self.check._resolver.answer = (V4, V6)
+        self.assertTrue(self.check._check(CheckKind.RETRY).open)
+        for action, operation in operations.items():
+            with self.subTest(action=action):
+                operation()
+                self.assertEqual(sorted(self.outcomes(action)), sorted([AuditOutcome.FAILED, AuditOutcome.SUCCEEDED]))
+
+    def test_owner_mutation_paused_across_a_cycle_is_refused(self):
+        # The Owner is authorized, a check closes and reopens access (no
+        # exposure, so nothing is revoked); the mutation must not commit on
+        # the authorization taken before the close.
+        admin = AccessAdministration(self.service, self.access, session_gate=self.check)
+        for action, operation in self.owner_operations(admin).items():
+            with self.subTest(action=action):
+                before = self.access_state()
+                box = self.paused_during(self.service.authorizer, "require_owner", operation,
+                                         exposure=False)
+                self.assertIsInstance(box.get("error"), HumanAccessClosed)
+                self.assertEqual(self.access_state(), before)
+                self.assertEqual(self.outcomes(action), [AuditOutcome.FAILED])
+
+    def test_owner_authorization_commits_inside_the_gate(self):
+        # Issue #228 item 5: authorize_owner_operation reads and touches the
+        # session inside admit(epoch); a cycle in between refuses it and
+        # writes nothing.
+        grant = self.owner_session()
+        held = []
+        real_transaction = self.access._transaction
+
+        def observed(write=False):
+            if write:
+                held.append(self.check._session_gate_lock.locked())
+            return real_transaction(write=write)
+
+        with patch.object(self.access, "_transaction", side_effect=observed):
+            self.ceremonies.authorize_owner_operation(grant.token, "owner@example.invalid")
+        self.assertEqual(held, [True])
+        before = self.access_state()
+        self.ceremony_clock.advance(minutes=1)
+        box = self.paused_during(
+            self.access, "authorize_owner",
+            lambda: self.ceremonies.authorize_owner_operation(grant.token, "owner@example.invalid"),
+            exposure=False)
+        self.assertIs(type(box.get("error")), CeremonyDenied)
+        self.assertEqual(self.access_state(), before)
+        self.assertEqual(
+            self.ceremonies.authorize_owner_operation(grant.token, "owner@example.invalid").id,
+            grant.principal_id)
+
 
 class MarkerUnsavedLogTests(SessionGateFixture):
     def test_unsaved_marker_is_logged_at_the_start_and_each_doubling(self):

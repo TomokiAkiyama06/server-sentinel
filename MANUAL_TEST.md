@@ -1458,6 +1458,42 @@ with synthetic `*.invalid` identities:
   mapping) and confirm sign-in and the session route are denied until it
   passes again.
 
+### Issue #10 phase 2 S1 sign-out and CSRF (pending)
+
+Verified only with the synthetic ASGI driver and synthetic stores
+(`server/tests/test_human_gated_authorization.py`,
+`tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve or
+real authenticator has exercised sign-out or the CSRF header yet, and no
+production entry point builds the composition. Once a deployment can enable it,
+verify on a shared machine (one OS account and browser profile, the shared
+Tailscale login, synthetic `*.invalid` people with their own passkeys on
+roaming authenticators):
+
+- [ ] person A signs in, the dashboard reads `GET /api/session` and keeps the
+  returned `csrf` only in memory; confirm the value never appears in the URL,
+  browser history, server logs or the audit log;
+- [ ] A signs out; confirm the response is `204` with
+  `Set-Cookie: __Host-session=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict`,
+  that the browser no longer sends the cookie, and that the audit log holds one
+  `sign_out_principal` record with A's logical UUID only;
+- [ ] press the Back button and reload the previous dashboard page, and replay
+  A's old cookie value (copied before sign-out, for example with a request
+  tool on the loopback upstream path); every request is the generic denial,
+  identical to an uninvited caller's;
+- [ ] person B then signs in with B's own passkey in the same browser profile
+  and sees only B's permissions; A's old cookie stays denied;
+- [ ] send the sign-out without `X-CSRF-Token`, with another session's token,
+  with a modified token, without `Origin`, and from another origin; each is the
+  generic denial, the session still works afterwards and no audit record is
+  written;
+- [ ] stop the reservation check from passing and try to sign out; confirm the
+  generic denial (accepted by Owner decision D7), that the session is still
+  present once the check passes again, and record that an emergency revocation
+  while access is closed is done over SSH with the local command;
+- [ ] record that sign-out ends this session only: a synced passkey of A can
+  still sign in on any device that holds it until the Owner revokes that
+  credential.
+
 ### Uninvited ordinary Tailnet member
 
 - [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;

@@ -40,6 +40,8 @@ class Event(StrEnum):
     HUMAN_LISTENER_ACTIVATION_INVALID = "human_listener_activation_invalid"
     HUMAN_REQUEST_RATE_LIMITED = "human_request_rate_limited"
     HUMAN_ACCESS_CHECK_FAILED = "human_access_check_failed"
+    HUMAN_ACCESS_SWEEP_FAILED = "human_access_sweep_failed"
+    HUMAN_ACCESS_RUN_FAILED = "human_access_run_failed"
     TIMELINE_FACT_QUARANTINED = "timeline_fact_quarantined"
     TIMELINE_FLUSH_FAILING = "timeline_flush_failing"
     TIMELINE_FLUSH_RECOVERED = "timeline_flush_recovered"

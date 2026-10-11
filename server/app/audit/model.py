@@ -67,6 +67,7 @@ class AuditAction(StrEnum):
     REVOKE_PRINCIPAL = "revoke_principal"
     AUTHENTICATE_PRINCIPAL = "authenticate_principal"
     VERIFY_PRINCIPAL_STEP_UP = "verify_principal_step_up"
+    SIGN_OUT_PRINCIPAL = "sign_out_principal"
     MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT = "mark_principal_credential_inconsistent"
     DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION = "detect_principal_credential_sign_count_regression"
     DETECT_SESSION_PROXY_IDENTITY_MISMATCH = "detect_session_proxy_identity_mismatch"
@@ -106,6 +107,7 @@ ACTION_TARGETS = {
     AuditAction.REVOKE_PRINCIPAL: TargetKind.PRINCIPAL,
     AuditAction.AUTHENTICATE_PRINCIPAL: TargetKind.PRINCIPAL,
     AuditAction.VERIFY_PRINCIPAL_STEP_UP: TargetKind.PRINCIPAL,
+    AuditAction.SIGN_OUT_PRINCIPAL: TargetKind.PRINCIPAL,
     AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT: TargetKind.PRINCIPAL,
     AuditAction.DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION: TargetKind.PRINCIPAL,
     AuditAction.DETECT_SESSION_PROXY_IDENTITY_MISMATCH: TargetKind.PRINCIPAL,

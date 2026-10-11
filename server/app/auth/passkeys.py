@@ -344,24 +344,38 @@ class PasskeyCeremonies:
     def authorize_owner_operation(self, token: bytes, proxy_identity: str) -> Principal:
         """Generic denial, ``StepUpRequired`` for a stale Owner session, or the Owner.
 
-        Refused at once while access is closed. ``StepUpRequired`` is returned
-        only when access stayed open since the request started (the gate epoch
-        is unchanged, checked under the gate); otherwise the generic denial.
+        Refused at once while access is closed. Otherwise the whole
+        authorization commits inside ``session_gate.admit(epoch)`` with the
+        epoch taken first (Issue #228 item 5, Owner decision D6), so the
+        Owner authorization, its idle touch and the ``StepUpRequired``
+        decision are all made while access stayed open since the request
+        started; a close in between is the generic denial and writes nothing.
         """
         try:
             epoch = self.session_gate.epoch()
             if epoch is None:
                 raise CeremonyDenied()
-            return self.store.authorize_owner(token, proxy_identity, now=self._now())
-        except StepUpRequired as stale:
-            try:
-                with self.session_gate.admit(epoch):
-                    pass
-            except Exception:
-                raise CeremonyDenied() from None
-            raise stale
+            return self.store.authorize_owner(token, proxy_identity,
+                                              admit=lambda: self.session_gate.admit(epoch))
+        except StepUpRequired:
+            raise
         except Exception:
             raise CeremonyDenied() from None
+
+    def guard_session_gate(self, gate: SessionGate) -> None:
+        """Replace the session gate by a wrapper of that same gate, once.
+
+        ``app.auth.human_surface.HumanAccess`` uses this to add its own
+        ``stopped`` check under the gate lock (Issue #228 item 1), so a
+        ceremony already past the request entry is refused after ``stop()``
+        or a failed check tick. The wrapper must expose the current gate as
+        ``reservation``; anything else is refused and nothing changes.
+        """
+        if (getattr(gate, "reservation", None) is not self.session_gate
+                or not callable(getattr(gate, "admit", None))
+                or not callable(getattr(gate, "epoch", None))):
+            raise ValueError("a session gate is required")
+        self.session_gate = gate
 
     def begin_step_up(self, token: bytes, proxy_identity: str) -> dict:
         """Issue a challenge bound to this Owner session and its own credential only."""

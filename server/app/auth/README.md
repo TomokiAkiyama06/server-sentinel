@@ -128,8 +128,9 @@ verifier's `http://localhost` support is not reachable from any human route.
 Not implemented yet, and required before routes open in production:
 
 - the remaining HTTP routes: invitation redemption (registration), Owner
-  step-up, sign-out with its CSRF token, and every live, recording, timeline,
-  event and administration route (later Issue #10 phases, #19);
+  step-up, and every live, recording, timeline, event and administration
+  route (later Issue #10 phases, #19). Sign-out and the CSRF token exist
+  since phase 2 S1 (below);
 - per-source rate limiting of invitation redemption (the authentication
   ceremony is limited in phase 1; redemption keeps its per-code bound);
 - the deployment-file key and production composition that build the
@@ -146,7 +147,13 @@ Owner-only mutations — invitation, invitation issue, grant change, single
 credential revocation and principal revocation — are exposed as `*_on`
 methods on a caller-owned transaction and reached at runtime only through
 `app.audit.integration.AccessAdministration`, which authorizes the Owner and
-commits each mutation with its security audit record. The plain wrappers refuse
+commits each mutation with its security audit record. Every one of them takes
+the gate epoch before the Owner authorization and commits inside
+`admit(epoch)` (Owner decision D6, 2026-10-11): while human access is closed,
+or after a close since the epoch, it is a failed operation with its `failed`
+record and changes nothing. An emergency revocation while access is closed is
+done over SSH with the local command (not built yet; see "Bootstrap and
+recovery commands"). The plain wrappers refuse
 with `UnauditedAccessWriteError` unless the store is constructed with
 `unaudited_writes=True` for non-runtime fixtures. Invitation redemption
 (`enroll_credential`) records its own audit row in the redemption transaction
@@ -321,12 +328,14 @@ rate limiting are described in "Human route foundation" below (Issue #181,
 #10). The low-level
 `AccessStore.establish_session` / `issue_enrollment` wrappers are fixture and
 local entries outside the gate and must not be reached from a human route.
-Two session writes stay outside the gate on purpose: the idle-expiry touch
-(`last_seen`) in `authorize()` / `authorize_owner()` and the expiry sweep. They
-never make a session valid: revocation advances the authorization generation
-and invalidates every row in one transaction, so a touch committed after it
-finds the session invalid and is refused, and one committed before it is
-revoked with the row.
+Every human authorization commits its idle-expiry touch (`last_seen`) inside
+`admit(epoch)`: `authorize_request` on the routes and `authorize_owner(admit=...)`
+for an Owner operation (Issue #10 phase 2 S1, #228). Only the expiry sweep, and
+the bare `authorize()` that fixtures call without `admit`, write outside the
+gate. Neither ever makes a session valid: revocation advances the authorization
+generation and invalidates every row in one transaction, so a write committed
+after it finds the session invalid and is refused, and one committed before it
+is revoked with the row.
 
 Two cases do not revoke twice. A fallback revocation that commits in the same
 check that reopens access, while access has never been open in this process (a
@@ -482,7 +491,7 @@ production path builds one yet. The assumed `tailscale serve status --json`
 shape is unverified against an installed Tailscale; unrecognised keys fail
 closed.
 
-## Human route foundation (Issue #10 phase 1)
+## Human route foundation (Issue #10 phase 1, phase 2 S1)
 
 `human_surface.py` replaces the closed surface only when `create_app` receives a
 `HumanAccess`. Constructing one requires `HumanAccessConfiguration(enabled=True)`,
@@ -496,22 +505,35 @@ closed. No deployment-file key builds a `HumanAccess` yet.
 
 Every HTTP request passes, in this order, before any handler runs:
 
+0. the route table (`ROUTES`, Issue #10 phase 2 S1): an exact method, a
+   strict path pattern (`fullmatch` on the decoded path, whose raw form must be
+   identical, so a percent-encoded spelling matches nothing) and a strict
+   per-route query allowlist (no S1 route accepts any parameter; an unknown,
+   repeated, valueless, percent-encoded or over-long parameter, or a query
+   longer than 512 bytes, is a denial). An unmatched request still passes the
+   checks below before its denial;
 1. reserved secure-context origin: exactly one `Host` equal to the reserved
    authority, and an `Origin`, when present, exactly equal to the reserved
-   origin; an absent `Origin` is accepted only for `GET /api/session`;
+   origin; an absent `Origin` is accepted only for `GET /api/session` (every
+   mutating route requires it);
 2. trusted-proxy path: the actual transport peer and the local listener
    address are loopback (`Forwarded`/`X-Forwarded-For` are never read), checked
    before the identity header is read, then exactly one canonical
    `Tailscale-User-Login` (printable ASCII, no space, no comma-joined value, no
    RFC 2047 encoded word);
-3. the reservation verdict (`access_open`, pid-guarded);
-4. for the session route, the gate epoch, then `AccessStore.authorize_session`
-   (credential-backed session, binding, lifetimes, revocation, idle touch)
-   committed inside `admit(epoch)`, so access stayed open from the epoch to
-   the commit and a request refused by a close in between writes nothing (no
-   idle touch extends the session; lock order gate -> storage admission ->
-   SQLite, denial bookkeeping after the gate is released); the ceremonies
-   take the epoch and `admit()` themselves.
+3. the reservation verdict (`access_open`, pid-guarded) and this composition
+   serving (`HumanAccess.stopped`);
+4. for a session route, `HumanSurface._authorize`: the read-only token
+   pre-check, the gate epoch (`HumanAccess.epoch()`), then
+   `AccessStore.authorize_request(token, identity, requirement,
+   admit=lambda: access.admit(epoch))` (credential-backed session, binding,
+   lifetimes, revocation, the requirement, the CSRF token of a mutating route,
+   idle touch) committed inside `admit(epoch)`, so access stayed open from the
+   epoch to the commit and a request refused by a close in between writes
+   nothing (no idle touch extends the session; lock order gate -> storage
+   admission -> SQLite, denial bookkeeping after the gate is released). Later
+   writes of the same request reuse `admit(epoch)`. The ceremonies take the
+   epoch and `admit()` themselves, through the same composition gate.
 
 Mounted routes, and nothing else (every other method, path, query string,
 WebSocket and error path gets the generic not-found denial; no FastAPI router,
@@ -521,12 +543,13 @@ OpenAPI or error handler is reachable):
 |---|---|---|
 | `POST /api/auth/authentication/options` | none (rate-limited) | `PasskeyCeremonies.begin_authentication()` options |
 | `POST /api/auth/authentication` | the assertion itself (rate-limited) | `204`, `Set-Cookie: __Host-session=…; Path=/; Secure; HttpOnly; SameSite=Strict` |
-| `GET /api/session` | session | `{"role": …, "permissions": […]}` of the caller only |
+| `GET /api/session` | session (`SESSION`) | `{"csrf": …, "role": …, "permissions": […]}` of the caller only |
+| `POST /api/auth/sign-out` | session (`SESSION`) + exact `Origin` + `X-CSRF-Token` | `204`, `Set-Cookie: __Host-session=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict` |
 
-The session route grants nothing and returns only the caller's own role and
-permissions (the Owner holds both). It is the only route a session reaches in
-this phase, so a `live:view`-only or `recordings:view`-only person reaches
-nothing they lack. Bodies are bounded (1 KiB options, 64 KiB assertion), JSON
+The session route grants nothing and returns only the caller's own role,
+permissions (the Owner holds both) and CSRF token. With sign-out it is the
+only route a session reaches in this phase, so a `live:view`-only or
+`recordings:view`-only person reaches nothing they lack. Bodies are bounded (1 KiB options, 64 KiB assertion), JSON
 with duplicate members is refused, and a ceremony refusal never sets a cookie.
 
 Accepted disclosure: `POST /api/auth/authentication/options` answers `200`
@@ -575,7 +598,7 @@ exception path for the Owner exists, by that decision.
 Admission latency (availability only). The storage admission runs on the
 monitoring runtime's single owning worker (`RuntimeStorageAdmission`), so
 every admitted write of this surface, which includes every sign-in step,
-every `GET /api/session` that reaches `authorize_session` and every
+every session route that reaches `authorize_request` and every
 `AccessStore.authorize()` (the idle touch is a write in both), waits in that
 worker's queue behind any long monitoring job (a storage evaluation,
 recording self-test step or retention batch), and while it holds the
@@ -583,7 +606,7 @@ admission through commit the worker is parked for it. Such a wait can delay a
 human request (the admission has no timeout of its own); it never grants
 access, and a request that cannot be admitted is the generic denial. The
 commits made inside `admit(epoch)` (the ceremony commits and the
-`authorize_session` transaction of `GET /api/session`) wait for that
+`authorize_request` transaction of a session route) wait for that
 admission while holding the session gate, so a check's close can wait behind
 them as well (availability only): a commit that wins this race committed
 while access was still open, before the close, and any revocation that close
@@ -599,13 +622,14 @@ socket owners, each under its enumeration timeout, before it decides on an
 exposure. So the exposure revocation and the Owner fault come at least that
 much later than the change that caused them. A request authorized through
 the gate (`epoch()` before authorization, then the commit inside
-`admit(epoch)`, as `authorize_session` does) is refused as soon as the close
+`admit(epoch)`, as `authorize_request` does) is refused as soon as the close
 has run. A route that called `AccessStore.authorize()` (or `authorize_owner()`)
 outside the gate, even after reading `access_open`, could keep serving
-through that whole window and after it. No such route is mounted. Any later
-live, recording, timeline or administration route must take the epoch and
-commit its authorization inside `admit(epoch)` exactly like
-`GET /api/session`, never a bare `authorize()` call.
+through that whole window and after it. No such route is mounted, and the
+route-side entry (`authorize_request`) refuses a call without `admit`. Any
+later live, recording, timeline or administration route declares its
+`Requirement` in `ROUTES` and goes through `_authorize`, never a bare
+`authorize()` call.
 
 Startup. A `HumanAccess` serves requests only while a `run()` of the current
 lifespan holds (Codex PR #219): every request is denied (`stopped`) from
@@ -651,7 +675,7 @@ well-formed cookie whose token names no live session row (unknown, forged,
 invalidated or past its idle/absolute expiry) is denied by a read-only
 lookup (`AccessStore.session_may_be_current`, one deferred read transaction)
 before the session gate lock or any SQLite write lock is taken. Only a token
-that names a live row goes through epoch, `authorize_session` (write
+that names a live row goes through epoch, `authorize_request` (write
 transaction) and `admit()`, so a flood of random 43-character cookies by a
 holder of the shared login neither takes the gate lock nor writes. An expired
 row skipped this way is cleared by the periodic sweep instead of the denied
@@ -663,6 +687,82 @@ takes SQLite's SHARED lock (rollback journal), so a forged-cookie flood can
 still contend with writers; that contention is bounded by the SQLite busy
 timeout, and a lookup or write that fails under it is a fail-closed denial,
 never access.
+
+### Gated authorization, CSRF and sign-out (Issue #10 phase 2, S1)
+
+Requirements (`store.Requirement`). Every route in `ROUTES` declares one:
+`PRE_CREDENTIAL` (the two sign-in ceremony routes, which gate themselves),
+`SESSION`, `LIVE`, `RECORDINGS`, `OWNER_READ` or `OWNER_OP`.
+`AccessStore.authorize_request` checks it server-side in the authorization
+transaction: `LIVE` needs the Owner or `live:view`, `RECORDINGS` the Owner or
+`recordings:view` (each on its own; historical timeline and events belong to
+`RECORDINGS`), `OWNER_READ` the Owner, and `OWNER_OP` the Owner with a user
+verification fresher than five minutes. It returns a `SessionView` (session
+id, principal id, role, authorization revision, permissions; the credential
+id is left out of `repr`). `admit` is mandatory; `PRE_CREDENTIAL` is never
+satisfied by it.
+
+Refusals (Owner decision D3). Every refusal is the same generic `404
+{"detail":"Not Found"}` with `no-store` and no other header, byte for byte.
+The single exception is an otherwise valid Owner session on an `OWNER_OP`
+route whose user verification is stale: it gets the fixed `403
+{"detail":"step_up_required"}`. That outcome is decided under the gate with
+the epoch unchanged, never for a non-owner, a wrong CSRF token, another proxy
+identity or a closed gate. S1 mounts no `OWNER_OP` route; the mapping is
+exercised through a synthetic route in the tests.
+
+CSRF (Owner decision D2). `SessionBindingKey` derives a CSRF subkey from the
+deployment's session-binding key under its own domain label, and a session's
+token is `HMAC-SHA-256(subkey, domain || session id)`, sent unpadded base64url
+(43 characters). It is not stored: `GET /api/session` returns it, and a
+mutating session route requires exactly one `X-CSRF-Token` header equal to it
+(constant-time comparison, inside the authorization transaction before the
+idle touch, so a refused mutation does not extend the session) in addition to
+the exact `Origin`. A token never validates another session, never equals a
+proxy-identity binding, and never reaches a URL, log or audit record. The
+`SameSite=Strict` `__Host-` cookie remains the first defense; the header
+check does not rely on it.
+
+Sign-out (Owner decision D7). `POST /api/auth/sign-out` (empty body or `{}`)
+authorizes `SESSION` with the CSRF token, then `AccessStore.sign_out` commits,
+inside the same request's `admit(epoch)`, the invalidation of the session row,
+the clearing of its keyed binding and a `sign_out_principal` audit record
+(actor `owner` or `invited_user`, target the principal's logical UUID only;
+never a token, session id, credential id or identity). The response clears the
+cookie (`Max-Age=0` with the attributes it was set with). Afterwards the old
+cookie, through the Back button or a copy, is the generic denial everywhere.
+A failed audit append rolls the sign-out back (counted in
+`audit_delivery_failed`) and the request is denied. While human access is
+closed the sign-out is denied and changes nothing (accepted by D7); the
+session then ends by expiry, by revocation, or by the reservation's
+revocation on an exposure. Sign-out ends one session, not the credential: a
+synced passkey can sign in again from any device that holds it.
+
+In-flight requests after stop (Issue #228 item 1). The composition installs a
+`ServingGate` around the reservation (`PasskeyCeremonies.guard_session_gate`),
+and both the routes' `_authorize` and the ceremonies use it: `epoch()` is
+`None` while the composition is stopped, and `admit()` re-reads `stopped`
+after taking the gate lock. A request that had already passed the entry
+checks when `stop()` ran, or when a periodic check failed, is therefore
+refused at its commit and writes nothing. A commit admitted before `stop()`
+may still complete. One `PasskeyCeremonies` serves exactly one composition.
+
+Lifecycle visibility (Issue #228 items 2-4). `HumanAccess.state`
+(`not_started`, `starting`, `serving`, `check_failing`, `stopped`, `failed`)
+and `check_failures` (consecutive failed startup/periodic checks) are
+value-free and readable through `application.state.human_access`; a `run()`
+that ends with an unexpected exception sets `failed` and logs
+`human_access_run_failed`. A second `run()` while one is running raises
+`HumanAccessAlreadyRunning` and changes nothing. A failing expiry sweep logs
+`human_access_sweep_failed` when the streak starts and each time it doubles.
+No Owner notification is emitted yet; delivering it belongs with the other
+reservation faults (see "Not implemented yet").
+
+Owner operation and live authorization. `PasskeyCeremonies.authorize_owner_operation`
+commits `authorize_owner` inside `admit(epoch)` (#228 item 5), so the Owner
+decision, its idle touch and `StepUpRequired` are all made while access stayed
+open. `live_access.authorize_live_access` requires `admit` and binds the live
+grant to the session id read in the same gated transaction.
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 

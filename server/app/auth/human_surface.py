@@ -1,4 +1,4 @@
-"""Human route foundation (Issue #10, phase 1; ADR-0003, ADR-0004).
+"""Human route foundation (Issue #10 phases 1 and 2; ADR-0003, ADR-0004).
 
 The human listener stays closed (``ClosedHumanSurface`` in ``app.main``)
 unless the embedder passes a validated ``HumanAccess`` composition, which
@@ -8,54 +8,70 @@ yet, so the production entry points keep every human path closed.
 
 When enabled, every HTTP request passes, server-side and in this order:
 
-1. the dedicated, reserved, secure-context origin: exactly one ``Host`` equal
+1. the route table (``ROUTES``): an exact method, a strict path pattern over
+   the decoded path (whose raw form must be the same, so no percent-encoded
+   variant matches), and a strict per-route query allowlist; an unmatched
+   request still passes the checks below before its denial, so a refusal
+   never says which check failed;
+2. the dedicated, reserved, secure-context origin: exactly one ``Host`` equal
    to the reserved ``<hostname>[:<port>]`` and, when present, an ``Origin``
    exactly equal to the relying-party origin ``https://<hostname>[:<port>]``
-   derived from the reservation; an absent ``Origin`` is accepted only for
-   the non-mutating session read;
-2. the trusted-proxy path: the actual transport peer and the local listener
+   derived from the reservation; a mutating route requires that ``Origin``;
+3. the trusted-proxy path: the actual transport peer and the local listener
    address are loopback (never a ``Forwarded``/``X-Forwarded-For`` value),
    and exactly one well-formed ``Tailscale-User-Login`` header is present.
    A request from any other peer is refused before its identity header is
    read, so a LAN client cannot spoof it;
-3. the hostname reservation verdict (``access_open``, pid-guarded), and for
-   every commit or authorization the gate epoch, re-checked by ``admit()``
-   held around the commit itself (Issue #144/#181);
-4. the per-person WebAuthn credential: a session established by a
+4. the hostname reservation verdict (``access_open``, pid-guarded) and this
+   composition serving (``HumanAccess.stopped``);
+5. for a route that needs a session, ``_authorize``: a read-only token
+   pre-check, the gate epoch, then ``AccessStore.authorize_request``
+   committed inside ``HumanAccess.admit(epoch)``, which re-checks under the
+   gate lock that access is open, unchanged since the epoch, and that this
+   composition has not stopped (Issue #144/#181/#228). A mutating session
+   route also requires ``X-CSRF-Token`` equal to the session's token (Owner
+   decision D2), compared inside the same transaction. Later writes of the
+   request reuse ``admit(epoch)``;
+6. the per-person WebAuthn credential: a session established by a
    user-verified assertion of the person's own passkey. The proxy identity
    is supplementary (ADR-0004 §1): it must be present and reproduce the
    session's keyed binding, but it never selects or authorizes anyone.
 
-Mounted routes (and nothing else; every other method, path, WebSocket and
-error path gets the same generic denial):
+Mounted routes (and nothing else; every other method, path, query string,
+WebSocket and error path gets the same generic denial):
 
 - ``POST /api/auth/authentication/options``: begin a passkey sign-in;
 - ``POST /api/auth/authentication``: finish it and set the ``__Host-`` cookie;
-- ``GET /api/session``: the caller's own role and permissions.
+- ``GET /api/session``: the caller's own role, permissions and CSRF token;
+- ``POST /api/auth/sign-out``: end the caller's own session (CSRF).
 
 The two ceremony routes run before a credential exists. They are
 rate-limited per verified proxy identity and globally before the ceremony
-takes any gate or SQLite lock (Issue #181). The session read is not
-charged; a forged or stale cookie is refused by a read-only token lookup
-before the gate or any SQLite write lock (see ``_session``). No live,
-recording, timeline, event, administration, health or version route is
-mounted here.
+takes any gate or SQLite lock (Issue #181). Session routes are not charged; a
+forged or stale cookie is refused by a read-only token lookup before the gate
+or any SQLite write lock. No live, recording, timeline, event,
+administration, health or version route is mounted here.
 
 Every refusal is the generic, non-branding not-found response used by the
-closed surface: no product/version header, no cookie, ``no-store``. Nothing
-here logs a header, identity, token, challenge or body.
+closed surface: no product/version header, no cookie, ``no-store``. The one
+exception is an otherwise valid Owner session on an ``OWNER_OP`` route whose
+user verification is stale: it gets the fixed ``403
+{"detail":"step_up_required"}`` (Owner decision D3). Nothing here logs a
+header, identity, token, CSRF token, challenge or body.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 import ipaddress
 import json
 import logging
 import re
-from typing import Callable
+from typing import Callable, Iterator
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -64,33 +80,51 @@ from app.logging import Event
 from app.storage.database import Database, PinnedDatabase
 from .passkeys import PasskeyCeremonies, SessionGrant
 from .rate_limit import SourceRateLimiter
-from .reservation import HostnameReservationCheck
+from .reservation import HostnameReservationCheck, HumanAccessClosed
 from .reservation_store import ListenerExceptionStore, ReservationSessionRevocation
 from .session_binding import canonical_identity
-from .store import AccessStore
+from .store import AccessStore, Requirement, SessionView, StepUpRequired
 
 
 PROXY_IDENTITY_HEADER = b"tailscale-user-login"
+# Owner decision D2 (2026-10-11): the CSRF token travels in this header only.
+CSRF_HEADER = b"x-csrf-token"
 SESSION_COOKIE = "__Host-session"
 AUTHENTICATION_OPTIONS_PATH = "/api/auth/authentication/options"
 AUTHENTICATION_PATH = "/api/auth/authentication"
 SESSION_PATH = "/api/session"
+SIGN_OUT_PATH = "/api/auth/sign-out"
 MAX_OPTIONS_BODY = 1024
 MAX_ASSERTION_BODY = 64 * 1024
+MAX_EMPTY_BODY = 2
+MAX_QUERY_BYTES = 512
+MAX_QUERY_VALUE = 128
 DEFAULT_TICK_SECONDS = 30.0
 
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
 _DENIAL_BODY = b'{"detail":"Not Found"}'
+_STEP_UP_BODY = b'{"detail":"step_up_required"}'
+# Clears the session cookie with the attributes it was set with.
+_CLEARED_COOKIE = (SESSION_COOKIE + "=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict").encode()
+
+
+async def _fixed_json(send: Send, status: int, body: bytes) -> None:
+    await send({"type": "http.response.start", "status": status, "headers": [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode()),
+        (b"cache-control", b"no-store"),
+    ]})
+    await send({"type": "http.response.body", "body": body})
 
 
 async def send_generic_denial(send: Send) -> None:
     """The one non-branding refusal for every human path (ADR-0003)."""
-    await send({"type": "http.response.start", "status": 404, "headers": [
-        (b"content-type", b"application/json"),
-        (b"content-length", str(len(_DENIAL_BODY)).encode()),
-        (b"cache-control", b"no-store"),
-    ]})
-    await send({"type": "http.response.body", "body": _DENIAL_BODY})
+    await _fixed_json(send, 404, _DENIAL_BODY)
+
+
+async def send_step_up_required(send: Send) -> None:
+    """The fixed step-up response for a stale Owner on an ``OWNER_OP`` route (D3)."""
+    await _fixed_json(send, 403, _STEP_UP_BODY)
 
 
 class HumanAccessUnavailable(ValueError):
@@ -98,6 +132,29 @@ class HumanAccessUnavailable(ValueError):
 
     def __init__(self) -> None:
         super().__init__("human access is unavailable")
+
+
+class HumanAccessAlreadyRunning(RuntimeError):
+    """A second ``HumanAccess.run()`` while one is running (Issue #228 item 3)."""
+
+    def __init__(self) -> None:
+        super().__init__("human access is already running")
+
+
+class HumanAccessState(StrEnum):
+    """Value-free lifecycle of one composition (Issue #228 item 2).
+
+    Readable by the embedder as ``HumanAccess.state`` (and through
+    ``application.state.human_access``); it carries no reason, identity,
+    path or exception text.
+    """
+
+    NOT_STARTED = "not_started"
+    STARTING = "starting"
+    SERVING = "serving"
+    CHECK_FAILING = "check_failing"
+    STOPPED = "stopped"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True)
@@ -124,6 +181,106 @@ def reserved_origin(check: HostnameReservationCheck) -> tuple[str, str]:
 
 class _Denied(Exception):
     pass
+
+
+class _StepUp(Exception):
+    """A stale, otherwise valid Owner session on an ``OWNER_OP`` route."""
+
+
+@dataclass(frozen=True)
+class Route:
+    """One mounted human route (Issue #10 phase 2, S1).
+
+    ``path`` is matched with ``fullmatch`` against the decoded request path.
+    ``mutating`` routes require an exact ``Origin``; ``csrf`` routes also
+    require ``X-CSRF-Token``. ``body_limit`` bounds the request body
+    (``0``: the body is not read). ``query`` is the strict allowlist of
+    query parameter names with the pattern each value must fully match; an
+    unknown, repeated or over-long parameter is a denial.
+    """
+
+    method: str
+    path: re.Pattern
+    requirement: Requirement
+    handler: str
+    mutating: bool
+    csrf: bool
+    body_limit: int
+    query: tuple[tuple[str, re.Pattern], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.mutating != (self.method != "GET"):
+            raise ValueError("a route mutates exactly when its method is not GET")
+        if self.csrf and (not self.mutating or self.requirement is Requirement.PRE_CREDENTIAL):
+            raise ValueError("CSRF applies to session-bearing mutations")
+        if self.mutating and self.requirement is not Requirement.PRE_CREDENTIAL and not self.csrf:
+            raise ValueError("a session-bearing mutation requires CSRF")
+        names = [name for name, _ in self.query]
+        if len(set(names)) != len(names):
+            raise ValueError("query parameter names must be unique")
+
+
+def _exact(path: str) -> re.Pattern:
+    return re.compile(re.escape(path))
+
+
+ROUTES: tuple[Route, ...] = (
+    Route("POST", _exact(AUTHENTICATION_OPTIONS_PATH), Requirement.PRE_CREDENTIAL, "_begin_authentication",
+          mutating=True, csrf=False, body_limit=MAX_OPTIONS_BODY),
+    Route("POST", _exact(AUTHENTICATION_PATH), Requirement.PRE_CREDENTIAL, "_finish_authentication",
+          mutating=True, csrf=False, body_limit=MAX_ASSERTION_BODY),
+    Route("GET", _exact(SESSION_PATH), Requirement.SESSION, "_session",
+          mutating=False, csrf=False, body_limit=0),
+    Route("POST", _exact(SIGN_OUT_PATH), Requirement.SESSION, "_sign_out",
+          mutating=True, csrf=True, body_limit=MAX_EMPTY_BODY),
+)
+
+
+def match_route(scope: Scope, routes: tuple[Route, ...] = None) -> Route | None:
+    """The route for this method and path, or ``None``.
+
+    The raw path, when the server supplies it, must be exactly the decoded
+    path, so a percent-encoded or otherwise re-encoded spelling of a mounted
+    path matches nothing.
+    """
+    method, path = scope.get("method"), scope.get("path")
+    if not isinstance(method, str) or not isinstance(path, str):
+        return None
+    raw = scope.get("raw_path")
+    if raw is not None:
+        try:
+            if raw != path.encode("ascii"):
+                return None
+        except UnicodeEncodeError:
+            return None
+    for route in ROUTES if routes is None else routes:
+        if route.method == method and route.path.fullmatch(path):
+            return route
+    return None
+
+
+def parse_query(route: Route, raw: object) -> dict[str, str]:
+    """Strictly parse a query string against the route's allowlist.
+
+    No percent-decoding and no ``+``: a value must fully match its pattern as
+    sent. An empty string is no parameters. Anything unknown, repeated,
+    valueless, over-long (whole string or one value) or not ASCII is a
+    denial.
+    """
+    if raw in (None, b""):
+        return {}
+    if not isinstance(raw, bytes) or len(raw) > MAX_QUERY_BYTES:
+        raise _Denied()
+    text = _ascii(raw)
+    allowed = dict(route.query)
+    result: dict[str, str] = {}
+    for part in text.split("&"):
+        name, separator, value = part.partition("=")
+        if (not separator or name not in allowed or name in result
+                or len(value) > MAX_QUERY_VALUE or not allowed[name].fullmatch(value)):
+            raise _Denied()
+        result[name] = value
+    return result
 
 
 def _loopback(endpoint) -> bool:
@@ -184,6 +341,17 @@ def session_token(headers) -> bytes:
     return token
 
 
+def csrf_header(headers) -> str:
+    """Exactly one well-formed ``X-CSRF-Token`` value; anything else denies."""
+    raw = _single(headers, CSRF_HEADER)
+    if raw is None:
+        raise _Denied()
+    value = _ascii(raw)
+    if not _TOKEN.fullmatch(value):
+        raise _Denied()
+    return value
+
+
 def _no_duplicates(pairs):
     result = {}
     for key, value in pairs:
@@ -195,6 +363,36 @@ def _no_duplicates(pairs):
 
 def _reject_constant(_value):
     raise ValueError("non-finite number")
+
+
+class ServingGate:
+    """The reservation session gate, also closed while the composition is stopped.
+
+    Issue #228 item 1: ``HumanAccess.stopped`` used to be read only at the
+    request entry, so a request already past it when ``stop()`` ran, or when
+    a periodic check failed, could still be authorized. ``admit()`` now
+    re-reads it after taking the gate lock, and ``epoch()`` is ``None`` while
+    stopped. This is the gate every human commit uses: the routes'
+    ``_authorize`` and later writes, and the ceremonies (installed through
+    ``PasskeyCeremonies.guard_session_gate``). A commit admitted before
+    ``stop()`` may still complete; none is admitted after it.
+    """
+
+    def __init__(self, access: "HumanAccess"):
+        self._access = access
+        self.reservation = access.reservation
+
+    def epoch(self) -> int | None:
+        if self._access.stopped:
+            return None
+        return self.reservation.epoch()
+
+    @contextmanager
+    def admit(self, epoch: int | None) -> Iterator[None]:
+        with self.reservation.admit(epoch):
+            if self._access.stopped:
+                raise HumanAccessClosed()
+            yield
 
 
 class HumanAccess:
@@ -213,6 +411,11 @@ class HumanAccess:
     gate has one, must be a ``ListenerExceptionStore`` on that same database:
     the exceptions the check applies are the ones the audited Owner path
     commits next to this store's sessions, never another database's.
+
+    On success the ceremonies' gate is replaced by this composition's
+    ``ServingGate`` (Issue #228 item 1), so one ``PasskeyCeremonies`` serves
+    exactly one composition; a second composition over the same ceremonies
+    is refused.
 
     Every human-access write is admitted through the application's storage
     admission: ``create_app`` binds it with ``bind_storage_admission`` (the
@@ -270,6 +473,14 @@ class HumanAccess:
         # lifespan is disabled, serves nothing.
         self._serving = False
         self._halted = False
+        self._running = False
+        self._state = HumanAccessState.NOT_STARTED
+        self._check_failures = 0
+        self._sweep_failures = 0
+        self.gate = ServingGate(self)
+        # Last: everything above validated, so a refused composition leaves
+        # the ceremonies untouched.
+        ceremonies.guard_session_gate(self.gate)
 
     def bind_storage_admission(self, admission: Callable, *, database: Database) -> None:
         """Admit every write of this composition through ``admission``.
@@ -309,26 +520,54 @@ class HumanAccess:
         check, from ``stop()``, after ``run()`` has ended, and from a failed
         periodic check until the retried startup check has returned (Codex
         PR #219): requests are served only on a verdict this lifespan's
-        ``run()`` published and keeps checking.
+        ``run()`` published and keeps checking. ``admit()`` re-reads it under
+        the gate lock, so a request already in flight is refused as well
+        (Issue #228 item 1).
         """
         return self._halted or not self._serving
+
+    @property
+    def state(self) -> HumanAccessState:
+        """Value-free lifecycle state for the embedder (Issue #228 item 2)."""
+        return self._state
+
+    @property
+    def check_failures(self) -> int:
+        """Consecutive failed startup/periodic checks; ``0`` once one returned."""
+        return self._check_failures
+
+    def epoch(self) -> int | None:
+        """The gate epoch for a request; ``None`` while closed or stopped."""
+        return self.gate.epoch()
+
+    def admit(self, epoch: int | None):
+        """Hold the gate for one commit; see ``ServingGate.admit``."""
+        return self.gate.admit(epoch)
 
     def stop(self) -> None:
         """Deny every later request; called first by the application shutdown.
 
-        ``run()`` starts no further check or sweep after this. The application
-        then cancels ``run()`` and waits for it, before it unbinds the storage
+        ``run()`` starts no further check or sweep after this, and a commit
+        not yet admitted through ``admit()`` is refused. The application then
+        cancels ``run()`` and waits for it, before it unbinds the storage
         admission or stops the monitoring runtime.
         """
         self._halted = True
         self._serving = False
+        if self._state is not HumanAccessState.FAILED:
+            self._state = HumanAccessState.STOPPED
 
     async def run(self, *, sleep: Callable = asyncio.sleep) -> None:
         """Startup check, then the periodic check tick and expiry sweep.
 
         ``tick()`` runs the daily check and the five-minute retries while
         closed; ``end_expired_sessions()`` clears expired rows even when no
-        request arrives. A failure is logged without values.
+        request arrives. A failure is logged without values: a failed check
+        each time, a failed sweep when its streak starts and each time the
+        streak doubles (Issue #228 item 4). ``state`` and ``check_failures``
+        make a failing or ended ``run()`` visible to the embedder (Issue #228
+        item 2). A second ``run()`` while one is running is refused with
+        ``HumanAccessAlreadyRunning`` and changes nothing (item 3).
 
         Requests are served only while this lifespan's checks hold (Codex
         PR #219). They are denied (``stopped``) from the start of ``run()``
@@ -355,9 +594,14 @@ class HumanAccess:
         without a timeout of its own), plus the SQLite busy timeout.
         Cancellation during the sleep between ticks ends at once.
         """
+        if self._running:
+            raise HumanAccessAlreadyRunning()
+        self._running = True
         self._halted = False
         self._serving = False
+        self._state = HumanAccessState.STARTING
         log = logging.getLogger(__name__)
+        failed = False
         try:
             started = await self._startup(log)
             while True:
@@ -375,26 +619,69 @@ class HumanAccess:
                     # a startup check has re-evaluated it (Codex PR #219).
                     self._serving = False
                     started = False
+                    self._check_failed()
                     log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
+                else:
+                    self._check_failures = 0
                 if self._halted:
                     return
                 try:
                     await run_to_completion(asyncio.to_thread(self.store.end_expired_sessions))
                 except Exception:
-                    log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
+                    self._sweep_failures += 1
+                    if self._sweep_failures & (self._sweep_failures - 1) == 0:
+                        log.error(Event.HUMAN_ACCESS_SWEEP_FAILED)
+                else:
+                    self._sweep_failures = 0
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            failed = True
+            log.error(Event.HUMAN_ACCESS_RUN_FAILED)
+            raise
         finally:
             self._serving = False
+            self._running = False
+            self._state = HumanAccessState.FAILED if failed else HumanAccessState.STOPPED
+
+    def _check_failed(self) -> None:
+        self._check_failures += 1
+        if not self._halted:
+            self._state = HumanAccessState.CHECK_FAILING
 
     async def _startup(self, log) -> bool:
         """Run the startup check; requests are served again only after it returned."""
         try:
             await run_to_completion(asyncio.to_thread(self.reservation.startup))
         except Exception:
+            self._check_failed()
             log.error(Event.HUMAN_ACCESS_CHECK_FAILED)
             return False
+        self._check_failures = 0
         # Still denied after a stop() during the check (``stopped``).
         self._serving = True
+        if not self._halted:
+            self._state = HumanAccessState.SERVING
         return True
+
+
+@dataclass(frozen=True)
+class _Request:
+    scope: Scope
+    receive: Receive
+    send: Send
+    headers: list
+    identity: str
+    route: Route
+    query: dict
+
+
+@dataclass(frozen=True)
+class _Authorized:
+    """A request authorized inside the gate; later writes reuse ``epoch``."""
+
+    session: SessionView
+    epoch: int
 
 
 class HumanSurface:
@@ -417,6 +704,9 @@ class HumanSurface:
 
             try:
                 await self._http(scope, receive, tracked)
+            except _StepUp:
+                if not started:
+                    await send_step_up_required(send)
             except Exception:
                 # _Denied and any unexpected fault alike: never a framework
                 # error page, traceback or distinguishable status.
@@ -454,24 +744,60 @@ class HumanSurface:
 
     async def _http(self, scope: Scope, receive: Receive, send: Send) -> None:
         headers = scope.get("headers") or []
-        method, path = scope.get("method"), scope.get("path")
-        route = {
-            ("POST", AUTHENTICATION_OPTIONS_PATH): self._begin_authentication,
-            ("POST", AUTHENTICATION_PATH): self._finish_authentication,
-            ("GET", SESSION_PATH): self._session,
-        }.get((method, path))
-        if scope.get("query_string"):
-            route = None
-        # 1. reserved secure-context origin
-        self._origin(headers, mutating=method != "GET")
+        route = match_route(scope)
+        # 1. reserved secure-context origin; a POST without a mounted route
+        # is held to the mutating rule as well.
+        self._origin(headers, mutating=route.mutating if route is not None else scope.get("method") != "GET")
         # 2. trusted proxy path
         self._trusted_peer(scope)
         identity = proxy_identity(headers)
-        # 3. reservation verdict
+        # 3. reservation verdict and this composition serving
         self._open()
         if route is None:
             raise _Denied()
-        await route(identity, headers, receive, send)
+        query = parse_query(route, scope.get("query_string"))
+        request = _Request(scope, receive, send, headers, identity, route, query)
+        await getattr(self, route.handler)(request)
+
+    async def _authorize(self, request: _Request, requirement: Requirement) -> _Authorized:
+        """Authorize a session-bearing request inside the gate.
+
+        Order: the cookie's form; a read-only token pre-check that takes no
+        gate lock and no SQLite write lock (a forged or stale cookie stops
+        here, Issue #181 item 4); the gate epoch; then
+        ``AccessStore.authorize_request`` inside ``admit(epoch)``, with the
+        CSRF header compared in that transaction for a CSRF route. Any
+        refusal is ``_Denied``; only ``StepUpRequired`` on ``OWNER_OP`` is
+        ``_StepUp``. The store releases the gate before its denial
+        bookkeeping.
+        """
+        if requirement is Requirement.PRE_CREDENTIAL or requirement is not request.route.requirement:
+            raise _Denied()
+        token = session_token(request.headers)
+        csrf = csrf_header(request.headers) if request.route.csrf else None
+        access = self.access
+        try:
+            known = await asyncio.to_thread(access.store.session_may_be_current, token)
+        except Exception:
+            raise _Denied() from None
+        if known is not True:
+            raise _Denied()
+        try:
+            epoch = await asyncio.to_thread(access.epoch)
+            if epoch is None:
+                raise _Denied()
+            session = await asyncio.to_thread(
+                access.store.authorize_request, token, request.identity, requirement,
+                admit=lambda: access.admit(epoch), csrf=csrf)
+        except StepUpRequired:
+            if requirement is Requirement.OWNER_OP:
+                raise _StepUp() from None
+            raise _Denied() from None
+        except Exception:
+            raise _Denied() from None
+        if not isinstance(session, SessionView):
+            raise _Denied()
+        return _Authorized(session, epoch)
 
     # -- routes --------------------------------------------------------
 
@@ -479,14 +805,15 @@ class HumanSurface:
         if not self.access.rate_limiter.allow(identity):
             raise _Denied()
 
-    async def _body(self, headers, receive: Receive, limit: int, *, json_required: bool) -> bytes:
-        content_type = _single(headers, b"content-type")
+    async def _body(self, request: _Request, *, json_required: bool) -> bytes:
+        limit = request.route.body_limit
+        content_type = _single(request.headers, b"content-type")
         if json_required and (content_type is None or _ascii(content_type).split(";")[0].strip().lower()
                               != "application/json"):
             raise _Denied()
         body = b""
         while True:
-            message = await receive()
+            message = await request.receive()
             if message.get("type") != "http.request":
                 raise _Denied()
             body += message.get("body", b"")
@@ -495,20 +822,20 @@ class HumanSurface:
             if not message.get("more_body", False):
                 return body
 
-    async def _begin_authentication(self, identity, headers, receive, send) -> None:
-        self._limit(identity)
-        body = await self._body(headers, receive, MAX_OPTIONS_BODY, json_required=False)
+    async def _begin_authentication(self, request: _Request) -> None:
+        self._limit(request.identity)
+        body = await self._body(request, json_required=False)
         if body not in (b"", b"{}"):
             raise _Denied()
         try:
             options = await asyncio.to_thread(self.access.ceremonies.begin_authentication)
         except Exception:
             raise _Denied() from None
-        await self._json(send, 200, options)
+        await self._json(request.send, 200, options)
 
-    async def _finish_authentication(self, identity, headers, receive, send) -> None:
-        self._limit(identity)
-        body = await self._body(headers, receive, MAX_ASSERTION_BODY, json_required=True)
+    async def _finish_authentication(self, request: _Request) -> None:
+        self._limit(request.identity)
+        body = await self._body(request, json_required=True)
         try:
             credential = json.loads(body, object_pairs_hook=_no_duplicates,
                                     parse_constant=_reject_constant)
@@ -518,52 +845,62 @@ class HumanSurface:
             raise _Denied()
         try:
             grant = await asyncio.to_thread(self.access.ceremonies.finish_authentication,
-                                            identity, credential)
+                                            request.identity, credential)
         except Exception:
             raise _Denied() from None
         if not isinstance(grant, SessionGrant):
             raise _Denied()
         cookie = (f"{SESSION_COOKIE}={base64.urlsafe_b64encode(grant.token).rstrip(b'=').decode()}"
                   "; Path=/; Secure; HttpOnly; SameSite=Strict").encode()
-        await send({"type": "http.response.start", "status": 204, "headers": [
+        await request.send({"type": "http.response.start", "status": 204, "headers": [
             (b"cache-control", b"no-store"),
             (b"set-cookie", cookie),
         ]})
-        await send({"type": "http.response.body", "body": b""})
+        await request.send({"type": "http.response.body", "body": b""})
 
-    async def _session(self, identity, headers, receive, send) -> None:
-        token = session_token(headers)
-        reservation = self.access.reservation
-        # A well-formed but unknown, invalidated or expired token is refused
-        # by a read-only lookup before the gate lock or any SQLite write lock
-        # is taken (Issue #181 item 4): only a token that names a live session
-        # row pays for epoch -> authorize -> admit.
+    async def _session(self, request: _Request) -> None:
+        # The epoch is taken before authorization, and the authorization
+        # transaction, idle-session touch included, commits inside
+        # admit(epoch): a close, revocation, reopen or stop() after the epoch
+        # refuses the request before anything is read or written, so a denied
+        # request never extends a session (Issue #144, Codex PR #219, #228).
+        authorized = await self._authorize(request, Requirement.SESSION)
+        session = authorized.session
         try:
-            known = await asyncio.to_thread(self.access.store.session_may_be_current, token)
+            csrf = self.access.store.csrf_token(session.session_id)
         except Exception:
             raise _Denied() from None
-        if known is not True:
-            raise _Denied()
-        try:
-            # The epoch is taken before authorization, and the authorization
-            # transaction, idle-session touch included, commits inside
-            # admit(epoch): a close, revocation or reopen after the epoch
-            # refuses the request before anything is read or written, so a
-            # denied request never extends a session (Issue #144, Codex
-            # PR #219). Lock order: gate -> storage admission -> SQLite write
-            # lock; the denial bookkeeping runs after the gate is released.
-            epoch = await asyncio.to_thread(reservation.epoch)
-            if epoch is None:
-                raise _Denied()
-            principal, permissions = await asyncio.to_thread(
-                self.access.store.authorize_session, token, identity,
-                admit=lambda: reservation.admit(epoch))
-        except Exception:
-            raise _Denied() from None
-        await self._json(send, 200, {
-            "role": principal.role.value,
-            "permissions": sorted(item.value for item in permissions),
+        await self._json(request.send, 200, {
+            "csrf": csrf,
+            "role": session.role.value,
+            "permissions": sorted(item.value for item in session.permissions),
         })
+
+    async def _sign_out(self, request: _Request) -> None:
+        """End the caller's own session (Owner decision D7).
+
+        Exact ``Origin`` and ``X-CSRF-Token`` are required. The invalidation
+        and its ``sign_out_principal`` audit record commit inside the same
+        ``admit(epoch)`` as the authorization; while access is closed or the
+        composition is stopped the sign-out is the generic denial and changes
+        nothing (accepted). Success clears the cookie with ``Max-Age=0`` and
+        the attributes it was set with.
+        """
+        body = await self._body(request, json_required=False)
+        if body not in (b"", b"{}"):
+            raise _Denied()
+        authorized = await self._authorize(request, Requirement.SESSION)
+        access = self.access
+        try:
+            await asyncio.to_thread(access.store.sign_out, authorized.session,
+                                    admit=lambda: access.admit(authorized.epoch))
+        except Exception:
+            raise _Denied() from None
+        await request.send({"type": "http.response.start", "status": 204, "headers": [
+            (b"cache-control", b"no-store"),
+            (b"set-cookie", _CLEARED_COOKIE),
+        ]})
+        await request.send({"type": "http.response.body", "body": b""})
 
     @staticmethod
     async def _json(send: Send, status: int, value) -> None:
