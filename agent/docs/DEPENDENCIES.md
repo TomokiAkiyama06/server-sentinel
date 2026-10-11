@@ -5,13 +5,13 @@ capture-node key, CSR and certificate handling; it is the single approval
 shared with the Main Server's WebAuthn use
 (`../../docs/decisions/2026-09-30-cryptography-dependency.md`). `../requirements.lock`
 pins cryptography 50.0.1, cffi 2.1.1 (MIT-0) and pycparser 3.0 with exact wheel
-hashes for CPython 3.12/3.14 on Linux x86_64/aarch64 (glibc); every permitted
+hashes for CPython 3.12/3.13/3.14 on Linux x86_64/aarch64 (glibc); every permitted
 wheel (filename, SHA-256, download URL, license-file hashes) is recorded in
 `cryptography-wheel-audit.json`. The Agent lock is wider than the Main lock
 because capture hosts are more often aarch64 single-board computers on varied
 distributions: cryptography `cp311-abi3` `manylinux_2_34` and `manylinux_2_28`
-(glibc 2.28-2.33 fallback), each x86_64 and aarch64; cffi `cp312` and `cp314`,
-each x86_64 and aarch64; pycparser `py3-none-any`. musl, free-threaded CPython,
+(glibc 2.28-2.33 fallback), each x86_64 and aarch64; cffi `cp312`, `cp313` and
+`cp314`, each x86_64 and aarch64; pycparser `py3-none-any`. musl, free-threaded CPython,
 PyPy, 32-bit ARM and non-Linux wheels are not permitted. Every permitted
 cryptography wheel statically links the same OpenSSL 4.0.2 and is built from the
 same 50.0.1 sdist `Cargo.lock`, so the license, OpenSSL, libffi and Rust-crate
@@ -23,11 +23,27 @@ Agent provisions them for the non-root service account is open installer work.
 The statement below that the runtime is stdlib-only now applies to every module
 except `node_tls`.
 
+**2026-10-11 update (Issue #127).** CPython 3.13 is supported by adding only the
+two cffi 2.1.1 `cp313` `manylinux2014` wheels (x86_64, aarch64) to the same
+pins; no package, version or license changes. Their SHA-256 values and download
+URLs match `https://pypi.org/pypi/cffi/2.1.1/json`; inspected without
+installation, their `METADATA` declares `License-Expression: MIT-0` and the same
+`Requires-Dist`, and their only license file
+`cffi-2.1.1.dist-info/licenses/LICENSE` has the SHA-256 already recorded for
+the `cp312`/`cp314` wheels. Each contains one `_cffi_backend` extension and no
+auditwheel `.libs` directory; its ELF `NEEDED` entries are only glibc
+(`libc`, `libpthread`, the loader), so libffi is statically linked as in the
+other wheels built by the same cffi v2.1.1 wheel workflow, and the libffi
+review and notice in `../../server/docs/DEPENDENCIES.md` apply. cryptography's `cp311-abi3` wheels and pycparser's
+`py3-none-any` wheel already cover 3.13. The Main Server lock is unchanged and
+still excludes 3.13.
+
 Reviewed 2026-09-20. The Agent runtime, installer and artifact builder use the
 Python standard library only. No model, media codec, third-party runtime library,
-SDK, native extension, or implicit package download is introduced. CPython 3.12
-or 3.14 is required (3.13 has no reviewed `cffi` wheel in the mTLS adapter lock
-above); exact CI interpreter is 3.12.14. Project code remains Apache-2.0;
+SDK, native extension, or implicit package download is introduced. CPython 3.12,
+3.13 or 3.14 is required (the versions with a reviewed `cffi` wheel in the mTLS
+adapter lock above); exact CI interpreter is 3.12.14, and a separate CI job runs
+the Agent lint and unit tests on the runner's CPython 3.13 with the same lock. Project code remains Apache-2.0;
 `agent/LICENSE` is a copy of the root license included in the executable zipapp.
 The zipapp contains application source and its license, not an interpreter or
 operating-system image. Deployments supply their separately licensed Python.

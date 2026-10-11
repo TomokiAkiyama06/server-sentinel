@@ -69,6 +69,60 @@
       "Issue Tracker, https://github.com/python-cffi/cffi/issues",
       "Source Code, https://github.com/python-cffi/cffi"
     ],
+    "wheel": "cffi-2.1.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+    "sha256": "f16c709686a78c727bbbf059f92b0bf41c6fc60deec706d2dc19f529175a6125",
+    "license_files": [
+      "cffi-2.1.1.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/37/6f/3b5ce4c3b2192d250f04908f2bfd91ef34552ec8f7716a5d4abdb8d67bb2/cffi-2.1.1-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/cffi/2.1.1/json",
+    "license_sha256": {
+      "cffi-2.1.1.dist-info/licenses/LICENSE": "5ba24ddc57067f9249add644c3afc41a5d6dc37e23433ef759d95df370b0af63"
+    }
+  },
+  {
+    "name": "cffi",
+    "version": "2.1.1",
+    "license": "MIT-0",
+    "requires_python": ">=3.10",
+    "requires_dist": [
+      "pycparser; implementation_name != \"PyPy\""
+    ],
+    "project_urls": [
+      "Changelog, https://cffi.readthedocs.io/en/latest/whatsnew.html",
+      "Contact, https://groups.google.com/forum/#!forum/python-cffi",
+      "Documentation, https://cffi.readthedocs.io/",
+      "Download, https://github.com/python-cffi/cffi/releases",
+      "Issue Tracker, https://github.com/python-cffi/cffi/issues",
+      "Source Code, https://github.com/python-cffi/cffi"
+    ],
+    "wheel": "cffi-2.1.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "sha256": "a931079504ecc49efed7744c476a5c343a92fabf66dec2db95edb1b2fdc770e2",
+    "license_files": [
+      "cffi-2.1.1.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/95/95/86342356ff5953b3fb06f7ef7c5bee212d45e770abc7218d451b9148313c/cffi-2.1.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/cffi/2.1.1/json",
+    "license_sha256": {
+      "cffi-2.1.1.dist-info/licenses/LICENSE": "5ba24ddc57067f9249add644c3afc41a5d6dc37e23433ef759d95df370b0af63"
+    }
+  },
+  {
+    "name": "cffi",
+    "version": "2.1.1",
+    "license": "MIT-0",
+    "requires_python": ">=3.10",
+    "requires_dist": [
+      "pycparser; implementation_name != \"PyPy\""
+    ],
+    "project_urls": [
+      "Changelog, https://cffi.readthedocs.io/en/latest/whatsnew.html",
+      "Contact, https://groups.google.com/forum/#!forum/python-cffi",
+      "Documentation, https://cffi.readthedocs.io/",
+      "Download, https://github.com/python-cffi/cffi/releases",
+      "Issue Tracker, https://github.com/python-cffi/cffi/issues",
+      "Source Code, https://github.com/python-cffi/cffi"
+    ],
     "wheel": "cffi-2.1.1-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
     "sha256": "58acb8ab8e295e6c5ea12f888cbb13cf21511ef2a3303a23f4325c29d17fe5c1",
     "license_files": [
