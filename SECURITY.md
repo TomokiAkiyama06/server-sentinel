@@ -41,7 +41,11 @@ Mandatory adapters and human authorization remain unwired; this module adds no
 recording playback/download route. See `server/app/media/recording/README.md`.
 
 The current backend foundation denies every human HTTP/WebSocket route,
-including system health, version, schema and framework documentation. Its
+including system health, version, schema and framework documentation. Issue
+#10 phase 1 adds a human route foundation that only an explicitly enabled,
+fully validated composition can open (passkey sign-in and the caller's own
+session description; see `server/app/auth/README.md`); the production entry
+points do not build one yet. Its
 documented launcher accepts only loopback bind settings, disables proxy-header
 parsing and access logs, and removes the server product header. The authorization
 adapter remains deny-all until the #6/#10 gates are met. Newly created SQLite
@@ -302,7 +306,9 @@ Accepting the two records does not open human access by itself. Human routes
 and dashboard assets stay closed — the backend shell denies them, including
 application assets, health/version/schema and SPA/error fallbacks — until
 Issue #10 implements and tests both records; the remaining work is listed in
-`server/app/auth/README.md`. Once they are open, a human request receives
+`server/app/auth/README.md`. Phase 1 mounts only the authentication ceremony
+and a session self-description behind an explicit composition; it does not
+make any of the conditions below optional. Once they are open, a human request receives
 application data only when every one of these server-side conditions holds:
 
 - **Network gate.** The request arrived over the Owner-managed private network

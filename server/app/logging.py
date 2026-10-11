@@ -29,6 +29,8 @@ class Event(StrEnum):
     LOCAL_UVC_HEALTH_FENCE_PIN_RELEASED = "local_uvc_health_fence_pin_released"
     LOCAL_UVC_SOURCE_HEALTH_CHANGED = "local_uvc_source_health_changed"
     HUMAN_LISTENER_ACTIVATION_INVALID = "human_listener_activation_invalid"
+    HUMAN_REQUEST_RATE_LIMITED = "human_request_rate_limited"
+    HUMAN_ACCESS_CHECK_FAILED = "human_access_check_failed"
     TIMELINE_FACT_QUARANTINED = "timeline_fact_quarantined"
     TIMELINE_FLUSH_FAILING = "timeline_flush_failing"
     TIMELINE_FLUSH_RECOVERED = "timeline_flush_recovered"

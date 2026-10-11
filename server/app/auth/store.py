@@ -564,6 +564,42 @@ class AccessStore:
             self._touch_session_on(connection, row, at)
             return principal
 
+    def authorize_session(self, token: bytes, proxy_identity: str, *,
+                          now: datetime | None = None) -> tuple[Principal, frozenset]:
+        """Authorize a request that needs a current session but no permission.
+
+        Exactly the session checks of ``authorize`` (current, unrevoked
+        principal and credential, generation, lifetimes, keyed proxy-identity
+        binding, idle touch), returning the principal with its current
+        permissions read in the same transaction. The Owner holds every
+        permission. Every refusal is the same generic denial. Used only by
+        the session self-description route, which grants nothing.
+        """
+        at = utc_time(self._clock() if now is None else now)
+        mismatch: list = []
+        try:
+            with self._transaction(write=True) as connection:
+                self._end_expired_sessions_on(connection, at)
+                row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
+                if row is None:
+                    raise AccessValidationError("access is unavailable")
+                principal = self._principal(row)
+                if principal.role is PrincipalRole.OWNER:
+                    granted = frozenset(Permission)
+                else:
+                    known = {item.value: item for item in Permission}
+                    granted = frozenset(
+                        known[value] for (value,) in connection.execute(
+                            "SELECT permission FROM access_principal_permissions WHERE principal_id=?",
+                            (row["principal_id"],)).fetchall()
+                        if value in known)
+                self._touch_session_on(connection, row, at)
+                return principal, granted
+        except AccessValidationError:
+            self._end_expired_sessions_after_denial(at)
+            self._record_binding_mismatch(mismatch, at)
+            raise
+
     def authorize_owner(self, token: bytes, proxy_identity: str, *, now: datetime | None = None,
                         freshness: timedelta = OWNER_STEP_UP_FRESHNESS) -> Principal:
         """Authorize an AUTH-008 owner operation with fresh user verification.

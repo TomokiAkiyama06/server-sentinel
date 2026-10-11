@@ -1349,6 +1349,40 @@ secure-context origin, using synthetic test identities (`*.invalid`):
   SHA-256 digests of challenges still pending. It holds no raw challenge,
   client data, signature or biometric data. Logs contain none of these either.
 
+### Issue #10 phase 1 human route foundation (pending)
+
+`server/app/auth/human_surface.py` is verified only with a synthetic ASGI driver
+(`server/tests/test_human_surface.py`): no socket, Tailscale Serve, browser or
+real authenticator has exercised it, and no production entry point builds the
+composition yet. Once a deployment can enable it, verify on the Main Server
+with synthetic `*.invalid` identities:
+
+- [ ] through the installed Tailscale Serve, record the `Host` header and peer
+  address the loopback upstream actually receives; the surface requires exactly
+  one `Host` equal to the reserved `<hostname>[:<port>]` and a loopback peer,
+  so a Serve that rewrites `Host` keeps every route denied (fail closed);
+- [ ] record whether the installed Serve replaces a client-supplied
+  `Tailscale-User-Login` and how it forwards a duplicate; the surface refuses a
+  repeated, comma-joined or encoded login;
+- [ ] from another LAN host, send requests with a forged `Tailscale-User-Login`
+  and `X-Forwarded-For: 127.0.0.1` to every Main Server address and port and
+  confirm none reaches the human upstream (it binds loopback only) and every
+  response is the generic denial or a refused connection;
+- [ ] sign in with a passkey at the reserved origin and confirm
+  `GET /api/session` returns only the caller's own role and permissions, that
+  the cookie is `__Host-session` with `Secure; HttpOnly; SameSite=Strict` and
+  no `Domain`, and that every other path (live, recordings, events, timeline,
+  health, version, download) is the generic denial for both a `live:view`-only
+  and a `recordings:view`-only person;
+- [ ] repeat sign-in attempts quickly and confirm they are refused with the
+  generic denial after the burst, that one value-free
+  `human_request_rate_limited` log event appears, and that sign-in works again
+  after a short wait; record that people sharing one Tailscale login share
+  this limit;
+- [ ] stop the reservation check from passing (for example remove the Serve
+  mapping) and confirm sign-in and the session route are denied until it
+  passes again.
+
 ### Uninvited ordinary Tailnet member
 
 - [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;

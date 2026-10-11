@@ -1276,6 +1276,20 @@ class HostnameReservationCheck:
         """
         return self._in_gate_process() and self._verdict.open
 
+    @property
+    def opening_configured(self) -> bool:
+        """Whether every input a passing check needs was supplied.
+
+        A check without the hostname resolver, the socket owner resolver
+        (mandatory, Owner decision 2026-10-05), its own socket table, the
+        unprivileged port start or the session revoker can never open access.
+        The human route composition refuses such a check at construction
+        instead of mounting routes that stay closed for a reason nobody sees.
+        """
+        return (self._resolver is not None and self._socket_owners is not None
+                and self._own_sockets is not None and self._port_start is not None
+                and self.session_revoker is not None)
+
     def _in_gate_process(self) -> bool:
         """True only in the process that built the gate (Issue #181).
 

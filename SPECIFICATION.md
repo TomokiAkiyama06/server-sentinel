@@ -1783,6 +1783,26 @@ there; the authoritative per-person application credential is decided separately
 for Issue #6, by §11.8 and ADR-0004: a per-person WebAuthn credential, which is
 the credential that local bootstrap provisions and that a session is bound to.
 
+Issue #10 phase 1 (human route foundation) defines the first main-to-Web
+contract, opened only by an explicitly enabled composition behind a fully
+configured reservation check (no production entry point builds one yet):
+
+```text
+POST /api/auth/authentication/options -> pre-credential, rate-limited;
+                                         discoverable-credential request options
+POST /api/auth/authentication         -> pre-credential, rate-limited; 204 and
+                                         __Host-session cookie, no data
+GET  /api/session                     -> credential-backed session; the caller's
+                                         own {"role", "permissions"} only
+anything else                         -> generic not-found denial
+```
+
+Every request first needs the reserved `Host`/`Origin` (absent `Origin` only for
+`GET /api/session`), a loopback transport peer and local address, exactly one
+canonical trusted-proxy login, and an open reservation verdict. Invitation
+redemption, step-up, sign-out and all live/recording/timeline/admin routes are
+later phases. Details: `server/app/auth/README.md`.
+
 ## 12. Dashboard UI
 
 The #8 foundation is a Japanese-default React/TypeScript shell with an English

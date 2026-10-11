@@ -23,8 +23,11 @@ Owns owner invitations/allowlists, independent `live:view` and `recordings:view`
 ## Current foundation
 
 ADR-0004 (per-person WebAuthn/passkey credentials) was accepted on 2026-09-30,
-alongside ADR-0003. No human route is mounted yet: route mounting stays closed
-until the remaining Issue #10 gates pass.
+alongside ADR-0003. The production entry points still mount no human route.
+Issue #10 phase 1 adds the human route foundation (`human_surface.py`, below):
+an embedder can open the passkey sign-in ceremony and a session
+self-description route only through a validated composition that the
+deployment explicitly enabled, behind a fully configured reservation check.
 
 - `webauthn.py` is pure relying-party verification over the Owner-approved
   `cryptography` package, with no WebAuthn/FIDO library. It checks the
@@ -116,20 +119,26 @@ until the remaining Issue #10 gates pass.
   in the same transaction as their effect. As with redemption, an attempt that
   matches no credential writes nothing.
 
-Not implemented yet, and required before routes open:
+Not implemented yet, and required before routes open in production:
 
-- the HTTP routes and their cookie handling;
-- per-source rate limiting (only the per-code attempt bound exists here);
+- the remaining HTTP routes: invitation redemption (registration), Owner
+  step-up, sign-out with its CSRF token, and every live, recording, timeline,
+  event and administration route (later Issue #10 phases, #19);
+- per-source rate limiting of invitation redemption (the authentication
+  ceremony is limited in phase 1; redemption keeps its per-code bound);
 - the decision whether any path (for example a strictly local
-  `http://localhost` Owner) may run without a trusted-proxy identity; until
-  the routes are built one is required on every ceremony and session check
-  (Owner decision, 2026-09-30);
-- the runtime composition that loads the session-binding key with
+  `http://localhost` Owner) may run without a trusted-proxy identity; one is
+  required on every ceremony and session check (Owner decision, 2026-09-30),
+  and the phase 1 composition accepts only the reserved `https` origin;
+- the deployment-file key and production composition that build the
+  `HostnameReservationCheck` (Serve status source, `SockDiagOwners`,
+  `GetaddrinfoResolver`), load the session-binding key with
   `SessionBindingKey.load_or_create(Settings.session_binding_key_path)` and
-  hands it to `AccessStore` (no human route constructs the store yet);
-- delivery of `CredentialFindingSink` to the Owner notification channel;
-- local owner bootstrap and recovery commands;
-- the startup/daily listener and route reservation check.
+  pass a `HumanAccess` to `create_app` (no production path builds one yet);
+- delivery of `CredentialFindingSink` and `ReservationFault` to the Owner
+  notification channel;
+- local owner bootstrap and recovery commands (see "Bootstrap and recovery
+  commands and the session gate" below for how they relate to the gate).
 
 Owner-only mutations — invitation, invitation issue, grant change, single
 credential revocation and principal revocation — are exposed as `*_on`
@@ -253,10 +262,10 @@ challenge share one lock, `HostnameReservationCheck.admit()`:
 `PasskeyCeremonies.finish_authentication()` (new session),
 `finish_step_up()` (user-verification time) and `finish_registration()`
 (invitation redemption) run their store commit inside it, and so does
-`AccessAdministration.issue_invitation()` when it is constructed with the
-check as `session_gate` (required for wiring a human route reaches; `None` only
-for a caller no human route reaches). `PasskeyCeremonies` cannot be constructed
-without a gate. Each of these requests first takes the gate epoch
+`AccessAdministration.issue_invitation()`. Neither `PasskeyCeremonies` nor
+`AccessAdministration` can be constructed without a gate (`session_gate=None`
+is refused, Issue #181), and the human route composition accepts only the
+`HostnameReservationCheck` itself. Each of these requests first takes the gate epoch
 (`HostnameReservationCheck.epoch()`), before it consumes its challenge,
 verifies an assertion or authorizes the Owner, and commits inside
 `admit(epoch)`. The epoch advances, under the lock, every time an open verdict
@@ -305,9 +314,9 @@ it is built and every gate entry compares it before taking any lock (Issue
 verdict that no check closes, `access_open` is false, `epoch()` reports closed
 (`None`, so callers keep their closed-at-start denial or failed audited
 operation) and `admit()` raises `HumanAccessClosed`. This fails closed; it is
-not a multi-process mode. Whether a future local bootstrap/recovery command
-goes through the gate, and per-source rate limiting, are decided when the
-human routes are wired (Issue #181, #10). The low-level
+not a multi-process mode. Local bootstrap/recovery commands and per-source
+rate limiting are described in "Human route foundation" below (Issue #181,
+#10). The low-level
 `AccessStore.establish_session` / `issue_enrollment` wrappers are fixture and
 local entries outside the gate and must not be reached from a human route.
 Two session writes stay outside the gate on purpose: the idle-expiry touch
@@ -463,7 +472,100 @@ and each identical extra row is unexpected. An exception allows one socket per
 endpoint even for its own process, so a service that opens several
 `SO_REUSEPORT` sockets on an excepted port keeps access closed.
 
-Nothing here is wired into the application or a route yet, reads the host
-implicitly, runs `tailscale`, changes Tailscale ACLs/Grants, or needs Tailscale
-administrative credentials. The assumed `tailscale serve status --json` shape
-is unverified against an installed Tailscale; unrecognised keys fail closed.
+Nothing here reads the host implicitly, runs `tailscale`, changes Tailscale
+ACLs/Grants, or needs Tailscale administrative credentials. The check is wired
+into the application only through the phase 1 `HumanAccess` composition below,
+whose lifespan task runs `startup()` and then `tick()` every 30 seconds; no
+production path builds one yet. The assumed `tailscale serve status --json`
+shape is unverified against an installed Tailscale; unrecognised keys fail
+closed.
+
+## Human route foundation (Issue #10 phase 1)
+
+`human_surface.py` replaces the closed surface only when `create_app` receives a
+`HumanAccess`. Constructing one requires `HumanAccessConfiguration(enabled=True)`,
+a `HostnameReservationCheck` with every opening input (`opening_configured`:
+hostname resolver, socket owner resolver, own socket table, unprivileged port
+start and session revoker), `PasskeyCeremonies` gated by exactly that check over
+this audited `AccessStore` with a session-binding key, and a relying party
+whose origin is the reserved `https://<hostname>[:<port>]` of the check. Any
+other combination raises `HumanAccessUnavailable` and the listener stays
+closed. No deployment-file key builds a `HumanAccess` yet.
+
+Every HTTP request passes, in this order, before any handler runs:
+
+1. reserved secure-context origin: exactly one `Host` equal to the reserved
+   authority, and an `Origin`, when present, exactly equal to the reserved
+   origin; an absent `Origin` is accepted only for `GET /api/session`;
+2. trusted-proxy path: the actual transport peer and the local listener
+   address are loopback (`Forwarded`/`X-Forwarded-For` are never read), checked
+   before the identity header is read, then exactly one canonical
+   `Tailscale-User-Login` (printable ASCII, no space, no comma-joined value, no
+   RFC 2047 encoded word);
+3. the reservation verdict (`access_open`, pid-guarded);
+4. for the session route, the gate epoch, `AccessStore.authorize_session`
+   (credential-backed session, binding, lifetimes, revocation) and `admit(epoch)`
+   confirming access stayed open until the answer was decided; the ceremonies
+   take the epoch and `admit()` themselves.
+
+Mounted routes, and nothing else (every other method, path, query string,
+WebSocket and error path gets the generic not-found denial; no FastAPI router,
+OpenAPI or error handler is reachable):
+
+| Route | Credential | Result |
+|---|---|---|
+| `POST /api/auth/authentication/options` | none (rate-limited) | `PasskeyCeremonies.begin_authentication()` options |
+| `POST /api/auth/authentication` | the assertion itself (rate-limited) | `204`, `Set-Cookie: __Host-session=…; Path=/; Secure; HttpOnly; SameSite=Strict` |
+| `GET /api/session` | session | `{"role": …, "permissions": […]}` of the caller only |
+
+The session route grants nothing and returns only the caller's own role and
+permissions (the Owner holds both). It is the only route a session reaches in
+this phase, so a `live:view`-only or `recordings:view`-only person reaches
+nothing they lack. Bodies are bounded (1 KiB options, 64 KiB assertion), JSON
+with duplicate members is refused, and a ceremony refusal never sets a cookie.
+
+Rate limiting (Issue #181 item 4, `rate_limit.py`). Both ceremony routes are
+charged to a per-source token bucket and a global one before the ceremony
+takes the gate or any SQLite lock, so a flood cannot hold the gate lock that
+the check's close waits for. The source key is the verified proxy identity,
+the only source attribute the backend can trust (the peer is always the
+loopback proxy and forwarded headers are client-controlled). In the shared
+Tailscale account every person presents the same login, so the per-source
+bucket is shared by the room: a holder of the shared login can delay others'
+sign-in (availability only, never access). Defaults: 20 requests burst and one
+every 3 s per source, 120 burst and two per second globally, at most 256
+source buckets (an identity digest, never the value; a full table evicts only
+a refilled bucket and otherwise refuses). A refused request gets the generic
+denial and at most one value-free `human_request_rate_limited` event per
+minute. Session reads are not charged; a request without a well-formed
+`__Host-session` cookie is denied before any storage access.
+
+### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
+
+The local bootstrap/recovery commands are not built yet. Proposed rationale,
+pending Owner confirmation: they do not go through the server gate, and the
+deployment authorization generation is what keeps them safe.
+
+- They cannot use the gate: it lives in the serving process's memory, and in
+  any other process the pid guard reports it closed, so a command that called
+  `epoch()`/`admit()` would always be refused. A command opening its own
+  `HostnameReservationCheck` would hold a second, unsynchronized verdict.
+- They do not create sessions, store challenges or update a session's
+  user-verification time; they create the Owner principal and issue one
+  enrollment authorization (bootstrap) or advance the generation, revoke the
+  old Owner and issue one (recovery). Every enrollment authorization records
+  the generation it was issued under, and redemption refuses it once the
+  generation has advanced (ADR-0003 bootstrap step 6, `issue_enrollment_on` /
+  `enroll_credential`).
+- So an authorization that a command commits before a reservation revocation
+  is voided by that revocation, and one committed after it was shown only on
+  the local console, never to the listener that caused the exposure.
+  Redemption itself is the HTTP route, which goes through the gate like every
+  other enrollment commit.
+- A recovery advances the generation itself and invalidates every session in
+  the same transaction, so it needs no gate to end sessions; the serving
+  process sees the new generation on the next request.
+
+Until the Owner confirms this, the commands stay unimplemented and the
+low-level `establish_session` / `issue_enrollment` wrappers stay unreachable
+from any human route.

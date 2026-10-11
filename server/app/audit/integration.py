@@ -194,22 +194,26 @@ class AccessAdministration:
     invitation secrets, credential identifiers and public keys never do.
     This class registers no route.
 
-    ``session_gate`` must be stated. Wiring reached from a human route passes
-    the ``HostnameReservationCheck``: issuing an enrollment authorization
-    takes the gate epoch before Owner authorization and commits inside
-    ``admit(epoch)`` before the write transaction opens, so it cannot land
-    after a reservation check has closed access, even if access has reopened
-    since, and so cannot rest on an Owner authorization that such a check
-    revoked (Issue #144, PR #174 review); a closed gate is a failed operation
-    with its ``failed`` record. ``None`` is only for a caller
-    that no human route reaches.
+    ``session_gate`` is mandatory (Issue #181): runtime wiring passes the
+    ``HostnameReservationCheck``, and ``None`` or an object without
+    ``epoch()``/``admit()`` is refused at construction, so no composition can
+    issue an enrollment authorization outside the gate. Issuing one takes the
+    gate epoch before Owner authorization and commits inside ``admit(epoch)``
+    before the write transaction opens, so it cannot land after a
+    reservation check has closed access, even if access has reopened since,
+    and so cannot rest on an Owner authorization that such a check revoked
+    (Issue #144, PR #174 review); a closed gate is a failed operation with
+    its ``failed`` record. Fixtures that exercise no reservation pass a
+    synthetic always-open gate explicitly.
     """
 
     def __init__(self, service, access_store, *, session_gate):
         if getattr(service.store, "database", None) != access_store.database:
             raise ValueError("access audit must share the access database")
-        if session_gate is not None and not (callable(getattr(session_gate, "admit", None))
-                                             and callable(getattr(session_gate, "epoch", None))):
+        if not (callable(getattr(session_gate, "admit", None))
+                and callable(getattr(session_gate, "epoch", None))):
+            # Mandatory (Issue #181): ``None`` would issue enrollment
+            # authorizations outside the reservation check's gate.
             raise ValueError("session gate is invalid")
         self.service = service
         self.access = access_store
@@ -217,7 +221,7 @@ class AccessAdministration:
 
     def _execute(self, actor_context, action, principal_id, operation, *, gated=False):
         reservation = None
-        if gated and self.session_gate is not None:
+        if gated:
             # The epoch is taken before authorization; the gate is entered
             # after it and held until the commit: gate lock before the SQLite
             # write lock (the check's lock order).
