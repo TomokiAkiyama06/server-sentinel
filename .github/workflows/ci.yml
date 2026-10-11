@@ -170,10 +170,55 @@ jobs:
         working-directory: web
         run: npm run test:browser
 
+  agent-python-313:
+    name: Agent lint and unit tests on CPython 3.13
+    # Issue #127: Debian 13 / Raspberry Pi OS trixie default to CPython 3.13.
+    # Installs the hash-pinned Agent lock (cffi cp313 wheel) on 3.13, compares
+    # the resolved pins with the reviewed evidence, then runs the Agent checks.
+    needs: repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Install and verify the hash-pinned Agent locks on CPython 3.13
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: '1'
+        run: |
+          python -c 'import sys; print(sys.version); sys.exit(sys.version_info[:2] != (3, 13))'
+          python -m venv "${RUNNER_TEMP}/agent-313"
+          "${RUNNER_TEMP}/agent-313/bin/python" -m pip install --require-hashes \
+            --only-binary=:all: --no-cache-dir \
+            --report "${RUNNER_TEMP}/agent-313-runtime.json" -r agent/requirements.lock
+          python scripts/ci/license_gate.py \
+            --resolved-python "${RUNNER_TEMP}/agent-313-runtime.json" \
+            --input agent/requirements.lock
+          # The runtime pins are already installed, so this report holds only
+          # the CI lint tools reviewed for agent/requirements-ci.lock.
+          "${RUNNER_TEMP}/agent-313/bin/python" -m pip install --require-hashes \
+            --only-binary=:all: --no-cache-dir \
+            --report "${RUNNER_TEMP}/agent-313-ci.json" -r agent/requirements-ci.lock
+          python scripts/ci/license_gate.py \
+            --resolved-python "${RUNNER_TEMP}/agent-313-ci.json" \
+            --input agent/requirements-ci.lock
+      - name: Agent lint and unit tests
+        working-directory: agent
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          PYTHONFAULTHANDLER: '1'
+        run: |
+          "${RUNNER_TEMP}/agent-313/bin/python" -c 'import sys; sys.exit(sys.version_info[:2] != (3, 13))'
+          "${RUNNER_TEMP}/agent-313/bin/python" -m pyflakes media_capture_agent tests build_artifact.py install.py
+          "${RUNNER_TEMP}/agent-313/bin/python" -m unittest discover -s tests -p 'test_*.py' -v
+
   ci:
     name: CI
     if: ${{ always() }}
-    needs: [repository, components, agent-ring-sqlite-340, web-browser]
+    needs: [repository, components, agent-ring-sqlite-340, web-browser, agent-python-313]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -183,8 +228,10 @@ jobs:
           COMPONENT_RESULT: ${{ needs.components.result }}
           AGENT_RING_SQLITE_340_RESULT: ${{ needs.agent-ring-sqlite-340.result }}
           WEB_BROWSER_RESULT: ${{ needs.web-browser.result }}
+          AGENT_PYTHON_313_RESULT: ${{ needs.agent-python-313.result }}
         run: |
           test "$REPOSITORY_RESULT" = success
           test "$COMPONENT_RESULT" = success
           test "$AGENT_RING_SQLITE_340_RESULT" = success
           test "$WEB_BROWSER_RESULT" = success
+          test "$AGENT_PYTHON_313_RESULT" = success

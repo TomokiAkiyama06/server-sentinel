@@ -30,8 +30,9 @@ substitute mock capture.
 
 ## Local configuration and service
 
-Use CPython 3.12 or 3.14 on Linux, the versions with reviewed wheel hashes in
-`requirements.lock` (3.13 is excluded by `requires-python`). Run
+Use CPython 3.12, 3.13 or 3.14 on Linux, the versions with reviewed wheel
+hashes in `requirements.lock` (3.13 is the Debian 13 / Raspberry Pi OS trixie
+default). Run
 `python3 agent/media-capture-agent --config <protected-config-file> --check`
 from a checkout, or invoke the installed `media-capture-agent` executable.
 `--check` validates the local account, storage

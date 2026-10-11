@@ -93,6 +93,37 @@ class CIWorkflowTests(unittest.TestCase):
         dockerfile = (ROOT / "agent/Dockerfile.ci").read_text(encoding="utf-8")
         self.assertRegex(dockerfile, r"^FROM python:[0-9.]+-slim-bookworm@sha256:[0-9a-f]{64}\n")
 
+    def test_agent_checks_run_on_cpython_313_with_the_hashed_lock(self):
+        # Issue #127: the Agent declares CPython 3.13, so its lock and unit
+        # tests must run on 3.13 and fail rather than test another version.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        start = workflow.find("\n  agent-python-313:\n")
+        self.assertNotEqual(-1, start, "CPython 3.13 Agent job is missing")
+        end = workflow.find("\n  ci:\n", start)
+        self.assertNotEqual(-1, end)
+        job = workflow[start:end]
+        self.assertIn("\n          python-version: '3.13'\n", job)
+        self.assertIn("sys.exit(sys.version_info[:2] != (3, 13))", job)
+        steps = []
+        for report, lock in (("agent-313-runtime", "agent/requirements.lock"),
+                             ("agent-313-ci", "agent/requirements-ci.lock")):
+            install = job.find(
+                "-m pip install --require-hashes \\\n"
+                "            --only-binary=:all: --no-cache-dir \\\n"
+                f"            --report \"${{RUNNER_TEMP}}/{report}.json\" -r {lock}\n")
+            verify = job.find(
+                f"--resolved-python \"${{RUNNER_TEMP}}/{report}.json\" \\\n"
+                f"            --input {lock}\n")
+            self.assertNotEqual(-1, install, f"{lock} is not installed on 3.13")
+            self.assertNotEqual(-1, verify, f"{lock} resolved pins are not verified")
+            steps.extend((install, verify))
+        tests = job.find(
+            "\"${RUNNER_TEMP}/agent-313/bin/python\" -m unittest discover"
+            " -s tests -p 'test_*.py' -v\n")
+        self.assertNotEqual(-1, tests, "Agent unit tests do not run on 3.13")
+        self.assertEqual(sorted(steps + [tests]), steps + [tests])
+        self.assertIn("\n        working-directory: agent\n", job)
+
     def test_aggregate_ci_gate_requires_every_other_job_to_succeed(self):
         # The ruleset requires only the terminal `CI` check, so every other job
         # must be in its `needs` and asserted as `success`; otherwise a failing

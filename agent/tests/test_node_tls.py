@@ -397,7 +397,8 @@ class AgentLockAuditTests(unittest.TestCase):
             self.assertTrue(row["license_files"])
             self.assertEqual(set(row["license_files"]), set(row["license_sha256"]))
 
-    def test_declared_python_range_is_covered_by_audited_wheels(self):
+    @staticmethod
+    def declared_python_minors():
         root = Path(__file__).resolve().parents[1]
         declared = re.search(r'^requires-python = "([^"]+)"$',
                              (root / "pyproject.toml").read_text(), re.M).group(1)
@@ -410,16 +411,30 @@ class AgentLockAuditTests(unittest.TestCase):
                     return False
             return True
 
+        return [minor for minor in range(12, 40) if allowed(minor)]
+
+    def test_debian_13_default_python_is_declared(self):
+        # Issue #127: Debian 13 / Raspberry Pi OS trixie ship CPython 3.13.
+        self.assertEqual(self.declared_python_minors(), [12, 13, 14])
+
+    def test_declared_python_range_is_covered_by_audited_wheels(self):
+        root = Path(__file__).resolve().parents[1]
         rows = json.loads((root / "docs/cryptography-wheel-audit.json").read_text())
         packages = {row["name"] for row in rows}
-        for minor in (minor for minor in range(12, 40) if allowed(minor)):
+        for minor in self.declared_python_minors():
             for name in packages:
-                tags = [row["wheel"].split("-")[2:4] for row in rows if row["name"] == name]
-                with self.subTest(python=f"3.{minor}", package=name):
-                    self.assertTrue(any(
-                        python == f"cp3{minor}" or python.startswith("py3")
-                        or (abi == "abi3" and int(python[3:]) <= minor)
-                        for python, abi in tags), "no audited wheel for a declared Python")
+                for machine in ("x86_64", "aarch64"):
+                    tags = [row["wheel"][:-len(".whl")].split("-")[2:5]
+                            for row in rows if row["name"] == name]
+                    with self.subTest(python=f"3.{minor}", package=name, machine=machine):
+                        self.assertTrue(any(
+                            (python == f"cp3{minor}" or python.startswith("py3")
+                             or (abi == "abi3" and int(python[3:]) <= minor))
+                            and (platform == "any" or any(
+                                tag.startswith("manylinux") and tag.endswith("_" + machine)
+                                for tag in platform.split(".")))
+                            for python, abi, platform in tags),
+                            "no audited glibc wheel for a declared Python and machine")
 
 
 if __name__ == "__main__":
