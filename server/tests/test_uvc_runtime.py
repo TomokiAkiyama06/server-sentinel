@@ -1147,6 +1147,41 @@ class RuntimeLifecycleTests(RuntimeFixture):
                 self.assertIn("src1: offline (synthetic-closed)", text)
                 self.assertEqual([], log.drain())
 
+    def test_manual_watch_helper_reports_negotiated_profile_per_source(self):
+        # Issue #193 / MANUAL_TEST P-5: each per-second line carries the
+        # registry negotiated profile so a person can see that it survives a
+        # video_frame_stalled degradation and the recovery to online.
+        import importlib.util
+        script = Path(__file__).resolve().parents[2] / "scripts" / "manual" / "uvc_watch.py"
+        spec = importlib.util.spec_from_file_location("uvc_watch_under_test", script)
+        watch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(watch)
+        first, second = self.source("src1"), self.source("src2")
+        ids = [first.id, second.id]
+        counts = {first.id: 30, second.id: 0}
+        before = {first.id: 0, second.id: 0}
+
+        def line():
+            return watch.source_parts(self.registry, ids, counts, before)
+
+        initial = first.health_state.value
+        self.assertEqual([f"src1={initial} 30fps profile=none",
+                          f"src2={initial} 0fps profile=none"], line())
+        self.registry.update_source_health(
+            first.id, health_state=SourceHealthState.ONLINE,
+            negotiated_capture_profile=CaptureProfile(1920, 1080, 30.0, "MJPG"))
+        self.registry.update_source_health(
+            second.id, health_state=SourceHealthState.ONLINE,
+            negotiated_capture_profile=CaptureProfile(640, 480, 29.97, None))
+        self.assertEqual(["src1=online 30fps profile=1920x1080@30/MJPG",
+                          "src2=online 0fps profile=640x480@29.97/?"], line())
+        # A stall keeps the stored profile (the adapter leaves it unset).
+        self.registry.update_source_health(second.id, health_state=SourceHealthState.DEGRADED)
+        self.assertEqual("src2=degraded 0fps profile=640x480@29.97/?", line()[1])
+        self.registry.update_source_health(
+            first.id, health_state=SourceHealthState.OFFLINE, negotiated_capture_profile=None)
+        self.assertEqual("src1=offline 30fps profile=none", line()[0])
+
     def test_frame_rate_does_not_write_registry_per_frame(self):
         source = self.source()
         runtime = self.runtime(source.id)
@@ -1531,6 +1566,68 @@ class FencePinTests(RuntimeFixture):
         self.assertFalse(status.health_fence_pin_held)
         self.assertFalse(status.sources[0].health_persisted)
         self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
+
+
+    def test_joined_source_with_a_stalled_handed_off_write_keeps_the_pin(self):
+        # Issue #211 item 3: the worker was joined (not fenced), but a
+        # handed-off ``degraded`` write was still stalled when the stop
+        # released the pin. The closing ``offline`` staged behind it was then
+        # refused and ``degraded`` stayed durable.
+        source = self.source()
+        pinned = PinnedDatabase(Database(self.database.path))
+        registry = CameraRegistry(pinned, reservation=ToggleAdmission())
+        self.addCleanup(pinned.release)
+        gate, entered, armed = threading.Event(), threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+        unpinned = CameraRegistry(self.database)
+        original = registry.update_source_health
+
+        def update(source_id, **values):
+            if values.get("health_state") is SourceHealthState.DEGRADED and not gate.is_set():
+                entered.set()
+                gate.wait(10)
+                # Already inside storage: commits through its own connection.
+                return unpinned.update_source_health(source_id, **values)
+            return original(source_id, **values)
+
+        class Adapter(LocalUvcAdapter):
+            def stop_source(self, source_id):
+                if not armed.is_set():
+                    return super().stop_source(source_id)
+                # Like a watchdog stall just before the stop: the write is
+                # handed off and blocks inside storage.
+                writer = self._writer(source_id)
+                writer.stage(health_state=SourceHealthState.DEGRADED)
+                writer.flush(blocking=False)
+                entered.wait(5)
+                return super().stop_source(source_id)
+
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), **FAST), registry,
+            on_frame=self.on_frame, discovery=self.discovery,
+            capture_factory=self.captures, adapter_factory=Adapter,
+        )
+        self.addCleanup(runtime.stop)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        with patch.object(registry, "update_source_health", side_effect=update):
+            armed.set()
+            status = runtime.stop()
+            self.assertTrue(entered.is_set())
+            self.assertIs(status.state, LocalUvcRuntimeState.STOPPED)
+            self.assertFalse(status.sources[0].worker_running)
+            self.assertTrue(status.health_fence_pin_held)
+            self.assertTrue(pinned.pinned)
+            with self.assertLogs("app.cameras.uvc.runtime", "INFO") as logs:
+                gate.set()
+                self.assertTrue(wait_for(lambda: not pinned.pinned))
+            self.assertIn(Event.LOCAL_UVC_HEALTH_FENCE_PIN_RELEASED.value,
+                          "\n".join(logs.output))
+        self.assertIs(self.health(source.id), SourceHealthState.OFFLINE)
+        status = runtime.status()
+        self.assertFalse(status.health_fence_pin_held)
+        self.assertTrue(status.sources[0].health_persisted)
 
 
 class RestartDurabilityTests(RuntimeFixture):

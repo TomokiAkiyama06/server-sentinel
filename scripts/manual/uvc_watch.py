@@ -6,8 +6,11 @@ the real audited approval path with a stand-in Owner authorizer (the Owner
 WebAuthn route is not wired yet), and runs the real Main startup, discovery and
 capture code. Frames are counted and discarded; nothing is written except the
 private SQLite state in --state-dir. Output contains only logical labels
-(src1/src2), health states, reasons, fps and descriptor counts — no serials,
-device paths, by-id names or USB ports.
+(src1/src2), health states, reasons, fps, the registry's negotiated capture
+profile (WIDTHxHEIGHT@FPS/PIXEL_FORMAT, `none` when unrecorded) and
+descriptor counts — no serials, device paths, by-id names or USB ports. The
+profile is read from the registry rows the script already reads every second;
+it opens no extra device and never touches audio.
 
 Usage (normal non-root user in group `video`, from the repository root;
 SERVER_DIR is optional and defaults to this checkout's server directory):
@@ -96,6 +99,35 @@ async def run_with_final_drain(app, log, ids, body):
         print_events(log, ids)
 
 
+def format_profile(profile):
+    """Render a registry negotiated_capture_profile for the per-second line.
+
+    `none` means the registry holds no negotiated profile (MANUAL_TEST P-5
+    checks that it never reads `none` while `degraded`/`video_frame_stalled`
+    or right after recovering to `online`). A field the driver did not report
+    is shown as `?`, never as an invented default.
+    """
+    if profile is None:
+        return "none"
+
+    def part(value):
+        if value is None:
+            return "?"
+        return f"{value:g}" if isinstance(value, float) else str(value)
+    return (f"{part(profile.width)}x{part(profile.height)}@{part(profile.fps)}"
+            f"/{part(profile.pixel_format)}")
+
+
+def source_parts(registry, ids, counts, before):
+    """Per-source fields of one per-second line, from the registry row only."""
+    parts = []
+    for n, sid in enumerate(ids, 1):
+        s = registry.get_source(sid)
+        parts.append(f"src{n}={s.health_state.value} {counts[sid] - before[sid]}fps"
+                     f" profile={format_profile(s.negotiated_capture_profile)}")
+    return parts
+
+
 def fds():
     video = audio = 0
     for e in os.listdir("/proc/self/fd"):
@@ -158,10 +190,7 @@ async def main():
             before = dict(counts)
             await asyncio.sleep(1.0)
             print_events(log, ids)
-            parts = []
-            for n, sid in enumerate(ids, 1):
-                s = registry.get_source(sid)
-                parts.append(f"src{n}={s.health_state.value} {counts[sid] - before[sid]}fps")
+            parts = source_parts(registry, ids, counts, before)
             v, au = fds()
             print(time.strftime("%H:%M:%S"), " ".join(parts), f"video_fds={v} audio_fds={au}",
                   f"service={rt.status().state.value}", flush=True)

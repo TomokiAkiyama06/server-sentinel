@@ -329,7 +329,10 @@ either way). While a fenced source's health writer is still busy at that
 bound (an earlier `online` write may still commit), the stop keeps the
 database pin (`health_fence_pin_held`) instead of refusing the fenced
 `offline` queued behind it, and the writer releases the pin as soon as no
-fenced write is in flight; the stop itself does not wait longer. A write that
+fenced write is in flight; the stop itself does not wait longer. The same
+applies to a source whose worker was joined: a handed-off health write (for
+example a watchdog `degraded`) still stalled when the stop releases the pin
+keeps it, so the closing `offline` staged behind that write is not refused. A write that
 never finishes before process exit can leave the row `online` until the next
 start, which writes it `offline` before any capture opens. Camera-health
 transitions reach the optional health sink only through a bounded, coalescing
@@ -849,8 +852,12 @@ setting); when full, the oldest is evicted and that source falls back to its
 durable watermark on reactivation, which can repeat an envelope or a gap report
 but never hides loss. Each such eviction, and each ignored durable
 acknowledgement (watermark for another node, or an unknown source), is never
-silent: it is counted in value-free operator diagnostics for health/status
-exposure and logged rate-limited without node/source identity. A unit behind loss already recorded (below the first
+silent: it is counted in value-free operator diagnostics (the tracker's
+`diagnostics()` counters, intended for a health/status surface but not yet
+wired to one; that exposure comes with the listener/route integration of
+#14/#15) and logged rate-limited without node/source identity (the first
+occurrence, every doubling, and at least once per 60 s while it keeps
+recurring; every qualifying occurrence keeps its own record). A unit behind loss already recorded (below the first
 refused unit that showed a skip or restart) is acknowledged as `duplicate`
 and never admitted, so media never contradicts the recorded gap. An in-epoch
 capture clock regression is measured against the committed unit and the
@@ -1012,6 +1019,72 @@ movement and a camera tamper, so local critical staging always admits a whole
 batch rather than refusing evidence a caller could never resubmit.
 A later runtime must durably handle a confirmed critical observation
 for evidence preservation and configured notifications in every presence state.
+The Issue #205 `SceneMonitoringRuntime` (`server/app/detection/roi/runtime.py`)
+wires this core into the Main application: capture callbacks hand it at most one
+pending sample per source at a bounded sample interval (default 1 sample/s),
+and a single worker runs the per-source `server_roi` and `camera_tamper`
+quality gates and the detector, with per-source failure isolation. Confirmed
+observations go through bounded in-memory critical staging to an injected
+durable recorder (`CriticalTimelineRecorder`); without it no detector runs. The
+recorder is called only on a dedicated delivery thread, never on the scene
+worker, so a stalled recorder (for example on stalled storage) never blocks
+sampling or detection: staging fills and further confirmations become explicit
+`critical_backpressure`, and a recorder call in flight longer than the stall
+bound reports the runtime `degraded` (`recorder_stalled`).
+Without a stored calibration whose reference frame can be re-bound, a source
+stays inactive and `unknown`; no baseline is taken from live frames. Only
+uncompressed `GREY`/`YUYV` local capture is read; compressed capture stays
+`unknown` until a reviewed decoder exists. Poor quality, undecodable frames,
+backpressure, camera loss and stale conclusions are `unknown`, never a
+negative. A camera loss that arrives while staging has no room is held as
+backpressure and processed after staging drains, never dropped as a
+per-source failure; a loss still queued at shutdown is processed by the final
+worker pass. Every loss or observation that remains undelivered is counted in
+the runtime status and logged (staging is in memory only): staged
+observations in `critical_pending`, losses still without staging room in
+`losses_held`, and losses lost to a per-source fault (while running or in the
+shutdown drain) in `losses_failed`. A camera loss (`offline`,
+`manual_intervention_required` or `degraded`, that is every non-`online`
+state) lowers the source to `degraded` until a new evaluated sample
+establishes recovery. A source with no sample evaluated within the
+calibration's `maximum_gap_ns` (including a bound source that never received
+one) is likewise `degraded` (`observation_stale`) with `unknown` conclusions
+until a fresh evaluated sample recovers it. A decoded-sample producer
+stream that has been replaced is refused as stale imagery on the capture side
+(`stale_rejected`) and never re-admitted under a new runtime identity; the
+transition is recorded even when the replacement stream's first frame is
+sampled out. When the bounded retired-stream history (1024 ids per source) is
+full, further replacement streams are refused (`stream_history_exhausted`)
+rather than forgetting one; from then on no sample of that source is admitted
+until restart and its conclusions are `unknown`, and a camera loss timestamped
+at or after exhaustion is untrusted, so it never confirms
+`source_loss_after_scene_shift` (a loss timestamped before exhaustion may still
+correlate; Owner decision 2026-10-11). A sample still pending when its
+producer stream is replaced is discarded as stale (`stale_rejected`). A
+calibration refresh waits until a held or just-dequeued camera loss has been
+handed to the current detector (reported as `refresh_pending`, which sustained
+losses can prolong), and then discards a pending sample captured at or before
+the refresh request (`refresh_discarded`). The runtime reports `degraded` while staging holds
+undelivered evidence, a loss is held, a recorder call is stalled, or any source
+is `degraded`; since every staged observation counts until the recorder
+accepts it, normal delivery of a confirmation also shows `degraded` briefly.
+The runtime status reports `unavailable` when its worker or delivery thread is
+no longer running (outside shutdown), with every source `inactive` and
+`unknown`, and logs it once; a worker thread that cannot be started rolls back
+the delivery thread within a bounded wait. Shutdown is bounded (worker and delivery each by the stop
+timeout, so up to about 10 s by default): a worker or recorder call still
+running after its bound is reported as `stop_failed` (with
+`critical_in_flight`), and the delivery thread then starts no further recorder
+call; a call that exceeded the stall bound is logged as stalled, one merely in
+flight separately. A delivery thread that had already died before stop has
+no call in flight, so the runtime ends `stopped` with what it left staged
+counted in `critical_pending` and logged as undelivered. After stop, staging refuses observations from a worker that
+outlived its bound (counted in `critical_refused` and logged) and no
+conclusion is republished. After a worker failure the final pass still stages
+evidence for queued losses but every source stays withdrawn
+(`worker_failed`). The application scene state follows the runtime status
+while running, so these conditions report `degraded`, and a failed or dead
+worker or delivery thread, or an unreadable status, `unavailable`.
 Synthetic tests do not establish physical-camera, lighting, pose, or
 source-health behavior.
 

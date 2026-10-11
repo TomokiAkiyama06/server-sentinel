@@ -101,6 +101,13 @@ stand-in）。一時 DB は repository 外に作り実行後に削除した。fr
 未確認: 抜線・ポート入替・再起動を伴う物理操作、非 serial 同型機、3〜4 source、
 実配信 fps の記録（registry は driver の frame interval のみ保持）。
 
+追記（2026-10-11）: 抜線・ポート入替・再列挙は 2026-09-30 の Issue #101 記録と
+2026-10-07 の物理抜線記録で、低照度の実配信 fps は 2026-10-07 の P-6 で記録済み。
+非 serial 同型機は、手元の C960 が 2 台とも serial を報告するため実機では確認
+できない。Owner 判断（2026-10-11）により当面は A-5 の mock（実機 evidence 由来）
+で受け入れ、非 serial の同型カメラを導入する時点で実機確認を必須とする
+（下記「Ambiguous identical-device test」）。3〜4 source は未確認のまま。
+
 #### フレーム停止 watchdog / presence scan 抑制の実機再確認（実施済み: 2026-10-05 非破壊部分、2026-10-07 Owner 立会いの物理抜線・遮蔽。下記記録）
 
 2026-09-30 の Main Server 候補機（C960 2 台）の抜き差し試験で、source が 0 fps の
@@ -117,12 +124,18 @@ device scan を `presence_scan_seconds` 間隔へ抑制）は synthetic fake で
    `online` へ戻ることを確認する。`video_frame_stalled` から復帰した source の
    negotiated profile が registry に残っていること、停止が
    `frame_stall_reopen_seconds` を超えた場合は `offline` になり再 open されることも
-   確認する。profile 残存を記録するため、観測 script は 1 秒ごとの行に各 source の
-   registry `negotiated_capture_profile`（`幅x高さ@fps/pixel_format`、未記録なら
-   `none`）を health と並べて出力すること。`degraded`（`video_frame_stalled`）の間と
-   `online` 復帰直後の行で profile が `none` にならないことを確認する（Issue #173、
-   P-5。2026-10-07 時点の `scripts/manual/uvc_watch.py` は profile を出力しないため、
-   次回の実機確認前に観測 script へ追加する）。
+   確認する。profile 残存は `scripts/manual/uvc_watch.py` で記録する。この script は
+   1 秒ごとの行に、各 source の registry `negotiated_capture_profile` を
+   `profile=幅x高さ@fps/pixel_format` の形で health・実測 fps と並べて出力する
+   （例: `src1=degraded 0fps profile=1920x1080@30/MJPG`）。未記録なら
+   `profile=none`、driver が報告しなかった項目は `?` と表示する（既定値で補わない）。
+   profile は script が毎秒読んでいる registry 行から取り出しており、device の追加
+   open や `/dev/snd` へのアクセスはしない。`degraded`（`video_frame_stalled`）の間と
+   `online` 復帰直後の行で `profile=none` にならないことを確認し、該当行（serial・
+   device path を含まない）を記録へ転記する。`frame_stall_reopen_seconds` を超えて
+   `offline` になった行では `profile=none` になってよく、再 open 後の `online` 行で
+   profile が再び記録されることを確認する（Issue #173、P-5、Issue #193。出力は
+   synthetic registry の unit test でのみ確認済みで、実機記録は Owner 立会いで行う）。
 3. レンズを覆う・暗室にするなど低照度で 5 分以上連続取得し、`video_frame_stalled`
    への遷移が 0 回であること（fps 低下で flap しないこと）を確認する。
 4. 30 fps × 2 台で 60 秒取得し、live 中の全 device scan が概ね
@@ -306,6 +319,13 @@ Results: **PARTIAL — 2026-09-30 に実機確認を一部実施（本節の 202
 非serial同型機・3–4 source・低照度・browser viewer（手順 10）・deployment
 launcher/systemd（手順 1, 2, 8）は未実施。Issue #11 はこれらの記録では close しない。**
 
+追記（2026-10-11）: 低照度は 2026-10-07 の実機記録 P-6（室内照明を落とした状態で
+5 分 12 秒遮蔽）で記録済み。非serial同型機（手順 7）は実機では未実施のまま、
+Owner 判断（2026-10-11）により A-5 の mock（実機 evidence 由来）で当面受け入れ、
+非 serial の同型カメラを導入する時点で実機確認を必須とする。3–4 source・browser
+viewer（手順 10）・deployment launcher/systemd（手順 1, 2, 8）・Owner 承認経路
+（#10）・P-5（profile 残存の実機記録）は未了のため、Issue #11 は引き続き close しない。
+
 For each tested camera:
 
 - [ ] exact manufacturer/model and advertised UVC resolution/FPS/pixel-format/codec capabilities are recorded locally;
@@ -411,6 +431,9 @@ device path・USB port・source UUID は本記録に含めない（INTEGRITY-007
    付きのため不可。serial を報告しない同型 UVC 2 台を用意できる場合のみ実施し、
    抜き差し・並べ替えで `manual_intervention_required`、restart 後も latch 維持、
    明示再承認後にだけ復帰することを確認する。用意できなければ mock 確認のみのまま。
+   Owner 判断（2026-10-11）: 手元の C960 は 2 台とも serial 付きで実機確認は
+   不可能。当面は A-5 の mock（実機 evidence 由来）で受け入れ、非 serial の同型
+   カメラを導入する時点で本手順の実機確認を必須とする。
 6. **レンズ遮蔽・低照度（L 節と共通）**: 片方のレンズを覆う、および室内照明を
    落とす。期待値を定めた上で、実配信 fps・health・image quality 表示を記録する
    （提案-1 の再現確認を兼ねる）。
@@ -430,6 +453,14 @@ Where possible use two identical UVC devices without a usable unique serial, or 
 - [ ] source enters `manual_intervention_required`;
 - [ ] owner can explicitly re-approve a physical mapping;
 - [ ] healthy monitoring resumes only after approval.
+
+上記は実機では未確認。手元の C960 は 2 台とも一意の serial を報告するため、
+serial を持たない同型機の曖昧性は物理的に再現できない。Owner 判断（2026-10-11）:
+当面は 2026-09-30 記録の A-5（serial を除去した実機 evidence による mock で
+`manual_intervention_required` / `identity_not_unique`、重複 serial で
+`duplicate_identity`）を証跡として受け入れる。非 serial の同型カメラを導入する
+時点で、本節の実機確認を必須とする（受け入れ前に未確認のまま運用しない）。
+mock での受け入れは Issue #11 全体の close を意味しない。
 
 ### 実機記録 2026-09-30: 抜き差し・ポート入替・再列挙・遮蔽（Issue #101）
 
@@ -494,16 +525,38 @@ Issue #101 の要再確認項目:
       `offline` 化・service 継続・取り違えのない復帰のみ）;
 - [ ] 手順 1: 触れていない `src2` が影響を受けず frame を出し続けること
       （不合格: 同一バスの相互リセットで一時切断。相互リセット自体は既知制約として
-      許容。その間の表示は次項）;
-- [ ] 手順 1・3: 切断/入替中に 0 fps の source が `online` を表示しないこと
-      （不合格。#111 で修正中、#111 の実機確認で再実施）;
+      許容。その間の表示は次項。Owner 判断 2026-10-11: #112（not planned で close）と
+      同じ同一バス上の C960 相互リセットという既知制約として扱う。取り違えなく自動
+      復帰するため、本項目の不合格は #101 の close を妨げない）;
+- [x] 手順 1・3: 切断/入替中に 0 fps の source が `online` を表示しないこと
+      （2026-09-30 は不合格。#111 の修正後、2026-10-07 の Owner 立会い物理抜線・
+      挿し直し記録 P-1・P-3 で、`online` 表示中に frame 0 の区間 0 回を確認。
+      修正後のポート入替（手順 3）の再実施はしていない。Owner 判断 2026-10-11:
+      2026-09-30 のポート入替・逆順再列挙の PASS（割当の追従）と 2026-10-07 の
+      修正後の物理抜線・挿し直しの PASS で十分とし、修正後のポート入替の個別再実施は
+      求めない）;
 - [x] 手順 2: 別 port・別 node で serial 照合により再承認なしで復帰;
 - [x] 手順 3: port 入替で割当がカメラ個体に追従;
 - [x] 手順 4: 再列挙・逆順 node でも再承認なしで正しい source に復帰;
 - [x] 手順 5: レンズ遮蔽 30 秒の fps・状態を記録;
-- [ ] 手順 5: 室内照明を落とした低照度での fps・状態（未実施）;
-- [ ] 遮蔽中の `capture_failed` / reopen flapping と USB 切断（原因未特定、再現せず）;
+- [x] 手順 5: 室内照明を落とした低照度での fps・状態（2026-09-30 は未実施。
+      2026-10-07 の実機記録 P-6 で記録済み: 室内照明を落とした状態で 5 分 12 秒遮蔽、
+      `video_frame_stalled` への遷移 0 回。fps の値は P-6 を参照）;
+- [ ] 遮蔽中の `capture_failed` / reopen flapping と USB 切断（原因未特定。同日の
+      その後 3 回の実行では再現せず、2026-10-07 の P-6 遮蔽中も #112 の USB reset に
+      よる一時 `offline` 1 回（約 4.8 秒で復帰）のみで、約 1 分間の反復は記録されて
+      いない。Owner
+      判断 2026-10-11: #112 と同じ系統の既知・未再現の事象として記録に残し、#101 の
+      close を妨げない）;
+- [ ] 手順 6（Issue #101 本文）: 後片付け（観測用 state directory の削除）の記録
+      （個別の記録は残していない。実施したとは記録しない）;
 - [ ] （任意）別 USB controller / 給電付き hub 構成での相互リセットの有無。
+
+Owner 判断 2026-10-11: Issue #101 は上記の既存記録（2026-09-30 本記録と
+2026-10-07 の Owner 立会い物理抜線・遮蔽記録）で close する。未チェックの項目は、
+既知制約（#112 の同一バス相互リセット）・既知で未再現の事象・個別記録なし・任意
+項目としてそれぞれ上に記載したとおりで、追加の実機作業は行わない。非 serial 同型機
+（#11）の扱いは「Ambiguous identical-device test」を参照。
 
 ## B. Remote Linux capture node / `media-capture-agent`
 
@@ -1078,6 +1131,25 @@ Per configured server source:
 - [ ] controlled displacement/rotation triggers event;
 - [ ] camera movement is distinguished from server-only movement where practical;
 - [ ] one event can link evidence from other active sources.
+
+### Issue #205 Main runtime wiring (pending physical execution)
+
+The `SceneMonitoringRuntime` wiring is verified only with synthetic, generated
+frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
+
+- [ ] a local UVC source negotiated as uncompressed `YUYV` or `GREY` reaches the
+  scene worker at the configured sample interval (default 1 sample/s) without
+  delaying preview or capture; an `MJPG` layout cannot be bound (no reviewed
+  decoder), and a camera whose frames do not match the bound layout stays
+  `unknown` (`frame_unusable`);
+- [ ] with no stored, re-bindable calibration the source stays inactive and
+  `unknown` (`calibration_provider_unconfigured` /
+  `calibration_reference_unavailable`), and no critical event is produced;
+- [ ] Main-host CPU of the scene worker at 1 to 4 sources while GPU benchmarks run;
+- [ ] a confirmed movement/tamper reaches the presence critical timeline with
+  neutral wording, in every presence state;
+- [ ] unplugging the camera right after a camera shift yields one
+  `source_loss_after_scene_shift` tamper, while an unplug alone stays `unknown`.
 
 ## F. Camera tamper and source health
 

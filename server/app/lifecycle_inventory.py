@@ -37,7 +37,14 @@
   the per-source publish cursor, the reference for the marker the first
   segment of a recording without evidence must bring;
 - the session-revocation exposure marker (#134) and the staged renewal
-  certificate (migration 21), checked as their services write them.
+  certificate (migration 21), checked as their services write them;
+- (#132) the per-source pre-roll gap markers, which may leave only as the
+  spool trim or a source release removes them; the append-only ROI
+  calibration history as keyed digests; the notification history of every
+  kind (kind, time, confirmed flag; only its retention removes a row); and
+  the survival and readability of the recomputed integrity /
+  recording-health status rows. Values the services legitimately rewrite
+  are listed in DECLARED_MUTABLE and reported, never silently ignored.
 
 Threat model (Owner decision 2026-10-07): a broken or buggy migration or
 update. Deliberate tampering by someone with write access to the database
@@ -96,9 +103,13 @@ from app.cameras.registry.repository import CameraRegistry
 from app.media.recording.store import RecordingStore
 from app.cameras.uvc.persistence import ApprovalStore
 from app.detection.owner import store as owner_store
+from app.detection.roi.calibration import COLUMNS as ROI_COLUMNS, decode_history_row
 from app.detection.owner.contracts import Operation
 from app.integrity.model import Component, Finding, Inventory, Kind, State
+from app.media.health.service import HealthState, Stage as HealthStage
 from app.media.recording.model import Limits as RecordingLimits, Segment
+from app.notifications.service import NotificationKind
+from app.monitoring.config import RECORDING_LIMIT_FIELDS
 from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.delivery import ActionResult
 from app.presence.models import (InvalidObservation, Observation, PresenceState,
@@ -125,32 +136,50 @@ NOT_APPLICABLE = {
     # complete deployment acceptance of Issue #28 verifies these.
     "capture_agent_protected_incidents": "not_applicable (#16 / #28)",
 }
-# Durable tables this tool does not inventory yet (#132); the report lists
-# them so a pass is never read as covering them.
-NOT_INVENTORIED = (
-    "recording_source_discontinuities", "notification_events",
-    "roi_calibration_history", "uvc_approvals.session_token",
-    "integrity_status", "recording_health_status",
-)
+# Durable tables this tool does not inventory; the report lists them so a
+# pass is never read as covering them. #132 covered the last ones: each is
+# now compared or, for values its service legitimately rewrites, declared in
+# DECLARED_MUTABLE below.
+NOT_INVENTORIED: tuple = ()
 
-# Why a listed table is not (fully) inventoried, when it is more than #132.
-NOT_INVENTORIED_NOTES = {
-    "notification_events": "not_inventoried (#132): only hardware-integrity alert kinds are "
-                           "checked, for the pending-alert invariant; other kinds and the "
-                           "delivery/confirmed fields are not inventoried",
-}
+# Why a listed table is not (fully) inventoried.
+NOT_INVENTORIED_NOTES: dict = {}
 
 
 def _not_inventoried() -> dict:
-    return {name: NOT_INVENTORIED_NOTES.get(name, "not_inventoried (#132)")
+    return {name: NOT_INVENTORIED_NOTES.get(name, "not_inventoried")
             for name in NOT_INVENTORIED}
 
 
-# Every Main-database table the inventory reads, except notification_events
-# (only partly read: listed in NOT_INVENTORIED with its note). A table
-# recorded present must still exist at verify time, whatever its comparator
-# does with an empty or absent section (a table dropped while empty is still
-# a loss); the schema comparison covers every other migration table.
+# Durable values a correct service rewrites across a restart or a daily run,
+# so they are deliberately not compared for equality (#132). The report
+# lists them, so a pass is never read as having compared them; what is
+# checked instead is named here.
+DECLARED_MUTABLE = {
+    "notification_events.delivery": (
+        "declared_mutable (#132): the delivery result is rewritten when a pending Slack "
+        "delivery completes or a presence notification is retried; kind, time and "
+        "confirmed flag never change and every row stays until its 90-day retention"),
+    "uvc_approvals.session_token": (
+        "declared_mutable (#132): a per-run marker, cleared at a clean stop and replaced at "
+        "every start; the Owner re-approval latch it arms (requires_approval) is compared "
+        "in camera_sources. A token cleared while the service was down after an unclean "
+        "stop is indistinguishable from a clean stop and is not detected"),
+    "integrity_status": (
+        "declared_mutable (#132): the latest hardware-integrity verdict is recomputed at "
+        "startup and daily; only the row's survival, the values the service reads back "
+        "and delivery_blocked matching the overflow slots are checked"),
+    "recording_health_status": (
+        "declared_mutable (#132): the latest recording-health verdict is recomputed at "
+        "startup and daily; only the row's survival and the values the service reads back "
+        "are checked"),
+}
+
+
+# Every Main-database table the inventory reads. A table recorded present
+# must still exist at verify time, whatever its comparator does with an
+# empty or absent section (a table dropped while empty is still a loss);
+# the schema comparison covers every other migration table.
 INVENTORIED_TABLES = (
     "recordings", "recording_links", "recording_segments", "recording_discontinuities",
     "recording_source_cursors",
@@ -166,11 +195,13 @@ INVENTORIED_TABLES = (
     "pairing_key_bindings", "capture_nodes",
     "integrity_outbox", "integrity_overflow", "integrity_baseline",
     "schema_migrations",
+    # #132
+    "recording_source_discontinuities", "roi_calibration_history", "notification_events",
+    "integrity_status", "recording_health_status",
 )
 
 # Migration-created tables deliberately left out: per-session or derived
-# state whose loss replays nothing and hides no failure (beside the
-# NOT_INVENTORIED ones above, still to be covered by #132).
+# state whose loss replays nothing and hides no failure.
 TRANSIENT_TABLES = {
     "access_webauthn_challenges": "short-lived single-use WebAuthn challenges",
     # Only its reservation exposure marker (#134) is state: it is read into
@@ -353,17 +384,29 @@ def _recordings(connection, tables) -> dict | None:
     rows = connection.execute(
         "SELECT id, source_id, event_id, status, starred, critical, start_ms, target_end_ms, "
         "ended_ms FROM recordings WHERE status != 'deleting' ORDER BY id").fetchall()
-    for row in rows:
-        segments = connection.execute(
-            "SELECT s.id, s.source_id, s.capture_node_id, s.stream_id, s.sequence, "
-            "s.start_ms, s.end_ms, s.codec, s.container, s.byte_length, s.sha256, s.critical, "
-            "s.state "
+    # One query for every link and one for every marker (#132), grouped per
+    # recording here, instead of two queries per recording.
+    linked: dict = {}
+    for segment in connection.execute(
+            "SELECT l.recording_id, s.id, s.source_id, s.capture_node_id, s.stream_id, "
+            "s.sequence, s.start_ms, s.end_ms, s.codec, s.container, s.byte_length, s.sha256, "
+            "s.critical, s.state "
             "FROM recording_segments s "
             "JOIN recording_links l ON l.segment_id = s.id "
             # Every linked segment, whatever its state, as manifest() reads
             # them: a hidden non-ready link would later degrade playback.
-            "WHERE l.recording_id = ? ORDER BY s.start_ms, s.id",
-            (row["id"],)).fetchall()
+            "ORDER BY l.recording_id, s.start_ms, s.id"):
+        linked.setdefault(segment["recording_id"], []).append(segment)
+    markers: dict = {}
+    # A dropped marker table leaves every recorded marker missing (changed)
+    # and the table check reports it.
+    for item in (connection.execute(
+            "SELECT recording_id, start_ms, end_ms, reason FROM recording_discontinuities")
+            if "recording_discontinuities" in tables else ()):
+        markers.setdefault(item["recording_id"], []).append(
+            [item["start_ms"], item["end_ms"], item["reason"]])
+    for row in rows:
+        segments = linked.get(row["id"], ())
         items = []
         for segment in segments:
             items.append({
@@ -390,10 +433,7 @@ def _recordings(connection, tables) -> dict | None:
             })
         # Explicit gap markers returned by RecordingStore.manifest(); the
         # table has no key, so they are kept as a sorted multiset.
-        discontinuities = sorted([item["start_ms"], item["end_ms"], item["reason"]]
-                                 for item in connection.execute(
-            "SELECT start_ms, end_ms, reason FROM recording_discontinuities "
-            "WHERE recording_id = ?", (row["id"],)))
+        discontinuities = sorted(markers.get(row["id"], ()))
         result[row["id"]] = {
             "source_id": row["source_id"],
             # RecordingStore.event_manifest() groups recordings by event_id.
@@ -504,23 +544,46 @@ def _cursor_rows(connection, tables) -> dict | None:
             for row in connection.execute("SELECT * FROM recording_source_cursors")}
 
 
-def _spool_file_matches(directory: Path, segment_id: str, catalog: list) -> bool:
-    digest, size, links = _file_digest(directory, segment_id)
+def _cached_digest(directory: Path, segment_id: str, cache: dict | None):
+    """_file_digest(), read once per segment ID per run when ``cache`` is given.
+
+    A segment shared by several recordings (overlapping event windows link
+    the same pre-roll) or also still in the ready spool is hashed once
+    (#132); every holder then sees the same observation of the file.
+    """
+    if cache is None:
+        return _file_digest(directory, segment_id)
+    if segment_id not in cache:
+        cache[segment_id] = _file_digest(directory, segment_id)
+    return cache[segment_id]
+
+
+def _observed_matches(observed: tuple, catalog: list) -> bool:
+    digest, size, links = observed
     return digest is not None and [digest, size] == catalog and links == 1
 
 
-def _hash_spool(spool: dict | None, directory: Path, database: Path) -> list:
+def _spool_file_matches(directory: Path, segment_id: str, catalog: list) -> bool:
+    return _observed_matches(_file_digest(directory, segment_id), catalog)
+
+
+def _hash_spool(spool: dict | None, directory: Path, database: Path,
+                cache: dict | None = None) -> list:
     """Hash every ready spool file outside the snapshot; return the mismatches.
 
     A file that does not match its catalog digest, byte length or single
     hard link is reported unless its row has since left the ready spool
     (_trim() clears spool=1 before it unlinks an unreferenced file), so a
-    live writer's eviction during hashing is not a loss.
+    live writer's eviction during hashing is not a loss. ``cache`` holds the
+    digests _hash_recordings() already read; a mismatch is re-read uncached.
     """
     mismatched = []
     for segment_id, item in (spool or {}).items():
         catalog = item.pop("_catalog")
-        item["catalog_match"] = _spool_file_matches(directory, segment_id, catalog)
+        # A spool segment also linked into a recording was already read.
+        item["catalog_match"] = (_observed_matches(cache[segment_id], catalog)
+                                 if cache is not None and segment_id in cache
+                                 else _spool_file_matches(directory, segment_id, catalog))
         if not item["catalog_match"]:
             mismatched.append((segment_id, catalog))
     if not mismatched:
@@ -547,18 +610,22 @@ def _hash_spool(spool: dict | None, directory: Path, database: Path) -> list:
 
 
 def _hash_recordings(recordings: dict | None, directory: Path, database: Path | None = None,
-                     recorded_at: str | None = None) -> None:
+                     recorded_at: str | None = None, cache: dict | None = None) -> None:
     """Hash every catalogued segment file, outside any database transaction.
 
     A ready segment's bytes are immutable, so hashing after the snapshot is
     equivalent; a file changed or removed meanwhile shows up as a change,
     except when the service's retention deleted the whole recording after
     the snapshot (_retention_gone()): such a recording is dropped, as if the
-    snapshot had been taken after the deletion.
+    snapshot had been taken after the deletion. Each segment file is read
+    once (``cache``, by segment ID), however many recordings link it, so the
+    run time grows with the distinct segments and their bytes, not with the
+    number of links.
     """
+    cache = {} if cache is None else cache
     for recording in (recordings or {}).values():
         for item in recording["segments"]:
-            digest, size, links = _file_digest(directory, item["segment_id"])
+            digest, size, links = _cached_digest(directory, item["segment_id"], cache)
             expected = item.pop("_catalog_sha256")
             # RecordingStore._integrity() needs the digest and the catalog
             # byte_length to match a file with exactly one hard link.
@@ -1997,6 +2064,72 @@ def _registry_settings(connection, tables) -> dict | None:
     return {"max_active_video_sources": None if row is None else row[0]}
 
 
+def _row_order(item) -> str:
+    """A total order for rows of any stored types (a malformed value must
+    never make sorting, and so the run, fail)."""
+    return json.dumps(item, separators=(",", ":"), sort_keys=True, default=_json_value)
+
+
+def _source_discontinuities(connection, tables) -> list | None:
+    """The per-source pre-roll gap markers (#132).
+
+    RecordingStore._publish() adds one when a published segment does not
+    continue the source cursor, and _start() copies every marker overlapping
+    a new recording's window into that recording: a lost marker hides a
+    stream discontinuity in the next event's playback. The rows hold only a
+    source ID, two times and a fixed reason.
+    """
+    if "recording_source_discontinuities" not in tables:
+        return None
+    return sorted(([row[0], row[1], row[2], row[3]] for row in connection.execute(
+        "SELECT source_id, start_ms, end_ms, reason FROM recording_source_discontinuities")),
+        key=_row_order)
+
+
+def _roi_history(connection, tables, salt: str) -> dict | None:
+    """Every ROI calibration version as a keyed digest (#132).
+
+    CalibrationArchive is append-only: a version is never rewritten or
+    removed. The identifier and metadata (reference digest, geometry and
+    policy of an Owner calibration) are kept only as keyed digests.
+    """
+    if "roi_calibration_history" not in tables:
+        return None
+    return {f"{row[0]}/{row[1]}/{row[2]}": _keyed(salt, ["roi-calibration-v1", row[3], row[4]])
+            for row in connection.execute(
+                "SELECT source_id, profile_id, version, identifier, metadata "
+                "FROM roi_calibration_history")}
+
+
+def _notification_events(connection, tables) -> dict | None:
+    """The local fault / notification history, every kind (#132).
+
+    NotificationEventStore.upsert() writes kind, time and confirmed flag
+    once and later rewrites only the delivery result (DECLARED_MUTABLE);
+    expire() removes rows older than the shared 90-day retention. The daily
+    summary counts these rows, and the deterministic event IDs deduplicate
+    redelivery, so a lost row hides a fault and may repeat an alert.
+    """
+    if "notification_events" not in tables:
+        return None
+    return {str(row[0]): [row[1], row[2], row[3]] for row in connection.execute(
+        "SELECT event_id, kind, at, confirmed FROM notification_events")}
+
+
+_STATUS_TABLES = ("integrity_status", "recording_health_status")
+
+
+def _status_rows(connection, tables) -> dict:
+    """Whether each recomputed status singleton exists (#132).
+
+    Their values are recomputed at startup and daily (DECLARED_MUTABLE); no
+    service deletes the row, so one present at record time stays.
+    """
+    return {name: (None if name not in tables else connection.execute(
+        f"SELECT COUNT(*) FROM {name} WHERE singleton = 1").fetchone()[0] == 1)
+        for name in _STATUS_TABLES}
+
+
 def _canonical_uuid(value) -> bool:
     try:
         return isinstance(value, str) and str(UUID(value)) == value
@@ -2244,6 +2377,93 @@ def _domain_errors(connection, tables) -> list:
                     f"'{REVOCATION_PENDING_KEY}'"):
         if row[0] != "1":
             bad("security_state", "session_revocation_pending")
+    errors.extend(_status_domain_errors(connection, tables))
+    return errors
+
+
+_NOTIFICATION_KINDS = frozenset(item.value for item in NotificationKind)
+
+
+def _status_domain_errors(connection, tables) -> list:
+    """The #132 tables' values, as their services write and read them back.
+
+    - recording_source_discontinuities: RecordingStore._publish() writes a
+      source UUID, the cursor end and the new segment start (a zero-length
+      marker for a stream change without a time gap) and the one reason
+      ``stream_discontinuity``;
+    - roi_calibration_history: CalibrationArchive.append() admits only the
+      next version under the identifier of the first one, so every source /
+      profile holds versions 1..n under one identifier, and every row must
+      read back through decode_history_row(), the function
+      CalibrationArchive.load() uses (decodable metadata whose embedded
+      source / profile / version / identifier is the row key);
+    - notification_events: NotificationEventStore.get() parses the event
+      UUID, the kind and the time (written as UTC ISO text, which
+      count_since() and expire() compare as text);
+    - integrity_status / recording_health_status: what IntegrityStore.latest()
+      and RecordingHealthStatusStore.latest() parse, and delivery_blocked
+      set exactly while an overflow slot exists (IntegrityStore.record() and
+      _promote_overflow() derive it so). A status row lost since the record
+      is reported by status_rows.
+    """
+    errors = []
+
+    def rows(table, sql):
+        return connection.execute(sql).fetchall() if table in tables else ()
+
+    def bad(section, item):
+        errors.append([section, item, "invalid_value"])
+    for row in rows("recording_source_discontinuities",
+                    "SELECT source_id, start_ms, end_ms, reason "
+                    "FROM recording_source_discontinuities"):
+        if not (_canonical_uuid(row[0]) and _int(row[1]) and _int(row[2])
+                and row[1] <= row[2] and row[3] == "stream_discontinuity"):
+            bad("recording_source_discontinuities", f"marker:{row[0]}:{row[1]}:{row[2]}")
+    histories: dict = {}
+    for row in rows("roi_calibration_history",
+                    f"SELECT {', '.join(ROI_COLUMNS)} FROM roi_calibration_history"):
+        histories.setdefault((str(row[0]), str(row[1])), []).append((row[2], row[3]))
+        try:
+            decode_history_row(row)
+        except Exception:
+            bad("roi_calibration_history", f"{row[0]}/{row[1]}/{row[2]}")
+    for (source, profile), versions in sorted(histories.items()):
+        numbers = sorted((item[0] for item in versions), key=_row_order)
+        if (not (_canonical_uuid(source) and _canonical_uuid(profile))
+                or numbers != list(range(1, len(versions) + 1))
+                or len({_row_order(item[1]) for item in versions}) != 1
+                or not _canonical_uuid(versions[0][1])):
+            bad("roi_calibration_history", f"{source}/{profile}")
+    for row in rows("notification_events",
+                    "SELECT event_id, kind, at FROM notification_events"):
+        if not (_canonical_uuid(row[0]) and row[1] in _NOTIFICATION_KINDS
+                and _utc_instant(row[2]) is not None):
+            bad("notification_events", str(row[0]))
+    overflow = bool(rows("integrity_overflow", "SELECT 1 FROM integrity_overflow LIMIT 1"))
+    status = rows("integrity_status",
+                  "SELECT at, findings, delivery_blocked FROM integrity_status")
+    if "integrity_status" in tables:
+        for row in status:
+            try:
+                [Finding(Kind(item["kind"]), State(item["state"]), item["reason"])
+                 for item in json.loads(row[1])]
+                valid = (_utc_instant(row[0]) is not None and row[2] in (0, 1)
+                         and row[2] == int(overflow))
+            except Exception:
+                valid = False
+            if not valid:
+                bad("status_rows", "integrity_status")
+    for row in rows("recording_health_status",
+                    "SELECT at, state, stages FROM recording_health_status"):
+        try:
+            HealthState(row[1])
+            stages = json.loads(row[2])
+            valid = (_utc_instant(row[0]) is not None and isinstance(stages, list)
+                     and all(isinstance(stage, str) and HealthStage(stage) for stage in stages))
+        except Exception:
+            valid = False
+        if not valid:
+            bad("status_rows", "recording_health_status")
     return errors
 
 
@@ -2747,9 +2967,9 @@ def _coverage(inventory: dict) -> dict:
         return "present" if flag else "empty"
     return {
         "ordinary_recording": present(any(
-            not r["starred"] and _evidenced(r) for r in recordings.values())),
+            not r["starred"] and _servable(r) for r in recordings.values())),
         "starred_recording": present(any(
-            r["starred"] and _evidenced(r) for r in recordings.values())),
+            r["starred"] and _servable(r) for r in recordings.values())),
         "camera_source": present(bool(inventory["camera_sources"])),
         "audit_record": present(bool(audit["rows"])),
         "owner": present(any(_usable_owner(item) for item in access["principals"].values())),
@@ -2824,15 +3044,22 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             "integrity_baseline": _integrity_baseline(connection, tables, salt),
             "security_state": _security_state(connection, tables, salt),
             "integrity_delivery": _integrity_delivery(connection, tables, salt),
+            "recording_source_discontinuities": _source_discontinuities(connection, tables),
+            "roi_calibration_history": _roi_history(connection, tables, salt),
+            "notification_events": _notification_events(connection, tables),
+            "status_rows": _status_rows(connection, tables),
         }
     except sqlite3.Error:
         raise InventoryError("state database could not be read") from None
     finally:
         connection.close()
-    _hash_recordings(inventory["recordings"], tree.recordings, tree.database, recorded_at)
+    digests: dict = {}
+    _hash_recordings(inventory["recordings"], tree.recordings, tree.database, recorded_at,
+                     digests)
     # A ready spool row whose file is missing or differs would hand the next
     # recording missing media: a current-state failure.
-    for segment_id in _hash_spool(inventory["spool_segments"], tree.recordings, tree.database):
+    for segment_id in _hash_spool(inventory["spool_segments"], tree.recordings, tree.database,
+                                  digests):
         inventory["domain_errors"].append(
             ["recordings", f"spool:{segment_id}", "spool_file_mismatch"])
     inventory["owner_template"] = _owner_template(
@@ -2849,6 +3076,7 @@ def collect(runtime_root: Path, *, salt: str | None = None,
     }
     inventory["not_applicable"] = dict(NOT_APPLICABLE)
     inventory["not_inventoried"] = _not_inventoried()
+    inventory["declared_mutable"] = dict(DECLARED_MUTABLE)
     inventory["manual"] = dict(MANUAL)
     return inventory
 
@@ -2917,6 +3145,14 @@ def _evidenced(item: dict) -> bool:
     return bool(item["segments"]) and all(
         segment.get("state") == "ready" and segment["sha256"] is not None
         for segment in item["segments"])
+
+
+def _servable(item: dict) -> bool:
+    """Evidence verify can count as preserved (#132): every linked segment is
+    ready, readable and matches its catalog digest, byte length and single
+    hard link (RecordingStore._integrity()). A recording already corrupt at
+    record time never makes a coverage item present."""
+    return _evidenced(item) and all(segment["catalog_match"] for segment in item["segments"])
 
 
 # Statuses an 'active' recording may reach (store.py: stop / reconcile /
@@ -3587,7 +3823,8 @@ def _future_times(current: dict, limit: datetime) -> dict:
     Presence clocks, tombstones, unresolved-marker times, the override start,
     the timeline gap and Owner-release audit times; pending integrity rows
     and overflow slots; security/admin, integrity, storage-state and
-    Owner-template audit times; pairing audit times. An override expiry is
+    Owner-template audit times; pairing audit times; notification event
+    times. An override expiry is
     legitimately in the future and PresenceService sets no longest
     duration, so it is not bounded.
     """
@@ -3640,6 +3877,14 @@ def _future_times(current: dict, limit: datetime) -> dict:
         late("owner_template", f"audit:{row_id}", _utc_instant(value))
     for row in (current.get("security_state") or {}).get("pairing_audit") or ():
         late("security_state", f"pairing_audit:{row[0]}", _epoch_instant(1000)(row[3]))
+    # A notification time beyond the verify time would be counted by every
+    # later count_since() and kept by expire() until then plus the retention
+    # (#132). A malformed one is already a notification_events invalid_value.
+    for event_id, value in sorted((current.get("notification_events") or {}).items()):
+        moment = (_utc_instant(value[1]) if isinstance(value, list) and len(value) == 3
+                  else None)
+        if moment is not None:
+            late("notification_events", event_id, moment)
     return found
 
 
@@ -3703,6 +3948,8 @@ def _retention_rules(now: datetime) -> dict:
                                     and _utc_instant(value) < cutoff),
         "storage_state": lambda value: isinstance(value, int) and value < audit_ms,
         "recording_cutoff_ms": now_ms - periods.recording_days * DAY_MS,
+        # NotificationEventStore.expire(): ``at < cutoff`` as stored text.
+        "notification_events_cutoff": cutoff.astimezone(timezone.utc).isoformat(),
         # OwnerTemplateStore's own default (Main constructs it with it).
         "owner_template": lambda value: (
             _utc_instant(value) is not None
@@ -3792,6 +4039,120 @@ def _compare_migrations(baseline: list | None, current: list | None) -> dict:
             "appended": [row[0] for row in current if row[0] not in recorded]}
 
 
+_NOT_RECORDED = {"status": "not_recorded", "failed": []}
+
+
+# RecordingStore._trim()'s duration cutoff. Main builds its recording limits
+# from RECORDING_LIMIT_FIELDS (monitoring configuration), which does not
+# include pre_roll_ms, so every Main store runs with the Limits default. Were
+# it ever made configurable, the largest value Limits admits is used instead:
+# a marker is then accepted as trimmed only where any configuration trims it
+# (a legitimate trim under a shorter window fails loudly, never the reverse).
+_PRE_ROLL_MS = (RecordingLimits.__dataclass_fields__["pre_roll_ms"].default
+                if "pre_roll_ms" not in RECORDING_LIMIT_FIELDS else 1_200_000)
+
+
+def _marker_trimmed(marker, spool: dict | None, cursor_rows: dict | None) -> bool:
+    """Whether RecordingStore itself removed a source pre-roll marker.
+
+    Only two paths delete one:
+
+    - _trim() deletes a marker whose end is at or before T = (latest
+      segment end of its source) - pre_roll_ms, its duration cutoff. Its
+      byte / count eviction unspools segments but never deletes a marker,
+      so an evicted spool alone is no evidence. _publish() sets the source
+      cursor end to the end of the latest publication and append() runs
+      _trim() right after it (or _recover() at the next start), with that
+      segment still catalogued: the marker leaves exactly once the cursor
+      end reaches ``end + pre_roll_ms``. The cursor end is compared with
+      its recorded value and the catalog elsewhere (cursor_regressed /
+      cursor_changed / invalid_value).
+    - release_source() deletes every marker of the source and leaves its
+      cursor inactive (only a later publication sets it active again, which
+      the first rule then judges).
+
+    Both also clear the spool flag of every segment of the source ending at
+    or before the marker's end in the same transaction (a later publication
+    starts past the cursor, beyond it), so a ready spool segment of the
+    source still ending there is a loss either way.
+    """
+    source, end = marker[0], marker[2]
+    if spool is None or cursor_rows is None or not _int(end):
+        return False
+    if any(item.get("source_id") == source
+           and (not _int(item.get("end_ms")) or item["end_ms"] <= end)
+           for item in spool.values()):
+        return False
+    cursor = cursor_rows.get(source)
+    if not isinstance(cursor, dict):
+        return False
+    released = cursor.get("active") == 0
+    trimmed = _int(cursor.get("end_ms")) and cursor["end_ms"] >= end + _PRE_ROLL_MS
+    return bool(released or trimmed)
+
+
+def _compare_source_discontinuities(baseline: list | None, current: list | None,
+                                    spool: dict | None, cursor_rows: dict | None) -> dict:
+    """Recorded markers stay, except those the duration trim or a release removed."""
+    if not baseline:
+        return {"status": "empty", "failed": [], "preserved_rows": 0,
+                "appended": [_row_order(item) for item in current or ()]}
+    if current is None:
+        return {"status": "failed", "failed": [{"id": None, "reason": "table_missing"}]}
+    remaining = Counter(_row_order(item) for item in current)
+    preserved, trimmed, failed = 0, [], []
+    for item in baseline:
+        key = _row_order(item)
+        if remaining[key]:
+            remaining[key] -= 1
+            preserved += 1
+        elif _marker_trimmed(item, spool, cursor_rows):
+            trimmed.append(key)
+        else:
+            failed.append({"id": f"marker:{item[0]}:{item[1]}:{item[2]}", "reason": "missing"})
+    return {"status": "failed" if failed else "preserved", "failed": failed,
+            "preserved_rows": preserved, "trimmed": trimmed,
+            "appended": sorted(key for key, count in remaining.items() for _ in range(count))}
+
+
+def _compare_notification_events(baseline: dict | None, current: dict | None,
+                                 cutoff: str) -> dict:
+    """Kind, time and confirmed flag never change; a row leaves only by
+    NotificationEventStore.expire(), which deletes ``at`` older than the
+    90-day retention compared as text (``cutoff``, at verify time)."""
+    result = _compare_keyed(baseline, current)
+    if result["status"] == "empty":
+        result["retention_expired"] = []
+        return result
+    if current is None:
+        result["failed"].append({"id": None, "reason": "table_missing"})
+    failed, expired = [], []
+    for entry in result["failed"]:
+        recorded = (baseline or {}).get(entry["id"])
+        if (entry["reason"] == "missing" and current is not None
+                and isinstance(recorded, list) and len(recorded) == 3
+                and isinstance(recorded[1], str) and recorded[1] < cutoff):
+            expired.append(entry["id"])
+        else:
+            failed.append(entry)
+    result.update(status="failed" if failed else "preserved", failed=failed,
+                  retention_expired=sorted(expired))
+    return result
+
+
+def _compare_status_rows(baseline: dict | None, current: dict | None) -> dict:
+    """A recomputed status row recorded present still exists (its values are
+    DECLARED_MUTABLE); a missing table is a table_missing failure."""
+    recorded = [name for name, present in sorted((baseline or {}).items()) if present]
+    if not recorded:
+        return {"status": "empty", "failed": [], "preserved": []}
+    current = current or {}
+    failed = [{"id": name, "reason": "table_missing" if current.get(name) is None
+               else "missing"} for name in recorded if current.get(name) is not True]
+    return {"status": "failed" if failed else "preserved", "failed": failed,
+            "preserved": [name for name in recorded if current.get(name) is True]}
+
+
 def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) -> dict:
     if (not isinstance(baseline, dict) or baseline.get("format") != FORMAT
             or baseline.get("format_version") != FORMAT_VERSION):
@@ -3872,6 +4233,25 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
                                                  access_now.get("principals")),
         "access_invitations": _compare_invitations(access_base.get("invitations"),
                                                    access_now.get("invitations")),
+        # #132; a baseline recorded before them reports not_recorded.
+        "recording_source_discontinuities": (
+            _compare_source_discontinuities(baseline["recording_source_discontinuities"],
+                                            current.get("recording_source_discontinuities"),
+                                            current.get("spool_segments"),
+                                            current.get("recording_source_cursor_rows"))
+            if "recording_source_discontinuities" in baseline else dict(_NOT_RECORDED)),
+        "roi_calibration_history": (
+            _compare_keyed(baseline["roi_calibration_history"],
+                           current.get("roi_calibration_history"))
+            if "roi_calibration_history" in baseline else dict(_NOT_RECORDED)),
+        "notification_events": (
+            _compare_notification_events(baseline["notification_events"],
+                                         current.get("notification_events"),
+                                         rules["notification_events_cutoff"])
+            if "notification_events" in baseline else dict(_NOT_RECORDED)),
+        "status_rows": (
+            _compare_status_rows(baseline["status_rows"], current.get("status_rows"))
+            if "status_rows" in baseline else dict(_NOT_RECORDED)),
     }
     # No time the services compare later may lie beyond the verify time
     # (plus a small clock-skew allowance): a far-future clock would refuse
@@ -3916,6 +4296,7 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
         "sections": sections,
         "not_applicable": dict(NOT_APPLICABLE),
         "not_inventoried": _not_inventoried(),
+        "declared_mutable": dict(DECLARED_MUTABLE),
         "manual": dict(MANUAL),
     }
 
@@ -4019,7 +4400,7 @@ def _summary_record(inventory: dict) -> list[str]:
     lines.append(f"coverage recordings_without_evidence: {without} "
                  "(row only, not counted as preserved evidence)")
     for key, value in {**inventory["not_applicable"], **inventory["not_inventoried"],
-                       **inventory["manual"]}.items():
+                       **inventory["declared_mutable"], **inventory["manual"]}.items():
         lines.append(f"{key}: {value}")
     return lines
 
@@ -4036,11 +4417,12 @@ def _summary_verify(report: dict) -> list[str]:
             f"retention_expired={len(section.get('retention_expired', []) or (section.get('audit') or {}).get('retention_expired', []))} "
             f"released={len(section.get('released', []))}"
             + (f" no_evidence={len(section['no_evidence'])}" if "no_evidence" in section
-               else ""))
+               else "")
+            + (f" trimmed={len(section['trimmed'])}" if "trimmed" in section else ""))
     for key in report["empty_coverage"]:
         lines.append(f"coverage {key}: empty (not counted as preserved)")
     for key, value in {**report["not_applicable"], **report["not_inventoried"],
-                       **report["manual"]}.items():
+                       **report.get("declared_mutable", {}), **report["manual"]}.items():
         lines.append(f"{key}: {value}")
     return lines
 
@@ -4153,6 +4535,7 @@ def main(arguments: list[str] | None = None) -> int:
                       "status": "failed", "unverifiable": type(exc).__name__, "sections": {},
                       "empty_coverage": [], "not_applicable": dict(NOT_APPLICABLE),
                       "not_inventoried": _not_inventoried(),
+                      "declared_mutable": dict(DECLARED_MUTABLE),
                       "manual": dict(MANUAL)}
         if args.report is not None:
             write_private(args.report, args.runtime_root, report)

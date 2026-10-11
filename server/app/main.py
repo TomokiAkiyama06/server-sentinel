@@ -20,6 +20,10 @@ from app.cameras.registry import CameraRegistry
 from app.cameras.uvc.config import LocalUvcConfiguration
 from app.cameras.uvc.runtime import LocalUvcDependencies, LocalUvcRuntime, LocalUvcRuntimeState
 from app.completion import run_to_completion
+from app.detection.roi.runtime import (
+    SceneMonitoringConfiguration, SceneMonitoringDependencies, SceneMonitoringRuntime,
+    SceneRuntimeState,
+)
 from app.diagnostics import DiagnosticExportEndpoint
 from app.logging import Event
 from app.media.live.local_preview import LocalPreviewHub
@@ -90,6 +94,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
                monitoring_dependencies: MonitoringDependencies | None = None,
                local_uvc: LocalUvcConfiguration | None = None,
                local_uvc_dependencies: LocalUvcDependencies | None = None,
+               scene_monitoring: SceneMonitoringConfiguration | None = None,
+               scene_monitoring_dependencies: SceneMonitoringDependencies | None = None,
                human_access: HumanAccess | None = None) -> FastAPI:
     # Closed unless the embedder passes a validated composition: it exists
     # only when the deployment explicitly enabled human access and the
@@ -105,6 +111,26 @@ def create_app(settings: Settings, *, database: Database | None = None,
         raise TypeError("local UVC configuration is invalid")
     uvc_dependencies = local_uvc_dependencies or LocalUvcDependencies()
     local_preview = LocalPreviewHub(local_uvc.source_ids if local_uvc is not None else ())
+    # Calibrated ROI movement / camera tamper (#205). Capture threads only
+    # hand it a bounded sample; detection runs on its own worker and confirmed
+    # observations go to the injected durable critical recorder. Without a
+    # recorder or a re-bindable stored calibration it stays unknown.
+    if scene_monitoring is not None and not isinstance(scene_monitoring,
+                                                       SceneMonitoringConfiguration):
+        raise TypeError("scene monitoring configuration is invalid")
+    scene_runtime = (SceneMonitoringRuntime(scene_monitoring, scene_monitoring_dependencies)
+                     if scene_monitoring is not None else None)
+
+    def on_local_frame(source_id, frame) -> None:
+        # Both sinks are non-blocking and never raise into the capture worker.
+        local_preview.on_frame(source_id, frame)
+        if scene_runtime is not None:
+            scene_runtime.on_uvc_frame(source_id, frame)
+
+    def on_local_camera_state(event) -> None:
+        local_preview.on_health(event)
+        if scene_runtime is not None:
+            scene_runtime.on_uvc_health(event)
     # The Main Server storage policy is bound by the monitoring runtime when
     # the deployment configures storage thresholds, so audit writes and
     # retention cleanup cannot spend the hard filesystem reserve. Without those
@@ -124,12 +150,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # startup cannot make a worker open/create a fallback database.
             CameraRegistry(PinnedDatabase(store),
                            reservation=storage_reservation or runtime_admission),
-            on_frame=local_preview.on_frame,
+            on_frame=on_local_frame,
             # A non-online camera transition drops that source's retained
             # preview frame in memory, in transition order, independently of
             # the optional downstream sink, which may be slow or hang; so it
             # is never served as live.
-            on_camera_state=local_preview.on_health,
+            on_camera_state=on_local_camera_state,
             health_sink=uvc_dependencies.health_sink,
             discovery=uvc_dependencies.discovery,
             capture_factory=uvc_dependencies.capture_factory,
@@ -184,6 +210,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
         cleanup_task = None
         uvc_watch_task = None
         human_task = None
+        scene_watch_task = None
 
         uvc_lifecycle = {"deferred": None, "stopping": False}
 
@@ -194,6 +221,64 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 # migrated or verified storage; its admission refuses writes.
                 return monitoring_runtime.status.state == RuntimeState.RUNNING
             return storage_reservation is not None
+
+        async def start_scene_monitoring() -> None:
+            if scene_runtime is None:
+                application.state.scene_monitoring_state = SceneRuntimeState.UNCONFIGURED
+                logging.getLogger(__name__).warning(Event.SCENE_MONITORING_UNCONFIGURED)
+                return
+            try:
+                status = await run_to_completion(asyncio.to_thread(scene_runtime.start))
+                application.state.scene_monitoring_state = status.state
+            except Exception:
+                # Scene detection failure must not take capture/monitoring down;
+                # every scene conclusion stays unknown.
+                application.state.scene_monitoring_state = SceneRuntimeState.UNAVAILABLE
+                logging.getLogger(__name__).error(Event.SCENE_MONITORING_STARTUP_FAILED)
+                return
+            logging.getLogger(__name__).log(
+                logging.INFO if status.state is SceneRuntimeState.RUNNING else logging.ERROR,
+                Event.SCENE_MONITORING_STARTED if status.state is SceneRuntimeState.RUNNING
+                else Event.SCENE_MONITORING_UNAVAILABLE)
+
+        async def watch_scene_monitoring() -> None:
+            # The application snapshot follows the live runtime, like the UVC
+            # watcher: critical backpressure (DEGRADED), its recovery, or a
+            # failed/dead worker or delivery thread (UNAVAILABLE, which the
+            # runtime status itself derives) is reflected here instead of
+            # the startup result staying RUNNING until shutdown. A recorder
+            # call stalled in flight, a camera loss, a stale source or any
+            # other lowered source is DEGRADED. Shutdown cancels this task
+            # before stop() writes the final state.
+            live = (SceneRuntimeState.RUNNING, SceneRuntimeState.DEGRADED)
+            while application.state.scene_monitoring_state in live:
+                await asyncio.sleep(scene_runtime.refresh_interval_seconds)
+                try:
+                    status = await asyncio.to_thread(scene_runtime.status)
+                    state = status.state
+                    lost = state in live and not (status.worker_running
+                                                  and status.delivery_running)
+                except Exception:
+                    state, lost = SceneRuntimeState.UNAVAILABLE, True
+                if lost:
+                    # A worker or delivery thread that is gone (or a status
+                    # that cannot be read) evaluates or delivers nothing.
+                    # Logged once here (the loop ends on a non-live state); an
+                    # `unavailable` the runtime status reports itself was
+                    # already logged by the runtime and is not logged again.
+                    state = SceneRuntimeState.UNAVAILABLE
+                    logging.getLogger(__name__).error(Event.SCENE_MONITORING_UNAVAILABLE)
+                application.state.scene_monitoring_state = state
+
+        async def stop_scene_monitoring() -> None:
+            if scene_runtime is None:
+                return
+            try:
+                status = await run_to_completion(asyncio.to_thread(scene_runtime.stop))
+                application.state.scene_monitoring_state = status.state
+            except Exception:
+                application.state.scene_monitoring_state = SceneRuntimeState.STOP_FAILED
+                logging.getLogger(__name__).error(Event.SCENE_MONITORING_STOP_FAILED)
 
         async def start_local_uvc() -> None:
             # Never a silent default: every outcome is an explicit state.
@@ -306,6 +391,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 human_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await human_task
+            if scene_watch_task is not None:
+                scene_watch_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await scene_watch_task
             if uvc_watch_task is not None:
                 uvc_watch_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -316,6 +405,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 with suppress(Exception):
                     await asyncio.shield(uvc_lifecycle["deferred"])
             await stop_local_uvc()
+            # After capture stops, so no frame is offered to a stopped worker;
+            # its final pass retries staged critical observations.
+            await stop_scene_monitoring()
             if cleanup_task is not None:
                 cleanup_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -362,6 +454,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 # take physical-security monitoring offline. The bounded degraded
                 # retention state stays visible and the scheduled run retries it.
                 logging.getLogger(__name__).error(Event.AUDIT_RETENTION_DEGRADED)
+            # Before capture, so the first frames already reach the detector.
+            await start_scene_monitoring()
+            if scene_runtime is not None:
+                scene_watch_task = asyncio.create_task(watch_scene_monitoring())
             await start_local_uvc()
             if local_uvc_runtime is not None:
                 uvc_watch_task = asyncio.create_task(watch_local_uvc())
@@ -408,6 +504,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
         else LocalUvcRuntimeState.UNCONFIGURED
     )
     application.state.local_preview = local_preview
+    # Internal only: no route exposes scene observations before #10.
+    application.state.scene_monitoring = scene_runtime
+    application.state.scene_monitoring_state = (
+        SceneRuntimeState.CONFIGURED if scene_runtime is not None
+        else SceneRuntimeState.UNCONFIGURED
+    )
     application.state.diagnostic_export_endpoint = diagnostic_export_endpoint
     application.state.human_access = human_access
     # No FastAPI human router is ever included: the surface below answers

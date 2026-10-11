@@ -3,7 +3,8 @@
 Issue [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5) provides
 the `CI` GitHub Actions workflow. It runs for every pull request, pushes to
 `main`, and manual dispatch. The final check is named **CI**; repository,
-component, and Dashboard browser smoke jobs must all succeed. A failed,
+component, Agent (Debian 12 SQLite, CPython 3.13) and Dashboard browser smoke
+jobs must all succeed. A failed,
 cancelled, or skipped prerequisite
 cannot produce a successful final check. Review provenance enforcement remains
 in Issue #4; the workflow itself does not change repository protection settings.
@@ -31,6 +32,12 @@ installation, TypeScript/JavaScript checks, Node tests, production bundling,
 Docker validation and isolated normal/error preview smoke. The additional
 Dashboard browser smoke job executes the built UI in runner-installed Chrome
 with synthetic viewport/session fixtures and intercepted page requests.
+The `media-capture-agent` checks run on CPython 3.12 in the component job. A
+separate Agent job installs the hash-pinned `agent/requirements-ci.lock` on the
+runner's CPython 3.13 (the Debian 13 / Raspberry Pi OS trixie default), compares
+the resolved pins with the reviewed evidence, and runs the Agent lint and unit
+tests; it fails if the interpreter is not 3.13. A Debian 12 image job runs the
+ring ledger tests against SQLite 3.40.
 Other components activate checks through their manifests; README-only skeletons
 continue to report **not implemented**. This coverage does not establish physical
 hardware, phone/Mac device, private network, authentication deployment or live

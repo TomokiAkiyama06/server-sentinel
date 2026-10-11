@@ -213,7 +213,9 @@ the stop is `stop_failed`). If the source's health writer is then still busy
 stop keeps the database pin (`health_fence_pin_held`) without waiting longer,
 so the fenced `offline` queued behind that write can still be written; the
 pin is released (`local_uvc_health_fence_pin_released`) as soon as no fenced
-write is in flight. If that write never finishes before the process exits,
+write is in flight. A joined source whose handed-off health write (for
+example a watchdog `degraded`) is still stalled at that point keeps the pin
+the same way, so its closing `offline` can still be written. If that write never finishes before the process exits,
 the row can stay `online` until the next start, which writes it `offline`
 before any capture opens. The local UVC stop as a whole can take up to
 `join_timeout_seconds` + 1 s for the frame-progress watchdog join + 1 s for
@@ -1287,21 +1289,69 @@ linked segments (about 128 MB) held the lock for about 0.03 s (previously
 about 2.5 s, when validation ran inside the read transaction), well inside
 the service writers' 5 s busy timeout; the whole run took about 2.6 s and
 about 430 MB of resident memory. Expect memory of roughly the database size
-plus about 1.5 KB per segment, and run time growing linearly with the
-segment count and the media bytes hashed. A file changed meanwhile shows as
+plus about 1.5 KB per segment link, and run time growing linearly with the
+number of distinct segments and the media bytes hashed: the catalog is read
+in a fixed number of queries (not one per recording), and each segment file
+is read once per run however many recordings link it (#132), so overlapping
+event recordings sharing pre-roll do not multiply the hashing. A file changed meanwhile shows as
 a change, except a recording that the service's retention deleted after the
 copy: a fresh read shows its row gone and, if retention could delete it, it
 is retention (verify) or left out of the baseline (record). The state
 database uses the DELETE journal mode; against a database switched to WAL
 mode, even a read-only open creates the `-wal` / `-shm` files next to it.
-Durable tables not yet inventoried are listed as `not_inventoried (#132)` in
-the record and verify output: `recording_source_discontinuities`,
-`notification_events`, `roi_calibration_history`,
-`uvc_approvals.session_token`, `integrity_status` and
-`recording_health_status`; do not read a pass as covering them. Of
-`notification_events`, only the hardware-integrity alert kinds are checked,
-for the pending-alert invariant; other kinds and the delivery / confirmed
-fields are not inventoried (the output says so).
+Since #132 every durable Main table is either compared or explained, and
+the `not_inventoried` list in the output is empty. What "preserved" means for
+the tables #132 added:
+
+- `recording_source_discontinuities` (the per-source pre-roll gap markers a
+  new event recording copies): every recorded marker stays, unless the
+  recording store itself removed it. Only two paths do: the spool trim's
+  duration cutoff deletes a marker ending at or before the source's latest
+  segment end minus `pre_roll_ms` (its byte / segment-count eviction never
+  deletes a marker), and `release_source()` drops all markers of a source and
+  leaves its cursor inactive. Main cannot configure `pre_roll_ms` (it is not
+  among the `recording_limits` fields), so the code default of 30 seconds
+  applies. A marker is therefore accepted as gone (`trimmed`, never
+  preserved) only when no ready spool segment of its source ends at or
+  before the marker's end and either the source cursor end has reached the
+  marker's end plus `pre_roll_ms` (a later publication moved the cutoff past
+  it) or the cursor is inactive (released); otherwise it is `missing`, even
+  when the capacity eviction has already emptied the spool before it. New
+  markers are `appended`; each current marker must carry a source UUID,
+  `start <= end` and the reason `stream_discontinuity`;
+- `roi_calibration_history`: append-only, every version kept as a keyed
+  digest of its identifier and metadata (never the values); a rewritten or
+  removed version fails, and each source / profile must hold versions 1..n
+  under one identifier, as `CalibrationArchive.append()` admits them. Every
+  current row, recorded or appended, must also read back through the
+  archive's own row decoder (`decode_history_row()`, which
+  `CalibrationArchive.load()` uses): metadata that does not decode, or whose
+  embedded source / profile / version / identifier differs from the row key,
+  is `invalid_value`;
+- `notification_events`, every kind (not only the hardware-integrity alerts
+  the pending-alert rule above reads): kind, time and confirmed flag never
+  change, and a row may leave only through the service's 90-day retention
+  (`at` older than verify time minus 90 days, compared as the stored UTC
+  text; listed as `retention_expired`). Each current row must have an event
+  UUID, a known kind and a UTC time no more than the 5-minute clock-skew
+  allowance beyond the verify time (`future_time`: a later time would be
+  counted by every daily summary and kept past its retention);
+- `integrity_status` and `recording_health_status`: a row present at record
+  time must still exist; each current row must parse as the service reads it
+  back, and `integrity_status.delivery_blocked` must be set exactly while an
+  overflow slot exists.
+
+Values a correct service rewrites across a restart or a daily run are not
+compared for equality; the output lists them under `declared_mutable`:
+`notification_events.delivery` (a pending Slack delivery completes, a
+presence notification is retried), `uvc_approvals.session_token` (cleared at
+a clean stop and replaced at every start; the Owner re-approval latch it arms
+is compared through the camera source's `requires_approval`, but a token
+cleared while the service was down after an unclean stop cannot be told from
+a clean stop), and the verdict values of `integrity_status` and
+`recording_health_status` (recomputed at startup and daily). A baseline
+recorded by a release before #132 has none of these sections; verify reports
+them `not_recorded` and they neither fail nor count as preserved.
 
 `record` writes a baseline only if verifying that very state, unchanged,
 would pass: it runs every current-state check `verify` runs (schema,
@@ -1611,7 +1661,8 @@ Out of scope, and not claimed by a passing verification:
 - full re-verification of every service's state-transition semantics. The
   pairing ledger, presence delivery jobs and clocks, and similar service state
   are checked only as far as the rules above describe; the tables listed as
-  `not_inventoried` are not compared at all.
+  `not_inventoried` (none since #132) are not compared at all, and the
+  values listed as `declared_mutable` are not compared for equality.
 
 Not judged: for a recording that closed at its own deadline or was
 interrupted by a restart, a lost link to a segment published after its

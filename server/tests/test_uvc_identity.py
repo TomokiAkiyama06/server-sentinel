@@ -198,6 +198,47 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual("video_capture_closed", notified[-1].reason)
         self.assertEqual(0, control.undelivered)
 
+    def test_transition_inside_emit_is_never_reported_delivered(self):
+        # Issue #211 item 1 (Codex P2 on PR #207): ``_set_state`` queued the
+        # event only after ``emit`` returned. A stop settling the delivery
+        # while a slow state callback was still inside ``emit`` saw an idle
+        # handoff and an empty queue and finished before the event existed.
+        entered, gate = threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
+        notified = []
+
+        def emit(event):
+            self.events.append(event)
+            if event.reason == "video_capture_ready":
+                entered.set()
+                gate.wait(10)
+
+        control = ReconnectController(self.source_id, self.camera, emit,
+                                      notify=notified.append)
+        control.reconcile([self.camera])
+        self.assertTrue(control.settle_delivery(1.0))
+        ready = threading.Thread(target=control.capture_ready, args=(self.camera,))
+        ready.start()
+        self.assertTrue(entered.wait(5))
+        self.assertFalse(control.settle_delivery(0.1))
+        self.assertNotIn("video_capture_ready", [event.reason for event in notified])
+        gate.set()
+        self.assertTrue(control.settle_delivery(5.0))
+        ready.join(5)
+        self.assertEqual("video_capture_ready", notified[-1].reason)
+        self.assertEqual(0, control.undelivered)
+
+    def test_failed_emit_leaves_the_delivery_idle(self):
+        def emit(event):
+            if event.reason == "video_capture_ready":
+                raise RuntimeError("synthetic state callback failure")
+
+        control = ReconnectController(self.source_id, self.camera, emit, notify=lambda event: None)
+        control.reconcile([self.camera])
+        with self.assertRaises(RuntimeError):
+            control.capture_ready(self.camera)
+        self.assertTrue(control.settle_delivery(0.0))
+
     def test_stop_fence_that_times_out_still_refuses_a_late_online(self):
         # PR #201 (Codex): a fence that cannot take the transition lock in
         # time (capture_ready inside a slow state callback) used to leave no

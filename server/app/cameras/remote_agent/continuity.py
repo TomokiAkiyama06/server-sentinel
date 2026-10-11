@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import logging
 from threading import Lock
+import time
 from typing import Callable, Iterator
 from uuid import UUID, uuid4
 
@@ -233,7 +234,7 @@ class SourceContinuity:
 
 @dataclass(frozen=True)
 class ContinuityDiagnostics:
-    """Operator-facing continuity counters for health/status exposure.
+    """Operator-facing continuity counters (health/status exposure: #14/#15).
 
     Carries counts only: no node, source, sequence or capture-time value, so
     it can be shown wherever the value-free logging policy allows a count.
@@ -255,6 +256,12 @@ class ContinuityDiagnostics:
 def _first_or_doubling(count: int) -> bool:
     """Rate limit: log the first occurrence and every doubling after it."""
     return count & (count - 1) == 0
+
+
+# Time floor of the doubling rate limit (Issue #211 item 6): doubling alone
+# spaces records exponentially, so a condition that keeps recurring is still
+# logged at least once per this interval.
+LOG_FLOOR_NS = 60 * 1_000_000_000
 
 
 @dataclass
@@ -382,17 +389,24 @@ class ContinuityTracker:
     committed position and the entry carries nothing else, after which the
     durable watermark is the source of truth.  These entries are hard-bounded
     by ``maximum_released_sources`` (oldest evicted first).
+
+    Evictions and ignored acknowledgements are logged as value-free events,
+    rate-limited to the first occurrence, every doubling and at least one
+    record per ``LOG_FLOOR_NS`` of ``log_clock_ns`` (monotonic by default)
+    while the condition recurs.
     """
 
     def __init__(self, limits: ContinuityLimits, authorizer: IngestAuthorizer,
                  ingest: AgentIngestQueue, *, clock_ns: Callable[[], int],
                  committed_watermark: Callable[[UUID], CommittedWatermark | None],
+                 log_clock_ns: Callable[[], int] = time.monotonic_ns,
                  ) -> None:
         if (not isinstance(limits, ContinuityLimits)
                 or not callable(getattr(authorizer, "require_node", None))
                 or not callable(getattr(authorizer, "require_source", None))
                 or not isinstance(ingest, AgentIngestQueue)
                 or not callable(clock_ns)
+                or not callable(log_clock_ns)
                 or not callable(committed_watermark)):
             raise ValueError("invalid continuity dependencies")
         self.limits = limits
@@ -411,8 +425,14 @@ class ContinuityTracker:
         self._ack_node_mismatches = 0
         self._ack_unknown_sources = 0
         # Rate-limited log records decided under the lock and emitted after it
-        # is released; at most one per distinct event, so bounded.
-        self._pending_logs: dict[Event, int] = {}
+        # is released: per distinct event its level and how many records are
+        # due, so concurrent qualifying occurrences before one emission each
+        # keep their record (Issue #211 item 5). Bounded by the event set.
+        self._pending_logs: dict[Event, tuple[int, int]] = {}
+        # Per event, the log clock reading of its last due record, for the
+        # time floor of the rate limit (``LOG_FLOOR_NS``).
+        self._log_clock_ns = log_clock_ns
+        self._last_log_ns: dict[Event, int] = {}
         # Monotonic across forget/re-enrollment; never reused for any node.
         self._generation = 0
         self._instance = uuid4()
@@ -467,19 +487,40 @@ class ContinuityTracker:
             self._emit_logs()
 
     def _note_log_locked(self, event: Event, level: int, count: int) -> None:
-        if _first_or_doubling(count):
-            self._pending_logs[event] = level
+        """Decide one rate-limited record: first, every doubling, and at
+        least once per ``LOG_FLOOR_NS`` while the condition keeps recurring."""
+        try:
+            now = self._log_clock_ns()
+        except Exception:
+            now = None
+        if type(now) is not int:
+            # A failing log clock never fails the caller; doubling still logs.
+            now = None
+        last = self._last_log_ns.get(event)
+        floor = (now is not None and last is not None
+                 and now - last >= LOG_FLOOR_NS)
+        if not (_first_or_doubling(count) or floor):
+            return
+        if now is not None:
+            self._last_log_ns[event] = now
+        _level, due = self._pending_logs.get(event, (level, 0))
+        self._pending_logs[event] = (level, due + 1)
 
     def _emit_logs(self) -> None:
         """Emit rate-limited records outside the lock (value-free events only)."""
         with self._lock:
             pending, self._pending_logs = self._pending_logs, {}
         logger = logging.getLogger(__name__)
-        for event, level in pending.items():
-            logger.log(level, event)
+        for event, (level, due) in pending.items():
+            for _ in range(due):
+                logger.log(level, event)
 
     def diagnostics(self) -> ContinuityDiagnostics:
-        """Value-free counters for an operator health/status surface."""
+        """Value-free counters for an operator health/status surface.
+
+        Not yet wired to such a surface; that exposure comes with the
+        listener/route integration (#14/#15).
+        """
         with self._lock:
             return ContinuityDiagnostics(
                 len(self._released), self.limits.maximum_released_sources,

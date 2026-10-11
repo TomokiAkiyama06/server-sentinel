@@ -251,7 +251,12 @@ refusing the fenced `offline` queued behind that write (Issue #204). The
 writer releases the pin, off the stop and logged as
 `local_uvc_health_fence_pin_released`, as soon as no fenced write is in
 flight: the fenced row is then durable, or its write failed and the source
-stays reported unpersisted. A later `stop()` re-checks it as well. The stop
+stays reported unpersisted. A later `stop()` re-checks it as well. A
+source that was not fenced (its worker was joined) is treated the same way:
+a handed-off health write (for example a watchdog `degraded`) still stalled
+when the stop releases the pin keeps it, so the closing `offline` staged
+behind that write is not refused and the earlier state does not stay durable
+(Issue #211 item 3). The stop
 itself stays bounded; a write that never returns keeps the pin until process
 exit, and the next start writes the row `offline` before any capture opens. A
 fenced controller refuses `capture_ready`, so a late frame from that worker
