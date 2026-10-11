@@ -1,13 +1,51 @@
-# 2026-10-11: MJPG frame decoder survey for ROI / camera tamper (proposed)
+# 2026-10-11: MJPG frame decoder survey for ROI / camera tamper (accepted: Option B)
 
-- Status: **proposed — the repository owner decides**. Nothing here is adopted.
+- Status: **accepted (Owner decision recorded)** — the Owner chose **Option B
+  (simplejpeg)** on 2026-10-11. The comparison below is kept as the decision
+  record.
 - Date: 2026-10-11
 - Related: Issue #217, Issue #205, PR #213, `docs/THIRD_PARTY_POLICY.md`,
   `agent/docs/DEPENDENCIES.md` (operator-installed GStreamer precedent)
-- Scope: decision support only. This document adds **no runtime dependency, no
+- Scope: decision record only. This document adds **no runtime dependency, no
   lock entry, no `license/components.json` or `license/owner-approvals.json`
-  record and no code**. Until the Owner decides, an `MJPG` source stays outside
+  record and no code**. The decoder is adopted by a separate adoption PR (which
+  closes Issue #217). Until that PR is merged, an `MJPG` source stays outside
   scene detection and reports `unknown` (Owner decision 2026-10-11, Issue #217).
+
+## Owner decision (2026-10-11)
+
+The Owner adopted **Option B — simplejpeg** for Main-host MJPG decoding, on the
+strength of its failure behaviour (the strictest of the candidates, see
+"Corrupt / edge frame behaviour"). Options A and C and the status quo are not
+adopted; their rows remain below as the comparison the decision was based on.
+
+The adoption PR must do all of the following; until it does, MJPG stays
+`unknown`:
+
+1. **numpy becomes a ROI runtime dependency**, hash-pinned with
+   `--require-hashes` in the runtime lock (not only the optional detector lock),
+   with matching entries in the wheel audit inventory and
+   `license/components.json`. simplejpeg itself is added the same way.
+2. **Every supported runtime artifact is pinned and audited** (see "Artifacts
+   needed for Option B" below), or the decoder runtime is explicitly narrowed;
+   narrowing requires a separate Owner approval.
+3. **libjpeg-turbo's `IJG` license is recorded through the license gate**
+   (allowlist extension with the exact SPDX id or an exact entry in
+   `license/owner-approvals.json`, whichever the Owner approves in that PR),
+   together with the IJG notice and the Modified BSD text that binary
+   distribution requires (see "License, license gate, pinning and packaging").
+4. **SOF dimension check before decoding** (rule 2): width/height in the SOF
+   header must equal the negotiated V4L2 format before simplejpeg is called,
+   because a full-size decode of a 65500x65500 header was OOM-killed.
+5. **Real C960 frame checks recorded in `MANUAL_TEST.md`**: whether frames carry
+   DHT segments, whether and how many bytes follow `EOI` (UVC padding, rule 2),
+   and real decode time; plus a check that decoding works inside the actual
+   `server-sentinel.service` systemd sandbox.
+6. **Every failure maps to `unknown`** (rule 1): pre-check rejection, decoder
+   exception, post-check mismatch, plausibility check (rule 7), worker exit,
+   timeout or kill.
+
+The decoder-independent rules below still apply in full.
 
 ## Question
 
@@ -81,6 +119,45 @@ failure behaviour that must map to `unknown`) before choosing one.
 FFmpeg (`mjpeg` decoder) was not measured: it is not installed on the Main host,
 its build configuration decides between LGPL and GPL terms, and it would add a
 much larger parser surface than a JPEG-only decoder.
+
+### Artifacts needed for Option B (adopted)
+
+`server/pyproject.toml` supports CPython 3.12 and 3.14, and the backend
+dependency inventory (`server/docs/DEPENDENCIES.md`, `server/docs/wheel-audit.json`)
+covers Linux x86-64 for both plus CPython 3.12 aarch64. Option B therefore needs
+**six native wheels** (two packages x three runtimes). The PyPI JSON API
+(read-only check, 2026-10-11) lists all six for the surveyed versions, so there
+is **no gap on PyPI**; only the cp312 x86-64 pair was downloaded and exercised.
+
+| Package | Runtime | Wheel (PyPI) | SHA-256 (PyPI JSON, not a pin) | Surveyed |
+| --- | --- | --- | --- | --- |
+| simplejpeg 1.9.0 | cp312 x86-64 | `simplejpeg-1.9.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl` | `5be1c8932f43f99b6cc52f8ac4c28e3ac19a1a830351efdb159715fd683e2053` | yes |
+| simplejpeg 1.9.0 | cp314 x86-64 | `simplejpeg-1.9.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl` | `f22024286577a4e9bb30c4b3c1a66a3b0c6e56801b26c83d0581ad294d1b99e3` | no |
+| simplejpeg 1.9.0 | cp312 aarch64 | `simplejpeg-1.9.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl` | `08ab337ca3b26d7562f5ad686ab8f3966fb206fced607d248e693cbc57fc53b3` | no |
+| numpy 2.3.5 | cp312 x86-64 | `numpy-2.3.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl` | `0d8163f43acde9a73c2a33605353a4f1bc4798745a8b1d73183b28e5b435ae28` (already in `server/requirements-detector.lock`) | yes |
+| numpy 2.3.5 | cp314 x86-64 | `numpy-2.3.5-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl` | `fffe29a1ef00883599d1dc2c51aa2e5d80afe49523c261a74933df395c15c520` | no |
+| numpy 2.3.5 | cp312 aarch64 | `numpy-2.3.5-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl` | `8b973c57ff8e184109db042c842423ff4f60446239bd585a5131cc47f06f789d` | no |
+
+simplejpeg 1.9.0 declares `numpy>=1.19.3`; numpy 2.3.5 requires Python >= 3.11.
+The adoption PR may choose newer versions, but must then pin and audit the same
+three runtimes for both packages. The four unsurveyed wheels each carry their
+own bundled native code (numpy's OpenBLAS / gfortran runtime differs between
+x86-64 and aarch64; simplejpeg's statically linked libjpeg-turbo uses Neon
+instead of x86 SIMD on aarch64), so each needs its own license-file and
+native-library audit entry, and their decode behaviour on the corrupt-frame set
+was not measured. The existing detector lock is x86-64 / CPython 3.12 only, so
+numpy's other two wheels are new review items. If the adoption PR instead
+narrows the decoder runtime (for example to CPython 3.12 x86-64 only, with MJPG
+remaining `unknown` elsewhere), that narrowing must be stated explicitly and
+approved by the Owner.
+
+For the comparison rows (not adopted): Pillow 12.3.0 also publishes cp312
+x86-64, cp314 x86-64 and cp312 aarch64 wheels on PyPI, each bundling its own set
+of about 18 native libraries (three wheels, three native audits); OpenCV
+5.0.0.93 publishes `abi3` wheels for x86-64 and aarch64 (two very large wheels,
+each to audit); GStreamer (Option C) is not a pip artifact, so per-architecture
+Ubuntu packages would be needed (arm64 availability of the exact versions was
+not checked).
 
 ## Results
 
@@ -166,7 +243,9 @@ extraneous bytes before a marker, most bad Huffman codes) as *warnings* and
 keeps decoding; Pillow has no API that turns them into errors. Pillow's
 `ImageFile.LOAD_TRUNCATED_IMAGES` (default `False`) only governs the case where
 the **input bytes run out** before the decoder finishes (`image file is
-truncated`); it has no effect once the frame ends with `EOI`. Pillow therefore
+truncated`); it has no effect once the frame ends with `EOI`. It must stay
+`False`: when `True`, Pillow also ignores negative decoder error codes, so fatal
+errors such as `broken data stream` would be returned as frames. Pillow therefore
 raises only for that input exhaustion, for errors libjpeg treats as fatal, for
 the decompression-bomb limit and for unidentifiable data. The single
 `entropy bit flips` sample in the first table happened to hit a fatal error and
@@ -201,11 +280,33 @@ quality gate remains responsible for implausible content.
 
 | Candidate | Own license | Material bundled / required native code | License gate fit (`scripts/ci/license_gate.py`) | Hash pinning | Non-root / sandbox notes |
 | --- | --- | --- | --- | --- | --- |
-| Pillow wheel | `MIT-CMU` (HPND-style) | 18 bundled shared libraries and statically linked code: libjpeg-turbo (`IJG AND BSD-3-Clause AND Zlib`), FreeType (`FTL` / GPL-2.0 dual), HarfBuzz (MIT), libtiff (`libtiff`), libwebp (BSD-3-Clause), OpenJPEG (BSD-2-Clause), Little CMS (MIT), libavif (BSD-2-Clause), libpng (`Libpng`), libxcb/libXau (`X11`), zlib-ng 2.3.3 (Zlib), brotli, zstd, xz; the SBOM also lists libimagequant (GPL-3.0-or-later) and FriBiDi (LGPL-2.1-or-later), which are **not** shipped in the wheel (FriBiDi is only loaded at runtime if the OS provides it) | `MIT-CMU`, `IJG`, `FTL`, `libtiff`, `Libpng`, `X11` are **not** in the permissive allowlist: needs an Owner decision (allowlist extension or exact approvals) and a native-library audit like `server/docs/wheel-audit.json` | Yes, `--require-hashes`, but one native wheel **per supported runtime**: only the cp312 x86-64 wheel was examined; cp314 x86-64 and cp312 aarch64 (both supported by `server/pyproject.toml` and the backend lock) need their own hashed and audited wheels | Pure in-process, no device or network access. Must open with `Image.open(fp, formats=["JPEG"])` so only the JPEG plugin parses camera bytes. No numpy needed (`Image.tobytes()` yields luma bytes). |
-| simplejpeg | MIT | libjpeg-turbo 3.1.2 statically linked (`IJG AND BSD-3-Clause AND Zlib`); requires numpy (BSD-3-Clause, bundles OpenBLAS / gfortran runtime, already reviewed for the optional detector lock) | MIT is allowlisted; `IJG` is not; numpy would move from the optional detector lock into the ROI runtime | Yes, two packages, each with one native wheel per supported runtime (cp312 x86-64 examined; cp314 x86-64 and cp312 aarch64 not) | Smallest native surface (one 1 MB extension). Single maintainer; latest release 2025-10-10 with libjpeg-turbo 3.1.2, so upstream libjpeg-turbo fixes arrive only with a new simplejpeg release. |
+| Pillow wheel | `MIT-CMU` (HPND-style) | 18 bundled shared libraries and statically linked code: libjpeg-turbo (`IJG AND BSD-3-Clause AND Zlib`), FreeType (`FTL` / GPL-2.0 dual), HarfBuzz (MIT), libtiff (`libtiff`), libwebp (BSD-3-Clause), OpenJPEG (BSD-2-Clause), Little CMS (MIT), libavif (BSD-2-Clause), libpng (`libpng-2.0`, the license of libpng 1.6.36 and later), libxcb/libXau (`X11`), zlib-ng 2.3.3 (Zlib), brotli, zstd, xz; the SBOM also lists libimagequant (GPL-3.0-or-later) and FriBiDi (LGPL-2.1-or-later), which are **not** shipped in the wheel (FriBiDi is only loaded at runtime if the OS provides it) | `MIT-CMU`, `IJG`, `FTL`, `libtiff`, `libpng-2.0`, `X11` are **not** in the permissive allowlist: needs an Owner decision (allowlist extension or exact approvals) and a native-library audit like `server/docs/wheel-audit.json` | Yes, `--require-hashes`, but one native wheel **per supported runtime**: three wheels (cp312 x86-64, cp314 x86-64, cp312 aarch64; all three exist on PyPI) each with its own native-library audit; only cp312 x86-64 was examined | Pure in-process, no device or network access. Must open with `Image.open(fp, formats=["JPEG"])` so only the JPEG plugin parses camera bytes. No numpy needed (`Image.tobytes()` yields luma bytes). |
+| simplejpeg | MIT | libjpeg-turbo 3.1.2 statically linked (`IJG AND BSD-3-Clause AND Zlib`); requires numpy (BSD-3-Clause, bundles OpenBLAS / gfortran runtime, already reviewed for the optional detector lock) | MIT is allowlisted; `IJG` is not; numpy would move from the optional detector lock into the ROI runtime | Yes: six wheels (simplejpeg + numpy for cp312 x86-64, cp314 x86-64, cp312 aarch64; all exist on PyPI, see "Artifacts needed for Option B"); only the cp312 x86-64 pair was examined | Smallest native surface (one 1 MB extension). Single maintainer; latest release 2025-10-10 with libjpeg-turbo 3.1.2, so upstream libjpeg-turbo fixes arrive only with a new simplejpeg release. |
 | PyTurboJPEG 2.5.0 | MIT (pure Python, `ctypes`) | Requires `libturbojpeg.so` **3.x**; Ubuntu on the Main host ships libjpeg-turbo 2.1.5 and has no `libturbojpeg` installed, so a non-distribution library would be needed (PyTurboJPEG 1.x would be needed for 2.x) | Python part allowlisted; the shared library is outside pip, so the gate cannot pin or review it | Python wheel yes; native library no | Recoverable corruption is a Python warning, not an error (see above); no default pixel limit on full-size decode. **Not recommended.** |
-| OpenCV headless | Apache-2.0 | About 150 MB of extracted code including FFmpeg (LGPL-2.1-or-later), OpenSSL 1.1.1k (upstream end-of-life), OpenBLAS + libgfortran, libvpx, libaom, statically linked Intel IPP ICV (Intel Simplified Software License) and more | Many non-allowlisted bundled licenses; LGPL and proprietary-licensed IPP need Owner review | Yes, but one huge wheel | Large parser surface for a JPEG-only need; silent success on corrupt data. **Not recommended.** |
-| GStreamer `jpegdec` | LGPL-2.1-or-later (gst-plugins-good), with system libjpeg-turbo8 (`IJG AND BSD-3-Clause AND Zlib`) | Operator-installed OS packages; nothing bundled | Outside the pip/npm gate, same as the Agent's operator-installed GStreamer; running an unmodified distribution package as a separate program places no license obligation on ServerSentinel code (see `agent/docs/DEPENDENCIES.md`), but adopting it on Main needs the Owner decision that precedent requires | No: apt package version only, updated by the distribution | Main's capture path does not use GStreamer today (direct V4L2 `mmap`), so this is a new runtime component on Main. Best fit is a separate `gst-launch-1.0` process confined like the Agent's Landlock-sandboxed capture child; PyGObject in the release venv is not an option (LGPL OS package, not in the venv). Per-frame output must be matched to input by the caller because a corrupt frame is dropped silently. |
+| OpenCV headless | Apache-2.0 | About 150 MB of extracted code including FFmpeg (LGPL-2.1-or-later), OpenSSL 1.1.1k (upstream end-of-life), OpenBLAS + libgfortran, libvpx, libaom, statically linked Intel IPP ICV (Intel Simplified Software License) and more | Many non-allowlisted bundled licenses; LGPL and proprietary-licensed IPP need Owner review | Yes, but one huge `abi3` wheel per architecture (x86-64 and aarch64) | Large parser surface for a JPEG-only need; silent success on corrupt data. **Not recommended.** |
+| GStreamer `jpegdec` (+ `videoconvert`, `gst-launch-1.0`) | `jpegdec`: LGPL-2.1-or-later (gst-plugins-good) with system libjpeg-turbo8 (`IJG AND BSD-3-Clause AND Zlib`); see the stack inventory below for the rest | Operator-installed OS packages; nothing bundled. The measured pipeline needs more than `jpegdec` (see below) | Outside the pip/npm gate, same as the Agent's operator-installed GStreamer; running an unmodified distribution package as a separate program places no license obligation on ServerSentinel code (see `agent/docs/DEPENDENCIES.md`), but adopting it on Main needs the Owner decision that precedent requires | No: apt package version only, updated by the distribution | Main's capture path does not use GStreamer today (direct V4L2 `mmap`), so this is a new runtime component on Main. Best fit is a separate `gst-launch-1.0` process confined like the Agent's Landlock-sandboxed capture child; PyGObject in the release venv is not an option (LGPL OS package, not in the venv). Per-frame output must be matched to input by the caller because a corrupt frame is dropped silently. |
+
+**Option C stack inventory (incomplete).** The measured per-frame pipeline
+(`gst-launch-1.0 ... ! jpegdec ! videoconvert ! video/x-raw,format=GRAY8 ! ...`)
+loads more than `jpegdec`. Packages on the Main host (Ubuntu, `dpkg -l`, read
+only), with the license as declared in each package's Debian `copyright` file:
+
+| Component | Ubuntu package (version) | License (Debian copyright, summary) |
+| --- | --- | --- |
+| `gst-launch-1.0` | `gstreamer1.0-tools` 1.28.2-1 | LGPL-2.1-or-later (GStreamer core) |
+| GStreamer core (`libgstreamer-1.0`, `libgstbase-1.0`, `coreelements`) | `libgstreamer1.0-0` 1.28.2-1 | mainly LGPL-2+ / LGPL-2.1+, a few MPL-2.0 and public-domain files |
+| `videoconvert` (`libgstvideoconvertscale.so`) and `libgstvideo-1.0` / `libgstallocators-1.0` | `gstreamer1.0-plugins-base` / `libgstreamer-plugins-base1.0-0` 1.28.2-1ubuntu0.1 | mainly LGPL-2+, some BSD-3-Clause / MIT files |
+| `jpegdec` (`libgstjpeg.so`) | `gstreamer1.0-plugins-good` 1.28.2-2ubuntu0.4 | LGPL-2.1-or-later |
+| ORC runtime compiler (`liborc-0.4`, used by `videoconvert`) | `liborc-0.4-0t64` 1:0.4.42-2 | BSD-2-Clause style |
+| GLib / GObject / GModule | `libglib2.0-0t64` 2.88.0-1ubuntu0.1 | LGPL-2.1-or-later with many differently licensed files |
+| libjpeg-turbo | `libjpeg-turbo8` 2.1.5-4ubuntu4 | `IJG AND BSD-3-Clause AND Zlib` |
+| other shared libraries from `ldd` | libffi, libpcre2-8, libdrm, libatomic, libc/libm | not reviewed |
+
+This inventory is **incomplete**: the transitive closure was listed with `ldd`
+only, the per-file licenses were not reviewed, plugins loaded at runtime by
+the registry scan were not enumerated, and arm64 packages were not checked.
+ORC's JIT would also conflict with `MemoryDenyWriteExecute=` (see below). Since
+Option C was not adopted, this inventory was not completed.
 
 All libjpeg-turbo based options (every candidate above) carry the IJG
 obligation for binary distribution: product documentation must state "This
@@ -223,9 +324,12 @@ rules, to be implemented and tested in the adoption PR:
 1. **Every failure is `unknown`, never "no movement" / "no tamper".** An
    exception, warning, `None`, missing output, process exit, timeout or kill all
    map to `unknown` for that sample, with the existing gap accounting.
-2. **Pre-validate before decoding**: `SOI` at the start, `EOI` at the end, a
-   bounded byte size, and SOF width/height equal to the negotiated V4L2 format.
-   This catches the truncation without `EOI`, dimension-mismatch and
+2. **Pre-validate before decoding**: `SOI` at the start, an `EOI` marker
+   followed by at most a small, bounded number of trailing bytes (UVC MJPG
+   payloads may be padded after `EOI`, so requiring `EOI` as the very last two
+   bytes could reject every valid frame; the bound is to be set from real C960
+   frames, see "Not verified"), a bounded total byte size, and SOF width/height
+   equal to the negotiated V4L2 format. This catches the truncation without `EOI`, dimension-mismatch and
    decompression-bomb cases where some decoders were silent or were
    OOM-killed. It does **not** catch a scan cut short and re-terminated with
    `EOI`, extraneous bytes before a marker, or bit flips.
@@ -233,8 +337,10 @@ rules, to be implemented and tested in the adoption PR:
    (simplejpeg `strict=True`; PyTurboJPEG under a `warnings` filter set to
    `error`) and **post-check** the decoded size against the expected (scaled)
    size. Pillow, OpenCV and GStreamer expose no libjpeg warnings at all
-   (`LOAD_TRUNCATED_IMAGES` left at `False` only rejects input that runs out
-   before `EOI`), so with them a warning-level corruption arrives as a normal
+   (`LOAD_TRUNCATED_IMAGES` must stay `False`: it only rejects input that runs
+   out before `EOI`, but setting it to `True` would additionally suppress the
+   decoder's negative error codes, turning even fatal decode errors into
+   returned frames), so with them a warning-level corruption arrives as a normal
    frame and must be handled by rule 7 or by the Owner decision below.
 4. **Decode in an isolated worker** with an address-space limit, not in the
    process that holds sessions and the database, because a native parser reads
@@ -254,24 +360,33 @@ rules, to be implemented and tested in the adoption PR:
    quality gate, not compared against the ROI reference. This is needed for
    every candidate (even simplejpeg's strict mode returned 3 banded frames
    without a warning) and is the only detection path for warning-level
-   corruption with Pillow. It is a heuristic: a legitimately flat scene can
+   corruption with Pillow. Implementation note: libjpeg stops at an MCU
+   boundary, so the band starts mid-row; the check should look at the trailing
+   MCUs / 8x8 blocks (scaled to the decode factor) in scan order, not only at
+   whole trailing rows. It is a heuristic: a legitimately flat scene can
    trigger it (fail-closed to `unknown`), and locally wrong pixels without a
    band are not detected by any rule here.
 
 ## Options and recommendation (for the Owner)
 
+These options and the survey's recommendation are kept as written before the
+Owner decision; the Owner chose Option B (see "Owner decision" above).
+
 - **Option A — Pillow wheel (recommended on maintenance and packaging, not on
   failure behaviour).** Actively maintained, ships the newest libjpeg-turbo of
   the candidates (3.1.4.1), needs no numpy and has a built-in
-  decompression-bomb limit. It raises only when the input runs out before `EOI`
+  decompression-bomb limit (only a `DecompressionBombWarning` between 1x and 2x
+  `Image.MAX_IMAGE_PIXELS`; `DecompressionBombError` only above 2x, so the
+  warning must be promoted to an error or the SOF pre-check of rule 2 relied
+  upon). It raises only when the input runs out before `EOI`
   and on fatal libjpeg errors (2 of 30 bit-flip samples); it returns
   `EOI`-terminated mid-scan truncations, extraneous bytes and most bit flips as
   normal frames, because it does not expose libjpeg warnings. Costs: an Owner
-  decision on `MIT-CMU`, `IJG`, `FTL`, `libtiff`, `Libpng` and `X11`, a
+  decision on `MIT-CMU`, `IJG`, `FTL`, `libtiff`, `libpng-2.0` and `X11`, a
   native-library audit of the 18 bundled libraries for every supported runtime
   wheel, the IJG notice, the SOF-dimension pre-check (rule 2), and a decision
   on how warning-level corruption is detected (decision 6 below).
-- **Option B — simplejpeg.** Strictest failure behaviour observed: it rejected
+- **Option B — simplejpeg (adopted by the Owner, 2026-10-11).** Strictest failure behaviour observed: it rejected
   every `EOI`-terminated truncation, both extraneous-byte frames and 15 of 30
   bit-flip samples, and it has the smallest native surface (MIT + statically
   linked libjpeg-turbo). Costs: an Owner decision on `IJG`, numpy as a ROI
@@ -282,7 +397,8 @@ rules, to be implemented and tested in the adoption PR:
 - **Option C — GStreamer `jpegdec` in a sandboxed per-frame process.** No new
   pip dependency and an existing Agent precedent for an operator-installed,
   Landlock-confined `gst-launch-1.0`. Costs: an LGPL OS dependency on Main that
-  cannot be hash-pinned, about 4 % of one core at 4 sources from process
+  cannot be hash-pinned, a GStreamer core + plugins-base (`videoconvert`) +
+  plugins-good + ORC + GLib stack whose inventory above is incomplete, about 4 % of one core at 4 sources from process
   start-up, and the most silent failure modes (truncated frames emitted as
   valid, corrupt frames dropped without a message, no warnings), which rules 2,
   6 and 7 must cover.
@@ -300,11 +416,19 @@ recommendation of A rests on maintenance, packaging (no numpy) and update
 cadence; on failure behaviour B is clearly stronger, so the choice between A and
 B is a trade-off for the Owner rather than a clear win for A.
 
-## Decisions requested from the Owner
+## Decisions requested from the Owner (resolved 2026-10-11)
+
+Resolution: item 1 → **Option B**; item 3 → numpy becomes a ROI runtime
+dependency (hash-pinned, lock and license inventory updated in the adoption
+PR); item 2 → `IJG` is recorded through the license gate / owner approvals in
+the adoption PR; item 7 → all supported runtimes are pinned and audited unless
+the Owner separately approves a narrowing; items 4 and 6 lapse with Option B
+(rule 7 still applies). Item 5 (decoding on the Agent) remains open and is out
+of scope here. The original list is kept below.
 
 1. Which option (A / B / C / status quo) to adopt for Main-host MJPG decoding.
 2. For A or B: whether to extend the license-gate allowlist with the exact SPDX
-   ids `IJG` (and for A `MIT-CMU`, `FTL`, `libtiff`, `Libpng`, `X11`) as was done for
+   ids `IJG` (and for A `MIT-CMU`, `FTL`, `libtiff`, `libpng-2.0`, `X11`) as was done for
    `MIT-0`, or to record exact per-component approvals instead.
 3. For B: whether numpy may become a ROI runtime dependency (today it is only in
    the optional detector lock).
@@ -329,15 +453,18 @@ B is a trade-off for the Owner rather than a clear win for A.
 
 ## Not verified
 
-- Real EMEET C960 MJPG frames (whether they carry DHT segments, their size and
-  entropy) and real decode time on them were not measured; checking this belongs
-  in `MANUAL_TEST.md` with the adoption PR.
+- Real EMEET C960 MJPG frames (whether they carry DHT segments, whether and how
+  many bytes follow `EOI`, their size and entropy) and real decode time on them
+  were not measured; checking this, including the trailing-byte bound of rule 2,
+  belongs in `MANUAL_TEST.md` with the adoption PR.
 - Behaviour inside the actual `server-sentinel.service` systemd sandbox was not
   exercised; only an unprivileged, network-less container was used.
 - Only one candidate version each was examined; versions and hashes above are
   survey evidence, not pins. Only CPython 3.12 x86-64 wheels were examined; the
-  CPython 3.14 x86-64 and CPython 3.12 aarch64 wheels, their bundled libraries
-  and their behaviour were not.
+  CPython 3.14 x86-64 and CPython 3.12 aarch64 wheels were only confirmed to
+  exist on PyPI (hashes from the PyPI JSON API), and their bundled libraries
+  and behaviour were not examined.
+- The Option C GStreamer stack inventory is incomplete (see above).
 - The corrupt-frame variants are synthetic and few (one bit-flip sample in the
   first table, 30 in the follow-up). How real UVC transfer errors on the C960
   damage MJPG payloads (dropped packets, re-framing, extraneous bytes) and how
