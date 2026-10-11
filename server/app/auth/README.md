@@ -590,6 +590,23 @@ while access was still open, before the close, and any revocation that close
 requires covers it (Issue #144). The
 read-only pre-check (`session_may_be_current`) takes no admission.
 
+Every future data route must be authorized through the reservation gate.
+While a gated commit waits for the storage admission, a check's close waits
+for the gate lock, so the published verdict (`access_open`) stays open for
+up to one in-flight monitoring job plus the SQLite busy timeout. After the
+check has closed access, it enumerates the hostname, listeners, routes and
+socket owners, each under its enumeration timeout, before it decides on an
+exposure. So the exposure revocation and the Owner fault come at least that
+much later than the change that caused them. A request authorized through
+the gate (`epoch()` before authorization, then the commit inside
+`admit(epoch)`, as `authorize_session` does) is refused as soon as the close
+has run. A route that called `AccessStore.authorize()` (or `authorize_owner()`)
+outside the gate, even after reading `access_open`, could keep serving
+through that whole window and after it. No such route is mounted. Any later
+live, recording, timeline or administration route must take the epoch and
+commit its authorization inside `admit(epoch)` exactly like
+`GET /api/session`, never a bare `authorize()` call.
+
 Startup. A `HumanAccess` serves requests only while a `run()` of the current
 lifespan holds (Codex PR #219): every request is denied (`stopped`) from
 construction, so a composition whose lifespan never runs (disabled or not yet

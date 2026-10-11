@@ -7,6 +7,7 @@ socket, browser, Tailscale or real authenticator is involved.
 """
 
 import asyncio
+import base64
 from contextlib import closing, contextmanager, suppress
 from datetime import timedelta
 import json
@@ -193,6 +194,15 @@ class HumanSurfaceFixture(unittest.IsolatedAsyncioTestCase):
                 break
             await asyncio.sleep(0.01)
         self.assertFalse(access.stopped)
+
+    async def until(self, predicate, seconds=10):
+        """Wait for ``predicate()``; fail (never hang) after ``seconds``."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + seconds
+        while not predicate():
+            if loop.time() > deadline:
+                self.fail("condition not reached before the deadline")
+            await asyncio.sleep(0.01)
 
     async def stop_serving(self):
         """End every run() started by ``start_serving`` (the shutdown order)."""
@@ -617,6 +627,76 @@ class ReservationGateTests(HumanSurfaceFixture):
         self.assertEqual(status(result), 200)
         self.assertEqual(held, [True])
 
+
+    def token(self, cookie):
+        return base64.urlsafe_b64decode(cookie.split("=", 1)[1] + "=")
+
+    def gated(self):
+        epoch = self.check.epoch()
+        return lambda: self.check.admit(epoch)
+
+    async def test_concurrent_session_reads_take_their_time_inside_the_gate(self):
+        """Claude review (PR #219): a read that waited while another read of
+        the same session committed its idle touch takes its request time
+        after that commit, so it is not refused for preceding ``last_seen``."""
+        _, authenticator, _ = self.enroll()
+        token = self.token(await self.sign_in(authenticator))
+        base, ticks, lock = self.ceremony_clock(), [0], threading.Lock()
+
+        def clock():
+            # Strictly increasing: every reading is one second later.
+            with lock:
+                ticks[0] += 1
+                return base + timedelta(seconds=ticks[0])
+
+        waiting, release = threading.Event(), threading.Event()
+        epoch = self.check.epoch()
+
+        @contextmanager
+        def delayed_gate():
+            waiting.set()
+            release.wait(10)
+            with self.check.admit(epoch):
+                yield
+
+        with patch.object(self.store, "_clock", side_effect=clock):
+            first = asyncio.create_task(asyncio.to_thread(
+                self.store.authorize_session, token, VIEWER, admit=delayed_gate))
+            await self.until(waiting.is_set)
+            principal, _ = await asyncio.to_thread(
+                self.store.authorize_session, token, VIEWER, admit=lambda: self.check.admit(epoch))
+            release.set()
+            later, _ = await asyncio.wait_for(first, 10)
+        self.assertEqual(later.id, principal.id)
+
+    async def test_denied_session_read_commits_the_expiry_sweep(self):
+        """The in-transaction expiry sweep of a denied ``authorize_session``
+        rolls back with it; the post-denial sweep commits it, so an expired
+        session's binding is cleared."""
+        _, authenticator, _ = self.enroll()
+        token = self.token(await self.sign_in(authenticator))
+        self.ceremony_clock.advance(hours=13)
+        self.assertEqual(self.count(
+            "SELECT count(*) FROM access_sessions WHERE external_identity_binding IS NOT NULL"), 1)
+        with self.assertRaises(AccessValidationError):
+            await asyncio.to_thread(self.store.authorize_session, token, VIEWER, admit=self.gated())
+        self.assertEqual(self.count(
+            "SELECT count(*) FROM access_sessions WHERE external_identity_binding IS NOT NULL"), 0)
+        self.assertEqual(self.count("SELECT count(*) FROM access_sessions WHERE invalidated_at_us IS NULL"), 0)
+
+    async def test_denied_session_read_audits_a_binding_mismatch(self):
+        """A session read with another proxy identity is denied and the
+        mismatch is audited after the gate is released, never revoked."""
+        _, authenticator, _ = self.enroll()
+        token = self.token(await self.sign_in(authenticator))
+        action = "SELECT count(*) FROM security_admin_audit_records WHERE action='detect_session_proxy_identity_mismatch'"
+        self.assertEqual(self.count(action), 0)
+        with self.assertRaises(AccessValidationError):
+            await asyncio.to_thread(self.store.authorize_session, token, OTHER_LOGIN, admit=self.gated())
+        self.assertEqual(self.count(action), 1)
+        self.assertEqual(self.count("SELECT count(*) FROM access_sessions WHERE invalidated_at_us IS NOT NULL"), 0)
+        principal, _ = await asyncio.to_thread(self.store.authorize_session, token, VIEWER, admit=self.gated())
+        self.assertIsNotNone(principal)
 
 class RateLimitTests(HumanSurfaceFixture):
     async def test_unauthenticated_ceremony_requests_are_limited_per_source(self):
@@ -1095,8 +1175,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
         await self.stop_serving()
         with patch.object(self.check, "startup", side_effect=blocking_startup):
             task = asyncio.create_task(self.access.run())
-            while not started.is_set():
-                await asyncio.sleep(0.01)
+            await self.until(started.is_set)
             task.cancel()
             await asyncio.sleep(0.2)
             self.assertFalse(task.done())
@@ -1139,13 +1218,11 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
                     await asyncio.sleep(0.01)
                 self.assertTrue(check.access_open)
                 with patch.object(check, "tick", side_effect=blocking_tick):
-                    while not started.is_set():
-                        await asyncio.sleep(0.01)
+                    await self.until(started.is_set)
             order.append("lifespan stopped")
 
         task = asyncio.create_task(lifecycle())
-        while not started.is_set():
-            await asyncio.sleep(0.01)
+        await self.until(started.is_set)
         # Still blocked in the check: the shutdown has not moved on, and the
         # surface already denies although the check's verdict is open.
         await asyncio.sleep(0.2)
@@ -1175,8 +1252,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
         await self.stop_serving()
         # First lifespan, then shutdown: the open verdict stays behind.
         task = asyncio.create_task(self.access.run(sleep=short))
-        while self.access.stopped:
-            await asyncio.sleep(0.01)
+        await self.until(lambda: not self.access.stopped)
         self.access.stop()
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
@@ -1193,8 +1269,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
 
         with patch.object(self.check, "startup", side_effect=blocking_startup):
             task = asyncio.create_task(self.access.run(sleep=short))
-            while not started.is_set():
-                await asyncio.sleep(0.01)
+            await self.until(started.is_set)
             # In the window before startup() closed and re-evaluated the
             # gate: the stale open verdict serves nothing.
             self.assertTrue(self.check.access_open)
@@ -1202,8 +1277,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
             self.assertEqual(await call(self.surface, "GET", SESSION_PATH, cookie=cookie), expected)
             self.assertEqual(await call(self.surface, "POST", AUTHENTICATION_OPTIONS_PATH), expected)
             release.set()
-            while self.access.stopped:
-                await asyncio.sleep(0.01)
+            await self.until(lambda: not self.access.stopped)
         self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=cookie)), 200)
         self.access.stop()
         task.cancel()
@@ -1238,16 +1312,14 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
                 patch.object(self.check, "tick", side_effect=lambda: ticks.append(True)):
             task = asyncio.create_task(self.access.run(sleep=stepped))
             for expected_attempts in (1, 2):
-                while len(attempts) < expected_attempts or not sleeps.empty():
-                    await asyncio.sleep(0.01)
+                await self.until(lambda: len(attempts) >= expected_attempts and sleeps.empty())
                 await asyncio.sleep(0.05)
                 self.assertEqual(len(attempts), expected_attempts)
                 self.assertTrue(self.access.stopped)
                 self.assertTrue(self.check.access_open)
                 self.assertEqual(await call(self.surface, "GET", SESSION_PATH, cookie=cookie), expected)
                 sleeps.put_nowait(None)
-            while self.access.stopped:
-                await asyncio.sleep(0.01)
+            await self.until(lambda: not self.access.stopped)
             self.assertEqual(len(attempts), 3)
             self.assertEqual(ticks, [])
             self.assertEqual(status(await call(self.surface, "GET", SESSION_PATH, cookie=cookie)), 200)
@@ -1444,8 +1516,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
             task = asyncio.create_task(self.access.run(sleep=stepped))
             await until_serving()
             sleeps.put_nowait(None)
-            while not started.is_set():
-                await asyncio.sleep(0.01)
+            await self.until(started.is_set)
             self.access.stop()
             release.set()
             await asyncio.wait_for(task, 10)
@@ -1461,8 +1532,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
 
             with patch.object(self.check, "startup", side_effect=blocking_startup):
                 task = asyncio.create_task(self.access.run(sleep=stepped))
-                while not calls:
-                    await asyncio.sleep(0.01)
+                await self.until(lambda: bool(calls))
                 self.access.stop()
                 gate.set()
                 await asyncio.sleep(0.1)
@@ -1491,8 +1561,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
         with patch.object(self.check, "tick", return_value=None), \
                 patch.object(self.store, "end_expired_sessions", side_effect=blocking_sweep):
             task = asyncio.create_task(self.access.run(sleep=short))
-            while not started.is_set():
-                await asyncio.sleep(0.01)
+            await self.until(started.is_set)
             self.access.stop()
             task.cancel()
             await asyncio.sleep(0.2)

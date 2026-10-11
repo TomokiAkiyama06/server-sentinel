@@ -1330,6 +1330,19 @@ class HostnameReservationCheck:
         verification and no other lock of this check. In any process other
         than the one that built the gate it raises ``HumanAccessClosed``
         without taking the lock (Issue #181).
+
+        Every human data route must commit its authorization inside this
+        block, after taking ``epoch()`` (as ``AccessStore.authorize_session``
+        does). Reading ``access_open`` is not enough. A commit inside the
+        block may wait for the storage admission (up to one in-flight
+        monitoring job plus the SQLite busy timeout), and a closing check
+        waits for this lock, so ``access_open`` stays True for that long.
+        After the close, the check's enumerations (each under its
+        enumeration timeout) delay the exposure decision, its session
+        revocation and the Owner fault further. A route authorized by a bare
+        ``AccessStore.authorize()`` outside the gate could keep serving
+        through that window. Only an epoch-checked commit here is refused
+        once the close has run.
         """
         if not self._in_gate_process():
             raise HumanAccessClosed()

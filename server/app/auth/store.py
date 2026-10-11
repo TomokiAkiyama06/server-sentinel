@@ -646,14 +646,21 @@ class AccessStore:
         propagates before anything is read or written. The denial
         bookkeeping (expiry sweep, binding-mismatch audit) runs after the
         gate is released (Codex PR #219).
+
+        The request time is read after the gate, the storage admission and
+        the write transaction have been entered. Concurrent reads of the same
+        session commit their idle touch in this order, so a request that
+        waited for an earlier one is never refused because its time precedes
+        that request's ``last_seen`` (Claude review, PR #219).
         """
-        at = utc_time(self._clock() if now is None else now)
+        at = None
         mismatch: list = []
         try:
             with ExitStack() as gate:
                 if admit is not None:
                     gate.enter_context(admit())
                 connection = gate.enter_context(self._transaction(write=True))
+                at = utc_time(self._clock() if now is None else now)
                 self._end_expired_sessions_on(connection, at)
                 row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
                 if row is None:
@@ -671,6 +678,8 @@ class AccessStore:
                 self._touch_session_on(connection, row, at)
                 return principal, granted
         except AccessValidationError:
+            if at is None:
+                at = utc_time(self._clock() if now is None else now)
             self._end_expired_sessions_after_denial(at)
             self._record_binding_mismatch(mismatch, at)
             raise
