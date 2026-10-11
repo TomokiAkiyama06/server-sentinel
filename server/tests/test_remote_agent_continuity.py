@@ -4,18 +4,22 @@ These tests use in-process mocks only.  They do not claim any real LAN, TLS,
 camera, or transport-candidate behavior; see MANUAL_TEST.md section G.
 """
 
+import io
+import logging
 import threading
 import unittest
 from uuid import UUID
 
 from app.cameras.remote_agent.continuity import (
-    AgentSession, CommittedWatermark, ContinuityLimits, ContinuityTracker, DeliveryOutcome,
+    AgentSession, CommittedWatermark, ContinuityDiagnostics, ContinuityLimits,
+    ContinuityTracker, DeliveryOutcome,
     GapReason, MediaUnitHeader, SourceFlow, _MAXIMUM_ATTEMPT_STEPS, _record_attempt,
 )
 from app.cameras.remote_agent.ingest import (
     AgentAction, AgentIngestQueue, AgentMessage, DenyIngestAuthorizer, IngestLimits,
     IngestOutcome,
 )
+from app.logging import Event, SafeJsonFormatter
 
 NODES = tuple(UUID(int=n) for n in range(1, 6))
 SOURCES = tuple(UUID(int=n) for n in range(11, 16))
@@ -2214,6 +2218,161 @@ class AttemptStaircaseTests(unittest.TestCase):
                 self.assertGreaterEqual(kept, exact)
                 if covered >= attempts[-1][0] - _MAXIMUM_ATTEMPT_STEPS + 1:
                     self.assertEqual(exact, kept)
+
+
+CONTINUITY_LOGGER = "app.cameras.remote_agent.continuity"
+
+
+class ContinuityObservabilityTests(unittest.TestCase):
+    """Issue #113: evictions and ignored acknowledgements are never silent."""
+
+    def _tracker(self, *, released=1):
+        authorizer = Authorizer({(NODE, SOURCE), (NODE, OTHER_SOURCE)})
+        clock = Clock()
+        ingest = AgentIngestQueue(IngestLimits(8, 4, 32, 1000, 10 ** 12),
+                                  authorizer, clock_ns=clock)
+        tracker = ContinuityTracker(
+            ContinuityLimits(4, 4, 100, maximum_released_sources=released), authorizer,
+            ingest, clock_ns=clock, committed_watermark=no_watermark)
+        return tracker, ingest, authorizer, tracker.open_session(NODE)
+
+    @staticmethod
+    def _release(tracker, ingest, authorizer, session, source, sequence, *, fenced):
+        tracker.receive(session, unit(sequence, source=source), b"v")
+        ingest.drain(10)
+        if fenced:
+            with tracker.authorization_change(deactivated_source=source):
+                authorizer.pairs.discard((NODE, source))
+        else:
+            authorizer.pairs.discard((NODE, source))
+            tracker.forget_source(source)
+        authorizer.pairs.add((NODE, source))
+
+    @staticmethod
+    def _formatted(records):
+        formatter = SafeJsonFormatter()
+        return "\n".join(formatter.format(record) for record in records)
+
+    def test_initial_diagnostics_are_zero_counts(self):
+        tracker, _, _, _ = self._tracker(released=64)
+        self.assertEqual(ContinuityDiagnostics(0, 64, 0, 0, 0), tracker.diagnostics())
+
+    def test_released_eviction_is_counted_and_logged_rate_limited(self):
+        for fenced in (True, False):
+            with self.subTest(fenced=fenced):
+                tracker, ingest, authorizer, session = self._tracker(released=1)
+                with self.assertLogs(CONTINUITY_LOGGER, logging.DEBUG) as logged:
+                    for sequence in range(5):
+                        for source in (SOURCE, OTHER_SOURCE):
+                            self._release(tracker, ingest, authorizer, session,
+                                          source, sequence, fenced=fenced)
+                # Ten unacknowledged releases into one slot: nine evictions.
+                diagnostics = tracker.diagnostics()
+                self.assertEqual((1, 1, 9), (diagnostics.released_sources,
+                                             diagnostics.maximum_released_sources,
+                                             diagnostics.released_evictions))
+                # First and every doubling: evictions 1, 2, 4 and 8.
+                self.assertEqual([Event.CAPTURE_CONTINUITY_RELEASED_EVICTED] * 4,
+                                 [record.msg for record in logged.records])
+                self.assertEqual({logging.WARNING},
+                                 {record.levelno for record in logged.records})
+                output = self._formatted(logged.records)
+                for identity in (NODE, SOURCE, OTHER_SOURCE):
+                    self.assertNotIn(str(identity), output)
+                    self.assertNotIn(identity.hex, output)
+
+    def test_release_within_the_bound_is_not_an_eviction(self):
+        tracker, ingest, authorizer, session = self._tracker(released=2)
+        logger = logging.getLogger(CONTINUITY_LOGGER)
+        with self.assertNoLogs(logger, logging.DEBUG):
+            for source in (SOURCE, OTHER_SOURCE):
+                self._release(tracker, ingest, authorizer, session, source, 0,
+                              fenced=True)
+        self.assertEqual((2, 0), (tracker.diagnostics().released_sources,
+                                  tracker.diagnostics().released_evictions))
+
+    def test_node_mismatched_acknowledgement_is_counted_and_warned(self):
+        tracker, ingest, authorizer, session = self._tracker(released=4)
+        self._release(tracker, ingest, authorizer, session, SOURCE, 0, fenced=True)
+        with self.assertLogs(CONTINUITY_LOGGER, logging.DEBUG) as logged:
+            for _ in range(3):
+                tracker.acknowledge_persisted(
+                    SOURCE, CommittedWatermark(OTHER_NODE, 1, 9, 90))
+        self.assertEqual([Event.CAPTURE_CONTINUITY_ACK_NODE_MISMATCH] * 2,
+                         [record.msg for record in logged.records])
+        self.assertEqual({logging.WARNING}, {record.levelno for record in logged.records})
+        diagnostics = tracker.diagnostics()
+        self.assertEqual((3, 0), (diagnostics.ignored_acknowledgements_node_mismatch,
+                                  diagnostics.ignored_acknowledgements_unknown_source))
+        # The mismatched acknowledgement changed nothing: the entry is kept.
+        self.assertEqual(1, diagnostics.released_sources)
+        self.assertEqual(DeliveryOutcome.DUPLICATE,
+                         tracker.receive(session, unit(0), b"v").outcome)
+        output = self._formatted(logged.records)
+        for identity in (NODE, OTHER_NODE, SOURCE):
+            self.assertNotIn(str(identity), output)
+
+    def test_unknown_source_acknowledgement_is_counted_at_debug(self):
+        tracker, _, _, _ = self._tracker(released=4)
+        with self.assertLogs(CONTINUITY_LOGGER, logging.DEBUG) as logged:
+            for _ in range(4):
+                tracker.acknowledge_persisted(
+                    SOURCE, CommittedWatermark(NODE, 1, 0, 0))
+        self.assertEqual([Event.CAPTURE_CONTINUITY_ACK_UNKNOWN_SOURCE] * 3,
+                         [record.msg for record in logged.records])
+        self.assertEqual({logging.DEBUG}, {record.levelno for record in logged.records})
+        diagnostics = tracker.diagnostics()
+        self.assertEqual((0, 4), (diagnostics.ignored_acknowledgements_node_mismatch,
+                                  diagnostics.ignored_acknowledgements_unknown_source))
+        self.assertNotIn(str(SOURCE), self._formatted(logged.records))
+
+    def test_matching_acknowledgement_is_not_counted_as_ignored(self):
+        tracker, ingest, authorizer, session = self._tracker(released=4)
+        self._release(tracker, ingest, authorizer, session, SOURCE, 0, fenced=True)
+        logger = logging.getLogger(CONTINUITY_LOGGER)
+        with self.assertNoLogs(logger, logging.DEBUG):
+            tracker.acknowledge_persisted(SOURCE, CommittedWatermark(NODE, 1, 0, 0))
+        self.assertEqual(ContinuityDiagnostics(0, 4, 0, 0, 0), tracker.diagnostics())
+
+    def test_records_are_emitted_after_the_tracker_lock_is_released(self):
+        tracker, _, _, _ = self._tracker(released=4)
+        observed = []
+
+        class Probe(logging.Handler):
+            def emit(self, record):
+                # A handler that inspects the tracker must not deadlock.
+                observed.append(tracker.diagnostics().ignored_acknowledgements_unknown_source)
+
+        logger = logging.getLogger(CONTINUITY_LOGGER)
+        probe = Probe(logging.DEBUG)
+        previous = logger.level
+        logger.addHandler(probe)
+        logger.setLevel(logging.DEBUG)
+        try:
+            tracker.acknowledge_persisted(SOURCE, CommittedWatermark(NODE, 1, 0, 0))
+        finally:
+            logger.removeHandler(probe)
+            logger.setLevel(previous)
+        self.assertEqual([1], observed)
+
+    def test_failed_authorization_change_logs_nothing_and_counts_nothing(self):
+        tracker, ingest, authorizer, session = self._tracker(released=1)
+        self._release(tracker, ingest, authorizer, session, SOURCE, 0, fenced=True)
+        tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v")
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(SafeJsonFormatter())
+        logger = logging.getLogger(CONTINUITY_LOGGER)
+        logger.addHandler(handler)
+        try:
+            with self.assertRaises(RuntimeError):
+                with tracker.authorization_change(deactivated_source=OTHER_SOURCE):
+                    raise RuntimeError("commit failed")
+        finally:
+            logger.removeHandler(handler)
+        self.assertEqual("", stream.getvalue())
+        self.assertEqual((1, 0), (tracker.diagnostics().released_sources,
+                                  tracker.diagnostics().released_evictions))
 
 
 if __name__ == "__main__":
