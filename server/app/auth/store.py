@@ -1235,14 +1235,30 @@ class AccessStore:
         connection.execute("INSERT INTO access_webauthn_challenges (challenge_digest, ceremony, invitation_id, session_id, issued_at_us, expires_at_us) VALUES (?, ?, ?, ?, ?, ?)",
                            (digest, ceremony, invitation_id, session_id, _us(at), _us(at + lifetime)))
 
-    def issue_authentication_challenge(self, digest: bytes, *, at: datetime, lifetime: timedelta) -> None:
-        """Store the digest of an unbound sign-in challenge (discoverable credentials)."""
-        at = utc_time(at)
+    def _in_transaction_time(self, pinned: datetime | None) -> datetime:
+        """The decision time of a ceremony step, read inside its transaction.
+
+        Called only after the storage admission and ``BEGIN IMMEDIATE`` were
+        entered, so nothing is decided with a time read before a wait for
+        either (PR #234 review). ``pinned`` is for deterministic tests and
+        direct callers only; ``PasskeyCeremonies`` passes none.
+        """
+        return pinned if pinned is not None else utc_time(self._clock())
+
+    def issue_authentication_challenge(self, digest: bytes, *, at: datetime | None = None,
+                                       lifetime: timedelta) -> None:
+        """Store the digest of an unbound sign-in challenge (discoverable credentials).
+
+        Its issue and expiry times are read inside the transaction (see
+        ``_in_transaction_time``); ``at`` pins them for tests only.
+        """
+        pinned = None if at is None else utc_time(at)
         with self._transaction(write=True) as connection:
-            self._insert_challenge_on(connection, digest, "authentication", at, lifetime)
+            self._insert_challenge_on(connection, digest, "authentication",
+                                      self._in_transaction_time(pinned), lifetime)
 
     def begin_registration(self, enrollment_secret: object, proxy_identity: object, digest: bytes, *,
-                           at: datetime, lifetime: timedelta) -> RegistrationSubject:
+                           at: datetime | None = None, lifetime: timedelta) -> RegistrationSubject:
         """Bind a registration challenge to one valid invitation and count the attempt.
 
         The invitation is not redeemed here. An absent, unknown, expired,
@@ -1250,19 +1266,29 @@ class AccessStore:
         the generic denial and writes nothing. The enrollment secret alone
         selects the invitation; the proxy identity must be present and
         well-formed but is not compared with anything.
+
+        Validity includes the boot-clock check (``app.auth.boot_clock``): the
+        wall-clock and boot-clock readings are taken as one pair inside the
+        transaction, after the storage-admission and lock waits and right
+        before the decision (PR #234 review, as in ``enroll_credential``), so
+        an invitation that expired, or a wall clock stepped back, during such
+        a wait is refused and nothing is written. The challenge's issue and
+        expiry times are that same reading. ``at`` pins the wall reading for
+        deterministic tests only; a ceremony passes none.
         """
-        at = utc_time(at)
+        pinned = None if at is None else utc_time(at)
         try:
             _digest(enrollment_secret)
             _identity(proxy_identity)
         except AccessValidationError:
             raise AccessValidationError("access is unavailable") from None
-        # Read next to the caller's wall-clock reading, before any lock wait.
-        instant = self._boot_instant()
         with self._transaction(write=True) as connection:
             row = self._invitation_row_on(connection, enrollment_secret,
                                           "i.*, p.display_name, p.status, p.authorization_revision")
             state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
+            # One pair, sampled together here where the decision is made.
+            at = self._in_transaction_time(pinned)
+            instant = self._boot_instant()
             if not self._redeemable(row, state, at, instant):
                 raise AccessValidationError("access is unavailable")
             counted = connection.execute("UPDATE access_invitations SET attempt_count=attempt_count+1 WHERE id=? AND attempt_count < ? AND redeemed_at_us IS NULL",
@@ -1279,17 +1305,21 @@ class AccessStore:
                 "AND inconsistent_at_us IS NULL ORDER BY enrolled_at_us", (row["principal_id"],)))
             return RegistrationSubject(UUID(row["id"]), UUID(row["principal_id"]), row["display_name"], excluded)
 
-    def consume_challenge(self, digest: bytes, ceremony: str, *, at: datetime) -> ConsumedChallenge:
+    def consume_challenge(self, digest: bytes, ceremony: str, *, at: datetime | None = None) -> ConsumedChallenge:
         """Delete a pending challenge exactly once and return its binding.
 
         The challenge is removed whether or not the ceremony later verifies, so
         a failed attempt cannot be retried with it. A challenge used outside
-        its issue-to-expiry window, or for another ceremony, is refused.
+        its issue-to-expiry window, or for another ceremony, is refused. The
+        window is checked at a time read inside the transaction (see
+        ``_in_transaction_time``), so a challenge that expired during a lock
+        or admission wait is refused; ``at`` pins it for tests only.
         """
-        at = utc_time(at)
+        pinned = None if at is None else utc_time(at)
         if not isinstance(digest, bytes) or len(digest) != 32 or ceremony not in ("registration", "authentication", "step_up"):
             raise AccessValidationError("access is unavailable")
         with self._transaction(write=True) as connection:
+            at = self._in_transaction_time(pinned)
             row = connection.execute("DELETE FROM access_webauthn_challenges WHERE challenge_digest=? AND ceremony=? RETURNING invitation_id, session_id, issued_at_us, expires_at_us",
                                      (digest, ceremony)).fetchone()
             row = None if row is None else dict(row)
@@ -1299,16 +1329,20 @@ class AccessStore:
                                  None if row["session_id"] is None else UUID(row["session_id"]))
 
     def begin_step_up(self, token: object, proxy_identity: object, digest: bytes, *,
-                      at: datetime, lifetime: timedelta) -> bytes:
+                      at: datetime | None = None, lifetime: timedelta) -> bytes:
         """Bind a step-up challenge to a current Owner session and return its credential id.
 
         The returned id is the only entry of the challenge's allowed-credential
         list; ``accept_assertion`` refuses an assertion from any other credential.
+        The session is judged current at a time read inside the transaction
+        (see ``_in_transaction_time``); ``at`` pins it for tests only.
         """
-        at = utc_time(at)
+        pinned = None if at is None else utc_time(at)
+        at = None
         mismatch: list = []
         try:
             with self._transaction(write=True) as connection:
+                at = self._in_transaction_time(pinned)
                 self._end_expired_sessions_on(connection, at)
                 row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
                 if row is None or row["role"] != PrincipalRole.OWNER.value:
@@ -1316,6 +1350,8 @@ class AccessStore:
                 self._insert_challenge_on(connection, digest, "step_up", at, lifetime, session_id=row["id"])
                 return bytes(row["credential_id"])
         except AccessValidationError:
+            if at is None:
+                at = self._in_transaction_time(pinned)
             self._end_expired_sessions_after_denial(at)
             self._record_binding_mismatch(mismatch, at)
             raise
@@ -1358,7 +1394,8 @@ class AccessStore:
         return tuple(self._credential(row) for row in rows)
 
     def accept_assertion(self, credential_id: bytes, principal_id: UUID, proxy_identity: str, *,
-                         expected_sign_count: int, sign_count: int, backup_state: bool, at: datetime,
+                         expected_sign_count: int, sign_count: int, backup_state: bool,
+                         at: datetime | None = None,
                          token: bytes | None = None, step_up_session_id: UUID | None = None) -> UUID:
         """Commit a verified assertion: counter, backup state, last use and its session effect.
 
@@ -1373,13 +1410,20 @@ class AccessStore:
         recorded as the principal's last observed value and, for a new
         session, bound into it. A step-up must present the identity its
         session is bound to.
+
+        The commit time (last use, the new session's start and verification
+        time, the step-up verification time and the step-up session's expiry
+        checks) is read inside the transaction (see ``_in_transaction_time``),
+        so a session that expired during a lock or admission wait is refused,
+        not refreshed; ``at`` pins it for tests only.
         """
         if (token is None) == (step_up_session_id is None):
             raise AccessValidationError("access is unavailable")
-        at = utc_time(at)
+        pinned = None if at is None else utc_time(at)
         identity = _identity(proxy_identity)
 
         def write(connection, mark):
+            at = self._in_transaction_time(pinned)
             row = connection.execute("SELECT c.sign_count, c.revoked_at_us, c.inconsistent_at_us, c.backup_eligible, p.role, p.status FROM access_credentials c JOIN access_principals p ON p.id=c.principal_id WHERE c.credential_id=? AND c.principal_id=?",
                                      (credential_id, str(principal_id))).fetchone()
             if (row is None or row["status"] != PrincipalStatus.ACTIVE.value or row["revoked_at_us"] is not None

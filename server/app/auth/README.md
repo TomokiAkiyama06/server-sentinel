@@ -809,11 +809,14 @@ Clock continuity (Owner decision 2026-10-11, `boot_clock.py`). At issuance
 `issue_enrollment_on` records the kernel boot id
 (`/proc/sys/kernel/random/boot_id`) and `CLOCK_BOOTTIME` next to the
 wall-clock issue and expiry times; if either cannot be read it issues nothing
-(`InvitationClockUnavailable`). Both redemption steps read them again, each
-time as one pair with the wall-clock reading they are compared with (options:
-taken together just before its transaction; finish: taken together inside the
-redemption transaction, after every gate, storage-admission and lock wait, so
-a slow commit path is never read as a rollback, PR #234 review), and require,
+(`InvitationClockUnavailable`). Both redemption steps (options and finish)
+read them again, each time as one pair with the wall-clock reading they are
+compared with, taken together inside the step's own transaction right before
+the decision, after every gate, storage-admission and lock wait (PR #234
+review): a slow commit path is never read as a rollback, and an invitation
+that expired, or a wall clock stepped back, during such a wait is refused
+(options then counts no attempt, stores no challenge and returns no display
+name). They require,
 besides the wall-clock window: on the same boot, a monotonic elapsed time that
 is `>= 0` and below the lifetime, and a wall-clock elapsed time that does not
 lag it by more than 30 seconds (the allowance for the instant between the two
@@ -824,6 +827,17 @@ ends the code earlier. After a reboot the readings are not comparable and the
 wall-clock window decides (a rollback across a reboot is not detectable). A
 row without the pair, or a host where it cannot be read now, is refused. Every
 refusal is the generic denial.
+
+Decision time of the other ceremony steps (PR #234 review). The same rule
+applies to every store step a `PasskeyCeremonies` request commits:
+`issue_authentication_challenge`, `consume_challenge`, `begin_step_up` and
+`accept_assertion` read the wall clock inside their own transaction, after the
+storage admission and the SQLite write lock, so a challenge that expired, or
+an Owner session whose idle or absolute lifetime ended, during such a wait is
+refused rather than consumed or refreshed; stored times (challenge issue and
+expiry, last use, session start, step-up verification) are that same reading.
+The ceremonies pass no time to these steps; the `at`/`now` arguments pin the
+reading for deterministic tests and direct callers only.
 
 Rate limit (Owner decision D4, `rate_limit.redemption_rate_limiter`): a
 separate `SourceRateLimiter` keyed by the verified proxy identity: per

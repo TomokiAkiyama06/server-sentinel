@@ -6,12 +6,13 @@ passing these tests is not evidence of real browser/authenticator behavior;
 see MANUAL_TEST.md for that.
 """
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -53,6 +54,26 @@ class Clock:
 
     def advance(self, **delta):
         self.value += timedelta(**delta)
+
+
+def microseconds(value):
+    return (value - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1)
+
+
+def waiting(store, name, wait):
+    """Enter the store's next (write) transaction of ``name`` only after
+    ``wait()``: a storage-admission or SQLite lock wait (PR #234 review)."""
+    original = getattr(store, name)
+    pending = [wait]
+
+    @contextmanager
+    def slow(*args, **kwargs):
+        if pending and (name != "_transaction" or kwargs.get("write") or (args and args[0])):
+            pending.pop()()
+        with original(*args, **kwargs) as connection:
+            yield connection
+
+    return patch.object(store, name, slow)
 
 
 class Findings:
@@ -382,6 +403,26 @@ class AuthenticationTests(CeremonyTestCase):
         self.assertGenericDenial(lambda: self.ceremonies.finish_authentication(VIEWER, response))
         self.assertEqual(self.count("SELECT count(*) FROM access_sessions"), 1)
 
+    def test_a_challenge_that_expired_during_the_consume_wait_is_refused(self):
+        # PR #234 review: the window was checked at a time read before the
+        # storage admission and SQLite write lock of ``consume_challenge``.
+        request = self.ceremonies.begin_authentication()
+        response = self.authenticator.assertion(request)
+        self.clock.advance(minutes=4)
+        with waiting(self.store, "_transaction", lambda: self.clock.advance(minutes=2)):
+            self.assertGenericDenial(lambda: self.ceremonies.finish_authentication(VIEWER, response))
+        self.assertEqual(self.count("SELECT count(*) FROM access_sessions"), 0)
+        self.assertEqual(self.count("SELECT count(*) FROM access_webauthn_challenges"), 0)
+
+    def test_sign_in_after_a_long_wait_inside_the_challenge_window(self):
+        request = self.ceremonies.begin_authentication()
+        response = self.authenticator.assertion(request)
+        self.clock.advance(minutes=1)
+        with waiting(self.store, "_transaction", lambda: self.clock.advance(minutes=3)):
+            grant = self.ceremonies.finish_authentication(VIEWER, response)
+        established = self.count("SELECT established_at_us FROM access_sessions WHERE id=?", str(grant.session_id))
+        self.assertEqual(established, microseconds(self.clock()))
+
     def test_failed_attempt_burns_its_challenge(self):
         request = self.ceremonies.begin_authentication()
         self.assertGenericDenial(lambda: self.ceremonies.finish_authentication(
@@ -559,6 +600,43 @@ class StepUpTests(CeremonyTestCase):
         self.store.establish_session(self.owner_principal.id, self.owner_key.credential_id, token, proxy_identity=OWNER)
         with self.assertRaises(StepUpRequired):
             self.ceremonies.authorize_owner_operation(token, OWNER)
+
+    def test_a_session_that_expired_during_the_commit_wait_is_not_refreshed(self):
+        # PR #234 review: the step-up commit time was read before storage
+        # admission and the SQLite write lock, so a session whose idle
+        # lifetime ended during that wait was accepted and its idle expiry
+        # pushed forward. The time is now read inside the transaction.
+        self.clock.advance(minutes=28)
+        before = (self.verification_time(), self.count(
+            "SELECT idle_expires_at_us FROM access_sessions WHERE id=?", str(self.grant.session_id)))
+        actions = self.audit_actions()
+        request = self.ceremonies.begin_step_up(self.grant.token, OWNER)
+        response = self.owner_key.assertion(request)
+        with waiting(self.store, "_audited_transaction", lambda: self.clock.advance(minutes=3)):
+            self.assertGenericDenial(lambda: self.ceremonies.finish_step_up(self.grant.token, OWNER, response))
+        self.assertEqual(before, (self.verification_time(), self.count(
+            "SELECT idle_expires_at_us FROM access_sessions WHERE id=?", str(self.grant.session_id))))
+        self.assertEqual(self.audit_actions(), actions)
+        self.assertGenericDenial(lambda: self.ceremonies.authorize_owner_operation(self.grant.token, OWNER))
+
+    def test_a_long_commit_wait_inside_the_session_lifetimes_steps_up(self):
+        self.clock.advance(minutes=6)
+        request = self.ceremonies.begin_step_up(self.grant.token, OWNER)
+        response = self.owner_key.assertion(request)
+        with waiting(self.store, "_audited_transaction", lambda: self.clock.advance(minutes=3)):
+            self.ceremonies.finish_step_up(self.grant.token, OWNER, response)
+        # The verification time is the post-wait, in-transaction reading.
+        self.assertEqual(self.verification_time(), microseconds(self.clock()))
+        self.assertEqual(self.ceremonies.authorize_owner_operation(self.grant.token, OWNER).id,
+                         self.owner_principal.id)
+
+    def test_begin_step_up_judges_the_session_after_the_wait(self):
+        self.clock.advance(minutes=28)
+        actions = self.audit_actions()
+        with waiting(self.store, "_transaction", lambda: self.clock.advance(minutes=3)):
+            self.assertGenericDenial(lambda: self.ceremonies.begin_step_up(self.grant.token, OWNER))
+        self.assertEqual(self.count("SELECT count(*) FROM access_webauthn_challenges WHERE ceremony='step_up'"), 0)
+        self.assertEqual(self.audit_actions(), actions)
 
     def test_revoked_session_credential_cannot_be_revived_by_step_up(self):
         self.clock.advance(minutes=6)

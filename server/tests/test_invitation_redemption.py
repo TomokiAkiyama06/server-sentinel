@@ -8,8 +8,8 @@ browser, Tailscale, proxy or real authenticator is involved.
 """
 
 import asyncio
-from contextlib import closing
-from datetime import timedelta
+from contextlib import closing, contextmanager
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import secrets
@@ -598,6 +598,64 @@ class InvitationClockTests(RedemptionFixture):
             self.assertEqual(await self.finish(code, credential), expected)
         self.assertEqual(self.count("SELECT count(*) FROM access_credentials"), 0)
         self.assertEqual(self.count(REDEEMED), 0)
+
+    def waiting_store(self, wait):
+        """The next store write transaction is entered only after ``wait()``:
+        a storage-admission or SQLite lock wait (Codex P2 on PR #234)."""
+        original = self.store._transaction
+        pending = [wait]
+
+        @contextmanager
+        def slow(write=False):
+            if write and pending:
+                pending.pop()()
+            with original(write=write) as connection:
+                yield connection
+
+        return patch.object(self.store, "_transaction", slow)
+
+    def options_state(self, principal):
+        return (self.count(f"SELECT attempt_count FROM access_invitations WHERE principal_id='{principal.id}'"),
+                self.count("SELECT count(*) FROM access_webauthn_challenges"))
+
+    async def test_options_refuse_an_invitation_that_expired_during_the_wait(self):
+        """Codex P2 on PR #234: the options step read its wall and boot clocks
+        before storage admission and ``BEGIN IMMEDIATE``, so an invitation
+        that expired during that wait was still accepted, counted an attempt,
+        stored a challenge and returned the invitee's display name."""
+        expected = await self.denial()
+        principal, code = self.invite()
+        self.elapse(hours=23, minutes=58)
+        with self.waiting_store(lambda: self.elapse(minutes=5)):
+            response = await self.options(code)
+        self.assertEqual(response, expected)
+        self.assertNotIn("Synthetic invitee", repr(response))
+        self.assertEqual(self.options_state(principal), (0, 0))
+
+    async def test_options_refuse_a_rollback_during_the_wait(self):
+        expected = await self.denial()
+        principal, code = self.invite()
+        # Five minutes pass during the wait, and the wall clock is stepped
+        # back by them: it reads the same time while the boot clock moved on.
+        with self.waiting_store(lambda: self.boot.advance(minutes=5)):
+            response = await self.options(code)
+        self.assertEqual(response, expected)
+        self.assertNotIn("Synthetic invitee", repr(response))
+        self.assertEqual(self.options_state(principal), (0, 0))
+
+    async def test_options_accept_a_long_wait_while_the_code_stays_valid(self):
+        principal, code = self.invite()
+        self.elapse(hours=23, minutes=50)
+        with self.waiting_store(lambda: self.elapse(minutes=5)):
+            begun = await self.options(code)
+        self.assertEqual(status(begun), 200)
+        self.assertEqual(payload(begun)["user"]["displayName"], "Synthetic invitee")
+        self.assertEqual(self.options_state(principal), (1, 1))
+        # The challenge carries the in-transaction (post-wait) time.
+        after_wait = (self.ceremony_clock() - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1)
+        self.assertEqual(self.count("SELECT issued_at_us FROM access_webauthn_challenges"), after_wait)
+        credential = SyntheticAuthenticator().register(payload(begun), origin=ORIGIN, rp_id=HOST)
+        self.assertEqual(status(await self.finish(code, credential)), 204)
 
     async def test_monotonic_elapsed_beyond_the_lifetime_or_negative_refuses(self):
         expected = await self.denial()
