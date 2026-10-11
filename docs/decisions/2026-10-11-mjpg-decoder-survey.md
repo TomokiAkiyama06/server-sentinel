@@ -47,6 +47,47 @@ The adoption PR must do all of the following; until it does, MJPG stays
 
 The decoder-independent rules below still apply in full.
 
+### Process isolation (Owner decision 2026-10-11, PR #225 Option 1)
+
+On review of the adoption PR the Owner chose to implement rule 4 in the same
+PR: the native simplejpeg / libjpeg-turbo decode runs in a separate resident
+child process per MJPG source, never inside the Main process. Implemented in
+`server/app/detection/roi/mjpg_worker.py` (supervisor, Main side) and
+`mjpg_child.py` (child program), mirroring the isolated inference worker
+(`server/app/detection/foundation/isolation.py`):
+
+- the structural pre-check (rule 2) stays in Main, in pure Python; only the
+  validated bytes up to `EOI` are sent to the child over a private `AF_UNIX`
+  socketpair, bounded by the frame-size limit;
+- the child is started by fork+exec of the service interpreter
+  (`python -I -B mjpg_child.py`, no `preexec_fn`) from the scene worker thread,
+  with a minimal explicit environment (one BLAS/OpenMP thread), stdio on
+  `/dev/null` and only its socket inherited; before importing simplejpeg/numpy
+  it sets `no_new_privs`, parent-death `SIGKILL`, non-dumpable, nice 10 and
+  equal soft/hard `RLIMIT_AS` (256 MiB default), `RLIMIT_NOFILE`,
+  `RLIMIT_NPROC=0`, `RLIMIT_CORE=0`, `RLIMIT_FSIZE=0`, and verifies the
+  imported versions; same unprivileged service account, no seccomp/Landlock
+  (the inference worker uses neither);
+- each exchange has a hard deadline (500 ms default, transfer included); a
+  crash, kill (including OOM), exit, timeout (child killed) or malformed reply
+  is `unknown` for that frame (rule 1 / item 6), a replacement starts after a
+  bounded exponential backoff, and repeated failures lower the source to
+  `degraded`; shutdown kills and reaps every child within the scene stop
+  bounds.
+
+This is fault isolation of the Main process (sessions, database, capture),
+not an untrusted-code sandbox: a compromised child keeps the service account's
+filesystem view inside the systemd unit and could return wrong pixels.
+
+### Decoder version follow-up
+
+simplejpeg 1.9.0 bundles libjpeg-turbo 3.1.2. Upstream libjpeg-turbo has
+released 3.1.3 and 3.1.4 since; their change logs have **not** been reviewed in
+this PR for security-relevant decoder fixes. Checking them (and whether a newer
+simplejpeg wheel bundles them) is a follow-up before or soon after enabling
+MJPG on a production host; until then the pinned 3.1.2 is what runs, isolated
+as above.
+
 ### License gate record for the adoption (Issue #217)
 
 For item 3 the Owner approved `IJG` **for this component only**, as an exact

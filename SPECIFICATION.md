@@ -1034,12 +1034,31 @@ bound reports the runtime `degraded` (`recorder_stalled`).
 Without a stored calibration whose reference frame can be re-bound, a source
 stays inactive and `unknown`; no baseline is taken from live frames. Local
 capture is read as uncompressed `GREY`/`YUYV` or, since Issue #217 (Owner
-decision 2026-10-11), as `MJPG` through the reviewed simplejpeg decoder on the
-scene worker: a structural pre-check (SOI, one baseline scan ending in a single
-EOI, bounded padding, SOF dimensions equal to the negotiated format within a
-pixel budget) runs before decoding, decoding is strict, and any refusal,
-decoder error, mid-grey undecoded band or slow decode is `unknown`
-(`frame_undecodable`); other compressed formats stay `unknown`. Poor quality, undecodable frames,
+decision 2026-10-11), as `MJPG` through the reviewed simplejpeg decoder: a
+structural pre-check in the Main process (flat byte buffer, SOI, one baseline
+scan ending in a single EOI, bounded padding, SOF dimensions equal to the
+negotiated format within a pixel budget) runs on the scene worker before any
+native code sees the bytes, and the strict decode itself runs only in a
+separate, per-source, resident decode child process (Owner decision
+2026-10-11 on PR #225), never in the Main process. The child is started by
+fork+exec of the service interpreter (`python -I -B`) from the scene worker
+thread with a minimal environment and only a private `AF_UNIX` socketpair
+inherited; before importing the decoder it sets `no_new_privs`, a parent-death
+`SIGKILL`, non-dumpable, a lower CPU priority and equal soft/hard rlimits
+(address space, descriptors, no new process, no core, no file writes), and it
+runs as the same unprivileged service account. Every exchange has a hard
+per-frame deadline that covers the transfer. Any pre-check refusal, strict
+decode error, decoded-shape mismatch or mid-grey undecoded band, and any child
+crash, kill (including OOM), exit, timeout (the child is killed) or malformed
+reply is `unknown` (`frame_undecodable`, counted per fixed reason in
+`undecodable_reasons`); a replacement child starts only after a bounded
+exponential backoff during which frames are refused without waiting, and
+repeated child failures lower the source (and the runtime) to `degraded`
+(`frame_decoder_failing`, logged value-free). A missing or differently
+versioned decoder keeps the source inactive (`frame_decoder_unavailable`).
+`stop()` kills and reaps every decode child within the scene stop bounds.
+Decode success does not prove frame integrity. `capture_luma_layout()` must be
+given the driver-negotiated profile. Other compressed formats stay `unknown`. Poor quality, undecodable frames,
 backpressure, camera loss and stale conclusions are `unknown`, never a
 negative. A camera loss that arrives while staging has no room is held as
 backpressure and processed after staging drains, never dropped as a

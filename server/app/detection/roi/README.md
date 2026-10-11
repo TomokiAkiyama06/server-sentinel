@@ -125,38 +125,93 @@ It fails closed:
   cannot take a full batch), a camera-state loss, or a conclusion older than the
   calibrated sampling gap is `unknown`, never "no movement" or "no tamper".
 
-`capture_luma_layout()` picks the reader for the driver-negotiated format.
-Packed uncompressed `GREY`/`YUYV` is read by nearest-sample luma decimation
-(byte slicing) to the reference size. `MJPG` is read by `MjpgLumaLayout`
-(`mjpg.py`, Issue #217, Owner decision 2026-10-11: simplejpeg 1.9.0 with
-statically linked libjpeg-turbo 3.1.2 and numpy 2.3.5), only on the scene
-worker, never on a capture thread:
+`capture_luma_layout()` picks the reader for the driver-negotiated format; when
+it is wired to local UVC capture it must receive the negotiated profile, never
+the requested one. Packed uncompressed `GREY`/`YUYV` is read by nearest-sample
+luma decimation (byte slicing) to the reference size. `MJPG` is read by
+`MjpgLumaLayout` (`mjpg.py`, Issue #217, Owner decision 2026-10-11: simplejpeg
+1.9.0 with statically linked libjpeg-turbo 3.1.2 and numpy 2.3.5), only on the
+scene worker, never on a capture thread, and the native decoder runs only in a
+separate child process (Owner decision 2026-10-11 on PR #225), never in the Main
+process:
 
-- a pure-Python pre-check runs before any native code sees the bytes: `SOI`
-  first, a bounded marker count and payload size, exactly one baseline or
-  extended-sequential Huffman `SOF` whose width/height equal the negotiated
-  format and fit the 3840x2160 pixel budget (a decompression-bomb header is
-  refused before the decoder allocates), one interleaved scan ending in a
-  single `EOI`, and at most `maximum_trailing_bytes` (provisionally 8192) of
-  padding after it with no further `SOI`/`EOI`;
-- decoding uses simplejpeg `strict=True` (libjpeg warnings such as a premature
-  end of data or extraneous bytes raise) to luma with the accurate integer IDCT
-  and libjpeg DCT scaling to the smallest power of two (1/8 to 1) whose output
-  decimates exactly to the reference, then nearest-sample decimation;
-- the decoded shape and type are checked, a decode whose trailing MCUs (one
-  MCU row's worth, in scan order) are all exactly 128 — the band libjpeg leaves
-  after stopping a scan early — is refused, and so is a decode slower than
-  250 ms.
+- a pure-Python pre-check in Main runs before any native code sees the bytes:
+  a flat byte buffer (a non-contiguous or multi-dimensional `memoryview` is
+  refused), `SOI` first, a bounded marker count and payload size, exactly one
+  baseline or extended-sequential Huffman `SOF` whose width/height equal the
+  negotiated format and fit the 3840x2160 pixel budget (a decompression-bomb
+  header is refused before the decoder allocates), one interleaved scan ending
+  in a single `EOI`, and at most `maximum_trailing_bytes` (provisionally 8192)
+  of padding after it with no further `SOI`/`EOI`. Only the validated bytes up
+  to `EOI` are sent to the child;
+- each MJPG source has its own resident decode child (`mjpg_worker.py`
+  supervising `mjpg_child.py`), started with fork+exec of the service's
+  interpreter (`python -I -B`, no `preexec_fn`) on the scene worker thread at
+  the source's first frame, with an explicit minimal environment (only
+  `LC_ALL=C` and one BLAS/OpenMP thread), stdio on `/dev/null` and only one
+  private `AF_UNIX` socketpair end inherited. Before importing simplejpeg or
+  numpy the child sets `no_new_privs`, a parent-death `SIGKILL` (and checks
+  that its parent is still the Main process), non-dumpable, nice 10, and equal
+  soft/hard `RLIMIT_AS` (default 256 MiB), `RLIMIT_NOFILE` (16),
+  `RLIMIT_NPROC=0`, `RLIMIT_CORE=0` and `RLIMIT_FSIZE=0`; it checks the
+  imported simplejpeg/numpy versions against the pins and opens no socket or
+  file afterwards. It runs as the same unprivileged service account inside the
+  same systemd unit; seccomp / Landlock are not used (the isolated inference
+  worker does not use them either), so this is fault isolation, not an
+  untrusted-code sandbox;
+- the child decodes with simplejpeg `strict=True` (libjpeg warnings such as a
+  premature end of data or extraneous bytes raise) to luma with the accurate
+  integer IDCT and libjpeg DCT scaling to the smallest power of two (1/8 to 1)
+  whose output decimates exactly to the reference, checks the decoded shape and
+  type, refuses a decode whose trailing MCUs (one MCU row's worth, in scan
+  order) are all exactly 128 — the band libjpeg leaves after stopping a scan
+  early — and returns the nearest-sample-decimated luma at the reference size;
+- Main checks the reply's type, request id and exact pixel count. Each
+  exchange (frame transfer included) has a hard deadline (default 500 ms): a
+  child that has not replied is killed. A crash, a kill (including an OOM
+  kill), a non-zero exit, a timeout, or a malformed, oversized or mismatched
+  reply kills and reaps the child and refuses that frame; a replacement starts
+  only after an exponential backoff (1 s doubling to 30 s), and frames during
+  the backoff are refused at once (`decoder_unavailable`), never waited on.
+  After 3 consecutive child failures the source is `degraded`
+  (`frame_decoder_failing`, which also lowers the runtime) and
+  `scene_frame_decoder_failing` is logged once (value-free);
+  one successful exchange clears it (`scene_frame_decoder_recovered`). A
+  refusal by a healthy child (strict decode error, shape mismatch, band) is not
+  a child failure. One source's child failing never refuses another source's
+  frames.
 
 Every refusal is `frame_undecodable` (counted in `unusable`, the episode ends,
-movement and tamper are `unknown`), and a missing or differently versioned
-decoder keeps the source inactive (`frame_decoder_unavailable`). Decode success
-does not prove integrity: a bit flip that keeps the entropy-coded syntax valid
-gives locally wrong pixels that no check here detects. A calibration reference
-for an `MJPG` source must be produced through the same reader (same decoder,
-scale and decimation); the Owner calibration route (#10) does not exist yet.
-Real EMEET C960 frames (DHT presence, bytes after `EOI`, decode time, decoding
-inside the systemd sandbox) are still to be checked (`MANUAL_TEST.md`).
+movement and tamper are `unknown`), with value-free per-reason counts in the
+source status (`undecodable_reasons`, the fixed `MjpgFrameRejected` reasons)
+and child failures in `decoder_failures`. A missing or differently versioned
+decoder (package metadata; Main never imports simplejpeg or numpy) keeps the
+source inactive (`frame_decoder_unavailable`) and starts no child. `stop()`
+lets a running child serve the final worker pass but starts no new one, kills
+every child once the worker has ended (or its bound expired) and reaps them
+within a 1 s bound inside the usual stop bounds (worker 5 s + delivery 5 s); a
+child that cannot be reaped makes the stop `stop_failed`.
+
+Decode success does not prove integrity. A corruption that keeps the
+entropy-coded syntax decodable can give substantially wrong pixels, not only
+locally wrong ones: in a synthetic mutation run during the PR #225 review
+(entropy-segment byte insertions/deletions) about 10% of the mutants decoded without any refusal
+while more than 5% of their pixels differed by more than 16 (worst cases 30–89%
+of the frame), including a bottom band clamped to 0 by a DC desync that the
+exactly-128 band check does not see. The band check is deliberately **not**
+extended to 0 or 255: that would also refuse a covered or dark lens and hide
+camera tamper. The quality gate and the detector's temporal confirmation still
+apply, and the real-scene rate of such frames is a `MANUAL_TEST.md` item. The
+band check is also a heuristic in the other direction: a real scene whose
+trailing MCUs are exactly 128 (a uniform mid-grey area at the bottom right)
+is refused as `undecoded_band` (fail-closed `unknown`).
+
+A calibration reference for an `MJPG` source must be produced through the same
+reader (same decoder, scale and decimation); the Owner calibration route (#10)
+does not exist yet, and recording the reader identity in the calibration
+metadata is a follow-up for it. Real EMEET C960 frames (DHT presence, bytes
+after `EOI`, decode time, refusal rates, the decode child inside the systemd
+sandbox) are still to be checked (`MANUAL_TEST.md`).
 
 A local `offline` or `manual_intervention_required`
 camera state is a trusted source loss and can correlate with a just-tracked

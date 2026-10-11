@@ -1152,9 +1152,11 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
 
 ### Issue #217 MJPG decoder on real C960 frames (pending physical execution)
 
-`MjpgLumaLayout` (simplejpeg 1.9.0, Owner decision 2026-10-11) is verified only
-with synthetic, generated JPEGs in a network-less container
-(`server/tests/test_scene_mjpg.py`). Real camera frames show a real room: keep
+`MjpgLumaLayout` (simplejpeg 1.9.0, Owner decision 2026-10-11) and its per-source
+decode child process (`mjpg_worker.py` / `mjpg_child.py`, Owner decision
+2026-10-11 on PR #225) are verified only with synthetic, generated JPEGs and
+synthetic stand-in children in a network-less, CPU-limited container as an
+unprivileged user (`server/tests/test_scene_mjpg.py`). Real camera frames show a real room: keep
 any captured frame in memory or in a private, non-repository temporary
 directory, delete it after the check, and record only the aggregate numbers
 below (no image, no hash of an image, no host/serial values). On the Main host
@@ -1170,20 +1172,52 @@ with each EMEET C960 negotiated as `MJPG` (1080p30 and 720p30), still to do:
   (the code default 8192 is provisional) and confirm no real frame is refused
   as `trailing_bytes_exceeded` / `trailing_marker`;
 - [ ] **other pre-check refusals**: count of real frames refused by any
-  pre-check or strict-decode reason over 10 minutes per camera (expected 0
-  apart from genuine transfer errors; a systematic refusal means the camera's
-  MJPG differs from the reviewed shape and must be reported, not relaxed
-  silently);
+  pre-check or strict-decode reason over 10 minutes per camera, from the
+  source status `undecodable_reasons` (expected 0 apart from genuine transfer
+  errors; a systematic refusal means the camera's MJPG differs from the
+  reviewed shape and must be reported, not relaxed silently);
+- [ ] **post-check refusal rates on real scenes**: over at least 30 minutes per
+  camera, in a lit and in a dark room, the counts of the post-decode reasons
+  `undecoded_band` (exactly-128 trailing MCUs; a real uniform mid-grey area at
+  the bottom right is a known false positive), `decoded_shape_mismatch` and
+  `decoder_timeout` (the per-frame deadline, which replaces the earlier
+  in-process `decode_too_slow` check), plus `decoder_crashed` /
+  `decoder_protocol` (expected 0);
+- [ ] **garbled-but-decoded rate**: with the camera fixed on a static scene,
+  the fraction of decoded samples whose luma differs from the median of their
+  neighbours by more than 16 on more than 5% of pixels (synthetic entropy
+  mutants showed about 10% such frames, including a bottom band clamped to 0
+  that the band check does not refuse). Record only the aggregate rate; a
+  non-zero rate means the quality gate / temporal confirmation must absorb it
+  and is reported to the Owner, not hidden by widening the band check to 0/255
+  (that would hide a covered lens);
 - [ ] **decode time**: median / p95 / max wall time of `MjpgLumaLayout.luma()`
-  at the configured reference scale on real frames, with 1 and with 4 sources
-  at 1 sample/s, while other sessions' GPU benchmarks run; confirm it stays far
-  below the 250 ms per-frame bound and that capture/preview frame rates are
-  unchanged;
-- [ ] **systemd sandbox**: inside the real `server-sentinel.service` unit (its
-  `ProtectSystem=`, `SystemCallFilter=`, `MemoryDenyWriteExecute=` if added,
-  and non-root user), the simplejpeg and numpy wheels import, the version check
-  passes (the source does not report `frame_decoder_unavailable`) and a real
-  frame decodes; check the journal for `SIGSYS`/seccomp denials;
+  (child round trip) at the configured reference scale on real frames, with 1
+  and with 4 sources at 1 sample/s, while other sessions' GPU benchmarks run;
+  confirm it stays far below the 500 ms per-frame deadline (no
+  `decoder_timeout`) and that capture/preview frame rates are unchanged; also
+  the child start time at the first frame and each child's RSS
+  (`/proc/<pid>/status` `VmRSS`; about 30 MiB synthetic) for 4 sources;
+- [ ] **decode child inside the systemd sandbox**: inside the real
+  `server-sentinel.service` unit (its `ProtectSystem=strict`,
+  `RestrictAddressFamilies=`, `NoNewPrivileges=`, `SystemCallFilter=` /
+  `MemoryDenyWriteExecute=` if added, and the non-root service user):
+  one child per active MJPG source appears under the unit's cgroup
+  (`systemctl status server-sentinel` / `systemd-cgls`) as
+  `venv/bin/python -I -B .../mjpg_child.py`, owned by the service user, with
+  `PPid` = the Main process, `NoNewPrivs: 1`, nice 10 and the expected
+  `/proc/<pid>/limits` (address space 256 MiB, open files 16, processes 0,
+  core 0, file size 0; `environ` / `fd` are not readable by design); the
+  simplejpeg and numpy wheels import inside it (the source does not report
+  `frame_decoder_unavailable` or `frame_decoder_failing`) and a real frame
+  decodes; check the journal for `SIGSYS`/seccomp or address-space denials;
+- [ ] **child failure handling on the real host** (as the service user, never
+  with sudo; cameras untouched): `kill -KILL <child pid>` gives one
+  `decoder_crashed` refusal and a new child pid after about 1 s;
+  `kill -STOP <child pid>` gives one `decoder_timeout` and the stopped child is
+  gone; `systemctl stop server-sentinel` leaves no `mjpg_child.py` process and
+  finishes within the scene stop bound; `kill -KILL` of the Main process leaves
+  no orphaned `mjpg_child.py` (parent-death signal);
 - [ ] a camera unplugged mid-frame or a USB transfer error yields
   `frame_undecodable` (`unknown`), never `ABSENT` movement or tamper.
 

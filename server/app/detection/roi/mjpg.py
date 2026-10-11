@@ -3,44 +3,52 @@
 The Owner adopted simplejpeg 1.9.0 (statically linked libjpeg-turbo 3.1.2)
 with numpy 2.3.5 on 2026-10-11 (`docs/decisions/2026-10-11-mjpg-decoder-survey.md`).
 Camera-supplied bytes reach the native parser only after a pure-Python
-structural pre-check, and every failure is a refusal (`MjpgFrameRejected`)
-that the scene runtime maps to `unknown`, never to "no movement" or
-"no tamper":
+structural pre-check in the Main process, and the native parser itself runs
+only in a separate, resource-limited, resident child process per source
+(`mjpg_worker.MjpgDecoderProcess` running `mjpg_child.py`; Owner decision
+2026-10-11 on PR #225). Every failure is a refusal (`MjpgFrameRejected`) that
+the scene runtime maps to `unknown`, never to "no movement" or "no tamper":
 
-1. pre-check before decoding: `SOI` first; one baseline / extended-sequential
-   Huffman frame whose `SOF` dimensions equal the negotiated V4L2 format and
-   fit the pixel budget (a decompression-bomb header is refused before the
-   decoder allocates anything); exactly one interleaved scan followed by a
-   single `EOI`; at most a bounded number of padding bytes after it; a bounded
-   total size and marker count;
-2. decode with simplejpeg `strict=True` (libjpeg-turbo warnings such as a
-   premature end of the entropy-coded data or extraneous bytes become
-   errors) straight to luma (`GRAY`), using libjpeg's DCT scaling to the
-   smallest power-of-two scale whose output decimates exactly to the
-   reference size, with the accurate integer IDCT;
-3. post-check the decoded shape and type, and refuse a decode whose trailing
-   MCUs in scan order are all exactly mid-grey (the band libjpeg leaves after
-   it stops decoding a scan early), or whose decode exceeded the per-frame
-   time bound.
+1. pre-check in Main before decoding: `SOI` first; one baseline /
+   extended-sequential Huffman frame whose `SOF` dimensions equal the
+   negotiated V4L2 format and fit the pixel budget (a decompression-bomb
+   header is refused before the decoder allocates anything); exactly one
+   interleaved scan followed by a single `EOI`; at most a bounded number of
+   padding bytes after it; a bounded total size and marker count. Only the
+   validated bytes up to `EOI` are sent to the child;
+2. decode in the child with simplejpeg `strict=True` (libjpeg-turbo warnings
+   such as a premature end of the entropy-coded data or extraneous bytes
+   become errors) straight to luma (`GRAY`), using libjpeg's DCT scaling to
+   the smallest power-of-two scale whose output decimates exactly to the
+   reference size, with the accurate integer IDCT; the child refuses a decode
+   whose shape differs or whose trailing MCUs in scan order are all exactly
+   mid-grey (the band libjpeg leaves after it stops decoding a scan early);
+3. in Main, check the reply's type, request id and exact pixel count. A child
+   crash, kill (including an OOM kill), exit, per-frame timeout (the child is
+   killed) or malformed reply refuses that frame; a replacement child is
+   started after a bounded backoff, and repeated failures lower the source to
+   `degraded`.
 
-Decode success never proves frame integrity: a bit flip that keeps the
-entropy-coded syntax valid yields locally wrong pixels that no check here can
-see. The quality gate and the detector's temporal confirmation still apply.
+Decode success never proves frame integrity: a corruption that keeps the
+entropy-coded data decodable can yield substantially wrong pixels (large
+areas, or a bottom band clamped to 0 by a DC desync, which the exactly-128
+band check does not see). The band check is deliberately not widened to 0 or
+255, because that would also refuse a covered lens and hide camera tamper; and
+a real scene whose trailing MCUs are exactly 128 is refused (fail-closed). The
+quality gate and the detector's temporal confirmation still apply.
 
 This runs only on the scene worker thread (one worker, at most one sample per
 second per source), never on a capture thread. Nothing decoded is retained.
 """
 
 from dataclasses import dataclass, field
-import importlib
 import importlib.metadata
 import math
-import threading
-import time
+
+from .mjpg_worker import (CHILD, NUMPY_VERSION, SIMPLEJPEG_VERSION, DecodeRequest,
+                          DecoderRefusal, MjpgDecoderLimits)
 
 
-SIMPLEJPEG_VERSION = "1.9.0"
-NUMPY_VERSION = "2.3.5"
 # Pixel budget for the negotiated format and the SOF header (4K UHD).
 MAXIMUM_DECODE_PIXELS = 3840 * 2160
 # Upper bound for a whole MJPG payload, independent of the pixel budget.
@@ -51,13 +59,8 @@ MAXIMUM_FRAME_BYTES = 32 * 1024 * 1024
 DEFAULT_TRAILING_BYTES = 8192
 MAXIMUM_TRAILING_LIMIT = 1024 * 1024
 MAXIMUM_SEGMENTS = 64
-# A decode slower than this is refused (it would delay every other source on
-# the single scene worker). Synthetic 1080p luma decodes take a few ms.
-DEFAULT_DECODE_NS = 250_000_000
 # libjpeg DCT scaling denominators, smallest output first.
 SCALE_DENOMINATORS = (8, 4, 2, 1)
-# Value of a block libjpeg leaves undecoded (all coefficients zero) in luma.
-UNDECODED_LUMA = 128
 
 # Markers.
 SOI, EOI, SOS, DHT, DQT, DRI, COM = 0xD8, 0xD9, 0xDA, 0xC4, 0xDB, 0xDD, 0xFE
@@ -71,7 +74,8 @@ REASONS = frozenset({
     "segment_invalid", "unsupported_process", "sof_invalid", "sof_dimension_mismatch",
     "sof_missing", "scan_invalid", "missing_eoi", "trailing_bytes_exceeded",
     "trailing_marker", "decoder_unavailable", "decode_failed", "decoded_shape_mismatch",
-    "undecoded_band", "decode_too_slow", "reference_incompatible",
+    "undecoded_band", "reference_incompatible",
+    "decoder_crashed", "decoder_timeout", "decoder_protocol",
 })
 
 
@@ -233,31 +237,19 @@ def _entropy_end(data, position):
             raise MjpgFrameRejected("scan_invalid")
 
 
-_LOCK = threading.Lock()
-_LOADED = None
-
-
-def _load():
-    """The reviewed decoder modules, or None when the exact pins are absent."""
-    global _LOADED
-    with _LOCK:
-        if _LOADED is None:
-            try:
-                if (importlib.metadata.version("simplejpeg") != SIMPLEJPEG_VERSION
-                        or importlib.metadata.version("numpy") != NUMPY_VERSION):
-                    raise ImportError("unreviewed decoder version")
-                simplejpeg = importlib.import_module("simplejpeg")
-                numpy = importlib.import_module("numpy")
-                if getattr(simplejpeg, "__version__", None) != SIMPLEJPEG_VERSION:
-                    raise ImportError("unreviewed decoder version")
-                _LOADED = (simplejpeg, numpy)
-            except Exception:
-                _LOADED = False
-        return _LOADED or None
-
-
 def decoder_available() -> bool:
-    return _load() is not None
+    """True when the exact reviewed simplejpeg / numpy pins are installed.
+
+    Only package metadata is read: the Main process never imports the native
+    decoder (or numpy). The decode child checks the imported versions again
+    and refuses to start on any difference.
+    """
+    try:
+        return (importlib.metadata.version("simplejpeg") == SIMPLEJPEG_VERSION
+                and importlib.metadata.version("numpy") == NUMPY_VERSION
+                and CHILD.is_file())
+    except Exception:
+        return False
 
 
 def _scale(width, height, target_width, target_height):
@@ -269,34 +261,22 @@ def _scale(width, height, target_width, target_height):
     return None
 
 
-def _undecoded_band(numpy, image, mcu_width, mcu_height, minimum):
-    """True when the last `minimum` MCUs in scan order are all exactly 128."""
-    rows, columns = image.shape
-    across, down = -(-columns // mcu_width), -(-rows // mcu_height)
-    padded = numpy.full((down * mcu_height, across * mcu_width), UNDECODED_LUMA, dtype=numpy.uint8)
-    padded[:rows, :columns] = image
-    uniform = (padded.reshape(down, mcu_height, across, mcu_width) == UNDECODED_LUMA).all(axis=(1, 3))
-    flat = uniform.reshape(-1)
-    minimum = min(minimum, flat.size)
-    return bool(flat[-minimum:].all())
-
-
 @dataclass(frozen=True)
 class MjpgLumaLayout:
     """Negotiated MJPG capture whose luma is decoded by the reviewed decoder.
 
-    The SOF header must state exactly `width` x `height`. Decoding uses the
-    accurate integer IDCT and libjpeg DCT scaling to the smallest power of two
-    (1/8, 1/4, 1/2, 1) whose output is an integer multiple of the reference
-    size, followed by nearest-sample decimation; a calibration reference for
-    such a source must come through this same reader.
+    The SOF header must state exactly `width` x `height`. Decoding (in the
+    source's decode child, `mjpg_worker`) uses the accurate integer IDCT and
+    libjpeg DCT scaling to the smallest power of two (1/8, 1/4, 1/2, 1) whose
+    output is an integer multiple of the reference size, followed by
+    nearest-sample decimation; a calibration reference for such a source must
+    come through this same reader.
     """
 
     width: int
     height: int
     maximum_trailing_bytes: int = DEFAULT_TRAILING_BYTES
-    maximum_decode_ns: int = DEFAULT_DECODE_NS
-    clock: object = field(default=time.perf_counter_ns, repr=False, compare=False)
+    decoder: MjpgDecoderLimits = field(default_factory=MjpgDecoderLimits)
     pixel_format = "MJPG"
 
     def __post_init__(self):
@@ -308,10 +288,8 @@ class MjpgLumaLayout:
         if (type(self.maximum_trailing_bytes) is not int
                 or not 0 <= self.maximum_trailing_bytes <= MAXIMUM_TRAILING_LIMIT):
             raise ValueError("invalid trailing byte bound")
-        if type(self.maximum_decode_ns) is not int or not 0 < self.maximum_decode_ns <= 5_000_000_000:
-            raise ValueError("invalid decode time bound")
-        if not callable(self.clock):
-            raise ValueError("invalid decode clock")
+        if not isinstance(self.decoder, MjpgDecoderLimits):
+            raise ValueError("invalid MJPG decoder limits")
 
     def available(self) -> bool:
         return decoder_available()
@@ -320,47 +298,55 @@ class MjpgLumaLayout:
         return (type(width) is int and type(height) is int and width > 0 and height > 0
                 and _scale(self.width, self.height, width, height) is not None)
 
-    def luma(self, data, width: int, height: int) -> bytes:
-        """Decoded luma of one frame at `width` x `height`, or a refusal."""
-        started = self.clock()
+    def request(self, data, width: int, height: int):
+        """Pre-check one frame: the validated JPEG bytes and the decode request.
+
+        Pure Python; raises `MjpgFrameRejected` before any decoder is reached.
+        """
         if not isinstance(data, (bytes, bytearray, memoryview)):
             raise MjpgFrameRejected("frame_type_invalid")
         view = memoryview(data)
         if view.nbytes > MAXIMUM_FRAME_BYTES:
             raise MjpgFrameRejected("frame_too_large")
-        buffer = data if type(data) is bytes else bytes(view.cast("B"))
+        if type(data) is bytes:
+            buffer = data
+        elif not view.c_contiguous or view.itemsize != 1 or view.ndim != 1:
+            # A capture buffer is one flat run of bytes; anything else is not
+            # a frame this reader understands.
+            raise MjpgFrameRejected("frame_type_invalid")
+        else:
+            buffer = view.tobytes()
         structure = inspect_frame(buffer, width=self.width, height=self.height,
                                   maximum_trailing=self.maximum_trailing_bytes)
         scale = _scale(self.width, self.height, width, height) if self.compatible(width, height) else None
         if scale is None:
             raise MjpgFrameRejected("reference_incompatible")
         denominator, scaled_width, scaled_height = scale
-        loaded = _load()
-        if loaded is None:
-            raise MjpgFrameRejected("decoder_unavailable")
-        simplejpeg, numpy = loaded
-        try:
-            decoded = simplejpeg.decode_jpeg(
-                buffer[:structure.end], colorspace="GRAY", fastdct=False, fastupsample=False,
-                min_width=scaled_width, min_height=scaled_height, strict=True)
-        except Exception:
-            # Includes libjpeg warnings promoted to errors by strict mode.
-            raise MjpgFrameRejected("decode_failed") from None
-        finally:
-            buffer = None
-        if (not isinstance(decoded, numpy.ndarray) or decoded.dtype != numpy.uint8
-                or decoded.shape != (scaled_height, scaled_width, 1)):
-            raise MjpgFrameRejected("decoded_shape_mismatch")
-        image = decoded[:, :, 0]
         mcu_width = max(1, structure.mcu_width // denominator)
         mcu_height = max(1, structure.mcu_height // denominator)
-        if _undecoded_band(numpy, image, mcu_width, mcu_height,
-                           -(-scaled_width // mcu_width)):
-            raise MjpgFrameRejected("undecoded_band")
-        step_x, step_y = scaled_width // width, scaled_height // height
-        pixels = numpy.ascontiguousarray(image[::step_y, ::step_x]).tobytes()
-        if len(pixels) != width * height:
+        # Only the bytes up to `EOI` reach the decoder; trailing padding never
+        # leaves the Main process.
+        encoded = buffer[:structure.end]
+        return encoded, DecodeRequest(scaled_width, scaled_height, width, height,
+                                      mcu_width, mcu_height, -(-scaled_width // mcu_width))
+
+    def luma(self, data, width: int, height: int, decoder) -> bytes:
+        """Decoded luma of one frame at `width` x `height`, or a refusal.
+
+        `decoder` is this source's `MjpgDecoderProcess`; every child failure,
+        timeout or malformed reply is a refusal, never a frame.
+        """
+        encoded, request = self.request(data, width, height)
+        if not self.available():
+            raise MjpgFrameRejected("decoder_unavailable")
+        try:
+            pixels = decoder.decode(encoded, request)
+        except DecoderRefusal as refusal:
+            raise MjpgFrameRejected(refusal.reason) from None
+        except Exception:
+            raise MjpgFrameRejected("decode_failed") from None
+        finally:
+            encoded = None
+        if type(pixels) is not bytes or len(pixels) != width * height:
             raise MjpgFrameRejected("decoded_shape_mismatch")
-        if self.clock() - started > self.maximum_decode_ns:
-            raise MjpgFrameRejected("decode_too_slow")
         return pixels
