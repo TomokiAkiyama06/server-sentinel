@@ -637,6 +637,60 @@
       ]
     },
     {
+      "id": "pypi:simplejpeg@1.9.0",
+      "name": "simplejpeg",
+      "version": "1.9.0",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/simplejpeg/1.9.0/",
+      "license": "MIT AND IJG AND BSD-3-Clause AND Zlib",
+      "license_evidence": [
+        "https://pypi.org/pypi/simplejpeg/1.9.0/json",
+        "server/docs/wheel-audit.json",
+        "server/docs/DEPENDENCIES.md",
+        "docs/decisions/2026-10-11-mjpg-decoder-survey.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright",
+        "preserve-notice",
+        "state-based-in-part-on-the-work-of-the-independent-jpeg-group",
+        "include-modified-bsd-license-text-in-documentation",
+        "no-endorsement-by-ijg-or-libjpeg-turbo-names"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md",
+        "NOTICE",
+        "THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "server/pyproject.toml",
+          "ecosystem": "python-project",
+          "scope": "backend",
+          "pin": {
+            "type": "lock-correspondence",
+            "lock": "server/requirements.lock"
+          }
+        },
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:08ab337ca3b26d7562f5ad686ab8f3966fb206fced607d248e693cbc57fc53b3",
+              "sha256:5be1c8932f43f99b6cc52f8ac4c28e3ac19a1a830351efdb159715fd683e2053",
+              "sha256:f22024286577a4e9bb30c4b3c1a66a3b0c6e56801b26c83d0581ad294d1b99e3"
+            ]
+          }
+        }
+      ]
+    },
+    {
       "id": "pypi:starlette@1.6.0",
       "name": "starlette",
       "version": "1.6.0",
@@ -2188,11 +2242,13 @@
       "license": "BSD-3-Clause",
       "license_evidence": [
         "https://pypi.org/pypi/numpy/2.3.5/json",
-        "server/docs/detector-wheel-audit.json",
+        "server/docs/wheel-audit.json",
+        "server/docs/DEPENDENCIES.md",
         "server/docs/RTDETR_RUNTIME_AUDIT.md"
       ],
       "transitive_evidence": [
-        "server/docs/detector-wheel-audit.json",
+        "server/docs/wheel-audit.json",
+        "server/docs/DEPENDENCIES.md",
         "server/docs/RTDETR_RUNTIME_AUDIT.md"
       ],
       "obligations": [
@@ -2202,17 +2258,29 @@
         "provide-relinkable-objects"
       ],
       "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md",
         "server/docs/DETECTOR_THIRD_PARTY_LICENSE_TEXTS.md"
       ],
       "locations": [
         {
-          "path": "server/requirements-detector.lock",
+          "path": "server/pyproject.toml",
+          "ecosystem": "python-project",
+          "scope": "backend",
+          "pin": {
+            "type": "lock-correspondence",
+            "lock": "server/requirements.lock"
+          }
+        },
+        {
+          "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
           "scope": "backend",
           "pin": {
             "type": "lockfile-entry",
             "digests": [
-              "sha256:0d8163f43acde9a73c2a33605353a4f1bc4798745a8b1d73183b28e5b435ae28"
+              "sha256:0d8163f43acde9a73c2a33605353a4f1bc4798745a8b1d73183b28e5b435ae28",
+              "sha256:8b973c57ff8e184109db042c842423ff4f60446239bd585a5131cc47f06f789d",
+              "sha256:fffe29a1ef00883599d1dc2c51aa2e5d80afe49523c261a74933df395c15c520"
             ]
           }
         }

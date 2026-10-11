@@ -1,0 +1,1466 @@
+"""Reviewed MJPG luma reader (Issue #217) with generated synthetic JPEGs only.
+
+Every frame is generated in memory with numpy and encoded with the reviewed
+simplejpeg encoder; no camera, real scene or person is used. Decoding runs in
+the real resident decode child (`mjpg_child.py`); contract violations use the
+synthetic stand-ins in `mjpg_child_fakes.py`.
+"""
+
+import json
+import os
+import random
+from pathlib import Path
+import signal
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import unittest
+from unittest import mock
+from uuid import UUID
+
+import numpy as np
+import simplejpeg
+
+from app.cameras.registry.models import SourceType
+from app.cameras.uvc.capture import VideoFrame
+from app.detection.foundation import Observation
+from app.detection.roi import CriticalKind
+from app.detection.roi import mjpg, mjpg_child, mjpg_worker
+from app.detection.roi.mjpg import (
+    MAXIMUM_DECODE_PIXELS, MAXIMUM_FRAME_BYTES, MAXIMUM_SEGMENTS, MjpgFrameRejected,
+    MjpgLumaLayout, frame_byte_budget, inspect_frame,
+)
+from app.detection.roi.mjpg_worker import (
+    CHILD_ENVIRONMENT, DecodeRequest, MjpgDecoderLimits, MjpgDecoderProcess,
+)
+from app.detection.roi.runtime import (
+    PackedLumaLayout, SceneRuntimeState, SceneSourceState, capture_luma_layout,
+)
+
+from tests.test_detector_roi import HEIGHT, SOURCE, WIDTH, pixels
+from tests.test_scene_runtime import (
+    INTERVAL, MOVED, OTHER, THIRD, Harness, binding, wait_for,
+)
+
+
+SCALE = 8
+CAPTURE_WIDTH, CAPTURE_HEIGHT = WIDTH * SCALE, HEIGHT * SCALE
+FOURTH = UUID(int=903)
+FAKES = Path(__file__).with_name("mjpg_child_fakes.py")
+# Test-only limits: a backoff shorter than one harness frame step, so a
+# replacement child may start at the next frame.
+FAST = MjpgDecoderLimits(restart_backoff_ns=1, maximum_backoff_ns=1, failing_after=2)
+
+
+def fake(behaviour):
+    return (sys.executable, "-I", "-B", str(FAKES), behaviour)
+
+
+def encode(luma, *, width=WIDTH, height=HEIGHT, scale=SCALE, subsampling="422", quality=100):
+    """Upscale a generated luma image and encode it like a UVC YCbCr MJPG frame."""
+    image = np.frombuffer(luma, dtype=np.uint8).reshape(height, width)
+    image = np.repeat(np.repeat(image, scale, axis=0), scale, axis=1)
+    rgb = np.ascontiguousarray(np.stack([image] * 3, axis=-1))
+    return simplejpeg.encode_jpeg(rgb, quality=quality, colorsubsampling=subsampling)
+
+
+def noise_frame(width, height, *, seed=217, subsampling="422"):
+    """Synthetic gradient + rectangle + uniform noise frame (no real scene)."""
+    rng = np.random.default_rng(seed)
+    y, x = np.mgrid[0:height, 0:width]
+    image = np.stack([(x * 255 // width), (y * 255 // height), (x + y) % 256], axis=-1)
+    image[height // 8:height // 3, width // 6:width // 2] = 40
+    image = np.clip(image + rng.integers(-12, 12, image.shape), 0, 255).astype(np.uint8)
+    return simplejpeg.encode_jpeg(np.ascontiguousarray(image), quality=85,
+                                  colorsubsampling=subsampling)
+
+
+def segment(data, marker):
+    """Offset of the first top-level segment with `marker` (generated frames)."""
+    position = 2
+    while data[position + 1] != marker:
+        position += 2 + int.from_bytes(data[position + 2:position + 4], "big")
+    return position
+
+
+def segment_count(data):
+    """Top-level segments up to and including `SOS` (generated frames)."""
+    position, count = 2, 0
+    while True:
+        count += 1
+        if data[position + 1] == 0xDA:
+            return count
+        position += 2 + int.from_bytes(data[position + 2:position + 4], "big")
+
+
+def with_sof(data, width, height):
+    offset = segment(data, 0xC0) + 5
+    return (data[:offset] + height.to_bytes(2, "big") + width.to_bytes(2, "big")
+            + data[offset + 4:])
+
+
+def scan_start(data):
+    position = segment(data, 0xDA)
+    return position + 2 + int.from_bytes(data[position + 2:position + 4], "big")
+
+
+def stuffed(width, height, *, size=None, ending=b"\xff\xd9", unit=b"\xff\x00"):
+    """A synthetic worst case for the entropy scan: a real header announcing
+    `width` x `height`, then nothing but `unit` (byte-stuffed `FF 00` pairs by
+    default) up to exactly `size` bytes (default: the whole budget), ending
+    with `ending`."""
+    header = with_sof(encode(pixels()), width, height)
+    header = header[:scan_start(header)]
+    size = frame_byte_budget(width, height, 0) if size is None else size
+    body = unit * ((size - len(header) - len(ending)) // len(unit))
+    # Fill bytes (0xFF) make up the remainder, so the frame is exactly `size`.
+    return header + body + b"\xff" * (size - len(header) - len(ending) - len(body)) + ending
+
+
+def reference_entropy_end(data, position):
+    """The former per-byte scan, kept as the semantic reference."""
+    size = len(data)
+    while True:
+        found = data.find(b"\xff", position)
+        if found < 0 or found + 1 >= size:
+            raise MjpgFrameRejected("missing_eoi")
+        following = data[found + 1]
+        if following == 0x00 or 0xD0 <= following <= 0xD7:
+            position = found + 2
+        elif following == 0xFF:
+            position = found + 1
+        elif following == 0xD9:
+            return found + 2
+        else:
+            raise MjpgFrameRejected("scan_invalid")
+
+
+def best_of(count, function):
+    """Shortest of `count` runs (scheduling noise only ever adds time)."""
+    durations = []
+    for _ in range(count):
+        started = time.perf_counter()
+        function()
+        durations.append(time.perf_counter() - started)
+    return min(durations)
+
+
+def reference_scan_seconds(data):
+    """One run of the former per-byte scan over `data`: the cost the C-level
+    pre-check replaced, measured in this process on this machine (scheduling
+    noise only ever makes it look slower, never the fix faster)."""
+    started = time.perf_counter()
+    try:
+        reference_entropy_end(data, scan_start(data))
+    except MjpgFrameRejected:
+        pass
+    return time.perf_counter() - started
+
+
+def alive(pid):
+    """True while `pid` is a live (not zombie) process."""
+    try:
+        with open(f"/proc/{pid}/stat") as stat:
+            return stat.read().rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+    except (FileNotFoundError, ProcessLookupError, IndexError):
+        return False
+
+
+def settle(decoder):
+    """Wait until no child start or reap is under way; the decoder state."""
+    assert wait_for(lambda: decoder.status().state not in ("starting", "reaping"), timeout=20)
+    return decoder.status().state
+
+
+def ready(decoder):
+    """Ask for a child (as the runtime does at bind) and wait for the outcome."""
+    settle(decoder)
+    decoder.prepare()
+    return settle(decoder)
+
+
+def stopped(pid):
+    """True while `pid` is stopped (SIGSTOP)."""
+    try:
+        with open(f"/proc/{pid}/stat") as stat:
+            return stat.read().rsplit(")", 1)[1].split()[0] in ("T", "t")
+    except (FileNotFoundError, ProcessLookupError, IndexError):
+        return False
+
+
+class Clock:
+    def __init__(self):
+        self.value = 0
+
+    def __call__(self):
+        return self.value
+
+
+class DecoderCase(unittest.TestCase):
+    def decoder(self, limits=None, *, behaviour=None, clock=None, start=True):
+        """A decode child supervisor; with `start`, its child is started (or
+        its start has failed) before it is returned."""
+        decoder = MjpgDecoderProcess(limits or MjpgDecoderLimits(), MAXIMUM_FRAME_BYTES,
+                                     clock_ns=clock or Clock(),
+                                     command=fake(behaviour) if behaviour else None)
+        self.addCleanup(decoder.close)
+        if start:
+            ready(decoder)
+        return decoder
+
+
+class MjpgPrecheckTests(DecoderCase):
+    def setUp(self):
+        self.frame = encode(pixels())
+        self.layout = MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT)
+        self.child = self.decoder()
+
+    def rejected(self, data, layout=None):
+        with self.assertRaises(MjpgFrameRejected) as caught:
+            (layout or self.layout).luma(data, WIDTH, HEIGHT, self.child)
+        return caught.exception.reason
+
+    def refused_before_decoding(self, data, layout=None):
+        unused = mock.Mock()
+        with self.assertRaises(MjpgFrameRejected) as caught:
+            (layout or self.layout).luma(data, WIDTH, HEIGHT, unused)
+        unused.decode.assert_not_called()
+        return caught.exception.reason
+
+    def test_valid_frame_decodes_to_reference_luma_in_the_child(self):
+        structure = inspect_frame(self.frame, width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT)
+        self.assertEqual((3, 16, 8, True, 0), (structure.components, structure.mcu_width,
+                                               structure.mcu_height, structure.huffman_tables,
+                                               structure.trailing))
+        luma = self.layout.luma(self.frame, WIDTH, HEIGHT, self.child)
+        self.assertEqual(WIDTH * HEIGHT, len(luma))
+        self.assertLessEqual(max(abs(a - b) for a, b in zip(luma, pixels())), 1)
+        self.assertNotEqual(os.getpid(), self.child.pid)
+        self.assertNotIn("simplejpeg", sys.modules.get("app.detection.roi.mjpg").__dict__)
+        # bytearray / flat memoryview capture buffers are read the same way.
+        self.assertEqual(luma, self.layout.luma(bytearray(self.frame), WIDTH, HEIGHT, self.child))
+        self.assertEqual(luma, self.layout.luma(memoryview(self.frame), WIDTH, HEIGHT, self.child))
+        self.assertEqual(1, self.child.status().starts)
+
+    def test_non_flat_capture_buffers_are_refused(self):
+        doubled = memoryview(bytes(a for byte in self.frame for a in (byte, 0)))[::2]
+        self.assertEqual("frame_type_invalid", self.refused_before_decoding(doubled))
+        square = memoryview((self.frame + bytes(4096))[:4096]).cast("B", (64, 64))
+        self.assertEqual("frame_type_invalid", self.refused_before_decoding(square))
+        wide = memoryview(bytearray(self.frame[:len(self.frame) // 4 * 4])).cast("I")
+        self.assertEqual("frame_type_invalid", self.refused_before_decoding(wide))
+        self.assertEqual("frame_type_invalid", self.refused_before_decoding("not bytes"))
+
+    def test_grayscale_and_420_frames_decode(self):
+        for subsampling in ("420", "444"):
+            with self.subTest(subsampling=subsampling):
+                luma = self.layout.luma(encode(pixels(), subsampling=subsampling),
+                                        WIDTH, HEIGHT, self.child)
+                self.assertLessEqual(max(abs(a - b) for a, b in zip(luma, pixels())), 1)
+        image = np.repeat(np.repeat(np.frombuffer(pixels(), np.uint8).reshape(HEIGHT, WIDTH),
+                                    SCALE, 0), SCALE, 1)[:, :, None]
+        gray = simplejpeg.encode_jpeg(np.ascontiguousarray(image), quality=100,
+                                      colorspace="GRAY", colorsubsampling="Gray")
+        self.assertEqual(1, inspect_frame(gray, width=CAPTURE_WIDTH,
+                                          height=CAPTURE_HEIGHT).components)
+        luma = self.layout.luma(gray, WIDTH, HEIGHT, self.child)
+        self.assertLessEqual(max(abs(a - b) for a, b in zip(luma, pixels())), 1)
+
+    def test_truncated_frame_is_refused(self):
+        start = scan_start(self.frame)
+        self.assertEqual("missing_eoi", self.refused_before_decoding(
+            self.frame[:start + (len(self.frame) - start) // 2]))
+        self.assertEqual("missing_soi", self.refused_before_decoding(self.frame[2:]))
+        self.assertEqual("missing_soi", self.refused_before_decoding(b""))
+        self.assertEqual("segment_invalid", self.refused_before_decoding(
+            self.frame[:segment(self.frame, 0xC0) + 6]))
+
+    def test_scan_truncated_and_reterminated_is_refused_by_strict_decoding(self):
+        start = scan_start(self.frame)
+        for fraction in (0.25, 0.5, 0.75, 0.95):
+            with self.subTest(fraction=fraction):
+                cut = start + int((len(self.frame) - 2 - start) * fraction)
+                data = self.frame[:cut].rstrip(b"\xff") + b"\xff\xd9"
+                self.assertEqual("decode_failed", self.rejected(data))
+        # A refusal by a healthy child is not a child failure.
+        self.assertEqual((1, 0, False), (self.child.status().starts,
+                                         self.child.status().failures, self.child.failing))
+
+    def test_missing_eoi_is_refused(self):
+        self.assertEqual("missing_eoi", self.refused_before_decoding(self.frame[:-2]))
+        self.assertEqual("missing_eoi", self.refused_before_decoding(self.frame[:-2] + bytes(64)))
+
+    def test_bit_flipped_entropy_data_is_refused(self):
+        frame = noise_frame(1280, 720)
+        layout = MjpgLumaLayout(1280, 720)
+        start = scan_start(frame)
+        middle = start + (len(frame) - start) // 2
+        flipped = bytearray(frame)
+        for offset in range(middle, middle + 41):
+            flipped[offset] ^= 0x5A
+        with self.assertRaises(MjpgFrameRejected):
+            layout.luma(bytes(flipped), 320, 180, self.child)
+        # A flip that forges a marker inside the scan is refused before decoding.
+        forged = bytearray(frame)
+        forged[middle:middle + 2] = b"\xff\xc4"
+        self.assertEqual("scan_invalid", self.refused_before_decoding(bytes(forged), layout))
+
+    def test_wrong_and_oversized_sof_are_refused_before_decoding(self):
+        cases = ((CAPTURE_WIDTH * 2, CAPTURE_HEIGHT), (CAPTURE_WIDTH, CAPTURE_HEIGHT - 8),
+                 (65500, 65500), (0, CAPTURE_HEIGHT))
+        for width, height in cases:
+            with self.subTest(width=width, height=height):
+                reason = self.refused_before_decoding(with_sof(self.frame, width, height))
+                self.assertIn(reason, ("sof_dimension_mismatch", "sof_invalid"))
+        with self.assertRaises(ValueError):
+            MjpgLumaLayout(7680, 4320)
+        self.assertLessEqual(3840 * 2160, MAXIMUM_DECODE_PIXELS)
+
+    def test_duplicate_sof_and_scan_header_fields_are_refused(self):
+        sof = segment(self.frame, 0xC0)
+        length = 2 + int.from_bytes(self.frame[sof + 2:sof + 4], "big")
+        duplicate = self.frame[:sof] + self.frame[sof:sof + length] + self.frame[sof:]
+        self.assertEqual("sof_invalid", self.refused_before_decoding(duplicate))
+        sos = segment(self.frame, 0xDA)
+        count = sos + 4
+        tail = scan_start(self.frame) - 3
+        for offset, value in ((count, 1), (count, 2), (tail, 1), (tail + 1, 62),
+                              (tail + 2, 0x10), (tail + 2, 0x01)):
+            with self.subTest(offset=offset - sos, value=value):
+                changed = bytearray(self.frame)
+                changed[offset] = value
+                self.assertEqual("scan_invalid", self.refused_before_decoding(bytes(changed)))
+
+    def test_segment_and_fill_byte_bounds(self):
+        sos = segment(self.frame, 0xDA)
+        spare = MAXIMUM_SEGMENTS - segment_count(self.frame)
+        comment = b"\xff\xfe\x00\x03x"
+        within = self.frame[:sos] + comment * spare + self.frame[sos:]
+        inspect_frame(within, width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT)
+        over = self.frame[:sos] + comment * (spare + 1) + self.frame[sos:]
+        self.assertEqual("segment_invalid", self.refused_before_decoding(over))
+        self.assertEqual(len(self.layout.luma(within, WIDTH, HEIGHT, self.child)), WIDTH * HEIGHT)
+        filled = self.frame[:sos] + b"\xff" * 16 + self.frame[sos:]
+        inspect_frame(filled, width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT)
+        overfilled = self.frame[:sos] + b"\xff" * 17 + self.frame[sos:]
+        self.assertEqual("marker_invalid", self.refused_before_decoding(overfilled))
+
+    def test_total_frame_size_is_bounded_in_both_checks(self):
+        with mock.patch.object(mjpg, "MAXIMUM_FRAME_BYTES", len(self.frame) - 1):
+            with self.assertRaises(MjpgFrameRejected) as caught:
+                inspect_frame(self.frame, width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT)
+            self.assertEqual("frame_too_large", caught.exception.reason)
+            # The wrapper refuses an oversized buffer before copying or
+            # parsing it.
+            with mock.patch.object(mjpg, "inspect_frame") as inspect:
+                self.assertEqual("frame_too_large",
+                                 self.refused_before_decoding(bytearray(self.frame)))
+            inspect.assert_not_called()
+        # The child is told the same bound and the parent never sends more.
+        with self.assertRaises(mjpg_worker.DecoderRefusal) as caught:
+            self.child.decode(bytes(MAXIMUM_FRAME_BYTES + 1),
+                              DecodeRequest(WIDTH, HEIGHT, WIDTH, HEIGHT, 8, 8, 2))
+        self.assertEqual("frame_too_large", caught.exception.reason)
+        self.assertEqual(("running", 0), (self.child.status().state,
+                                          self.child.status().failures))
+
+    def test_frame_byte_budget_follows_the_negotiated_resolution(self):
+        self.assertEqual(2 * CAPTURE_WIDTH * CAPTURE_HEIGHT + 256 * 1024 + 8192,
+                         frame_byte_budget(CAPTURE_WIDTH, CAPTURE_HEIGHT))
+        self.assertEqual(MAXIMUM_FRAME_BYTES, frame_byte_budget(16384, 16384))
+        budget = frame_byte_budget(CAPTURE_WIDTH, CAPTURE_HEIGHT)
+        # A payload at the budget is scanned; one byte more is refused before
+        # it is scanned or copied, in both checks.
+        at = stuffed(CAPTURE_WIDTH, CAPTURE_HEIGHT, size=budget)
+        self.assertEqual(budget, len(at))
+        self.assertEqual(budget, inspect_frame(at, width=CAPTURE_WIDTH,
+                                               height=CAPTURE_HEIGHT).end)
+        over = at + b"\x00"
+        with self.assertRaises(MjpgFrameRejected) as caught:
+            inspect_frame(over, width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT)
+        self.assertEqual("frame_too_large", caught.exception.reason)
+        with mock.patch.object(mjpg, "inspect_frame") as inspect:
+            self.assertEqual("frame_too_large", self.refused_before_decoding(bytearray(over)))
+        inspect.assert_not_called()
+        # The configured trailing bound is part of the budget.
+        layout = MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, maximum_trailing_bytes=0)
+        self.assertEqual("frame_too_large", self.refused_before_decoding(at, layout))
+
+    def test_entropy_scan_keeps_the_marker_rules(self):
+        """The C-level scan decides exactly like the former per-byte loop:
+        stuffing, `RST`, fill bytes, a single `EOI`, any other marker refused,
+        including pairs that straddle a scan chunk boundary."""
+        alphabet = b"\x00\xff\xff\xff\xd0\xd7\xd8\xd9\xc4\xda\x01\x55\xcf"
+        generator = random.Random(217)
+        cases = [b"", b"\xff", b"\xff\xd9", b"\xff\xff\xd9", b"\xff\x00\xff\xd9",
+                 b"\xff\xd0\xff\xd9", b"\xff\xd8", b"\xff\x01\xff\xd9", b"\x00\xff\xff",
+                 b"\xff\x00" * 5 + b"\xff\xd9" + b"\xff\xc4"]
+        cases += [bytes(generator.choice(alphabet) for _ in range(generator.randrange(1, 24)))
+                  for _ in range(3000)]
+        for chunk in (1, 2, 3, 5, 1024 * 1024):
+            with mock.patch.object(mjpg, "_SCAN_CHUNK_BYTES", chunk):
+                for data in cases:
+                    for position in (0, 1):
+                        try:
+                            expected = reference_entropy_end(data, position)
+                        except MjpgFrameRejected as rejected:
+                            expected = rejected.reason
+                        try:
+                            actual = mjpg._entropy_end(data, position)
+                        except MjpgFrameRejected as rejected:
+                            actual = rejected.reason
+                        self.assertEqual(expected, actual, (chunk, data.hex(), position))
+
+    def test_worst_case_stuffing_is_prechecked_quickly(self):
+        """Codex P2 on PR #225: a frame at the byte budget made only of
+        `FF 00` stuffing (and the other dense variants) is checked by C-level
+        scanning, not one Python iteration per stuffed pair. 4K is the
+        largest budget (16.8 MB); the former loop took seconds here."""
+        width, height = 3840, 2160
+        budget = frame_byte_budget(width, height, 0)
+        # The former scan of the plain `FF 00` frame at the budget, timed
+        # here: absolute timings vary with the runner (shared CI cores were
+        # about 5x slower than the test container), the ratio does not.
+        reference = reference_scan_seconds(stuffed(width, height))
+        variants = {
+            "accepted": (stuffed(width, height), None),
+            "marker_at_the_end": (stuffed(width, height, ending=b"\xff\x01\xff\xd9"),
+                                  "scan_invalid"),
+            "no_eoi": (stuffed(width, height, ending=b"\xff\x00"), "missing_eoi"),
+            "fill_only": (stuffed(width, height, unit=b"\xff"), None),
+            "restarts": (stuffed(width, height, unit=b"\xff\xd3"), None),
+            "stuffing_then_marker": (stuffed(width, height, unit=b"\x00\xff\x00",
+                                             ending=b"\xff\xc4\xff\xd9"), "scan_invalid"),
+        }
+        for name, (data, reason) in variants.items():
+            with self.subTest(variant=name):
+                self.assertEqual(budget, len(data))
+
+                def check():
+                    try:
+                        inspect_frame(data, width=width, height=height, maximum_trailing=0)
+                    except MjpgFrameRejected as rejected:
+                        self.assertEqual(reason, rejected.reason)
+                    else:
+                        self.assertIsNone(reason)
+
+                # Measured at 10-20 ms in the CPU-limited test container
+                # and about 60-110 ms on a GitHub runner, where the former
+                # per-pair loop took 50-200x as long. A regression to any
+                # per-pair or per-byte Python loop fails the ratio; the
+                # absolute bound keeps the check well inside the 1 s
+                # sampling interval of the shared scene worker.
+                elapsed = best_of(3, check)
+                self.assertLess(elapsed * 5, reference, (elapsed, reference))
+                self.assertLess(elapsed, 0.5)
+
+    def test_trailing_padding_is_bounded(self):
+        layout = MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, maximum_trailing_bytes=64)
+        expected = layout.luma(self.frame, WIDTH, HEIGHT, self.child)
+        self.assertEqual(expected, layout.luma(self.frame + bytes(64), WIDTH, HEIGHT, self.child))
+        self.assertEqual(64, inspect_frame(self.frame + bytes(64), width=CAPTURE_WIDTH,
+                                           height=CAPTURE_HEIGHT,
+                                           maximum_trailing=64).trailing)
+        self.assertEqual("trailing_bytes_exceeded",
+                         self.refused_before_decoding(self.frame + bytes(65), layout))
+        # A second EOI or a second image after the frame is not padding.
+        self.assertEqual("trailing_marker",
+                         self.refused_before_decoding(self.frame + b"\x00\xff\xd9", layout))
+        self.assertEqual("trailing_marker",
+                         self.refused_before_decoding(self.frame + b"\xff\xd8\xff", layout))
+        with self.assertRaises(ValueError):
+            MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, maximum_trailing_bytes=-1)
+
+    def test_only_the_bytes_up_to_eoi_are_sent_to_the_child(self):
+        layout = MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, maximum_trailing_bytes=64)
+        recording = mock.Mock()
+        recording.decode.return_value = bytes(WIDTH * HEIGHT)
+        for padding in (b"", bytes(1), b"\xff" * 3 + bytes(61)):
+            with self.subTest(padding=len(padding)):
+                recording.reset_mock()
+                layout.luma(bytearray(self.frame + padding), WIDTH, HEIGHT, recording)
+                sent = recording.decode.call_args.args[0]
+                self.assertIs(bytes, type(sent))
+                self.assertEqual(self.frame, sent)
+                self.assertTrue(sent.endswith(b"\xff\xd9"))
+
+    def test_extraneous_bytes_and_unsupported_processes_are_refused(self):
+        before = segment(self.frame, 0xDA)
+        self.assertEqual("marker_invalid", self.refused_before_decoding(
+            self.frame[:before] + bytes(16) + self.frame[before:]))
+        sof = segment(self.frame, 0xC0)
+        progressive = self.frame[:sof + 1] + b"\xc2" + self.frame[sof + 2:]
+        self.assertEqual("unsupported_process", self.refused_before_decoding(progressive))
+        double = self.frame[:2] + self.frame[2:-2] + self.frame[2:]
+        self.assertIn(self.refused_before_decoding(double), ("scan_invalid", "sof_invalid"))
+        self.assertEqual("marker_invalid", self.refused_before_decoding(b"\xff\xd8\xff\xd9"))
+
+    def test_missing_or_unreviewed_decoder_is_unavailable(self):
+        self.assertTrue(self.layout.available())
+        for package in ("simplejpeg", "numpy"):
+            with self.subTest(package=package):
+                real = mjpg.importlib.metadata.version
+
+                def version(name, package=package):
+                    return "0.0" if name == package else real(name)
+
+                with mock.patch("importlib.metadata.version", version):
+                    self.assertFalse(mjpg.decoder_available())
+                    self.assertEqual("decoder_unavailable", self.refused_before_decoding(self.frame))
+        with mock.patch("importlib.metadata.version", side_effect=ImportError):
+            self.assertFalse(mjpg.decoder_available())
+        with mock.patch.object(mjpg, "CHILD", Path("/nonexistent/mjpg_child.py")):
+            self.assertFalse(mjpg.decoder_available())
+
+    def test_dct_scale_and_reference_compatibility(self):
+        frame = noise_frame(1280, 720)
+        layout = MjpgLumaLayout(1280, 720)
+        for size in ((160, 90), (320, 180), (640, 360), (1280, 720), (80, 45)):
+            with self.subTest(size=size):
+                self.assertTrue(layout.compatible(*size))
+                self.assertEqual(size[0] * size[1], len(layout.luma(frame, *size, self.child)))
+        self.assertFalse(layout.compatible(300, 180))
+        unused = mock.Mock()
+        with self.assertRaises(MjpgFrameRejected) as caught:
+            layout.luma(frame, 300, 180, unused)
+        unused.decode.assert_not_called()
+        self.assertEqual("reference_incompatible", caught.exception.reason)
+
+    def test_negotiated_format_selects_the_reviewed_reader(self):
+        self.assertIsInstance(capture_luma_layout(1920, 1080, "MJPG"), MjpgLumaLayout)
+        self.assertIsInstance(capture_luma_layout(640, 480, "YUYV"), PackedLumaLayout)
+        for fourcc in ("H264", "NV12"):
+            with self.assertRaises(ValueError):
+                capture_luma_layout(640, 480, fourcc)
+
+
+class FakeSimplejpeg:
+    """Records the decode arguments; returns a prepared array."""
+
+    def __init__(self, result):
+        self.result, self.calls = result, []
+
+    def decode_jpeg(self, data, **options):
+        self.calls.append(options)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+def child_request(scaled=(WIDTH, HEIGHT), output=(WIDTH, HEIGHT), mcu=(2, 1), band=7):
+    header = DecodeRequest(*scaled, *output, *mcu, band).header(5)
+    return bytearray(header + b"jpeg")
+
+
+class MjpgChildDecodeTests(unittest.TestCase):
+    """The child's decode step, with a stand-in decoder (no native code)."""
+
+    def image(self):
+        return np.frombuffer(pixels(), np.uint8).reshape(HEIGHT, WIDTH, 1).copy()
+
+    def test_strict_accurate_luma_decode_options(self):
+        decoder = FakeSimplejpeg(self.image())
+        pixels_out, refusal = mjpg_child._decode(decoder, np, child_request())
+        self.assertEqual((pixels(), 0), (pixels_out, refusal))
+        self.assertEqual([dict(colorspace="GRAY", fastdct=False, fastupsample=False,
+                               min_width=WIDTH, min_height=HEIGHT, strict=True)], decoder.calls)
+
+    def test_decoder_error_shape_and_dtype_are_refused(self):
+        cases = ((ValueError("synthetic libjpeg warning"), mjpg_child.DECODE_FAILED),
+                 (np.zeros((HEIGHT, WIDTH + 1, 1), np.uint8), mjpg_child.SHAPE_MISMATCH),
+                 (np.zeros((HEIGHT, WIDTH), np.uint8), mjpg_child.SHAPE_MISMATCH),
+                 (np.zeros((HEIGHT, WIDTH, 1), np.uint16), mjpg_child.SHAPE_MISMATCH),
+                 (self.image().tolist(), mjpg_child.SHAPE_MISMATCH))
+        for result, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual((None, expected),
+                                 mjpg_child._decode(FakeSimplejpeg(result), np, child_request()))
+
+    def test_undecoded_mid_grey_band_is_refused(self):
+        image = self.image()
+        # libjpeg stopped mid-row: the last 7 MCUs (2x1 at 1/8) are 128.
+        image.reshape(-1)[-14:] = 128
+        self.assertEqual((None, mjpg_child.UNDECODED_BAND),
+                         mjpg_child._decode(FakeSimplejpeg(image), np, child_request()))
+        # Six trailing MCUs are not the band.
+        image = self.image()
+        image.reshape(-1)[-12:] = 128
+        self.assertIsNotNone(mjpg_child._decode(FakeSimplejpeg(image), np, child_request())[0])
+        # A dark (covered-lens-like) uniform frame is not mistaken for the band;
+        # an exactly mid-grey uniform scene is (documented false positive).
+        dark = np.full((HEIGHT, WIDTH, 1), 4, np.uint8)
+        self.assertIsNotNone(mjpg_child._decode(FakeSimplejpeg(dark), np, child_request())[0])
+        grey = np.full((HEIGHT, WIDTH, 1), 128, np.uint8)
+        self.assertEqual(mjpg_child.UNDECODED_BAND,
+                         mjpg_child._decode(FakeSimplejpeg(grey), np, child_request())[1])
+
+    def test_decimation_and_invalid_requests(self):
+        image = np.arange(4 * WIDTH * HEIGHT, dtype=np.uint32).astype(np.uint8)
+        image = image.reshape(HEIGHT * 2, WIDTH * 2, 1)
+        output, _ = mjpg_child._decode(FakeSimplejpeg(image), np, child_request(
+            scaled=(WIDTH * 2, HEIGHT * 2)))
+        self.assertEqual(image[::2, ::2, 0].tobytes(), output)
+        for request in (child_request(scaled=(WIDTH + 1, HEIGHT)), child_request(band=0),
+                        child_request(mcu=(0, 1))):
+            with self.assertRaises(ValueError):
+                mjpg_child._decode(FakeSimplejpeg(self.image()), np, request)
+
+
+class MjpgDecoderProcessTests(DecoderCase):
+    REQUEST = DecodeRequest(WIDTH, HEIGHT, WIDTH, HEIGHT, 2, 1, 7)
+
+    def setUp(self):
+        self.frame = encode(pixels())
+        self.layout = MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT)
+
+    def refused(self, decoder, data=None, layout=None):
+        with self.assertRaises(MjpgFrameRejected) as caught:
+            (layout or self.layout).luma(data or self.frame, WIDTH, HEIGHT, decoder)
+        return caught.exception.reason
+
+    def timed_refusal(self, decoder, data=b"\xff"):
+        started = time.monotonic()
+        with self.assertRaises(mjpg_worker.DecoderRefusal) as caught:
+            decoder.decode(data, self.REQUEST)
+        return caught.exception.reason, time.monotonic() - started
+
+    def test_child_is_confined_and_limited(self):
+        decoder = self.decoder(MjpgDecoderLimits(address_space_bytes=200 * 1024 * 1024))
+        self.layout.luma(self.frame, WIDTH, HEIGHT, decoder)
+        with open(f"/proc/{decoder.pid}/status") as status:
+            fields = dict(line.split(":", 1) for line in status)
+        self.assertEqual(("1", "1", str(os.getpid())),
+                         (fields["NoNewPrivs"].strip(), fields["Threads"].strip(),
+                          fields["PPid"].strip()))
+        self.assertEqual(os.getuid(), int(fields["Uid"].split()[0]))
+        with open(f"/proc/{decoder.pid}/limits") as limits:
+            values = {line[:26].strip(): line[26:].split()[:2] for line in limits}
+        self.assertEqual([str(200 * 1024 * 1024)] * 2, values["Max address space"])
+        self.assertEqual(["16", "16"], values["Max open files"])
+        self.assertEqual(["0", "0"], values["Max processes"])
+        self.assertEqual(["0", "0"], values["Max core file size"])
+        self.assertEqual(["0", "0"], values["Max file size"])
+        self.assertEqual(10, os.getpriority(os.PRIO_PROCESS, decoder.pid))
+        # Not dumpable: another process of the service account cannot read
+        # its memory or environment.
+        with self.assertRaises(PermissionError):
+            open(f"/proc/{decoder.pid}/environ").close()
+
+    def test_child_gets_minimal_environment_and_only_its_socket(self):
+        decoder = self.decoder(behaviour="inspect", start=False)
+        with mock.patch.dict(os.environ, {"SERVERSENTINEL_SYNTHETIC_SECRET": "x"}):
+            self.assertEqual("running", ready(decoder))
+        report = decoder.decode(b"\xff", DecodeRequest(64, 64, 64, 64, 8, 8, 8))
+        report = json.loads(report)
+        self.assertEqual(CHILD_ENVIRONMENT, report["environment"])
+        # stdio, the private socket and the descriptor listing itself.
+        self.assertEqual(5, len(report["descriptors"]))
+        self.assertEqual([0, 1, 2], report["descriptors"][:3])
+        self.assertIn(report["socket"], report["descriptors"])
+
+    def test_first_frame_asks_for_a_child_without_waiting_for_it(self):
+        decoder = self.decoder(start=False)
+        started = time.monotonic()
+        self.assertEqual("decoder_starting", self.refused(decoder))
+        # `decoder_starting` itself shows the frame did not wait for the
+        # child; the bound only catches a blocking start (generous for CI).
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual("running", settle(decoder))
+        self.assertEqual(WIDTH * HEIGHT, len(self.layout.luma(self.frame, WIDTH, HEIGHT, decoder)))
+        # Asking again while a child runs never starts a second one.
+        pid = decoder.pid
+        decoder.prepare()
+        self.assertEqual("running", settle(decoder))
+        self.assertEqual(pid, decoder.pid)
+        self.assertEqual((1, 0), (decoder.status().starts, decoder.status().failures))
+
+    def test_idle_child_kill_is_unknown_then_respawned_after_backoff(self):
+        clock = Clock()
+        decoder = self.decoder(MjpgDecoderLimits(restart_backoff_ns=100), clock=clock)
+        first = self.layout.luma(self.frame, WIDTH, HEIGHT, decoder)
+        pid = decoder.pid
+        os.kill(pid, signal.SIGKILL)
+        self.assertTrue(wait_for(lambda: not alive(pid)))
+        self.assertEqual("decoder_crashed", self.refused(decoder))
+        self.assertEqual("backoff", settle(decoder))
+        # During the backoff a frame is refused at once, never waited on.
+        started = time.monotonic()
+        self.assertEqual("decoder_unavailable", self.refused(decoder))
+        # The fake clock never advances here: a waiting refusal never returns.
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIsNone(decoder.pid)
+        clock.value = 100
+        # The supervisor starts the replacement when the backoff ends, without
+        # waiting for (and refusing) one more frame.
+        self.assertTrue(wait_for(lambda: decoder.status().state == "running", timeout=20))
+        self.assertEqual(first, self.layout.luma(self.frame, WIDTH, HEIGHT, decoder))
+        self.assertNotEqual(pid, decoder.pid)
+        status = decoder.status()
+        self.assertEqual((2, 1, 0), (status.starts, status.crashes, status.consecutive_failures))
+
+    def test_hung_child_is_killed_at_the_frame_deadline(self):
+        decoder = self.decoder(MjpgDecoderLimits(frame_timeout_ns=300_000_000))
+        self.layout.luma(self.frame, WIDTH, HEIGHT, decoder)
+        pid = decoder.pid
+        os.kill(pid, signal.SIGSTOP)
+        started = time.monotonic()
+        self.assertEqual("decoder_timeout", self.refused(decoder))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(wait_for(lambda: not alive(pid)))
+        self.assertEqual(1, decoder.status().timeouts)
+        hang = self.decoder(MjpgDecoderLimits(frame_timeout_ns=300_000_000), behaviour="hang")
+        self.assertEqual("decoder_timeout", self.refused(hang))
+        settle(hang)
+        self.assertIsNone(hang.pid)
+
+    def test_crashing_child_is_unknown(self):
+        for behaviour in ("exit", "sigkill"):
+            with self.subTest(behaviour=behaviour):
+                decoder = self.decoder(behaviour=behaviour)
+                self.assertEqual("decoder_crashed", self.refused(decoder))
+                self.assertEqual(1, decoder.status().crashes)
+                settle(decoder)
+                self.assertIsNone(decoder.pid)
+
+    def test_malformed_replies_are_protocol_failures(self):
+        limits = MjpgDecoderLimits(frame_timeout_ns=300_000_000)
+        for behaviour, reason in (("short", "decoder_protocol"), ("wrong_id", "decoder_protocol"),
+                                  ("wrong_kind", "decoder_protocol"),
+                                  ("bad_refusal", "decoder_protocol"),
+                                  ("oversized", "decoder_protocol"),
+                                  ("partial", "decoder_timeout")):
+            with self.subTest(behaviour=behaviour):
+                decoder = self.decoder(limits, behaviour=behaviour)
+                self.assertEqual(reason, self.refused(decoder))
+                settle(decoder)
+                self.assertIsNone(decoder.pid)
+                self.assertEqual(1, decoder.status().failures)
+
+    def test_reply_size_outside_the_two_reply_sizes_is_refused_before_reading(self):
+        # The fake announces the size and then sends nothing more: only a
+        # check made before reading the body answers before the deadline.
+        limits = MjpgDecoderLimits(frame_timeout_ns=2_000_000_000)
+        expected = WIDTH * HEIGHT
+        for size in (9 + 2 * expected, 9 + expected + 1, 9 + expected - 1, 9, 9 + 2, 0):
+            with self.subTest(size=size):
+                decoder = self.decoder(limits, behaviour=f"size_{size}")
+                reason, elapsed = self.timed_refusal(decoder)
+                self.assertEqual("decoder_protocol", reason)
+                self.assertLess(elapsed, 1.0)
+                self.assertEqual(1, decoder.status().protocol_errors)
+
+    def test_slow_drip_reply_hits_the_overall_frame_deadline(self):
+        # One reply byte every 50 ms: each read makes progress, but the whole
+        # exchange is bounded by the per-frame deadline.
+        decoder = self.decoder(MjpgDecoderLimits(frame_timeout_ns=300_000_000), behaviour="drip")
+        reason, elapsed = self.timed_refusal(decoder)
+        self.assertEqual("decoder_timeout", reason)
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(1, decoder.status().timeouts)
+
+    def test_failed_starts_are_unavailable(self):
+        limits = MjpgDecoderLimits(start_timeout_ns=300_000_000)
+        for behaviour in ("exit_at_start", "hang_at_start", "wrong_ready"):
+            with self.subTest(behaviour=behaviour):
+                decoder = self.decoder(limits, behaviour=behaviour)
+                self.assertEqual("backoff", settle(decoder))
+                self.assertEqual("decoder_unavailable", self.refused(decoder))
+                self.assertEqual(1, decoder.status().start_failures)
+                self.assertIsNone(decoder.pid)
+        # The real child refuses to start with any other numpy version.
+        with mock.patch.object(mjpg_worker, "NUMPY_VERSION", "0.0"):
+            decoder = self.decoder(limits)
+            self.assertEqual("decoder_unavailable", self.refused(decoder))
+        self.assertEqual(1, decoder.status().start_failures)
+
+    def test_hung_start_never_delays_a_frame_and_stop_interrupts_it(self):
+        decoder = self.decoder(MjpgDecoderLimits(start_timeout_ns=5_000_000_000),
+                               behaviour="hang_at_start", start=False)
+        for _ in range(3):
+            reason, elapsed = self.timed_refusal(decoder)
+            self.assertEqual("decoder_starting", reason)
+            # Far below the 5 s start timeout a waiting refusal would take.
+            self.assertLess(elapsed, 1.0)
+        self.assertTrue(wait_for(lambda: decoder.pid is not None))
+        pid = decoder.pid
+        self.assertTrue(alive(pid))
+        # A stop during the hung start does not wait for the start timeout.
+        started = time.monotonic()
+        self.assertTrue(decoder.close(1.0))
+        self.assertLess(time.monotonic() - started, 2.5)
+        self.assertFalse(alive(pid))
+        self.assertEqual((0, 0), (decoder.status().starts, decoder.status().start_failures))
+
+    def test_failed_reap_never_starts_a_second_child(self):
+        clock = Clock()
+        decoder = self.decoder(MjpgDecoderLimits(frame_timeout_ns=300_000_000),
+                               behaviour="hang", clock=clock)
+        process = decoder._process
+        with mock.patch.object(mjpg_worker, "_REAP_TIMEOUT_S", 1.5), \
+                mock.patch.object(process, "wait",
+                                  side_effect=subprocess.TimeoutExpired("child", 0)):
+            reason, elapsed = self.timed_refusal(decoder)
+            self.assertEqual("decoder_timeout", reason)
+            # The reap runs on the supervisor, not in the refused exchange:
+            # the 0.3 s frame deadline plus a 1.5 s reap would exceed this.
+            self.assertLess(elapsed, 1.5)
+            self.assertTrue(wait_for(lambda: decoder.status().state == "reap_failed",
+                                     timeout=20))
+            clock.value += 10 ** 12
+            with mock.patch.object(mjpg_worker.subprocess, "Popen") as popen:
+                for _ in range(3):
+                    reason, elapsed = self.timed_refusal(decoder)
+                    self.assertEqual("decoder_unavailable", reason)
+                    # Below the 1.5 s reap a waiting refusal would take.
+                    self.assertLess(elapsed, 1.0)
+                decoder.prepare()
+                time.sleep(0.3)
+                popen.assert_not_called()
+            self.assertEqual(process.pid, decoder.pid)
+            self.assertEqual("reap_failed", decoder.status().state)
+        # Once the old child is reaped, the replacement starts on its own
+        # (the backoff has long ended).
+        self.assertTrue(wait_for(lambda: decoder.status().state == "running", timeout=20))
+        self.assertEqual("running", ready(decoder))
+        self.assertNotEqual(process.pid, decoder.pid)
+        self.assertEqual(2, decoder.status().starts)
+
+    def test_kill_between_spawn_and_publication_reaches_the_child(self):
+        decoder = self.decoder(start=False)
+        real, spawned = subprocess.Popen, []
+
+        def popen(*args, **options):
+            process = real(*args, **options)
+            spawned.append(process)
+            # A stop arriving after Popen returned, before the handle is
+            # published to `kill()`.
+            decoder.kill()
+            return process
+
+        with mock.patch.object(mjpg_worker.subprocess, "Popen", popen):
+            decoder.prepare()
+            self.assertEqual("closed", settle(decoder))
+        self.assertEqual(1, len(spawned))
+        self.assertTrue(wait_for(lambda: not alive(spawned[0].pid)))
+        self.assertEqual(-signal.SIGKILL, spawned[0].returncode)
+        self.assertIsNone(decoder.pid)
+        # A shutdown, not a child failure.
+        self.assertEqual((0, 0), (decoder.status().starts, decoder.status().failures))
+
+    def test_retire_alone_abandons_a_hung_start(self):
+        """`retire()` (no `kill()`, no `close()`) ends a start that hangs in
+        the ready handshake: the child is killed and reaped and no other is
+        started."""
+        decoder = self.decoder(MjpgDecoderLimits(start_timeout_ns=30_000_000_000),
+                               behaviour="hang_at_start", start=False)
+        decoder.prepare()
+        self.assertTrue(wait_for(lambda: decoder.pid is not None))
+        pid = decoder.pid
+        self.assertTrue(alive(pid))
+        started = time.monotonic()
+        decoder.retire()
+        self.assertEqual("closed", settle(decoder))
+        # Far below the 30 s start timeout a waiting retire would take.
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertTrue(wait_for(lambda: not alive(pid)))
+        self.assertIsNone(decoder.pid)
+        self.assertEqual("decoder_unavailable", self.refused(decoder))
+        decoder.prepare()
+        self.assertEqual("closed", settle(decoder))
+        self.assertEqual((0, 0), (decoder.status().starts, decoder.status().start_failures))
+
+    def test_retire_before_spawn_starts_nothing(self):
+        """A retire that lands after the start was requested but before the
+        supervisor spawns: no child process is created."""
+        decoder = self.decoder(start=False)
+        with mock.patch.object(mjpg_worker.subprocess, "Popen") as popen, \
+                mock.patch.object(decoder, "_supervisor_locked", return_value=True):
+            decoder.prepare()  # STARTING, but no supervisor runs it yet
+            decoder.retire()
+            decoder._start()
+        popen.assert_not_called()
+        self.assertEqual("closed", decoder.status().state)
+        self.assertEqual((0, 0), (decoder.status().starts, decoder.status().failures))
+
+    def test_post_publication_recheck_alone_kills_a_retired_start(self):
+        """A retire that lands between Popen returning and the publication of
+        the handle: the re-check after publication alone kills the child,
+        before any ready handshake is read."""
+        decoder = self.decoder(start=False)
+        real, spawned = subprocess.Popen, []
+
+        def popen(*args, **options):
+            process = real(*args, **options)
+            spawned.append(process)
+            # `retire()` signals nothing; only the re-check can reach it.
+            decoder.retire()
+            return process
+
+        with mock.patch.object(mjpg_worker.subprocess, "Popen", popen), \
+                mock.patch.object(mjpg_worker, "_read_exact") as handshake:
+            decoder.prepare()
+            self.assertEqual("closed", settle(decoder))
+        handshake.assert_not_called()
+        self.assertEqual(1, len(spawned))
+        self.assertTrue(wait_for(lambda: not alive(spawned[0].pid)))
+        self.assertEqual(-signal.SIGKILL, spawned[0].returncode)
+        self.assertIsNone(decoder.pid)
+        self.assertEqual((0, 0), (decoder.status().starts, decoder.status().failures))
+
+    def test_status_leaves_backoff_when_it_ends(self):
+        clock = Clock()
+        decoder = self.decoder(MjpgDecoderLimits(restart_backoff_ns=100), behaviour="exit",
+                               clock=clock)
+        # Hold the supervisor's own restart, to observe the state in between.
+        with mock.patch.object(decoder, "_due_restart_locked", return_value=None):
+            self.assertEqual("decoder_crashed", self.refused(decoder))
+            self.assertEqual("backoff", settle(decoder))
+            clock.value = 99
+            self.assertEqual("backoff", decoder.status().state)
+            clock.value = 100
+            self.assertEqual("stopped", decoder.status().state)
+            self.assertEqual("decoder_starting", self.refused(decoder))
+        self.assertEqual("running", settle(decoder))
+
+    def test_memory_cap_exceeded_is_unknown(self):
+        # Too small for the interpreter with numpy: the start fails.
+        tiny = self.decoder(MjpgDecoderLimits(address_space_bytes=64 * 1024 * 1024))
+        self.assertEqual("decoder_unavailable", self.refused(tiny))
+        self.assertEqual(1, tiny.status().start_failures)
+        # Just above the started child's size: a full-size 4K decode cannot
+        # allocate its output.
+        probe = self.decoder()
+        self.layout.luma(self.frame, WIDTH, HEIGHT, probe)
+        with open(f"/proc/{probe.pid}/status") as status:
+            size = next(int(line.split()[1]) for line in status if line.startswith("VmSize"))
+        cap = (size + 4096) * 1024
+        clock = Clock()
+        tight = self.decoder(MjpgDecoderLimits(address_space_bytes=cap, restart_backoff_ns=1,
+                                               maximum_backoff_ns=1), clock=clock)
+        layout = MjpgLumaLayout(3840, 2160)
+        frame = noise_frame(3840, 2160, subsampling="444")
+        with self.assertRaises(MjpgFrameRejected) as caught:
+            layout.luma(frame, 3840, 2160, tight)
+        self.assertIn(caught.exception.reason, ("decode_failed", "decoder_crashed"))
+        clock.value += 10
+        # The child (or its replacement) still decodes a frame that fits.
+        self.assertEqual("running", ready(tight))
+        self.assertEqual(WIDTH * HEIGHT, len(self.layout.luma(self.frame, WIDTH, HEIGHT, tight)))
+
+    def test_repeated_failures_report_failing_until_a_success(self):
+        clock = Clock()
+        decoder = self.decoder(FAST, behaviour="exit_second", clock=clock)
+        self.assertEqual(WIDTH * HEIGHT, len(decoder.decode(b"\xff", self.REQUEST)))
+        for count in range(1, 3):
+            clock.value += 10
+            with self.assertRaises(mjpg_worker.DecoderRefusal):
+                decoder.decode(b"\xff", self.REQUEST)
+            clock.value += 10
+            # A replacement child answers the first frame, then exits again.
+            self.assertEqual("running", ready(decoder))
+            self.assertEqual(WIDTH * HEIGHT, len(decoder.decode(b"\xff", self.REQUEST)))
+            self.assertFalse(decoder.failing)
+        always = self.decoder(FAST, behaviour="exit", clock=clock)
+        for count in range(1, 4):
+            clock.value += 10
+            self.assertEqual("running", ready(always))
+            with self.assertRaises(mjpg_worker.DecoderRefusal):
+                always.decode(b"\xff", self.REQUEST)
+            self.assertEqual(count >= 2, always.failing)
+
+    def test_healthy_refusal_resets_consecutive_failures(self):
+        clock = Clock()
+        decoder = self.decoder(FAST, behaviour="refuse", clock=clock)
+        for _ in range(2):
+            pid = decoder.pid
+            os.kill(pid, signal.SIGKILL)
+            self.assertTrue(wait_for(lambda: not alive(pid)))
+            self.assertEqual("decoder_crashed", self.timed_refusal(decoder)[0])
+            clock.value += 10
+            self.assertEqual("running", ready(decoder))
+        self.assertEqual((2, True), (decoder.status().consecutive_failures, decoder.failing))
+        # A healthy child refusing a frame (strict decode error) clears it and
+        # stays.
+        pid = decoder.pid
+        self.assertEqual("decode_failed", self.timed_refusal(decoder)[0])
+        status = decoder.status()
+        self.assertEqual((0, False, "running", 2), (status.consecutive_failures, status.failing,
+                                                    status.state, status.crashes))
+        self.assertEqual(pid, decoder.pid)
+
+    def test_backoff_is_exponential_and_bounded(self):
+        clock = Clock()
+        limits = MjpgDecoderLimits(restart_backoff_ns=10, maximum_backoff_ns=35)
+        decoder = self.decoder(limits, behaviour="exit_at_start", clock=clock, start=False)
+        waits = []
+        for _ in range(4):
+            self.assertEqual("backoff", ready(decoder))
+            with self.assertRaises(mjpg_worker.DecoderRefusal):
+                decoder.decode(b"\xff", self.REQUEST)
+            waits.append(decoder._retry_at - clock.value)
+            clock.value = decoder._retry_at
+        self.assertEqual([10, 20, 35, 35], waits)
+        self.assertEqual(4, decoder.status().start_failures)
+
+    def test_close_reaps_and_retire_prevents_restart(self):
+        decoder = self.decoder()
+        self.layout.luma(self.frame, WIDTH, HEIGHT, decoder)
+        pid = decoder.pid
+        self.assertTrue(decoder.close())
+        self.assertFalse(alive(pid))
+        self.assertEqual("decoder_unavailable", self.refused(decoder))
+        self.assertTrue(decoder.close())
+        retired = self.decoder(start=False)
+        retired.retire()
+        self.assertEqual("decoder_unavailable", self.refused(retired))
+        retired.prepare()
+        self.assertEqual("closed", settle(retired))
+        self.assertIsNone(retired.pid)
+
+    def test_child_outlives_the_thread_that_asked_for_it(self):
+        """The parent-death signal is tied to the source's supervisor
+        thread, not to whichever thread asked for the child."""
+        decoder = self.decoder(start=False)
+        asker = threading.Thread(target=decoder.prepare)
+        asker.start()
+        asker.join()
+        self.assertEqual("running", settle(decoder))
+        time.sleep(0.2)
+        self.assertTrue(alive(decoder.pid))
+        self.assertEqual(WIDTH * HEIGHT, len(self.layout.luma(self.frame, WIDTH, HEIGHT, decoder)))
+
+    def test_limits_are_validated(self):
+        for changes in (dict(frame_timeout_ns=0), dict(address_space_bytes=1 << 20),
+                        dict(open_files=4), dict(niceness=20), dict(restart_backoff_ns=0),
+                        dict(restart_backoff_ns=10, maximum_backoff_ns=5),
+                        dict(failing_after=0), dict(start_timeout_ns=-1),
+                        dict(frame_timeout_ns=1.5)):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                MjpgDecoderLimits(**changes)
+        with self.assertRaises(ValueError):
+            MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, decoder=None)
+
+    def test_child_dies_with_its_parent(self):
+        """No orphan: SIGKILL the parent and the decode child goes too.
+
+        The real child is stopped first, so it cannot notice the closed
+        socket and exit by itself: only the parent-death SIGKILL ends it.
+        """
+        program = (
+            "import sys, time\n"
+            "from app.detection.roi.mjpg_worker import *\n"
+            "from app.detection.roi.mjpg import MAXIMUM_FRAME_BYTES\n"
+            "decoder = MjpgDecoderProcess(MjpgDecoderLimits(), MAXIMUM_FRAME_BYTES)\n"
+            "frame = sys.stdin.buffer.read()\n"
+            "decoder.prepare()\n"
+            "deadline = time.monotonic() + 20\n"
+            "while decoder.status().state == 'starting' and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n"
+            "decoder.decode(frame, DecodeRequest(%d, %d, %d, %d, 2, 1, 7))\n"
+            "print(decoder.pid, flush=True)\n"
+            "time.sleep(60)\n" % (WIDTH, HEIGHT, WIDTH, HEIGHT))
+        parent = subprocess.Popen([sys.executable, "-c", program], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, cwd=Path(__file__).parents[1])
+        self.addCleanup(parent.stdout.close)
+        self.addCleanup(parent.wait)
+        self.addCleanup(parent.kill)
+        parent.stdin.write(self.frame)
+        parent.stdin.close()
+        pid = int(parent.stdout.readline())
+        self.assertTrue(alive(pid))
+
+        def reap_stray():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        self.addCleanup(reap_stray)
+        os.kill(pid, signal.SIGSTOP)
+        self.assertTrue(wait_for(lambda: stopped(pid)))
+        parent.kill()
+        parent.wait()
+        self.assertTrue(wait_for(lambda: not alive(pid)))
+
+
+class MjpgHarness(Harness):
+    def frame(self, luma=None, source=SOURCE, advance=INTERVAL, data=None):
+        self.queue(luma, source, advance, data)
+        before = self._handled(source)
+        if self.threaded:
+            assert wait_for(lambda: self._handled(source) > before)
+        else:
+            self.runtime.step()
+        return self.source(source)
+
+    def queue(self, luma=None, source=SOURCE, advance=INTERVAL, data=None):
+        self.clock.value += advance
+        number = self.sequence.get(source, 0) + 1
+        self.sequence[source] = number
+        payload = data if data is not None else encode(luma or pixels())
+        self.runtime.on_uvc_frame(source, VideoFrame(payload, number, 0.0))
+
+    def start(self):
+        """Start the runtime and wait until every bound source's decode child
+        is ready (the runtime asks for it at bind, without waiting)."""
+        status = self.runtime.start()
+        self.warm()
+        return status
+
+    def warm(self, *sources):
+        """Bind (or wait for the worker to bind) and, past any restart
+        backoff, wait until each bound source's child is ready."""
+        if self.threaded:
+            wait_for(lambda: all(self.source(source).state is not SceneSourceState.INACTIVE
+                                 for source in sources or self.runtime.source_ids))
+        else:
+            self.runtime.step()
+        self.clock.value += 1  # past a 1 ns test backoff
+        for source in sources or self.runtime.source_ids:
+            if self.source(source).state is not SceneSourceState.INACTIVE:
+                ready(self.runtime._contexts[source].decoder)
+
+    def use(self, source, behaviour=None, limits=FAST):
+        """Replace a source's decode child with a synthetic stand-in."""
+        context = self.runtime._contexts[source]
+        previous = context.decoder
+        context.decoder = MjpgDecoderProcess(
+            limits, MAXIMUM_FRAME_BYTES, clock_ns=self.clock,
+            command=fake(behaviour) if behaviour else None)
+        previous.close()
+
+    def pid(self, source=SOURCE):
+        return self.runtime._contexts[source].decoder.pid
+
+
+MJPG_LAYOUT = MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT)
+FAST_LAYOUT = MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, decoder=FAST)
+
+
+class SceneRuntimeMjpgTests(unittest.TestCase):
+    def harness(self, *bindings, **options):
+        harness = MjpgHarness(*bindings, **options)
+        self.addCleanup(harness.runtime.stop)
+        return harness
+
+    def test_local_uvc_mjpg_frames_confirm_server_movement(self):
+        harness = self.harness(binding(layout=MJPG_LAYOUT))
+        harness.start()
+        harness.frame()
+        self.assertEqual(Observation.ABSENT, harness.frame().movement)
+        harness.frame(MOVED)
+        confirmed = harness.frame(MOVED)
+        self.assertEqual(Observation.PRESENT, confirmed.movement)
+        self.assertEqual([CriticalKind.SERVER_MOVEMENT], harness.recorder.kinds())
+        self.assertNotEqual(os.getpid(), harness.pid())
+
+    def test_bind_asks_for_the_child_and_frames_before_it_is_ready_are_unknown(self):
+        harness = self.harness(binding(layout=MJPG_LAYOUT))
+        harness.runtime.start()
+        self.assertIsNone(harness.pid())
+        harness.runtime.step()  # binds the source: its child is requested
+        decoder = harness.runtime._contexts[SOURCE].decoder
+        self.assertIn(decoder.status().state, ("starting", "running"))
+        self.assertEqual("running", settle(decoder))
+        self.assertEqual(1, harness.frame().evaluated)
+        cold = self.harness(binding(layout=MJPG_LAYOUT))
+        cold.runtime.start()
+        with mock.patch.object(MjpgDecoderProcess, "prepare"):
+            source = cold.frame(MOVED)
+        self.assertEqual(("frame_undecodable", (("decoder_starting", 1),), Observation.UNKNOWN),
+                         (source.reason, source.undecodable_reasons, source.movement))
+        self.assertEqual(0, source.decoder_failures)
+
+    def test_corrupt_mjpg_frame_is_unknown_never_no_movement(self):
+        harness = self.harness(binding(layout=MJPG_LAYOUT), binding(OTHER, layout=MJPG_LAYOUT))
+        harness.start()
+        for _ in range(2):
+            harness.frame(source=OTHER, advance=0)
+            harness.frame()
+        good = encode(pixels())
+        start = scan_start(good)
+        corrupt = (good[:start + (len(good) - start) // 2],
+                   with_sof(good, CAPTURE_WIDTH * 2, CAPTURE_HEIGHT),
+                   good + bytes(mjpg.DEFAULT_TRAILING_BYTES + 1), good[:-2],
+                   good[:start + (len(good) - start) // 2].rstrip(b"\xff") + b"\xff\xd9")
+        for index, data in enumerate(corrupt, 1):
+            with self.subTest(index=index):
+                harness.frame(source=OTHER, advance=0, data=data)
+                harness.frame()
+                broken = harness.source(OTHER)
+                self.assertEqual("frame_undecodable", broken.reason)
+                self.assertIs(SceneSourceState.DEGRADED, broken.state)
+                self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN),
+                                 (broken.movement, broken.tamper))
+                self.assertEqual(index, broken.unusable)
+        self.assertEqual((("decode_failed", 1), ("missing_eoi", 2), ("sof_dimension_mismatch", 1),
+                          ("trailing_bytes_exceeded", 1)),
+                         harness.source(OTHER).undecodable_reasons)
+        # The other source keeps running.
+        self.assertEqual(Observation.ABSENT, harness.source().movement)
+        self.assertEqual((), harness.source().undecodable_reasons)
+        self.assertEqual([], harness.recorder.items)
+
+    def test_child_crash_is_unknown_and_a_replacement_resumes(self):
+        harness = self.harness(binding(layout=FAST_LAYOUT), binding(OTHER, layout=FAST_LAYOUT))
+        harness.start()
+        harness.frame(source=OTHER, advance=0)
+        harness.frame()
+        self.assertEqual(Observation.ABSENT, harness.frame().movement)
+        pid, other = harness.pid(), harness.pid(OTHER)
+        self.assertNotEqual(pid, other)
+        os.kill(pid, signal.SIGKILL)
+        self.assertTrue(wait_for(lambda: not alive(pid)))
+        broken = harness.frame(MOVED)
+        self.assertEqual(("frame_undecodable", Observation.UNKNOWN, Observation.UNKNOWN, 1),
+                         (broken.reason, broken.movement, broken.tamper, broken.decoder_failures))
+        self.assertEqual((("decoder_crashed", 1),), broken.undecodable_reasons)
+        # The replacement starts after the backoff and evaluation resumes.
+        harness.warm(SOURCE)
+        resumed = harness.frame()
+        self.assertIs(SceneSourceState.ACTIVE, resumed.state)
+        self.assertNotEqual(pid, harness.pid())
+        # The other source's child was never affected.
+        self.assertEqual(other, harness.pid(OTHER))
+        self.assertEqual(SceneSourceState.ACTIVE, harness.frame(source=OTHER, advance=0).state)
+        self.assertEqual([], harness.recorder.items)
+
+    def test_hung_child_is_killed_and_the_frame_is_unknown(self):
+        limits = MjpgDecoderLimits(frame_timeout_ns=300_000_000, restart_backoff_ns=1,
+                                   maximum_backoff_ns=1)
+        harness = self.harness(binding(layout=FAST_LAYOUT))
+        harness.use(SOURCE, "hang", limits)
+        harness.start()
+        source = harness.frame()
+        self.assertEqual(("frame_undecodable", (("decoder_timeout", 1),)),
+                         (source.reason, source.undecodable_reasons))
+        settle(harness.runtime._contexts[SOURCE].decoder)
+        self.assertIsNone(harness.pid())
+
+    def test_a_child_hanging_at_start_never_delays_another_source(self):
+        """One source's child hangs in its start: the shared scene worker
+        keeps evaluating the other source on every cycle without waiting."""
+        harness = self.harness(binding(layout=FAST_LAYOUT), binding(OTHER, layout=FAST_LAYOUT))
+        harness.use(SOURCE, "hang_at_start", MjpgDecoderLimits(start_timeout_ns=5_000_000_000))
+        harness.runtime.start()
+        harness.runtime.step()  # binds both: both children are requested
+        self.assertEqual("running", settle(harness.runtime._contexts[OTHER].decoder))
+        self.assertEqual("starting", harness.runtime._contexts[SOURCE].decoder.status().state)
+        cycles = []
+        for _ in range(3):
+            harness.queue(MOVED)
+            started = time.monotonic()
+            harness.frame(source=OTHER, advance=0)  # one worker cycle, both sources
+            cycles.append(time.monotonic() - started)
+        # A synchronous start would hold the cycle for the 5 s start timeout
+        # (and end it as a start failure, not `decoder_starting`).
+        self.assertLess(max(cycles), 2.5)
+        hung, other = harness.source(), harness.source(OTHER)
+        self.assertEqual(("frame_undecodable", (("decoder_starting", 3),), Observation.UNKNOWN),
+                         (hung.reason, hung.undecodable_reasons, hung.movement))
+        self.assertEqual((3, SceneSourceState.ACTIVE, ()),
+                         (other.evaluated, other.state, other.undecodable_reasons))
+        # Stopping during the hung start stays within the stop bounds.
+        pid = harness.pid()
+        started = time.monotonic()
+        status = harness.runtime.stop()
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertIs(SceneRuntimeState.STOPPED, status.state)
+        self.assertFalse(alive(pid))
+
+    def test_a_worst_case_stuffed_frame_never_delays_another_source(self):
+        """Codex P2 on PR #225: a 4K source sending frames at its byte budget
+        made only of `FF 00` stuffing is refused by the pre-check on the
+        shared scene worker within milliseconds, so the other source is still
+        evaluated on every cycle."""
+        large = MjpgLumaLayout(3840, 2160, maximum_trailing_bytes=0, decoder=FAST)
+        harness = self.harness(binding(layout=large), binding(OTHER, layout=FAST_LAYOUT))
+        harness.start()
+        hostile = (stuffed(3840, 2160, ending=b"\xff\x01\xff\xd9"),
+                   stuffed(3840, 2160, ending=b"\xff\x00"))
+        reference = reference_scan_seconds(hostile[0])
+        cycles = []
+        for index in range(4):
+            harness.queue(data=hostile[index % 2])
+            started = time.monotonic()
+            harness.frame(source=OTHER, advance=0)  # one worker cycle, both sources
+            cycles.append(time.monotonic() - started)
+        # The former per-pair loop held each cycle for about as long as
+        # `reference` (seconds); the C-level scan of 16.8 MB takes 10-100 ms
+        # depending on the runner, the other source's decode a few. The
+        # ratio does not depend on the runner's speed; the median keeps the
+        # cycle inside the 1 s sampling interval.
+        self.assertLess(min(cycles) * 5, reference, (cycles, reference))
+        self.assertLess(statistics.median(cycles), 1.0)
+        hostile_source, other = harness.source(), harness.source(OTHER)
+        self.assertEqual((("missing_eoi", 2), ("scan_invalid", 2)),
+                         hostile_source.undecodable_reasons)
+        self.assertEqual(Observation.UNKNOWN, hostile_source.movement)
+        # Refused before any native code: the child is untouched.
+        self.assertEqual((0, "running"), (hostile_source.decoder_failures,
+                                          harness.runtime._contexts[SOURCE].decoder.status().state))
+        self.assertEqual((4, SceneSourceState.ACTIVE, ()),
+                         (other.evaluated, other.state, other.undecodable_reasons))
+        self.assertEqual([], harness.recorder.items)
+
+    def test_repeated_failures_lower_the_source_and_the_runtime(self):
+        harness = self.harness(binding(layout=FAST_LAYOUT), binding(OTHER, layout=FAST_LAYOUT))
+        harness.use(SOURCE, "exit")
+        harness.start()
+        harness.frame(source=OTHER, advance=0)
+        harness.frame(source=OTHER, advance=0)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            for _ in range(4):
+                harness.warm(SOURCE)
+                source = harness.frame(MOVED)
+        self.assertEqual(1, sum("scene_frame_decoder_failing" in line for line in logs.output))
+        self.assertTrue(all("scene_frame_decoder" in line for line in logs.output))
+        self.assertEqual((SceneSourceState.DEGRADED, "frame_decoder_failing", Observation.UNKNOWN),
+                         (source.state, source.reason, source.movement))
+        self.assertEqual(4, source.decoder_failures)
+        status = harness.runtime.status()
+        self.assertIs(SceneRuntimeState.DEGRADED, status.state)
+        # One successful exchange clears it, logged once.
+        harness.use(SOURCE)
+        harness.warm(SOURCE)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            harness.frame()
+            recovered = harness.frame()
+        self.assertEqual(1, sum("scene_frame_decoder_recovered" in line for line in logs.output))
+        self.assertIs(SceneSourceState.ACTIVE, recovered.state)
+        self.assertEqual([], harness.recorder.items)
+
+    def test_decoder_unavailable_keeps_source_inactive(self):
+        with mock.patch.object(mjpg, "decoder_available", return_value=False):
+            harness = self.harness(binding(layout=MJPG_LAYOUT))
+            harness.runtime.start()
+            for luma in (None, MOVED, MOVED, MOVED):
+                source = harness.frame(luma)
+        self.assertIs(SceneSourceState.INACTIVE, source.state)
+        self.assertEqual("frame_decoder_unavailable", source.reason)
+        self.assertEqual(Observation.UNKNOWN, source.movement)
+        self.assertIsNone(harness.pid())
+        self.assertEqual("stopped", harness.runtime._contexts[SOURCE].decoder.status().state)
+        self.assertEqual([], harness.recorder.items)
+
+    def test_without_calibration_mjpg_source_fails_closed(self):
+        harness = self.harness(binding(layout=MJPG_LAYOUT), calibrations=None)
+        harness.runtime.start()
+        for luma in (None, MOVED, MOVED):
+            source = harness.frame(luma)
+        self.assertEqual("calibration_provider_unconfigured", source.reason)
+        self.assertEqual(0, source.evaluated)
+        self.assertIsNone(harness.pid())
+        harness = self.harness(binding(layout=MJPG_LAYOUT), recorder=False)
+        self.assertEqual("critical_recorder_unavailable",
+                         harness.runtime.start().sources[0].reason)
+
+    def test_incompatible_mjpg_layout_is_not_bound(self):
+        harness = self.harness(binding(layout=MjpgLumaLayout(CAPTURE_WIDTH + 4, CAPTURE_HEIGHT)))
+        harness.runtime.start()
+        self.assertEqual("capture_layout_incompatible", harness.frame().reason)
+        self.assertIsNone(harness.pid())
+        with self.assertRaises(ValueError):
+            binding(source_type=SourceType.REMOTE_AGENT, layout=MJPG_LAYOUT)
+
+    def test_decoding_runs_on_the_scene_worker_not_the_capture_thread(self):
+        threads = []
+        original = MjpgLumaLayout.luma
+
+        def recording(layout, data, width, height, decoder):
+            threads.append(threading.current_thread().name)
+            return original(layout, data, width, height, decoder)
+
+        with mock.patch.object(MjpgLumaLayout, "luma", recording):
+            harness = self.harness(binding(layout=MJPG_LAYOUT))
+            harness.runtime.start()
+            harness.clock.value += INTERVAL
+            harness.runtime.on_uvc_frame(SOURCE, VideoFrame(encode(pixels()), 1, 0.0))
+            self.assertEqual([], threads)  # the capture callback only queues
+            self.assertIsNone(harness.pid())
+            harness.runtime.step()
+            self.assertEqual(1, len(threads))
+            threaded = MjpgHarness(binding(layout=MJPG_LAYOUT), threaded=True)
+            threaded.start()
+            try:
+                self.assertEqual(1, threaded.frame().evaluated)
+            finally:
+                threaded.runtime.stop()
+        self.assertEqual("scene-monitoring", threads[-1])
+
+    def test_stop_kills_and_reaps_every_child(self):
+        harness = MjpgHarness(binding(layout=MJPG_LAYOUT), binding(OTHER, layout=MJPG_LAYOUT),
+                              threaded=True)
+        harness.start()
+        try:
+            harness.frame()
+            harness.frame(source=OTHER, advance=0)
+            pids = (harness.pid(), harness.pid(OTHER))
+            self.assertTrue(all(alive(pid) for pid in pids))
+            # One child hangs in the middle of a frame when stop() begins.
+            os.kill(pids[1], signal.SIGSTOP)
+            harness.clock.value += INTERVAL
+            harness.runtime.on_uvc_frame(OTHER, VideoFrame(encode(pixels()), 99, 0.0))
+            threads = supervisors(harness)
+            self.assertEqual(2, len(threads))
+        finally:
+            started = time.monotonic()
+            status = harness.runtime.stop()
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertIs(SceneRuntimeState.STOPPED, status.state)
+        self.assertFalse(any(alive(pid) for pid in pids))
+        self.assertEqual((None, None), (harness.pid(), harness.pid(OTHER)))
+        # The per-source supervisor threads ended with the stop.
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+
+    def test_stop_reports_failure_when_a_child_cannot_be_reaped(self):
+        harness = self.harness(binding(layout=MJPG_LAYOUT))
+        harness.start()
+        harness.frame()
+        with mock.patch.object(MjpgDecoderProcess, "close", return_value=False), \
+                self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            status = harness.runtime.stop()
+        self.assertTrue(any("scene_monitoring_stop_failed" in line for line in logs.output))
+        self.assertIs(SceneRuntimeState.STOP_FAILED, status.state)
+
+    def test_four_sources_at_one_frame_per_second_fit_the_budget(self):
+        """Performance smoke: 4 sources x 1 fps, synthetic 1080p 4:2:2 frames."""
+        layout = MjpgLumaLayout(1920, 1080)
+        decoders = [MjpgDecoderProcess(layout.decoder, MAXIMUM_FRAME_BYTES) for _ in range(4)]
+        for decoder in decoders:
+            self.addCleanup(decoder.close)
+        frames = [noise_frame(1920, 1080, seed=seed) for seed in range(4)]
+        for decoder in decoders:
+            self.assertEqual("running", ready(decoder))  # child start, not timed
+        rounds, durations = [], []
+        for _ in range(5):
+            started = time.perf_counter()
+            for decoder, frame in zip(decoders, frames):
+                before = time.perf_counter()
+                layout.luma(frame, 480, 270, decoder)
+                durations.append(time.perf_counter() - before)
+            rounds.append(time.perf_counter() - started)
+        # Generous bounds for a shared CI core; measured values are a few ms
+        # per frame. Every round of four frames must fit inside the 1 s
+        # sampling interval.
+        self.assertLess(statistics.median(durations), 0.2)
+        self.assertLess(max(rounds), 1.0)
+        self.assertEqual([1] * 4, [decoder.status().starts for decoder in decoders])
+        # The runtime with four MJPG sources evaluates each through its child.
+        sources = (SOURCE, OTHER, THIRD, FOURTH)
+        harness = self.harness(*(binding(item, layout=MJPG_LAYOUT) for item in sources))
+        harness.start()
+        for item in sources:
+            self.assertEqual(1, harness.frame(source=item, advance=0).evaluated)
+        self.assertEqual(4, len({harness.pid(item) for item in sources}))
+
+
+def supervisors(harness):
+    return [context.decoder._thread for context in harness.runtime._contexts.values()
+            if context.decoder is not None and context.decoder._thread is not None]
+
+
+if __name__ == "__main__":
+    unittest.main()

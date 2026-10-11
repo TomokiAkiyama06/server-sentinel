@@ -347,6 +347,99 @@
     }
   },
   {
+    "name": "numpy",
+    "version": "2.3.5",
+    "license": "BSD-3-Clause; bundled BSD/MIT/Zlib, GPL-3.0-or-later WITH GCC-exception-3.1, LGPL-2.1-or-later",
+    "requires_python": ">=3.11",
+    "requires_dist": [],
+    "project_urls": [
+      "homepage, https://numpy.org",
+      "documentation, https://numpy.org/doc/",
+      "source, https://github.com/numpy/numpy",
+      "download, https://pypi.org/project/numpy/#files",
+      "tracker, https://github.com/numpy/numpy/issues",
+      "release notes, https://numpy.org/doc/stable/release"
+    ],
+    "wheel": "numpy-2.3.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "sha256": "0d8163f43acde9a73c2a33605353a4f1bc4798745a8b1d73183b28e5b435ae28",
+    "license_files": [
+      "numpy-2.3.5.dist-info/LICENSE.txt",
+      "numpy/_core/include/numpy/random/LICENSE.txt",
+      "numpy/ma/LICENSE",
+      "numpy/random/LICENSE.md"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/b6/23/2a1b231b8ff672b4c450dac27164a8b2ca7d9b7144f9c02d2396518352eb/numpy-2.3.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/numpy/2.3.5/json",
+    "license_sha256": {
+      "numpy-2.3.5.dist-info/LICENSE.txt": "2046a3130e50b11c01659b3a0d963e6ae0b7436ff8e89cbcfd9e87bc6112d595",
+      "numpy/_core/include/numpy/random/LICENSE.txt": "fbc539f47d0cf83bc61378080fb873d5c14630126cacbfe754035c3926daa5ec",
+      "numpy/ma/LICENSE": "05f3b88351988ecfad10abe92c0c50e5875c6452d5009a0084cc291551ffcca6",
+      "numpy/random/LICENSE.md": "103166b62b80443afb9eb3488e052ea06be0cff566b908f199e561fde49af19f"
+    }
+  },
+  {
+    "name": "numpy",
+    "version": "2.3.5",
+    "license": "BSD-3-Clause; bundled BSD/MIT/Zlib, GPL-3.0-or-later WITH GCC-exception-3.1, LGPL-2.1-or-later",
+    "requires_python": ">=3.11",
+    "requires_dist": [],
+    "project_urls": [
+      "homepage, https://numpy.org",
+      "documentation, https://numpy.org/doc/",
+      "source, https://github.com/numpy/numpy",
+      "download, https://pypi.org/project/numpy/#files",
+      "tracker, https://github.com/numpy/numpy/issues",
+      "release notes, https://numpy.org/doc/stable/release"
+    ],
+    "wheel": "numpy-2.3.5-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "sha256": "fffe29a1ef00883599d1dc2c51aa2e5d80afe49523c261a74933df395c15c520",
+    "license_files": [
+      "numpy-2.3.5.dist-info/LICENSE.txt",
+      "numpy/_core/include/numpy/random/LICENSE.txt",
+      "numpy/ma/LICENSE",
+      "numpy/random/LICENSE.md"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/c8/f6/07ec185b90ec9d7217a00eeeed7383b73d7e709dae2a9a021b051542a708/numpy-2.3.5-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/numpy/2.3.5/json",
+    "license_sha256": {
+      "numpy-2.3.5.dist-info/LICENSE.txt": "2046a3130e50b11c01659b3a0d963e6ae0b7436ff8e89cbcfd9e87bc6112d595",
+      "numpy/_core/include/numpy/random/LICENSE.txt": "fbc539f47d0cf83bc61378080fb873d5c14630126cacbfe754035c3926daa5ec",
+      "numpy/ma/LICENSE": "05f3b88351988ecfad10abe92c0c50e5875c6452d5009a0084cc291551ffcca6",
+      "numpy/random/LICENSE.md": "103166b62b80443afb9eb3488e052ea06be0cff566b908f199e561fde49af19f"
+    }
+  },
+  {
+    "name": "numpy",
+    "version": "2.3.5",
+    "license": "BSD-3-Clause; bundled BSD/MIT/Zlib, GPL-3.0-or-later WITH GCC-exception-3.1, LGPL-2.1-or-later",
+    "requires_python": ">=3.11",
+    "requires_dist": [],
+    "project_urls": [
+      "homepage, https://numpy.org",
+      "documentation, https://numpy.org/doc/",
+      "source, https://github.com/numpy/numpy",
+      "download, https://pypi.org/project/numpy/#files",
+      "tracker, https://github.com/numpy/numpy/issues",
+      "release notes, https://numpy.org/doc/stable/release"
+    ],
+    "wheel": "numpy-2.3.5-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+    "sha256": "8b973c57ff8e184109db042c842423ff4f60446239bd585a5131cc47f06f789d",
+    "license_files": [
+      "numpy-2.3.5.dist-info/LICENSE.txt",
+      "numpy/_core/include/numpy/random/LICENSE.txt",
+      "numpy/ma/LICENSE",
+      "numpy/random/LICENSE.md"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/74/78/fcd41e5a0ce4f3f7b003da85825acddae6d7ecb60cf25194741b036ca7d6/numpy-2.3.5-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/numpy/2.3.5/json",
+    "license_sha256": {
+      "numpy-2.3.5.dist-info/LICENSE.txt": "2046a3130e50b11c01659b3a0d963e6ae0b7436ff8e89cbcfd9e87bc6112d595",
+      "numpy/_core/include/numpy/random/LICENSE.txt": "fbc539f47d0cf83bc61378080fb873d5c14630126cacbfe754035c3926daa5ec",
+      "numpy/ma/LICENSE": "05f3b88351988ecfad10abe92c0c50e5875c6452d5009a0084cc291551ffcca6",
+      "numpy/random/LICENSE.md": "103166b62b80443afb9eb3488e052ea06be0cff566b908f199e561fde49af19f"
+    }
+  },
+  {
     "name": "pycodestyle",
     "version": "2.14.0",
     "license": "MIT",
@@ -505,6 +598,78 @@
     "release_metadata_url": "https://pypi.org/pypi/pyflakes/3.4.0/json",
     "license_sha256": {
       "pyflakes-3.4.0.dist-info/LICENSE": "22c47569cc0aae531b372361366818af01c6fc2e314770584a7866c92b3a0463"
+    }
+  },
+  {
+    "name": "simplejpeg",
+    "version": "1.9.0",
+    "license": "MIT; statically linked libjpeg-turbo 3.1.2: IJG AND BSD-3-Clause AND Zlib (Owner approval 2026-10-11)",
+    "requires_python": ">=3.9",
+    "requires_dist": [
+      "numpy>=1.19.3"
+    ],
+    "project_urls": [
+      "Documentation, https://github.com/jfolz/simplejpeg/blob/master/README.rst",
+      "Source, https://github.com/jfolz/simplejpeg",
+      "Tracker, https://github.com/jfolz/simplejpeg/issues"
+    ],
+    "wheel": "simplejpeg-1.9.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+    "sha256": "5be1c8932f43f99b6cc52f8ac4c28e3ac19a1a830351efdb159715fd683e2053",
+    "license_files": [
+      "simplejpeg-1.9.0.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/03/80/44514f83a09500d1eb8ebba8cadd9aa16f7a60690c19dbd98a570ca2c0ec/simplejpeg-1.9.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/simplejpeg/1.9.0/json",
+    "license_sha256": {
+      "simplejpeg-1.9.0.dist-info/licenses/LICENSE": "5369bac453d46967c841a657546cc016bd9dcb07b473fefaef39e31099449c80"
+    }
+  },
+  {
+    "name": "simplejpeg",
+    "version": "1.9.0",
+    "license": "MIT; statically linked libjpeg-turbo 3.1.2: IJG AND BSD-3-Clause AND Zlib (Owner approval 2026-10-11)",
+    "requires_python": ">=3.9",
+    "requires_dist": [
+      "numpy>=1.19.3"
+    ],
+    "project_urls": [
+      "Documentation, https://github.com/jfolz/simplejpeg/blob/master/README.rst",
+      "Source, https://github.com/jfolz/simplejpeg",
+      "Tracker, https://github.com/jfolz/simplejpeg/issues"
+    ],
+    "wheel": "simplejpeg-1.9.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+    "sha256": "f22024286577a4e9bb30c4b3c1a66a3b0c6e56801b26c83d0581ad294d1b99e3",
+    "license_files": [
+      "simplejpeg-1.9.0.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/4d/dc/48db2d81c29ce13f60ab2e5912498f2c6d94afb2f6515bf2a1fc3c1b3046/simplejpeg-1.9.0-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/simplejpeg/1.9.0/json",
+    "license_sha256": {
+      "simplejpeg-1.9.0.dist-info/licenses/LICENSE": "5369bac453d46967c841a657546cc016bd9dcb07b473fefaef39e31099449c80"
+    }
+  },
+  {
+    "name": "simplejpeg",
+    "version": "1.9.0",
+    "license": "MIT; statically linked libjpeg-turbo 3.1.2: IJG AND BSD-3-Clause AND Zlib (Owner approval 2026-10-11)",
+    "requires_python": ">=3.9",
+    "requires_dist": [
+      "numpy>=1.19.3"
+    ],
+    "project_urls": [
+      "Documentation, https://github.com/jfolz/simplejpeg/blob/master/README.rst",
+      "Source, https://github.com/jfolz/simplejpeg",
+      "Tracker, https://github.com/jfolz/simplejpeg/issues"
+    ],
+    "wheel": "simplejpeg-1.9.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+    "sha256": "08ab337ca3b26d7562f5ad686ab8f3966fb206fced607d248e693cbc57fc53b3",
+    "license_files": [
+      "simplejpeg-1.9.0.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/75/c1/0cbf167e3efa32adfbb0674a3504eb118cc5bdc372a44ee937c30324188e/simplejpeg-1.9.0-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/simplejpeg/1.9.0/json",
+    "license_sha256": {
+      "simplejpeg-1.9.0.dist-info/licenses/LICENSE": "5369bac453d46967c841a657546cc016bd9dcb07b473fefaef39e31099449c80"
     }
   },
   {

@@ -47,6 +47,8 @@ from .calibration import CalibrationArchive, CalibrationRecord
 from .contracts import Calibration, CriticalObservation
 from .delivery import MAXIMUM_BATCH, CriticalRecorder
 from .detector import SceneDetector
+from .mjpg import MAXIMUM_FRAME_BYTES, MjpgFrameRejected, MjpgLumaLayout
+from .mjpg_worker import MjpgDecoderProcess
 
 
 MAXIMUM_SOURCES = 4
@@ -71,6 +73,10 @@ DEFAULT_RECORDER_STALL_NS = 5 * 1_000_000_000
 # Bound on closing an already started delivery thread when the worker thread
 # cannot be started.
 START_ROLLBACK_TIMEOUT_SECONDS = 5.0
+# Bound on reaping the MJPG decode children at stop. They are signalled as
+# soon as the worker has ended (or its bound expired), so by then SIGKILL has
+# normally been delivered long ago.
+DECODER_REAP_TIMEOUT_SECONDS = 1.0
 PACKED_FORMATS = {"GREY": 1, "YUYV": 2}
 
 
@@ -139,10 +145,11 @@ class ArchiveCalibrationProvider:
 class PackedLumaLayout:
     """Exact uncompressed capture layout whose luma plane can be sampled.
 
-    Only packed `GREY` and `YUYV` are reviewed here: their luma is read by
-    byte slicing with no image library. A compressed format (for example
-    `MJPG`) needs a reviewed decoder and is refused. Frames whose length does
-    not match this exact unpadded layout are refused per frame.
+    Only packed `GREY` and `YUYV` are read here: their luma is read by byte
+    slicing with no image library. `MJPG` uses the reviewed decoder in
+    `MjpgLumaLayout` (Issue #217); any other compressed format is refused.
+    Frames whose length does not match this exact unpadded layout are refused
+    per frame.
     """
 
     width: int
@@ -155,6 +162,9 @@ class PackedLumaLayout:
                 raise ValueError("invalid capture dimensions")
         if self.pixel_format not in PACKED_FORMATS:
             raise ValueError("capture pixel format has no reviewed luma reader")
+
+    def available(self) -> bool:
+        return True
 
     def compatible(self, width: int, height: int) -> bool:
         return self.width % width == 0 and self.height % height == 0
@@ -176,6 +186,20 @@ class PackedLumaLayout:
         return bytes(output)
 
 
+CAPTURE_LAYOUTS = (PackedLumaLayout, MjpgLumaLayout)
+
+
+def capture_luma_layout(width: int, height: int, pixel_format: str):
+    """The reviewed luma reader for a negotiated local UVC format.
+
+    Pass the driver-negotiated profile, never the requested one. A format with
+    no reviewed reader raises `ValueError`, so that source cannot be bound.
+    """
+    if pixel_format == MjpgLumaLayout.pixel_format:
+        return MjpgLumaLayout(width, height)
+    return PackedLumaLayout(width, height, pixel_format)
+
+
 def _policy(value, detector):
     if not isinstance(value, DetectorQualityPolicy) or value.detector != detector:
         raise ValueError("a detector-specific quality policy is required")
@@ -191,9 +215,10 @@ class SceneSourceBinding:
     # for the other. Neither is supplied by default.
     movement_quality: DetectorQualityPolicy = field(repr=False)
     tamper_quality: DetectorQualityPolicy = field(repr=False)
-    # Required for raw local UVC frames; None for producers that already
+    # Required for raw local UVC frames (packed luma or reviewed MJPG
+    # decoding, see `capture_luma_layout`); None for producers that already
     # supply decoded grayscale samples (`offer_luma`).
-    layout: PackedLumaLayout | None = None
+    layout: PackedLumaLayout | MjpgLumaLayout | None = None
     sample_interval_ns: int = DEFAULT_SAMPLE_INTERVAL_NS
 
     def __post_init__(self):
@@ -203,7 +228,7 @@ class SceneSourceBinding:
             raise ValueError("invalid scene source type")
         _policy(self.movement_quality, "server_roi")
         _policy(self.tamper_quality, "camera_tamper")
-        if self.layout is not None and not isinstance(self.layout, PackedLumaLayout):
+        if self.layout is not None and not isinstance(self.layout, CAPTURE_LAYOUTS):
             raise ValueError("invalid capture layout")
         if self.source_type is SourceType.LOCAL_UVC and self.layout is None:
             raise ValueError("local UVC scene detection requires its capture layout")
@@ -309,6 +334,13 @@ class SceneSourceStatus:
     # while a camera loss is still to be handed to the current detector, so
     # under sustained losses it can stay pending; this makes that visible.
     refresh_pending: bool = False
+    # MJPG decode child failures (start failure, crash or kill, timeout,
+    # malformed reply) for this source; 0 for packed or decoded sources.
+    decoder_failures: int = 0
+    # Value-free per-reason counts of refused MJPG frames (`frame_undecodable`),
+    # as sorted (reason, count) pairs; the reasons are the fixed
+    # `MjpgFrameRejected` set.
+    undecodable_reasons: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -402,13 +434,22 @@ class _Published:
     backpressured: int = 0
     failures: int = 0
     refresh_discarded: int = 0
+    undecodable: dict = field(default_factory=dict)
 
 
 class _Context:
     """Worker-only detector state for one source."""
 
-    def __init__(self, binding):
+    def __init__(self, binding, clock):
         self.binding = binding
+        # The source's own MJPG decode child, started and reaped by its own
+        # supervisor thread (requested at bind and at frames), so a crashing,
+        # hanging or slow-starting child of one camera never refuses or delays
+        # another camera's frames on this worker.
+        self.decoder = (MjpgDecoderProcess(binding.layout.decoder, MAXIMUM_FRAME_BYTES,
+                                           clock_ns=clock)
+                        if isinstance(binding.layout, MjpgLumaLayout) else None)
+        self.decoder_failing = False
         self.calibration = None
         self.detector = None
         self.movement_gate = self.tamper_gate = None
@@ -612,7 +653,8 @@ class SceneMonitoringRuntime:
         self._wake = threading.Condition(self._lock)
         self._slots = {item.source_id: _Slot(item) for item in configuration.bindings}
         self._published = {item.source_id: _Published() for item in configuration.bindings}
-        self._contexts = {item.source_id: _Context(item) for item in configuration.bindings}
+        self._contexts = {item.source_id: _Context(item, dependencies.monotonic_ns)
+                          for item in configuration.bindings}
         self._pump = _CriticalPump(capacity=configuration.critical_capacity,
                                    recorder=dependencies.recorder,
                                    clock=dependencies.monotonic_ns,
@@ -702,6 +744,11 @@ class SceneMonitoringRuntime:
         with self._lock:
             self._accepting = False
             self._stopping = True
+            for context in self._contexts.values():
+                if context.decoder is not None:
+                    # No decode child is started any more; a running one
+                    # still serves the final pass.
+                    context.decoder.retire()
             # A loss queued just before shutdown (possibly correlated with a
             # scene shift) stays in its slot: the final worker pass
             # (`_finish`) hands it to the detector before slots are cleared.
@@ -713,9 +760,18 @@ class SceneMonitoringRuntime:
             worker_alive = thread.is_alive()
         elif self._state is SceneRuntimeState.RUNNING:
             self._finish()
+        decoders = [context.decoder for context in self._contexts.values()
+                    if context.decoder is not None]
+        for decoder in decoders:
+            # Signalled without waiting, even when the worker outlived its
+            # bound (a decode in progress then fails instead of running on).
+            decoder.kill()
         # The final worker pass has staged what it could; one bounded final
         # delivery pass follows.
         since = self._pump.close(timeout)
+        reap_deadline = time.monotonic() + DECODER_REAP_TIMEOUT_SECONDS
+        decoders_left = not all([decoder.close(max(0.0, reap_deadline - time.monotonic()))
+                                 for decoder in decoders])
         in_flight = since is not None
         stalled = in_flight and (
             self._deps.monotonic_ns() - since >= self._deps.recorder_stall_ns)
@@ -726,7 +782,7 @@ class SceneMonitoringRuntime:
                 if slot.sample is not None:
                     slot.sample.data = None
                 slot.sample = slot.loss = None
-            if worker_alive or in_flight:
+            if worker_alive or in_flight or decoders_left:
                 self._state = SceneRuntimeState.STOP_FAILED
             elif self._state is not SceneRuntimeState.UNAVAILABLE:
                 self._state = SceneRuntimeState.STOPPED
@@ -741,7 +797,7 @@ class SceneMonitoringRuntime:
             log.error(Event.SCENE_CRITICAL_RECORDER_STALLED)
         elif in_flight:
             log.error(Event.SCENE_CRITICAL_IN_FLIGHT_AT_STOP)
-        if worker_alive or in_flight:
+        if worker_alive or in_flight or decoders_left:
             log.error(Event.SCENE_MONITORING_STOP_FAILED)
         if (status.critical_pending or status.critical_refused or status.losses_held
                 or status.losses_failed):
@@ -949,7 +1005,14 @@ class SceneMonitoringRuntime:
             logging.getLogger(__name__).error(
                 Event.SCENE_MONITORING_UNAVAILABLE if log else Event.SCENE_SOURCE_FAILED)
         finally:
-            self._finish()
+            try:
+                self._finish()
+            finally:
+                # The decode children and their supervisor threads end with
+                # the worker (bounded; `stop()` checks the result).
+                for context in self._contexts.values():
+                    if context.decoder is not None:
+                        context.decoder.close(DECODER_REAP_TIMEOUT_SECONDS)
 
     def _kick(self):
         """Let staging progress (inline when unthreaded) and report each
@@ -1069,6 +1132,10 @@ class SceneMonitoringRuntime:
             elif binding.layout is not None and not binding.layout.compatible(
                     reference.width, reference.height):
                 reason = "capture_layout_incompatible"
+            elif binding.layout is not None and not binding.layout.available():
+                # The reviewed MJPG decoder (exact simplejpeg / numpy pins) is
+                # not installed: nothing can be decoded, so nothing is bound.
+                reason = "frame_decoder_unavailable"
             else:
                 try:
                     detector = SceneDetector(calibration)
@@ -1090,6 +1157,11 @@ class SceneMonitoringRuntime:
             published.maximum_gap_ns = calibration.policy.maximum_gap_ns
             published.active_since_ns = now
             self._withdraw(published, "awaiting_sample")
+        if context.decoder is not None:
+            # Non-blocking: the child starts in the background, so it is
+            # normally ready by the first frame; until then frames are
+            # refused (`decoder_starting`), never waited on.
+            context.decoder.prepare()
 
     @staticmethod
     def _merge_loss(held, loss):
@@ -1192,13 +1264,29 @@ class SceneMonitoringRuntime:
             self._end_episode(context, item, "critical_backpressure", "backpressured")
             return
         try:
-            if context.binding.layout is not None:
+            if context.decoder is not None:
+                try:
+                    pixels = context.binding.layout.luma(item.data, reference.width,
+                                                         reference.height, context.decoder)
+                finally:
+                    self._decoder_health(context)
+                width, height = reference.width, reference.height
+            elif context.binding.layout is not None:
                 pixels = context.binding.layout.luma(item.data, reference.width, reference.height)
                 width, height = reference.width, reference.height
             else:
                 pixels, width, height = item.data, item.width, item.height
             frame = GrayFrame(context.binding.source_id, item.stream_id, item.sequence,
                               width, height, pixels)
+        except MjpgFrameRejected as rejected:
+            with self._lock:
+                counts = self._target_locked(context.binding.source_id).undecodable
+                counts[rejected.reason] = counts.get(rejected.reason, 0) + 1
+            # Pre-check refusal, decoder error or warning, undecoded band,
+            # decode child crash / kill / timeout / malformed reply, or no
+            # child (backoff): unknown, never "no movement" / "no tamper".
+            self._end_episode(context, item, "frame_undecodable", "unusable")
+            return
         except Exception:
             self._end_episode(context, item, "frame_unusable", "unusable")
             return
@@ -1213,6 +1301,16 @@ class SceneMonitoringRuntime:
                                           movement_quality=movement.quality,
                                           tamper_quality=tamper.quality, roi_occluded=None)
         self._handle(context, result, item.monotonic_ns, reason="evaluated")
+
+    def _decoder_health(self, context):
+        """Log (value-free, once per transition) a decode child that keeps
+        failing; `status()` lowers the source while it does."""
+        failing = context.decoder.failing
+        if failing != context.decoder_failing:
+            context.decoder_failing = failing
+            logging.getLogger(__name__).error(
+                Event.SCENE_FRAME_DECODER_FAILING if failing
+                else Event.SCENE_FRAME_DECODER_RECOVERED)
 
     def _handle(self, context, result, monotonic_ns, *, reason):
         if result.critical:
@@ -1316,6 +1414,12 @@ class SceneMonitoringRuntime:
                 # stopped, worker stalled): the source is lowered, not only
                 # its conclusions, until a fresh evaluated sample recovers it.
                 state, reason = SceneSourceState.DEGRADED, "observation_stale"
+            decoder = context.decoder
+            if (decoder is not None and decoder.failing and state is not SceneSourceState.INACTIVE
+                    and self._state is SceneRuntimeState.RUNNING):
+                # Repeated decode child failures: the source is lowered until
+                # one frame is exchanged successfully again.
+                state, reason = SceneSourceState.DEGRADED, "frame_decoder_failing"
             if slot.history_exhausted:
                 # No sample of this source is admitted any more, so nothing it
                 # concluded is current; the source is lowered while running.
@@ -1336,6 +1440,8 @@ class SceneMonitoringRuntime:
                 # An explicitly requested refresh not yet run (the initial
                 # bind is not a request).
                 context.refresh and context.refresh_ns is not None,
+                decoder.status().failures if decoder is not None else 0,
+                tuple(sorted(published.undecodable.items())),
             ))
         # A reference read of worker-owned state; a snapshot, never a decision.
         held = sum(context.held_loss is not None for context in self._contexts.values())
