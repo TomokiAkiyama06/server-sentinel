@@ -146,8 +146,11 @@ process:
   to `EOI` are sent to the child;
 - each MJPG source has its own resident decode child (`mjpg_worker.py`
   supervising `mjpg_child.py`), started with fork+exec of the service's
-  interpreter (`python -I -B`, no `preexec_fn`) on the scene worker thread at
-  the source's first frame, with an explicit minimal environment (only
+  interpreter (`python -I -B`, no `preexec_fn`) by that source's own
+  supervisor thread (`mjpg-decoder`, kept until stop, so the child's
+  parent-death signal is tied to a thread that outlives it), requested
+  without waiting when the source is bound and again by a frame after a
+  failure, with an explicit minimal environment (only
   `LC_ALL=C` and one BLAS/OpenMP thread), stdio on `/dev/null` and only one
   private `AF_UNIX` socketpair end inherited. Before importing simplejpeg or
   numpy the child sets `no_new_privs`, a parent-death `SIGKILL` (and checks
@@ -171,15 +174,25 @@ process:
   child that has not replied is killed. A crash, a kill (including an OOM
   kill), a non-zero exit, a timeout, or a malformed, oversized or mismatched
   reply kills and reaps the child and refuses that frame; a replacement starts
-  only after an exponential backoff (1 s doubling to 30 s), and frames during
-  the backoff are refused at once (`decoder_unavailable`), never waited on.
+  only after an exponential backoff (1 s doubling to 30 s) and only once the
+  killed child has been reaped. Starting a child (fork+exec and the ready
+  handshake, bounded by a 5 s start timeout) and reaping a killed one (2 s
+  bound, then `reap_failed` and periodic retries, never a second child
+  alongside) run on the source's supervisor thread, never on the shared scene
+  worker: frames while the child starts (`decoder_starting`), during the
+  backoff, a reap or after a reap failure (`decoder_unavailable`) are refused
+  at once, never waited on. The scene worker waits only for one exchange with
+  a ready child, bounded by the 500 ms per-frame deadline.
   After 3 consecutive child failures the source is `degraded`
   (`frame_decoder_failing`, which also lowers the runtime) and
   `scene_frame_decoder_failing` is logged once (value-free);
   one successful exchange clears it (`scene_frame_decoder_recovered`). A
   refusal by a healthy child (strict decode error, shape mismatch, band) is not
-  a child failure. One source's child failing never refuses another source's
-  frames.
+  a child failure. One source's child failing, hanging, starting slowly or
+  not being reaped never refuses another source's frames and never delays
+  their evaluation by more than that source's own bounded exchange (at most
+  the 500 ms per-frame deadline per cycle, and only while its child is
+  ready).
 
 Every refusal is `frame_undecodable` (counted in `unusable`, the episode ends,
 movement and tamper are `unknown`), with value-free per-reason counts in the
@@ -188,9 +201,12 @@ and child failures in `decoder_failures`. A missing or differently versioned
 decoder (package metadata; Main never imports simplejpeg or numpy) keeps the
 source inactive (`frame_decoder_unavailable`) and starts no child. `stop()`
 lets a running child serve the final worker pass but starts no new one, kills
-every child once the worker has ended (or its bound expired) and reaps them
-within a 1 s bound inside the usual stop bounds (worker 5 s + delivery 5 s); a
-child that cannot be reaped makes the stop `stop_failed`.
+every child once the worker has ended (or its bound expired), and ends the
+supervisor threads and reaps the children within a 1 s bound inside the usual
+stop bounds (worker 5 s + delivery 5 s). A start in progress (even one hanging
+until its 5 s start timeout) is interrupted within 50 ms, so it does not make
+the stop wait or fail; a supervisor or child that cannot be ended within the
+bound makes the stop `stop_failed`.
 
 Decode success does not prove integrity. A corruption that keeps the
 entropy-coded syntax decodable can give substantially wrong pixels, not only

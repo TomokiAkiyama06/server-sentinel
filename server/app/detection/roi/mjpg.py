@@ -27,7 +27,9 @@ the scene runtime maps to `unknown`, never to "no movement" or "no tamper":
    crash, kill (including an OOM kill), exit, per-frame timeout (the child is
    killed) or malformed reply refuses that frame; a replacement child is
    started after a bounded backoff, and repeated failures lower the source to
-   `degraded`.
+   `degraded`. Starting and reaping a child run on the source's own
+   supervisor thread: a frame that arrives meanwhile is refused at once
+   (`decoder_starting` / `decoder_unavailable`).
 
 Decode success never proves frame integrity: a corruption that keeps the
 entropy-coded data decodable can yield substantially wrong pixels (large
@@ -38,7 +40,9 @@ a real scene whose trailing MCUs are exactly 128 is refused (fail-closed). The
 quality gate and the detector's temporal confirmation still apply.
 
 This runs only on the scene worker thread (one worker, at most one sample per
-second per source), never on a capture thread. Nothing decoded is retained.
+second per source), never on a capture thread; the worker waits only for one
+exchange with a ready child (bounded by the per-frame deadline), never for a
+child start or reap. Nothing decoded is retained.
 """
 
 from dataclasses import dataclass, field
@@ -75,7 +79,7 @@ REASONS = frozenset({
     "sof_missing", "scan_invalid", "missing_eoi", "trailing_bytes_exceeded",
     "trailing_marker", "decoder_unavailable", "decode_failed", "decoded_shape_mismatch",
     "undecoded_band", "reference_incompatible",
-    "decoder_crashed", "decoder_timeout", "decoder_protocol",
+    "decoder_crashed", "decoder_timeout", "decoder_protocol", "decoder_starting",
 })
 
 

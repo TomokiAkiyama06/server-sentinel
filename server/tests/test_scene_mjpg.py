@@ -114,6 +114,28 @@ def alive(pid):
         return False
 
 
+def settle(decoder):
+    """Wait until no child start or reap is under way; the decoder state."""
+    assert wait_for(lambda: decoder.status().state not in ("starting", "reaping"), timeout=20)
+    return decoder.status().state
+
+
+def ready(decoder):
+    """Ask for a child (as the runtime does at bind) and wait for the outcome."""
+    settle(decoder)
+    decoder.prepare()
+    return settle(decoder)
+
+
+def stopped(pid):
+    """True while `pid` is stopped (SIGSTOP)."""
+    try:
+        with open(f"/proc/{pid}/stat") as stat:
+            return stat.read().rsplit(")", 1)[1].split()[0] in ("T", "t")
+    except (FileNotFoundError, ProcessLookupError, IndexError):
+        return False
+
+
 class Clock:
     def __init__(self):
         self.value = 0
@@ -123,11 +145,15 @@ class Clock:
 
 
 class DecoderCase(unittest.TestCase):
-    def decoder(self, limits=None, *, behaviour=None, clock=None):
+    def decoder(self, limits=None, *, behaviour=None, clock=None, start=True):
+        """A decode child supervisor; with `start`, its child is started (or
+        its start has failed) before it is returned."""
         decoder = MjpgDecoderProcess(limits or MjpgDecoderLimits(), MAXIMUM_FRAME_BYTES,
                                      clock_ns=clock or Clock(),
                                      command=fake(behaviour) if behaviour else None)
         self.addCleanup(decoder.close)
+        if start:
+            ready(decoder)
         return decoder
 
 
@@ -279,10 +305,12 @@ class MjpgPrecheckTests(DecoderCase):
                                  self.refused_before_decoding(bytearray(self.frame)))
             inspect.assert_not_called()
         # The child is told the same bound and the parent never sends more.
-        with self.assertRaises(mjpg_worker.DecoderRefusal):
+        with self.assertRaises(mjpg_worker.DecoderRefusal) as caught:
             self.child.decode(bytes(MAXIMUM_FRAME_BYTES + 1),
                               DecodeRequest(WIDTH, HEIGHT, WIDTH, HEIGHT, 8, 8, 2))
-        self.assertIsNone(self.child.pid)
+        self.assertEqual("frame_too_large", caught.exception.reason)
+        self.assertEqual(("running", 0), (self.child.status().state,
+                                          self.child.status().failures))
 
     def test_trailing_padding_is_bounded(self):
         layout = MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, maximum_trailing_bytes=64)
@@ -300,6 +328,19 @@ class MjpgPrecheckTests(DecoderCase):
                          self.refused_before_decoding(self.frame + b"\xff\xd8\xff", layout))
         with self.assertRaises(ValueError):
             MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, maximum_trailing_bytes=-1)
+
+    def test_only_the_bytes_up_to_eoi_are_sent_to_the_child(self):
+        layout = MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, maximum_trailing_bytes=64)
+        recording = mock.Mock()
+        recording.decode.return_value = bytes(WIDTH * HEIGHT)
+        for padding in (b"", bytes(1), b"\xff" * 3 + bytes(61)):
+            with self.subTest(padding=len(padding)):
+                recording.reset_mock()
+                layout.luma(bytearray(self.frame + padding), WIDTH, HEIGHT, recording)
+                sent = recording.decode.call_args.args[0]
+                self.assertIs(bytes, type(sent))
+                self.assertEqual(self.frame, sent)
+                self.assertTrue(sent.endswith(b"\xff\xd9"))
 
     def test_extraneous_bytes_and_unsupported_processes_are_refused(self):
         before = segment(self.frame, 0xDA)
@@ -435,6 +476,12 @@ class MjpgDecoderProcessTests(DecoderCase):
             (layout or self.layout).luma(data or self.frame, WIDTH, HEIGHT, decoder)
         return caught.exception.reason
 
+    def timed_refusal(self, decoder, data=b"\xff"):
+        started = time.monotonic()
+        with self.assertRaises(mjpg_worker.DecoderRefusal) as caught:
+            decoder.decode(data, self.REQUEST)
+        return caught.exception.reason, time.monotonic() - started
+
     def test_child_is_confined_and_limited(self):
         decoder = self.decoder(MjpgDecoderLimits(address_space_bytes=200 * 1024 * 1024))
         self.layout.luma(self.frame, WIDTH, HEIGHT, decoder)
@@ -458,15 +505,30 @@ class MjpgDecoderProcessTests(DecoderCase):
             open(f"/proc/{decoder.pid}/environ").close()
 
     def test_child_gets_minimal_environment_and_only_its_socket(self):
-        decoder = self.decoder(behaviour="inspect")
+        decoder = self.decoder(behaviour="inspect", start=False)
         with mock.patch.dict(os.environ, {"SERVERSENTINEL_SYNTHETIC_SECRET": "x"}):
-            report = decoder.decode(b"\xff", DecodeRequest(64, 64, 64, 64, 8, 8, 8))
+            self.assertEqual("running", ready(decoder))
+        report = decoder.decode(b"\xff", DecodeRequest(64, 64, 64, 64, 8, 8, 8))
         report = json.loads(report)
         self.assertEqual(CHILD_ENVIRONMENT, report["environment"])
         # stdio, the private socket and the descriptor listing itself.
         self.assertEqual(5, len(report["descriptors"]))
         self.assertEqual([0, 1, 2], report["descriptors"][:3])
         self.assertIn(report["socket"], report["descriptors"])
+
+    def test_first_frame_asks_for_a_child_without_waiting_for_it(self):
+        decoder = self.decoder(start=False)
+        started = time.monotonic()
+        self.assertEqual("decoder_starting", self.refused(decoder))
+        self.assertLess(time.monotonic() - started, 0.1)
+        self.assertEqual("running", settle(decoder))
+        self.assertEqual(WIDTH * HEIGHT, len(self.layout.luma(self.frame, WIDTH, HEIGHT, decoder)))
+        # Asking again while a child runs never starts a second one.
+        pid = decoder.pid
+        decoder.prepare()
+        self.assertEqual("running", settle(decoder))
+        self.assertEqual(pid, decoder.pid)
+        self.assertEqual((1, 0), (decoder.status().starts, decoder.status().failures))
 
     def test_idle_child_kill_is_unknown_then_respawned_after_backoff(self):
         clock = Clock()
@@ -476,12 +538,16 @@ class MjpgDecoderProcessTests(DecoderCase):
         os.kill(pid, signal.SIGKILL)
         self.assertTrue(wait_for(lambda: not alive(pid)))
         self.assertEqual("decoder_crashed", self.refused(decoder))
-        self.assertEqual("backoff", decoder.status().state)
+        self.assertEqual("backoff", settle(decoder))
         # During the backoff a frame is refused at once, never waited on.
         started = time.monotonic()
         self.assertEqual("decoder_unavailable", self.refused(decoder))
         self.assertLess(time.monotonic() - started, 0.1)
+        self.assertIsNone(decoder.pid)
         clock.value = 100
+        # The next frame asks for the replacement and is refused meanwhile.
+        self.assertEqual("decoder_starting", self.refused(decoder))
+        self.assertEqual("running", settle(decoder))
         self.assertEqual(first, self.layout.luma(self.frame, WIDTH, HEIGHT, decoder))
         self.assertNotEqual(pid, decoder.pid)
         status = decoder.status()
@@ -494,11 +560,12 @@ class MjpgDecoderProcessTests(DecoderCase):
         os.kill(pid, signal.SIGSTOP)
         started = time.monotonic()
         self.assertEqual("decoder_timeout", self.refused(decoder))
-        self.assertLess(time.monotonic() - started, 2.0)
-        self.assertFalse(alive(pid))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertTrue(wait_for(lambda: not alive(pid)))
         self.assertEqual(1, decoder.status().timeouts)
         hang = self.decoder(MjpgDecoderLimits(frame_timeout_ns=300_000_000), behaviour="hang")
         self.assertEqual("decoder_timeout", self.refused(hang))
+        settle(hang)
         self.assertIsNone(hang.pid)
 
     def test_crashing_child_is_unknown(self):
@@ -507,6 +574,7 @@ class MjpgDecoderProcessTests(DecoderCase):
                 decoder = self.decoder(behaviour=behaviour)
                 self.assertEqual("decoder_crashed", self.refused(decoder))
                 self.assertEqual(1, decoder.status().crashes)
+                settle(decoder)
                 self.assertIsNone(decoder.pid)
 
     def test_malformed_replies_are_protocol_failures(self):
@@ -519,14 +587,38 @@ class MjpgDecoderProcessTests(DecoderCase):
             with self.subTest(behaviour=behaviour):
                 decoder = self.decoder(limits, behaviour=behaviour)
                 self.assertEqual(reason, self.refused(decoder))
+                settle(decoder)
                 self.assertIsNone(decoder.pid)
                 self.assertEqual(1, decoder.status().failures)
+
+    def test_reply_size_outside_the_two_reply_sizes_is_refused_before_reading(self):
+        # The fake announces the size and then sends nothing more: only a
+        # check made before reading the body answers before the deadline.
+        limits = MjpgDecoderLimits(frame_timeout_ns=2_000_000_000)
+        expected = WIDTH * HEIGHT
+        for size in (9 + 2 * expected, 9 + expected + 1, 9 + expected - 1, 9, 9 + 2, 0):
+            with self.subTest(size=size):
+                decoder = self.decoder(limits, behaviour=f"size_{size}")
+                reason, elapsed = self.timed_refusal(decoder)
+                self.assertEqual("decoder_protocol", reason)
+                self.assertLess(elapsed, 1.0)
+                self.assertEqual(1, decoder.status().protocol_errors)
+
+    def test_slow_drip_reply_hits_the_overall_frame_deadline(self):
+        # One reply byte every 50 ms: each read makes progress, but the whole
+        # exchange is bounded by the per-frame deadline.
+        decoder = self.decoder(MjpgDecoderLimits(frame_timeout_ns=300_000_000), behaviour="drip")
+        reason, elapsed = self.timed_refusal(decoder)
+        self.assertEqual("decoder_timeout", reason)
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(1, decoder.status().timeouts)
 
     def test_failed_starts_are_unavailable(self):
         limits = MjpgDecoderLimits(start_timeout_ns=300_000_000)
         for behaviour in ("exit_at_start", "hang_at_start", "wrong_ready"):
             with self.subTest(behaviour=behaviour):
                 decoder = self.decoder(limits, behaviour=behaviour)
+                self.assertEqual("backoff", settle(decoder))
                 self.assertEqual("decoder_unavailable", self.refused(decoder))
                 self.assertEqual(1, decoder.status().start_failures)
                 self.assertIsNone(decoder.pid)
@@ -535,6 +627,75 @@ class MjpgDecoderProcessTests(DecoderCase):
             decoder = self.decoder(limits)
             self.assertEqual("decoder_unavailable", self.refused(decoder))
         self.assertEqual(1, decoder.status().start_failures)
+
+    def test_hung_start_never_delays_a_frame_and_stop_interrupts_it(self):
+        decoder = self.decoder(MjpgDecoderLimits(start_timeout_ns=5_000_000_000),
+                               behaviour="hang_at_start", start=False)
+        for _ in range(3):
+            reason, elapsed = self.timed_refusal(decoder)
+            self.assertEqual("decoder_starting", reason)
+            self.assertLess(elapsed, 0.1)
+        self.assertTrue(wait_for(lambda: decoder.pid is not None))
+        pid = decoder.pid
+        self.assertTrue(alive(pid))
+        # A stop during the hung start does not wait for the start timeout.
+        started = time.monotonic()
+        self.assertTrue(decoder.close(1.0))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertFalse(alive(pid))
+        self.assertEqual((0, 0), (decoder.status().starts, decoder.status().start_failures))
+
+    def test_failed_reap_never_starts_a_second_child(self):
+        clock = Clock()
+        decoder = self.decoder(MjpgDecoderLimits(frame_timeout_ns=300_000_000),
+                               behaviour="hang", clock=clock)
+        process = decoder._process
+        with mock.patch.object(mjpg_worker, "_REAP_TIMEOUT_S", 0.2), \
+                mock.patch.object(process, "wait",
+                                  side_effect=subprocess.TimeoutExpired("child", 0)):
+            reason, elapsed = self.timed_refusal(decoder)
+            self.assertEqual("decoder_timeout", reason)
+            # The reap runs on the supervisor, not in the refused exchange.
+            self.assertLess(elapsed, 1.0)
+            self.assertTrue(wait_for(lambda: decoder.status().state == "reap_failed"))
+            clock.value += 10 ** 12
+            with mock.patch.object(mjpg_worker.subprocess, "Popen") as popen:
+                for _ in range(3):
+                    reason, elapsed = self.timed_refusal(decoder)
+                    self.assertEqual("decoder_unavailable", reason)
+                    self.assertLess(elapsed, 0.1)
+                decoder.prepare()
+                time.sleep(0.3)
+                popen.assert_not_called()
+            self.assertEqual(process.pid, decoder.pid)
+            self.assertEqual("reap_failed", decoder.status().state)
+        # Once the old child is reaped, a replacement may start.
+        self.assertTrue(wait_for(lambda: decoder.status().state == "backoff"))
+        self.assertEqual("running", ready(decoder))
+        self.assertNotEqual(process.pid, decoder.pid)
+        self.assertEqual(2, decoder.status().starts)
+
+    def test_kill_between_spawn_and_publication_reaches_the_child(self):
+        decoder = self.decoder(start=False)
+        real, spawned = subprocess.Popen, []
+
+        def popen(*args, **options):
+            process = real(*args, **options)
+            spawned.append(process)
+            # A stop arriving after Popen returned, before the handle is
+            # published to `kill()`.
+            decoder.kill()
+            return process
+
+        with mock.patch.object(mjpg_worker.subprocess, "Popen", popen):
+            decoder.prepare()
+            self.assertEqual("closed", settle(decoder))
+        self.assertEqual(1, len(spawned))
+        self.assertTrue(wait_for(lambda: not alive(spawned[0].pid)))
+        self.assertEqual(-signal.SIGKILL, spawned[0].returncode)
+        self.assertIsNone(decoder.pid)
+        # A shutdown, not a child failure.
+        self.assertEqual((0, 0), (decoder.status().starts, decoder.status().failures))
 
     def test_memory_cap_exceeded_is_unknown(self):
         # Too small for the interpreter with numpy: the start fails.
@@ -558,6 +719,7 @@ class MjpgDecoderProcessTests(DecoderCase):
         self.assertIn(caught.exception.reason, ("decode_failed", "decoder_crashed"))
         clock.value += 10
         # The child (or its replacement) still decodes a frame that fits.
+        self.assertEqual("running", ready(tight))
         self.assertEqual(WIDTH * HEIGHT, len(self.layout.luma(self.frame, WIDTH, HEIGHT, tight)))
 
     def test_repeated_failures_report_failing_until_a_success(self):
@@ -570,26 +732,50 @@ class MjpgDecoderProcessTests(DecoderCase):
                 decoder.decode(b"\xff", self.REQUEST)
             clock.value += 10
             # A replacement child answers the first frame, then exits again.
+            self.assertEqual("running", ready(decoder))
             self.assertEqual(WIDTH * HEIGHT, len(decoder.decode(b"\xff", self.REQUEST)))
             self.assertFalse(decoder.failing)
         always = self.decoder(FAST, behaviour="exit", clock=clock)
         for count in range(1, 4):
             clock.value += 10
+            self.assertEqual("running", ready(always))
             with self.assertRaises(mjpg_worker.DecoderRefusal):
                 always.decode(b"\xff", self.REQUEST)
             self.assertEqual(count >= 2, always.failing)
 
+    def test_healthy_refusal_resets_consecutive_failures(self):
+        clock = Clock()
+        decoder = self.decoder(FAST, behaviour="refuse", clock=clock)
+        for _ in range(2):
+            pid = decoder.pid
+            os.kill(pid, signal.SIGKILL)
+            self.assertTrue(wait_for(lambda: not alive(pid)))
+            self.assertEqual("decoder_crashed", self.timed_refusal(decoder)[0])
+            clock.value += 10
+            self.assertEqual("running", ready(decoder))
+        self.assertEqual((2, True), (decoder.status().consecutive_failures, decoder.failing))
+        # A healthy child refusing a frame (strict decode error) clears it and
+        # stays.
+        pid = decoder.pid
+        self.assertEqual("decode_failed", self.timed_refusal(decoder)[0])
+        status = decoder.status()
+        self.assertEqual((0, False, "running", 2), (status.consecutive_failures, status.failing,
+                                                    status.state, status.crashes))
+        self.assertEqual(pid, decoder.pid)
+
     def test_backoff_is_exponential_and_bounded(self):
         clock = Clock()
         limits = MjpgDecoderLimits(restart_backoff_ns=10, maximum_backoff_ns=35)
-        decoder = self.decoder(limits, behaviour="exit_at_start", clock=clock)
+        decoder = self.decoder(limits, behaviour="exit_at_start", clock=clock, start=False)
         waits = []
         for _ in range(4):
+            self.assertEqual("backoff", ready(decoder))
             with self.assertRaises(mjpg_worker.DecoderRefusal):
                 decoder.decode(b"\xff", self.REQUEST)
             waits.append(decoder._retry_at - clock.value)
             clock.value = decoder._retry_at
         self.assertEqual([10, 20, 35, 35], waits)
+        self.assertEqual(4, decoder.status().start_failures)
 
     def test_close_reaps_and_retire_prevents_restart(self):
         decoder = self.decoder()
@@ -599,10 +785,24 @@ class MjpgDecoderProcessTests(DecoderCase):
         self.assertFalse(alive(pid))
         self.assertEqual("decoder_unavailable", self.refused(decoder))
         self.assertTrue(decoder.close())
-        retired = self.decoder()
+        retired = self.decoder(start=False)
         retired.retire()
         self.assertEqual("decoder_unavailable", self.refused(retired))
+        retired.prepare()
+        self.assertEqual("closed", settle(retired))
         self.assertIsNone(retired.pid)
+
+    def test_child_outlives_the_thread_that_asked_for_it(self):
+        """The parent-death signal is tied to the source's supervisor
+        thread, not to whichever thread asked for the child."""
+        decoder = self.decoder(start=False)
+        asker = threading.Thread(target=decoder.prepare)
+        asker.start()
+        asker.join()
+        self.assertEqual("running", settle(decoder))
+        time.sleep(0.2)
+        self.assertTrue(alive(decoder.pid))
+        self.assertEqual(WIDTH * HEIGHT, len(self.layout.luma(self.frame, WIDTH, HEIGHT, decoder)))
 
     def test_limits_are_validated(self):
         for changes in (dict(frame_timeout_ns=0), dict(address_space_bytes=1 << 20),
@@ -616,13 +816,21 @@ class MjpgDecoderProcessTests(DecoderCase):
             MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, decoder=None)
 
     def test_child_dies_with_its_parent(self):
-        """No orphan: SIGKILL the parent and the decode child goes too."""
+        """No orphan: SIGKILL the parent and the decode child goes too.
+
+        The real child is stopped first, so it cannot notice the closed
+        socket and exit by itself: only the parent-death SIGKILL ends it.
+        """
         program = (
             "import sys, time\n"
             "from app.detection.roi.mjpg_worker import *\n"
             "from app.detection.roi.mjpg import MAXIMUM_FRAME_BYTES\n"
             "decoder = MjpgDecoderProcess(MjpgDecoderLimits(), MAXIMUM_FRAME_BYTES)\n"
             "frame = sys.stdin.buffer.read()\n"
+            "decoder.prepare()\n"
+            "deadline = time.monotonic() + 20\n"
+            "while decoder.status().state == 'starting' and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n"
             "decoder.decode(frame, DecodeRequest(%d, %d, %d, %d, 2, 1, 7))\n"
             "print(decoder.pid, flush=True)\n"
             "time.sleep(60)\n" % (WIDTH, HEIGHT, WIDTH, HEIGHT))
@@ -635,6 +843,16 @@ class MjpgDecoderProcessTests(DecoderCase):
         parent.stdin.close()
         pid = int(parent.stdout.readline())
         self.assertTrue(alive(pid))
+
+        def reap_stray():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        self.addCleanup(reap_stray)
+        os.kill(pid, signal.SIGSTOP)
+        self.assertTrue(wait_for(lambda: stopped(pid)))
         parent.kill()
         parent.wait()
         self.assertTrue(wait_for(lambda: not alive(pid)))
@@ -642,23 +860,49 @@ class MjpgDecoderProcessTests(DecoderCase):
 
 class MjpgHarness(Harness):
     def frame(self, luma=None, source=SOURCE, advance=INTERVAL, data=None):
-        self.clock.value += advance
-        number = self.sequence.get(source, 0) + 1
-        self.sequence[source] = number
+        self.queue(luma, source, advance, data)
         before = self._handled(source)
-        payload = data if data is not None else encode(luma or pixels())
-        self.runtime.on_uvc_frame(source, VideoFrame(payload, number, 0.0))
         if self.threaded:
             assert wait_for(lambda: self._handled(source) > before)
         else:
             self.runtime.step()
         return self.source(source)
 
+    def queue(self, luma=None, source=SOURCE, advance=INTERVAL, data=None):
+        self.clock.value += advance
+        number = self.sequence.get(source, 0) + 1
+        self.sequence[source] = number
+        payload = data if data is not None else encode(luma or pixels())
+        self.runtime.on_uvc_frame(source, VideoFrame(payload, number, 0.0))
+
+    def start(self):
+        """Start the runtime and wait until every bound source's decode child
+        is ready (the runtime asks for it at bind, without waiting)."""
+        status = self.runtime.start()
+        self.warm()
+        return status
+
+    def warm(self, *sources):
+        """Bind (or wait for the worker to bind) and, past any restart
+        backoff, wait until each bound source's child is ready."""
+        if self.threaded:
+            wait_for(lambda: all(self.source(source).state is not SceneSourceState.INACTIVE
+                                 for source in sources or self.runtime.source_ids))
+        else:
+            self.runtime.step()
+        self.clock.value += 1  # past a 1 ns test backoff
+        for source in sources or self.runtime.source_ids:
+            if self.source(source).state is not SceneSourceState.INACTIVE:
+                ready(self.runtime._contexts[source].decoder)
+
     def use(self, source, behaviour=None, limits=FAST):
         """Replace a source's decode child with a synthetic stand-in."""
-        self.runtime._contexts[source].decoder = MjpgDecoderProcess(
+        context = self.runtime._contexts[source]
+        previous = context.decoder
+        context.decoder = MjpgDecoderProcess(
             limits, MAXIMUM_FRAME_BYTES, clock_ns=self.clock,
             command=fake(behaviour) if behaviour else None)
+        previous.close()
 
     def pid(self, source=SOURCE):
         return self.runtime._contexts[source].decoder.pid
@@ -676,7 +920,7 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
 
     def test_local_uvc_mjpg_frames_confirm_server_movement(self):
         harness = self.harness(binding(layout=MJPG_LAYOUT))
-        harness.runtime.start()
+        harness.start()
         harness.frame()
         self.assertEqual(Observation.ABSENT, harness.frame().movement)
         harness.frame(MOVED)
@@ -685,9 +929,26 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         self.assertEqual([CriticalKind.SERVER_MOVEMENT], harness.recorder.kinds())
         self.assertNotEqual(os.getpid(), harness.pid())
 
+    def test_bind_asks_for_the_child_and_frames_before_it_is_ready_are_unknown(self):
+        harness = self.harness(binding(layout=MJPG_LAYOUT))
+        harness.runtime.start()
+        self.assertIsNone(harness.pid())
+        harness.runtime.step()  # binds the source: its child is requested
+        decoder = harness.runtime._contexts[SOURCE].decoder
+        self.assertIn(decoder.status().state, ("starting", "running"))
+        self.assertEqual("running", settle(decoder))
+        self.assertEqual(1, harness.frame().evaluated)
+        cold = self.harness(binding(layout=MJPG_LAYOUT))
+        cold.runtime.start()
+        with mock.patch.object(MjpgDecoderProcess, "prepare"):
+            source = cold.frame(MOVED)
+        self.assertEqual(("frame_undecodable", (("decoder_starting", 1),), Observation.UNKNOWN),
+                         (source.reason, source.undecodable_reasons, source.movement))
+        self.assertEqual(0, source.decoder_failures)
+
     def test_corrupt_mjpg_frame_is_unknown_never_no_movement(self):
         harness = self.harness(binding(layout=MJPG_LAYOUT), binding(OTHER, layout=MJPG_LAYOUT))
-        harness.runtime.start()
+        harness.start()
         for _ in range(2):
             harness.frame(source=OTHER, advance=0)
             harness.frame()
@@ -717,7 +978,7 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
 
     def test_child_crash_is_unknown_and_a_replacement_resumes(self):
         harness = self.harness(binding(layout=FAST_LAYOUT), binding(OTHER, layout=FAST_LAYOUT))
-        harness.runtime.start()
+        harness.start()
         harness.frame(source=OTHER, advance=0)
         harness.frame()
         self.assertEqual(Observation.ABSENT, harness.frame().movement)
@@ -730,6 +991,7 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
                          (broken.reason, broken.movement, broken.tamper, broken.decoder_failures))
         self.assertEqual((("decoder_crashed", 1),), broken.undecodable_reasons)
         # The replacement starts after the backoff and evaluation resumes.
+        harness.warm(SOURCE)
         resumed = harness.frame()
         self.assertIs(SceneSourceState.ACTIVE, resumed.state)
         self.assertNotEqual(pid, harness.pid())
@@ -743,20 +1005,52 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
                                    maximum_backoff_ns=1)
         harness = self.harness(binding(layout=FAST_LAYOUT))
         harness.use(SOURCE, "hang", limits)
-        harness.runtime.start()
+        harness.start()
         source = harness.frame()
         self.assertEqual(("frame_undecodable", (("decoder_timeout", 1),)),
                          (source.reason, source.undecodable_reasons))
+        settle(harness.runtime._contexts[SOURCE].decoder)
         self.assertIsNone(harness.pid())
+
+    def test_a_child_hanging_at_start_never_delays_another_source(self):
+        """One source's child hangs in its start: the shared scene worker
+        keeps evaluating the other source on every cycle without waiting."""
+        harness = self.harness(binding(layout=FAST_LAYOUT), binding(OTHER, layout=FAST_LAYOUT))
+        harness.use(SOURCE, "hang_at_start", MjpgDecoderLimits(start_timeout_ns=5_000_000_000))
+        harness.runtime.start()
+        harness.runtime.step()  # binds both: both children are requested
+        self.assertEqual("running", settle(harness.runtime._contexts[OTHER].decoder))
+        self.assertEqual("starting", harness.runtime._contexts[SOURCE].decoder.status().state)
+        cycles = []
+        for _ in range(3):
+            harness.queue(MOVED)
+            started = time.monotonic()
+            harness.frame(source=OTHER, advance=0)  # one worker cycle, both sources
+            cycles.append(time.monotonic() - started)
+        # A synchronous start would hold the cycle for the 5 s start timeout.
+        self.assertLess(max(cycles), 1.0)
+        hung, other = harness.source(), harness.source(OTHER)
+        self.assertEqual(("frame_undecodable", (("decoder_starting", 3),), Observation.UNKNOWN),
+                         (hung.reason, hung.undecodable_reasons, hung.movement))
+        self.assertEqual((3, SceneSourceState.ACTIVE, ()),
+                         (other.evaluated, other.state, other.undecodable_reasons))
+        # Stopping during the hung start stays within the stop bounds.
+        pid = harness.pid()
+        started = time.monotonic()
+        status = harness.runtime.stop()
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertIs(SceneRuntimeState.STOPPED, status.state)
+        self.assertFalse(alive(pid))
 
     def test_repeated_failures_lower_the_source_and_the_runtime(self):
         harness = self.harness(binding(layout=FAST_LAYOUT), binding(OTHER, layout=FAST_LAYOUT))
         harness.use(SOURCE, "exit")
-        harness.runtime.start()
+        harness.start()
         harness.frame(source=OTHER, advance=0)
         harness.frame(source=OTHER, advance=0)
         with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
             for _ in range(4):
+                harness.warm(SOURCE)
                 source = harness.frame(MOVED)
         self.assertEqual(1, sum("scene_frame_decoder_failing" in line for line in logs.output))
         self.assertTrue(all("scene_frame_decoder" in line for line in logs.output))
@@ -767,6 +1061,7 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         self.assertIs(SceneRuntimeState.DEGRADED, status.state)
         # One successful exchange clears it, logged once.
         harness.use(SOURCE)
+        harness.warm(SOURCE)
         with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
             harness.frame()
             recovered = harness.frame()
@@ -784,6 +1079,7 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         self.assertEqual("frame_decoder_unavailable", source.reason)
         self.assertEqual(Observation.UNKNOWN, source.movement)
         self.assertIsNone(harness.pid())
+        self.assertEqual("stopped", harness.runtime._contexts[SOURCE].decoder.status().state)
         self.assertEqual([], harness.recorder.items)
 
     def test_without_calibration_mjpg_source_fails_closed(self):
@@ -802,6 +1098,7 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         harness = self.harness(binding(layout=MjpgLumaLayout(CAPTURE_WIDTH + 4, CAPTURE_HEIGHT)))
         harness.runtime.start()
         self.assertEqual("capture_layout_incompatible", harness.frame().reason)
+        self.assertIsNone(harness.pid())
         with self.assertRaises(ValueError):
             binding(source_type=SourceType.REMOTE_AGENT, layout=MJPG_LAYOUT)
 
@@ -823,9 +1120,9 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
             harness.runtime.step()
             self.assertEqual(1, len(threads))
             threaded = MjpgHarness(binding(layout=MJPG_LAYOUT), threaded=True)
-            threaded.runtime.start()
+            threaded.start()
             try:
-                threaded.frame()
+                self.assertEqual(1, threaded.frame().evaluated)
             finally:
                 threaded.runtime.stop()
         self.assertEqual("scene-monitoring", threads[-1])
@@ -833,7 +1130,7 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
     def test_stop_kills_and_reaps_every_child(self):
         harness = MjpgHarness(binding(layout=MJPG_LAYOUT), binding(OTHER, layout=MJPG_LAYOUT),
                               threaded=True)
-        harness.runtime.start()
+        harness.start()
         try:
             harness.frame()
             harness.frame(source=OTHER, advance=0)
@@ -843,6 +1140,8 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
             os.kill(pids[1], signal.SIGSTOP)
             harness.clock.value += INTERVAL
             harness.runtime.on_uvc_frame(OTHER, VideoFrame(encode(pixels()), 99, 0.0))
+            threads = supervisors(harness)
+            self.assertEqual(2, len(threads))
         finally:
             started = time.monotonic()
             status = harness.runtime.stop()
@@ -850,10 +1149,12 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         self.assertIs(SceneRuntimeState.STOPPED, status.state)
         self.assertFalse(any(alive(pid) for pid in pids))
         self.assertEqual((None, None), (harness.pid(), harness.pid(OTHER)))
+        # The per-source supervisor threads ended with the stop.
+        self.assertFalse(any(thread.is_alive() for thread in threads))
 
     def test_stop_reports_failure_when_a_child_cannot_be_reaped(self):
         harness = self.harness(binding(layout=MJPG_LAYOUT))
-        harness.runtime.start()
+        harness.start()
         harness.frame()
         with mock.patch.object(MjpgDecoderProcess, "close", return_value=False), \
                 self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
@@ -868,8 +1169,8 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         for decoder in decoders:
             self.addCleanup(decoder.close)
         frames = [noise_frame(1920, 1080, seed=seed) for seed in range(4)]
-        for decoder, frame in zip(decoders, frames):
-            layout.luma(frame, 480, 270, decoder)  # child start, not timed
+        for decoder in decoders:
+            self.assertEqual("running", ready(decoder))  # child start, not timed
         rounds, durations = [], []
         for _ in range(5):
             started = time.perf_counter()
@@ -886,10 +1187,15 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         # The runtime with four MJPG sources evaluates each through its child.
         sources = (SOURCE, OTHER, THIRD, FOURTH)
         harness = self.harness(*(binding(item, layout=MJPG_LAYOUT) for item in sources))
-        harness.runtime.start()
+        harness.start()
         for item in sources:
             self.assertEqual(1, harness.frame(source=item, advance=0).evaluated)
         self.assertEqual(4, len({harness.pid(item) for item in sources}))
+
+
+def supervisors(harness):
+    return [context.decoder._thread for context in harness.runtime._contexts.values()
+            if context.decoder is not None and context.decoder._thread is not None]
 
 
 if __name__ == "__main__":

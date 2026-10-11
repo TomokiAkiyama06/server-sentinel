@@ -80,6 +80,21 @@ def main(argv):
         elif behaviour == "partial":
             connection.sendall((9 + width * height).to_bytes(4, "big") + b"K" + identifier)
             time.sleep(3600)
+        elif behaviour == "refuse":
+            # A healthy child refusing every frame (strict decode error).
+            _send(connection, b"F" + identifier + bytes((1,)))
+        elif behaviour == "drip":
+            # A correct reply, one byte every 50 ms.
+            connection.sendall((9 + width * height).to_bytes(4, "big") + b"K" + identifier)
+            for _ in range(width * height):
+                time.sleep(0.05)
+                connection.sendall(b"\x00")
+            time.sleep(3600)
+        elif behaviour.startswith("size_"):
+            # Announces a reply of this size, then sends nothing more.
+            size = int(behaviour[5:])
+            connection.sendall(size.to_bytes(4, "big") + (b"K" + identifier)[:size])
+            time.sleep(3600)
         else:
             os._exit(5)
 

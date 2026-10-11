@@ -442,9 +442,10 @@ class _Context:
 
     def __init__(self, binding, clock):
         self.binding = binding
-        # The source's own MJPG decode child (started on the worker thread at
-        # its first frame), so a crashing frame of one camera never refuses
-        # another camera's frames.
+        # The source's own MJPG decode child, started and reaped by its own
+        # supervisor thread (requested at bind and at frames), so a crashing,
+        # hanging or slow-starting child of one camera never refuses or delays
+        # another camera's frames on this worker.
         self.decoder = (MjpgDecoderProcess(binding.layout.decoder, MAXIMUM_FRAME_BYTES,
                                            clock_ns=clock)
                         if isinstance(binding.layout, MjpgLumaLayout) else None)
@@ -1007,8 +1008,8 @@ class SceneMonitoringRuntime:
             try:
                 self._finish()
             finally:
-                # The decode children were started on this thread; they are
-                # killed with it (the parent-death signal would also do so).
+                # The decode children and their supervisor threads end with
+                # the worker (bounded; `stop()` checks the result).
                 for context in self._contexts.values():
                     if context.decoder is not None:
                         context.decoder.close(DECODER_REAP_TIMEOUT_SECONDS)
@@ -1156,6 +1157,11 @@ class SceneMonitoringRuntime:
             published.maximum_gap_ns = calibration.policy.maximum_gap_ns
             published.active_since_ns = now
             self._withdraw(published, "awaiting_sample")
+        if context.decoder is not None:
+            # Non-blocking: the child starts in the background, so it is
+            # normally ready by the first frame; until then frames are
+            # refused (`decoder_starting`), never waited on.
+            context.decoder.prepare()
 
     @staticmethod
     def _merge_loss(held, loss):

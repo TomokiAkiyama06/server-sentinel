@@ -60,7 +60,10 @@ child process per MJPG source, never inside the Main process. Implemented in
   validated bytes up to `EOI` are sent to the child over a private `AF_UNIX`
   socketpair, bounded by the frame-size limit;
 - the child is started by fork+exec of the service interpreter
-  (`python -I -B mjpg_child.py`, no `preexec_fn`) from the scene worker thread,
+  (`python -I -B mjpg_child.py`, no `preexec_fn`) from the source's own
+  long-lived supervisor thread (so neither the start nor the reap of a child
+  ever runs on the shared scene worker, and the parent-death signal is tied to
+  a thread that outlives the child),
   with a minimal explicit environment (one BLAS/OpenMP thread), stdio on
   `/dev/null` and only its socket inherited; before importing simplejpeg/numpy
   it sets `no_new_privs`, parent-death `SIGKILL`, non-dumpable, nice 10 and
@@ -84,9 +87,9 @@ filesystem view inside the systemd unit and could return wrong pixels.
 simplejpeg 1.9.0 bundles libjpeg-turbo 3.1.2. Upstream libjpeg-turbo has
 released 3.1.3 and 3.1.4 since; their change logs have **not** been reviewed in
 this PR for security-relevant decoder fixes. Checking them (and whether a newer
-simplejpeg wheel bundles them) is a follow-up before or soon after enabling
-MJPG on a production host; until then the pinned 3.1.2 is what runs, isolated
-as above.
+simplejpeg wheel bundles them) is tracked in a follow-up issue, to be done
+before or soon after enabling MJPG on a production host; until then the pinned
+3.1.2 is what runs, isolated as above.
 
 ### License gate record for the adoption (Issue #217)
 

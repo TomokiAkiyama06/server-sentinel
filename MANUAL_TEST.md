@@ -1196,7 +1196,9 @@ with each EMEET C960 negotiated as `MJPG` (1080p30 and 720p30), still to do:
   and with 4 sources at 1 sample/s, while other sessions' GPU benchmarks run;
   confirm it stays far below the 500 ms per-frame deadline (no
   `decoder_timeout`) and that capture/preview frame rates are unchanged; also
-  the child start time at the first frame and each child's RSS
+  the child start time after bind (frames before it are `decoder_starting`)
+  and that a child start never lengthens another source's sample cycle, and
+  each child's RSS
   (`/proc/<pid>/status` `VmRSS`; about 30 MiB synthetic) for 4 sources;
 - [ ] **decode child inside the systemd sandbox**: inside the real
   `server-sentinel.service` unit (its `ProtectSystem=strict`,

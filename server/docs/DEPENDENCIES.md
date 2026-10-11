@@ -70,7 +70,7 @@ Static review found no telemetry or network client code in cryptography or cffi;
 
 ## Issue #217 addition: `simplejpeg` and `numpy` (2026-10-11)
 
-The Owner adopted simplejpeg as the Main-host MJPG decoder for ROI movement and camera tamper on 2026-10-11 (Option B of `../../docs/decisions/2026-10-11-mjpg-decoder-survey.md`), with NumPy as a ROI runtime dependency. Only `app/detection/roi/mjpg.py` imports them, and only on the scene worker thread. No other package is added.
+The Owner adopted simplejpeg as the Main-host MJPG decoder for ROI movement and camera tamper on 2026-10-11 (Option B of `../../docs/decisions/2026-10-11-mjpg-decoder-survey.md`), with NumPy as a ROI runtime dependency. Only the decode child program `app/detection/roi/mjpg_child.py` imports them, in a separate resident process per MJPG source; the Main process never imports them (`app/detection/roi/mjpg.py` reads only their package metadata). No other package is added.
 
 | Package | Exact version | Artifacts | Declared license |
 |---|---|---|---|

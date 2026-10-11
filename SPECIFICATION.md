@@ -1041,8 +1041,10 @@ negotiated format within a pixel budget) runs on the scene worker before any
 native code sees the bytes, and the strict decode itself runs only in a
 separate, per-source, resident decode child process (Owner decision
 2026-10-11 on PR #225), never in the Main process. The child is started by
-fork+exec of the service interpreter (`python -I -B`) from the scene worker
-thread with a minimal environment and only a private `AF_UNIX` socketpair
+fork+exec of the service interpreter (`python -I -B`) from that source's own
+long-lived supervisor thread (child start and reap never run on the shared
+scene worker; frames are refused as `unknown` until the child is ready) with
+a minimal environment and only a private `AF_UNIX` socketpair
 inherited; before importing the decoder it sets `no_new_privs`, a parent-death
 `SIGKILL`, non-dumpable, a lower CPU priority and equal soft/hard rlimits
 (address space, descriptors, no new process, no core, no file writes), and it
