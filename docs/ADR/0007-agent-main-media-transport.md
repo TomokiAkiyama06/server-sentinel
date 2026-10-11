@@ -13,7 +13,8 @@ boundary), #16 (Agent ring buffer), #17 (recording).
 Issue #15 requires a PoC comparison of WebRTC, SRT, QUIC and authenticated
 HTTP streaming, ranked by (1) stability, (2) reconnect, (3) accurate gap
 reporting, (4) bounded buffering/backpressure, (5) authenticated encryption,
-(6) resource usage, (7) latency. Authenticated encryption is a mandatory
+(6) resource usage, (7) latency. (SRT was later dropped from the PoC candidate set by the
+Owner on 2026-10-11; see the Measurement harness section.) Authenticated encryption is a mandatory
 invariant for every candidate regardless of its rank. Near-real-time is the
 goal, but stability and reconnect take priority over any particular latency.
 
@@ -156,20 +157,41 @@ exact/unknown gaps, stale sessions, bounded backpressure and gap coalescing,
 1–4 sources with a fifth refused, stale/clock-regression fail-closed,
 revocation, concurrency, and a deterministic synthetic impairment run.
 
+Measurement harness (Issue #15): `scripts/manual/transport_poc/` runs the
+same impairment matrix and G1–G6 gates for TLS 1.3 mTLS framed streaming and
+mTLS HTTP/1.1 chunked / 1 s segment upload. It has run only as a synthetic
+loopback on one host; it selects no candidate and measures nothing on a real
+LAN by itself.
+
+SRT is dropped from the PoC candidate set (Owner decision, 2026-10-11): its
+passphrase-based encryption gives no mutual certificate identity (ADR-0006)
+and cannot satisfy G1, so the harness has no SRT adapter and the table below
+has no SRT column.
+
 Real hardware (not done): MANUAL_TEST.md §G "Agent-to-Main transport PoC".
 Record per candidate, for 1, 2, 3 and 4 sources (state real vs synthetic
 inputs for each):
 
-| Measurement | WebRTC | SRT | QUIC | HTTP/WS |
-| --- | --- | --- | --- | --- |
-| Reconnect time after 1–5 s link loss | | | | |
-| Gap reported vs actual after reconnect | | | | |
-| Max sender / receiver queue depth, slow consumer | | | | |
-| Behaviour under sustained packet loss / added jitter | | | | |
-| LAN glass-to-glass latency (informational) | | | | |
-| CPU / GPU / VRAM, Main and Agent | | | | |
-| Bitrate | | | | |
-| Codec/container and recording-extraction impact | | | | |
+The harness candidates are `a_framed` (TLS 1.3 mTLS framed stream),
+`b_chunked` (mTLS HTTP/1.1 chunked upload) and `b_segment` (mTLS HTTP/1.1
+1 s segment upload); WebRTC and QUIC are not in the harness and SRT is dropped.
+
+Transcribe only summaries in which every run has `fast: false` (full timing;
+`fast_runs` 0 on the candidate row): `--fast` results are CI smoke durations,
+not measurements. For two-host runs, state that the Main-side stop/restart
+and Main stale-detection checks of G5 are matched by count only (no
+cross-host clock comparison, so no per-window attribution).
+
+| Measurement | a_framed | b_chunked | b_segment | WebRTC (not in harness) | QUIC (not in harness) |
+| --- | --- | --- | --- | --- | --- |
+| Reconnect time after 1–5 s link loss | | | | | |
+| Gap reported vs actual after reconnect | | | | | |
+| Max sender / receiver queue depth, slow consumer | | | | | |
+| Behaviour under sustained packet loss / added jitter | | | | | |
+| LAN glass-to-glass latency (informational) | | | | | |
+| CPU / GPU / VRAM, Main and Agent | | | | | |
+| Bitrate | | | | | |
+| Codec/container and recording-extraction impact | | | | | |
 
 ## Follow-up
 

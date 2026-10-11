@@ -1317,7 +1317,8 @@ Record:
 ### Agent-to-Main transport PoC (Issue #15, ADR-0007 — pending physical execution)
 
 Synthetic continuity tests do not verify any transport. For each candidate
-(WebRTC, SRT, QUIC, authenticated HTTP/WebSocket streaming) on the real Main
+(WebRTC, QUIC, authenticated HTTP/WebSocket streaming; SRT was dropped by the
+Owner decision of 2026-10-11, see ADR-0007) on the real Main
 Server, capture node and UVC camera over the private LAN, and for 1, 2, 3 and 4
 sources (record which sources are real cameras and which are synthetic input):
 
@@ -1335,6 +1336,45 @@ CPU/GPU/VRAM on Main and Agent, bitrate, informational LAN latency,
 codec/container and recording-extraction impact, and the exact dependency
 versions/licences. Enter the results in the ADR-0007 validation table; do not
 attach private addresses, credentials or real footage.
+
+### 実機記録テンプレート: Issue #15 transport PoC 計測ハーネス（未実施）
+
+手順は [`scripts/manual/transport_poc/README.md`](scripts/manual/transport_poc/README.md)
+（step 0 の read-only inventory、使い捨て materials、1 scenario ずつの実行、kill switch
+`systemctl --user stop 'ss-poc15-*'`、1 日 3 時間上限、cleanup checklist）。ハーネスの PR
+時点の確認は同一 host の loopback・synthetic 入力だけで、以下は**どれも実機では未実施**です。
+TCP の packet loss / jitter は root の `netem` を使わないため `unmeasured` のまま残し、
+QUIC / WebRTC はこのハーネスの対象外です。
+
+```text
+Date / tester:
+ServerSentinel Git commit (harness HEAD):
+Main host（粗い値のみ）/ capture host（粗い値のみ）:
+Candidate(s): a_framed / b_chunked / b_segment
+Sources: n=  real cameras=  synthetic (gst / builtin)=
+Profile / bitrate:
+CPU cap (Main CPUQuota / capture CPUQuota):
+Run id(s):
+Total run time today (≤ 3 h):
+```
+
+- [ ] step 0 inventory を両 host で取得し、47200–47214 が未使用であることを確認した;
+- [ ] G1: `auth_unpaired` / `auth_other_ca` / `auth_revoked` / `auth_revoked_live` で受理 media 0、`route_probe` でハーネス receiver に human route なし（製品の human/admin API は上の transport PoC 項目で別途確認）;
+- [ ] G2: 各 impairment 後の報告 gap が実欠落と一致（epoch 内は完全一致、capture 再起動は範囲不明）、重複 commit 0、sender の unit 収支（末尾 drop を含む）が照合済み（`drop_accounting` が `pass`）;
+- [ ] G3: receiver queue / kernel send queue の滞留 byte（`TIOCOUTQ` と `ss -tmi` の skmem `w`）/ VmHWM が設定上限内で warmup 後に増加しない;
+- [ ] G4: 手動操作なしで再接続し p95 ≤ 10 s;
+- [ ] G5: 無音断の検知 ≤ 15 s、Main の未 commit 区間が Agent 保護区間 [T−600 s, T+600 s] に含まれる;
+- [ ] G6: CPU 制限下の 4 source で backpressure 0、5 source 目は拒否;
+- [ ] 全 run が非 fast（`--fast` なし。summary の各 run 行と候補行の `fast` が `false`、`fast_runs` が 0）;
+- [ ] 2 host の run では G5 の Main `interrupted`（proxy blackhole）が件数照合（window との時刻対応なし）であることを結果に併記した（Main 側停止・再起動の Agent 検知と再接続は session nonce で対応付け済み）;
+- [ ] 1 / 2 / 3 / 4 source の各構成を候補ごとに実行した（`normal` / `sources_2` / `sources_3` / `capacity_4`、summary の `*_missing_source_counts` が 0）、全 run の `integrity` が `pass`（別実行の記録の混入・子 process の異常終了なし）;
+- [ ] 副次: 30 分 soak（full matrix とは別の日に実行）で予期しない切断 0、overhead ≤ 10 %、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %、latency p95（参考）;
+- [ ] cleanup checklist を完了（使い捨て CA / ledger / node 鍵 / holder state を削除、`ss-poc15-*` scope なし）;
+- [ ] ADR-0007 へ転記する前に、Claude と Owner が全 run の生 JSONL 記録（各 run directory の
+  orchestrator / receiver / sender / proxy と holder の記録。summary だけではない）を確認し、
+  summary の判定が記録と食い違わないこと（想定外の `fail` / `unmeasured`、記録の欠落・混在、
+  不自然な時刻や件数が無いこと）を確かめ、確認した run id と確認者を記録した;
+- [ ] 結果を ADR-0007 Validation 表へ転記し、real / synthetic の内訳と未測定項目を明記した。
 
 ### LAN baseline measurement (2026-09-30, Issue #15; no transport candidate yet)
 
