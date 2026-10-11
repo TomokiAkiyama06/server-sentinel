@@ -65,6 +65,10 @@ SIDE_PROCESSES = {"both": ("receiver", "proxy", "sender"), "main": ("receiver",)
 # always for reset / restart, and for a silent window only when it is longer
 # than the Agent loss timeout by a full second (no borderline expectation).
 LOSS_MARGIN_NS = SECOND
+# Two hosts: a connection only detects a Main-side stop/restart when Main
+# (Main clock) saw it end by the window end + DETECTION_NS + this grace, and
+# the Agent never received a Main reply sent after the window started.
+SESSION_CLOSE_GRACE_NS = 5 * SECOND
 # Orchestrator ``start`` fields every side must declare identically (one run).
 RUN_FIELDS = ("n_sources", "fast", "duration_ns", "scenario", "candidate")
 # Continuous production (sender ``end`` per source and epoch, sender clock):
@@ -1066,8 +1070,22 @@ class RunSummary:
         one of those sessions (the sender records carry the nonce), each
         episode used once (maximum bipartite matching). An incidental
         disconnect before the stop is on a session that had already closed,
-        so it never satisfies the window. Returns ``[(window, session or
-        None)]`` in window order, or None when the records carry no nonces.
+        so it never satisfies the window.
+
+        The loss must also be the outage's, not a later unrelated drop of a
+        connection that survived it. A candidate session must (Main clock)
+        end -- its ``session_close``, its receiver's ``end`` or the
+        orchestrator's receiver ``exit`` -- by the window end +
+        DETECTION_NS + SESSION_CLOSE_GRACE_NS, and the Agent must never have
+        received a Main reply sent after the window started: the last
+        heartbeat echo the Agent received on it (``last_echo_ns``) must be
+        older than every echo the receiver returned on it after the window
+        start (``heartbeat_ack``). Echo values are Agent clock readings and
+        are only compared with each other; ``heartbeat_ack`` times only with
+        the Main windows. Bytes the receiver drains after SIGCONT (sent
+        before the Agent dropped the connection) are not evidence either
+        way. Returns ``[(window, session or None)]`` in window order, or
+        None when the records carry no nonces or no echo evidence.
         """
         windows = sorted((start, end) for start, end, origin in self._impairment_windows()
                          if origin == "main")
@@ -1078,25 +1096,55 @@ class RunSummary:
         losses = _kind(self.sender, "loss_detected")
         if not hellos or any(not _is_int(loss.get("session")) for loss in losses):
             return None
+        if any("last_echo_ns" not in loss for loss in losses):
+            return None  # records from before the echo evidence existed
+        echoes = {}
+        for loss in losses:
+            echo = loss["last_echo_ns"]
+            if echo is None:
+                continue
+            if not _is_int(echo):
+                return None
+            echoes[loss["session"]] = max(echo, echoes.get(loss["session"], echo))
+        replies = {}
+        for item in _kind(self.receiver, "heartbeat_ack"):
+            if _is_int(item.get("session")) and _is_int(item.get("echo_ns")):
+                replies.setdefault(item["session"], []).append((item["t_ns"], item["echo_ns"]))
+        if echoes and not replies:
+            return None  # the Agent saw replies Main has no record of
         # A session ends at its close, or at the end of its receiver process
-        # (an abruptly stopped receiver may not write every close).
+        # (an abruptly stopped receiver may not write every close; the
+        # orchestrator's ``exit`` is written once the process is gone).
         ends = [item["t_ns"] for item in _kind(self.receiver, "end")]
+        ends += [item["t_ns"] for item in _kind(self.orchestrator, "exit")
+                 if item.get("process") == "receiver" and item.get("side") != "agent"]
         closes = {}
         for item in _kind(self.receiver, "session_close"):
             if _is_int(item.get("session")):
                 closes.setdefault(item["session"], item["t_ns"])
         episodes = {loss["session"] for loss in losses}
         candidates = []
-        for start, _end in windows:
+        survived = 0
+        for start, end in windows:
             live = []
             for session, opened in sorted(hellos.items(), key=lambda kv: kv[1]):
                 bounds = [t for t in ends if t >= opened]
                 if session in closes:
                     bounds.append(closes[session])
-                if (session in episodes and opened <= start
+                if not (session in episodes and opened <= start
                         and (not bounds or min(bounds) >= start)):
-                    live.append(session)
+                    continue
+                ended = min(bounds) if bounds else None
+                late = ended is None or ended > end + DETECTION_NS + SESSION_CLOSE_GRACE_NS
+                echo = echoes.get(session)
+                answered = echo is not None and any(
+                    at >= start and value <= echo for at, value in replies.get(session, ()))
+                if late or answered:
+                    survived += 1  # kept alive through the outage: not its detection
+                    continue
+                live.append(session)
             candidates.append(live)
+        self.metrics.update(main_outage_survivors=survived)
         owner = {}
 
         def assign(index, seen):

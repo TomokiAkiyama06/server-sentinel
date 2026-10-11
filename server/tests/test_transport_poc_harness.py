@@ -623,7 +623,8 @@ class SummarizerTests(unittest.TestCase):
                       {"kind": "impairment_end", "t_ns": 15 * second, "impairment": "blackhole",
                        "duration_ns": 5 * second, "rate_bytes": 0}]
         events = [{"kind": "start", "t_ns": 0, "loss_timeout_ns": 2 * second},
-                  {"kind": "loss_detected", "t_ns": 12 * second, "source": 0, "idle_ns": 1,
+                  {"kind": "loss_detected", "last_echo_ns": None,
+                   "t_ns": 12 * second, "source": 0, "idle_ns": 1,
                    "last_committed_capture_ns": 10 * second},
                   {"kind": "closed", "t_ns": 12 * second, "reason": "loss_timeout"},
                   {"kind": "first_accept", "t_ns": 16 * second, "connection": 2, "source": 0}]
@@ -665,7 +666,8 @@ class SummarizerTests(unittest.TestCase):
                 self.run_dir(name, orchestrator=orchestrator, receiver=receiver,
                              sender_rows=sender_rows + [start])
                 self.assertEqual("fail", self.report()[scenario]["g5"])
-                loss = {"kind": "loss_detected", "t_ns": 15 * second, "source": 0,
+                loss = {"kind": "loss_detected", "last_echo_ns": None,
+                        "t_ns": 15 * second, "source": 0,
                         "idle_ns": 5 * second, "connection": 1, "session": 11,
                         "last_committed_capture_ns": 9 * second}
                 self.rewrite(name, "sender", sender_rows + [start, loss])
@@ -925,7 +927,8 @@ class SummarizerTests(unittest.TestCase):
                       {"kind": "impairment_end", "t_ns": 13 * second, "impairment": "blackhole",
                        "duration_ns": 3 * second, "rate_bytes": 0}]
         events = [{"kind": "start", "t_ns": 0, "loss_timeout_ns": int(1.5 * second)},
-                  {"kind": "loss_detected", "t_ns": 12 * second, "source": 0, "idle_ns": 1,
+                  {"kind": "loss_detected", "last_echo_ns": None,
+                   "t_ns": 12 * second, "source": 0, "idle_ns": 1,
                    "last_committed_capture_ns": 10 * second},
                   {"kind": "closed", "t_ns": 12 * second, "reason": "loss_timeout"},
                   {"kind": "first_accept", "t_ns": 14 * second, "connection": 2, "source": 0}]
@@ -1002,7 +1005,7 @@ class SummarizerTests(unittest.TestCase):
         start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": 5 * second}
         # Agent-clock loss far outside the Main-clock window: fine on two hosts
         # (the lost connection was live at the stop on the Main clock)
-        loss = {"kind": "loss_detected", "t_ns": 900 * second, "source": 0,
+        loss = {"kind": "loss_detected", "last_echo_ns": None, "t_ns": 900 * second, "source": 0,
                 "idle_ns": 5 * second, "connection": 1, "session": 11,
                 "last_committed_capture_ns": 1}
         self.run_dir("slow_stop_10s-a_framed", orchestrator=main,
@@ -1569,7 +1572,8 @@ class SummarizerTests(unittest.TestCase):
                        "duration_ns": 3 * second, "rate_bytes": 0}]
         events = [{"kind": "start", "t_ns": 0, "n_sources": 1,
                    "loss_timeout_ns": int(1.5 * second)},
-                  {"kind": "loss_detected", "t_ns": 12 * second, "source": 0, "idle_ns": 1,
+                  {"kind": "loss_detected", "last_echo_ns": None,
+                   "t_ns": 12 * second, "source": 0, "idle_ns": 1,
                    "last_committed_capture_ns": 10 * second},
                   {"kind": "closed", "t_ns": 12 * second, "reason": "loss_timeout"},
                   {"kind": "first_accept", "t_ns": 14 * second, "connection": 2, "source": 0}]
@@ -1664,7 +1668,8 @@ class SummarizerTests(unittest.TestCase):
         # Agent clock: the stopping receiver drops the live connection (11),
         # then accepts one more connection (12) and drops it in _finish, then
         # the new receiver accepts (13)
-        lost = {"kind": "loss_detected", "t_ns": 500 * second, "source": 0, "idle_ns": 1,
+        lost = {"kind": "loss_detected", "last_echo_ns": None,
+                "t_ns": 500 * second, "source": 0, "idle_ns": 1,
                 "connection": 1, "session": 11, "last_committed_capture_ns": 1}
         burst = [{"kind": "closed", "t_ns": 500 * second, "reason": "peer_closed",
                   "session": 11},
@@ -1672,7 +1677,10 @@ class SummarizerTests(unittest.TestCase):
                   "session": 12},
                  {"kind": "first_accept", "t_ns": 503 * second, "connection": 3, "source": 0,
                   "session": 13}]
-        sessions = _session(11, 1) + _session(12, 11, 11, 2) + _session(13, 13, 30, 1)
+        # Main clock: the stopping receiver closes 11 at 11 s (the old process
+        # ends before the new one is ready: a session left open past the
+        # restart window would not be its detection)
+        sessions = _session(11, 1, 11) + _session(12, 11, 11, 2) + _session(13, 13, 30, 1)
         receiver = receiver + self._durable(1) + sessions
         self.run_dir("main_restart-a_framed", orchestrator=orchestrator, two_host=True,
                      receiver=receiver, sender_rows=[start] + sender_rows + [lost] + burst)
@@ -1693,7 +1701,8 @@ class SummarizerTests(unittest.TestCase):
                             "impairment": "reset", "duration_ns": 0, "rate_bytes": 0},
                            {"kind": "impairment_end", "t_ns": at * second,
                             "impairment": "reset", "duration_ns": 0, "rate_bytes": 0}]
-        losses = [{"kind": "loss_detected", "t_ns": at * second + 1, "source": 0, "idle_ns": 1,
+        losses = [{"kind": "loss_detected", "last_echo_ns": None,
+                   "t_ns": at * second + 1, "source": 0, "idle_ns": 1,
                    "connection": index, "last_committed_capture_ns": 1}
                   for index, at in enumerate((10, 12), 1)]
         start = {"kind": "start", "t_ns": 0, "n_sources": 1, "loss_timeout_ns": 2 * second}
@@ -1721,7 +1730,8 @@ class SummarizerTests(unittest.TestCase):
         start = {"kind": "start", "t_ns": 0, "n_sources": 2, "loss_timeout_ns": 2 * second}
 
         def loss(at, connection, source):
-            return {"kind": "loss_detected", "t_ns": at, "source": source, "idle_ns": 1,
+            return {"kind": "loss_detected", "last_echo_ns": None,
+                    "t_ns": at, "source": source, "idle_ns": 1,
                     "connection": connection, "last_committed_capture_ns": 1}
 
         # one connection lost after the second reset, recorded once per source:
@@ -1923,7 +1933,7 @@ class SummarizerTests(unittest.TestCase):
                 {"kind": "action", "t_ns": 10 * second, "action": "sigstop", "duration_ns": 0},
                 {"kind": "action", "t_ns": 20 * second, "action": "sigcont", "duration_ns": 0}]
         start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": 5 * second}
-        loss = {"kind": "loss_detected", "t_ns": 900 * second, "source": 0,
+        loss = {"kind": "loss_detected", "last_echo_ns": None, "t_ns": 900 * second, "source": 0,
                 "idle_ns": 5 * second, "connection": 1, "session": 11,
                 "last_committed_capture_ns": 1}
         name = "slow_stop_10s-a_framed"
@@ -2016,7 +2026,8 @@ class SummarizerTests(unittest.TestCase):
                      "duration_ns": length, "rate_bytes": 0}]
 
         def loss(at, connection):
-            return {"kind": "loss_detected", "t_ns": at, "source": 0, "idle_ns": 1,
+            return {"kind": "loss_detected", "last_echo_ns": None,
+                    "t_ns": at, "source": 0, "idle_ns": 1,
                     "connection": connection, "last_committed_capture_ns": 1}
 
         orchestrator, receiver, sender_rows = _base("rst")
@@ -2111,7 +2122,8 @@ class SummarizerTests(unittest.TestCase):
                          "loss_timeout_ns": second // 2}
 
                 def lost(at, session, connection):
-                    return [{"kind": "loss_detected", "t_ns": at * second, "source": 0,
+                    return [{"kind": "loss_detected", "last_echo_ns": None,
+                             "t_ns": at * second, "source": 0,
                              "idle_ns": 2 * second, "connection": connection,
                              "session": session, "last_committed_capture_ns": 1},
                             {"kind": "closed", "t_ns": at * second, "reason": "peer_closed",
@@ -2144,6 +2156,86 @@ class SummarizerTests(unittest.TestCase):
                                  (row["g4"], row["g5"], row["reconnect_p95_ns"]))
                 # the receiver records carry no session nonces: not correlated
                 self.rewrite(name, "receiver", receiver + self._durable(1))
+                row = self.report()[scenario]
+                self.assertEqual(("unmeasured", "unmeasured"), (row["g4"], row["g5"]))
+                for path in (self.root / name).iterdir():
+                    path.unlink()
+
+    def test_two_host_loss_after_the_main_outage_is_not_its_detection(self):
+        """Two hosts: a connection the Agent kept alive through the Main
+        stop/restart and that dropped later for an unrelated reason is not the
+        outage's detection (G5) nor its reconnect episode (G4). Main clock
+        evidence only: the receiver must see that session end by the window
+        end + 15 s + grace, and the Agent must not have received a Main
+        heartbeat reply sent after the window started."""
+        second = 10**9
+        for scenario, actions in (
+                ("slow_stop_10s", [("sigstop", 10), ("sigcont", 20)]),
+                ("main_restart", [("restart_receiver", 10), ("ready", 12)])):
+            with self.subTest(scenario=scenario):
+                orchestrator, receiver, sender_rows = _base(scenario)
+                orchestrator = orchestrator + [
+                    {"kind": "action", "t_ns": at * second, "action": action,
+                     "duration_ns": 0} for action, at in actions]
+                end = actions[1][1]
+                start = {"kind": "start", "t_ns": 0, "n_sources": 1,
+                         "loss_timeout_ns": second // 2}
+
+                def lost(at, echo):
+                    # Agent clock (unrelated offset); echo: an Agent clock value
+                    return [{"kind": "loss_detected", "t_ns": at * second, "source": 0,
+                             "idle_ns": 2 * second, "connection": 1, "session": 11,
+                             "last_echo_ns": echo, "last_committed_capture_ns": 1},
+                            {"kind": "closed", "t_ns": at * second, "reason": "peer_closed",
+                             "connection": 1, "session": 11, "last_echo_ns": echo},
+                            {"kind": "first_accept", "t_ns": (at + 2) * second,
+                             "connection": 2, "source": 0, "session": 12}]
+
+                def ack(at, echo):
+                    # Main clock reply on session 11, echoing an Agent clock value
+                    return {"kind": "heartbeat_ack", "t_ns": at * second,
+                            "connection": 1, "session": 11, "echo_ns": echo}
+
+                name = f"{scenario}-a_framed"
+                # replies before the outage echo Agent heartbeats 104..108
+                before = [ack(at, (100 + at) * second) for at in range(4, 9)]
+
+                def check(close_s, replies, echo, expected):
+                    sessions = (_session(11, 1, close_s, 1) + _session(12, close_s + 1, 90, 2))
+                    self.run_dir(name, orchestrator=orchestrator, two_host=True,
+                                 receiver=receiver + self._durable(1) + sessions + replies,
+                                 sender_rows=[start] + sender_rows + lost(200, echo))
+                    row = self.report()[scenario]
+                    for path in (self.root / name).iterdir():
+                        path.unlink()
+                    return self.assertEqual(expected, (row["g4"], row["g5"]),
+                                            (close_s, echo))
+
+                # compliant: the Agent's last echo is from before the outage and
+                # Main sees the session end promptly after it (backlog replies
+                # after SIGCONT never reached the Agent)
+                drained = [ack(end, 109 * second)] if scenario == "slow_stop_10s" else []
+                check(end + 1, before + drained, 108 * second, ("pass", "pass"))
+                check(end + 15 + 5, before + drained, 108 * second, ("pass", "pass"))
+                # the session stayed open well past the window: it survived, and
+                # its later loss (an unrelated drop) is not the detection
+                check(end + 15 + 6, before, 108 * second, ("fail", "fail"))
+                check(end + 300, before, 108 * second, ("fail", "fail"))
+                if scenario == "slow_stop_10s":
+                    # closed inside the bound, but the Agent received a reply
+                    # Main sent after the stop (echo 111 acked at 21 s): it was
+                    # alive across SIGSTOP/SIGCONT, so its loss is not detection
+                    alive = before + [ack(end, 109 * second), ack(end + 1, 111 * second)]
+                    check(end + 3, alive, 111 * second, ("fail", "fail"))
+                    # the Agent's echoes have no Main-side record at all
+                    check(end + 1, [], 108 * second, ("unmeasured", "unmeasured"))
+                # sender records from before the echo evidence: not correlated
+                sessions = _session(11, 1, end + 1, 1) + _session(12, end + 2, 90, 2)
+                old = [{key: value for key, value in row.items() if key != "last_echo_ns"}
+                       for row in lost(200, None)]
+                self.run_dir(name, orchestrator=orchestrator, two_host=True,
+                             receiver=receiver + self._durable(1) + sessions,
+                             sender_rows=[start] + sender_rows + old)
                 row = self.report()[scenario]
                 self.assertEqual(("unmeasured", "unmeasured"), (row["g4"], row["g5"]))
                 for path in (self.root / name).iterdir():

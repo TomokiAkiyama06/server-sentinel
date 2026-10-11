@@ -464,6 +464,13 @@ class Receiver:
             elif parsed[0] == wire.HEARTBEAT:
                 if not self.tracker.heartbeat(grant):
                     raise _Close("superseded")
+                # Main clock time of each reply and the opaque echo value (an
+                # Agent clock reading, only ever compared with other echo
+                # values): the Agent records the last echo it received, so a
+                # connection that kept receiving Main replies after a Main
+                # stop is told apart from one the Agent dropped (G4/G5).
+                self._event("heartbeat_ack", connection=state["connection"],
+                            session=state["session"], echo_ns=parsed[1])
                 replies.append(wire.heartbeat_ack_frame(parsed[1]))
             else:
                 raise wire.ProtocolError("unexpected frame from agent")

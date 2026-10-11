@@ -169,6 +169,11 @@ class Sender:
         # summarizer can tie this connection's loss, reconnect and probe to
         # the Main-side session of the same run without comparing clocks.
         self.session = None
+        # The last heartbeat echo Main returned on this connection (an Agent
+        # clock value, None until one arrives). With the receiver's
+        # ``heartbeat_ack`` records (Main clock) it shows whether this
+        # connection still received Main replies after a Main stop.
+        self.last_echo_ns = None
         self.connected = False
         self.payload_bytes = self.wire_bytes = 0
         self.max_outq = 0
@@ -371,6 +376,7 @@ class Sender:
         connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.config.sndbuf)
         self.connections += 1
         self.session = session
+        self.last_echo_ns = None
         self.connected = True
         self._first_accept_pending = True
         self.last_inbound = time.monotonic()
@@ -416,7 +422,7 @@ class Sender:
                 _close(connection)
                 self._requeue_inflight()
             self.writer.write("closed", connection=self.connections, session=self.session,
-                              reason=token(reason))
+                              reason=token(reason), last_echo_ns=self.last_echo_ns)
             if reason not in ("loss_timeout", "shutdown") and not self.stop.is_set():
                 # Any unexpected disconnect is a Main-communication loss for the
                 # Agent's T-600 s/T+600 s protection, not only a silent timeout.
@@ -439,6 +445,7 @@ class Sender:
             self.writer.write("loss_detected", source=state.index, epoch=self.epoch,
                               idle_ns=idle_ns,
                               connection=self.connections, session=self.session,
+                              last_echo_ns=self.last_echo_ns,
                               last_committed_capture_ns=state.last_committed_capture_ns)
 
     def _session_stream(self, connection, deadline):
@@ -531,8 +538,14 @@ class Sender:
         parsed = wire.parse_body(body)
         if parsed[0] == wire.ACK:
             self._ack(*parsed[1:])
-        elif parsed[0] != wire.HEARTBEAT_ACK:
+        elif parsed[0] == wire.HEARTBEAT_ACK:
+            self._echo(parsed[1])
+        else:
             raise wire.ProtocolError("unexpected frame from main")
+
+    def _echo(self, echo_ns):
+        if self.last_echo_ns is None or echo_ns > self.last_echo_ns:
+            self.last_echo_ns = echo_ns
 
     def _session_segment(self, connection, deadline):
         connection.settimeout(self.config.loss_timeout_s)
@@ -612,6 +625,8 @@ class Sender:
         for parsed in acks:
             if parsed[0] == wire.ACK:
                 results[(parsed[1], parsed[3])] = (parsed[4], parsed[5])
+            elif parsed[0] == wire.HEARTBEAT_ACK:
+                self._echo(parsed[1])
         retry = []
         now = time.monotonic_ns()
         for state, unit in units:
