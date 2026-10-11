@@ -219,6 +219,10 @@ def _matrix(args):
     for candidate in candidates:
         if candidate not in matrix.RECEIVER_PORTS:
             raise SystemExit("matrix candidates: a_framed, b_chunked, b_segment")
+    if args.role != "both" and (len(names) != 1 or len(candidates) != 1):
+        # Each host's orchestrator times only its own actions; with several
+        # runs per invocation the agent can reach the previous run's receiver.
+        raise SystemExit("--role main/agent runs exactly one scenario and one candidate")
     run_id = args.run_id or records.new_run_id()
     out = matrix.Orchestrator(args, run_id).run(names, candidates)
     print(run_id)

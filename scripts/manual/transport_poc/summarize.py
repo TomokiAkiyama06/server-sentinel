@@ -233,6 +233,11 @@ class RunSummary:
                 return "fail"
         if self.inputs == "real" and "sender" in expected and not self.real_sources():
             return "fail"  # declared real, but not every sender ran on the holder
+        sender_accepted = sum(item.get("accepted") or 0 for item in _kind(self.sender, "end"))
+        if self.receiver and sender_accepted > 0 and (
+                _sum_end(self.receiver, "accepted") <= 0
+                or not _kind(self.receiver, "session_open")):
+            return "fail"  # the Agent's acks came from a receiver outside this run
         if "sender" in expected:
             production = self.production()
             if production == "fail":
@@ -494,16 +499,14 @@ class RunSummary:
         runs_measured = True
         actual_total = reported_total = duplicates = misplaced = 0
         reported_by_epoch = {}
-        restart_starts = {(g["source"], g["epoch"], g["before_sequence"])
-                          for g in gaps if g["reason"] == "capture_restart"}
+        origins, restarts_ok = self._restart_origins(durable, gaps)
         durable_runs = self._durable_runs()
         for (source, epoch), row in durable.items():
             # Every epoch starts at sequence 0, so units lost before the first
             # durable one are loss too (the tracker reports them as a leading
-            # sequence_skip). After a capture restart the leading extent is
-            # the unknown-extent capture_restart gap instead.
-            origin = (row["min_sequence"] if (source, epoch, row["min_sequence"]) in restart_starts
-                      else 0)
+            # sequence_skip). After a proven capture restart the leading
+            # extent is the unknown-extent capture_restart gap instead.
+            origin = origins.get((source, epoch), 0)
             # Main's reported loss as a sequence set: [after + 1, before) per
             # exact gap whose first missing unit is at or before the last
             # durable sequence (later ones belong to the Agent tail accounting).
@@ -559,25 +562,24 @@ class RunSummary:
             exact = False
         # Negative authentication / route probe: nothing is meant to be delivered.
         accounting = ("not_applicable" if self.scenario in NEGATIVE_SCENARIOS | {"route_probe"}
-                      else self._drop_accounting(durable, reported_by_epoch))
-        restarts_ok = True
+                      else self._drop_accounting(durable, reported_by_epoch, origins))
         epochs_by_source = defaultdict(set)
         for source, epoch in durable:
             epochs_by_source[source].add(epoch)
         restart_gaps = [g for g in gaps if g["reason"] == "capture_restart"]
-        for source, epochs in epochs_by_source.items():
-            needed = len(epochs) - 1
-            unknown = [g for g in restart_gaps if g["source"] == source]
-            if len(unknown) < needed or any(g["missing_units"] is not None for g in unknown):
-                restarts_ok = False
         if self.scenario == "capture_restart" and not any(len(e) > 1
                                                           for e in epochs_by_source.values()):
             restarts_ok = False
         self.metrics.update(gap_set_mismatches=misplaced)
+        # Leading units of a restarted epoch, before its origin: inside the
+        # unknown-extent restart gap, so not in actual/reported_missing.
+        unknown_extent = sum(origins.values())
         self.metrics.update(actual_missing=actual_total, reported_missing=reported_total,
                             durable_duplicates=duplicates, capture_restart_gaps=len(restart_gaps),
                             epochs_without_durable=len(unrecorded),
+                            unknown_extent_units=unknown_extent,
                             lossless=(actual_total == 0 and reported_total == 0
+                                      and unknown_extent == 0
                                       and not self.metrics.get("agent_dropped_units")))
         if not durable and self.scenario not in NEGATIVE_SCENARIOS | {"route_probe"}:
             return "fail"
@@ -591,6 +593,93 @@ class RunSummary:
         if verdict == "pass" and not runs_measured:
             verdict = "unmeasured"  # the gap set cannot be checked, only its size
         return _combine([verdict, accounting])
+
+    def _restart_origins(self, durable, gaps):
+        """Sequence origin of each durable epoch, and whether every
+        ``capture_restart`` gap is a proven epoch transition.
+
+        A source's first durable epoch always starts at sequence 0. Every
+        later durable epoch needs exactly one unknown-extent capture_restart
+        gap (``after_sequence`` and ``missing_units`` None) whose
+        ``before_sequence`` is at or before its first durable unit; that
+        sequence is its origin. A restart gap on or before the first durable
+        epoch, a second one for an epoch, or one for an epoch the sender never
+        ran is not a restart: it would only hide leading loss, so it fails.
+        The sender must corroborate each restarted source's epochs: one
+        ``start`` (and ``epoch_start`` when recorded) and one ``end`` per
+        epoch, starts strictly advancing in epoch, and each epoch's ``end``
+        written before the next epoch began.
+        """
+        origins, ok = {}, True
+        epochs_by_source = defaultdict(list)
+        for source, epoch in durable:
+            if not _is_int(epoch):
+                return origins, False
+            epochs_by_source[source].append(epoch)
+        restarts = defaultdict(list)
+        for gap in gaps:
+            if gap.get("reason") != "capture_restart":
+                continue
+            if (not _is_int(gap.get("epoch")) or gap.get("missing_units") is not None
+                    or gap.get("after_sequence") is not None
+                    or not _is_int(gap.get("before_sequence")) or gap["before_sequence"] < 0):
+                ok = False
+                continue
+            restarts[(gap.get("source"), gap["epoch"])].append(gap)
+        if any(len(found) > 1 for found in restarts.values()):
+            ok = False  # one restart per epoch transition
+        restarted = {source for source, _ in restarts}
+        for source, epochs in epochs_by_source.items():
+            epochs.sort()
+            if len(epochs) > 1:
+                restarted.add(source)
+            for epoch in epochs[1:]:
+                found = restarts.get((source, epoch), [])
+                if len(found) != 1:
+                    ok = False
+                    continue
+                before = found[0]["before_sequence"]
+                if before > durable[(source, epoch)]["min_sequence"]:
+                    ok = False  # durable units before the restart point
+                    continue
+                origins[(source, epoch)] = before
+        for source, epoch in restarts:
+            first = epochs_by_source.get(source)
+            if not first or epoch <= first[0]:
+                ok = False  # no restart on (or before) the first durable epoch
+        if restarted and not self._sender_epochs_advance(restarted, restarts, epochs_by_source):
+            ok = False
+        return origins, ok
+
+    def _sender_epochs_advance(self, sources, restarts, epochs_by_source):
+        """Sender evidence that each listed source ran its restarted epochs
+        one after another (see ``_restart_origins``)."""
+        positions = defaultdict(list)  # (kind, source or None, epoch) -> file positions
+        for index, item in enumerate(self.sender):
+            kind = item.get("kind")
+            if kind == "start":
+                positions[("start", None, item.get("epoch"))].append(index)
+            elif kind in ("epoch_start", "end") and item.get("epoch") is not None:
+                positions[(kind, item.get("source"), item["epoch"])].append(index)
+        starts = [item.get("epoch") for item in _kind(self.sender, "start")]
+        if not starts or not all(_is_int(epoch) for epoch in starts) or any(
+                later <= earlier for earlier, later in zip(starts, starts[1:])):
+            return False  # every sender process states its epoch, strictly advancing
+        recorded = any(item.get("kind") == "epoch_start" for item in self.sender)
+        for source in sources:
+            epochs = set(epochs_by_source.get(source, ()))
+            epochs |= {epoch for gap_source, epoch in restarts if gap_source == source}
+            previous_end = None
+            for epoch in sorted(epochs):
+                start = positions.get(("start", None, epoch), [])
+                ends = positions.get(("end", source, epoch), [])
+                marks = positions.get(("epoch_start", source, epoch), [])
+                if len(start) != 1 or len(ends) != 1 or (recorded and len(marks) != 1):
+                    return False
+                if previous_end is not None and previous_end > start[0]:
+                    return False  # the earlier epoch had not ended when this one began
+                previous_end = ends[0]
+        return True
 
     def _durable_runs(self):
         """Persisted sequence runs per (source, epoch), from the receiver
@@ -606,7 +695,7 @@ class RunSummary:
                 result[key] = pending.pop(key, [])
         return result
 
-    def _drop_accounting(self, durable, reported_by_epoch):
+    def _drop_accounting(self, durable, reported_by_epoch, origins=None):
         """Reconcile the Agent's own unit accounting with what reached Main.
 
         Units the Agent dropped after the last durable sequence of an epoch
@@ -633,6 +722,10 @@ class RunSummary:
           and no sequence may appear in two ranges (a range written twice, or
           a drop also reported as residual, never explains two lost units);
           ``fail`` otherwise;
+        * after a capture restart, every sequence before the epoch's origin
+          (``origins``: the unknown-extent leading units, never durable on
+          Main) must be a dropped, refused or residual unit of that epoch;
+          any other leading unit was lost unexplained: ``fail``;
         * a dropped, refused or residual sequence can be durable on Main only
           if it was sent before it was dropped or at shutdown: refused units
           never, and at most ``drops_sent + residual_sent`` dropped/residual
@@ -642,6 +735,8 @@ class RunSummary:
         fields = ("generated", "drops", "drops_sent", "residual", "residual_sent",
                   "unit_ranges")
         tail_drops = unexplained_loss = unexplained_drops = drops_total = 0
+        unexplained_leading = 0
+        origins = origins or {}
         verdict = "pass"
         ends = [e for e in _kind(self.sender, "end") if e.get("epoch") is not None]
         keys = {(e.get("source"), e["epoch"]) for e in ends}
@@ -705,6 +800,12 @@ class RunSummary:
                 overlapping += len(durable_named)
                 verdict = "fail"  # a "lost" unit that Main holds durably
                 continue
+            origin = origins.get(key, 0)
+            leading = origin - sum(1 for sequence in seen if sequence < origin)
+            if leading:
+                unexplained_leading += leading
+                verdict = "fail"  # restart-gap units the Agent does not account for
+                continue
             tail = end["generated"] - 1 - top
             drops_total += end["drops"]
             silent = tail - after["drop"] - after["rejected"] - after["residual"]
@@ -722,6 +823,7 @@ class RunSummary:
                             agent_accounted_tail_units=tail_drops,
                             unexplained_loss_units=unexplained_loss,
                             unexplained_drop_units=unexplained_drops,
+                            unexplained_unknown_extent_units=unexplained_leading,
                             durable_named_units=overlapping,
                             drop_accounting=verdict)
         return verdict

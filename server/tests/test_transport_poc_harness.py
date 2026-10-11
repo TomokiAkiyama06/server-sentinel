@@ -7,6 +7,8 @@ disposable CA/ledger in a temporary directory). They do not verify any real
 LAN, capture host, camera or transport choice.
 """
 import argparse
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -322,8 +324,13 @@ def _finished_receiver(rows):
     rows = _with_durable_runs(list(rows))
     if not any(row["kind"] == "ready" for row in rows):
         rows.insert(0, {"kind": "ready", "t_ns": 0, "port": 1})
+    # Like a real receiver, one that persisted units opened a session and
+    # counts them as accepted (integrity: the Agent's acks came from it).
+    units = sum(row["units"] for row in rows if row["kind"] == "durable")
+    if units and not any(row["kind"] == "session_open" for row in rows):
+        rows.insert(1, {"kind": "session_open", "t_ns": 0})
     if not any(row["kind"] == "end" for row in rows):
-        rows.append({"kind": "end", "t_ns": _LATE, "accepted": 0})
+        rows.append({"kind": "end", "t_ns": _LATE, "accepted": units})
     return rows
 
 
@@ -391,6 +398,31 @@ def _finished_sender(rows, sources=1, receiver=()):
     return _expand_ranges(rows)
 
 
+def _restarted(sender_rows, receiver, starts=None, leading_drops=None):
+    """Sender rows of a restarted sender: per epoch (ascending) its process
+    ``start`` and then the ``end`` of every durable row of that epoch, in
+    file order like successive sender processes appending to one file.
+    ``leading_drops``: epoch -> n, the epoch's first n sequences dropped."""
+    leading_drops = leading_drops or {}
+    durable = [row for row in receiver if row["kind"] == "durable"]
+    epochs = sorted({row["epoch"] for row in durable})
+    starts = starts or [{"kind": "start", "t_ns": 0, "n_sources": 1, "epoch": epoch}
+                        for epoch in epochs]
+    rows = []
+    for start in starts:
+        rows.append(start)
+        for row in durable:
+            if row["epoch"] != start["epoch"]:
+                continue
+            dropped = leading_drops.get(row["epoch"], 0)
+            extra = ({"ranges": [("drop", 0, dropped - 1)], "drops": dropped}
+                     if dropped else {})
+            rows.append(_sender_end(row["source"], row["epoch"], row["max_sequence"] + 1,
+                                    row["units"], **extra))
+        rows.append({"kind": "metric", "t_ns": _LATE, "payload_bytes": 0})
+    return rows + list(sender_rows)
+
+
 def _finished_proxy(rows):
     rows = list(rows)
     if not any(row["kind"] == "ready" for row in rows):
@@ -444,6 +476,19 @@ class SummarizerTests(unittest.TestCase):
         _write(directory, "sender", _finished_sender(sender_rows, sources, receiver))
         _write(directory, "proxy", _finished_proxy(proxy_rows))
 
+    def restarted_run(self, name, *, orchestrator, receiver, durable, sender_rows, starts=None,
+                      leading_drops=None):
+        """A run whose sender was restarted once per later epoch of
+        ``durable``: one sender spawn / exit / start / metric per epoch."""
+        rows = _restarted(sender_rows, durable, starts, leading_drops)
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver, sender_rows=rows)
+        complete = _complete(orchestrator, ("receiver", "proxy", "sender"))
+        extra = sum(1 for row in rows if row["kind"] == "start") - 1
+        complete[1:1] = [{"kind": kind, "t_ns": 1, "process": "sender", "side": "both",
+                          **({"code": 0} if kind == "exit" else {})}
+                         for _ in range(extra) for kind in ("spawn", "exit")]
+        _write(self.root / name, "orchestrator-both", complete)
+
     def rewrite(self, name, role, rows):
         """Replace one file of a run, keeping its completion records."""
         if role == "sender":
@@ -478,8 +523,9 @@ class SummarizerTests(unittest.TestCase):
                  "max_sequence": 9, "units": 10, "duplicates": 0} for epoch in (1, 2)]
         restart = {"kind": "gap", "t_ns": 5, "source": 0, "epoch": 2, "reason": "capture_restart",
                    "after_sequence": None, "before_sequence": 0, "missing_units": None}
-        self.run_dir("capture_restart-a_framed", orchestrator=orchestrator,
-                     receiver=receiver + rows + [restart], sender_rows=sender_rows)
+        self.restarted_run("capture_restart-a_framed", orchestrator=orchestrator,
+                           receiver=receiver + rows + [restart], durable=rows,
+                           sender_rows=sender_rows)
         self.assertEqual("pass", self.report()["capture_restart"]["g2"])
         self.rewrite("capture_restart-a_framed", "receiver",
                      receiver + rows + [{**restart, "missing_units": 3}])
@@ -1098,23 +1144,17 @@ class SummarizerTests(unittest.TestCase):
                    "reason": "capture_restart", "after_sequence": None, "before_sequence": 0,
                    "missing_units": None}
         starts = [_REAL_START, {**_REAL_START, "holder_nonce": 88, "epoch": 2}]
-        # two sender executions: two spawns / exits / metrics
-        metrics = [{"kind": "metric", "t_ns": _LATE, "payload_bytes": 0}] * 2
-        sender_rows = sender_rows + metrics
-        self.run_dir("capture_restart-a_framed", orchestrator=orchestrator,
-                     receiver=receiver + durable + [restart], sender_rows=starts + sender_rows)
-        complete = _complete(orchestrator, ("receiver", "proxy", "sender"))
-        complete[1:1] = [{"kind": "spawn", "t_ns": 1, "process": "sender", "side": "both"},
-                         {"kind": "exit", "t_ns": 2, "process": "sender", "side": "both",
-                          "code": 0}]
-        _write(self.root / "capture_restart-a_framed", "orchestrator-both", complete)
+        # two sender executions: two spawns / exits / starts / metrics
+        self.restarted_run("capture_restart-a_framed", orchestrator=orchestrator,
+                           receiver=receiver + durable + [restart], durable=durable,
+                           sender_rows=sender_rows, starts=starts)
         rows, _ = self._real_report([self._holder_file([(77, {0: 10}), (88, {0: 10})])])
         self.assertEqual("pass", rows["capture_restart"]["g2"])
         rows, _ = self._real_report([self._holder_file([(77, {0: 10})])])
         self.assertEqual("fail", rows["capture_restart"]["g2"])
         # two sender starts claiming one nonce are not two sessions
-        self.rewrite("capture_restart-a_framed", "sender",
-                     [_REAL_START, {**_REAL_START, "epoch": 2}] + sender_rows)
+        self.rewrite("capture_restart-a_framed", "sender", _restarted(
+            sender_rows, durable, [_REAL_START, {**_REAL_START, "epoch": 2}]))
         rows, _ = self._real_report([self._holder_file([(77, {0: 10})])])
         self.assertEqual("fail", rows["capture_restart"]["integrity"])
 
@@ -1206,13 +1246,128 @@ class SummarizerTests(unittest.TestCase):
                    "missing_units": None}
         skip = {"kind": "gap", "t_ns": 6, "source": 0, "epoch": 2, "reason": "sequence_skip",
                 "after_sequence": 5, "before_sequence": 8, "missing_units": 2}
-        self.run_dir(name, orchestrator=orchestrator,
-                     receiver=receiver + [restart, skip] + rows, sender_rows=sender_rows)
-        self.assertEqual("pass", self.report()["capture_restart"]["g2"])
+        self.restarted_run(name, orchestrator=orchestrator,
+                           receiver=receiver + [restart, skip] + rows, durable=rows,
+                           sender_rows=sender_rows, leading_drops={2: 3})
+        row = self.report()["capture_restart"]
+        self.assertEqual(("pass", 3, False), (row["g2"], row["unknown_extent_units"],
+                                              row["lossless"]))
         # the same 2 units claimed inside the unknown-extent restart gap instead
         misplaced = {**skip, "after_sequence": None, "before_sequence": 2}
         self.rewrite(name, "receiver", receiver + [restart, misplaced] + rows)
         self.assertEqual("fail", self.report()["capture_restart"]["g2"])
+
+    def test_capture_restart_gap_must_be_a_sender_proven_later_epoch(self):
+        """PR #222 review (head 327fd26): a ``capture_restart`` gap only moves
+        an epoch's origin when it is the single restart into a later durable
+        epoch that the sender records as a new, advancing process."""
+        orchestrator, receiver, sender_rows = _base("capture_restart")
+        name = "capture_restart-a_framed"
+
+        def epoch_rows(epoch, first, last):
+            return [{"kind": "durable_run", "t_ns": 9, "source": 0, "epoch": epoch,
+                     "first_sequence": first, "last_sequence": last},
+                    {"kind": "durable", "t_ns": 9, "source": 0, "epoch": epoch,
+                     "min_sequence": first, "max_sequence": last,
+                     "units": last - first + 1, "duplicates": 0, "runs": 1}]
+
+        def restart(epoch, before):
+            return {"kind": "gap", "t_ns": 5, "source": 0, "epoch": epoch,
+                    "reason": "capture_restart", "after_sequence": None,
+                    "before_sequence": before, "missing_units": None}
+
+        def skip(epoch, after, before):
+            return {"kind": "gap", "t_ns": 5, "source": 0, "epoch": epoch,
+                    "reason": "sequence_skip", "after_sequence": after,
+                    "before_sequence": before,
+                    "missing_units": before - (0 if after is None else after + 1)}
+
+        def g2(gaps, durable, starts=None, sender=None, leading_drops=None):
+            self.restarted_run(name, orchestrator=orchestrator, receiver=receiver + gaps + durable,
+                               durable=durable, sender_rows=sender_rows, starts=starts,
+                               leading_drops=leading_drops)
+            if sender is not None:
+                self.rewrite(name, "sender", sender)
+            return self.report()["capture_restart"]["g2"]
+
+        late = epoch_rows(1, 10, 19)  # sequences 0-9 of the first epoch never arrived
+        second = epoch_rows(2, 0, 9)
+        # compliant: the leading loss of epoch 1 is a sequence_skip, epoch 2 a restart
+        self.assertEqual("pass", g2([skip(1, None, 10), restart(2, 0)], late + second))
+        # a spurious restart at epoch 1's first durable unit hides 0-9
+        self.assertEqual("fail", g2([restart(1, 10), restart(2, 0)], late + second))
+        self.assertEqual("fail", g2([restart(1, 10)], late))
+        # duplicate restart gaps for one transition, or none at all
+        self.assertEqual("fail", g2([skip(1, None, 10), restart(2, 0), restart(2, 0)],
+                                    late + second))
+        self.assertEqual("fail", g2([skip(1, None, 10)], late + second))
+        # a restart claimed for an epoch the sender never ran
+        self.assertEqual("fail", g2([skip(1, None, 10), restart(2, 0), restart(3, 0)],
+                                    late + second))
+        # a restart point after the epoch's first durable unit
+        later = epoch_rows(2, 3, 9)
+        self.assertEqual("fail", g2([skip(1, None, 10), restart(2, 5)], late + later))
+        # restart noted at a refused unit, the rest reported as a skip: exact
+        # when the Agent accounts for the unknown-extent leading unit 0
+        noted = [skip(1, None, 10), restart(2, 1), skip(2, 0, 3)]
+        self.assertEqual("pass", g2(noted, late + later, leading_drops={2: 1}))
+        row = self.report()["capture_restart"]
+        self.assertEqual((1, 0), (row["unknown_extent_units"],
+                                  row["unexplained_unknown_extent_units"]))
+        # ... and fails when nothing on the Agent side explains it
+        self.assertEqual("fail", g2(noted, late + later))
+        self.assertEqual(1, self.report()["capture_restart"]["unexplained_unknown_extent_units"])
+        gaps = [skip(1, None, 10), restart(2, 0)]
+        # sender epochs must advance: process starts out of order
+        starts = [{"kind": "start", "t_ns": 0, "n_sources": 1, "epoch": epoch}
+                  for epoch in (2, 1)]
+        self.assertEqual("fail", g2(gaps, late + second, starts=starts))
+        rows = _restarted(sender_rows, late + second)
+        self.assertEqual("pass", g2(gaps, late + second, sender=rows))
+        # a start that does not state its epoch
+        unstated = [{k: v for k, v in row.items() if not (row["kind"] == "start"
+                                                          and row["epoch"] == 2 and k == "epoch")}
+                    for row in rows]
+        self.assertEqual("fail", g2(gaps, late + second, sender=unstated))
+        # epoch 1 had not ended when epoch 2 started
+        first_end = next(i for i, row in enumerate(rows) if row["kind"] == "end")
+        reordered = rows[:first_end] + rows[first_end + 1:]
+        second_end = max(i for i, row in enumerate(reordered) if row["kind"] == "end")
+        reordered.insert(second_end + 1, rows[first_end])
+        self.assertEqual("fail", g2(gaps, late + second, sender=reordered))
+        # per-source epoch_start marks, when recorded, are one per epoch
+        marked = []
+        for row in rows:
+            marked.append(row)
+            if row["kind"] == "start":
+                marked.append({"kind": "epoch_start", "t_ns": 0, "source": 0,
+                               "epoch": row["epoch"]})
+        self.assertEqual("pass", g2(gaps, late + second, sender=marked))
+        self.assertEqual("fail", g2(gaps, late + second,
+                                    sender=[row for row in marked
+                                            if not (row["kind"] == "epoch_start"
+                                                    and row["epoch"] == 2)]))
+
+    def test_sender_acks_need_this_runs_receiver(self):
+        """Media the Agent saw accepted must have reached this run's receiver
+        (a session and accepted units); otherwise it hit another receiver."""
+        orchestrator, receiver, sender_rows = _base("outage_5s")
+        name = "outage_5s-a_framed"
+        durable = {"kind": "durable", "t_ns": 9, "source": 0, "epoch": 1, "min_sequence": 0,
+                   "max_sequence": 9, "units": 10, "duplicates": 0}
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver + [durable],
+                     sender_rows=sender_rows)
+        self.assertEqual("pass", self.report()["outage_5s"]["integrity"])
+        rows = _finished_receiver(receiver + [durable])
+        for label, changed in (
+                ("nothing accepted", [{**r, "accepted": 0} if r["kind"] == "end" else r
+                                      for r in rows]),
+                ("no session", [r for r in rows if r["kind"] != "session_open"])):
+            with self.subTest(case=label):
+                _write(self.root / name, "receiver", changed)
+                row = self.report()["outage_5s"]
+                self.assertEqual(("fail", "fail", "fail"),
+                                 (row["integrity"], row["g4"], row["g5"]))
 
     # -- regressions for the PR #222 review (head a28c38a) ---------------------
     def _durable(self, sources, units=10):
@@ -1289,7 +1444,7 @@ class SummarizerTests(unittest.TestCase):
         self.assertEqual("fail", self.report()["normal"]["integrity"])
         second = [{"kind": "end", "t_ns": 5, "accepted": 0},
                   {"kind": "ready", "t_ns": 6, "port": 1},
-                  {"kind": "end", "t_ns": 8, "accepted": 0}]
+                  {"kind": "end", "t_ns": 8, "accepted": 10}]
         self.rewrite(name, "receiver", receiver + second + self._durable(1))
         self.assertEqual(("pass", "pass"), (self.report()["normal"]["integrity"],
                                             self.report()["normal"]["g2"]))
@@ -1446,15 +1601,16 @@ class SummarizerTests(unittest.TestCase):
         restart = {"kind": "gap", "t_ns": 5, "source": 0, "epoch": 2, "reason": "capture_restart",
                    "after_sequence": None, "before_sequence": 0, "missing_units": None}
         name = "capture_restart-a_framed"
-        self.run_dir(name, orchestrator=orchestrator, receiver=receiver + rows + [restart],
-                     sender_rows=sender_rows)
+        self.restarted_run(name, orchestrator=orchestrator, receiver=receiver + rows + [restart],
+                           durable=rows, sender_rows=sender_rows)
         self.assertEqual("pass", self.report()["capture_restart"]["g2"])
         (self.root / name / "sender.jsonl").unlink()
         self.assertEqual("unmeasured", self.report()["capture_restart"]["g2"])
-        # a sender that started but left no per-source totals
+        # a (twice started) sender that left no per-source totals
         _write(self.root / name, "sender",
-               [{"kind": "start", "t_ns": 0, "n_sources": 1}, *sender_rows,
-                {"kind": "metric", "t_ns": 9, "payload_bytes": 0}])
+               [row for epoch in (1, 2) for row in (
+                   {"kind": "start", "t_ns": 0, "n_sources": 1, "epoch": epoch},
+                   {"kind": "metric", "t_ns": 9, "payload_bytes": 0})] + sender_rows)
         self.assertEqual("unmeasured", self.report()["capture_restart"]["g2"])
 
     def test_two_host_receiver_stop_close_burst_is_one_episode(self):
@@ -1991,6 +2147,31 @@ class MiscTests(unittest.TestCase):
                             str(Path(directory) / "s.jsonl"), "--run-id", RUN,
                             "--source-kind", "gst", "--real-inputs"])
             self.assertFalse((Path(directory) / "s.jsonl").exists())
+
+    def test_host_roles_run_exactly_one_scenario_and_candidate(self):
+        """PR #222 review (head 327fd26): a ``--role main`` / ``--role agent``
+        invocation with several runs lets the agent reach the previous run's
+        receiver, so each host role refuses more than one scenario or candidate."""
+        from transport_poc import poc15
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(matrix, "Orchestrator") as orchestrator:
+            orchestrator.return_value.run.return_value = Path(directory)
+            base = ["matrix", "--materials", directory, "--state", directory,
+                    "--out", directory, "--run-id", RUN]
+            for role in ("main", "agent"):
+                for extra in (["--scenarios", "normal,outage_5s", "--candidates", "a_framed"],
+                              ["--scenarios", "normal"],  # default: three candidates
+                              ["--scenarios", "default", "--candidates", "a_framed"]):
+                    with self.subTest(role=role, extra=extra):
+                        with self.assertRaises(SystemExit) as raised:
+                            poc15.main(base + ["--role", role] + extra)
+                        self.assertIn("exactly one scenario", str(raised.exception.code))
+            orchestrator.assert_not_called()
+            with contextlib.redirect_stdout(io.StringIO()):
+                poc15.main(base + ["--role", "main", "--scenarios", "normal",
+                                   "--candidates", "a_framed"])
+                poc15.main(base + ["--scenarios", "normal,outage_5s"])  # role both
+            self.assertEqual(2, orchestrator.call_count)
 
     def test_holder_hello_identifies_the_sender(self):
         left, right = socket.socketpair()
