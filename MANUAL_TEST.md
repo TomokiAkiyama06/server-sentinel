@@ -117,12 +117,18 @@ device scan を `presence_scan_seconds` 間隔へ抑制）は synthetic fake で
    `online` へ戻ることを確認する。`video_frame_stalled` から復帰した source の
    negotiated profile が registry に残っていること、停止が
    `frame_stall_reopen_seconds` を超えた場合は `offline` になり再 open されることも
-   確認する。profile 残存を記録するため、観測 script は 1 秒ごとの行に各 source の
-   registry `negotiated_capture_profile`（`幅x高さ@fps/pixel_format`、未記録なら
-   `none`）を health と並べて出力すること。`degraded`（`video_frame_stalled`）の間と
-   `online` 復帰直後の行で profile が `none` にならないことを確認する（Issue #173、
-   P-5。2026-10-07 時点の `scripts/manual/uvc_watch.py` は profile を出力しないため、
-   次回の実機確認前に観測 script へ追加する）。
+   確認する。profile 残存は `scripts/manual/uvc_watch.py` で記録する。この script は
+   1 秒ごとの行に、各 source の registry `negotiated_capture_profile` を
+   `profile=幅x高さ@fps/pixel_format` の形で health・実測 fps と並べて出力する
+   （例: `src1=degraded 0fps profile=1920x1080@30/MJPG`）。未記録なら
+   `profile=none`、driver が報告しなかった項目は `?` と表示する（既定値で補わない）。
+   profile は script が毎秒読んでいる registry 行から取り出しており、device の追加
+   open や `/dev/snd` へのアクセスはしない。`degraded`（`video_frame_stalled`）の間と
+   `online` 復帰直後の行で `profile=none` にならないことを確認し、該当行（serial・
+   device path を含まない）を記録へ転記する。`frame_stall_reopen_seconds` を超えて
+   `offline` になった行では `profile=none` になってよく、再 open 後の `online` 行で
+   profile が再び記録されることを確認する（Issue #173、P-5、Issue #193。出力は
+   synthetic registry の unit test でのみ確認済みで、実機記録は Owner 立会いで行う）。
 3. レンズを覆う・暗室にするなど低照度で 5 分以上連続取得し、`video_frame_stalled`
    への遷移が 0 回であること（fps 低下で flap しないこと）を確認する。
 4. 30 fps × 2 台で 60 秒取得し、live 中の全 device scan が概ね
