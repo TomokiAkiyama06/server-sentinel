@@ -131,6 +131,12 @@ class SenderConfig:
         self.real_inputs = real_inputs
         self.segment_seconds = segment_seconds
         self.route_probe = route_probe
+        if real_inputs and source_kind != "holder":
+            # Only holder frames (real cameras) may be declared real; the
+            # summarizer also requires the holder's own session record.
+            raise ValueError("--real-inputs requires --source-kind holder")
+        if source_kind == "holder" and not holder_socket:
+            raise ValueError("--source-kind holder requires --holder-socket")
 
 
 class Sender:
@@ -169,6 +175,9 @@ class Sender:
         self.last_inbound = time.monotonic()
         self.producer_failed = False
         self.produce_started_ns = self.produce_stopped_ns = None
+        # This execution's identity on the holder socket (holder ``session_open``).
+        self.holder_nonce = ((int.from_bytes(os.urandom(8), "big") >> 1) or 1
+                             if config.source_kind == "holder" else None)
 
     # -- media sources --------------------------------------------------------
     def _offer(self, index, capture_ns, payload):
@@ -229,10 +238,11 @@ class Sender:
             process.terminate()
 
     def _holder(self):
-        from .holder import read_frames
+        from .holder import read_frames, send_hello
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         connection.connect(str(self.config.holder_socket))
         try:
+            send_hello(connection, self.holder_nonce)
             read_frames(connection, self._offer, self.stop)
         finally:
             connection.close()
@@ -364,6 +374,7 @@ class Sender:
             "start", candidate=self.config.candidate, n_sources=self.config.n_sources,
             source_kind=token(self.config.source_kind),
             inputs="real" if self.config.real_inputs else "synthetic",
+            holder_nonce=self.holder_nonce,
             fps=self.config.fps, frame_bytes=self.config.frame_bytes, epoch=self.epoch,
             pending_limit=self.config.pending_limit, sndbuf=self.config.sndbuf,
             loss_timeout_ns=int(self.config.loss_timeout_s * 1e9))

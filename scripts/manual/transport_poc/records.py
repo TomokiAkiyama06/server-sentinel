@@ -41,6 +41,7 @@ TOKENS = frozenset((
     "impairment_start", "impairment_end", "action", "spawn", "exit", "epoch_start",
     "latency", "route_probe", "committed_gap", "rtt", "capture", "unavailable", "ready",
     "durable_duplicate", "durable_gap", "producer_failed", "unit_range", "drop", "residual",
+    "durable_run", "forwarded",
     # impairments / actions
     "good", "revoked_live", "unpaired", "other_ca",
     "blackhole", "reset", "rate_cap", "sigstop", "sigcont", "restart_receiver",

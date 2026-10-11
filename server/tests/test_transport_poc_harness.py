@@ -279,15 +279,57 @@ def _complete(orchestrator, processes, *, side="both", codes=None):
     return rows
 
 
+def _durable_runs_for(row, gaps):
+    """The persisted runs a consistent durable stand-in would hold for ``row``:
+    ``[min, max]`` minus the exact reported gap ranges of the same epoch."""
+    holes = sorted((g["after_sequence"] + 1 if isinstance(g.get("after_sequence"), int) else 0,
+                    g["before_sequence"]) for g in gaps
+                   if (g["source"], g["epoch"]) == (row["source"], row["epoch"])
+                   and g.get("reason") in ("sequence_skip", "ingest_refused")
+                   and isinstance(g.get("missing_units"), int))
+    runs, cursor = [], row["min_sequence"]
+    for first, end in holes:
+        if end <= cursor or first > row["max_sequence"]:
+            continue
+        if first > cursor:
+            runs.append((cursor, first - 1))
+        cursor = max(cursor, end)
+    if cursor <= row["max_sequence"]:
+        runs.append((cursor, row["max_sequence"]))
+    return runs if row["units"] > 0 else []
+
+
+def _with_durable_runs(rows):
+    """Add ``durable_run`` records (and ``runs``) to durable rows without them,
+    as the receiver writes them, derived from the rows' own reported gaps."""
+    if any(row["kind"] == "durable_run" for row in rows):
+        return rows
+    gaps = [row for row in rows if row["kind"] == "gap"]
+    out = []
+    for row in rows:
+        if row["kind"] == "durable" and "runs" not in row:
+            runs = _durable_runs_for(row, gaps)
+            out += [{"kind": "durable_run", "t_ns": row["t_ns"], "source": row["source"],
+                     "epoch": row["epoch"], "first_sequence": first, "last_sequence": last}
+                    for first, last in runs]
+            row = {**row, "runs": len(runs)}
+        out.append(row)
+    return out
+
+
 def _finished_receiver(rows):
     """Receiver rows with one ``ready`` and one ``end`` (one process instance)."""
-    rows = list(rows)
+    rows = _with_durable_runs(list(rows))
     if not any(row["kind"] == "ready" for row in rows):
         rows.insert(0, {"kind": "ready", "t_ns": 0, "port": 1})
     if not any(row["kind"] == "end" for row in rows):
         rows.append({"kind": "end", "t_ns": _LATE, "accepted": 0})
     return rows
 
+
+# A real-input sender start: holder frames, with its holder session nonce.
+_REAL_START = {"kind": "start", "t_ns": 0, "n_sources": 1, "inputs": "real",
+               "source_kind": "holder", "holder_nonce": 77, "epoch": 1}
 
 _ACCOUNTED = {"drops": 0, "drops_sent": 0, "residual": 0, "residual_sent": 0,
               "unit_ranges": 0}
@@ -782,6 +824,7 @@ class SummarizerTests(unittest.TestCase):
         self.assertEqual("pass", self.report()["normal"]["g3"])
         _write(self.root / name, "orchestrator-both",
                _complete([{**orchestrator[0], "inputs": "real"}], ("receiver", "proxy", "sender")))
+        self.rewrite(name, "sender", [_REAL_START] + sender_rows)
         self.assertEqual("unmeasured", self.report()["normal"]["g3"])
         _write(self.root / name, "orchestrator-both",
                _complete(orchestrator, ("receiver", "proxy", "sender")))
@@ -960,6 +1003,216 @@ class SummarizerTests(unittest.TestCase):
         report = summarize.summarize([self.root])
         self.assertEqual("unmeasured", report["candidates"][0]["secondary_packet_loss"])
         self.assertIn("a_framed", summarize.render(report))
+
+    # -- regressions for the PR #222 review (head 946d654) ---------------------
+    def _real_run(self, name="normal-a_framed", units=10):
+        """A real-input run whose sender fed source 0 from the holder (nonce 77)."""
+        orchestrator, receiver, sender_rows = _base(name.rsplit("-", 1)[0])
+        orchestrator[0]["inputs"] = "real"
+        durable = [{"kind": "durable", "t_ns": 9, "source": 0, "epoch": 1, "min_sequence": 0,
+                    "max_sequence": units - 1, "units": units, "duplicates": 0}]
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver + durable,
+                     sender_rows=[_REAL_START] + sender_rows)
+        return orchestrator, receiver, sender_rows
+
+    def _holder_file(self, sessions, *, name="holder", run_id=RUN, samples=None):
+        """A complete holder execution; ``sessions``: (nonce, {source: frames})."""
+        rows = []
+        for nonce, forwarded in sessions:
+            rows.append({"kind": "session_open", "t_ns": 1, "nonce": nonce})
+            rows += [{"kind": "forwarded", "t_ns": 2, "nonce": nonce, "source": source,
+                      "frames": frames} for source, frames in forwarded.items()]
+            rows.append({"kind": "session_close", "t_ns": 3, "nonce": nonce})
+        sample = {"kind": "sample", "t_ns": 1, "frames": 100, "queue_drops": 0,
+                  "forward_drops": 0, "cpu_seconds": 0.1, "child_cpu_seconds": 0.0}
+        if samples is None:
+            samples = [sample]
+        _write(self.root, name, _holder(samples + rows), run_id=run_id)
+        return self.root / f"{name}.jsonl"
+
+    def _real_report(self, holder_files):
+        report = summarize.summarize([self.root], holder_files=holder_files)
+        return {row["scenario"]: row for row in report["runs"]}, report
+
+    def test_real_inputs_from_a_generated_source_fail(self):
+        """``--real-inputs`` with ``builtin``/``gst`` is never scored real-and-passing,
+        even when a holder file of the same run id shows a session."""
+        _orchestrator, _receiver, sender_rows = self._real_run()
+        path = self._holder_file([(77, {0: 10})])
+        rows, _ = self._real_report([path])
+        self.assertEqual(("pass", "pass", "pass"),
+                         (rows["normal"]["integrity"], rows["normal"]["g2"],
+                          rows["normal"]["holder_linkage"]))
+        for kind in ("builtin", "gst", None):
+            with self.subTest(source_kind=kind):
+                start = {**_REAL_START, "source_kind": kind}
+                if kind is None:
+                    del start["source_kind"]
+                self.rewrite("normal-a_framed", "sender", [start] + sender_rows)
+                rows, _ = self._real_report([path])
+                self.assertEqual("fail", rows["normal"]["integrity"])
+                self.assertEqual(["fail"] * 3, [rows["normal"][g] for g in ("g1", "g2", "g3")])
+        # a holder start without its session nonce cannot be linked either
+        start = {**_REAL_START}
+        del start["holder_nonce"]
+        self.rewrite("normal-a_framed", "sender", [start] + sender_rows)
+        rows, _ = self._real_report([path])
+        self.assertEqual(("fail", "fail"), (rows["normal"]["integrity"], rows["normal"]["g2"]))
+
+    def test_real_run_requires_the_holder_session_of_its_own_sender(self):
+        self._real_run()
+        # no holder record: never a pass
+        rows, _ = self._real_report([])
+        self.assertEqual(("unmeasured", "unmeasured"),
+                         (rows["normal"]["holder_linkage"], rows["normal"]["g2"]))
+        cases = {
+            # a concurrent holder serving another sender (another nonce)
+            "other sender's session": ([(78, {0: 10})], "fail"),
+            # forwarded fewer frames than the sender generated from it
+            "fewer forwarded than generated": ([(77, {0: 9})], "fail"),
+            # far more forwarded than this sender ever generated
+            "forwarded beyond in-flight slack": (
+                [(77, {0: 10 + summarize.HOLDER_INFLIGHT_SLACK + 1})], "fail"),
+            # the session was opened twice under one nonce
+            "nonce reused": ([(77, {0: 10}), (77, {0: 10})], "fail"),
+            # no per-source count for the declared source
+            "source not forwarded": ([(77, {1: 10})], "fail"),
+            "matching session": ([(77, {0: 10})], "pass"),
+            "matching session with in-flight frames": (
+                [(78, {0: 500}), (77, {0: 10 + summarize.HOLDER_INFLIGHT_SLACK})], "pass"),
+        }
+        for label, (sessions, expected) in cases.items():
+            with self.subTest(case=label):
+                path = self._holder_file(sessions)
+                rows, _ = self._real_report([path])
+                self.assertEqual((expected, expected),
+                                 (rows["normal"]["holder_linkage"], rows["normal"]["g2"]))
+
+    def test_restarted_real_sender_needs_a_session_per_epoch(self):
+        orchestrator, receiver, sender_rows = _base("capture_restart")
+        orchestrator[0]["inputs"] = "real"
+        durable = [{"kind": "durable", "t_ns": 9, "source": 0, "epoch": epoch,
+                    "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0}
+                   for epoch in (1, 2)]
+        restart = {"kind": "gap", "t_ns": 5, "source": 0, "epoch": 2,
+                   "reason": "capture_restart", "after_sequence": None, "before_sequence": 0,
+                   "missing_units": None}
+        starts = [_REAL_START, {**_REAL_START, "holder_nonce": 88, "epoch": 2}]
+        # two sender executions: two spawns / exits / metrics
+        metrics = [{"kind": "metric", "t_ns": _LATE, "payload_bytes": 0}] * 2
+        sender_rows = sender_rows + metrics
+        self.run_dir("capture_restart-a_framed", orchestrator=orchestrator,
+                     receiver=receiver + durable + [restart], sender_rows=starts + sender_rows)
+        complete = _complete(orchestrator, ("receiver", "proxy", "sender"))
+        complete[1:1] = [{"kind": "spawn", "t_ns": 1, "process": "sender", "side": "both"},
+                         {"kind": "exit", "t_ns": 2, "process": "sender", "side": "both",
+                          "code": 0}]
+        _write(self.root / "capture_restart-a_framed", "orchestrator-both", complete)
+        rows, _ = self._real_report([self._holder_file([(77, {0: 10}), (88, {0: 10})])])
+        self.assertEqual("pass", rows["capture_restart"]["g2"])
+        rows, _ = self._real_report([self._holder_file([(77, {0: 10})])])
+        self.assertEqual("fail", rows["capture_restart"]["g2"])
+        # two sender starts claiming one nonce are not two sessions
+        self.rewrite("capture_restart-a_framed", "sender",
+                     [_REAL_START, {**_REAL_START, "epoch": 2}] + sender_rows)
+        rows, _ = self._real_report([self._holder_file([(77, {0: 10})])])
+        self.assertEqual("fail", rows["capture_restart"]["integrity"])
+
+    def test_agent_cpu_unmeasured_unless_every_real_run_has_its_holder_cpu(self):
+        self._real_run("normal-a_framed")
+        self._real_run("capacity_4-a_framed")
+        other = "r20261011t000000cd"
+        for path in (self.root / "capacity_4-a_framed").glob("*.jsonl"):
+            rows = [{k: v for k, v in row.items() if k != "run_id"}
+                    for row in records.read_jsonl(path)]
+            _write(path.parent, path.stem, rows, run_id=other)
+        samples = [{"kind": "sample", "t_ns": index * 10**9, "frames": 100, "queue_drops": 0,
+                    "forward_drops": 0, "cpu_seconds": 0.01 * index,
+                    "child_cpu_seconds": 0.0} for index in range(2)]
+        first = self._holder_file([(77, {0: 10})], samples=samples)
+        _rows, report = self._real_report([first])
+        candidate = report["candidates"][0]
+        # one real run has its holder CPU, the other has none: not a pass
+        self.assertEqual("unmeasured", candidate["secondary_agent_cpu"])
+        second = self._holder_file([(77, {0: 10})], name="holder-2", run_id=other,
+                                   samples=samples)
+        _rows, report = self._real_report([first, second])
+        self.assertEqual("pass", report["candidates"][0]["secondary_agent_cpu"])
+
+    def test_gap_ranges_must_equal_the_durable_missing_set(self):
+        """Matching gap counts are not enough: the reported ranges must be the
+        durable stand-in's missing sequences exactly, each reported once."""
+        orchestrator, receiver, sender_rows = _base("outage_5s")
+        name = "outage_5s-a_framed"
+        durable = {"kind": "durable", "t_ns": 9, "source": 0, "epoch": 1, "min_sequence": 0,
+                   "max_sequence": 19, "units": 15, "duplicates": 0, "runs": 2}
+        runs = [{"kind": "durable_run", "t_ns": 9, "source": 0, "epoch": 1,
+                 "first_sequence": first, "last_sequence": last}
+                for first, last in ((0, 4), (10, 19))]
+
+        def gap(after, before):
+            return {"kind": "gap", "t_ns": 5, "source": 0, "epoch": 1,
+                    "reason": "sequence_skip", "after_sequence": after,
+                    "before_sequence": before, "missing_units": before - after - 1}
+
+        self.run_dir(name, orchestrator=orchestrator,
+                     receiver=receiver + [gap(4, 10)] + runs + [durable],
+                     sender_rows=sender_rows)
+        self.assertEqual("pass", self.report()["outage_5s"]["g2"])
+        cases = {
+            # the same 5 units, but two overlapping reports (2 + 3 = 5)
+            "double-reported": [gap(4, 7), gap(5, 9)],
+            # 5 units reported where Main holds them, none where it lacks them
+            "misplaced": [gap(11, 17)],
+            # one range reported twice and the count split elsewhere
+            "duplicate range": [gap(4, 10), gap(4, 10)],
+            # a count that does not match its own range
+            "inconsistent count": [{**gap(4, 10), "missing_units": 4}, gap(11, 13)],
+        }
+        for label, gaps in cases.items():
+            with self.subTest(case=label):
+                self.rewrite(name, "receiver", receiver + gaps + runs + [durable])
+                row = self.report()["outage_5s"]
+                self.assertEqual("fail", row["g2"])
+                self.assertGreater(row["gap_set_mismatches"], 0)
+        # persisted runs that are not the durable row's sequence set
+        for label, bad in {
+                "units": [*runs[:1], {**runs[1], "last_sequence": 18}],
+                "count": runs[:1],
+                "overlap": [runs[0], {**runs[1], "first_sequence": 3}]}.items():
+            with self.subTest(runs=label):
+                self.rewrite(name, "receiver", receiver + [gap(4, 10)] + bad + [durable])
+                self.assertEqual("fail", self.report()["outage_5s"]["g2"])
+        # older records without the persisted runs: the set cannot be checked
+        self.rewrite(name, "receiver",
+                     receiver + [gap(4, 10), {**durable, "runs": None}])
+        self.assertEqual("unmeasured", self.report()["outage_5s"]["g2"])
+
+    def test_gap_set_after_capture_restart_excludes_the_unknown_extent(self):
+        orchestrator, receiver, sender_rows = _base("capture_restart")
+        name = "capture_restart-a_framed"
+        rows = [{"kind": "durable_run", "t_ns": 9, "source": 0, "epoch": 1,
+                 "first_sequence": 0, "last_sequence": 9},
+                {"kind": "durable", "t_ns": 9, "source": 0, "epoch": 1, "min_sequence": 0,
+                 "max_sequence": 9, "units": 10, "duplicates": 0, "runs": 1},
+                {"kind": "durable_run", "t_ns": 9, "source": 0, "epoch": 2,
+                 "first_sequence": 3, "last_sequence": 5},
+                {"kind": "durable_run", "t_ns": 9, "source": 0, "epoch": 2,
+                 "first_sequence": 8, "last_sequence": 9},
+                {"kind": "durable", "t_ns": 9, "source": 0, "epoch": 2, "min_sequence": 3,
+                 "max_sequence": 9, "units": 5, "duplicates": 0, "runs": 2}]
+        restart = {"kind": "gap", "t_ns": 5, "source": 0, "epoch": 2,
+                   "reason": "capture_restart", "after_sequence": None, "before_sequence": 3,
+                   "missing_units": None}
+        skip = {"kind": "gap", "t_ns": 6, "source": 0, "epoch": 2, "reason": "sequence_skip",
+                "after_sequence": 5, "before_sequence": 8, "missing_units": 2}
+        self.run_dir(name, orchestrator=orchestrator,
+                     receiver=receiver + [restart, skip] + rows, sender_rows=sender_rows)
+        self.assertEqual("pass", self.report()["capture_restart"]["g2"])
+        # the same 2 units claimed inside the unknown-extent restart gap instead
+        misplaced = {**skip, "after_sequence": None, "before_sequence": 2}
+        self.rewrite(name, "receiver", receiver + [restart, misplaced] + rows)
+        self.assertEqual("fail", self.report()["capture_restart"]["g2"])
 
     # -- regressions for the PR #222 review (head a28c38a) ---------------------
     def _durable(self, sources, units=10):
@@ -1153,7 +1406,7 @@ class SummarizerTests(unittest.TestCase):
     def test_real_inputs_declared_by_either_side(self):
         orchestrator, receiver, sender_rows = _base("normal")
         name = "normal-a_framed"
-        real_sender = [{"kind": "start", "t_ns": 0, "n_sources": 1, "inputs": "real"}]
+        real_sender = [_REAL_START]
         # the README Main command carries no --real-inputs; the capture side does
         self.run_dir(name, orchestrator=orchestrator, two_host=True,
                      receiver=receiver + self._durable(1), sender_rows=real_sender + sender_rows)
@@ -1719,6 +1972,40 @@ class MiscTests(unittest.TestCase):
         holder.approve_all(capture, sources)
         self.assertEqual(2, capture.approve.call_count)
 
+    def test_real_inputs_require_the_holder_source(self):
+        common = dict(candidate="a_framed", host="127.0.0.1", port=1, n_sources=1)
+        for kind in ("builtin", "gst"):
+            with self.subTest(source_kind=kind):
+                with self.assertRaises(ValueError):
+                    sender.SenderConfig(source_kind=kind, real_inputs=True, **common)
+        with self.assertRaises(ValueError):
+            sender.SenderConfig(source_kind="holder", real_inputs=True, **common)  # no socket
+        sender.SenderConfig(source_kind="holder", holder_socket="/x", real_inputs=True,
+                            **common)
+        from transport_poc import poc15
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(SystemExit):
+                poc15.main(["sender", "--candidate", "a_framed", "--host", "127.0.0.1",
+                            "--port", "1", "--node-dir", directory, "--epoch-file",
+                            str(Path(directory) / "e"), "--seconds", "1", "--out",
+                            str(Path(directory) / "s.jsonl"), "--run-id", RUN,
+                            "--source-kind", "gst", "--real-inputs"])
+            self.assertFalse((Path(directory) / "s.jsonl").exists())
+
+    def test_holder_hello_identifies_the_sender(self):
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        holder.send_hello(left, 12345)
+        self.assertEqual(12345, holder.read_hello(right))
+        left.sendall(b"\0" * 8)  # zero is not a nonce
+        self.assertIsNone(holder.read_hello(right))
+        left.close()
+        self.assertIsNone(holder.read_hello(right))
+        for bad in (0, 1 << 63):
+            with self.assertRaises(ValueError):
+                holder.send_hello(right, bad)
+
     def test_holder_forwards_frames_from_capture_in_memory(self):
         frame = mock.Mock(data=b"\xff\xd8x\xff\xd9", received_monotonic=1.5)
         queue = mock.Mock()
@@ -1732,6 +2019,7 @@ class MiscTests(unittest.TestCase):
             self.assertEqual(0o700, stat.S_IMODE(os.stat(Path(directory) / "sock").st_mode))
             client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             client.connect(str(instance.path))
+            holder.send_hello(client, 4242)
             got = []
             stop = threading.Event()
             reader = threading.Thread(target=lambda: holder.read_frames(
@@ -1744,6 +2032,14 @@ class MiscTests(unittest.TestCase):
             self.assertEqual((0, 1_500_000_000, b"\xff\xd8x\xff\xd9"), got[0])
             capture.close.assert_called_once()
             self.assertFalse(instance.path.exists())
+            # the session is recorded under the sender's nonce, with its counts
+            rows = records.read_jsonl(Path(directory) / "h.jsonl")
+            opened = [row for row in rows if row["kind"] == "session_open"]
+            forwarded = [row for row in rows if row["kind"] == "forwarded"]
+            self.assertEqual([4242], [row["nonce"] for row in opened])
+            self.assertEqual([(4242, 0)], [(row["nonce"], row["source"]) for row in forwarded])
+            self.assertGreaterEqual(forwarded[0]["frames"], 1)
+            self.assertEqual(1, sum(1 for row in rows if row["kind"] == "session_close"))
 
 
 def _free_offset():

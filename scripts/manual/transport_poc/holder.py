@@ -6,6 +6,15 @@ in a throwaway runtime root and hands each compressed frame, in memory, to
 one local sender over a unix socket inside a private (0700) directory. No
 frame is written to disk; the socket file is the only filesystem entry.
 
+Session identity: a connecting sender first writes its 8-byte start nonce
+(``HELLO``). The holder records ``session_open`` / ``session_close`` with that
+nonce and, at the close, one ``forwarded`` record per source (frames whose
+``sendall`` completed on that session). The summarizer accepts a real-input
+sender epoch only when this holder's session with the sender's own nonce
+forwarded at least, and at most ``HOLDER_INFLIGHT_SLACK`` more than, the
+units the sender generated: a concurrently running holder of another sender
+cannot vouch for it.
+
 Frames on the socket: ``uint8 source_index, uint64 capture_ns, uint32 length``
 then ``length`` JPEG bytes. ``capture_ns`` is this host's CLOCK_MONOTONIC when
 the frame left the capture queue, the same clock the sender and the local
@@ -32,6 +41,7 @@ from uuid import uuid4
 from . import materials, records
 
 FRAME_HEADER = struct.Struct(">BQI")
+HELLO = struct.Struct(">Q")
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 
 
@@ -56,6 +66,28 @@ def read_frames(connection, deliver, stop):
             payload = bytes(buffer[FRAME_HEADER.size:FRAME_HEADER.size + length])
             del buffer[:FRAME_HEADER.size + length]
             deliver(index, capture_ns, payload)
+
+
+def send_hello(connection, nonce):
+    """Sender side: identify this sender execution to the holder."""
+    if not 0 < nonce < 1 << 63:
+        raise ValueError("holder nonce out of range")
+    connection.sendall(HELLO.pack(nonce))
+
+
+def read_hello(connection):
+    """Holder side: the sender's start nonce, or None (closed / malformed)."""
+    data = b""
+    while len(data) < HELLO.size:
+        try:
+            chunk = connection.recv(HELLO.size - len(data))
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        data += chunk
+    nonce = HELLO.unpack(data)[0]
+    return nonce if 0 < nonce < 1 << 63 else None
 
 
 def encode_frame(index, capture_ns, payload):
@@ -143,6 +175,8 @@ class Holder:
             os.umask(old)
         self.listener.listen(1)
         self.client = None
+        self.client_nonce = None
+        self.client_frames = [0] * len(source_ids)
         self.frames = [0] * len(source_ids)
         self.forward_drops = 0
 
@@ -167,7 +201,13 @@ class Holder:
                     else:
                         connection.setblocking(True)
                         connection.settimeout(1.0)
-                        self.client = connection
+                        nonce = read_hello(connection)
+                        if nonce is None:
+                            connection.close()  # no session identity: not served
+                            continue
+                        self.client, self.client_nonce = connection, nonce
+                        self.client_frames = [0] * len(self.source_ids)
+                        self.writer.write("session_open", nonce=nonce)
                 for index, source in enumerate(self.source_ids):
                     frame = self.capture.frames(source).get(0.005)
                     if frame is None:
@@ -177,9 +217,9 @@ class Holder:
                         try:
                             self.client.sendall(encode_frame(index, int(
                                 frame.received_monotonic * 1e9), frame.data))
+                            self.client_frames[index] += 1
                         except OSError:
-                            self.client.close()
-                            self.client = None
+                            self._close_client()
                             self.forward_drops += 1
                 if now >= next_sample:
                     next_sample = now + 1.0
@@ -195,9 +235,19 @@ class Holder:
         finally:
             self.close()
 
+    def _close_client(self):
+        """End the current sender session: its per-source forwarded counts."""
+        if self.client is None:
+            return
+        self.client.close()
+        for index, frames in enumerate(self.client_frames):
+            self.writer.write("forwarded", nonce=self.client_nonce, source=index,
+                              frames=frames)
+        self.writer.write("session_close", nonce=self.client_nonce)
+        self.client = self.client_nonce = None
+
     def close(self):
-        if self.client is not None:
-            self.client.close()
+        self._close_client()
         self.listener.close()
         try:
             self.path.unlink()

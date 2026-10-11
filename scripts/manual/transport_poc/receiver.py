@@ -9,6 +9,7 @@ then records only per-source numeric watermarks in a private SQLite file so a
 restarted receiver resumes from the "durably recorded" position (ADR-0007
 item 1). No media byte is ever written to disk.
 """
+from collections import defaultdict
 import hashlib
 from pathlib import Path
 import signal
@@ -89,10 +90,21 @@ class DurableStandIn:
             "CREATE TABLE IF NOT EXISTS durable (source TEXT, epoch INTEGER, node TEXT, "
             "min_seq INTEGER, max_seq INTEGER, units INTEGER, duplicates INTEGER, "
             "last_capture_ns INTEGER, PRIMARY KEY (source, epoch))")
+        # The persisted sequence set itself, as [first, last] runs: the
+        # summarizer derives the durable gaps from it, independently of the
+        # continuity tracker's reported gaps (G2 set equality).
+        self._connection.execute(
+            "CREATE TABLE IF NOT EXISTS durable_runs (source TEXT, epoch INTEGER, "
+            "first_seq INTEGER, last_seq INTEGER, PRIMARY KEY (source, epoch, first_seq))")
         self._connection.commit()
         self._rows = {}
         for row in self._connection.execute("SELECT * FROM durable"):
             self._rows[(UUID(row[0]), row[1])] = [UUID(row[2]), *row[3:]]
+        self._runs = defaultdict(list)
+        for source, epoch, first, last in self._connection.execute(
+                "SELECT * FROM durable_runs ORDER BY source, epoch, first_seq"):
+            self._runs[(UUID(source), epoch)].append([first, last])
+        self._flushed_runs = {key: len(runs) for key, runs in self._runs.items()}
         self._dirty = set()
         self._lock = threading.Lock()
 
@@ -123,9 +135,15 @@ class DurableStandIn:
                     gap = (None, previous[5], message.capture_time_ns)
                 self._rows[key] = [message.node_id, message.sequence, message.sequence, 1, 0,
                                    message.capture_time_ns]
+                self._runs[key].append([message.sequence, message.sequence])
             else:
+                runs = self._runs[key]
                 if message.sequence > row[2] + 1:
                     gap = (message.sequence - row[2] - 1, row[5], message.capture_time_ns)
+                if runs and runs[-1][1] + 1 == message.sequence:
+                    runs[-1][1] = message.sequence
+                else:
+                    runs.append([message.sequence, message.sequence])
                 row[2] = message.sequence
                 row[3] += 1
                 row[5] = message.capture_time_ns
@@ -137,10 +155,20 @@ class DurableStandIn:
             rows = [(str(source), epoch, str(row[0]), *row[1:])
                     for (source, epoch), row in self._rows.items()
                     if (source, epoch) in self._dirty]
+            # Only the last flushed run can have grown; later runs are new.
+            runs = []
+            for key in self._dirty:
+                done = self._flushed_runs.get(key, 0)
+                mine = self._runs.get(key, [])
+                runs += [(str(key[0]), key[1], first, last)
+                         for first, last in mine[max(0, done - 1):]]
+                self._flushed_runs[key] = len(mine)
             self._dirty.clear()
         if rows:
             self._connection.executemany(
                 "INSERT OR REPLACE INTO durable VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            self._connection.executemany(
+                "INSERT OR REPLACE INTO durable_runs VALUES (?, ?, ?, ?)", runs)
             self._connection.commit()
 
     def watermark(self, source_id):
@@ -155,7 +183,8 @@ class DurableStandIn:
 
     def summary(self):
         with self._lock:
-            return [(source, epoch, list(row)) for (source, epoch), row in self._rows.items()]
+            return [(source, epoch, list(row), [list(run) for run in self._runs.get(
+                (source, epoch), [])]) for (source, epoch), row in self._rows.items()]
 
     def close(self):
         self.flush()
@@ -633,10 +662,14 @@ class Receiver:
             while self._persist_batch(256):
                 pass
         self._drain_gaps()
-        for source, epoch, row in self.durable.summary():
+        for source, epoch, row, runs in self.durable.summary():
+            # The persisted sequence runs first, then the row that counts them.
+            for first, last in runs:
+                self._event("durable_run", **self._source_fields(source), epoch=epoch,
+                            first_sequence=first, last_sequence=last)
             self._event("durable", **self._source_fields(source), epoch=epoch,
                         min_sequence=row[1], max_sequence=row[2], units=row[3],
-                        duplicates=row[4])
+                        duplicates=row[4], runs=len(runs))
         quota, period = records.cgroup_cpu_quota()
         rss, hwm = records.process_memory()
         self._event("end", discarded_at_stop=self.discarded_at_stop, persisted=self.persisted,

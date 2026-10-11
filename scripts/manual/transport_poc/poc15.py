@@ -169,6 +169,8 @@ def _sender(args):
     from transport_poc import sender
     materials.require_outside_repository(args.out)
     frame_bytes = 16000 if args.fast and args.frame_bytes == 125000 else args.frame_bytes
+    if args.real_inputs and args.source_kind != "holder":
+        raise SystemExit("--real-inputs requires --source-kind holder")
     config = sender.SenderConfig(
         candidate=args.candidate, host=args.host, port=args.port, n_sources=args.sources,
         source_kind=args.source_kind, fps=args.fps, frame_bytes=frame_bytes,
@@ -211,6 +213,8 @@ def _matrix(args):
     for name in names:
         if name not in matrix.SCENARIOS:
             raise SystemExit("unknown scenario")
+    if args.real_inputs and args.role != "main" and args.source_kind != "holder":
+        raise SystemExit("--real-inputs requires --source-kind holder")
     candidates = args.candidates.split(",")
     for candidate in candidates:
         if candidate not in matrix.RECEIVER_PORTS:
