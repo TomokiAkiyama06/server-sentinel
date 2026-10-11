@@ -1770,7 +1770,11 @@ monotonic clock by at most one second: a wall clock stepped back after the
 verification, a reboot, a session without a recorded pair (established
 before migration 23) and an unreadable boot clock are stale (fail closed,
 Owner decision 2026-10-12), and a step-up is refused while the boot
-clock cannot be read. Refused finishes are counted value-free
+clock cannot be read. A finish refused by the session gate (stop, failed
+check tick or close/reopen during verification) is a no-op that leaves the
+challenge pending, a credential finding (BE change, counter regression)
+included; every other refusal after the client data parsed spends the
+challenge, with any finding committed under the same gate admission. Refused finishes are counted value-free
 (`owner_step_up_refused` logged on the first and each doubling). No `OWNER_OP`
 route is mounted until S4.
 

@@ -9,6 +9,7 @@ operation route exists yet (S4): the ``OWNER_OP`` contract is exercised
 through a synthetic route added to the table for the test only.
 """
 
+import asyncio
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -16,6 +17,7 @@ import json
 import logging
 import re
 import secrets
+import threading
 import unittest
 from unittest.mock import patch
 from uuid import UUID
@@ -26,7 +28,7 @@ from app.auth.human_surface import (
     ROUTES, HumanAccess, HumanAccessConfiguration, HumanAccessUnavailable, STEP_UP_OPTIONS_PATH, STEP_UP_PATH, Route, match_route,
 )
 from app.auth.model import AccessValidationError, Permission
-from app.auth.passkeys import PasskeyCeremonies
+from app.auth.passkeys import CeremonyDenied, CredentialFinding, PasskeyCeremonies
 from app.auth.rate_limit import SourceRateLimiter, step_up_rate_limiter
 from app.auth.store import OWNER_STEP_UP_FRESHNESS, Requirement, SessionView, StepUpRequired
 from app.logging import Event, SafeJsonFormatter
@@ -37,7 +39,7 @@ from tests.test_human_surface import (
 )
 from tests.test_invitation_redemption import OTHER_BOOT, BootClock
 from tests.test_webauthn_ceremonies import waiting
-from tests.webauthn_fakes import SyntheticAuthenticator, b64
+from tests.webauthn_fakes import SyntheticAuthenticator, b64, unb64
 
 
 OWNER_OPERATION_PATH = "/api/synthetic/owner-operation"
@@ -586,6 +588,113 @@ class ClosedAccessTests(StepUpFixture):
                 self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
                 self.elapse(minutes=6)
 
+    def finding_state(self):
+        """Credential findings, session validity and their audit records."""
+        with closing(self.database.connect()) as connection:
+            credentials = sorted(tuple(row) for row in connection.execute(
+                "SELECT credential_id, sign_count, inconsistency_reason, inconsistent_at_us "
+                "FROM access_credentials"))
+            sessions = sorted(tuple(row) for row in connection.execute(
+                "SELECT id, invalidated_at_us, external_identity_binding IS NULL FROM access_sessions"))
+            audit = connection.execute(
+                "SELECT action, count(*) FROM security_admin_audit_records WHERE action IN "
+                "('mark_principal_credential_inconsistent', "
+                "'detect_principal_credential_sign_count_regression', 'verify_principal_step_up') "
+                "GROUP BY action ORDER BY action").fetchall()
+        return credentials, sessions, [tuple(row) for row in audit]
+
+    async def test_a_gate_refusal_records_no_credential_finding(self):
+        """PR #236 review (Codex P2): a changed backup eligibility or a regressed
+        counter found by a step-up whose gate is refused between
+        ``_step_up_epoch()`` and the commit writes nothing — no credential mark,
+        no session invalidation, no audit record, no Owner notification — and
+        leaves the challenge pending. Admitted, the finding is recorded and
+        spends the challenge in the same admission."""
+        owner, key, _, cookie, csrf = await self.owner_session()
+        self.elapse(minutes=6)
+        # A counting credential, so that a regression can be presented.
+        begun = await self.begin(cookie, csrf)
+        self.assertEqual(status(await self.finish(
+            cookie, csrf, key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST, count=5))), 204)
+        reported = []
+
+        class Sink:
+            def credential_finding(self, kind, principal_id):
+                reported.append((kind, principal_id))
+
+        self.ceremonies.findings = Sink()
+        real_epoch = self.ceremonies._step_up_epoch
+
+        def stop():
+            self.access.stop()
+
+        def fail_tick():
+            self.access._serving = False
+
+        def cycle():
+            self.close_access()
+            self.reopen_access()
+
+        kinds = (("counter regression", CredentialFinding.SIGN_COUNT_REGRESSION,
+                  "detect_principal_credential_sign_count_regression", dict(count=3)),
+                 # Last: admitted, it ends the Owner's sessions.
+                 ("backup eligibility changed", CredentialFinding.BACKUP_ELIGIBILITY_CHANGED,
+                  "mark_principal_credential_inconsistent", dict(count=6, be=True)))
+        for finding, kind, action, options in kinds:
+            assertion = None
+            for name, interrupt, restart in (("stop", stop, True), ("tick failure", fail_tick, True),
+                                             ("close/reopen", cycle, False)):
+                with self.subTest(finding=finding, interrupt=name):
+                    self.elapse(minutes=6)
+                    begun = await self.begin(cookie, csrf)
+                    assertion = key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST, **options)
+                    before = self.finding_state()
+                    fired = []
+
+                    def epoch_then_interrupt(*args, **kwargs):
+                        epoch = real_epoch(*args, **kwargs)
+                        fired.append(True)
+                        interrupt()
+                        return epoch
+
+                    with patch.object(self.ceremonies, "_step_up_epoch", side_effect=epoch_then_interrupt):
+                        result = await self.finish(cookie, csrf, assertion)
+                    self.assertEqual(fired, [True])
+                    self.assertEqual(result, GENERIC)
+                    self.assertEqual(self.finding_state(), before)
+                    self.assertEqual(reported, [])
+                    self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
+                    if restart:
+                        await self.restart()
+                    self.assertEqual(self.finding_state(), before)
+                    self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
+                    self.assertEqual(await self.owner_operation(cookie, csrf), STEP_UP)
+            # Admitted: the same pending answer records the finding once and
+            # spends its challenge.
+            before = dict(self.finding_state()[2])
+            self.assertEqual(await self.finish(cookie, csrf, assertion), GENERIC)
+            self.assertEqual(reported, [(kind, owner.id)])
+            reported.clear()
+            self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+            after = dict(self.finding_state()[2])
+            self.assertEqual(after.get(action, 0), before.get(action, 0) + 1)
+            self.assertEqual(after.get("verify_principal_step_up"), before.get("verify_principal_step_up"))
+        credentials, sessions, _ = self.finding_state()
+        self.assertEqual([row[1:3] for row in credentials], [(5, "backup_eligibility_changed")])
+        self.assertTrue(all(row[1] is not None for row in sessions))
+        self.assertEqual(await self.owner_operation(cookie, csrf), GENERIC)
+
+    async def test_a_finding_whose_record_fails_still_spends_the_challenge(self):
+        _, key, _, cookie, csrf = await self.owner_session()
+        self.elapse(minutes=6)
+        begun = await self.begin(cookie, csrf)
+        assertion = key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST, be=True)
+        before = self.finding_state()
+        with patch.object(self.store, "mark_credential_inconsistent", side_effect=OSError("synthetic")):
+            self.assertEqual(await self.finish(cookie, csrf, assertion), GENERIC)
+        self.assertEqual(self.finding_state(), before)
+        self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+
     async def test_a_genuinely_failed_step_up_spends_its_challenge(self):
         """Single use as before: a bad signature, another session's challenge
         context or a commit refused inside its transaction spends the challenge."""
@@ -815,6 +924,95 @@ class RateLimitAndHygieneTests(StepUpFixture):
             text = repr(item)
             for value in seen[:4] + seen[5:]:
                 self.assertNotIn(value, text)
+
+
+class CommitCheckTests(StepUpFixture):
+    """Claude review suggestions on PR #236: the commit-time checks of
+    ``accept_assertion`` and a ceremony-level race."""
+
+    @staticmethod
+    def challenge_digest(begun):
+        return hashlib.sha256(unb64(payload(begun)["challenge"])).digest()
+
+    async def test_a_challenge_expiring_before_the_commit_transaction_is_refused(self):
+        _, key, _, cookie, csrf = await self.owner_session()
+        self.elapse(minutes=6)
+        begun = await self.begin(cookie, csrf)
+        assertion = key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST)
+        before = self.unchanged_state(cookie)
+        real_pending = self.store.pending_step_up_challenge
+
+        def pending_then_wait(*args, **kwargs):
+            # Still pending when read; expired by the time the commit
+            # transaction reads its own time (a lock or admission wait).
+            result = real_pending(*args, **kwargs)
+            self.elapse(minutes=5)
+            return result
+
+        with patch.object(self.store, "pending_step_up_challenge", side_effect=pending_then_wait):
+            self.assertEqual(await self.finish(cookie, csrf, assertion), GENERIC)
+        self.assertEqual(self.unchanged_state(cookie), before)
+        self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+        self.assertEqual(await self.owner_operation(cookie, csrf), STEP_UP)
+
+    async def test_the_commit_deletes_only_a_challenge_of_its_own_session(self):
+        owner, key, credential, first, first_csrf = await self.owner_session()
+        second = await self.sign_in(key)
+        self.elapse(minutes=6)
+        digest = self.challenge_digest(await self.begin(first, first_csrf))
+        at = self.ceremony_clock()
+        first_view = self.store.current_session(self.token(first), VIEWER, at=at)
+        second_view = self.store.current_session(self.token(second), VIEWER, at=at)
+        before = (self.verification(first), self.verification(second), self.count(STEP_UP_AUDIT))
+        stored = self.store.credentials_for(owner.id)[0]
+        commit = dict(expected_sign_count=stored.sign_count, sign_count=stored.sign_count,
+                      backup_state=False, step_up_challenge=digest)
+        # The first session's challenge cannot refresh the second session.
+        with self.assertRaises(AccessValidationError):
+            self.store.accept_assertion(credential.credential_id, owner.id, VIEWER,
+                                        step_up_session_id=second_view.session_id, **commit)
+        self.assertEqual((self.verification(first), self.verification(second),
+                          self.count(STEP_UP_AUDIT)), before)
+        self.assertEqual(self.store.pending_step_up_challenge(digest), first_view.session_id)
+        # Its own session commits and spends it.
+        self.store.accept_assertion(credential.credential_id, owner.id, VIEWER,
+                                    step_up_session_id=first_view.session_id, **commit)
+        self.assertIsNone(self.store.pending_step_up_challenge(digest))
+        self.assertEqual(self.verification(second), before[1])
+        self.assertNotEqual(self.verification(first), before[0])
+
+    async def test_two_racing_finishes_of_one_counterless_answer_commit_once(self):
+        """Sign count 0 never advances, so only the challenge deletion inside
+        the commit transaction keeps the answer single use."""
+        owner, key, _, cookie, csrf = await self.owner_session()
+        self.assertEqual(self.store.credentials_for(owner.id)[0].sign_count, 0)
+        self.elapse(minutes=6)
+        begun = await self.begin(cookie, csrf)
+        assertion = key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST)
+        token = self.token(cookie)
+        barrier = threading.Barrier(2, timeout=10)
+        real_pending = self.store.pending_step_up_challenge
+
+        def pending_together(*args, **kwargs):
+            # Both read the challenge as pending before either commits.
+            result = real_pending(*args, **kwargs)
+            barrier.wait()
+            return result
+
+        def finish():
+            try:
+                self.ceremonies.finish_step_up(token, VIEWER, assertion)
+            except CeremonyDenied:
+                return "denied"
+            return "ok"
+
+        audits = self.count(STEP_UP_AUDIT)
+        with patch.object(self.store, "pending_step_up_challenge", side_effect=pending_together):
+            results = await asyncio.gather(asyncio.to_thread(finish), asyncio.to_thread(finish))
+        self.assertEqual(sorted(results), ["denied", "ok"])
+        self.assertEqual(self.count(STEP_UP_AUDIT), audits + 1)
+        self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+        self.assertEqual(self.store.credentials_for(owner.id)[0].sign_count, 0)
 
 
 class StoreFreshnessTests(StepUpFixture):

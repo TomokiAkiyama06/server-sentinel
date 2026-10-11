@@ -112,6 +112,15 @@ class SessionGrant:
         return f"SessionGrant(principal_id={self.principal_id}, session_id={self.session_id})"
 
 
+@dataclass(frozen=True)
+class _Finding:
+    """A credential finding detected by a verified assertion, not yet recorded."""
+
+    kind: CredentialFinding
+    principal_id: UUID
+    credential_id: bytes
+
+
 def _digest(challenge: bytes) -> bytes:
     return hashlib.sha256(challenge).digest()
 
@@ -170,6 +179,17 @@ class PasskeyCeremonies:
 
     def _timeout_ms(self) -> int:
         return int(self.challenge_lifetime.total_seconds() * 1000)
+
+    def _record_finding(self, finding: _Finding) -> None:
+        """Commit a credential finding: the credential mark (with its session
+        invalidation) or the counter-regression record, each with its audit
+        record. The caller decides under which gate this runs; the Owner
+        notification (``_report``) is sent only after it committed."""
+        if finding.kind is CredentialFinding.BACKUP_ELIGIBILITY_CHANGED:
+            self.store.mark_credential_inconsistent(finding.credential_id, finding.principal_id,
+                                                    at=self._now())
+        else:
+            self.store.record_sign_count_regression(finding.principal_id)
 
     def _report(self, kind: CredentialFinding, principal_id: UUID) -> None:
         if self.findings is None:
@@ -281,7 +301,15 @@ class PasskeyCeremonies:
                 "allowCredentials": []}
 
     def _verified_assertion(self, credential: Mapping, claims: webauthn.AssertionClaims,
-                            *, require_user_handle: bool) -> tuple[Principal, Credential, webauthn.VerifiedAssertion]:
+                            *, require_user_handle: bool
+                            ) -> tuple[Principal, Credential, webauthn.VerifiedAssertion, _Finding | None]:
+        """Verify the signature against the stored credential; write nothing.
+
+        A changed backup eligibility or a counter that does not advance is
+        returned as a finding instead of being recorded here (PR #236
+        review), so each caller commits it under the gate it needs; with a
+        finding the assertion must be refused.
+        """
         subject = self.store.assertion_subject(claims.credential_id)
         if subject is None:
             raise CeremonyDenied()
@@ -295,16 +323,12 @@ class PasskeyCeremonies:
             raise CeremonyDenied()
         verified = webauthn.verify_assertion(credential, self.rp, claims.challenge,
                                              stored.public_key, stored.algorithm)
-        at = self._now()
+        finding = None
         if verified.backup_eligible != stored.backup_eligible:
-            self.store.mark_credential_inconsistent(stored.credential_id, principal.id, at=at)
-            self._report(CredentialFinding.BACKUP_ELIGIBILITY_CHANGED, principal.id)
-            raise CeremonyDenied()
-        if not webauthn.sign_count_advances(stored.sign_count, verified.sign_count):
-            self.store.record_sign_count_regression(principal.id)
-            self._report(CredentialFinding.SIGN_COUNT_REGRESSION, principal.id)
-            raise CeremonyDenied()
-        return principal, stored, verified
+            finding = _Finding(CredentialFinding.BACKUP_ELIGIBILITY_CHANGED, principal.id, stored.credential_id)
+        elif not webauthn.sign_count_advances(stored.sign_count, verified.sign_count):
+            finding = _Finding(CredentialFinding.SIGN_COUNT_REGRESSION, principal.id, stored.credential_id)
+        return principal, stored, verified, finding
 
     def finish_authentication(self, proxy_identity: str, credential: Mapping) -> SessionGrant:
         """Verify an assertion and establish a credential-bound session.
@@ -323,7 +347,15 @@ class PasskeyCeremonies:
                 raise CeremonyDenied()
             claims = webauthn.assertion_claims(credential, self.rp)
             self.store.consume_challenge(_digest(claims.challenge), "authentication")
-            principal, stored, verified = self._verified_assertion(credential, claims, require_user_handle=True)
+            principal, stored, verified, finding = self._verified_assertion(
+                credential, claims, require_user_handle=True)
+            if finding is not None:
+                # Sign-in keeps its behaviour: the challenge is already
+                # consumed and the finding is recorded at once, so a cloned
+                # or re-provisioned credential is never lost to a close.
+                self._record_finding(finding)
+                self._report(finding.kind, finding.principal_id)
+                raise CeremonyDenied()
             token = self._random(SESSION_TOKEN_BYTES)
             if not isinstance(token, bytes) or len(token) != SESSION_TOKEN_BYTES:
                 raise CeremonyDenied()
@@ -441,6 +473,15 @@ class PasskeyCeremonies:
         the challenge: it is consumed in its own transaction, again inside
         ``admit(epoch)``, so it is single use exactly as before; only if the
         gate refuses that consumption too does it stay pending until expiry.
+
+        A verified assertion with a credential finding (changed backup
+        eligibility, or a counter that does not advance) is refused too, but
+        its writes — the credential mark with its session invalidation, or
+        the regression record, and their audit records — commit only inside
+        ``admit(epoch)``, in the same admission that spends the challenge;
+        the Owner notification is sent after that commit. A gate refusal
+        there records nothing, notifies nothing and leaves the challenge
+        pending, like any other gate refusal (PR #236 review).
         """
         # First: a close after this point refuses the commit (Issue #144).
         try:
@@ -449,6 +490,7 @@ class PasskeyCeremonies:
             raise CeremonyDenied() from None
         digest = None
         gate_refused = False
+        spent = False
         try:
             at = self._now()
             claims = webauthn.assertion_claims(credential, self.rp)
@@ -458,8 +500,29 @@ class PasskeyCeremonies:
             if (session is None or bound_session is None or bound_session != session.session_id
                     or claims.credential_id != session.credential_id):
                 raise CeremonyDenied()
-            principal, stored, verified = self._verified_assertion(credential, claims, require_user_handle=False)
+            principal, stored, verified, finding = self._verified_assertion(
+                credential, claims, require_user_handle=False)
             if principal.id != session.principal_id:
+                raise CeremonyDenied()
+            if finding is not None:
+                # Signature verification ran outside the lock; the finding's
+                # writes (credential mark with session invalidation, or the
+                # regression record, each with its audit record) and the
+                # challenge spend commit together inside ``admit(epoch)``
+                # (PR #236 review). A gate refusal records nothing and leaves
+                # the challenge pending; the notification follows the commit.
+                gate_refused = True
+                with self.session_gate.admit(epoch):
+                    gate_refused = False
+                    spent = True
+                    try:
+                        self._record_finding(finding)
+                    finally:
+                        try:
+                            self.store.consume_challenge(digest, "step_up")
+                        except Exception:
+                            pass
+                self._report(finding.kind, finding.principal_id)
                 raise CeremonyDenied()
             gate_refused = True
             with self.session_gate.admit(epoch):
@@ -470,7 +533,7 @@ class PasskeyCeremonies:
                     backup_state=verified.backup_state,
                     step_up_session_id=session.session_id, step_up_challenge=digest)
         except Exception:
-            if digest is not None and not gate_refused:
+            if digest is not None and not gate_refused and not spent:
                 self._spend_step_up_challenge(digest, epoch)
             raise CeremonyDenied() from None
 

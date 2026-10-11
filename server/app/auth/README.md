@@ -962,7 +962,7 @@ and no cookie; the client then retries the Owner operation, which is
 re-checked server-side. A cancelled, failed or refused step-up changes no
 verification time, counter, backup state or audit record; the only write is
 the authorization's idle touch, as for any authenticated request, and a
-consumed challenge.
+consumed challenge. The one exception is a credential finding (below).
 
 Challenge consumption (PR #236 review). Before verification the pending
 challenge is only read (`AccessStore.pending_step_up_challenge`). A successful
@@ -978,7 +978,16 @@ before. Every other refusal (bad signature, missing UP/UV, rpId hash, counter
 or BE/BS, another credential or session, an unknown or expired challenge, a
 commit refused inside its transaction) spends the challenge through `consume_challenge` in its own transaction, again inside
 `admit(epoch)`, so it stays single use; only when the gate refuses that
-consumption too is it left to expire. Each refused finish increments the value-free
+consumption too is it left to expire. A verified assertion with a credential
+finding (backup eligibility changed: the credential is marked inconsistent and
+its sessions end; or a counter that does not advance: a regression record)
+is refused too, but `_verified_assertion` only returns the finding, signature
+verification staying outside the lock: the finding's writes and audit record
+commit inside the same `admit(epoch)` that spends the challenge, and the Owner
+notification is sent after that commit, so a gate refusal there records,
+invalidates and notifies nothing and leaves the challenge pending. Sign-in
+(`finish_authentication`) keeps recording a finding at once: its challenge is
+already consumed before verification. Each refused finish increments the value-free
 `HumanAccess.refused_step_ups`, and `owner_step_up_refused` is logged on the
 first refusal and each power of two, with no token, CSRF token, challenge,
 credential, identity or reason.
