@@ -4,6 +4,7 @@ All rows, identities, secrets and segment bytes are generated placeholders;
 no real person, deployment value or playable media is involved.
 """
 
+from collections import Counter
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -4657,29 +4658,6 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(report["sections"]["security_state"]["failed"],
                          [{"id": f"pairing_renewals:{node}", "reason": "changed"}])
 
-    def test_uncovered_durable_tables_are_listed_as_not_inventoried(self):
-        self.runtime.seed()
-        _, baseline = self.record()
-        code, report, stdout = self.verify(baseline)
-        self.assertEqual(code, inventory.EXIT_PRESERVED)
-        for name in ("recording_source_discontinuities", "roi_calibration_history",
-                     "uvc_approvals.session_token", "integrity_status",
-                     "recording_health_status"):
-            self.assertEqual(report["not_inventoried"][name], "not_inventoried (#132)")
-            self.assertIn(f"{name}: not_inventoried (#132)", stdout)
-        # Source cursors are inventoried, so never listed as uncovered.
-        self.assertNotIn("recording_source_cursors", report["not_inventoried"])
-        self.assertIn("recording_source_cursors", inventory.INVENTORIED_TABLES)
-        # Only the hardware-integrity alert kinds of notification_events are
-        # read: it is listed as not inventoried with that note, never covered.
-        note = ("not_inventoried (#132): only hardware-integrity alert kinds are checked, "
-                "for the pending-alert invariant; other kinds and the delivery/confirmed "
-                "fields are not inventoried")
-        self.assertEqual(report["not_inventoried"]["notification_events"], note)
-        self.assertIn(f"notification_events: {note}", stdout)
-        self.assertNotIn("notification_events", inventory.INVENTORIED_TABLES)
-        self.assertNotIn("notification_events", report["sections"]["tables"]["preserved"])
-
     def test_verify_refuses_a_baseline_that_is_not_private(self):
         self.runtime.seed()
         _, baseline = self.record()
@@ -5538,17 +5516,18 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual({name for name, section in report["sections"].items()
                           if section["status"] == "failed"}, {"access_invitations"})
 
-    def _recording_store(self, connection):
+    def _recording_store(self, connection, **limits):
         from app.media.recording import RecordingStore, RootIdentity
         from app.media.recording.model import Limits
         from tests.test_recording import Reservation, SyntheticValidator
         media = self.runtime.root / "recordings"
         info = media.stat()
+        values = dict(pre_roll_bytes=4096, max_segment_bytes=512, max_segment_ms=30_000,
+                      max_active_recordings=8, max_spool_segments=16,
+                      max_segments_per_recording=100)
+        values.update(limits)
         store = RecordingStore(connection, media, RootIdentity(info.st_dev, info.st_ino),
-                               Limits(pre_roll_bytes=4096, max_segment_bytes=512,
-                                      max_segment_ms=30_000, max_active_recordings=8,
-                                      max_spool_segments=16, max_segments_per_recording=100),
-                               Reservation(), SyntheticValidator())
+                               Limits(**values), Reservation(), SyntheticValidator())
         self.addCleanup(store.close)
         return store
 
@@ -6486,6 +6465,546 @@ class LifecycleInventoryTests(unittest.TestCase):
                         self.assertEqual(code, inventory.EXIT_FAILED)
                         self.assertIn(expected, report["sections"]["recordings"]["failed"])
         self.runtime.database.write_bytes(original)
+
+
+    # -- Issue #132: the remaining durable tables and the hashing cost -------
+
+    def test_issue_132_tables_are_inventoried_or_declared_mutable(self):
+        self.runtime.seed()
+        _, baseline = self.record()
+        recorded = json.loads(baseline.read_text())
+        code, report, stdout = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        # Nothing durable is left uncompared without being named.
+        self.assertEqual(report["not_inventoried"], {})
+        self.assertEqual(recorded["not_inventoried"], {})
+        for name in ("recording_source_discontinuities", "roi_calibration_history",
+                     "notification_events", "integrity_status", "recording_health_status",
+                     "recording_source_cursors"):
+            self.assertIn(name, inventory.INVENTORIED_TABLES)
+            self.assertIn(name, report["sections"]["tables"]["preserved"])
+        # Values the services rewrite are declared, in the files and on the console.
+        for name in ("notification_events.delivery", "uvc_approvals.session_token",
+                     "integrity_status", "recording_health_status"):
+            note = inventory.DECLARED_MUTABLE[name]
+            self.assertTrue(note.startswith("declared_mutable (#132)"), name)
+            self.assertEqual(report["declared_mutable"][name], note)
+            self.assertEqual(recorded["declared_mutable"][name], note)
+            self.assertIn(f"{name}: {note}", stdout)
+        for name in ("recording_source_discontinuities", "roi_calibration_history",
+                     "notification_events", "status_rows"):
+            self.assertIn(name, report["sections"])
+
+    def test_baseline_recorded_before_issue_132_reports_not_recorded(self):
+        # A baseline taken by an older release lacks the #132 sections: they
+        # are reported not_recorded, never failed and never preserved.
+        self.runtime.seed()
+        _, baseline = self.record()
+        recorded = json.loads(baseline.read_text())
+        for key in ("recording_source_discontinuities", "roi_calibration_history",
+                    "notification_events", "status_rows", "declared_mutable"):
+            del recorded[key]
+        old = self.notes / "old.json"
+        descriptor = os.open(old, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(recorded, handle)
+        code, report, _ = self.verify(old)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"])
+        for name in ("recording_source_discontinuities", "roi_calibration_history",
+                     "notification_events", "status_rows"):
+            self.assertEqual(report["sections"][name]["status"], "not_recorded", name)
+
+    def _marker_source(self):
+        """A source with a stream discontinuity in its ready pre-roll spool,
+        written by the real RecordingStore (one marker)."""
+        import zlib
+        from app.media.recording import Segment
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        store = self._recording_store(connection)
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+        source = uuid4()
+        store.append(Segment(source, uuid4(), 0, base, base + 10_000,
+                             "synthetic", "deflate", payload))
+        second = uuid4()
+        store.append(Segment(source, second, 0, base + 10_000, base + 20_000,
+                             "synthetic", "deflate", payload))
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            markers = db.execute("SELECT source_id, start_ms, end_ms, reason "
+                                 "FROM recording_source_discontinuities").fetchall()
+        self.assertEqual(markers, [(str(source), base + 10_000, base + 10_000,
+                                    "stream_discontinuity")])
+        return store, source, second, base, payload
+
+    def test_source_pre_roll_markers_leave_only_by_the_spool_trim_or_a_release(self):
+        # RecordingStore._start() copies the source markers into a new
+        # recording; a lost marker hides a stream discontinuity in the next
+        # event's playback (#132).
+        from app.media.recording import Segment
+        self.runtime.seed()
+        store, source, second, base, payload = self._marker_source()
+        _, baseline = self.record()
+        recorded = json.loads(baseline.read_text())
+        self.assertEqual(len(recorded["recording_source_discontinuities"]), 1)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.assertEqual(report["sections"]["recording_source_discontinuities"]["status"],
+                         "preserved")
+        # A migration dropping the marker while the spool segments it
+        # separates are still there: a loss.
+        self.runtime.execute("DELETE FROM recording_source_discontinuities")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["recording_source_discontinuities"]["failed"],
+                         [{"id": f"marker:{source}:{base + 10_000}:{base + 10_000}",
+                           "reason": "missing"}])
+        self.runtime.execute("INSERT INTO recording_source_discontinuities VALUES (?,?,?,?)",
+                             (str(source), base + 10_000, base + 10_000,
+                              "stream_discontinuity"))
+        # The real spool trim: a later publication moves the pre-roll window
+        # past the marker, which leaves with the segment before it.
+        store.append(Segment(source, second, 1, base + 20_000, base + 45_000,
+                             "synthetic", "deflate", payload))
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM recording_source_discontinuities"
+                                        ).fetchone()[0], 0)
+        code, report, _ = self.verify(baseline)
+        section = report["sections"]["recording_source_discontinuities"]
+        self.assertEqual(code, inventory.EXIT_PRESERVED, section)
+        self.assertEqual((section["status"], len(section["trimmed"])), ("preserved", 1))
+        # The real release of a source drops every marker and its spool.
+        other_store, other, _, other_base, _ = self._marker_source_again(store)
+        _, later = self.record("later.json")
+        other_store.release_source(other)
+        code, report, stdout = self.verify(later)
+        section = report["sections"]["recording_source_discontinuities"]
+        self.assertEqual(code, inventory.EXIT_PRESERVED, section)
+        self.assertEqual(len(section["trimmed"]), 1)
+        self.assertIn("recording_source_discontinuities: preserved", stdout)
+        self.assertIn("trimmed=1", stdout)
+
+    def _marker_source_again(self, store):
+        import zlib
+        from app.media.recording import Segment
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(minutes=30)).timestamp() * 1000)
+        source = uuid4()
+        store.append(Segment(source, uuid4(), 0, base, base + 10_000,
+                             "synthetic", "deflate", payload))
+        store.append(Segment(source, uuid4(), 0, base + 10_000, base + 20_000,
+                             "synthetic", "deflate", payload))
+        return store, source, None, base, payload
+
+    def test_source_pre_roll_marker_values_are_checked(self):
+        self.runtime.seed()
+        source = str(uuid4())
+        for values in ((source, 5, 4, "stream_discontinuity"),
+                       (source, 1, 2, "synthetic-other-reason"),
+                       ("not-a-uuid", 1, 2, "stream_discontinuity")):
+            with self.subTest(values=values):
+                self.runtime.execute("DELETE FROM recording_source_discontinuities")
+                self.runtime.execute(
+                    "INSERT INTO recording_source_discontinuities VALUES (?,?,?,?)", values)
+                self.assert_record_refused("recording_source_discontinuities:invalid_value")
+
+    def _roi_archive(self, source, profile, identifier):
+        """The real CalibrationArchive and a generated calibration factory
+        (a synthetic texture, never a camera frame)."""
+        from app.cameras.registry.models import SourceType
+        from app.detection.roi import Calibration, CalibrationArchive
+        from tests.test_detector_roi import HEIGHT, POLYGON, WIDTH, frame, policy
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        reference = frame(0, source=UUID(source))
+
+        def calibration(version, created=None):
+            return Calibration(UUID(identifier), UUID(source), SourceType.LOCAL_UVC,
+                               UUID(profile), version, created or self.now, POLYGON,
+                               reference, policy())
+        self.assertEqual((reference.width, reference.height), (WIDTH, HEIGHT))
+        return CalibrationArchive(connection), calibration
+
+    def test_roi_calibration_history_is_append_only_and_private(self):
+        from app.detection.roi.calibration import calibration_metadata
+        self.runtime.seed()
+        source, profile, identifier = str(uuid4()), str(uuid4()), str(uuid4())
+        archive, calibration = self._roi_archive(source, profile, identifier)
+        for version in (1, 2):
+            archive.append(calibration(version))
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            digest = db.execute("SELECT metadata FROM roi_calibration_history "
+                                "WHERE version=1").fetchone()[0]
+        _, baseline = self.record()
+        self.assertNotIn(json.loads(digest)["reference"]["sha256"], baseline.read_text())
+        self.assertNotIn(identifier, baseline.read_text())
+        # A next version is appended, never counted as preserved.
+        archive.append(calibration(3))
+        code, report, _ = self.verify(baseline)
+        section = report["sections"]["roi_calibration_history"]
+        self.assertEqual(code, inventory.EXIT_PRESERVED, section)
+        self.assertEqual(section["appended"], [f"{source}/{profile}/3"])
+        self.assertEqual(len(section["preserved"]), 2)
+        # A rewritten or removed version is a loss (the rewrite still decodes).
+        rewritten = json.dumps(calibration_metadata(calibration(1, self.now - timedelta(days=1))),
+                               sort_keys=True)
+        self.runtime.execute("UPDATE roi_calibration_history SET metadata=? WHERE version=1",
+                             (rewritten,))
+        self.runtime.execute("DELETE FROM roi_calibration_history WHERE version=3")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["roi_calibration_history"]["failed"],
+                         [{"id": f"{source}/{profile}/1", "reason": "changed"}])
+        self.runtime.execute("DELETE FROM roi_calibration_history WHERE version=2")
+        code, report, _ = self.verify(baseline)
+        self.assertIn({"id": f"{source}/{profile}/2", "reason": "missing"},
+                      report["sections"]["roi_calibration_history"]["failed"])
+
+    def test_roi_calibration_history_follows_the_archive_versioning(self):
+        # CalibrationArchive.append() admits only the next version under the
+        # identifier of the first one.
+        self.runtime.seed()
+        source, profile = str(uuid4()), str(uuid4())
+        for rows in (((1, str(uuid4())), (2, str(uuid4()))),
+                     ((1, "same"), (3, "same")),
+                     ((2, str(UUID(int=7))),)):
+            with self.subTest(rows=rows):
+                self.runtime.execute("DELETE FROM roi_calibration_history")
+                for version, identifier in rows:
+                    self.runtime.execute(
+                        "INSERT INTO roi_calibration_history VALUES (?,?,?,?, '{}')",
+                        (source, profile, version, identifier))
+                self.assert_record_refused("roi_calibration_history:invalid_value")
+
+    def test_notification_history_survives_except_its_retention(self):
+        # Every kind, not only hardware integrity (#132): the daily summary
+        # counts these rows and their IDs deduplicate redelivery.
+        from contextlib import nullcontext
+        from app.audit.store import DEFAULT_RETENTION
+        from app.monitoring.store import NotificationEventStore
+        from app.notifications.service import NotificationEvent, NotificationKind
+        from app.notifications.slack import DeliveryResult
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        events = NotificationEventStore(connection, nullcontext)
+        made = {}
+        for label, kind, age, delivery in (
+                ("movement", NotificationKind.SERVER_MOVEMENT, timedelta(days=1),
+                 DeliveryResult.PENDING),
+                ("tamper", NotificationKind.CAMERA_TAMPER, timedelta(days=2),
+                 DeliveryResult.SUPPRESSED),
+                ("trust", NotificationKind.CAPTURE_TRUST_WARNING, timedelta(days=3),
+                 DeliveryResult.SUPPRESSED),
+                ("old", NotificationKind.RECORDING_HEALTH_WARNING, timedelta(days=91),
+                 DeliveryResult.SUPPRESSED),
+                ("at-cutoff", NotificationKind.RECORDING_HEALTH_WARNING, DEFAULT_RETENTION,
+                 DeliveryResult.SUPPRESSED)):
+            event = NotificationEvent(kind, self.now - age, label == "movement",
+                                      delivery=delivery)
+            events.upsert(event)
+            made[label] = str(event.event_id)
+        _, baseline = self.record()
+        # The real retention at the verify time and a completed delivery
+        # (the declared mutable delivery result).
+        self.assertEqual(events.expire(self.now, DEFAULT_RETENTION), 1)
+        events.upsert(NotificationEvent(NotificationKind.SERVER_MOVEMENT,
+                                        self.now - timedelta(days=1), True,
+                                        event_id=UUID(made["movement"]),
+                                        delivery=DeliveryResult.SENT))
+        code, report, _ = self.verify(baseline)
+        section = report["sections"]["notification_events"]
+        self.assertEqual(code, inventory.EXIT_PRESERVED, section)
+        self.assertEqual(section["retention_expired"], [made["old"]])
+        self.assertIn(made["at-cutoff"], section["preserved"])
+        self.assertIn(made["movement"], section["preserved"])
+        # A lost recent fault and a rewritten kind / time / flag are failures.
+        self.runtime.execute("DELETE FROM notification_events WHERE event_id=?",
+                             (made["tamper"],))
+        self.runtime.execute("UPDATE notification_events SET confirmed=0 WHERE event_id=?",
+                             (made["movement"],))
+        self.runtime.execute("UPDATE notification_events SET kind='camera_tamper' "
+                             "WHERE event_id=?", (made["trust"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(sorted(report["sections"]["notification_events"]["failed"],
+                                key=lambda item: item["id"]),
+                         sorted([{"id": made["tamper"], "reason": "missing"},
+                                 {"id": made["movement"], "reason": "changed"},
+                                 {"id": made["trust"], "reason": "changed"}],
+                                key=lambda item: item["id"]))
+
+    def test_notification_event_values_are_checked(self):
+        self.runtime.seed()
+        for values in (("not-a-uuid", "camera_tamper", "2026-01-01T00:00:00+00:00"),
+                       (str(uuid4()), "synthetic-kind", "2026-01-01T00:00:00+00:00"),
+                       (str(uuid4()), "camera_tamper", "2026-01-01 00:00:00")):
+            with self.subTest(values=values):
+                self.runtime.execute("DELETE FROM notification_events")
+                self.runtime.execute("INSERT INTO notification_events VALUES (?,?,?,0,'sent')",
+                                     values)
+                self.assert_record_refused("notification_events:invalid_value")
+
+    def test_recomputed_status_rows_survive_and_stay_readable(self):
+        from contextlib import nullcontext
+        from app.integrity.model import Finding, Kind, State
+        from app.integrity.store import IntegrityOutboxFull, IntegrityStore
+        from app.media.health.service import HealthResult, HealthState, Stage
+        from app.monitoring.store import RecordingHealthStatusStore
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        integrity = IntegrityStore(connection, reservation=nullcontext, max_pending_events=1)
+        health = RecordingHealthStatusStore(connection, nullcontext)
+        warning = (Finding(Kind.GPU, State.NEW_DEVICE, "synthetic"),)
+        integrity.record(warning, self.now - timedelta(hours=2))
+        # The outbox is full: the second warning coalesces into overflow and
+        # the status row says delivery is blocked.
+        with self.assertRaises(IntegrityOutboxFull):
+            integrity.record((Finding(Kind.CPU, State.NEW_DEVICE, "synthetic"),),
+                             self.now - timedelta(hours=1))
+        health.record(HealthResult(HealthState.OK, ()), self.now - timedelta(hours=1))
+        _, baseline = self.record()
+        # The daily recomputation rewrites both rows (declared mutable).
+        health.record(HealthResult(HealthState.FAILED, (Stage.WRITE,)), self.now)
+        code, report, _ = self.verify(baseline)
+        section = report["sections"]["status_rows"]
+        self.assertEqual(code, inventory.EXIT_PRESERVED, section)
+        self.assertEqual(section["preserved"], ["integrity_status", "recording_health_status"])
+        # delivery_blocked cleared while an overflow slot remains hides the
+        # blocked delivery: invalid on the current state.
+        self.runtime.execute("UPDATE integrity_status SET delivery_blocked=0")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["status_rows"]["failed"],
+                         [{"id": "integrity_status", "reason": "invalid_value"}])
+        self.runtime.execute("UPDATE integrity_status SET delivery_blocked=1")
+        for statement in ("UPDATE recording_health_status SET stages='[\"SYNTHETIC\"]'",
+                          "UPDATE integrity_status SET findings='[{\"kind\":\"GPU\"}]'"):
+            with self.subTest(statement=statement):
+                self.runtime.execute(statement)
+                self.assert_record_refused("status_rows:invalid_value")
+        # A status row lost since the record is a failure.
+        self.runtime.execute("DELETE FROM integrity_status")
+        self.runtime.execute("DELETE FROM recording_health_status")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["status_rows"]["failed"],
+                         [{"id": "integrity_status", "reason": "missing"},
+                          {"id": "recording_health_status", "reason": "missing"}])
+
+    def test_corrupt_recording_never_makes_coverage_present(self):
+        # #132: a recording whose segment already failed its catalog digest,
+        # byte length or single hard link at record time is no evidence.
+        seeded = self.runtime.seed()
+        self.assertEqual(inventory.collect(self.runtime.root)["coverage"]["ordinary_recording"],
+                         "present")
+        path = self.runtime.segment_path(seeded["ordinary"])
+        os.link(path, self.base / "second-link.seg")
+        self.assertEqual(inventory.collect(self.runtime.root)["coverage"]["ordinary_recording"],
+                         "empty")
+
+    def test_a_shared_segment_file_is_hashed_once(self):
+        # Overlapping recordings link the same segment; it is read once per
+        # run, however many recordings link it (#132).
+        seeded = self.runtime.seed()
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            source, segment = db.execute(
+                "SELECT r.source_id, l.segment_id FROM recordings r JOIN recording_links l "
+                "ON l.recording_id = r.id WHERE r.id=?", (seeded["ordinary"],)).fetchone()
+        extra = []
+        for _ in range(3):
+            recording_id = str(uuid4())
+            extra.append(recording_id)
+            self.runtime.execute(
+                "INSERT INTO recordings (id, source_id, start_ms, target_end_ms, ended_ms, "
+                "status, critical, starred) VALUES (?, ?, 0, 10000, 10000, 'complete', 0, 0)",
+                (recording_id, source))
+            self.runtime.execute("INSERT INTO recording_links VALUES (?, ?)",
+                                 (recording_id, segment))
+        hashed = Counter()
+        digest = inventory._file_digest
+
+        def counting(directory, segment_id):
+            hashed[segment_id] += 1
+            return digest(directory, segment_id)
+        with mock.patch.object(inventory, "_file_digest", counting):
+            collected = inventory.collect(self.runtime.root)
+        self.assertEqual(hashed[segment], 1)
+        self.assertTrue(all(hashed[key] == 1 for key in hashed), hashed)
+        for recording_id in extra + [seeded["ordinary"]]:
+            item = collected["recordings"][recording_id]["segments"][0]
+            self.assertTrue(item["catalog_match"])
+        code, baseline = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        for recording_id in extra:
+            self.assertIn(recording_id, report["sections"]["recordings"]["preserved"])
+
+    # -- PR #215 review (Codex P1 / P1 / P2, Claude suggestion) --------------
+
+    def test_capacity_eviction_is_no_evidence_for_a_lost_source_marker(self):
+        # Codex P1: the byte / count eviction can empty the spool before a
+        # marker while RecordingStore._trim() deletes markers only by its
+        # duration cutoff. A marker lost with no publication moving that
+        # cutoff past it and no release is a loss, not a trim.
+        import zlib
+        from app.media.recording import Segment
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        store = self._recording_store(connection, max_spool_segments=1)
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+        source = uuid4()
+        store.append(Segment(source, uuid4(), 0, base, base + 10_000,
+                             "synthetic", "deflate", payload))
+        stream = uuid4()
+        store.append(Segment(source, stream, 0, base + 10_000, base + 20_000,
+                             "synthetic", "deflate", payload))
+        marker = (str(source), base + 10_000, base + 10_000, "stream_discontinuity")
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            # The capacity eviction left only the segment after the marker.
+            self.assertEqual(db.execute(
+                "SELECT start_ms FROM recording_segments WHERE source_id=? AND spool=1",
+                (str(source),)).fetchall(), [(base + 10_000,)])
+            self.assertEqual(db.execute(
+                "SELECT * FROM recording_source_discontinuities").fetchall(), [marker])
+        _, baseline = self.record()
+        self.runtime.execute("DELETE FROM recording_source_discontinuities")
+        code, report, _ = self.verify(baseline)
+        section = report["sections"]["recording_source_discontinuities"]
+        self.assertEqual(code, inventory.EXIT_FAILED, section)
+        self.assertEqual(section["failed"],
+                         [{"id": f"marker:{source}:{base + 10_000}:{base + 10_000}",
+                           "reason": "missing"}])
+        self.assertEqual(section["trimmed"], [])
+        # A publication short of the cutoff (marker end + 30 s) leaves it.
+        self.runtime.execute("INSERT INTO recording_source_discontinuities VALUES (?,?,?,?)",
+                             marker)
+        store.append(Segment(source, stream, 1, base + 20_000, base + 39_999,
+                             "synthetic", "deflate", payload))
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            self.assertEqual(db.execute(
+                "SELECT * FROM recording_source_discontinuities").fetchall(), [marker])
+        self.runtime.execute("DELETE FROM recording_source_discontinuities")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        # The publication reaching the cutoff: the real trim deletes it.
+        self.runtime.execute("INSERT INTO recording_source_discontinuities VALUES (?,?,?,?)",
+                             marker)
+        store.append(Segment(source, stream, 2, base + 39_999, base + 40_000,
+                             "synthetic", "deflate", payload))
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM recording_source_discontinuities").fetchone()[0], 0)
+        code, report, _ = self.verify(baseline)
+        section = report["sections"]["recording_source_discontinuities"]
+        self.assertEqual(code, inventory.EXIT_PRESERVED, section)
+        self.assertEqual(len(section["trimmed"]), 1)
+
+    def test_pre_roll_cutoff_is_the_store_default_main_cannot_configure(self):
+        from app.media.recording.model import Limits
+        from app.monitoring.config import RECORDING_LIMIT_FIELDS
+        self.assertNotIn("pre_roll_ms", RECORDING_LIMIT_FIELDS)
+        self.assertEqual(inventory._PRE_ROLL_MS,
+                         Limits(1, 1, 1, 1, 1, 1).pre_roll_ms)
+
+    def test_roi_rows_must_read_back_through_the_archive(self):
+        # Codex P1: an appended version with the right number and identifier
+        # but metadata CalibrationArchive.load() rejects leaves the detector
+        # unable to resume; it is invalid, not appended.
+        from app.detection.roi.calibration import calibration_metadata
+        self.runtime.seed()
+        source, profile, identifier = str(uuid4()), str(uuid4()), str(uuid4())
+        archive, calibration = self._roi_archive(source, profile, identifier)
+        archive.append(calibration(1))
+        _, baseline = self.record()
+        other = calibration_metadata(calibration(3))
+        other_source = dict(other, source_id=str(uuid4()))
+        for metadata in ("{not json", json.dumps({"synthetic": "roi-metadata-marker"}),
+                         json.dumps(other, sort_keys=True),
+                         json.dumps(other_source, sort_keys=True)):
+            with self.subTest(metadata=metadata[:40]):
+                self.runtime.execute("DELETE FROM roi_calibration_history WHERE version=2")
+                self.runtime.execute("INSERT INTO roi_calibration_history VALUES (?,?,2,?,?)",
+                                     (source, profile, identifier, metadata))
+                with self.assertRaises(ValueError):
+                    archive.load(UUID(source), UUID(profile))
+                code, report, _ = self.verify(baseline)
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertIn({"id": f"{source}/{profile}/2", "reason": "invalid_value"},
+                              report["sections"]["roi_calibration_history"]["failed"])
+                self.assert_record_refused("roi_calibration_history:invalid_value")
+        self.runtime.execute("DELETE FROM roi_calibration_history WHERE version=2")
+        archive.append(calibration(2))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"])
+
+    def test_future_notification_time_fails(self):
+        # Codex P2: a far-future row would be counted by every daily summary
+        # and kept by expire() long past its retention.
+        from contextlib import nullcontext
+        from app.monitoring.store import NotificationEventStore
+        from app.notifications.service import NotificationEvent, NotificationKind
+        from app.notifications.slack import DeliveryResult
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        events = NotificationEventStore(connection, nullcontext)
+        _, baseline = self.record()
+        skewed = NotificationEvent(NotificationKind.CAMERA_TAMPER,
+                                   self.now + timedelta(minutes=4), False,
+                                   delivery=DeliveryResult.SUPPRESSED)
+        events.upsert(skewed)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"])
+        future = NotificationEvent(NotificationKind.CAMERA_TAMPER,
+                                   self.now + timedelta(days=365), False,
+                                   delivery=DeliveryResult.SUPPRESSED)
+        events.upsert(future)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["notification_events"]["failed"],
+                         [{"id": str(future.event_id), "reason": "future_time"}])
+        self.assert_record_refused("notification_events:future_time")
+
+    def test_spool_segment_also_linked_is_hashed_once_and_rechecked_uncached(self):
+        # Claude review suggestion: _hash_spool() reuses the digest
+        # _hash_recordings() read for a spool segment also linked into a
+        # recording, and re-reads a mismatch without that cache.
+        seeded = self.runtime.seed()
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            segment = db.execute("SELECT segment_id FROM recording_links WHERE recording_id=?",
+                                 (seeded["ordinary"],)).fetchone()[0]
+        self.runtime.execute("UPDATE recording_segments SET spool=1 WHERE id=?", (segment,))
+        hashed = Counter()
+        digest = inventory._file_digest
+
+        def counting(directory, segment_id):
+            hashed[segment_id] += 1
+            return digest(directory, segment_id)
+        with mock.patch.object(inventory, "_file_digest", counting):
+            collected = inventory.collect(self.runtime.root)
+        self.assertIn(segment, collected["spool_segments"])
+        self.assertTrue(collected["spool_segments"][segment]["catalog_match"])
+        self.assertEqual(hashed[segment], 1)
+        # A cached observation that does not match is read again, uncached.
+        hashed.clear()
+        path = self.runtime.segment_path(seeded["ordinary"])
+        original = path.read_bytes()
+        path.write_bytes(original + b"x")
+        with mock.patch.object(inventory, "_file_digest", counting):
+            spool = {segment: {"_catalog": [hashlib.sha256(original).hexdigest(),
+                                            len(original)],
+                               "source_id": None}}
+            cache = {segment: inventory._file_digest(path.parent, segment)}
+            hashed.clear()
+            still = inventory._hash_spool(spool, path.parent, self.runtime.database, cache)
+        self.assertEqual(still, [segment])
+        self.assertFalse(spool[segment]["catalog_match"])
+        self.assertEqual(hashed[segment], 1)
 
 
 class DocumentedCommandTests(unittest.TestCase):

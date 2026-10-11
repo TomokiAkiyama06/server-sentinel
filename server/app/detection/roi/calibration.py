@@ -137,6 +137,31 @@ def _decode(metadata) -> CalibrationRecord:
                              reference["sha256"], Policy(**policy))
 
 
+def decode_history_row(row) -> CalibrationRecord:
+    """Read one stored ``COLUMNS`` row back exactly as ``load()`` does.
+
+    The lifecycle inventory (#132) checks every stored version through this
+    same function, so a row it accepts is one ``load()`` can return.
+    """
+    try:
+        record = _decode(row[4])
+    except Exception:
+        # A stored record that cannot be decoded is corrupt history, not an
+        # unavailable database. Reporting it as unavailable would hide an
+        # integrity problem behind a transient-looking failure; the stored
+        # content stays out of the message either way.
+        raise ValueError("calibration history record is unreadable") from None
+    # The decoded provenance must be the row that was looked up. Logical
+    # corruption or a manual recovery can leave another calibration's
+    # metadata under these keys, and the embedded identities would then
+    # validate against themselves, binding a detector to a source or
+    # profile the caller never asked for.
+    if (str(record.source_id), str(record.profile_id), record.version,
+            str(record.identifier)) != tuple(row[:4]):
+        raise ValueError("calibration history record does not match its key")
+    return record
+
+
 class CalibrationArchive:
     """Append-only versions in a caller-owned private deployment SQLite database.
 
@@ -202,23 +227,7 @@ class CalibrationArchive:
             raise RuntimeError("calibration archive unavailable") from None
         if row is None:
             return None
-        try:
-            record = _decode(row[4])
-        except Exception:
-            # A stored record that cannot be decoded is corrupt history, not an
-            # unavailable database. Reporting it as unavailable would hide an
-            # integrity problem behind a transient-looking failure; the stored
-            # content stays out of the message either way.
-            raise ValueError("calibration history record is unreadable") from None
-        # The decoded provenance must be the row that was looked up. Logical
-        # corruption or a manual recovery can leave another calibration's
-        # metadata under these keys, and the embedded identities would then
-        # validate against themselves, binding a detector to a source or
-        # profile the caller never asked for.
-        if (str(record.source_id), str(record.profile_id), record.version,
-                str(record.identifier)) != tuple(row[:4]):
-            raise ValueError("calibration history record does not match its key")
-        return record
+        return decode_history_row(row)
 
 
 class OwnerCalibrationOperations:
