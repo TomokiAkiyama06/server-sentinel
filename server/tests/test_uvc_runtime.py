@@ -1147,6 +1147,41 @@ class RuntimeLifecycleTests(RuntimeFixture):
                 self.assertIn("src1: offline (synthetic-closed)", text)
                 self.assertEqual([], log.drain())
 
+    def test_manual_watch_helper_reports_negotiated_profile_per_source(self):
+        # Issue #193 / MANUAL_TEST P-5: each per-second line carries the
+        # registry negotiated profile so a person can see that it survives a
+        # video_frame_stalled degradation and the recovery to online.
+        import importlib.util
+        script = Path(__file__).resolve().parents[2] / "scripts" / "manual" / "uvc_watch.py"
+        spec = importlib.util.spec_from_file_location("uvc_watch_under_test", script)
+        watch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(watch)
+        first, second = self.source("src1"), self.source("src2")
+        ids = [first.id, second.id]
+        counts = {first.id: 30, second.id: 0}
+        before = {first.id: 0, second.id: 0}
+
+        def line():
+            return watch.source_parts(self.registry, ids, counts, before)
+
+        initial = first.health_state.value
+        self.assertEqual([f"src1={initial} 30fps profile=none",
+                          f"src2={initial} 0fps profile=none"], line())
+        self.registry.update_source_health(
+            first.id, health_state=SourceHealthState.ONLINE,
+            negotiated_capture_profile=CaptureProfile(1920, 1080, 30.0, "MJPG"))
+        self.registry.update_source_health(
+            second.id, health_state=SourceHealthState.ONLINE,
+            negotiated_capture_profile=CaptureProfile(640, 480, 29.97, None))
+        self.assertEqual(["src1=online 30fps profile=1920x1080@30/MJPG",
+                          "src2=online 0fps profile=640x480@29.97/?"], line())
+        # A stall keeps the stored profile (the adapter leaves it unset).
+        self.registry.update_source_health(second.id, health_state=SourceHealthState.DEGRADED)
+        self.assertEqual("src2=degraded 0fps profile=640x480@29.97/?", line()[1])
+        self.registry.update_source_health(
+            first.id, health_state=SourceHealthState.OFFLINE, negotiated_capture_profile=None)
+        self.assertEqual("src1=offline 30fps profile=none", line()[0])
+
     def test_frame_rate_does_not_write_registry_per_frame(self):
         source = self.source()
         runtime = self.runtime(source.id)
