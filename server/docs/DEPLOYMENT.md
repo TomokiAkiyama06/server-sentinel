@@ -987,8 +987,13 @@ sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
   replaced while the command waits for `REVOKE` is refused with
   `database_rejected`). One exception: `committed_verification_failed`
   means the revocation and its audit record were already committed, but
-  re-verifying the database file afterwards failed; do not repeat the
-  command, run `list` to confirm the result and check the state directory.
+  re-verifying the database file afterwards failed (it was renamed or
+  replaced meanwhile), so the revocation may sit only in the old file and
+  not in the database now at the path. Run `list`: if the target is still
+  not revoked, investigate the state directory and re-run the command. A
+  revocation that did reach that database is refused as
+  `principal_already_revoked` / `credential_already_revoked`, so re-running
+  is safe.
 - Each revocation commits with its security audit record
   (`revoke_principal` / `revoke_principal_credential`, the principal's
   logical UUID only). It does not change the Tailnet: removing a device or

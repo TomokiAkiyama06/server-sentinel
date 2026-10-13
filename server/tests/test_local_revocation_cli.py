@@ -464,6 +464,10 @@ class RevocationTests(LocalAdministrationFixture):
         self.assertEqual((code, stdout), (2, ""))
         self.assertIn("refused: committed_verification_failed\n", stderr)
         self.assertIn("the revocation was committed", stderr)
+        # Issue #243 item 1: re-checked with 'list' and re-run, not "do not repeat it".
+        self.assertIn("run 'list': if the target is still not revoked, investigate the state directory "
+                      "and re-run the command", stderr)
+        self.assertNotIn("do not repeat", stderr)
         # Committed with its audit record before the verification failed.
         self.assertEqual(self.rows(AUDIT), before + [
             ("owner", "revoke_principal", "principal", str(self.viewer.id), "succeeded")])

@@ -62,10 +62,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
+import logging
 import secrets
+import threading
 from typing import Callable, ContextManager, Mapping, Protocol
 from uuid import UUID
 
+from app.logging import Event
 from . import webauthn
 from .model import AccessValidationError, Credential, CredentialStatus, Principal, PrincipalStatus, utc_time
 from .store import AccessStore, DeviceBoundCredentialRequired, MAX_CHALLENGE_LIFETIME, StepUpRequired
@@ -167,6 +170,12 @@ class PasskeyCeremonies:
         self._random = random_bytes
         # Bounded health only: an Owner finding that could not be delivered.
         self.finding_delivery_failed = 0
+        # Bounded health only (Issue #238 item 5): a detected credential
+        # finding whose write failed (for example a refused storage admission
+        # under STORAGE_HARD_STOP), so neither its audit record nor the Owner
+        # notification exists. Counted and logged value-free.
+        self.unrecorded_findings = 0
+        self._unrecorded_lock = threading.Lock()
 
     def _now(self) -> datetime:
         return utc_time(self._clock())
@@ -180,16 +189,30 @@ class PasskeyCeremonies:
     def _timeout_ms(self) -> int:
         return int(self.challenge_lifetime.total_seconds() * 1000)
 
-    def _record_finding(self, finding: _Finding) -> None:
+    def _record_finding(self, finding: _Finding) -> bool:
         """Commit a credential finding: the credential mark (with its session
         invalidation) or the counter-regression record, each with its audit
         record. The caller decides under which gate this runs; the Owner
-        notification (``_report``) is sent only after it committed."""
+        notification (``_report``) is sent only after it committed, and only
+        when this returns ``True``: a credential another attempt already
+        marked writes nothing and returns ``False`` (Issue #238 item 2)."""
         if finding.kind is CredentialFinding.BACKUP_ELIGIBILITY_CHANGED:
-            self.store.mark_credential_inconsistent(finding.credential_id, finding.principal_id,
-                                                    at=self._now())
-        else:
-            self.store.record_sign_count_regression(finding.principal_id)
+            return self.store.mark_credential_inconsistent(finding.credential_id, finding.principal_id,
+                                                           at=self._now())
+        self.store.record_sign_count_regression(finding.principal_id)
+        return True
+
+    def _note_unrecorded_finding(self) -> None:
+        """Count a finding whose write failed; log the value-free event at 1, 2, 4, 8, ...
+
+        Nothing about the finding is logged: no kind, principal, credential,
+        challenge or reason, only the event name.
+        """
+        with self._unrecorded_lock:
+            self.unrecorded_findings += 1
+            count = self.unrecorded_findings
+        if count & (count - 1) == 0:
+            logging.getLogger(__name__).warning(Event.CREDENTIAL_FINDING_UNRECORDED)
 
     def _report(self, kind: CredentialFinding, principal_id: UUID) -> None:
         if self.findings is None:
@@ -353,8 +376,16 @@ class PasskeyCeremonies:
                 # Sign-in keeps its behaviour: the challenge is already
                 # consumed and the finding is recorded at once, so a cloned
                 # or re-provisioned credential is never lost to a close.
-                self._record_finding(finding)
-                self._report(finding.kind, finding.principal_id)
+                # A credential a racing attempt already marked is not
+                # notified twice (Issue #238 item 2); a failed write is
+                # counted value-free (item 5).
+                try:
+                    recorded = self._record_finding(finding)
+                except Exception:
+                    self._note_unrecorded_finding()
+                    raise
+                if recorded:
+                    self._report(finding.kind, finding.principal_id)
                 raise CeremonyDenied()
             token = self._random(SESSION_TOKEN_BYTES)
             if not isinstance(token, bytes) or len(token) != SESSION_TOKEN_BYTES:
@@ -473,6 +504,11 @@ class PasskeyCeremonies:
         the challenge: it is consumed in its own transaction, again inside
         ``admit(epoch)``, so it is single use exactly as before; only if the
         gate refuses that consumption too does it stay pending until expiry.
+        That consumption is scoped to the request's own current session
+        (Issue #238 item 4): a challenge bound to another session, even of
+        the same Owner, is left pending, and a request without a current
+        session consumes nothing (availability only; the challenge still
+        verifies only for its own session and expires).
 
         A verified assertion with a credential finding (changed backup
         eligibility, or a counter that does not advance) is refused too. Its
@@ -491,7 +527,12 @@ class PasskeyCeremonies:
         back the DELETE with the finding; the challenge is then spent on its
         own under a new ``admit(epoch)``, so it stays single use, and the
         unchanged stored credential lets the next assertion detect the
-        finding again (PR #236 review).
+        finding again (PR #236 review); such a failure is counted in
+        ``unrecorded_findings`` and logged value-free
+        (``credential_finding_unrecorded``, Issue #238 item 5). A changed
+        backup eligibility that another session's step-up (or a sign-in)
+        already marked spends the challenge but records and notifies nothing
+        more (Issue #238 item 2).
         """
         # First: a close after this point refuses the commit (Issue #144).
         try:
@@ -499,14 +540,20 @@ class PasskeyCeremonies:
         except Exception:
             raise CeremonyDenied() from None
         digest = None
+        own_session = None
         gate_refused = False
         spent = False
+        finding_failed = False
         try:
             at = self._now()
             claims = webauthn.assertion_claims(credential, self.rp)
             digest = _digest(claims.challenge)
             bound_session = self.store.pending_step_up_challenge(digest)
             session = self.store.current_session(token, proxy_identity, at=at)
+            if session is not None:
+                # A refusal spends only a challenge of this request's own
+                # session (Issue #238 item 4).
+                own_session = session.session_id
             if (session is None or bound_session is None or bound_session != session.session_id
                     or claims.credential_id != session.credential_id):
                 raise CeremonyDenied()
@@ -529,10 +576,12 @@ class PasskeyCeremonies:
                 gate_refused = True
                 with self.session_gate.admit(epoch):
                     gate_refused = False
+                    finding_failed = True
                     recorded = self.store.record_step_up_finding(
                         digest, session.session_id,
                         backup_eligibility_changed=finding.kind is CredentialFinding.BACKUP_ELIGIBILITY_CHANGED,
                         credential_id=finding.credential_id, principal_id=finding.principal_id)
+                    finding_failed = False
                     spent = True
                 if recorded:
                     self._report(finding.kind, finding.principal_id)
@@ -546,19 +595,26 @@ class PasskeyCeremonies:
                     backup_state=verified.backup_state,
                     step_up_session_id=session.session_id, step_up_challenge=digest)
         except Exception:
-            if digest is not None and not gate_refused and not spent:
-                self._spend_step_up_challenge(digest, epoch)
+            if finding_failed:
+                # The finding's transaction failed: no audit record and no
+                # notification exist for it (Issue #238 item 5).
+                self._note_unrecorded_finding()
+            if digest is not None and own_session is not None and not gate_refused and not spent:
+                self._spend_step_up_challenge(digest, own_session, epoch)
             raise CeremonyDenied() from None
 
-    def _spend_step_up_challenge(self, digest: bytes, epoch: int) -> None:
+    def _spend_step_up_challenge(self, digest: bytes, session_id: UUID, epoch: int) -> None:
         """Consume a refused step-up's challenge under ``admit(epoch)``; best effort.
 
         Lock order gate -> storage admission -> SQLite, as at every commit. A
         gate refusal here consumes nothing; the challenge then expires
-        unused (a close that revokes sessions deletes it at once).
+        unused (a close that revokes sessions deletes it at once). Only a
+        challenge bound to ``session_id``, the refused request's own current
+        session, is consumed: another session of the same Owner that learned
+        the value cannot spend it (Issue #238 item 4, availability only).
         """
         try:
             with self.session_gate.admit(epoch):
-                self.store.consume_challenge(digest, "step_up")
+                self.store.consume_challenge(digest, "step_up", session_id=session_id)
         except Exception:
             pass

@@ -999,7 +999,12 @@ before. Every other refusal (bad signature, missing UP/UV, rpId hash, counter
 or BE/BS, another credential or session, an unknown or expired challenge, a
 commit refused inside its transaction) spends the challenge through `consume_challenge` in its own transaction, again inside
 `admit(epoch)`, so it stays single use; only when the gate refuses that
-consumption too is it left to expire. A verified assertion with a credential
+consumption too is it left to expire. That consumption is scoped to the
+request's own current session (`consume_challenge(..., "step_up",
+session_id=...)`, Issue #238 item 4): a challenge bound to another session,
+even one of the same Owner that learned the value, is left pending, and a
+request without a current session consumes nothing (availability only; the
+challenge still verifies only for its own session and expires). A verified assertion with a credential
 finding (backup eligibility changed: the credential is marked inconsistent and
 its sessions end; or a counter that does not advance: a regression record)
 is refused too, but `_verified_assertion` only returns the finding, signature
@@ -1016,7 +1021,12 @@ same regressing answer recorded the finding first (one challenge yields at
 most one finding and one notification), or a new options request replaced
 the challenge after the pending read — or the removed row had
 expired, nothing else is written: no mark, no regression record, no audit
-record and no Owner notification, and the finish is refused. The Owner
+record and no Owner notification, and the finish is refused. A changed backup
+eligibility whose credential is already marked (another session's step-up or
+a sign-in of the same change committed first) spends the challenge but
+writes, audits and notifies nothing more, so the Owner is notified once
+(Issue #238 item 2); sign-in likewise notifies only when its own mark
+changed the credential. The Owner
 notification is sent only after a commit that recorded the finding. A gate
 refusal there records, invalidates and notifies nothing and leaves the
 challenge pending. If the transaction itself fails (for example a refused
@@ -1025,7 +1035,12 @@ the refusal then spends the challenge through `consume_challenge` under a new
 `admit(epoch)` (the gate lock is not reentrant, so this runs after the first
 admission is released), so the challenge stays single use while the unchanged
 stored credential lets the next assertion detect the finding again; if the
-gate refuses that consumption too, it expires unused. Sign-in
+gate refuses that consumption too, it expires unused. A finding whose write
+failed (step-up or sign-in) leaves no audit record or notification; it is
+counted in the value-free `PasskeyCeremonies.unrecorded_findings`, and
+`credential_finding_unrecorded` is logged on the first failure and each power
+of two, with no kind, principal, credential, challenge or reason (Issue #238
+item 5). Sign-in
 (`finish_authentication`) keeps recording a finding at once: its challenge is
 already consumed before verification. Each refused finish increments the value-free
 `HumanAccess.refused_step_ups`, and `owner_step_up_refused` is logged on the
@@ -1388,8 +1403,8 @@ deployment steps are in `server/docs/DEPLOYMENT.md` ("Emergency revocation").
   others, the rest counted on a `revoked ... not shown` line. The principals
   not revoked are bounded by the store (at most 64, S4-8). The credentials
   not revoked have no store cap; each is a separate redemption of an
-  Owner-issued code (at most one pending per principal), so they grow only
-  by Owner action, and hiding one would leave an active passkey the
+  Owner-issued or local bootstrap/recover code (at most one pending per
+  principal), so they grow only by Owner or local operator action, and hiding one would leave an active passkey the
   emergency command could not name.
 - `revoke-principal <principal id>` revokes the person: every credential
   (each on all the devices it synced to), every pending invitation code and
@@ -1417,7 +1432,11 @@ deployment steps are in `server/docs/DEPLOYMENT.md` ("Emergency revocation").
   One refusal comes after the commit: `committed_verification_failed`
   means the revocation and its audit record are already committed, but
   re-verifying the pinned database file afterwards failed (renamed or
-  replaced meanwhile); run `list` and check the state directory. A file
+  replaced meanwhile), so the revocation may sit only in the old file. Run
+  `list`: if the target is still not revoked, investigate the state
+  directory and re-run the command (a revocation that did reach that
+  database is refused as `*_already_revoked`, so re-running is safe; Issue
+  #243 item 1). A file
   renamed or replaced while the command waits for the confirmation is
   refused before the commit (`database_rejected`, nothing changed).
 - Outside the gate. Like `recover` they cannot take the serving process's
