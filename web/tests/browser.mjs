@@ -3,15 +3,16 @@ import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { launchChrome, pageFor } from './chrome.mjs';
 import { compile } from './compile.mjs';
+import { APP_CSP } from '../scripts/policy.mjs';
 
 await compile('tests/harness.tsx', 'build/harness.js', 'browser');
 const origin = 'http://server-sentinel.test';
-const html = await readFile('dist/index.html', 'utf8');
+const html = await readFile('dist/app/index.html', 'utf8');
 const assets = new Map([
-  ['/assets/app.js', [await readFile('dist/assets/app.js'), 'text/javascript']],
-  ['/assets/app.css', [await readFile('dist/assets/app.css'), 'text/css']],
-  ['/assets/icon.svg', [await readFile('dist/assets/icon.svg'), 'image/svg+xml']],
-  ['/assets/harness.js', [await readFile('build/harness.js'), 'text/javascript']],
+  ['/app/app.js', [await readFile('dist/app/app.js'), 'text/javascript']],
+  ['/app/app.css', [await readFile('dist/app/app.css'), 'text/css']],
+  ['/app/icon.svg', [await readFile('dist/app/icon.svg'), 'image/svg+xml']],
+  ['/app/harness.js', [await readFile('build/harness.js'), 'text/javascript']],
 ]);
 const browser = await launchChrome();
 const sizes = [
@@ -111,16 +112,18 @@ async function scenario(viewport, { production = false, status = 200, session = 
   async function route({ requestId, request }) {
     const url = new URL(request.url);
     requests.push(url.pathname);
-    async function fulfill(body, contentType, responseCode = 200) {
+    async function fulfill(body, contentType, responseCode = 200, headers = []) {
       await page.command('Fetch.fulfillRequest', { requestId, responseCode,
-        responseHeaders: [{ name: 'Content-Type', value: contentType }], body: Buffer.from(body).toString('base64') });
+        responseHeaders: [{ name: 'Content-Type', value: contentType }, ...headers], body: Buffer.from(body).toString('base64') });
     }
     if (url.origin !== origin || request.method !== 'GET') {
       unexpected.push('unexpected origin or method');
       await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }); return;
     }
-    if (url.pathname === '/') {
-      await fulfill(production ? html : html.replace('/assets/app.js', '/assets/harness.js'), 'text/html'); return;
+    if (url.pathname === '/app/') {
+      // The Main Server sends the dashboard policy as a header (S5b); so does this test.
+      await fulfill(production ? html : html.replace('/app/app.js', '/app/harness.js'), 'text/html', 200,
+        [{ name: 'Content-Security-Policy', value: APP_CSP }]); return;
     }
     if (assets.has(url.pathname)) { await fulfill(...assets.get(url.pathname)); return; }
     if (!production && url.pathname === '/api/mock/session') {
@@ -168,7 +171,7 @@ async function scenario(viewport, { production = false, status = 200, session = 
   }));
   await page.command('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
   try {
-    const url = new URL(origin);
+    const url = new URL('/app/', origin);
     if (optIn) for (const key of ['telemetryOptIn', 'analyticsEnabled', 'crashUpload', 'trackingOptIn']) url.searchParams.set(key, 'true');
     await page.command('Page.navigate', { url: url.href });
     await assertions(page, requests);

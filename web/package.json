@@ -11,7 +11,7 @@
     "lint": "tsc --noEmit && node scripts/lint.mjs",
     "build": "node scripts/build.mjs",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "test:browser": "node tests/browser.mjs",
+    "test:browser": "node tests/browser.mjs && node tests/signin_browser.mjs",
     "preview": "node scripts/preview.mjs"
   },
   "dependencies": {
