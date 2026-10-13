@@ -93,6 +93,24 @@ class CIWorkflowTests(unittest.TestCase):
         dockerfile = (ROOT / "agent/Dockerfile.ci").read_text(encoding="utf-8")
         self.assertRegex(dockerfile, r"^FROM python:[0-9.]+-slim-bookworm@sha256:[0-9a-f]{64}\n")
 
+    def test_server_loader_accepts_the_freshly_built_web_dist(self):
+        # Issue #10 S5b (Codex PR #247): the Main Server loader runs against the
+        # web build this job just produced, and a missing build fails.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        start = workflow.find("\n  web-browser:\n")
+        self.assertNotEqual(-1, start, "web-browser job is missing")
+        end = workflow.find("\n  agent-python-313:\n", start)
+        self.assertNotEqual(-1, end)
+        job = workflow[start:end]
+        build = job.find("          npm run build\n")
+        load = job.find("        run: python -m unittest -v tests.test_web_build_contract\n")
+        self.assertNotEqual(-1, build)
+        self.assertNotEqual(-1, load, "the server asset loader does not run on the web build")
+        self.assertLess(build, load)
+        step = job[job.rfind("      - name:", 0, load):load]
+        self.assertIn("        working-directory: server\n", step)
+        self.assertIn("          WEB_DIST_REQUIRED: '1'\n", step)
+
     def test_agent_checks_run_on_cpython_313_with_the_hashed_lock(self):
         # Issue #127: the Agent declares CPython 3.13, so its lock and unit
         # tests must run on 3.13 and fail rather than test another version.

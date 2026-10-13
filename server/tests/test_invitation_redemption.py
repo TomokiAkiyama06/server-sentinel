@@ -496,7 +496,7 @@ class RedemptionRateLimitTests(RedemptionFixture):
 
 class CompositionTests(RedemptionFixture):
     def test_one_limiter_object_cannot_serve_both(self):
-        fresh = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+        fresh = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
                             ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
                                                          clock=self.ceremony_clock),
                             reservation=self.check)
@@ -510,10 +510,10 @@ class CompositionTests(RedemptionFixture):
         ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
                                        clock=self.ceremony_clock)
         with self.assertRaises(HumanAccessUnavailable):
-            HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store, ceremonies=ceremonies,
+            HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store, ceremonies=ceremonies,
                         reservation=self.check, rate_limiter=shared, redemption_limiter=shared)
         with self.assertRaises(HumanAccessUnavailable):
-            HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store, ceremonies=ceremonies,
+            HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store, ceremonies=ceremonies,
                         reservation=self.check, redemption_limiter=object())
 
 

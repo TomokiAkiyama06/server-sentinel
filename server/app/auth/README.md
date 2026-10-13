@@ -507,9 +507,11 @@ a `HostnameReservationCheck` with every opening input (`opening_configured`:
 hostname resolver, socket owner resolver, own socket table, unprivileged port
 start and session revoker), `PasskeyCeremonies` gated by exactly that check over
 this audited `AccessStore` with a session-binding key, and a relying party
-whose origin is the reserved `https://<hostname>[:<port>]` of the check. Any
+whose origin is the reserved `https://<hostname>[:<port>]` of the check, and
+a verified `WebAssets` set (`assets=`, S5b below). Any
 other combination raises `HumanAccessUnavailable` and the listener stays
-closed. No deployment-file key builds a `HumanAccess` yet.
+closed. `create_app` also refuses a composition whose assets were not loaded
+from `Settings.web_assets_dir`. No deployment-file key builds a `HumanAccess` yet.
 
 Every HTTP request passes, in this order, before any handler runs:
 
@@ -523,7 +525,7 @@ Every HTTP request passes, in this order, before any handler runs:
    checks below before its denial;
 1. reserved secure-context origin: exactly one `Host` equal to the reserved
    authority, and an `Origin`, when present, exactly equal to the reserved
-   origin; an absent `Origin` is accepted only for `GET /api/session` (every
+   origin; an absent `Origin` is accepted only for a `GET` route (every
    mutating route requires it);
 2. trusted-proxy path: the actual transport peer and the local listener
    address are loopback (`Forwarded`/`X-Forwarded-For` are never read), checked
@@ -558,6 +560,8 @@ OpenAPI or error handler is reachable):
 | `POST /api/auth/sign-out` | session (`SESSION`) + exact `Origin` + `X-CSRF-Token` | `204`, `Set-Cookie: __Host-session=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict` |
 | `POST /api/auth/step-up/options` | Owner session (`OWNER_READ`) + exact `Origin` + `X-CSRF-Token` (step-up rate limit) | `PasskeyCeremonies.begin_step_up()` request options (S3, below) |
 | `POST /api/auth/step-up` | the same, and the assertion of the session's own credential (step-up rate limit) | `204`, no body, no cookie (S3, below) |
+| `GET /`, `GET /s.js`, `GET /s.css` | none (`PRE_CREDENTIAL`; the gates above only, no limiter) | the sign-in shell, byte-identical for every caller (S5b, below) |
+| `GET /app/`, `GET /app/<name>` | any active session (`SESSION`, `touch=False`) | the application assets (S5b, below) |
 
 The session route grants nothing and returns only the caller's own role,
 permissions (the Owner holds both) and CSRF token. With sign-out it is the
@@ -778,7 +782,8 @@ echoes it.
   required` and `attestation: "none"`. No camera, recording, timeline,
   product or deployment data.
 - `POST /api/auth/registration`, body `{"code", "credential", "label"?}`
-  (label: 1-64 characters, no control character):
+  (label: 1-64 characters, no control character, no DEL and no lone
+  surrogate):
   `PasskeyCeremonies.finish_registration` consumes the challenge, verifies the
   registration server-side (client data type `webauthn.create`, challenge,
   exact origin, rp id hash, UP and UV, attestation `none` or `packed` self
@@ -1294,6 +1299,112 @@ credential id) are the only values in these URLs.
 - Logs. These routes log nothing; no code, display name, handle,
   credential id or identity reaches a log, a URL other than the path ids
   above, or an audit record.
+
+### Web assets (Issue #10 phase 2 S5b)
+
+Owner decisions D1 (2026-10-11) and S5-1 .. S5-5 (2026-10-14). The Serve
+configuration has exactly one proxy route, to this backend
+(`HostnameReservationConfig.expected_route`), and ADR-0003 forbids a separate
+static host, so the human surface serves the Web build itself.
+
+- Loading (`web_assets.py`). `WebAssets.load(directory)` runs once, when the
+  embedder composes `HumanAccess`; the directory is `Settings.web_assets_dir`
+  (Issue #10 S5c points it at the release's build). It reads
+  `manifest.json` (`{"files": {"<dir>/<name>": {"sha256", "size", "type"}}}`)
+  and refuses, value-free (`WebAssetsUnavailable`, so the composition fails
+  closed), unless the directory holds exactly `manifest.json`, `shell/` and
+  `app/`; `shell/` exactly `index.html`, `s.js` and `s.css`; `app/` at least
+  `index.html` and otherwise flat files whose names fully match
+  `[A-Za-z0-9][A-Za-z0-9.-]{0,63}` (upper case for the build's
+  `app.js.LEGAL.txt` and `*-LICENSE.txt`; the lookup is exact, so another
+  case is a miss); the manifest lists exactly those files; every
+  entry below the directory is opened relative to its parent with
+  `O_NOFOLLOW` and is a regular file or directory (no symlink, FIFO, device
+  or socket; the configured directory itself is resolved once, so a
+  deployment-controlled symlink to a release build works); neither that
+  directory nor anything below it is group- or world-writable and no file
+  has a second hard link (`st_nlink` 1); every extension is
+  `html`, `js`, `css`, `svg` or `txt` and its manifest `type` is exactly
+  that extension's content type (below); every size and SHA-256 matches and
+  every body is UTF-8; and the caps hold (64 files, 8 MiB per file, 32 MiB in
+  all, 64 KiB of manifest). The bytes and their complete header lists are
+  then frozen in memory: a later change on disk is never served, and no
+  request builds a filesystem path. The manifest comes from the same build
+  as the files, so these checks catch an accidental, partial or mixed
+  deployment; they are not tamper resistance (an account that can write the
+  directory can rewrite the manifest too). That rests on the S5c release
+  manifest's SHA-256 of the build and on a root-owned directory the service
+  account cannot write.
+- The shell, pre-credential (D1, S5-1). `GET /`, `GET /s.js` and
+  `GET /s.css` serve `shell/index.html`, `shell/s.js` and `shell/s.css`
+  after the route table, `Host`/`Origin`, loopback peer and listener, the one
+  well-formed proxy identity, the reservation verdict and the serving
+  composition with its storage admission bound. Nothing else is consulted:
+  no cookie, session, SQLite, gate lock or rate limiter, and no other request
+  header, so the response is byte-identical for every caller who passes those
+  gates (unknown, invited, revoked or Owner; with no, forged, expired or valid
+  cookie; with any `Accept-*`, `If-None-Match` or `Range`): always `200`, no
+  `304`, `ETag`, `Last-Modified`, `Set-Cookie`, range or content coding. A
+  caller that fails a gate gets the generic denial of an unknown route.
+- The application (S5-2, S5-3). `GET /app/` serves `app/index.html` and
+  `GET /app/<name>` the named file of the in-memory map (a miss, and
+  `/app/index.html`, is the generic denial). Both authorize first with
+  `_authorize(request, SESSION, touch=False)` inside `admit(epoch)`: any
+  active session, no permission needed (every data route checks its own),
+  and the idle expiry is never extended, so a session that only loads assets
+  still ends 30 minutes after its last other activity. A close, revocation or
+  `stop()` between the epoch and the commit is the generic denial. So a
+  browser whose session expired gets that generic `404` at `/app/`, not the
+  shell and not a redirect; the person opens `/` to sign in again (the
+  application's own handling of an expired session is S5c/S6 work).
+- Headers, exactly and in this order: `content-type`
+  (`text/html; charset=utf-8`, `text/javascript; charset=utf-8`,
+  `text/css; charset=utf-8`, `image/svg+xml` or
+  `text/plain; charset=utf-8`), `content-length`, `cache-control: no-store`,
+  `x-content-type-options: nosniff`, `referrer-policy: no-referrer`,
+  `cross-origin-opener-policy: same-origin`,
+  `cross-origin-resource-policy: same-origin`,
+  `permissions-policy: camera=(), microphone=(), geolocation=()` and
+  `content-security-policy`: for the shell `default-src 'none'; script-src
+  'self'; style-src 'self'; connect-src 'self'; img-src 'none'; font-src
+  'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none';
+  require-trusted-types-for 'script'; trusted-types 'none'`, for the
+  application `default-src 'none'; script-src 'self'; style-src 'self';
+  connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none';
+  form-action 'none'; frame-ancestors 'none'` (`APP_META_CSP`, which the
+  document also carries in a meta element as defence in depth, plus the
+  `frame-ancestors` a meta element cannot carry). The content types and the
+  policies are copies of `web/scripts/policy.mjs` (S5a), held as constants in
+  `web_assets.py` so the server never reads `web/` at run time; a change on
+  either side must change the other: `tests/test_web_build_contract.py`
+  parses `policy.mjs` and compares, and the CI `web-browser` job loads the
+  freshly built `web/dist` with `WebAssets.load` (`WEB_DIST_REQUIRED=1`).
+- Referrer and `Origin`. Every document is `referrer-policy: no-referrer`.
+  Under that policy a browser may send `Origin: null` on a same-origin
+  `POST` (Safari and Firefox do), and every mutating route (the ceremonies,
+  sign-out, step-up and the Owner's administration) requires the exact
+  reserved `Origin`, so it denies that request. Every mutating `fetch` from the shell or the application
+  must therefore set `referrer: ''` (no `Referer`) and
+  `referrerPolicy: 'same-origin'` (the real `Origin`) in its init, as
+  `web/src/signin/main.ts` does; the documents keep `no-referrer`.
+  The production launcher runs uvicorn without its `server` and `date`
+  headers, so no product or version header is added.
+- Accepted disclosure (S5-5). The shell bytes, and so their hash, are the
+  same for everyone on the shared account: anyone who reaches the reserved
+  name can tell it runs ServerSentinel, and which build of the shell. The
+  shell therefore carries no version marker. Nothing in it names the
+  deployment, a camera or a person.
+- Paths and methods. Only `GET` and the exact paths above; `HEAD`, `OPTIONS`
+  and every other method, a trailing slash, a different case, a
+  percent-encoded or dot-segment spelling, `/index.html`, any query parameter
+  (an empty query string is none) and a WebSocket get the generic denial.
+
+This is synthetic/mock verified only (`server/tests/test_human_web_assets.py`,
+`server/tests/test_web_build_contract.py`): no browser has enforced the
+policies or rendered the build (`MANUAL_TEST.md`). The wire-shape test sends
+registration and assertion bodies with exactly the members of
+`web/src/shared/webauthn.ts` through the real routes and verifiers, but from a
+software authenticator, not a browser.
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 

@@ -67,7 +67,14 @@ WebSocket and error path gets the same generic denial):
   authorization's epoch. The Owner is never a target (S4-3), and every
   refused change (unknown, revoked or Owner target, a foreign handle, a limit
   of S4-8, a gate change or a session that no longer holds at the commit) is
-  the generic denial.
+  the generic denial;
+- the Web assets (Issue #10 phase 2 S5b, Owner decisions D1, S5-1 .. S5-3),
+  served from the frozen ``WebAssets`` set of the composition: the sign-in
+  shell ``GET /``, ``GET /s.js`` and ``GET /s.css`` (``PRE_CREDENTIAL``: the
+  gates above only, byte-identical for everyone who passes them), and the
+  application ``GET /app/`` and ``GET /app/<name>`` (any active session,
+  ``touch=False``). Each carries a fixed header list with ``no-store`` and a
+  strict ``Content-Security-Policy``.
 
 The four ceremony routes run before a credential exists (AUTH-013). Each is
 rate-limited per verified proxy identity before the request body is parsed
@@ -162,6 +169,7 @@ from .session_binding import canonical_identity
 from .store import (
     AccessStore, Requirement, SessionView, StepUpRequired, display_name_acceptable,
 )
+from .web_assets import APP_NAME, WebAsset, WebAssets
 
 
 PROXY_IDENTITY_HEADER = b"tailscale-user-login"
@@ -178,6 +186,11 @@ STEP_UP_OPTIONS_PATH = "/api/auth/step-up/options"
 STEP_UP_PATH = "/api/auth/step-up"
 # Owner access administration (Issue #10 phase 2 S4b, routes A1-A6).
 ADMIN_PRINCIPALS_PATH = "/api/admin/principals"
+# The Web assets (Issue #10 phase 2 S5b): the sign-in shell and the application.
+SHELL_PATH = "/"
+SHELL_SCRIPT_PATH = "/s.js"
+SHELL_STYLE_PATH = "/s.css"
+APP_PATH = "/app/"
 MAX_OPTIONS_BODY = 1024
 MAX_ASSERTION_BODY = 64 * 1024
 MAX_REGISTRATION_BODY = 64 * 1024
@@ -290,8 +303,8 @@ class Route:
     """One mounted human route (Issue #10 phase 2, S1).
 
     ``path`` is matched with ``fullmatch`` against the decoded request path;
-    its named groups (only ``_UUID`` path ids, S4b) are passed to the handler
-    as ``_Request.params``.
+    its named groups (``_UUID`` path ids, S4b, and the ``APP_NAME`` asset
+    name, S5b) are passed to the handler as ``_Request.params``.
     ``mutating`` routes require an exact ``Origin``; ``csrf`` routes also
     require ``X-CSRF-Token``. ``body_limit`` bounds the request body
     (``0``: the body is not read). ``query`` is the strict allowlist of
@@ -368,6 +381,21 @@ ROUTES: tuple[Route, ...] = (
     Route("POST", _with_ids(ADMIN_PRINCIPALS_PATH, "/", ("principal",), "/credentials/", ("handle",), "/revoke"),
           Requirement.OWNER_OP, "_admin_revoke_credential", mutating=True, csrf=True,
           body_limit=MAX_EMPTY_BODY),
+    # S5b, the Web assets (Owner decisions D1, S5-1 .. S5-3). The sign-in
+    # shell is pre-credential: the same bytes for everyone who passes the
+    # origin, trusted-path and reservation gates, with no session, SQLite,
+    # lock or limiter work. The application needs any active session and
+    # never extends it (touch=False, S5-3).
+    Route("GET", _exact(SHELL_PATH), Requirement.PRE_CREDENTIAL, "_shell_index",
+          mutating=False, csrf=False, body_limit=0),
+    Route("GET", _exact(SHELL_SCRIPT_PATH), Requirement.PRE_CREDENTIAL, "_shell_script",
+          mutating=False, csrf=False, body_limit=0),
+    Route("GET", _exact(SHELL_STYLE_PATH), Requirement.PRE_CREDENTIAL, "_shell_style",
+          mutating=False, csrf=False, body_limit=0),
+    Route("GET", _exact(APP_PATH), Requirement.SESSION, "_app_index",
+          mutating=False, csrf=False, body_limit=0),
+    Route("GET", re.compile(re.escape(APP_PATH) + f"(?P<name>{APP_NAME.pattern})"), Requirement.SESSION,
+          "_app_asset", mutating=False, csrf=False, body_limit=0),
 )
 
 
@@ -523,11 +551,13 @@ def _invitation_secret(value: object) -> bytes:
 
 
 def _label(value: object) -> str | None:
-    """An optional credential label, checked as ``Credential`` checks it (and no DEL)."""
+    """An optional credential label, checked as ``Credential`` checks it, and
+    no DEL and no lone surrogate (JSON can escape one, ``"\\ud800"``; it
+    cannot be stored as UTF-8, so it is refused here, before the ceremony)."""
     if value is None:
         return None
     if (not isinstance(value, str) or not 1 <= len(value) <= MAX_LABEL
-            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+            or any(ord(char) < 32 or ord(char) == 127 or 0xD800 <= ord(char) <= 0xDFFF for char in value)):
         raise _Denied()
     return value
 
@@ -582,7 +612,8 @@ class HumanAccess:
     decision D4, Owner step-up per Owner decision 2026-10-12, and the Owner
     administration changes per Owner decision 2026-10-13), the ceremonies use exactly that gate and this
     audited access store with a session-binding key, and the relying party
-    is the reserved https origin. A missing or substituted gate is never
+    is the reserved https origin, and ``assets`` is a verified, frozen
+    ``WebAssets`` set (S5b). A missing or substituted gate is never
     accepted (Issue #181 item 3). The gate's session revoker must be a
     ``ReservationSessionRevocation`` of exactly this store, so a revocation
     after an exposure invalidates the sessions this surface authorizes and
@@ -613,8 +644,13 @@ class HumanAccess:
                  redemption_limiter: SourceRateLimiter | None = None,
                  step_up_limiter: SourceRateLimiter | None = None,
                  admin_limiter: SourceRateLimiter | None = None,
+                 assets: WebAssets | None = None,
                  tick_seconds: float = DEFAULT_TICK_SECONDS):
         if not isinstance(configuration, HumanAccessConfiguration) or configuration.enabled is not True:
+            raise HumanAccessUnavailable()
+        if not isinstance(assets, WebAssets):
+            # S5b: the shell and application bytes are part of the
+            # composition; without a verified set nothing is served.
             raise HumanAccessUnavailable()
         if not isinstance(reservation, HostnameReservationCheck) or not reservation.opening_configured:
             raise HumanAccessUnavailable()
@@ -649,6 +685,7 @@ class HumanAccess:
                 or not 0 < tick_seconds <= 300):
             raise HumanAccessUnavailable()
         self.configuration = configuration
+        self.assets = assets
         self.store = store
         self.ceremonies = ceremonies
         self.reservation = reservation
@@ -997,8 +1034,8 @@ class HumanSurface:
         CSRF header compared in that transaction for a CSRF route. Any
         refusal is ``_Denied``; only ``StepUpRequired`` on ``OWNER_OP`` is
         ``_StepUp``. The store releases the gate before its denial
-        bookkeeping. ``touch=False`` (the step-up routes only) makes the same
-        checks without committing the idle touch. ``charge`` (the
+        bookkeeping. ``touch=False`` (the step-up routes and the application
+        assets, S5-3) makes the same checks without committing the idle touch. ``charge`` (the
         administration changes only) is called with the token right after
         the pre-check found a current session and before the gate epoch: a
         refusal there is ``_Denied`` and nothing is locked or written. With
@@ -1318,6 +1355,62 @@ class HumanSurface:
             (b"cache-control", b"no-store"),
         ]})
         await request.send({"type": "http.response.body", "body": b""})
+
+    # -- Web assets (S5b) ------------------------------------------------
+
+    @staticmethod
+    async def _asset(send: Send, asset: WebAsset) -> None:
+        """One frozen asset: its fixed header list and bytes, nothing else.
+
+        No ``ETag``, ``Last-Modified``, ``Set-Cookie``, range or content
+        coding: the response never depends on a request header.
+        """
+        await send({"type": "http.response.start", "status": 200, "headers": list(asset.headers)})
+        await send({"type": "http.response.body", "body": asset.body})
+
+    async def _shell_index(self, request: _Request) -> None:
+        """``GET /``: the sign-in shell (Owner decisions D1, S5-1).
+
+        Pre-credential: only the gates of ``_http`` (route, reserved
+        ``Host``/``Origin``, loopback peer and listener, one well-formed proxy
+        identity, the open reservation verdict, a serving composition with
+        its storage admission bound). No cookie, session, SQLite, gate lock or
+        rate limiter is consulted, and no other request header is read, so
+        everyone who passes those gates gets the same bytes.
+        """
+        await self._asset(request.send, self.access.assets.shell_index)
+
+    async def _shell_script(self, request: _Request) -> None:
+        """``GET /s.js``: the shell's script; see ``_shell_index``."""
+        await self._asset(request.send, self.access.assets.shell_script)
+
+    async def _shell_style(self, request: _Request) -> None:
+        """``GET /s.css``: the shell's style sheet; see ``_shell_index``."""
+        await self._asset(request.send, self.access.assets.shell_style)
+
+    async def _app_index(self, request: _Request) -> None:
+        """``GET /app/``: the application page, for any active session (S5-2).
+
+        ``_authorize`` with ``SESSION`` inside ``admit(epoch)`` (current
+        principal, credential, generations, lifetimes and proxy-identity
+        binding); no permission is needed, since every data route checks its
+        own. ``touch=False`` (S5-3): loading assets is not activity, so it
+        never extends the idle expiry.
+        """
+        await self._authorize(request, Requirement.SESSION, touch=False)
+        await self._asset(request.send, self.access.assets.app_index)
+
+    async def _app_asset(self, request: _Request) -> None:
+        """``GET /app/<name>``: one application asset; see ``_app_index``.
+
+        The authorization precedes the lookup (ADR-0003), and the name only
+        selects an entry of the in-memory map; a miss is the generic denial.
+        """
+        await self._authorize(request, Requirement.SESSION, touch=False)
+        asset = self.access.assets.app_file(request.params["name"])
+        if asset is None:
+            raise _Denied()
+        await self._asset(request.send, asset)
 
     # -- Owner access administration (S4b, A1-A6) ----------------------
 

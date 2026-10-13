@@ -572,3 +572,21 @@ defense in depth. The idle-expiry touch of an existing session stays outside
 the lock, which is safe because revocation advances the authorization
 generation. Enumeration and network I/O stay outside the lock. The lock order
 and the single-process requirement are in `server/app/auth/README.md`.
+
+Owner decision D1, 2026-10-11, implemented by Issue #10 phase 2 S5b
+(2026-10-14, Owner decisions S5-1 .. S5-5): the "minimal neutral markup and
+script" the pre-credential pair needs is the sign-in shell, `GET /`,
+`GET /s.js` and `GET /s.css`. It is an exception to the "no pre-auth exposure"
+of application assets in the permission table above, and only for those
+three paths: they pass the origin, trusted-path, reservation and serving
+gates but no session check, return the same bytes to everyone who passes
+them, and contain no application data or version marker. Their bytes still
+fingerprint the software to anyone who reaches the reserved name, which the
+Owner accepted (S5-5). The application assets (`/app/`, `/app/<name>`) need
+an active session, and loading them does not extend it (S5-3). S5-2 also
+relaxes the table's "application assets" row for those assets: any active
+session suffices, with no explicit permission, because each data route still
+checks its own permission and the assets carry no application data. They are
+served from the backend's verified, in-memory copy of the build, since the
+reservation check accepts exactly one proxy route; the current contract is
+in `server/app/auth/README.md`.

@@ -2122,6 +2122,51 @@ redemption (S2), the Owner step-up (S3) and the Owner access administration
 other admin routes are later phases. Details:
 `server/app/auth/README.md`.
 
+Issue #10 phase 2 S5b serves the Web build through the same surface (Owner
+decisions D1 and S5-1 .. S5-5; the reservation check accepts exactly one Serve
+proxy route, to the backend, so there is no static host):
+
+```text
+GET /, /s.js, /s.css        -> pre-credential sign-in shell; only the route,
+                               Host/Origin, loopback-peer, one-identity,
+                               reservation and serving gates; no cookie,
+                               session, SQLite, lock or rate limiter; the same
+                               bytes for every caller who passes them
+GET /app/, /app/<name>      -> any active session (SESSION, no permission,
+                               authorized inside admit(epoch), touch=False:
+                               never extends the idle expiry); <name> fully
+                               matches [A-Za-z0-9][A-Za-z0-9.-]{0,63}, selects an
+                               in-memory entry, a miss is the generic denial
+```
+
+The bytes come from `WebAssets.load(Settings.web_assets_dir)` at composition:
+`manifest.json` lists exactly `shell/index.html`, `shell/s.js`,
+`shell/s.css`, `app/index.html` and any further flat `app/` files, each with
+its SHA-256, size and media type (`html`, `js`, `css`, `svg`, `txt` only);
+an extra, missing, modified, oversized, symlinked or non-regular file, a
+group- or world-writable entry and a file with a second hard link refuse the
+whole composition (fail closed), and the verified bytes are frozen in
+memory, so a later disk change is never served. This guards against an
+accidental or partial deployment; tamper resistance is the S5c release
+manifest plus a root-owned, service-unwritable directory. Every asset response has a
+fixed header list: its `Content-Type` (the manifest's, from the S5a
+build policy `web/scripts/policy.mjs`), `Content-Length`,
+`Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin`,
+`Cross-Origin-Resource-Policy: same-origin`,
+`Permissions-Policy: camera=(), microphone=(), geolocation=()` and a
+`Content-Security-Policy` (`default-src 'none'`, `'self'` scripts, styles and
+connections, no images or fonts and Trusted Types with no policy for the
+shell, `base-uri 'none'`, `form-action 'none'`, `frame-ancestors 'none'`;
+the exact strings are those of `web/scripts/policy.mjs`); never `ETag`, `Last-Modified`,
+`Set-Cookie`, `304`, ranges or a content coding. `HEAD`, other methods, query
+parameters and re-encoded spellings get the generic denial. Because every
+document is `no-referrer`, each mutating `fetch` of the shell and the
+application sets `referrer: ''` and `referrerPolicy: 'same-origin'`, so the
+`POST` carries the exact `Origin` the mutating routes require (not `null`). The shell's bytes
+identify the software to anyone on the shared account (accepted, S5-5), so it
+carries no version marker.
+
 ## 12. Dashboard UI
 
 The #8 foundation is a Japanese-default React/TypeScript shell with an English
@@ -2136,6 +2181,12 @@ preview are development/test artifacts. Production integration must protect the
 full HTML/JS/CSS/icon/map/worker/config namespace through the human listener,
 independent of UI visibility. Never mount these assets on the capture listener
 or an unauthenticated static host. See `web/README.md`.
+
+Issue #10 phase 2 S5b is that integration on the server side (§11.9): only
+the neutral sign-in shell (`/`, `/s.js`, `/s.css`, Owner decision D1) is
+served before a credential exists; the application (`/app/`, `/app/<name>`)
+needs an active session. No other asset path (source maps, workers,
+`/index.html`, configuration) is served.
 
 Primary views:
 

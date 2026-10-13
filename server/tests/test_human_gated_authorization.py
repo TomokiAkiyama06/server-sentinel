@@ -560,7 +560,7 @@ class ServingGateTests(GatedFixture):
         self.assertIsInstance(self.ceremonies.session_gate, ServingGate)
         self.assertIs(self.ceremonies.session_gate.reservation, self.check)
         with self.assertRaises(HumanAccessUnavailable):
-            HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+            HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
                         ceremonies=self.ceremonies, reservation=self.check)
         fresh = PasskeyCeremonies(self.store, self.rp, session_gate=self.check, clock=self.ceremony_clock)
         other, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker)
@@ -571,7 +571,7 @@ class ServingGateTests(GatedFixture):
         # Once guarded, the ceremonies no longer compose with any access.
         fresh.guard_session_gate(SimpleGate(self.check))
         with self.assertRaises(HumanAccessUnavailable):
-            HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+            HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
                         ceremonies=fresh, reservation=self.check)
 
 
@@ -602,7 +602,7 @@ class RunLifecycleTests(GatedFixture):
         await self.stop_serving()
         self.assertEqual(self.access.state, HumanAccessState.STOPPED)
         ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=self.check, clock=self.ceremony_clock)
-        fresh = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store, ceremonies=ceremonies,
+        fresh = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store, ceremonies=ceremonies,
                             reservation=self.check)
         self.assertEqual(fresh.state, HumanAccessState.NOT_STARTED)
         logging.disable(logging.CRITICAL)

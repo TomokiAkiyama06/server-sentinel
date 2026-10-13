@@ -1945,6 +1945,41 @@ browser and OS versions used):
 - [ ] the layout fits a phone screen without horizontal scrolling in portrait
   and landscape, in light and dark appearance.
 
+### Issue #10 phase 2 S5b sign-in shell and application asset serving (pending)
+
+Mock only: verified with a synthetic Web build, the synthetic ASGI driver and
+software authenticators (`server/tests/test_human_web_assets.py`); no browser
+has loaded, rendered or enforced the response policies of the shell or the
+application, no Tailscale Serve or real deployment has served them, and the
+release does not yet ship the build (Issue #10 S5c). Once a deployment can
+enable the human routes with a real S5a build, from a browser on the shared
+account at the reserved name:
+
+- [ ] open `https://<reserved name>/` without any session: the sign-in shell
+  loads with its script and style; record the response headers in the
+  browser's developer tools (exactly the fixed list of
+  `server/app/auth/README.md`, "Web assets", `no-store`, no `Set-Cookie`,
+  `ETag`, `Last-Modified`, `Server` or `Date`) and that the console shows no
+  CSP violation other than, possibly, an `img-src` one for the browser's own
+  automatic `/favicon.ico` request (the shell has no favicon and its policy is
+  `img-src 'none'`; the request itself is the generic `404`);
+- [ ] load `/`, `/s.js` and `/s.css` from two browsers (one signed in as the
+  Owner, one never invited) and compare the bodies' SHA-256: identical; reload
+  with the cache disabled and enabled: always `200`, never `304`;
+- [ ] without a session, request `/app/`, `/app/app.js` and a missing
+  `/app/<name>`: the generic `404` for each; sign in with a test invitee that
+  holds no permission: `/app/` and its assets load; sign out: they are the
+  generic `404` again;
+- [ ] stay on `/app/` with only asset reloads for more than 30 minutes after
+  the last other request: the next request is the generic `404` (assets do
+  not extend the session);
+- [ ] try to embed `/` and `/app/` in a frame from another origin: the browser
+  refuses (`frame-ancestors 'none'`); confirm `HEAD /`, `/index.html`,
+  `/s.js?x=1` and `/app/app.js.map` are the generic `404`;
+- [ ] replace a file of the deployed build on disk while the service runs: the
+  served bytes do not change; restart with the modified build: the human
+  routes stay closed (the manifest no longer matches).
+
 ### Uninvited ordinary Tailnet member
 
 - [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;

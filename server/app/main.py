@@ -83,6 +83,16 @@ class ClosedHumanSurface:
             await self.app(scope, receive, send)
 
 
+def _assets_from_settings(human_access: HumanAccess, settings: Settings) -> bool:
+    """Whether the composition serves the Web build at ``settings.web_assets_dir``."""
+    if settings.web_assets_dir is None:
+        return False
+    try:
+        return human_access.assets.directory == settings.web_assets_dir.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def create_app(settings: Settings, *, database: Database | None = None,
                human_authorizer: HumanAuthorizer | None = None,
                owner_authorizer: OwnerAuthorizer | None = None,
@@ -108,6 +118,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # deployment's ``invitation_lifetime_hours``; a store left at another
         # lifetime (the 24-hour default, say) would issue codes with the
         # wrong expiry or refuse every one.
+        raise TypeError("human access composition is invalid")
+    if human_access is not None and not _assets_from_settings(human_access, settings):
+        # Issue #10 phase 2 S5b: the served Web build is the one the
+        # deployment settings name, never one an embedder picked elsewhere.
         raise TypeError("human access composition is invalid")
     store = database or Database(settings.database_path)
     # Local UVC capture is driven only by the deployment's list of approved

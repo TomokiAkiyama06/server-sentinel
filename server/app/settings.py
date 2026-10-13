@@ -54,6 +54,12 @@ class Settings:
     # default 24 hours, at most 7 days (deployment key
     # ``invitation_lifetime_hours``, whole hours 1-168).
     invitation_lifetime: timedelta = INVITATION_LIFETIME
+    # Issue #10 phase 2 S5b: the verified Web build (``manifest.json``,
+    # ``shell/``, ``app/``) the human surface serves, loaded once by
+    # ``app.auth.web_assets.WebAssets.load``. ``None`` means no human
+    # composition can be mounted (``create_app`` refuses one). Issue #10 S5c
+    # points it at the release's own build directory.
+    web_assets_dir: Path | None = field(default=None, repr=False)
     source_root: InitVar[Path | None] = None
 
     def __post_init__(self, source_root: Path | None) -> None:
@@ -80,6 +86,9 @@ class Settings:
             raise ConfigurationError("log_level must be INFO, WARNING or ERROR")
         if not valid_invitation_lifetime(self.invitation_lifetime):
             raise ConfigurationError("invitation_lifetime_hours must be an integer from 1 to 168")
+        if self.web_assets_dir is not None and (not isinstance(self.web_assets_dir, Path)
+                                                or not self.web_assets_dir.is_absolute()):
+            raise ConfigurationError("web_assets_dir must be an absolute directory")
 
     @property
     def database_path(self) -> Path:
