@@ -1836,6 +1836,43 @@ passkeys (never a real person's credential):
   is in flight (for example a grant change submitted right after the
   command commits): the Web operation is refused and changes nothing.
 
+### Issue #10 phase 2 S5a sign-in shell in real browsers (pending, not executed)
+
+`web/src/signin/` is verified only in headless Chrome with intercepted
+requests and a CDP virtual authenticator (`web/tests/signin_browser.mjs`) and
+with Node unit tests; no real browser, passkey provider or security key has
+used it, and it is not served by the Main Server until S5b. Once S5b serves
+`/` at the reserved `https` origin, run with synthetic `*.invalid` people on
+each of **iOS Safari**, **macOS Safari** and **Android Chrome** (and record the
+browser and OS versions used):
+
+- [ ] `/` shows only 「サインイン」, the sign-in button, the invitation code
+  field and the label field 「名前（後で見分けるため）」, in Japanese, with no
+  product name, camera wording, version or favicon; the page source and
+  `/s.js`, `/s.css` carry none either;
+- [ ] redeem a fresh invitation code typed by hand in lower case with spaces,
+  and once with the Japanese IME on (full-width characters, 「ー」 as the
+  separator): it registers, the page shows 「登録しました。サインインしてください」
+  and focus moves to the sign-in button; the code field is empty afterwards;
+- [ ] the OS / browser passkey sheet asks for user verification at
+  registration and at sign-in; sign-in lands on `/app/`;
+- [ ] with a valid session, opening `/` goes straight to `/app/`;
+- [ ] a wrong, expired or already used code, a cancelled passkey sheet and a
+  refused sign-in each show only 「完了できませんでした。もう一度お試しください。」 and
+  nothing from the server;
+- [ ] on a deployment that requires device-bound credentials, registering a
+  synced passkey (iCloud Keychain / Google Password Manager) shows the
+  device-bound guidance, and a security key then registers;
+- [ ] after each attempt, the code appears nowhere in the address bar, the
+  history list, the browser's saved form data / password manager prompts, or
+  the Web Inspector's storage panes (local / session storage, IndexedDB,
+  cookies other than `__Host-session`);
+- [ ] the browser console reports no Content-Security-Policy violation on `/`,
+  and `/` opened over plain HTTP from another host shows only
+  「このブラウザーまたは接続ではパスキーを使えません。」;
+- [ ] the layout fits a phone screen without horizontal scrolling in portrait
+  and landscape, in light and dark appearance.
+
 ### Uninvited ordinary Tailnet member
 
 - [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;

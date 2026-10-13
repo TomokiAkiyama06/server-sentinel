@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { compile } from './compile.mjs';
+import { APP_CSP } from '../scripts/policy.mjs';
 
 await compile('src/api.ts', 'build/api.mjs');
 await compile('src/domain.ts', 'build/domain.mjs');
@@ -85,13 +86,15 @@ test('invalid content, schema and JSON fail closed; abort stays local', async ()
 });
 
 test('production assets contain no test provider or runtime remote imports', async () => {
-  const html = await readFile('dist/index.html', 'utf8');
-  const bundle = await readFile('dist/assets/app.js', 'utf8');
+  const html = await readFile('dist/app/index.html', 'utf8');
+  const bundle = await readFile('dist/app/app.js', 'utf8');
   assert.match(html, /lang="ja"/);
-  assert.match(html, /connect-src 'self'/);
+  // The policy is a response header now (S5b sends it; preview and tests use policy.mjs).
+  assert.doesNotMatch(html, /<meta[^>]+Content-Security-Policy/i);
+  assert.match(APP_CSP, /connect-src 'self'/);
   assert.doesNotMatch(html, /https?:\/\//);
   assert.doesNotMatch(bundle, /\/api\/mock|synthetic-source|tests\/harness|import\s*\(\s*['"]https?:/);
-  for (const name of ['react', 'react-dom', 'scheduler']) assert.match(await readFile(`dist/${name}-LICENSE.txt`, 'utf8'), /MIT License/);
+  for (const name of ['react', 'react-dom', 'scheduler']) assert.match(await readFile(`dist/app/${name}-LICENSE.txt`, 'utf8'), /MIT License/);
 });
 
 test('a repeated mutation on the same recording is refused while one is in flight', async () => {
