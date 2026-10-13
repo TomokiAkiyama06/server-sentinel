@@ -249,6 +249,17 @@ class _PinnedLedgerDatabase(Database):
                 raise
         return connection
 
+    def connect_read_only(self) -> sqlite3.Connection:
+        """A read through the pin (Issue #10 S4c ``list``), never by pathname.
+
+        ``Database.connect_read_only`` reopens the path without the pin
+        checks, so a read here uses the pinned ``connect()`` instead: the
+        same inode checks, ``mode=rw`` (never creates a file). The caller
+        only reads (``BEGIN``, never ``BEGIN IMMEDIATE``), so nothing is
+        written.
+        """
+        return self.connect()
+
     def release(self) -> None:
         """End the ledger's use of the file; later connections and commits refuse.
 

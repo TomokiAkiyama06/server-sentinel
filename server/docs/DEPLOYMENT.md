@@ -939,6 +939,56 @@ issues no code (`invitation_clock_unavailable`).
   service's storage admission; do not run it while the state filesystem is at
   its hard stop.
 
+### Emergency revocation over SSH (Issue #10 phase 2 S4c)
+
+Owner decision D6: while human access is closed (for example after a
+hostname-reservation finding, or when the Owner cannot sign in), the Owner
+revokes a person or one passkey from an interactive SSH or console session
+on the Main Server. Exactly three commands exist (S4-6), run like
+`bootstrap`/`recover`: as the service account, with the installed release's
+interpreter, from that release directory, never as root and never from a
+checkout:
+
+```sh
+cd /opt/server-sentinel-main/current
+# 1. find the person and the credential handle
+sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
+  list --config /etc/server-sentinel/deployment.json
+# 2a. revoke the person (every passkey, pending code and session)
+sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
+  revoke-principal --config /etc/server-sentinel/deployment.json <principal id>
+# 2b. or revoke one passkey (on all the devices it synced to) and its sessions
+sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
+  revoke-credential --config /etc/server-sentinel/deployment.json <principal id> <handle>
+```
+
+- `list` prints one line per person (`principal <id> role=... status=...
+  permissions=... name="..."`) and one per credential (`credential <handle>
+  status=... label="..."`). It never prints the Tailscale login (D14: on a
+  shared account it does not tell people apart), credential ids, keys or
+  codes. A label is only a hint chosen at registration; it does not identify
+  a device.
+- Each revocation shows the target on the terminal and asks for the word
+  `REVOKE`. A synced passkey is one credential: `revoke-credential` revokes
+  it on every device it synced to, never on one device only. The service
+  keeps running; no restart is needed: the revoked person's (or passkey's)
+  next request is denied.
+- The Owner is never a target (`owner_target_use_recover`): to replace the
+  Owner's passkeys, run `recover` (above). Other refusals print one fixed
+  word and exit `2`, changing nothing: `principal_not_found`,
+  `principal_already_revoked`, `credential_not_found`,
+  `credential_already_revoked`, `principal_id_rejected`,
+  `credential_handle_rejected`, `owner_confirmation_declined`, and the
+  shared words of `bootstrap`/`recover`.
+- Each revocation commits with its security audit record
+  (`revoke_principal` / `revoke_principal_credential`, the principal's
+  logical UUID only). It does not change the Tailnet: removing a device or
+  login from Tailscale stays a separate Tailscale administration task, and
+  network reachability is not what identifies a person.
+- A person revoked here has to be invited again (a new principal) to regain
+  access; a revoked passkey cannot be restored, the person registers a new
+  one with a new invitation code.
+
 ## Install, update, and rollback
 
 **`capture_ca_directory` across update and rollback (Issue #109).**
