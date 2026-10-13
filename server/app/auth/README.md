@@ -127,17 +127,14 @@ verifier's `http://localhost` support is not reachable from any human route.
 
 Not implemented yet, and required before routes open in production:
 
-- the remaining HTTP routes: every live, recording, timeline, event and
-  administration route, including every `OWNER_OP` route (later Issue #10
-  phases, #19). Sign-out and the CSRF token exist since phase 2 S1,
-  invitation redemption and the local bootstrap/recovery command since S2,
-  and the Owner step-up routes since S3 (below);
-- the Owner's administration routes (S4b: invitation, re-issue, grant
-  change, revocations and the inventory read) and the local `list` /
-  `revoke-principal` / `revoke-credential` commands (S4c). S4a builds the
-  store and `AccessAdministration` they will call ("Owner access
-  administration", below); until S4b the only runtime issuer of an
-  enrollment code is the local command, which covers the Owner only;
+- the remaining HTTP routes: every live, recording, timeline, event,
+  diagnostics and audit route and every other `OWNER_OP` route (later
+  Issue #10 phases, #19). Sign-out and the CSRF token exist since phase 2
+  S1, invitation redemption and the local bootstrap/recovery command since
+  S2, the Owner step-up routes since S3, and the Owner's access
+  administration routes A1-A6 since S4b (below);
+- the local `list` / `revoke-principal` / `revoke-credential` commands
+  (S4c) and the Owner's administration screen in the Web UI (S6);
 - the deployment-file key and production composition that build the
   `HostnameReservationCheck` (Serve status source, `SockDiagOwners`,
   `GetaddrinfoResolver`), load the session-binding key with
@@ -727,9 +724,9 @@ route whose user verification is stale: it gets the fixed `403
 the epoch unchanged, never for a non-owner, a wrong CSRF token, another proxy
 identity or a closed gate, and it commits no idle touch (Owner decision
 S4-2, Issue #238 item 1): only a request that is served extends the session.
-No `OWNER_OP` route is mounted yet (S4b adds the Owner's permission
-management); the mapping, and its resolution through the S3 step-up routes,
-is exercised through a synthetic route in the tests.
+The Owner's access administration routes (S4b, below) are the mounted
+`OWNER_OP` routes; the tests exercise the mapping, and its resolution through
+the S3 step-up routes, through them.
 
 CSRF (Owner decision D2). `SessionBindingKey` derives a CSRF subkey from the
 deployment's session-binding key under its own domain label, and a session's
@@ -1075,8 +1072,8 @@ MANUAL_TEST records the observation on the real host.
 
 ### Owner access administration (Issue #10 phase 2 S4a)
 
-S4a hardens the store and `AccessAdministration`; it mounts no route (S4b
-adds routes A1-A6, S4c the local CLI, S6 the Web screen). Owner decisions
+S4a hardens the store and `AccessAdministration`; S4b mounts routes A1-A6
+(next section), S4c adds the local CLI and S6 the Web screen. Owner decisions
 S4-1 .. S4-8 (2026-10-13) apply.
 
 - Authorization (S4-1). Every mutation (invitation, re-issue, grant change,
@@ -1144,6 +1141,144 @@ S4-1 .. S4-8 (2026-10-13) apply.
   any session data.
 - Nothing logs or audits a code, credential id or handle, identity or
   display name; audit records carry the principal's logical UUID only.
+- Composition (Issue #240 item 6). Never construct an `AccessAdministration`
+  with any `session_gate` other than `HumanAccess.gate` (the composition's
+  own `ServingGate`); only the human surface routes below call it (the
+  local commands of D6 commit outside the gate and do not use it): the
+  constructor refuses
+  anything that is not a `ServingGate`, but only `HumanAccess.gate` is also
+  closed after that composition's `stop()` or a failed check tick, and only
+  the surface builds the `OwnerOperationContext` it requires.
+- Pending code (Issue #240 item 1). "Pending" is one definition,
+  `AccessStore._pending_invitations_on`, used by the inventory and by the
+  one-pending-code cap alike: exactly the conditions a redemption checks
+  (unredeemed, unrevoked, a lookup key, fewer than `MAX_REDEMPTION_ATTEMPTS`
+  attempts, a principal not revoked, the current authorization revision and
+  deployment generation, and `invitation_clock_valid` on both clocks with a
+  recorded boot pair). A code that fails any of them is not shown as pending
+  and does not block a new code; issuing one marks every other unused code
+  of the principal revoked in the same transaction, so a code unusable only
+  for now (a wall clock stepped back in the same boot) never comes back
+  next to the new one. A grant change moves only a code at the current
+  revision (`_advance_principal`); a stale one stays stale.
+- A grant change that changes nothing (Issue #240 item 4). Still one
+  `change_principal_permissions` record with outcome `succeeded`, read as
+  "requested, no change": the audit vocabulary has no separate outcome, the
+  Owner did make the request, and nothing else is written (no revision bump,
+  no session ends).
+
+### Owner access administration routes (Issue #10 phase 2 S4b)
+
+Mounted in `ROUTES` (`human_surface.py`); `<id>` and `<handle>` are path ids
+matching only the canonical lower-case UUID form (`fullmatch`), and the raw
+path must equal the decoded one, so an upper-case, braced, hex-only or
+percent-encoded spelling matches nothing and is the generic denial. The
+principal id and the credential handle (a random UUID, never the WebAuthn
+credential id) are the only values in these URLs.
+
+| Route | Requirement | Body | Success |
+|---|---|---|---|
+| A1 `GET /api/admin/principals` | `OWNER_READ` | none | `200 {"principals": [...]}` (`admin_inventory`) |
+| A2 `POST /api/admin/principals` | `OWNER_OP` | `{"display_name", "permissions"}` | `200 {"principal_id", "code", "expires_at"}` |
+| A3 `POST /api/admin/principals/<id>/invitation` | `OWNER_OP` | `{}` | `200 {"code", "expires_at"}` |
+| A4 `POST /api/admin/principals/<id>/permissions` | `OWNER_OP` | `{"permission", "granted"}` | `204` |
+| A5 `POST /api/admin/principals/<id>/revoke` | `OWNER_OP` | `{}` | `204` |
+| A6 `POST /api/admin/principals/<id>/credentials/<handle>/revoke` | `OWNER_OP` | `{}` | `204` |
+
+- Order (A2-A6). The reserved `Host`, an exact `Origin`, the trusted-proxy
+  path, the reservation verdict and a serving composition; then the strict
+  JSON body (`application/json`, at most 2048 bytes for A2, 256 for A4 and 2
+  for the others; one object, no duplicate or extra member, no NaN), read
+  before any session work so a malformed request touches nothing; then
+  `_owner_operation` (`_authorize(OWNER_OP)` with `X-CSRF-Token`, inside
+  `admit(epoch)`); then one `HumanAccess.administration` call with that
+  context and `epoch=context.epoch`, which commits inside a second
+  `admit(epoch)` and re-checks the Owner session in its own transaction.
+  A1 is a read: `_authorize(OWNER_READ)` (an absent `Origin` is allowed, a
+  present one must be exact; no CSRF), then
+  `admin_inventory(owner_session=...)` inside `admit` of the same epoch, so a
+  close, reopen or `stop()` after the authorization returns nothing, and the
+  same read transaction re-checks the Owner session first
+  (`require_owner_read_session_on`: every check of an `OWNER_OP` re-check
+  but the freshness, nothing written, no idle touch; a separate method, so
+  a mutation's `require_owner_session_on` cannot be called without its
+  freshness window) and
+  only then reads the inventory from that one snapshot. The local `recover`
+  and revocation commands commit outside the gate without moving its epoch,
+  so without this re-check an inventory could be returned to a session they
+  ended between the authorization and the read (PR #242 review); with it
+  that is the generic denial and nothing is returned.
+- Bodies. `display_name` (the store's one rule, `display_name_acceptable`,
+  shared with the local `bootstrap` / `recover` commands and enforced by
+  the store on every write; names stored under the earlier rule stay
+  readable): a string of 1-64 characters with no control
+  (`Cc`), format (`Cf`: bidirectional overrides and isolates, zero-width
+  characters), lone surrogate (`Cs`), line separator (`Zl`, U+2028) or
+  paragraph separator (`Zp`, U+2029) character. `permissions`: a list of
+  distinct `"live:view"` / `"recordings:view"` (possibly empty).
+  `permission`: one of those two; `granted`: `true` or `false` (never `1` or
+  `"true"`).
+- Responses. Every success is `no-store`. The code appears only in the A2 /
+  A3 response; only its digest and lookup key are stored. Nothing that can
+  refuse runs after a change committed: the expiry A2 / A3 return is
+  checked to be an aware `datetime` inside the mutation's transaction
+  (`AccessAdministration._expiry`), so its formatting cannot fail and a
+  committed change is never answered with a refusal. A4 that changes
+  nothing is `204` too (see "A grant change that changes nothing" above).
+- Refusals. Everything is the byte-identical generic `404`: no or a forged
+  cookie, a non-Owner session (`live:view`, `recordings:view` or both), a
+  revoked person, a missing or wrong `X-CSRF-Token`, a missing or foreign
+  `Origin`, another proxy identity, a closed gate, `stop()`, a missing
+  `raw_path`, a bad path id, an unknown principal or handle, another
+  principal's handle, the Owner as the target (S4-3), a revoked target, a
+  malformed, oversized or duplicate-key body, `AccessLimitReached` (S4-8),
+  and a change refused at the commit (a close, reopen, `stop()`, failed tick
+  or local `recover` since the authorization, or a verification that went
+  stale in between). The one exception: an otherwise valid Owner session
+  whose verification is stale gets `403 {"detail":"step_up_required"}` on
+  A2-A6, decided by the authorization alone, with no state change and no
+  idle touch (S4-2); after a step-up the retried request runs. A refusal
+  that reached `AccessAdministration` writes its bounded `failed` record
+  (principal logical UUID only).
+- Credential revocation (A6) is credential-scoped: a synced passkey is
+  revoked on all synced devices that hold it, and only that credential's
+  sessions end; it is not a per-device revocation.
+- Rate limits (Owner decision 2026-10-13). The changes A2-A6 are charged to
+  a fourth, separate limiter (`rate_limit.admin_rate_limiter`,
+  `HumanAccess.admin_limiter`, which `HumanAccess` refuses to share with any
+  other limiter): per session a burst of 20 and one more every 3 seconds, no
+  global bucket, at most 256 tracked sessions (a full table evicts the
+  least recently used bucket that has refilled completely, found by a scan
+  bounded by the table size; when none has, it refuses: fail closed, never
+  growing). The key is a domain-separated
+  SHA-256 of the session token, taken inside `_authorize` right after the
+  read-only pre-check found a current session for that token and before
+  the gate epoch, any SQLite write or audit work; it is never the proxy
+  identity (shared by the room) and never logged. For A2-A6 that pre-check
+  is `session_may_be_current(token, owner=True)`: the session's principal
+  must also be the active Owner, read in the same read-only transaction (PR
+  #242 review). A forged cookie and a non-Owner session (`live:view`,
+  `recordings:view`, both or none) are refused by it with the same generic
+  `404` they got before, before they are charged, so only Owner sessions
+  ever take a slot and no number of non-Owner sessions can fill the table
+  and lock the Owner out; the role is still decided authoritatively by
+  `authorize_request` inside the gate. A non-Owner cookie presented from
+  another proxy identity on A2-A6 therefore records no binding-mismatch
+  audit there (it does on every route that session could use). Each
+  session spends only its own bucket, so another person's session cannot
+  spend the Owner's. An Owner session whose verification is stale is
+  charged before its `403 step_up_required` (the freshness is decided
+  inside the gate, after the charge), so each such answer consumes one
+  token. Over the
+  limit the change is the generic `404` and writes nothing, no audit record
+  included. Without it a fresh Owner session could repeat no-op changes or
+  changes of unknown targets and grow the audit table without bound (soft
+  space only; the hard reserve stays with the storage admission). A1 is a
+  read and not charged. The binding-mismatch audit of another proxy
+  identity keeps its own once-per-window bound.
+- Logs. These routes log nothing; no code, display name, handle,
+  credential id or identity reaches a log, a URL other than the path ids
+  above, or an audit record.
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 
@@ -1177,8 +1312,10 @@ What they do:
 
 - `bootstrap` refuses unless no Owner principal exists (any status; the
   `access_one_owner` index refuses a concurrent second one). It reads the
-  Owner's display name and the confirmation word `BOOTSTRAP` from the
-  controlling terminal, then in one transaction creates the Owner `invited`
+  Owner's display name (the store's one rule, `display_name_acceptable`,
+  as for the Web invitation: 1-64 characters, no `Cc`, `Cf`, `Cs`, `Zl` or
+  `Zp` character; otherwise `display_name_rejected`) and the confirmation
+  word `BOOTSTRAP` from the controlling terminal, then in one transaction creates the Owner `invited`
   with no credential, issues one code (the deployment's invitation lifetime)
   under the current generation and
   appends `invite_principal` and `issue_principal_invitation` (actor `owner`,

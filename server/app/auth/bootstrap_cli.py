@@ -164,7 +164,9 @@ from app.local_admin import (
 from .invitation_code import new_invitation_code
 from .model import AccessValidationError, CredentialStatus, PrincipalRole, PrincipalStatus, utc_time
 from .reservation_store import HUMAN_SESSIONS_ID
-from .store import AccessStore, InvitationClockUnavailable, OwnerAlreadyConfigured, OwnerNotConfigured
+from .store import (
+    AccessStore, InvitationClockUnavailable, OwnerAlreadyConfigured, OwnerNotConfigured, display_name_acceptable,
+)
 
 
 PROG = "python -m app.auth.bootstrap_cli"
@@ -349,7 +351,8 @@ def _display_name(terminal: ControllingTerminal, prompt: str, *, optional: bool)
     name = terminal.read_line()
     if optional and name == "":
         return None
-    if not 1 <= len(name) <= 64 or any(ord(char) < 32 or ord(char) == 127 for char in name):
+    # The store's one rule (PR #242 review): the same as the Web invitation.
+    if not display_name_acceptable(name):
         raise CliRefused("display_name_rejected")
     return name
 

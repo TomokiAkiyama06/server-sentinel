@@ -37,7 +37,8 @@ from app.auth.reservation_store import ReservationSessionRevocation
 from app.auth.serving_gate import ServingGate
 from app.auth.session_binding import SessionBindingKey
 from app.auth.store import (
-    MAX_PRINCIPALS, AccessLimitReached, AccessStore, Requirement, SessionView, StepUpRequired,
+    MAX_DISPLAY_NAME, MAX_PRINCIPALS, MAX_REDEMPTION_ATTEMPTS, AccessLimitReached, AccessStore, Requirement,
+    SessionView, StepUpRequired, display_name_acceptable,
 )
 from app.auth.webauthn import RelyingParty
 from app.main import create_app
@@ -50,6 +51,7 @@ from tests.admin_fakes import OWNER_IDENTITY, open_serving_gate, owner_context, 
 from tests.test_hostname_reservation import checker
 from tests.test_human_gated_authorization import GENERIC, STEP_UP, GatedFixture
 from tests.test_human_surface import HOST, ORIGIN, VIEWER, call, status
+from tests.test_invitation_redemption import BootClock
 from tests.test_webauthn_ceremonies import Clock, waiting
 from tests.webauthn_fakes import SyntheticAuthenticator
 
@@ -636,9 +638,10 @@ class OwnerSessionRecheckTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(AccessValidationError) as raised:
                 self.check(variant)
             self.assertIs(type(raised.exception), AccessValidationError)
-        # Expired idle lifetime.
-        with self.assertRaises(AccessValidationError):
+        # Expired idle lifetime: the generic error, never StepUpRequired (#240 item 3).
+        with self.assertRaises(AccessValidationError) as raised:
             self.check(view, self.clock() + timedelta(minutes=31))
+        self.assertIs(type(raised.exception), AccessValidationError)
         # Signed out, inconsistent credential, deployment generation.
         for statement in ("UPDATE access_sessions SET invalidated_at_us=1, external_identity_binding=NULL",
                           "UPDATE access_credentials SET inconsistent_at_us=1, "
@@ -657,6 +660,93 @@ class OwnerSessionRecheckTests(unittest.TestCase):
         token = owner_session(self.store, fresh=False)
         with self.assertRaises(StepUpRequired):
             self.store.authorize_request(token, OWNER_IDENTITY, Requirement.OWNER_OP, admit=nullcontext)
+
+    def test_the_mutation_form_never_skips_the_freshness(self):
+        # PR #242 review proposal 4: no None (or other) freshness reaches a
+        # mutation's re-check; the read form is a separate method.
+        view = owner_context(self.store).session
+        for freshness in (None, timedelta(0), timedelta(seconds=-1), 300, True):
+            with self.subTest(freshness=freshness), self.store._transaction(write=True) as connection, \
+                    self.assertRaises(AccessValidationError) as raised:
+                self.store.require_owner_session_on(connection, view, self.clock(), freshness=freshness)
+            self.assertIs(type(raised.exception), AccessValidationError)
+
+    def test_the_read_form_checks_everything_but_the_freshness(self):
+        def read(view, at=None):
+            with self.store._transaction() as connection:
+                self.store.require_owner_read_session_on(connection, view, at or self.clock())
+
+        context = owner_context(self.store)
+        view = context.session
+        read(view)
+        self.clock.advance(minutes=10)
+        # Stale: still served, never StepUpRequired.
+        read(view)
+        with self.assertRaises(StepUpRequired):
+            self.check(view)
+        stranger = SessionView(uuid4(), view.principal_id, view.credential_id, role=view.role,
+                               authorization_revision=view.authorization_revision)
+        viewer = SessionView(view.session_id, view.principal_id, view.credential_id,
+                             role=PrincipalRole.INVITED_USER, authorization_revision=view.authorization_revision)
+        for variant in (stranger, viewer):
+            with self.assertRaises(AccessValidationError) as raised:
+                read(variant)
+            self.assertIs(type(raised.exception), AccessValidationError)
+        with self.assertRaises(AccessValidationError):
+            read(view, self.clock() + timedelta(hours=13))
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE access_sessions SET invalidated_at_us=1, external_identity_binding=NULL")
+            connection.commit()
+        with self.assertRaises(AccessValidationError):
+            read(view)
+
+
+class DisplayNameRuleTests(unittest.TestCase):
+    """One display-name rule for every write (PR #242 review proposal 3)."""
+
+    ACCEPTED = ("S", "Synthetic Person", "x" * MAX_DISPLAY_NAME, "合成 テスト", "Ünïcødé ✓", "a b\u00a0c")
+    REFUSED = ("", "x" * (MAX_DISPLAY_NAME + 1), "a\x00", "tab\there", "line\nbreak", "del\x7f", "c1\x85",
+               "bidi\u202eevil", "isolate\u2066x", "zero\u200bwidth", "joiner\u200d", "bom\ufeff",
+               "lone\ud800", "ls\u2028", "ps\u2029", None, 5, b"bytes", ["x"])
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.database = Database(Path(temporary.name) / "synthetic.sqlite3")
+        with closing(self.database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        self.store = AccessStore(self.database, clock=Clock(), unaudited_writes=True)
+
+    def test_the_predicate(self):
+        self.assertEqual(MAX_DISPLAY_NAME, 64)
+        for value in self.ACCEPTED:
+            with self.subTest(value=value):
+                self.assertTrue(display_name_acceptable(value))
+        for value in self.REFUSED:
+            with self.subTest(value=value):
+                self.assertFalse(display_name_acceptable(value))
+
+    def test_the_store_enforces_it_on_write(self):
+        for value in self.REFUSED:
+            with self.subTest(value=value), self.assertRaises(AccessValidationError):
+                self.store.invite(value, ())
+        with closing(self.database.connect()) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM access_principals").fetchone()[0], 0)
+        for value in self.ACCEPTED:
+            with self.subTest(value=value):
+                self.assertEqual(self.store.invite(value, ()).display_name, value)
+
+    def test_names_stored_under_the_earlier_rule_stay_readable(self):
+        # Validation is at write time only: a legacy row (up to 128
+        # characters, only characters below U+0020 refused) is read as is.
+        legacy = "y" * 128 + "\u202e\x7f"
+        principal = self.store.invite("Synthetic", ())
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE access_principals SET display_name=? WHERE id=?",
+                               (legacy, str(principal.id)))
+            connection.commit()
+        entry = next(item for item in self.store.admin_inventory() if item["id"] == str(principal.id))
+        self.assertEqual(entry["display_name"], legacy)
 
 
 class AuthorizerTests(unittest.TestCase):
@@ -713,6 +803,123 @@ class HandleMigrationTests(unittest.TestCase):
                 connection.execute("INSERT INTO access_credentials (credential_id, principal_id, public_key, "
                                    "algorithm, sign_count, enrolled_at_us, handle) VALUES (X'FE', ?, X'01', -7, 0, 1, ?)",
                                    (principal, handles[0]))
+
+
+class PendingConditionTests(AdministrationFixture):
+    """Issue #240 items 1 and 2: "pending" is exactly what a redemption accepts,
+    for the inventory and for the one-pending-code cap alike."""
+
+    def setUp(self):
+        super().setUp()
+        # A synthetic boot clock from the start, so the Owner's sign-in and
+        # every invitation carry its readings.
+        self.boot = BootClock()
+        self.store._boot_clock = self.boot
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.context_ = await self.context()
+
+    def invited(self):
+        principal_id, code, _ = self.admin.invite(self.context_, "Synthetic invitee", (Permission.LIVE_VIEW,),
+                                                  epoch=self.context_.epoch)
+        self.assertTrue(self.entry(principal_id)["invitation"]["pending"])
+        return principal_id, code
+
+    def invitation(self, principal_id, column):
+        return self.count(f"SELECT {column} FROM access_invitations WHERE principal_id='{principal_id}' "
+                          "ORDER BY issued_at_us LIMIT 1")
+
+    def assert_unredeemable_and_replaceable(self, principal_id, code):
+        """Not pending, refused by redemption, and replaceable by a new code."""
+        entry = self.entry(principal_id)
+        self.assertEqual(entry["invitation"], {"pending": False, "expires_at": None})
+        with self.assertRaises(Exception):
+            self.redeem(code)
+        secret, fresh = new_invitation_code()
+        self.store.issue_enrollment(principal_id, secret, self.ceremony_clock() + timedelta(hours=1))
+        # The unredeemable code was marked revoked with the issue, so it can
+        # never come back next to the new one (the cap holds).
+        self.assertIsNotNone(self.invitation(principal_id, "revoked_at_us"))
+        self.assertEqual(self.count(f"SELECT count(*) FROM access_invitations WHERE principal_id='{principal_id}' "
+                                    "AND redeemed_at_us IS NULL AND revoked_at_us IS NULL"), 1)
+        self.assertTrue(self.entry(principal_id)["invitation"]["pending"])
+        with self.assertRaises(AccessLimitReached):
+            self.store.issue_enrollment(principal_id, new_invitation_code()[0],
+                                        self.ceremony_clock() + timedelta(hours=1))
+        self.redeem(fresh)
+
+    def update(self, principal_id, assignment):
+        with closing(self.database.connect()) as connection:
+            connection.execute(f"UPDATE access_invitations SET {assignment} WHERE principal_id=?",
+                               (str(principal_id),))
+            connection.commit()
+
+    async def test_a_code_without_its_boot_clock_pair_is_not_pending(self):
+        for assignment in ("issued_boot_id=NULL", "issued_boottime_us=NULL", "lookup_key=NULL"):
+            with self.subTest(assignment=assignment):
+                principal_id, code = self.invited()
+                self.update(principal_id, assignment)
+                self.assert_unredeemable_and_replaceable(principal_id, code)
+
+    async def test_an_attempt_exhausted_code_is_not_pending(self):
+        principal_id, code = self.invited()
+        self.update(principal_id, f"attempt_count={MAX_REDEMPTION_ATTEMPTS}")
+        self.assert_unredeemable_and_replaceable(principal_id, code)
+
+    async def test_a_code_after_a_wall_clock_step_back_is_not_pending_and_never_revives(self):
+        principal_id, code = self.invited()
+        # Ten minutes pass on CLOCK_BOOTTIME while the wall clock stands still
+        # (stepped back by ten minutes): invitation_clock_valid refuses.
+        self.boot.advance(minutes=10)
+        self.assert_unredeemable_and_replaceable(principal_id, code)
+
+    async def test_a_code_of_a_stale_revision_is_not_pending_and_a_grant_change_does_not_revive_it(self):
+        principal_id, code = self.invited()
+        # The principal's revision moved without the code (as before S4-5).
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE access_principals SET authorization_revision=authorization_revision+1 "
+                               "WHERE id=?", (str(principal_id),))
+            connection.commit()
+        self.assertFalse(self.entry(principal_id)["invitation"]["pending"])
+        stale = self.invitation(principal_id, "principal_revision")
+        # A real grant change advances only a code at the current revision.
+        self.assertTrue(self.admin.change_permission(self.context_, principal_id, Permission.RECORDINGS_VIEW, True,
+                                                     epoch=self.context_.epoch))
+        self.assertEqual(self.invitation(principal_id, "principal_revision"), stale)
+        self.assertFalse(self.entry(principal_id)["invitation"]["pending"])
+        with self.assertRaises(Exception):
+            self.redeem(code)
+        # A current code moves with the principal and stays pending (S4-5).
+        fresh, _ = self.admin.reissue_invitation(self.context_, principal_id, epoch=self.context_.epoch)
+        self.assertTrue(self.admin.change_permission(self.context_, principal_id, Permission.LIVE_VIEW, False,
+                                                     epoch=self.context_.epoch))
+        self.assertTrue(self.entry(principal_id)["invitation"]["pending"])
+        self.redeem(fresh)
+
+    async def test_an_unreadable_boot_clock_shows_nothing_pending(self):
+        principal_id, _ = self.invited()
+        self.boot.available = False
+        self.assertFalse(self.entry(principal_id)["invitation"]["pending"])
+        self.boot.available = True
+        self.assertTrue(self.entry(principal_id)["invitation"]["pending"])
+
+
+class NoOpAuditTests(AdministrationFixture):
+    async def test_a_no_op_grant_change_keeps_one_succeeded_record(self):
+        """Issue #240 item 4: a requested change that changes nothing is
+        recorded once as ``succeeded`` ("requested, no change"); the
+        authorization revision and the sessions stay as they were."""
+        context = await self.context()
+        _, _, credential = self.enroll((Permission.LIVE_VIEW,))
+        state = self.access_state()
+        self.assertFalse(self.admin.change_permission(context, credential.principal_id, Permission.LIVE_VIEW,
+                                                      True, epoch=context.epoch))
+        self.assertEqual(self.access_state(), state)
+        records = [record for record in self.audit.list_records(limit=1000)
+                   if record.action is AuditAction.CHANGE_PRINCIPAL_PERMISSIONS]
+        self.assertEqual([(record.outcome, record.target_logical_id) for record in records],
+                         [(AuditOutcome.SUCCEEDED, credential.principal_id)])
 
 
 class LogHygieneTests(AdministrationFixture):

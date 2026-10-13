@@ -7,6 +7,7 @@ from enum import Enum
 import hashlib
 import hmac
 import sqlite3
+import unicodedata
 from typing import Callable, ContextManager, Iterable
 from uuid import UUID, uuid4
 
@@ -234,8 +235,29 @@ def _handle(value: object) -> str:
     raise AccessValidationError("credential is unavailable")
 
 
+# One display-name rule for every write (PR #242 review proposal 3): the Web
+# invitation route, the local ``bootstrap`` / ``recover`` commands and the
+# store itself. 1-64 characters, none of them a control (``Cc``, DEL
+# included), format (``Cf``: bidirectional overrides and isolates,
+# zero-width characters), lone surrogate (``Cs``), line separator (``Zl``) or
+# paragraph separator (``Zp``) character.
+MAX_DISPLAY_NAME = 64
+REFUSED_DISPLAY_NAME_CATEGORIES = frozenset(("Cc", "Cf", "Cs", "Zl", "Zp"))
+
+
+def display_name_acceptable(value: object) -> bool:
+    """Whether ``value`` may be written as a principal's display name.
+
+    Checked at write time only: a stored name is read back as it is, so a row
+    written under an earlier, looser rule (up to 128 characters, only
+    characters below U+0020 refused) stays readable.
+    """
+    return (isinstance(value, str) and 1 <= len(value) <= MAX_DISPLAY_NAME
+            and not any(unicodedata.category(char) in REFUSED_DISPLAY_NAME_CATEGORIES for char in value))
+
+
 def _display(value: str) -> str:
-    if not isinstance(value, str) or not 1 <= len(value) <= 128 or any(ord(char) < 32 for char in value):
+    if not display_name_acceptable(value):
         raise AccessValidationError("display name is invalid")
     return value
 
@@ -543,9 +565,13 @@ class AccessStore:
 
         At most ``MAX_PENDING_INVITATIONS`` (one) pending code per principal
         (Owner decision S4-8): while one is pending
-        (``_pending_invitations_on``) another is refused with
-        ``AccessLimitReached``. Re-issuing revokes the pending one first in
-        the same transaction (``reissue_invitation_on``).
+        (``_pending_invitations_on``, the full redemption conditions) another
+        is refused with ``AccessLimitReached``. Re-issuing revokes the
+        pending one first in the same transaction (``reissue_invitation_on``).
+        A code that can no longer be redeemed does not block the new one; it
+        is marked revoked here, in the same transaction (Issue #240 item 1),
+        so a code unusable only for now (a wall clock stepped back in the
+        same boot) can never become redeemable again next to the new one.
         """
         if not isinstance(principal_id, UUID):
             raise AccessValidationError("principal identity is invalid")
@@ -561,30 +587,58 @@ class AccessStore:
         principal = connection.execute("SELECT * FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
         if principal is None or principal["status"] == PrincipalStatus.REVOKED.value:
             raise AccessValidationError("principal is unavailable")
-        if self._pending_invitations_on(connection, principal_id, at) >= MAX_PENDING_INVITATIONS:
+        pending = self._pending_invitations_on(connection, at, instant, principal_id=principal_id)
+        if len(pending) >= MAX_PENDING_INVITATIONS:
             raise AccessLimitReached()
+        # Every other unused code of the principal is unredeemable: mark it.
+        connection.execute("UPDATE access_invitations SET revoked_at_us=? WHERE principal_id=? "
+                           "AND redeemed_at_us IS NULL AND revoked_at_us IS NULL", (_us(at), str(principal_id)))
         generation = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
         connection.execute("INSERT INTO access_invitations (id, secret_digest, principal_id, principal_revision, deployment_generation, issued_at_us, expires_at_us, redeemed_at_us, revoked_at_us, lookup_key, issued_boot_id, issued_boottime_us) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)",
                            (str(invitation_id), digest, str(principal_id), principal["authorization_revision"], generation, _us(at), _us(expiry),
                             lookup, instant.boot_id, instant.boottime_us))
         return invitation_id
 
-    @staticmethod
-    def _pending_invitations_on(connection, principal_id: UUID, at: datetime) -> int:
-        """Unused codes of a principal that could still be redeemed at ``at``.
+    def _pending_invitations_on(self, connection, at: datetime, now: BootInstant | None, *,
+                                principal_id: UUID | None = None) -> list:
+        """The unused codes that could be redeemed at ``at`` (Issue #240 item 1).
 
-        Unredeemed, unrevoked, unexpired, of the current deployment
-        generation and the principal's current authorization revision (the
-        stored conditions of ``_redeemable``; the boot-clock check is left to
-        redemption). A code made unusable by a recovery or an expiry does not
-        count, so it never blocks a new one.
+        Exactly the conditions a redemption checks (``begin_registration``):
+        unredeemed and unrevoked, a lookup key present (rows from before the
+        lookup key are never found), fewer than ``MAX_REDEMPTION_ATTEMPTS``
+        attempts, a principal that is not revoked, the principal's current
+        authorization revision and the current deployment generation, and
+        ``invitation_clock_valid`` on both clocks (boot pair recorded, inside
+        the lifetime, no wall clock stepped back in the same boot). ``now`` is
+        the boot-clock reading taken with ``at``; without one nothing is
+        pending, as nothing could be redeemed. Rows of one principal, or of
+        every principal when ``principal_id`` is ``None``. The cap
+        (``issue_enrollment_on``) and the inventory (``admin_inventory``) use
+        this one definition, so a code shown as pending is one that blocks a
+        second code and one that a redemption would accept.
+
+        The attempt bound applies to starting a redemption, not to finishing
+        one: the fifth ``begin_registration`` makes the code no longer pending
+        (``attempt_count`` reaches ``MAX_REDEMPTION_ATTEMPTS``), yet the
+        challenge it issued stays usable until it expires, so a fifth attempt
+        can still complete the enrollment. That is safe (PR #242 review): the
+        challenge is single use and bound to that one invitation, the finish
+        re-checks every other condition above in its own transaction, and no
+        further challenge can be obtained for the code.
         """
-        return connection.execute(
-            "SELECT count(*) FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id "
-            "WHERE i.principal_id=? AND i.redeemed_at_us IS NULL AND i.revoked_at_us IS NULL "
-            "AND i.expires_at_us > ? AND i.principal_revision = p.authorization_revision "
-            "AND i.deployment_generation = (SELECT authorization_generation FROM access_deployment_state WHERE singleton=1)",
-            (str(principal_id), _us(utc_time(at)))).fetchone()[0]
+        generation = connection.execute(
+            "SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
+        query = ("SELECT i.*, p.status, p.authorization_revision FROM access_invitations i "
+                 "JOIN access_principals p ON p.id=i.principal_id "
+                 "WHERE i.redeemed_at_us IS NULL AND i.revoked_at_us IS NULL AND i.lookup_key IS NOT NULL "
+                 "AND i.attempt_count < ?")
+        parameters: tuple = (MAX_REDEMPTION_ATTEMPTS,)
+        if principal_id is not None:
+            query += " AND i.principal_id=?"
+            parameters += (str(principal_id),)
+        at = utc_time(at)
+        return [row for row in connection.execute(query, parameters)
+                if self._redeemable(row, generation, at, now)]
 
     @staticmethod
     def _administered_on(connection, principal_id: UUID):
@@ -1168,7 +1222,8 @@ class AccessStore:
         with admit():
             self._audited_write(write)
 
-    def session_may_be_current(self, token: object, *, now: datetime | None = None) -> bool:
+    def session_may_be_current(self, token: object, *, now: datetime | None = None,
+                               owner: bool = False) -> bool:
         """Read-only pre-check of a presented session token.
 
         It takes no session gate lock and no SQLite write lock; the deferred
@@ -1189,18 +1244,32 @@ class AccessStore:
         any SQLite write lock: a flood of forged, well-formed cookies costs one
         deferred read transaction each and never writes (Issue #181 item 4).
         An expired row it skips is left to the periodic expiry sweep.
+
+        ``owner=True`` (the administration changes A2-A6 only, PR #242
+        review) additionally requires the session's principal to be the
+        active Owner, in the same read: the human surface charges the
+        administration limiter only after this, so a non-Owner session is
+        refused before it can take a limiter slot and can never fill the
+        table against the Owner. Still only a pre-check: it grants nothing,
+        and ``authorize_request`` decides the role again inside the gate.
         """
+        if type(owner) is not bool:
+            return False
         try:
             at = utc_time(self._clock() if now is None else now)
             digest = _digest(token)
         except Exception:
             return False
+        query = ("SELECT 1 FROM access_sessions s WHERE s.token_digest=? AND s.invalidated_at_us IS NULL "
+                 "AND s.idle_expires_at_us > ? AND s.absolute_expires_at_us > ?")
+        parameters: tuple = (digest, _us(at), _us(at))
+        if owner:
+            query += (" AND EXISTS (SELECT 1 FROM access_principals p WHERE p.id=s.principal_id "
+                      "AND p.role=? AND p.status=?)")
+            parameters += (PrincipalRole.OWNER.value, PrincipalStatus.ACTIVE.value)
         try:
             with self._transaction() as connection:
-                row = connection.execute(
-                    "SELECT 1 FROM access_sessions WHERE token_digest=? AND invalidated_at_us IS NULL "
-                    "AND idle_expires_at_us > ? AND absolute_expires_at_us > ?",
-                    (digest, _us(at), _us(at))).fetchone()
+                row = connection.execute(query, parameters).fetchone()
         except Exception:
             return False
         return row is not None
@@ -1393,7 +1462,31 @@ class AccessStore:
         the authorization under the same epoch. A stale verification raises
         ``StepUpRequired``; anything else the generic ``AccessValidationError``.
         Nothing is written, so the session's idle expiry does not move.
+
+        ``freshness`` must be a positive ``timedelta``; anything else (also
+        ``None``) is refused with the generic error before anything is read,
+        so a mutation cannot skip the freshness check by accident. The
+        ``OWNER_READ`` form (the A1 inventory) is the separate
+        ``require_owner_read_session_on`` (PR #242 review proposal 4).
         """
+        if not isinstance(freshness, timedelta) or freshness <= timedelta(0):
+            raise AccessValidationError("access is unavailable")
+        row = self._owner_session_row_on(connection, view, at)
+        if self._verification_stale(row, utc_time(at), freshness):
+            raise StepUpRequired()
+
+    def require_owner_read_session_on(self, connection, view: "SessionView", at: datetime) -> None:
+        """The ``OWNER_READ`` re-check (the A1 inventory, PR #242 review).
+
+        Every check of ``require_owner_session_on`` except the verification
+        freshness: a stale Owner session is still served, and this never
+        raises ``StepUpRequired``. Only for reads; every mutation uses
+        ``require_owner_session_on``. Nothing is written.
+        """
+        self._owner_session_row_on(connection, view, at)
+
+    def _owner_session_row_on(self, connection, view: "SessionView", at: datetime):
+        """The session row if ``view`` is still a current active Owner session, else the generic error."""
         if (not isinstance(view, SessionView) or view.role is not PrincipalRole.OWNER
                 or type(view.authorization_revision) is not int or not isinstance(view.credential_id, bytes)):
             raise AccessValidationError("access is unavailable")
@@ -1416,17 +1509,17 @@ class AccessStore:
                    and now < row["idle_expires_at_us"] and now < row["absolute_expires_at_us"])
         if not current:
             raise AccessValidationError("access is unavailable")
-        if self._verification_stale(row, at, freshness):
-            raise StepUpRequired()
+        return row
 
-    def admin_inventory(self) -> tuple[dict, ...]:
+    def admin_inventory(self, *, owner_session: "SessionView | None" = None) -> tuple[dict, ...]:
         """The Owner's read-only view of every principal (Issue #10 phase 2 S4).
 
         One read transaction (``mode=ro``, nothing written). Per principal,
         ordered by creation: ``id``, ``display_name``, ``role``, ``status``,
         ``created_at``, ``revoked_at``, ``permissions`` (sorted values; the
         Owner holds every one), ``invitation`` (``pending``: an unused code
-        that could still be redeemed, with its ``expires_at``) and
+        that a redemption would accept now, ``_pending_invitations_on``, with
+        its ``expires_at``) and
         ``credentials``: per credential ``handle``, ``label``, ``status``
         (``active``/``revoked``/``inconsistent``), ``inconsistency_reason``,
         ``backup_eligible``, ``backup_state``, ``created_at``,
@@ -1436,12 +1529,27 @@ class AccessStore:
         D14: a shared account does not tell people apart), WebAuthn credential
         ids, public keys, signature counters, invitation digests and lookup
         keys, and all session data.
+
+        ``owner_session`` (the human A1 route, PR #242 review): the
+        ``SessionView`` its ``OWNER_READ`` authorization returned. The same
+        read transaction first re-checks that session with
+        ``require_owner_read_session_on`` and only then reads
+        the inventory, so both come from one snapshot. The local ``recover``
+        and revocation commands commit outside the serving gate (D6) and do
+        not move its epoch; a session they ended (or a generation they
+        advanced) after the authorization is refused here with the generic
+        ``AccessValidationError`` and nothing is returned. Nothing is
+        written: no idle touch. Local callers (tests, the local CLI) omit it.
         """
         def iso(value):
             return None if value is None else _time(value).isoformat()
 
         with self._transaction() as connection:
-            at = _us(self.now())
+            now = self.now()
+            if owner_session is not None:
+                # First, so the session check and the inventory share the
+                # snapshot of the transaction's first read.
+                self.require_owner_read_session_on(connection, owner_session, now)
             principals = connection.execute(
                 "SELECT id, display_name, role, status, created_at_us, revoked_at_us FROM access_principals "
                 "ORDER BY created_at_us, id").fetchall()
@@ -1449,13 +1557,10 @@ class AccessStore:
             for principal_id, value in connection.execute(
                     "SELECT principal_id, permission FROM access_principal_permissions ORDER BY permission"):
                 grants.setdefault(principal_id, []).append(value)
-            pending = {row[0]: row[1] for row in connection.execute(
-                "SELECT i.principal_id, max(i.expires_at_us) FROM access_invitations i "
-                "JOIN access_principals p ON p.id=i.principal_id "
-                "WHERE i.redeemed_at_us IS NULL AND i.revoked_at_us IS NULL AND i.expires_at_us > ? "
-                "AND i.principal_revision = p.authorization_revision AND p.status <> 'revoked' "
-                "AND i.deployment_generation = (SELECT authorization_generation FROM access_deployment_state WHERE singleton=1) "
-                "GROUP BY i.principal_id", (at,))}
+            # The redemption conditions themselves (Issue #240 item 1).
+            pending: dict[str, int] = {}
+            for row in self._pending_invitations_on(connection, now, self._boot_instant()):
+                pending[row["principal_id"]] = max(row["expires_at_us"], pending.get(row["principal_id"], 0))
             credentials: dict[str, list] = {}
             for row in connection.execute(
                     "SELECT principal_id, handle, label, revoked_at_us, inconsistent_at_us, inconsistency_reason, "

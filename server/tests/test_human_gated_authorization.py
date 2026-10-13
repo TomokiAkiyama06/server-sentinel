@@ -17,10 +17,9 @@ import unittest
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
-from app.auth import human_surface as surface_module
 from app.auth import session_binding as binding_module
 from app.auth.human_surface import (
-    AUTHENTICATION_OPTIONS_PATH, AUTHENTICATION_PATH, ROUTES, SESSION_COOKIE, SESSION_PATH,
+    ADMIN_PRINCIPALS_PATH, AUTHENTICATION_OPTIONS_PATH, AUTHENTICATION_PATH, ROUTES, SESSION_COOKIE, SESSION_PATH,
     SIGN_OUT_PATH, HumanAccess, HumanAccessAlreadyRunning, HumanAccessConfiguration,
     HumanAccessState, HumanAccessUnavailable, Route, ServingGate, _Denied,
     match_route, parse_query,
@@ -99,6 +98,20 @@ class GatedFixture(HumanSurfaceFixture):
     def gated(self):
         epoch = self.access.epoch()
         return lambda: self.access.admit(epoch)
+
+    async def real_owner_operation(self, cookie, csrf, **options):
+        """A real ``OWNER_OP`` route (S4b A4) that changes nothing.
+
+        Withdraws ``live:view`` from a probe principal that never held it: a
+        no-op grant change, ``204`` when the Owner session is fresh, ``403
+        step_up_required`` when it is stale, the generic denial otherwise.
+        """
+        probe = getattr(self, "_probe_principal", None)
+        if probe is None:
+            probe = self._probe_principal = self.store.invite("Synthetic probe", ()).id
+        headers = [(b"x-csrf-token", csrf.encode())] if csrf is not None else []
+        return await call(self.surface, "POST", f"{ADMIN_PRINCIPALS_PATH}/{probe}/permissions", cookie=cookie,
+                          headers=headers, body=b'{"permission":"live:view","granted":false}', **options)
 
 
 class RequirementTests(GatedFixture):
@@ -399,7 +412,9 @@ class RouteTableTests(GatedFixture):
         cookie = await self.sign_in(key)
         csrf = await self.csrf(cookie)
         for route in ROUTES:
-            path = route.path.pattern.replace("\\", "")
+            # Path ids (S4b) filled with a canonical UUID, so the path matches.
+            path = re.sub(r"\(\?P<[a-z]+>[^)]*\)", str(uuid4()), route.path.pattern).replace("\\", "")
+            self.assertIs(match_route({"method": route.method, "path": path, "raw_path": path.encode()}), route)
             with self.subTest(path=path):
                 headers = [(b"x-csrf-token", csrf.encode())]
                 self.assertEqual(await call(self.surface, route.method, path, cookie=cookie, headers=headers,
@@ -444,26 +459,10 @@ class RouteTableTests(GatedFixture):
 
 
 class StepUpResponseTests(GatedFixture):
-    """The fixed 403 of Owner decision D3, through a synthetic OWNER_OP route
-    (S1 mounts none; S3/S4 will)."""
+    """The fixed 403 of Owner decision D3, through a real OWNER_OP route (S4b)."""
 
     async def probe(self, cookie, csrf):
-        route = Route("POST", re.compile("/api/synthetic/owner-operation"), Requirement.OWNER_OP,
-                      "_synthetic_owner_operation", mutating=True, csrf=True, body_limit=2)
-        surface = self.surface
-
-        async def handler(request):
-            await surface._authorize(request, Requirement.OWNER_OP)
-            await request.send({"type": "http.response.start", "status": 204, "headers": []})
-            await request.send({"type": "http.response.body", "body": b""})
-
-        surface._synthetic_owner_operation = handler
-        try:
-            with patch.object(surface_module, "ROUTES", ROUTES + (route,)):
-                return await call(surface, "POST", "/api/synthetic/owner-operation", cookie=cookie,
-                                  headers=[(b"x-csrf-token", csrf.encode())], content_type=None)
-        finally:
-            del surface._synthetic_owner_operation
+        return await self.real_owner_operation(cookie, csrf)
 
     async def test_stale_owner_gets_the_fixed_403_and_everyone_else_the_generic_denial(self):
         _, owner_key, _ = self.enroll(owner=True)

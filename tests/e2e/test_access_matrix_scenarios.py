@@ -21,7 +21,11 @@ Two layers are exercised:
   the S3 Owner step-up rows (no matrix identity gets a step-up challenge or
   ``step_up_required``; only a stale Owner session gets the latter, another
   person's credential cannot refresh it, and a wall clock stepped back keeps
-  it stale), the ``live:view`` validator and the
+  it stale), the S4 Owner administration rows (no matrix identity
+  authorizes ``OWNER_OP``, an administration context around a non-Owner
+  session is denied and changes nothing, and the Owner's invitation, grant
+  delta and credential/principal revocation take effect at the next request),
+  the ``live:view`` validator and the
   historical timeline gate. The timeline ``access`` port is a test adapter
   that calls ``AccessStore.authorize`` with ``recordings:view``; the
   production route adapter does not exist yet. The reservation gate is a
@@ -40,10 +44,15 @@ import tempfile
 import unittest
 from uuid import UUID, uuid4
 
+from app.audit.integration import AccessAdministration
+from app.audit.model import AuditAction, AuditOutcome
+from app.audit.service import OwnerAuditService
 from app.audit.store import AuditStore
 from app.auth.boot_clock import BootInstant
 from app.auth.live_access import BoundLiveAccess, authorize_live_access, live_view_validator
 from app.auth.model import AccessValidationError, Permission
+from app.auth.owner_operation import HumanOwnerAuthorizer, OwnerOperationContext
+from app.auth.serving_gate import ServingGate
 from app.auth.session_binding import SessionBindingKey
 from app.auth.store import AccessStore, Requirement, StepUpRequired
 from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
@@ -79,6 +88,10 @@ HUMAN_PATHS = (
     "/api/recordings/" + str(UUID(int=7)) + "/download",
     "/media/" + str(UUID(int=7)) + "/segment-0001.m4s",
     "/api/admin/principals", "/api/admin/pairing", "/api/admin/audit",
+    "/api/admin/principals/" + str(UUID(int=11)) + "/invitation",
+    "/api/admin/principals/" + str(UUID(int=11)) + "/permissions",
+    "/api/admin/principals/" + str(UUID(int=11)) + "/revoke",
+    "/api/admin/principals/" + str(UUID(int=11)) + "/credentials/" + str(UUID(int=12)) + "/revoke",
     "/api/diagnostics/export", "/api/agent/ingest",
 )
 METHODS = ("GET", "POST", "DELETE")
@@ -541,6 +554,97 @@ class AccessMatrixScenarios(unittest.TestCase):
         for permission in (LIVE, RECORDINGS):
             with self.assertRaises(AccessValidationError):
                 self.store.authorize(fresh, viewer, permission)
+
+    def administration(self):
+        """The Owner administration over the synthetic gate (epoch 0)."""
+        gate = ServingGate(self.gate, stopped=lambda: False)
+        return AccessAdministration(OwnerAuditService(self.audit, HumanOwnerAuthorizer()), self.store,
+                                    session_gate=gate)
+
+    def admin_state(self):
+        with closing(self.database.connect()) as connection:
+            return [tuple(tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY 1"))
+                    for table in ("access_principals", "access_principal_permissions", "access_invitations",
+                                  "access_credentials")]
+
+    def test_owner_administration_rows(self):
+        from app.auth.invitation_code import parse_invitation_code
+        administration = self.administration()
+        both = self.identities["both"]
+        # No matrix identity authorizes OWNER_OP, so the surface never builds
+        # an administration context for one; a context around a non-Owner
+        # session (which no surface builds) is denied and changes nothing.
+        before = self.admin_state()
+        for name, identity in self.identities.items():
+            with self.subTest(identity=name):
+                self.assertIsNone(self.request(identity, Requirement.OWNER_OP))
+                self.assertIsNone(self.request(identity, Requirement.OWNER_READ))
+        view = self.request(both, Requirement.SESSION)
+        for operation in (
+                lambda context: administration.invite(context, "Synthetic x", (LIVE,), epoch=0),
+                lambda context: administration.change_permission(context, both.principal.id, RECORDINGS,
+                                                                 False, epoch=0),
+                lambda context: administration.revoke_principal(context, both.principal.id, epoch=0),
+                lambda context: administration.reissue_invitation(context, both.principal.id, epoch=0)):
+            with self.assertRaises(Exception):
+                operation(OwnerOperationContext(view, 0))
+            for raw in (both.token, both.external_identity, both.principal, None):
+                with self.assertRaises(Exception):
+                    operation(raw)
+        self.assertEqual(before, self.admin_state())
+        self.assertTrue(self.outcome(both, RECORDINGS))
+        # The Owner, fresh: one invitation with live:view only.
+        owner = self.owner()
+        context = OwnerOperationContext(self.request(owner, Requirement.OWNER_OP), 0)
+        principal_id, code, _ = administration.invite(context, "Synthetic invitee", (LIVE,), epoch=0)
+        invitee = Identity("invitee", both.external_identity)  # the shared login
+        credential = self.redemption(parse_invitation_code(code), invitee.external_identity)
+        self.assertEqual(principal_id, credential.principal_id)
+        invitee.session_id = self.store.establish_session(principal_id, credential.credential_id, invitee.token,
+                                                          proxy_identity=invitee.external_identity)
+        self.assertEqual((True, False), (self.outcome(invitee, LIVE), self.outcome(invitee, RECORDINGS)))
+        # A no-op change keeps the session; withdrawing live:view ends it.
+        self.assertFalse(administration.change_permission(context, principal_id, RECORDINGS, False, epoch=0))
+        self.assertTrue(self.outcome(invitee, LIVE))
+        self.assertTrue(administration.change_permission(context, principal_id, LIVE, False, epoch=0))
+        self.assertIsNone(self.request(invitee, Requirement.LIVE))
+        self.assertIsNone(self.request(invitee, Requirement.SESSION))
+        # A second credential; revoking one ends only its sessions.
+        self.assertTrue(administration.change_permission(context, principal_id, RECORDINGS, True, epoch=0))
+        code, _ = administration.reissue_invitation(context, principal_id, epoch=0)
+        second = self.redemption(parse_invitation_code(code), invitee.external_identity)
+        first = Identity("first", invitee.external_identity)
+        first.session_id = self.store.establish_session(principal_id, credential.credential_id, first.token,
+                                                        proxy_identity=first.external_identity)
+        other = Identity("second", invitee.external_identity)
+        self.store.establish_session(principal_id, second.credential_id, other.token,
+                                     proxy_identity=other.external_identity)
+        entry = next(item for item in self.store.admin_inventory() if item["id"] == str(principal_id))
+        with closing(self.database.connect()) as connection:
+            handle = connection.execute("SELECT handle FROM access_credentials WHERE credential_id=?",
+                                        (credential.credential_id,)).fetchone()[0]
+        self.assertIn(handle, [item["handle"] for item in entry["credentials"]])
+        administration.revoke_credential(context, principal_id, handle, epoch=0)
+        self.assertFalse(self.outcome(first, RECORDINGS))
+        self.assertTrue(self.outcome(other, RECORDINGS))
+        # The Owner is never a target; revoking the person ends everything.
+        state = self.admin_state()
+        with self.assertRaises(AccessValidationError):
+            administration.revoke_principal(context, owner.principal.id, epoch=0)
+        self.assertEqual(state, self.admin_state())
+        administration.revoke_principal(context, principal_id, epoch=0)
+        self.assertFalse(self.outcome(other, RECORDINGS))
+        # The inventory never returns a proxy identity (D14), only logical UUIDs reach the audit.
+        text = repr(self.store.admin_inventory())
+        for identity in self.identities.values():
+            self.assertNotIn(identity.external_identity, text)
+        audited = [record for record in self.audit.list_records(limit=1000)
+                   if record.action in (AuditAction.INVITE_PRINCIPAL, AuditAction.REVOKE_PRINCIPAL)]
+        self.assertIn((AuditAction.REVOKE_PRINCIPAL, AuditOutcome.SUCCEEDED, principal_id),
+                      [(record.action, record.outcome, record.target_logical_id) for record in audited])
+        self.assertNotIn(code, repr(self.audit.list_records(limit=1000)))
+        # Members are unaffected by any of it.
+        self.assertTrue(self.outcome(self.identities["live_only"], LIVE))
 
     def test_historical_timeline_requires_recordings_view_only(self):
         presence = PresenceService(

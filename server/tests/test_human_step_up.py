@@ -4,9 +4,9 @@ Synthetic only: software authenticators (``webauthn_fakes``), synthetic
 ``/proc/net`` rows, a synthetic boot id and ``CLOCK_BOOTTIME``, a temporary
 SQLite database and the in-process ASGI driver of ``test_human_surface``.
 Every identity is an invented ``.invalid`` value. Mock only: no browser,
-proxy, Tailscale or real authenticator is involved, and no real Owner
-operation route exists yet (S4): the ``OWNER_OP`` contract is exercised
-through a synthetic route added to the table for the test only.
+proxy, Tailscale or real authenticator is involved. The ``OWNER_OP``
+contract is exercised through a real Owner operation route (S4b A4, a
+grant change that changes nothing).
 """
 
 import asyncio
@@ -15,17 +15,15 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
-import re
 import secrets
 import threading
 import unittest
 from unittest.mock import patch
 from uuid import UUID
 
-from app.auth import human_surface as surface_module
 from app.auth.boot_clock import STEP_UP_ROLLBACK_TOLERANCE, BootInstant, step_up_fresh
 from app.auth.human_surface import (
-    ROUTES, HumanAccess, HumanAccessConfiguration, HumanAccessUnavailable, STEP_UP_OPTIONS_PATH, STEP_UP_PATH, Route, match_route,
+    HumanAccess, HumanAccessConfiguration, HumanAccessUnavailable, STEP_UP_OPTIONS_PATH, STEP_UP_PATH, match_route,
 )
 from app.auth.model import AccessValidationError, Permission
 from app.auth.passkeys import CeremonyDenied, CredentialFinding, PasskeyCeremonies
@@ -42,7 +40,6 @@ from tests.test_webauthn_ceremonies import waiting
 from tests.webauthn_fakes import SyntheticAuthenticator, b64, unb64
 
 
-OWNER_OPERATION_PATH = "/api/synthetic/owner-operation"
 STEP_UP_AUDIT = "SELECT count(*) FROM security_admin_audit_records WHERE action='verify_principal_step_up'"
 STEP_UP_CHALLENGES = "SELECT count(*) FROM access_webauthn_challenges WHERE ceremony='step_up'"
 OPTION_KEYS = ["allowCredentials", "challenge", "rpId", "timeout", "userVerification"]
@@ -98,23 +95,8 @@ class StepUpFixture(GatedFixture):
         return await self.finish(cookie, csrf, assertion)
 
     async def owner_operation(self, cookie, csrf):
-        """A synthetic ``OWNER_OP`` route (S4 mounts the real ones)."""
-        route = Route("POST", re.compile(re.escape(OWNER_OPERATION_PATH)), Requirement.OWNER_OP,
-                      "_synthetic_owner_operation", mutating=True, csrf=True, body_limit=2)
-        surface = self.surface
-
-        async def handler(request):
-            await surface._authorize(request, Requirement.OWNER_OP)
-            await request.send({"type": "http.response.start", "status": 204, "headers": []})
-            await request.send({"type": "http.response.body", "body": b""})
-
-        surface._synthetic_owner_operation = handler
-        try:
-            with patch.object(surface_module, "ROUTES", ROUTES + (route,)):
-                return await call(surface, "POST", OWNER_OPERATION_PATH, cookie=cookie,
-                                  headers=[(b"x-csrf-token", csrf.encode())], content_type=None)
-        finally:
-            del surface._synthetic_owner_operation
+        """A real ``OWNER_OP`` route that changes nothing (S4b A4, a no-op grant change)."""
+        return await self.real_owner_operation(cookie, csrf)
 
     def verification(self, cookie):
         """The session's verification time and boot pair, read directly."""
