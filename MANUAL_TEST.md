@@ -1897,8 +1897,11 @@ passkeys (never a real person's credential):
 `web/src/signin/` is verified only in headless Chrome with intercepted
 requests and a CDP virtual authenticator (`web/tests/signin_browser.mjs`) and
 with Node unit tests; no real browser, passkey provider or security key has
-used it, and it is not served by the Main Server until S5b. Once S5b serves
-`/` at the reserved `https` origin, run with synthetic `*.invalid` people on
+used it. Since S5b the Main Server serves it at `/` (mock-verified with a
+synthetic build), CI loads the real `npm run build` output through the
+server's loader in `server/tests/test_web_build_contract.py`, and since S5c
+the release ships that build. Once a deployment serves `/` at the reserved
+`https` origin, run with synthetic `*.invalid` people on
 each of **iOS Safari**, **macOS Safari** and **Android Chrome** (and record the
 browser and OS versions used):
 
@@ -1921,6 +1924,12 @@ browser and OS versions used):
   sends nothing;
 - [ ] the OS / browser passkey sheet asks for user verification at
   registration and at sign-in; sign-in lands on `/app/`;
+- [ ] sign in with a roaming **security key** (USB or NFC) registered
+  through the shell as a discoverable credential: in the browser's developer
+  tools, the sign-in `POST` body carries `response.userHandle` as a non-empty
+  string (not `null`) and sign-in succeeds; record the key model. A key that
+  returns `null` there is refused by the server (the shell sends the member,
+  never omits it) and must be recorded as such;
 - [ ] with a valid session, opening `/` goes straight to `/app/`;
 - [ ] a wrong, expired or already used code, a cancelled passkey sheet and a
   refused sign-in each show only 「完了できませんでした。もう一度お試しください。」 and
@@ -1948,12 +1957,14 @@ browser and OS versions used):
 ### Issue #10 phase 2 S5b sign-in shell and application asset serving (pending)
 
 Mock only: verified with a synthetic Web build, the synthetic ASGI driver and
-software authenticators (`server/tests/test_human_web_assets.py`); no browser
-has loaded, rendered or enforced the response policies of the shell or the
-application, no Tailscale Serve or real deployment has served them, and the
-release does not yet ship the build (Issue #10 S5c). Once a deployment can
-enable the human routes with a real S5a build, from a browser on the shared
-account at the reserved name:
+software authenticators (`server/tests/test_human_web_assets.py`), and CI
+loads the real S5a build through the same loader
+(`server/tests/test_web_build_contract.py`); no browser has loaded, rendered
+or enforced the response policies of the shell or the application, and no
+Tailscale Serve or real deployment has served them. The release ships the
+build since S5c (next section). Once a deployment can enable the human
+routes with that build, from a browser on the shared account at the reserved
+name:
 
 - [ ] open `https://<reserved name>/` without any session: the sign-in shell
   loads with its script and style; record the response headers in the
@@ -1979,6 +1990,35 @@ account at the reserved name:
 - [ ] replace a file of the deployed build on disk while the service runs: the
   served bytes do not change; restart with the modified build: the human
   routes stay closed (the manifest no longer matches).
+
+### Issue #10 phase 2 S5c Web build in the release (pending, not executed)
+
+Mock only: the release build, the installer's placement and the rollback
+check were exercised with a synthetic Web build in temporary directories
+(`server/tests/test_release_web_assets.py`), as the test account standing
+for root; no real artifact has been built with the real `npm ci && npm run
+build` output, and no host has installed or rolled back one. On a build host
+and then on the Main Server (Owner, synthetic data only):
+
+- [ ] build the release as in `server/docs/DEPLOYMENT.md` ("Release
+  artifact"): `node --version` is the major of `web/package.json` `engines`
+  (24), `npm ci --ignore-scripts` then `npm run build` in `web/`; build again
+  and compare: `diff -r` of the two `web/dist` reports nothing and the two
+  release manifests (`tar -xOzf <artifact> manifest.json`) list the same
+  `web/...` SHA-256 values;
+- [ ] with the administrator umask at `0002` (`umask` prints `0002`), install
+  or update with the installer: `stat -c '%U %a %h' ` on every entry of
+  `<installation>/releases/<version>/web` prints `root 755` for directories
+  and `root 444 1` for files; `find <release>/web -links +1` prints nothing;
+- [ ] add `"web_assets_directory": "<installation>/current/web"` to the
+  deployment configuration and run, as the service account,
+  `<installation>/current/venv/bin/python -m app.deployment --config <config>
+  --check`: it passes; with the key pointing at a missing directory it fails
+  with `web assets refused (reason=path)` and names no path;
+- [ ] on a disposable test installation only, change one byte of a file
+  under `releases/<older version>/web/` as root and run `rollback`: it is
+  refused before any change with the "differs from its release manifest"
+  steps; `current`, `previous` and the unit are unchanged.
 
 ### Uninvited ordinary Tailnet member
 

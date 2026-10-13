@@ -31,6 +31,12 @@ following hold:
 - every file's size and SHA-256 equal the manifest's, it is valid UTF-8, and
   the per-file, total, count and manifest caps hold.
 
+A refusal carries one value-free word of ``REFUSAL_REASONS`` (``mode``,
+``nlink``, ``digest``, ``set``, ``size``, ``type``, ``utf8``, ...) in
+``WebAssetsUnavailable.reason``, which the deployment check prints for the
+operator (Issue #10 S5c); its message stays one generic sentence and no
+client ever sees either.
+
 The bytes are then frozen in memory with their complete response headers: a
 later change on disk is never served, and no request ever builds a
 filesystem path (a request only selects one of the fixed shell entries or
@@ -39,16 +45,18 @@ looks a validated name up in the in-memory map).
 The manifest is written by the same build as the files, so these checks
 catch an accidental, partial or mixed deployment, not a deliberate one: an
 account that can write the directory can rewrite the manifest too. Tamper
-resistance comes from the release manifest's SHA-256 of the whole build
-(Issue #10 S5c) and from a root-owned directory the service account cannot
-write; the permission and hard-link checks only refuse the layouts that
-would make such a directory writable by another account or alias a file
-from elsewhere.
+resistance comes from the release manifest's SHA-256 of every build file,
+which the installer checks when it installs a release and before a rollback
+(Issue #10 S5c, ``install.py``), and from a root-owned directory the service
+account cannot write; the permission and hard-link checks only refuse the
+layouts that would make such a directory writable by another account or
+alias a file from elsewhere.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import hashlib
 import hmac
 import json
@@ -112,11 +120,34 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _LOADER = object()
 
 
-class WebAssetsUnavailable(ValueError):
-    """The asset directory cannot be served; carries no path or value."""
+# Value-free reasons a load is refused (Issue #10 S5c), for the operator: the
+# deployment check prints one of these words, never a path, name or value.
+# The exception message itself stays the one generic sentence.
+REFUSAL_REASONS = frozenset({
+    "path",      # the configured directory is not an absolute, existing directory
+    "type",      # not a regular file/directory, or an unknown extension or content type
+    "mode",      # an entry is group- or world-writable
+    "nlink",     # a file has a second hard link
+    "set",       # the files on disk are not exactly the manifest's, or the layout differs
+    "manifest",  # manifest.json is not the strict format
+    "size",      # a size differs from the manifest or a cap is exceeded
+    "digest",    # a SHA-256 differs from the manifest
+    "utf8",      # a file is not valid UTF-8
+    "io",        # the filesystem refused a read
+    "invalid",   # anything else (an asset set not built by the loader)
+})
 
-    def __init__(self) -> None:
+
+class WebAssetsUnavailable(ValueError):
+    """The asset directory cannot be served; carries no path or value.
+
+    ``reason`` is one word of ``REFUSAL_REASONS`` for operator diagnosis; the
+    message is always the same generic sentence.
+    """
+
+    def __init__(self, reason: str = "invalid") -> None:
         super().__init__("web assets are unavailable")
+        self.reason = reason if reason in REFUSAL_REASONS else "invalid"
 
 
 @dataclass(frozen=True)
@@ -148,12 +179,13 @@ def _extension(name: str) -> str | None:
 
 def _entry(value: object) -> tuple[str, int, str]:
     if not isinstance(value, dict) or set(value) != {"sha256", "size", "type"}:
-        raise WebAssetsUnavailable()
+        raise WebAssetsUnavailable("manifest")
     digest, size, kind = value["sha256"], value["size"], value["type"]
     if (not isinstance(digest, str) or not _SHA256.fullmatch(digest)
-            or type(size) is not int or not 0 <= size <= MAX_FILE_BYTES
-            or not isinstance(kind, str)):
-        raise WebAssetsUnavailable()
+            or type(size) is not int or not isinstance(kind, str)):
+        raise WebAssetsUnavailable("manifest")
+    if not 0 <= size <= MAX_FILE_BYTES:
+        raise WebAssetsUnavailable("size")
     return digest, size, kind
 
 
@@ -163,31 +195,31 @@ def _parse_manifest(raw: bytes) -> dict[str, dict[str, tuple[str, int, str]]]:
         document = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates,
                               parse_constant=_reject_constant)
     except (UnicodeDecodeError, ValueError, RecursionError):
-        raise WebAssetsUnavailable() from None
+        raise WebAssetsUnavailable("manifest") from None
     if not isinstance(document, dict) or set(document) != {"files"} or not isinstance(document["files"], dict):
-        raise WebAssetsUnavailable()
+        raise WebAssetsUnavailable("manifest")
     files = document["files"]
     if len(files) > MAX_FILES:
-        raise WebAssetsUnavailable()
+        raise WebAssetsUnavailable("size")
     layout: dict[str, dict[str, tuple[str, int, str]]] = {SHELL_DIRECTORY: {}, APP_DIRECTORY: {}}
     for path, value in files.items():
         directory, slash, name = path.partition("/")
         if not slash or directory not in layout or "/" in name:
-            raise WebAssetsUnavailable()
+            raise WebAssetsUnavailable("set")
         if directory == SHELL_DIRECTORY and name not in SHELL_FILES:
-            raise WebAssetsUnavailable()
+            raise WebAssetsUnavailable("set")
         if directory == APP_DIRECTORY and not APP_NAME.fullmatch(name):
-            raise WebAssetsUnavailable()
+            raise WebAssetsUnavailable("set")
         extension = _extension(name)
         if extension not in CONTENT_TYPES:
-            raise WebAssetsUnavailable()
+            raise WebAssetsUnavailable("type")
         digest, size, kind = _entry(value)
         expected = CONTENT_TYPES[extension]
         if kind != expected:
-            raise WebAssetsUnavailable()
+            raise WebAssetsUnavailable("type")
         layout[directory][name] = (digest, size, expected)
     if set(layout[SHELL_DIRECTORY]) != set(SHELL_FILES) or APP_INDEX not in layout[APP_DIRECTORY]:
-        raise WebAssetsUnavailable()
+        raise WebAssetsUnavailable("set")
     return layout
 
 
@@ -208,11 +240,11 @@ def _open_below(parent: int, name: str, *, directory: bool) -> int:
 def _check_mode(info: os.stat_result, *, directory: bool) -> None:
     """A directory or a singly linked regular file nobody else may write."""
     if not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
-        raise WebAssetsUnavailable()
+        raise WebAssetsUnavailable("type")
     if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise WebAssetsUnavailable()
+        raise WebAssetsUnavailable("mode")
     if not directory and info.st_nlink != 1:
-        raise WebAssetsUnavailable()
+        raise WebAssetsUnavailable("nlink")
 
 
 def _read_file(parent: int, name: str, limit: int) -> bytes:
@@ -220,7 +252,7 @@ def _read_file(parent: int, name: str, limit: int) -> bytes:
     descriptor = _open_below(parent, name, directory=False)
     try:
         if os.fstat(descriptor).st_size > limit:
-            raise WebAssetsUnavailable()
+            raise WebAssetsUnavailable("size")
         chunks, total = [], 0
         while True:
             chunk = os.read(descriptor, min(limit + 1 - total, 1024 * 1024))
@@ -228,7 +260,7 @@ def _read_file(parent: int, name: str, limit: int) -> bytes:
                 break
             total += len(chunk)
             if total > limit:
-                raise WebAssetsUnavailable()
+                raise WebAssetsUnavailable("size")
             chunks.append(chunk)
         return b"".join(chunks)
     finally:
@@ -267,43 +299,54 @@ class WebAssets:
     def load(cls, directory: object) -> "WebAssets":
         """Verify and freeze the build in ``directory``; see the module docstring."""
         if not isinstance(directory, Path) or not directory.is_absolute():
-            raise WebAssetsUnavailable()
+            raise WebAssetsUnavailable("path")
         try:
             root_path = directory.resolve(strict=True)
             root = os.open(root_path, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
         except (OSError, RuntimeError, ValueError):
-            raise WebAssetsUnavailable() from None
+            raise WebAssetsUnavailable("path") from None
         try:
             _check_mode(os.fstat(root), directory=True)
             return cls._load(root, root_path)
         except WebAssetsUnavailable:
             raise
-        except (OSError, ValueError, RecursionError):
-            raise WebAssetsUnavailable() from None
+        except (NotADirectoryError, IsADirectoryError):
+            raise WebAssetsUnavailable("type") from None
+        except OSError as error:
+            # O_NOFOLLOW on a symbolic link fails with ELOOP; a missing
+            # entry is a layout that differs from the expected one.
+            reason = {errno.ELOOP: "type", errno.ENOENT: "set"}.get(error.errno, "io")
+            raise WebAssetsUnavailable(reason) from None
+        except (ValueError, RecursionError):
+            raise WebAssetsUnavailable("io") from None
         finally:
             os.close(root)
 
     @classmethod
     def _load(cls, root: int, root_path: Path) -> "WebAssets":
         if _entries(root) != {MANIFEST_NAME, SHELL_DIRECTORY, APP_DIRECTORY}:
-            raise WebAssetsUnavailable()
+            raise WebAssetsUnavailable("set")
         layout = _parse_manifest(_read_file(root, MANIFEST_NAME, MAX_MANIFEST_BYTES))
         if sum(size for entries in layout.values() for _, size, _ in entries.values()) > MAX_TOTAL_BYTES:
-            raise WebAssetsUnavailable()
+            raise WebAssetsUnavailable("size")
         frozen: dict[str, dict[str, WebAsset]] = {}
         for directory, entries in layout.items():
             csp = SHELL_CSP if directory == SHELL_DIRECTORY else APP_CSP
             descriptor = _open_below(root, directory, directory=True)
             try:
                 if _entries(descriptor) != set(entries):
-                    raise WebAssetsUnavailable()
+                    raise WebAssetsUnavailable("set")
                 frozen[directory] = {}
                 for name, (digest, size, content_type) in entries.items():
                     body = _read_file(descriptor, name, size)
-                    actual = hashlib.sha256(body).hexdigest()
-                    if len(body) != size or not hmac.compare_digest(actual, digest):
-                        raise WebAssetsUnavailable()
-                    body.decode("utf-8")
+                    if len(body) != size:
+                        raise WebAssetsUnavailable("size")
+                    if not hmac.compare_digest(hashlib.sha256(body).hexdigest(), digest):
+                        raise WebAssetsUnavailable("digest")
+                    try:
+                        body.decode("utf-8")
+                    except UnicodeDecodeError:
+                        raise WebAssetsUnavailable("utf8") from None
                     frozen[directory][name] = _response(body, content_type, csp, digest)
             finally:
                 os.close(descriptor)

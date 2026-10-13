@@ -390,6 +390,13 @@ directory under `build/` (tests), never `web/` itself, a source directory or
 byte-identical (tested). Shell budget: HTML ≤ 2 KB, JS ≤ 12 KB minified,
 CSS ≤ 3 KB.
 
+The release (Issue #10 S5c, Owner decision S5-5) runs `npm ci --ignore-scripts`
+and `npm run build` with the Node.js major of `engines` (24) and passes the
+resulting `dist/` to `server/build_artifact.py --web-dist`. The release
+archive carries those bytes under `web/` with every file's SHA-256 in the
+release manifest, and the installer places them root-owned and read-only and
+checks them against that manifest (`server/docs/DEPLOYMENT.md`).
+
 `dist/manifest.json` is the contract with the Main Server's loader (S5b) and
 the release manifest (S5c):
 

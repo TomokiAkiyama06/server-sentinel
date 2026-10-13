@@ -663,6 +663,54 @@ class LoaderTests(unittest.TestCase):
     def test_a_body_that_is_not_utf8_is_refused(self):
         self.refused(write_build(self.directory, app=dict(APP, **{"app.js": b"\xff\xfe"})))
 
+    def test_each_refusal_carries_one_value_free_reason(self):
+        # Issue #10 S5c: the deployment check prints this word for the
+        # operator; the message stays the same generic sentence.
+        def reason(directory):
+            with self.assertRaises(WebAssetsUnavailable) as raised:
+                WebAssets.load(directory)
+            self.assertEqual(str(raised.exception), "web assets are unavailable")
+            self.assertIn(raised.exception.reason, web_assets_module.REFUSAL_REASONS)
+            return raised.exception.reason
+
+        def build(**changes):
+            return write_build(self.root / secrets.token_hex(4), **changes)
+
+        self.assertEqual(reason(self.root / "missing"), "path")
+        self.assertEqual(reason(Path("relative")), "path")
+        writable = build()
+        (writable / "app" / "app.js").chmod(0o666)
+        self.assertEqual(reason(writable), "mode")
+        linked = build()
+        os.link(linked / "app" / "app.js", self.root / (secrets.token_hex(4) + ".alias"))
+        self.assertEqual(reason(linked), "nlink")
+        changed = build()
+        (changed / "app" / "app.js").write_bytes(APP["app.js"][:-1] + b"!")
+        self.assertEqual(reason(changed), "digest")
+        resized = build()
+        (resized / "app" / "app.js").write_bytes(APP["app.js"] + b"x")
+        self.assertEqual(reason(resized), "size")
+        extra = build()
+        (extra / "app" / "unlisted.js").write_bytes(b"synthetic\n")
+        self.assertEqual(reason(extra), "set")
+        missing = build()
+        (missing / "shell" / "s.css").unlink()
+        self.assertEqual(reason(missing), "set")
+        self.assertEqual(reason(build(app=dict(APP, **{"data.json": b"{}"}))), "type")
+        fifo = build()
+        (fifo / "app" / "app.js").unlink()
+        os.mkfifo(fifo / "app" / "app.js")
+        self.assertEqual(reason(fifo), "type")
+        symlinked = build()
+        (symlinked / "app" / "app.js").unlink()
+        os.symlink(self.root / "elsewhere.js", symlinked / "app" / "app.js")
+        self.assertEqual(reason(symlinked), "type")
+        self.assertEqual(reason(build(app=dict(APP, **{"app.js": b"\xff\xfe"}))), "utf8")
+        broken = build()
+        (broken / "manifest.json").write_bytes(b"[]")
+        self.assertEqual(reason(broken), "manifest")
+        self.assertEqual(web_assets_module.WebAssetsUnavailable("not-a-reason").reason, "invalid")
+
 
 class CompositionTests(WebAssetFixture):
     def test_human_access_requires_a_verified_asset_set(self):
@@ -770,6 +818,20 @@ def _interface_fields(source, name):
     return outer, re.findall(r"(\w+): ", inner.group(1))
 
 
+class ShellWireRequiredTests(unittest.TestCase):
+    def test_a_missing_shell_source_fails_instead_of_skipping_when_required(self):
+        # Issue #10 S5c: with WEB_DIST_REQUIRED=1 (CI) the contract cannot
+        # silently skip.
+        missing = Path(tempfile.gettempdir()) / (secrets.token_hex(8) + "-webauthn.ts")
+        for required, failures, skips in (("1", 1, 0), ("0", 0, 1)):
+            with self.subTest(required=required), patch(__name__ + ".WEBAUTHN_TS", missing), \
+                    patch.dict(os.environ, {"WEB_DIST_REQUIRED": required}):
+                result = unittest.TestResult()
+                ShellWireContractTests("test_the_interfaces_are_the_members_the_verifier_reads").run(result)
+                self.assertEqual((len(result.failures), len(result.skipped), len(result.errors)),
+                                 (failures, skips, 0))
+
+
 class ShellWireContractTests(RedemptionFixture):
     """The JSON ``web/src/shared/webauthn.ts`` sends, through the real routes.
 
@@ -784,6 +846,10 @@ class ShellWireContractTests(RedemptionFixture):
 
     def setUp(self):
         if not WEBAUTHN_TS.is_file():
+            # Issue #10 S5c: CI sets WEB_DIST_REQUIRED=1, where a missing
+            # source fails instead of silently skipping the wire contract.
+            if os.environ.get("WEB_DIST_REQUIRED") == "1":
+                self.fail("WEB_DIST_REQUIRED=1 but web/src/shared/webauthn.ts is missing")
             raise unittest.SkipTest("web/src/shared/webauthn.ts is not part of this checkout")
         super().setUp()
         source = WEBAUTHN_TS.read_text(encoding="utf-8")

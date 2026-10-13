@@ -55,6 +55,17 @@ PAIRING_WRAPPER_MARKER = (
 PAIRING_MODULE = "app.cameras.remote_agent.pairing_cli"
 PAIRING_WRAPPER_OWNER = (0, 0)  # root:root; only root may replace the wrapper
 MAX_WRAPPER_BYTES = 16 * 1024
+# Issue #10 phase 2 S5c: each release keeps the release manifest it was
+# installed from, so its Web build can be checked again before a rollback.
+RELEASE_MANIFEST = "release-manifest.json"
+MAX_MANIFEST_BYTES = 256 * 1024
+WEB_DIRECTORY = "web"
+# Every release file and directory belongs to root (the installer runs as
+# root) and has exactly these modes, whatever the administrator umask.
+RELEASE_OWNER_UID = 0
+RELEASE_DIRECTORY_MODE = 0o755
+RELEASE_FILE_MODE = 0o444
+RELEASE_CODE_MODE = 0o555
 
 
 class OwnerActionRequired(ValueError):
@@ -87,12 +98,51 @@ def read_artifact(path: Path) -> bytes:
     return content
 
 
+def _release_mode(name: str) -> int:
+    return RELEASE_CODE_MODE if name.endswith(".py") else RELEASE_FILE_MODE
+
+
+def _release_directories(destination: Path, name: str) -> Path:
+    """Create the parent directories of member ``name`` with the exact release mode.
+
+    Each directory is created on its own and then given ``0755`` explicitly,
+    so neither the administrator umask nor ``mkdir(parents=True)`` (which
+    ignores ``mode`` for intermediate directories) decides the result.
+    """
+    current = destination
+    for part in PurePosixPath(name).parts[:-1]:
+        current = current / part
+        try:
+            os.mkdir(current, 0o700)
+        except FileExistsError:
+            if not stat.S_ISDIR(os.lstat(current).st_mode):
+                raise ValueError("unsafe artifact member") from None
+            continue
+        os.chmod(current, RELEASE_DIRECTORY_MODE)
+    return current
+
+
+def _write_release_file(path: Path, data: bytes, mode: int) -> None:
+    """Write one new release file: never linked, never writable after the write.
+
+    ``O_EXCL`` and ``O_NOFOLLOW`` create a fresh inode (no hard link to an
+    existing file, no symbolic link followed); the file is created ``0600``
+    and set to its final mode by descriptor, independent of the umask.
+    """
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                         0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fchmod(stream.fileno(), mode)
+
+
 def _extract(content: bytes, destination: Path, expected_version: str) -> None:
     with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
         members = archive.getmembers()
         names = [member.name for member in members]
         if (len(names) > 1024 or len(names) != len(set(names))
-                or names.count("manifest.json") != 1):
+                or names.count("manifest.json") != 1 or RELEASE_MANIFEST in names):
             raise ValueError("invalid artifact members")
         total_size = 0
         for member in members:
@@ -106,8 +156,11 @@ def _extract(content: bytes, destination: Path, expected_version: str) -> None:
         manifest_stream = archive.extractfile("manifest.json")
         if manifest_stream is None:
             raise ValueError("artifact manifest missing")
+        raw_manifest = manifest_stream.read(MAX_MANIFEST_BYTES + 1)
+        if len(raw_manifest) > MAX_MANIFEST_BYTES:
+            raise ValueError("artifact manifest invalid")
         try:
-            manifest = json.loads(manifest_stream.read(64 * 1024 + 1))
+            manifest = json.loads(raw_manifest)
         except (UnicodeError, json.JSONDecodeError):
             raise ValueError("artifact manifest invalid") from None
         expected = {"format", "name", "version", "files"}
@@ -126,11 +179,128 @@ def _extract(content: bytes, destination: Path, expected_version: str) -> None:
             data = stream.read(MAX_ARTIFACT_BYTES + 1)
             if hashlib.sha256(data).hexdigest() != digest:
                 raise ValueError("artifact member digest mismatch")
-            output = destination.joinpath(*PurePosixPath(name).parts)
-            output.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-            with output.open("xb") as writer:
-                writer.write(data)
-            output.chmod(0o555 if output.suffix == ".py" else 0o444)
+            parent = _release_directories(destination, name)
+            _write_release_file(parent / PurePosixPath(name).name, data, _release_mode(name))
+        # The manifest this release was verified against, kept for the
+        # rollback check of its Web build (Issue #10 S5c).
+        _write_release_file(destination / RELEASE_MANIFEST, raw_manifest, RELEASE_FILE_MODE)
+
+
+class ReleaseFilesDiffer(OwnerActionRequired):
+    """An installed release's Web build differs from its release manifest."""
+
+
+def _open_release_entry(parent: int, name: str, *, directory: bool) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    descriptor = os.open(name, flags | (os.O_DIRECTORY if directory else 0), dir_fd=parent)
+    info = os.fstat(descriptor)
+    expected = RELEASE_DIRECTORY_MODE if directory else None
+    kind = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if (not kind or info.st_uid != RELEASE_OWNER_UID
+            or (expected is not None and stat.S_IMODE(info.st_mode) != expected)
+            or (not directory and info.st_nlink != 1)):
+        os.close(descriptor)
+        raise ValueError("release entry differs")
+    return descriptor, info
+
+
+def _read_release_file(parent: int, name: str, mode: int, limit: int) -> bytes:
+    descriptor, info = _open_release_entry(parent, name, directory=False)
+    with os.fdopen(descriptor, "rb") as stream:
+        if stat.S_IMODE(info.st_mode) != mode or info.st_size > limit:
+            raise ValueError("release entry differs")
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("release entry differs")
+    return data
+
+
+def _web_tree(descriptor: int, prefix: str) -> dict[str, bytes]:
+    """Every file below an open Web directory: root-owned, exact modes, single link."""
+    files: dict[str, bytes] = {}
+    for name in sorted(os.listdir(descriptor)):
+        info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            if prefix.count("/") > 2:
+                raise ValueError("release entry differs")
+            child, _ = _open_release_entry(descriptor, name, directory=True)
+            try:
+                files.update(_web_tree(child, prefix + name + "/"))
+            finally:
+                os.close(child)
+        else:
+            files[prefix + name] = _read_release_file(descriptor, name, RELEASE_FILE_MODE,
+                                                      MAX_ARTIFACT_BYTES)
+    return files
+
+
+def verify_release_web(release: Path) -> bool:
+    """Check ``release``'s Web build against its own release manifest (Issue #10 S5c).
+
+    The build under ``web/`` must be exactly the manifest's ``web/`` entries:
+    every SHA-256 equal, nothing extra or missing, every file a regular,
+    singly linked, root-owned ``0444`` file and every directory root-owned
+    ``0755``, all opened without following a symbolic link. Returns ``False``
+    for a release from before S5c, which has neither the manifest copy nor
+    ``web/``; raises ``ValueError`` for anything else.
+    """
+    try:
+        root = os.open(release, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise ValueError("release entry differs") from None
+    try:
+        entries = set(os.listdir(root))
+        if RELEASE_MANIFEST not in entries:
+            if WEB_DIRECTORY in entries:
+                raise ValueError("release entry differs")
+            return False
+        try:
+            manifest = json.loads(_read_release_file(root, RELEASE_MANIFEST, RELEASE_FILE_MODE,
+                                                     MAX_MANIFEST_BYTES))
+        except (UnicodeError, json.JSONDecodeError):
+            raise ValueError("release entry differs") from None
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
+            raise ValueError("release entry differs")
+        expected = {name[len(WEB_DIRECTORY) + 1:]: digest for name, digest in manifest["files"].items()
+                    if isinstance(name, str) and name.startswith(WEB_DIRECTORY + "/")}
+        if not expected:
+            # A release built before S5c by a newer installer keeps the
+            # manifest but ships no build; nothing may appear under web/.
+            if WEB_DIRECTORY in entries:
+                raise ValueError("release entry differs")
+            return False
+        web, _ = _open_release_entry(root, WEB_DIRECTORY, directory=True)
+        try:
+            actual = _web_tree(web, "")
+        finally:
+            os.close(web)
+    except OSError:
+        raise ValueError("release entry differs") from None
+    finally:
+        os.close(root)
+    if set(actual) != set(expected) or any(
+            hashlib.sha256(data).hexdigest() != expected[name] for name, data in actual.items()):
+        raise ValueError("release entry differs")
+    return True
+
+
+def _require_release_web(args, release: Path, target: str) -> None:
+    """Refuse, before anything changes, a switch to a release whose Web build differs."""
+    try:
+        verify_release_web(release)
+    except ValueError:
+        rerun = ("rollback" + (f" --version {args.version}" if args.version else "")
+                 if args.command == "rollback" else args.command + " ...")
+        raise ReleaseFilesDiffer(
+            "ServerSentinel release operation refused before any change: the Web build of\n"
+            f"release {target} differs from its release manifest (a file under web/ was\n"
+            "changed, added, removed, linked, or has another owner or mode).\n"
+            "As the Owner:\n"
+            "  1. do not switch to that release; keep its directory for inspection\n"
+            "  2. to use that version again, move its directory out of releases/ and\n"
+            "     install it again with update and the verified artifact\n"
+            f"  3. otherwise rerun the same command ({rerun}) with another target\n"
+            "(server/docs/DEPLOYMENT.md, Install, update, and rollback).\n") from None
 
 
 def _quote(value: Path | str) -> str:
@@ -847,7 +1017,9 @@ def _require_release_accepts_configuration(args, release: Path, target: str,
         f"{target} refused the current deployment configuration in its own check\n"
         "(python -m app.deployment --check), so it could not start with it.\n"
         "A common cause is a setting added after that release, which it refuses as an\n"
-        "unknown key, such as the optional \"invitation_lifetime_hours\".\n"
+        "unknown key, such as the optional \"invitation_lifetime_hours\" or\n"
+        "\"web_assets_directory\"; a release whose Web build its own check refuses\n"
+        "fails here too (run that check as the service account to see the reason).\n"
         "To switch to it, as the Owner, in this order:\n"
         f"  1. edit {args.config}: remove every setting that release predates (for\n"
         "     \"invitation_lifetime_hours\" the default of 24 hours then applies; note\n"
@@ -875,9 +1047,13 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
         staging = releases / ("." + args.version + ".staging")
         if final.exists() or staging.exists():
             raise ValueError("release version already exists")
-        staging.mkdir(mode=0o755)
+        staging.mkdir(mode=0o700)
         try:
+            os.chmod(staging, RELEASE_DIRECTORY_MODE)
             _extract(content, staging, args.version)
+            # The placed Web build, read back from disk: exact modes, owner,
+            # single links and the release manifest's digests (Issue #10 S5c).
+            verify_release_web(staging)
             # Before the release's own --check, which would only fail without
             # saying why (Issue #109).
             _require_capture_ca_setting(args, staging, "releases/" + args.version, deployment)
@@ -1087,6 +1263,10 @@ def _execute_locked(args, runner) -> None:
             # A snapshot naming the socket would pull it back in on every
             # start of a release that cannot accept it.
             raise ValueError("installed service configuration differs")
+        # Issue #10 S5c: the target's Web build is checked against the
+        # release manifest it was installed from, as root, before its own
+        # check loads it as the service account.
+        _require_release_web(args, args.destination / target, target)
         # Like update's staging check: the target release validates the
         # configuration itself, after the refusals above that name the cause.
         _require_release_accepts_configuration(args, args.destination / target, target,

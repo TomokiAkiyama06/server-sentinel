@@ -1309,7 +1309,8 @@ static host, so the human surface serves the Web build itself.
 
 - Loading (`web_assets.py`). `WebAssets.load(directory)` runs once, when the
   embedder composes `HumanAccess`; the directory is `Settings.web_assets_dir`
-  (Issue #10 S5c points it at the release's build). It reads
+  (Issue #10 S5c: the deployment key `web_assets_directory`, the release's
+  own `<release>/web`, `server/docs/DEPLOYMENT.md`). It reads
   `manifest.json` (`{"files": {"<dir>/<name>": {"sha256", "size", "type"}}}`)
   and refuses, value-free (`WebAssetsUnavailable`, so the composition fails
   closed), unless the directory holds exactly `manifest.json`, `shell/` and
@@ -1333,8 +1334,13 @@ static host, so the human surface serves the Web build itself.
   as the files, so these checks catch an accidental, partial or mixed
   deployment; they are not tamper resistance (an account that can write the
   directory can rewrite the manifest too). That rests on the S5c release
-  manifest's SHA-256 of the build and on a root-owned directory the service
-  account cannot write.
+  manifest's SHA-256 of every build file, which the installer checks at
+  install and before a rollback, and on a root-owned directory the service
+  account cannot write. Each refusal carries one value-free word
+  (`WebAssetsUnavailable.reason`: `path`, `type`, `mode`, `nlink`, `set`,
+  `manifest`, `size`, `digest`, `utf8`, `io`) that the deployment check
+  prints for the operator (`web assets refused (reason=<word>)`); the
+  exception message stays one generic sentence and no client sees either.
 - The shell, pre-credential (D1, S5-1). `GET /`, `GET /s.js` and
   `GET /s.css` serve `shell/index.html`, `shell/s.js` and `shell/s.css`
   after the route table, `Host`/`Origin`, loopback peer and listener, the one

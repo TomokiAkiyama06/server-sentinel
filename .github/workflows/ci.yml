@@ -72,6 +72,19 @@ jobs:
           cd "$workdir/server"
           sudo -n env PYTHONDONTWRITEBYTECODE=1 CA_SEPARATION_REQUIRE_ROOT=1 \
             "$(command -v python)" -m unittest -v tests.test_ca_privilege_separation_root
+      - name: Web source contracts fail instead of skipping (Issue #10 S5c)
+        # The shell wire contract and the policy cross-check read web/
+        # sources; WEB_DIST_REQUIRED turns a missing source into a failure.
+        working-directory: server
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          WEB_DIST_REQUIRED: '1'
+        run: >-
+          python -m unittest -v
+          tests.test_human_web_assets.ShellWireContractTests
+          tests.test_human_web_assets.ShellWireRequiredTests
+          tests.test_web_build_contract.PolicyCrossCheckTests
+          tests.test_web_build_contract.RequiredBuildTests
       - name: Hardware-free mock E2E core scenarios
         env:
           PYTHONDONTWRITEBYTECODE: '1'

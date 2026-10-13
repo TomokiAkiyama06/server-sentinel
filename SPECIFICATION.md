@@ -2148,7 +2148,13 @@ group- or world-writable entry and a file with a second hard link refuse the
 whole composition (fail closed), and the verified bytes are frozen in
 memory, so a later disk change is never served. This guards against an
 accidental or partial deployment; tamper resistance is the S5c release
-manifest plus a root-owned, service-unwritable directory. Every asset response has a
+manifest (every build file's SHA-256, checked by the installer at install
+and before a rollback) plus a root-owned, service-unwritable directory.
+`Settings.web_assets_dir` comes from the optional deployment key
+`web_assets_directory` (`<installation>/current/web`, resolved against the
+running release's own `web/`); without it no human composition can be
+mounted, and with it the release's `--check` refuses to start unless the
+build loads. Every asset response has a
 fixed header list: its `Content-Type` (the manifest's, from the S5a
 build policy `web/scripts/policy.mjs`), `Content-Length`,
 `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,

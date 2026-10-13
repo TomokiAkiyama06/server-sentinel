@@ -7,22 +7,46 @@ not point a production service at a Git clone.
 ## Release artifact
 
 Use a supported CPython and download the exact reviewed wheels from
-`requirements.lock` into an otherwise empty wheelhouse. Build from a tagged
-release checkout:
+`requirements.lock` into an otherwise empty wheelhouse. Build the Web
+dashboard first (Issue #10 phase 2 S5c, Owner decision S5-5) with the Node.js
+major that `web/package.json` `engines` names (currently 24; `node --version`
+must print `v24.x`) and the locked dependencies only -- `npm ci`, never
+`npm install`. Build from a tagged release checkout:
 
 ```sh
-cd server
+cd web
+npm ci --ignore-scripts --no-audit --no-fund
+npm run build
+cd ../server
 python3 -m pip download --require-hashes --only-binary=:all: --no-deps \
   --dest /tmp/server-sentinel-wheelhouse -r requirements.lock
 python3 build_artifact.py --version 1.0.0 \
   --wheelhouse /tmp/server-sentinel-wheelhouse \
+  --web-dist "$(cd ../web && pwd)/dist" \
   --output /tmp/server-sentinel-main-1.0.0.tar.gz
 python3 build_installer.py \
   --output /tmp/server-sentinel-installer-1.0.0.pyz
 ```
 
-The archive contains only the Main Server package, reviewed lock and license
-material, and supplied wheelhouse. It contains no checkout history, tests,
+`--web-dist` is the absolute path of the `web/dist` directory that build just
+wrote (`manifest.json`, `shell/`, `app/`). The Web build is deterministic:
+building the same sources with the same lock again gives a byte-identical
+`web/dist`. `build_artifact.py` reads that directory without following any
+symbolic link, refuses anything but regular files and the two subdirectories,
+loads a private copy through the Main Server's own asset loader
+(`WebAssets.load`), and fails with a fixed, value-free reason
+(`web build refused by the asset loader (reason=<word>)`) for a missing,
+modified, extra or unlisted file instead of releasing a build the service
+would refuse. The archive carries those exact bytes under `web/`, and the
+release manifest records the SHA-256 of every one of them. That release
+manifest -- not only `web/dist/manifest.json`, which the same build writes
+and an account able to write the directory could rewrite too -- is what the
+installer checks the build against. The sign-in shell carries no version
+marker, but its bytes can identify the software (Owner decision S5-5,
+`server/app/auth/README.md`).
+
+The archive contains only the Main Server package, the Web build, reviewed
+lock and license material, and supplied wheelhouse. It contains no checkout history, tests,
 deployment configuration, credentials, or runtime data. Publish its reported
 SHA-256 separately with the versioned release. The installer verifies that
 outer digest, the manifest version, every member digest, and the bounded
@@ -78,6 +102,42 @@ defaults):
 
 The optional `"invitation_lifetime_hours"` (an integer from 1 to 168, default
 24) sets the invitation code lifetime; see "Owner bootstrap and recovery".
+
+The optional `"web_assets_directory"` (Issue #10 phase 2 S5c) names the Web
+build the human surface serves (`Settings.web_assets_dir`). Write it as
+`"<installation>/current/web"`, for example
+`"/opt/server-sentinel-main/current/web"`, with the installation root spelled
+exactly as `--destination` (an absolute path without `..` or a symbolic link
+in it). It must name a directory inside the release: each release resolves
+it against its own release directory, so the same configuration serves the
+build of whichever release runs, and the update staging check and the
+rollback check load the build of the release being switched to, never the
+one still running. A path outside the release, the installation root itself,
+a relative path or a non-string is refused. Without the key no Web build is
+configured, and no human composition can be mounted (`create_app` refuses
+one without `Settings.web_assets_dir`), so human access stays closed: fail
+closed, never a fallback to another directory. No deployment key enables
+human access yet; the key is read and its build checked now so a release
+that does can rely on it.
+
+When the key is present, the release's own check (`python -m app.deployment
+--config <config> --check`, the unit's `ExecStartPre`, and the installer's
+staging and rollback checks) and the launcher load that build as the service
+account with the release's loader and refuse to start when it is refused,
+printing one value-free reason for the operator:
+
+```text
+ServerSentinel deployment validation failed: web assets refused (reason=<word>)
+```
+
+`<word>` is one of `path` (missing, not a directory, or a symbolic link out of
+the release), `type` (not a regular file or directory, a symbolic link, or an
+unknown extension or content type), `mode` (group- or world-writable),
+`nlink` (a file with a second hard link), `set` (files differ from the
+manifest), `manifest` (malformed manifest), `size` (a size differs or a cap
+is exceeded), `digest` (a SHA-256 differs), `utf8` or `io`. It never names a
+path, file or digest, and no client ever sees it. A release from before S5c
+refuses the key as an unknown key (see "Install, update, and rollback").
 
 `capture_ca_directory` is required (Owner decision 2026-10-07, Issue #109):
 it is either the absolute path of the capture-node CA directory on this host
@@ -1062,6 +1122,33 @@ again. When returning to a release that has the key, switch first, then add
 the entry back and restart the service (`sudo systemctl restart
 server-sentinel.service`); until then the 24-hour default applies to newly
 issued codes.
+
+**The Web build in each release (Issue #10 phase 2 S5c).** The installer
+writes every release file as a new inode (`O_CREAT | O_EXCL | O_NOFOLLOW`,
+created `0600` and set to its final mode by descriptor) and every directory
+with an explicit `chmod`, so the result never depends on the administrator's
+umask (Ubuntu's default `0002` included): release directories are root-owned
+`0755`, Python files `0555` and every other file -- the Web build included --
+root-owned `0444`, none writable by the service account. It never creates a
+hard link and uses no hard-link or deduplicating tooling (no `cp -al`, no
+`rsync --link-dest`, no filesystem dedup or `hardlink` run over releases):
+the asset loader refuses any Web file with a second link, and a link shared
+with a writable copy would let that copy change the served build. Do not run
+such tools over the installation tree afterwards either.
+
+After extracting a release, and again before a rollback switches to one, the
+installer (as root) reads the release's `web/` back without following a
+symbolic link and compares it with the release manifest it kept in that
+release (`release-manifest.json`, root-owned `0444`): the same set of files,
+every SHA-256 equal, every file a singly linked root-owned `0444` regular
+file and every directory root-owned `0755`. Any difference refuses the
+operation before anything changes, with the steps to follow: keep the release
+directory for inspection, and to use that version again move its directory
+out of `releases/` and install it again with `update` and the verified
+artifact. A release from before S5c has neither `web/` nor the manifest copy
+and is not checked; one that has `web/` without the manifest copy is refused.
+The target release's own check then loads the build as the service account
+when `"web_assets_directory"` is set, as described above.
 
 Run the separately downloaded installer only after verifying its published
 SHA-256. Global arguments precede the operation:
