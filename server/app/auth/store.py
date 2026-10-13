@@ -7,6 +7,7 @@ from enum import Enum
 import hashlib
 import hmac
 import sqlite3
+import unicodedata
 from typing import Callable, ContextManager, Iterable
 from uuid import UUID, uuid4
 
@@ -234,8 +235,29 @@ def _handle(value: object) -> str:
     raise AccessValidationError("credential is unavailable")
 
 
+# One display-name rule for every write (PR #242 review proposal 3): the Web
+# invitation route, the local ``bootstrap`` / ``recover`` commands and the
+# store itself. 1-64 characters, none of them a control (``Cc``, DEL
+# included), format (``Cf``: bidirectional overrides and isolates,
+# zero-width characters), lone surrogate (``Cs``), line separator (``Zl``) or
+# paragraph separator (``Zp``) character.
+MAX_DISPLAY_NAME = 64
+REFUSED_DISPLAY_NAME_CATEGORIES = frozenset(("Cc", "Cf", "Cs", "Zl", "Zp"))
+
+
+def display_name_acceptable(value: object) -> bool:
+    """Whether ``value`` may be written as a principal's display name.
+
+    Checked at write time only: a stored name is read back as it is, so a row
+    written under an earlier, looser rule (up to 128 characters, only
+    characters below U+0020 refused) stays readable.
+    """
+    return (isinstance(value, str) and 1 <= len(value) <= MAX_DISPLAY_NAME
+            and not any(unicodedata.category(char) in REFUSED_DISPLAY_NAME_CATEGORIES for char in value))
+
+
 def _display(value: str) -> str:
-    if not isinstance(value, str) or not 1 <= len(value) <= 128 or any(ord(char) < 32 for char in value):
+    if not display_name_acceptable(value):
         raise AccessValidationError("display name is invalid")
     return value
 
@@ -1200,7 +1222,8 @@ class AccessStore:
         with admit():
             self._audited_write(write)
 
-    def session_may_be_current(self, token: object, *, now: datetime | None = None) -> bool:
+    def session_may_be_current(self, token: object, *, now: datetime | None = None,
+                               owner: bool = False) -> bool:
         """Read-only pre-check of a presented session token.
 
         It takes no session gate lock and no SQLite write lock; the deferred
@@ -1221,18 +1244,32 @@ class AccessStore:
         any SQLite write lock: a flood of forged, well-formed cookies costs one
         deferred read transaction each and never writes (Issue #181 item 4).
         An expired row it skips is left to the periodic expiry sweep.
+
+        ``owner=True`` (the administration changes A2-A6 only, PR #242
+        review) additionally requires the session's principal to be the
+        active Owner, in the same read: the human surface charges the
+        administration limiter only after this, so a non-Owner session is
+        refused before it can take a limiter slot and can never fill the
+        table against the Owner. Still only a pre-check: it grants nothing,
+        and ``authorize_request`` decides the role again inside the gate.
         """
+        if type(owner) is not bool:
+            return False
         try:
             at = utc_time(self._clock() if now is None else now)
             digest = _digest(token)
         except Exception:
             return False
+        query = ("SELECT 1 FROM access_sessions s WHERE s.token_digest=? AND s.invalidated_at_us IS NULL "
+                 "AND s.idle_expires_at_us > ? AND s.absolute_expires_at_us > ?")
+        parameters: tuple = (digest, _us(at), _us(at))
+        if owner:
+            query += (" AND EXISTS (SELECT 1 FROM access_principals p WHERE p.id=s.principal_id "
+                      "AND p.role=? AND p.status=?)")
+            parameters += (PrincipalRole.OWNER.value, PrincipalStatus.ACTIVE.value)
         try:
             with self._transaction() as connection:
-                row = connection.execute(
-                    "SELECT 1 FROM access_sessions WHERE token_digest=? AND invalidated_at_us IS NULL "
-                    "AND idle_expires_at_us > ? AND absolute_expires_at_us > ?",
-                    (digest, _us(at), _us(at))).fetchone()
+                row = connection.execute(query, parameters).fetchone()
         except Exception:
             return False
         return row is not None
@@ -1407,7 +1444,7 @@ class AccessStore:
         connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
 
     def require_owner_session_on(self, connection, view: "SessionView", at: datetime, *,
-                                 freshness: timedelta | None = OWNER_STEP_UP_FRESHNESS) -> None:
+                                 freshness: timedelta = OWNER_STEP_UP_FRESHNESS) -> None:
         """Re-check, inside an Owner operation's own transaction, that its session still holds.
 
         ``view`` is the ``SessionView`` the request's ``OWNER_OP``
@@ -1426,10 +1463,30 @@ class AccessStore:
         ``StepUpRequired``; anything else the generic ``AccessValidationError``.
         Nothing is written, so the session's idle expiry does not move.
 
-        ``freshness=None`` is the ``OWNER_READ`` form (the A1 inventory, PR
-        #242 review): every check above except the verification freshness, so
-        a stale Owner session is still served, and never ``StepUpRequired``.
+        ``freshness`` must be a positive ``timedelta``; anything else (also
+        ``None``) is refused with the generic error before anything is read,
+        so a mutation cannot skip the freshness check by accident. The
+        ``OWNER_READ`` form (the A1 inventory) is the separate
+        ``require_owner_read_session_on`` (PR #242 review proposal 4).
         """
+        if not isinstance(freshness, timedelta) or freshness <= timedelta(0):
+            raise AccessValidationError("access is unavailable")
+        row = self._owner_session_row_on(connection, view, at)
+        if self._verification_stale(row, utc_time(at), freshness):
+            raise StepUpRequired()
+
+    def require_owner_read_session_on(self, connection, view: "SessionView", at: datetime) -> None:
+        """The ``OWNER_READ`` re-check (the A1 inventory, PR #242 review).
+
+        Every check of ``require_owner_session_on`` except the verification
+        freshness: a stale Owner session is still served, and this never
+        raises ``StepUpRequired``. Only for reads; every mutation uses
+        ``require_owner_session_on``. Nothing is written.
+        """
+        self._owner_session_row_on(connection, view, at)
+
+    def _owner_session_row_on(self, connection, view: "SessionView", at: datetime):
+        """The session row if ``view`` is still a current active Owner session, else the generic error."""
         if (not isinstance(view, SessionView) or view.role is not PrincipalRole.OWNER
                 or type(view.authorization_revision) is not int or not isinstance(view.credential_id, bytes)):
             raise AccessValidationError("access is unavailable")
@@ -1452,8 +1509,7 @@ class AccessStore:
                    and now < row["idle_expires_at_us"] and now < row["absolute_expires_at_us"])
         if not current:
             raise AccessValidationError("access is unavailable")
-        if freshness is not None and self._verification_stale(row, at, freshness):
-            raise StepUpRequired()
+        return row
 
     def admin_inventory(self, *, owner_session: "SessionView | None" = None) -> tuple[dict, ...]:
         """The Owner's read-only view of every principal (Issue #10 phase 2 S4).
@@ -1477,7 +1533,7 @@ class AccessStore:
         ``owner_session`` (the human A1 route, PR #242 review): the
         ``SessionView`` its ``OWNER_READ`` authorization returned. The same
         read transaction first re-checks that session with
-        ``require_owner_session_on(..., freshness=None)`` and only then reads
+        ``require_owner_read_session_on`` and only then reads
         the inventory, so both come from one snapshot. The local ``recover``
         and revocation commands commit outside the serving gate (D6) and do
         not move its epoch; a session they ended (or a generation they
@@ -1493,7 +1549,7 @@ class AccessStore:
             if owner_session is not None:
                 # First, so the session check and the inventory share the
                 # snapshot of the transaction's first read.
-                self.require_owner_session_on(connection, owner_session, now, freshness=None)
+                self.require_owner_read_session_on(connection, owner_session, now)
             principals = connection.execute(
                 "SELECT id, display_name, role, status, created_at_us, revoked_at_us FROM access_principals "
                 "ORDER BY created_at_us, id").fetchall()

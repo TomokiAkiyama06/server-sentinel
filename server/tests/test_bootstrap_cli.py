@@ -193,7 +193,14 @@ class BootstrapCliTests(unittest.TestCase):
         for lines, reason in ((("Synthetic Owner", "bootstrap"), "owner_confirmation_declined"),
                               (("Synthetic Owner", ""), "owner_confirmation_declined"),
                               (("",), "display_name_rejected"),
-                              (("x" * 65,), "display_name_rejected")):
+                              (("x" * 65,), "display_name_rejected"),
+                              # The store's one rule (PR #242 review): no
+                              # format or separator character either (DEL is
+                              # the pseudo-terminal's erase character, so it is
+                              # covered by the predicate's own tests).
+                              (("bidi\u202eevil",), "display_name_rejected"),
+                              (("zero\u200bwidth",), "display_name_rejected"),
+                              (("line\u2028sep",), "display_name_rejected")):
             with self.subTest(lines=lines):
                 code, stdout, stderr, terminal = self.run_cli("bootstrap", *lines)
                 self.assertEqual((code, stdout), (2, ""))
@@ -281,6 +288,18 @@ class BootstrapCliTests(unittest.TestCase):
         self.assertNotIn("revoke_principal_credential", [row[1] for row in self.rows(AUDIT)])
         # Two outstanding Owner invitations never coexist: the first was revoked.
         self.assertEqual(self.rows("SELECT count(*) FROM access_invitations WHERE revoked_at_us IS NULL"), [(1,)])
+        # A new name follows the store's one rule (PR #242 review); a refused
+        # one changes nothing.
+        before = (self.rows(AUDIT), self.rows("SELECT * FROM access_invitations"))
+        # (Inside the name: the terminal line is stripped, which removes a
+        # trailing separator before the rule sees it.)
+        for name in ("x" * 65, "bidi\u202eevil", "p\u2029s"):
+            with self.subTest(name=name):
+                code, stdout, stderr, _ = self.run_cli("recover", name)
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn("refused: display_name_rejected", stderr)
+        self.assertEqual((self.rows(AUDIT), self.rows("SELECT * FROM access_invitations")), before)
+        self.assertEqual(self.rows("SELECT display_name FROM access_principals"), [("Synthetic Owner",)])
 
     def test_the_lifetime_comes_from_the_deployment_configuration(self):
         # Owner decision 2026-10-11: configurable per deployment (here 2 hours).

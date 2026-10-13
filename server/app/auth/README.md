@@ -1199,14 +1199,19 @@ credential id) are the only values in these URLs.
   `admin_inventory(owner_session=...)` inside `admit` of the same epoch, so a
   close, reopen or `stop()` after the authorization returns nothing, and the
   same read transaction re-checks the Owner session first
-  (`require_owner_session_on(..., freshness=None)`: every check of an
-  `OWNER_OP` re-check but the freshness, nothing written, no idle touch) and
+  (`require_owner_read_session_on`: every check of an `OWNER_OP` re-check
+  but the freshness, nothing written, no idle touch; a separate method, so
+  a mutation's `require_owner_session_on` cannot be called without its
+  freshness window) and
   only then reads the inventory from that one snapshot. The local `recover`
   and revocation commands commit outside the gate without moving its epoch,
   so without this re-check an inventory could be returned to a session they
   ended between the authorization and the read (PR #242 review); with it
   that is the generic denial and nothing is returned.
-- Bodies. `display_name`: a string of 1-64 characters with no control
+- Bodies. `display_name` (the store's one rule, `display_name_acceptable`,
+  shared with the local `bootstrap` / `recover` commands and enforced by
+  the store on every write; names stored under the earlier rule stay
+  readable): a string of 1-64 characters with no control
   (`Cc`), format (`Cf`: bidirectional overrides and isolates, zero-width
   characters), lone surrogate (`Cs`), line separator (`Zl`, U+2028) or
   paragraph separator (`Zp`, U+2029) character. `permissions`: a list of
@@ -1242,15 +1247,29 @@ credential id) are the only values in these URLs.
   a fourth, separate limiter (`rate_limit.admin_rate_limiter`,
   `HumanAccess.admin_limiter`, which `HumanAccess` refuses to share with any
   other limiter): per session a burst of 20 and one more every 3 seconds, no
-  global bucket, at most 256 tracked sessions (a full table evicts only a
-  least recently used bucket that has refilled completely, otherwise it
-  refuses: fail closed, never growing). The key is a domain-separated
+  global bucket, at most 256 tracked sessions (a full table evicts the
+  least recently used bucket that has refilled completely, found by a scan
+  bounded by the table size; when none has, it refuses: fail closed, never
+  growing). The key is a domain-separated
   SHA-256 of the session token, taken inside `_authorize` right after the
   read-only pre-check found a current session for that token and before
   the gate epoch, any SQLite write or audit work; it is never the proxy
-  identity (shared by the room) and never logged. A forged cookie is refused
-  by the pre-check before it is charged, and each session spends only its
-  own bucket, so another person's session cannot spend the Owner's. Over the
+  identity (shared by the room) and never logged. For A2-A6 that pre-check
+  is `session_may_be_current(token, owner=True)`: the session's principal
+  must also be the active Owner, read in the same read-only transaction (PR
+  #242 review). A forged cookie and a non-Owner session (`live:view`,
+  `recordings:view`, both or none) are refused by it with the same generic
+  `404` they got before, before they are charged, so only Owner sessions
+  ever take a slot and no number of non-Owner sessions can fill the table
+  and lock the Owner out; the role is still decided authoritatively by
+  `authorize_request` inside the gate. A non-Owner cookie presented from
+  another proxy identity on A2-A6 therefore records no binding-mismatch
+  audit there (it does on every route that session could use). Each
+  session spends only its own bucket, so another person's session cannot
+  spend the Owner's. An Owner session whose verification is stale is
+  charged before its `403 step_up_required` (the freshness is decided
+  inside the gate, after the charge), so each such answer consumes one
+  token. Over the
   limit the change is the generic `404` and writes nothing, no audit record
   included. Without it a fresh Owner session could repeat no-op changes or
   changes of unknown targets and grow the audit table without bound (soft
@@ -1293,8 +1312,10 @@ What they do:
 
 - `bootstrap` refuses unless no Owner principal exists (any status; the
   `access_one_owner` index refuses a concurrent second one). It reads the
-  Owner's display name and the confirmation word `BOOTSTRAP` from the
-  controlling terminal, then in one transaction creates the Owner `invited`
+  Owner's display name (the store's one rule, `display_name_acceptable`,
+  as for the Web invitation: 1-64 characters, no `Cc`, `Cf`, `Cs`, `Zl` or
+  `Zp` character; otherwise `display_name_rejected`) and the confirmation
+  word `BOOTSTRAP` from the controlling terminal, then in one transaction creates the Owner `invited`
   with no credential, issues one code (the deployment's invitation lifetime)
   under the current generation and
   appends `invite_principal` and `issue_principal_invitation` (actor `owner`,

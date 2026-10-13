@@ -37,7 +37,8 @@ from app.auth.reservation_store import ReservationSessionRevocation
 from app.auth.serving_gate import ServingGate
 from app.auth.session_binding import SessionBindingKey
 from app.auth.store import (
-    MAX_PRINCIPALS, MAX_REDEMPTION_ATTEMPTS, AccessLimitReached, AccessStore, Requirement, SessionView, StepUpRequired,
+    MAX_DISPLAY_NAME, MAX_PRINCIPALS, MAX_REDEMPTION_ATTEMPTS, AccessLimitReached, AccessStore, Requirement,
+    SessionView, StepUpRequired, display_name_acceptable,
 )
 from app.auth.webauthn import RelyingParty
 from app.main import create_app
@@ -659,6 +660,93 @@ class OwnerSessionRecheckTests(unittest.TestCase):
         token = owner_session(self.store, fresh=False)
         with self.assertRaises(StepUpRequired):
             self.store.authorize_request(token, OWNER_IDENTITY, Requirement.OWNER_OP, admit=nullcontext)
+
+    def test_the_mutation_form_never_skips_the_freshness(self):
+        # PR #242 review proposal 4: no None (or other) freshness reaches a
+        # mutation's re-check; the read form is a separate method.
+        view = owner_context(self.store).session
+        for freshness in (None, timedelta(0), timedelta(seconds=-1), 300, True):
+            with self.subTest(freshness=freshness), self.store._transaction(write=True) as connection, \
+                    self.assertRaises(AccessValidationError) as raised:
+                self.store.require_owner_session_on(connection, view, self.clock(), freshness=freshness)
+            self.assertIs(type(raised.exception), AccessValidationError)
+
+    def test_the_read_form_checks_everything_but_the_freshness(self):
+        def read(view, at=None):
+            with self.store._transaction() as connection:
+                self.store.require_owner_read_session_on(connection, view, at or self.clock())
+
+        context = owner_context(self.store)
+        view = context.session
+        read(view)
+        self.clock.advance(minutes=10)
+        # Stale: still served, never StepUpRequired.
+        read(view)
+        with self.assertRaises(StepUpRequired):
+            self.check(view)
+        stranger = SessionView(uuid4(), view.principal_id, view.credential_id, role=view.role,
+                               authorization_revision=view.authorization_revision)
+        viewer = SessionView(view.session_id, view.principal_id, view.credential_id,
+                             role=PrincipalRole.INVITED_USER, authorization_revision=view.authorization_revision)
+        for variant in (stranger, viewer):
+            with self.assertRaises(AccessValidationError) as raised:
+                read(variant)
+            self.assertIs(type(raised.exception), AccessValidationError)
+        with self.assertRaises(AccessValidationError):
+            read(view, self.clock() + timedelta(hours=13))
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE access_sessions SET invalidated_at_us=1, external_identity_binding=NULL")
+            connection.commit()
+        with self.assertRaises(AccessValidationError):
+            read(view)
+
+
+class DisplayNameRuleTests(unittest.TestCase):
+    """One display-name rule for every write (PR #242 review proposal 3)."""
+
+    ACCEPTED = ("S", "Synthetic Person", "x" * MAX_DISPLAY_NAME, "合成 テスト", "Ünïcødé ✓", "a b\u00a0c")
+    REFUSED = ("", "x" * (MAX_DISPLAY_NAME + 1), "a\x00", "tab\there", "line\nbreak", "del\x7f", "c1\x85",
+               "bidi\u202eevil", "isolate\u2066x", "zero\u200bwidth", "joiner\u200d", "bom\ufeff",
+               "lone\ud800", "ls\u2028", "ps\u2029", None, 5, b"bytes", ["x"])
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.database = Database(Path(temporary.name) / "synthetic.sqlite3")
+        with closing(self.database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        self.store = AccessStore(self.database, clock=Clock(), unaudited_writes=True)
+
+    def test_the_predicate(self):
+        self.assertEqual(MAX_DISPLAY_NAME, 64)
+        for value in self.ACCEPTED:
+            with self.subTest(value=value):
+                self.assertTrue(display_name_acceptable(value))
+        for value in self.REFUSED:
+            with self.subTest(value=value):
+                self.assertFalse(display_name_acceptable(value))
+
+    def test_the_store_enforces_it_on_write(self):
+        for value in self.REFUSED:
+            with self.subTest(value=value), self.assertRaises(AccessValidationError):
+                self.store.invite(value, ())
+        with closing(self.database.connect()) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM access_principals").fetchone()[0], 0)
+        for value in self.ACCEPTED:
+            with self.subTest(value=value):
+                self.assertEqual(self.store.invite(value, ()).display_name, value)
+
+    def test_names_stored_under_the_earlier_rule_stay_readable(self):
+        # Validation is at write time only: a legacy row (up to 128
+        # characters, only characters below U+0020 refused) is read as is.
+        legacy = "y" * 128 + "\u202e\x7f"
+        principal = self.store.invite("Synthetic", ())
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE access_principals SET display_name=? WHERE id=?",
+                               (legacy, str(principal.id)))
+            connection.commit()
+        entry = next(item for item in self.store.admin_inventory() if item["id"] == str(principal.id))
+        self.assertEqual(entry["display_name"], legacy)
 
 
 class AuthorizerTests(unittest.TestCase):

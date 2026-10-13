@@ -1894,8 +1894,12 @@ are charged to their own per-session rate limiter (Owner decision
 bounded table of 256 sessions), keyed server-side on a digest of the session
 token after the read-only session pre-check and before the gate or any
 SQLite or audit work; over the limit the change is the generic `404` and
-writes nothing, no audit record included. The inventory read is not
-charged.
+writes nothing, no audit record included. For A2-A6 that pre-check also
+requires the session's principal to be the active Owner (PR #242 review), so
+a non-Owner session is the generic `404` before it is charged and can never
+take a limiter slot or lock the Owner out; the role is still decided
+authoritatively inside the gate. A stale Owner's `403 step_up_required`
+consumes one token. The inventory read is not charged.
 
 Exactly two HTTP routes run before a credential exists, and the pair is closed.
 Owner bootstrap is not a third one: it is a local action on the host that feeds

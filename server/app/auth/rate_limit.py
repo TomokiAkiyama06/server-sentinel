@@ -20,9 +20,10 @@ bounding the total rate across all sources; it is optional
 
 Memory is bounded: at most ``max_sources`` buckets, keyed by a SHA-256 digest of
 the identity rather than the identity itself. When the table is full, the
-least recently used bucket is evicted only if it has refilled completely (an
-evicted full bucket behaves exactly like an absent one); otherwise the new
-source is refused, which fails closed instead of growing.
+least recently used bucket that has refilled completely is evicted (an
+evicted full bucket behaves exactly like an absent one; the scan is bounded by
+``max_sources``); when none has, the new source is refused, which fails
+closed instead of growing.
 
 Logging is value-free: a limited request writes at most one
 ``human_request_rate_limited`` event per ``log_interval_seconds``, with no
@@ -51,8 +52,11 @@ seconds, no global bucket. Its source key is not the proxy identity (shared
 by the room) but a domain-separated digest of the session token, computed by
 the human surface only after the read-only session pre-check found a current
 session for it, so each session (the Owner's included) spends only its own
-bucket, and a forged cookie is refused before it is charged. The key is
-never logged; the table is bounded by ``max_sources`` like every limiter.
+bucket, and a forged cookie is refused before it is charged. That pre-check
+also requires the active Owner (PR #242 review), so only Owner sessions ever
+take a slot: a non-Owner session cannot fill the table and lock the Owner
+out. The key is never logged; the table is bounded by ``max_sources`` like
+every limiter.
 """
 
 from __future__ import annotations
@@ -158,13 +162,20 @@ class SourceRateLimiter:
             bucket = self._sources.get(key)
             if bucket is None:
                 if len(self._sources) >= self.max_sources:
-                    oldest_key, oldest = next(iter(self._sources.items()))
-                    self._refill(oldest, now, self.per_source_capacity, self.per_source_refill_seconds)
-                    if oldest.tokens < self.per_source_capacity:
+                    # The least recently used bucket that has refilled
+                    # completely (PR #242 review proposal 2): a bounded scan,
+                    # at most ``max_sources`` buckets, in LRU order.
+                    evictable = None
+                    for candidate_key, candidate in self._sources.items():
+                        self._refill(candidate, now, self.per_source_capacity, self.per_source_refill_seconds)
+                        if candidate.tokens >= self.per_source_capacity:
+                            evictable = candidate_key
+                            break
+                    if evictable is None:
                         # Every bucket is still in use: refuse rather than grow
                         # or forget a source that is being limited.
                         return self._refuse_locked(now)
-                    del self._sources[oldest_key]
+                    del self._sources[evictable]
                 bucket = _Bucket(float(self.per_source_capacity), now)
                 self._sources[key] = bucket
             else:

@@ -887,10 +887,11 @@ class RateLimitTests(AdminRouteFixture):
         self.assertEqual(await self.noop(), GENERIC)
 
     async def test_sessions_have_separate_buckets(self):
-        # A non-Owner session exhausting its own bucket spends nothing of the Owner's.
+        # A non-Owner session is refused by the Owner pre-check before it is
+        # charged (PR #242 review): it takes no slot and spends nothing.
         for _ in range(ADMIN_PER_SESSION_CAPACITY + 5):
             self.assertEqual(await self.noop(cookie=self.target_cookie, csrf=self.target_csrf), GENERIC)
-        self.assertEqual(self.access.admin_limiter.limited, 5)
+        self.assertEqual((self.access.admin_limiter.sources(), self.access.admin_limiter.limited), (0, 0))
         for _ in range(ADMIN_PER_SESSION_CAPACITY):
             self.assertEqual(status(await self.noop()), 204)
         self.assertEqual(await self.noop(), GENERIC)
@@ -899,6 +900,57 @@ class RateLimitTests(AdminRouteFixture):
         csrf = await self.csrf(cookie)
         self.assertEqual(status(await self.noop(cookie=cookie, csrf=csrf)), 204)
         self.assertEqual(await self.noop(), GENERIC)
+
+    async def test_non_owner_sessions_cannot_fill_the_table_against_the_owner(self):
+        # PR #242 review (重要): with a small table, many non-Owner sessions
+        # (each with its own CSRF token) hammering A2-A6 never take a slot,
+        # so the Owner's new session can still make its change.
+        self.access.admin_limiter = admin_rate_limiter(max_sources=2, monotonic=self.limit_clock)
+        sessions = [(self.target_cookie, self.target_csrf)]
+        for permissions in ((), (Permission.LIVE_VIEW,), (Permission.RECORDINGS_VIEW,),
+                            (Permission.LIVE_VIEW, Permission.RECORDINGS_VIEW)):
+            _, key, _ = self.enroll(permissions)
+            for _ in range(2):
+                cookie = await self.sign_in(key)
+                sessions.append((cookie, await self.csrf(cookie)))
+        self.assertGreater(len(sessions), self.access.admin_limiter.max_sources)
+        before = self.snapshot()
+        work = []
+        real_epoch = self.access.epoch
+
+        def epoch(*args, **kwargs):
+            work.append("gate")
+            return real_epoch(*args, **kwargs)
+
+        with patch.object(self.access, "epoch", side_effect=epoch):
+            for cookie, csrf in sessions:
+                for name, (method, path, body) in self.mutations().items():
+                    for _ in range(3):
+                        with self.subTest(route=name):
+                            self.assertEqual(await self.admin(method, path, body, cookie=cookie, csrf=csrf),
+                                             GENERIC)
+        # Refused before the charge and before the gate; nothing written.
+        self.assertEqual(work, [])
+        self.assertEqual((self.access.admin_limiter.sources(), self.access.admin_limiter.limited), (0, 0))
+        self.assertEqual(self.snapshot(), before)
+        # The Owner's sessions (an existing one and a new one) each get a slot.
+        self.assertEqual(status(await self.noop()), 204)
+        cookie = await self.sign_in(self.owner_key)
+        csrf = await self.csrf(cookie)
+        for name, (method, path, body) in self.mutations().items():
+            with self.subTest(owner_route=name):
+                self.assertIn(status(await self.admin(method, path, body, cookie=cookie, csrf=csrf)), (200, 204))
+        self.assertEqual(self.access.admin_limiter.sources(), 2)
+
+    async def test_a_stale_owner_step_up_answer_consumes_one_token(self):
+        # Documented (PR #242 review proposal 4): the charge precedes the
+        # in-gate freshness decision.
+        self.access.admin_limiter = admin_rate_limiter(monotonic=self.limit_clock)
+        self.elapse(minutes=6)
+        for _ in range(ADMIN_PER_SESSION_CAPACITY):
+            self.assertEqual(await self.noop(), STEP_UP)
+        self.assertEqual(await self.noop(), GENERIC)
+        self.assertEqual(self.access.admin_limiter.limited, 1)
 
     async def test_forged_or_absent_cookies_are_never_charged(self):
         for _ in range(ADMIN_PER_SESSION_CAPACITY * 3):

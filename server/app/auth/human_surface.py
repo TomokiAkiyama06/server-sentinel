@@ -139,7 +139,6 @@ import logging
 import re
 import threading
 from typing import Callable
-import unicodedata
 from uuid import UUID
 
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -160,7 +159,9 @@ from .reservation import HostnameReservationCheck
 from .reservation_store import ListenerExceptionStore, ReservationSessionRevocation
 from .serving_gate import ServingGate
 from .session_binding import canonical_identity
-from .store import AccessStore, Requirement, SessionView, StepUpRequired
+from .store import (
+    AccessStore, Requirement, SessionView, StepUpRequired, display_name_acceptable,
+)
 
 
 PROXY_IDENTITY_HEADER = b"tailscale-user-login"
@@ -184,7 +185,6 @@ MAX_LABEL = 64
 MAX_EMPTY_BODY = 2
 MAX_INVITE_BODY = 2048
 MAX_PERMISSION_BODY = 256
-MAX_DISPLAY_NAME = 64
 MAX_QUERY_BYTES = 512
 MAX_QUERY_VALUE = 128
 DEFAULT_TICK_SECONDS = 30.0
@@ -532,16 +532,12 @@ def _label(value: object) -> str | None:
     return value
 
 
-_REFUSED_NAME_CATEGORIES = frozenset(("Cc", "Cf", "Cs", "Zl", "Zp"))
-
-
 def _display_name(value: object) -> str:
-    """An invitee's display name: 1-64 characters, none of them a control,
-    format (bidirectional overrides and isolates, zero-width characters),
-    surrogate, line separator or paragraph separator character (``Cc``,
-    ``Cf``, ``Cs``, ``Zl``, ``Zp``; PR #242 review)."""
-    if (not isinstance(value, str) or not 1 <= len(value) <= MAX_DISPLAY_NAME
-            or any(unicodedata.category(char) in _REFUSED_NAME_CATEGORIES for char in value)):
+    """An invitee's display name, by the store's one rule
+    (``store.display_name_acceptable``: 1-64 characters, no ``Cc``, ``Cf``,
+    ``Cs``, ``Zl`` or ``Zp`` character; PR #242 review), checked before any
+    session work."""
+    if not display_name_acceptable(value):
         raise _Denied()
     return value
 
@@ -1005,7 +1001,12 @@ class HumanSurface:
         checks without committing the idle touch. ``charge`` (the
         administration changes only) is called with the token right after
         the pre-check found a current session and before the gate epoch: a
-        refusal there is ``_Denied`` and nothing is locked or written.
+        refusal there is ``_Denied`` and nothing is locked or written. With
+        ``charge`` the pre-check also requires the active Owner
+        (``session_may_be_current(..., owner=True)``, PR #242 review): a
+        non-Owner session is the same generic ``_Denied`` it would get from
+        the full check, before it is charged, so it never takes a limiter
+        slot and cannot fill the table against the Owner.
         """
         if requirement is Requirement.PRE_CREDENTIAL or requirement is not request.route.requirement:
             raise _Denied()
@@ -1013,7 +1014,8 @@ class HumanSurface:
         csrf = csrf_header(request.headers) if request.route.csrf else None
         access = self.access
         try:
-            known = await asyncio.to_thread(access.store.session_may_be_current, token)
+            known = await asyncio.to_thread(access.store.session_may_be_current, token,
+                                            owner=charge is not None)
         except Exception:
             raise _Denied() from None
         if known is not True:

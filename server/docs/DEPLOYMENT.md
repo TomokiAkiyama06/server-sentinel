@@ -897,7 +897,9 @@ issues no code (`invitation_clock_unavailable`).
   issuing codes.
 
 - The command asks on the controlling terminal for the Owner's display name
-  (for `recover`: a new one, or empty to keep it) and for a typed
+  (for `recover`: a new one, or empty to keep it; 1-64 characters with no
+  control, format, surrogate, line or paragraph separator character, the
+  same rule as the Web invitation, else `display_name_rejected`) and for a typed
   confirmation (`BOOTSTRAP` or `RECOVER`). It takes nothing secret from its
   arguments or the environment, and refuses without a controlling terminal
   (`controlling_terminal_required`, for example from a pipe, cron or a unit),

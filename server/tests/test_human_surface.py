@@ -945,6 +945,30 @@ class SourceRateLimiterTests(unittest.TestCase):
         self.assertTrue(limiter.allow("c@example.invalid"))
         self.assertEqual(limiter.sources(), 2)
 
+    def test_a_full_table_evicts_any_refilled_bucket_not_only_the_oldest(self):
+        # PR #242 review proposal 2: the least recently used bucket still in
+        # use does not block evicting a later one that has refilled.
+        clock = Clock()
+        limiter = SourceRateLimiter(per_source_capacity=2, per_source_refill_seconds=10, global_capacity=None,
+                                    max_sources=3, monotonic=clock)
+        for source, spent in (("a", 2), ("b", 1), ("c", 2)):
+            for _ in range(spent):
+                self.assertTrue(limiter.allow(source + "@example.invalid"))
+        with self.assertLogs("app.auth.rate_limit", "WARNING"):
+            # Every bucket is in use: refused, not added.
+            self.assertFalse(limiter.allow("d@example.invalid"))
+        clock.value += 10
+        # a (least recently used) and c have refilled one token, b both: b goes.
+        self.assertTrue(limiter.allow("d@example.invalid"))
+        self.assertEqual(limiter.sources(), 3)
+        # a kept its partly refilled bucket: one token, not a fresh two.
+        self.assertTrue(limiter.allow("a@example.invalid"))
+        # (Refusals within the log interval are counted, not logged again.)
+        self.assertFalse(limiter.allow("a@example.invalid"))
+        # None of a, c, d has refilled completely: a new source is refused.
+        self.assertFalse(limiter.allow("e@example.invalid"))
+        self.assertEqual((limiter.sources(), limiter.limited), (3, 3))
+
     def test_backward_clock_never_adds_tokens_and_bad_inputs_refuse(self):
         clock = Clock()
         limiter = SourceRateLimiter(per_source_capacity=1, monotonic=clock)

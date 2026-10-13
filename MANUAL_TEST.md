@@ -1786,7 +1786,10 @@ and synthetic invitees, each with their own passkey:
 - [ ] send more than 20 changes within a few seconds from one Owner session
   (for example a repeated no-op grant): the excess gets the generic `404`
   and writes no audit record; after a few seconds changes run again, and
-  another session's changes were never limited by it;
+  another session's changes were never limited by it; repeated change
+  requests from invitee sessions (each with its own CSRF token) beforehand
+  never stop the Owner's change (they are refused before the limiter, PR
+  #242 review);
 - [ ] check the audit log: each change has its records with the principal's
   logical UUID only (no code, display name, handle, credential id or
   identity): an invitation (A2) has two, `invite_principal` and
