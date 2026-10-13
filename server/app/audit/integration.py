@@ -309,7 +309,11 @@ class AccessAdministration:
         )
 
     def change_permission(self, actor_context, principal_id, permission, granted, *, epoch):
-        """Grant or withdraw one permission as a delta; ``True`` when the grants changed."""
+        """Grant or withdraw one permission as a delta; ``True`` when the grants changed.
+
+        A request that changes nothing still commits its one ``succeeded``
+        record, read as "requested, no change" (Issue #240 item 4).
+        """
         return self._execute(
             actor_context, AuditAction.CHANGE_PRINCIPAL_PERMISSIONS, principal_id,
             lambda connection, at: self.access.change_permission_on(

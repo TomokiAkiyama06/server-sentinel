@@ -1484,8 +1484,10 @@ access_principal
 principal_credential
 - id
 - handle (random UUID naming the credential in the Owner's inventory and in a
-  credential revocation, migration 24; the WebAuthn credential_id never
-  reaches a URL, log or audit record)
+  credential revocation, migration 24; it is the only credential name in a URL,
+  the path id of `POST /api/admin/principals/<id>/credentials/<handle>/revoke`
+  (§11.5), and reveals nothing about the credential; the WebAuthn
+  credential_id never reaches a URL, log or audit record)
 - principal_id
 - kind (WebAuthn/passkey, as accepted in ADR-0004)
 - credential_id
@@ -1797,8 +1799,8 @@ notified and the finish is refused. If the transaction fails, the deletion
 rolls back with the finding, and the challenge is spent on its own under a new
 gate admission: it stays single use, and the unchanged stored credential lets
 the next assertion detect the finding again. Refused finishes are counted value-free
-(`owner_step_up_refused` logged on the first and each doubling). No `OWNER_OP`
-route is mounted until S4b.
+(`owner_step_up_refused` logged on the first and each doubling). The first
+mounted `OWNER_OP` routes are the S4b administration routes below.
 
 Owner access administration (Issue #10 phase 2 S4, Owner decisions S4-1 ..
 S4-8, 2026-10-13; S4a implements the store and administration, S4b the
@@ -1811,7 +1813,8 @@ revoke principal / revoke credential      -> OWNER_OP (owner + fresh user verifi
 list principals, grants, codes, credentials -> OWNER_READ
 step_up_required answer                    -> no idle touch (the session is not extended)
 Owner principal as the target             -> refused (only the local recover changes it)
-grant change that changes nothing         -> no revision bump, no session ends
+grant change that changes nothing         -> no revision bump, no session ends; one
+                                             succeeded record ("requested, no change")
 real grant change                         -> that principal's sessions end; its pending code stays valid
 re-issue                                  -> other unused codes revoked, one new code (invited or active)
 more than 64 non-revoked principals,
@@ -1833,6 +1836,51 @@ times, permissions, a pending-code summary (pending, expires_at) and per
 credential its handle, label, status, inconsistency reason, backup flags and
 created / last-used / revoked times; never the last observed proxy identity
 (D14), a credential id, public key, counter, digest or session data.
+"Pending" there and in the one-pending-code limit is one definition: exactly
+the conditions a redemption checks (unredeemed, unrevoked, a lookup key,
+fewer than five attempts, the principal not revoked, its current
+authorization revision, the current deployment generation, and the
+invitation clock check on both clocks with a recorded boot pair; Issue #240).
+A code failing any of them is not pending and does not block a new one, and
+issuing a code marks every other unused code of that principal revoked in
+the same transaction, so at most one code can ever become redeemable. A grant
+change that changes nothing still writes one `change_principal_permissions`
+record with outcome `succeeded`, meaning "requested, no change"; the audit
+vocabulary has no separate outcome for it.
+
+Routes (S4b; `<id>` and `<handle>` match only the canonical lower-case UUID
+form, the raw path must equal the decoded one, and the handle is a random
+administration name, never the WebAuthn credential id):
+
+```text
+GET  /api/admin/principals                                   OWNER_READ
+       -> 200 {"principals": [inventory entries]}
+POST /api/admin/principals                                   OWNER_OP
+       {"display_name": 1-64 chars, "permissions": [distinct live:view / recordings:view]}
+       -> 200 {"principal_id", "code", "expires_at"}   (the only time the code is shown)
+POST /api/admin/principals/<id>/invitation                   OWNER_OP  {}
+       -> 200 {"code", "expires_at"}                   (other unused codes revoked)
+POST /api/admin/principals/<id>/permissions                  OWNER_OP
+       {"permission": "live:view" | "recordings:view", "granted": true | false}
+       -> 204                                          (a delta)
+POST /api/admin/principals/<id>/revoke                       OWNER_OP  {} -> 204
+POST /api/admin/principals/<id>/credentials/<handle>/revoke  OWNER_OP  {} -> 204
+       (credential-scoped: on all synced devices that hold the passkey)
+```
+
+Each change needs the exact `Origin` and `X-CSRF-Token`; its body
+(`application/json`, bounded, one object with no duplicate or extra member) is
+validated before the authorization, which runs inside `admit(epoch)`, and the
+change commits through the administration inside `admit` of the same epoch.
+The inventory read runs inside `admit` of its authorization's epoch. Every
+response is `no-store`. Every refusal is the generic `404` — anyone but a
+current Owner session, a missing or wrong CSRF token or `Origin`, another
+proxy identity, a closed or stopped surface, a bad path id, an unknown,
+revoked or Owner target, another principal's handle, a malformed body, a
+limit, or a change refused at the commit — except `403 step_up_required` for
+an otherwise valid but stale Owner session on a change, decided by the
+authorization with no state change and no idle touch. The routes are not
+rate-limited: only a fresh Owner session reaches an administration write.
 
 Exactly two HTTP routes run before a credential exists, and the pair is closed.
 Owner bootstrap is not a third one: it is a local action on the host that feeds
@@ -2041,8 +2089,9 @@ session on an `OWNER_OP` route (Owner decision D3). Sign-out invalidates the
 server-side session and its binding with a `sign_out_principal` audit record
 holding only the principal's logical UUID (D7); it ends that session, not the
 credential, and is refused while human access is closed. Invitation
-redemption (S2) and the Owner step-up (S3, §11.5 above) are mounted; all
-live/recording/timeline/admin routes are later phases. Details:
+redemption (S2), the Owner step-up (S3) and the Owner access administration
+(S4b, §11.5 above) are mounted; all live/recording/timeline routes and the
+other admin routes are later phases. Details:
 `server/app/auth/README.md`.
 
 ## 12. Dashboard UI

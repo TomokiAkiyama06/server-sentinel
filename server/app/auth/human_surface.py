@@ -52,7 +52,22 @@ WebSocket and error path gets the same generic denial):
 - ``POST /api/auth/step-up/options``: an Owner session's step-up challenge
   (CSRF, Issue #10 phase 2 S3);
 - ``POST /api/auth/step-up``: verify it and refresh the session's user
-  verification (CSRF); ``204`` with no body.
+  verification (CSRF); ``204`` with no body;
+- the Owner's access administration (Issue #10 phase 2 S4b, Owner decisions
+  S4-1 .. S4-8), ``<id>`` and ``<handle>`` being lower-case UUID path ids:
+  A1 ``GET /api/admin/principals`` (``OWNER_READ``, the inventory);
+  A2 ``POST /api/admin/principals`` (invite with one code);
+  A3 ``POST /api/admin/principals/<id>/invitation`` (re-issue the code);
+  A4 ``POST /api/admin/principals/<id>/permissions`` (one grant as a delta);
+  A5 ``POST /api/admin/principals/<id>/revoke`` (the person);
+  A6 ``POST /api/admin/principals/<id>/credentials/<handle>/revoke`` (one
+  credential, on all synced devices that hold it). A2-A6 are ``OWNER_OP``
+  with CSRF and a strict JSON body read before the authorization; each
+  commits through ``HumanAccess.administration`` inside ``admit`` of the
+  authorization's epoch. The Owner is never a target (S4-3), and every
+  refused change (unknown, revoked or Owner target, a foreign handle, a limit
+  of S4-8, a gate change or a session that no longer holds at the commit) is
+  the generic denial.
 
 The four ceremony routes run before a credential exists (AUTH-013). Each is
 rate-limited per verified proxy identity before the request body is parsed
@@ -74,9 +89,13 @@ only in the request body and is decoded strictly
 (``invitation_code.parse_invitation_code``) before the gate; a code that does
 not parse never reaches SQLite. Session routes are not charged; a forged or
 stale cookie is refused by a read-only token lookup before the gate or any
-SQLite write lock. No live, recording, timeline, event, administration,
-health or version route is mounted here, and no ``OWNER_OP`` route yet (S4):
-the step-up routes require ``OWNER_READ`` (an Owner session, fresh or stale),
+SQLite write lock. The administration routes are not charged either: only a
+fresh Owner session with its CSRF token reaches an administration write or
+its audit record (every other caller is refused inside the authorization),
+their state is bounded by the S4-8 limits, and every write goes through the
+storage admission. No live, recording, timeline, event, health or version
+route is mounted here. The step-up routes require ``OWNER_READ`` (an Owner
+session, fresh or stale),
 so a non-Owner gets the generic denial inside the authorization transaction.
 Neither step-up route commits an idle touch: only a successful step-up
 extends the session's idle expiry (PR #236 review).
@@ -102,6 +121,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import StrEnum
 import ipaddress
 import json
@@ -109,6 +129,8 @@ import logging
 import re
 import threading
 from typing import Callable
+import unicodedata
+from uuid import UUID
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -118,7 +140,7 @@ from app.completion import run_to_completion
 from app.logging import Event
 from app.storage.database import Database, PinnedDatabase
 from .invitation_code import InvalidInvitationCode, parse_invitation_code
-from .model import Credential
+from .model import Credential, Permission
 from .owner_operation import HumanOwnerAuthorizer, OwnerOperationContext
 from .passkeys import DeviceBoundCredentialRequired, PasskeyCeremonies, SessionGrant
 from .rate_limit import SourceRateLimiter, redemption_rate_limiter, step_up_rate_limiter
@@ -141,16 +163,24 @@ REGISTRATION_OPTIONS_PATH = "/api/auth/registration/options"
 REGISTRATION_PATH = "/api/auth/registration"
 STEP_UP_OPTIONS_PATH = "/api/auth/step-up/options"
 STEP_UP_PATH = "/api/auth/step-up"
+# Owner access administration (Issue #10 phase 2 S4b, routes A1-A6).
+ADMIN_PRINCIPALS_PATH = "/api/admin/principals"
 MAX_OPTIONS_BODY = 1024
 MAX_ASSERTION_BODY = 64 * 1024
 MAX_REGISTRATION_BODY = 64 * 1024
 MAX_LABEL = 64
 MAX_EMPTY_BODY = 2
+MAX_INVITE_BODY = 2048
+MAX_PERMISSION_BODY = 256
+MAX_DISPLAY_NAME = 64
 MAX_QUERY_BYTES = 512
 MAX_QUERY_VALUE = 128
 DEFAULT_TICK_SECONDS = 30.0
 
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
+# A path id: a canonical lower-case UUID only (``str(UUID(...))`` form), so
+# an upper-case, brace, URN or hex-only spelling matches no route.
+_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _DENIAL_BODY = b'{"detail":"Not Found"}'
 _STEP_UP_BODY = b'{"detail":"step_up_required"}'
 _DEVICE_BOUND_BODY = b'{"detail":"device_bound_credential_required"}'
@@ -246,7 +276,9 @@ class _StepUp(Exception):
 class Route:
     """One mounted human route (Issue #10 phase 2, S1).
 
-    ``path`` is matched with ``fullmatch`` against the decoded request path.
+    ``path`` is matched with ``fullmatch`` against the decoded request path;
+    its named groups (only ``_UUID`` path ids, S4b) are passed to the handler
+    as ``_Request.params``.
     ``mutating`` routes require an exact ``Origin``; ``csrf`` routes also
     require ``X-CSRF-Token``. ``body_limit`` bounds the request body
     (``0``: the body is not read). ``query`` is the strict allowlist of
@@ -279,6 +311,12 @@ def _exact(path: str) -> re.Pattern:
     return re.compile(re.escape(path))
 
 
+def _with_ids(*parts) -> re.Pattern:
+    """A path of literal parts and ``(name,)`` lower-case UUID path ids."""
+    return re.compile("".join(f"(?P<{part[0]}>{_UUID})" if isinstance(part, tuple) else re.escape(part)
+                              for part in parts))
+
+
 ROUTES: tuple[Route, ...] = (
     Route("POST", _exact(REGISTRATION_OPTIONS_PATH), Requirement.PRE_CREDENTIAL, "_begin_registration",
           mutating=True, csrf=False, body_limit=MAX_OPTIONS_BODY),
@@ -300,6 +338,23 @@ ROUTES: tuple[Route, ...] = (
           mutating=True, csrf=True, body_limit=MAX_EMPTY_BODY),
     Route("POST", _exact(STEP_UP_PATH), Requirement.OWNER_READ, "_finish_step_up",
           mutating=True, csrf=True, body_limit=MAX_ASSERTION_BODY),
+    # S4b, Owner access administration (Owner decisions S4-1 .. S4-8): the
+    # inventory read is OWNER_READ, every change OWNER_OP.
+    Route("GET", _exact(ADMIN_PRINCIPALS_PATH), Requirement.OWNER_READ, "_admin_inventory",
+          mutating=False, csrf=False, body_limit=0),
+    Route("POST", _exact(ADMIN_PRINCIPALS_PATH), Requirement.OWNER_OP, "_admin_invite",
+          mutating=True, csrf=True, body_limit=MAX_INVITE_BODY),
+    Route("POST", _with_ids(ADMIN_PRINCIPALS_PATH, "/", ("principal",), "/invitation"),
+          Requirement.OWNER_OP, "_admin_reissue", mutating=True, csrf=True, body_limit=MAX_EMPTY_BODY),
+    Route("POST", _with_ids(ADMIN_PRINCIPALS_PATH, "/", ("principal",), "/permissions"),
+          Requirement.OWNER_OP, "_admin_permission", mutating=True, csrf=True,
+          body_limit=MAX_PERMISSION_BODY),
+    Route("POST", _with_ids(ADMIN_PRINCIPALS_PATH, "/", ("principal",), "/revoke"),
+          Requirement.OWNER_OP, "_admin_revoke_principal", mutating=True, csrf=True,
+          body_limit=MAX_EMPTY_BODY),
+    Route("POST", _with_ids(ADMIN_PRINCIPALS_PATH, "/", ("principal",), "/credentials/", ("handle",), "/revoke"),
+          Requirement.OWNER_OP, "_admin_revoke_credential", mutating=True, csrf=True,
+          body_limit=MAX_EMPTY_BODY),
 )
 
 
@@ -462,6 +517,40 @@ def _label(value: object) -> str | None:
             or any(ord(char) < 32 or ord(char) == 127 for char in value)):
         raise _Denied()
     return value
+
+
+def _display_name(value: object) -> str:
+    """An invitee's display name: 1-64 characters, no control or surrogate character."""
+    if (not isinstance(value, str) or not 1 <= len(value) <= MAX_DISPLAY_NAME
+            or any(unicodedata.category(char) in ("Cc", "Cs") for char in value)):
+        raise _Denied()
+    return value
+
+
+_PERMISSIONS = {item.value: item for item in Permission}
+
+
+def _permission(value: object) -> Permission:
+    """``"live:view"`` or ``"recordings:view"`` exactly; anything else is a denial."""
+    if not isinstance(value, str) or value not in _PERMISSIONS:
+        raise _Denied()
+    return _PERMISSIONS[value]
+
+
+def _permission_list(value: object) -> tuple[Permission, ...]:
+    """A JSON array of distinct permission names (possibly empty)."""
+    if not isinstance(value, list) or len(value) > len(_PERMISSIONS):
+        raise _Denied()
+    permissions = tuple(_permission(item) for item in value)
+    if len(set(permissions)) != len(permissions):
+        raise _Denied()
+    return permissions
+
+
+def _iso(value: object) -> str:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise _Denied()
+    return value.astimezone(timezone.utc).isoformat()
 
 
 class HumanAccess:
@@ -787,6 +876,7 @@ class _Request:
     identity: str
     route: Route
     query: dict
+    params: dict
 
 
 @dataclass(frozen=True)
@@ -869,7 +959,10 @@ class HumanSurface:
         if route is None:
             raise _Denied()
         query = parse_query(route, scope.get("query_string"))
-        request = _Request(scope, receive, send, headers, identity, route, query)
+        matched = route.path.fullmatch(scope["path"])
+        if matched is None:
+            raise _Denied()
+        request = _Request(scope, receive, send, headers, identity, route, query, matched.groupdict())
         await getattr(self, route.handler)(request)
 
     async def _authorize(self, request: _Request, requirement: Requirement, *,
@@ -1180,6 +1273,146 @@ class HumanSurface:
             (b"cache-control", b"no-store"),
         ]})
         await request.send({"type": "http.response.body", "body": b""})
+
+    # -- Owner access administration (S4b, A1-A6) ----------------------
+
+    async def _admin_body(self, request: _Request) -> dict:
+        """The strict JSON object body of an administration change.
+
+        ``application/json``, at most the route's ``body_limit`` bytes, one
+        object with no duplicate member and no NaN/Infinity. Read before the
+        authorization, so a malformed request touches no session.
+        """
+        return _json_object(await self._body(request, json_required=True))
+
+    async def _administer(self, request: _Request, operation: Callable[[OwnerOperationContext], object]):
+        """Authorize ``OWNER_OP`` and commit ``operation(context)`` under its epoch.
+
+        ``_owner_operation`` authorizes inside ``admit(epoch)`` (a stale
+        Owner is ``_StepUp`` with no idle touch); the operation is one
+        ``HumanAccess.administration`` call, which commits inside a second
+        ``admit`` of that same epoch and re-checks the Owner session inside
+        its own transaction. Every failure there (an unknown, revoked or
+        Owner target, a limit, a gate change, a session that ended or whose
+        verification is no longer fresh at the commit) is the generic
+        denial: the 403 is decided only by the authorization, which committed
+        no idle touch for it (S4-2).
+        """
+        context = await self._owner_operation(request)
+        try:
+            return await asyncio.to_thread(operation, context)
+        except Exception:
+            raise _Denied() from None
+
+    async def _admin_inventory(self, request: _Request) -> None:
+        """A1 ``GET /api/admin/principals`` (``OWNER_READ``).
+
+        The read runs inside ``admit`` of the authorization's epoch, so a
+        close, reopen or ``stop()`` after the authorization returns nothing.
+        The body is ``{"principals": [...]}`` from ``admin_inventory``: no
+        proxy identity (D14), credential id, public key, counter, digest or
+        session data.
+        """
+        authorized = await self._authorize(request, Requirement.OWNER_READ)
+        access = self.access
+
+        def read():
+            with access.admit(authorized.epoch):
+                return access.store.admin_inventory()
+
+        try:
+            inventory = await asyncio.to_thread(read)
+        except Exception:
+            raise _Denied() from None
+        await self._json(request.send, 200, {"principals": list(inventory)})
+
+    async def _admin_invite(self, request: _Request) -> None:
+        """A2 ``POST /api/admin/principals``: invite one person with one code.
+
+        Body ``{"display_name": <1-64 characters>, "permissions": [...]}``
+        (distinct ``live:view`` / ``recordings:view``). ``200 {"principal_id",
+        "code", "expires_at"}``; this response is the only place the code is
+        ever shown (only its digest and lookup key are stored).
+        """
+        body = await self._admin_body(request)
+        if set(body) != {"display_name", "permissions"}:
+            raise _Denied()
+        name = _display_name(body["display_name"])
+        permissions = _permission_list(body["permissions"])
+        administration = self.access.administration
+        principal_id, code, expires_at = await self._administer(
+            request, lambda context: administration.invite(context, name, permissions, epoch=context.epoch))
+        if not isinstance(principal_id, UUID) or not isinstance(code, str):
+            raise _Denied()
+        await self._json(request.send, 200, {
+            "principal_id": str(principal_id), "code": code, "expires_at": _iso(expires_at),
+        })
+
+    async def _admin_reissue(self, request: _Request) -> None:
+        """A3: revoke the principal's unused codes and issue one; ``200 {"code", "expires_at"}``."""
+        principal_id = self._empty_change(await self._admin_body(request), request)
+        administration = self.access.administration
+        code, expires_at = await self._administer(
+            request, lambda context: administration.reissue_invitation(context, principal_id,
+                                                                       epoch=context.epoch))
+        if not isinstance(code, str):
+            raise _Denied()
+        await self._json(request.send, 200, {"code": code, "expires_at": _iso(expires_at)})
+
+    async def _admin_permission(self, request: _Request) -> None:
+        """A4: grant or withdraw one permission as a delta (S4-5); ``204``.
+
+        Body ``{"permission": "live:view" | "recordings:view", "granted":
+        true | false}``. A request that changes nothing is still ``204`` and
+        its ``succeeded`` record means "requested, no change" (Issue #240
+        item 4); only a real change ends the principal's sessions.
+        """
+        body = await self._admin_body(request)
+        if set(body) != {"permission", "granted"} or type(body["granted"]) is not bool:
+            raise _Denied()
+        permission, granted = _permission(body["permission"]), body["granted"]
+        principal_id = UUID(request.params["principal"])
+        administration = self.access.administration
+        await self._administer(request, lambda context: administration.change_permission(
+            context, principal_id, permission, granted, epoch=context.epoch))
+        await self._no_content(request.send)
+
+    async def _admin_revoke_principal(self, request: _Request) -> None:
+        """A5: revoke the person with every credential, code and session; ``204``."""
+        principal_id = self._empty_change(await self._admin_body(request), request)
+        administration = self.access.administration
+        await self._administer(request, lambda context: administration.revoke_principal(
+            context, principal_id, epoch=context.epoch))
+        await self._no_content(request.send)
+
+    async def _admin_revoke_credential(self, request: _Request) -> None:
+        """A6: revoke one credential, named by its handle, and end its sessions; ``204``.
+
+        Credential-scoped, not device-scoped: a synced passkey is revoked on
+        all synced devices that hold it. The handle is the random UUID the
+        inventory shows, never the WebAuthn credential id; a handle of
+        another principal is the generic denial.
+        """
+        principal_id = self._empty_change(await self._admin_body(request), request)
+        handle = request.params["handle"]
+        administration = self.access.administration
+        await self._administer(request, lambda context: administration.revoke_credential(
+            context, principal_id, handle, epoch=context.epoch))
+        await self._no_content(request.send)
+
+    @staticmethod
+    def _empty_change(body: dict, request: _Request) -> UUID:
+        """The target of a change whose body must be exactly ``{}``."""
+        if body:
+            raise _Denied()
+        return UUID(request.params["principal"])
+
+    @staticmethod
+    async def _no_content(send: Send) -> None:
+        await send({"type": "http.response.start", "status": 204, "headers": [
+            (b"cache-control", b"no-store"),
+        ]})
+        await send({"type": "http.response.body", "body": b""})
 
     @staticmethod
     async def _json(send: Send, status: int, value) -> None:

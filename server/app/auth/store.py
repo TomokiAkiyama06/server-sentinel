@@ -543,9 +543,13 @@ class AccessStore:
 
         At most ``MAX_PENDING_INVITATIONS`` (one) pending code per principal
         (Owner decision S4-8): while one is pending
-        (``_pending_invitations_on``) another is refused with
-        ``AccessLimitReached``. Re-issuing revokes the pending one first in
-        the same transaction (``reissue_invitation_on``).
+        (``_pending_invitations_on``, the full redemption conditions) another
+        is refused with ``AccessLimitReached``. Re-issuing revokes the
+        pending one first in the same transaction (``reissue_invitation_on``).
+        A code that can no longer be redeemed does not block the new one; it
+        is marked revoked here, in the same transaction (Issue #240 item 1),
+        so a code unusable only for now (a wall clock stepped back in the
+        same boot) can never become redeemable again next to the new one.
         """
         if not isinstance(principal_id, UUID):
             raise AccessValidationError("principal identity is invalid")
@@ -561,30 +565,49 @@ class AccessStore:
         principal = connection.execute("SELECT * FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
         if principal is None or principal["status"] == PrincipalStatus.REVOKED.value:
             raise AccessValidationError("principal is unavailable")
-        if self._pending_invitations_on(connection, principal_id, at) >= MAX_PENDING_INVITATIONS:
+        pending = self._pending_invitations_on(connection, at, instant, principal_id=principal_id)
+        if len(pending) >= MAX_PENDING_INVITATIONS:
             raise AccessLimitReached()
+        # Every other unused code of the principal is unredeemable: mark it.
+        connection.execute("UPDATE access_invitations SET revoked_at_us=? WHERE principal_id=? "
+                           "AND redeemed_at_us IS NULL AND revoked_at_us IS NULL", (_us(at), str(principal_id)))
         generation = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
         connection.execute("INSERT INTO access_invitations (id, secret_digest, principal_id, principal_revision, deployment_generation, issued_at_us, expires_at_us, redeemed_at_us, revoked_at_us, lookup_key, issued_boot_id, issued_boottime_us) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)",
                            (str(invitation_id), digest, str(principal_id), principal["authorization_revision"], generation, _us(at), _us(expiry),
                             lookup, instant.boot_id, instant.boottime_us))
         return invitation_id
 
-    @staticmethod
-    def _pending_invitations_on(connection, principal_id: UUID, at: datetime) -> int:
-        """Unused codes of a principal that could still be redeemed at ``at``.
+    def _pending_invitations_on(self, connection, at: datetime, now: BootInstant | None, *,
+                                principal_id: UUID | None = None) -> list:
+        """The unused codes that could be redeemed at ``at`` (Issue #240 item 1).
 
-        Unredeemed, unrevoked, unexpired, of the current deployment
-        generation and the principal's current authorization revision (the
-        stored conditions of ``_redeemable``; the boot-clock check is left to
-        redemption). A code made unusable by a recovery or an expiry does not
-        count, so it never blocks a new one.
+        Exactly the conditions a redemption checks (``begin_registration``):
+        unredeemed and unrevoked, a lookup key present (rows from before the
+        lookup key are never found), fewer than ``MAX_REDEMPTION_ATTEMPTS``
+        attempts, a principal that is not revoked, the principal's current
+        authorization revision and the current deployment generation, and
+        ``invitation_clock_valid`` on both clocks (boot pair recorded, inside
+        the lifetime, no wall clock stepped back in the same boot). ``now`` is
+        the boot-clock reading taken with ``at``; without one nothing is
+        pending, as nothing could be redeemed. Rows of one principal, or of
+        every principal when ``principal_id`` is ``None``. The cap
+        (``issue_enrollment_on``) and the inventory (``admin_inventory``) use
+        this one definition, so a code shown as pending is one that blocks a
+        second code and one that a redemption would accept.
         """
-        return connection.execute(
-            "SELECT count(*) FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id "
-            "WHERE i.principal_id=? AND i.redeemed_at_us IS NULL AND i.revoked_at_us IS NULL "
-            "AND i.expires_at_us > ? AND i.principal_revision = p.authorization_revision "
-            "AND i.deployment_generation = (SELECT authorization_generation FROM access_deployment_state WHERE singleton=1)",
-            (str(principal_id), _us(utc_time(at)))).fetchone()[0]
+        generation = connection.execute(
+            "SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
+        query = ("SELECT i.*, p.status, p.authorization_revision FROM access_invitations i "
+                 "JOIN access_principals p ON p.id=i.principal_id "
+                 "WHERE i.redeemed_at_us IS NULL AND i.revoked_at_us IS NULL AND i.lookup_key IS NOT NULL "
+                 "AND i.attempt_count < ?")
+        parameters: tuple = (MAX_REDEMPTION_ATTEMPTS,)
+        if principal_id is not None:
+            query += " AND i.principal_id=?"
+            parameters += (str(principal_id),)
+        at = utc_time(at)
+        return [row for row in connection.execute(query, parameters)
+                if self._redeemable(row, generation, at, now)]
 
     @staticmethod
     def _administered_on(connection, principal_id: UUID):
@@ -1426,7 +1449,8 @@ class AccessStore:
         ordered by creation: ``id``, ``display_name``, ``role``, ``status``,
         ``created_at``, ``revoked_at``, ``permissions`` (sorted values; the
         Owner holds every one), ``invitation`` (``pending``: an unused code
-        that could still be redeemed, with its ``expires_at``) and
+        that a redemption would accept now, ``_pending_invitations_on``, with
+        its ``expires_at``) and
         ``credentials``: per credential ``handle``, ``label``, ``status``
         (``active``/``revoked``/``inconsistent``), ``inconsistency_reason``,
         ``backup_eligible``, ``backup_state``, ``created_at``,
@@ -1441,7 +1465,7 @@ class AccessStore:
             return None if value is None else _time(value).isoformat()
 
         with self._transaction() as connection:
-            at = _us(self.now())
+            now = self.now()
             principals = connection.execute(
                 "SELECT id, display_name, role, status, created_at_us, revoked_at_us FROM access_principals "
                 "ORDER BY created_at_us, id").fetchall()
@@ -1449,13 +1473,10 @@ class AccessStore:
             for principal_id, value in connection.execute(
                     "SELECT principal_id, permission FROM access_principal_permissions ORDER BY permission"):
                 grants.setdefault(principal_id, []).append(value)
-            pending = {row[0]: row[1] for row in connection.execute(
-                "SELECT i.principal_id, max(i.expires_at_us) FROM access_invitations i "
-                "JOIN access_principals p ON p.id=i.principal_id "
-                "WHERE i.redeemed_at_us IS NULL AND i.revoked_at_us IS NULL AND i.expires_at_us > ? "
-                "AND i.principal_revision = p.authorization_revision AND p.status <> 'revoked' "
-                "AND i.deployment_generation = (SELECT authorization_generation FROM access_deployment_state WHERE singleton=1) "
-                "GROUP BY i.principal_id", (at,))}
+            # The redemption conditions themselves (Issue #240 item 1).
+            pending: dict[str, int] = {}
+            for row in self._pending_invitations_on(connection, now, self._boot_instant()):
+                pending[row["principal_id"]] = max(row["expires_at_us"], pending.get(row["principal_id"], 0))
             credentials: dict[str, list] = {}
             for row in connection.execute(
                     "SELECT principal_id, handle, label, revoked_at_us, inconsistent_at_us, inconsistency_reason, "

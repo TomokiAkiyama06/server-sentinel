@@ -1684,10 +1684,9 @@ Verified only with the synthetic ASGI driver, software authenticators and a
 synthetic boot clock (`server/tests/test_human_step_up.py`,
 `tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve,
 real authenticator or real clock step has exercised it, no production entry
-point mounts the human routes yet, and no Owner operation route exists until
-S4 (the `403 step_up_required` contract is exercised through a synthetic
-route in the tests). Once S4 mounts an Owner operation and a deployment can
-enable the routes, on a shared machine (one OS account and browser profile,
+point mounts the human routes yet; the `403 step_up_required` contract is
+exercised through the S4b administration routes in the tests. Once a
+deployment can enable the routes, on a shared machine (one OS account and browser profile,
 the shared Tailscale login, a synthetic `*.invalid` Owner and a synthetic
 `*.invalid` invitee, each with their own passkey on a separate roaming
 authenticator):
@@ -1744,6 +1743,48 @@ authenticator):
   `CLOCK_BOOTTIME` too) or turned stale early (`403 step_up_required`, fail
   closed, availability only); either way confirm a new step-up works and the
   window never exceeds five minutes.
+
+### Issue #10 phase 2 S4b Owner access administration routes (pending)
+
+Mock only: verified with the synthetic ASGI driver, software authenticators
+and a synthetic boot clock (`server/tests/test_human_admin_routes.py`,
+`server/tests/test_access_administration.py`,
+`tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve,
+real authenticator or real deployment has exercised them, no production
+entry point mounts the human routes yet, and the Owner's Web screen is S6.
+Once a deployment can enable the routes, with a synthetic `*.invalid` Owner
+and synthetic invitees, each with their own passkey:
+
+- [ ] as the Owner (fresh), `POST /api/admin/principals` with a display name
+  and `["live:view"]`: `200` with `principal_id`, `code`, `expires_at`;
+  record that the code appears only in that response (not in the inventory,
+  the application log, the audit log or the browser's URL bar or history);
+- [ ] the invitee redeems the code at the plain redemption screen with their
+  own passkey and signs in: `GET /api/session` lists exactly `live:view`;
+- [ ] `GET /api/admin/principals` lists every principal with its permissions,
+  pending-code summary and credential handles, and never a Tailscale login,
+  credential id or public key (inspect the raw response);
+- [ ] withdraw `live:view` (`POST .../permissions` with `granted: false`):
+  the invitee's open session ends at its next request; repeat the request
+  (nothing to change): `204`, the session of a re-signed-in invitee stays;
+- [ ] re-issue the code (`POST .../invitation`) for an active invitee: the
+  old code is refused, the new one registers a second passkey; revoke the
+  first passkey by its handle (`POST .../credentials/<handle>/revoke`): only
+  sessions of that passkey end, and a synced copy of it on another device of
+  the invitee no longer signs in either (credential-scoped, all synced
+  devices);
+- [ ] revoke the invitee (`POST .../revoke`): every session of theirs ends and
+  their pending code is refused;
+- [ ] wait more than five minutes after the Owner's sign-in or step-up and
+  repeat any change: `403 {"detail":"step_up_required"}`, nothing changed;
+  step up and retry: it runs; record that the stale `403` did not extend
+  the Owner session's idle expiry;
+- [ ] as an invitee with `live:view`, `recordings:view` or both, call every
+  route with the invitee's own session and CSRF token: the generic `404`;
+  without `X-CSRF-Token`, without `Origin`, from another origin, or with the
+  Owner as the target: the generic `404`, and nothing changed;
+- [ ] check the audit log: one record per change with the principal's logical
+  UUID only (no code, display name, handle, credential id or identity).
 
 ### Uninvited ordinary Tailnet member
 
