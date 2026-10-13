@@ -53,6 +53,7 @@ from tests.test_human_gated_authorization import GENERIC, STEP_UP, GatedFixture
 from tests.test_human_surface import HOST, ORIGIN, VIEWER, call, status
 from tests.test_invitation_redemption import BootClock
 from tests.test_webauthn_ceremonies import Clock, waiting
+from tests.web_asset_fakes import synthetic_assets
 from tests.webauthn_fakes import SyntheticAuthenticator
 
 
@@ -248,6 +249,7 @@ class InvitationExpiryTests(unittest.TestCase):
         with closing(self.database.connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
         self.clock = Clock()
+        self.assets = synthetic_assets(self.temporary / "web")
 
     def administration(self, lifetime):
         audit = AuditStore(self.database, clock=self.clock)
@@ -281,13 +283,15 @@ class InvitationExpiryTests(unittest.TestCase):
             with self.subTest(store=store_hours, setting=setting_hours):
                 access = _composition(self, timedelta(hours=store_hours))
                 with self.assertRaises(TypeError):
-                    create_app(Settings(self.temporary, invitation_lifetime=timedelta(hours=setting_hours)),
+                    create_app(Settings(self.temporary, web_assets_dir=self.temporary / "web",
+                                        invitation_lifetime=timedelta(hours=setting_hours)),
                                database=self.database, human_access=access)
                 self.assertIsNone(access.store.audit.reservation)
         for hours in (1, 24, 168):
             with self.subTest(both=hours):
                 access = _composition(self, timedelta(hours=hours))
-                application = create_app(Settings(self.temporary, invitation_lifetime=timedelta(hours=hours)),
+                application = create_app(Settings(self.temporary, web_assets_dir=self.temporary / "web",
+                                                  invitation_lifetime=timedelta(hours=hours)),
                                          database=self.database, human_access=access,
                                          storage_reservation=_Admission())
                 self.assertIsNotNone(application)
@@ -306,8 +310,8 @@ def _composition(case, lifetime):
                         session_binding=SessionBindingKey.generate())
     check, _, _, _ = checker(session_revoker=ReservationSessionRevocation(store))
     ceremonies = PasskeyCeremonies(store, RelyingParty(HOST, ORIGIN), session_gate=check)
-    return HumanAccess(HumanAccessConfiguration(enabled=True), store=store, ceremonies=ceremonies,
-                       reservation=check)
+    return HumanAccess(HumanAccessConfiguration(enabled=True), assets=case.assets, store=store,
+                       ceremonies=ceremonies, reservation=check)
 
 
 class GateRaceTests(AdministrationFixture):

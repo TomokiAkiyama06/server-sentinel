@@ -842,7 +842,7 @@ class RateLimitAndHygieneTests(StepUpFixture):
         self.assertEqual(status(await self.step_up(cookie, csrf, key)), 204)
 
     def test_one_limiter_object_cannot_serve_two_routes(self):
-        default = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+        default = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
                               ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
                                                            clock=self.ceremony_clock),
                               reservation=self.check)
@@ -860,7 +860,7 @@ class RateLimitAndHygieneTests(StepUpFixture):
                 ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
                                                clock=self.ceremony_clock)
                 with self.assertRaises(HumanAccessUnavailable):
-                    HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+                    HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
                                 ceremonies=ceremonies, reservation=self.check, **limiters)
 
     async def test_every_refusal_is_byte_identical(self):

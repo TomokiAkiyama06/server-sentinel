@@ -48,6 +48,7 @@ from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.asgi import request
 from tests.test_hostname_reservation import HOST, Clock, Resolver, checker, proc
 from tests.test_webauthn_ceremonies import Clock as CeremonyClock
+from tests.web_asset_fakes import synthetic_assets
 from tests.webauthn_fakes import ORIGIN as OTHER_ORIGIN, OpenGate, SyntheticAuthenticator
 
 
@@ -61,7 +62,7 @@ EXPOSED = proc(("127.0.0.1", 8080, "0A"), ("100.64.0.10", 8443, "0A"))
 UNMOUNTED = ("/health", "/version", "/openapi.json", "/docs", "/api/live/1", "/api/sources",
              "/api/recordings", "/api/recordings/1/playback", "/api/recordings/1/download",
              "/api/events", "/api/timeline", "/api/access/invitations", "/diagnostics/export",
-             "/api/auth/registration/", "/api/auth/registration/options/", "/api/session/", "/", "/index.html")
+             "/api/auth/registration/", "/api/auth/registration/options/", "/api/session/", "/index.html")
 
 
 class SyntheticAdmission:
@@ -164,7 +165,12 @@ class HumanSurfaceFixture(unittest.IsolatedAsyncioTestCase):
                                             clock=self.ceremony_clock)
         self.limit_clock = Clock()
         self.limiter = SourceRateLimiter(monotonic=self.limit_clock)
-        self.access = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+        # The synthetic Web build lives outside the data directory (S5b).
+        web = tempfile.TemporaryDirectory()
+        self.addCleanup(web.cleanup)
+        self.assets_dir = Path(web.name) / "build"
+        self.assets = synthetic_assets(self.assets_dir)
+        self.access = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
                                   ceremonies=self.ceremonies, reservation=self.check,
                                   rate_limiter=self.limiter)
         self.admission = SyntheticAdmission()
@@ -237,6 +243,10 @@ class HumanSurfaceFixture(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status(finished), 204)
         (cookie,) = header(finished, b"set-cookie")
         return cookie.decode().split(";")[0]
+
+    def settings(self):
+        """Deployment settings naming this fixture's synthetic Web build."""
+        return Settings(self.temporary, web_assets_dir=self.assets_dir)
 
     async def denial(self):
         """The response an uninvited caller without any session receives."""
@@ -987,7 +997,7 @@ class SourceRateLimiterTests(unittest.TestCase):
 
 class CompositionTests(HumanSurfaceFixture):
     def compose(self, **overrides):
-        values = dict(store=self.store, ceremonies=self.ceremonies, reservation=self.check)
+        values = dict(store=self.store, ceremonies=self.ceremonies, reservation=self.check, assets=self.assets)
         values.update(overrides)
         configuration = values.pop("configuration", HumanAccessConfiguration(enabled=True))
         return HumanAccess(configuration, **values)
@@ -1098,7 +1108,7 @@ class StorageAdmissionTests(HumanSurfaceFixture):
         revoker = ReservationSessionRevocation(store)
         check, _, _, _ = checker(clock=self.clock, session_revoker=revoker)
         self.assertTrue(check.startup().open)
-        access = HumanAccess(HumanAccessConfiguration(enabled=True), store=store,
+        access = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=store,
                              ceremonies=PasskeyCeremonies(store, self.rp, session_gate=check),
                              reservation=check)
         self.assertFalse(access.storage_admitted)
@@ -1134,7 +1144,7 @@ class StorageAdmissionTests(HumanSurfaceFixture):
         self.assertTrue(self.access.storage_admitted)
         # create_app binds its own admission and refuses a store wired elsewhere.
         with self.assertRaises(HumanAccessUnavailable):
-            create_app(Settings(self.temporary), database=self.database, human_access=self.access)
+            create_app(self.settings(), database=self.database, human_access=self.access)
         self.assertIs(self.audit.reservation, self.admission)
 
 
@@ -1149,7 +1159,7 @@ class StorageAdmissionTests(HumanSurfaceFixture):
         store = AccessStore(other_database, clock=self.ceremony_clock, audit=audit,
                             session_binding=SessionBindingKey.generate())
         check, _, _, _ = checker(clock=self.clock, session_revoker=ReservationSessionRevocation(store))
-        access = HumanAccess(HumanAccessConfiguration(enabled=True), store=store,
+        access = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=store,
                              ceremonies=PasskeyCeremonies(store, self.rp, session_gate=check),
                              reservation=check)
         for database in (self.database, None):
@@ -1157,7 +1167,7 @@ class StorageAdmissionTests(HumanSurfaceFixture):
                 access.bind_storage_admission(self.admission, database=database)
         for reservation in (None, self.admission):
             with self.subTest(reservation=reservation), self.assertRaises(HumanAccessUnavailable):
-                create_app(Settings(self.temporary), database=self.database, human_access=access,
+                create_app(self.settings(), database=self.database, human_access=access,
                            storage_reservation=reservation)
         self.assertIsNone(audit.reservation)
         self.assertFalse(access.storage_admitted)
@@ -1172,9 +1182,9 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
         check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker)
         self.assertFalse(check.access_open)
         ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=check, clock=self.ceremony_clock)
-        access = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+        access = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
                              ceremonies=ceremonies, reservation=check, tick_seconds=0.01)
-        application = create_app(Settings(self.temporary), database=self.database, human_access=access,
+        application = create_app(self.settings(), database=self.database, human_access=access,
                                  storage_reservation=self.admission)
         self.assertTrue(access.storage_admitted)
         before = await call(application, "POST", AUTHENTICATION_OPTIONS_PATH)
@@ -1232,9 +1242,9 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
         self.enroll()
         check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker)
         ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=check, clock=self.ceremony_clock)
-        access = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+        access = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
                              ceremonies=ceremonies, reservation=check, tick_seconds=0.01)
-        application = create_app(Settings(self.temporary), database=self.database, human_access=access,
+        application = create_app(self.settings(), database=self.database, human_access=access,
                                  storage_reservation=self.admission)
         started, release, order = threading.Event(), threading.Event(), []
         real_tick = check.tick
@@ -1377,7 +1387,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
         expected = await self.denial()
         ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
                                        clock=self.ceremony_clock)
-        access = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+        access = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
                              ceremonies=ceremonies, reservation=self.check)
         access.bind_storage_admission(self.admission, database=self.database)
         self.assertTrue(self.check.access_open)
@@ -1389,7 +1399,7 @@ class ApplicationCompositionTests(HumanSurfaceFixture):
         self.assertEqual(await call(surface, "GET", SESSION_PATH, cookie=cookie), expected)
         self.assertEqual(self.count("SELECT count(*) FROM access_webauthn_challenges"), stored)
         # An application whose lifespan never runs serves nothing either.
-        application = create_app(Settings(self.temporary), database=self.database, human_access=access,
+        application = create_app(self.settings(), database=self.database, human_access=access,
                                  storage_reservation=self.admission)
         self.assertEqual(await call(application, "GET", SESSION_PATH, cookie=cookie), expected)
         # Served only once this composition's own run() completed startup().

@@ -985,7 +985,7 @@ class RateLimitTests(AdminRouteFixture):
         self.assertEqual(self.access.admin_limiter.sources(), 1)
 
     def test_the_admin_limiter_cannot_be_shared(self):
-        default = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+        default = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
                               ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
                                                            clock=self.ceremony_clock),
                               reservation=self.check)
@@ -1003,7 +1003,7 @@ class RateLimitTests(AdminRouteFixture):
                 ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
                                                clock=self.ceremony_clock)
                 with self.assertRaises(HumanAccessUnavailable):
-                    HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+                    HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
                                 ceremonies=ceremonies, reservation=self.check, **limiters)
 
 
