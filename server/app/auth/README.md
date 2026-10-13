@@ -10,7 +10,7 @@ Owns owner invitations/allowlists, independent `live:view` and `recordings:view`
 - Treats revocation as credential-scoped rather than device-scoped, and persists the last accepted signature counter so the clone check has something to compare against. The comparison runs whenever the stored or received counter is non-zero, so a received 0 after a stored non-zero is a regression; only a stored-and-received 0 is exempt.
 - Accepts `none` attestation at registration, verifying the challenge, origin/relying-party id, authenticator data, credential public key and user-verification flag instead; a present-but-invalid attestation statement fails.
 - Records the authenticator's backup-eligibility and backup-state flags with the credential so the owner UI can show whether it syncs, and refuses a backup-eligible registration where the deployment requires device-bound credentials. Eligibility is fixed at registration and a differing value in a later assertion is refused and reported; backup state is refreshed from every verified assertion.
-- Keeps at most the last observed proxy identity on the principal: optional and non-unique (every holder of the shared account presents the same login), owner-visible, overwritten each authentication, cleared on revocation or deletion, out of diagnostic exports, and never an authorization input. Sessions keep only its deployment-keyed HMAC binding.
+- Keeps at most the last observed proxy identity on the principal: optional and non-unique (every holder of the shared account presents the same login), stored but never returned or shown, not even to the Owner (Owner decision D14: in the shared-account deployment it does not tell people apart), overwritten each authentication, cleared on revocation or deletion, out of diagnostic exports, and never an authorization input. Sessions keep only its deployment-keyed HMAC binding.
 - Supports revoking a single credential and revoking a whole principal, and binds sessions to the credential that created them.
 - Exposes exactly two pre-credential routes, enrollment-code redemption and authentication; local owner bootstrap is a host-side action that issues an authorization for the same redemption route rather than a third endpoint. They return no application data, redemption is single-use and rate-limited, an absent/unknown/expired/redeemed code gets the uninvited response, and enrollment codes stay out of logs.
 - Generates enrollment codes and bootstrap authorizations from a CSPRNG with at least 128 bits of entropy in the checked value, stores only their hash and compares in constant time; lifetime and rate limits bound guessing but do not replace the entropy.
@@ -132,8 +132,12 @@ Not implemented yet, and required before routes open in production:
   phases, #19). Sign-out and the CSRF token exist since phase 2 S1,
   invitation redemption and the local bootstrap/recovery command since S2,
   and the Owner step-up routes since S3 (below);
-- the Owner's invitation route (S4): until then the only runtime issuer of
-  an enrollment code is the local command, which covers the Owner only;
+- the Owner's administration routes (S4b: invitation, re-issue, grant
+  change, revocations and the inventory read) and the local `list` /
+  `revoke-principal` / `revoke-credential` commands (S4c). S4a builds the
+  store and `AccessAdministration` they will call ("Owner access
+  administration", below); until S4b the only runtime issuer of an
+  enrollment code is the local command, which covers the Owner only;
 - the deployment-file key and production composition that build the
   `HostnameReservationCheck` (Serve status source, `SockDiagOwners`,
   `GetaddrinfoResolver`), load the session-binding key with
@@ -142,15 +146,16 @@ Not implemented yet, and required before routes open in production:
 - delivery of `CredentialFindingSink` and `ReservationFault` to the Owner
   notification channel.
 
-Owner-only mutations — invitation, invitation issue, grant change, single
-credential revocation and principal revocation — are exposed as `*_on`
-methods on a caller-owned transaction and reached at runtime only through
-`app.audit.integration.AccessAdministration`, which authorizes the Owner and
-commits each mutation with its security audit record. Every one of them takes
-the gate epoch before the Owner authorization and commits inside
-`admit(epoch)` (Owner decision D6, 2026-10-11): while human access is closed,
-or after a close since the epoch, it is a failed operation with its `failed`
-record and changes nothing. An emergency revocation while access is closed is
+Owner-only mutations — invitation (with its code), code re-issue, grant
+change, single credential revocation and principal revocation — are exposed
+as `*_on` methods on a caller-owned transaction and reached at runtime only
+through `app.audit.integration.AccessAdministration` (`HumanAccess.administration`),
+which authorizes the Owner and commits each mutation with its security audit
+record. Every one of them commits inside `admit(epoch)` of the epoch its
+`OWNER_OP` authorization was made under (Owner decision D6, 2026-10-11; S4a):
+while human access is closed, or after a close, reopen, `stop()` or failed
+tick since that epoch, it is a failed operation with its `failed` record and
+changes nothing (see "Owner access administration" below). An emergency revocation while access is closed is
 done over SSH with a local command (Owner recovery exists since S2, see
 "Bootstrap and recovery commands"; a per-person local revocation command is
 not built yet). The plain wrappers refuse
@@ -270,11 +275,14 @@ time, creates or redeems an enrollment authorization, or stores a WebAuthn
 challenge share one lock, `HostnameReservationCheck.admit()`:
 `PasskeyCeremonies.finish_authentication()` (new session),
 `finish_step_up()` (user-verification time) and `finish_registration()`
-(invitation redemption) run their store commit inside it, and so does
-`AccessAdministration.issue_invitation()`. Neither `PasskeyCeremonies` nor
-`AccessAdministration` can be constructed without a gate (`session_gate=None`
-is refused, Issue #181), and the human route composition accepts only the
-`HostnameReservationCheck` itself. Each of these requests first takes the gate epoch
+(invitation redemption) run their store commit inside it, and so does every
+`AccessAdministration` mutation (invitation and re-issue included). Neither
+`PasskeyCeremonies` nor `AccessAdministration` can be constructed without a
+gate (`session_gate=None` is refused, Issue #181), the human route composition
+accepts only the `HostnameReservationCheck` itself, and `AccessAdministration`
+accepts only the composition's `ServingGate` (`app.auth.serving_gate`, Issue
+#232 item 1), never the raw check, so an Owner mutation is also refused after
+`HumanAccess.stop()` or a failed tick. Each of these requests first takes the gate epoch
 (`HostnameReservationCheck.epoch()`), before it consumes its challenge,
 verifies an assertion or authorizes the Owner, and commits inside
 `admit(epoch)`. The epoch advances, under the lock, every time an open verdict
@@ -717,9 +725,11 @@ The single exception is an otherwise valid Owner session on an `OWNER_OP`
 route whose user verification is stale: it gets the fixed `403
 {"detail":"step_up_required"}`. That outcome is decided under the gate with
 the epoch unchanged, never for a non-owner, a wrong CSRF token, another proxy
-identity or a closed gate. No `OWNER_OP` route is mounted yet (S4 adds the
-Owner's permission management); the mapping, and its resolution through the
-S3 step-up routes, is exercised through a synthetic route in the tests.
+identity or a closed gate, and it commits no idle touch (Owner decision
+S4-2, Issue #238 item 1): only a request that is served extends the session.
+No `OWNER_OP` route is mounted yet (S4b adds the Owner's permission
+management); the mapping, and its resolution through the S3 step-up routes,
+is exercised through a synthetic route in the tests.
 
 CSRF (Owner decision D2). `SessionBindingKey` derives a CSRF subkey from the
 deployment's session-binding key under its own domain label, and a session's
@@ -1062,6 +1072,78 @@ separate them by more than a second, a just-verified session turns stale:
 the Owner operation answers `403 step_up_required` and the Owner steps up
 again (fail closed, availability only; it never lengthens the window).
 MANUAL_TEST records the observation on the real host.
+
+### Owner access administration (Issue #10 phase 2 S4a)
+
+S4a hardens the store and `AccessAdministration`; it mounts no route (S4b
+adds routes A1-A6, S4c the local CLI, S6 the Web screen). Owner decisions
+S4-1 .. S4-8 (2026-10-13) apply.
+
+- Authorization (S4-1). Every mutation (invitation, re-issue, grant change,
+  principal and credential revocation) is an `OWNER_OP`: a fresh Owner
+  session (step-up within five minutes). Reading the inventory is
+  `OWNER_READ`. `HumanAccess.administration` is
+  `AccessAdministration(OwnerAuditService(store.audit, HumanOwnerAuthorizer()), store, session_gate=HumanAccess.gate)`.
+  `HumanOwnerAuthorizer` (`owner_operation.py`) accepts only an
+  `OwnerOperationContext(session, epoch)`, which `HumanSurface._owner_operation`
+  builds after `_authorize(..., OWNER_OP)` accepted the request inside
+  `admit(epoch)`; a non-Owner context is denied as `invited_user`, anything
+  else (a token, a login, a capture-node credential) as `unauthenticated`.
+- Same epoch (S4a item 2). Each method takes `epoch=` from the route's
+  `_Authorized.epoch`, never a fresh `epoch()`, and the context must carry
+  the same epoch: the mutation commits inside `ServingGate.admit(epoch)`
+  (gate -> storage admission -> SQLite, non-reentrant gate lock), so a close,
+  reopen, `stop()` or failed tick since the authorization refuses it.
+- In-transaction re-check (S4a item 3). The local `recover` and revocation
+  commands commit outside the gate (D6), so after `BEGIN IMMEDIATE` the
+  mutation reads the session again (`AccessStore.require_owner_session_on`):
+  not invalidated, the same principal and credential, still the active Owner
+  at the authorization revision the request saw, the deployment generation
+  unchanged, the credential usable, idle and absolute lifetimes not passed,
+  and the verification still fresh (else `StepUpRequired`). Every time the
+  mutation depends on (an invitation's expiry included) is read inside that
+  transaction. A refusal is a failed operation with its `failed` record.
+- Invitation (S4-4, S4-8). `invite` commits the principal, its grants and
+  its one code in one transaction (`invite_with_invitation_on`) with two
+  records, `invite_principal` then `issue_principal_invitation` (as the local
+  bootstrap does), and returns `(principal id, code, expires_at)`; the
+  expiry is the in-transaction time plus the deployment's
+  `invitation_lifetime` (PR #234 rule). `create_app` refuses a `HumanAccess`
+  whose store's `invitation_lifetime` differs from
+  `Settings.invitation_lifetime` (Issue #235 item 3). At most 64 principals
+  that are not revoked (`MAX_PRINCIPALS`, the Owner included) and at most one
+  pending code per principal (`MAX_PENDING_INVITATIONS`): beyond either the
+  store raises `AccessLimitReached`, which the surface answers with the
+  generic denial.
+- Re-issue (S4-4). `reissue_invitation` revokes the principal's other unused
+  codes and issues one, for an invited or an active principal (an active one
+  registers another credential with it); refused for a revoked principal and
+  for the Owner.
+- Grants as a delta (S4-5). `change_permission(principal, permission,
+  granted)` (and `set_permissions`) read and write in one transaction. A
+  no-op changes nothing: no revision bump, no session ends. A real change
+  advances the principal's revision and ends its sessions, while its pending
+  code stays valid (the pending invitation's `principal_revision` advances
+  with the principal's). `live:view` and `recordings:view` are independent.
+- The Owner is never a target (S4-3): grant changes, both revocations and
+  re-issue refuse the Owner principal; only the local `recover` changes the
+  Owner's credentials.
+- Credential handle (migration 24). Each credential has a random UUID
+  `handle`, backfilled for existing rows, unique, required on insert and
+  fixed (triggers). `revoke_credential` names a credential by
+  `(principal id, handle)`; the WebAuthn credential id never reaches a URL,
+  log or audit record. Revocation is credential-scoped: a synced passkey is
+  revoked on every device it exists on.
+- Inventory. `AccessStore.admin_inventory()` is one read-only transaction:
+  per principal `id`, `display_name`, `role`, `status`, `created_at`,
+  `revoked_at`, `permissions`, `invitation` (`pending`, `expires_at`) and
+  `credentials` (`handle`, `label`, `status`, `inconsistency_reason`,
+  `backup_eligible`, `backup_state`, `created_at`, `last_used_at`,
+  `revoked_at`). It never returns the last observed proxy identity (Owner
+  decision D14), credential ids, public keys, signature counters, digests or
+  any session data.
+- Nothing logs or audits a code, credential id or handle, identity or
+  display name; audit records carry the principal's logical UUID only.
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 

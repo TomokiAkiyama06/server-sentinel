@@ -646,6 +646,10 @@ class ClosedAccessTests(StepUpFixture):
                                              ("close/reopen", cycle, False)):
                 with self.subTest(finding=finding, interrupt=name):
                     self.elapse(minutes=6)
+                    # A served request keeps the session within its idle
+                    # limit: neither the step-up routes nor a step_up_required
+                    # answer extend it (PR #236 review, Owner decision S4-2).
+                    await self.csrf(cookie)
                     begun = await self.begin(cookie, csrf)
                     assertion = key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST, **options)
                     before = self.finding_state()

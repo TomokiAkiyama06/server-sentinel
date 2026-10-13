@@ -196,8 +196,10 @@ class LiveViewEnforcementTests(unittest.TestCase):
         _token, _identity, credential = self.access.tokens[viewer.principal_id]
         session = self.preview.open(viewer, self.source)
         with self.access.store._transaction(write=True) as connection:
+            handle = connection.execute("SELECT handle FROM access_credentials WHERE credential_id=?",
+                                        (credential,)).fetchone()[0]
             self.access.store.revoke_credential_on(connection, viewer.principal_id,
-                                                   credential, at=NOW)
+                                                   handle, at=NOW)
         self.assertEqual(viewer, self.access.access(viewer.principal_id,
                                                     viewer.access_session_id))
         with self.assertRaises(LiveSessionUnavailable):

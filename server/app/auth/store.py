@@ -15,7 +15,10 @@ from app.audit.store import AuditStorageError, AuditStore
 from app.storage.database import Database
 from .boot_clock import BootInstant, invitation_clock_valid, read_boot_instant, step_up_fresh
 from .invitation_code import INVITATION_LIFETIME, MAX_INVITATION_LIFETIME, valid_invitation_lifetime
-from .model import AccessValidationError, Credential, Permission, Principal, PrincipalRole, PrincipalStatus, utc_time
+from .model import (
+    AccessValidationError, Credential, CredentialStatus, Permission, Principal, PrincipalRole, PrincipalStatus,
+    utc_time,
+)
 from .session_binding import SessionBindingKey, canonical_identity
 
 
@@ -64,6 +67,18 @@ class InvitationClockUnavailable(AccessValidationError):
         super().__init__("invitation clock is unavailable")
 
 
+class AccessLimitReached(AccessValidationError):
+    """An Owner invitation refused by a deployment bound (Owner decision S4-8).
+
+    At most ``MAX_PRINCIPALS`` principals that are not revoked, and at most
+    ``MAX_PENDING_INVITATIONS`` unused invitation code per principal. The
+    human surface answers it with the generic denial; it carries no count.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("access limit reached")
+
+
 class DeviceBoundCredentialRequired(AccessValidationError):
     """A verified backup-eligible registration refused by deployment policy.
 
@@ -92,6 +107,9 @@ MAX_REDEMPTION_ATTEMPTS = 5
 # window only increment the session's counter, so a replayed stolen cookie
 # cannot flood the audit log.
 BINDING_MISMATCH_AUDIT_INTERVAL = timedelta(minutes=10)
+# Owner decision S4-8 (2026-10-13): administration bounds.
+MAX_PRINCIPALS = 64
+MAX_PENDING_INVITATIONS = 1
 
 
 @dataclass(frozen=True)
@@ -204,6 +222,16 @@ def _identity(value: object) -> str:
     if canonical is None:
         raise AccessValidationError("external identity is invalid")
     return canonical
+
+
+def _handle(value: object) -> str:
+    """A credential handle in its canonical form (a lower-case UUID string), else denial."""
+    try:
+        if isinstance(value, str) and len(value) == 36 and str(UUID(value)) == value:
+            return value
+    except ValueError:
+        pass
+    raise AccessValidationError("credential is unavailable")
 
 
 def _display(value: str) -> str:
@@ -512,6 +540,12 @@ class AccessStore:
         now (``app.auth.boot_clock``); when they cannot be read nothing is
         issued (``InvitationClockUnavailable``). Applies to every invitation:
         the local bootstrap/recovery command's and an Owner-issued one.
+
+        At most ``MAX_PENDING_INVITATIONS`` (one) pending code per principal
+        (Owner decision S4-8): while one is pending
+        (``_pending_invitations_on``) another is refused with
+        ``AccessLimitReached``. Re-issuing revokes the pending one first in
+        the same transaction (``reissue_invitation_on``).
         """
         if not isinstance(principal_id, UUID):
             raise AccessValidationError("principal identity is invalid")
@@ -527,11 +561,89 @@ class AccessStore:
         principal = connection.execute("SELECT * FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
         if principal is None or principal["status"] == PrincipalStatus.REVOKED.value:
             raise AccessValidationError("principal is unavailable")
+        if self._pending_invitations_on(connection, principal_id, at) >= MAX_PENDING_INVITATIONS:
+            raise AccessLimitReached()
         generation = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
         connection.execute("INSERT INTO access_invitations (id, secret_digest, principal_id, principal_revision, deployment_generation, issued_at_us, expires_at_us, redeemed_at_us, revoked_at_us, lookup_key, issued_boot_id, issued_boottime_us) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)",
                            (str(invitation_id), digest, str(principal_id), principal["authorization_revision"], generation, _us(at), _us(expiry),
                             lookup, instant.boot_id, instant.boottime_us))
         return invitation_id
+
+    @staticmethod
+    def _pending_invitations_on(connection, principal_id: UUID, at: datetime) -> int:
+        """Unused codes of a principal that could still be redeemed at ``at``.
+
+        Unredeemed, unrevoked, unexpired, of the current deployment
+        generation and the principal's current authorization revision (the
+        stored conditions of ``_redeemable``; the boot-clock check is left to
+        redemption). A code made unusable by a recovery or an expiry does not
+        count, so it never blocks a new one.
+        """
+        return connection.execute(
+            "SELECT count(*) FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id "
+            "WHERE i.principal_id=? AND i.redeemed_at_us IS NULL AND i.revoked_at_us IS NULL "
+            "AND i.expires_at_us > ? AND i.principal_revision = p.authorization_revision "
+            "AND i.deployment_generation = (SELECT authorization_generation FROM access_deployment_state WHERE singleton=1)",
+            (str(principal_id), _us(utc_time(at)))).fetchone()[0]
+
+    @staticmethod
+    def _administered_on(connection, principal_id: UUID):
+        """The principal row an Owner administration targets, never the Owner.
+
+        Owner decision S4-3: grant changes, revocations and re-issued codes
+        refuse the Owner principal; only the local ``recover`` command changes
+        the Owner's credentials. A missing or revoked principal is refused as
+        well. Every refusal is the same ``AccessValidationError``.
+        """
+        if not isinstance(principal_id, UUID):
+            raise AccessValidationError("principal identity is invalid")
+        row = connection.execute("SELECT id, role, status, authorization_revision FROM access_principals WHERE id=?",
+                                 (str(principal_id),)).fetchone()
+        if (row is None or row["role"] != PrincipalRole.INVITED_USER.value
+                or row["status"] == PrincipalStatus.REVOKED.value):
+            raise AccessValidationError("principal is unavailable")
+        return row
+
+    def invite_with_invitation_on(self, connection, principal_id: UUID, display_name: str,
+                                  permissions: Iterable[Permission], secret: bytes, *,
+                                  at: datetime) -> datetime:
+        """Invite one person and issue their single code in one transaction.
+
+        On a caller-owned (audited) write transaction: the principal, its
+        grants and its one invitation commit together or not at all, so no
+        principal is left without the code the Owner was shown. ``at`` must
+        be the time read inside that transaction; the expiry is ``at`` plus
+        this deployment's ``invitation_lifetime`` (PR #234 rule) and is
+        returned. Refused with ``AccessLimitReached`` when ``MAX_PRINCIPALS``
+        principals (the Owner included) are not revoked (Owner decision S4-8).
+        """
+        at = utc_time(at)
+        alive = connection.execute("SELECT count(*) FROM access_principals WHERE status<>?",
+                                   (PrincipalStatus.REVOKED.value,)).fetchone()[0]
+        if alive >= MAX_PRINCIPALS:
+            raise AccessLimitReached()
+        self.invite_on(connection, principal_id, display_name, permissions, at=at)
+        expires_at = self.invitation_expiry(at)
+        self.issue_enrollment_on(connection, principal_id, secret, expires_at, at=at)
+        return expires_at
+
+    def reissue_invitation_on(self, connection, principal_id: UUID, secret: bytes, *,
+                              at: datetime) -> datetime:
+        """Revoke a principal's unused codes and issue its one new code (Owner decision S4-4).
+
+        Allowed for an invited and for an active principal (an active one
+        redeems it to register another credential); refused for a revoked
+        principal and for the Owner (S4-3). ``at`` is read inside the caller's
+        transaction and the expiry, ``at`` plus ``invitation_lifetime``, is
+        returned.
+        """
+        self._administered_on(connection, principal_id)
+        at = utc_time(at)
+        connection.execute("UPDATE access_invitations SET revoked_at_us=? WHERE principal_id=? "
+                           "AND redeemed_at_us IS NULL AND revoked_at_us IS NULL", (_us(at), str(principal_id)))
+        expires_at = self.invitation_expiry(at)
+        self.issue_enrollment_on(connection, principal_id, secret, expires_at, at=at)
+        return expires_at
 
     def enroll_credential(self, enrollment_secret: bytes, proxy_identity: str, credential_id: bytes,
                           public_key: bytes, algorithm: int, sign_count: int, *, now: datetime | None = None,
@@ -596,9 +708,13 @@ class AccessStore:
                 principal_id = UUID(row["principal_id"])
                 credential = Credential(credential_id, principal_id, public_key, algorithm, sign_count, at,
                                         backup_eligible=backup_eligible, backup_state=backup_state, label=label)
-                connection.execute("INSERT INTO access_credentials (credential_id, principal_id, public_key, algorithm, sign_count, enrolled_at_us, revoked_at_us, backup_eligible, backup_state, label) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                # ``handle`` (migration 24) is the credential's random,
+                # non-secret administration name: the Owner's inventory and
+                # revocation use it, so the WebAuthn credential id never
+                # reaches a URL, log or audit record.
+                connection.execute("INSERT INTO access_credentials (credential_id, principal_id, public_key, algorithm, sign_count, enrolled_at_us, revoked_at_us, backup_eligible, backup_state, label, handle) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
                                    (credential.credential_id, str(principal_id), credential.public_key, credential.algorithm, credential.sign_count, _us(at),
-                                    int(credential.backup_eligible), int(credential.backup_state), credential.label))
+                                    int(credential.backup_eligible), int(credential.backup_state), credential.label, str(uuid4())))
                 connection.execute("UPDATE access_invitations SET redeemed_at_us=? WHERE id=?", (_us(at), row["id"]))
                 connection.execute("UPDATE access_principals SET status=? WHERE id=? AND status=?", (PrincipalStatus.ACTIVE.value, str(principal_id), PrincipalStatus.INVITED.value))
                 # Same transaction: an audit write failure rolls the redemption back.
@@ -947,8 +1063,10 @@ class AccessStore:
         exactly five minutes) on both the wall clock and ``CLOCK_BOOTTIME``
         of the same boot, with no detected wall-clock step back, and not
         before the session's establishment (``_verification_stale``). That
-        outcome is decided under the gate with the epoch unchanged; the
-        session's idle touch commits before it is raised.
+        outcome is decided under the gate with the epoch unchanged and
+        commits no idle touch (Owner decision S4-2, #238 item 1): an Owner
+        operation refused for a stale verification is not served, so it does
+        not keep the session alive; the expiry sweep still commits.
         """
         if not isinstance(requirement, Requirement) or requirement is Requirement.PRE_CREDENTIAL:
             raise AccessValidationError("access is unavailable")
@@ -972,7 +1090,10 @@ class AccessStore:
             if csrf is not None and (binding is None or not binding.csrf_matches(UUID(row["id"]), csrf)):
                 raise AccessValidationError("access is unavailable")
             stale = requirement is Requirement.OWNER_OP and self._verification_stale(row, at, freshness)
-            if touch:
+            # Owner decision S4-2 (#238 item 1): a step_up_required answer
+            # does not extend the session; the touch commits only when the
+            # request is actually served.
+            if touch and not stale:
                 self._touch_session_on(connection, row, at)
             view = SessionView(UUID(row["id"]), UUID(row["principal_id"]), bytes(row["credential_id"]),
                                role=PrincipalRole(row["role"]),
@@ -1133,7 +1254,8 @@ class AccessStore:
         ``CLOCK_BOOTTIME``, another boot, a detected wall-clock step back, or
         not between the session's establishment and now) receives the
         distinct ``StepUpRequired``. A stale session never performs the
-        operation.
+        operation, and its idle expiry is left as it was (Owner decision
+        S4-2).
 
         ``admit`` is the reservation session gate (Issue #228 item 5): the
         same gated pattern as ``authorize_request`` (gate -> storage
@@ -1149,7 +1271,8 @@ class AccessStore:
             if row["role"] != PrincipalRole.OWNER.value:
                 raise AccessValidationError("access is unavailable")
             stale = self._verification_stale(row, at, freshness)
-            self._touch_session_on(connection, row, at)
+            if not stale:  # Owner decision S4-2: no idle touch on StepUpRequired.
+                self._touch_session_on(connection, row, at)
             return self._principal(row), stale
 
         principal, stale = self._authorize_gated(token, proxy_identity, decide, now=now, admit=admit)
@@ -1164,18 +1287,46 @@ class AccessStore:
             self.set_permissions_on(connection, principal_id, permissions, at=at)
 
     def set_permissions_on(self, connection, principal_id: UUID, permissions: Iterable[Permission],
-                           *, at: datetime) -> None:
-        """Replace grants and invalidate existing sessions on a caller-owned transaction."""
-        if not isinstance(principal_id, UUID):
-            raise AccessValidationError("principal identity is invalid")
-        grants = self._permissions(permissions)
+                           *, at: datetime) -> bool:
+        """Set a principal's grants on a caller-owned transaction; ``True`` when they changed.
+
+        Read-modify-write in the caller's transaction (Owner decision S4-5):
+        when the grant set is already the requested one nothing is written,
+        the authorization revision stays and no session ends. A real change
+        replaces the grants, advances the revision and ends that principal's
+        sessions, while its pending invitation code stays valid
+        (``_advance_principal``). Refused for the Owner, a revoked or a
+        missing principal (S4-3).
+        """
+        self._administered_on(connection, principal_id)
+        grants = frozenset(self._permissions(permissions))
+        current = frozenset(Permission(value) for (value,) in connection.execute(
+            "SELECT permission FROM access_principal_permissions WHERE principal_id=?", (str(principal_id),)))
+        if grants == current:
+            return False
         at = utc_time(at)
-        row = connection.execute("SELECT status FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
-        if row is None or row["status"] == PrincipalStatus.REVOKED.value:
-            raise AccessValidationError("principal is unavailable")
         connection.execute("DELETE FROM access_principal_permissions WHERE principal_id=?", (str(principal_id),))
-        connection.executemany("INSERT INTO access_principal_permissions VALUES (?, ?)", ((str(principal_id), value.value) for value in grants))
+        connection.executemany("INSERT INTO access_principal_permissions VALUES (?, ?)",
+                               ((str(principal_id), value.value) for value in sorted(grants, key=lambda item: item.value)))
         self._advance_principal(connection, principal_id, at)
+        return True
+
+    def change_permission_on(self, connection, principal_id: UUID, permission: Permission,
+                             granted: bool, *, at: datetime) -> bool:
+        """Grant or withdraw one permission as a delta; ``True`` when the grants changed.
+
+        ``live:view`` and ``recordings:view`` are independent: changing one
+        never touches the other. Read and written in the caller's single
+        transaction, so two concurrent changes of different permissions both
+        apply. No-op and change semantics are those of ``set_permissions_on``.
+        """
+        if not isinstance(permission, Permission) or type(granted) is not bool:
+            raise AccessValidationError("permissions are invalid")
+        self._administered_on(connection, principal_id)
+        current = {Permission(value) for (value,) in connection.execute(
+            "SELECT permission FROM access_principal_permissions WHERE principal_id=?", (str(principal_id),))}
+        wanted = current | {permission} if granted else current - {permission}
+        return self.set_permissions_on(connection, principal_id, wanted, at=at)
 
     def revoke_principal(self, principal_id: UUID, *, now: datetime | None = None) -> None:
         self._require_unaudited_writes()
@@ -1184,35 +1335,161 @@ class AccessStore:
             self.revoke_principal_on(connection, principal_id, at=at)
 
     def revoke_principal_on(self, connection, principal_id: UUID, *, at: datetime) -> None:
-        """Revoke a principal with its credentials, invitations and sessions together."""
-        if not isinstance(principal_id, UUID):
-            raise AccessValidationError("principal identity is invalid")
+        """Revoke a principal with its credentials, invitations and sessions together.
+
+        Refused for the Owner (S4-3: the Owner is replaced only by the local
+        ``recover`` command), for a principal already revoked and for a
+        missing one.
+        """
+        self._administered_on(connection, principal_id)
         at = utc_time(at)
-        row = connection.execute("SELECT status FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
-        if row is None:
-            raise AccessValidationError("principal is unavailable")
         # The last observed proxy identity is cleared with the principal (§11.4).
         connection.execute("UPDATE access_principals SET status=?, revoked_at_us=?, external_identity=NULL, authorization_revision=authorization_revision+1 WHERE id=?", (PrincipalStatus.REVOKED.value, _us(at), str(principal_id)))
         connection.execute("UPDATE access_credentials SET revoked_at_us=? WHERE principal_id=? AND revoked_at_us IS NULL", (_us(at), str(principal_id)))
         connection.execute("UPDATE access_invitations SET revoked_at_us=? WHERE principal_id=? AND redeemed_at_us IS NULL AND revoked_at_us IS NULL", (_us(at), str(principal_id)))
         connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE principal_id=? AND invalidated_at_us IS NULL", (_us(at), str(principal_id)))
 
-    def revoke_credential_on(self, connection, principal_id: UUID, credential_id: bytes, *, at: datetime) -> None:
-        """Revoke one credential of a principal and end the sessions it created.
+    def revoke_credential_on(self, connection, principal_id: UUID, handle: str, *, at: datetime) -> None:
+        """Revoke one credential of a principal, named by its handle, and end its sessions.
 
-        Revocation is credential-scoped, not device-scoped: a synced passkey may
-        exist on several devices. The credential identifier is opaque WebAuthn
-        material; the audited caller records only the principal's logical UUID.
+        ``handle`` is the credential's random administration name (migration
+        24, ``admin_inventory``); the WebAuthn credential id is looked up here
+        and never leaves the store. Revocation is credential-scoped, not
+        device-scoped: a synced passkey may exist on several devices and is
+        revoked on all of them. Refused for the Owner's credentials (S4-3),
+        for a revoked principal, and for an unknown, foreign or already
+        revoked handle. The audited caller records only the principal's
+        logical UUID.
         """
-        if not isinstance(principal_id, UUID) or not isinstance(credential_id, bytes):
-            raise AccessValidationError("credential subject is invalid")
+        self._administered_on(connection, principal_id)
+        handle = _handle(handle)
         at = utc_time(at)
-        changed = connection.execute(
-            "UPDATE access_credentials SET revoked_at_us=? WHERE credential_id=? AND principal_id=? AND revoked_at_us IS NULL",
-            (_us(at), credential_id, str(principal_id))).rowcount
-        if changed != 1:
+        row = connection.execute(
+            "SELECT credential_id FROM access_credentials WHERE handle=? AND principal_id=? AND revoked_at_us IS NULL",
+            (handle, str(principal_id))).fetchone()
+        if row is None:
             raise AccessValidationError("credential is unavailable")
+        credential_id = bytes(row["credential_id"])
+        connection.execute("UPDATE access_credentials SET revoked_at_us=? WHERE credential_id=? AND principal_id=?",
+                           (_us(at), credential_id, str(principal_id)))
         connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
+
+    def require_owner_session_on(self, connection, view: "SessionView", at: datetime, *,
+                                 freshness: timedelta = OWNER_STEP_UP_FRESHNESS) -> None:
+        """Re-check, inside an Owner operation's own transaction, that its session still holds.
+
+        ``view`` is the ``SessionView`` the request's ``OWNER_OP``
+        authorization returned. The gate (``admit(epoch)``) already refuses a
+        reservation close, reopen or ``stop()`` since that authorization, but
+        the local ``recover`` / revocation commands commit outside the gate
+        (D6), so the operation's transaction reads the session again after
+        ``BEGIN IMMEDIATE``: not invalidated, of the same principal and
+        credential, the principal still the active Owner at the
+        authorization revision the view saw (and the session's own revision
+        and the deployment generation unchanged), the credential neither
+        revoked nor inconsistent, the idle and absolute lifetimes not passed
+        at ``at``, and the user verification still fresh
+        (``_verification_stale``). The proxy-identity binding was checked by
+        the authorization under the same epoch. A stale verification raises
+        ``StepUpRequired``; anything else the generic ``AccessValidationError``.
+        Nothing is written, so the session's idle expiry does not move.
+        """
+        if (not isinstance(view, SessionView) or view.role is not PrincipalRole.OWNER
+                or type(view.authorization_revision) is not int or not isinstance(view.credential_id, bytes)):
+            raise AccessValidationError("access is unavailable")
+        at = utc_time(at)
+        row = connection.execute(
+            "SELECT s.*, p.role, p.status, p.authorization_revision, c.revoked_at_us credential_revoked, "
+            "c.inconsistent_at_us credential_inconsistent FROM access_sessions s "
+            "JOIN access_principals p ON p.id=s.principal_id JOIN access_credentials c ON c.credential_id=s.credential_id "
+            "WHERE s.id=?", (str(view.session_id),)).fetchone()
+        generation = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
+        now = _us(at)
+        current = (row is not None and row["principal_id"] == str(view.principal_id)
+                   and hmac.compare_digest(bytes(row["credential_id"]), view.credential_id)
+                   and row["invalidated_at_us"] is None
+                   and row["role"] == PrincipalRole.OWNER.value and row["status"] == PrincipalStatus.ACTIVE.value
+                   and row["credential_revoked"] is None and row["credential_inconsistent"] is None
+                   and row["principal_revision"] == row["authorization_revision"] == view.authorization_revision
+                   and row["deployment_generation"] == generation
+                   and row["established_at_us"] <= now and row["last_seen_at_us"] <= now
+                   and now < row["idle_expires_at_us"] and now < row["absolute_expires_at_us"])
+        if not current:
+            raise AccessValidationError("access is unavailable")
+        if self._verification_stale(row, at, freshness):
+            raise StepUpRequired()
+
+    def admin_inventory(self) -> tuple[dict, ...]:
+        """The Owner's read-only view of every principal (Issue #10 phase 2 S4).
+
+        One read transaction (``mode=ro``, nothing written). Per principal,
+        ordered by creation: ``id``, ``display_name``, ``role``, ``status``,
+        ``created_at``, ``revoked_at``, ``permissions`` (sorted values; the
+        Owner holds every one), ``invitation`` (``pending``: an unused code
+        that could still be redeemed, with its ``expires_at``) and
+        ``credentials``: per credential ``handle``, ``label``, ``status``
+        (``active``/``revoked``/``inconsistent``), ``inconsistency_reason``,
+        ``backup_eligible``, ``backup_state``, ``created_at``,
+        ``last_used_at`` and ``revoked_at``. Times are ISO 8601 UTC strings.
+
+        Deliberately absent: the last observed proxy identity (Owner decision
+        D14: a shared account does not tell people apart), WebAuthn credential
+        ids, public keys, signature counters, invitation digests and lookup
+        keys, and all session data.
+        """
+        def iso(value):
+            return None if value is None else _time(value).isoformat()
+
+        with self._transaction() as connection:
+            at = _us(self.now())
+            principals = connection.execute(
+                "SELECT id, display_name, role, status, created_at_us, revoked_at_us FROM access_principals "
+                "ORDER BY created_at_us, id").fetchall()
+            grants: dict[str, list] = {}
+            for principal_id, value in connection.execute(
+                    "SELECT principal_id, permission FROM access_principal_permissions ORDER BY permission"):
+                grants.setdefault(principal_id, []).append(value)
+            pending = {row[0]: row[1] for row in connection.execute(
+                "SELECT i.principal_id, max(i.expires_at_us) FROM access_invitations i "
+                "JOIN access_principals p ON p.id=i.principal_id "
+                "WHERE i.redeemed_at_us IS NULL AND i.revoked_at_us IS NULL AND i.expires_at_us > ? "
+                "AND i.principal_revision = p.authorization_revision AND p.status <> 'revoked' "
+                "AND i.deployment_generation = (SELECT authorization_generation FROM access_deployment_state WHERE singleton=1) "
+                "GROUP BY i.principal_id", (at,))}
+            credentials: dict[str, list] = {}
+            for row in connection.execute(
+                    "SELECT principal_id, handle, label, revoked_at_us, inconsistent_at_us, inconsistency_reason, "
+                    "backup_eligible, backup_state, enrolled_at_us, last_used_at_us FROM access_credentials "
+                    "ORDER BY enrolled_at_us, handle"):
+                status = (CredentialStatus.REVOKED if row["revoked_at_us"] is not None
+                          else CredentialStatus.INCONSISTENT if row["inconsistent_at_us"] is not None
+                          else CredentialStatus.ACTIVE)
+                credentials.setdefault(row["principal_id"], []).append({
+                    "handle": row["handle"],
+                    "label": row["label"],
+                    "status": status.value,
+                    "inconsistency_reason": row["inconsistency_reason"],
+                    "backup_eligible": bool(row["backup_eligible"]),
+                    "backup_state": bool(row["backup_state"]),
+                    "created_at": iso(row["enrolled_at_us"]),
+                    "last_used_at": iso(row["last_used_at_us"]),
+                    "revoked_at": iso(row["revoked_at_us"]),
+                })
+        result = []
+        for row in principals:
+            owner = row["role"] == PrincipalRole.OWNER.value
+            result.append({
+                "id": row["id"],
+                "display_name": row["display_name"],
+                "role": row["role"],
+                "status": row["status"],
+                "created_at": iso(row["created_at_us"]),
+                "revoked_at": iso(row["revoked_at_us"]),
+                "permissions": sorted(item.value for item in Permission) if owner else grants.get(row["id"], []),
+                "invitation": {"pending": row["id"] in pending, "expires_at": iso(pending.get(row["id"]))},
+                "credentials": credentials.get(row["id"], []),
+            })
+        return tuple(result)
 
     def invalidate_all_sessions_on(self, connection, *, at: datetime) -> None:
         """Advance the deployment authorization generation and end every human session.
@@ -1456,7 +1733,11 @@ class AccessStore:
         return principal, self._credential(row)
 
     def credentials_for(self, principal_id: UUID) -> tuple[Credential, ...]:
-        """Owner-visible credential inventory; revocation is credential-scoped."""
+        """Credential rows of a principal, WebAuthn material included (internal and tests).
+
+        Not an Owner view: the Owner's inventory is ``admin_inventory``, which
+        names credentials by handle only.
+        """
         if not isinstance(principal_id, UUID):
             raise AccessValidationError("principal identity is invalid")
         with self._transaction() as connection:
@@ -1550,7 +1831,8 @@ class AccessStore:
                 self._touch_session_on(connection, session, at)
                 session_id = step_up_session_id
                 action = AuditAction.VERIFY_PRINCIPAL_STEP_UP
-            # Owner-visible, overwritten each authentication, never an input.
+            # Stored, never returned or shown (Owner decision D14), overwritten
+            # each authentication, never an input.
             connection.execute("UPDATE access_principals SET external_identity=? WHERE id=?", (identity, str(principal_id)))
             mark()
             self.audit.append_on(connection, actor_category=actor, action=action,
@@ -1651,9 +1933,16 @@ class AccessStore:
 
     @staticmethod
     def _advance_principal(connection, principal_id: UUID, at: datetime) -> None:
-        # Both statements are within the caller's BEGIN IMMEDIATE transaction:
+        # All statements are within the caller's BEGIN IMMEDIATE transaction:
         # a commit publishes the revision and every invalidation together, while
         # a failure rolls both back. A real invalidation timestamp avoids a
         # sentinel value that could be misread as a valid Unix epoch session.
+        # A grant change keeps the principal's pending code valid (Owner
+        # decision S4-5): an invitation still at the current revision moves
+        # with it, while one already stale (or redeemed/revoked) stays as is.
+        connection.execute("UPDATE access_invitations SET principal_revision=principal_revision+1 WHERE principal_id=? "
+                           "AND redeemed_at_us IS NULL AND revoked_at_us IS NULL AND principal_revision="
+                           "(SELECT authorization_revision FROM access_principals WHERE id=?)",
+                           (str(principal_id), str(principal_id)))
         connection.execute("UPDATE access_principals SET authorization_revision=authorization_revision+1 WHERE id=?", (str(principal_id),))
         connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE principal_id=? AND invalidated_at_us IS NULL", (_us(at), str(principal_id)))

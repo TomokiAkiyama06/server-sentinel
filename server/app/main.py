@@ -103,6 +103,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # builds one yet, so `python -m app` / `app.deployment` stay closed.
     if human_access is not None and not isinstance(human_access, HumanAccess):
         raise TypeError("human access composition is invalid")
+    if human_access is not None and human_access.store.invitation_lifetime != settings.invitation_lifetime:
+        # Issue #235 item 3: Owner-issued invitations expire after the
+        # deployment's ``invitation_lifetime_hours``; a store left at another
+        # lifetime (the 24-hour default, say) would issue codes with the
+        # wrong expiry or refuse every one.
+        raise TypeError("human access composition is invalid")
     store = database or Database(settings.database_path)
     # Local UVC capture is driven only by the deployment's list of approved
     # logical sources. Frames go to a bounded preview hub that retains nothing

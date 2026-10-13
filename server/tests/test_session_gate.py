@@ -29,6 +29,8 @@ from app.auth.reservation import (
 )
 from app.auth.reservation_store import ListenerExceptionStore, ReservationSessionRevocation
 from app.auth.session_binding import SessionBindingKey
+from app.auth.owner_operation import HumanOwnerAuthorizer
+from app.auth.serving_gate import ServingGate
 from app.auth.store import AccessStore, StepUpRequired
 from app.auth.webauthn import RelyingParty
 from app.storage.database import Database
@@ -38,6 +40,7 @@ from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.test_hostname_reservation import (
     SSH, V4, V6, WILDCARD_SSH, Clock, Files, SyntheticOwnerAuthorizer, checker, proc,
 )
+from tests.admin_fakes import owner_context
 from tests.test_webauthn_ceremonies import Clock as CeremonyClock
 from tests.webauthn_fakes import ORIGIN, RP_ID, SyntheticAuthenticator
 
@@ -87,6 +90,18 @@ class SessionGateFixture(unittest.TestCase):
         self.assertTrue(self.check.startup().open)
         self.ceremonies = self.ceremonies_for(self.check)
         self.service = OwnerAuditService(self.audit, SyntheticOwnerAuthorizer())
+        # Access administration (Issue #10 phase 2 S4): the human Owner
+        # authorizer and a ServingGate over this check (Issue #232 item 1).
+        self.owner_service = OwnerAuditService(self.audit, HumanOwnerAuthorizer())
+
+    def access_admin(self):
+        return AccessAdministration(self.owner_service, self.access,
+                                    session_gate=ServingGate(self.check, stopped=lambda: False))
+
+    def owner_op(self):
+        """A fresh Owner's OWNER_OP context, authorized under the current epoch."""
+        epoch = self.check.epoch()
+        return owner_context(self.access, epoch=epoch, admit=lambda: self.check.admit(epoch))
 
     def ceremonies_for(self, gate):
         return PasskeyCeremonies(self.access, RelyingParty(RP_ID, ORIGIN), session_gate=gate,
@@ -352,12 +367,12 @@ class SessionCommitRaceTests(SessionGateFixture):
         # The Owner is authorized, a check closes access and revokes every
         # session (the Owner's included), a clean check reopens; the
         # invitation must not commit on that revoked authorization.
-        admin = AccessAdministration(self.service, self.access, session_gate=self.check)
+        admin = self.access_admin()
         principal = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
-        expires = self.ceremony_clock() + timedelta(minutes=30)
+        context = self.owner_op()
         box = self.paused_during(
-            self.service.authorizer, "require_owner",
-            lambda: admin.issue_invitation(OWNER_SESSION, principal.id, b"a" * 32, expires))
+            self.owner_service.authorizer, "require_owner",
+            lambda: admin.reissue_invitation(context, principal.id, epoch=context.epoch))
         self.assertIsInstance(box.get("error"), HumanAccessClosed)
         with closing(self.database.connect()) as connection:
             count = connection.execute("SELECT count(*) FROM access_invitations WHERE principal_id=?",
@@ -516,14 +531,14 @@ class SessionCommitRaceTests(SessionGateFixture):
         self.assertEqual(verified[0], verified[1])
 
     def test_invitation_issued_through_the_gate_is_refused_while_closed(self):
-        admin = AccessAdministration(self.service, self.access, session_gate=self.check)
+        admin = self.access_admin()
         principal = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
-        expires = self.ceremony_clock() + timedelta(minutes=30)
-        admin.issue_invitation(OWNER_SESSION, principal.id, b"a" * 32, expires)
+        context = self.owner_op()
+        admin.reissue_invitation(context, principal.id, epoch=context.epoch)
         self.files.files["tcp"] = EXPOSED
         self.assertFalse(self.check._check(CheckKind.RETRY).open)
         with self.assertRaises(HumanAccessClosed):
-            admin.issue_invitation(OWNER_SESSION, principal.id, b"b" * 32, expires)
+            admin.reissue_invitation(context, principal.id, epoch=context.epoch)
         issued = [record.outcome for record in self.audit.list_records()
                   if record.action is AuditAction.ISSUE_PRINCIPAL_INVITATION]
         self.assertEqual(sorted(issued), sorted([AuditOutcome.SUCCEEDED, AuditOutcome.FAILED]))
@@ -545,29 +560,36 @@ class SessionCommitRaceTests(SessionGateFixture):
                     for table in ("access_principals", "access_principal_permissions", "access_invitations",
                                   "access_credentials", "access_sessions")]
 
-    def owner_operations(self, admin):
+    def owner_operations(self, admin, box):
+        """Every Owner mutation, run with the context ``box["context"]`` holds."""
         viewer, _ = self.enroll()
-        credential_id = self.access.credentials_for(viewer.id)[0].credential_id
-        expires = self.ceremony_clock() + timedelta(minutes=30)
+        handle = next(entry for entry in self.access.admin_inventory()
+                      if entry["id"] == str(viewer.id))["credentials"][0]["handle"]
+
+        def run(call):
+            return lambda: call(box["context"], epoch=box["context"].epoch)
         return {
             AuditAction.INVITE_PRINCIPAL:
-                lambda: admin.invite(OWNER_SESSION, "Synthetic invitee", (Permission.LIVE_VIEW,)),
+                run(lambda context, **kw: admin.invite(context, "Synthetic invitee", (Permission.LIVE_VIEW,), **kw)),
             AuditAction.ISSUE_PRINCIPAL_INVITATION:
-                lambda: admin.issue_invitation(OWNER_SESSION, viewer.id, b"i" * 32, expires),
+                run(lambda context, **kw: admin.reissue_invitation(context, viewer.id, **kw)),
             AuditAction.CHANGE_PRINCIPAL_PERMISSIONS:
-                lambda: admin.set_permissions(OWNER_SESSION, viewer.id, (Permission.RECORDINGS_VIEW,)),
+                run(lambda context, **kw: admin.change_permission(context, viewer.id, Permission.RECORDINGS_VIEW,
+                                                                  True, **kw)),
             AuditAction.REVOKE_PRINCIPAL_CREDENTIAL:
-                lambda: admin.revoke_credential(OWNER_SESSION, viewer.id, credential_id),
+                run(lambda context, **kw: admin.revoke_credential(context, viewer.id, handle, **kw)),
             AuditAction.REVOKE_PRINCIPAL:
-                lambda: admin.revoke_principal(OWNER_SESSION, viewer.id),
+                run(lambda context, **kw: admin.revoke_principal(context, viewer.id, **kw)),
         }
 
     def outcomes(self, action):
         return [record.outcome for record in self.audit.list_records() if record.action is action]
 
     def test_every_owner_mutation_is_refused_while_closed(self):
-        admin = AccessAdministration(self.service, self.access, session_gate=self.check)
-        operations = self.owner_operations(admin)
+        admin = self.access_admin()
+        box = {}
+        operations = self.owner_operations(admin, box)
+        box["context"] = self.owner_op()
         self.check._resolver.answer = OSError("synthetic resolver failure")
         self.assertFalse(self.check._check(CheckKind.RETRY).open)
         before = self.access_state()
@@ -579,20 +601,30 @@ class SessionCommitRaceTests(SessionGateFixture):
         # Reopened: each one commits with its success record.
         self.check._resolver.answer = (V4, V6)
         self.assertTrue(self.check._check(CheckKind.RETRY).open)
+        # The context of the old epoch stays refused after the reopen.
+        for action, operation in operations.items():
+            with self.subTest(action=action, epoch="old"), self.assertRaises(HumanAccessClosed):
+                operation()
+        self.assertEqual(self.access_state(), before)
+        box["context"] = self.owner_op()
         for action, operation in operations.items():
             with self.subTest(action=action):
                 operation()
-                self.assertEqual(sorted(self.outcomes(action)), sorted([AuditOutcome.FAILED, AuditOutcome.SUCCEEDED]))
+                outcomes = self.outcomes(action)
+                self.assertEqual(outcomes.count(AuditOutcome.FAILED), 2)
+                self.assertIn(AuditOutcome.SUCCEEDED, outcomes)
 
     def test_owner_mutation_paused_across_a_cycle_is_refused(self):
         # The Owner is authorized, a check closes and reopens access (no
         # exposure, so nothing is revoked); the mutation must not commit on
         # the authorization taken before the close.
-        admin = AccessAdministration(self.service, self.access, session_gate=self.check)
-        for action, operation in self.owner_operations(admin).items():
+        admin = self.access_admin()
+        context = {}
+        for action, operation in self.owner_operations(admin, context).items():
             with self.subTest(action=action):
+                context["context"] = self.owner_op()
                 before = self.access_state()
-                box = self.paused_during(self.service.authorizer, "require_owner", operation,
+                box = self.paused_during(self.owner_service.authorizer, "require_owner", operation,
                                          exposure=False)
                 self.assertIsInstance(box.get("error"), HumanAccessClosed)
                 self.assertEqual(self.access_state(), before)
@@ -713,11 +745,11 @@ class ProcessGuardTests(SessionGateFixture):
         self.assertTrue(self.valid(grant))
 
     def test_invitation_in_another_process_is_a_failed_operation(self):
-        admin = AccessAdministration(self.service, self.access, session_gate=self.check)
+        admin = self.access_admin()
         principal = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
-        expires = self.ceremony_clock() + timedelta(minutes=30)
+        context = self.owner_op()
         with self.other_process(), self.assertRaises(HumanAccessClosed):
-            admin.issue_invitation(OWNER_SESSION, principal.id, b"c" * 32, expires)
+            admin.reissue_invitation(context, principal.id, epoch=context.epoch)
         issued = [record.outcome for record in self.audit.list_records()
                   if record.action is AuditAction.ISSUE_PRINCIPAL_INVITATION]
         self.assertEqual(issued, [AuditOutcome.FAILED])
@@ -766,7 +798,7 @@ class GateLockOrderTests(SessionGateFixture):
     def test_concurrent_checks_logins_and_owner_changes_do_not_deadlock(self):
         users = [self.enroll(bytes([65 + index]) * 32, f"synthetic-{index}@example.invalid")
                  for index in range(3)]
-        admin = AccessAdministration(self.service, self.access, session_gate=self.check)
+        admin = self.access_admin()
         reservation_admin = ReservationAdministration(self.service, self.check)
         self.files.files.update(Files(**WILDCARD_SSH.raw).files)
         reservation_admin.set_listener_exceptions(OWNER_SESSION, {SSH})
@@ -819,10 +851,12 @@ class GateLockOrderTests(SessionGateFixture):
 
         def invitations(index):
             try:
-                admin.issue_invitation(OWNER_SESSION, pending.id, index.to_bytes(32, "big"),
-                                       self.ceremony_clock() + timedelta(minutes=30))
-            except HumanAccessClosed:
-                pass  # refused while a check holds access closed
+                context = self.owner_op()
+                admin.reissue_invitation(context, pending.id, epoch=context.epoch)
+            except (HumanAccessClosed, AccessValidationError, ValueError):
+                # Refused while a check holds access closed (no epoch, or a
+                # changed one), or after an exposure revoked the session.
+                pass
 
         bodies = (checks, changes, invitations, *(logins(user) for user in range(3)))
         self.assertEqual(len(bodies), workers_count)

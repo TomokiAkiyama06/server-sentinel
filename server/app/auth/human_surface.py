@@ -101,7 +101,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 import ipaddress
@@ -109,19 +108,23 @@ import json
 import logging
 import re
 import threading
-from typing import Callable, Iterator
+from typing import Callable
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from app.audit.integration import AccessAdministration
+from app.audit.service import OwnerAuditService
 from app.completion import run_to_completion
 from app.logging import Event
 from app.storage.database import Database, PinnedDatabase
 from .invitation_code import InvalidInvitationCode, parse_invitation_code
 from .model import Credential
+from .owner_operation import HumanOwnerAuthorizer, OwnerOperationContext
 from .passkeys import DeviceBoundCredentialRequired, PasskeyCeremonies, SessionGrant
 from .rate_limit import SourceRateLimiter, redemption_rate_limiter, step_up_rate_limiter
-from .reservation import HostnameReservationCheck, HumanAccessClosed
+from .reservation import HostnameReservationCheck
 from .reservation_store import ListenerExceptionStore, ReservationSessionRevocation
+from .serving_gate import ServingGate
 from .session_binding import canonical_identity
 from .store import AccessStore, Requirement, SessionView, StepUpRequired
 
@@ -461,36 +464,6 @@ def _label(value: object) -> str | None:
     return value
 
 
-class ServingGate:
-    """The reservation session gate, also closed while the composition is stopped.
-
-    Issue #228 item 1: ``HumanAccess.stopped`` used to be read only at the
-    request entry, so a request already past it when ``stop()`` ran, or when
-    a periodic check failed, could still be authorized. ``admit()`` now
-    re-reads it after taking the gate lock, and ``epoch()`` is ``None`` while
-    stopped. This is the gate every human commit uses: the routes'
-    ``_authorize`` and later writes, and the ceremonies (installed through
-    ``PasskeyCeremonies.guard_session_gate``). A commit admitted before
-    ``stop()`` may still complete; none is admitted after it.
-    """
-
-    def __init__(self, access: "HumanAccess"):
-        self._access = access
-        self.reservation = access.reservation
-
-    def epoch(self) -> int | None:
-        if self._access.stopped:
-            return None
-        return self.reservation.epoch()
-
-    @contextmanager
-    def admit(self, epoch: int | None) -> Iterator[None]:
-        with self.reservation.admit(epoch):
-            if self._access.stopped:
-                raise HumanAccessClosed()
-            yield
-
-
 class HumanAccess:
     """Validated composition of the human route foundation.
 
@@ -594,7 +567,14 @@ class HumanAccess:
         # without credential material): a count only.
         self.refused_step_ups = 0
         self._refusal_lock = threading.Lock()
-        self.gate = ServingGate(self)
+        self.gate = ServingGate(reservation, stopped=lambda: self.stopped)
+        # The Owner's access administration (Issue #10 phase 2 S4): every
+        # mutation commits through this composition's own ServingGate (Issue
+        # #232 item 1) and is authorized only from an OwnerOperationContext
+        # the surface built after a gated OWNER_OP authorization. Its audit
+        # records share the access store's database and storage admission.
+        self.administration = AccessAdministration(
+            OwnerAuditService(store.audit, HumanOwnerAuthorizer()), store, session_gate=self.gate)
         # Last: everything above validated, so a refused composition leaves
         # the ceremonies untouched.
         ceremonies.guard_session_gate(self.gate)
@@ -933,6 +913,20 @@ class HumanSurface:
         if not isinstance(session, SessionView):
             raise _Denied()
         return _Authorized(session, epoch)
+
+    async def _owner_operation(self, request: _Request) -> OwnerOperationContext:
+        """Authorize an ``OWNER_OP`` route and return its administration context.
+
+        The only producer of ``OwnerOperationContext`` (Issue #10 phase 2
+        S4): ``_authorize`` with ``OWNER_OP`` (a fresh Owner session, CSRF,
+        binding, all inside ``admit(epoch)``; a stale Owner is ``_StepUp``
+        and commits no idle touch, Owner decision S4-2), then the context
+        carries that session view and epoch. ``HumanAccess.administration``
+        commits the mutation inside ``admit`` of the same epoch and re-reads
+        the session in its own transaction.
+        """
+        authorized = await self._authorize(request, Requirement.OWNER_OP)
+        return OwnerOperationContext(authorized.session, authorized.epoch)
 
     # -- routes --------------------------------------------------------
 

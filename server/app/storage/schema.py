@@ -2,8 +2,8 @@
 
 from app.audit.schema import audit_migration
 from app.auth.schema import (
-    access_invitation_clock_migration, access_migration, access_shared_identity_migration,
-    access_step_up_clock_migration, access_webauthn_migration,
+    access_credential_handle_migration, access_invitation_clock_migration, access_migration,
+    access_shared_identity_migration, access_step_up_clock_migration, access_webauthn_migration,
 )
 from app.cameras.remote_agent.schema import (
     PAIRING_MIGRATION, pairing_renewal_certificate_migration, pairing_renewal_migration,
@@ -65,4 +65,7 @@ APPLICATION_MIGRATIONS = (
     # Issue #10 phase 2 S3: the boot id + CLOCK_BOOTTIME of each session's
     # user verification, so the Owner step-up window holds on both clocks.
     access_step_up_clock_migration(23),
+    # Issue #10 phase 2 S4: a random, non-secret handle names each credential
+    # in the Owner's inventory and revocation instead of its WebAuthn id.
+    access_credential_handle_migration(24),
 )
