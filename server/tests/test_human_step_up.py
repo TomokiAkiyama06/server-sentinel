@@ -1479,7 +1479,8 @@ class FollowUpTests(StepUpFixture):
             with self.assertRaises(CeremonyDenied):
                 self.ceremonies.finish_step_up(self.token(cookie), VIEWER, assertion)
 
-        with patch.object(gate, "admit", side_effect=admit),                 patch.object(self.store, "consume_challenge", side_effect=consume):
+        with patch.object(gate, "admit", side_effect=admit), \
+                patch.object(self.store, "consume_challenge", side_effect=consume):
             await asyncio.to_thread(finish)
         self.assertEqual(events, ["gate held", ("consume", "step_up", view.session_id), "gate released"])
         self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
@@ -1503,6 +1504,46 @@ class FollowUpTests(StepUpFixture):
         self.assertEqual(status(await self.finish(
             first, first_csrf, key.assertion(begun, origin=ORIGIN, rp_id=HOST))), 204)
         self.assertIsNone(self.store.pending_step_up_challenge(digest))
+
+    async def test_a_refused_finish_without_a_current_session_spends_nothing(self):
+        # Item 4 at the ceremony: a finish whose request has no current session
+        # (the proxy identity does not match the session's binding, or the
+        # session has idle-expired) is refused and consumes nothing; with the
+        # binding restored, the challenge's own session steps up with it.
+        _, key, _, cookie, csrf = await self.owner_session()
+        self.elapse(minutes=6)
+        begun = payload(await self.begin(cookie, csrf))
+        digest = hashlib.sha256(unb64(begun["challenge"])).digest()
+        token = self.token(cookie)
+        view = self.store.current_session(token, VIEWER, at=self.ceremony_clock())
+        before = self.unchanged_state(cookie)
+        for options in (dict(), dict(tamper=True)):
+            with self.subTest(binding="mismatch", options=options):
+                assertion = key.assertion(begun, origin=ORIGIN, rp_id=HOST, **options)
+                with self.assertRaises(CeremonyDenied):
+                    await asyncio.to_thread(self.ceremonies.finish_step_up, token, OTHER_LOGIN, assertion)
+                self.assertEqual(self.store.pending_step_up_challenge(digest), view.session_id)
+                self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
+                self.assertEqual(self.unchanged_state(cookie), before)
+        self.assertEqual(status(await self.finish(
+            cookie, csrf, key.assertion(begun, origin=ORIGIN, rp_id=HOST))), 204)
+        self.assertIsNone(self.store.pending_step_up_challenge(digest))
+
+        # An idle-expired session: its pending challenge is not consumed by the
+        # refusal (it is left to expire), and nothing else changes.
+        self.elapse(minutes=6)
+        begun = payload(await self.begin(cookie, csrf))
+        digest = hashlib.sha256(unb64(begun["challenge"])).digest()
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE access_sessions SET idle_expires_at_us=? WHERE id=?",
+                               (microseconds(self.ceremony_clock()) - 1, str(view.session_id)))
+            connection.commit()
+        self.assertIsNone(self.store.current_session(token, VIEWER, at=self.ceremony_clock()))
+        with self.assertRaises(CeremonyDenied):
+            await asyncio.to_thread(self.ceremonies.finish_step_up, token, VIEWER,
+                                    key.assertion(begun, origin=ORIGIN, rp_id=HOST))
+        self.assertEqual(self.store.pending_step_up_challenge(digest), view.session_id)
+        self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
 
     async def test_a_failed_finding_write_is_counted_and_logged_value_free(self):
         # Item 5: no audit record and no notification exist for it, so the
@@ -1530,10 +1571,23 @@ class FollowUpTests(StepUpFixture):
             with self.assertRaises(CeremonyDenied):
                 await asyncio.to_thread(self.ceremonies.finish_authentication, VIEWER, sign_in)
             self.assertEqual(self.ceremonies.unrecorded_findings, 2)
+
+            def unrecorded_events():
+                return [record for record in records if record.msg == Event.CREDENTIAL_FINDING_UNRECORDED]
+
+            self.assertEqual(len(unrecorded_events()), 2)  # at 1 and 2
+            # The throttle is pinned: the third failure is counted but not
+            # logged, the fourth (a power of two) is logged again.
+            for count, logged in ((3, 2), (4, 3)):
+                again = key.assertion(self.ceremonies.begin_authentication(), origin=ORIGIN, rp_id=HOST, be=True)
+                with self.assertRaises(CeremonyDenied):
+                    await asyncio.to_thread(self.ceremonies.finish_authentication, VIEWER, again)
+                self.assertEqual(self.ceremonies.unrecorded_findings, count)
+                self.assertEqual(len(unrecorded_events()), logged)
         self.assertEqual(self.finding_state(), before)
         self.assertEqual(reported, [])
-        events = [record for record in records if record.msg == Event.CREDENTIAL_FINDING_UNRECORDED]
-        self.assertEqual(len(events), 2)  # at 1 and 2 (each power of two)
+        events = unrecorded_events()
+        self.assertEqual(len(events), 3)  # at 1, 2 and 4 (each power of two)
         token = self.token(cookie)
         for record in events:
             self.assertEqual(record.levelno, logging.WARNING)

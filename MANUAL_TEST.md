@@ -1744,6 +1744,62 @@ authenticator):
   closed, availability only); either way confirm a new step-up works and the
   window never exceeds five minutes.
 
+### Issue #238 step-up follow-ups (pending, not executed)
+
+Mock only: verified with the synthetic ASGI driver, software authenticators,
+a synthetic boot clock and patched storage failures
+(`server/tests/test_human_step_up.py` `FollowUpTests` and
+`StepUpFindingStoreTests`); no browser, real authenticator, real storage
+hard stop or real notification channel has exercised it, and no production
+entry point mounts the human routes yet. Once a deployment can enable the
+routes, with a synthetic `*.invalid` Owner whose passkey is on a roaming
+authenticator usable from two separate browser profiles (A and B), on a
+disposable deployment:
+
+- [ ] another session cannot spend a challenge: sign the Owner in from
+  profile A and from profile B; wait more than five minutes so both are
+  stale; in A request step-up options and copy the challenge from the
+  developer tools before answering A's prompt; in B, with B's own cookie and
+  `X-CSRF-Token`, obtain an assertion for A's challenge
+  (`navigator.credentials.get` from the developer tools console with A's
+  options) and submit it to `POST /api/auth/step-up`, once unchanged and
+  once with the assertion's signature altered: each is the generic denial,
+  B's next Owner operation still answers `403 {"detail":"step_up_required"}`,
+  and the audit log has no new `verify_principal_step_up` record; then
+  complete A's still-open step-up prompt with the same challenge: `204`, one
+  `verify_principal_step_up` record, and A's retried Owner operation runs;
+- [ ] a request without a current session spends nothing: repeat with B
+  signed out (or idle past 30 minutes) before it submits A's challenge, and
+  separately with B's request carrying another Tailscale login than B's
+  session was bound to: each is the generic denial and A still completes its
+  step-up with the same challenge (`204`); record that a challenge only one
+  session can redeem stays pending until its normal expiry when that session
+  never answers (availability only);
+- [ ] a finding whose write fails is observable: in A request step-up
+  options, then drive the Main state storage into `STORAGE_HARD_STOP` (fill
+  its filesystem to the safety reserve), then answer with an assertion whose
+  backup-eligibility flag differs from registration (the same method as in
+  the WebAuthn credential checks above): the generic denial, no
+  `mark_principal_credential_inconsistent` audit record, no Owner
+  notification, and the application log (journald for the service) shows one
+  WARNING `credential_finding_unrecorded` event carrying only the event name
+  (no kind, principal, credential, challenge, token, identity or reason);
+  repeat to a third and a fourth failure and confirm the event appears at
+  the first, second and fourth failure only (1, 2, 4, 8, ...); release the
+  space, sign in or step up again with the changed flag and confirm the
+  finding is now recorded and notified (the stored credential was unchanged,
+  so it is detected again); record that the in-process counter is not
+  persisted across a restart;
+- [ ] a racing finding is notified once: with the Owner signed in from A and
+  B (both stale), request step-up options in both, then answer both prompts
+  with a changed backup-eligibility assertion as close together as possible
+  (and separately one step-up and one sign-in): both are the generic denial,
+  both sessions end, the credential is shown inconsistent, the audit log has
+  exactly one `mark_principal_credential_inconsistent` record and the Owner
+  receives exactly one notification; record whether the two finishes
+  actually overlapped (the dedup is exercised either way: the later finish
+  finds the credential already marked).
+
 ### Issue #10 phase 2 S4b Owner access administration routes (pending)
 
 Mock only: verified with the synthetic ASGI driver, software authenticators
