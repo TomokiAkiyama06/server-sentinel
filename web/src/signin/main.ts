@@ -12,7 +12,8 @@
  * The invitation code travels only in the JSON body of the two redemption
  * requests: never in a URL, history entry, storage or form submission (there
  * is no form element and the inputs have no `name`), and the field is cleared
- * after every attempt.
+ * after every attempt and whenever the page is hidden (`pagehide`) or restored
+ * from the back-forward cache.
  */
 import {
   decodeCreationOptions, decodeRequestOptions, serializeAssertion, serializeRegistration,
@@ -22,11 +23,13 @@ import { credentialLabel, normalizeInvitationCode } from './code';
 const MESSAGES = {
   unsupported: 'このブラウザーまたは接続ではパスキーを使えません。',
   failed: '完了できませんでした。もう一度お試しください。',
-  registered: '登録しました。サインインしてください',
+  registered: '登録しました。サインインしてください。',
   deviceBound: 'この登録では、同期されないパスキーが必要です。セキュリティキーか、この端末だけに保存されるパスキーで登録してください。',
 } as const;
 
 const APP = '/app/';
+// Without an answer to the initial session check in this time, show the form.
+const SESSION_CHECK_MS = 5000;
 
 class Denied extends Error {}
 class DeviceBound extends Error {}
@@ -51,7 +54,11 @@ let current: AbortController | null = null;
 function request(method: 'GET' | 'POST', path: string, signal: AbortSignal, body?: unknown): Promise<Response> {
   const init: RequestInit = {
     method, credentials: 'same-origin', mode: 'same-origin', cache: 'no-store',
-    redirect: 'error', referrerPolicy: 'no-referrer', signal,
+    // Policy 'same-origin', not 'no-referrer': for a non-CORS POST, Fetch
+    // serializes the Origin header as `null` under 'no-referrer', and the
+    // ceremony routes require the exact Origin. `referrer: ''` still sends no
+    // Referer. The document itself stays `no-referrer`.
+    redirect: 'error', referrer: '', referrerPolicy: 'same-origin', signal,
     headers: body === undefined ? { Accept: 'application/json' }
       : { Accept: 'application/json', 'Content-Type': 'application/json' },
   };
@@ -140,12 +147,14 @@ async function start(): Promise<void> {
   }
   const controller = new AbortController();
   current = controller;
+  const timer = setTimeout(() => controller.abort(), SESSION_CHECK_MS);
   try {
     const response = await request('GET', '/api/session', controller.signal);
     if (response.status === 200) { location.replace(APP); return; }
   } catch {
-    // No session, or no answer: the sign-in form is the only next step.
+    // No session, or no answer in time: the sign-in form is the only next step.
   } finally {
+    clearTimeout(timer);
     current = null;
   }
   signIn.addEventListener('click', startSignIn);
@@ -156,6 +165,17 @@ async function start(): Promise<void> {
   panel.hidden = false;
 }
 
-// Leaving the page abandons the ceremony in progress.
-addEventListener('pagehide', () => current?.abort());
+/**
+ * Empty both fields. Called synchronously on `pagehide`, so a document kept in
+ * the back-forward cache holds no typed code, and again on a `pageshow` that
+ * restores one from that cache.
+ */
+function clearFields(): void {
+  code.value = '';
+  label.value = '';
+}
+
+// Leaving the page abandons the ceremony in progress and drops what was typed.
+addEventListener('pagehide', () => { current?.abort(); clearFields(); });
+addEventListener('pageshow', event => { if (event.persisted) clearFields(); });
 void start();

@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { compile } from './compile.mjs';
-import { buildAll, checkShellInputs, listFiles, SHELL_BUDGET } from '../scripts/build.mjs';
-import { CONTENT_TYPES } from '../scripts/policy.mjs';
+import { buildAll, checkAppDocument, checkShellInputs, listFiles, outputDirectory, SHELL_BUDGET } from '../scripts/build.mjs';
+import { APP_CSP, APP_META_CSP, CONTENT_TYPES } from '../scripts/policy.mjs';
 
 await compile('src/signin/code.ts', 'build/signin-code.mjs');
 await compile('src/shared/webauthn.ts', 'build/shared-webauthn.mjs');
@@ -65,6 +65,13 @@ const NORMALIZATION = [
   ['-'.repeat(40), null],
   ['S'.repeat(300), null],
   ['Ä34W-NJYC-SQ7C-ZM6H-TB9X-9NEP-TZCD-KPPV', null],
+  // Non-ASCII left after NFKC is refused before upper-casing could make it
+  // ASCII: dotless i would become the alias I -> 1, sharp s would become SS.
+  ['S34W-NJYC-SQ7C-ZM6H-TB9X-9NEP-TZCD-KPPı', null],
+  ['S34W-NJYC-SQ7C-ZM6H-TB9X-9NEP-TZCD-ßPV', null],
+  ['S34W-NJYC-SQ7C-ZM6H-TB9X-9NEP-TZCD-KPPｖ', CANONICAL],
+  // Long s is an NFKC compatibility form of s, like the full-width letters.
+  ['ſ34W-NJYC-SQ7C-ZM6H-TB9X-9NEP-TZCD-KPPV', CANONICAL],
 ];
 
 test('typed invitation codes normalize to exactly the server canonical form', () => {
@@ -91,6 +98,10 @@ test('the credential label follows the server rule (1-64 characters, no control 
   assert.equal(credentialLabel('a'.repeat(64)), 'a'.repeat(64));
   assert.equal(credentialLabel('😀'.repeat(64)), '😀'.repeat(64));
   assert.equal(credentialLabel('a'.repeat(65)), undefined);
+  // Code points, not UTF-16 units: 64 emoji are 128 units and still fit.
+  assert.equal('😀'.repeat(64).length, 128);
+  assert.equal(credentialLabel('😀'.repeat(65)), undefined);
+  assert.equal(credentialLabel(' ' + '😀'.repeat(64) + ' '), '😀'.repeat(64));
   assert.equal(credentialLabel('a\u0007b'), undefined);
   assert.equal(credentialLabel('a\u007fb'), undefined);
 });
@@ -226,6 +237,27 @@ test('the shell is built only from src/signin and the shared WebAuthn module', a
   }
 });
 
+test('the build clears and rewrites only dist/ or a directory under build/', () => {
+  for (const ok of ['dist', 'build/x', 'build/a/b', './dist']) assert.ok(outputDirectory(ok));
+  for (const refused of ['.', '', 'src', 'build', 'node_modules', 'dist/sub', '..', '../dist', 'scripts', '/tmp/x']) {
+    assert.throws(() => outputDirectory(refused), /outdir must be/, JSON.stringify(refused));
+  }
+});
+
+test('the dashboard document keeps exactly the reviewed meta policy', async () => {
+  assert.equal(APP_CSP, `${APP_META_CSP}; frame-ancestors 'none'`);
+  assert.doesNotMatch(APP_META_CSP, /frame-ancestors/);
+  const html = await readFile('src/app/index.html', 'utf8');
+  assert.equal(checkAppDocument(html), html);
+  const meta = `<meta http-equiv="Content-Security-Policy" content="${APP_META_CSP}">`;
+  for (const changed of [
+    html.replace(meta, ''),
+    html.replace("connect-src 'self'", "connect-src *"),
+    html.replace(meta, meta + meta),
+    html.replace(meta, `<meta http-equiv="Content-Security-Policy" content="${APP_CSP}">`),
+  ]) assert.throws(() => checkAppDocument(changed), /differs/);
+});
+
 test('the shell stays within its size budget', async () => {
   const size = async path => (await readFile(path)).length;
   assert.ok(await size('dist/shell/index.html') <= SHELL_BUDGET.html, 'HTML <= 2 KB');
@@ -245,6 +277,19 @@ test('the shell carries no product, feature, dependency or version string', asyn
   // Only its own two assets; no inline script or style, no external URL, no form.
   assert.deepEqual([...html.matchAll(/(?:src|href)="([^"]*)"/g)].map(match => match[1]).sort(), ['/s.css', '/s.js']);
   assert.doesNotMatch(html, /<script>|<style|\sstyle="|\son[a-z]+="|https?:|<form|<input[^>]*\sname=/i);
+  // The label is limited in code points by the script, not by maxlength (UTF-16 units).
+  assert.match(html, /<input id="n"[^>]*>/);
+  assert.doesNotMatch(html.match(/<input id="n"[^>]*>/)[0], /maxlength/i);
+  assert.match(html, /このパスキーの目印（任意）/);
+});
+
+test('shell requests keep a real Origin and send no Referer', async () => {
+  // Fetch serializes Origin as `null` for a non-CORS POST under the
+  // 'no-referrer' policy (Safari, Firefox); headless Chrome still sends the
+  // origin, so the browser test's Origin assertion alone cannot catch it.
+  const script = await readFile('dist/shell/s.js', 'utf8');
+  assert.match(script, /referrer:"",referrerPolicy:"same-origin"/);
+  assert.doesNotMatch(script, /no-referrer/);
 });
 
 test('two builds are byte-identical', async () => {

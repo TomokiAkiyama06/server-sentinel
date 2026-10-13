@@ -13,13 +13,14 @@ export const SHELL_CSP = [
   "frame-ancestors 'none'", "require-trusted-types-for 'script'", "trusted-types 'none'",
 ].join('; ');
 
-// The dashboard at `/app/` (the policy formerly in its meta element, plus
-// frame-ancestors, which only a header can carry).
-export const APP_CSP = [
+// The dashboard at `/app/`. The document also carries APP_META_CSP in a meta
+// element as defence in depth (the build refuses a document whose meta policy
+// differs); the header adds frame-ancestors, which a meta element cannot carry.
+export const APP_META_CSP = [
   "default-src 'none'", "script-src 'self'", "style-src 'self'", "connect-src 'self'",
   "img-src 'self'", "font-src 'self'", "base-uri 'none'", "form-action 'none'",
-  "frame-ancestors 'none'",
 ].join('; ');
+export const APP_CSP = `${APP_META_CSP}; frame-ancestors 'none'`;
 
 /** Content types written into dist/manifest.json, by file extension. */
 export const CONTENT_TYPES = new Map([

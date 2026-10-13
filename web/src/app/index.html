@@ -3,9 +3,10 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <!-- The Main Server sends the Content-Security-Policy for /app/ as a
-         response header (S5b), not as a meta element, so it also covers
-         frame-ancestors. The policy is documented in web/README.md. -->
+    <!-- Defence in depth: the Main Server sends the same policy plus
+         frame-ancestors as a response header (S5b). It must equal
+         APP_META_CSP in scripts/policy.mjs (the build checks). -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'">
     <meta name="referrer" content="no-referrer">
     <title>ServerSentinel</title>
     <link rel="icon" href="/app/icon.svg" type="image/svg+xml">

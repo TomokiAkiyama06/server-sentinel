@@ -7,6 +7,10 @@
  *
  * - NFKC first, so full-width letters, digits, spaces and hyphens typed with a
  *   Japanese IME read as their ASCII forms;
+ * - after NFKC and the separators, any non-ASCII character is refused before
+ *   upper-casing, so `toUpperCase()` cannot turn one into ASCII (`ß` -> `SS`,
+ *   dotless `ı` -> `I`); compatibility forms NFKC itself maps to ASCII (for
+ *   example full-width letters, or `ſ` -> `s`) stay accepted;
  * - case-insensitive;
  * - whitespace and dash-like separators anywhere are ignored (the grouping is
  *   recomputed, so a misplaced separator is harmless);
@@ -27,8 +31,10 @@ const ALIASES: Record<string, string> = { O: '0', I: '1', L: '1' };
 
 export function normalizeInvitationCode(input: string): string | null {
   if (typeof input !== 'string' || input.length > 256) return null;
+  const compact = input.normalize('NFKC').replace(SEPARATORS, '');
+  if (!/^[\x20-\x7e]*$/.test(compact)) return null;
   let plain = '';
-  for (const character of input.normalize('NFKC').replace(SEPARATORS, '').toUpperCase()) {
+  for (const character of compact.toUpperCase()) {
     const canonical = ALIASES[character] ?? character;
     if (!ALPHABET.includes(canonical)) return null;
     plain += canonical;
@@ -42,8 +48,11 @@ export function normalizeInvitationCode(input: string): string | null {
 /**
  * The optional credential label as the server accepts it
  * (`human_surface._label`): 1-64 characters, no control character and no
- * DEL. Surrounding whitespace is dropped; an empty label is omitted (`null`);
- * an unacceptable one is `undefined` and the page sends nothing.
+ * DEL. Characters are Unicode code points, as the server's `len()` counts
+ * them (not UTF-16 units: the input has no HTML `maxlength`, which would cut
+ * a label of emoji at 32). Surrounding whitespace is dropped; an empty label
+ * is omitted (`null`); an unacceptable one is `undefined` and the page sends
+ * nothing.
  */
 export function credentialLabel(input: string): string | null | undefined {
   const label = input.trim();

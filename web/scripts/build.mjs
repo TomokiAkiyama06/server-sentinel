@@ -2,7 +2,7 @@ import { build } from 'esbuild';
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { extname, join, relative, resolve, sep } from 'node:path';
-import { CONTENT_TYPES } from './policy.mjs';
+import { APP_META_CSP, CONTENT_TYPES } from './policy.mjs';
 
 /**
  * Two separately built documents (Issue #10 phase 2 S5a, Owner decision S5-1):
@@ -48,15 +48,35 @@ function checkAppInputs(metafile) {
 
 const common = { bundle: true, minify: true, write: false, metafile: true, logLevel: 'silent' };
 
+/** The dashboard document must carry exactly the reviewed meta policy, once. */
+export function checkAppDocument(html) {
+  const policies = [...html.matchAll(/<meta\s+http-equiv="Content-Security-Policy"\s+content="([^"]*)"\s*>/gi)];
+  if (policies.length !== 1 || policies[0][1] !== APP_META_CSP
+      || (html.match(/Content-Security-Policy/gi) ?? []).length !== 1) {
+    throw new Error('Dashboard document meta policy differs from APP_META_CSP');
+  }
+  return html;
+}
+
+/**
+ * The only directories `buildAll` may clear and rewrite: `dist` itself or a
+ * directory under `build/` (tests). Never web/, the sources or node_modules.
+ */
+export function outputDirectory(outdir) {
+  const target = resolve(outdir);
+  if (target !== resolve('dist') && !target.startsWith(resolve('build') + sep)) {
+    throw new Error('outdir must be dist/ or a directory under build/');
+  }
+  return target;
+}
+
 function collapse(html) {
   return html.replace(/>\s+</g, '><').trim() + '\n';
 }
 
 /** Build both documents into `outdir` (default `dist`) and return the inputs and manifest. */
 export async function buildAll(outdir = 'dist') {
-  const root = resolve('.');
-  const target = resolve(outdir);
-  if (target === root || !target.startsWith(root + sep)) throw new Error('outdir must be inside web/');
+  const target = outputDirectory(outdir);
 
   const shellScript = await build({
     ...common, entryPoints: ['src/signin/main.ts'], outfile: join(target, 'shell/s.js'),
@@ -80,7 +100,7 @@ export async function buildAll(outdir = 'dist') {
     for (const file of result.outputFiles) files.set(relative(target, file.path).split(sep).join('/'), file.contents);
   }
   files.set('shell/index.html', Buffer.from(collapse(await readFile('src/signin/index.html', 'utf8'))));
-  files.set('app/index.html', await readFile('src/app/index.html'));
+  files.set('app/index.html', Buffer.from(checkAppDocument(await readFile('src/app/index.html', 'utf8'))));
   files.set('app/icon.svg', await readFile('src/icon.svg'));
   // Production runtime attribution ships beside the bundle, not from a CDN.
   for (const name of ['react', 'react-dom', 'scheduler']) {

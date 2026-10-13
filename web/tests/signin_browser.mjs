@@ -34,13 +34,14 @@ const TYPED_ALIASES = 'ol2e-4567 89AB\u3000cdef\u30fcghjk mnpq rstv wxyz';
 const ALIAS_CANONICAL = '012E-4567-89AB-CDEF-GHJK-MNPQ-RSTV-WXYZ';
 const MESSAGE = {
   failed: '完了できませんでした。もう一度お試しください。',
-  registered: '登録しました。サインインしてください',
+  registered: '登録しました。サインインしてください。',
   deviceBound: 'この登録では、同期されないパスキーが必要です。セキュリティキーか、この端末だけに保存されるパスキーで登録してください。',
   unsupported: 'このブラウザーまたは接続ではパスキーを使えません。',
 };
 
 const browser = await launchChrome();
 let cases = 0;
+let origins = 0;
 
 function serverStandIn(overrides) {
   const state = { userId: b64(randomBytes(16)), challenges: [] };
@@ -120,7 +121,12 @@ async function scenario(name, { origin = secure, overrides = {}, viewport = { wi
     }
     if (request.method === 'GET' && url.pathname === '/favicon.ico') { await fulfill(404, '', null, null); return; }
     const handler = stand.handlers[`${request.method} ${url.pathname}`];
-    if (handler && url.search === '') { await fulfill(...handler(body), null); return; }
+    if (handler && url.search === '') {
+      const answer = handler(body);
+      // `null` leaves the request unanswered (a Main Server that never replies).
+      if (answer !== null) await fulfill(...answer, null);
+      return;
+    }
     unexpected.push(`${request.method} ${url.pathname}`);
     await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' });
   }
@@ -164,9 +170,12 @@ async function scenario(name, { origin = secure, overrides = {}, viewport = { wi
     }
     for (const request of requests) {
       if (request.method !== 'POST') continue;
-      // Pre-credential POSTs are same-origin JSON with no referrer.
+      // Pre-credential POSTs are same-origin JSON with no referrer, and carry
+      // the exact Origin the ceremony routes require (never `null`).
       assert.match(request.headers['Content-Type'] ?? request.headers['content-type'] ?? '', /^application\/json/);
       assert.equal(request.headers.Referer ?? request.headers.referer, undefined);
+      assert.equal(request.headers.Origin ?? request.headers.origin, origin, `Origin on POST ${request.path}`);
+      origins++;
     }
     cases++;
     process.stdout.write(`sign-in shell: ${name}\n`);
@@ -301,5 +310,53 @@ try {
     assert.deepEqual(posted('/api/auth/authentication'), []);
   });
 
-  process.stdout.write(`${cases} sign-in shell scenarios passed; a virtual authenticator is not real-device acceptance.\n`);
+  await scenario('leaving the page empties the code and label fields', {}, async ({ ui, page, requests }) => {
+    await ui.ready();
+    await ui.type('c', CODE);
+    await ui.type('n', '研究室の鍵');
+    // A document entering the back-forward cache fires pagehide (persisted).
+    await page.evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }))");
+    assert.deepEqual(await page.evaluate("[document.getElementById('c').value, document.getElementById('n').value]"), ['', '']);
+    // And a restore from that cache clears again, whatever the browser kept.
+    await ui.type('c', CODE);
+    await ui.type('n', '研究室の鍵');
+    await page.evaluate("window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))");
+    assert.deepEqual(await page.evaluate("[document.getElementById('c').value, document.getElementById('n').value]"), ['', '']);
+    // A first load (persisted: false) leaves what the user is typing alone.
+    await ui.type('c', CODE);
+    await page.evaluate("window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: false }))");
+    assert.equal(await page.evaluate("document.getElementById('c').value"), CODE);
+    assert.equal(requests.some(item => item.method === 'POST'), false);
+  });
+
+  await scenario('a label of 64 emoji is sent whole; 65 are refused locally', {}, async ({ ui, page, posted, requests }) => {
+    await ui.ready();
+    assert.equal(await page.evaluate("document.getElementById('n').maxLength"), -1, 'no UTF-16 maxlength');
+    await ui.type('c', CODE);
+    await ui.type('n', '😀'.repeat(64));
+    await ui.click('r');
+    await ui.message(MESSAGE.registered);
+    assert.equal(posted('/api/auth/registration')[0].label, '😀'.repeat(64));
+    const before = requests.length;
+    await ui.type('c', CODE);
+    await ui.type('n', '😀'.repeat(65));
+    await ui.click('r');
+    await ui.message(MESSAGE.failed);
+    assert.equal(requests.length, before, 'nothing sent for a 65-character label');
+    assert.equal(await page.evaluate("document.getElementById('c').value"), '');
+  });
+
+  await scenario('an unanswered session check shows the form after its timeout', { overrides: { 'GET /api/session': () => null } }, async ({ ui, page }) => {
+    const started = Date.now();
+    while (!(await page.evaluate("Boolean(document.getElementById('f')) && !document.getElementById('f').hidden"))) {
+      assert.ok(Date.now() - started < 9000, 'the form appears after the session check timeout');
+      await delay(100);
+    }
+    const waited = Date.now() - started;
+    assert.ok(waited >= 4000, `form shown after ${waited} ms, not before the timeout`);
+    await ui.idle();
+  });
+
+  assert.ok(origins >= 10, 'the Origin assertion ran on the ceremony POSTs');
+  process.stdout.write(`${cases} sign-in shell scenarios passed (${origins} POSTs carried the exact Origin); a virtual authenticator is not real-device acceptance.\n`);
 } finally { await browser.close(); }

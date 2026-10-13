@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { compile } from './compile.mjs';
-import { APP_CSP } from '../scripts/policy.mjs';
+import { APP_CSP, APP_META_CSP } from '../scripts/policy.mjs';
 
 await compile('src/api.ts', 'build/api.mjs');
 await compile('src/domain.ts', 'build/domain.mjs');
@@ -89,9 +89,11 @@ test('production assets contain no test provider or runtime remote imports', asy
   const html = await readFile('dist/app/index.html', 'utf8');
   const bundle = await readFile('dist/app/app.js', 'utf8');
   assert.match(html, /lang="ja"/);
-  // The policy is a response header now (S5b sends it; preview and tests use policy.mjs).
-  assert.doesNotMatch(html, /<meta[^>]+Content-Security-Policy/i);
-  assert.match(APP_CSP, /connect-src 'self'/);
+  // The header (S5b; preview and tests use policy.mjs) and, as defence in
+  // depth, the same policy without frame-ancestors in a meta element.
+  assert.ok(html.includes(`<meta http-equiv="Content-Security-Policy" content="${APP_META_CSP}">`));
+  assert.match(APP_META_CSP, /connect-src 'self'/);
+  assert.equal(APP_CSP, `${APP_META_CSP}; frame-ancestors 'none'`);
   assert.doesNotMatch(html, /https?:\/\//);
   assert.doesNotMatch(bundle, /\/api\/mock|synthetic-source|tests\/harness|import\s*\(\s*['"]https?:/);
   for (const name of ['react', 'react-dom', 'scheduler']) assert.match(await readFile(`dist/app/${name}-LICENSE.txt`, 'utf8'), /MIT License/);

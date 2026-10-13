@@ -289,44 +289,59 @@ two separate documents:
   `i18n.ts`; Japanese only (S5-4); unbranded: title 「サインイン」, no product,
   feature or version string, no favicon link and no `meta generator`. It holds
   a passkey sign-in button, an invitation code field and an optional label
-  field 「名前（後で見分けるため）」 (at most 64 characters, the server's label
-  rule). It shows only four fixed local messages (unsupported browser /
-  connection, one generic failure, 「登録しました。サインインしてください」, and the
+  field 「このパスキーの目印（任意）」 that names the credential, never the
+  device (at most 64 Unicode code points, the server's `_label` rule, checked
+  by the script: the input has no HTML `maxlength`, which counts UTF-16 units
+  and would cut a label of emoji at 32). It shows only four fixed local
+  messages (unsupported browser / connection, one generic failure,
+  「登録しました。サインインしてください。」, and the
   device-bound guidance of `src/access/README.md`) and never renders a server
   response body, status text or error detail.
 - **Dashboard** (`src/main.tsx`, `src/app/index.html`, served under `/app/`):
   the React application, unchanged in behaviour. Its document keeps the
-  product title; its Content-Security-Policy moved from a meta element to the
-  response header (a comment in the document says so).
+  product title. Its Content-Security-Policy is sent as a response header
+  (`APP_CSP`) and, as defence in depth, kept in a meta element
+  (`APP_META_CSP`: the same policy without `frame-ancestors`, which a meta
+  element cannot carry); the build refuses a document whose meta policy is not
+  exactly `APP_META_CSP`.
 
 Shell behaviour:
 
 - without `isSecureContext`, `PublicKeyCredential` or `navigator.credentials`
   it shows one fixed message and makes no request;
 - on load `GET /api/session`: `200` ⇒ `location.replace('/app/')`, anything
-  else ⇒ the form;
+  else, or no answer within 5 s (the request is then aborted) ⇒ the form;
 - sign-in: `POST /api/auth/authentication/options` `{}` →
   `navigator.credentials.get` → `POST /api/auth/authentication` → `204` ⇒
   `location.replace('/app/')`;
 - redemption: the typed code is normalized to the server's canonical form
-  (`src/signin/code.ts`, from `server/app/auth/invitation_code.py`: NFKC, case,
+  (`src/signin/code.ts`, from `server/app/auth/invitation_code.py`: NFKC, then
+  any remaining non-ASCII character refused before upper-casing (so `ß` or a
+  dotless `ı` cannot become ASCII), case,
   whitespace and dash-like separators ignored, Crockford aliases `O`→`0`,
   `I`/`L`→`1`, `U` and anything else refused, exactly 32 characters, regrouped
   `XXXX-…` ×8); a code that does not normalize is refused locally with the
   generic message and nothing is sent. Then
   `POST /api/auth/registration/options` `{code}` →
   `navigator.credentials.create` → `POST /api/auth/registration`
-  `{code, credential, label?}` → `204` ⇒ 「登録しました。サインインしてください」
+  `{code, credential, label?}` → `204` ⇒ 「登録しました。サインインしてください。」
   and focus on the sign-in button; `409 {"detail":"device_bound_credential_required"}`
   ⇒ the device-bound guidance; every other outcome ⇒ the generic message;
 - every request is `credentials: 'same-origin'`, `mode: 'same-origin'`,
-  `cache: 'no-store'`, `redirect: 'error'`, `referrerPolicy: 'no-referrer'`,
-  JSON;
+  `cache: 'no-store'`, `redirect: 'error'`, `referrer: ''`,
+  `referrerPolicy: 'same-origin'`, JSON. The policy is deliberately not
+  `no-referrer`: for a non-CORS POST, Fetch then serializes the `Origin`
+  header as `null` (Safari and Firefox do; headless Chrome does not), and the
+  ceremony routes require the exact Origin. `referrer: ''` still sends no
+  `Referer`; the documents themselves keep `Referrer-Policy: no-referrer`;
 - the code is never in a URL, history entry, storage or form submission (no
   `<form>`, no input `name`), the field is cleared at every attempt and has
   `autocomplete=off`, `spellcheck=false`, `autocapitalize=characters`;
 - one ceremony at a time, each with its own `AbortController`; leaving the page
-  (`pagehide`) aborts it.
+  (`pagehide`) aborts it and synchronously empties the code and label fields,
+  so a document kept in the back-forward cache holds no typed code; a
+  `pageshow` with `persisted: true` (a restore from that cache) empties them
+  again.
 
 `src/shared/webauthn.ts` is the string-free wire module shared with the
 dashboard's later step-up (S6): strict unpadded base64url (the server's
@@ -337,6 +352,14 @@ hand-written credential serialization with exactly the members the server reads
 (`id` = `rawId`, `type`, `response.clientDataJSON` + `attestationObject`, or
 `clientDataJSON` + `authenticatorData` + `signature` + `userHandle`).
 `toJSON()` and `parse*OptionsFromJSON()` are not used.
+
+Known limit (S5b / server follow-up): option decoding refuses more than 64
+`excludeCredentials` entries, while the server's registration options list
+every usable credential of the principal with no cap. A principal holding more
+than 64 usable credentials therefore cannot register another through the shell
+(it shows the generic message and sends nothing further). That is far beyond
+the expected use; S5b should either cap the server list at the same 64 or
+refuse further registration explicitly. No server change is made here.
 
 Fingerprinting (S5-5): the shell's bytes are the same for every deployment of
 one release, so anyone who reaches `/` can tell which software answers there.
@@ -359,8 +382,11 @@ dist/manifest.json      not served
 
 The build fails unless every shell input is `src/signin/<file>.ts|.css` or
 `src/shared/webauthn.ts` (no package, no dashboard module), and unless every
-dashboard package is React, React DOM or scheduler. It clears `dist/` first,
-so no stale file survives, and is deterministic: two builds are
+dashboard package is React, React DOM or scheduler, and unless the dashboard
+document's meta policy is exactly `APP_META_CSP`. It clears its output
+directory first, so no stale file survives; that directory must be `dist/` or a
+directory under `build/` (tests), never `web/` itself, a source directory or
+`node_modules`. The build is deterministic: two builds are
 byte-identical (tested). Shell budget: HTML ≤ 2 KB, JS ≤ 12 KB minified,
 CSS ≤ 3 KB.
 
@@ -390,7 +416,7 @@ that is not listed. URL mapping: `shell/index.html` → `/`, `shell/<name>` →
 Expected headers (S5b owns the real ones; `scripts/policy.mjs` holds the values
 the preview and browser tests send): the shell document
 `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'`,
-the dashboard document the same as its former meta policy plus
+the dashboard document `APP_CSP`, which is its meta policy `APP_META_CSP` plus
 `frame-ancestors 'none'` (`img-src 'self'; font-src 'self'`, no Trusted
 Types), and on every response `Cache-Control: no-store`,
 `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
@@ -399,7 +425,9 @@ Tests (`tests/signin.test.mjs`): the code normalization table and 500 random
 codes from a transcription of the server encoder (with four vectors printed by
 `format_invitation_code`; a Python cross-check through
 `parse_invitation_code` is left to S5b, which owns `server/` tests), the label
-rule, base64url round-trip and strictness, option decoding and refusal, the
+rule (in code points, with emoji), the output-directory guard, the dashboard
+meta policy check, the shell's fetch referrer settings, base64url round-trip
+and strictness, option decoding and refusal, the
 serializers' exact field sets, shell input isolation, the size budget, a
 forbidden-string scan of `dist/shell` (`ServerSentinel`, `Sentinel`, `camera`,
 カメラ, 録画, ライブ, `live`, `recording`, `media-capture`, `react`, `version`,
@@ -412,8 +440,11 @@ insecure origin shows the unsupported message and sends nothing, register then
 sign in end at `/app/` with the exact request bodies and field sets, alias
 normalization, a malformed code sends nothing, a `404` and a non-device-bound
 `409` show the generic message, the device-bound `409` shows its guidance, a
-refused sign-in stays on `/`, and a failed ceremony posts nothing. Every
-scenario asserts that no URL carries the code, no storage or history write
+refused sign-in stays on `/`, a failed ceremony posts nothing, `pagehide` and
+a persisted `pageshow` empty both fields, a 64-emoji label is sent whole and a
+65-emoji one is refused locally, and an unanswered session check shows the
+form after its 5 s timeout. Every scenario asserts that every ceremony POST
+carries the exact `Origin` and no `Referer`, that no URL carries the code, no storage or history write
 happens, no cookie is set by the page, no unexpected request is made and the
 CSP reports no violation (with a positive control showing the policy is
 enforced). A virtual authenticator in headless Chrome is not Safari, Android or
