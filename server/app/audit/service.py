@@ -116,8 +116,15 @@ class OwnerAuditService:
                               operation: Callable[..., Result],
                               prepare: Callable[[], object] | None = None,
                               connection: sqlite3.Connection | None = None,
-                              reservation: Callable[[], ContextManager] | None = None) -> Result:
+                              reservation: Callable[[], ContextManager] | None = None,
+                              followed_by: tuple[AuditAction, ...] = ()) -> Result:
         """Commit the mutation and success audit in one SQLite transaction.
+
+        ``followed_by`` names further actions on the same target whose
+        ``succeeded`` records are appended, in order, after the main one in
+        that same transaction (one mutation that is two audited steps, such
+        as inviting a person and issuing their code). A denial or failure is
+        recorded once, under ``action``.
 
         An optional reservation is acquired after authorization and remains
         active until the shared transaction commits or rolls back.
@@ -131,6 +138,10 @@ class OwnerAuditService:
         is passed to ``operation``, and its failure is audited like any other.
         """
         validate_action_target(action, target_kind, target_logical_id)
+        if not isinstance(followed_by, tuple):
+            raise AuditValidationError("invalid audit action or target")
+        for extra in followed_by:
+            validate_action_target(extra, target_kind, target_logical_id)
         if reservation is not None and not callable(reservation):
             raise AuditValidationError("invalid audit storage reservation")
         if prepare is not None and not callable(prepare):
@@ -140,11 +151,12 @@ class OwnerAuditService:
 
         def run(active):
             result = operation(active) if prepare is None else operation(active, prepared)
-            self.store.append_on(
-                active, actor_category=ActorCategory.OWNER, action=action,
-                target_kind=target_kind, target_logical_id=target_logical_id,
-                outcome=AuditOutcome.SUCCEEDED,
-            )
+            for recorded in (action, *followed_by):
+                self.store.append_on(
+                    active, actor_category=ActorCategory.OWNER, action=recorded,
+                    target_kind=target_kind, target_logical_id=target_logical_id,
+                    outcome=AuditOutcome.SUCCEEDED,
+                )
             return result
 
         try:

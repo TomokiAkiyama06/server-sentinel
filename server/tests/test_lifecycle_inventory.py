@@ -264,10 +264,16 @@ class Runtime:
         recordings = self.principal("invited_user", ("recordings:view",))
         revoked = self.principal("invited_user", ("live:view", "recordings:view"),
                                  status="revoked", revoked=True)
+        with closing(sqlite3.connect(self.database)) as connection:
+            # Migration 24 requires the credential's administration handle.
+            handle = any(row[1] == "handle" for row in connection.execute(
+                "PRAGMA table_info(access_credentials)"))
         self.execute(
             "INSERT INTO access_credentials (credential_id, principal_id, public_key, algorithm, "
-            "sign_count, enrolled_at_us, revoked_at_us, backup_eligible, backup_state, label) "
-            "VALUES (?, ?, X'00', -7, 0, 1, NULL, 0, 0, ?)", (CREDENTIAL_ID, owner, CREDENTIAL_LABEL))
+            "sign_count, enrolled_at_us, revoked_at_us, backup_eligible, backup_state, label"
+            + (", handle" if handle else "") + ") "
+            "VALUES (?, ?, X'00', -7, 0, 1, NULL, 0, 0, ?" + (", ?" if handle else "") + ")",
+            (CREDENTIAL_ID, owner, CREDENTIAL_LABEL) + ((str(uuid4()),) if handle else ()))
         self.execute(
             "INSERT INTO access_sessions (id, token_digest, principal_id, credential_id, "
             "principal_revision, deployment_generation, established_at_us, last_seen_at_us, "
@@ -2641,7 +2647,9 @@ class LifecycleInventoryTests(unittest.TestCase):
         sign_in(viewer.id, viewer_second, material("viewer-second-token"))
         tick(minutes=2)
         owner_transaction(lambda connection: access.revoke_credential_on(
-            connection, viewer.id, viewer_second, at=clock[0]))
+            connection, viewer.id, connection.execute(
+                "SELECT handle FROM access_credentials WHERE credential_id=?",
+                (viewer_second,)).fetchone()[0], at=clock[0]))
         viewer_token = material("viewer-token")
         sign_in(viewer.id, viewer_credential, viewer_token)
         tick(minutes=5)

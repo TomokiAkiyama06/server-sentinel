@@ -1227,9 +1227,9 @@ its new baseline and its audit record in one transaction on the integrity
 store's connection, and no unaudited camera approval entry point is exposed.
 Human-access invitation, invitation issue, `live:view` / `recordings:view`
 grant change and principal/credential revocation run only through the audited
-`AccessAdministration` boundary, each committed inside the reservation gate
-(`admit(epoch)`, epoch taken before the Owner authorization; Owner decision
-D6, 2026-10-11); invitation redemption and capture-node
+`AccessAdministration` boundary, each committed inside the human composition's
+serving gate (`admit(epoch)` of the epoch its `OWNER_OP` authorization was
+made under; Owner decision D6, 2026-10-11; Issue #10 S4a); invitation redemption and capture-node
 pairing approval, redemption, activation and revocation append their record on
 the same transaction as the state change. Non-Owner attempts at Owner-only
 operations are recorded as `denied` and do not run; redemption attempts that
@@ -1475,13 +1475,17 @@ access_principal
 - revoked_at
 - external_identity (optional, supplementary: the verified Tailscale
   login/device last observed at authentication, overwritten each time and never
-  an authorization input; not authoritative, see §11.8. Owner-visible only,
-  cleared when the principal is revoked or deleted, and excluded from
-  diagnostic exports. Per-authentication history belongs to the audit log under
+  an authorization input; not authoritative, see §11.8. Stored but never
+  returned or shown, not even to the Owner (Owner decision D14: the shared
+  account does not tell people apart), cleared when the principal is revoked
+  or deleted, and excluded from diagnostic exports. Per-authentication history belongs to the audit log under
   its own retention, not to this field)
 
 principal_credential
 - id
+- handle (random UUID naming the credential in the Owner's inventory and in a
+  credential revocation, migration 24; the WebAuthn credential_id never
+  reaches a URL, log or audit record)
 - principal_id
 - kind (WebAuthn/passkey, as accepted in ADR-0004)
 - credential_id
@@ -1794,7 +1798,41 @@ rolls back with the finding, and the challenge is spent on its own under a new
 gate admission: it stays single use, and the unchanged stored credential lets
 the next assertion detect the finding again. Refused finishes are counted value-free
 (`owner_step_up_refused` logged on the first and each doubling). No `OWNER_OP`
-route is mounted until S4.
+route is mounted until S4b.
+
+Owner access administration (Issue #10 phase 2 S4, Owner decisions S4-1 ..
+S4-8, 2026-10-13; S4a implements the store and administration, S4b the
+routes, S4c the local `list` / `revoke-principal` / `revoke-credential`
+commands, S6 the Web screen):
+
+```text
+invite / re-issue code / change permission /
+revoke principal / revoke credential      -> OWNER_OP (owner + fresh user verification)
+list principals, grants, codes, credentials -> OWNER_READ
+step_up_required answer                    -> no idle touch (the session is not extended)
+Owner principal as the target             -> refused (only the local recover changes it)
+grant change that changes nothing         -> no revision bump, no session ends
+real grant change                         -> that principal's sessions end; its pending code stays valid
+re-issue                                  -> other unused codes revoked, one new code (invited or active)
+more than 64 non-revoked principals,
+or a second pending code                  -> refused with the generic denial
+```
+
+Each mutation commits inside `admit(epoch)` of the epoch its `OWNER_OP`
+authorization was made under, and re-reads the Owner session inside its own
+SQLite transaction (the local recover and revocation commands commit outside
+the gate): a session ended, a credential revoked, a recovery, an expired
+lifetime or a verification no longer fresh since the authorization makes it
+a failed operation that changes nothing. An invitation commits the
+principal, its grants and its single code together, with the
+`invite_principal` and `issue_principal_invitation` records; its expiry is
+the in-transaction time plus the deployment's `invitation_lifetime_hours`,
+and the application refuses a composition whose store has another lifetime.
+The inventory returns per principal its id, display name, role, status,
+times, permissions, a pending-code summary (pending, expires_at) and per
+credential its handle, label, status, inconsistency reason, backup flags and
+created / last-used / revoked times; never the last observed proxy identity
+(D14), a credential id, public key, counter, digest or session data.
 
 Exactly two HTTP routes run before a credential exists, and the pair is closed.
 Owner bootstrap is not a third one: it is a local action on the host that feeds

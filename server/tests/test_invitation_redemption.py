@@ -902,7 +902,9 @@ class ExcludedCredentialTests(RedemptionFixture):
                 "SELECT credential_id FROM access_credentials WHERE principal_id=? ORDER BY enrolled_at_us",
                 (str(principal.id),))]
         with self.store._transaction(write=True) as connection:
-            self.store.revoke_credential_on(connection, principal.id, revoked, at=self.ceremony_clock())
+            handle = connection.execute("SELECT handle FROM access_credentials WHERE credential_id=?",
+                                        (revoked,)).fetchone()[0]
+            self.store.revoke_credential_on(connection, principal.id, handle, at=self.ceremony_clock())
         self.store.mark_credential_inconsistent(inconsistent, principal.id, at=self.ceremony_clock())
         secret, code = new_invitation_code()
         self.store.issue_enrollment(principal.id, secret, self.ceremony_clock() + INVITATION_LIFETIME)

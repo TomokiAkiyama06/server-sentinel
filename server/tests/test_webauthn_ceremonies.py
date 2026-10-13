@@ -17,9 +17,7 @@ from unittest.mock import patch
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from app.audit.integration import AccessAdministration
 from app.audit.model import ActorCategory, AuditAction, AuditOutcome
-from app.audit.service import OwnerAuditService
 from app.audit.store import AuditStore
 from app.auth.model import AccessValidationError, CredentialStatus, Permission
 from app.auth.passkeys import (
@@ -32,6 +30,7 @@ from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
+from tests.admin_fakes import StoreAdministration
 from tests.webauthn_fakes import ORIGIN, RP_ID, OpenGate, SyntheticAuthenticator, _DROP, b64, cbor
 
 
@@ -105,8 +104,9 @@ class CeremonyTestCase(unittest.TestCase):
         self.rp = RelyingParty(RP_ID, ORIGIN)
         self.gate = OpenGate()
         self.ceremonies = self.make_ceremonies()
-        self.admin = AccessAdministration(OwnerAuditService(self.audit, OwnerOnly()), self.store,
-                                          session_gate=self.gate)
+        # Ceremony tests revoke and change grants directly on the store; the
+        # Owner administration itself is tested in test_access_administration.
+        self.admin = StoreAdministration(self.store)
 
     def make_ceremonies(self, **options):
         options.setdefault("session_gate", self.gate)
@@ -656,7 +656,12 @@ class StepUpTests(CeremonyTestCase):
     def test_revoked_session_credential_cannot_be_revived_by_step_up(self):
         self.clock.advance(minutes=6)
         request = self.ceremonies.begin_step_up(self.grant.token, OWNER)
-        self.admin.revoke_credential(OWNER_CONTEXT, self.owner_principal.id, self.owner_key.credential_id)
+        # The Owner's credentials change only through the local recover
+        # command (Owner decision S4-3); revoke the row directly here.
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE access_credentials SET revoked_at_us=? WHERE credential_id=?",
+                               (microseconds(self.clock()), self.owner_key.credential_id))
+            connection.commit()
         self.assertGenericDenial(lambda: self.ceremonies.finish_step_up(
             self.grant.token, OWNER, self.owner_key.assertion(request)))
         self.assertGenericDenial(lambda: self.ceremonies.authorize_owner_operation(self.grant.token, OWNER))

@@ -184,3 +184,37 @@ def access_step_up_clock_migration(version: int) -> Migration:
         "ALTER TABLE access_sessions ADD COLUMN last_user_verification_boot_id TEXT CHECK(last_user_verification_boot_id IS NULL OR length(last_user_verification_boot_id) = 36)",
         "ALTER TABLE access_sessions ADD COLUMN last_user_verification_boottime_us INTEGER CHECK(last_user_verification_boottime_us IS NULL OR last_user_verification_boottime_us >= 0)",
     ))
+
+
+# A random version-4 UUID per row, in SQLite: ``randomblob`` is evaluated for
+# every row an UPDATE touches, and the variant nibble is one of 8, 9, a, b.
+_RANDOM_UUID = ("lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || "
+                "substr(lower(hex(randomblob(2))), 2) || '-' || substr('89ab', 1 + (abs(random()) % 4), 1) || "
+                "substr(lower(hex(randomblob(2))), 2) || '-' || lower(hex(randomblob(6)))")
+
+
+def access_credential_handle_migration(version: int) -> Migration:
+    """A non-secret administration handle per credential (Issue #10 phase 2 S4).
+
+    ``handle`` is a random UUID that names one credential in the Owner's
+    inventory and in a credential revocation, so the WebAuthn credential id
+    (opaque authenticator material) never reaches a URL, a log or an audit
+    record. It says nothing about the credential and is not an authorization
+    input. Existing rows are backfilled with a fresh random value each; new
+    rows get one from ``AccessStore.enroll_credential``; a row inserted
+    without one, or a change of a stored one, is refused by a trigger.
+    Nothing is deleted.
+    """
+    return Migration(version, "human_access_credential_handle", (
+        "ALTER TABLE access_credentials ADD COLUMN handle TEXT CHECK(handle IS NULL OR length(handle) = 36)",
+        f"UPDATE access_credentials SET handle = {_RANDOM_UUID} WHERE handle IS NULL",
+        "CREATE UNIQUE INDEX access_credentials_handle ON access_credentials(handle)",
+        "CREATE TRIGGER access_credentials_handle_required BEFORE INSERT ON access_credentials "
+        "WHEN NEW.handle IS NULL BEGIN SELECT RAISE(ABORT, 'credential handle is required'); END",
+        "CREATE TRIGGER access_credentials_handle_fixed BEFORE UPDATE OF handle ON access_credentials "
+        "WHEN NEW.handle IS NOT OLD.handle BEGIN SELECT RAISE(ABORT, 'credential handle is fixed'); END",
+        # Verification before the runner commits: every row has a handle.
+        "CREATE TEMP TABLE mig_handle_guard (ok INTEGER NOT NULL CHECK(ok = 1))",
+        "INSERT INTO temp.mig_handle_guard SELECT NOT EXISTS (SELECT 1 FROM access_credentials WHERE handle IS NULL)",
+        "DROP TABLE temp.mig_handle_guard",
+    ))

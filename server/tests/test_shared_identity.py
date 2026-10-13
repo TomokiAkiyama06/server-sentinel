@@ -49,6 +49,9 @@ LATER_INVITATION_COLUMNS = ("lookup_key", "issued_boot_id", "issued_boottime_us"
 # Added by access_step_up_clock_migration (Issue #10 phase 2 S3); NULL for
 # every session that existed before it.
 LATER_SESSION_COLUMNS = ("last_user_verification_boot_id", "last_user_verification_boottime_us")
+# Added by access_credential_handle_migration (Issue #10 phase 2 S4): a fresh
+# random handle per credential, checked by test_access_administration.
+LATER_CREDENTIAL_COLUMNS = ("handle",)
 ALICE_CODE = b"a" * 32
 BOB_CODE = b"b" * 32
 
@@ -615,7 +618,8 @@ class SharedIdentityMigrationTests(unittest.TestCase):
         result = {}
         for table in self.TABLES:
             columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")
-                       if row[1] not in NEW_SESSION_COLUMNS + LATER_INVITATION_COLUMNS + LATER_SESSION_COLUMNS]
+                       if row[1] not in NEW_SESSION_COLUMNS + LATER_INVITATION_COLUMNS + LATER_SESSION_COLUMNS
+                       + LATER_CREDENTIAL_COLUMNS]
             result[table] = sorted(tuple(row) for row in connection.execute(
                 f"SELECT rowid, {', '.join(columns)} FROM {table}"))
         return result

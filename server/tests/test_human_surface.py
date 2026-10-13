@@ -360,8 +360,10 @@ class GenericDenialTests(HumanSurfaceFixture):
         principal, authenticator, credential = self.enroll()
         cookie = await self.sign_in(authenticator)
         with self.store._transaction(write=True) as connection:
-            self.store.revoke_credential_on(connection, principal.id, credential.credential_id,
-                                            at=self.ceremony_clock())
+            # By its administration handle (migration 24), never the credential id.
+            handle = connection.execute("SELECT handle FROM access_credentials WHERE credential_id=?",
+                                        (credential.credential_id,)).fetchone()[0]
+            self.store.revoke_credential_on(connection, principal.id, handle, at=self.ceremony_clock())
         self.assertEqual(await call(self.surface, "GET", SESSION_PATH, cookie=cookie), await self.denial())
 
     async def test_live_only_and_recordings_only_reach_nothing_they_lack(self):

@@ -1,10 +1,13 @@
 """Runtime integration for Owner-authorized administrative mutations."""
 
-from functools import partial
 from uuid import UUID, uuid4
 
+from app.auth.invitation_code import new_invitation_code
+from app.auth.model import AccessValidationError
+from app.auth.owner_operation import OwnerOperationContext
 from app.auth.reservation import HostnameReservationCheck
 from app.auth.reservation_store import ListenerExceptionStore
+from app.auth.serving_gate import ServingGate
 from app.cameras.registry import NodeHealthState
 from .model import AuditAction, TargetKind
 
@@ -189,92 +192,149 @@ class AccessAdministration:
     Each operation runs through ``OwnerAuditService.execute_transactional``:
     the Owner authorizer runs first, a refused actor gets a bounded ``denied``
     record and no mutation, and a permitted mutation commits in the same SQLite
-    transaction as its ``succeeded`` record. Only the principal's application
-    logical UUID reaches the audit log; external identities, display names,
-    invitation secrets, credential identifiers and public keys never do.
-    This class registers no route.
+    transaction as its ``succeeded`` record(s). Only the principal's
+    application logical UUID reaches the audit log; external identities,
+    display names, invitation codes, credential identifiers or handles and
+    public keys never do. This class registers no route.
 
-    ``session_gate`` is mandatory (Issue #181): runtime wiring passes the
-    ``HostnameReservationCheck`` (or the human composition's wrapper of it),
-    and ``None`` or an object without ``epoch()``/``admit()`` is refused at
-    construction. Every mutation (invitation, invitation issue, grant change,
-    principal revocation and credential revocation; Owner decision D6,
-    2026-10-11) takes the gate epoch before Owner authorization and commits
-    inside ``admit(epoch)`` before the write transaction opens, so it cannot
-    land after a reservation check has closed access, even if access has
-    reopened since, and so cannot rest on an Owner authorization that such a
-    check revoked (Issue #144, PR #174 review). A closed gate is a failed
-    operation with its ``failed`` record and changes nothing. While human
-    access is closed, an emergency revocation is done over SSH with the local
-    command instead (D6). Fixtures that exercise no reservation pass a
-    synthetic always-open gate explicitly.
+    ``session_gate`` must be the human composition's ``ServingGate``
+    (``HumanAccess.gate``; Issue #181, Issue #232 item 1): anything else, a
+    raw ``HostnameReservationCheck`` included, is refused at construction,
+    because only the ``ServingGate`` also refuses a commit after
+    ``HumanAccess.stop()`` or a failed check tick (Issue #228 item 1).
+
+    Every method takes the ``epoch`` the request's ``OWNER_OP``
+    authorization was made under (``_Authorized.epoch``), never a fresh one,
+    and commits inside ``admit(epoch)`` before the write transaction opens
+    (lock order: gate -> storage admission -> SQLite). A close, reopen,
+    ``stop()`` or failed tick since that authorization is a failed operation
+    with its ``failed`` record and changes nothing (Issue #144, D6). The
+    actor context must be the ``OwnerOperationContext`` of that same
+    authorization (same epoch), and inside the mutation's transaction its
+    session is read again (``AccessStore.require_owner_session_on``): a local
+    ``recover`` or revocation that committed outside the gate in between, an
+    expired session or a verification no longer fresh (``StepUpRequired``)
+    is a failed operation that changes nothing. Every time the mutation
+    depends on (an invitation's expiry included) is read inside that
+    transaction. While human access is closed, an emergency revocation is
+    done over SSH with the local command instead (D6).
+
+    Owner decisions applied (S4, 2026-10-13): the Owner principal is never a
+    target (S4-3); grants change as a delta and only a real change ends the
+    principal's sessions, its pending code staying valid (S4-5); a principal
+    has at most one pending code and re-issuing revokes the others, for an
+    invited or an active principal (S4-4, S4-8); at most ``MAX_PRINCIPALS``
+    principals are not revoked (S4-8).
     """
 
-    def __init__(self, service, access_store, *, session_gate):
+    def __init__(self, service, access_store, *, session_gate, new_code=new_invitation_code):
         if getattr(service.store, "database", None) != access_store.database:
             raise ValueError("access audit must share the access database")
-        if not (callable(getattr(session_gate, "admit", None))
-                and callable(getattr(session_gate, "epoch", None))):
-            # Mandatory (Issue #181): ``None`` would commit Owner mutations
-            # outside the reservation check's gate.
+        if not isinstance(session_gate, ServingGate):
+            # Issue #181 / #232 item 1: ``None``, a raw reservation check or
+            # any other gate would let an Owner mutation commit after
+            # ``HumanAccess.stop()``.
             raise ValueError("session gate is invalid")
+        if not callable(new_code):
+            raise ValueError("invitation code source is invalid")
         self.service = service
         self.access = access_store
         self.session_gate = session_gate
+        self._new_code = new_code
 
-    def _execute(self, actor_context, action, principal_id, operation):
-        # The epoch is taken before authorization; the gate is entered after
-        # it and held until the commit: gate lock before the SQLite write
-        # lock (the check's lock order).
-        reservation = partial(self.session_gate.admit, self.session_gate.epoch())
+    def _execute(self, actor_context, action, principal_id, operation, *, epoch, followed_by=()):
+        def run(connection):
+            # Read inside the transaction, after the gate, the storage
+            # admission and BEGIN IMMEDIATE (PR #234 rule).
+            at = self.access.now()
+            if (not isinstance(actor_context, OwnerOperationContext) or isinstance(epoch, bool)
+                    or not isinstance(epoch, int) or actor_context.epoch != epoch):
+                raise AccessValidationError("access is unavailable")
+            self.access.require_owner_session_on(connection, actor_context.session, at)
+            return operation(connection, at)
+
         return self.service.execute_transactional(
             actor_context, action=action, target_kind=TargetKind.PRINCIPAL,
-            target_logical_id=principal_id,
-            operation=lambda connection: operation(connection, self.access.now()),
-            reservation=reservation,
+            target_logical_id=principal_id, operation=run,
+            reservation=lambda: self.session_gate.admit(epoch),
+            followed_by=followed_by,
         )
 
-    def invite(self, actor_context, display_name, permissions):
-        """Invite one person; the invitation, not a proxy login, identifies them."""
+    def _code(self) -> tuple[bytes, str]:
+        secret, code = self._new_code()
+        if not isinstance(secret, bytes) or not isinstance(code, str):
+            raise AccessValidationError("invitation is unavailable")
+        return secret, code
+
+    def invite(self, actor_context, display_name, permissions, *, epoch):
+        """Invite one person with their grants and one code; ``(principal id, code, expiry)``.
+
+        The principal, its grants and its invitation commit in one
+        transaction with the ``invite_principal`` and
+        ``issue_principal_invitation`` records
+        (``AccessStore.invite_with_invitation_on``). The code is returned for
+        the Owner to hand over once; only its digest and lookup key are stored.
+        """
         target = uuid4()
-        return self._execute(
+        secret, code = self._code()
+        expires_at = self._execute(
             actor_context, AuditAction.INVITE_PRINCIPAL, target,
-            lambda connection, at: self.access.invite_on(
-                connection, target, display_name, permissions, at=at,
+            lambda connection, at: self.access.invite_with_invitation_on(
+                connection, target, display_name, permissions, secret, at=at,
             ),
+            epoch=epoch, followed_by=(AuditAction.ISSUE_PRINCIPAL_INVITATION,),
         )
+        return target, code, expires_at
 
-    def issue_invitation(self, actor_context, principal_id, secret, expires_at):
-        return self._execute(
+    def reissue_invitation(self, actor_context, principal_id, *, epoch):
+        """Revoke the principal's unused codes and issue one new code; ``(code, expiry)``."""
+        secret, code = self._code()
+        expires_at = self._execute(
             actor_context, AuditAction.ISSUE_PRINCIPAL_INVITATION, principal_id,
-            lambda connection, at: self.access.issue_enrollment_on(
-                connection, principal_id, secret, expires_at, at=at,
+            lambda connection, at: self.access.reissue_invitation_on(
+                connection, principal_id, secret, at=at,
             ),
+            epoch=epoch,
         )
+        return code, expires_at
 
-    def set_permissions(self, actor_context, principal_id, permissions):
+    def set_permissions(self, actor_context, principal_id, permissions, *, epoch):
+        """Set the grants; ``True`` when they changed (a no-op ends no session)."""
         return self._execute(
             actor_context, AuditAction.CHANGE_PRINCIPAL_PERMISSIONS, principal_id,
             lambda connection, at: self.access.set_permissions_on(
                 connection, principal_id, permissions, at=at,
             ),
+            epoch=epoch,
         )
 
-    def revoke_principal(self, actor_context, principal_id):
+    def change_permission(self, actor_context, principal_id, permission, granted, *, epoch):
+        """Grant or withdraw one permission as a delta; ``True`` when the grants changed."""
+        return self._execute(
+            actor_context, AuditAction.CHANGE_PRINCIPAL_PERMISSIONS, principal_id,
+            lambda connection, at: self.access.change_permission_on(
+                connection, principal_id, permission, granted, at=at,
+            ),
+            epoch=epoch,
+        )
+
+    def revoke_principal(self, actor_context, principal_id, *, epoch):
         return self._execute(
             actor_context, AuditAction.REVOKE_PRINCIPAL, principal_id,
             lambda connection, at: self.access.revoke_principal_on(
                 connection, principal_id, at=at,
             ),
+            epoch=epoch,
         )
 
-    def revoke_credential(self, actor_context, principal_id, credential_id):
-        """Credential-scoped: a synced passkey is revoked on every device it exists on."""
+    def revoke_credential(self, actor_context, principal_id, handle, *, epoch):
+        """Credential-scoped, by handle: a synced passkey is revoked on every device it exists on."""
         return self._execute(
             actor_context, AuditAction.REVOKE_PRINCIPAL_CREDENTIAL, principal_id,
             lambda connection, at: self.access.revoke_credential_on(
-                connection, principal_id, credential_id, at=at,
+                connection, principal_id, handle, at=at,
             ),
+            epoch=epoch,
         )
 
 

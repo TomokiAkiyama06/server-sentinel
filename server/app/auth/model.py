@@ -46,8 +46,8 @@ class Principal:
     passkey credentials bound to it are what authorize.
 
     ``external_identity`` is only the trusted-proxy identity last observed at
-    authentication (SPECIFICATION §11.4): optional, non-unique, owner-visible,
-    cleared on revocation and never an authorization input. In the
+    authentication (SPECIFICATION §11.4): optional, non-unique, stored but
+    never returned or shown, not even to the Owner (D14), cleared on revocation and never an authorization input. In the
     shared-Tailnet deployment every person presents the same value.
     """
 
