@@ -967,7 +967,9 @@ sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
   status=... label="..."`). It never prints the Tailscale login (D14: on a
   shared account it does not tell people apart), credential ids, keys or
   codes. A label is only a hint chosen at registration; it does not identify
-  a device.
+  a device. Every person and passkey that is not revoked is always listed;
+  only revoked entries beyond 64 people or 8 passkeys per person are
+  counted on a `revoked ... not shown` line instead.
 - Each revocation shows the target on the terminal and asks for the word
   `REVOKE`. A synced passkey is one credential: `revoke-credential` revokes
   it on every device it synced to, never on one device only. The service
@@ -979,7 +981,12 @@ sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
   `principal_already_revoked`, `credential_not_found`,
   `credential_already_revoked`, `principal_id_rejected`,
   `credential_handle_rejected`, `owner_confirmation_declined`, and the
-  shared words of `bootstrap`/`recover`.
+  shared words of `bootstrap`/`recover` (a database file renamed or
+  replaced while the command waits for `REVOKE` is refused with
+  `database_rejected`). One exception: `committed_verification_failed`
+  means the revocation and its audit record were already committed, but
+  re-verifying the database file afterwards failed; do not repeat the
+  command, run `list` to confirm the result and check the state directory.
 - Each revocation commits with its security audit record
   (`revoke_principal` / `revoke_principal_credential`, the principal's
   logical UUID only). It does not change the Tailnet: removing a device or
@@ -988,6 +995,10 @@ sudo -u <service account> ./venv/bin/python -m app.auth.bootstrap_cli \
 - A person revoked here has to be invited again (a new principal) to regain
   access; a revoked passkey cannot be restored, the person registers a new
   one with a new invitation code.
+- The rows written are bounded (the revocation and one audit record) and do
+  not pass the running service's storage admission; do not run a
+  revocation while the state filesystem is at its hard stop. `list` writes
+  nothing.
 
 ## Install, update, and rollback
 

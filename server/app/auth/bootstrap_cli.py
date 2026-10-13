@@ -94,10 +94,19 @@ closed (D6); the commands work the same while it is open. Exactly three
   written or audited). Never the last observed proxy identity (Owner
   decision D14), a WebAuthn credential id, public key, signature counter,
   digest, session data or code. Names and labels are printed quoted, with
-  every non-printable character escaped and the text bounded. The output is
-  bounded (``MAX_LISTED_PRINCIPALS`` principals, ``MAX_LISTED_CREDENTIALS``
-  credentials each): principals and credentials that are not revoked come
-  first, and what does not fit is counted on a ``not shown`` line.
+  every non-printable character escaped and the text bounded. Every
+  principal and every credential that is not revoked is always listed, so
+  each target the revocation commands accept has its line (PR #241 review);
+  only revoked entries, which no command can act on, are cut: at most
+  ``MAX_LISTED_REVOKED_PRINCIPALS`` revoked principals and
+  ``MAX_LISTED_REVOKED_CREDENTIALS`` revoked credentials per principal are
+  printed, after the others, and the rest is counted on a ``not shown``
+  line. The principals not revoked are bounded by the store
+  (``MAX_PRINCIPALS``); the credentials not revoked have no store cap, but
+  each one is a separate redemption of an Owner-issued invitation code (at
+  most one pending per principal), so their number grows only by Owner
+  action, and hiding one would leave an active passkey that the emergency
+  command could not name.
 - ``revoke-principal <principal id>`` revokes that person: every credential
   (each on all the devices it synced to), every pending invitation code and
   every session (``AccessStore.revoke_principal_on``).
@@ -120,7 +129,11 @@ principal's (``credential_not_found``) or already revoked
 (``principal_id_rejected`` / ``credential_handle_rejected``) and a declined
 confirmation (``owner_confirmation_declined``). The target is classified
 again inside the write transaction, so a change made meanwhile is refused,
-not overwritten.
+not overwritten. One refusal comes after the commit:
+``committed_verification_failed`` means the revocation and its audit record
+were committed, but re-verifying the pinned database file afterwards failed
+(it was renamed or replaced meanwhile); run ``list`` to see the result and
+check the state directory.
 
 Like ``recover`` they do not go through the server gate. That is safe
 because they only reduce access, and the running server re-reads the
@@ -159,14 +172,17 @@ BOOTSTRAP_WORD = "BOOTSTRAP"
 RECOVER_WORD = "RECOVER"
 REVOKE_WORD = "REVOKE"
 REVOKE_COMMANDS = ("revoke-principal", "revoke-credential")
-# Output bounds of ``list``. MAX_PRINCIPALS (64) bounds the principals that
-# are not revoked; revoked ones accumulate.
-MAX_LISTED_PRINCIPALS = 128
-MAX_LISTED_CREDENTIALS = 32
+# Output bounds of ``list``, for revoked entries only: every principal and
+# credential that is not revoked is always listed (a revocation target must
+# stay addressable; PR #241 review). MAX_PRINCIPALS (64) bounds the
+# principals that are not revoked; revoked ones accumulate.
+MAX_LISTED_REVOKED_PRINCIPALS = 64
+MAX_LISTED_REVOKED_CREDENTIALS = 8
 _MAX_LISTED_TEXT = 128
 # A fixed second line for a refusal that has a next step.
 _HINTS = {
     "owner_target_use_recover": "the Owner's credentials change only through the 'recover' command",
+    "committed_verification_failed": "the revocation was committed; run 'list' to confirm it, do not repeat it",
 }
 
 
@@ -292,25 +308,32 @@ def _quoted(value: object) -> str:
 
 
 def inventory_lines(inventory) -> list[str]:
-    """The ``list`` output: only the fields named in the module docstring, bounded."""
-    def revoked(item):
-        return item["status"] == PrincipalStatus.REVOKED.value
+    """The ``list`` output: only the fields named in the module docstring.
 
-    principals = sorted(inventory, key=revoked)  # stable: creation order within each group
+    Every principal and credential that is not revoked is printed; only
+    revoked ones beyond ``MAX_LISTED_REVOKED_*`` are counted instead.
+    """
+    def split(items, revoked_status, limit):
+        live = [item for item in items if item["status"] != revoked_status]
+        revoked = [item for item in items if item["status"] == revoked_status]
+        return live + revoked[:limit], max(0, len(revoked) - limit)
+
+    principals, hidden_principals = split(inventory, PrincipalStatus.REVOKED.value,
+                                          MAX_LISTED_REVOKED_PRINCIPALS)
     lines = []
-    for principal in principals[:MAX_LISTED_PRINCIPALS]:
+    for principal in principals:
         grants = ",".join(principal["permissions"]) or "-"
         lines.append(f"principal {principal['id']} role={principal['role']} status={principal['status']} "
                      f"permissions={grants} name={_quoted(principal['display_name'])}")
-        credentials = sorted(principal["credentials"],
-                             key=lambda item: item["status"] == CredentialStatus.REVOKED.value)
-        for credential in credentials[:MAX_LISTED_CREDENTIALS]:
+        credentials, hidden = split(principal["credentials"], CredentialStatus.REVOKED.value,
+                                    MAX_LISTED_REVOKED_CREDENTIALS)
+        for credential in credentials:
             lines.append(f"  credential {credential['handle']} status={credential['status']} "
                          f"label={_quoted(credential['label'])}")
-        if len(credentials) > MAX_LISTED_CREDENTIALS:
-            lines.append(f"  credentials not shown: {len(credentials) - MAX_LISTED_CREDENTIALS}")
-    if len(principals) > MAX_LISTED_PRINCIPALS:
-        lines.append(f"principals not shown: {len(principals) - MAX_LISTED_PRINCIPALS}")
+        if hidden:
+            lines.append(f"  revoked credentials not shown: {hidden}")
+    if hidden_principals:
+        lines.append(f"revoked principals not shown: {hidden_principals}")
     if not principals:
         lines.append("no principals")
     return lines
@@ -459,7 +482,12 @@ def _revoke(command: str, principal_id: UUID, handle: UUID | None, store: Access
         raise CliRefused("revocation_refused") from None
     except Exception:
         raise _storage_refusal(database) from None
-    _verify_pinned(database)
+    try:
+        _verify_pinned(database)
+    except CliRefused:
+        # The revocation and its audit record are already committed; only the
+        # re-verification of the pinned file failed afterwards.
+        raise CliRefused("committed_verification_failed") from None
     if handle is None:
         return [f"principal revoked: principal_id={principal_id}"]
     return [f"credential revoked on all synced devices: principal_id={principal_id} handle={handle}"]

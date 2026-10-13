@@ -1243,10 +1243,17 @@ deployment steps are in `server/docs/DEPLOYMENT.md` ("Emergency revocation").
   WebAuthn credential id, public key, signature counter, digest, session
   data or code. Names and labels are quoted with every non-printable
   character escaped (no terminal control sequence or bidi override reaches
-  the terminal) and cut at 128 characters. At most 128 principals (those not
-  revoked first; at most 64 exist, S4-8) and 32 credentials per principal
-  (those not revoked first) are printed; the rest is counted on a
-  `not shown` line.
+  the terminal) and cut at 128 characters. Every principal and every
+  credential that is not revoked is always printed, so every target the
+  revocation commands accept is addressable (PR #241 review); only revoked
+  entries, which no command can act on, are cut: at most 64 revoked
+  principals and 8 revoked credentials per principal, printed after the
+  others, the rest counted on a `revoked ... not shown` line. The principals
+  not revoked are bounded by the store (at most 64, S4-8). The credentials
+  not revoked have no store cap; each is a separate redemption of an
+  Owner-issued code (at most one pending per principal), so they grow only
+  by Owner action, and hiding one would leave an active passkey the
+  emergency command could not name.
 - `revoke-principal <principal id>` revokes the person: every credential
   (each on all the devices it synced to), every pending invitation code and
   every session, and clears the last observed login
@@ -1270,6 +1277,12 @@ deployment steps are in `server/docs/DEPLOYMENT.md` ("Emergency revocation").
   principal's handle), `credential_already_revoked`, `principal_id_rejected`
   / `credential_handle_rejected` (malformed; a credential id is not a
   handle), `owner_confirmation_declined`, plus the shared refusal words.
+  One refusal comes after the commit: `committed_verification_failed`
+  means the revocation and its audit record are already committed, but
+  re-verifying the pinned database file afterwards failed (renamed or
+  replaced meanwhile); run `list` and check the state directory. A file
+  renamed or replaced while the command waits for the confirmation is
+  refused before the commit (`database_rejected`, nothing changed).
 - Outside the gate. Like `recover` they cannot take the serving process's
   gate. That is safe because they only reduce access, and the running
   server re-reads session, credential and principal inside each request's
@@ -1277,4 +1290,5 @@ deployment steps are in `server/docs/DEPLOYMENT.md` ("Emergency revocation").
   generic denial, as is an Owner operation already authorized against that
   principal (the store's `*_on` method refuses a revoked principal or
   credential in its own transaction). Not admitted through the running
-  server's storage policy (a few bounded rows, as for the pairing CLI).
+  server's storage policy (a few bounded rows, as for the pairing CLI), so
+  they must not be run while the state filesystem is at its hard stop.

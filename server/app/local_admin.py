@@ -255,10 +255,17 @@ class _PinnedLedgerDatabase(Database):
         ``Database.connect_read_only`` reopens the path without the pin
         checks, so a read here uses the pinned ``connect()`` instead: the
         same inode checks, ``mode=rw`` (never creates a file). The caller
-        only reads (``BEGIN``, never ``BEGIN IMMEDIATE``), so nothing is
-        written.
+        only reads (``BEGIN``, never ``BEGIN IMMEDIATE``), and the connection
+        is set ``PRAGMA query_only``, so SQLite itself refuses any write
+        through it.
         """
-        return self.connect()
+        connection = self.connect()
+        try:
+            connection.execute("PRAGMA query_only = ON")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
 
     def release(self) -> None:
         """End the ledger's use of the file; later connections and commits refuse.

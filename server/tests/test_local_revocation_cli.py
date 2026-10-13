@@ -14,15 +14,18 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
+import sqlite3
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from app import local_admin
 from app.auth import bootstrap_cli
 from app.auth.human_surface import SESSION_PATH
 from app.auth.model import AccessValidationError, Permission
-from app.auth.store import Requirement
+from app.auth.store import MAX_PRINCIPALS, Requirement
 from app.local_admin import ControllingTerminal
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -176,29 +179,96 @@ class ListTests(LocalAdministrationFixture):
         self.assertLess(len(line), 400)
         self.assertIn('label="phone\\u0007\\u000a"', stdout)
 
-    def test_list_is_bounded(self):
+    def insert_credentials(self, principal_id, count, *, revoked):
+        handles = []
         with closing(self.database.connect()) as connection:
-            for index in range(bootstrap_cli.MAX_LISTED_PRINCIPALS + 3):
-                connection.execute("INSERT INTO access_principals VALUES (?, NULL, ?, 'invited_user', 'revoked', 0, ?, ?)",
-                                   (str(uuid4()), f"Synthetic revoked {index}", index + 1, index + 1))
-            for _ in range(bootstrap_cli.MAX_LISTED_CREDENTIALS + 2):
+            for index in range(count):
+                handle = str(uuid4())
                 connection.execute(
                     "INSERT INTO access_credentials (credential_id, principal_id, public_key, algorithm, sign_count, "
-                    "enrolled_at_us, revoked_at_us, handle) VALUES (?, ?, ?, -7, 0, 1, 1, ?)",
-                    (secrets.token_bytes(32), str(self.viewer.id), b"synthetic-key", str(uuid4())))
+                    "enrolled_at_us, revoked_at_us, handle) VALUES (?, ?, ?, -7, 0, ?, ?, ?)",
+                    (secrets.token_bytes(32), str(principal_id), b"synthetic-key", 10 + index,
+                     1 if revoked else None, handle))
+                handles.append(handle)
+        return handles
+
+    def insert_revoked_principals(self, count):
+        with closing(self.database.connect()) as connection:
+            for index in range(count):
+                connection.execute("INSERT INTO access_principals VALUES (?, NULL, ?, 'invited_user', 'revoked', 0, ?, ?)",
+                                   (str(uuid4()), f"Synthetic revoked {index}", index + 1, index + 1))
+
+    def test_list_bounds_only_revoked_entries(self):
+        self.insert_revoked_principals(bootstrap_cli.MAX_LISTED_REVOKED_PRINCIPALS + 3)
+        self.insert_credentials(self.viewer.id, bootstrap_cli.MAX_LISTED_REVOKED_CREDENTIALS + 2, revoked=True)
         code, stdout, _, _ = self.run_cli("list")
         self.assertEqual(code, 0)
         lines = stdout.splitlines()
         principals = [line for line in lines if line.startswith("principal ")]
-        self.assertEqual(len(principals), bootstrap_cli.MAX_LISTED_PRINCIPALS)
+        self.assertEqual(len(principals), 3 + bootstrap_cli.MAX_LISTED_REVOKED_PRINCIPALS)
         # Principals that are not revoked come first, credentials not revoked first.
         self.assertTrue(all("status=revoked" not in line for line in principals[:3]))
         self.assertTrue(all("status=revoked" in line for line in principals[3:]))
-        self.assertEqual(lines[-1], "principals not shown: 6")
-        self.assertIn("  credentials not shown: 4", lines)
+        self.assertEqual(lines[-1], "revoked principals not shown: 3")
         viewer = lines.index(next(line for line in lines if str(self.viewer.id) in line))
         self.assertIn(f"credential {self.handle(self.first)} status=active", lines[viewer + 1])
         self.assertIn(f"credential {self.handle(self.second)} status=active", lines[viewer + 2])
+        revoked = lines[viewer + 3:viewer + 3 + bootstrap_cli.MAX_LISTED_REVOKED_CREDENTIALS]
+        self.assertTrue(all(CREDENTIAL_LINE.match(line)["status"] == "revoked" for line in revoked))
+        self.assertEqual(lines[viewer + 3 + bootstrap_cli.MAX_LISTED_REVOKED_CREDENTIALS],
+                         "  revoked credentials not shown: 2")
+
+    def test_every_credential_that_is_not_revoked_stays_addressable(self):
+        # PR #241 review: no store cap bounds a person's active credentials,
+        # so ``list`` must never hide one the emergency command could revoke.
+        many = 3 * bootstrap_cli.MAX_LISTED_REVOKED_CREDENTIALS + 40
+        revoked = self.insert_credentials(self.viewer.id, many, revoked=True)
+        active = self.insert_credentials(self.viewer.id, many, revoked=False)
+        with closing(self.database.connect()) as connection:
+            # An inconsistent credential is not revoked and stays a target.
+            connection.execute("UPDATE access_credentials SET inconsistent_at_us=1, inconsistency_reason='backup_eligibility_changed' "
+                               "WHERE handle=?", (active[-1],))
+        code, stdout, _, _ = self.run_cli("list")
+        self.assertEqual(code, 0)
+        listed = {match["handle"]: match["status"] for match in map(CREDENTIAL_LINE.match, stdout.splitlines())
+                  if match}
+        for handle in active + [self.handle(self.first), self.handle(self.second)]:
+            self.assertIn(handle, listed)
+        self.assertEqual(listed[active[-1]], "inconsistent")
+        self.assertEqual(sum(1 for handle in revoked if handle in listed),
+                         bootstrap_cli.MAX_LISTED_REVOKED_CREDENTIALS)
+        self.assertIn(f"  revoked credentials not shown: {many - bootstrap_cli.MAX_LISTED_REVOKED_CREDENTIALS}",
+                      stdout.splitlines())
+        # A handle only the untruncated listing shows is revocable by the command.
+        for handle in (active[-2], active[-1]):
+            code, _, stderr, _ = self.run_cli("revoke-credential", "REVOKE", arguments=[str(self.viewer.id), handle])
+            self.assertEqual((code, stderr), (0, ""))
+
+    def test_every_principal_that_is_not_revoked_is_listed(self):
+        self.insert_revoked_principals(2 * bootstrap_cli.MAX_LISTED_REVOKED_PRINCIPALS)
+        alive = [self.owner.id, self.viewer.id, self.other.id]
+        # The store keeps at most MAX_PRINCIPALS principals that are not revoked.
+        alive += [self.store.invite(f"Synthetic extra {index}", ()).id
+                  for index in range(MAX_PRINCIPALS - len(alive))]
+        code, stdout, _, _ = self.run_cli("list")
+        self.assertEqual(code, 0)
+        listed = {match["id"]: match["status"] for match in map(LINE.match, stdout.splitlines()) if match}
+        self.assertEqual(len(alive), MAX_PRINCIPALS)
+        for principal_id in alive:
+            self.assertNotEqual(listed[str(principal_id)], "revoked")
+        self.assertEqual(stdout.splitlines()[-1],
+                         f"revoked principals not shown: {bootstrap_cli.MAX_LISTED_REVOKED_PRINCIPALS}")
+
+    def test_the_pinned_read_connection_refuses_writes(self):
+        database = local_admin._existing_database(self.path)
+        try:
+            with closing(database.connect_read_only()) as connection:
+                self.assertEqual(connection.execute("PRAGMA query_only").fetchone()[0], 1)
+                with self.assertRaises(sqlite3.OperationalError):
+                    connection.execute("DELETE FROM access_principal_permissions")
+        finally:
+            database.release()
+        self.assertEqual(self.rows("SELECT count(*) FROM access_principals")[0][0], 3)
 
     def test_an_empty_database_lists_no_principals(self):
         with closing(self.database.connect()) as connection:
@@ -337,6 +407,68 @@ class RevocationTests(LocalAdministrationFixture):
         self.assertEqual((code, stdout), (2, ""))
         self.assertIn("refused: principal_already_revoked", stderr)
         self.assertEqual(self.rows(AUDIT), before)
+
+    def test_a_database_renamed_or_replaced_during_the_confirmation_is_refused(self):
+        moved = self.root / "moved.sqlite3"
+
+        def replace():
+            copy = self.root / "copy.sqlite3"
+            shutil.copy2(self.path, copy)
+            os.replace(copy, self.path)
+
+        def rename():
+            os.rename(self.path, moved)
+
+        def state(path):
+            with closing(Database(path).connect()) as connection:
+                return [tuple(tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY 1"))
+                        for table in ACCESS_TABLES]
+
+        for change in (replace, rename):
+            for command, arguments in (("revoke-principal", [str(self.viewer.id)]),
+                                       ("revoke-credential", [str(self.viewer.id), self.handle(self.first)])):
+                with self.subTest(change=change.__name__, command=command):
+                    before = state(self.path)
+                    console = Console(self)
+                    terminal = console.factory()
+                    original = terminal.read_line
+
+                    def read_line(original=original, change=change):
+                        word = original()
+                        change()
+                        return word
+
+                    terminal.read_line = read_line
+                    code, stdout, stderr, _ = self.run_cli(command, "REVOKE", arguments=arguments, console=console,
+                                                           terminal_factory=lambda terminal=terminal: terminal)
+                    self.assertEqual((code, stdout), (2, ""))
+                    self.assertIn("refused: database_rejected\n", stderr)
+                    if change is rename:
+                        self.assertFalse(self.path.exists())
+                        self.assertEqual(state(moved), before)
+                        os.rename(moved, self.path)
+                    self.assertEqual(state(self.path), before)
+
+    def test_a_verification_failure_after_the_commit_says_it_was_committed(self):
+        original = bootstrap_cli.revoke_principal
+
+        def revoke_then_replace(store, principal_id):
+            original(store, principal_id)
+            copy = self.root / "copy.sqlite3"
+            shutil.copy2(self.path, copy)
+            os.replace(copy, self.path)
+
+        before = self.rows(AUDIT)
+        with patch.object(bootstrap_cli, "revoke_principal", revoke_then_replace):
+            code, stdout, stderr, _ = self.run_cli("revoke-principal", "REVOKE", arguments=[str(self.viewer.id)])
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("refused: committed_verification_failed\n", stderr)
+        self.assertIn("the revocation was committed", stderr)
+        # Committed with its audit record before the verification failed.
+        self.assertEqual(self.rows(AUDIT), before + [
+            ("owner", "revoke_principal", "principal", str(self.viewer.id), "succeeded")])
+        self.assertEqual(self.rows(f"SELECT status FROM access_principals WHERE id='{self.viewer.id}'"),
+                         [("revoked",)])
 
     def test_a_failed_audit_append_rolls_the_revocation_back(self):
         before = self.state()
