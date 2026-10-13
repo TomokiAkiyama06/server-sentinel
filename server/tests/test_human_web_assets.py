@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import tempfile
 import unittest
@@ -21,6 +22,7 @@ from unittest.mock import patch
 from app.auth import reservation as reservation_module
 from app.auth import web_assets as web_assets_module
 from app.auth.human_surface import (
+    AUTHENTICATION_OPTIONS_PATH, AUTHENTICATION_PATH, REGISTRATION_OPTIONS_PATH, REGISTRATION_PATH,
     SESSION_COOKIE, SESSION_PATH, HumanAccess, HumanAccessConfiguration, HumanAccessUnavailable,
     send_generic_denial,
 )
@@ -34,10 +36,13 @@ from app.settings import ConfigurationError, Settings
 from app.storage.database import Database
 
 from tests.test_human_surface import (
-    EXPOSED, LAN, LOOPBACK, OTHER_LOGIN, UPSTREAM, VIEWER, HumanSurfaceFixture, call, status,
+    EXPOSED, LAN, LOOPBACK, OTHER_LOGIN, UPSTREAM, VIEWER, HumanSurfaceFixture, call, header, payload,
+    status,
 )
 from tests.test_hostname_reservation import HOST, Resolver
+from tests.test_invitation_redemption import RedemptionFixture
 from tests.web_asset_fakes import APP, SHELL, manifest_for, write_build
+from tests.webauthn_fakes import SyntheticAuthenticator
 
 
 ORIGIN = f"https://{HOST}"
@@ -592,6 +597,37 @@ class LoaderTests(unittest.TestCase):
         os.mkfifo(directory / "app" / "app.js")
         self.refused(directory)
 
+    def test_group_or_world_writable_entries_are_refused(self):
+        for relative in (".", "shell", "app", "manifest.json", "shell/s.js", "app/index.html", "app/icon.svg"):
+            for bits in (0o020, 0o002):
+                with self.subTest(relative=relative, bits=oct(bits)):
+                    directory = write_build(self.root / secrets.token_hex(4))
+                    target = directory / relative
+                    target.chmod(target.stat().st_mode & 0o777 | bits)
+                    self.refused(directory)
+        # Read-only or owner-only modes are fine (a root-owned 0555/0444 release).
+        directory = write_build(self.root / "read-only")
+        for path in sorted(directory.rglob("*"), reverse=True):
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        directory.chmod(0o500)
+        self.addCleanup(directory.chmod, 0o755)
+        for path in directory.iterdir():
+            self.addCleanup(path.chmod, 0o755)
+        self.assertEqual(WebAssets.load(directory).shell_index.body, SHELL["index.html"])
+
+    def test_a_file_with_a_second_hard_link_is_refused(self):
+        for relative in ("manifest.json", "shell/s.css", "app/app.js"):
+            with self.subTest(relative=relative):
+                directory = write_build(self.root / secrets.token_hex(4))
+                os.link(directory / relative, self.root / (secrets.token_hex(4) + ".alias"))
+                self.refused(directory)
+
+    def test_the_directory_is_read_only(self):
+        assets = WebAssets.load(write_build(self.directory))
+        with self.assertRaises(AttributeError):
+            assets.directory = self.root
+        self.assertEqual(assets.directory, self.directory.resolve())
+
     def test_the_configured_directory_may_be_a_symlink_the_deployment_controls(self):
         build = write_build(self.root / "release-build")
         link = self.root / "current"
@@ -716,6 +752,114 @@ class ShellInvitationCodeContractTests(unittest.TestCase):
                     # shell's normalization is required, not cosmetic.
                     with self.assertRaises(InvalidInvitationCode):
                         parse_invitation_code(typed)
+
+
+WEBAUTHN_TS = Path(__file__).resolve().parents[2] / "web" / "src" / "shared" / "webauthn.ts"
+
+
+def _interface_fields(source, name):
+    """``(top-level members, response members)`` of one ``webauthn.ts`` interface."""
+    match = re.search(r"export interface " + name + r" \{\n(.*?)\n\}", source, re.S)
+    if match is None:
+        raise AssertionError(f"{name} in webauthn.ts no longer has the parsed shape")
+    body = match.group(1)
+    inner = re.search(r"response: \{ (.*?) \};", body)
+    if inner is None:
+        raise AssertionError(f"{name}.response in webauthn.ts no longer has the parsed shape")
+    outer = re.findall(r"(\w+): ", body.replace(inner.group(0), "response: x;"))
+    return outer, re.findall(r"(\w+): ", inner.group(1))
+
+
+class ShellWireContractTests(RedemptionFixture):
+    """The JSON ``web/src/shared/webauthn.ts`` sends, through the real routes.
+
+    The member sets are read from the ``RegistrationJSON`` / ``AssertionJSON``
+    interfaces, and each body carries exactly those members (the shell's
+    ``userHandle`` is a string or ``null``, never omitted), as
+    ``serializeRegistration`` / ``serializeAssertion`` and the sign-in
+    shell's request bodies build them. The verifiers are the real
+    ``verify_registration`` / ``verify_assertion``; only the authenticator is
+    a software one, so no browser serialisation is exercised here.
+    """
+
+    def setUp(self):
+        if not WEBAUTHN_TS.is_file():
+            raise unittest.SkipTest("web/src/shared/webauthn.ts is not part of this checkout")
+        super().setUp()
+        source = WEBAUTHN_TS.read_text(encoding="utf-8")
+        self.registration_fields = _interface_fields(source, "RegistrationJSON")
+        self.assertion_fields = _interface_fields(source, "AssertionJSON")
+
+    @staticmethod
+    def shaped(produced, fields, **response_overrides):
+        outer, inner = fields
+        response = {name: produced["response"].get(name) for name in inner}
+        response.update(response_overrides)
+        body = {name: produced[name] for name in outer if name != "response"}
+        body["response"] = response
+        return body
+
+    async def shell_sign_in(self, authenticator, **response_overrides):
+        options = await call(self.surface, "POST", AUTHENTICATION_OPTIONS_PATH, body=b"{}")
+        self.assertEqual(status(options), 200)
+        produced = authenticator.assertion(payload(options), origin=ORIGIN, rp_id=HOST)
+        body = self.shaped(produced, self.assertion_fields, **response_overrides)
+        return await call(self.surface, "POST", AUTHENTICATION_PATH, body=json.dumps(body).encode())
+
+    def test_the_interfaces_are_the_members_the_verifier_reads(self):
+        self.assertEqual(self.registration_fields,
+                         (["id", "rawId", "type", "response"], ["clientDataJSON", "attestationObject"]))
+        self.assertEqual(self.assertion_fields,
+                         (["id", "rawId", "type", "response"],
+                          ["clientDataJSON", "authenticatorData", "signature", "userHandle"]))
+
+    async def test_shell_shaped_registration_and_sign_in_pass_the_real_verifiers(self):
+        _, code = self.invite((Permission.LIVE_VIEW,))
+        begun = await call(self.surface, "POST", REGISTRATION_OPTIONS_PATH, body=json.dumps({"code": code}).encode())
+        self.assertEqual(status(begun), 200)
+        authenticator = SyntheticAuthenticator()
+        credential = self.shaped(authenticator.register(payload(begun), origin=ORIGIN, rp_id=HOST),
+                                 self.registration_fields)
+        self.assertEqual(credential["id"], credential["rawId"])
+        # A label of 64 non-BMP characters (two UTF-16 units each in the browser).
+        label = "\U0001f511" * 64
+        finished = await call(self.surface, "POST", REGISTRATION_PATH,
+                              body=json.dumps({"code": code, "credential": credential, "label": label}).encode())
+        self.assertEqual(status(finished), 204)
+        self.assertEqual(self.count("SELECT label FROM access_credentials"), label)
+        signed_in = await self.shell_sign_in(authenticator)
+        self.assertEqual(status(signed_in), 204)
+        (cookie,) = header(signed_in, b"set-cookie")
+        session = await call(self.surface, "GET", SESSION_PATH, cookie=cookie.decode().split(";")[0])
+        self.assertEqual(payload(session)["permissions"], ["live:view"])
+
+    async def test_a_null_user_handle_is_a_denied_sign_in(self):
+        # ``serializeAssertion`` sends ``null`` when the authenticator returns
+        # no handle. A discoverable sign-in requires the handle, so that is the
+        # generic denial (the shell shows its one generic message), never a
+        # parse error or a different response.
+        _, authenticator, _ = self.enroll()
+        expected = await self.denial()
+        self.assertEqual(await self.shell_sign_in(authenticator, userHandle=None), expected)
+        self.assertEqual(self.count("SELECT count(*) FROM access_sessions"), 0)
+        self.assertEqual(status(await self.shell_sign_in(authenticator)), 204)
+
+    async def test_a_lone_surrogate_label_is_refused_before_the_ceremony(self):
+        principal, code = self.invite()
+        begun = payload(await call(self.surface, "POST", REGISTRATION_OPTIONS_PATH,
+                                   body=json.dumps({"code": code}).encode()))
+        credential = self.shaped(SyntheticAuthenticator().register(begun, origin=ORIGIN, rp_id=HOST),
+                                 self.registration_fields)
+        expected = await self.denial()
+        for label in ("\ud800", "key\udfff", "\udc00\ud83d"):
+            with self.subTest(label=ascii(label)):
+                body = json.dumps({"code": code, "credential": credential, "label": label}).encode()
+                self.assertEqual(await call(self.surface, "POST", REGISTRATION_PATH, body=body), expected)
+        self.assertEqual(self.count("SELECT count(*) FROM access_credentials"), 0)
+        # Never reached the ceremony: the challenge is still pending.
+        finished = await call(self.surface, "POST", REGISTRATION_PATH,
+                              body=json.dumps({"code": code, "credential": credential}).encode())
+        self.assertEqual(status(finished), 204)
 
 
 if __name__ == "__main__":

@@ -2136,9 +2136,12 @@ The bytes come from `WebAssets.load(Settings.web_assets_dir)` at composition:
 `manifest.json` lists exactly `shell/index.html`, `shell/s.js`,
 `shell/s.css`, `app/index.html` and any further flat `app/` files, each with
 its SHA-256, size and media type (`html`, `js`, `css`, `svg`, `txt` only);
-an extra, missing, modified, oversized, symlinked or non-regular file refuses
-the whole composition (fail closed), and the verified bytes are frozen in
-memory, so a later disk change is never served. Every asset response has a
+an extra, missing, modified, oversized, symlinked or non-regular file, a
+group- or world-writable entry and a file with a second hard link refuse the
+whole composition (fail closed), and the verified bytes are frozen in
+memory, so a later disk change is never served. This guards against an
+accidental or partial deployment; tamper resistance is the S5c release
+manifest plus a root-owned, service-unwritable directory. Every asset response has a
 fixed header list: its `Content-Type` (the manifest's, from the S5a
 build policy `web/scripts/policy.mjs`), `Content-Length`,
 `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
@@ -2150,7 +2153,10 @@ connections, no images or fonts and Trusted Types with no policy for the
 shell, `base-uri 'none'`, `form-action 'none'`, `frame-ancestors 'none'`;
 the exact strings are those of `web/scripts/policy.mjs`); never `ETag`, `Last-Modified`,
 `Set-Cookie`, `304`, ranges or a content coding. `HEAD`, other methods, query
-parameters and re-encoded spellings get the generic denial. The shell's bytes
+parameters and re-encoded spellings get the generic denial. Because every
+document is `no-referrer`, each mutating `fetch` of the shell and the
+application sets `referrer: ''` and `referrerPolicy: 'same-origin'`, so the
+`POST` carries the exact `Origin` the mutating routes require (not `null`). The shell's bytes
 identify the software to anyone on the shared account (accepted, S5-5), so it
 carries no version marker.
 

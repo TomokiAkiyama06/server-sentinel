@@ -551,11 +551,13 @@ def _invitation_secret(value: object) -> bytes:
 
 
 def _label(value: object) -> str | None:
-    """An optional credential label, checked as ``Credential`` checks it (and no DEL)."""
+    """An optional credential label, checked as ``Credential`` checks it, and
+    no DEL and no lone surrogate (JSON can escape one, ``"\\ud800"``; it
+    cannot be stored as UTF-8, so it is refused here, before the ceremony)."""
     if value is None:
         return None
     if (not isinstance(value, str) or not 1 <= len(value) <= MAX_LABEL
-            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+            or any(ord(char) < 32 or ord(char) == 127 or 0xD800 <= ord(char) <= 0xDFFF for char in value)):
         raise _Denied()
     return value
 

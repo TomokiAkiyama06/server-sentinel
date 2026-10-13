@@ -22,6 +22,9 @@ following hold:
   relative to its parent with ``O_NOFOLLOW`` (a symlink, device, FIFO or
   socket is refused). The configured directory itself is resolved once (a
   deployment may point its setting through a symlink it controls);
+- neither the resolved directory nor any directory or file below it is
+  group- or world-writable, and no file has a second hard link
+  (``st_nlink`` must be 1);
 - every extension is in ``CONTENT_TYPES`` (``html``, ``js``, ``css``,
   ``svg``, ``txt``) and the manifest's ``type`` is exactly that extension's
   content type in ``CONTENT_TYPES``;
@@ -32,6 +35,15 @@ The bytes are then frozen in memory with their complete response headers: a
 later change on disk is never served, and no request ever builds a
 filesystem path (a request only selects one of the fixed shell entries or
 looks a validated name up in the in-memory map).
+
+The manifest is written by the same build as the files, so these checks
+catch an accidental, partial or mixed deployment, not a deliberate one: an
+account that can write the directory can rewrite the manifest too. Tamper
+resistance comes from the release manifest's SHA-256 of the whole build
+(Issue #10 S5c) and from a root-owned directory the service account cannot
+write; the permission and hard-link checks only refuse the layouts that
+would make such a directory writable by another account or alias a file
+from elsewhere.
 """
 
 from __future__ import annotations
@@ -72,7 +84,8 @@ CONTENT_TYPES: Mapping[str, str] = MappingProxyType({
 # The content types and policies below are the values of
 # ``web/scripts/policy.mjs`` (Issue #10 phase 2 S5a), copied, not read at
 # run time, so ``server/`` does not depend on ``web/``; a change there must
-# change these (pinned by ``tests/test_human_web_assets.py``).
+# change these. ``tests/test_web_build_contract.py`` parses ``policy.mjs``
+# and compares, and CI loads the freshly built ``web/dist`` with this loader.
 #
 # The sign-in shell (Owner decisions D1, S5-1): its own script and style,
 # same-origin API calls only, no image, font, frame, form, base or
@@ -80,11 +93,13 @@ CONTENT_TYPES: Mapping[str, str] = MappingProxyType({
 SHELL_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
              "img-src 'none'; font-src 'none'; base-uri 'none'; form-action 'none'; "
              "frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types 'none'")
-# The application (S5-2): the policy its index.html formerly carried in a
-# meta element, plus ``frame-ancestors``, which only a header can carry.
-APP_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
-           "img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; "
-           "frame-ancestors 'none'")
+# The application (S5-2). Its index.html also carries ``APP_META_CSP`` in a
+# meta element as defence in depth (the S5a build refuses a document whose
+# meta policy differs); the header is that policy plus ``frame-ancestors``,
+# which a meta element cannot carry.
+APP_META_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+                "img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'")
+APP_CSP = APP_META_CSP + "; frame-ancestors 'none'"
 _COMMON_HEADERS = (
     (b"cache-control", b"no-store"),
     (b"x-content-type-options", b"nosniff"),
@@ -183,13 +198,21 @@ def _open_below(parent: int, name: str, *, directory: bool) -> int:
         flags |= os.O_DIRECTORY
     descriptor = os.open(name, flags, dir_fd=parent)
     try:
-        info = os.fstat(descriptor)
-        if not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
-            raise WebAssetsUnavailable()
+        _check_mode(os.fstat(descriptor), directory=directory)
     except BaseException:
         os.close(descriptor)
         raise
     return descriptor
+
+
+def _check_mode(info: os.stat_result, *, directory: bool) -> None:
+    """A directory or a singly linked regular file nobody else may write."""
+    if not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)):
+        raise WebAssetsUnavailable()
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise WebAssetsUnavailable()
+    if not directory and info.st_nlink != 1:
+        raise WebAssetsUnavailable()
 
 
 def _read_file(parent: int, name: str, limit: int) -> bytes:
@@ -231,9 +254,14 @@ class WebAssets:
                  app: Mapping[str, WebAsset]) -> None:
         if token is not _LOADER:
             raise WebAssetsUnavailable()
-        self.directory = directory
+        self._directory = directory
         self._shell = MappingProxyType(dict(shell))
         self._app = MappingProxyType(dict(app))
+
+    @property
+    def directory(self) -> Path:
+        """The resolved directory the set was loaded from (read-only)."""
+        return self._directory
 
     @classmethod
     def load(cls, directory: object) -> "WebAssets":
@@ -246,6 +274,7 @@ class WebAssets:
         except (OSError, RuntimeError, ValueError):
             raise WebAssetsUnavailable() from None
         try:
+            _check_mode(os.fstat(root), directory=True)
             return cls._load(root, root_path)
         except WebAssetsUnavailable:
             raise

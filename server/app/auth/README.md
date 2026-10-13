@@ -782,7 +782,8 @@ echoes it.
   required` and `attestation: "none"`. No camera, recording, timeline,
   product or deployment data.
 - `POST /api/auth/registration`, body `{"code", "credential", "label"?}`
-  (label: 1-64 characters, no control character):
+  (label: 1-64 characters, no control character, no DEL and no lone
+  surrogate):
   `PasskeyCeremonies.finish_registration` consumes the challenge, verifies the
   registration server-side (client data type `webauthn.create`, challenge,
   exact origin, rp id hash, UP and UV, attestation `none` or `packed` self
@@ -1305,13 +1306,20 @@ static host, so the human surface serves the Web build itself.
   entry below the directory is opened relative to its parent with
   `O_NOFOLLOW` and is a regular file or directory (no symlink, FIFO, device
   or socket; the configured directory itself is resolved once, so a
-  deployment-controlled symlink to a release build works); every extension is
+  deployment-controlled symlink to a release build works); neither that
+  directory nor anything below it is group- or world-writable and no file
+  has a second hard link (`st_nlink` 1); every extension is
   `html`, `js`, `css`, `svg` or `txt` and its manifest `type` is exactly
   that extension's content type (below); every size and SHA-256 matches and
   every body is UTF-8; and the caps hold (64 files, 8 MiB per file, 32 MiB in
   all, 64 KiB of manifest). The bytes and their complete header lists are
   then frozen in memory: a later change on disk is never served, and no
-  request builds a filesystem path.
+  request builds a filesystem path. The manifest comes from the same build
+  as the files, so these checks catch an accidental, partial or mixed
+  deployment; they are not tamper resistance (an account that can write the
+  directory can rewrite the manifest too). That rests on the S5c release
+  manifest's SHA-256 of the build and on a root-owned directory the service
+  account cannot write.
 - The shell, pre-credential (D1, S5-1). `GET /`, `GET /s.js` and
   `GET /s.css` serve `shell/index.html`, `shell/s.js` and `shell/s.css`
   after the route table, `Host`/`Origin`, loopback peer and listener, the one
@@ -1330,7 +1338,10 @@ static host, so the human surface serves the Web build itself.
   active session, no permission needed (every data route checks its own),
   and the idle expiry is never extended, so a session that only loads assets
   still ends 30 minutes after its last other activity. A close, revocation or
-  `stop()` between the epoch and the commit is the generic denial.
+  `stop()` between the epoch and the commit is the generic denial. So a
+  browser whose session expired gets that generic `404` at `/app/`, not the
+  shell and not a redirect; the person opens `/` to sign in again (the
+  application's own handling of an expired session is S5c/S6 work).
 - Headers, exactly and in this order: `content-type`
   (`text/html; charset=utf-8`, `text/javascript; charset=utf-8`,
   `text/css; charset=utf-8`, `image/svg+xml` or
@@ -1345,10 +1356,22 @@ static host, so the human surface serves the Web build itself.
   require-trusted-types-for 'script'; trusted-types 'none'`, for the
   application `default-src 'none'; script-src 'self'; style-src 'self';
   connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none';
-  form-action 'none'; frame-ancestors 'none'`. The content types and both
+  form-action 'none'; frame-ancestors 'none'` (`APP_META_CSP`, which the
+  document also carries in a meta element as defence in depth, plus the
+  `frame-ancestors` a meta element cannot carry). The content types and the
   policies are copies of `web/scripts/policy.mjs` (S5a), held as constants in
   `web_assets.py` so the server never reads `web/` at run time; a change on
-  either side must change the other (pinned by the tests).
+  either side must change the other: `tests/test_web_build_contract.py`
+  parses `policy.mjs` and compares, and the CI `web-browser` job loads the
+  freshly built `web/dist` with `WebAssets.load` (`WEB_DIST_REQUIRED=1`).
+- Referrer and `Origin`. Every document is `referrer-policy: no-referrer`.
+  Under that policy a browser may send `Origin: null` on a same-origin
+  `POST` (Safari and Firefox do), and every mutating route (the ceremonies,
+  sign-out, step-up and the Owner's administration) requires the exact
+  reserved `Origin`, so it denies that request. Every mutating `fetch` from the shell or the application
+  must therefore set `referrer: ''` (no `Referer`) and
+  `referrerPolicy: 'same-origin'` (the real `Origin`) in its init, as
+  `web/src/signin/main.ts` does; the documents keep `no-referrer`.
   The production launcher runs uvicorn without its `server` and `date`
   headers, so no product or version header is added.
 - Accepted disclosure (S5-5). The shell bytes, and so their hash, are the
@@ -1361,9 +1384,12 @@ static host, so the human surface serves the Web build itself.
   percent-encoded or dot-segment spelling, `/index.html`, any query parameter
   (an empty query string is none) and a WebSocket get the generic denial.
 
-This is synthetic/mock verified only (`server/tests/test_human_web_assets.py`):
-no browser has enforced the policies or rendered the build
-(`MANUAL_TEST.md`).
+This is synthetic/mock verified only (`server/tests/test_human_web_assets.py`,
+`server/tests/test_web_build_contract.py`): no browser has enforced the
+policies or rendered the build (`MANUAL_TEST.md`). The wire-shape test sends
+registration and assertion bodies with exactly the members of
+`web/src/shared/webauthn.ts` through the real routes and verifiers, but from a
+software authenticator, not a browser.
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 

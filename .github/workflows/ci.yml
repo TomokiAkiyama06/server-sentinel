@@ -166,6 +166,16 @@ jobs:
         run: |
           python3 scripts/ci/license_gate.py \
             --resolved-npm web/node_modules/.package-lock.json --input web/package-lock.json
+      - name: Load the built web/dist with the Main Server asset loader
+        # Issue #10 S5b: the server's WebAssets.load must accept the real
+        # S5a build output, and its policies must equal web/scripts/policy.mjs.
+        # Standard library only; WEB_DIST_REQUIRED turns a missing build into
+        # a failure instead of a skip.
+        working-directory: server
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          WEB_DIST_REQUIRED: '1'
+        run: python -m unittest -v tests.test_web_build_contract
       - name: Synthetic viewport and browser request interception
         working-directory: web
         run: npm run test:browser

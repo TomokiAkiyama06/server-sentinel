@@ -420,6 +420,19 @@ the dashboard document `APP_CSP`, which is its meta policy `APP_META_CSP` plus
 `frame-ancestors 'none'` (`img-src 'self'; font-src 'self'`, no Trusted
 Types), and on every response `Cache-Control: no-store`,
 `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+The server holds copies of these values (`server/app/auth/web_assets.py`);
+`server/tests/test_web_build_contract.py` parses `scripts/policy.mjs` and
+compares them, and the CI `web-browser` job loads the freshly built `dist/`
+with the server's loader, so a change here must change the server too.
+
+Because every document, the dashboard included, is `Referrer-Policy:
+no-referrer`, **every mutating `fetch` from the shell or the dashboard must set
+`referrer: ''` and `referrerPolicy: 'same-origin'` in its init** (as
+`src/signin/main.ts` does). Without them a browser may send `Origin: null` on
+the `POST`, and the server denies every mutating route whose `Origin` is not
+exactly the reserved origin. A dashboard whose session has expired gets the
+server's generic `404` for `/app/` and its files, not the shell; the person
+opens `/` to sign in again.
 
 Tests (`tests/signin.test.mjs`): the code normalization table and 500 random
 codes from a transcription of the server encoder (with four vectors printed by

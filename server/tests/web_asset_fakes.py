@@ -52,13 +52,19 @@ def write_build(directory: Path, *, shell: dict | None = None, app: dict | None 
     """Write a synthetic build to ``directory`` (created) and return it."""
     shell = dict(SHELL if shell is None else shell)
     app = dict(APP if app is None else app)
+    # Explicit modes: the loader refuses group- or world-writable entries,
+    # so the fixture must not depend on the umask of whoever runs the tests.
     directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o755)
     for name, contents in (("shell", shell), ("app", app)):
         (directory / name).mkdir(exist_ok=True)
+        (directory / name).chmod(0o755)
         for file, body in contents.items():
             (directory / name / file).write_bytes(body)
+            (directory / name / file).chmod(0o644)
     document = manifest_for(shell, app) if manifest is None else manifest
     (directory / "manifest.json").write_text(json.dumps(document))
+    (directory / "manifest.json").chmod(0o644)
     return directory
 
 

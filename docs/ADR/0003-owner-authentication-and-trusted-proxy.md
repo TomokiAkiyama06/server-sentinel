@@ -583,7 +583,10 @@ gates but no session check, return the same bytes to everyone who passes
 them, and contain no application data or version marker. Their bytes still
 fingerprint the software to anyone who reaches the reserved name, which the
 Owner accepted (S5-5). The application assets (`/app/`, `/app/<name>`) need
-an active session, and loading them does not extend it (S5-3). They are
+an active session, and loading them does not extend it (S5-3). S5-2 also
+relaxes the table's "application assets" row for those assets: any active
+session suffices, with no explicit permission, because each data route still
+checks its own permission and the assets carry no application data. They are
 served from the backend's verified, in-memory copy of the build, since the
 reservation check accepts exactly one proxy route; the current contract is
 in `server/app/auth/README.md`.
