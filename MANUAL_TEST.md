@@ -1792,6 +1792,47 @@ and synthetic invitees, each with their own passkey:
   identity): an invitation (A2) has two, `invite_principal` and
   `issue_principal_invitation`, and every other change (A3-A6) has one.
 
+### Issue #10 phase 2 S4c local emergency revocation over SSH (pending; requires the Owner)
+
+Verified only with a temporary SQLite database, a pseudo-terminal and the
+synthetic ASGI driver with software authenticators
+(`server/tests/test_local_revocation_cli.py`); the command has not been run
+on the real Main Server or against any deployment database. These steps
+change real access state and need the Owner present; they were not executed
+as part of the S4c change. Once a deployment can enable the human routes, on
+the Main Server, with synthetic `*.invalid` invitees and their own test
+passkeys (never a real person's credential):
+
+- [ ] over SSH, as the service account, run `list`
+  (`server/docs/DEPLOYMENT.md`, "Emergency revocation over SSH"); confirm it
+  shows each principal's logical UUID, role, status, grants and display name
+  and each credential's handle, status and label, and no Tailscale login,
+  credential id, key, code or session data; confirm the output with stdout
+  redirected to a file holds nothing else, and that `list` adds no audit
+  record;
+- [ ] with two test invitees signed in from two browsers, make human access
+  closed (stop the reservation check from passing), run `revoke-principal`
+  for invitee A, type `REVOKE`, and confirm the stdout line holds A's logical
+  UUID only and the audit log holds one `revoke_principal` record with that
+  UUID; let the check pass again: A's next request (reload) is the generic
+  denial without a service restart, A's pending code (if any) is refused,
+  and invitee B still works;
+- [ ] register a synced passkey for invitee B on two devices of the same
+  sync account, sign in on both, run `revoke-credential` for that handle
+  and confirm the prompt says it is revoked on all the devices it synced to:
+  both devices' next requests are denied and neither can sign in with it
+  again; record that the revocation is credential-scoped, not per device;
+- [ ] run both commands with the Owner's UUID / handle: each refuses with
+  `owner_target_use_recover` and points to `recover`; repeat a finished
+  revocation: `principal_already_revoked` / `credential_already_revoked`;
+  type anything but `REVOKE`: `owner_confirmation_declined`; run as root,
+  without a controlling terminal (`systemd-run`, `cron`) and as another
+  account: `run_as_service_account` / `controlling_terminal_required`, each
+  changing nothing;
+- [ ] run a revocation while the Owner's Web operation on the same invitee
+  is in flight (for example a grant change submitted right after the
+  command commits): the Web operation is refused and changes nothing.
+
 ### Uninvited ordinary Tailnet member
 
 - [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;

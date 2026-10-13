@@ -153,9 +153,9 @@ record. Every one of them commits inside `admit(epoch)` of the epoch its
 while human access is closed, or after a close, reopen, `stop()` or failed
 tick since that epoch, it is a failed operation with its `failed` record and
 changes nothing (see "Owner access administration" below). An emergency revocation while access is closed is
-done over SSH with a local command (Owner recovery exists since S2, see
-"Bootstrap and recovery commands"; a per-person local revocation command is
-not built yet). The plain wrappers refuse
+done over SSH with a local command: `revoke-principal` / `revoke-credential`
+(S4c) for a person or one credential, `recover` (S2) for the Owner; see
+"Local emergency administration commands" below. The plain wrappers refuse
 with `UnauditedAccessWriteError` unless the store is constructed with
 `unaudited_writes=True` for non-runtime fixtures. Invitation redemption
 (`enroll_credential`) records its own audit row in the redemption transaction
@@ -1337,3 +1337,74 @@ to the terminal fails after the commit, the code is lost
 running server's in-memory state does not change: it sees the new generation
 on its next request. The low-level `establish_session` / `issue_enrollment`
 wrappers stay unreachable from any human route.
+
+### Local emergency administration commands (Issue #10 phase 2 S4c)
+
+`python -m app.auth.bootstrap_cli list|revoke-principal|revoke-credential --config <deployment.json>`
+(Owner decisions D6 and S4-6: exactly these three), for an emergency over
+SSH while human access is closed; they work the same while it is open. The
+deployment steps are in `server/docs/DEPLOYMENT.md` ("Emergency revocation").
+
+- Shared checks. Exactly those of `bootstrap` / `recover`: refused as root
+  and unless running as the configuration's `service_uid`, `--config` loaded
+  as the launcher does, a controlling terminal (`/dev/tty`) required before
+  any change, the existing database file pinned (also for `list`'s read,
+  `_PinnedLedgerDatabase.connect_read_only`) and re-verified before each
+  commit, and the schema exactly this release's. Arguments are non-secret
+  logical UUIDs only.
+- `list` prints on stdout, per principal, its logical UUID, role, status,
+  grants and display name and, per credential, its handle, status and label
+  (from `AccessStore.admin_inventory`, one read-only transaction; nothing is
+  written or audited). Never the last observed proxy identity (D14), a
+  WebAuthn credential id, public key, signature counter, digest, session
+  data or code. Names and labels are quoted with every non-printable
+  character escaped (no terminal control sequence or bidi override reaches
+  the terminal) and cut at 128 characters. Every principal and every
+  credential that is not revoked is always printed, so every target the
+  revocation commands accept is addressable (PR #241 review); only revoked
+  entries, which no command can act on, are cut: at most 64 revoked
+  principals and 8 revoked credentials per principal, printed after the
+  others, the rest counted on a `revoked ... not shown` line. The principals
+  not revoked are bounded by the store (at most 64, S4-8). The credentials
+  not revoked have no store cap; each is a separate redemption of an
+  Owner-issued code (at most one pending per principal), so they grow only
+  by Owner action, and hiding one would leave an active passkey the
+  emergency command could not name.
+- `revoke-principal <principal id>` revokes the person: every credential
+  (each on all the devices it synced to), every pending invitation code and
+  every session, and clears the last observed login
+  (`AccessStore.revoke_principal_on`).
+- `revoke-credential <principal id> <handle>` revokes one credential,
+  named by the handle `list` prints, and ends the sessions it established
+  (`AccessStore.revoke_credential_on`). The prompt and the output say the
+  passkey is revoked on all the devices it synced to: revocation is
+  credential-scoped, never per device.
+- Both show the target (logical UUID, display name, label) on the terminal
+  and read the word `REVOKE` from it. Then one write transaction classifies
+  the target again, reads the time after `BEGIN IMMEDIATE`, applies the same
+  store method as the Web routes and appends `revoke_principal` /
+  `revoke_principal_credential` (actor `owner`, target the principal's
+  logical UUID only); a failed append rolls the revocation back. stdout gets
+  the principal's logical UUID (and the handle). Exit `0`, or `2` with a
+  fixed word on stderr, changing and recording nothing:
+  `owner_target_use_recover` (S4-3: the Owner's credentials change only
+  through `recover`; a second stderr line says so), `principal_not_found`,
+  `principal_already_revoked`, `credential_not_found` (unknown or another
+  principal's handle), `credential_already_revoked`, `principal_id_rejected`
+  / `credential_handle_rejected` (malformed; a credential id is not a
+  handle), `owner_confirmation_declined`, plus the shared refusal words.
+  One refusal comes after the commit: `committed_verification_failed`
+  means the revocation and its audit record are already committed, but
+  re-verifying the pinned database file afterwards failed (renamed or
+  replaced meanwhile); run `list` and check the state directory. A file
+  renamed or replaced while the command waits for the confirmation is
+  refused before the commit (`database_rejected`, nothing changed).
+- Outside the gate. Like `recover` they cannot take the serving process's
+  gate. That is safe because they only reduce access, and the running
+  server re-reads session, credential and principal inside each request's
+  own transaction: the revoked person's or credential's next request is the
+  generic denial, as is an Owner operation already authorized against that
+  principal (the store's `*_on` method refuses a revoked principal or
+  credential in its own transaction). Not admitted through the running
+  server's storage policy (a few bounded rows, as for the pairing CLI), so
+  they must not be run while the state filesystem is at its hard stop.
