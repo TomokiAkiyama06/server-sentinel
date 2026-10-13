@@ -20,11 +20,15 @@ from app.audit.model import AuditAction, AuditOutcome
 from app.auth.bootstrap_cli import recover_owner
 from app.auth.human_surface import (
     ADMIN_PRINCIPALS_PATH, REGISTRATION_OPTIONS_PATH, REGISTRATION_PATH, SESSION_COOKIE,
-    SESSION_PATH, match_route,
+    SESSION_PATH, HumanAccess, HumanAccessConfiguration, HumanAccessUnavailable, match_route,
 )
 from app.auth.invitation_code import new_invitation_code, parse_invitation_code
 from app.auth.model import AccessValidationError, Permission
-from app.auth.rate_limit import SourceRateLimiter
+from app.auth.passkeys import PasskeyCeremonies
+from app.auth.rate_limit import (
+    ADMIN_MAX_SESSIONS, ADMIN_PER_SESSION_CAPACITY, ADMIN_PER_SESSION_REFILL_SECONDS, SourceRateLimiter,
+    admin_rate_limiter,
+)
 from app.auth.store import MAX_PRINCIPALS, Requirement
 from app.logging import SafeJsonFormatter
 
@@ -65,6 +69,9 @@ class AdminRouteFixture(StepUpFixture):
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.access.redemption_limiter = SourceRateLimiter(
+            per_source_capacity=1000, global_capacity=None, monotonic=self.limit_clock)
+        # Lenient here; RateLimitTests installs the real shape.
+        self.access.admin_limiter = SourceRateLimiter(
             per_source_capacity=1000, global_capacity=None, monotonic=self.limit_clock)
         self.owner, self.owner_key, _, self.owner_cookie, self.owner_csrf = await self.owner_session()
         self.target, self.target_key, self.target_credential = self.enroll((Permission.LIVE_VIEW,))
@@ -517,6 +524,11 @@ class BodyTests(AdminRouteFixture):
                 {"display_name": "", "permissions": []}, {"display_name": "x" * 65, "permissions": []},
                 {"display_name": "bad\nname", "permissions": []}, {"display_name": "bad\x7fname", "permissions": []},
                 {"display_name": "bad\x85name", "permissions": []}, {"display_name": 7, "permissions": []},
+                # Format (Cf: bidirectional overrides and isolates, zero-width,
+                # BOM), line and paragraph separators (Zl, Zp; PR #242 review).
+                *({"display_name": f"bad{char}name", "permissions": []}
+                  for char in ("\u202e", "\u202a", "\u2066", "\u2069", "\u200b", "\u200d", "\u200e",
+                               "\ufeff", "\u2028", "\u2029")),
                 {"display_name": None, "permissions": []}, {"display_name": [NAME], "permissions": []},
                 {"display_name": NAME, "permissions": ["live:view", "live:view"]},
                 {"display_name": NAME, "permissions": ["admin"]},
@@ -614,8 +626,8 @@ class StepUpTests(AdminRouteFixture):
         surface = self.surface
         real = surface._owner_operation
 
-        async def then_age(request):
-            context = await real(request)
+        async def then_age(request, **kwargs):
+            context = await real(request, **kwargs)
             self.elapse(minutes=5)
             return context
 
@@ -642,8 +654,8 @@ class GateRaceTests(AdminRouteFixture):
             with self.subTest(route=route):
                 state = {}
 
-                async def paused(request):
-                    context = await real(request)
+                async def paused(request, **kwargs):
+                    context = await real(request, **kwargs)
                     interrupt()
                     state["access"] = self.access_state()
                     state["records"] = self.admin_records()
@@ -721,6 +733,249 @@ class GateRaceTests(AdminRouteFixture):
             self.assertEqual(await self.admin("GET", PRINCIPALS), GENERIC)
         self.reopen_access()
         self.assertEqual(status(await self.admin("GET", PRINCIPALS)), 200)
+
+
+class InventoryRaceTests(AdminRouteFixture):
+    """A1 re-checks the Owner session inside its own read transaction (PR
+    #242 review): the local recover and revocation commands commit outside
+    the gate without moving its epoch, so only that re-check stops an
+    inventory reaching a session they ended after the authorization."""
+
+    def us(self):
+        return int(self.ceremony_clock().timestamp() * 1_000_000)
+
+    def sql(self, statement, parameters=()):
+        with closing(self.database.connect()) as connection:
+            connection.execute(statement, parameters)
+
+    async def read_after(self, interrupt):
+        surface = self.surface
+        real = surface._authorize
+        epochs = []
+
+        async def then_interrupt(*args, **kwargs):
+            authorized = await real(*args, **kwargs)
+            try:
+                interrupt()
+                epochs.append((authorized.epoch, self.access.epoch()))
+            except Exception as error:  # surfaced below, not as a denial
+                epochs.append(error)
+            return authorized
+
+        before = self.access_state()
+        with patch.object(surface, "_authorize", side_effect=then_interrupt):
+            result = await self.admin("GET", PRINCIPALS)
+        # The gate epoch did not move: only the in-transaction re-check refuses.
+        self.assertEqual(len(epochs), 1)
+        self.assertEqual(epochs[0][0], epochs[0][1])
+        self.assertEqual(result, GENERIC)
+        self.assertNotIn(str(self.target.id).encode(), result[1]["body"])
+        return before
+
+    async def test_a_local_recover_between_authorization_and_read_returns_nothing(self):
+        def recover():
+            secret, _ = new_invitation_code()
+            recover_owner(self.store, secret, at=self.ceremony_clock())
+
+        await self.read_after(recover)
+        self.assertIsNone(await self.session_of(self.owner_cookie))
+
+    async def test_a_session_ended_between_authorization_and_read_returns_nothing(self):
+        before = await self.read_after(lambda: self.sql(
+            "UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE principal_id=?",
+            (self.us(), str(self.owner.id))))
+        self.assertEqual(self.access_state(), before)
+
+    async def test_a_credential_revoked_between_authorization_and_read_returns_nothing(self):
+        await self.read_after(lambda: self.sql(
+            "UPDATE access_credentials SET revoked_at_us=? WHERE principal_id=?", (self.us(), str(self.owner.id))))
+
+    async def test_a_generation_advanced_between_authorization_and_read_returns_nothing(self):
+        await self.read_after(lambda: self.sql(
+            "UPDATE access_deployment_state SET authorization_generation=authorization_generation+1 "
+            "WHERE singleton=1"))
+
+    async def test_an_authorization_revision_bump_between_authorization_and_read_returns_nothing(self):
+        await self.read_after(lambda: self.sql(
+            "UPDATE access_principals SET authorization_revision=authorization_revision+1 WHERE id=?",
+            (str(self.owner.id),)))
+
+    async def test_the_recheck_writes_nothing_and_does_not_require_freshness(self):
+        self.elapse(minutes=6)  # stale: OWNER_READ still serves the inventory
+        rows = self.session_rows()
+        surface = self.surface
+        real = surface._authorize
+        after_authorization = []
+
+        async def capture(*args, **kwargs):
+            authorized = await real(*args, **kwargs)
+            after_authorization.append(self.session_rows())
+            return authorized
+
+        with patch.object(surface, "_authorize", side_effect=capture):
+            result = await self.admin("GET", PRINCIPALS)
+        self.assertEqual(status(result), 200)
+        # Only the authorization's own idle touch; the re-check and the read
+        # write nothing.
+        self.assertEqual(self.session_rows(), after_authorization[0])
+        self.assertNotEqual(after_authorization[0], rows)  # the authorization's touch
+
+    async def test_the_store_recheck_refuses_anything_but_a_session_view(self):
+        for view in (object(), "x", 1):
+            with self.subTest(view=type(view).__name__):
+                with self.assertRaises(AccessValidationError):
+                    self.store.admin_inventory(owner_session=view)
+
+
+class RateLimitTests(AdminRouteFixture):
+    """Owner decision 2026-10-13: a coarse per-session limiter for A2-A6."""
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.access.admin_limiter = admin_rate_limiter(monotonic=self.limit_clock)
+
+    def noop(self, cookie=OMIT, csrf=OMIT):
+        # A grant the target already holds: a "requested, no change" record.
+        return self.admin("POST", f"{PRINCIPALS}/{self.target.id}/permissions",
+                          {"permission": "live:view", "granted": True}, cookie=cookie, csrf=csrf)
+
+    async def test_the_default_shape(self):
+        limiter = admin_rate_limiter()
+        self.assertEqual((ADMIN_PER_SESSION_CAPACITY, ADMIN_PER_SESSION_REFILL_SECONDS, ADMIN_MAX_SESSIONS),
+                         (20, 3.0, 256))
+        self.assertEqual((limiter.per_source_capacity, limiter.per_source_refill_seconds,
+                          limiter.global_capacity, limiter.max_sources), (20, 3.0, None, 256))
+
+    async def test_a_burst_over_the_limit_is_the_generic_denial_with_nothing_written(self):
+        for _ in range(ADMIN_PER_SESSION_CAPACITY):
+            self.assertEqual(status(await self.noop()), 204)
+        before = self.snapshot()
+        work = []
+        real_epoch = self.access.epoch
+
+        def epoch(*args, **kwargs):
+            work.append("gate")
+            return real_epoch(*args, **kwargs)
+
+        with patch.object(self.access, "epoch", side_effect=epoch), \
+                patch.object(self.access.administration, "change_permission") as change, \
+                patch.object(self.access.administration, "invite") as invite:
+            for name, (method, path, body) in self.mutations().items():
+                with self.subTest(route=name):
+                    self.assertEqual(await self.admin(method, path, body), GENERIC)
+        self.assertEqual(work, [])
+        change.assert_not_called()
+        invite.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.access.admin_limiter.limited, len(self.mutations()))
+        # The read is not charged, and the session itself still works.
+        self.assertEqual(status(await self.admin("GET", PRINCIPALS)), 200)
+        self.assertIsNotNone(await self.session_of(self.owner_cookie))
+
+    async def test_the_bucket_refills_one_change_every_three_seconds(self):
+        for _ in range(ADMIN_PER_SESSION_CAPACITY):
+            self.assertEqual(status(await self.noop()), 204)
+        self.assertEqual(await self.noop(), GENERIC)
+        self.limit_clock.value += ADMIN_PER_SESSION_REFILL_SECONDS - 0.5
+        self.assertEqual(await self.noop(), GENERIC)
+        self.limit_clock.value += 0.5
+        self.assertEqual(status(await self.noop()), 204)
+        self.assertEqual(await self.noop(), GENERIC)
+        self.limit_clock.value += ADMIN_PER_SESSION_REFILL_SECONDS * ADMIN_PER_SESSION_CAPACITY
+        for _ in range(ADMIN_PER_SESSION_CAPACITY):
+            self.assertEqual(status(await self.noop()), 204)
+        self.assertEqual(await self.noop(), GENERIC)
+
+    async def test_sessions_have_separate_buckets(self):
+        # A non-Owner session exhausting its own bucket spends nothing of the Owner's.
+        for _ in range(ADMIN_PER_SESSION_CAPACITY + 5):
+            self.assertEqual(await self.noop(cookie=self.target_cookie, csrf=self.target_csrf), GENERIC)
+        self.assertEqual(self.access.admin_limiter.limited, 5)
+        for _ in range(ADMIN_PER_SESSION_CAPACITY):
+            self.assertEqual(status(await self.noop()), 204)
+        self.assertEqual(await self.noop(), GENERIC)
+        # A second Owner session (the Owner signed in again) has its own bucket.
+        cookie = await self.sign_in(self.owner_key)
+        csrf = await self.csrf(cookie)
+        self.assertEqual(status(await self.noop(cookie=cookie, csrf=csrf)), 204)
+        self.assertEqual(await self.noop(), GENERIC)
+
+    async def test_forged_or_absent_cookies_are_never_charged(self):
+        for _ in range(ADMIN_PER_SESSION_CAPACITY * 3):
+            self.assertEqual(await self.noop(cookie=FORGED), GENERIC)
+            self.assertEqual(await self.noop(cookie=None), GENERIC)
+        for _ in range(ADMIN_PER_SESSION_CAPACITY * 2):
+            self.assertEqual(status(await self.admin("GET", PRINCIPALS)), 200)
+        self.assertEqual((self.access.admin_limiter.sources(), self.access.admin_limiter.limited), (0, 0))
+        for _ in range(ADMIN_PER_SESSION_CAPACITY):
+            self.assertEqual(status(await self.noop()), 204)
+
+    async def test_the_key_is_not_logged_and_not_the_identity(self):
+        records = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = Capture(level=logging.DEBUG)
+        logger = logging.getLogger("app.auth.rate_limit")
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+        for _ in range(ADMIN_PER_SESSION_CAPACITY + 2):
+            await self.noop()
+        self.assertTrue(records)
+        token = self.owner_cookie.split("=", 1)[1]
+        for record in records:
+            text = repr(record.__dict__)
+            for value in (token, VIEWER, self.owner_csrf):
+                self.assertNotIn(value, text)
+        # One bucket for the one session charged (keyed per session).
+        self.assertEqual(self.access.admin_limiter.sources(), 1)
+
+    def test_the_admin_limiter_cannot_be_shared(self):
+        default = HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+                              ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
+                                                           clock=self.ceremony_clock),
+                              reservation=self.check)
+        limiter = default.admin_limiter
+        self.assertEqual((limiter.per_source_capacity, limiter.per_source_refill_seconds,
+                          limiter.global_capacity), (20, 3.0, None))
+        self.assertEqual(len({id(default.rate_limiter), id(default.redemption_limiter),
+                              id(default.step_up_limiter), id(limiter)}), 4)
+        shared = SourceRateLimiter()
+        for limiters in ({"rate_limiter": shared, "admin_limiter": shared},
+                         {"redemption_limiter": shared, "admin_limiter": shared},
+                         {"step_up_limiter": shared, "admin_limiter": shared},
+                         {"admin_limiter": object()}):
+            with self.subTest(limiters=sorted(limiters)):
+                ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=self.check,
+                                               clock=self.ceremony_clock)
+                with self.assertRaises(HumanAccessUnavailable):
+                    HumanAccess(HumanAccessConfiguration(enabled=True), store=self.store,
+                                ceremonies=ceremonies, reservation=self.check, **limiters)
+
+
+class CommittedResponseTests(AdminRouteFixture):
+    """Nothing that can refuse runs after an A2 / A3 commit (PR #242 review)."""
+
+    async def test_a_naive_expiry_is_refused_before_the_commit(self):
+        for name, method_name in (("A2 invite", "invite_with_invitation_on"),
+                                  ("A3 re-issue", "reissue_invitation_on")):
+            with self.subTest(route=name):
+                real = getattr(self.store, method_name)
+                method, path, body = self.mutations()[name]
+                state = self.access_state()
+                failed = len([outcome for outcome in self.outcomes(
+                    AuditAction.INVITE_PRINCIPAL if name == "A2 invite"
+                    else AuditAction.ISSUE_PRINCIPAL_INVITATION) if outcome is AuditOutcome.FAILED])
+                with patch.object(self.store, method_name,
+                                  side_effect=lambda *a, **k: real(*a, **k).replace(tzinfo=None)):
+                    self.assertEqual(await self.admin(method, path, body), GENERIC)
+                self.assertEqual(self.access_state(), state)
+                action = AuditAction.INVITE_PRINCIPAL if name == "A2 invite" else AuditAction.ISSUE_PRINCIPAL_INVITATION
+                self.assertEqual(len([outcome for outcome in self.outcomes(action)
+                                      if outcome is AuditOutcome.FAILED]), failed + 1)
+                self.assertEqual(status(await self.admin(method, path, body)), 200)
 
 
 class HygieneTests(AdminRouteFixture):

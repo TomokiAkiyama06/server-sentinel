@@ -89,12 +89,21 @@ only in the request body and is decoded strictly
 (``invitation_code.parse_invitation_code``) before the gate; a code that does
 not parse never reaches SQLite. Session routes are not charged; a forged or
 stale cookie is refused by a read-only token lookup before the gate or any
-SQLite write lock. The administration routes are not charged either: only a
-fresh Owner session with its CSRF token reaches an administration write or
-its audit record (every other caller is refused inside the authorization),
-their state is bounded by the S4-8 limits, and every write goes through the
-storage admission. No live, recording, timeline, event, health or version
-route is mounted here. The step-up routes require ``OWNER_READ`` (an Owner
+SQLite write lock. The administration changes A2-A6 are charged to a fourth,
+separate limiter (``admin_rate_limiter``, Owner decision 2026-10-13): per
+session a burst of 20 and one more every 3 seconds, keyed on a
+domain-separated digest of the session token and charged inside
+``_authorize`` right after the read-only session pre-check found a current
+session and before the gate, any SQLite write or audit work. A request over
+the limit is the generic denial and writes nothing, no audit record
+included; a forged cookie is refused by the pre-check before it is charged,
+and each session spends only its own bucket, so another person's session
+cannot spend the Owner's. The inventory read A1 is not charged. Beyond the
+limiter, only a fresh Owner session with its CSRF token reaches an
+administration write or its audit record (every other caller is refused
+inside the authorization), their state is bounded by the S4-8 limits, and
+every write goes through the storage admission. No live, recording,
+timeline, event, health or version route is mounted here. The step-up routes require ``OWNER_READ`` (an Owner
 session, fresh or stale),
 so a non-Owner gets the generic denial inside the authorization transaction.
 Neither step-up route commits an idle touch: only a successful step-up
@@ -120,6 +129,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -143,7 +153,9 @@ from .invitation_code import InvalidInvitationCode, parse_invitation_code
 from .model import Credential, Permission
 from .owner_operation import HumanOwnerAuthorizer, OwnerOperationContext
 from .passkeys import DeviceBoundCredentialRequired, PasskeyCeremonies, SessionGrant
-from .rate_limit import SourceRateLimiter, redemption_rate_limiter, step_up_rate_limiter
+from .rate_limit import (
+    SourceRateLimiter, admin_rate_limiter, redemption_rate_limiter, step_up_rate_limiter,
+)
 from .reservation import HostnameReservationCheck
 from .reservation_store import ListenerExceptionStore, ReservationSessionRevocation
 from .serving_gate import ServingGate
@@ -181,6 +193,7 @@ _TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
 # A path id: a canonical lower-case UUID only (``str(UUID(...))`` form), so
 # an upper-case, brace, URN or hex-only spelling matches no route.
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_ADMIN_LIMIT_DOMAIN = b"ServerSentinel admin change rate limit v1\x00"
 _DENIAL_BODY = b'{"detail":"Not Found"}'
 _STEP_UP_BODY = b'{"detail":"step_up_required"}'
 _DEVICE_BOUND_BODY = b'{"detail":"device_bound_credential_required"}'
@@ -519,10 +532,16 @@ def _label(value: object) -> str | None:
     return value
 
 
+_REFUSED_NAME_CATEGORIES = frozenset(("Cc", "Cf", "Cs", "Zl", "Zp"))
+
+
 def _display_name(value: object) -> str:
-    """An invitee's display name: 1-64 characters, no control or surrogate character."""
+    """An invitee's display name: 1-64 characters, none of them a control,
+    format (bidirectional overrides and isolates, zero-width characters),
+    surrogate, line separator or paragraph separator character (``Cc``,
+    ``Cf``, ``Cs``, ``Zl``, ``Zp``; PR #242 review)."""
     if (not isinstance(value, str) or not 1 <= len(value) <= MAX_DISPLAY_NAME
-            or any(unicodedata.category(char) in ("Cc", "Cs") for char in value)):
+            or any(unicodedata.category(char) in _REFUSED_NAME_CATEGORIES for char in value)):
         raise _Denied()
     return value
 
@@ -547,9 +566,12 @@ def _permission_list(value: object) -> tuple[Permission, ...]:
     return permissions
 
 
-def _iso(value: object) -> str:
-    if not isinstance(value, datetime) or value.tzinfo is None:
-        raise _Denied()
+def _utc_iso(value: datetime) -> str:
+    """An aware ``datetime`` as ISO 8601 UTC; used after a commit, so it never refuses.
+
+    ``AccessAdministration`` refuses a naive or non-``datetime`` expiry
+    inside the mutation's transaction, before the commit.
+    """
     return value.astimezone(timezone.utc).isoformat()
 
 
@@ -559,9 +581,10 @@ class HumanAccess:
     Refuses construction unless the deployment explicitly enabled it, the
     session gate is a ``HostnameReservationCheck`` with every opening input
     configured (resolver, socket owners, own sockets, unprivileged port
-    start, session revoker), the three rate limiters are distinct
+    start, session revoker), the four rate limiters are distinct
     ``SourceRateLimiter`` objects (sign-in, invitation redemption per Owner
-    decision D4, and Owner step-up per Owner decision 2026-10-12), the ceremonies use exactly that gate and this
+    decision D4, Owner step-up per Owner decision 2026-10-12, and the Owner
+    administration changes per Owner decision 2026-10-13), the ceremonies use exactly that gate and this
     audited access store with a session-binding key, and the relying party
     is the reserved https origin. A missing or substituted gate is never
     accepted (Issue #181 item 3). The gate's session revoker must be a
@@ -593,6 +616,7 @@ class HumanAccess:
                  rate_limiter: SourceRateLimiter | None = None,
                  redemption_limiter: SourceRateLimiter | None = None,
                  step_up_limiter: SourceRateLimiter | None = None,
+                 admin_limiter: SourceRateLimiter | None = None,
                  tick_seconds: float = DEFAULT_TICK_SECONDS):
         if not isinstance(configuration, HumanAccessConfiguration) or configuration.enabled is not True:
             raise HumanAccessUnavailable()
@@ -616,7 +640,7 @@ class HumanAccess:
         origin, host = reserved_origin(reservation)
         if ceremonies.rp.origin != origin or ceremonies.rp.rp_id != reservation.config.hostname:
             raise HumanAccessUnavailable()
-        limiters = [limiter for limiter in (rate_limiter, redemption_limiter, step_up_limiter)
+        limiters = [limiter for limiter in (rate_limiter, redemption_limiter, step_up_limiter, admin_limiter)
                     if limiter is not None]
         if any(not isinstance(limiter, SourceRateLimiter) for limiter in limiters):
             raise HumanAccessUnavailable()
@@ -635,6 +659,7 @@ class HumanAccess:
         self.rate_limiter = rate_limiter or SourceRateLimiter()
         self.redemption_limiter = redemption_limiter or redemption_rate_limiter()
         self.step_up_limiter = step_up_limiter or step_up_rate_limiter()
+        self.admin_limiter = admin_limiter or admin_rate_limiter()
         self.origin = origin
         self.host = host
         self.tick_seconds = float(tick_seconds)
@@ -966,7 +991,7 @@ class HumanSurface:
         await getattr(self, route.handler)(request)
 
     async def _authorize(self, request: _Request, requirement: Requirement, *,
-                         touch: bool = True) -> _Authorized:
+                         touch: bool = True, charge: Callable[[bytes], None] | None = None) -> _Authorized:
         """Authorize a session-bearing request inside the gate.
 
         Order: the cookie's form; a read-only token pre-check that takes no
@@ -977,7 +1002,10 @@ class HumanSurface:
         refusal is ``_Denied``; only ``StepUpRequired`` on ``OWNER_OP`` is
         ``_StepUp``. The store releases the gate before its denial
         bookkeeping. ``touch=False`` (the step-up routes only) makes the same
-        checks without committing the idle touch.
+        checks without committing the idle touch. ``charge`` (the
+        administration changes only) is called with the token right after
+        the pre-check found a current session and before the gate epoch: a
+        refusal there is ``_Denied`` and nothing is locked or written.
         """
         if requirement is Requirement.PRE_CREDENTIAL or requirement is not request.route.requirement:
             raise _Denied()
@@ -990,6 +1018,8 @@ class HumanSurface:
             raise _Denied() from None
         if known is not True:
             raise _Denied()
+        if charge is not None:
+            charge(token)
         try:
             epoch = await asyncio.to_thread(access.epoch)
             if epoch is None:
@@ -1007,7 +1037,8 @@ class HumanSurface:
             raise _Denied()
         return _Authorized(session, epoch)
 
-    async def _owner_operation(self, request: _Request) -> OwnerOperationContext:
+    async def _owner_operation(self, request: _Request, *,
+                               charge: Callable[[bytes], None] | None = None) -> OwnerOperationContext:
         """Authorize an ``OWNER_OP`` route and return its administration context.
 
         The only producer of ``OwnerOperationContext`` (Issue #10 phase 2
@@ -1018,7 +1049,7 @@ class HumanSurface:
         commits the mutation inside ``admit`` of the same epoch and re-reads
         the session in its own transaction.
         """
-        authorized = await self._authorize(request, Requirement.OWNER_OP)
+        authorized = await self._authorize(request, Requirement.OWNER_OP, charge=charge)
         return OwnerOperationContext(authorized.session, authorized.epoch)
 
     # -- routes --------------------------------------------------------
@@ -1033,6 +1064,18 @@ class HumanSurface:
 
     def _limit_step_up(self, identity: str) -> None:
         if not self.access.step_up_limiter.allow(identity):
+            raise _Denied()
+
+    def _limit_admin(self, token: bytes) -> None:
+        """Charge one administration change to its session's bucket (Owner decision 2026-10-13).
+
+        The key is a domain-separated SHA-256 of the session token that the
+        read-only pre-check has just found current: derived server-side from
+        that session, never the proxy identity (shared by the room) and never
+        logged (the limiter logs value-free and hashes the key again).
+        """
+        key = hashlib.sha256(_ADMIN_LIMIT_DOMAIN + token).hexdigest()
+        if not self.access.admin_limiter.allow(key):
             raise _Denied()
 
     async def _body(self, request: _Request, *, json_required: bool) -> bytes:
@@ -1296,9 +1339,11 @@ class HumanSurface:
         Owner target, a limit, a gate change, a session that ended or whose
         verification is no longer fresh at the commit) is the generic
         denial: the 403 is decided only by the authorization, which committed
-        no idle touch for it (S4-2).
+        no idle touch for it (S4-2). The change is charged to the session's
+        administration bucket inside the authorization, before the gate
+        (``_limit_admin``); over the limit nothing is written or audited.
         """
-        context = await self._owner_operation(request)
+        context = await self._owner_operation(request, charge=self._limit_admin)
         try:
             return await asyncio.to_thread(operation, context)
         except Exception:
@@ -1308,7 +1353,12 @@ class HumanSurface:
         """A1 ``GET /api/admin/principals`` (``OWNER_READ``).
 
         The read runs inside ``admit`` of the authorization's epoch, so a
-        close, reopen or ``stop()`` after the authorization returns nothing.
+        close, reopen or ``stop()`` after the authorization returns nothing,
+        and the same read transaction re-checks the Owner session first
+        (``admin_inventory(owner_session=...)``, ``OWNER_READ`` semantics: no
+        freshness requirement, no idle touch; PR #242 review): a local
+        ``recover`` or revocation, which commits outside the gate without
+        moving its epoch, after the authorization returns nothing either.
         The body is ``{"principals": [...]}`` from ``admin_inventory``: no
         proxy identity (D14), credential id, public key, counter, digest or
         session data.
@@ -1318,7 +1368,7 @@ class HumanSurface:
 
         def read():
             with access.admit(authorized.epoch):
-                return access.store.admin_inventory()
+                return access.store.admin_inventory(owner_session=authorized.session)
 
         try:
             inventory = await asyncio.to_thread(read)
@@ -1342,10 +1392,11 @@ class HumanSurface:
         administration = self.access.administration
         principal_id, code, expires_at = await self._administer(
             request, lambda context: administration.invite(context, name, permissions, epoch=context.epoch))
-        if not isinstance(principal_id, UUID) or not isinstance(code, str):
-            raise _Denied()
+        # Committed: nothing below may refuse (PR #242 review). The id is a
+        # uuid4, the code was checked to be a str and the expiry to be an
+        # aware datetime before the commit (``AccessAdministration``).
         await self._json(request.send, 200, {
-            "principal_id": str(principal_id), "code": code, "expires_at": _iso(expires_at),
+            "principal_id": str(principal_id), "code": code, "expires_at": _utc_iso(expires_at),
         })
 
     async def _admin_reissue(self, request: _Request) -> None:
@@ -1355,9 +1406,8 @@ class HumanSurface:
         code, expires_at = await self._administer(
             request, lambda context: administration.reissue_invitation(context, principal_id,
                                                                        epoch=context.epoch))
-        if not isinstance(code, str):
-            raise _Denied()
-        await self._json(request.send, 200, {"code": code, "expires_at": _iso(expires_at)})
+        # Committed: nothing below may refuse (see ``_admin_invite``).
+        await self._json(request.send, 200, {"code": code, "expires_at": _utc_iso(expires_at)})
 
     async def _admin_permission(self, request: _Request) -> None:
         """A4: grant or withdraw one permission as a delta (S4-5); ``204``.

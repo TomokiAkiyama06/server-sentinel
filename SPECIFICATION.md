@@ -1843,7 +1843,13 @@ authorization revision, the current deployment generation, and the
 invitation clock check on both clocks with a recorded boot pair; Issue #240).
 A code failing any of them is not pending and does not block a new one, and
 issuing a code marks every other unused code of that principal revoked in
-the same transaction, so at most one code can ever become redeemable. A grant
+the same transaction, so at most one code can ever become redeemable. The
+attempt bound limits starting a redemption, not finishing one: the challenge
+issued by the fifth attempt stays usable until it expires, so that attempt can
+still complete the enrollment although the code is no longer shown as pending.
+This is safe: the challenge is single use and bound to that invitation, the
+finish re-checks every other condition, and no further challenge can be
+obtained for the code. A grant
 change that changes nothing still writes one `change_principal_permissions`
 record with outcome `succeeded`, meaning "requested, no change"; the audit
 vocabulary has no separate outcome for it.
@@ -1872,15 +1878,24 @@ Each change needs the exact `Origin` and `X-CSRF-Token`; its body
 (`application/json`, bounded, one object with no duplicate or extra member) is
 validated before the authorization, which runs inside `admit(epoch)`, and the
 change commits through the administration inside `admit` of the same epoch.
-The inventory read runs inside `admit` of its authorization's epoch. Every
+The inventory read runs inside `admit` of its authorization's epoch and
+re-checks the Owner session in its own read transaction before reading
+(without the freshness requirement and without an idle touch), so a local
+recover or revocation after the authorization returns nothing. Every
 response is `no-store`. Every refusal is the generic `404` — anyone but a
 current Owner session, a missing or wrong CSRF token or `Origin`, another
 proxy identity, a closed or stopped surface, a bad path id, an unknown,
 revoked or Owner target, another principal's handle, a malformed body, a
 limit, or a change refused at the commit — except `403 step_up_required` for
 an otherwise valid but stale Owner session on a change, decided by the
-authorization with no state change and no idle touch. The routes are not
-rate-limited: only a fresh Owner session reaches an administration write.
+authorization with no state change and no idle touch. The changes A2-A6
+are charged to their own per-session rate limiter (Owner decision
+2026-10-13: a burst of 20, one more every 3 seconds, no global bucket, a
+bounded table of 256 sessions), keyed server-side on a digest of the session
+token after the read-only session pre-check and before the gate or any
+SQLite or audit work; over the limit the change is the generic `404` and
+writes nothing, no audit record included. The inventory read is not
+charged.
 
 Exactly two HTTP routes run before a credential exists, and the pair is closed.
 Owner bootstrap is not a third one: it is a local action on the host that feeds

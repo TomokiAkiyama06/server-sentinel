@@ -594,6 +594,15 @@ class AccessStore:
         (``issue_enrollment_on``) and the inventory (``admin_inventory``) use
         this one definition, so a code shown as pending is one that blocks a
         second code and one that a redemption would accept.
+
+        The attempt bound applies to starting a redemption, not to finishing
+        one: the fifth ``begin_registration`` makes the code no longer pending
+        (``attempt_count`` reaches ``MAX_REDEMPTION_ATTEMPTS``), yet the
+        challenge it issued stays usable until it expires, so a fifth attempt
+        can still complete the enrollment. That is safe (PR #242 review): the
+        challenge is single use and bound to that one invitation, the finish
+        re-checks every other condition above in its own transaction, and no
+        further challenge can be obtained for the code.
         """
         generation = connection.execute(
             "SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
@@ -1398,7 +1407,7 @@ class AccessStore:
         connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
 
     def require_owner_session_on(self, connection, view: "SessionView", at: datetime, *,
-                                 freshness: timedelta = OWNER_STEP_UP_FRESHNESS) -> None:
+                                 freshness: timedelta | None = OWNER_STEP_UP_FRESHNESS) -> None:
         """Re-check, inside an Owner operation's own transaction, that its session still holds.
 
         ``view`` is the ``SessionView`` the request's ``OWNER_OP``
@@ -1416,6 +1425,10 @@ class AccessStore:
         the authorization under the same epoch. A stale verification raises
         ``StepUpRequired``; anything else the generic ``AccessValidationError``.
         Nothing is written, so the session's idle expiry does not move.
+
+        ``freshness=None`` is the ``OWNER_READ`` form (the A1 inventory, PR
+        #242 review): every check above except the verification freshness, so
+        a stale Owner session is still served, and never ``StepUpRequired``.
         """
         if (not isinstance(view, SessionView) or view.role is not PrincipalRole.OWNER
                 or type(view.authorization_revision) is not int or not isinstance(view.credential_id, bytes)):
@@ -1439,10 +1452,10 @@ class AccessStore:
                    and now < row["idle_expires_at_us"] and now < row["absolute_expires_at_us"])
         if not current:
             raise AccessValidationError("access is unavailable")
-        if self._verification_stale(row, at, freshness):
+        if freshness is not None and self._verification_stale(row, at, freshness):
             raise StepUpRequired()
 
-    def admin_inventory(self) -> tuple[dict, ...]:
+    def admin_inventory(self, *, owner_session: "SessionView | None" = None) -> tuple[dict, ...]:
         """The Owner's read-only view of every principal (Issue #10 phase 2 S4).
 
         One read transaction (``mode=ro``, nothing written). Per principal,
@@ -1460,12 +1473,27 @@ class AccessStore:
         D14: a shared account does not tell people apart), WebAuthn credential
         ids, public keys, signature counters, invitation digests and lookup
         keys, and all session data.
+
+        ``owner_session`` (the human A1 route, PR #242 review): the
+        ``SessionView`` its ``OWNER_READ`` authorization returned. The same
+        read transaction first re-checks that session with
+        ``require_owner_session_on(..., freshness=None)`` and only then reads
+        the inventory, so both come from one snapshot. The local ``recover``
+        and revocation commands commit outside the serving gate (D6) and do
+        not move its epoch; a session they ended (or a generation they
+        advanced) after the authorization is refused here with the generic
+        ``AccessValidationError`` and nothing is returned. Nothing is
+        written: no idle touch. Local callers (tests, the local CLI) omit it.
         """
         def iso(value):
             return None if value is None else _time(value).isoformat()
 
         with self._transaction() as connection:
             now = self.now()
+            if owner_session is not None:
+                # First, so the session check and the inventory share the
+                # snapshot of the transaction's first read.
+                self.require_owner_session_on(connection, owner_session, now, freshness=None)
             principals = connection.execute(
                 "SELECT id, display_name, role, status, created_at_us, revoked_at_us FROM access_principals "
                 "ORDER BY created_at_us, id").fetchall()

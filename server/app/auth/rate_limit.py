@@ -43,6 +43,16 @@ instance (``step_up_rate_limiter``, Owner decision 2026-10-12): the same
 shape as redemption (per source a burst of 5 and one more every 12 seconds,
 no global bucket), so a sign-in flood cannot stop the Owner from stepping up
 and a step-up flood never spends the sign-in buckets.
+
+The Owner administration changes (Issue #10 phase 2 S4b, routes A2-A6) use a
+fourth, separate instance (``admin_rate_limiter``, Owner decision
+2026-10-13): a coarse bucket per session, a burst of 20 and one more every 3
+seconds, no global bucket. Its source key is not the proxy identity (shared
+by the room) but a domain-separated digest of the session token, computed by
+the human surface only after the read-only session pre-check found a current
+session for it, so each session (the Owner's included) spends only its own
+bucket, and a forged cookie is refused before it is charged. The key is
+never logged; the table is bounded by ``max_sources`` like every limiter.
 """
 
 from __future__ import annotations
@@ -207,5 +217,21 @@ def step_up_rate_limiter(*, max_sources: int = 256,
     """The separate limiter for the Owner step-up routes; per source only."""
     return SourceRateLimiter(per_source_capacity=STEP_UP_PER_SOURCE_CAPACITY,
                              per_source_refill_seconds=STEP_UP_PER_SOURCE_REFILL_SECONDS,
+                             global_capacity=None,
+                             max_sources=max_sources, monotonic=monotonic)
+
+
+# Owner decision 2026-10-13 (PR #242): the administration changes A2-A6 get a
+# coarse per-session bucket: a burst of 20 changes, one more every 3 seconds.
+ADMIN_PER_SESSION_CAPACITY = 20
+ADMIN_PER_SESSION_REFILL_SECONDS = 3.0
+ADMIN_MAX_SESSIONS = 256
+
+
+def admin_rate_limiter(*, max_sources: int = ADMIN_MAX_SESSIONS,
+                       monotonic: Callable[[], float] = time.monotonic) -> SourceRateLimiter:
+    """The separate limiter for the Owner administration changes; per session only."""
+    return SourceRateLimiter(per_source_capacity=ADMIN_PER_SESSION_CAPACITY,
+                             per_source_refill_seconds=ADMIN_PER_SESSION_REFILL_SECONDS,
                              global_capacity=None,
                              max_sources=max_sources, monotonic=monotonic)

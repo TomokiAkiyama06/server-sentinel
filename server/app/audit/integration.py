@@ -1,5 +1,6 @@
 """Runtime integration for Owner-authorized administrative mutations."""
 
+from datetime import datetime
 from uuid import UUID, uuid4
 
 from app.auth.invitation_code import new_invitation_code
@@ -260,6 +261,19 @@ class AccessAdministration:
             followed_by=followed_by,
         )
 
+    @staticmethod
+    def _expiry(value):
+        """An invitation expiry checked inside the mutation's transaction.
+
+        The human A2/A3 routes format it into their response after the
+        commit (PR #242 review): an expiry that is not an aware ``datetime``
+        is refused here, before the commit, so that formatting cannot fail
+        and no refusal is ever returned for a change that was committed.
+        """
+        if not isinstance(value, datetime) or value.utcoffset() is None:
+            raise AccessValidationError("invitation is unavailable")
+        return value
+
     def _code(self) -> tuple[bytes, str]:
         secret, code = self._new_code()
         if not isinstance(secret, bytes) or not isinstance(code, str):
@@ -279,9 +293,9 @@ class AccessAdministration:
         secret, code = self._code()
         expires_at = self._execute(
             actor_context, AuditAction.INVITE_PRINCIPAL, target,
-            lambda connection, at: self.access.invite_with_invitation_on(
+            lambda connection, at: self._expiry(self.access.invite_with_invitation_on(
                 connection, target, display_name, permissions, secret, at=at,
-            ),
+            )),
             epoch=epoch, followed_by=(AuditAction.ISSUE_PRINCIPAL_INVITATION,),
         )
         return target, code, expires_at
@@ -291,9 +305,9 @@ class AccessAdministration:
         secret, code = self._code()
         expires_at = self._execute(
             actor_context, AuditAction.ISSUE_PRINCIPAL_INVITATION, principal_id,
-            lambda connection, at: self.access.reissue_invitation_on(
+            lambda connection, at: self._expiry(self.access.reissue_invitation_on(
                 connection, principal_id, secret, at=at,
-            ),
+            )),
             epoch=epoch,
         )
         return code, expires_at

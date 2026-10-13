@@ -1195,16 +1195,30 @@ credential id) are the only values in these URLs.
   context and `epoch=context.epoch`, which commits inside a second
   `admit(epoch)` and re-checks the Owner session in its own transaction.
   A1 is a read: `_authorize(OWNER_READ)` (an absent `Origin` is allowed, a
-  present one must be exact; no CSRF), then `admin_inventory()` inside
-  `admit` of the same epoch, so a close, reopen or `stop()` after the
-  authorization returns nothing.
+  present one must be exact; no CSRF), then
+  `admin_inventory(owner_session=...)` inside `admit` of the same epoch, so a
+  close, reopen or `stop()` after the authorization returns nothing, and the
+  same read transaction re-checks the Owner session first
+  (`require_owner_session_on(..., freshness=None)`: every check of an
+  `OWNER_OP` re-check but the freshness, nothing written, no idle touch) and
+  only then reads the inventory from that one snapshot. The local `recover`
+  and revocation commands commit outside the gate without moving its epoch,
+  so without this re-check an inventory could be returned to a session they
+  ended between the authorization and the read (PR #242 review); with it
+  that is the generic denial and nothing is returned.
 - Bodies. `display_name`: a string of 1-64 characters with no control
-  (`Cc`) or lone surrogate (`Cs`) character. `permissions`: a list of
+  (`Cc`), format (`Cf`: bidirectional overrides and isolates, zero-width
+  characters), lone surrogate (`Cs`), line separator (`Zl`, U+2028) or
+  paragraph separator (`Zp`, U+2029) character. `permissions`: a list of
   distinct `"live:view"` / `"recordings:view"` (possibly empty).
   `permission`: one of those two; `granted`: `true` or `false` (never `1` or
   `"true"`).
 - Responses. Every success is `no-store`. The code appears only in the A2 /
-  A3 response; only its digest and lookup key are stored. A4 that changes
+  A3 response; only its digest and lookup key are stored. Nothing that can
+  refuse runs after a change committed: the expiry A2 / A3 return is
+  checked to be an aware `datetime` inside the mutation's transaction
+  (`AccessAdministration._expiry`), so its formatting cannot fail and a
+  committed change is never answered with a refusal. A4 that changes
   nothing is `204` too (see "A grant change that changes nothing" above).
 - Refusals. Everything is the byte-identical generic `404`: no or a forged
   cookie, a non-Owner session (`live:view`, `recordings:view` or both), a
@@ -1224,12 +1238,25 @@ credential id) are the only values in these URLs.
 - Credential revocation (A6) is credential-scoped: a synced passkey is
   revoked on all synced devices that hold it, and only that credential's
   sessions end; it is not a per-device revocation.
-- Rate limits. These routes are not charged to a limiter, like the other
-  session routes: only a fresh Owner session with its CSRF token reaches an
-  administration write or its audit record (a non-Owner is refused inside
-  the authorization), the state they create is bounded (S4-8), and every
-  write passes the storage admission. The binding-mismatch audit of another
-  proxy identity keeps its own once-per-window bound.
+- Rate limits (Owner decision 2026-10-13). The changes A2-A6 are charged to
+  a fourth, separate limiter (`rate_limit.admin_rate_limiter`,
+  `HumanAccess.admin_limiter`, which `HumanAccess` refuses to share with any
+  other limiter): per session a burst of 20 and one more every 3 seconds, no
+  global bucket, at most 256 tracked sessions (a full table evicts only a
+  least recently used bucket that has refilled completely, otherwise it
+  refuses: fail closed, never growing). The key is a domain-separated
+  SHA-256 of the session token, taken inside `_authorize` right after the
+  read-only pre-check found a current session for that token and before
+  the gate epoch, any SQLite write or audit work; it is never the proxy
+  identity (shared by the room) and never logged. A forged cookie is refused
+  by the pre-check before it is charged, and each session spends only its
+  own bucket, so another person's session cannot spend the Owner's. Over the
+  limit the change is the generic `404` and writes nothing, no audit record
+  included. Without it a fresh Owner session could repeat no-op changes or
+  changes of unknown targets and grow the audit table without bound (soft
+  space only; the hard reserve stays with the storage admission). A1 is a
+  read and not charged. The binding-mismatch audit of another proxy
+  identity keeps its own once-per-window bound.
 - Logs. These routes log nothing; no code, display name, handle,
   credential id or identity reaches a log, a URL other than the path ids
   above, or an audit record.

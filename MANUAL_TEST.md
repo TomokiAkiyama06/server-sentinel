@@ -1783,8 +1783,14 @@ and synthetic invitees, each with their own passkey:
   route with the invitee's own session and CSRF token: the generic `404`;
   without `X-CSRF-Token`, without `Origin`, from another origin, or with the
   Owner as the target: the generic `404`, and nothing changed;
-- [ ] check the audit log: one record per change with the principal's logical
-  UUID only (no code, display name, handle, credential id or identity).
+- [ ] send more than 20 changes within a few seconds from one Owner session
+  (for example a repeated no-op grant): the excess gets the generic `404`
+  and writes no audit record; after a few seconds changes run again, and
+  another session's changes were never limited by it;
+- [ ] check the audit log: each change has its records with the principal's
+  logical UUID only (no code, display name, handle, credential id or
+  identity): an invitation (A2) has two, `invite_principal` and
+  `issue_principal_invitation`, and every other change (A3-A6) has one.
 
 ### Uninvited ordinary Tailnet member
 
