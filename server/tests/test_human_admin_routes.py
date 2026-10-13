@@ -962,6 +962,30 @@ class RateLimitTests(AdminRouteFixture):
         for _ in range(ADMIN_PER_SESSION_CAPACITY):
             self.assertEqual(status(await self.noop()), 204)
 
+    async def test_a_session_of_an_owner_no_longer_active_is_never_charged(self):
+        # Issue #244 item 1: the Owner pre-check requires p.status=active, not
+        # only p.role=owner. The Owner principal is set back to ``invited``
+        # while its session row stays valid; the change is the generic denial
+        # before the charge and before the gate.
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE access_principals SET status='invited' WHERE id=?", (str(self.owner.id),))
+            connection.commit()
+        work = []
+        real_epoch = self.access.epoch
+
+        def epoch(*args, **kwargs):
+            work.append("gate")
+            return real_epoch(*args, **kwargs)
+
+        before = self.snapshot()
+        with patch.object(self.access, "epoch", side_effect=epoch):
+            for name, (method, path, body) in self.mutations().items():
+                with self.subTest(route=name):
+                    self.assertEqual(await self.admin(method, path, body), GENERIC)
+        self.assertEqual(work, [])
+        self.assertEqual((self.access.admin_limiter.sources(), self.access.admin_limiter.limited), (0, 0))
+        self.assertEqual(self.snapshot(), before)
+
     async def test_the_key_is_not_logged_and_not_the_identity(self):
         records = []
 

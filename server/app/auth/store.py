@@ -1729,7 +1729,8 @@ class AccessStore:
                 "AND inconsistent_at_us IS NULL ORDER BY enrolled_at_us", (row["principal_id"],)))
             return RegistrationSubject(UUID(row["id"]), UUID(row["principal_id"]), row["display_name"], excluded)
 
-    def consume_challenge(self, digest: bytes, ceremony: str, *, at: datetime | None = None) -> ConsumedChallenge:
+    def consume_challenge(self, digest: bytes, ceremony: str, *, at: datetime | None = None,
+                          session_id: UUID | None = None) -> ConsumedChallenge:
         """Delete a pending challenge exactly once and return its binding.
 
         The challenge is removed whether or not the ceremony later verifies, so
@@ -1738,14 +1739,28 @@ class AccessStore:
         window is checked at a time read inside the transaction (see
         ``_in_transaction_time``), so a challenge that expired during a lock
         or admission wait is refused; ``at`` pins it for tests only.
+
+        A ``step_up`` challenge is consumed only together with the session it
+        is bound to: ``session_id`` is required for that ceremony (and
+        refused for the others), and a challenge bound to another session is
+        neither deleted nor returned, so another session of the same Owner
+        that learned the value cannot spend it (Issue #238 item 4,
+        availability only).
         """
         pinned = None if at is None else utc_time(at)
         if not isinstance(digest, bytes) or len(digest) != 32 or ceremony not in ("registration", "authentication", "step_up"):
             raise AccessValidationError("access is unavailable")
+        if (ceremony == "step_up") != isinstance(session_id, UUID) or (
+                ceremony != "step_up" and session_id is not None):
+            raise AccessValidationError("access is unavailable")
         with self._transaction(write=True) as connection:
             at = self._in_transaction_time(pinned)
-            row = connection.execute("DELETE FROM access_webauthn_challenges WHERE challenge_digest=? AND ceremony=? RETURNING invitation_id, session_id, issued_at_us, expires_at_us",
-                                     (digest, ceremony)).fetchone()
+            if session_id is None:
+                row = connection.execute("DELETE FROM access_webauthn_challenges WHERE challenge_digest=? AND ceremony=? RETURNING invitation_id, session_id, issued_at_us, expires_at_us",
+                                         (digest, ceremony)).fetchone()
+            else:
+                row = connection.execute("DELETE FROM access_webauthn_challenges WHERE challenge_digest=? AND ceremony=? AND session_id=? RETURNING invitation_id, session_id, issued_at_us, expires_at_us",
+                                         (digest, ceremony, str(session_id))).fetchone()
             row = None if row is None else dict(row)
         if row is None or not row["issued_at_us"] <= _us(at) < row["expires_at_us"]:
             raise AccessValidationError("access is unavailable")
@@ -1947,28 +1962,33 @@ class AccessStore:
 
         return self._audited_write(write)
 
-    def mark_credential_inconsistent(self, credential_id: bytes, principal_id: UUID, *, at: datetime) -> None:
+    def mark_credential_inconsistent(self, credential_id: bytes, principal_id: UUID, *, at: datetime) -> bool:
         """Atomically mark a credential whose backup eligibility changed and end its sessions.
 
         The credential stays unusable until the Owner revokes/replaces it; the
-        audit record carries only the principal's logical UUID.
+        audit record carries only the principal's logical UUID. Returns
+        ``True`` only when this call marked it: a credential already marked
+        (a racing attempt of the same change committed first) or revoked
+        writes nothing and returns ``False``, so the change is recorded,
+        audited and notified once (Issue #238 item 2).
         """
         at = utc_time(at)
-        self._audited_write(lambda connection, mark: self._mark_credential_inconsistent_on(
+        return self._audited_write(lambda connection, mark: self._mark_credential_inconsistent_on(
             connection, mark, credential_id, principal_id, at))
 
     def _mark_credential_inconsistent_on(self, connection, mark, credential_id: bytes, principal_id: UUID,
-                                         at: datetime) -> None:
+                                         at: datetime) -> bool:
         changed = connection.execute("UPDATE access_credentials SET inconsistency_reason='backup_eligibility_changed', inconsistent_at_us=? WHERE credential_id=? AND principal_id=? AND inconsistent_at_us IS NULL AND revoked_at_us IS NULL",
                                      (_us(at), credential_id, str(principal_id))).rowcount
         if changed != 1:
-            return
+            return False
         connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
         mark()
         self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
                              action=AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
                              target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
                              outcome=AuditOutcome.SUCCEEDED)
+        return True
 
     def record_sign_count_regression(self, principal_id: UUID) -> None:
         """Record a refused assertion whose signature counter regressed."""
@@ -1994,7 +2014,12 @@ class AccessStore:
         match): the DELETE runs first, and the finding's writes — the
         credential mark with its session invalidation, or the regression
         record, each with its audit record — follow in the same SQLite
-        transaction (PR #236 review). Returns ``True`` only then.
+        transaction (PR #236 review). Returns ``True`` only then, and for a
+        changed backup eligibility only when this transaction marked the
+        credential: if it was already marked (another session's step-up or a
+        sign-in of the same change committed first) or revoked, the
+        challenge is still spent but nothing else is written and ``False`` is
+        returned, so the Owner is notified once (Issue #238 item 2).
 
         When the DELETE removes nothing (a concurrent finish of the same
         assertion already spent the challenge, and its ``accept_assertion``
@@ -2019,9 +2044,12 @@ class AccessStore:
             if row is None or not row["issued_at_us"] <= _us(now) < row["expires_at_us"]:
                 return False
             if backup_eligibility_changed:
-                self._mark_credential_inconsistent_on(connection, mark, credential_id, principal_id, now)
-            else:
-                self._record_sign_count_regression_on(connection, mark, principal_id)
+                # ``False`` when another session's step-up (or a sign-in) of
+                # the same changed credential marked it first: the challenge
+                # is still spent, but no second audit record or notification
+                # (Issue #238 item 2).
+                return self._mark_credential_inconsistent_on(connection, mark, credential_id, principal_id, now)
+            self._record_sign_count_regression_on(connection, mark, principal_id)
             return True
 
         return self._audited_write(write)

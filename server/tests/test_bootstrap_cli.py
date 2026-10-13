@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -44,8 +45,40 @@ AUDIT = "SELECT actor_category, action, target_kind, target_logical_id, outcome 
         "FROM security_admin_audit_records ORDER BY rowid"
 
 
+# How long a terminal read waits for a queued line (Issue #244 item 2).
+TERMINAL_READ_TIMEOUT = 10.0
+
+
+class _TimedTerminal(ControllingTerminal):
+    """``ControllingTerminal`` whose reads give up after the console's timeout.
+
+    Without it a regression that makes the command ask for one line more
+    than the test queued blocks the whole suite on ``os.read``. On timeout
+    the read returns an empty line (as at end of input, so the command
+    refuses) and the console records it; the test then fails.
+    """
+
+    def __init__(self, console, **kwargs):
+        super().__init__(**kwargs)
+        self._console = console
+
+    def read_line(self) -> str:
+        # ``poll``, not ``select``: in the full suite the descriptor number
+        # can exceed ``FD_SETSIZE``.
+        poller = select.poll()
+        poller.register(self._descriptor, select.POLLIN)
+        if not poller.poll(int(self._console.read_timeout * 1000)):
+            self._console.timed_out = True
+            return ""
+        return super().read_line()
+
+
 class Console:
-    """A pseudo-terminal: input is queued on the master side, output read back."""
+    """A pseudo-terminal: input is queued on the master side, output read back.
+
+    A read that finds no queued line within ``read_timeout`` fails the test
+    (checked at cleanup) instead of hanging it (Issue #244 item 2).
+    """
 
     def __init__(self, test):
         self.master, self.slave = os.openpty()
@@ -53,6 +86,10 @@ class Console:
         test.addCleanup(os.close, self.slave)
         os.set_blocking(self.master, False)
         self.opened = 0
+        self.read_timeout = TERMINAL_READ_TIMEOUT
+        self.timed_out = False
+        test.addCleanup(lambda: test.assertFalse(
+            self.timed_out, "the command waited for terminal input the test did not queue"))
 
     def type(self, *lines):
         os.write(self.master, "".join(line + "\n" for line in lines).encode())
@@ -62,7 +99,7 @@ class Console:
             assert path == "/dev/tty"
             self.opened += 1
             return os.dup(self.slave)
-        return ControllingTerminal(opener=opener)
+        return _TimedTerminal(self, opener=opener)
 
     def output(self) -> str:
         data = b""
@@ -208,6 +245,19 @@ class BootstrapCliTests(unittest.TestCase):
                 self.assertIsNone(CODE.search(terminal))
         self.assertEqual(self.rows("SELECT count(*) FROM access_principals"), [(0,)])
         self.assertEqual(self.rows(AUDIT), [])
+
+    def test_the_harness_fails_rather_than_hangs_on_an_unqueued_read(self):
+        # Issue #244 item 2: the name is queued but the confirmation is not.
+        # The read gives up after the timeout, the command refuses, and the
+        # console records the timeout that fails a test at cleanup.
+        console = Console(self)
+        console.read_timeout = 0.2
+        code, stdout, stderr, _ = self.run_cli("bootstrap", "Synthetic Owner", console=console)
+        self.assertTrue(console.timed_out)
+        console.timed_out = False  # Expected here; do not fail this test at cleanup.
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("refused: owner_confirmation_declined", stderr)
+        self.assertEqual(self.rows("SELECT count(*) FROM access_principals"), [(0,)])
 
     def test_refuses_root_and_a_database_it_cannot_trust(self):
         with patch.object(bootstrap_cli.os, "geteuid", return_value=0):

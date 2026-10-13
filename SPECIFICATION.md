@@ -1786,7 +1786,9 @@ clock cannot be read. A finish refused by the session gate (stop, failed
 check tick or close/reopen during verification) is a no-op that leaves the
 challenge pending, a credential finding (BE change, counter regression)
 included; every other refusal after the client data parsed spends the
-challenge. A successful step-up deletes the challenge in the SQLite transaction
+challenge, but only one bound to the refused request's own current session
+(Issue #238 item 4: another session of the same Owner cannot spend it, and a
+request without a current session spends nothing). A successful step-up deletes the challenge in the SQLite transaction
 that refreshes the session (a refused commit rolls the deletion back and the
 refusal then spends it on its own). A credential finding commits inside one
 gate admission and one SQLite transaction that first deletes this session's
@@ -1798,7 +1800,12 @@ and may have advanced the counter, or a new options request replaced it), nothin
 notified and the finish is refused. If the transaction fails, the deletion
 rolls back with the finding, and the challenge is spent on its own under a new
 gate admission: it stays single use, and the unchanged stored credential lets
-the next assertion detect the finding again. Refused finishes are counted value-free
+the next assertion detect the finding again; such a failed finding write (at
+step-up or sign-in) is counted value-free (`credential_finding_unrecorded`
+logged on the first and each doubling, Issue #238 item 5). A changed backup
+eligibility that another session's step-up or a sign-in already marked spends
+the challenge but records and notifies nothing more, so the Owner is notified
+once (Issue #238 item 2). Refused finishes are counted value-free
 (`owner_step_up_refused` logged on the first and each doubling). The first
 mounted `OWNER_OP` routes are the S4b administration routes below.
 

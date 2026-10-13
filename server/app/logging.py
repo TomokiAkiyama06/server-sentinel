@@ -43,6 +43,7 @@ class Event(StrEnum):
     HUMAN_REQUEST_RATE_LIMITED = "human_request_rate_limited"
     INVITATION_REDEMPTION_REFUSED = "invitation_redemption_refused"
     OWNER_STEP_UP_REFUSED = "owner_step_up_refused"
+    CREDENTIAL_FINDING_UNRECORDED = "credential_finding_unrecorded"
     HUMAN_ACCESS_CHECK_FAILED = "human_access_check_failed"
     HUMAN_ACCESS_SWEEP_FAILED = "human_access_sweep_failed"
     HUMAN_ACCESS_RUN_FAILED = "human_access_run_failed"

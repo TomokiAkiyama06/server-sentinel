@@ -10,7 +10,7 @@ grant change that changes nothing).
 """
 
 import asyncio
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -669,6 +669,8 @@ class ClosedAccessTests(StepUpFixture):
         self.assertEqual([row[1:3] for row in credentials], [(5, "backup_eligibility_changed")])
         self.assertTrue(all(row[1] is not None for row in sessions))
         self.assertEqual(await self.owner_operation(cookie, csrf), GENERIC)
+        # A gate refusal is not a failed finding write (Issue #238 item 5).
+        self.assertEqual(self.ceremonies.unrecorded_findings, 0)
 
     async def test_a_finding_whose_record_fails_still_spends_the_challenge(self):
         _, key, _, cookie, csrf = await self.owner_session()
@@ -700,8 +702,9 @@ class ClosedAccessTests(StepUpFixture):
         self.assertEqual(self.finding_state()[0][0][2], "backup_eligibility_changed")
 
     async def test_a_genuinely_failed_step_up_spends_its_challenge(self):
-        """Single use as before: a bad signature, another session's challenge
-        context or a commit refused inside its transaction spends the challenge."""
+        """Single use as before: a bad signature or a commit refused inside its
+        transaction spends the challenge (a request of another session cannot,
+        Issue #238 item 4: ``FollowUpTests``)."""
         _, key, _, cookie, csrf = await self.owner_session()
         self.elapse(minutes=6)
         before = self.unchanged_state(cookie)
@@ -1326,6 +1329,275 @@ class StepUpFindingStoreTests(StepUpFixture):
                     credential_id=credential.credential_id, principal_id=owner.id))
                 self.assertEqual(self.finding_state(), before)
         self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+
+    async def test_a_step_up_challenge_is_consumed_only_with_its_own_session(self):
+        # Issue #238 item 4: another session of the same Owner that learned the
+        # value cannot spend it; the session is required for this ceremony and
+        # refused for the others.
+        owner, credential, digest, view = await self.prepared()
+        for arguments in (dict(), dict(session_id=UUID(int=view.session_id.int ^ 1)),
+                          dict(session_id=str(view.session_id))):
+            with self.subTest(arguments=sorted(arguments)):
+                with self.assertRaises(AccessValidationError):
+                    self.store.consume_challenge(digest, "step_up", **arguments)
+                self.assertEqual(self.store.pending_step_up_challenge(digest), view.session_id)
+        for ceremony in ("registration", "authentication"):
+            with self.subTest(ceremony=ceremony), self.assertRaises(AccessValidationError):
+                self.store.consume_challenge(digest, ceremony, session_id=view.session_id)
+        self.assertEqual(self.store.pending_step_up_challenge(digest), view.session_id)
+        consumed = self.store.consume_challenge(digest, "step_up", session_id=view.session_id)
+        self.assertEqual((consumed.invitation_id, consumed.session_id), (None, view.session_id))
+        self.assertIsNone(self.store.pending_step_up_challenge(digest))
+        self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+
+    async def test_a_backup_eligibility_change_already_marked_is_recorded_once(self):
+        # Issue #238 item 2: two sessions of the one credential each spend
+        # their own challenge, but only the first mark is a finding.
+        owner, credential, digest, view = await self.prepared()
+        second = await self.sign_in(self.owner_key)
+        second_digest = hashlib.sha256(unb64(payload(await self.begin(
+            second, await self.csrf(second)))["challenge"])).digest()
+        second_view = self.store.current_session(self.token(second), VIEWER, at=self.ceremony_clock())
+        before = dict(self.finding_state()[2])
+        finding = dict(backup_eligibility_changed=True, credential_id=credential.credential_id,
+                       principal_id=owner.id)
+        self.assertTrue(self.store.record_step_up_finding(digest, view.session_id, **finding))
+        self.assertFalse(self.store.record_step_up_finding(second_digest, second_view.session_id, **finding))
+        self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+        after = dict(self.finding_state()[2])
+        self.assertEqual(after.get("mark_principal_credential_inconsistent", 0),
+                         before.get("mark_principal_credential_inconsistent", 0) + 1)
+        # The sign-in helper says the same.
+        self.assertFalse(self.store.mark_credential_inconsistent(credential.credential_id, owner.id,
+                                                                 at=self.ceremony_clock()))
+        self.assertEqual(dict(self.finding_state()[2]), after)
+
+    async def owner_session(self):
+        principal, key, credential, cookie, csrf = await super().owner_session()
+        self.owner_key = key
+        return principal, key, credential, cookie, csrf
+
+
+class FollowUpTests(StepUpFixture):
+    """Issue #238 items 2-5 at the ceremony."""
+
+    def sink(self):
+        reported = []
+
+        class Sink:
+            def credential_finding(self, kind, principal_id):
+                reported.append((kind, principal_id))
+
+        self.ceremonies.findings = Sink()
+        return reported
+
+    def verified_together(self):
+        """Both racing finishes pass signature verification before either commits."""
+        barrier = threading.Barrier(2, timeout=10)
+        real_verified = self.ceremonies._verified_assertion
+
+        def verified(*args, **kwargs):
+            result = real_verified(*args, **kwargs)
+            barrier.wait()
+            return result
+
+        return patch.object(self.ceremonies, "_verified_assertion", side_effect=verified)
+
+    async def test_two_sessions_racing_one_backup_eligibility_change_notify_once(self):
+        # Item 2: each session's step-up spends its own challenge; the second
+        # mark changes nothing, so the Owner is notified once.
+        owner, key, _, first, first_csrf = await self.owner_session()
+        second = await self.sign_in(key)
+        second_csrf = await self.csrf(second)
+        self.elapse(minutes=6)
+        answers = []
+        for cookie, csrf in ((first, first_csrf), (second, second_csrf)):
+            begun = await self.begin(cookie, csrf)
+            answers.append((self.token(cookie), key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST, be=True)))
+        reported = self.sink()
+        before = dict(self.finding_state()[2])
+
+        def finish(token, assertion):
+            with self.assertRaises(CeremonyDenied):
+                self.ceremonies.finish_step_up(token, VIEWER, assertion)
+
+        with self.verified_together():
+            await asyncio.gather(*(asyncio.to_thread(finish, *answer) for answer in answers))
+        self.assertEqual(reported, [(CredentialFinding.BACKUP_ELIGIBILITY_CHANGED, owner.id)])
+        after = dict(self.finding_state()[2])
+        self.assertEqual(after.get("mark_principal_credential_inconsistent", 0),
+                         before.get("mark_principal_credential_inconsistent", 0) + 1)
+        self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+        self.assertEqual(self.ceremonies.unrecorded_findings, 0)
+
+    async def test_two_racing_sign_ins_of_one_backup_eligibility_change_notify_once(self):
+        # Item 2, sign-in path: same helper, same single notification.
+        owner, key, _, _, _ = await self.owner_session()
+        answers = [key.assertion(self.ceremonies.begin_authentication(), origin=ORIGIN, rp_id=HOST, be=True)
+                   for _ in range(2)]
+        reported = self.sink()
+        before = dict(self.finding_state()[2])
+
+        def finish(assertion):
+            with self.assertRaises(CeremonyDenied):
+                self.ceremonies.finish_authentication(VIEWER, assertion)
+
+        with self.verified_together():
+            await asyncio.gather(*(asyncio.to_thread(finish, answer) for answer in answers))
+        self.assertEqual(reported, [(CredentialFinding.BACKUP_ELIGIBILITY_CHANGED, owner.id)])
+        after = dict(self.finding_state()[2])
+        self.assertEqual(after.get("mark_principal_credential_inconsistent", 0),
+                         before.get("mark_principal_credential_inconsistent", 0) + 1)
+
+    async def test_a_refused_step_up_spends_its_challenge_inside_the_gate(self):
+        # Item 3: ``_spend_step_up_challenge`` consumes under ``admit(epoch)``,
+        # lock order gate -> SQLite, scoped to the request's own session.
+        _, key, _, cookie, csrf = await self.owner_session()
+        self.elapse(minutes=6)
+        begun = await self.begin(cookie, csrf)
+        assertion = key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST, tamper=True)
+        view = self.store.current_session(self.token(cookie), VIEWER, at=self.ceremony_clock())
+        gate = self.ceremonies.session_gate
+        real_admit = gate.admit
+        real_consume = self.store.consume_challenge
+        events = []
+
+        @contextmanager
+        def admit(epoch):
+            with real_admit(epoch):
+                events.append("gate held")
+                try:
+                    yield
+                finally:
+                    events.append("gate released")
+
+        def consume(digest, ceremony, **kwargs):
+            events.append(("consume", ceremony, kwargs.get("session_id")))
+            return real_consume(digest, ceremony, **kwargs)
+
+        def finish():
+            with self.assertRaises(CeremonyDenied):
+                self.ceremonies.finish_step_up(self.token(cookie), VIEWER, assertion)
+
+        with patch.object(gate, "admit", side_effect=admit), \
+                patch.object(self.store, "consume_challenge", side_effect=consume):
+            await asyncio.to_thread(finish)
+        self.assertEqual(events, ["gate held", ("consume", "step_up", view.session_id), "gate released"])
+        self.assertEqual(self.count(STEP_UP_CHALLENGES), 0)
+
+    async def test_another_session_cannot_spend_a_challenge_it_learned(self):
+        # Item 4: a refused finish of another session of the same Owner leaves
+        # the challenge pending, and its own session still steps up with it.
+        _, key, _, first, first_csrf = await self.owner_session()
+        second = await self.sign_in(key)
+        second_csrf = await self.csrf(second)
+        self.elapse(minutes=6)
+        begun = payload(await self.begin(first, first_csrf))
+        digest = hashlib.sha256(unb64(begun["challenge"])).digest()
+        owner_view = self.store.current_session(self.token(first), VIEWER, at=self.ceremony_clock())
+        for options in (dict(), dict(tamper=True)):
+            with self.subTest(options=options):
+                self.assertEqual(await self.finish(
+                    second, second_csrf, key.assertion(begun, origin=ORIGIN, rp_id=HOST, **options)), GENERIC)
+                self.assertEqual(self.store.pending_step_up_challenge(digest), owner_view.session_id)
+        self.assertEqual(await self.owner_operation(second, second_csrf), STEP_UP)
+        self.assertEqual(status(await self.finish(
+            first, first_csrf, key.assertion(begun, origin=ORIGIN, rp_id=HOST))), 204)
+        self.assertIsNone(self.store.pending_step_up_challenge(digest))
+
+    async def test_a_refused_finish_without_a_current_session_spends_nothing(self):
+        # Item 4 at the ceremony: a finish whose request has no current session
+        # (the proxy identity does not match the session's binding, or the
+        # session has idle-expired) is refused and consumes nothing; with the
+        # binding restored, the challenge's own session steps up with it.
+        _, key, _, cookie, csrf = await self.owner_session()
+        self.elapse(minutes=6)
+        begun = payload(await self.begin(cookie, csrf))
+        digest = hashlib.sha256(unb64(begun["challenge"])).digest()
+        token = self.token(cookie)
+        view = self.store.current_session(token, VIEWER, at=self.ceremony_clock())
+        before = self.unchanged_state(cookie)
+        for options in (dict(), dict(tamper=True)):
+            with self.subTest(binding="mismatch", options=options):
+                assertion = key.assertion(begun, origin=ORIGIN, rp_id=HOST, **options)
+                with self.assertRaises(CeremonyDenied):
+                    await asyncio.to_thread(self.ceremonies.finish_step_up, token, OTHER_LOGIN, assertion)
+                self.assertEqual(self.store.pending_step_up_challenge(digest), view.session_id)
+                self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
+                self.assertEqual(self.unchanged_state(cookie), before)
+        self.assertEqual(status(await self.finish(
+            cookie, csrf, key.assertion(begun, origin=ORIGIN, rp_id=HOST))), 204)
+        self.assertIsNone(self.store.pending_step_up_challenge(digest))
+
+        # An idle-expired session: its pending challenge is not consumed by the
+        # refusal (it is left to expire), and nothing else changes.
+        self.elapse(minutes=6)
+        begun = payload(await self.begin(cookie, csrf))
+        digest = hashlib.sha256(unb64(begun["challenge"])).digest()
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE access_sessions SET idle_expires_at_us=? WHERE id=?",
+                               (microseconds(self.ceremony_clock()) - 1, str(view.session_id)))
+            connection.commit()
+        self.assertIsNone(self.store.current_session(token, VIEWER, at=self.ceremony_clock()))
+        with self.assertRaises(CeremonyDenied):
+            await asyncio.to_thread(self.ceremonies.finish_step_up, token, VIEWER,
+                                    key.assertion(begun, origin=ORIGIN, rp_id=HOST))
+        self.assertEqual(self.store.pending_step_up_challenge(digest), view.session_id)
+        self.assertEqual(self.count(STEP_UP_CHALLENGES), 1)
+
+    async def test_a_failed_finding_write_is_counted_and_logged_value_free(self):
+        # Item 5: no audit record and no notification exist for it, so the
+        # failure is counted, and logged without any value.
+        owner, key, credential, cookie, csrf = await self.owner_session()
+        records = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = Capture(level=logging.DEBUG)
+        logger = logging.getLogger("app.auth.passkeys")
+        logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
+        reported = self.sink()
+        self.elapse(minutes=6)
+        begun = await self.begin(cookie, csrf)
+        step_up = key.assertion(payload(begun), origin=ORIGIN, rp_id=HOST, be=True)
+        sign_in = key.assertion(self.ceremonies.begin_authentication(), origin=ORIGIN, rp_id=HOST, be=True)
+        before = self.finding_state()
+        with patch.object(self.store, "_mark_credential_inconsistent_on", side_effect=OSError("synthetic")):
+            self.assertEqual(await self.finish(cookie, csrf, step_up), GENERIC)
+            self.assertEqual(self.ceremonies.unrecorded_findings, 1)
+            with self.assertRaises(CeremonyDenied):
+                await asyncio.to_thread(self.ceremonies.finish_authentication, VIEWER, sign_in)
+            self.assertEqual(self.ceremonies.unrecorded_findings, 2)
+
+            def unrecorded_events():
+                return [record for record in records if record.msg == Event.CREDENTIAL_FINDING_UNRECORDED]
+
+            self.assertEqual(len(unrecorded_events()), 2)  # at 1 and 2
+            # The throttle is pinned: the third failure is counted but not
+            # logged, the fourth (a power of two) is logged again.
+            for count, logged in ((3, 2), (4, 3)):
+                again = key.assertion(self.ceremonies.begin_authentication(), origin=ORIGIN, rp_id=HOST, be=True)
+                with self.assertRaises(CeremonyDenied):
+                    await asyncio.to_thread(self.ceremonies.finish_authentication, VIEWER, again)
+                self.assertEqual(self.ceremonies.unrecorded_findings, count)
+                self.assertEqual(len(unrecorded_events()), logged)
+        self.assertEqual(self.finding_state(), before)
+        self.assertEqual(reported, [])
+        events = unrecorded_events()
+        self.assertEqual(len(events), 3)  # at 1, 2 and 4 (each power of two)
+        token = self.token(cookie)
+        for record in events:
+            self.assertEqual(record.levelno, logging.WARNING)
+            self.assertEqual(json.loads(SafeJsonFormatter().format(record))["event"],
+                             "credential_finding_unrecorded")
+            text = repr(record.__dict__)
+            for value in (str(owner.id), owner.id.hex, b64(credential.credential_id),
+                          repr(credential.credential_id), token.hex(), VIEWER, "synthetic",
+                          "backup_eligibility_changed"):
+                self.assertNotIn(value, text)
 
 
 if __name__ == "__main__":

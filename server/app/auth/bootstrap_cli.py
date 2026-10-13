@@ -103,9 +103,9 @@ closed (D6); the commands work the same while it is open. Exactly three
   printed, after the others, and the rest is counted on a ``not shown``
   line. The principals not revoked are bounded by the store
   (``MAX_PRINCIPALS``); the credentials not revoked have no store cap, but
-  each one is a separate redemption of an Owner-issued invitation code (at
-  most one pending per principal), so their number grows only by Owner
-  action, and hiding one would leave an active passkey that the emergency
+  each one is a separate redemption of an Owner-issued or local
+  bootstrap/recover code (at most one pending per principal), so their
+  number grows only by Owner or local operator action, and hiding one would leave an active passkey that the emergency
   command could not name.
 - ``revoke-principal <principal id>`` revokes that person: every credential
   (each on all the devices it synced to), every pending invitation code and
@@ -132,8 +132,11 @@ again inside the write transaction, so a change made meanwhile is refused,
 not overwritten. One refusal comes after the commit:
 ``committed_verification_failed`` means the revocation and its audit record
 were committed, but re-verifying the pinned database file afterwards failed
-(it was renamed or replaced meanwhile); run ``list`` to see the result and
-check the state directory.
+(it was renamed or replaced meanwhile), so the revocation may sit only in the
+old file and not in the database now at the path. Run ``list``: if the target
+is still not revoked, investigate the state directory and re-run the command
+(a revocation that did reach that database is refused as
+``*_already_revoked``, so re-running is safe; Issue #243 item 1).
 
 Like ``recover`` they do not go through the server gate. That is safe
 because they only reduce access, and the running server re-reads the
@@ -184,7 +187,9 @@ _MAX_LISTED_TEXT = 128
 # A fixed second line for a refusal that has a next step.
 _HINTS = {
     "owner_target_use_recover": "the Owner's credentials change only through the 'recover' command",
-    "committed_verification_failed": "the revocation was committed; run 'list' to confirm it, do not repeat it",
+    "committed_verification_failed": ("the revocation was committed, but maybe not to the database now at the "
+                                      "path; run 'list': if the target is still not revoked, investigate the "
+                                      "state directory and re-run the command"),
 }
 
 
