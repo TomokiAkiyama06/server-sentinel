@@ -1836,6 +1836,59 @@ passkeys (never a real person's credential):
   is in flight (for example a grant change submitted right after the
   command commits): the Web operation is refused and changes nothing.
 
+### Issue #10 phase 2 S5a sign-in shell in real browsers (pending, not executed)
+
+`web/src/signin/` is verified only in headless Chrome with intercepted
+requests and a CDP virtual authenticator (`web/tests/signin_browser.mjs`) and
+with Node unit tests; no real browser, passkey provider or security key has
+used it, and it is not served by the Main Server until S5b. Once S5b serves
+`/` at the reserved `https` origin, run with synthetic `*.invalid` people on
+each of **iOS Safari**, **macOS Safari** and **Android Chrome** (and record the
+browser and OS versions used):
+
+- [ ] `/` shows only 「サインイン」, the sign-in button, the invitation code
+  field and the label field 「このパスキーの目印（任意）」, in Japanese, with no
+  product name, camera wording, version or favicon; the page source and
+  `/s.js`, `/s.css` carry none either;
+- [ ] redeem a fresh invitation code typed by hand in lower case with spaces,
+  and once with the Japanese IME on (full-width characters, 「ー」 as the
+  separator): it registers, the page shows 「登録しました。サインインしてください。」
+  and focus moves to the sign-in button; the code field is empty afterwards;
+- [ ] on **iOS Safari** and **macOS Safari** (and Firefox if available), the
+  registration and sign-in `POST`s reach the Main Server with the exact
+  `Origin` of the reserved origin, never `Origin: null`, and no `Referer`
+  (Web Inspector → Network → request headers, or the Main Server's ceremony
+  outcome): registration and sign-in both succeed; the documents themselves
+  still answer with `Referrer-Policy: no-referrer`;
+- [ ] a label of 64 emoji registers and is shown whole in the Owner's
+  credential list; a label of 65 characters shows the generic message and
+  sends nothing;
+- [ ] the OS / browser passkey sheet asks for user verification at
+  registration and at sign-in; sign-in lands on `/app/`;
+- [ ] with a valid session, opening `/` goes straight to `/app/`;
+- [ ] a wrong, expired or already used code, a cancelled passkey sheet and a
+  refused sign-in each show only 「完了できませんでした。もう一度お試しください。」 and
+  nothing from the server;
+- [ ] on a deployment that requires device-bound credentials, registering a
+  synced passkey (iCloud Keychain / Google Password Manager) shows the
+  device-bound guidance, and a security key then registers;
+- [ ] type a code (and a label), navigate to another page without
+  registering, then press Back: both fields are empty (also after a
+  back-forward cache restore);
+- [ ] with the Main Server not answering `GET /api/session`, the form appears
+  after about 5 s;
+- [ ] after each attempt, the code appears nowhere in the address bar, the
+  history list, the browser's saved form data / password manager prompts, or
+  the Web Inspector's storage panes (local / session storage, IndexedDB,
+  cookies other than `__Host-session`);
+- [ ] the browser console reports no Content-Security-Policy violation on `/`
+  other than, possibly, an `img-src` one for the browser's own automatic
+  `/favicon.ico` request (expected: the shell has no favicon and its policy is
+  `img-src 'none'`), and `/` opened over plain HTTP from another host shows only
+  「このブラウザーまたは接続ではパスキーを使えません。」;
+- [ ] the layout fits a phone screen without horizontal scrolling in portrait
+  and landscape, in light and dark appearance.
+
 ### Issue #10 phase 2 S5b sign-in shell and application asset serving (pending)
 
 Mock only: verified with a synthetic Web build, the synthetic ASGI driver and
@@ -1851,7 +1904,9 @@ account at the reserved name:
   browser's developer tools (exactly the fixed list of
   `server/app/auth/README.md`, "Web assets", `no-store`, no `Set-Cookie`,
   `ETag`, `Last-Modified`, `Server` or `Date`) and that the console shows no
-  CSP violation;
+  CSP violation other than, possibly, an `img-src` one for the browser's own
+  automatic `/favicon.ico` request (the shell has no favicon and its policy is
+  `img-src 'none'`; the request itself is the generic `404`);
 - [ ] load `/`, `/s.js` and `/s.css` from two browsers (one signed in as the
   Owner, one never invited) and compare the bodies' SHA-256: identical; reload
   with the cache disabled and enabled: always `200`, never `304`;

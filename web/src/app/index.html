@@ -3,12 +3,15 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- Defence in depth: the Main Server sends the same policy plus
+         frame-ancestors as a response header (S5b). It must equal
+         APP_META_CSP in scripts/policy.mjs (the build checks). -->
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'">
     <meta name="referrer" content="no-referrer">
     <title>ServerSentinel</title>
-    <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="/assets/app.css">
-    <script type="module" src="/assets/app.js"></script>
+    <link rel="icon" href="/app/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/app/app.css">
+    <script type="module" src="/app/app.js"></script>
   </head>
   <body><div id="root"></div></body>
 </html>
