@@ -1342,7 +1342,7 @@ class SceneRuntimeThirdReviewRegressionTests(unittest.TestCase):
 class SceneRuntimeFourthReviewRegressionTests(unittest.TestCase):
     """Regressions for the #213 review findings on 9a069a9."""
 
-    def _exhausted_after_shift(self, *, loss_before_exhaustion):
+    def _exhausted_after_shift(self, *, loss_before_exhaustion, loss_delay_ns=5):
         harness = Harness(binding(OTHER, SourceType.REMOTE_AGENT))
         harness.runtime.start()
         current, replacement = uuid4(), uuid4()
@@ -1363,7 +1363,7 @@ class SceneRuntimeFourthReviewRegressionTests(unittest.TestCase):
             # The replacement is refused: the detector never sees the restart.
             self.assertFalse(offer(replacement))
         self.assertTrue(harness.runtime._slots[OTHER].history_exhausted)
-        harness.clock.value += 5
+        harness.clock.value += loss_delay_ns
         harness.runtime.source_unavailable(OTHER, trusted=True)
         harness.runtime.step()
         return harness
@@ -1372,6 +1372,18 @@ class SceneRuntimeFourthReviewRegressionTests(unittest.TestCase):
         # Claude (#213) / Owner decision 2026-10-11: a loss after exhaustion
         # is handed to the detector as untrusted.
         harness = self._exhausted_after_shift(loss_before_exhaustion=False)
+        self.assertEqual([], harness.recorder.items)
+        source = harness.source(OTHER)
+        self.assertEqual(Observation.UNKNOWN, source.tamper)
+        self.assertEqual("stream_history_exhausted", source.tamper_reason)
+
+    def test_loss_at_the_exhaustion_instant_is_untrusted(self):
+        # #224 item 1: the boundary `now >= exhausted_ns` is inclusive. A loss
+        # with the very monotonic timestamp of the exhaustion is already after
+        # it (the detector never saw the refused restart), so it never
+        # confirms tamper; a `>` comparison would let it correlate.
+        harness = self._exhausted_after_shift(loss_before_exhaustion=False, loss_delay_ns=0)
+        self.assertEqual(harness.runtime._slots[OTHER].exhausted_ns, harness.clock.value)
         self.assertEqual([], harness.recorder.items)
         source = harness.source(OTHER)
         self.assertEqual(Observation.UNKNOWN, source.tamper)

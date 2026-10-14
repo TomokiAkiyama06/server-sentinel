@@ -276,6 +276,13 @@ timestamped before exhaustion keeps its trust and may still correlate (Owner
 decision 2026-10-11). A sample still pending when its producer stream is
 replaced (the worker has not taken it yet) is discarded as stale imagery
 (`stale_rejected`), even when the replacement's first frame is sampled out.
+Only a replacement producer stream consumes that history: a camera loss or a
+capture reopen mints a new runtime stream, and a calibration refresh binds a
+fresh detector, without adding a retired producer id. A future producer
+(Issue #224 review) should therefore change `stream_id` only when the imagery
+itself restarts (for a remote agent, a new `capture_epoch`), not on every
+transport reconnect or session generation; otherwise a flapping LAN could
+exhaust the history and leave the source `unknown` until restart.
 A calibration refresh request (`request_calibration_refresh()`) is deferred
 while a held loss or a loss just taken from the capture slot is still to be
 handed to the current detector, so the refresh never discards the scene-shift
