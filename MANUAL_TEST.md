@@ -1362,7 +1362,8 @@ Total run time today (≤ 3 h):
 - [ ] G1: `auth_unpaired` / `auth_other_ca` / `auth_revoked` / `auth_revoked_live` で受理 media 0、`route_probe` でハーネス receiver に human route なし（製品の human/admin API は上の transport PoC 項目で別途確認）;
 - [ ] G2: 各 impairment 後の報告 gap が実欠落と一致（epoch 内は完全一致、capture 再起動は範囲不明）、重複 commit 0、sender の unit 収支（末尾 drop を含む）が照合済み（`drop_accounting` が `pass`）;
 - [ ] G3: receiver queue / kernel send queue の滞留 byte（`TIOCOUTQ` と `ss -tmi` の skmem `w`）/ VmHWM が設定上限内で warmup 後に増加しない;
-- [ ] G4: 手動操作なしで再接続し p95 ≤ 10 s;
+- [ ] G4: 手動操作なしで再接続し p95 ≤ 10 s（再接続時間は impairment の終了から。2 host の Main 側停止・再起動は Main 時計「window 終了 → 後続接続の `session_hello`」+ Agent 時計「`connected` → `first_accept`」で、Main の停止時間を含めない。#237 の変更後の 2 host / 実 LAN での確認は**未実施**）;
+- [ ] #237 の harness 修正（heartbeat 応答記録と停止の協調、`stopped` / `stopping` 記録、応答への echo 付け直し、fast `slow_stop_10s` 4 s）を含む HEAD で実行し、2 host run の receiver 記録に `stopping`（`coordinated: true`）、Main 側 orchestrator 記録に `sigstop` の後の `stopped` があることを生記録レビューで確かめた（未実施）;
 - [ ] G5: 無音断の検知 ≤ 15 s、Main の未 commit 区間が Agent 保護区間 [T−600 s, T+600 s] に含まれる;
 - [ ] G6: CPU 制限下の 4 source で backpressure 0、5 source 目は拒否;
 - [ ] 全 run が非 fast（`--fast` なし。summary の各 run 行と候補行の `fast` が `false`、`fast_runs` が 0）;

@@ -1675,6 +1675,8 @@ class SummarizerTests(unittest.TestCase):
                   "session": 11},
                  {"kind": "closed", "t_ns": 501 * second, "reason": "tls_session_failed",
                   "session": 12},
+                 {"kind": "connected", "t_ns": 502 * second + second // 2, "connection": 3,
+                  "session": 13},
                  {"kind": "first_accept", "t_ns": 503 * second, "connection": 3, "source": 0,
                   "session": 13}]
         # Main clock: the stopping receiver closes 11 at 11 s (the old process
@@ -1687,6 +1689,10 @@ class SummarizerTests(unittest.TestCase):
         row = self.report()["main_restart"]
         self.assertEqual(("pass", 1, 1), (row["g4"], row["reconnects"],
                                           row["reconnects_required"]))
+        # from the new receiver's ready (12 s) to Main greeting 13 (13 s), plus
+        # 13's connected -> first accept (0.5 s, Agent clock); 12 was greeted
+        # by the stopping receiver before the window end and does not count
+        self.assertEqual(3 * second // 2, row["reconnect_p95_ns"])
         # the connection live at the restart has no accepted unit after it
         self.rewrite("main_restart-a_framed", "sender",
                      [start] + sender_rows + [lost] + burst[:2])
@@ -2130,7 +2136,10 @@ class SummarizerTests(unittest.TestCase):
                              "connection": connection, "session": session}]
 
                 def accept(at, session, connection):
-                    return [{"kind": "first_accept", "t_ns": at * second,
+                    # TLS handshake done 0.5 s (Agent clock) before the accept
+                    return [{"kind": "connected", "t_ns": at * second - second // 2,
+                             "connection": connection, "session": session},
+                            {"kind": "first_accept", "t_ns": at * second,
                              "connection": connection, "source": 0, "session": session}]
 
                 # Main clock: connection 10 closed at 5 s (incidental), 11 opened at
@@ -2148,11 +2157,14 @@ class SummarizerTests(unittest.TestCase):
                 self.assertEqual(("fail", "fail"), (row["g4"], row["g5"]))
                 # connection 11 lost at the outage and the Agent reconnected (12)
                 detected = incidental + lost(111, 11, 2) + accept(113, 12, 3)
+                # Main greets connection 12 one second after the window end:
+                # reconnect = 1 s (Main) + 0.5 s connected -> accept (Agent)
+                end = actions[1][1]
                 self.rewrite(name, "receiver", receiver + self._durable(1) + sessions
-                             + _session(12, 22, 30, 3))
+                             + _session(12, end + 1, 30, 3))
                 self.rewrite(name, "sender", detected)
                 row = self.report()[scenario]
-                self.assertEqual(("pass", "pass", 2 * second),
+                self.assertEqual(("pass", "pass", 3 * second // 2),
                                  (row["g4"], row["g5"], row["reconnect_p95_ns"]))
                 # the receiver records carry no session nonces: not correlated
                 self.rewrite(name, "receiver", receiver + self._durable(1))
@@ -2188,6 +2200,8 @@ class SummarizerTests(unittest.TestCase):
                              "last_echo_ns": echo, "last_committed_capture_ns": 1},
                             {"kind": "closed", "t_ns": at * second, "reason": "peer_closed",
                              "connection": 1, "session": 11, "last_echo_ns": echo},
+                            {"kind": "connected", "t_ns": (at + 1) * second,
+                             "connection": 2, "session": 12},
                             {"kind": "first_accept", "t_ns": (at + 2) * second,
                              "connection": 2, "source": 0, "session": 12}]
 
@@ -2200,8 +2214,11 @@ class SummarizerTests(unittest.TestCase):
                 # replies before the outage echo Agent heartbeats 104..108
                 before = [ack(at, (100 + at) * second) for at in range(4, 9)]
 
-                def check(close_s, replies, echo, expected):
-                    sessions = (_session(11, 1, close_s, 1) + _session(12, close_s + 1, 90, 2))
+                def check(close_s, replies, echo, expected, greeted=None):
+                    # Main greets the reconnect (12) at ``greeted`` (default:
+                    # after 11 closed); G4 adds 1 s connected -> accept
+                    greeted = close_s + 1 if greeted is None else greeted
+                    sessions = (_session(11, 1, close_s, 1) + _session(12, greeted, 90, 2))
                     self.run_dir(name, orchestrator=orchestrator, two_host=True,
                                  receiver=receiver + self._durable(1) + sessions + replies,
                                  sender_rows=[start] + sender_rows + lost(200, echo))
@@ -2216,7 +2233,11 @@ class SummarizerTests(unittest.TestCase):
                 # after SIGCONT never reached the Agent)
                 drained = [ack(end, 109 * second)] if scenario == "slow_stop_10s" else []
                 check(end + 1, before + drained, 108 * second, ("pass", "pass"))
-                check(end + 15 + 5, before + drained, 108 * second, ("pass", "pass"))
+                check(end + 15 + 5, before + drained, 108 * second, ("pass", "pass"),
+                      greeted=end + 2)
+                # the same, but Main greets the reconnect only 21 s after the
+                # window end: G4 measures from the window end and fails
+                check(end + 15 + 5, before + drained, 108 * second, ("fail", "pass"))
                 # the session stayed open well past the window: it survived, and
                 # its later loss (an unrelated drop) is not the detection
                 check(end + 15 + 6, before, 108 * second, ("fail", "fail"))
@@ -2246,6 +2267,198 @@ class SummarizerTests(unittest.TestCase):
                 self.assertEqual(("unmeasured", "unmeasured"), (row["g4"], row["g5"]))
                 for path in (self.root / name).iterdir():
                     path.unlink()
+
+    def test_two_host_reconnect_is_measured_from_the_main_window_end(self):
+        """#237: on two hosts the G4 reconnect after a Main SIGSTOP excludes
+        Main's own stop time, like one host (window end -> first accepted
+        unit), as Main (window end -> HELLO received) + Agent (connected ->
+        first accept): never less than the true value, so a slow reconnect
+        after SIGCONT still fails."""
+        second = 10**9
+        name = "slow_stop_60s-a_framed"
+        orchestrator, receiver, sender_rows = _base("slow_stop_60s")
+        # Main clock: SIGSTOP 10 s -> SIGCONT 70 s
+        orchestrator = orchestrator + [
+            {"kind": "action", "t_ns": at * second, "action": action, "duration_ns": 0}
+            for action, at in (("sigstop", 10), ("sigcont", 70))]
+        start = {"kind": "start", "t_ns": 0, "n_sources": 1, "loss_timeout_ns": 2 * second}
+
+        def run(greeted_ms, connected_ms, accepted_ms, *, connected=True):
+            # Agent clock (offset 200 s): the Agent loses connection 11 5 s into
+            # the stop, then reconnects as 12 once Main runs again
+            agent = [start] + sender_rows + [
+                {"kind": "loss_detected", "t_ns": 205 * second, "source": 0,
+                 "idle_ns": 5 * second, "connection": 1, "session": 11,
+                 "last_echo_ns": None, "last_committed_capture_ns": 1},
+                {"kind": "closed", "t_ns": 205 * second, "reason": "loss_timeout",
+                 "connection": 1, "session": 11, "last_echo_ns": None},
+                {"kind": "first_accept", "t_ns": accepted_ms * 10**6, "connection": 2,
+                 "source": 0, "session": 12}]
+            if connected:
+                agent.append({"kind": "connected", "t_ns": connected_ms * 10**6,
+                              "connection": 2, "session": 12})
+            main = (receiver + self._durable(1) + _session(11, 1, 72, 1)
+                    + [{"kind": "session_hello", "t_ns": greeted_ms * 10**6,
+                        "connection": 2, "session": 12}])
+            self.run_dir(name, orchestrator=orchestrator, two_host=True, receiver=main,
+                         sender_rows=agent)
+            row = self.report()["slow_stop_60s"]
+            for path in (self.root / name).iterdir():
+                path.unlink()
+            return row
+
+        # the Agent-clock close -> accept is 65.5 s (the old false FAIL); from
+        # the window end it is 0.4 s (Main) + 0.2 s (Agent)
+        row = run(70_400, 270_300, 270_500)
+        self.assertEqual("pass", row["g4"])
+        self.assertEqual(600 * 10**6, row["reconnect_p95_ns"])
+        # Main greets the reconnect 11 s after SIGCONT: fails
+        row = run(81_000, 270_300, 270_500)
+        self.assertEqual("fail", row["g4"])
+        self.assertEqual(11_200 * 10**6, row["reconnect_p95_ns"])
+        # the reconnect's first accept comes 10.5 s after its handshake: fails
+        row = run(70_400, 270_300, 280_800)
+        self.assertEqual("fail", row["g4"])
+        # a HELLO Main received before the window end is not the reconnect
+        self.assertEqual("fail", run(69_000, 270_300, 270_500)["g4"])
+        # records without the Agent ``connected`` evidence: not measured
+        self.assertEqual("unmeasured",
+                         run(70_400, 270_300, 270_500, connected=False)["g4"])
+
+    def test_main_reply_cutoff_needs_proof_that_main_had_stopped(self):
+        """#237: a heartbeat reply written after the orchestrator recorded the
+        stop/restart but before the receiver actually stopped is no survival
+        evidence, only when a record proves when Main stopped replying (the
+        orchestrator's confirmed ``stopped``, or the stopped receiver's
+        coordinated ``stopping``). Without that proof, or for a reply written
+        after it, the session still counts as answered (fail)."""
+        second = 10**9
+        ms = 10**6
+        for scenario, actions in (
+                ("slow_stop_10s", [("sigstop", 10), ("sigcont", 20)]),
+                ("main_restart", [("restart_receiver", 10), ("ready", 12)])):
+            with self.subTest(scenario=scenario):
+                name = f"{scenario}-a_framed"
+                orchestrator, receiver, sender_rows = _base(scenario)
+                orchestrator = orchestrator + [
+                    {"kind": "action", "t_ns": at * second, "action": action,
+                     "duration_ns": 0} for action, at in actions]
+                end = actions[1][1]
+                start = {"kind": "start", "t_ns": 0, "n_sources": 1,
+                         "loss_timeout_ns": second // 2}
+                agent = [start] + sender_rows + [
+                    {"kind": "loss_detected", "t_ns": 200 * second, "source": 0,
+                     "idle_ns": 2 * second, "connection": 1, "session": 11,
+                     "last_echo_ns": 109 * second, "last_committed_capture_ns": 1},
+                    {"kind": "closed", "t_ns": 200 * second, "reason": "peer_closed",
+                     "connection": 1, "session": 11, "last_echo_ns": 109 * second},
+                    {"kind": "connected", "t_ns": 201 * second, "connection": 2,
+                     "session": 12},
+                    {"kind": "first_accept", "t_ns": 202 * second, "connection": 2,
+                     "source": 0, "session": 12}]
+                before = [{"kind": "heartbeat_ack", "t_ns": at * second, "sent_ns": at * second,
+                           "connection": 1, "session": 11, "echo_ns": (100 + at) * second}
+                          for at in range(4, 9)]
+
+                def check(extra_main, sent_ms, expected, *, extra_orchestrator=(),
+                          record_ms=None):
+                    # the Agent's last echo (109) was written at ``sent_ms``
+                    # (Main clock); its record may be written later
+                    last = {"kind": "heartbeat_ack", "t_ns": (record_ms or sent_ms) * ms,
+                            "sent_ns": sent_ms * ms, "connection": 1, "session": 11,
+                            "echo_ns": 109 * second}
+                    main = (receiver + self._durable(1) + _session(11, 1, end + 1, 1)
+                            + _session(12, end + 1, 90, 2) + before + [last]
+                            + list(extra_main))
+                    self.run_dir(name, orchestrator=orchestrator + list(extra_orchestrator),
+                                 two_host=True, receiver=main, sender_rows=agent)
+                    row = self.report()[scenario]
+                    for path in (self.root / name).iterdir():
+                        path.unlink()
+                    self.assertEqual(expected, (row["g4"], row["g5"]),
+                                     (sent_ms, extra_main, extra_orchestrator))
+
+                # written before the window start: never evidence (record late)
+                check((), 9_990, ("pass", "pass"), record_ms=10_020)
+                # written 5 ms after the recorded start, no proof: answered
+                check((), 10_005, ("fail", "fail"))
+                if scenario == "slow_stop_10s":
+                    stopped = [{"kind": "action", "t_ns": 10_010 * ms, "action": "stopped",
+                                "duration_ns": 0}]
+                    check((), 10_005, ("pass", "pass"), extra_orchestrator=stopped)
+                    # written after the receiver was seen frozen: answered
+                    check((), 10_015, ("fail", "fail"), extra_orchestrator=stopped)
+                    # a ``stopped`` outside the window proves nothing
+                    late = [{**stopped[0], "t_ns": 30 * second}]
+                    check((), 10_005, ("fail", "fail"), extra_orchestrator=late)
+                else:
+                    stopping = {"kind": "stopping", "t_ns": 11 * second,
+                                "stop_ns": 10_010 * ms, "abrupt": True, "coordinated": True}
+                    check([stopping], 10_005, ("pass", "pass"))
+                    # written after the receiver's own stop time: answered
+                    check([stopping], 10_015, ("fail", "fail"))
+                    # an uncoordinated stop proves nothing about later writes
+                    check([{**stopping, "coordinated": False}], 10_005, ("fail", "fail"))
+                    # a graceful stop's record (not the restart) proves nothing
+                    check([{**stopping, "abrupt": False}], 10_005, ("fail", "fail"))
+
+    def test_repeated_echo_counts_only_if_the_agent_received_that_frame(self):
+        """#237 review: after SIGCONT the receiver drains data the Agent sent
+        before dropping the connection and its reply repeats the old latest
+        echo (same value as the Agent's last echo). With numbered frames the
+        Agent's received count, not the value, decides: a repeat beyond that
+        count is no survival evidence (pass), one within it is (fail), and a
+        count beyond Main's records is unmeasured."""
+        second = 10**9
+        name = "slow_stop_10s-a_framed"
+        orchestrator, receiver, sender_rows = _base("slow_stop_10s")
+        orchestrator = orchestrator + [
+            {"kind": "action", "t_ns": at * second, "action": action, "duration_ns": 0}
+            for action, at in (("sigstop", 10), ("sigcont", 20))]
+        start = {"kind": "start", "t_ns": 0, "n_sources": 1, "loss_timeout_ns": second // 2}
+
+        def ack(at, echo, index):
+            row = {"kind": "heartbeat_ack", "t_ns": at * second, "sent_ns": at * second,
+                   "connection": 1, "session": 11, "echo_ns": echo}
+            return row if index is None else {**row, "index": index}
+
+        def run(frames, *, numbered=True, repeat_index=6):
+            # replies 1..5 before the stop echo Agent heartbeats 104..108; the
+            # repeat of 108 is written at SIGCONT (20 s), after the cutoff
+            replies = [ack(at, (100 + at) * second, (at - 3) if numbered else None)
+                       for at in range(4, 9)]
+            replies.append(ack(20, 108 * second, repeat_index if numbered else None))
+            counted = {} if frames is None else {"echo_frames": frames}
+            agent = [start] + sender_rows + [
+                {"kind": "loss_detected", "t_ns": 200 * second, "source": 0,
+                 "idle_ns": 2 * second, "connection": 1, "session": 11,
+                 "last_echo_ns": 108 * second, "last_committed_capture_ns": 1, **counted},
+                {"kind": "closed", "t_ns": 200 * second, "reason": "peer_closed",
+                 "connection": 1, "session": 11, "last_echo_ns": 108 * second, **counted},
+                {"kind": "connected", "t_ns": 201 * second, "connection": 2, "session": 12},
+                {"kind": "first_accept", "t_ns": 202 * second, "connection": 2,
+                 "source": 0, "session": 12}]
+            main = (receiver + self._durable(1) + _session(11, 1, 21, 1)
+                    + _session(12, 21, 90, 2) + replies)
+            self.run_dir(name, orchestrator=orchestrator, two_host=True, receiver=main,
+                         sender_rows=agent)
+            row = self.report()["slow_stop_10s"]
+            for path in (self.root / name).iterdir():
+                path.unlink()
+            return row["g4"], row["g5"]
+
+        # the review's repro: the Agent received frames 1..5 only, so the
+        # repeat (frame 6, after SIGCONT) never reached it: compliant
+        self.assertEqual(("pass", "pass"), run(5))
+        # the Agent received the repeat (6 frames): it survived the stop
+        self.assertEqual(("fail", "fail"), run(6))
+        # the Agent counts a frame Main has no record of: unmeasured
+        self.assertEqual(("unmeasured", "unmeasured"), run(7))
+        self.assertEqual(("unmeasured", "unmeasured"), run(6, repeat_index=7))
+        # without the numbering the echo value decides, conservatively: the
+        # repeat's value equals the Agent's last echo, so never a pass
+        self.assertEqual(("fail", "fail"), run(None))
+        self.assertEqual(("fail", "fail"), run(5, numbered=False))
 
 
 def second_ns(value):
@@ -2335,7 +2548,7 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
     class Connection:
         def __init__(self, chunks, log, fail=None):
             self.chunks, self.log, self.fail = list(chunks), log, fail
-            self.on_recv = None
+            self.on_recv = self.on_send = None
 
         def settimeout(self, _value):
             pass
@@ -2351,6 +2564,8 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
         def sendall(self, data):
             if self.fail is not None and wire.heartbeat_ack_frame(7) in data:
                 raise self.fail
+            if self.on_send is not None:
+                self.on_send(bytes(data))
             self.log.append(("send", bytes(data)))
 
     class Writer:
@@ -2365,7 +2580,8 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
         config.admission_check_s = config.idle_timeout_s = 10**6
         instance = object.__new__(receiver.Receiver)
         instance.config, instance.writer = config, self.Writer(log)
-        instance.stop, instance._lock = threading.Event(), threading.Lock()
+        instance._init_stop_state()
+        instance._lock = threading.Lock()
         instance.bytes_in = instance.max_outq = instance.max_inq = 0
         instance.tracker = mock.Mock(heartbeat=mock.Mock(return_value=True))
         return instance
@@ -2384,10 +2600,12 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
                                  content_length=len(first) + len(second))
         return [head + first, second]
 
-    def _run(self, candidate, fail=None, stop_before_last=False):
+    def _run(self, candidate, fail=None, stop_before_last=False, on_send=None):
         log = []
         instance = self._receiver(candidate, log)
         connection = self.Connection(self._chunks(candidate), log, fail)
+        if on_send is not None:
+            connection.on_send = lambda data: on_send(instance, data)
         if stop_before_last:
             # The stop arrives while the session thread is inside its read:
             # the last chunk (heartbeat 8) is read after ``stop`` was set.
@@ -2402,6 +2620,7 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
             reason = instance._run_session(session, object(), state)
         except OSError:
             reason = "tls_session_failed"
+        self.last_instance = instance
         return log, reason
 
     def test_ack_recorded_only_after_its_reply_was_sent(self):
@@ -2436,8 +2655,10 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
         for candidate in ("a_framed", "b_chunked", "b_segment"):
             with self.subTest(candidate=candidate):
                 log, reason = self._run(candidate, stop_before_last=True)
-                # b_chunked leaves its loop before processing the late chunk
-                self.assertIn(reason, ("shutdown", "peer_closed"))
+                # a_framed / b_segment refuse the reply to the late chunk;
+                # b_chunked leaves its loop before processing it. Either way
+                # the session of a stopping receiver closes as ``shutdown``.
+                self.assertEqual("shutdown", reason, candidate)
                 echoes = [item[2]["echo_ns"] for item in log
                           if item[0] == "event" and item[1] == "heartbeat_ack"]
                 self.assertNotIn(8, echoes)
@@ -2454,8 +2675,176 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
         self.assertEqual("shutdown", raised.exception.reason)
         self.assertEqual([], log)
 
+    @staticmethod
+    def _acks(log):
+        return [item[2] for item in log if item[0] == "event" and item[1] == "heartbeat_ack"]
+
+    def test_stop_requested_inside_sendall_waits_for_the_reply_and_its_record(self):
+        # #237: SIGUSR1 (``request_stop``) arriving while a reply is being
+        # written waits for the write and its record: the echo is recorded
+        # with a ``sent_ns`` before ``stop_ns``, and nothing is written after.
+        for candidate in ("a_framed", "b_chunked", "b_segment"):
+            with self.subTest(candidate=candidate):
+                stopper = {}
+
+                def on_send(instance, data):
+                    if wire.heartbeat_ack_frame(7) in data and "thread" not in stopper:
+                        thread = threading.Thread(target=instance.request_stop,
+                                                  kwargs={"abrupt": True})
+                        stopper["thread"] = thread
+                        thread.start()
+                        # the stop request cannot complete inside this write
+                        stopper["set_inside_send"] = instance.stop.wait(0.3)
+
+                log = []
+                instance = self._receiver(candidate, log)
+                connection = self.Connection(self._chunks(candidate), log)
+                connection.on_send = lambda data: on_send(instance, data)
+                # the read after the reply carrying echo 7 (heartbeat 8; for
+                # b_segment the next segment head) happens once the stop landed
+                after = 0 if candidate == "b_segment" else 1
+                connection.on_recv = lambda left: left == after and instance.stop.wait(5)
+                state = {"last_rx": time.monotonic(), "checked": time.monotonic(),
+                         "connection": 1, "session": None}
+                reason = instance._run_session(mock.Mock(connection=connection), object(),
+                                               state)
+                stopper["thread"].join(5)
+                self.assertFalse(stopper["set_inside_send"])
+                self.assertEqual("shutdown", reason)
+                self.assertTrue(instance.stop_coordinated)
+                self.assertTrue(instance.abrupt)
+                acks = self._acks(log)
+                # b_segment answers both heartbeats of its one segment at once
+                expected = [7, 8] if candidate == "b_segment" else [7]
+                self.assertEqual(expected, [ack["echo_ns"] for ack in acks])
+                for ack in acks:
+                    self.assertLess(ack["sent_ns"], instance.stop_ns)
+                if candidate != "b_segment":
+                    self.assertFalse([item for item in log if item[0] == "send"
+                                      and wire.heartbeat_ack_frame(8) in item[1]], log)
+
+    def test_stop_set_inside_sendall_without_the_lock_still_records_the_reply(self):
+        # A stop that bypasses ``request_stop`` while the write is in
+        # progress: the Agent may receive the reply, so it is still recorded,
+        # with a ``sent_ns`` no earlier than the stop (conservative for G4/G5).
+        for candidate in ("a_framed", "b_chunked", "b_segment"):
+            with self.subTest(candidate=candidate):
+                stopped = {}
+
+                def on_send(instance, data):
+                    if wire.heartbeat_ack_frame(7) in data and not stopped:
+                        stopped["at"] = time.monotonic_ns()
+                        instance.stop.set()
+
+                log, reason = self._run(candidate, on_send=on_send)
+                self.assertEqual("shutdown", reason)
+                acks = self._acks(log)
+                self.assertTrue(acks and acks[0]["echo_ns"] == 7, log)
+                for ack in acks:
+                    self.assertGreaterEqual(ack["sent_ns"], stopped["at"])
+                if candidate != "b_segment":
+                    self.assertNotIn(8, [ack["echo_ns"] for ack in acks])
+
+    def test_stop_request_without_the_send_lock_is_recorded_uncoordinated(self):
+        instance = self._receiver("a_framed", [])
+        instance.request_stop()
+        self.assertTrue(instance.stop.is_set())
+        self.assertTrue(instance.stop_coordinated)
+        self.assertFalse(instance.abrupt)
+        first = instance.stop_ns
+        instance.request_stop(abrupt=True)
+        self.assertEqual(first, instance.stop_ns)  # the first stop decision stays
+
+        # a session thread holds the lock (a write in progress) too long
+        held = self._receiver("a_framed", [])
+        taken, release = threading.Event(), threading.Event()
+
+        def writer():
+            with held._send_lock:
+                taken.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        self.assertTrue(taken.wait(5))
+        try:
+            with mock.patch.object(receiver, "STOP_SEND_WAIT_S", 0.05):
+                held.request_stop(abrupt=True)
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertTrue(held.stop.is_set())
+        self.assertFalse(held.stop_coordinated)
+
+        # a signal handler interrupting the main thread's own request_stop
+        # (lock held by the same thread) re-enters instead of waiting on itself
+        nested = self._receiver("a_framed", [])
+        with nested._send_lock:
+            with mock.patch.object(receiver, "STOP_SEND_WAIT_S", 5.0):
+                began = time.monotonic()
+                nested.request_stop(abrupt=True)
+        self.assertLess(time.monotonic() - began, 1.0)
+        self.assertTrue(nested.stop_coordinated)
+
+    def test_first_reply_after_a_pause_repeats_the_latest_echo(self):
+        # #237: a reply holding only media acknowledgements (the Agent's
+        # heartbeat still queued behind its backlog) after a pause carries the
+        # session's latest echo, recorded like any other heartbeat reply.
+        log = []
+        instance = self._receiver("a_framed", log)
+        ack = wire.ack_frame(uuid4(), 1, 3, "accepted", "none")
+        state = {"connection": 1, "session": 5, "echo": 7,
+                 "echo_sent": time.monotonic() - 2 * receiver.ECHO_REPEAT_S}
+        reply, echoes = instance._with_echo(state, ack, [])
+        # first in the write, so any part of it the Agent reads includes it
+        self.assertEqual((wire.heartbeat_ack_frame(7) + ack, [7]), (reply, echoes))
+        connection = self.Connection([], log)
+        instance._send(mock.Mock(connection=connection), reply, state, echoes)
+        # numbered like every heartbeat_ack frame of the session (1-based)
+        self.assertEqual([(7, 1)], [(item["echo_ns"], item["index"])
+                                    for item in self._acks(log)])
+        instance._send(mock.Mock(connection=connection), wire.heartbeat_ack_frame(8),
+                       state, [8])
+        self.assertEqual([(7, 1), (8, 2)], [(item["echo_ns"], item["index"])
+                                            for item in self._acks(log)])
+        state["echo_sent"] = time.monotonic()
+        # within the repeat interval, with its own echo, without any echo yet,
+        # or with nothing to send: unchanged
+        self.assertEqual((ack, []), instance._with_echo(state, ack, []))
+        stale = {**state, "echo_sent": time.monotonic() - 2 * receiver.ECHO_REPEAT_S}
+        own = ack + wire.heartbeat_ack_frame(9)
+        self.assertEqual((own, [9]), instance._with_echo(stale, own, [9]))
+        self.assertEqual((ack, []), instance._with_echo({"echo_sent": None}, ack, []))
+        self.assertEqual((b"", []), instance._with_echo(stale, b"", []))
+
 
 class MiscTests(unittest.TestCase):
+    def test_every_main_stop_outlasts_the_agent_loss_timeout(self):
+        # #237: G5 requires an Agent loss detection for every Main stop, so
+        # each scheduled SIGSTOP (fast and full) must outlast the default loss
+        # timeout of that timing by the b_segment cadence + reply timeout
+        # margin; the old 2 s fast stop could end undetected.
+        for fast in (True, False):
+            loss_timeout = sender.SenderConfig(candidate="b_segment", host="127.0.0.1",
+                                               port=1, n_sources=1, fast=fast).loss_timeout_s
+            for name, spec in matrix.SCENARIOS.items():
+                for item in spec["fast" if fast else "full"].get("actions", []):
+                    if item[1] == "sigstop":
+                        with self.subTest(scenario=name, fast=fast):
+                            self.assertGreaterEqual(item[2], loss_timeout + 2.5)
+
+    def test_sigstop_is_confirmed_from_the_process_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stat = Path(directory) / "42" / "stat"
+            stat.parent.mkdir()
+            # a command name with a space and parenthesis does not confuse it
+            stat.write_text("42 (py (x) R) T 1 42 42 0 -1\n", encoding="ascii")
+            self.assertTrue(matrix._wait_stopped(42, timeout=0.1, stat_root=directory))
+            for state in ("R", "S", "t"):
+                stat.write_text(f"42 (py) {state} 1 42\n", encoding="ascii")
+                self.assertFalse(matrix._wait_stopped(42, timeout=0.05, stat_root=directory))
+            self.assertFalse(matrix._wait_stopped(43, timeout=0.05, stat_root=directory))
+
     def test_epoch_strictly_increases_in_private_file(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "epoch"
@@ -2621,7 +3010,13 @@ class LoopbackMatrixTests(unittest.TestCase):
         out = orchestrator.run(["normal", "outage_5s", "auth_other_ca", "route_probe"],
                                ["a_framed"])
         orchestrator.run(["rst", "route_probe"], ["b_chunked"])
-        orchestrator.run(["normal"], ["b_segment"])
+        # #237: the fast Main stop is long enough for b_segment's Agent to
+        # detect it (G5), and the orchestrator confirms the SIGSTOP
+        orchestrator.run(["normal", "slow_stop_10s"], ["b_segment"])
+        actions = [row["action"] for row in records.read_jsonl(
+            out / "slow_stop_10s-b_segment" / "orchestrator-both.jsonl")
+            if row["kind"] == "action"]
+        self.assertEqual(["sigstop", "stopped", "sigcont"], actions)
         report = summarize.summarize([out])
         runs = {(row["scenario"], row["candidate"]): row for row in report["runs"]}
         for key, row in runs.items():
@@ -2678,6 +3073,15 @@ class LoopbackMatrixTests(unittest.TestCase):
         detail = json.dumps(row, sort_keys=True)
         self.assertEqual(("pass", 1), (row["integrity"], row["run_ids"]), detail)
         self.assertEqual(("pass", "pass", "pass"), (row["g2"], row["g4"], row["g5"]), detail)
+        # #237: the restarted receiver's stop was coordinated with its reply
+        # writes, and the Agent recorded each connection's handshake
+        name = "main_restart-a_framed"
+        stops = [(item["abrupt"], item["coordinated"]) for item in records.read_jsonl(
+            Path(outs["main"]) / name / "receiver.jsonl") if item["kind"] == "stopping"]
+        self.assertIn((True, True), stops)
+        connected = [item for item in records.read_jsonl(
+            Path(outs["agent"]) / name / "sender.jsonl") if item["kind"] == "connected"]
+        self.assertGreaterEqual(len(connected), 2)
         # one Main-side tree alone is incomplete, never a pass
         alone = summarize.summarize([outs["main"]])["runs"][0]
         self.assertEqual("unmeasured", alone["integrity"])
