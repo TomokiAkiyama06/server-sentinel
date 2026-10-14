@@ -1868,14 +1868,23 @@ while the recording was active. A recording stopped early and then closed by
 its deadline before the source caught up is held to the stricter rule and may
 fail closed. Requiring an `interrupted` recording to keep a link to every
 overlapping publication of the same `stream_id` (#161 item 1(b)) is not
-implemented and awaits an Owner decision: it would hold only if a stream never
-continues across a Main restart, and that `stream_id` contract is not defined
-yet (no production ingest path publishes segments). If a source continues the
-same stream after the restart, its next overlapping publication is
-legitimately unlinked (the recording is no longer active) and leaves exactly
-the catalog that a link lost just before the restart leaves, so the rule would
-fail an ordinary update; `test_an_interrupted_recording_cannot_tell_a_lost_link_from_a_later_publication`
-pins both cases as preserved.
+implemented and is deferred until the `stream_id` contract is settled with the
+ingest wiring (#256): it would hold only if a stream never continues across a Main
+restart, and that contract is not defined yet (no production ingest path
+publishes segments). If a source continues the same stream after the restart,
+its next overlapping publication is legitimately unlinked (the recording is no
+longer active). For a non-critical recording that leaves exactly the catalog
+that a link lost just before the restart leaves, so the rule would fail an
+ordinary update. A critical recording leaves partial evidence only: `append()`
+marks a segment `critical` while an overlapping active recording is critical,
+so a segment whose link was lost before the restart keeps `critical = 1`
+while a later one has `0`; that evidence is not turned into a rule (overlapping
+recordings, early stops and deletion are not assessed).
+`test_an_interrupted_recording_cannot_tell_a_lost_link_from_a_later_publication`
+pins both cases, manual and critical, as preserved. Because every update
+restarts Main and startup recovery turns every active recording `interrupted`,
+the cursor rule above (#161 item 1(a)) judges only recordings stopped early
+when verifying across an update.
 
 Known fail-closed side effects (verification fails although the service did
 nothing wrong; investigate, then take a new baseline):
