@@ -51,6 +51,13 @@ update. Deliberate tampering by someone with write access to the database
 and full re-verification of every service's transition semantics are out of
 scope (server/docs/DEPLOYMENT.md, "Scope, threat model and limits").
 
+Structure (#161 item 4, deferred to #256): this module re-implements the read-side
+semantics of RecordingStore, PairingLedger, PresenceService and others. A
+future split (recordings / access / pairing / presence) should come together
+with contract tests that drive each service's real transitions; the private
+helpers and the _fail_closed boundary are shared across sections, so a
+mechanical split is not low-risk on its own.
+
 Keyed digests are HMAC-SHA-256 under a random per-baseline salt stored in the
 baseline.
 
