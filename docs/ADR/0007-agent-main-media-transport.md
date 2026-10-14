@@ -182,6 +182,18 @@ not measurements. For two-host runs, state that the Main-side stop/restart
 and Main stale-detection checks of G5 are matched by count only (no
 cross-host clock comparison, so no per-window attribution).
 
+Harness follow-ups of Issue #237 (synthetic/loopback tests only; no real
+two-host or LAN run has used them yet, so nothing in the table below comes
+from them): the G4 reconnect after a Main-side stop/restart is measured from
+the window end on two hosts as well, as a Main-clock (window end -> HELLO
+received) plus an Agent-clock (TLS handshake done -> first accepted unit)
+interval, which can only overstate the true value; Main's own stop time is no
+longer counted (it caused a false FAIL of about 55 s p95 on `slow_stop_60s`).
+Heartbeat-reply records are atomic with the receiver's stop, the first reply
+after a pause always carries an echo, and the fast `slow_stop_10s` stop is 4 s
+so the Agent detects it. Two-host G4/G5 under these rules remain
+**unmeasured** until the MANUAL_TEST.md §G run.
+
 | Measurement | a_framed | b_chunked | b_segment | WebRTC (not in harness) | QUIC (not in harness) |
 | --- | --- | --- | --- | --- | --- |
 | Reconnect time after 1–5 s link loss | | | | | |

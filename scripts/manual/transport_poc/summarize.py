@@ -924,24 +924,12 @@ class RunSummary:
         """(start_ns, end_ns) per impairment, on the host that applied it."""
         windows = []
         starts = {}
-        restart_at = None
         for item in self.proxy:
             if item["kind"] == "impairment_start":
                 starts[item["impairment"]] = item["t_ns"]
             elif item["kind"] == "impairment_end" and item["impairment"] in starts:
                 windows.append((starts.pop(item["impairment"]), item["t_ns"], "proxy"))
-        stop_at = None
-        for item in _kind(self.orchestrator, "action"):
-            if item["action"] == "sigstop":
-                stop_at = item["t_ns"]
-            elif item["action"] == "sigcont" and stop_at is not None:
-                windows.append((stop_at, item["t_ns"], "main"))
-                stop_at = None
-            elif item["action"] == "restart_receiver":
-                restart_at = item["t_ns"]
-            elif item["action"] == "ready" and restart_at is not None:
-                windows.append((restart_at, item["t_ns"], "main"))
-                restart_at = None
+        windows += [(start, end, origin) for start, end, origin, _ in self._main_windows()]
         return windows
 
     def _impairment_starts(self):
@@ -982,9 +970,10 @@ class RunSummary:
         if any(origin == "main" for *_, origin in windows) and not single_host:
             # Main-side windows use the Main clock: each is tied to the Agent
             # connection that was live when it started (session nonce, see
-            # ``_main_session_matches``) and its reconnect is measured on the
-            # Agent clock from that connection's close to the next accepted
-            # unit on a later connection. An unrelated disconnect never
+            # ``_main_session_matches``) and its reconnect is measured from
+            # the window end, as on one host, as a sum of a Main-clock and an
+            # Agent-clock interval that never understates it (see
+            # ``_main_window_reconnects``). An unrelated disconnect never
             # stands in for a scheduled one. Agent-clock (proxy) windows are
             # matched below as on one host.
             verdict = self._main_window_reconnects(times)
@@ -1026,14 +1015,32 @@ class RunSummary:
         return "unmeasured" if required is None else "pass"
 
     def _main_window_reconnects(self, times):
-        """Two hosts: the reconnect time of each Main-side window, Agent clock.
+        """Two hosts: the reconnect time of each Main-side window.
 
-        Appends one time per window matched to a live session
-        (``_main_session_matches``): from that connection's ``closed`` to the
-        first accepted unit on a later connection, each accept used once.
-        Returns ``unmeasured`` when the records carry no session nonces,
-        ``fail`` when a matched connection has no later accepted unit, else
-        None (the caller checks the required count).
+        Like one host, measured from the window end (SIGCONT / restarted
+        receiver ready), so Main's own stop time is not counted (#237: the
+        Agent-clock close -> accept interval included up to the whole 60 s
+        SIGSTOP). Without comparing clocks it is the sum of two single-host
+        intervals of the reconnecting connection ``s``::
+
+            (session_hello[s] - window end)      Main clock
+          + (first_accept[s] - connected[s])     Agent clock
+
+        ``connected`` (TLS handshake done) precedes the HELLO's sending,
+        which precedes its receipt (``session_hello``), so the sum is never
+        less than the true window end -> first accepted unit, by the HELLO's
+        one-way delay: a false PASS is impossible, at worst it overstates.
+        ``s`` is the earliest-greeted later connection with an accepted unit
+        whose HELLO Main received at or after the window end (any later one
+        only gives a larger value), each used once, never the window's own
+        matched (lost) connection.
+
+        Only windows matched to a live, lost session
+        (``_main_session_matches``) are measured. Returns ``unmeasured`` when
+        the records carry no session nonces or the chosen connection has no
+        ``connected`` record (older records), ``fail`` when a matched window
+        has no later accepted connection, else None (the caller checks the
+        required count).
         """
         matches = self._main_session_matches()
         if matches is None:
@@ -1043,20 +1050,37 @@ class RunSummary:
         for item in _kind(self.sender, "closed"):
             if _is_int(item.get("session")) and item.get("reason") != "shutdown":
                 closed.setdefault(item["session"], item["t_ns"])
-        accepts = sorted((a["t_ns"], a.get("session") or 0)
-                         for a in _kind(self.sender, "first_accept"))
+        hellos = {}
+        for item in _kind(self.receiver, "session_hello"):
+            if _is_int(item.get("session")):
+                hellos.setdefault(item["session"], item["t_ns"])
+        connected = {}
+        for item in _kind(self.sender, "connected"):
+            if _is_int(item.get("session")):
+                connected.setdefault(item["session"], item["t_ns"])
+        accepted = {}
+        for item in _kind(self.sender, "first_accept"):
+            if _is_int(item.get("session")):
+                accepted.setdefault(item["session"], item["t_ns"])
         used = set()
-        for _window, session in matches:
+        for (_start, end), session in matches:
             if session is None or session not in closed:
                 continue
-            at = closed[session]
-            accept = next((i for i, (t, other) in enumerate(accepts)
-                           if i not in used and t >= at and other != session), None)
-            if accept is None:
+            later = sorted((hellos[other], other) for other in accepted
+                           if other != session and other not in used
+                           and other in hellos and hellos[other] >= end)
+            if not later:
                 self.metrics.update(reconnect_missing=True)
                 return "fail"
-            used.add(accept)
-            times.append(accepts[accept][0] - at)
+            greeted, other = later[0]
+            if other not in connected:
+                self.metrics.update(main_reconnect_evidence=False)
+                return "unmeasured"
+            used.add(other)
+            agent_part = accepted[other] - connected[other]
+            if agent_part < 0:
+                return "unmeasured"  # inconsistent Agent records
+            times.append(greeted - end + agent_part)
         return None
 
     def _main_session_matches(self):
@@ -1077,17 +1101,22 @@ class RunSummary:
         end -- its ``session_close``, its receiver's ``end`` or the
         orchestrator's receiver ``exit`` -- by the window end +
         DETECTION_NS + SESSION_CLOSE_GRACE_NS, and the Agent must never have
-        received a Main reply sent after the window started: the last
+        received a Main reply sent after Main stopped replying: the last
         heartbeat echo the Agent received on it (``last_echo_ns``) must be
-        older than every echo the receiver returned on it after the window
-        start (``heartbeat_ack``, recorded only after the reply was written).
-        Every session's ``last_echo_ns`` must appear among that session's
-        ``heartbeat_ack`` echoes, or the result is unmeasured. Echo values
-        are Agent clock readings and are only compared with each other;
-        ``heartbeat_ack`` times only with the Main windows. Bytes the
-        receiver drains after SIGCONT (sent before the Agent dropped the
-        connection) are not evidence either way. Returns ``[(window, session or None)]`` in window order, or
-        None when the records carry no nonces or no echo evidence.
+        older than every echo the receiver returned on it at or after the
+        window's cutoff (``heartbeat_ack`` ``sent_ns``, taken once the reply
+        was written; the cutoff is the window start, or a later proven stop
+        time, see ``_main_reply_cutoffs``). The receiver repeats the latest
+        echo in the first reply after a pause (``ECHO_REPEAT_S``), so a
+        connection kept alive after SIGCONT by media acknowledgements alone
+        still shows such an echo. Every session's ``last_echo_ns`` must
+        appear among that session's ``heartbeat_ack`` echoes, or the result
+        is unmeasured. Echo values are Agent clock readings and are only
+        compared with each other; ``heartbeat_ack`` times only with the Main
+        windows. Bytes the receiver drains after SIGCONT (sent before the
+        Agent dropped the connection) are not evidence either way. Returns
+        ``[(window, session or None)]`` in window order, or None when the
+        records carry no nonces or no echo evidence.
         """
         windows = sorted((start, end) for start, end, origin in self._impairment_windows()
                          if origin == "main")
@@ -1111,7 +1140,11 @@ class RunSummary:
         replies = {}
         for item in _kind(self.receiver, "heartbeat_ack"):
             if _is_int(item.get("session")) and _is_int(item.get("echo_ns")):
-                replies.setdefault(item["session"], []).append((item["t_ns"], item["echo_ns"]))
+                # ``sent_ns``: when the write of the reply returned (older
+                # records: the record time, which is never earlier).
+                at = item["sent_ns"] if _is_int(item.get("sent_ns")) else item["t_ns"]
+                replies.setdefault(item["session"], []).append((at, item["echo_ns"]))
+        cutoffs = self._main_reply_cutoffs()
         for session, echo in echoes.items():
             if echo not in {value for _, value in replies.get(session, ())}:
                 # The Agent received a reply on this session that Main has no
@@ -1142,8 +1175,9 @@ class RunSummary:
                 ended = min(bounds) if bounds else None
                 late = ended is None or ended > end + DETECTION_NS + SESSION_CLOSE_GRACE_NS
                 echo = echoes.get(session)
+                cutoff = cutoffs.get((start, end), start)
                 answered = echo is not None and any(
-                    at >= start and value <= echo for at, value in replies.get(session, ()))
+                    at >= cutoff and value <= echo for at, value in replies.get(session, ()))
                 if late or answered:
                     survived += 1  # kept alive through the outage: not its detection
                     continue
@@ -1166,6 +1200,48 @@ class RunSummary:
             assign(index, set())
         chosen = {index: session for session, index in owner.items()}
         return [(window, chosen.get(index)) for index, window in enumerate(windows)]
+
+    def _main_reply_cutoffs(self):
+        """Per Main-side window, the Main clock time Main stopped replying.
+
+        The orchestrator writes ``sigstop`` / ``restart_receiver`` just
+        before it signals the receiver, so a reply written in between is
+        "after the window start" without being survival evidence (#237).
+        The cutoff moves later only on a record proving no reply was written
+        after it, inside the window: for a SIGSTOP the orchestrator's
+        ``stopped`` (the receiver was seen frozen), for a restart the stopped
+        receiver's ``stopping`` ``stop_ns`` when ``coordinated`` (no reply
+        written after it, see ``Receiver.request_stop``). Otherwise the
+        window start. Same (Main) clock throughout.
+        """
+        cutoffs = {}
+        stopped = [item["t_ns"] for item in _kind(self.orchestrator, "action")
+                   if item.get("action") == "stopped"]
+        stops = [item["stop_ns"] for item in _kind(self.receiver, "stopping")
+                 if item.get("coordinated") is True and item.get("abrupt") is True
+                 and _is_int(item.get("stop_ns"))]
+        for start, end, _origin, kind in self._main_windows():
+            marks = stopped if kind == "sigstop" else stops
+            inside = [t for t in marks if start <= t <= end]
+            cutoffs[(start, end)] = min(inside) if inside else start
+        return cutoffs
+
+    def _main_windows(self):
+        """(start_ns, end_ns, "main", kind) per Main-side window, Main clock."""
+        windows = []
+        stop_at = restart_at = None
+        for item in _kind(self.orchestrator, "action"):
+            if item["action"] == "sigstop":
+                stop_at = item["t_ns"]
+            elif item["action"] == "sigcont" and stop_at is not None:
+                windows.append((stop_at, item["t_ns"], "main", "sigstop"))
+                stop_at = None
+            elif item["action"] == "restart_receiver":
+                restart_at = item["t_ns"]
+            elif item["action"] == "ready" and restart_at is not None:
+                windows.append((restart_at, item["t_ns"], "main", "restart_receiver"))
+                restart_at = None
+        return windows
 
     # -- G5 -----------------------------------------------------------------
     def _main_outage_detection(self, losses, single_host):

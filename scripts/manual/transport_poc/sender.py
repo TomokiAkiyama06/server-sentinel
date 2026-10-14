@@ -374,6 +374,11 @@ class Sender:
                                                              or str(error)))
             return None
         connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.config.sndbuf)
+        # The TLS handshake completed (Agent clock), before this connection's
+        # HELLO is written: a two-host G4 reconnect after a Main-side window
+        # adds this connection's ``connected`` -> ``first_accept`` interval
+        # to Main's window end -> ``session_hello`` (#237).
+        self.writer.write("connected", connection=self.connections + 1, session=session)
         self.connections += 1
         self.session = session
         self.last_echo_ns = None
