@@ -9,7 +9,7 @@ then records only per-source numeric watermarks in a private SQLite file so a
 restarted receiver resumes from the "durably recorded" position (ADR-0007
 item 1). No media byte is ever written to disk.
 """
-from collections import defaultdict
+from collections import defaultdict, deque
 import hashlib
 from pathlib import Path
 import signal
@@ -26,6 +26,15 @@ from .records import token
 source_ids = wire.source_ids
 # Request-line starts that mark an HTTP request sent to the framed listener.
 HTTP_METHODS = (b"GET /", b"POST ", b"PUT /", b"HEAD ")
+# A reply written after this long without a heartbeat echo on its session
+# repeats the session's latest echo (#237): the first reply after a SIGSTOP
+# then always carries Main-clock echo evidence, even when the Agent's
+# heartbeat is still queued behind its outbound backlog and the reply holds
+# only media acknowledgements.
+ECHO_REPEAT_S = 0.5
+# How long a stop request waits for an in-progress reply write before it
+# stops anyway (recorded as an uncoordinated stop; see ``request_stop``).
+STOP_SEND_WAIT_S = 2.0
 
 
 class ReceiverConfig:
@@ -234,8 +243,7 @@ class Receiver:
                              stale_after_ns=int(config.stale_after_s * 1e9)),
             self.authorizer, self.queue, clock_ns=time.monotonic_ns,
             committed_watermark=self.durable.watermark)
-        self.stop = threading.Event()
-        self.abrupt = False
+        self._init_stop_state()
         self._lock = threading.Lock()
         self._connections = {}
         self._connection_counter = 0
@@ -248,6 +256,46 @@ class Receiver:
         self.flows = {}
         self.persisted = self.durable_duplicates = 0
         self.discarded_at_stop = 0
+
+    def _init_stop_state(self):
+        self.stop = threading.Event()
+        self.abrupt = False
+        # Every reply write and the record of its heartbeat echoes happen
+        # under this lock, and a stop request sets ``stop`` under it too: a
+        # reply is either completely written (its ``sent_ns`` taken) before
+        # ``stop_ns``, or never written (#237). Re-entrant: the main thread
+        # takes it only inside ``request_stop``, and a signal handler that
+        # interrupts that very call re-enters instead of waiting on itself.
+        self._send_lock = threading.RLock()
+        self._acks = deque()
+        self.stop_ns = None
+        self.stop_coordinated = None
+
+    def request_stop(self, *, abrupt=False):
+        """Stop the receiver; safe to call from a signal handler.
+
+        Signal handlers run in the main thread. Only session threads write
+        replies under ``_send_lock``; the main thread holds it only inside
+        this method (the ``serve_with`` cleanup calls it too), and the lock
+        is re-entrant, so a handler interrupting that call acquires it at
+        once instead of waiting on its own frame. A reply write in
+        progress finishes first (bounded by the socket timeout); if the lock
+        is not free within ``STOP_SEND_WAIT_S`` the stop proceeds anyway and
+        is recorded as uncoordinated: a reply that then completes after
+        ``stop_ns`` is still recorded with its later ``sent_ns``, which only
+        makes the G4/G5 survivor check more conservative.
+        """
+        if abrupt:
+            self.abrupt = True
+        acquired = self._send_lock.acquire(timeout=STOP_SEND_WAIT_S)
+        try:
+            self.stop.set()
+            if self.stop_ns is None:
+                self.stop_ns = time.monotonic_ns()
+                self.stop_coordinated = acquired
+        finally:
+            if acquired:
+                self._send_lock.release()
 
     # -- helpers ------------------------------------------------------------
     def _event(self, kind, **fields):
@@ -290,7 +338,7 @@ class Receiver:
         try:
             loop()
         finally:
-            self.stop.set()
+            self.request_stop()
             if self.listener is not None:
                 try:
                     self.listener.close()
@@ -425,7 +473,9 @@ class Receiver:
                 self._session_b_segment(session, grant, state)
         except _Close as close:
             return close.reason
-        return "peer_closed"
+        # A session loop that ended because ``stop`` was set is a shutdown,
+        # whichever read it was in (#237: one close reason per candidate).
+        return "shutdown" if self.stop.is_set() else "peer_closed"
 
     def _sample_socket(self, connection):
         outq, inq = records.socket_queues(connection)
@@ -445,10 +495,11 @@ class Receiver:
     def _handle_bodies(self, bodies, grant, state, *, segment_blocked=None):
         """Process ``bodies``; returns ``(reply bytes, heartbeat echoes)``.
 
-        The echoes are recorded (``_record_acks``) by the caller only after
-        the reply carrying them was written, never before.
+        The echoes are recorded by ``_send`` only once the reply carrying
+        them was written, never before.
         """
         replies = []
+        heartbeats = []
         echoes = []
         for body in bodies:
             parsed = wire.parse_body(body)
@@ -472,26 +523,60 @@ class Receiver:
                 if not self.tracker.heartbeat(grant):
                     raise _Close("superseded")
                 echoes.append(parsed[1])
-                replies.append(wire.heartbeat_ack_frame(parsed[1]))
+                state["echo"] = parsed[1]
+                heartbeats.append(wire.heartbeat_ack_frame(parsed[1]))
             else:
                 raise wire.ProtocolError("unexpected frame from agent")
-        return b"".join(replies), echoes
+        # Heartbeat replies first: an Agent that received any part of this
+        # write received the first of them (in-order stream; a TLS record is
+        # delivered whole and the first record starts with it), so its
+        # ``echo_frames`` count shows every write it read part of.
+        return b"".join(heartbeats + replies), echoes
 
-    def _record_acks(self, state, echoes):
-        """Record heartbeat replies once they have been written to the socket.
+    def _with_echo(self, state, reply, echoes):
+        """Add the session's latest echo to a reply that carries none (#237).
 
-        Main clock time of each reply and the opaque echo value (an Agent
-        clock reading, only ever compared with other echo values): the Agent
-        records the last echo it received, so a connection that kept
-        receiving Main replies after a Main stop is told apart from one the
-        Agent dropped (G4/G5). The record is written only after ``_send``
-        returned, so its time is never earlier than the moment the Agent
-        could have received the echo (a SIGSTOP between the two makes it
-        later, i.e. more conservative); a failed send records nothing.
+        Only once the session received a heartbeat and no echo was written
+        on it for ``ECHO_REPEAT_S``: the first reply after a Main stop then
+        carries an echo the Agent keeps as ``last_echo_ns``, so a connection
+        that survived the stop on media acknowledgements alone is still seen
+        to have been answered after the window started (G4/G5 survivor).
         """
-        for echo in echoes:
-            self._event("heartbeat_ack", connection=state["connection"],
-                        session=state["session"], echo_ns=echo)
+        latest = state.get("echo")
+        if not reply or echoes or latest is None:
+            return reply, echoes
+        sent = state.get("echo_sent")
+        if sent is not None and time.monotonic() - sent < ECHO_REPEAT_S:
+            return reply, echoes
+        # First in the reply: an Agent that received any byte of this reply
+        # received this frame too (in-order stream; the frame is a few bytes
+        # at the start of the write), so it is counted in ``echo_frames``.
+        return wire.heartbeat_ack_frame(latest) + reply, [latest]
+
+    def _flush_acks(self):
+        """Write the queued ``heartbeat_ack`` records (outside ``_send_lock``).
+
+        Main clock evidence for G4/G5: the Agent records the last echo it
+        received, so a connection that kept receiving Main replies after a
+        Main stop is told apart from one the Agent dropped. Each record
+        carries ``sent_ns``, the Main clock time ``sendall`` returned for the
+        reply holding the echo, taken under ``_send_lock``: never earlier
+        than the reply was fully handed to the kernel, so never earlier than
+        the Agent could receive it (a SIGSTOP in between only makes it
+        later). The record's own ``t_ns`` can be later still (e.g. written
+        after a SIGUSR1); the summarizer uses ``sent_ns``. ``index`` is the
+        frame's position among the session's written heartbeat_ack frames,
+        matched against the Agent's received count (``echo_frames``). The
+        echo value is an Agent clock reading, only ever compared with other
+        echo values.
+        """
+        while True:
+            try:
+                connection, session, echo, sent_ns, index = self._acks.popleft()
+            except IndexError:
+                return
+            self._event("heartbeat_ack", connection=connection, session=session,
+                        echo_ns=echo, sent_ns=sent_ns, index=index)
 
     def _session_a(self, session, grant, state):
         reader = wire.FrameReader(self.config.maximum_message_bytes + wire.MEDIA_HEADER_BYTES)
@@ -511,26 +596,44 @@ class Receiver:
                     self._event("route_probe", reason="protocol_error",
                                 session=state["session"])
                 raise
-            reply, echoes = self._handle_bodies(bodies, grant, state)
+            reply, echoes = self._with_echo(state, *self._handle_bodies(bodies, grant, state))
             if reply:
-                self._send(session, reply)
-            self._record_acks(state, echoes)
+                self._send(session, reply, state, echoes)
 
-    def _send(self, session, data):
-        """Write ``data``, or nothing once the receiver is stopping.
+    def _send(self, session, data, state=None, echoes=()):
+        """Write ``data`` and record its echoes, or nothing once stopping.
 
         After ``stop`` is set (SIGUSR1 / SIGTERM) Main sends no further reply:
         a session thread still inside its read loop must not answer a
-        heartbeat after the orchestrator recorded the stop, or the Agent
-        would see a Main reply from inside the outage window (a false
-        survivor for G4/G5, and not what a stopped Main does).
+        heartbeat after the stop, or the Agent would see a Main reply from
+        inside the outage window (a false survivor for G4/G5, and not what a
+        stopped Main does). The check, the write and the echo record are one
+        step under ``_send_lock``, which ``request_stop`` takes too (#237): a
+        stop can no longer land between the check and the write, nor between
+        the write and its record. A failed write records nothing. If ``stop``
+        is set without the lock while the write is in progress, the reply is
+        still recorded, with its (later) ``sent_ns``.
         """
-        if self.stop.is_set():
-            raise _Close("shutdown")
-        try:
-            session.connection.sendall(data)
-        except socket.timeout:
-            raise _Close("send_failed") from None
+        with self._send_lock:
+            if self.stop.is_set():
+                raise _Close("shutdown")
+            try:
+                session.connection.sendall(data)
+            except socket.timeout:
+                raise _Close("send_failed") from None
+            sent_ns = time.monotonic_ns()
+            if echoes:
+                state["echo_sent"] = time.monotonic()
+                for echo in echoes:
+                    # 1-based position of this heartbeat_ack frame among all
+                    # written on the session, in stream order: the Agent's
+                    # ``echo_frames`` count k means it received exactly
+                    # frames 1..k (a repeated echo carries an old value, so
+                    # only the position tells what the Agent received).
+                    state["echo_frames"] = state.get("echo_frames", 0) + 1
+                    self._acks.append((state["connection"], state["session"], echo, sent_ns,
+                                       state["echo_frames"]))
+        self._flush_acks()
         self._sample_socket(session.connection)
 
     def _read_head(self, session, state, pending):
@@ -569,10 +672,10 @@ class Receiver:
                 bodies = []
                 for piece in decoder.feed(data):
                     bodies.extend(reader.feed(piece))
-                reply, echoes = self._handle_bodies(bodies, grant, state)
+                reply, echoes = self._with_echo(state,
+                                                *self._handle_bodies(bodies, grant, state))
                 if reply:
-                    self._send(session, wire.chunk(reply))
-                self._record_acks(state, echoes)
+                    self._send(session, wire.chunk(reply), state, echoes)
                 if decoder.finished:
                     self._send(session, wire.LAST_CHUNK)
                     raise _Close("peer_closed")
@@ -615,9 +718,9 @@ class Receiver:
                     data = data[:remaining]
             if len(reader):
                 raise wire.ProtocolError("segment ended inside a frame")
-            reply = b"".join(replies)
-            self._send(session, wire.response_head(200, content_length=len(reply)) + reply)
-            self._record_acks(state, echoes)
+            reply, echoes = self._with_echo(state, b"".join(replies), echoes)
+            self._send(session, wire.response_head(200, content_length=len(reply)) + reply,
+                       state, echoes)
 
     # -- consumer (durable-recording stand-in) ------------------------------
     def _consume(self):
@@ -726,6 +829,11 @@ class Receiver:
 
     def _finish(self):
         time.sleep(0.2)
+        self._flush_acks()
+        # Main clock time of the stop decision: when ``coordinated``, no reply
+        # was written after it (see ``request_stop``).
+        self._event("stopping", stop_ns=self.stop_ns, abrupt=self.abrupt,
+                    coordinated=self.stop_coordinated)
         if self.abrupt:
             # SIGUSR1: a crashing Main loses what it had not yet persisted.
             self.discarded_at_stop = len(self.queue.drain(1 << 20))
@@ -805,14 +913,18 @@ def run(config, materials_root, state_dir, out_path, run_id):
     state_dir = materials.private_directory(state_dir, exist_ok=True)
     receiver = Receiver(config, materials_root, state_dir, writer)
     def abrupt(*_):
-        receiver.abrupt = True
-        receiver.stop.set()
+        receiver.request_stop(abrupt=True)
         # A crash ends every connection at once, not after the accept loop's
-        # next timeout. No lock here: the interrupted main thread may hold it.
+        # next timeout. No ``_lock`` here: the interrupted main thread may
+        # hold it. ``list(dict.values())`` without that lock relies on the
+        # GIL (CPython): the copy is a single C-level call that no session
+        # thread's insert or pop can interleave with, so it never sees the
+        # dict change size mid-copy. A connection added right after the copy
+        # finds ``stop`` set and ends on its own.
         for connection in list(receiver._connections.values()):
             _shutdown(connection)
-    signal.signal(signal.SIGTERM, lambda *_: receiver.stop.set())
-    signal.signal(signal.SIGINT, lambda *_: receiver.stop.set())
+    signal.signal(signal.SIGTERM, lambda *_: receiver.request_stop())
+    signal.signal(signal.SIGINT, lambda *_: receiver.request_stop())
     signal.signal(signal.SIGUSR1, abrupt)
     try:
         receiver.serve()

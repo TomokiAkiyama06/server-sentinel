@@ -174,6 +174,11 @@ class Sender:
         # ``heartbeat_ack`` records (Main clock) it shows whether this
         # connection still received Main replies after a Main stop.
         self.last_echo_ns = None
+        # Main heartbeat_ack frames received on this connection: Main writes
+        # them in order and numbers them (receiver ``heartbeat_ack`` ``index``),
+        # so this count says exactly which of them reached the Agent, even
+        # when Main repeats an old echo value (#237).
+        self.echo_frames = 0
         self.connected = False
         self.payload_bytes = self.wire_bytes = 0
         self.max_outq = 0
@@ -374,9 +379,15 @@ class Sender:
                                                              or str(error)))
             return None
         connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.config.sndbuf)
+        # The TLS handshake completed (Agent clock), before this connection's
+        # HELLO is written: a two-host G4 reconnect after a Main-side window
+        # adds this connection's ``connected`` -> ``first_accept`` interval
+        # to Main's window end -> ``session_hello`` (#237).
+        self.writer.write("connected", connection=self.connections + 1, session=session)
         self.connections += 1
         self.session = session
         self.last_echo_ns = None
+        self.echo_frames = 0
         self.connected = True
         self._first_accept_pending = True
         self.last_inbound = time.monotonic()
@@ -422,7 +433,8 @@ class Sender:
                 _close(connection)
                 self._requeue_inflight()
             self.writer.write("closed", connection=self.connections, session=self.session,
-                              reason=token(reason), last_echo_ns=self.last_echo_ns)
+                              reason=token(reason), last_echo_ns=self.last_echo_ns,
+                              echo_frames=self.echo_frames)
             if reason not in ("loss_timeout", "shutdown") and not self.stop.is_set():
                 # Any unexpected disconnect is a Main-communication loss for the
                 # Agent's T-600 s/T+600 s protection, not only a silent timeout.
@@ -445,7 +457,7 @@ class Sender:
             self.writer.write("loss_detected", source=state.index, epoch=self.epoch,
                               idle_ns=idle_ns,
                               connection=self.connections, session=self.session,
-                              last_echo_ns=self.last_echo_ns,
+                              last_echo_ns=self.last_echo_ns, echo_frames=self.echo_frames,
                               last_committed_capture_ns=state.last_committed_capture_ns)
 
     def _session_stream(self, connection, deadline):
@@ -544,6 +556,7 @@ class Sender:
             raise wire.ProtocolError("unexpected frame from main")
 
     def _echo(self, echo_ns):
+        self.echo_frames += 1
         if self.last_echo_ns is None or echo_ns > self.last_echo_ns:
             self.last_echo_ns = echo_ns
 
