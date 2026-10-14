@@ -1149,6 +1149,19 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   neutral wording, in every presence state;
 - [ ] unplugging the camera right after a camera shift yields one
   `source_loss_after_scene_shift` tamper, while an unplug alone stays `unknown`.
+- [ ] (#224, Owner decision 2026-10-14) with the recorder's storage stalled so
+  a camera loss is held, an Owner calibration refresh stays `refresh_pending`;
+  after 60 s the source reports `refresh_deferred` (reason
+  `critical_backpressure` while the loss is held, otherwise
+  `calibration_refresh_deferred`) with `unknown` conclusions, and
+  `scene_calibration_refresh_deferred` is logged once; the state clears when
+  the refresh runs;
+- [ ] (#224) stopping the Main service while critical evidence is still
+  undelivered (recorder storage stalled) adds that count as `lost` to the
+  presence timeline gap marker, and Owner status reports `timeline_gap` after
+  restart; with the outbox close made to fail (for example a refused storage
+  admission), the next start reports an interrupted gap instead. This needs
+  the outbox wired into Main first (follow-up).
 
 ### Issue #217 MJPG decoder on real C960 frames (pending physical execution)
 

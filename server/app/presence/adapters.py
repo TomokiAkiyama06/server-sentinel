@@ -264,6 +264,9 @@ class TimelineOutbox:
         self._receipt = threading.RLock()
         self._recorded = self._refused = self._rejected = 0
         self._unpersisted_refused = self._unpersisted_rejected = 0
+        # Loss reported by another component (`record_lost`), such as scene
+        # critical evidence undelivered at shutdown, not yet in the marker.
+        self._unpersisted_lost = 0
         self._session = False
         # The durable session and its lock, from `open_timeline_session()`.
         self._handle = None
@@ -413,6 +416,22 @@ class TimelineOutbox:
             self._unpersisted_refused += 1
         return False
 
+    def record_lost(self, count: int):
+        """Count loss another component could not hand to the timeline.
+
+        Count only, never content: it is added to the durable gap marker by
+        the next flush, or at the latest by `close()` together with the
+        session's clean end. A close that fails leaves the session row, so the
+        next start records an interrupted gap instead. Refused (raises) once
+        the outbox is closed or before it is open, like `stage()`: the caller
+        reports that the count could not be recorded.
+        """
+        if type(count) is not int or not 1 <= count <= 2**31:
+            raise ValueError("positive loss count required")
+        with self._lock:
+            self._accepting_locked()
+            self._unpersisted_lost += count
+
     def open(self):
         """Open the durable session at startup, before any producer is wired.
 
@@ -449,12 +468,13 @@ class TimelineOutbox:
     def _unpersisted(self):
         """Counted loss not yet in the durable marker; read by Owner status."""
         with self._lock:
-            return self._unpersisted_refused + self._unpersisted_rejected
+            return self._unpersisted_refused + self._unpersisted_rejected + self._unpersisted_lost
 
     def _backlog(self):
         """Staged facts, unpersisted loss and quarantined facts, read together for Owner status."""
         with self._lock:
-            return (len(self._pending), self._unpersisted_refused + self._unpersisted_rejected,
+            return (len(self._pending),
+                    self._unpersisted_refused + self._unpersisted_rejected + self._unpersisted_lost,
                     len(self._quarantined))
 
     def _consecutive_failures(self):
@@ -465,7 +485,8 @@ class TimelineOutbox:
         """Add unpersisted counts to the durable marker, or re-read it."""
         with self._lock:
             refused, rejected = self._unpersisted_refused, self._unpersisted_rejected
-        if not (refused or rejected or lost or close):
+            reported = self._unpersisted_lost
+        if not (refused or rejected or reported or lost or close):
             try:
                 gap = self.service.timeline_gap() is not None
             except Exception:
@@ -475,13 +496,15 @@ class TimelineOutbox:
             return
         now, _ = _stamp(self.clock)
         gap = self.service.record_timeline_gap(now=now, refused=refused, rejected=rejected,
-                                               lost=lost, close=self._handle if close else None)
+                                               lost=lost + reported,
+                                               close=self._handle if close else None)
         with self._lock:
             # Subtract what was written; facts refused meanwhile stay counted.
             # The durable marker is published in the same critical section,
             # so `state()` never sees the loss in neither place.
             self._unpersisted_refused -= refused
             self._unpersisted_rejected -= rejected
+            self._unpersisted_lost -= reported
             self._gap = gap is not None
 
     def close(self):
@@ -545,7 +568,8 @@ class TimelineOutbox:
     def state(self):
         with self._lock:
             return OutboxState(self._recorded, len(self._pending), self._refused, self._rejected,
-                               self._unpersisted_refused + self._unpersisted_rejected,
+                               self._unpersisted_refused + self._unpersisted_rejected
+                               + self._unpersisted_lost,
                                self._session, self._gap, len(self._quarantined), self._failures)
 
 
@@ -694,6 +718,17 @@ class CriticalTimelineRecorder:
         self._quality(item)
         with self.outbox.receipt() as (received, trusted):
             self.outbox.service.record(self.observation(item, received, trusted), restamped=True)
+
+    def record_undelivered(self, count: int) -> None:
+        """Scene runtime `undelivered` sink: a count-only durable gap record.
+
+        Critical observations and camera losses the scene runtime could not
+        deliver (#224, Owner decision 2026-10-14) become lost facts in the
+        presence timeline gap marker through the shared outbox session; no
+        observation content, identifier or source is written. The Main
+        runtime stops scene monitoring before it closes the outbox.
+        """
+        self.outbox.record_lost(count)
 
 
 class HealthTimeline:

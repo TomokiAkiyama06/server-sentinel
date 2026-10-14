@@ -1074,8 +1074,17 @@ never dropped as a per-source failure; a loss still queued at shutdown is
 processed by the final worker pass. Every loss or observation that remains
 undelivered is counted in the runtime status and logged (staging is in memory
 only): staged observations in `critical_pending`, losses still without staging
-room in `losses_held`, and losses lost to a per-source fault (while running or
-in the shutdown drain) in `losses_failed`.
+room in `losses_held`, losses lost to a per-source fault (while running or in
+the shutdown drain) in `losses_failed`, and a loss left in a capture slot by a
+worker that outlived its stop bound in `losses_cleared`. Their total (and any
+observation refused after staging closed) is handed to an injected count-only
+durable sink (Owner decision 2026-10-14, #224); in Main it adds the count as
+lost facts to the presence timeline gap marker through the open outbox session,
+without observation content, identifiers or sources, so a failed outbox close
+leaves an interrupted gap for the next start and Owner status reports
+`timeline_gap` until the Owner clears it. Scene monitoring is stopped before the
+outbox closes. A missing or failing sink is reported (`undelivered_recorded`,
+logged); a count may be overstated, never hidden.
 
 A camera loss (`offline`, `manual_intervention_required` or `degraded`, that is
 every non-`online` state) lowers the source to `degraded` until a new evaluated
@@ -1086,17 +1095,26 @@ until a fresh evaluated sample recovers it. A decoded-sample producer stream
 that has been replaced is refused as stale imagery on the capture side
 (`stale_rejected`) and never re-admitted under a new runtime identity; the
 transition is recorded even when the replacement stream's first frame is sampled
-out. When the bounded retired-stream history (1024 ids per source) is full,
-further replacement streams are refused (`stream_history_exhausted`) rather than
-forgetting one; from then on no sample of that source is admitted until restart
-and its conclusions are `unknown`, and a camera loss timestamped at or after
-exhaustion is untrusted, so it never confirms `source_loss_after_scene_shift` (a
-loss timestamped before exhaustion may still correlate; Owner decision
-2026-10-11). A sample still pending when its producer stream is replaced is
-discarded as stale (`stale_rejected`). A calibration refresh waits until a held
-or just-dequeued camera loss has been handed to the current detector (reported
-as `refresh_pending`, which sustained losses can prolong), and then discards a
-pending sample captured at or before the refresh request (`refresh_discarded`).
+out. Every new producer stream id uses up the retired-stream history (for a
+remote agent, every capture restart), while a local UVC loss or reopen does not.
+When the bounded retired-stream history (1024 ids per source) is full, further
+replacement streams are refused (`stream_history_exhausted`, logged once) rather
+than forgetting one; from then on no sample of that source is admitted until
+restart and its conclusions are `unknown`, and a camera loss timestamped at or
+after exhaustion is untrusted, so it never confirms
+`source_loss_after_scene_shift` (a loss timestamped before exhaustion may still
+correlate; Owner decision 2026-10-11). A sample still pending when its producer
+stream is replaced is discarded as stale (`stale_rejected`). A calibration
+refresh waits until a held or just-dequeued camera loss has been handed to the
+current detector (reported as `refresh_pending`, which sustained losses can
+prolong), and then discards a pending sample captured at or before the refresh
+request (`refresh_discarded`). An explicit refresh request still waiting after
+`calibration_refresh_defer_ns` (default 60 s, the calibration retry interval,
+measured from the first waiting request) sets `refresh_deferred`, lowers the
+source to `degraded` (`calibration_refresh_deferred`) with `unknown` movement
+and tamper conclusions, and is logged once (Owner decision 2026-10-14); a source
+already `degraded` for `critical_backpressure` keeps that reason. The refresh
+still waits for the loss, and the state clears when it runs.
 
 The runtime reports `degraded` while staging holds undelivered evidence, a loss
 is held, a recorder call is stalled, or any source is `degraded`; since every

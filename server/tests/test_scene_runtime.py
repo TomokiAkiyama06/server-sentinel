@@ -26,7 +26,7 @@ from app.detection.foundation import Observation
 from app.detection.quality import DetectorQualityPolicy, Metric, MetricRule
 from app.detection.roi import Calibration, CalibrationArchive, CriticalKind
 from app.detection.roi.runtime import (
-    CALIBRATION_RETRY_NS, ArchiveCalibrationProvider, CalibrationUnavailable, PackedLumaLayout,
+    CALIBRATION_REFRESH_DEFER_NS, CALIBRATION_RETRY_NS, ArchiveCalibrationProvider, CalibrationUnavailable, PackedLumaLayout,
     SceneMonitoringConfiguration, SceneMonitoringDependencies, SceneMonitoringRuntime,
     SceneRuntimeState, SceneSourceBinding, SceneSourceState, _CriticalPump,
 )
@@ -132,7 +132,7 @@ class BlockingRecorder(Recorder):
 
 class Harness:
     def __init__(self, *bindings, recorder=True, calibrations="default", capacity=None,
-                 threaded=False, stall_ns=None):
+                 threaded=False, stall_ns=None, **deps):
         self.clock = Clock()
         if recorder is True:
             recorder = Recorder()
@@ -146,7 +146,7 @@ class Harness:
             self.configuration,
             SceneMonitoringDependencies(recorder=self.recorder, calibrations=calibrations,
                                         monotonic_ns=self.clock, utcnow=lambda: NOW,
-                                        tick_seconds=0.01, **stall),
+                                        tick_seconds=0.01, **stall, **deps),
             threaded=threaded)
         self.threaded = threaded
         self.sequence = {}
@@ -847,11 +847,14 @@ class SceneRuntimeReviewRegressionTests(unittest.TestCase):
         for tick in (0, 0.0, -1, 0.001, float("nan"), float("inf"), True, "1", 61):
             with self.subTest(tick=tick), self.assertRaises(ValueError):
                 SceneMonitoringDependencies(tick_seconds=tick)
-        for field in ("calibration_retry_ns", "recorder_stall_ns"):
+        for field in ("calibration_retry_ns", "recorder_stall_ns",
+                      "calibration_refresh_defer_ns"):
             for value in (0, -1, 1.5, True):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                     SceneMonitoringDependencies(**{field: value})
         self.assertEqual(0.01, SceneMonitoringDependencies(tick_seconds=0.01).tick_seconds)
+        with self.assertRaises(ValueError):
+            SceneMonitoringDependencies(undelivered=3)
 
 
 class SteppingClock(Clock):
@@ -1459,6 +1462,246 @@ class SceneRuntimeFourthReviewRegressionTests(unittest.TestCase):
         harness.runtime.step()
         self.assertFalse(harness.source().refresh_pending)
         self.assertEqual("awaiting_sample", harness.source().reason)
+
+
+class _AliveWorker:
+    """Stand-in for a worker thread that outlives its stop bound."""
+
+    def join(self, timeout=None):
+        pass
+
+    def is_alive(self):
+        return True
+
+
+class SceneRuntimeOwnerDecisionTests(unittest.TestCase):
+    """#224 items 2 and 4 (Owner decisions 2026-10-14) and Claude review proposals."""
+
+    BOUND = 100
+
+    def _deferred(self):
+        harness = Harness(calibration_refresh_defer_ns=self.BOUND)
+        harness.runtime.start()
+        harness.frame()
+        harness.frame()
+        self.assertIs(SceneSourceState.ACTIVE, harness.source().state)
+        requested = harness.clock.value
+        harness.runtime.request_calibration_refresh()
+        harness.clock.value += 1
+        harness.runtime.source_unavailable(SOURCE, trusted=False)
+        harness.runtime.step()
+        return harness, requested
+
+    def queue_loss_and_step(self, harness):
+        harness.runtime.source_unavailable(SOURCE, trusted=False)
+        harness.runtime.step()
+
+    def test_default_deferral_bound_is_the_calibration_retry_interval(self):
+        self.assertEqual(CALIBRATION_RETRY_NS, CALIBRATION_REFRESH_DEFER_NS)
+        self.assertEqual(CALIBRATION_REFRESH_DEFER_NS,
+                         SceneMonitoringDependencies().calibration_refresh_defer_ns)
+
+    def test_refresh_deferred_past_the_bound_is_degraded_and_unknown(self):
+        harness, requested = self._deferred()
+        # A repeated request never postpones the bound.
+        harness.clock.value = requested + 50
+        harness.runtime.request_calibration_refresh()
+        harness.clock.value = requested + self.BOUND
+        source = harness.source()
+        self.assertTrue(source.refresh_pending)
+        self.assertFalse(source.refresh_deferred)
+        self.assertNotEqual("calibration_refresh_deferred", source.reason)
+        harness.clock.value = requested + self.BOUND + 1
+        source = harness.source()
+        self.assertTrue(source.refresh_deferred)
+        self.assertIs(SceneSourceState.DEGRADED, source.state)
+        self.assertEqual("calibration_refresh_deferred", source.reason)
+        self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN), (source.movement, source.tamper))
+        self.assertEqual(("calibration_refresh_deferred",) * 2,
+                         (source.movement_reason, source.tamper_reason))
+        self.assertIs(SceneRuntimeState.DEGRADED, harness.runtime.status().state)
+
+    def test_deferral_is_logged_once_and_cleared_when_the_refresh_runs(self):
+        calls = []
+
+        def calibrations(item):
+            calls.append(item.source_id)
+            return calibration_for(item)
+
+        harness = Harness(calibration_refresh_defer_ns=self.BOUND, calibrations=calibrations)
+        harness.runtime.start()
+        harness.frame()
+        requested = harness.clock.value
+        harness.runtime.request_calibration_refresh()
+        harness.clock.value += 1
+        with self.assertNoLogs("app.detection.roi.runtime", level="ERROR"):
+            self.queue_loss_and_step(harness)
+        harness.clock.value = requested + self.BOUND + 1
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            self.queue_loss_and_step(harness)
+        self.assertEqual(["ERROR:app.detection.roi.runtime:scene_calibration_refresh_deferred"],
+                         logs.output)
+        harness.clock.value += 1
+        with self.assertNoLogs("app.detection.roi.runtime", level="ERROR"):
+            self.queue_loss_and_step(harness)
+        self.assertEqual(1, len(calls))
+        # No loss is waiting any more: the refresh runs and the state clears.
+        harness.runtime.step()
+        self.assertEqual(2, len(calls))
+        source = harness.source()
+        self.assertFalse(source.refresh_pending)
+        self.assertFalse(source.refresh_deferred)
+        self.assertEqual("awaiting_sample", source.reason)
+        # A later request starts a new bound and is logged again.
+        harness.runtime.request_calibration_refresh()
+        later = harness.clock.value
+        harness.clock.value += 1
+        self.queue_loss_and_step(harness)
+        harness.clock.value = later + self.BOUND
+        self.assertFalse(harness.source().refresh_deferred)
+        harness.clock.value = later + self.BOUND + 1
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            self.queue_loss_and_step(harness)
+
+    def test_deferral_behind_a_held_loss_keeps_critical_backpressure(self):
+        # Claude review proposal 2 (#250): the held loss is the cause; the
+        # deferral is reported alongside it, never instead of it.
+        harness = SceneRuntimeIsolationTests._loss_backpressure_harness(self)
+        harness.runtime.request_calibration_refresh(THIRD)
+        harness.runtime.step()
+        harness.clock.value += CALIBRATION_REFRESH_DEFER_NS + 1
+        source = harness.source(THIRD)
+        self.assertTrue(source.refresh_deferred)
+        self.assertIs(SceneSourceState.DEGRADED, source.state)
+        self.assertEqual("critical_backpressure", source.reason)
+        self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN), (source.movement, source.tamper))
+        self.assertEqual(1, harness.runtime.status().losses_held)
+        harness.recorder.fail = False
+        harness.runtime.step()
+        harness.runtime.step()
+        source = harness.source(THIRD)
+        self.assertFalse(source.refresh_pending)
+        self.assertFalse(source.refresh_deferred)
+        self.assertEqual(0, harness.runtime.status().losses_held)
+
+    def test_undelivered_total_reaches_the_durable_sink_at_stop(self):
+        counts = []
+        harness = Harness(binding(), binding(OTHER), binding(THIRD), capacity=3,
+                          undelivered=counts.append)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        for luma, moved in ((None, None), (None, MOVED), (SHIFTED, MOVED)):
+            harness.frame(luma, OTHER, advance=0)
+            harness.frame(luma, THIRD, advance=0)
+            harness.frame(moved)
+        harness.clock.value += 5
+        for source in (OTHER, THIRD):
+            harness.runtime.on_uvc_health(HealthEvent(source, CameraState.OFFLINE, "synthetic_unplug"))
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            status = harness.runtime.stop()
+        self.assertEqual((3, 1), (status.critical_pending, status.losses_held))
+        self.assertEqual([4], counts)
+        self.assertIs(True, status.undelivered_recorded)
+        self.assertFalse(any("scene_undelivered_unrecorded" in line for line in logs.output))
+
+    def test_every_undelivered_count_is_part_of_the_total(self):
+        fields = ("critical_pending", "critical_refused", "losses_held", "losses_failed",
+                  "losses_cleared")
+        for index, name in enumerate(fields):
+            with self.subTest(field=name):
+                counts = []
+                harness = Harness(undelivered=counts.append)
+                harness.runtime.start()
+                original = harness.runtime._status_locked
+
+                def inflated(name=name, value=10 ** index, original=original):
+                    return replace(original(), **{name: value})
+
+                with mock.patch.object(harness.runtime, "_status_locked", side_effect=inflated), \
+                        self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+                    harness.runtime.stop()
+                self.assertEqual([10 ** index], counts)
+
+    def test_failing_or_missing_sink_is_reported(self):
+        def failing(count):
+            raise RuntimeError("synthetic marker write failure")
+
+        for sink in (failing, None):
+            with self.subTest(sink=sink):
+                harness = Harness(undelivered=sink)
+                harness.runtime.start()
+                harness.recorder.fail = True
+                for luma in (None, None, MOVED, MOVED):
+                    harness.frame(luma)
+                with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+                    status = harness.runtime.stop()
+                self.assertEqual(1, status.critical_pending)
+                self.assertIs(False, status.undelivered_recorded)
+                self.assertTrue(any("scene_undelivered_unrecorded" in line
+                                    for line in logs.output))
+
+    def test_nothing_undelivered_writes_no_marker(self):
+        counts = []
+        harness = Harness(undelivered=counts.append)
+        harness.runtime.start()
+        harness.frame()
+        status = harness.runtime.stop()
+        self.assertEqual([], counts)
+        self.assertIsNone(status.undelivered_recorded)
+
+    def test_loss_left_in_a_slot_by_an_outliving_worker_is_counted(self):
+        # Claude review proposal 3 (#250): STOP_FAILED clears the slot; the
+        # loss in it must not be left out of the undelivered count.
+        counts = []
+        harness = Harness(undelivered=counts.append)
+        harness.runtime.start()
+        harness.frame()
+        harness.clock.value += 5
+        harness.runtime.source_unavailable(SOURCE, trusted=True)
+        harness.runtime._thread = _AliveWorker()
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            status = harness.runtime.stop()
+        self.assertIs(SceneRuntimeState.STOP_FAILED, status.state)
+        self.assertEqual(1, status.losses_cleared)
+        self.assertEqual([1], counts)
+        self.assertTrue(any("scene_critical_undelivered" in line for line in logs.output))
+
+    def test_late_refusal_after_stop_is_recorded_too(self):
+        counts = []
+        source = Harness()
+        source.runtime.start()
+        for luma in (None, None, MOVED, MOVED):
+            source.frame(luma)
+        observation = source.recorder.items[0]
+        harness = Harness(undelivered=counts.append)
+        harness.runtime.start()
+        harness.runtime._pump.close(0)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime._submit([observation])
+        self.assertEqual([1], counts)
+
+    def test_stream_history_exhaustion_is_logged_once(self):
+        harness = Harness(binding(OTHER, SourceType.REMOTE_AGENT))
+        harness.runtime.start()
+        streams = [uuid4() for _ in range(3)]
+
+        def offer(stream):
+            harness.clock.value += INTERVAL
+            return harness.runtime.offer_luma(OTHER, stream_id=stream, width=WIDTH,
+                                              height=HEIGHT, pixels=pixels())
+
+        with mock.patch("app.detection.roi.runtime.RETIRED_PRODUCER_LIMIT", 0):
+            with self.assertNoLogs("app.detection.roi.runtime", level="ERROR"):
+                self.assertTrue(offer(streams[0]))
+            with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+                self.assertFalse(offer(streams[1]))
+            self.assertEqual(["ERROR:app.detection.roi.runtime:scene_stream_history_exhausted"],
+                             logs.output)
+            with self.assertNoLogs("app.detection.roi.runtime", level="ERROR"):
+                self.assertFalse(offer(streams[2]))
+                self.assertFalse(offer(streams[0]))
 
 
 class SyntheticYuyvCapture:

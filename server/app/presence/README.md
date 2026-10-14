@@ -237,7 +237,12 @@ refused and rejected counts to a singleton gap marker that holds counts and
 times only, never observation content. `TimelineOutbox.close()` records any
 still-staged fact as lost and ends the session; staging or flushing after close
 raises, so the runtime stops its producers first; a repeated close is a
-no-op. A process that exits without
+no-op. `record_lost(count)` lets another component report count-only loss
+it could not hand to the timeline, such as scene critical evidence undelivered
+at shutdown (`CriticalTimelineRecorder.record_undelivered`, #224); the count
+is added to the marker's `lost` by the next flush or by `close()`, and a close
+that fails leaves the session row for the next start to record as interrupted.
+It is refused like `stage()` before `open()` and after close. A process that exits without
 a successful close leaves its session row behind, and the next start records
 an interrupted gap: a restart is never assumed clean, and staged facts are not
 recovered. A failed close reopens the outbox only when a read proves its

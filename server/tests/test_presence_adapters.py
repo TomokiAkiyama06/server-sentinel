@@ -768,6 +768,50 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         detail = self.gap()[1]
         self.assertEqual((detail["lost"], detail["interrupted"]), (1, 0))
 
+    def test_reported_loss_is_written_as_lost_at_a_clean_close(self):
+        # #224 item 4 (Owner decision 2026-10-14): scene critical evidence
+        # undelivered at shutdown becomes a count-only durable gap record.
+        self.outbox.flush()
+        self.outbox.record_lost(3)
+        self.outbox.record_lost(1)
+        self.assertEqual(self.outbox.state().unpersisted, 4)
+        self.assertTrue(self.outbox.state().degraded)
+        self.outbox.close()
+        self.restart()
+        present, detail = self.gap()
+        self.assertTrue(present)
+        self.assertEqual((detail["refused"], detail["rejected"], detail["lost"],
+                          detail["interrupted"]), (0, 0, 4, 0))
+
+    def test_reported_loss_is_written_by_the_next_flush(self):
+        self.outbox.flush()
+        recorder = CriticalTimelineRecorder(self.outbox, maximum_source_latency=LATENCY)
+        recorder.record_undelivered(2)
+        self.assertEqual(self.outbox.flush().unpersisted, 0)
+        self.assertEqual(self.gap()[1]["lost"], 2)
+
+    def test_reported_loss_with_a_failed_close_restarts_interrupted(self):
+        self.outbox.flush()
+        self.outbox.record_lost(2)
+        self.refuse = True
+        with self.assertRaises(RuntimeError):
+            self.outbox.close()
+        self.refuse = False
+        # The process exits now: its session row tells the next start.
+        self.restart()
+        present, detail = self.gap()
+        self.assertTrue(present)
+        self.assertEqual(detail["interrupted"], 1)
+
+    def test_reported_loss_is_refused_when_closed_or_malformed(self):
+        self.outbox.flush()
+        for count in (0, -1, True, 1.0, 2**31 + 1):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                self.outbox.record_lost(count)
+        self.outbox.close()
+        with self.assertRaises(RuntimeError):
+            self.outbox.record_lost(1)
+
     def test_failed_close_keeps_the_session_so_restart_is_interrupted(self):
         self.outbox.flush()
         self.refuse = True
