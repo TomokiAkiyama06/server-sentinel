@@ -2,6 +2,7 @@
 """Build a versioned Main Server release archive from reviewed local inputs."""
 
 import argparse
+import gzip
 import hashlib
 import io
 import json
@@ -172,7 +173,11 @@ def build(destination: Path, version: str, wheelhouse: Path, web_dist: Path) -> 
         "version": version,
         "files": {name: hashlib.sha256(data).hexdigest() for name, data in entries},
     }
-    with tarfile.open(destination, "x:gz", format=tarfile.PAX_FORMAT) as archive:
+    # The outer archive is reproducible too: no file name and a zero time in
+    # the gzip header, fixed member metadata, sorted members.
+    with open(destination, "xb") as raw, gzip.GzipFile(
+            filename="", mode="wb", fileobj=raw, mtime=0) as compressed, tarfile.open(
+            fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
         payload = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
         info = tarfile.TarInfo("manifest.json")
         info.size, info.mode, info.mtime = len(payload), 0o444, 0

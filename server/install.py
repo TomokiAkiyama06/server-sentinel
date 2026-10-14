@@ -17,7 +17,7 @@ import subprocess
 import tarfile
 import time
 
-from app.deployment import CaptureCaSettingMissing, Deployment
+from app.deployment import CaptureCaSettingMissing, Deployment, WebAssetsRefused
 from app.settings import ConfigurationError
 
 
@@ -228,9 +228,14 @@ def _web_tree(descriptor: int, prefix: str) -> dict[str, bytes]:
                 files.update(_web_tree(child, prefix + name + "/"))
             finally:
                 os.close(child)
-        else:
+        elif stat.S_ISREG(info.st_mode):
+            # Opened only after the type check: root never opens a device
+            # node, FIFO or socket placed in the tree; the descriptor's own
+            # fstat is checked again in _open_release_entry.
             files[prefix + name] = _read_release_file(descriptor, name, RELEASE_FILE_MODE,
                                                       MAX_ARTIFACT_BYTES)
+        else:
+            raise ValueError("release entry differs")
     return files
 
 
@@ -300,6 +305,29 @@ def _require_release_web(args, release: Path, target: str) -> None:
             "  2. to use that version again, move its directory out of releases/ and\n"
             "     install it again with update and the verified artifact\n"
             f"  3. otherwise rerun the same command ({rerun}) with another target\n"
+            "(server/docs/DEPLOYMENT.md, Install, update, and rollback).\n") from None
+
+
+def _require_staged_web(staging: Path, version: str) -> None:
+    """Refuse a staged release whose freshly written Web build already differs.
+
+    The bytes were just written from the verified artifact, so a difference
+    means the filesystem did not keep what the installer set (an owner other
+    than root, as on NFS with root_squash or under uid mapping, or a mount
+    option that changes modes) or an installer fault; nothing was switched.
+    """
+    try:
+        verify_release_web(staging)
+    except ValueError:
+        raise ReleaseFilesDiffer(
+            "ServerSentinel release operation refused before any change: the Web build of\n"
+            f"release {version} differs from its release manifest right after it was written,\n"
+            "so the staged release was removed and nothing was switched.\n"
+            "As the Owner:\n"
+            "  1. check that the installation filesystem keeps root as owner and the\n"
+            "     modes the installer sets (for example not NFS with root_squash, no uid\n"
+            "     mapping, no mount option that changes modes)\n"
+            "  2. rerun the same command\n"
             "(server/docs/DEPLOYMENT.md, Install, update, and rollback).\n") from None
 
 
@@ -1053,7 +1081,7 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
             _extract(content, staging, args.version)
             # The placed Web build, read back from disk: exact modes, owner,
             # single links and the release manifest's digests (Issue #10 S5c).
-            verify_release_web(staging)
+            _require_staged_web(staging, args.version)
             # Before the release's own --check, which would only fail without
             # saying why (Issue #109).
             _require_capture_ca_setting(args, staging, "releases/" + args.version, deployment)
@@ -1308,6 +1336,10 @@ def main() -> None:
         execute(args)
     except OwnerActionRequired as refused:
         parser.exit(1, str(refused))
+    except WebAssetsRefused as refused:
+        # One value-free word, as the release's own check prints it.
+        parser.exit(1, "ServerSentinel release operation failed: web assets refused "
+                       f"(reason={refused.reason})\n")
     except CaptureCaSettingMissing:
         # Releases with Issue #109 require the setting: say so before any
         # release is staged or activated, instead of a generic failure.

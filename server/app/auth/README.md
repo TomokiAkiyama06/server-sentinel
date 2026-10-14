@@ -1333,10 +1333,14 @@ static host, so the human surface serves the Web build itself.
   request builds a filesystem path. The manifest comes from the same build
   as the files, so these checks catch an accidental, partial or mixed
   deployment; they are not tamper resistance (an account that can write the
-  directory can rewrite the manifest too). That rests on the S5c release
-  manifest's SHA-256 of every build file, which the installer checks at
-  install and before a rollback, and on a root-owned directory the service
-  account cannot write. Each refusal carries one value-free word
+  directory can rewrite the manifest too). Protection against the service
+  account rests on the S5c placement: root-owned, read-only (`0444` files,
+  `0755` directories), never hard-linked, so it cannot write the build. The
+  installer additionally compares the build with the release manifest copy
+  at install and before a rollback; that copy is unsigned and in the same
+  root-owned tree, so it detects accidental or partial changes and changed
+  owners or modes, not a change by root, and it is not compared at every
+  start (`--check` loads against `manifest.json` only). Each refusal carries one value-free word
   (`WebAssetsUnavailable.reason`: `path`, `type`, `mode`, `nlink`, `set`,
   `manifest`, `size`, `digest`, `utf8`, `io`) that the deployment check
   prints for the operator (`web assets refused (reason=<word>)`); the

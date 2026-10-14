@@ -44,13 +44,16 @@ looks a validated name up in the in-memory map).
 
 The manifest is written by the same build as the files, so these checks
 catch an accidental, partial or mixed deployment, not a deliberate one: an
-account that can write the directory can rewrite the manifest too. Tamper
-resistance comes from the release manifest's SHA-256 of every build file,
-which the installer checks when it installs a release and before a rollback
-(Issue #10 S5c, ``install.py``), and from a root-owned directory the service
-account cannot write; the permission and hard-link checks only refuse the
-layouts that would make such a directory writable by another account or
-alias a file from elsewhere.
+account that can write the directory can rewrite the manifest too.
+Protection against the service account comes from ownership and modes: the
+release places the build root-owned and read-only, never hard-linked
+(Issue #10 S5c, ``install.py``), so it cannot write it; the permission and
+hard-link checks here refuse the layouts that would make such a directory
+writable by another account or alias a file from elsewhere. The installer
+also compares the build with the release manifest copy at install and
+before a rollback; that copy is unsigned and in the same root-owned tree,
+so it detects accidental or partial changes, not a change by root, and it
+is not compared at every start.
 """
 
 from __future__ import annotations

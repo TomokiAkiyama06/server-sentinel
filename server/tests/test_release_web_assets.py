@@ -79,17 +79,41 @@ class ArtifactWebBuildTests(ReleaseFixture):
                 self.assertEqual(members[name], (data, 0o444))
                 self.assertEqual(manifest["files"][name], hashlib.sha256(data).hexdigest())
 
-    def test_rebuilding_from_the_same_build_records_the_same_release_manifest(self):
-        first, _ = self.artifact("1.0.0")
+    def test_rebuilding_from_the_same_build_gives_the_same_archive(self):
+        first, first_digest = self.artifact("1.0.0")
         copy = self.root / "web-dist-copy"
         shutil.copytree(self.web_dist, copy)
         self.web_dist = copy
         second = self.root / "again.tar.gz"
         wheels = sorted(self.wheelhouse.glob("*.whl"))
+        # A later clock: a gzip header with the current time would differ.
         with patch("build_artifact.REPOSITORY", self.root), patch(
-                "build_artifact._required_wheels", return_value=wheels):
-            build(second, "1.0.0", self.wheelhouse, copy)
+                "build_artifact._required_wheels", return_value=wheels), patch(
+                "gzip.time.time", return_value=4_000_000_000):
+            second_digest = build(second, "1.0.0", self.wheelhouse, copy)
         self.assertEqual(self.members(first), self.members(second))
+        # The outer archive too (no file name or time in the gzip header).
+        self.assertEqual(first_digest, second_digest)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_members_that_collide_with_the_manifest_names_are_refused(self):
+        real = build_artifact._files
+        for extra in (("release-manifest.json", b"{}"), ("manifest.json", b"{}"),
+                      ("requirements.lock", b"duplicate")):
+            with self.subTest(extra=extra[0]):
+                destination = self.root / "collide.tar.gz"
+
+                def files(wheelhouse, web_dist, extra=extra):
+                    yield from real(wheelhouse, web_dist)
+                    yield extra
+
+                with patch("build_artifact.REPOSITORY", self.root), patch(
+                        "build_artifact._required_wheels",
+                        return_value=sorted(self.wheelhouse.glob("*.whl"))), patch(
+                        "build_artifact._files", side_effect=files), \
+                        self.assertRaisesRegex(ValueError, "collide"):
+                    build(destination, "1.0.0", self.wheelhouse, self.web_dist)
+                self.assertFalse(destination.exists())
 
     def refused_build(self, reason_text=None):
         destination = self.root / "refused.tar.gz"
@@ -227,14 +251,50 @@ class InstalledWebBuildTests(ReleaseFixture):
             _extract(forged.getvalue(), destination, "1.0.0")
         self.assertEqual(list(destination.iterdir()), [])
 
+    def test_a_manifest_listing_the_installer_copy_is_refused_before_any_write(self):
+        # Even when the artifact's own manifest lists it with a matching
+        # digest, the name is refused up front: nothing is written.
+        payload = b"{}"
+        files = {"app/__init__.py": b"", install.RELEASE_MANIFEST: payload}
+        manifest = {"format": 1, "name": "server-sentinel-main", "version": "1.0.0",
+                    "files": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
+        content = io.BytesIO()
+        with tarfile.open(fileobj=content, mode="w:gz") as archive:
+            for name, data in (("manifest.json", json.dumps(manifest).encode()), *files.items()):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+        destination = Path(tempfile.mkdtemp(dir=self.root))
+        with self.assertRaisesRegex(ValueError, "invalid artifact members"):
+            _extract(content.getvalue(), destination, "1.0.0")
+        self.assertEqual(list(destination.iterdir()), [])
+
+    def test_release_files_are_always_new_inodes(self):
+        # O_EXCL | O_NOFOLLOW: never truncate an existing file (which may be
+        # hard-linked elsewhere) and never write through a symbolic link.
+        existing = self.root / "existing.js"
+        existing.write_bytes(b"original\n")
+        alias = self.root / "alias.js"
+        os.link(existing, alias)
+        link = self.root / "link.js"
+        link.symlink_to(self.root / "target.js")
+        for path in (alias, link):
+            with self.subTest(path=path.name), self.assertRaises(FileExistsError):
+                install._write_release_file(path, b"replaced\n", 0o444)
+        self.assertEqual(existing.read_bytes(), b"original\n")
+        self.assertFalse((self.root / "target.js").exists())
+
     def test_a_staged_build_that_differs_is_refused_and_unstaged(self):
         self.perform(self.arguments("install", "1.0.0"))
         state = self.state() if (self.installation / "previous").is_symlink() else None
         real = install._release_mode
         with patch("install._release_mode",
                    side_effect=lambda name: 0o644 if name.startswith("web/") else real(name)):
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ReleaseFilesDiffer) as refused:
                 self.perform(self.arguments("update", "1.1.0"))
+        for phrase in ("before any change", "right after it was written", "root_squash",
+                       "rerun the same command"):
+            self.assertIn(phrase, str(refused.exception))
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
         self.assertFalse((self.installation / "releases/1.1.0").exists())
         self.assertFalse((self.installation / "releases/.1.1.0.staging").exists())
@@ -310,6 +370,27 @@ class InstalledWebBuildTests(ReleaseFixture):
                 self.assertEqual(reloads, self.daemon_reloads())
                 # Refused as root before the target's own check runs.
                 self.assertEqual(checks, len([c for c, _ in self.runner.calls if "--check" in c]))
+
+    def test_a_special_file_in_the_build_is_refused_without_being_opened(self):
+        target = self.installed_two()
+        os.mkfifo(target / "web" / "app" / "pipe.js")
+        with patch("install._read_release_file", wraps=install._read_release_file) as read, \
+                self.assertRaises(ValueError):
+            self.verify(target)
+        self.assertNotIn("pipe.js", [c.args[1] for c in read.call_args_list])
+
+    def test_an_invalid_web_assets_directory_is_refused_before_staging(self):
+        base = json.loads(self.config.read_text())
+        self.config.write_text(json.dumps({**base, "web_assets_directory": str(self.root / "web")}))
+        arguments = self.arguments("install", "1.0.0")
+        with self.assertRaises(deployment_module.WebAssetsRefused) as refused:
+            self.perform(arguments)
+        self.assertEqual(refused.exception.reason, "setting")
+        self.assertFalse((self.installation / "releases").exists())
+        self.config.write_text(json.dumps(
+            {**base, "web_assets_directory": str(self.installation / "current/web")}))
+        self.perform(arguments)
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
 
     def test_rollback_to_a_release_from_before_the_web_build_proceeds(self):
         target = self.installed_two()
@@ -428,18 +509,40 @@ class WebAssetsDirectorySettingTests(unittest.TestCase):
         self.write(web_assets_directory=str(code / "web"))
         deployment = Deployment.load(self.config, code_root=code)
         self.assertEqual(deployment.settings.web_assets_dir, code / "web")
-        self.write(web_assets_directory=str(self.root / "checkout/web/dist"))
+        for value in (self.root / "checkout/web/dist", code / "web/app", code / "app/web"):
+            self.write(web_assets_directory=str(value))
+            with self.subTest(value=value), self.assertRaises(ConfigurationError):
+                Deployment.load(self.config, code_root=code)
+
+    def test_a_symlinked_installation_root_is_accepted_the_same_on_both_sides(self):
+        # The installer knows --destination as typed (here through a link);
+        # the release knows its own resolved location. Both accept either
+        # spelling of the same installation root, and nothing else.
+        link = self.root / "installation-link"
+        link.symlink_to(self.installation, target_is_directory=True)
+        for value in (link / "current/web", self.installation / "current/web"):
+            for install_root in (link, self.installation):
+                with self.subTest(value=str(value), install_root=install_root.name):
+                    settings = self.load(install_root=install_root,
+                                         web_assets_directory=str(value)).settings
+                    self.assertEqual(settings.web_assets_dir, self.release / "web")
+        other = self.root / "other-installation"
+        (other / "current").mkdir(parents=True)
         with self.assertRaises(ConfigurationError):
-            Deployment.load(self.config, code_root=code)
+            self.load(install_root=link, web_assets_directory=str(other / "current/web"))
 
     def test_invalid_values_are_refused_value_free(self):
         current = self.installation / "current"
         for value in ("", "web", "relative/web", str(current), str(current) + "/../web",
                       str(current / "web/../../web"), str(self.release / "web"),
+                      str(current / "web/shell"), str(current / "app"), str(current / "WEB"),
+                      str(self.installation / "previous/web"), str(self.root / "current/web"),
                       str(self.root / "web"), "/", None, 1, True, ["/x"], {"path": "/x"},
                       str(current / "web") + "\0"):
-            with self.subTest(value=value), self.assertRaises(ConfigurationError) as refused:
+            with self.subTest(value=value), self.assertRaises(
+                    deployment_module.WebAssetsRefused) as refused:
                 self.load(web_assets_directory=value)
+            self.assertEqual(refused.exception.reason, "setting")
             if isinstance(value, str) and "/" in value:
                 self.assertNotIn(value, str(refused.exception))
 
@@ -493,6 +596,9 @@ class WebAssetsDirectorySettingTests(unittest.TestCase):
         refused("path")
         # Without the key nothing is loaded, as before S5c.
         self.assertEqual(self.check()[0], 0)
+        code, _, error = self.check(web_assets_directory=str(self.release / "web"))
+        self.assertEqual((code, error), (
+            1, "ServerSentinel deployment validation failed: web assets refused (reason=setting)\n"))
 
 
 if __name__ == "__main__":

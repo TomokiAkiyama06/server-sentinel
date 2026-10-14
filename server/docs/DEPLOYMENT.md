@@ -38,10 +38,13 @@ loads a private copy through the Main Server's own asset loader
 (`web build refused by the asset loader (reason=<word>)`) for a missing,
 modified, extra or unlisted file instead of releasing a build the service
 would refuse. The archive carries those exact bytes under `web/`, and the
-release manifest records the SHA-256 of every one of them. That release
-manifest -- not only `web/dist/manifest.json`, which the same build writes
-and an account able to write the directory could rewrite too -- is what the
-installer checks the build against. The sign-in shell carries no version
+release manifest records the SHA-256 of every one of them. The installer
+checks the placed build against that release manifest -- not only against
+`web/dist/manifest.json`, which the same build writes -- at install and
+before a rollback (below). The copy it keeps is unsigned and lives in the
+same root-owned release tree, so the check detects accidental or partial
+changes, not a change made by root; protection against the service account
+is the root-owned, read-only placement. The sign-in shell carries no version
 marker, but its bytes can identify the software (Owner decision S5-5,
 `server/app/auth/README.md`).
 
@@ -106,14 +109,17 @@ The optional `"invitation_lifetime_hours"` (an integer from 1 to 168, default
 The optional `"web_assets_directory"` (Issue #10 phase 2 S5c) names the Web
 build the human surface serves (`Settings.web_assets_dir`). Write it as
 `"<installation>/current/web"`, for example
-`"/opt/server-sentinel-main/current/web"`, with the installation root spelled
-exactly as `--destination` (an absolute path without `..` or a symbolic link
-in it). It must name a directory inside the release: each release resolves
-it against its own release directory, so the same configuration serves the
-build of whichever release runs, and the update staging check and the
-rollback check load the build of the release being switched to, never the
-one still running. A path outside the release, the installation root itself,
-a relative path or a non-string is refused. Without the key no Web build is
+`"/opt/server-sentinel-main/current/web"`: exactly the installation root
+(`--destination`), then `current/web`, with no `..`. The installation root
+part is compared after resolving symbolic links on both sides, so the
+installer and the release accept the same value. Each release takes it as
+its own `<release>/web` -- the directory the installer checks against the
+release manifest -- so the same configuration serves the build of whichever
+release runs, and the update staging check and the rollback check load the
+build of the release being switched to, never the one still running. Any
+other value (another directory, a different installation root, a relative
+path, a non-string) is refused by the installer and by the release's check
+with `web assets refused (reason=setting)`. Without the key no Web build is
 configured, and no human composition can be mounted (`create_app` refuses
 one without `Settings.web_assets_dir`), so human access stays closed: fail
 closed, never a fallback to another directory. No deployment key enables
@@ -130,7 +136,8 @@ printing one value-free reason for the operator:
 ServerSentinel deployment validation failed: web assets refused (reason=<word>)
 ```
 
-`<word>` is one of `path` (missing, not a directory, or a symbolic link out of
+`<word>` is one of `setting` (the value is not `<installation>/current/web`),
+`path` (missing, not a directory, or a symbolic link out of
 the release), `type` (not a regular file or directory, a symbolic link, or an
 unknown extension or content type), `mode` (group- or world-writable),
 `nlink` (a file with a second hard link), `set` (files differ from the
@@ -1149,6 +1156,15 @@ artifact. A release from before S5c has neither `web/` nor the manifest copy
 and is not checked; one that has `web/` without the manifest copy is refused.
 The target release's own check then loads the build as the service account
 when `"web_assets_directory"` is set, as described above.
+This comparison runs only at install and before a rollback, not at every
+start (the unit's `ExecStartPre` check loads the build against its own
+`manifest.json`), and the manifest copy is unsigned in the same root-owned
+tree: it detects accidental or partial changes and changed owners or modes,
+not a change made by root. What keeps the service account from changing the
+build is the root ownership and the read-only modes. A staged release whose
+freshly written build already differs is removed with steps that point at
+the filesystem (an owner other than root, as on NFS with `root_squash` or
+under uid mapping, or a mount option that changes modes).
 
 Run the separately downloaded installer only after verifying its published
 SHA-256. Global arguments precede the operation:

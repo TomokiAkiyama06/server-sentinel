@@ -264,24 +264,39 @@ class WebAssetsRefused(ConfigurationError):
 def _web_assets_directory(value: object, code_root: Path, install_root: Path | None) -> Path:
     """The release's own Web build directory named by ``web_assets_directory`` (Issue #10 S5c).
 
-    The value is absolute and names a directory inside the release. On an
-    installed host it is written ``<installation>/current/web``: the release
-    a process runs from is the one ``current`` names once it has started, so
-    the path is taken relative to that process's own release (``code_root``).
-    The rollback and staging checks therefore validate the build of the
-    release being switched to, not of the one still running. Without an
-    installation root (a source tree) it must lie inside ``code_root``.
-    Existence and content are checked by ``main`` (``WebAssets.load``).
+    On an installed host the value is exactly ``<installation>/current/web``:
+    the release a process runs from is the one ``current`` names once it has
+    started, so the path is taken as that process's own ``<release>/web``
+    (``code_root``), the directory the installer checks against the release
+    manifest. The rollback and staging checks therefore validate the build
+    of the release being switched to, not of the one still running. Without
+    an installation root (a source tree) it is exactly ``<code_root>/web``.
+
+    The installation part is compared after resolving both sides, so the
+    installer (which knows ``--destination`` as typed) and the release
+    (which knows its own resolved location) accept the same value even when
+    the installation path contains a symbolic link. Any other value is
+    refused with the value-free reason ``setting``. Existence and content
+    are checked by ``main`` (``WebAssets.load``).
     """
     if not isinstance(value, str) or not value or "\0" in value:
-        raise ConfigurationError("invalid web_assets_directory")
+        raise WebAssetsRefused("setting")
     path = Path(value)
-    if not path.is_absolute() or ".." in path.parts:
-        raise ConfigurationError("web_assets_directory must be absolute")
-    base = install_root / "current" if install_root is not None else code_root
-    if not path.is_relative_to(base) or path == base:
-        raise ConfigurationError("web_assets_directory must name a directory inside the release")
-    return code_root / path.relative_to(base)
+    if not path.is_absolute() or ".." in path.parts or path.name != "web":
+        raise WebAssetsRefused("setting")
+    if install_root is not None:
+        if path.parent.name != "current":
+            raise WebAssetsRefused("setting")
+        named, expected = path.parent.parent, install_root
+    else:
+        named, expected = path.parent, code_root
+    try:
+        same = named.resolve(strict=True) == expected.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        same = False
+    if not same:
+        raise WebAssetsRefused("setting")
+    return code_root / "web"
 
 
 def _load_web_assets(directory: Path, code_root: Path) -> None:
