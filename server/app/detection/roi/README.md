@@ -304,9 +304,12 @@ not postpone it), the source reports `refresh_deferred`, is `degraded`
 `unknown`, because they are judged against a calibration the Owner replaced
 (Owner decision 2026-10-14). `scene_calibration_refresh_deferred` is logged
 once per request. The refresh still waits for the loss, so no evidence is
-dropped. When the deferral is behind a held loss, the source keeps reporting
-`critical_backpressure` (the cause; its later samples are already dropped and
-its conclusions already `unknown`) with `refresh_deferred` set alongside it.
+dropped. A reason the source already reports is the cause and is kept, with
+`refresh_deferred` alongside it: behind a held loss that is
+`critical_backpressure` (its later samples are already dropped), and likewise
+`source_unavailable`, `frame_decoder_failing`, `scene_evaluation_failed`,
+`observation_stale` or an inactive source; only an otherwise active source takes
+`calibration_refresh_deferred`. Either way its conclusions are `unknown`.
 The state clears when the refresh runs. When the refresh runs, a pending
 sample captured at or before the request is discarded (`refresh_discarded`),
 so a frame of the scene before the new calibration never becomes a
@@ -339,24 +342,36 @@ republish a conclusion; every source stays `inactive` and `unknown`.
 Observations the recorder has not accepted stay counted in
 `critical_pending`, losses that still had no staging room in `losses_held`,
 and losses lost to a per-source fault (while running or during the shutdown
-drain) in `losses_failed`; a loss still in a capture slot when a worker that
-outlived its stop bound leaves it there is counted in `losses_cleared`. All
-are logged (`scene_critical_undelivered`); the evidence itself is not
-persisted, but their total is handed to the injected `undelivered` sink, a
-count-only durable record (Owner decision 2026-10-14). In Main that sink is
+drain) in `losses_failed`; a loss still in a capture slot, or already taken from
+it but not yet handed to its detector, when the worker outlived its stop bound
+is counted in `losses_cleared`. All are logged (`scene_critical_undelivered`);
+the evidence itself is not persisted, but their total is handed to the injected
+`undelivered` sink, a count-only durable record (Owner decision 2026-10-14).
+Refusals are counted once: those before `stop()` fences the staging count are in
+the stop total, and each batch a worker that outlived its bound confirms after
+the fence is handed to the sink on its own. `undelivered_recorded` reports
+whether the sink took every count (one failure keeps it `False`); a missing or
+failing sink logs `scene_undelivered_unrecorded`. A count can be overstated (a
+loss counted in `losses_cleared` whose outliving worker later confirms evidence
+that is then refused), never hidden.
+
+**Today Main passes no sink**, so the count is only logged
+(`scene_undelivered_unrecorded`) and nothing marks the stop as unclean. Once
+Main wires the timeline outbox (follow-up, #205), the sink is meant to be
 `CriticalTimelineRecorder.record_undelivered`, which adds the count as lost
 facts to the presence timeline gap marker through the open outbox session (no
-observation content, identifier or source). The marker is written by the
-outbox's next flush or at its clean close; a close that fails leaves the
-session row, so the next start records an interrupted gap, and Owner status
-reports `timeline_gap` until the Owner clears it. The Main composition must
-therefore stop scene monitoring before it closes the outbox (the outbox is not
-wired into Main yet; that wiring is a follow-up). An observation a worker that
-outlived its bound confirms after staging closed is handed to the sink as
-well. `undelivered_recorded` reports whether the sink took the count; a
-missing or failing sink logs `scene_undelivered_unrecorded`. A count can be
-overstated (a refusal racing with `stop()` may be counted twice), never
-hidden. A direct Owner notification for an unclean stop is a follow-up. After a worker failure the final pass still stages that
+observation content, identifier or source). The marker is then written by the
+outbox's next flush or at its clean close; a close that fails leaves the session
+row, so the next start records an interrupted gap, and Owner status reports
+`timeline_gap` until the Owner clears it. A count handed over after the outbox
+closed (or before it opened) is refused and only logged, and the next start then
+shows no unclean stop. The wiring therefore has to stop scene monitoring before
+it closes the outbox, and must not close the outbox cleanly when `stop()`
+returned `stop_failed` or `undelivered_recorded is False`, so the session row
+stays and the next start records an interrupted gap. A direct Owner notification
+for an unclean stop is a follow-up.
+
+After a worker failure the final pass still stages that
 evidence, but every source stays withdrawn as `worker_failed`. The runtime is
 `degraded` while evidence is undelivered, a loss is held, the recorder is
 stalled, or any source is `degraded`. Because `critical_pending` counts every

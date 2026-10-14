@@ -1075,16 +1075,23 @@ processed by the final worker pass. Every loss or observation that remains
 undelivered is counted in the runtime status and logged (staging is in memory
 only): staged observations in `critical_pending`, losses still without staging
 room in `losses_held`, losses lost to a per-source fault (while running or in
-the shutdown drain) in `losses_failed`, and a loss left in a capture slot by a
-worker that outlived its stop bound in `losses_cleared`. Their total (and any
-observation refused after staging closed) is handed to an injected count-only
-durable sink (Owner decision 2026-10-14, #224); in Main it adds the count as
-lost facts to the presence timeline gap marker through the open outbox session,
-without observation content, identifiers or sources, so a failed outbox close
-leaves an interrupted gap for the next start and Owner status reports
-`timeline_gap` until the Owner clears it. Scene monitoring is stopped before the
-outbox closes. A missing or failing sink is reported (`undelivered_recorded`,
-logged); a count may be overstated, never hidden.
+the shutdown drain) in `losses_failed`, and a loss left in a capture slot, or
+taken from it and not yet handed to its detector, by a worker that outlived its
+stop bound in `losses_cleared`. Their total, and separately each batch refused
+after `stop()` fenced the count, is handed to an injected count-only durable
+sink (Owner decision 2026-10-14, #224), so each refusal is counted once; a count
+may be overstated, never hidden. A missing or failing sink is reported
+(`undelivered_recorded`, `scene_undelivered_unrecorded`). Main does not pass a
+sink yet, so today the count is only logged. Once Main wires the timeline outbox
+(follow-up, #205), the sink is to add the count as lost facts to the presence
+timeline gap marker through the open outbox session, without observation
+content, identifiers or sources, so that a failed outbox close leaves an
+interrupted gap for the next start and Owner status reports `timeline_gap` until
+the Owner clears it. That wiring stops scene monitoring before the outbox
+closes, and does not close the outbox cleanly when `stop()` returns
+`stop_failed` or `undelivered_recorded` is false. A count handed over after the
+outbox closed or before it opened is refused and only logged; the next start
+then shows no unclean stop.
 
 A camera loss (`offline`, `manual_intervention_required` or `degraded`, that is
 every non-`online` state) lowers the source to `degraded` until a new evaluated
@@ -1113,7 +1120,10 @@ request (`refresh_discarded`). An explicit refresh request still waiting after
 measured from the first waiting request) sets `refresh_deferred`, lowers the
 source to `degraded` (`calibration_refresh_deferred`) with `unknown` movement
 and tamper conclusions, and is logged once (Owner decision 2026-10-14); a source
-already `degraded` for `critical_backpressure` keeps that reason. The refresh
+already `degraded` for another reason (such as `critical_backpressure`,
+`source_unavailable`, `frame_decoder_failing`, `scene_evaluation_failed` or
+`observation_stale`) or inactive keeps that reason, with `refresh_deferred`
+alongside and `unknown` conclusions. The refresh
 still waits for the loss, and the state clears when it runs.
 
 The runtime reports `degraded` while staging holds undelivered evidence, a loss
