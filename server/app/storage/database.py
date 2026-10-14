@@ -114,6 +114,91 @@ def held_descriptors() -> frozenset[int]:
         return frozenset(_HELD.values()) | frozenset(_DUPLICATES)
 
 
+def _process_descriptors() -> list[int] | None:
+    """Every descriptor number this process has open, or ``None`` if unknown."""
+    for listing in ("/proc/self/fd", "/dev/fd"):
+        try:
+            return [int(name) for name in os.listdir(listing)]
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _release_unlinked_held_files_for_tests() -> tuple[int, int]:
+    """TEST-ONLY: close held descriptors whose file is gone and unused.
+
+    Application code must never call this (``tests`` enforces it); the
+    production rule above stays: a held descriptor lives for the process.
+    A test suite, however, creates and deletes one temporary database per
+    test, and each would keep one descriptor open until the test process
+    exits (Issue #248).
+
+    Only an identity that is safe to close is released: every holder
+    descriptor on it (held and duplicates) refers to a file that is no longer
+    linked anywhere (``st_nlink == 0``, so no path can open it again), and no
+    other descriptor in the process refers to the same inode. SQLite opens
+    its own descriptor for each connection and defers closing it while this
+    process holds locks on the inode, so an open (or leaked) connection, or a
+    pending SQLite close, leaves the identity held. With no other descriptor
+    on the inode the process holds no POSIX lock on it that a close could
+    drop. If the descriptors cannot be listed nothing is released.
+
+    A ``PinnedDatabase`` or the local admin ledger may still remember a
+    released descriptor number; they already refuse an unlinked file, and a
+    reused number names another file, which they refuse too.
+
+    Returns ``(released, kept)``: identities closed and unlinked identities
+    left held because something else still uses them.
+    """
+    released = kept = 0
+    with _HELD_LOCK:
+        candidates: dict[tuple[int, int], list[int]] = {}
+        for identity, descriptor in _HELD.items():
+            candidates[identity] = [descriptor]
+        for descriptor in _DUPLICATES:
+            try:
+                identity = _identity(os.fstat(descriptor))
+            except OSError:
+                continue
+            candidates.setdefault(identity, []).append(descriptor)
+        unlinked = {}
+        for identity, descriptors in candidates.items():
+            try:
+                infos = [os.fstat(descriptor) for descriptor in descriptors]
+            except OSError:
+                continue
+            if all(_identity(info) == identity and info.st_nlink == 0 for info in infos):
+                unlinked[identity] = descriptors
+        if not unlinked:
+            return 0, 0
+        listed = _process_descriptors()
+        if listed is None:
+            return 0, len(unlinked)
+        holder = {descriptor for descriptors in unlinked.values() for descriptor in descriptors}
+        in_use = set()
+        for descriptor in listed:
+            if descriptor in holder:
+                continue
+            try:
+                identity = _identity(os.fstat(descriptor))
+            except OSError:
+                continue
+            if identity in unlinked:
+                in_use.add(identity)
+        for identity, descriptors in unlinked.items():
+            if identity in in_use:
+                kept += 1
+                continue
+            if _HELD.get(identity) in descriptors:
+                del _HELD[identity]
+            for descriptor in descriptors:
+                if descriptor in _DUPLICATES:
+                    _DUPLICATES.remove(descriptor)
+                os.close(descriptor)
+            released += 1
+    return released, kept
+
+
 def _hold_file(path: Path) -> tuple[int, tuple[int, int]]:
     with _HELD_LOCK:
         try:

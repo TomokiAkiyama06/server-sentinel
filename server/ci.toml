@@ -2,7 +2,10 @@ version = 1
 
 [checks]
 lint = ["python", "-m", "tests.lint"]
-test = ["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-v"]
+# Issue #248: a soft and hard limit of 1024 descriptors (a common Ubuntu
+# default), so a held-descriptor leak fails here; exec keeps SIGABRT on timeout
+# reaching Python's faulthandler.
+test = ["sh", "-c", "ulimit -n 1024 && exec python -m unittest discover -s tests -p 'test_*.py' -v"]
 
 [smoke]
 dockerfile = "Dockerfile.ci"
