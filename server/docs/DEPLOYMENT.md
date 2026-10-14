@@ -1866,7 +1866,16 @@ overlapping segment after that close, which the store does not link. Its
 link is required only if a later linked segment shows it was published
 while the recording was active. A recording stopped early and then closed by
 its deadline before the source caught up is held to the stricter rule and may
-fail closed.
+fail closed. Requiring an `interrupted` recording to keep a link to every
+overlapping publication of the same `stream_id` (#161 item 1(b)) is not
+implemented and awaits an Owner decision: it would hold only if a stream never
+continues across a Main restart, and that `stream_id` contract is not defined
+yet (no production ingest path publishes segments). If a source continues the
+same stream after the restart, its next overlapping publication is
+legitimately unlinked (the recording is no longer active) and leaves exactly
+the catalog that a link lost just before the restart leaves, so the rule would
+fail an ordinary update; `test_an_interrupted_recording_cannot_tell_a_lost_link_from_a_later_publication`
+pins both cases as preserved.
 
 Known fail-closed side effects (verification fails although the service did
 nothing wrong; investigate, then take a new baseline):
