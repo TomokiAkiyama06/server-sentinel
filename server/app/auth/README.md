@@ -140,8 +140,11 @@ Not implemented yet, and required before routes open in production:
   `GetaddrinfoResolver`), load the session-binding key with
   `SessionBindingKey.load_or_create(Settings.session_binding_key_path)` and
   pass a `HumanAccess` to `create_app` (no production path builds one yet);
-- delivery of `CredentialFindingSink` and `ReservationFault` to the Owner
-  notification channel.
+- delivery of `CredentialFindingSink`, `ReservationFault` and the
+  `HumanAccess.state` / `check_failures` lifecycle to the Owner notification
+  channel and health (Issue #232 item 4). `NotificationService` has no
+  human-access kind yet and no production composition builds the check, so
+  there is nothing to wire into until that composition exists.
 
 Owner-only mutations — invitation (with its code), code re-issue, grant
 change, single credential revocation and principal revocation — are exposed
@@ -913,7 +916,7 @@ that ends with an unexpected exception sets `failed` and logs
 `HumanAccessAlreadyRunning` and changes nothing. A failing expiry sweep logs
 `human_access_sweep_failed` when the streak starts and each time it doubles.
 No Owner notification is emitted yet; delivering it belongs with the other
-reservation faults (see "Not implemented yet").
+reservation faults (Issue #232 item 4, see "Not implemented yet").
 
 Owner operation and live authorization. `PasskeyCeremonies.authorize_owner_operation`
 commits `authorize_owner` inside `admit(epoch)` (#228 item 5), so the Owner
