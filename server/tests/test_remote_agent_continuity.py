@@ -2445,11 +2445,12 @@ class ReleasedTombstoneDurabilityTests(unittest.TestCase):
     ``committed_watermark`` covering it, never ingest-queue membership.
     """
 
-    def _tracker(self, *, watermark=no_watermark, released=None, pairs=None):
+    def _tracker(self, *, watermark=no_watermark, released=None, pairs=None,
+                 queue=AgentIngestQueue):
         authorizer = Authorizer(pairs or {(NODE, SOURCE), (NODE, OTHER_SOURCE)})
         clock = Clock()
-        ingest = AgentIngestQueue(IngestLimits(8, 4, 32, 1000, 10 ** 12),
-                                  authorizer, clock_ns=clock)
+        ingest = queue(IngestLimits(8, 4, 32, 1000, 10 ** 12),
+                       authorizer, clock_ns=clock)
         limits = (ContinuityLimits(4, 4, 100) if released is None
                   else ContinuityLimits(4, 4, 100, maximum_released_sources=released))
         tracker = ContinuityTracker(limits, authorizer, ingest, clock_ns=clock,
@@ -2577,6 +2578,89 @@ class ReleasedTombstoneDurabilityTests(unittest.TestCase):
                 self.assertEqual((1, 1, 0), (diagnostics.released_sources,
                                              diagnostics.released_evictions,
                                              diagnostics.released_reclaimed_by_watermark))
+
+    def test_entry_no_watermark_can_cover_is_evicted_without_a_lookup(self):
+        # A watermark at or past the committed position does not restore
+        # noted loss, a refused attempt or an unresolved lookup: reclaiming
+        # such an entry would report the same loss twice after reactivation.
+        for kind in ("noted_skip", "refused_attempt", "unresolved"):
+            with self.subTest(kind=kind):
+                state = {"armed": False, "broken": kind == "unresolved"}
+                lookups = []
+
+                def watermark(source_id, state=state, lookups=lookups):
+                    if source_id != SOURCE:
+                        return None
+                    if state["armed"]:
+                        lookups.append(source_id)
+                        return CommittedWatermark(NODE, 1, 9, 90)
+                    if state["broken"]:
+                        raise OSError("synthetic durable store failure")
+                    return None
+                tracker, ingest, authorizer, session = self._tracker(
+                    watermark=watermark, released=1, queue=TransientRefusalQueue)
+                if kind == "unresolved":
+                    self.assertEqual("watermark_unavailable",
+                                     tracker.receive(session, unit(0), b"v").reason)
+                else:
+                    tracker.receive(session, unit(0), b"v")
+                    ingest.drain(10)
+                    ingest.refusing = True
+                    refused = tracker.receive(
+                        session, unit(5 if kind == "noted_skip" else 1), b"v")
+                    self.assertEqual("transient_refusal", refused.reason)
+                    ingest.refusing = False
+                self._deactivate(tracker, authorizer, SOURCE, fenced=True)
+                # From here the durable store covers SOURCE's position.
+                state["armed"] = True
+                tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v")
+                ingest.drain(10)
+                with self.assertLogs(CONTINUITY_LOGGER, logging.DEBUG) as logged:
+                    self._deactivate(tracker, authorizer, OTHER_SOURCE, fenced=True)
+                self.assertEqual([Event.CAPTURE_CONTINUITY_RELEASED_EVICTED],
+                                 [record.msg for record in logged.records])
+                self.assertEqual([], lookups)
+                self.assertEqual(ContinuityDiagnostics(1, 1, 1, 0, 0, 0),
+                                 tracker.diagnostics())
+
+    def test_only_the_oldest_released_entry_is_looked_up_per_release(self):
+        third, fourth = SOURCES[2], SOURCES[3]
+        for oldest_covered in (False, True):
+            with self.subTest(oldest_covered=oldest_covered):
+                marks, lookups, armed = {}, [], []
+
+                def watermark(source_id, marks=marks, lookups=lookups, armed=armed):
+                    if armed:
+                        lookups.append(source_id)
+                    return marks.get(source_id) if armed else None
+                tracker, ingest, authorizer, session = self._tracker(
+                    watermark=watermark, released=2,
+                    pairs={(NODE, s) for s in (SOURCE, OTHER_SOURCE, third, fourth)})
+                for source in (SOURCE, OTHER_SOURCE, third):
+                    tracker.receive(session, unit(0, source=source), b"v")
+                    ingest.drain(10)
+                if oldest_covered:
+                    marks[SOURCE] = CommittedWatermark(NODE, 1, 0, 0)
+                # The second entry is covered too, but is never looked up.
+                marks[OTHER_SOURCE] = CommittedWatermark(NODE, 1, 0, 0)
+                armed.append(True)
+                self._deactivate(tracker, authorizer, SOURCE, fenced=True)
+                self._deactivate(tracker, authorizer, OTHER_SOURCE, fenced=False)
+                self.assertEqual([], lookups)
+                # Full at two entries: one lookup, for the oldest only.
+                self._deactivate(tracker, authorizer, third, fenced=True)
+                self.assertEqual([SOURCE], lookups)
+                diagnostics = tracker.diagnostics()
+                self.assertEqual(
+                    (2, 0 if oldest_covered else 1, 1 if oldest_covered else 0),
+                    (diagnostics.released_sources, diagnostics.released_evictions,
+                     diagnostics.released_reclaimed_by_watermark))
+                # The next full release looks up the new oldest entry only.
+                tracker.receive(session, unit(0, source=fourth), b"v")
+                ingest.drain(10)
+                del lookups[:]
+                self._deactivate(tracker, authorizer, fourth, fenced=False)
+                self.assertEqual([OTHER_SOURCE], lookups)
 
     def test_default_bound_of_64_makes_an_eviction_visible(self):
         sources = tuple(UUID(int=1000 + n) for n in range(65))

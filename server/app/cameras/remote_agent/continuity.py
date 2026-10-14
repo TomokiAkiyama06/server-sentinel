@@ -377,7 +377,16 @@ class ContinuityTracker:
     consulted, under this tracker's lock, before the first unit of a source
     this tracker does not yet track and before a released entry is evicted
     at a full bound (see below), and must not call back into the tracker
-    or its ingest queue.  An attempt that the node's rate budget (or its
+    or its ingest queue.  The eviction lookup runs from ``forget_source``
+    and from ``authorization_change`` right after the caller's block
+    completes, still under this tracker's lock: the store must therefore not
+    need any lock or transaction that the caller holds around
+    ``authorization_change`` (for example the transaction that committed
+    the deactivation), or it deadlocks or blocks every ingest call.
+    Conversely ``acknowledge_persisted`` takes this tracker's lock, so the
+    durable consumer must not call it while holding a lock or transaction
+    that ``committed_watermark`` needs (lock order is always tracker lock,
+    then store; never the reverse), as for the lookup in ``receive``.  An attempt that the node's rate budget (or its
     authorization) already refuses is refused before the lookup, so retries
     cannot drive unbounded durable-store work; the attempt is still charged
     exactly once.  A lookup that fails refuses the unit transiently
@@ -1114,6 +1123,13 @@ class ContinuityTracker:
             return tuple(result)
 
     @staticmethod
+    def _coverable(state: _Source) -> bool:
+        """Whether some durable position could make ``state`` covered."""
+        return (not state.unresolved and state.last_sequence is not None
+                and state.noted_before is None and state.attempted_time_ns is None
+                and state.attempted_epoch <= state.capture_epoch)
+
+    @staticmethod
     def _durably_covered(state: _Source) -> bool:
         """Whether the durable watermark alone restores this continuity.
 
@@ -1122,12 +1138,10 @@ class ContinuityTracker:
         unit and no refused attempt since the last commit.  An unresolved or
         uncommitted entry is never covered.
         """
-        return (not state.unresolved and state.last_sequence is not None
+        return (ContinuityTracker._coverable(state)
                 and state.durable_sequence is not None
                 and (state.durable_epoch, state.durable_sequence)
-                >= (state.capture_epoch, state.last_sequence)
-                and state.noted_before is None and state.attempted_time_ns is None
-                and state.attempted_epoch <= state.capture_epoch)
+                >= (state.capture_epoch, state.last_sequence))
 
     def _forget_source_locked(self, source_id: UUID) -> tuple[GapEvent, ...]:
         state = self._sources.pop(source_id, None)
@@ -1175,8 +1189,13 @@ class ContinuityTracker:
         then ``_durably_covered``.  A failing lookup, a value that is not a
         ``CommittedWatermark``, another node's watermark or a watermark
         behind the entry leaves it to be evicted (counted and logged).
+        An entry no watermark can cover (unresolved, uncommitted, or carrying
+        noted loss or a refused attempt, see ``_durably_covered``) is evicted
+        without a lookup, saving durable I/O under this lock.
         """
         state = self._released[source_id]
+        if not self._coverable(state):
+            return False
         try:
             mark = self._committed_watermark(source_id)
         except Exception:

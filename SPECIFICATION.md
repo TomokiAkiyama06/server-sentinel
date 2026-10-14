@@ -854,7 +854,13 @@ or never sent), the entry is dropped as reclaimed without counting an
 eviction. Otherwise (nothing recorded, a watermark behind the entry or for
 another node, or a failed lookup) the oldest is evicted and that source falls
 back to its durable watermark on reactivation, which can repeat an envelope or
-a gap report but never hides loss. Each such eviction, and each ignored durable
+a gap report but never hides loss. An entry that no watermark can cover (it
+carries noted loss, a refused attempt, or an unresolved lookup) is evicted
+without that lookup. Revoking or forgetting a node drops its released entries
+without durable confirmation: re-enrolling the same node UUID then resumes
+from the durable watermark, which can repeat a drained but not yet persisted
+envelope (a duplicate, never loss); a node re-paired under another UUID is
+refused by the watermark's node identity instead. Each such eviction, and each ignored durable
 acknowledgement (watermark for another node, or an unknown source), is never
 silent: it is counted in value-free operator diagnostics (the tracker's
 `diagnostics()` counters, intended for a health/status surface but not yet
