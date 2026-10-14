@@ -263,8 +263,10 @@ class Receiver:
         # Every reply write and the record of its heartbeat echoes happen
         # under this lock, and a stop request sets ``stop`` under it too: a
         # reply is either completely written (its ``sent_ns`` taken) before
-        # ``stop_ns``, or never written (#237).
-        self._send_lock = threading.Lock()
+        # ``stop_ns``, or never written (#237). Re-entrant: the main thread
+        # takes it only inside ``request_stop``, and a signal handler that
+        # interrupts that very call re-enters instead of waiting on itself.
+        self._send_lock = threading.RLock()
         self._acks = deque()
         self.stop_ns = None
         self.stop_coordinated = None
@@ -272,9 +274,11 @@ class Receiver:
     def request_stop(self, *, abrupt=False):
         """Stop the receiver; safe to call from a signal handler.
 
-        Signal handlers run in the main thread, which never takes
-        ``_send_lock`` (only session threads write replies), so waiting for
-        it cannot deadlock on the interrupted frame. A reply write in
+        Signal handlers run in the main thread. Only session threads write
+        replies under ``_send_lock``; the main thread holds it only inside
+        this method (the ``serve_with`` cleanup calls it too), and the lock
+        is re-entrant, so a handler interrupting that call acquires it at
+        once instead of waiting on its own frame. A reply write in
         progress finishes first (bounded by the socket timeout); if the lock
         is not free within ``STOP_SEND_WAIT_S`` the stop proceeds anyway and
         is recorded as uncoordinated: a reply that then completes after
@@ -495,6 +499,7 @@ class Receiver:
         them was written, never before.
         """
         replies = []
+        heartbeats = []
         echoes = []
         for body in bodies:
             parsed = wire.parse_body(body)
@@ -519,10 +524,14 @@ class Receiver:
                     raise _Close("superseded")
                 echoes.append(parsed[1])
                 state["echo"] = parsed[1]
-                replies.append(wire.heartbeat_ack_frame(parsed[1]))
+                heartbeats.append(wire.heartbeat_ack_frame(parsed[1]))
             else:
                 raise wire.ProtocolError("unexpected frame from agent")
-        return b"".join(replies), echoes
+        # Heartbeat replies first: an Agent that received any part of this
+        # write received the first of them (in-order stream; a TLS record is
+        # delivered whole and the first record starts with it), so its
+        # ``echo_frames`` count shows every write it read part of.
+        return b"".join(heartbeats + replies), echoes
 
     def _with_echo(self, state, reply, echoes):
         """Add the session's latest echo to a reply that carries none (#237).
@@ -539,7 +548,10 @@ class Receiver:
         sent = state.get("echo_sent")
         if sent is not None and time.monotonic() - sent < ECHO_REPEAT_S:
             return reply, echoes
-        return reply + wire.heartbeat_ack_frame(latest), [latest]
+        # First in the reply: an Agent that received any byte of this reply
+        # received this frame too (in-order stream; the frame is a few bytes
+        # at the start of the write), so it is counted in ``echo_frames``.
+        return wire.heartbeat_ack_frame(latest) + reply, [latest]
 
     def _flush_acks(self):
         """Write the queued ``heartbeat_ack`` records (outside ``_send_lock``).
@@ -552,16 +564,19 @@ class Receiver:
         than the reply was fully handed to the kernel, so never earlier than
         the Agent could receive it (a SIGSTOP in between only makes it
         later). The record's own ``t_ns`` can be later still (e.g. written
-        after a SIGUSR1); the summarizer uses ``sent_ns``. The echo value is
-        an Agent clock reading, only ever compared with other echo values.
+        after a SIGUSR1); the summarizer uses ``sent_ns``. ``index`` is the
+        frame's position among the session's written heartbeat_ack frames,
+        matched against the Agent's received count (``echo_frames``). The
+        echo value is an Agent clock reading, only ever compared with other
+        echo values.
         """
         while True:
             try:
-                connection, session, echo, sent_ns = self._acks.popleft()
+                connection, session, echo, sent_ns, index = self._acks.popleft()
             except IndexError:
                 return
             self._event("heartbeat_ack", connection=connection, session=session,
-                        echo_ns=echo, sent_ns=sent_ns)
+                        echo_ns=echo, sent_ns=sent_ns, index=index)
 
     def _session_a(self, session, grant, state):
         reader = wire.FrameReader(self.config.maximum_message_bytes + wire.MEDIA_HEADER_BYTES)
@@ -610,7 +625,14 @@ class Receiver:
             if echoes:
                 state["echo_sent"] = time.monotonic()
                 for echo in echoes:
-                    self._acks.append((state["connection"], state["session"], echo, sent_ns))
+                    # 1-based position of this heartbeat_ack frame among all
+                    # written on the session, in stream order: the Agent's
+                    # ``echo_frames`` count k means it received exactly
+                    # frames 1..k (a repeated echo carries an old value, so
+                    # only the position tells what the Agent received).
+                    state["echo_frames"] = state.get("echo_frames", 0) + 1
+                    self._acks.append((state["connection"], state["session"], echo, sent_ns,
+                                       state["echo_frames"]))
         self._flush_acks()
         self._sample_socket(session.connection)
 

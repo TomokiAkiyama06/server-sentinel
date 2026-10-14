@@ -188,9 +188,12 @@ from them): the G4 reconnect after a Main-side stop/restart is measured from
 the window end on two hosts as well, as a Main-clock (window end -> HELLO
 received) plus an Agent-clock (TLS handshake done -> first accepted unit)
 interval, which can only overstate the true value; Main's own stop time is no
-longer counted (it caused a false FAIL of about 55 s p95 on `slow_stop_60s`).
+longer counted (by the #237 record analysis, not a two-host measurement, it
+would put about 55 s p95 on `slow_stop_60s`, a false FAIL).
 Heartbeat-reply records are atomic with the receiver's stop, the first reply
-after a pause always carries an echo, and the fast `slow_stop_10s` stop is 4 s
+after a pause always carries an echo (numbered heartbeat-reply frames and an
+Agent received-frame count tell whether a repeated echo actually reached the
+Agent), and the fast `slow_stop_10s` stop is 4 s
 so the Agent detects it. Two-host G4/G5 under these rules remain
 **unmeasured** until the MANUAL_TEST.md §G run.
 

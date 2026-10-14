@@ -261,14 +261,18 @@ python3 scripts/manual/transport_poc/poc15.py summarize --two-host MAIN_OUT/<RUN
   episode の `idle_ns`（Agent 時計）≤ 15 s。session nonce の記録が無ければ `unmeasured`。
 - 2 host の G4 再接続時間（#237）: 1 host と同じく window 終了からの時間で、Main の停止時間は
   含めません（以前は Agent 時計の `closed` → 後続接続の初回受理を測っていたため、`slow_stop_60s`
-  では 60 s の停止がほぼ丸ごと入って p95 ≈ 55 s の false FAIL になった）。時計を比べずに、
+  では 60 s の停止がほぼ丸ごと入り、p95 ≈ 55 s の false FAIL になる。この値は #237 の記録解析によるもので、
+  2 host の実測ではない）。時計を比べずに、
   後続接続 s について (Main 時計: window 終了 → s の `session_hello`) + (Agent 時計: s の
   `connected`（TLS handshake 完了、HELLO 送信前）→ s の `first_accept`) を求めます。`connected` は
   HELLO の送信より前、送信は Main の受信（`session_hello`）より前なので、和は真の「window 終了 →
   初回受理」より HELLO の片道遅延の分だけ大きく、小さくはなりません（false PASS にならない）。
   s は window 終了以後に Main が HELLO を受けた、受理のある後続接続のうち最も早いもの（それより
   後の接続を選んでも値は大きくなるだけ）で、各接続は 1 回だけ使います。Main が window 終了前に
-  受けた HELLO は再接続に数えません。`connected` の無い古い記録は `unmeasured`。
+  受けた HELLO は再接続に数えません。SIGSTOP では、orchestrator が SIGCONT を送ってから `sigcont` を
+  記録するまでの間に receiver が HELLO を受けることがあり、その接続も除外されて、より後の接続で
+  測ります（値は大きくなる側で、受理のある後続接続が他に無ければ `fail`）。`connected` の無い古い
+  記録は `unmeasured`。
 - heartbeat 応答の記録と停止の協調（#237）: receiver は応答の書き込みと `heartbeat_ack` の記録を
   1 つの lock の下で行い、SIGUSR1 / SIGTERM の停止要求も同じ lock を取ってから `stop` を立てます。
   これで「`stop` の確認後に停止が来て応答が出る」「`sendall()` が戻った後、記録の前に停止が来る」の
@@ -286,7 +290,17 @@ python3 scripts/manual/transport_poc/poc15.py summarize --two-host MAIN_OUT/<RUN
   後ろに並び、SIGCONT 後の Main の返信が media ACK だけになりえます（Agent はそれで受信ありとして
   生き延びるのに、最後の echo は停止前のまま）。receiver は、その session で heartbeat を受けたことが
   あり、0.5 s（`ECHO_REPEAT_S`）以上 echo を書いていない返信に、最新の echo を付け直して記録します。
+  付け直した echo は返信の先頭に置きます（heartbeat 応答も各返信の先頭）。Agent がその返信の一部でも
+  受け取れば、その frame も受け取っています（stream は順序どおりで、TLS record は丸ごと届く）。
   これで停止後の最初の返信は必ず echo を運び、生き延びた session は `answered` として除外されます。
+  ただし付け直した echo は古い値なので、値だけでは Agent が受け取ったかどうかが分かりません。たとえば
+  SIGCONT 後に、Agent が切断前に送った kernel buffer 上のデータへ返信した場合、Agent はもう読んでいない
+  のに、Agent の最後の echo と同じ値が記録されます。そこで receiver は各 session の `heartbeat_ack`
+  frame に書き込み順の番号 `index`（1 から）を付け、sender は接続ごとに受け取った frame 数
+  `echo_frames` を `loss_detected` / `closed` に記録します。Agent が受け取ったのは frame 1..k
+  （k = `echo_frames`）ちょうどなので、そのどれかが cutoff 以後に書かれていれば `answered` です。
+  1..k のどれかが Main の記録に無ければ `unmeasured` になります。番号の無い古い記録は、従来どおり
+  echo の値で判定します（保守側）。
 
 2 host の残る制約（時計比較をしない代償）: Main の stale 閾値以上の proxy blackhole（G5 の Main
 `interrupted`）は、Agent 時計の blackhole window と Main の検知記録を対応付けられないため、

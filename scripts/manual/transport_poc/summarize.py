@@ -1107,11 +1107,25 @@ class RunSummary:
         window's cutoff (``heartbeat_ack`` ``sent_ns``, taken once the reply
         was written; the cutoff is the window start, or a later proven stop
         time, see ``_main_reply_cutoffs``). The receiver repeats the latest
-        echo in the first reply after a pause (``ECHO_REPEAT_S``), so a
+        echo first in the first reply after a pause (``ECHO_REPEAT_S``), so a
         connection kept alive after SIGCONT by media acknowledgements alone
-        still shows such an echo. Every session's ``last_echo_ns`` must
-        appear among that session's ``heartbeat_ack`` echoes, or the result
-        is unmeasured. Echo values are Agent clock readings and are only
+        still shows such an echo.
+
+        A repeated echo carries an old value, so the value cannot tell
+        whether the Agent received the repeat (#237: a repeat written after
+        SIGCONT to a connection the Agent had already dropped, in reply to
+        data drained from the kernel buffer, has the same value as the
+        Agent's last echo). When both sides number the frames -- the
+        receiver's ``heartbeat_ack`` ``index`` (position among the session's
+        written frames, in stream order) and the Agent's ``echo_frames``
+        (frames it received on the connection) -- the Agent received exactly
+        frames 1..k, and the session was answered iff one of those was
+        written at or after the cutoff; frames 1..k must all be on record,
+        or the result is unmeasured. Records without the numbering (from
+        before the repeat existed) use the echo values: the Agent's
+        ``last_echo_ns`` must appear among that session's echoes (else
+        unmeasured) and an echo written at or after the cutoff with a value
+        not newer than it means answered. Echo values are Agent clock readings and are only
         compared with each other; ``heartbeat_ack`` times only with the Main
         windows. Bytes the receiver drains after SIGCONT (sent before the
         Agent dropped the connection) are not evidence either way. Returns
@@ -1137,19 +1151,47 @@ class RunSummary:
             if not _is_int(echo):
                 return None
             echoes[loss["session"]] = max(echo, echoes.get(loss["session"], echo))
+        # Frames the Agent received per session (None: records without it).
+        frames = None
+        if losses and all(_is_int(loss.get("echo_frames")) for loss in losses):
+            frames = {}
+            for loss in losses:
+                frames[loss["session"]] = max(loss["echo_frames"],
+                                              frames.get(loss["session"], 0))
         replies = {}
         for item in _kind(self.receiver, "heartbeat_ack"):
             if _is_int(item.get("session")) and _is_int(item.get("echo_ns")):
                 # ``sent_ns``: when the write of the reply returned (older
                 # records: the record time, which is never earlier).
                 at = item["sent_ns"] if _is_int(item.get("sent_ns")) else item["t_ns"]
-                replies.setdefault(item["session"], []).append((at, item["echo_ns"]))
+                index = item["index"] if _is_int(item.get("index")) else None
+                replies.setdefault(item["session"], []).append((at, item["echo_ns"], index))
         cutoffs = self._main_reply_cutoffs()
-        for session, echo in echoes.items():
-            if echo not in {value for _, value in replies.get(session, ())}:
+
+        def numbered(session):
+            return frames is not None and session in frames and all(
+                index is not None for _, _, index in replies.get(session, ()))
+
+        for session in set(echoes) | set(frames or ()):
+            if numbered(session):
+                written = {index for _, _, index in replies.get(session, ())}
+                if not set(range(1, frames[session] + 1)) <= written:
+                    # The Agent received a frame on this session that Main
+                    # has no (successfully written) record of.
+                    return None
+            elif session in echoes and echoes[session] not in {
+                    value for _, value, _ in replies.get(session, ())}:
                 # The Agent received a reply on this session that Main has no
                 # (successfully sent) record of: its Main clock time is unknown.
                 return None
+
+        def answered(session, cutoff):
+            mine = replies.get(session, ())
+            if numbered(session):
+                return any(at >= cutoff and index <= frames[session] for at, _, index in mine)
+            echo = echoes.get(session)
+            return echo is not None and any(
+                at >= cutoff and value <= echo for at, value, _ in mine)
         # A session ends at its close, or at the end of its receiver process
         # (an abruptly stopped receiver may not write every close; the
         # orchestrator's ``exit`` is written once the process is gone).
@@ -1174,11 +1216,7 @@ class RunSummary:
                     continue
                 ended = min(bounds) if bounds else None
                 late = ended is None or ended > end + DETECTION_NS + SESSION_CLOSE_GRACE_NS
-                echo = echoes.get(session)
-                cutoff = cutoffs.get((start, end), start)
-                answered = echo is not None and any(
-                    at >= cutoff and value <= echo for at, value in replies.get(session, ()))
-                if late or answered:
+                if late or answered(session, cutoffs.get((start, end), start)):
                     survived += 1  # kept alive through the outage: not its detection
                     continue
                 live.append(session)

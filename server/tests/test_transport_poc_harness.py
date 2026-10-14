@@ -2402,6 +2402,64 @@ class SummarizerTests(unittest.TestCase):
                     # a graceful stop's record (not the restart) proves nothing
                     check([{**stopping, "abrupt": False}], 10_005, ("fail", "fail"))
 
+    def test_repeated_echo_counts_only_if_the_agent_received_that_frame(self):
+        """#237 review: after SIGCONT the receiver drains data the Agent sent
+        before dropping the connection and its reply repeats the old latest
+        echo (same value as the Agent's last echo). With numbered frames the
+        Agent's received count, not the value, decides: a repeat beyond that
+        count is no survival evidence (pass), one within it is (fail), and a
+        count beyond Main's records is unmeasured."""
+        second = 10**9
+        name = "slow_stop_10s-a_framed"
+        orchestrator, receiver, sender_rows = _base("slow_stop_10s")
+        orchestrator = orchestrator + [
+            {"kind": "action", "t_ns": at * second, "action": action, "duration_ns": 0}
+            for action, at in (("sigstop", 10), ("sigcont", 20))]
+        start = {"kind": "start", "t_ns": 0, "n_sources": 1, "loss_timeout_ns": second // 2}
+
+        def ack(at, echo, index):
+            row = {"kind": "heartbeat_ack", "t_ns": at * second, "sent_ns": at * second,
+                   "connection": 1, "session": 11, "echo_ns": echo}
+            return row if index is None else {**row, "index": index}
+
+        def run(frames, *, numbered=True, repeat_index=6):
+            # replies 1..5 before the stop echo Agent heartbeats 104..108; the
+            # repeat of 108 is written at SIGCONT (20 s), after the cutoff
+            replies = [ack(at, (100 + at) * second, (at - 3) if numbered else None)
+                       for at in range(4, 9)]
+            replies.append(ack(20, 108 * second, repeat_index if numbered else None))
+            counted = {} if frames is None else {"echo_frames": frames}
+            agent = [start] + sender_rows + [
+                {"kind": "loss_detected", "t_ns": 200 * second, "source": 0,
+                 "idle_ns": 2 * second, "connection": 1, "session": 11,
+                 "last_echo_ns": 108 * second, "last_committed_capture_ns": 1, **counted},
+                {"kind": "closed", "t_ns": 200 * second, "reason": "peer_closed",
+                 "connection": 1, "session": 11, "last_echo_ns": 108 * second, **counted},
+                {"kind": "connected", "t_ns": 201 * second, "connection": 2, "session": 12},
+                {"kind": "first_accept", "t_ns": 202 * second, "connection": 2,
+                 "source": 0, "session": 12}]
+            main = (receiver + self._durable(1) + _session(11, 1, 21, 1)
+                    + _session(12, 21, 90, 2) + replies)
+            self.run_dir(name, orchestrator=orchestrator, two_host=True, receiver=main,
+                         sender_rows=agent)
+            row = self.report()["slow_stop_10s"]
+            for path in (self.root / name).iterdir():
+                path.unlink()
+            return row["g4"], row["g5"]
+
+        # the review's repro: the Agent received frames 1..5 only, so the
+        # repeat (frame 6, after SIGCONT) never reached it: compliant
+        self.assertEqual(("pass", "pass"), run(5))
+        # the Agent received the repeat (6 frames): it survived the stop
+        self.assertEqual(("fail", "fail"), run(6))
+        # the Agent counts a frame Main has no record of: unmeasured
+        self.assertEqual(("unmeasured", "unmeasured"), run(7))
+        self.assertEqual(("unmeasured", "unmeasured"), run(6, repeat_index=7))
+        # without the numbering the echo value decides, conservatively: the
+        # repeat's value equals the Agent's last echo, so never a pass
+        self.assertEqual(("fail", "fail"), run(None))
+        self.assertEqual(("fail", "fail"), run(5, numbered=False))
+
 
 def second_ns(value):
     return value * 10**9
@@ -2697,15 +2755,36 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
         instance.request_stop(abrupt=True)
         self.assertEqual(first, instance.stop_ns)  # the first stop decision stays
 
+        # a session thread holds the lock (a write in progress) too long
         held = self._receiver("a_framed", [])
-        held._send_lock.acquire()
+        taken, release = threading.Event(), threading.Event()
+
+        def writer():
+            with held._send_lock:
+                taken.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        self.assertTrue(taken.wait(5))
         try:
             with mock.patch.object(receiver, "STOP_SEND_WAIT_S", 0.05):
                 held.request_stop(abrupt=True)
         finally:
-            held._send_lock.release()
+            release.set()
+            thread.join(5)
         self.assertTrue(held.stop.is_set())
         self.assertFalse(held.stop_coordinated)
+
+        # a signal handler interrupting the main thread's own request_stop
+        # (lock held by the same thread) re-enters instead of waiting on itself
+        nested = self._receiver("a_framed", [])
+        with nested._send_lock:
+            with mock.patch.object(receiver, "STOP_SEND_WAIT_S", 5.0):
+                began = time.monotonic()
+                nested.request_stop(abrupt=True)
+        self.assertLess(time.monotonic() - began, 1.0)
+        self.assertTrue(nested.stop_coordinated)
 
     def test_first_reply_after_a_pause_repeats_the_latest_echo(self):
         # #237: a reply holding only media acknowledgements (the Agent's
@@ -2717,10 +2796,18 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
         state = {"connection": 1, "session": 5, "echo": 7,
                  "echo_sent": time.monotonic() - 2 * receiver.ECHO_REPEAT_S}
         reply, echoes = instance._with_echo(state, ack, [])
-        self.assertEqual((ack + wire.heartbeat_ack_frame(7), [7]), (reply, echoes))
+        # first in the write, so any part of it the Agent reads includes it
+        self.assertEqual((wire.heartbeat_ack_frame(7) + ack, [7]), (reply, echoes))
         connection = self.Connection([], log)
         instance._send(mock.Mock(connection=connection), reply, state, echoes)
-        self.assertEqual([7], [item["echo_ns"] for item in self._acks(log)])
+        # numbered like every heartbeat_ack frame of the session (1-based)
+        self.assertEqual([(7, 1)], [(item["echo_ns"], item["index"])
+                                    for item in self._acks(log)])
+        instance._send(mock.Mock(connection=connection), wire.heartbeat_ack_frame(8),
+                       state, [8])
+        self.assertEqual([(7, 1), (8, 2)], [(item["echo_ns"], item["index"])
+                                            for item in self._acks(log)])
+        state["echo_sent"] = time.monotonic()
         # within the repeat interval, with its own echo, without any echo yet,
         # or with nothing to send: unchanged
         self.assertEqual((ack, []), instance._with_echo(state, ack, []))
