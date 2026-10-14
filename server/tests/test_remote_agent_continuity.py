@@ -1851,6 +1851,10 @@ class ContinuityTrackerTests(unittest.TestCase):
         lookups.clear()
         self._cycle(tracker, authorizer, SOURCE)
         self._cycle(tracker, authorizer, OTHER_SOURCE)
+        # Issue #113: the oldest entry's durable watermark is looked up once
+        # before eviction; it covers nothing here, so SOURCE is evicted.
+        self.assertEqual([SOURCE], lookups)
+        lookups.clear()
         # The newest release is kept; the evicted one falls back to the
         # durable watermark lookup.
         self.assertEqual(DeliveryOutcome.DUPLICATE,
@@ -2432,6 +2436,178 @@ class ContinuityObservabilityTests(unittest.TestCase):
         self.assertEqual("", stream.getvalue())
         self.assertEqual((1, 0), (tracker.diagnostics().released_sources,
                                   tracker.diagnostics().released_evictions))
+
+
+class ReleasedTombstoneDurabilityTests(unittest.TestCase):
+    """Issue #113: a released source's continuity lives until durable coverage.
+
+    Its lifetime follows ``acknowledge_persisted`` or the durable
+    ``committed_watermark`` covering it, never ingest-queue membership.
+    """
+
+    def _tracker(self, *, watermark=no_watermark, released=None, pairs=None):
+        authorizer = Authorizer(pairs or {(NODE, SOURCE), (NODE, OTHER_SOURCE)})
+        clock = Clock()
+        ingest = AgentIngestQueue(IngestLimits(8, 4, 32, 1000, 10 ** 12),
+                                  authorizer, clock_ns=clock)
+        limits = (ContinuityLimits(4, 4, 100) if released is None
+                  else ContinuityLimits(4, 4, 100, maximum_released_sources=released))
+        tracker = ContinuityTracker(limits, authorizer, ingest, clock_ns=clock,
+                                    committed_watermark=watermark)
+        return tracker, ingest, authorizer, tracker.open_session(NODE)
+
+    @staticmethod
+    def _deactivate(tracker, authorizer, source, *, fenced):
+        if fenced:
+            with tracker.authorization_change(deactivated_source=source):
+                authorizer.pairs.discard((NODE, source))
+        else:
+            authorizer.pairs.discard((NODE, source))
+            tracker.forget_source(source)
+
+    def test_reauthorized_between_drain_and_durable_watermark_never_re_enqueues(self):
+        # The original #113 race: the envelopes left the queue on drain(), the
+        # durable store has not (fully) recorded them, and the source is
+        # re-authorized.  The retry must be a duplicate, never a new envelope.
+        for fenced in (True, False):
+            for durable in ("nothing", "lagging"):
+                with self.subTest(fenced=fenced, durable=durable):
+                    marks, lookups = {}, []
+
+                    def lookup(source_id):
+                        lookups.append(source_id)
+                        return marks.get(source_id)
+                    tracker, ingest, authorizer, session = self._tracker(watermark=lookup)
+                    for sequence in range(3):
+                        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                                         tracker.receive(session, unit(sequence),
+                                                         b"v").outcome)
+                    self.assertEqual([0, 1, 2], [m.sequence for m in ingest.drain(10)])
+                    if durable == "lagging":
+                        # Only the first drained unit is durable so far.
+                        marks[SOURCE] = CommittedWatermark(NODE, 1, 0, 0)
+                        tracker.acknowledge_persisted(SOURCE, marks[SOURCE])
+                    lookups.clear()
+                    self._deactivate(tracker, authorizer, SOURCE, fenced=fenced)
+                    self.assertEqual(1, tracker.diagnostics().released_sources)
+                    authorizer.pairs.add((NODE, SOURCE))
+                    for sequence in range(3):
+                        retry = tracker.receive(session, unit(sequence), b"v")
+                        self.assertEqual((DeliveryOutcome.DUPLICATE, "already_committed"),
+                                         (retry.outcome, retry.reason))
+                    self.assertEqual(0, ingest.snapshot().queued_messages)
+                    # The kept continuity is used; the lagging store is not.
+                    self.assertEqual([], lookups)
+                    following = tracker.receive(session, unit(3), b"v")
+                    self.assertEqual((DeliveryOutcome.ACCEPTED, ()),
+                                     (following.outcome, following.gaps))
+                    self.assertEqual([3], [m.sequence for m in ingest.drain(10)])
+                    self.assertEqual(0, tracker.diagnostics().released_evictions)
+
+    def test_full_bound_reclaims_an_entry_the_durable_watermark_covers(self):
+        for fenced in (True, False):
+            with self.subTest(fenced=fenced):
+                marks, lookups = {}, []
+
+                def lookup(source_id):
+                    lookups.append(source_id)
+                    return marks.get(source_id)
+                tracker, ingest, authorizer, session = self._tracker(
+                    watermark=lookup, released=1)
+                tracker.receive(session, unit(0), b"v")
+                ingest.drain(10)
+                # Persisted durably, but the acknowledgement never arrived.
+                marks[SOURCE] = CommittedWatermark(NODE, 1, 0, 0)
+                self._deactivate(tracker, authorizer, SOURCE, fenced=fenced)
+                tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v")
+                ingest.drain(10)
+                lookups.clear()
+                logger = logging.getLogger(CONTINUITY_LOGGER)
+                with self.assertNoLogs(logger, logging.DEBUG):
+                    self._deactivate(tracker, authorizer, OTHER_SOURCE, fenced=fenced)
+                # One lookup, for the oldest entry only.
+                self.assertEqual([SOURCE], lookups)
+                self.assertEqual(ContinuityDiagnostics(1, 1, 0, 0, 0, 1),
+                                 tracker.diagnostics())
+                authorizer.pairs |= {(NODE, SOURCE), (NODE, OTHER_SOURCE)}
+                # Neither source enqueues its drained unit a second time.
+                self.assertEqual(DeliveryOutcome.DUPLICATE,
+                                 tracker.receive(session, unit(0), b"v").outcome)
+                self.assertEqual(DeliveryOutcome.DUPLICATE,
+                                 tracker.receive(session, unit(0, source=OTHER_SOURCE),
+                                                 b"v").outcome)
+                self.assertEqual(0, ingest.snapshot().queued_messages)
+
+    def test_full_bound_evicts_an_entry_the_durable_watermark_does_not_cover(self):
+        def raising(source_id):
+            raise OSError("synthetic durable store failure")
+
+        cases = {
+            "nothing_recorded": no_watermark,
+            "lagging": lambda source_id: CommittedWatermark(NODE, 1, 0, 0),
+            "other_node": lambda source_id: CommittedWatermark(OTHER_NODE, 1, 9, 90),
+            "older_epoch": lambda source_id: CommittedWatermark(NODE, 0, 9, 90),
+            "lookup_fails": raising,
+            "not_a_watermark": lambda source_id: (NODE, 1, 9, 90),
+        }
+        for name, answer in cases.items():
+            with self.subTest(case=name):
+                armed = []
+
+                def watermark(source_id, answer=answer, armed=armed):
+                    # Nothing durable until SOURCE is released; then the
+                    # store answers this case for SOURCE only.
+                    return answer(source_id) if armed and source_id == SOURCE else None
+                tracker, ingest, authorizer, session = self._tracker(
+                    watermark=watermark, released=1)
+                for sequence in range(2):
+                    tracker.receive(session, unit(sequence), b"v")
+                ingest.drain(10)
+                self._deactivate(tracker, authorizer, SOURCE, fenced=True)
+                armed.append(True)
+                tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v")
+                ingest.drain(10)
+                with self.assertLogs(CONTINUITY_LOGGER, logging.DEBUG) as logged:
+                    self._deactivate(tracker, authorizer, OTHER_SOURCE, fenced=True)
+                self.assertEqual([Event.CAPTURE_CONTINUITY_RELEASED_EVICTED],
+                                 [record.msg for record in logged.records])
+                self.assertEqual({logging.WARNING},
+                                 {record.levelno for record in logged.records})
+                diagnostics = tracker.diagnostics()
+                self.assertEqual((1, 1, 0), (diagnostics.released_sources,
+                                             diagnostics.released_evictions,
+                                             diagnostics.released_reclaimed_by_watermark))
+
+    def test_default_bound_of_64_makes_an_eviction_visible(self):
+        sources = tuple(UUID(int=1000 + n) for n in range(65))
+        tracker, ingest, authorizer, session = self._tracker(
+            pairs={(NODE, source) for source in sources})
+        self.assertEqual(64, tracker.limits.maximum_released_sources)
+        with self.assertLogs(CONTINUITY_LOGGER, logging.DEBUG) as logged:
+            for source in sources:
+                tracker.receive(session, unit(0, source=source), b"v")
+                ingest.drain(10)
+                self._deactivate(tracker, authorizer, source, fenced=True)
+        self.assertEqual(ContinuityDiagnostics(64, 64, 1, 0, 0, 0), tracker.diagnostics())
+        self.assertEqual([Event.CAPTURE_CONTINUITY_RELEASED_EVICTED],
+                         [record.msg for record in logged.records])
+        output = "\n".join(SafeJsonFormatter().format(r) for r in logged.records)
+        for identity in (NODE, sources[0]):
+            self.assertNotIn(str(identity), output)
+            self.assertNotIn(identity.hex, output)
+        # The evicted (oldest) source falls back to its durable watermark;
+        # the newest released source keeps its continuity.
+        authorizer.pairs |= {(NODE, sources[0]), (NODE, sources[-1])}
+        self.assertEqual(DeliveryOutcome.DUPLICATE,
+                         tracker.receive(session, unit(0, source=sources[-1]), b"v").outcome)
+
+    def test_acknowledgement_covering_an_active_source_keeps_no_tombstone(self):
+        tracker, ingest, authorizer, session = self._tracker(released=1)
+        tracker.receive(session, unit(0), b"v")
+        ingest.drain(10)
+        tracker.acknowledge_persisted(SOURCE, CommittedWatermark(NODE, 1, 0, 0))
+        self._deactivate(tracker, authorizer, SOURCE, fenced=True)
+        self.assertEqual(ContinuityDiagnostics(0, 1, 0, 0, 0, 0), tracker.diagnostics())
 
 
 if __name__ == "__main__":

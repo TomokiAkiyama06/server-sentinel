@@ -288,7 +288,11 @@ refused unit) is kept outside the slot limit, hard-bounded by
 `maximum_released_sources`, until the durable recording layer calls
 `acknowledge_persisted` with a watermark covering it, so a retry after
 reactivation stays a `duplicate` and the same loss is never reported twice
-(leaving the ingest queue is not durability). Evicting such an entry because the
+(leaving the ingest queue is not durability). When the bound is full, the
+oldest entry's `committed_watermark` is looked up once first: if the durable
+store already covers it (an acknowledgement that was lost or never sent) it is
+dropped as reclaimed (`released_reclaimed_by_watermark`, not an eviction);
+otherwise, or if the lookup fails, it is evicted. Evicting such an entry because the
 bound is full, and an `acknowledge_persisted` call that is ignored (watermark
 for another node, or a source neither tracked nor released), are counted in the
 value-free `diagnostics()` counters (meant for a health/status surface, which

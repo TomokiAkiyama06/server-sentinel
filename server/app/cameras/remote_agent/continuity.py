@@ -244,6 +244,10 @@ class ContinuityDiagnostics:
     acknowledgement counters count ``acknowledge_persisted`` calls that
     changed nothing because the watermark names another node, or because
     the source is neither tracked nor released.
+    ``released_reclaimed_by_watermark`` counts released entries dropped at a
+    full bound without eviction because the durable store's
+    ``committed_watermark`` already covered them (an acknowledgement that
+    never arrived); these are not loss of continuity and are not evictions.
     """
 
     released_sources: int
@@ -251,6 +255,7 @@ class ContinuityDiagnostics:
     released_evictions: int
     ignored_acknowledgements_node_mismatch: int
     ignored_acknowledgements_unknown_source: int
+    released_reclaimed_by_watermark: int = 0
 
 
 def _first_or_doubling(count: int) -> bool:
@@ -370,7 +375,8 @@ class ContinuityTracker:
     ``committed_watermark(source_id)`` returns the source's durably recorded
     ``CommittedWatermark`` or None when nothing was ever recorded.  It is
     consulted, under this tracker's lock, before the first unit of a source
-    this tracker does not yet track, and must not call back into the tracker
+    this tracker does not yet track and before a released entry is evicted
+    at a full bound (see below), and must not call back into the tracker
     or its ingest queue.  An attempt that the node's rate budget (or its
     authorization) already refuses is refused before the lookup, so retries
     cannot drive unbounded durable-store work; the attempt is still charged
@@ -388,7 +394,14 @@ class ContinuityTracker:
     has acknowledged (``acknowledge_persisted``) a watermark covering its
     committed position and the entry carries nothing else, after which the
     durable watermark is the source of truth.  These entries are hard-bounded
-    by ``maximum_released_sources`` (oldest evicted first).
+    by ``maximum_released_sources`` (oldest evicted first).  Before the oldest
+    entry is evicted at a full bound, its ``committed_watermark`` is looked up
+    once (under this lock, like the lookup in ``receive``): a durable
+    watermark that already covers it (the acknowledgement was lost or never
+    sent) drops it as reclaimed instead, and only an entry the durable store
+    does not cover, or whose lookup fails, is counted as an eviction.  So the
+    entry's lifetime follows durable coverage (an acknowledgement or the
+    committed watermark), never ingest-queue membership.
 
     Evictions and ignored acknowledgements are logged as value-free events,
     rate-limited to the first occurrence, every doubling and at least one
@@ -422,6 +435,7 @@ class ContinuityTracker:
         self._released: dict[UUID, _Source] = {}
         # Value-free operator counters (``diagnostics``); never reset.
         self._released_evictions = 0
+        self._released_reclaimed = 0
         self._ack_node_mismatches = 0
         self._ack_unknown_sources = 0
         # Rate-limited log records decided under the lock and emitted after it
@@ -525,7 +539,7 @@ class ContinuityTracker:
             return ContinuityDiagnostics(
                 len(self._released), self.limits.maximum_released_sources,
                 self._released_evictions, self._ack_node_mismatches,
-                self._ack_unknown_sources)
+                self._ack_unknown_sources, self._released_reclaimed)
 
     def open_session(self, node_id: UUID) -> AgentSession:
         """Grant a new session to an already mTLS-authenticated node identity.
@@ -1135,17 +1149,49 @@ class ContinuityTracker:
         self._released.pop(source_id, None)
         if not self._durably_covered(released):
             while len(self._released) >= self.limits.maximum_released_sources:
+                oldest = next(iter(self._released))
+                if self._reclaim_covered_locked(oldest):
+                    # Durably covered: dropping it loses no continuity.
+                    continue
                 # Hard bound: the oldest entry falls back to its durable
                 # watermark (a possible duplicate envelope or repeated gap
                 # report on reactivation, never unreported loss).  Counted
                 # and logged (rate-limited, no identity) so the operator
                 # notices that the durable consumer is not acknowledging.
-                del self._released[next(iter(self._released))]
+                del self._released[oldest]
                 self._released_evictions += 1
                 self._note_log_locked(Event.CAPTURE_CONTINUITY_RELEASED_EVICTED,
                                       logging.WARNING, self._released_evictions)
             self._released[source_id] = released
         return gaps
+
+    def _reclaim_covered_locked(self, source_id: UUID) -> bool:
+        """Drop a released entry the durable watermark already covers.
+
+        Called once per entry about to be evicted at a full bound, so a full
+        table costs at most one durable lookup per release.  The looked-up
+        watermark is applied like an acknowledgement (only for the entry's
+        own node, and only forwards); the entry is dropped only when it is
+        then ``_durably_covered``.  A failing lookup, a value that is not a
+        ``CommittedWatermark``, another node's watermark or a watermark
+        behind the entry leaves it to be evicted (counted and logged).
+        """
+        state = self._released[source_id]
+        try:
+            mark = self._committed_watermark(source_id)
+        except Exception:
+            return False
+        if not isinstance(mark, CommittedWatermark) or mark.node_id != state.node_id:
+            return False
+        position = (mark.capture_epoch, mark.sequence)
+        if (state.durable_sequence is None
+                or position > (state.durable_epoch, state.durable_sequence)):
+            state.durable_epoch, state.durable_sequence = position
+        if not self._durably_covered(state):
+            return False
+        del self._released[source_id]
+        self._released_reclaimed += 1
+        return True
 
     def acknowledge_persisted(self, source_id: UUID, mark: CommittedWatermark) -> None:
         """Record that the durable recording layer persisted ``mark``.
