@@ -6,7 +6,7 @@ temporary SQLite database and the in-process ASGI driver of
 Mock only: no browser, proxy, Tailscale or real authenticator is involved.
 
 Owner decisions S4-1 .. S4-8 (Issue #10, 2026-10-13), Issue #232 item 1,
-Issue #235 item 3 and Issue #238 item 1.
+Issue #235 item 3, Issue #238 item 1 and Issue #181 items 1 and 3.
 """
 
 import base64
@@ -32,7 +32,8 @@ from app.auth.invitation_code import new_invitation_code, parse_invitation_code
 from app.auth.model import AccessValidationError, Permission, PrincipalRole
 from app.auth.owner_operation import HumanOwnerAuthorizer, OwnerOperationContext
 from app.auth.passkeys import PasskeyCeremonies
-from app.auth.reservation import HumanAccessClosed
+from app.auth import reservation as reservation_module
+from app.auth.reservation import HostnameReservationCheck, HumanAccessClosed
 from app.auth.reservation_store import ReservationSessionRevocation
 from app.auth.serving_gate import ServingGate
 from app.auth.session_binding import SessionBindingKey
@@ -134,6 +135,42 @@ class WiringTests(AdministrationFixture):
         self.assertIsInstance(self.admin.service.authorizer, HumanOwnerAuthorizer)
         self.assertIs(self.admin.service.store, self.store.audit)
         self.assertIs(self.admin.access, self.store)
+
+    async def test_the_wired_gate_wraps_the_fully_configured_reservation_check(self):
+        # Issue #181 item 3: in the wired path the Owner's administration and
+        # the ceremonies commit through one ServingGate whose wrapped gate is
+        # the composition's own HostnameReservationCheck, never None or a
+        # substitute, so a closing check refuses an Owner mutation.
+        gate = self.admin.session_gate
+        self.assertIs(gate.reservation, self.check)
+        self.assertIs(gate.reservation, self.access.reservation)
+        self.assertIsInstance(gate.reservation, HostnameReservationCheck)
+        self.assertTrue(gate.reservation.opening_configured)
+        self.assertIs(self.access.ceremonies.session_gate, gate)
+        context = await self.context()
+        self.close_access()
+        self.assertIsNone(gate.epoch())
+        before = self.access_state()
+        with self.assertRaises(HumanAccessClosed):
+            self.admin.invite(context, "Synthetic invitee", (), epoch=context.epoch)
+        self.assertEqual(self.access_state(), before)
+        self.assertEqual(self.outcomes(AuditAction.INVITE_PRINCIPAL), [AuditOutcome.FAILED])
+
+    async def test_the_composition_gate_fails_closed_in_another_process(self):
+        # Issue #181 item 1 at the composition: HumanAccess.epoch()/admit()
+        # (and so every route, ceremony and Owner commit) delegate to the
+        # check's pid guard; a fork child sees closed access.
+        epoch = self.access.epoch()
+        self.assertIsNotNone(epoch)
+        with patch.object(reservation_module.os, "getpid", return_value=reservation_module.os.getpid() + 1):
+            self.assertIsNone(self.access.epoch())
+            self.assertIsNone(self.admin.session_gate.epoch())
+            for stale in (epoch, None):
+                with self.subTest(epoch=stale), self.assertRaises(HumanAccessClosed):
+                    with self.access.admit(stale):
+                        self.fail("admitted in another process")
+        with self.access.admit(epoch):
+            pass
 
     async def test_the_surface_builds_the_context_only_after_a_fresh_owner_op(self):
         context = await self.context()
@@ -373,6 +410,16 @@ class GateRaceTests(AdministrationFixture):
             self.close_access()
             self.reopen_access()
         await self.assert_refused_after(cycle, HumanAccessClosed)
+
+    async def test_another_process_between_authorization_and_commit(self):
+        # Issue #181 item 1: a commit attempted with a different pid (a fork
+        # child holding a copy of the open verdict) is refused by the gate.
+        def fork():
+            patcher = patch.object(reservation_module.os, "getpid",
+                                   return_value=reservation_module.os.getpid() + 1)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        await self.assert_refused_after(fork, HumanAccessClosed)
 
     async def test_local_recover_between_authorization_and_commit(self):
         # The local recover command commits outside the gate (D6): the epoch
