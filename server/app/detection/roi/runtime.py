@@ -910,7 +910,11 @@ class SceneMonitoringRuntime:
                     # Once False (here or for a late batch), it stays False.
                     if self._undelivered_recorded is not False:
                         self._undelivered_recorded = recorded
-                    status = self._status_locked()
+            # Refreshed even with nothing left to hand over: a concurrent
+            # stop or a late batch may have changed `undelivered_recorded`
+            # since `status` was taken.
+            with self._lock:
+                status = self._status_locked()
         if stalled:
             # Only a call that actually exceeded `recorder_stall_ns`.
             log.error(Event.SCENE_CRITICAL_RECORDER_STALLED)
