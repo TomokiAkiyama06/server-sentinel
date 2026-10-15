@@ -5895,6 +5895,108 @@ class LifecycleInventoryTests(unittest.TestCase):
                 self.assertEqual(code, inventory.EXIT_PRESERVED,
                                  report["sections"]["recordings"])
 
+    def test_an_interrupted_recording_cannot_tell_a_lost_link_from_a_later_publication(self):
+        # #161 (1b), deferred to #256: the proposed rule "an
+        # interrupted recording needs a link to every publication of the same
+        # stream_id" assumes a stream never continues across a Main restart.
+        # That contract is not defined (no production append() caller yet).
+        # If the source continues the stream after the restart, a later
+        # overlapping publication is legitimately unlinked (the row is no
+        # longer active). For a non-critical recording it leaves exactly the
+        # catalog a link lost before the restart leaves, so the rule would
+        # fail an ordinary update. A critical recording leaves partial
+        # evidence: append() marks a segment critical while an overlapping
+        # active recording is critical, so the lost-link segment keeps
+        # critical=1 and the later one has 0. That evidence is not a rule
+        # (overlapping recordings, early stops and deletion are unassessed);
+        # both stay preserved until the stream_id contract decides it
+        # (DEPLOYMENT.md). Update this test when 1(b) is implemented.
+        import zlib
+        from app.media.recording import Segment
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+
+        def scenario(label, lose_before_restart, critical):
+            runtime = Runtime(self.base / f"interrupted-{label}")
+            saved, self.runtime = self.runtime, runtime
+            try:
+                runtime.seed()
+                connection = sqlite3.connect(runtime.database, isolation_level=None)
+                self.addCleanup(connection.close)
+                store = self._recording_store(connection)
+                base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+                source, stream_id = uuid4(), uuid4()
+
+                def put(target, sequence, start, end):
+                    return target.append(Segment(source, stream_id, sequence, base + start,
+                                                 base + end, "synthetic", "deflate", payload))
+                put(store, 0, 0, 10_000)
+                # Window base + 10,000 to the target end at base + 50,000.
+                if critical:
+                    recording, = store.start_event(uuid4(), (source,), base + 20_000,
+                                                   pre_ms=10_000, post_ms=30_000,
+                                                   critical=True)
+                else:
+                    recording = store.start_manual(source, base + 10_000, duration_ms=40_000)
+                code, baseline = self.record(f"interrupted-{label}.json")
+                self.assertEqual(code, inventory.EXIT_PRESERVED)
+                put(store, 1, 10_000, 20_000)
+                put(store, 2, 20_000, 30_000)
+                if lose_before_restart:
+                    # Published while active, its link then lost before the
+                    # restart; startup recovery ends the row at the remaining
+                    # links.
+                    lost = put(store, 3, 30_000, 40_000)
+                    runtime.execute("DELETE FROM recording_links WHERE segment_id=?",
+                                    (str(lost),))
+                store.close()
+                reopened = sqlite3.connect(runtime.database, isolation_level=None)
+                self.addCleanup(reopened.close)
+                restarted = self._recording_store(reopened)
+                if not lose_before_restart:
+                    # The source continues the same stream after the restart:
+                    # the row is interrupted, so _publish() does not link it.
+                    put(restarted, 3, 30_000, 40_000)
+                with closing(sqlite3.connect(runtime.database)) as db:
+                    shape = (
+                        db.execute("SELECT status, ended_ms - ? FROM recordings WHERE id=?",
+                                   (base, str(recording))).fetchone(),
+                        db.execute("SELECT s.sequence, s.start_ms - ?, s.end_ms - ?, "
+                                   "l.recording_id IS NOT NULL, s.critical "
+                                   "FROM recording_segments s "
+                                   "LEFT JOIN recording_links l ON l.segment_id = s.id "
+                                   "AND l.recording_id = ? WHERE s.state = 'ready' "
+                                   "AND s.source_id = ? ORDER BY s.sequence",
+                                   (base, base, str(recording), str(source))).fetchall(),
+                        db.execute("SELECT sequence, end_ms - ? FROM recording_source_cursors "
+                                   "WHERE source_id = ?", (base, str(source))).fetchall())
+                code, report, _ = self.verify(baseline)
+                return code, report, shape
+            finally:
+                self.runtime = saved
+
+        for critical in (False, True):
+            with self.subTest(critical=critical):
+                tag = "critical" if critical else "manual"
+                lost_code, lost_report, lost_shape = scenario(f"lost-{tag}", True, critical)
+                later_code, later_report, later_shape = scenario(f"later-{tag}", False,
+                                                                 critical)
+                # Interrupted at 30,000, sequence 3 of the same stream unlinked
+                # although it overlaps the window, the cursor on it.
+                self.assertEqual(later_shape[0], ("interrupted", 30_000))
+                self.assertEqual(later_shape[1][-1], (3, 30_000, 40_000, 0, 0))
+                if critical:
+                    # Partial evidence only: the critical flag of sequence 3.
+                    self.assertEqual(lost_shape[1][-1], (3, 30_000, 40_000, 0, 1))
+                    self.assertEqual((lost_shape[0], lost_shape[1][:-1], lost_shape[2]),
+                                     (later_shape[0], later_shape[1][:-1], later_shape[2]))
+                else:
+                    self.assertEqual(lost_shape, later_shape)
+                self.assertEqual(later_code, inventory.EXIT_PRESERVED,
+                                 later_report["sections"]["recordings"])
+                # Not judged (documented limit), so the lost link is not caught.
+                self.assertEqual(lost_code, inventory.EXIT_PRESERVED,
+                                 lost_report["sections"]["recordings"])
+
     def test_a_cursor_named_publication_straddling_the_target_end_cannot_vanish(self):
         # Codex P1 (#161): append() links a segment starting before the
         # target end (start_ms < target_end_ms) even when it ends after it, so

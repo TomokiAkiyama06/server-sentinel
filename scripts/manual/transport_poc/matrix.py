@@ -51,8 +51,12 @@ SCENARIOS = dict((
               {"duration": 10, "proxy": [[3, "reset"], [6, "reset"]]}),
     _scenario("bandwidth_cap", {"duration": 230, "proxy": [[20, "rate_cap", 180, 0.5]]},
               {"duration": 10, "proxy": [[3, "rate_cap", 4, 0.5]]}),
+    # Every Main stop must be detected by the Agent (G5), so each stop is at
+    # least the Agent loss timeout + 2.5 s (fast: 1.5 s timeout, 1 s segment
+    # cadence for b_segment); a 2 s fast stop could end before b_segment's
+    # first reply timeout and leave no loss to detect (#237).
     _scenario("slow_stop_10s", {"duration": 80, "actions": [[20, "sigstop", 10]]},
-              {"duration": 9, "actions": [[3, "sigstop", 2]]}, silent=True),
+              {"duration": 10, "actions": [[3, "sigstop", 4]]}, silent=True),
     _scenario("slow_stop_60s", {"duration": 140, "actions": [[20, "sigstop", 60]]},
               {"duration": 12, "actions": [[3, "sigstop", 5]]}, silent=True),
     # The fast queue is small so seconds of half-rate drain reach backpressure.
@@ -79,6 +83,23 @@ AGENT_ACTIONS = {"restart_sender"}
 def timing(name, fast):
     spec = SCENARIOS[name]
     return spec["fast" if fast else "full"]
+
+
+def _wait_stopped(pid, timeout=1.0, stat_root="/proc"):
+    """True once ``/proc/<pid>/stat`` shows the process stopped (state ``T``)."""
+    deadline = time.monotonic() + timeout
+    path = Path(stat_root) / str(int(pid)) / "stat"
+    while True:
+        try:
+            # The state follows the parenthesised command name.
+            state = path.read_text(encoding="ascii", errors="replace").rpartition(")")[2].split()
+        except OSError:
+            return False
+        if state and state[0] == "T":
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.001)
 
 
 def nominal_bitrate(n_sources, fps, frame_bytes):
@@ -249,8 +270,14 @@ class Orchestrator:
         writer.write("action", action=action, duration_ns=int(length * 1e9))
         if action == "sigstop":
             receiver = children["receiver"].process
+            started = time.monotonic()
             receiver.send_signal(signal.SIGSTOP)
-            time.sleep(length)
+            if _wait_stopped(receiver.pid):
+                # Main clock time by which the receiver was seen frozen: a
+                # reply it handed to the kernel before this is no survival
+                # evidence for G4/G5 (#237). Not written if unconfirmed.
+                writer.write("action", action="stopped", duration_ns=0)
+            time.sleep(max(0.0, length - (time.monotonic() - started)))
             receiver.send_signal(signal.SIGCONT)
             writer.write("action", action="sigcont", duration_ns=0)
         elif action == "restart_receiver":

@@ -211,7 +211,7 @@ holder は接続済みの実カメラ数しか供給しないため（現状 1 �
 | `outage_1s` / `outage_5s` / `outage_120s` | proxy blackhole（無音の読み停止）1 s×3 / 5 s×3 / 120 s×1 |
 | `rst` | 全接続を RST ×3 |
 | `bandwidth_cap` | 公称 bitrate の 50 % へ 180 s 制限 |
-| `slow_stop_10s` / `slow_stop_60s` | Main receiver を SIGSTOP 10 s / 60 s |
+| `slow_stop_10s` / `slow_stop_60s` | Main receiver を SIGSTOP 10 s / 60 s（`--fast` は 4 s / 5 s。どの停止も Agent loss timeout + 2.5 s 以上で、b_segment でも Agent が loss を検知する長さ。#237） |
 | `slow_drain` | durable stand-in の消費を公称の 50 % に制限 |
 | `main_restart` / `capture_restart` | receiver の異常停止（SIGUSR1: 未永続の queue を破棄）→ 再起動（durable watermark から再開）/ sender 再起動（epoch 前進）。通常終了（SIGTERM）の receiver は受理済み queue を永続化してから終了 |
 | `capacity_4` / `fifth_refused` | 4 source 無 backpressure / 5 source 目の拒否 |
@@ -233,7 +233,7 @@ python3 scripts/manual/transport_poc/poc15.py summarize --two-host MAIN_OUT/<RUN
 接続ごとの session nonce: sender は接続ごとに乱数の session nonce（63 bit、0 以外）を作り、
 接続の最初の frame（`HELLO`。`b_chunked` は最初の chunk、`b_segment` は最初の segment の先頭）で
 送ります。receiver はそれを `session_hello`（と `session_close` の `session`）に、sender は
-`connect` / `closed` / `loss_detected` / `first_accept` / `route_probe` に記録します。これで
+`connect` / `connected` / `closed` / `loss_detected` / `first_accept` / `route_probe` に記録します。これで
 時計を比べずに Agent 側の接続と Main 側の session を対応付けます。
 
 - `route_probe`: probe も自分の nonce を運び（`a_framed` は `HELLO` の後に HTTP request、
@@ -248,8 +248,9 @@ python3 scripts/manual/transport_poc/poc15.py summarize --two-host MAIN_OUT/<RUN
   生き延びた接続の後の無関係な切断も割り当てられません: 候補 session は Main 時計で window 終了
   + 15 s + 5 s（`SESSION_CLOSE_GRACE_NS`）以内に終わっていること（`session_close`、receiver の `end`、または orchestrator の
   receiver `exit`）、かつ Agent がその接続で最後に受け取った heartbeat echo（`loss_detected` /
-  `closed` の `last_echo_ns`）が、receiver が window 開始以後にその session で返した echo
-  （`heartbeat_ack` の `echo_ns`、Main 時計の時刻付き。receiver は応答を socket に書き終えた後に
+  `closed` の `last_echo_ns`）が、receiver が window の cutoff（window 開始、または下記の
+  `stopped` / `stopping` で示せる Main の応答停止時刻）以後にその session で返した echo
+  （`heartbeat_ack` の `echo_ns`、Main 時計の `sent_ns` 付き。receiver は応答を socket に書き終えた後に
   記録し、送信に失敗した応答は記録しない）のどれよりも古いこと（= 停止後の Main の
   応答を Agent が受け取っていない）。echo 値は Agent 時計の値で echo 同士でしか比べず、
   `heartbeat_ack` の時刻は Main の window とだけ比べます。SIGCONT 後に receiver が読み出す
@@ -257,8 +258,49 @@ python3 scripts/manual/transport_poc/poc15.py summarize --two-host MAIN_OUT/<RUN
   古い記録、または Agent がある session で最後に受けた echo がその session の `heartbeat_ack` に
   無ければ `unmeasured`。
   生き延びて除外された session 数は `main_outage_survivors`。遅延は割り当てた
-  episode の `idle_ns`（Agent 時計）≤ 15 s、G4 の再接続時間はその接続の `closed` から後続接続の
-  最初の受理まで（Agent 時計）。session nonce の記録が無ければ `unmeasured`。
+  episode の `idle_ns`（Agent 時計）≤ 15 s。session nonce の記録が無ければ `unmeasured`。
+- 2 host の G4 再接続時間（#237）: 1 host と同じく window 終了からの時間で、Main の停止時間は
+  含めません（以前は Agent 時計の `closed` → 後続接続の初回受理を測っていたため、`slow_stop_60s`
+  では 60 s の停止がほぼ丸ごと入り、p95 ≈ 55 s の false FAIL になる。この値は #237 の記録解析によるもので、
+  2 host の実測ではない）。時計を比べずに、
+  後続接続 s について (Main 時計: window 終了 → s の `session_hello`) + (Agent 時計: s の
+  `connected`（TLS handshake 完了、HELLO 送信前）→ s の `first_accept`) を求めます。`connected` は
+  HELLO の送信より前、送信は Main の受信（`session_hello`）より前なので、和は真の「window 終了 →
+  初回受理」より HELLO の片道遅延の分だけ大きく、小さくはなりません（false PASS にならない）。
+  s は window 終了以後に Main が HELLO を受けた、受理のある後続接続のうち最も早いもの（それより
+  後の接続を選んでも値は大きくなるだけ）で、各接続は 1 回だけ使います。Main が window 終了前に
+  受けた HELLO は再接続に数えません。SIGSTOP では、orchestrator が SIGCONT を送ってから `sigcont` を
+  記録するまでの間に receiver が HELLO を受けることがあり、その接続も除外されて、より後の接続で
+  測ります（値は大きくなる側で、受理のある後続接続が他に無ければ `fail`）。`connected` の無い古い
+  記録は `unmeasured`。
+- heartbeat 応答の記録と停止の協調（#237）: receiver は応答の書き込みと `heartbeat_ack` の記録を
+  1 つの lock の下で行い、SIGUSR1 / SIGTERM の停止要求も同じ lock を取ってから `stop` を立てます。
+  これで「`stop` の確認後に停止が来て応答が出る」「`sendall()` が戻った後、記録の前に停止が来る」の
+  どちらの競合も無くなりました。`heartbeat_ack` は `sendall()` が戻った Main 時刻 `sent_ns` を持ち、
+  summarizer はこれを使います（古い記録は記録時刻 `t_ns`。どちらも Agent が受け取りうる時刻より
+  早くはならない）。receiver は終了時に `stopping`（`stop_ns`、`abrupt`、`coordinated`）を記録し、
+  orchestrator は SIGSTOP の後に `/proc/<pid>/stat` で停止状態を確認できたら `stopped` を記録します。
+  orchestrator は action を記録してから signal を送るので、その間に書かれた応答は window 開始後でも
+  生存の証拠になりません。そのため「Main が応答をやめた時刻」（cutoff）は、window 内の `stopped`
+  （SIGSTOP）または再起動で止まった receiver の協調済み `stopping` の `stop_ns`（`abrupt` かつ
+  `coordinated`）があればその時刻、無ければ window 開始のままです（証明が無ければ従来どおり保守的）。
+  lock を 2 s 以内に取れなかった停止は `coordinated: false` で、その後に完了した応答も後の `sent_ns`
+  で記録されるため、生存判定は保守側に倒れます。
+- 応答に echo を必ず含める（#237）: Agent の送信 backlog が 256 KiB 以上だと heartbeat が backlog の
+  後ろに並び、SIGCONT 後の Main の返信が media ACK だけになりえます（Agent はそれで受信ありとして
+  生き延びるのに、最後の echo は停止前のまま）。receiver は、その session で heartbeat を受けたことが
+  あり、0.5 s（`ECHO_REPEAT_S`）以上 echo を書いていない返信に、最新の echo を付け直して記録します。
+  付け直した echo は返信の先頭に置きます（heartbeat 応答も各返信の先頭）。Agent がその返信の一部でも
+  受け取れば、その frame も受け取っています（stream は順序どおりで、TLS record は丸ごと届く）。
+  これで停止後の最初の返信は必ず echo を運び、生き延びた session は `answered` として除外されます。
+  ただし付け直した echo は古い値なので、値だけでは Agent が受け取ったかどうかが分かりません。たとえば
+  SIGCONT 後に、Agent が切断前に送った kernel buffer 上のデータへ返信した場合、Agent はもう読んでいない
+  のに、Agent の最後の echo と同じ値が記録されます。そこで receiver は各 session の `heartbeat_ack`
+  frame に書き込み順の番号 `index`（1 から）を付け、sender は接続ごとに受け取った frame 数
+  `echo_frames` を `loss_detected` / `closed` に記録します。Agent が受け取ったのは frame 1..k
+  （k = `echo_frames`）ちょうどなので、そのどれかが cutoff 以後に書かれていれば `answered` です。
+  1..k のどれかが Main の記録に無ければ `unmeasured` になります。番号の無い古い記録は、従来どおり
+  echo の値で判定します（保守側）。
 
 2 host の残る制約（時計比較をしない代償）: Main の stale 閾値以上の proxy blackhole（G5 の Main
 `interrupted`）は、Agent 時計の blackhole window と Main の検知記録を対応付けられないため、
@@ -338,8 +380,8 @@ session が 1 回だけ開閉され、宣言した全 source で `forwarded` ≥
 | G1 | mTLS 相互認証。否定試験（未 activation / 別 CA / 失効 / 接続中失効）で受理 media 0、`route_probe` は 404 か切断で、この run の receiver がその probe の session nonce の拒否記録（`route_probe`）を残していること（無ければ `fail`、nonce の無い古い記録は `unmeasured`）。未 activation / 別 CA / 失効は sender の接続試行 ≥ 1 と Main 側の認証拒否記録（`auth_refused`、`connection_limit` を除く）が両方必要で、sender 記録が無ければ `unmeasured`、試行か拒否記録が無ければ `fail`。接続中失効は Main 側 orchestrator の `revoke` 記録（無ければ `unmeasured`）、receiver の `revoked`、その後の receiver sample ≥ 1（無ければ `unmeasured`）がすべて `revoked` 時点の受理数と一致、`revoked` 後の再接続拒否として、`revoked` より後の Main の `auth_refused`（認証理由。`connection_limit` を除く）が 1 host・2 host とも必要で、無ければ `fail`（Main の記録が無ければ `unmeasured`）。sender の `connect` は TLS 試行の前に書かれるので拒否の証拠にしない |
 | G2 | sender の `start` と `end` 記録が必要（否定認証と `route_probe` 以外。無ければ `unmeasured`）。epoch 内の報告 gap = durable stand-in から算出した実欠落（sequence 集合として完全一致）。durable stand-in は永続化した sequence 自体を `[first, last]` の run として SQLite に保持し、receiver 終了時に `durable_run` 記録（と `durable` の `runs` 件数）を出す。集計は run から epoch の欠落集合を独立に導出し（run の件数・境界・unit 数・順序・重複が `durable` 行と食い違えば `fail`、`runs` の無い古い記録は `unmeasured`）、continuity tracker が報告した厳密な gap（`sequence_skip` / `ingest_refused`）の範囲 `[after_sequence + 1, before_sequence)` の和集合と比較する。範囲同士の重複（二重報告）、`missing_units` と自分の範囲の不一致、durable unit 上や capture 再起動後の範囲不明区間内への誤配置は件数が合っていても `fail`。実欠落は epoch の起点（sequence 0）から数え、最初の durable unit より前の欠落も含む（capture 再起動後の epoch の先頭は範囲不明 gap）。Agent が受理を得た epoch に durable 記録が無ければ不一致。capture 再起動は範囲不明 gap、重複 commit 0。範囲不明 `capture_restart` gap が epoch の起点を動かせるのは、source の最初の durable epoch より後の各 durable epoch にちょうど 1 つあり（`after_sequence` / `missing_units` は無し、`before_sequence` はその epoch の最初の durable unit 以下で、それが起点になる）、sender 記録が epoch の前進を裏付ける場合だけ: sender の `start` は全て epoch を持ち記録順に厳密増加、再起動した source の各 epoch に `start` と `end`（`epoch_start` を記録していればそれも）がちょうど 1 つ、前の epoch の `end` が次の epoch の `start` より前。最初の durable epoch（起点は常に 0）以前への restart gap、同じ epoch への重複、sender が実行していない epoch への restart gap、これらの裏付けの欠落は `fail`。再起動後 epoch の起点より前 `[0, origin)` の unit は `unknown_extent_units` として出し（0 でなければ `lossless` は false）、その全 sequence が sender のその epoch の drop / 拒否 / residual の `unit_range` に含まれなければ `fail`（`unexplained_unknown_extent_units`）。さらに sender の `end`（source・epoch ごとに `generated` / `drops` / `drops_sent` / `residual` / `residual_sent` / `unit_ranges`）と `unit_range` 記録（drop / 拒否 / 終了時保持の sequence 範囲）で Agent 側の unit 収支を照合する: 最後の durable sequence より後の unit（backpressure で末尾が落ちると Main には gap が出ない）は、その sequence より**後**の drop / 拒否 / 保持中（`residual`）の unit と件数が一致しなければ `fail`（`unit_range` は sequence の集合として扱い、各範囲は [0, `generated`) 内、範囲同士は重複しないこと（同じ範囲の二重記録や drop と residual の重複で欠落を二重に説明しない）、drop / residual の sequence が Main の durable sequence（報告 gap の外）と重なるのは送信済み未 ack の `drops_sent` + `residual_sent` 件まで、拒否 unit は durable と重ならないこと。違反は `fail`）（記録の無い消失。例: Main が ack した後に失った末尾。epoch 途中の drop・拒否は Main の gap として報告済みなので末尾の説明に使わない）、それ以前の `drops` は Main がその epoch で報告した gap（送信後未 ack の unit は Main が持ちうるので余裕に含める）に収まらなければ `fail`（説明のつかない drop）、範囲と件数が食い違えば `fail`、`end` に収支や範囲が無い・durable 記録のある epoch に `end` が無いなら `unmeasured`。最後の receiver が停止時に受理済み unit を破棄した（`end` の `discarded_at_stop` > 0。後続の receiver が gap を報告できない）場合も `fail`。末尾の drop 数は `agent_accounted_tail_units`（Agent 側で計上した欠落） |
 | G3 | receiver と sender の両方の sample が必要（片方でも無ければ `unmeasured`）。receiver queue ≤ 設定上限、sender pending ≤ 上限、kernel send queue の滞留 byte（`TIOCOUTQ`、`ss -tmi` があれば skmem `w`）≤ 2×SO_SNDBUF + 64 KiB、VmHWM ≤ 上限、warmup 後の RSS 増加 ≤ max(16 MiB, 10 %)（sample < 4 なら `unmeasured`）。skmem `tb` は送信 buffer の上限値で、SO_SNDBUF 設定前に kernel が拡大しうるため記録のみ。実入力の run で `ss` が無い（socket を 1 つも報告した sample が無い）なら `unmeasured`。proxy 保持量は 1 回の `recv()` buffer で構造的に有界なので記録のみ |
-| G4 | 切断を伴う impairment から手動操作なしで再接続、p95 ≤ 10 s（2 host で Main 側 action の場合は、window 開始時に live だった session（session nonce で対応付け）の Agent 側切断→後続接続の初回受理を Agent 時計で測る。対応する session が無い window は再接続 0 として数え、nonce の記録が無ければ `unmeasured`）。切断と初回受理は impairment ごとに 1 組ずつ対応させ（同じ記録を複数回使わない）、各 impairment の対応範囲は次に予定された impairment の開始で打ち切る（切断は [開始, min(終了 + 30 s, 次の開始))、初回受理は次の開始より前。後の impairment の後に起きた切断・受理を前の impairment の再接続として数えない）、必要な再接続数は予定された reset / Main 再起動と、Agent loss timeout + 1 s 以上の blackhole / SIGSTOP の数だけで決まる（scenario 名による追加要求はない） |
-| G5 | 無音断の検知 ≤ 15 s（Agent / Main とも）、Main の未 commit 区間（Agent capture 時刻）⊆ Agent 保護区間 [T−600 s, T+600 s]。proxy blackhole は予定数の `impairment_start` 記録が必要（`proxy.jsonl` が無ければ `unmeasured`、不足は `fail`）、Main の stale 閾値以上の blackhole には source ごとに Main の `interrupted`（最後の受信から ≤ 15 s）が必要。Main 側停止（`slow_stop_10s` / `slow_stop_60s` / `main_restart`）は停止ごとに Agent の loss 検知が必要で、遅延は Agent 時計で最後の受信からの経過（`idle_ns`）≤ 15 s（2 host では停止開始時に live だった session のうち、停止を生き延びていない（Main 時計で window 終了 + 15 s + 5 s（`SESSION_CLOSE_GRACE_NS`）以内に終わり、停止開始後の Main の heartbeat 応答を Agent が受けていない）session の loss episode だけを数える）。Main 側 orchestrator 記録が無ければ `unmeasured`。予定された proxy reset はそれぞれ Agent 時計で 15 s 以内の `loss_detected` が必要（`proxy.jsonl` が無ければ `unmeasured`）。`loss_detected` は source ごとに出るが connection 単位で 1 episode とし、reset / 長い blackhole ごとに別の episode を 1 つずつ消費する（1 回の検知を 2 つの reset に使わない）。対応づけの範囲は [impairment 開始, min(開始 + 15 s, 次に予定された impairment の開始)) で、後の impairment の後に出た検知は前の impairment の検知として数えない（最後の impairment は開始 + 15 s まで）。1 host の Main 側停止と Main の `interrupted` の照合も同様に次の window の開始で打ち切る。Main の `interrupted` は最後の `session_close` 以前のものだけを数える（sender 終了後の stale 判定は障害検知ではない） |
+| G4 | 切断を伴う impairment から手動操作なしで再接続、p95 ≤ 10 s（再接続時間は impairment の終了から測り、Main の停止時間そのものは含めない。2 host で Main 側 action の場合は、window 開始時に live だった session（session nonce で対応付け）が切れた window について、Main 時計の「window 終了（SIGCONT / 再起動後の `ready`）→ 後続接続の `session_hello`」と Agent 時計の「その接続の `connected` → `first_accept`」の和で測る（真の値より小さくならない。#237）。対応する session が無い window は再接続 0 として数え、nonce や `connected` の記録が無ければ `unmeasured`）。切断と初回受理は impairment ごとに 1 組ずつ対応させ（同じ記録を複数回使わない）、各 impairment の対応範囲は次に予定された impairment の開始で打ち切る（切断は [開始, min(終了 + 30 s, 次の開始))、初回受理は次の開始より前。後の impairment の後に起きた切断・受理を前の impairment の再接続として数えない）、必要な再接続数は予定された reset / Main 再起動と、Agent loss timeout + 1 s 以上の blackhole / SIGSTOP の数だけで決まる（scenario 名による追加要求はない） |
+| G5 | 無音断の検知 ≤ 15 s（Agent / Main とも）、Main の未 commit 区間（Agent capture 時刻）⊆ Agent 保護区間 [T−600 s, T+600 s]。proxy blackhole は予定数の `impairment_start` 記録が必要（`proxy.jsonl` が無ければ `unmeasured`、不足は `fail`）、Main の stale 閾値以上の blackhole には source ごとに Main の `interrupted`（最後の受信から ≤ 15 s）が必要。Main 側停止（`slow_stop_10s` / `slow_stop_60s` / `main_restart`）は停止ごとに Agent の loss 検知が必要で、遅延は Agent 時計で最後の受信からの経過（`idle_ns`）≤ 15 s（2 host では停止開始時に live だった session のうち、停止を生き延びていない（Main 時計で window 終了 + 15 s + 5 s（`SESSION_CLOSE_GRACE_NS`）以内に終わり、停止開始後（Main が応答をやめたことを記録で示せる場合はその時刻以後）の Main の heartbeat 応答を Agent が受けていない）session の loss episode だけを数える）。Main 側 orchestrator 記録が無ければ `unmeasured`。予定された proxy reset はそれぞれ Agent 時計で 15 s 以内の `loss_detected` が必要（`proxy.jsonl` が無ければ `unmeasured`）。`loss_detected` は source ごとに出るが connection 単位で 1 episode とし、reset / 長い blackhole ごとに別の episode を 1 つずつ消費する（1 回の検知を 2 つの reset に使わない）。対応づけの範囲は [impairment 開始, min(開始 + 15 s, 次に予定された impairment の開始)) で、後の impairment の後に出た検知は前の impairment の検知として数えない（最後の impairment は開始 + 15 s まで）。1 host の Main 側停止と Main の `interrupted` の照合も同様に次の window の開始で打ち切る。Main の `interrupted` は最後の `session_close` 以前のものだけを数える（sender 終了後の stale 判定は障害検知ではない） |
 | G6 | 4 source で backpressure / rate limit / sender drop 0（4 source すべての sender `end` 記録が必要、1 つも無ければ `unmeasured`）、かつ Main / Agent とも cgroup v2 `cpu.max` の CPU 上限下で実行（`capacity_4`、上限が無ければ `fail`）。5 source 目は active-source 上限（`source_capacity`）で拒否 |
 | 副次 | soak 30 分で予期しない切断 0、overhead ≤ 10 %（proxy の上り byte / payload）、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %（最初の sample からの差分で算出）、latency p95 ≤ 1 s（参考） |
 
