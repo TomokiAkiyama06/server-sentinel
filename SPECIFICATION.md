@@ -980,13 +980,12 @@ API, retain decoded media, make a presence decision, or issue a notification.
 A calibration policy whose bounded search window cannot reach its own movement
 or camera-shift threshold is refused: such a configuration cannot express the
 displacement it asks to detect and would report a matching geometry instead. A
-calibration is refused as well when its own support leaves no translating
-pure translation at or beyond a threshold above the coverage minimum in every
-axis direction, since a quarter turn does not register a pixel shift even when
-it carries a translation and one direction does not stand for its opposite, or
-when its reference
-already meets the obscured-scene threshold, since every unchanged sample would
-then confirm a tamper that never happened.
+calibration is refused as well when its own support leaves no translating pure
+translation at or beyond a threshold above the coverage minimum in every axis
+direction, since a quarter turn does not register a pixel shift even when it
+carries a translation and one direction does not stand for its opposite, or when
+its reference already meets the obscured-scene threshold, since every unchanged
+sample would then confirm a tamper that never happened.
 
 It first estimates a bounded global translation/quarter-turn transform from
 background support, then compares the ROI relative to that transform. A
@@ -999,19 +998,18 @@ the episode as well, so no later confirmation spans it, and the observed stream,
 sequence and clock advance before any such result so that a buffered frame from
 a superseded geometry cannot re-enter confirmation. An identified sample whose
 metadata alone is unusable, and a refused source-loss report carrying a valid
-outage clock, advance that progression too. Every replaced stream is
-retained for the detector's lifetime, so a delayed frame from a stream the
-source has already left is refused as stale imagery instead of becoming current
-again, and no number of later replacements restores an old identity. The number
-of admitted stream transitions is bounded instead, and a detector that reaches
-that bound latches: every later sample and source-loss report stays unknown
-until a fresh detector is bound. Temporal confirmation also begins at the
-reference sample, so imagery the source captured before the calibration existed
-cannot contribute to it. Because such an
-interruption ends the episode, a condition
-confirmed again afterwards is emitted again instead of being suppressed as a
-duplicate, so no confirmed critical observation is silently lost. Person
-presence is not an input to this conclusion.
+outage clock, advance that progression too. Every replaced stream is retained
+for the detector's lifetime, so a delayed frame from a stream the source has
+already left is refused as stale imagery instead of becoming current again, and
+no number of later replacements restores an old identity. The number of admitted
+stream transitions is bounded instead, and a detector that reaches that bound
+latches: every later sample and source-loss report stays unknown until a fresh
+detector is bound. Temporal confirmation also begins at the reference sample, so
+imagery the source captured before the calibration existed cannot contribute to
+it. Because such an interruption ends the episode, a condition confirmed again
+afterwards is emitted again instead of being suppressed as a duplicate, so no
+confirmed critical observation is silently lost. Person presence is not an input
+to this conclusion.
 
 Camera tamper has an independent quality input and confirmation state. The core
 can report a persistent near-dark scene, a global scene shift, or a scene that
@@ -1019,114 +1017,147 @@ stops registering while differing measurably from the calibrated background,
 which covers a covered or redirected camera. That difference is a bounded
 scene-change scalar and never an identity or a culprit attribution. A
 registration whose best transform is acceptable but ambiguous, as on a
-repetitive scene, remains `unknown` and confirms neither tamper nor its
-absence, because its untransformed difference is large even when the
-registered transform is small. Trusted source loss becomes critical
-only when it occurs within the configured interval after a recorded global
-scene shift, and at most once per tracked shift episode; uncorrelated or
-untrusted loss stays `unknown`. One confirmed sample may carry both a server
-movement and a camera tamper, so local critical staging always admits a whole
-batch rather than refusing evidence a caller could never resubmit.
-A later runtime must durably handle a confirmed critical observation
-for evidence preservation and configured notifications in every presence state.
+repetitive scene, remains `unknown` and confirms neither tamper nor its absence,
+because its untransformed difference is large even when the registered transform
+is small. Trusted source loss becomes critical only when it occurs within the
+configured interval after a recorded global scene shift, and at most once per
+tracked shift episode; uncorrelated or untrusted loss stays `unknown`. One
+confirmed sample may carry both a server movement and a camera tamper, so local
+critical staging always admits a whole batch rather than refusing evidence a
+caller could never resubmit. A later runtime must durably handle a confirmed
+critical observation for evidence preservation and configured notifications in
+every presence state.
+
 The Issue #205 `SceneMonitoringRuntime` (`server/app/detection/roi/runtime.py`)
 wires this core into the Main application: capture callbacks hand it at most one
-pending sample per source at a bounded sample interval (default 1 sample/s),
-and a single worker runs the per-source `server_roi` and `camera_tamper`
-quality gates and the detector, with per-source failure isolation. Confirmed
+pending sample per source at a bounded sample interval (default 1 sample/s), and
+a single worker runs the per-source `server_roi` and `camera_tamper` quality
+gates and the detector, with per-source failure isolation. Confirmed
 observations go through bounded in-memory critical staging to an injected
 durable recorder (`CriticalTimelineRecorder`); without it no detector runs. The
 recorder is called only on a dedicated delivery thread, never on the scene
 worker, so a stalled recorder (for example on stalled storage) never blocks
 sampling or detection: staging fills and further confirmations become explicit
 `critical_backpressure`, and a recorder call in flight longer than the stall
-bound reports the runtime `degraded` (`recorder_stalled`).
-Without a stored calibration whose reference frame can be re-bound, a source
-stays inactive and `unknown`; no baseline is taken from live frames. Local
-capture is read as uncompressed `GREY`/`YUYV` or, since Issue #217 (Owner
+bound reports the runtime `degraded` (`recorder_stalled`). Without a stored
+calibration whose reference frame can be re-bound, a source stays inactive and
+`unknown`; no baseline is taken from live frames.
+
+Local capture is read as uncompressed `GREY`/`YUYV` or, since Issue #217 (Owner
 decision 2026-10-11), as `MJPG` through the reviewed simplejpeg decoder: a
 structural pre-check in the Main process (flat byte buffer, SOI, one baseline
 scan ending in a single EOI, bounded padding, SOF dimensions equal to the
 negotiated format within a pixel budget, a payload of at most 2 bytes per
-negotiated pixel plus 256 KiB, entropy data checked with C-level byte
-operations so its cost is linear in that bound) runs on the scene worker before any
-native code sees the bytes, and the strict decode itself runs only in a
-separate, per-source, resident decode child process (Owner decision
-2026-10-11 on PR #225), never in the Main process. The child is started by
-fork+exec of the service interpreter (`python -I -B`) from that source's own
-long-lived supervisor thread (child start and reap never run on the shared
-scene worker; frames are refused as `unknown` until the child is ready) with
-a minimal environment and only a private `AF_UNIX` socketpair
-inherited; before importing the decoder it sets `no_new_privs`, a parent-death
-`SIGKILL`, non-dumpable, a lower CPU priority and equal soft/hard rlimits
-(address space, descriptors, no new process, no core, no file writes), and it
-runs as the same unprivileged service account. Every exchange has a hard
-per-frame deadline that covers the transfer. Any pre-check refusal, strict
-decode error, decoded-shape mismatch or mid-grey undecoded band, and any child
-crash, kill (including OOM), exit, timeout (the child is killed) or malformed
-reply is `unknown` (`frame_undecodable`, counted per fixed reason in
-`undecodable_reasons`); a replacement child starts only after a bounded
-exponential backoff during which frames are refused without waiting (the
-supervisor starts it when the backoff ends, without waiting for a frame), and
-repeated child failures lower the source (and the runtime) to `degraded`
-(`frame_decoder_failing`, logged value-free). The restart never gives up: a
-child that can never start (address-space cap, import failure) is respawned at
-most once per 30 s per source for as long as the source is bound, while the
-source stays `degraded`. A missing or differently
+negotiated pixel plus 256 KiB, entropy data checked with C-level byte operations
+so its cost is linear in that bound) runs on the scene worker before any native
+code sees the bytes, and the strict decode itself runs only in a separate,
+per-source, resident decode child process (Owner decision 2026-10-11 on PR
+#225), never in the Main process. The child is started by fork+exec of the
+service interpreter (`python -I -B`) from that source's own long-lived
+supervisor thread (child start and reap never run on the shared scene worker;
+frames are refused as `unknown` until the child is ready) with a minimal
+environment and only a private `AF_UNIX` socketpair inherited; before importing
+the decoder it sets `no_new_privs`, a parent-death `SIGKILL`, non-dumpable, a
+lower CPU priority and equal soft/hard rlimits (address space, descriptors, no
+new process, no core, no file writes), and it runs as the same unprivileged
+service account. Every exchange has a hard per-frame deadline that covers the
+transfer. Any pre-check refusal, strict decode error, decoded-shape mismatch or
+mid-grey undecoded band, and any child crash, kill (including OOM), exit,
+timeout (the child is killed) or malformed reply is `unknown`
+(`frame_undecodable`, counted per fixed reason in `undecodable_reasons`); a
+replacement child starts only after a bounded exponential backoff during which
+frames are refused without waiting (the supervisor starts it when the backoff
+ends, without waiting for a frame), and repeated child failures lower the source
+(and the runtime) to `degraded` (`frame_decoder_failing`, logged value-free).
+The restart never gives up: a child that can never start (address-space cap,
+import failure) is respawned at most once per 30 s per source for as long as the
+source is bound, while the source stays `degraded`. A missing or differently
 versioned decoder keeps the source inactive (`frame_decoder_unavailable`).
-`stop()` kills and reaps every decode child within the scene stop bounds.
-Decode success does not prove frame integrity. `capture_luma_layout()` must be
-given the driver-negotiated profile. Other compressed formats stay `unknown`. Poor quality, undecodable frames,
-backpressure, camera loss and stale conclusions are `unknown`, never a
-negative. A camera loss that arrives while staging has no room is held as
-backpressure and processed after staging drains, never dropped as a
-per-source failure; a loss still queued at shutdown is processed by the final
-worker pass. Every loss or observation that remains undelivered is counted in
-the runtime status and logged (staging is in memory only): staged
-observations in `critical_pending`, losses still without staging room in
-`losses_held`, and losses lost to a per-source fault (while running or in the
-shutdown drain) in `losses_failed`. A camera loss (`offline`,
-`manual_intervention_required` or `degraded`, that is every non-`online`
-state) lowers the source to `degraded` until a new evaluated sample
-establishes recovery. A source with no sample evaluated within the
+`stop()` kills and reaps every decode child within the scene stop bounds. Decode
+success does not prove frame integrity. `capture_luma_layout()` must be given
+the driver-negotiated profile. Other compressed formats stay `unknown`.
+
+Poor quality, undecodable frames, backpressure, camera loss and stale
+conclusions are `unknown`, never a negative. A camera loss that arrives while
+staging has no room is held as backpressure and processed after staging drains,
+never dropped as a per-source failure; a loss still queued at shutdown is
+processed by the final worker pass. Every loss or observation that remains
+undelivered is counted in the runtime status and logged (staging is in memory
+only): staged observations in `critical_pending`, losses still without staging
+room in `losses_held`, losses lost to a per-source fault (while running or in
+the shutdown drain) in `losses_failed`, and a loss left in a capture slot, or
+taken from it and not yet handed to its detector, by a worker that outlived its
+stop bound in `losses_cleared`. Their total, and separately each batch refused
+after `stop()` fenced the count, is handed to an injected count-only durable
+sink (Owner decision 2026-10-14, #224), so each refusal is counted once; a count
+may be overstated, never hidden. A missing or failing sink is reported
+(`undelivered_recorded`, `scene_undelivered_unrecorded`). Main does not pass a
+sink yet, so today the count is only logged. Once Main wires the timeline outbox
+(follow-up, #205), the sink is to add the count as lost facts to the presence
+timeline gap marker through the open outbox session, without observation
+content, identifiers or sources, so that a failed outbox close leaves an
+interrupted gap for the next start and Owner status reports `timeline_gap` until
+the Owner clears it. That wiring stops scene monitoring before the outbox
+closes, and does not close the outbox cleanly when `stop()` returns
+`stop_failed` or `undelivered_recorded` is false. A count handed over after the
+outbox closed or before it opened is refused and only logged; the next start
+then shows no unclean stop.
+
+A camera loss (`offline`, `manual_intervention_required` or `degraded`, that is
+every non-`online` state) lowers the source to `degraded` until a new evaluated
+sample establishes recovery. A source with no sample evaluated within the
 calibration's `maximum_gap_ns` (including a bound source that never received
 one) is likewise `degraded` (`observation_stale`) with `unknown` conclusions
-until a fresh evaluated sample recovers it. A decoded-sample producer
-stream that has been replaced is refused as stale imagery on the capture side
+until a fresh evaluated sample recovers it. A decoded-sample producer stream
+that has been replaced is refused as stale imagery on the capture side
 (`stale_rejected`) and never re-admitted under a new runtime identity; the
-transition is recorded even when the replacement stream's first frame is
-sampled out. When the bounded retired-stream history (1024 ids per source) is
-full, further replacement streams are refused (`stream_history_exhausted`)
-rather than forgetting one; from then on no sample of that source is admitted
-until restart and its conclusions are `unknown`, and a camera loss timestamped
-at or after exhaustion is untrusted, so it never confirms
+transition is recorded even when the replacement stream's first frame is sampled
+out. Every new producer stream id uses up the retired-stream history (for a
+remote agent, every capture restart), while a local UVC loss or reopen does not.
+When the bounded retired-stream history (1024 ids per source) is full, further
+replacement streams are refused (`stream_history_exhausted`, logged once) rather
+than forgetting one; from then on no sample of that source is admitted until
+restart and its conclusions are `unknown`, and a camera loss timestamped at or
+after exhaustion is untrusted, so it never confirms
 `source_loss_after_scene_shift` (a loss timestamped before exhaustion may still
-correlate; Owner decision 2026-10-11). A sample still pending when its
-producer stream is replaced is discarded as stale (`stale_rejected`). A
-calibration refresh waits until a held or just-dequeued camera loss has been
-handed to the current detector (reported as `refresh_pending`, which sustained
-losses can prolong), and then discards a pending sample captured at or before
-the refresh request (`refresh_discarded`). The runtime reports `degraded` while staging holds
-undelivered evidence, a loss is held, a recorder call is stalled, or any source
-is `degraded`; since every staged observation counts until the recorder
-accepts it, normal delivery of a confirmation also shows `degraded` briefly.
-The runtime status reports `unavailable` when its worker or delivery thread is
-no longer running (outside shutdown), with every source `inactive` and
-`unknown`, and logs it once; a worker thread that cannot be started rolls back
-the delivery thread within a bounded wait. Shutdown is bounded (worker and delivery each by the stop
-timeout, so up to about 10 s by default): a worker or recorder call still
-running after its bound is reported as `stop_failed` (with
-`critical_in_flight`), and the delivery thread then starts no further recorder
-call; a call that exceeded the stall bound is logged as stalled, one merely in
-flight separately. A delivery thread that had already died before stop has
-no call in flight, so the runtime ends `stopped` with what it left staged
-counted in `critical_pending` and logged as undelivered. After stop, staging refuses observations from a worker that
-outlived its bound (counted in `critical_refused` and logged) and no
-conclusion is republished. After a worker failure the final pass still stages
-evidence for queued losses but every source stays withdrawn
-(`worker_failed`). The application scene state follows the runtime status
-while running, so these conditions report `degraded`, and a failed or dead
-worker or delivery thread, or an unreadable status, `unavailable`.
+correlate; Owner decision 2026-10-11). A sample still pending when its producer
+stream is replaced is discarded as stale (`stale_rejected`). A calibration
+refresh waits until a held or just-dequeued camera loss has been handed to the
+current detector (reported as `refresh_pending`, which sustained losses can
+prolong), and then discards a pending sample captured at or before the refresh
+request (`refresh_discarded`). An explicit refresh request still waiting after
+`calibration_refresh_defer_ns` (default 60 s, the calibration retry interval,
+measured from the first waiting request) sets `refresh_deferred`, lowers the
+source to `degraded` (`calibration_refresh_deferred`) with `unknown` movement
+and tamper conclusions, and is logged once (Owner decision 2026-10-14); a source
+already `degraded` for another reason (such as `critical_backpressure`,
+`source_unavailable`, `frame_decoder_failing`, `scene_evaluation_failed` or
+`observation_stale`) or inactive keeps that reason, with `refresh_deferred`
+alongside and `unknown` conclusions. The refresh
+still waits for the loss, and the state clears when it runs.
+
+The runtime reports `degraded` while staging holds undelivered evidence, a loss
+is held, a recorder call is stalled, or any source is `degraded`; since every
+staged observation counts until the recorder accepts it, normal delivery of a
+confirmation also shows `degraded` briefly. The runtime status reports
+`unavailable` when its worker or delivery thread is no longer running (outside
+shutdown), with every source `inactive` and `unknown`, and logs it once; a
+worker thread that cannot be started rolls back the delivery thread within a
+bounded wait. Shutdown is bounded (worker and delivery each by the stop timeout,
+so up to about 10 s by default): a worker or recorder call still running after
+its bound is reported as `stop_failed` (with `critical_in_flight`), and the
+delivery thread then starts no further recorder call; a call that exceeded the
+stall bound is logged as stalled, one merely in flight separately. A delivery
+thread that had already died before stop has no call in flight, so the runtime
+ends `stopped` with what it left staged counted in `critical_pending` and logged
+as undelivered. After stop, staging refuses observations from a worker that
+outlived its bound (counted in `critical_refused` and logged) and no conclusion
+is republished. After a worker failure the final pass still stages evidence for
+queued losses but every source stays withdrawn (`worker_failed`). The
+application scene state follows the runtime status while running, so these
+conditions report `degraded`, and a failed or dead worker or delivery thread, or
+an unreadable status, `unavailable`.
+
 Synthetic tests do not establish physical-camera, lighting, pose, or
 source-health behavior.
 

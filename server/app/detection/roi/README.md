@@ -269,19 +269,48 @@ the source reports `stream_history_exhausted` until the runtime is restarted.
 The refused replacement also shows that the current stream is stale, so from
 then on no sample of that source is admitted at all (its pending sample is
 dropped and counted in `stale_rejected`), and its conclusions are `unknown`
-(`stream_history_exhausted`). Because the detector never sees the refused
+(`stream_history_exhausted`); `scene_stream_history_exhausted` is logged once,
+value-free, when that happens. Because the detector never sees the refused
 stream restart, a camera loss timestamped at or after exhaustion is handed to
 it as untrusted and never confirms `source_loss_after_scene_shift`; a loss
 timestamped before exhaustion keeps its trust and may still correlate (Owner
 decision 2026-10-11). A sample still pending when its producer stream is
 replaced (the worker has not taken it yet) is discarded as stale imagery
 (`stale_rejected`), even when the replacement's first frame is sampled out.
+Only a replacement producer stream consumes that history. For local UVC
+capture (`on_uvc_frame`, which has no producer stream id) a camera loss or a
+capture reopen mints a new runtime stream without adding a retired id, and a
+calibration refresh binds a fresh detector for any source. For a decoded-sample
+producer such as a future remote-agent decoder, every new producer
+`stream_id` does use up the history: a remote agent capture restart (a new
+`capture_epoch`) is a new stream. A capture restart loop (for example a
+restart every 10 s) therefore reaches 1024 in about 2.8 hours; the source then
+fails safe as above (`stream_history_exhausted`, `unknown` until restart, the
+log event once), never as "no movement" or "no tamper". Such a producer
+(Issue #224 review) should change `stream_id` only when the imagery itself
+restarts (a new `capture_epoch`), not on every transport reconnect or session
+generation, so that a flapping LAN alone does not use up the history.
 A calibration refresh request (`request_calibration_refresh()`) is deferred
 while a held loss or a loss just taken from the capture slot is still to be
 handed to the current detector, so the refresh never discards the scene-shift
 state a loss must be correlated with; it runs on the next pass. Under
-sustained losses (a loss on every pass) it can stay deferred; the source
-reports `refresh_pending` while it waits. When the refresh runs, a pending
+sustained losses (a loss on every pass, or a loss held while staging has no
+room) it can stay deferred; the source reports `refresh_pending` while it
+waits. Once an explicit request has waited longer than
+`calibration_refresh_defer_ns` (default 60 s, the calibration retry interval;
+the bound runs from the first request still waiting, so repeated requests do
+not postpone it), the source reports `refresh_deferred`, is `degraded`
+(`calibration_refresh_deferred`) and its movement and tamper conclusions are
+`unknown`, because they are judged against a calibration the Owner replaced
+(Owner decision 2026-10-14). `scene_calibration_refresh_deferred` is logged
+once per request. The refresh still waits for the loss, so no evidence is
+dropped. A reason the source already reports is the cause and is kept, with
+`refresh_deferred` alongside it: behind a held loss that is
+`critical_backpressure` (its later samples are already dropped), and likewise
+`source_unavailable`, `frame_decoder_failing`, `scene_evaluation_failed`,
+`observation_stale` or an inactive source; only an otherwise active source takes
+`calibration_refresh_deferred`. Either way its conclusions are `unknown`.
+The state clears when the refresh runs. When the refresh runs, a pending
 sample captured at or before the request is discarded (`refresh_discarded`),
 so a frame of the scene before the new calibration never becomes a
 temporal-confirmation sample of the refreshed detector.
@@ -313,8 +342,38 @@ republish a conclusion; every source stays `inactive` and `unknown`.
 Observations the recorder has not accepted stay counted in
 `critical_pending`, losses that still had no staging room in `losses_held`,
 and losses lost to a per-source fault (while running or during the shutdown
-drain) in `losses_failed`; all are logged (`scene_critical_undelivered`) and
-are not persisted. After a worker failure the final pass still stages that
+drain) in `losses_failed`; a loss still in a capture slot, or already taken from
+it but not yet handed to its detector, when the worker outlived its stop bound
+is counted in `losses_cleared`. All are logged (`scene_critical_undelivered`);
+the evidence itself is not persisted, but their total is handed to the injected
+`undelivered` sink, a count-only durable record (Owner decision 2026-10-14).
+Refusals are counted once: those before `stop()` fences the staging count are in
+the stop total, and each batch a worker that outlived its bound confirms after
+the fence is handed to the sink on its own. `undelivered_recorded` reports
+whether the sink took every count (one failure keeps it `False`); a missing or
+failing sink logs `scene_undelivered_unrecorded`. A count can be overstated (a
+loss counted in `losses_cleared` whose outliving worker later confirms evidence
+that is then refused), never hidden. A retried `stop()` (for example after
+`stop_failed`) hands over only what no earlier stop or late batch recorded, and
+resends a count whose record failed.
+
+**Today Main passes no sink**, so the count is only logged
+(`scene_undelivered_unrecorded`) and nothing marks the stop as unclean. Once
+Main wires the timeline outbox (follow-up, #205), the sink is meant to be
+`CriticalTimelineRecorder.record_undelivered`, which adds the count as lost
+facts to the presence timeline gap marker through the open outbox session (no
+observation content, identifier or source). The marker is then written by the
+outbox's next flush or at its clean close; a close that fails leaves the session
+row, so the next start records an interrupted gap, and Owner status reports
+`timeline_gap` until the Owner clears it. A count handed over after the outbox
+closed (or before it opened) is refused and only logged, and the next start then
+shows no unclean stop. The wiring therefore has to stop scene monitoring before
+it closes the outbox, and must not close the outbox cleanly when `stop()`
+returned `stop_failed` or `undelivered_recorded is False`, so the session row
+stays and the next start records an interrupted gap. A direct Owner notification
+for an unclean stop is a follow-up.
+
+After a worker failure the final pass still stages that
 evidence, but every source stays withdrawn as `worker_failed`. The runtime is
 `degraded` while evidence is undelivered, a loss is held, the recorder is
 stalled, or any source is `degraded`. Because `critical_pending` counts every

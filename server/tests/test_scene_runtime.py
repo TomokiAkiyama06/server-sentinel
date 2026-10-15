@@ -26,7 +26,7 @@ from app.detection.foundation import Observation
 from app.detection.quality import DetectorQualityPolicy, Metric, MetricRule
 from app.detection.roi import Calibration, CalibrationArchive, CriticalKind
 from app.detection.roi.runtime import (
-    CALIBRATION_RETRY_NS, ArchiveCalibrationProvider, CalibrationUnavailable, PackedLumaLayout,
+    CALIBRATION_REFRESH_DEFER_NS, CALIBRATION_RETRY_NS, ArchiveCalibrationProvider, CalibrationUnavailable, PackedLumaLayout,
     SceneMonitoringConfiguration, SceneMonitoringDependencies, SceneMonitoringRuntime,
     SceneRuntimeState, SceneSourceBinding, SceneSourceState, _CriticalPump,
 )
@@ -132,7 +132,7 @@ class BlockingRecorder(Recorder):
 
 class Harness:
     def __init__(self, *bindings, recorder=True, calibrations="default", capacity=None,
-                 threaded=False, stall_ns=None):
+                 threaded=False, stall_ns=None, **deps):
         self.clock = Clock()
         if recorder is True:
             recorder = Recorder()
@@ -146,7 +146,7 @@ class Harness:
             self.configuration,
             SceneMonitoringDependencies(recorder=self.recorder, calibrations=calibrations,
                                         monotonic_ns=self.clock, utcnow=lambda: NOW,
-                                        tick_seconds=0.01, **stall),
+                                        tick_seconds=0.01, **stall, **deps),
             threaded=threaded)
         self.threaded = threaded
         self.sequence = {}
@@ -847,11 +847,14 @@ class SceneRuntimeReviewRegressionTests(unittest.TestCase):
         for tick in (0, 0.0, -1, 0.001, float("nan"), float("inf"), True, "1", 61):
             with self.subTest(tick=tick), self.assertRaises(ValueError):
                 SceneMonitoringDependencies(tick_seconds=tick)
-        for field in ("calibration_retry_ns", "recorder_stall_ns"):
+        for field in ("calibration_retry_ns", "recorder_stall_ns",
+                      "calibration_refresh_defer_ns"):
             for value in (0, -1, 1.5, True):
                 with self.subTest(field=field, value=value), self.assertRaises(ValueError):
                     SceneMonitoringDependencies(**{field: value})
         self.assertEqual(0.01, SceneMonitoringDependencies(tick_seconds=0.01).tick_seconds)
+        with self.assertRaises(ValueError):
+            SceneMonitoringDependencies(undelivered=3)
 
 
 class SteppingClock(Clock):
@@ -1342,7 +1345,7 @@ class SceneRuntimeThirdReviewRegressionTests(unittest.TestCase):
 class SceneRuntimeFourthReviewRegressionTests(unittest.TestCase):
     """Regressions for the #213 review findings on 9a069a9."""
 
-    def _exhausted_after_shift(self, *, loss_before_exhaustion):
+    def _exhausted_after_shift(self, *, loss_before_exhaustion, loss_delay_ns=5):
         harness = Harness(binding(OTHER, SourceType.REMOTE_AGENT))
         harness.runtime.start()
         current, replacement = uuid4(), uuid4()
@@ -1363,7 +1366,7 @@ class SceneRuntimeFourthReviewRegressionTests(unittest.TestCase):
             # The replacement is refused: the detector never sees the restart.
             self.assertFalse(offer(replacement))
         self.assertTrue(harness.runtime._slots[OTHER].history_exhausted)
-        harness.clock.value += 5
+        harness.clock.value += loss_delay_ns
         harness.runtime.source_unavailable(OTHER, trusted=True)
         harness.runtime.step()
         return harness
@@ -1372,6 +1375,18 @@ class SceneRuntimeFourthReviewRegressionTests(unittest.TestCase):
         # Claude (#213) / Owner decision 2026-10-11: a loss after exhaustion
         # is handed to the detector as untrusted.
         harness = self._exhausted_after_shift(loss_before_exhaustion=False)
+        self.assertEqual([], harness.recorder.items)
+        source = harness.source(OTHER)
+        self.assertEqual(Observation.UNKNOWN, source.tamper)
+        self.assertEqual("stream_history_exhausted", source.tamper_reason)
+
+    def test_loss_at_the_exhaustion_instant_is_untrusted(self):
+        # #224 item 1: the boundary `now >= exhausted_ns` is inclusive. A loss
+        # with the very monotonic timestamp of the exhaustion is already after
+        # it (the detector never saw the refused restart), so it never
+        # confirms tamper; a `>` comparison would let it correlate.
+        harness = self._exhausted_after_shift(loss_before_exhaustion=False, loss_delay_ns=0)
+        self.assertEqual(harness.runtime._slots[OTHER].exhausted_ns, harness.clock.value)
         self.assertEqual([], harness.recorder.items)
         source = harness.source(OTHER)
         self.assertEqual(Observation.UNKNOWN, source.tamper)
@@ -1447,6 +1462,452 @@ class SceneRuntimeFourthReviewRegressionTests(unittest.TestCase):
         harness.runtime.step()
         self.assertFalse(harness.source().refresh_pending)
         self.assertEqual("awaiting_sample", harness.source().reason)
+
+
+class _AliveWorker:
+    """Stand-in for a worker thread that outlives its stop bound."""
+
+    def join(self, timeout=None):
+        pass
+
+    def is_alive(self):
+        return True
+
+
+class _DeadWorker(_AliveWorker):
+    """Stand-in for a worker thread that ended within its stop bound."""
+
+    def is_alive(self):
+        return False
+
+
+class SceneRuntimeOwnerDecisionTests(unittest.TestCase):
+    """#224 items 2 and 4 (Owner decisions 2026-10-14) and Claude review proposals."""
+
+    BOUND = 50
+
+    def _deferred(self):
+        """A source kept active while each pass also takes a camera loss, so a
+        requested refresh stays deferred; returns the request time."""
+        harness = Harness(calibration_refresh_defer_ns=self.BOUND)
+        harness.runtime.start()
+        harness.frame()
+        harness.frame()
+        self.assertIs(SceneSourceState.ACTIVE, harness.source().state)
+        requested = harness.clock.value
+        harness.runtime.request_calibration_refresh()
+        # A loss and a later sample in one pass: the loss defers the refresh,
+        # the evaluated sample leaves the source active.
+        harness.runtime.source_unavailable(SOURCE, trusted=False)
+        self.assertIs(SceneSourceState.ACTIVE, harness.frame().state)
+        return harness, requested
+
+    def queue_loss_and_step(self, harness):
+        harness.runtime.source_unavailable(SOURCE, trusted=False)
+        harness.runtime.step()
+
+    def test_default_deferral_bound_is_the_calibration_retry_interval(self):
+        self.assertEqual(CALIBRATION_RETRY_NS, CALIBRATION_REFRESH_DEFER_NS)
+        self.assertEqual(CALIBRATION_REFRESH_DEFER_NS,
+                         SceneMonitoringDependencies().calibration_refresh_defer_ns)
+
+    def test_refresh_deferred_past_the_bound_is_degraded_and_unknown(self):
+        harness, requested = self._deferred()
+        # A repeated request never postpones the bound.
+        harness.runtime.request_calibration_refresh()
+        harness.clock.value = requested + self.BOUND
+        source = harness.source()
+        self.assertTrue(source.refresh_pending)
+        self.assertFalse(source.refresh_deferred)
+        self.assertIs(SceneSourceState.ACTIVE, source.state)
+        harness.clock.value = requested + self.BOUND + 1
+        source = harness.source()
+        self.assertTrue(source.refresh_deferred)
+        self.assertIs(SceneSourceState.DEGRADED, source.state)
+        self.assertEqual("calibration_refresh_deferred", source.reason)
+        self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN), (source.movement, source.tamper))
+        self.assertIs(SceneRuntimeState.DEGRADED, harness.runtime.status().state)
+        # A conclusion the detector still holds is withdrawn too (fail closed).
+        with harness.runtime._lock:
+            published = harness.runtime._published[SOURCE]
+            published.movement = published.tamper = Observation.ABSENT
+            published.movement_reason = published.tamper_reason = "evaluated"
+        source = harness.source()
+        self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN), (source.movement, source.tamper))
+        self.assertEqual(("calibration_refresh_deferred",) * 2,
+                         (source.movement_reason, source.tamper_reason))
+
+    def test_deferral_keeps_any_reason_already_given(self):
+        # Claude review proposal 2 (#250): another degraded reason is the
+        # cause and is kept; the deferral is reported alongside it.
+        harness, requested = self._deferred()
+        harness.clock.value += 1
+        self.queue_loss_and_step(harness)
+        harness.clock.value = requested + self.BOUND + 1
+        source = harness.source()
+        self.assertTrue(source.refresh_deferred)
+        self.assertIs(SceneSourceState.DEGRADED, source.state)
+        self.assertEqual("source_unavailable", source.reason)
+        self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN), (source.movement, source.tamper))
+        # Conclusions that are already unknown keep their own reasons.
+        with harness.runtime._lock:
+            published = harness.runtime._published[SOURCE]
+            expected = (published.movement_reason, published.tamper_reason)
+        self.assertNotIn("calibration_refresh_deferred", expected)
+        self.assertEqual(expected, (source.movement_reason, source.tamper_reason))
+        for reason in ("frame_decoder_failing", "scene_evaluation_failed", "observation_stale",
+                       "critical_backpressure"):
+            with self.subTest(reason=reason):
+                with harness.runtime._lock:
+                    published = harness.runtime._published[SOURCE]
+                    published.state, published.reason = SceneSourceState.DEGRADED, reason
+                source = harness.source()
+                self.assertTrue(source.refresh_deferred)
+                self.assertEqual(reason, source.reason)
+
+    def test_deferral_keeps_an_inactive_source_inactive(self):
+        def unavailable(item):
+            raise CalibrationUnavailable("calibration_missing")
+
+        harness = Harness(calibration_refresh_defer_ns=self.BOUND, calibrations=unavailable)
+        harness.runtime.start()
+        harness.frame()
+        requested = harness.clock.value
+        harness.runtime.request_calibration_refresh()
+        harness.clock.value += 1
+        self.queue_loss_and_step(harness)
+        harness.clock.value = requested + self.BOUND + 1
+        source = harness.source()
+        self.assertTrue(source.refresh_deferred)
+        self.assertIs(SceneSourceState.INACTIVE, source.state)
+        self.assertEqual("calibration_missing", source.reason)
+        self.assertEqual(Observation.UNKNOWN, source.movement)
+
+    def test_deferral_is_logged_once_and_cleared_when_the_refresh_runs(self):
+        calls = []
+
+        def calibrations(item):
+            calls.append(item.source_id)
+            return calibration_for(item)
+
+        harness = Harness(calibration_refresh_defer_ns=self.BOUND, calibrations=calibrations)
+        harness.runtime.start()
+        harness.frame()
+        requested = harness.clock.value
+        harness.runtime.request_calibration_refresh()
+        harness.clock.value += 1
+        with self.assertNoLogs("app.detection.roi.runtime", level="ERROR"):
+            self.queue_loss_and_step(harness)
+        harness.clock.value = requested + self.BOUND + 1
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            self.queue_loss_and_step(harness)
+        self.assertEqual(["ERROR:app.detection.roi.runtime:scene_calibration_refresh_deferred"],
+                         logs.output)
+        harness.clock.value += 1
+        with self.assertNoLogs("app.detection.roi.runtime", level="ERROR"):
+            self.queue_loss_and_step(harness)
+        self.assertEqual(1, len(calls))
+        # No loss is waiting any more: the refresh runs and the state clears.
+        harness.runtime.step()
+        self.assertEqual(2, len(calls))
+        source = harness.source()
+        self.assertFalse(source.refresh_pending)
+        self.assertFalse(source.refresh_deferred)
+        self.assertEqual("awaiting_sample", source.reason)
+        # A later request starts a new bound and is logged again.
+        harness.runtime.request_calibration_refresh()
+        later = harness.clock.value
+        harness.clock.value += 1
+        self.queue_loss_and_step(harness)
+        harness.clock.value = later + self.BOUND
+        self.assertFalse(harness.source().refresh_deferred)
+        harness.clock.value = later + self.BOUND + 1
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            self.queue_loss_and_step(harness)
+
+    def test_deferral_behind_a_held_loss_keeps_critical_backpressure(self):
+        # Claude review proposal 2 (#250): the held loss is the cause; the
+        # deferral is reported alongside it, never instead of it.
+        harness = SceneRuntimeIsolationTests._loss_backpressure_harness(self)
+        harness.runtime.request_calibration_refresh(THIRD)
+        harness.runtime.step()
+        harness.clock.value += CALIBRATION_REFRESH_DEFER_NS + 1
+        source = harness.source(THIRD)
+        self.assertTrue(source.refresh_deferred)
+        self.assertIs(SceneSourceState.DEGRADED, source.state)
+        self.assertEqual("critical_backpressure", source.reason)
+        self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN), (source.movement, source.tamper))
+        self.assertEqual(1, harness.runtime.status().losses_held)
+        harness.recorder.fail = False
+        harness.runtime.step()
+        harness.runtime.step()
+        source = harness.source(THIRD)
+        self.assertFalse(source.refresh_pending)
+        self.assertFalse(source.refresh_deferred)
+        self.assertEqual(0, harness.runtime.status().losses_held)
+
+    def test_undelivered_total_reaches_the_durable_sink_at_stop(self):
+        counts = []
+        harness = Harness(binding(), binding(OTHER), binding(THIRD), capacity=3,
+                          undelivered=counts.append)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        for luma, moved in ((None, None), (None, MOVED), (SHIFTED, MOVED)):
+            harness.frame(luma, OTHER, advance=0)
+            harness.frame(luma, THIRD, advance=0)
+            harness.frame(moved)
+        harness.clock.value += 5
+        for source in (OTHER, THIRD):
+            harness.runtime.on_uvc_health(HealthEvent(source, CameraState.OFFLINE, "synthetic_unplug"))
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            status = harness.runtime.stop()
+        self.assertEqual((3, 1), (status.critical_pending, status.losses_held))
+        self.assertEqual([4], counts)
+        self.assertIs(True, status.undelivered_recorded)
+        self.assertFalse(any("scene_undelivered_unrecorded" in line for line in logs.output))
+
+    def test_every_undelivered_count_is_part_of_the_total(self):
+        fields = ("critical_pending", "critical_refused", "losses_held", "losses_failed",
+                  "losses_cleared")
+        for index, name in enumerate(fields):
+            with self.subTest(field=name):
+                counts = []
+                harness = Harness(undelivered=counts.append)
+                harness.runtime.start()
+                original = harness.runtime._status_locked
+
+                def inflated(name=name, value=10 ** index, original=original):
+                    return replace(original(), **{name: value})
+
+                if name == "critical_refused":
+                    # Refusals are counted at the fence, not from the status.
+                    patch = mock.patch.object(harness.runtime._pump, "fence",
+                                              return_value=10 ** index)
+                else:
+                    patch = mock.patch.object(harness.runtime, "_status_locked",
+                                              side_effect=inflated)
+                with patch, self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+                    harness.runtime.stop()
+                self.assertEqual([10 ** index], counts)
+
+    def test_failing_or_missing_sink_is_reported(self):
+        def failing(count):
+            raise RuntimeError("synthetic marker write failure")
+
+        for sink in (failing, None):
+            with self.subTest(sink=sink):
+                harness = Harness(undelivered=sink)
+                harness.runtime.start()
+                harness.recorder.fail = True
+                for luma in (None, None, MOVED, MOVED):
+                    harness.frame(luma)
+                with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+                    status = harness.runtime.stop()
+                self.assertEqual(1, status.critical_pending)
+                self.assertIs(False, status.undelivered_recorded)
+                self.assertTrue(any("scene_undelivered_unrecorded" in line
+                                    for line in logs.output))
+
+    def test_nothing_undelivered_writes_no_marker(self):
+        counts = []
+        harness = Harness(undelivered=counts.append)
+        harness.runtime.start()
+        harness.frame()
+        status = harness.runtime.stop()
+        self.assertEqual([], counts)
+        self.assertIsNone(status.undelivered_recorded)
+
+    def test_loss_left_in_a_slot_by_an_outliving_worker_is_counted(self):
+        # Claude review proposal 3 (#250): STOP_FAILED clears the slot; the
+        # loss in it must not be left out of the undelivered count.
+        counts = []
+        harness = Harness(undelivered=counts.append)
+        harness.runtime.start()
+        harness.frame()
+        harness.clock.value += 5
+        harness.runtime.source_unavailable(SOURCE, trusted=True)
+        harness.runtime._thread = _AliveWorker()
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            status = harness.runtime.stop()
+        self.assertIs(SceneRuntimeState.STOP_FAILED, status.state)
+        self.assertEqual(1, status.losses_cleared)
+        self.assertEqual([1], counts)
+        self.assertTrue(any("scene_critical_undelivered" in line for line in logs.output))
+
+    def _observation(self):
+        source = Harness()
+        source.runtime.start()
+        for luma in (None, None, MOVED, MOVED):
+            source.frame(luma)
+        return source.recorder.items[0]
+
+    def test_late_refusal_after_stop_is_recorded_once(self):
+        # Codex P2 (#250): a refusal before stop() fences its count is in the
+        # stop total only; one after the fence is recorded on its own.
+        counts = []
+        observation = self._observation()
+        harness = Harness(undelivered=counts.append)
+        harness.runtime.start()
+        harness.runtime._pump.close(0)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime._submit([observation])
+        self.assertEqual([], counts)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            status = harness.runtime.stop()
+        self.assertEqual([1], counts)
+        self.assertIs(True, status.undelivered_recorded)
+        late = replace(observation, identifier=uuid4())
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime._submit([late])
+        self.assertEqual([1, 1], counts)
+        self.assertEqual(2, harness.runtime.status().critical_refused)
+
+    def test_a_failed_record_stays_reported_after_a_later_success(self):
+        outcomes = [RuntimeError("synthetic marker write failure"), None]
+        counts = []
+
+        def sink(count):
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+            counts.append(count)
+
+        harness = Harness(undelivered=sink)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            self.assertIs(False, harness.runtime.stop().undelivered_recorded)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime._submit([self._observation()])
+        self.assertEqual([1], counts)
+        self.assertIs(False, harness.runtime.status().undelivered_recorded)
+
+    def test_a_late_failure_during_the_stop_record_stays_reported(self):
+        # Codex P2 (#250): a late batch whose record fails while the stop
+        # total is being recorded keeps `undelivered_recorded` False.
+        observation = self._observation()
+        calls = []
+        harness = None
+
+        def sink(count):
+            calls.append(count)
+            if len(calls) == 1:
+                # An outliving worker's refusal arrives meanwhile.
+                harness.runtime._pump.submit([observation])
+                return
+            raise RuntimeError("synthetic marker write failure")
+
+        harness = Harness(undelivered=sink)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            status = harness.runtime.stop()
+        self.assertEqual([1, 1], calls)
+        self.assertIs(False, status.undelivered_recorded)
+
+    def test_a_retried_stop_hands_over_only_what_was_not_recorded(self):
+        # Codex P2 (#250): a second stop() never resends counts an earlier
+        # stop or a late batch already recorded, yet never drops a new one.
+        counts = []
+        harness = Harness(undelivered=counts.append)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        harness.runtime._contexts[SOURCE].unprocessed_loss = object()
+        harness.runtime._thread = _AliveWorker()
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            first = harness.runtime.stop()
+        self.assertEqual((1, 1), (first.critical_pending, first.losses_cleared))
+        self.assertEqual([2], counts)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime._submit([self._observation()])
+        self.assertEqual([2, 1], counts)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            again = harness.runtime.stop()
+        self.assertEqual([2, 1], counts)
+        self.assertEqual(1, again.losses_cleared)
+        # A loss lost after the first stop is still handed over.
+        with harness.runtime._lock:
+            harness.runtime._losses_failed += 1
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime.stop()
+        self.assertEqual([2, 1, 1], counts)
+
+    def test_a_retried_stop_resends_a_count_that_failed(self):
+        outcomes = [RuntimeError("synthetic marker write failure"), None]
+        counts = []
+
+        def sink(count):
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+            counts.append(count)
+
+        harness = Harness(undelivered=sink)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime.stop()
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            status = harness.runtime.stop()
+        self.assertEqual([1], counts)
+        self.assertIs(False, status.undelivered_recorded)
+
+    def test_loss_taken_by_an_outliving_worker_is_counted(self):
+        # Codex P2 (#250): a loss the worker already took from the slot but
+        # has not handed to its detector is counted on STOP_FAILED.
+        counts = []
+        harness = Harness(undelivered=counts.append)
+        harness.runtime.start()
+        harness.frame()
+        harness.runtime._contexts[SOURCE].unprocessed_loss = object()
+        harness.runtime._thread = _AliveWorker()
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            status = harness.runtime.stop()
+        self.assertIs(SceneRuntimeState.STOP_FAILED, status.state)
+        self.assertEqual(1, status.losses_cleared)
+        self.assertEqual([1], counts)
+
+    def test_loss_taken_by_a_finished_worker_is_not_counted_twice(self):
+        counts = []
+        harness = Harness(undelivered=counts.append)
+        harness.runtime.start()
+        harness.frame()
+        harness.runtime._contexts[SOURCE].unprocessed_loss = object()
+        harness.runtime._thread = _DeadWorker()
+        status = harness.runtime.stop()
+        self.assertEqual(0, status.losses_cleared)
+        self.assertEqual([], counts)
+
+    def test_stream_history_exhaustion_is_logged_once(self):
+        harness = Harness(binding(OTHER, SourceType.REMOTE_AGENT))
+        harness.runtime.start()
+        streams = [uuid4() for _ in range(3)]
+
+        def offer(stream):
+            harness.clock.value += INTERVAL
+            return harness.runtime.offer_luma(OTHER, stream_id=stream, width=WIDTH,
+                                              height=HEIGHT, pixels=pixels())
+
+        with mock.patch("app.detection.roi.runtime.RETIRED_PRODUCER_LIMIT", 0):
+            with self.assertNoLogs("app.detection.roi.runtime", level="ERROR"):
+                self.assertTrue(offer(streams[0]))
+            with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+                self.assertFalse(offer(streams[1]))
+            self.assertEqual(["ERROR:app.detection.roi.runtime:scene_stream_history_exhausted"],
+                             logs.output)
+            with self.assertNoLogs("app.detection.roi.runtime", level="ERROR"):
+                self.assertFalse(offer(streams[2]))
+                self.assertFalse(offer(streams[0]))
 
 
 class SyntheticYuyvCapture:

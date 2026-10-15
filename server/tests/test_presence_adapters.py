@@ -768,6 +768,120 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         detail = self.gap()[1]
         self.assertEqual((detail["lost"], detail["interrupted"]), (1, 0))
 
+    def test_reported_loss_is_written_as_lost_at_a_clean_close(self):
+        # #224 item 4 (Owner decision 2026-10-14): scene critical evidence
+        # undelivered at shutdown becomes a count-only durable gap record.
+        self.outbox.flush()
+        self.outbox.record_lost(3)
+        self.outbox.record_lost(1)
+        self.assertEqual(self.outbox.state().unpersisted, 4)
+        self.assertTrue(self.outbox.state().degraded)
+        self.outbox.close()
+        self.restart()
+        present, detail = self.gap()
+        self.assertTrue(present)
+        self.assertEqual((detail["refused"], detail["rejected"], detail["lost"],
+                          detail["interrupted"]), (0, 0, 4, 0))
+
+    def test_reported_loss_is_written_by_the_next_flush(self):
+        self.outbox.flush()
+        recorder = CriticalTimelineRecorder(self.outbox, maximum_source_latency=LATENCY)
+        recorder.record_undelivered(2)
+        self.assertEqual(self.outbox.flush().unpersisted, 0)
+        self.assertEqual(self.gap()[1]["lost"], 2)
+
+    def test_reported_loss_with_a_failed_close_restarts_interrupted(self):
+        self.outbox.flush()
+        self.outbox.record_lost(2)
+        self.refuse = True
+        with self.assertRaises(RuntimeError):
+            self.outbox.close()
+        self.refuse = False
+        # The process exits now: its session row tells the next start.
+        self.restart()
+        present, detail = self.gap()
+        self.assertTrue(present)
+        self.assertEqual(detail["interrupted"], 1)
+
+    def test_reported_loss_not_yet_written_is_shown_and_refuses_the_clear(self):
+        # Claude review proposal 3 (#250): between `record_lost` and the next
+        # flush, Owner status shows the loss and the Owner cannot clear it.
+        self.outbox.flush()
+        self.restart()  # interrupted: a durable marker the Owner may clear
+        self.outbox.record_lost(3)
+        # Both session read-outs carry it (`unpersisted` and `backlog`).
+        self.assertEqual(self.outbox._handle.unpersisted(), 3)
+        self.assertEqual(self.outbox._handle.backlog(), (0, 3, 0))
+        status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertTrue(status["timeline_gap"])
+        self.assertEqual(status["timeline_gap_unpersisted"], 3)
+        with self.assertRaisesRegex(ValueError, "unpersisted"):
+            self.presence.clear_timeline_gap("owner", now=NOW, clock_trusted=True)
+        self.assertEqual(self.outbox.flush().unpersisted, 0)
+        cleared = self.presence.clear_timeline_gap("owner", now=NOW, clock_trusted=True)
+        self.assertEqual((cleared["lost"], cleared["interrupted"]), (3, 1))
+
+    def _scene_runtime(self, recorder):
+        from tests.test_scene_runtime import MOVED, Harness, Recorder
+
+        failing = Recorder()
+        failing.fail = True
+        harness = Harness(recorder=failing, undelivered=recorder.record_undelivered)
+        harness.runtime.start()
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        return harness
+
+    def test_scene_stop_undelivered_count_survives_a_restart(self):
+        # Claude review proposal 3 (#250): runtime stop -> record_undelivered
+        # -> outbox close -> restart shows the count in the gap marker.
+        self.outbox.flush()
+        recorder = CriticalTimelineRecorder(self.outbox, maximum_source_latency=LATENCY)
+        harness = self._scene_runtime(recorder)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            status = harness.runtime.stop()
+        self.assertEqual(1, status.critical_pending)
+        self.assertIs(True, status.undelivered_recorded)
+        self.outbox.close()
+        self.restart()
+        present, detail = self.gap()
+        self.assertTrue(present)
+        self.assertEqual((detail["lost"], detail["interrupted"]), (1, 0))
+
+    def test_scene_stop_count_with_a_failed_close_restarts_interrupted(self):
+        self.outbox.flush()
+        recorder = CriticalTimelineRecorder(self.outbox, maximum_source_latency=LATENCY)
+        harness = self._scene_runtime(recorder)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime.stop()
+        self.refuse = True
+        with self.assertRaises(RuntimeError):
+            self.outbox.close()
+        self.refuse = False
+        self.restart()
+        self.assertEqual(self.gap()[1]["interrupted"], 1)
+
+    def test_scene_stop_after_the_outbox_closed_is_only_logged(self):
+        # The documented remaining gap (#250): a count handed over after the
+        # outbox closed is refused; the scene runtime logs it.
+        self.outbox.flush()
+        recorder = CriticalTimelineRecorder(self.outbox, maximum_source_latency=LATENCY)
+        harness = self._scene_runtime(recorder)
+        self.outbox.close()
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            status = harness.runtime.stop()
+        self.assertIs(False, status.undelivered_recorded)
+        self.assertTrue(any("scene_undelivered_unrecorded" in line for line in logs.output))
+
+    def test_reported_loss_is_refused_when_closed_or_malformed(self):
+        self.outbox.flush()
+        for count in (0, -1, True, 1.0, 2**31 + 1):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                self.outbox.record_lost(count)
+        self.outbox.close()
+        with self.assertRaises(RuntimeError):
+            self.outbox.record_lost(1)
+
     def test_failed_close_keeps_the_session_so_restart_is_interrupted(self):
         self.outbox.flush()
         self.refuse = True
