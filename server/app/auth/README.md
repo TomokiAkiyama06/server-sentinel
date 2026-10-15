@@ -847,7 +847,18 @@ reads of a pair; NTP slews both clocks together, so only a step separates
 them). A wall clock stepped back is
 therefore refused rather than extending the code; one stepped forward only
 ends the code earlier. After a reboot the readings are not comparable and the
-wall-clock window decides (a rollback across a reboot is not detectable). A
+wall-clock window decides; the code itself does not detect a rollback across
+a reboot. The deployment mitigates the accidental case instead (Issue #235
+item 4, Owner decision 2026-10-14): the generated Main unit is ordered
+`After=`/`Wants=time-sync.target`, so on a host with an enabled wait service
+(`systemd-time-wait-sync.service`, `chrony-wait.service`) the service does
+not start, and decides nothing, on an unsynchronized real-time clock after a
+boot (a stale or flat RTC). It does not cover a clock set deliberately by
+root or an administrator (who can also write the database), a time source
+that answers with a wrong time (NTP spoofing, a misconfigured server), or a
+host without an enabled wait service, where the target does not wait and the
+installer only warns (`server/docs/DEPLOYMENT.md`, "Clock synchronization
+before start"). A
 row without the pair, or a host where it cannot be read now, is refused. Every
 refusal is the generic denial.
 

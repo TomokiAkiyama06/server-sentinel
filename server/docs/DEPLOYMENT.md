@@ -950,7 +950,9 @@ configuration (the service and `--check` do not start). Each code also
 records the kernel boot id and the monotonic boot clock at issuance: on the
 same boot a code is refused once that much monotonic time has passed, and
 whenever the wall clock is found stepped back since issuance, so setting the
-clock back never extends a code; after a reboot the wall clock decides. A host
+clock back never extends a code; after a reboot the wall clock decides (the
+unit waits for `time-sync.target` so that it is a synchronized one, see
+"Clock synchronization before start"). A host
 where `/proc/sys/kernel/random/boot_id` or `CLOCK_BOOTTIME` cannot be read
 issues no code (`invitation_clock_unavailable`).
 
@@ -963,7 +965,8 @@ issues no code (`invitation_clock_unavailable`).
   example by NTP after a boot without time sync), a legitimate code is
   refused as if the clock had been set back. Issue a new code: `recover` for
   the Owner, or (Issue #10 S4) a new invitation. Keep time synchronised before
-  issuing codes.
+  issuing codes (enable the wait service described in "Clock synchronization
+  before start").
 
 - The command asks on the controlling terminal for the Owner's display name
   (for `recover`: a new one, or empty to keep it; 1-64 characters with no
@@ -1223,6 +1226,86 @@ inside one guarded transaction: a failure at any point restores both pointers an
 the previous unit and restarts the release that was running before the attempt.
 One service-global lock covers each whole install, update, and rollback, so
 overlapping administrator invocations are serialized rather than interleaved.
+
+**Clock synchronization before start (Issue #235 item 4, Owner decision
+2026-10-14).** The generated unit has `After=time-sync.target` and
+`Wants=time-sync.target`, so at boot the service starts only once the host
+reports a synchronized clock. Within one boot, invitation codes and Owner
+step-up detect a wall clock set back by comparing the kernel boot id and
+`CLOCK_BOOTTIME` (`server/app/auth/boot_clock.py`); across a reboot those
+readings are not comparable and the wall clock decides. This ordering keeps
+the service from deciding on a stale real-time clock (for example a flat RTC
+battery) in the minutes before NTP corrects it.
+
+`time-sync.target` is a passive target: on its own it is reached early in
+boot whether or not the clock is synchronized. It waits for synchronization
+only when a service that blocks until then is enabled and ordered before it.
+Enable the one for the time daemon the Main host actually uses (check with
+`timedatectl show -p NTP -p NTPSynchronized` and
+`systemctl is-active systemd-timesyncd.service chrony.service`):
+
+```bash
+# systemd-timesyncd (the Ubuntu default)
+sudo systemctl enable systemd-time-wait-sync.service
+systemctl is-enabled systemd-time-wait-sync.service     # expect: enabled
+
+# or chrony
+sudo systemctl enable chrony-wait.service
+systemctl is-enabled chrony-wait.service                # expect: enabled
+```
+
+After the next boot, confirm the ordering took effect:
+
+```bash
+systemctl show -p ActiveState -p Result systemd-time-wait-sync.service  # or chrony-wait.service
+timedatectl show -p NTPSynchronized                     # expect: NTPSynchronized=yes
+systemd-analyze critical-chain server-sentinel.service  # time-sync.target precedes it
+```
+
+Availability trade-off. The service is ordered after the wait; its own
+`TimeoutStartSec=60` does not bound the time it spends queued behind it.
+Check the wait service's own limit with `systemctl cat <wait service>`
+(`TimeoutStartSec=`). A wait service without a limit (for example
+`TimeoutStartSec=infinity`) keeps ServerSentinel, local recording included,
+from starting at boot for as long as no time source can be reached. When it
+gives up or fails, `time-sync.target` is still reached and the service starts
+(it only `Wants=` the target, so a failed wait never keeps it down), with the
+same unsynchronized clock as before this change. To bound the wait, the Owner
+may add a drop-in to the wait service (`sudo systemctl edit <wait service>`,
+`[Service]` `TimeoutStartSec=<bound>`); the installer never does.
+
+The installer checks, after a completed `install`, `update` or `rollback`,
+whether `systemd-time-wait-sync.service` or `chrony-wait.service` is enabled
+(`systemctl is-enabled`, a query only). When neither is, or the query fails,
+it prints a warning with the steps above to standard error; the operation is
+not refused and the exit status is unchanged. It warns rather than refuses
+because:
+
+- the ordering mitigates an accident, not an attack (below), and same-boot
+  rollback detection does not depend on it;
+- the installer must not change host time configuration, so a refusal would
+  make every install and update wait for an Owner change to an unrelated host
+  setting, including during a rollback after a failed update;
+- a host may use another time daemon whose wait service the installer does
+  not know; that host then sees the warning on each operation, but is not
+  blocked.
+
+A `rollback` to a release installed before this change restores that
+release's own stored unit, which has no `time-sync.target` ordering; the
+installer then warns that the active unit is not ordered after it, and the
+next `update` to a current release restores the ordering.
+
+What it mitigates and what it does not. It mitigates the service starting
+with a wrong wall clock after a reboot before synchronization, which could
+make an expired invitation code look valid again, keep a session past its idle
+or absolute limit, or misdate audit records and recordings until NTP steps the
+clock. It does not detect or prevent a clock set deliberately by root or an
+administrator (who can also write the database), a time source that answers
+with a wrong time (NTP spoofing or a misconfigured server: the wait ends as
+soon as the daemon reports synchronized, to whatever time it was given), or a
+clock step after the service has started (same-boot detection covers that for
+invitations and step-up). A persisted wall-clock high-water mark (Issue #235
+option c) was not chosen.
 
 **Crossing the socket-activation boundary (Issue #126).** A release from before
 socket activation has no `app/release_capabilities.py` declaring
