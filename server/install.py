@@ -14,6 +14,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import time
 
@@ -45,6 +46,19 @@ SOCKET_ACTIVATION_CAPABILITY = re.compile(r"^HUMAN_UPSTREAM_SOCKET_ACTIVATION = 
 CAPTURE_CA_SETTING_CAPABILITY = re.compile(r"^CAPTURE_CA_DIRECTORY_SETTING = True$", re.MULTILINE)
 UNPRIVILEGED_PORT_START = Path("/proc/sys/net/ipv4/ip_unprivileged_port_start")
 MAX_CAPABILITIES_BYTES = 16 * 1024
+# Issue #235 item 4 (Owner decision 2026-10-14, option b): the unit is ordered
+# after time-sync.target (``After=`` only: systemd.special(7) says services
+# that need synchronized time order themselves after it and only the time
+# daemons pull it in). That target only waits for a synchronized clock when a
+# service that blocks until synchronization is enabled, and then at most for
+# that service's own start limit; these are the ones the installer recognizes. It only queries them (``systemctl is-enabled``) and
+# never enables, starts or configures anything, and an unrecognized wait
+# service only costs a warning (see _time_sync_warning).
+TIME_SYNC_WAIT_SERVICES = (
+    "chrony-wait.service",             # chrony (the Ubuntu default since 25.10)
+    "systemd-time-wait-sync.service",  # systemd-timesyncd
+)
+TIME_SYNC_ORDERING = "After=time-sync.target"
 # Issue #180: the Owner runs the pairing CLI as ``sudo serversentinel-pairing``.
 # The wrapper resolves ``current`` each time it starts, so update and rollback
 # need not rewrite it (see render_pairing_wrapper).
@@ -428,6 +442,18 @@ def render_unit(root: Path, config: Path, deployment: Deployment,
     the host network namespace (no ``PrivateNetwork=``) and
     ``ProtectControlGroups=true`` (not ``private``/``strict``), which keep
     sock_diag and ``/sys/fs/cgroup`` ids consistent.
+
+    ``After=time-sync.target`` (Issue #235 item 4, Owner decision
+    2026-10-14): at boot the service waits until the host reports a
+    synchronized clock, or until the wait service gives up (chrony-wait:
+    ``TimeoutStartSec=180``), after which it starts on whatever clock the host
+    has, as before. This narrows the window in which a stale RTC can make an
+    expired invitation or session look current before NTP corrects it.
+    Reboot-crossing rollback is otherwise undetectable
+    (``app/auth/boot_clock.py`` compares boot id and the monotonic clock
+    within one boot only). The target waits at all only if a wait service is
+    enabled on the host (``_time_sync_warning``). No ``Wants=``: per
+    systemd.special(7) only the time daemons pull the target in.
     """
     current = root / "current"
     python = current / "venv/bin/python"
@@ -446,6 +472,7 @@ def render_unit(root: Path, config: Path, deployment: Deployment,
     return f"""[Unit]
 Description=ServerSentinel Main Server
 After=local-fs.target network.target
+After=time-sync.target
 RequiresMountsFor={_quote(deployment.runtime_root)}
 
 [Service]
@@ -682,6 +709,74 @@ def _require_startable(args, root: Path, target: str, deployment: Deployment, ru
         "  6. verify: ss -ltne shows one socket on that port whose inode is in\n"
         "     /proc/<service pid>/fd\n"
         "(server/docs/DEPLOYMENT.md, Install, update, and rollback).\n")
+
+
+def _wait_service_enabled(runner, service: str) -> bool | None:
+    """``systemctl is-enabled`` for one wait service: True, False, or None when unclear."""
+    try:
+        result = runner(["systemctl", "is-enabled", service],
+                        check=False, timeout=30, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, text=True)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None  # timed out, not executable, or failed
+    output = getattr(result, "stdout", None)
+    if not isinstance(output, str) or not isinstance(getattr(result, "returncode", None), int):
+        return None
+    # Only a persistent enablement counts: "enabled-runtime" lives in /run and
+    # is gone at the next boot, the moment the wait matters; "static",
+    # "indirect", "alias", "masked", "disabled" and "not-found" do not pull
+    # the service into the boot transaction either.
+    return output.strip() == "enabled"
+
+
+def _time_sync_warning(runner, unit: str) -> str | None:
+    """The Owner warning when the active unit would not wait for a synced clock.
+
+    Issue #235 item 4: a warning, not a refusal. The ordering mitigates an
+    accident (a stale RTC at boot), not an attack, and the installer must not
+    change host time configuration to satisfy a check of its own; refusing
+    would also block hosts that use a wait service it does not recognize.
+    Same-boot rollback detection does not depend on it. A failed or unclear
+    query warns as well, since the Owner should then confirm it by hand.
+    """
+    lines = unit.splitlines()
+    if TIME_SYNC_ORDERING not in lines:
+        return ("ServerSentinel warning: the active service unit is not ordered after\n"
+                "  time-sync.target (a release from before Issue #235 restores its own unit),\n"
+                "  so after a reboot the service may start before the clock is synchronized.\n"
+                "  Updating to a current release restores the ordering\n"
+                "  (server/docs/DEPLOYMENT.md, Clock synchronization before start).\n")
+    states = [_wait_service_enabled(runner, service) for service in TIME_SYNC_WAIT_SERVICES]
+    if any(state is True for state in states):
+        return None
+    unclear = any(state is None for state in states)
+    return ("ServerSentinel warning: "
+            + ("could not confirm that any of" if unclear else "none of")
+            + " " + ", ".join(TIME_SYNC_WAIT_SERVICES) + "\n"
+            "  is enabled, so time-sync.target may be reached before the clock is synchronized\n"
+            "  and the service may start with a stale clock after a reboot. The installer\n"
+            "  changed nothing about time configuration. As the Owner, enable the wait\n"
+            "  service of the time daemon this host uses (persistently, not for one boot):\n"
+            "    sudo systemctl enable chrony-wait.service              (chrony)\n"
+            "    sudo systemctl enable systemd-time-wait-sync.service   (systemd-timesyncd)\n"
+            "  and check: systemctl is-enabled <that service>   (expect: enabled)\n"
+            "  It waits at most for that service's own start limit (chrony-wait: 180 s),\n"
+            "  then the service starts on the unsynchronized clock as before.\n"
+            "  (another daemon's wait service ordered Before=time-sync.target works too;\n"
+            "  this check does not recognize it, so the warning then stays; see\n"
+            "  server/docs/DEPLOYMENT.md, Clock synchronization before start).\n")
+
+
+def _report_time_sync(runner, unit: str) -> None:
+    """Print the time-sync warning, if any; never fails a completed operation."""
+    warning = _time_sync_warning(runner, unit)
+    if warning is None:
+        return
+    try:
+        sys.stderr.write(warning)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
 
 
 def _clean_absolute(path: Path) -> Path:
@@ -1330,6 +1425,8 @@ def _execute_locked(args, runner) -> None:
             except Exception:
                 restore_unit()
                 raise
+        # After the operation completed: advice only, never a refusal.
+        _report_time_sync(runner, unit_content)
     else:
         # Rollback leaves the wrapper alone: it follows "current".
         if args.version is not None and not VERSION.fullmatch(args.version):
@@ -1375,6 +1472,7 @@ def _execute_locked(args, runner) -> None:
         except Exception:
             restore_unit()
             raise
+        _report_time_sync(runner, target_unit)
 
 
 def main() -> None:

@@ -950,7 +950,10 @@ configuration (the service and `--check` do not start). Each code also
 records the kernel boot id and the monotonic boot clock at issuance: on the
 same boot a code is refused once that much monotonic time has passed, and
 whenever the wall clock is found stepped back since issuance, so setting the
-clock back never extends a code; after a reboot the wall clock decides. A host
+clock back never extends a code; after a reboot the wall clock decides (the
+unit waits for `time-sync.target`, so with an enabled wait service it is a
+synchronized one unless the host fails to synchronize within that service's
+limit, chrony-wait: 180 s; see "Clock synchronization before start"). A host
 where `/proc/sys/kernel/random/boot_id` or `CLOCK_BOOTTIME` cannot be read
 issues no code (`invitation_clock_unavailable`).
 
@@ -963,7 +966,8 @@ issues no code (`invitation_clock_unavailable`).
   example by NTP after a boot without time sync), a legitimate code is
   refused as if the clock had been set back. Issue a new code: `recover` for
   the Owner, or (Issue #10 S4) a new invitation. Keep time synchronised before
-  issuing codes.
+  issuing codes (enable the wait service described in "Clock synchronization
+  before start").
 
 - The command asks on the controlling terminal for the Owner's display name
   (for `recover`: a new one, or empty to keep it; 1-64 characters with no
@@ -1223,6 +1227,125 @@ inside one guarded transaction: a failure at any point restores both pointers an
 the previous unit and restarts the release that was running before the attempt.
 One service-global lock covers each whole install, update, and rollback, so
 overlapping administrator invocations are serialized rather than interleaved.
+
+**Clock synchronization before start (Issue #235 item 4, Owner decision
+2026-10-14).** The generated unit has `After=time-sync.target` (ordering
+only; per systemd.special(7) only the time daemons pull the target in). At
+boot the service therefore waits until the host reports a synchronized
+clock, or until the host's wait service gives up, whichever comes first.
+Within one boot, invitation codes and Owner step-up detect a wall clock set
+back by comparing the kernel boot id and `CLOCK_BOOTTIME`
+(`server/app/auth/boot_clock.py`); across a reboot those readings are not
+comparable and the wall clock decides. The ordering narrows the window in
+which the service decides on a stale real-time clock (for example a flat RTC
+battery) before NTP corrects it; it does not close it (below).
+
+`time-sync.target` is a passive target: on its own it is reached early in
+boot whether or not the clock is synchronized. It waits for synchronization
+only when a service that blocks until then is enabled and ordered before it,
+and only for as long as that service's own start limit allows. Since Ubuntu
+25.10 (including 26.04 LTS) the default time daemon is chrony, whose wait
+service is `chrony-wait.service`; systemd-timesyncd, the earlier default,
+uses `systemd-time-wait-sync.service`. Both are shipped disabled. Enable the
+one for the time daemon the Main host actually uses, persistently (not
+`--runtime`, which is gone at the next boot). Check which daemon runs with
+`timedatectl show -p NTP -p NTPSynchronized` and
+`systemctl is-active chrony.service systemd-timesyncd.service`:
+
+```bash
+# chrony (the Ubuntu default since 25.10, including 26.04 LTS)
+sudo systemctl enable chrony-wait.service
+systemctl is-enabled chrony-wait.service                # expect: enabled
+systemctl cat chrony-wait.service                       # note ExecStart= and TimeoutStartSec=
+
+# or systemd-timesyncd
+sudo systemctl enable systemd-time-wait-sync.service
+systemctl is-enabled systemd-time-wait-sync.service     # expect: enabled
+systemctl cat systemd-time-wait-sync.service            # note TimeoutStartSec=
+```
+
+Recorded state of the Main host (read-only check, Ubuntu 26.04.1, before
+this change was deployed): chrony is enabled, systemd-timesyncd is not
+installed, and `chrony-wait.service` is disabled; its unit runs
+`chronyc ... waitsync 0 0.1 0.0 1` (keep polling once a second, without a
+try limit, until chrony reports synchronized with a remaining correction
+below 0.1 s) with `TimeoutStartSec=180`. Until the Owner enables it, the
+ordering waits for nothing on that host and the installer warns (below).
+
+After the next boot, confirm the ordering took effect:
+
+```bash
+systemctl show -p ActiveState -p Result chrony-wait.service  # or systemd-time-wait-sync.service
+timedatectl show -p NTPSynchronized                     # expect: NTPSynchronized=yes
+systemd-analyze critical-chain server-sentinel.service  # time-sync.target precedes it
+```
+
+How long it waits, and what happens after. The service's own
+`TimeoutStartSec=60` does not bound the time it spends queued behind the
+wait; the wait service's `TimeoutStartSec=` does. With `chrony-wait.service`
+as shipped (`TimeoutStartSec=180`), the service starts at most about three
+minutes after the wait began: synchronized if chrony synchronized by then,
+otherwise the wait service fails, `time-sync.target` is still reached (an
+ordering waits for the job to finish, whatever its result), and
+ServerSentinel starts on the unsynchronized clock, exactly as before this
+change. While it waits, ServerSentinel, local recording included, is not
+running. A wait service without a limit (`TimeoutStartSec=infinity`, as
+`systemd-time-wait-sync.service` may have; check with `systemctl cat`) keeps
+the service from starting for as long as no time source can be reached; the
+Owner can bound it with a drop-in (`sudo systemctl edit <wait service>`,
+`[Service]` `TimeoutStartSec=<bound>`), and can lengthen the chrony bound
+the same way, trading start delay for a smaller chance of an unsynchronized
+start. The installer never changes either.
+
+Running the installer while a boot still waits. An `install`, `update` or
+`rollback` restarts the service with a 90-second limit. During a boot that
+is still waiting for synchronization, that restart job is queued behind
+`time-sync.target` too, so it can time out: the installer then restores the
+release pointers and the previous unit as for any failed restart and
+reports failure, but the queued start job stays in systemd and runs later,
+when the wait ends, with whatever `current` and unit are in place then (the
+restored ones). Before running the installer after a boot, confirm the wait
+is over: `systemctl is-active time-sync.target` is `active` and
+`systemctl list-jobs` shows no queued `server-sentinel.service` job.
+
+The installer checks, after a completed `install`, `update` or `rollback`,
+whether `chrony-wait.service` or `systemd-time-wait-sync.service` is
+persistently enabled (`systemctl is-enabled` reports exactly `enabled`, a
+query only; `enabled-runtime` does not count). When neither is, or the query
+fails, it prints a warning with the steps above to standard error; the
+operation is not refused and the exit status is unchanged. It warns rather
+than refuses because:
+
+- the ordering mitigates an accident, not an attack (below), and same-boot
+  rollback detection does not depend on it;
+- the installer must not change host time configuration, so a refusal would
+  make every install and update wait for an Owner change to an unrelated host
+  setting, including during a rollback after a failed update;
+- a host may use another time daemon whose wait service the installer does
+  not know; that host then sees the warning on each operation, but is not
+  blocked.
+
+A `rollback` to a release installed before this change restores that
+release's own stored unit, which has no `time-sync.target` ordering; the
+installer then warns that the active unit is not ordered after it, and the
+next `update` to a current release restores the ordering.
+
+What it mitigates and what it does not. It narrows the window in which the
+service runs on a wrong wall clock after a reboot before synchronization
+(which could make an expired invitation code look valid again, keep a
+session past its idle or absolute limit, or misdate audit records and
+recordings until NTP steps the clock) to the case where the host does not
+synchronize within the wait service's limit. It does not cover that case: if
+no time source answers within the limit (chrony-wait: 180 s), the service
+starts unsynchronized, as before. Nor does it cover a host without an
+enabled wait service, a clock set deliberately by root or an administrator
+(who can also write the database), a time source that answers with a wrong
+time (NTP spoofing or a misconfigured server: the wait ends as soon as the
+daemon reports synchronized, to whatever time it was given), or a clock step
+after the service has started (same-boot detection covers that for
+invitations and step-up). A persisted wall-clock high-water mark (Issue #235
+option c) was not chosen.
+
 
 **Crossing the socket-activation boundary (Issue #126).** A release from before
 socket activation has no `app/release_capabilities.py` declaring
