@@ -251,6 +251,67 @@ class ReleaseTests(TestCase):
         self.assertTrue(ledger.rejected)
         local_admin._existing_database(database.path).verify()
 
+    def reused_by_a_non_holder(self, database: Database, descriptor: int) -> tuple[int, int]:
+        """Release the unlinked file, recreate one at the same path, and reopen
+        ``descriptor``'s number on it outside the holder; the new identity.
+
+        The released number is first taken by a descriptor the holder never
+        adopted (standing in for a SQLite connection's), so no new adoption
+        overwrites the released number's serial.
+        """
+        os.unlink(database.path)
+        self.assertEqual((1, 0), release_unlinked_test_databases())
+        connection = sqlite3.connect(database.path, isolation_level=None)
+        connection.execute("CREATE TABLE probe (value INTEGER)")
+        connection.close()
+        with self.assertRaises(OSError) as closed:
+            os.fstat(descriptor)
+        self.assertEqual(errno.EBADF, closed.exception.errno)
+        opened = os.open(database.path, os.O_RDONLY | os.O_CLOEXEC)
+        if opened != descriptor:  # usually the lowest free number already
+            try:
+                os.dup2(opened, descriptor, inheritable=False)
+            finally:
+                os.close(opened)
+        self.addCleanup(os.close, descriptor)
+        self.assertNotIn(descriptor, held_descriptors())
+        return self.identity(database)
+
+    def test_a_stale_pin_refuses_a_number_reused_by_a_non_holder(self):
+        # Without the release forgetting the serial, the released number
+        # would still carry the pin's serial: a non-holder descriptor on a
+        # recreated file with the reused inode would then pass every check.
+        directory, database = self.make_database()
+        pinned = PinnedDatabase(database)
+        pinned.pin()
+        descriptor, serial = pinned._descriptor, pinned._serial
+        identity = self.reused_by_a_non_holder(database, descriptor)
+        self.assertFalse(storage_database.held_descriptor_is_current(descriptor, serial))
+        pinned._pinned = identity
+        with self.assertRaises(ValueError):
+            pinned.connect()
+        with self.assertRaises(ValueError):
+            pinned.connect_read_only()
+
+    def test_a_stale_ledger_pin_refuses_a_number_reused_by_a_non_holder(self):
+        directory, database = self.make_database()
+        ledger = local_admin._existing_database(database.path)
+        ledger.verify()
+        identity = self.reused_by_a_non_holder(database, ledger._descriptor)
+        object.__setattr__(ledger, "_identity", identity)
+        with self.assertRaises(sqlite3.DatabaseError):
+            ledger.verify()
+        self.assertTrue(ledger.rejected)
+
+    def test_the_ledger_takes_the_serial_with_its_hold(self):
+        directory, database = self.make_database()
+        descriptor, identity, serial = storage_database.hold_database_file(database.path)
+        self.assertEqual(self.identity(database), identity)
+        self.assertTrue(storage_database.held_descriptor_is_current(descriptor, serial))
+        ledger = local_admin._existing_database(database.path)
+        self.assertEqual((descriptor, identity, serial),
+                         (ledger._descriptor, ledger._identity, ledger._serial))
+
     def test_an_unexaminable_descriptor_keeps_the_file_held(self):
         directory, database = self.make_database()
         identity = self.identity(database)
