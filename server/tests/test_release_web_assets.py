@@ -22,6 +22,7 @@ import unittest
 from unittest.mock import patch
 
 from app import deployment as deployment_module
+from app.auth.web_assets import WebAssets, WebAssetsUnavailable
 from app.deployment import Deployment, main as deployment_main
 from app.settings import ConfigurationError
 import build_artifact
@@ -167,6 +168,83 @@ class ArtifactWebBuildTests(ReleaseFixture):
         for index in range(build_artifact.MAX_WEB_ENTRIES):
             (self.web_dist / f"empty-{index:03d}").mkdir()
         self.refused_build("exceeds the asset caps")
+
+    def test_the_entry_bound_is_the_loader_file_cap_plus_the_layout(self):
+        # Issue #260: the bound is pinned, and a build at the loader's file
+        # cap passes while one more file is refused.
+        self.assertEqual(build_artifact.MAX_WEB_ENTRIES, 67)
+        self.assertEqual(build_artifact.MAX_WEB_ENTRIES, build_artifact.MAX_FILES + 3)
+        padding = build_artifact.MAX_FILES - len(SHELL) - len(APP)
+        for count, refused in ((padding, False), (padding + 1, True)):
+            with self.subTest(files=len(SHELL) + len(APP) + count):
+                app = {**APP, **{f"pad-{index:03d}.js": b"//\n" for index in range(count)}}
+                self.web_dist = write_build(self.root / f"web-{count}", app=app)
+                if refused:
+                    self.refused_build("exceeds the asset caps")
+                else:
+                    artifact, _ = self.artifact("1.0.0")
+                    _, members = self.members(artifact)
+                    self.assertEqual(len([name for name in members if name.startswith("web/")]),
+                                     build_artifact.MAX_FILES + 1)
+
+    def test_an_empty_or_extra_top_level_directory_is_refused_like_the_loader(self):
+        # Issue #260: the private copy holds files only, so these directories
+        # are checked on the real tree; the loader refuses each as reason=set.
+        cases = {"empty-extra": ("extra",), "extra-with-file": ("extra", "x.js"),
+                 "empty-app": ("app",), "empty-shell": ("shell",)}
+        for case, (directory, *file) in cases.items():
+            with self.subTest(case=case):
+                self.web_dist = write_build(self.root / ("web-" + case))
+                if directory in ("app", "shell"):
+                    shutil.rmtree(self.web_dist / directory)
+                (self.web_dist / directory).mkdir(mode=0o755)
+                for name in file:
+                    (self.web_dist / directory / name).write_bytes(b"synthetic\n")
+                with self.assertRaises(WebAssetsUnavailable) as loader:
+                    WebAssets.load(self.web_dist)
+                self.assertEqual(loader.exception.reason, "set")
+                self.refused_build("reason=set")
+
+    def test_a_symbolic_link_is_refused_as_such_without_being_followed(self):
+        # The entry is examined with lstat: a link to a regular file or a
+        # dangling link is "not a regular file", never a failed read.
+        outside = self.root / "outside.js"
+        outside.write_bytes(APP["app.js"])
+        for case, target in (("linked", outside), ("dangling", self.root / "absent.js")):
+            with self.subTest(case=case):
+                self.web_dist = write_build(self.root / ("web-" + case))
+                (self.web_dist / "app" / "app.js").unlink()
+                (self.web_dist / "app" / "app.js").symlink_to(target)
+                self.refused_build("not a regular file")
+
+    def test_the_archive_does_not_depend_on_the_directory_listing_order(self):
+        # Issue #260: names are sorted after the bounded collection, so a
+        # filesystem that lists them in another order builds the same bytes.
+        first, first_digest = self.artifact("1.0.0")
+        real = os.scandir
+
+        class Reversed:
+            def __init__(self, target):
+                with real(target) as listing:
+                    self.entries = list(listing)[::-1]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return None
+
+            def __iter__(self):
+                return iter(self.entries)
+
+        second = self.root / "reversed.tar.gz"
+        with patch("build_artifact.os.scandir", side_effect=Reversed), patch(
+                "build_artifact.REPOSITORY", self.root), patch(
+                "build_artifact._required_wheels",
+                return_value=sorted(self.wheelhouse.glob("*.whl"))):
+            second_digest = build(second, "1.0.0", self.wheelhouse, self.web_dist)
+        self.assertEqual(first_digest, second_digest)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
 
     def test_a_flood_of_names_is_not_enumerated_past_the_bound(self):
         for index in range(500):
@@ -431,6 +509,20 @@ class InstalledWebBuildTests(ReleaseFixture):
             self.verify(target)
         self.assertNotIn("pipe.js", [c.args[1] for c in read.call_args_list])
 
+    def test_a_linked_build_file_is_refused_without_being_opened(self):
+        # Issue #260: each entry is examined with lstat, so a link standing
+        # in for a listed file is refused before any open, even one to an
+        # identical regular file.
+        target = self.installed_two()
+        outside = self.root / "outside.js"
+        outside.write_bytes(APP["app.js"])
+        (target / "web" / "app" / "app.js").unlink()
+        (target / "web" / "app" / "app.js").symlink_to(outside)
+        with patch("install._hash_release_file", wraps=install._hash_release_file) as read, \
+                self.assertRaises(ValueError):
+            self.verify(target)
+        self.assertNotIn("app.js", [c.args[1] for c in read.call_args_list])
+
     def test_unlisted_entries_are_refused_before_anything_is_read(self):
         # Review of PR #249: names are compared with the release manifest
         # before a file is opened, so a flood of unlisted files is not read.
@@ -460,6 +552,38 @@ class InstalledWebBuildTests(ReleaseFixture):
                 self.verify(target)
             (target / install.RELEASE_MANIFEST).unlink()
             self.assertFalse(self.verify(target))
+
+    def test_a_dangling_web_link_without_a_manifest_copy_is_refused(self):
+        # Issue #260: web/ is looked up without following a link, so a
+        # dangling one still counts as present and is not a pre-S5c release.
+        target = self.installed_two()
+        shutil.rmtree(target / "web")
+        (target / install.RELEASE_MANIFEST).unlink()
+        (target / "web").symlink_to(self.root / "absent", target_is_directory=True)
+        with self.assertRaises(ValueError):
+            self.verify(target)
+        (target / "web").unlink()
+        self.assertFalse(self.verify(target))
+
+    def test_a_manifest_without_web_entries_refuses_a_web_directory(self):
+        # Issue #260: a manifest copy that lists no web/ entry admits no
+        # web/ at all, not even an empty directory.
+        target = self.installed_two()
+        copy = target / install.RELEASE_MANIFEST
+        manifest = json.loads(copy.read_text())
+        manifest["files"] = {name: digest for name, digest in manifest["files"].items()
+                             if not name.startswith("web/")}
+        copy.chmod(0o644)
+        copy.write_text(json.dumps(manifest))
+        copy.chmod(0o444)
+        with self.assertRaises(ValueError):
+            self.verify(target)
+        shutil.rmtree(target / "web")
+        (target / "web").mkdir(mode=0o755)
+        with self.assertRaises(ValueError):
+            self.verify(target)
+        (target / "web").rmdir()
+        self.assertFalse(self.verify(target))
 
     def test_the_check_is_bounded_in_files_and_bytes(self):
         target = self.installed_two()
