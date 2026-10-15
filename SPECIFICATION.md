@@ -848,9 +848,19 @@ queue is not durability: that entry is dropped only after the durable
 recording layer acknowledges persisting a watermark at or past its committed
 position (and it carries no noted loss or uncommitted attempt), after which
 the durable watermark applies. These entries are hard-bounded (deployment
-setting); when full, the oldest is evicted and that source falls back to its
-durable watermark on reactivation, which can repeat an envelope or a gap report
-but never hides loss. Each such eviction, and each ignored durable
+setting); when full, the oldest entry's durable committed watermark is looked
+up once and, if it already covers that entry (an acknowledgement that was lost
+or never sent), the entry is dropped as reclaimed without counting an
+eviction. Otherwise (nothing recorded, a watermark behind the entry or for
+another node, or a failed lookup) the oldest is evicted and that source falls
+back to its durable watermark on reactivation, which can repeat an envelope or
+a gap report but never hides loss. An entry that no watermark can cover (it
+carries noted loss, a refused attempt, or an unresolved lookup) is evicted
+without that lookup. Revoking or forgetting a node drops its released entries
+without durable confirmation: re-enrolling the same node UUID then resumes
+from the durable watermark, which can repeat a drained but not yet persisted
+envelope (a duplicate, never loss); a node re-paired under another UUID is
+refused by the watermark's node identity instead. Each such eviction, and each ignored durable
 acknowledgement (watermark for another node, or an unknown source), is never
 silent: it is counted in value-free operator diagnostics (the tracker's
 `diagnostics()` counters, intended for a health/status surface but not yet
