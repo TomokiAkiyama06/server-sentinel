@@ -3,6 +3,8 @@
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
+import errno
+import itertools
 import os
 import sqlite3
 import stat
@@ -31,6 +33,13 @@ _HELD: dict[tuple[int, int], int] = {}
 # Descriptors that duplicate a held file (the path was swapped back to it
 # between stat and open). They are kept open too, never read from.
 _DUPLICATES: list[int] = []
+# A serial per adopted descriptor, never reused. A holder of a descriptor
+# number (a pin) records it and later checks ``held_descriptor_is_current``:
+# a number that was closed (only by the test-only release below) and reused
+# for another adoption, even of a recreated file with the same inode, then no
+# longer matches.
+_SERIALS: dict[int, int] = {}
+_NEXT_SERIAL = itertools.count(1)
 _HOLD_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY | os.O_NONBLOCK
 
 
@@ -41,6 +50,7 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
 def _adopt_locked(descriptor: int) -> tuple[int, int]:
     """Keep ``descriptor`` for the process lifetime; returns its file identity."""
     identity = _identity(os.fstat(descriptor))
+    _SERIALS[descriptor] = next(_NEXT_SERIAL)
     if identity in _HELD:
         _DUPLICATES.append(descriptor)
     else:
@@ -82,7 +92,9 @@ def read_database_prefix(path: Path, size: int) -> bytes | None:
     """The first ``size`` bytes of the database file, or ``None`` if missing.
 
     Read through a held descriptor, so this process's SQLite locks on the
-    file survive. Raises ``ValueError`` when the location is unusable.
+    file survive. Raises ``ValueError`` when the location is unusable. The
+    read happens outside ``_HELD_LOCK``: production never closes a held
+    descriptor, and the test-only release must not run concurrently.
     """
     with _HELD_LOCK:
         try:
@@ -106,6 +118,29 @@ def hold_database_file(path: Path) -> tuple[int, tuple[int, int]]:
     """
     with _HELD_LOCK:
         return _hold_locked(path)
+
+
+def held_descriptor_serial(descriptor: int) -> int:
+    """The adoption serial of a descriptor the process-wide holder keeps.
+
+    Raises ``ValueError`` if the holder does not keep ``descriptor``.
+    """
+    with _HELD_LOCK:
+        serial = _SERIALS.get(descriptor)
+    if serial is None:
+        raise ValueError("database location is unavailable")
+    return serial
+
+
+def held_descriptor_is_current(descriptor: int, serial: int) -> bool:
+    """Whether ``descriptor`` is still the holder's adoption ``serial``.
+
+    In production a held descriptor is never closed, so this stays true; it
+    becomes false once the test-only release closed the descriptor, even if
+    the number was reused for a recreated file with the same inode.
+    """
+    with _HELD_LOCK:
+        return _SERIALS.get(descriptor) == serial
 
 
 def held_descriptors() -> frozenset[int]:
@@ -141,11 +176,22 @@ def _release_unlinked_held_files_for_tests() -> tuple[int, int]:
     process holds locks on the inode, so an open (or leaked) connection, or a
     pending SQLite close, leaves the identity held. With no other descriptor
     on the inode the process holds no POSIX lock on it that a close could
-    drop. If the descriptors cannot be listed nothing is released.
+    drop. If the descriptors cannot be listed, or one of them cannot be
+    examined for a reason other than having been closed meanwhile, nothing is
+    released.
 
     A ``PinnedDatabase`` or the local admin ledger may still remember a
-    released descriptor number; they already refuse an unlinked file, and a
-    reused number names another file, which they refuse too.
+    released descriptor number. The number, and the inode, can be reused
+    (for example by a database recreated at the same path), so they do not
+    rely on the file identity: each recorded the descriptor's adoption serial
+    and refuses once ``held_descriptor_is_current`` no longer matches it,
+    which this release causes by forgetting the serial.
+
+    ``read_database_prefix`` reads its descriptor after leaving
+    ``_HELD_LOCK``; a release running concurrently in another thread could
+    close (and the process reuse) that number in between. Call this only
+    while no other thread is using the databases concerned, as the per-test
+    hook in ``tests`` does.
 
     Returns ``(released, kept)``: identities closed and unlinked identities
     left held because something else still uses them.
@@ -181,8 +227,11 @@ def _release_unlinked_held_files_for_tests() -> tuple[int, int]:
                 continue
             try:
                 identity = _identity(os.fstat(descriptor))
-            except OSError:
-                continue
+            except OSError as error:
+                if error.errno == errno.EBADF:  # closed since it was listed
+                    continue
+                # Unknown which file it names: it may be a connection's.
+                return 0, len(unlinked)
             if identity in unlinked:
                 in_use.add(identity)
         for identity, descriptors in unlinked.items():
@@ -194,17 +243,19 @@ def _release_unlinked_held_files_for_tests() -> tuple[int, int]:
             for descriptor in descriptors:
                 if descriptor in _DUPLICATES:
                     _DUPLICATES.remove(descriptor)
+                _SERIALS.pop(descriptor, None)
                 os.close(descriptor)
             released += 1
     return released, kept
 
 
-def _hold_file(path: Path) -> tuple[int, tuple[int, int]]:
+def _hold_file(path: Path) -> tuple[int, tuple[int, int], int]:
     with _HELD_LOCK:
         try:
-            return _hold_locked(path)
+            descriptor, identity = _hold_locked(path)
         except FileNotFoundError:
             raise ValueError("database location is unavailable") from None
+        return descriptor, identity, _SERIALS[descriptor]
 
 
 @dataclass(frozen=True)
@@ -307,6 +358,7 @@ class PinnedDatabase:
         self._lock = threading.Lock()
         self._pinned: tuple[int, int] | None = None
         self._descriptor: int | None = None
+        self._serial: int | None = None
 
     @property
     def path(self) -> Path:
@@ -349,11 +401,11 @@ class PinnedDatabase:
             # The descriptor comes from the process-wide holder and is never
             # closed here: closing it would drop the POSIX locks of this
             # process's open connections to the same file.
-            descriptor, identity = _hold_file(self.path)
+            descriptor, identity, serial = _hold_file(self.path)
             if self._held_identity(descriptor) != identity or self._path_identity() != identity:
                 raise ValueError("database location is unavailable")
         with self._lock:
-            self._pinned, self._descriptor = identity, descriptor
+            self._pinned, self._descriptor, self._serial = identity, descriptor, serial
 
     def release(self) -> None:
         """Drop the pin; later connections are refused until pinned again.
@@ -363,12 +415,17 @@ class PinnedDatabase:
         connections in this process.
         """
         with self._lock:
-            self._pinned = self._descriptor = None
+            self._pinned = self._descriptor = self._serial = None
 
     def _verify(self) -> tuple[int, int]:
         with self._lock:
-            pinned, descriptor = self._pinned, self._descriptor
-            if pinned is None or descriptor is None:
+            pinned, descriptor, serial = self._pinned, self._descriptor, self._serial
+            if pinned is None or descriptor is None or serial is None:
+                raise ValueError("database location is unavailable")
+            # A descriptor closed by the test-only release and its number
+            # reused (even for a recreated file with the same inode) no
+            # longer carries the serial recorded by pin().
+            if not held_descriptor_is_current(descriptor, serial):
                 raise ValueError("database location is unavailable")
             # Checked under the lock so a concurrent release() cannot close
             # (and the process reuse) the descriptor number mid-check.

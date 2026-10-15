@@ -2,9 +2,10 @@ version = 1
 
 [checks]
 lint = ["python", "-m", "tests.lint"]
-# Issue #248: a soft and hard limit of 1024 descriptors (a common Ubuntu
-# default), so a held-descriptor leak fails here; exec keeps SIGABRT on timeout
-# reaching Python's faulthandler.
+# Issue #248: Ubuntu's default soft descriptor limit is 1024 (the hard limit is
+# usually far higher, and tests/__init__.py raises the soft limit up to it).
+# Setting both soft and hard to 1024 here keeps that raise from hiding a
+# held-descriptor leak; exec keeps SIGABRT on timeout reaching faulthandler.
 test = ["sh", "-c", "ulimit -n 1024 && exec python -m unittest discover -s tests -p 'test_*.py' -v"]
 
 [smoke]

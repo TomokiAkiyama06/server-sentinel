@@ -85,3 +85,15 @@ SQLite deferred, keeps it held, so no lock is ever dropped). `tests/__init__.py`
 calls it after every test's cleanups. Application code never calls it, which a
 test enforces, and the production lock behavior is unchanged. The server CI
 test command runs with `ulimit -n 1024` (soft and hard) so a regression fails.
+
+Each held descriptor also gets an adoption serial that is never reused.
+`PinnedDatabase` and the local admin ledger record it when they pin and refuse
+once `held_descriptor_is_current()` no longer matches. After the test-only
+release, the descriptor number and even the inode may be reused, for example
+by a database recreated at the same path, so a stale pin is refused because
+of the serial, not because of the file identity. In production a held
+descriptor is never closed, so the serial never changes. The release keeps a
+file held when it cannot examine some other descriptor (any `fstat` error
+other than `EBADF`). `read_database_prefix()` reads after leaving the
+holder's lock, so the release must not run concurrently with other threads
+that use those databases. The per-test hook runs it between tests.

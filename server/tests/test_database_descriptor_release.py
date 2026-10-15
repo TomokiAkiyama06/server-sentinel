@@ -1,13 +1,17 @@
 """Issue #248: the test-only release of held database descriptors."""
 
+import errno
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import TestCase
+from unittest.mock import patch
 
+from app import local_admin
 from app.storage import database as storage_database
 from app.storage.database import Database, PinnedDatabase, held_descriptors, read_database_prefix
 import tests
@@ -198,6 +202,82 @@ class ReleaseTests(TestCase):
         with self.assertRaises(ValueError):
             pinned.connect()
 
+    def stale_after_recreation(self, database: Database) -> tuple[int, tuple[int, int]]:
+        """Release the unlinked file, recreate one at the same path; its hold."""
+        os.unlink(database.path)
+        self.assertEqual((1, 0), release_unlinked_test_databases())
+        with database.connect() as connection:
+            connection.execute("CREATE TABLE probe (value INTEGER)")
+        connection.close()
+        identity = self.identity(database)
+        with storage_database._HELD_LOCK:
+            return storage_database._HELD[identity], identity
+
+    def test_a_stale_pin_refuses_a_database_recreated_at_the_same_path(self):
+        directory, database = self.make_database()
+        pinned = PinnedDatabase(database)
+        pinned.pin()
+        self.stale_after_recreation(database)
+        with self.assertRaises(ValueError):
+            pinned.connect()
+        with self.assertRaises(ValueError):
+            pinned.connect_read_only()
+
+    def test_a_stale_pin_refuses_even_a_reused_number_and_inode(self):
+        # The worst case Linux allows: the recreated file got the freed inode
+        # and the freed descriptor number. Simulated by pointing the stale
+        # pin at the new hold; only the adoption serial tells them apart.
+        directory, database = self.make_database()
+        pinned = PinnedDatabase(database)
+        pinned.pin()
+        descriptor, identity = self.stale_after_recreation(database)
+        pinned._pinned, pinned._descriptor = identity, descriptor
+        with self.assertRaises(ValueError):
+            pinned.connect()
+        # A fresh pin of the recreated file works.
+        fresh = PinnedDatabase(database)
+        fresh.pin()
+        fresh.connect().close()
+
+    def test_a_stale_ledger_pin_refuses_a_reused_number_and_inode(self):
+        directory, database = self.make_database()
+        ledger = local_admin._existing_database(database.path)
+        ledger.verify()
+        descriptor, identity = self.stale_after_recreation(database)
+        object.__setattr__(ledger, "_descriptor", descriptor)
+        object.__setattr__(ledger, "_identity", identity)
+        with self.assertRaises(sqlite3.DatabaseError):
+            ledger.verify()
+        self.assertTrue(ledger.rejected)
+        local_admin._existing_database(database.path).verify()
+
+    def test_an_unexaminable_descriptor_keeps_the_file_held(self):
+        directory, database = self.make_database()
+        identity = self.identity(database)
+        os.unlink(database.path)
+        unrelated = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+        self.addCleanup(os.close, unrelated)
+        real_fstat = os.fstat
+
+        def failing_fstat(descriptor):
+            if descriptor == unrelated:
+                raise OSError(errno.EIO, "synthetic I/O error")
+            return real_fstat(descriptor)
+
+        with patch.object(storage_database.os, "fstat", failing_fstat):
+            self.assertEqual((0, 1), release_unlinked_test_databases())
+        self.assertIn(identity, held_identities())
+        # A descriptor closed since it was listed (EBADF) does not block.
+
+        def closed_fstat(descriptor):
+            if descriptor == unrelated:
+                raise OSError(errno.EBADF, "closed")
+            return real_fstat(descriptor)
+
+        with patch.object(storage_database.os, "fstat", closed_fstat):
+            self.assertEqual((1, 0), release_unlinked_test_databases())
+        self.assertNotIn(identity, held_identities())
+
 
 class WiringTests(TestCase):
     def test_every_test_releases_after_its_cleanups(self):
@@ -206,7 +286,8 @@ class WiringTests(TestCase):
 
     def test_application_code_never_calls_the_release(self):
         offenders = []
-        for path in sorted((SERVER_ROOT / "app").rglob("*.py")):
+        paths = list((SERVER_ROOT / "app").rglob("*.py")) + list(SERVER_ROOT.glob("*.py"))
+        for path in sorted(paths):
             text = path.read_text(encoding="utf-8")
             count = text.count(RELEASE_NAME)
             allowed = 1 if path == SERVER_ROOT / "app/storage/database.py" else 0

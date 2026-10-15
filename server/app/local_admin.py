@@ -26,7 +26,10 @@ import stat
 import threading
 from urllib.parse import quote
 
-from app.storage.database import Database, held_descriptors, hold_database_file
+from app.storage.database import (
+    Database, held_descriptor_is_current, held_descriptor_serial, held_descriptors,
+    hold_database_file,
+)
 from app.storage.schema import APPLICATION_MIGRATIONS
 
 
@@ -161,10 +164,13 @@ class _PinnedLedgerDatabase(Database):
     A failed check marks the database rejected; nothing is committed.
     """
 
-    def __init__(self, path: Path, descriptor: int, identity: tuple[int, int]):
+    def __init__(self, path: Path, descriptor: int, identity: tuple[int, int], serial: int):
         object.__setattr__(self, "path", path)
         object.__setattr__(self, "_descriptor", descriptor)
         object.__setattr__(self, "_identity", identity)
+        # The holder's adoption serial: a descriptor number closed by the
+        # test-only release and reused never matches it (Issue #248).
+        object.__setattr__(self, "_serial", serial)
         object.__setattr__(self, "_state", {"rejected": False, "released": False})
 
     @property
@@ -176,7 +182,7 @@ class _PinnedLedgerDatabase(Database):
         raise _LedgerDatabaseChanged("ledger database changed")
 
     def verify(self) -> None:
-        if self._state["released"]:
+        if self._state["released"] or not held_descriptor_is_current(self._descriptor, self._serial):
             self._reject()
         try:
             held = os.fstat(self._descriptor)
@@ -304,12 +310,13 @@ def _existing_database(database_path: Path) -> _PinnedLedgerDatabase:
     except ValueError:
         raise CliRefused("database_rejected") from None
     try:
+        serial = held_descriptor_serial(descriptor)
         info = os.fstat(descriptor)
-    except OSError:
+    except (OSError, ValueError):
         raise CliRefused("database_rejected") from None
     if not _safe_database_file(info) or (info.st_dev, info.st_ino) != identity:
         raise CliRefused("database_rejected")
-    return _PinnedLedgerDatabase(database_path, descriptor, identity)
+    return _PinnedLedgerDatabase(database_path, descriptor, identity, serial)
 
 
 def _require_current_schema(connection: sqlite3.Connection) -> None:
