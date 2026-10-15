@@ -32,6 +32,9 @@ python -m tests.smoke normal
 python -m tests.smoke error
 ```
 
+CI runs the test command under `ulimit -n 1024` (see `ci.toml`); the suite must
+stay well below that descriptor limit (Issue #248, `app/storage/README.md`).
+
 To run `python -m app`, the deployment operator must set
 `SERVERSENTINEL_DATA_DIRECTORY` to an existing absolute directory outside the
 checkout. Keep that directory private to the dedicated service account. The
