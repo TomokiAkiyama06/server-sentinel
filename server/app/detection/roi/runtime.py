@@ -295,7 +295,10 @@ class SceneMonitoringDependencies:
     # the presence timeline gap marker through the open outbox session; a
     # failed outbox close then leaves the session row and the next start
     # records an interrupted gap. A count handed over after the outbox closed
-    # (or before it opened) is refused and only logged.
+    # (or before it opened) is refused and only logged. The sink is called
+    # synchronously from `stop()` and from the delivery thread, so it must
+    # not block and must do no I/O (that record only adds to a count in
+    # memory); a blocking sink would hold `stop()` past its bound.
     undelivered: Callable[[int], None] | None = None
 
     def __post_init__(self):
@@ -734,6 +737,9 @@ class SceneMonitoringRuntime:
         self._undelivered_recorded = None
         # The highest stop total already handed to the `undelivered` sink.
         self._undelivered_handed = 0
+        # Serialises handing the stop total over, so two concurrent `stop()`
+        # calls never both record it (held across the non-blocking sink).
+        self._handover_lock = threading.Lock()
         # Serial of the last recorder call reported as stalled.
         self._stall_logged_call = None
         # Set by `stop()` once every source is withdrawn: a worker that
@@ -894,16 +900,17 @@ class SceneMonitoringRuntime:
         # delivery after a stop, so the recorded total never falls below what
         # is undelivered (overstated, never hidden). A failed record is not
         # counted as handed over, so a retry sends it again.
-        delta = undelivered - self._undelivered_handed
-        if delta > 0:
-            recorded = self._record_undelivered(delta)
-            with self._lock:
-                if recorded:
-                    self._undelivered_handed = undelivered
-                # Once False (here or for a late batch), it stays False.
-                if self._undelivered_recorded is not False:
-                    self._undelivered_recorded = recorded
-                status = self._status_locked()
+        with self._handover_lock:
+            delta = undelivered - self._undelivered_handed
+            if delta > 0:
+                recorded = self._record_undelivered(delta)
+                with self._lock:
+                    if recorded:
+                        self._undelivered_handed = undelivered
+                    # Once False (here or for a late batch), it stays False.
+                    if self._undelivered_recorded is not False:
+                        self._undelivered_recorded = recorded
+                    status = self._status_locked()
         if stalled:
             # Only a call that actually exceeded `recorder_stall_ns`.
             log.error(Event.SCENE_CRITICAL_RECORDER_STALLED)

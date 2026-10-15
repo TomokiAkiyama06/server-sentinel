@@ -355,7 +355,12 @@ failing sink logs `scene_undelivered_unrecorded`. A count can be overstated (a
 loss counted in `losses_cleared` whose outliving worker later confirms evidence
 that is then refused), never hidden. A retried `stop()` (for example after
 `stop_failed`) hands over only what no earlier stop or late batch recorded, and
-resends a count whose record failed.
+resends a stop total whose record failed; concurrent `stop()` calls hand the
+total over once. A late batch whose record failed is not resent, but
+`undelivered_recorded` stays `False`, so the wiring below must not close the
+outbox cleanly and the next start still records an interrupted gap. The sink is
+called synchronously (from `stop()` and the delivery thread), so it must not
+block and must do no I/O.
 
 **Today Main passes no sink**, so the count is only logged
 (`scene_undelivered_unrecorded`) and nothing marks the stop as unclean. Once

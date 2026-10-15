@@ -1839,6 +1839,42 @@ class SceneRuntimeOwnerDecisionTests(unittest.TestCase):
         with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
             harness.runtime.stop()
         self.assertEqual([2, 1, 1], counts)
+        # The highest recorded total, not the last delta, is what a fourth
+        # stop compares with (#259), so nothing already recorded is resent.
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime.stop()
+        self.assertEqual([2, 1, 1], counts)
+
+    def test_concurrent_stops_record_the_total_once(self):
+        # #259: two stop() calls racing on the hand-over never both record.
+        entered, release = threading.Event(), threading.Event()
+        counts = []
+
+        def sink(count):
+            counts.append(count)
+            entered.set()
+            release.wait(5)
+
+        harness = Harness(undelivered=sink)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            first = threading.Thread(target=harness.runtime.stop)
+            first.start()
+            self.assertTrue(entered.wait(5))
+            second = threading.Thread(target=harness.runtime.stop)
+            second.start()
+            # The second stop waits for the first hand-over to finish.
+            second.join(0.5)
+            self.assertTrue(second.is_alive())
+            release.set()
+            first.join(5)
+            second.join(5)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual([1], counts)
+        self.assertIs(True, harness.runtime.status().undelivered_recorded)
 
     def test_a_retried_stop_resends_a_count_that_failed(self):
         outcomes = [RuntimeError("synthetic marker write failure"), None]
