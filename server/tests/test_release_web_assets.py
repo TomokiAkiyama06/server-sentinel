@@ -161,6 +161,42 @@ class ArtifactWebBuildTests(ReleaseFixture):
                 self.web_dist = directory
                 self.refused_build()
 
+    def test_empty_directories_count_against_the_entry_bound(self):
+        # Review of PR #249: directories count too, so a build padded with
+        # empty directories is refused by the bound, not enumerated whole.
+        for index in range(build_artifact.MAX_WEB_ENTRIES):
+            (self.web_dist / f"empty-{index:03d}").mkdir()
+        self.refused_build("exceeds the asset caps")
+
+    def test_a_flood_of_names_is_not_enumerated_past_the_bound(self):
+        for index in range(500):
+            (self.web_dist / "app" / f"flood-{index:03d}.js").write_bytes(b"")
+        real = os.scandir
+        seen = []
+
+        class Counting:
+            def __init__(self, target):
+                self.listing = real(target)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.listing.close()
+
+            def __iter__(self):
+                for entry in self.listing:
+                    seen.append(entry.name)
+                    yield entry
+
+        with patch("build_artifact.os.scandir", side_effect=Counting), \
+                patch("build_artifact.os.listdir", side_effect=AssertionError("unbounded")):
+            self.refused_build("exceeds the asset caps")
+        # ``os.scandir`` is patched process-wide (pathlib uses it too), so
+        # only the flood's own names are counted.
+        flood = [name for name in seen if name.startswith("flood-")]
+        self.assertLessEqual(len(flood), build_artifact.MAX_WEB_ENTRIES + 1)
+
     def test_the_build_copy_does_not_depend_on_the_builder_umask(self):
         # The builder's own tree may be group-writable (umask 0002); the
         # release still carries exactly the bytes, and the loader check runs
@@ -410,6 +446,20 @@ class InstalledWebBuildTests(ReleaseFixture):
             path = target / "web" / ("app/unlisted.js" if name == "unlisted.js" else name)
             path.unlink() if path.is_file() else path.rmdir()
         self.assertTrue(self.verify(target))
+
+    def test_the_release_root_is_never_enumerated(self):
+        # Review of PR #249: only release-manifest.json and web/ are looked
+        # up, so a release root flooded with names costs nothing extra.
+        target = self.installed_two()
+        for index in range(200):
+            (target / f"flood-{index:03d}").write_bytes(b"")
+        with patch("install.os.listdir", side_effect=AssertionError("unbounded")):
+            self.assertTrue(self.verify(target))
+            shutil.rmtree(target / "web")
+            with self.assertRaises(ValueError):
+                self.verify(target)
+            (target / install.RELEASE_MANIFEST).unlink()
+            self.assertFalse(self.verify(target))
 
     def test_the_check_is_bounded_in_files_and_bytes(self):
         target = self.installed_two()

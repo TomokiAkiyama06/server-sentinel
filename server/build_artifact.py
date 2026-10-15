@@ -24,6 +24,8 @@ REPOSITORY = ROOT.parent
 WEB_DIRECTORY = "web"
 # The copy of the release manifest the installer keeps in each release.
 RESERVED_NAMES = frozenset({"manifest.json", "release-manifest.json"})
+# Entries a Web build may hold: the loader's files plus manifest.json, shell/ and app/.
+MAX_WEB_ENTRIES = MAX_FILES + 3
 
 
 class WebBuildRefused(ValueError):
@@ -44,10 +46,22 @@ def _web_files(web_dist: Path) -> list[tuple[str, bytes]]:
         raise WebBuildRefused("web build directory must be absolute")
     files: list[tuple[str, bytes]] = []
     total = 0
+    # Every directory entry (files and directories alike, empty ones too)
+    # counts against one bound before anything else is done with it: the
+    # loader's files plus manifest.json, shell/ and app/.
+    entries = 0
 
     def walk(descriptor: int, prefix: PurePosixPath) -> None:
-        nonlocal total
-        for name in sorted(os.listdir(descriptor)):
+        nonlocal total, entries
+        names = []
+        with os.scandir(descriptor) as listing:
+            for entry in listing:
+                entries += 1
+                if entries > MAX_WEB_ENTRIES:
+                    raise WebBuildRefused("web build exceeds the asset caps")
+                names.append(entry.name)
+        # Sorted only after the bounded collection: the output stays deterministic.
+        for name in sorted(names):
             info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
             relative = prefix / name
             if stat.S_ISDIR(info.st_mode):

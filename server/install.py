@@ -267,6 +267,15 @@ def _check_web_tree(descriptor: int, prefix: str, expected: dict[str, str],
                 raise ValueError("release entry differs")
 
 
+def _entry_present(parent: int, name: str) -> bool:
+    """Whether ``name`` exists below ``parent`` (a symbolic link counts; none is followed)."""
+    try:
+        os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def verify_release_web(release: Path) -> bool:
     """Check ``release``'s Web build against its own release manifest (Issue #10 S5c).
 
@@ -284,9 +293,11 @@ def verify_release_web(release: Path) -> bool:
     except OSError:
         raise ValueError("release entry differs") from None
     try:
-        entries = set(os.listdir(root))
-        if RELEASE_MANIFEST not in entries:
-            if WEB_DIRECTORY in entries:
+        # Only the two names that matter are looked up: the release root is
+        # never enumerated, so its size cannot make this check expensive.
+        web_present = _entry_present(root, WEB_DIRECTORY)
+        if not _entry_present(root, RELEASE_MANIFEST):
+            if web_present:
                 raise ValueError("release entry differs")
             return False
         try:
@@ -301,7 +312,7 @@ def verify_release_web(release: Path) -> bool:
         if not expected:
             # A release built before S5c by a newer installer keeps the
             # manifest but ships no build; nothing may appear under web/.
-            if WEB_DIRECTORY in entries:
+            if web_present:
                 raise ValueError("release entry differs")
             return False
         if len(expected) > MAX_WEB_FILES:
