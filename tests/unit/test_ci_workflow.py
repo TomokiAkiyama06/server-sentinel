@@ -66,7 +66,8 @@ class CIWorkflowTests(unittest.TestCase):
         repository, separator, _remaining = workflow.partition("\n  components:\n")
         self.assertTrue(separator, "components job boundary is missing")
         runtime = repository.find("--input server/requirements.lock\n")
-        step = repository.find("- name: Two-account CA key separation as root (Issue #109)")
+        step = repository.find("- name: Two-account CA key separation and release placement as root "
+                               "(Issue #109, #10 S5c)")
         self.assertNotEqual(-1, runtime)
         self.assertNotEqual(-1, step)
         self.assertLess(runtime, step)
@@ -76,6 +77,12 @@ class CIWorkflowTests(unittest.TestCase):
         test = (ROOT / "server/tests/test_ca_privilege_separation_root.py").read_text(
             encoding="utf-8")
         self.assertIn('REQUIRE_ROOT = "CA_SEPARATION_REQUIRE_ROOT"', test)
+        # Issue #10 S5c: release placement as real root, also unable to skip.
+        self.assertIn("            RELEASE_PLACEMENT_REQUIRE_ROOT=1 \\\n", body)
+        self.assertIn("            tests.test_release_placement_root", body)
+        placement = (ROOT / "server/tests/test_release_placement_root.py").read_text(
+            encoding="utf-8")
+        self.assertIn('os.environ.get("RELEASE_PLACEMENT_REQUIRE_ROOT") == "1"', placement)
 
     def test_agent_ring_ledger_runs_against_debian_12_sqlite(self):
         # Issue #191: SQLite 3.40.x is covered by the pinned Debian 12 image,

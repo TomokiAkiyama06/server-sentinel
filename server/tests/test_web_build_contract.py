@@ -7,10 +7,11 @@ shape) and compare it with the server's constants, so a change on one side
 alone fails here.
 
 ``RealBuildTests`` loads an actual ``web/dist`` (S5a ``npm run build``)
-through ``WebAssets.load``. Without a build it is skipped, unless
+through ``WebAssets.load``. Without a build, or without ``policy.mjs`` (a
+copy of ``server/`` alone), these tests are skipped, unless
 ``WEB_DIST_REQUIRED=1`` (the CI ``web-browser`` job, right after building),
-where a missing build fails. Standard library only: that job installs no
-Main Server dependency.
+where either one missing fails instead (Issue #10 S5c). Standard library
+only: that job installs no Main Server dependency.
 """
 
 import json
@@ -20,6 +21,7 @@ import re
 import shutil
 import tempfile
 import unittest
+import unittest.mock
 
 from app.auth import web_assets
 from app.auth.web_assets import WebAssets
@@ -31,8 +33,15 @@ DIST = REPOSITORY / "web" / "dist"
 _STRING = re.compile(r'"((?:[^"\\]|\\.)*)"')
 
 
+def web_required() -> bool:
+    """Whether a missing Web source or build must fail instead of skip (CI)."""
+    return os.environ.get("WEB_DIST_REQUIRED") == "1"
+
+
 def _policy_source() -> str:
     if not POLICY.is_file():
+        if web_required():
+            raise AssertionError("WEB_DIST_REQUIRED=1 but web/scripts/policy.mjs is missing")
         raise unittest.SkipTest("web/scripts/policy.mjs is not part of this checkout")
     return POLICY.read_text(encoding="utf-8")
 
@@ -94,7 +103,7 @@ class RealBuildTests(unittest.TestCase):
 
     def setUp(self):
         if not (DIST / "manifest.json").is_file():
-            if os.environ.get("WEB_DIST_REQUIRED") == "1":
+            if web_required():
                 self.fail("WEB_DIST_REQUIRED=1 but web/dist/manifest.json is missing")
             raise unittest.SkipTest("no web/dist build in this checkout")
         # A private copy with release-like modes: the loader refuses group- or
@@ -129,6 +138,27 @@ class RealBuildTests(unittest.TestCase):
                       document)
         header = dict(WebAssets.load(self.build).app_index.headers)[b"content-security-policy"]
         self.assertEqual(header.decode(), web_assets.APP_CSP)
+
+
+class RequiredBuildTests(unittest.TestCase):
+    """Issue #10 S5c: ``WEB_DIST_REQUIRED=1`` turns every skip into a failure."""
+
+    def run_case(self, case, required):
+        missing = Path(tempfile.mkdtemp()) / "missing"
+        self.addCleanup(shutil.rmtree, missing.parent)
+        result = unittest.TestResult()
+        with unittest.mock.patch(__name__ + ".POLICY", missing / "policy.mjs"), \
+                unittest.mock.patch(__name__ + ".DIST", missing / "dist"), \
+                unittest.mock.patch.dict(os.environ, {"WEB_DIST_REQUIRED": required}):
+            case.run(result)
+        return len(result.failures), len(result.skipped), len(result.errors)
+
+    def test_a_missing_policy_or_build_fails_only_when_required(self):
+        for case in (lambda: PolicyCrossCheckTests("test_the_content_types_are_the_web_content_types"),
+                     lambda: RealBuildTests("test_the_real_build_loads_and_is_served_byte_for_byte")):
+            with self.subTest(case=case().id()):
+                self.assertEqual(self.run_case(case(), "1"), (1, 0, 0))
+                self.assertEqual(self.run_case(case(), ""), (0, 1, 0))
 
 
 if __name__ == "__main__":

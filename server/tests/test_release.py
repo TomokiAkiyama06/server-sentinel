@@ -22,6 +22,7 @@ from app.deployment import (
 )
 from app.settings import ConfigurationError
 from build_artifact import _required_wheels, build
+from tests.web_asset_fakes import write_build
 from build_installer import build as build_installer
 import install
 from install import (
@@ -144,6 +145,8 @@ class ReleaseLifecycleTests(unittest.TestCase):
                 (self.wheelhouse / f"{name}-{version}-py3-none-any.whl").write_bytes(
                     (name + version).encode()
                 )
+        # Issue #10 S5c: the synthetic Web build every artifact ships.
+        self.web_dist = write_build(self.root / "web-dist")
         self.runner = Runner(self.installation)
         # Issue #180: a fake root prefix for /usr/local/sbin; nothing is
         # written outside the temporary tree.
@@ -155,7 +158,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
         wheels = sorted(self.wheelhouse.glob("*.whl"))
         with patch("build_artifact.REPOSITORY", self.root), patch(
                 "build_artifact._required_wheels", return_value=wheels):
-            digest = build(path, version, self.wheelhouse)
+            digest = build(path, version, self.wheelhouse, self.web_dist)
         return path, digest
 
     def arguments(self, command, version=None):
@@ -191,7 +194,8 @@ class ReleaseLifecycleTests(unittest.TestCase):
                 "install.PROTECTED_HOME_ROOTS", protected_home), patch(
                 "install.pwd.getpwuid", return_value=account), patch(
                 "install.PAIRING_WRAPPER", self.wrapper), patch(
-                "install.PAIRING_WRAPPER_OWNER", (self.uid, self.gid)):
+                "install.PAIRING_WRAPPER_OWNER", (self.uid, self.gid)), patch(
+                "install.RELEASE_OWNER_UID", self.uid):
             execute(arguments, runner=self.runner)
 
     def approved_device_lookup(self, approved_device=None):

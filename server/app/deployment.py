@@ -234,14 +234,86 @@ def capture_ca_directory_accessible(path: Path) -> bool:
 
 
 def _runtime_roots() -> tuple[Path, Path | None]:
+    """The running release (code root) and, for an installed one, the installation root.
+
+    A release is ``<installation>/releases/<version>``; while the installer
+    stages it, it is ``<installation>/releases/.<version>.staging`` and runs
+    its own ``--check`` there, which must resolve the same settings.
+    """
     try:
         code_root = Path(__file__).resolve(strict=True).parents[1]
     except (OSError, RuntimeError, IndexError):
         raise ConfigurationError("deployment code location is unavailable") from None
     install_root = None
-    if code_root.parent.name == "releases" and RELEASE_VERSION.fullmatch(code_root.name):
+    name = code_root.name
+    if name.startswith(".") and name.endswith(".staging"):
+        name = name[1:-len(".staging")]
+    if code_root.parent.name == "releases" and RELEASE_VERSION.fullmatch(name):
         install_root = code_root.parent.parent
     return code_root, install_root
+
+
+class WebAssetsRefused(ConfigurationError):
+    """The configured Web build failed the loader; ``reason`` is one value-free word."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__("web assets refused")
+        self.reason = reason
+
+
+def _web_assets_directory(value: object, code_root: Path, install_root: Path | None) -> Path:
+    """The release's own Web build directory named by ``web_assets_directory`` (Issue #10 S5c).
+
+    On an installed host the value is exactly ``<installation>/current/web``:
+    the release a process runs from is the one ``current`` names once it has
+    started, so the path is taken as that process's own ``<release>/web``
+    (``code_root``), the directory the installer checks against the release
+    manifest. The rollback and staging checks therefore validate the build
+    of the release being switched to, not of the one still running. Without
+    an installation root (a source tree) it is exactly ``<code_root>/web``.
+
+    The installation part is compared after resolving both sides, so the
+    installer (which knows ``--destination`` as typed) and the release
+    (which knows its own resolved location) accept the same value even when
+    the installation path contains a symbolic link. Any other value is
+    refused with the value-free reason ``setting``. Existence and content
+    are checked by ``main`` (``WebAssets.load``).
+    """
+    if not isinstance(value, str) or not value or "\0" in value:
+        raise WebAssetsRefused("setting")
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts or path.name != "web":
+        raise WebAssetsRefused("setting")
+    if install_root is not None:
+        if path.parent.name != "current":
+            raise WebAssetsRefused("setting")
+        named, expected = path.parent.parent, install_root
+    else:
+        named, expected = path.parent, code_root
+    try:
+        same = named.resolve(strict=True) == expected.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        same = False
+    if not same:
+        raise WebAssetsRefused("setting")
+    return code_root / "web"
+
+
+def _load_web_assets(directory: Path, code_root: Path) -> None:
+    """Load the configured build exactly as the human surface would, or refuse."""
+    from app.auth.web_assets import WebAssets, WebAssetsUnavailable
+    try:
+        resolved = directory.resolve(strict=True)
+        release = code_root.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        raise WebAssetsRefused("path") from None
+    if not resolved.is_relative_to(release) or resolved == release:
+        # A symbolic link inside the release must not lead out of it.
+        raise WebAssetsRefused("path")
+    try:
+        WebAssets.load(directory)
+    except WebAssetsUnavailable as refused:
+        raise WebAssetsRefused(refused.reason) from None
 
 
 def _read_configuration(path: Path) -> tuple[dict, os.stat_result]:
@@ -338,7 +410,8 @@ class Deployment:
         if (not allowed <= set(value)
                 or not set(value) <= allowed | {"monitoring", "local_uvc", "detection",
                                                 "capture_ca_directory",
-                                                "invitation_lifetime_hours"}
+                                                "invitation_lifetime_hours",
+                                                "web_assets_directory"}
                 or type(value.get("service_uid")) is not int):
             raise ConfigurationError("invalid deployment configuration")
         # Required (Owner decision 2026-10-07, Issue #109): every configuration
@@ -417,10 +490,15 @@ class Deployment:
                     "invitation_lifetime_hours must be an integer from 1 to 168") from None
         else:
             lifetime = INVITATION_LIFETIME
+        # Optional (Issue #10 S5c): the release's Web build. Absent means no
+        # human composition can be mounted (``create_app`` refuses one
+        # without ``Settings.web_assets_dir``), so human access stays closed.
+        web_assets = (_web_assets_directory(value["web_assets_directory"], code_root, install_root)
+                      if "web_assets_directory" in value else None)
         settings = Settings(
             directories[0], human_host=value["human_host"],
             human_port=value["human_port"], log_level=value["log_level"],
-            invitation_lifetime=lifetime, source_root=code_root,
+            invitation_lifetime=lifetime, web_assets_dir=web_assets, source_root=code_root,
         )
         monitoring = None
         if "monitoring" in value:
@@ -467,9 +545,19 @@ def main(arguments: list[str] | None = None) -> int:
         if (deployment.capture_ca_directory is not None
                 and capture_ca_directory_accessible(deployment.capture_ca_directory)):
             raise ConfigurationError("service account can open the capture CA directory")
+        # Issue #10 S5c: the configured Web build must load as this account
+        # with the release's own loader, before every start (ExecStartPre)
+        # and in the installer's staging and rollback checks.
+        if deployment.settings.web_assets_dir is not None:
+            _load_web_assets(deployment.settings.web_assets_dir, code_root)
     except CaptureCaSettingMissing:
         parser.exit(1, "ServerSentinel deployment validation failed: "
                        + CaptureCaSettingMissing.REASON + "\n")
+    except WebAssetsRefused as refused:
+        # One value-free word for the operator (no path, name or digest);
+        # no client ever sees it.
+        parser.exit(1, "ServerSentinel deployment validation failed: web assets refused "
+                       f"(reason={refused.reason})\n")
     except ConfigurationError:
         parser.exit(1, "ServerSentinel deployment validation failed\n")
     if args.check:

@@ -2188,8 +2188,18 @@ an extra, missing, modified, oversized, symlinked or non-regular file, a
 group- or world-writable entry and a file with a second hard link refuse the
 whole composition (fail closed), and the verified bytes are frozen in
 memory, so a later disk change is never served. This guards against an
-accidental or partial deployment; tamper resistance is the S5c release
-manifest plus a root-owned, service-unwritable directory. Every asset response has a
+accidental or partial deployment. Protection against the service account
+is the root-owned, read-only placement (S5c: files `0444`, directories
+`0755`, no hard link) that it cannot write. The installer also compares the
+build with the unsigned release manifest copy kept in the same root-owned
+release tree at install and before a rollback; that detects accidental or
+partial changes and changed owners or modes, not a change by root, and it
+is not repeated at every start.
+`Settings.web_assets_dir` comes from the optional deployment key
+`web_assets_directory` (`<installation>/current/web`, resolved against the
+running release's own `web/`); without it no human composition can be
+mounted, and with it the release's `--check` refuses to start unless the
+build loads. Every asset response has a
 fixed header list: its `Content-Type` (the manifest's, from the S5a
 build policy `web/scripts/policy.mjs`), `Content-Length`,
 `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
