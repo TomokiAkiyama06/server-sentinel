@@ -67,3 +67,33 @@ route integration remain deployment/integration acceptance, not claims made by
 these tests. No dependency was added; all new Python code uses the stdlib.
 The lifespan binding, periodic retention and state-audit wiring live in
 `../monitoring/`.
+
+## Held database descriptors (Issues #152, #248)
+
+`database.py` keeps one read-only descriptor per database file (device, inode)
+that the process opened or created through it, and never closes it: closing
+any descriptor on the file would drop this process's SQLite POSIX locks on it.
+In production the count is bounded by the database files the process uses.
+
+The test suite creates and deletes one temporary database per test, so each
+used to keep one descriptor open until the test process exited (about 2000 for
+the full suite, `EMFILE` under `ulimit -n 1024`). The test-only
+`_release_unlinked_held_files_for_tests()` closes the held descriptors of a
+file only when it is no longer linked anywhere and no other descriptor in the
+process refers to its inode (an open or leaked SQLite connection, or a close
+SQLite deferred, keeps it held, so no lock is ever dropped). `tests/__init__.py`
+calls it after every test's cleanups. Application code never calls it, which a
+test enforces, and the production lock behavior is unchanged. The server CI
+test command runs with `ulimit -n 1024` (soft and hard) so a regression fails.
+
+Each held descriptor also gets an adoption serial that is never reused.
+`PinnedDatabase` and the local admin ledger record it when they pin and refuse
+once `held_descriptor_is_current()` no longer matches. After the test-only
+release, the descriptor number and even the inode may be reused, for example
+by a database recreated at the same path, so a stale pin is refused because
+of the serial, not because of the file identity. In production a held
+descriptor is never closed, so the serial never changes. The release keeps a
+file held when it cannot examine some other descriptor (any `fstat` error
+other than `EBADF`). `read_database_prefix()` reads after leaving the
+holder's lock, so the release must not run concurrently with other threads
+that use those databases. The per-test hook runs it between tests.
