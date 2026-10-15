@@ -527,10 +527,14 @@ class Receiver:
                 heartbeats.append(wire.heartbeat_ack_frame(parsed[1]))
             else:
                 raise wire.ProtocolError("unexpected frame from agent")
-        # Heartbeat replies first: an Agent that received any part of this
-        # write received the first of them (in-order stream; a TLS record is
-        # delivered whole and the first record starts with it), so its
-        # ``echo_frames`` count shows every write it read part of.
+        # Heartbeat replies first. a_framed / b_chunked: the Agent parses
+        # frames as bytes arrive and any received byte refreshes its
+        # liveness, so a write it read any part of already gave it the first
+        # of these (in-order stream; a TLS record is delivered whole and the
+        # first record starts with it) and ``echo_frames`` shows that write.
+        # b_segment parses only after the whole response body, so a partly
+        # read response is not counted (its bytes can still restart the
+        # Agent's per-read timeout): there the count shows whole responses.
         return b"".join(heartbeats + replies), echoes
 
     def _with_echo(self, state, reply, echoes):
@@ -548,9 +552,11 @@ class Receiver:
         sent = state.get("echo_sent")
         if sent is not None and time.monotonic() - sent < ECHO_REPEAT_S:
             return reply, echoes
-        # First in the reply: an Agent that received any byte of this reply
-        # received this frame too (in-order stream; the frame is a few bytes
-        # at the start of the write), so it is counted in ``echo_frames``.
+        # First in the reply. a_framed / b_chunked: an Agent that received
+        # any byte of this reply received this frame too (in-order stream;
+        # the frame is a few bytes at the start of the write), so it is
+        # counted in ``echo_frames``. b_segment counts it only once the whole
+        # response body was read.
         return wire.heartbeat_ack_frame(latest) + reply, [latest]
 
     def _flush_acks(self):
@@ -562,8 +568,11 @@ class Receiver:
         carries ``sent_ns``, the Main clock time ``sendall`` returned for the
         reply holding the echo, taken under ``_send_lock``: never earlier
         than the reply was fully handed to the kernel, so never earlier than
-        the Agent could receive it (a SIGSTOP in between only makes it
-        later). The record's own ``t_ns`` can be later still (e.g. written
+        the Agent could receive it. A SIGSTOP landing in the microseconds
+        between ``sendall`` returning and ``sent_ns`` being taken makes it
+        later (after SIGCONT): a reply the Agent read during the stop then
+        looks written after the cutoff, a rare false FAIL, never a false
+        PASS. The record's own ``t_ns`` can be later still (e.g. written
         after a SIGUSR1); the summarizer uses ``sent_ns``. ``index`` is the
         frame's position among the session's written heartbeat_ack frames,
         matched against the Agent's received count (``echo_frames``). The

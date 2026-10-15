@@ -1115,17 +1115,19 @@ class RunSummary:
         whether the Agent received the repeat (#237: a repeat written after
         SIGCONT to a connection the Agent had already dropped, in reply to
         data drained from the kernel buffer, has the same value as the
-        Agent's last echo). When both sides number the frames -- the
-        receiver's ``heartbeat_ack`` ``index`` (position among the session's
-        written frames, in stream order) and the Agent's ``echo_frames``
-        (frames it received on the connection) -- the Agent received exactly
-        frames 1..k, and the session was answered iff one of those was
-        written at or after the cutoff; frames 1..k must all be on record,
-        or the result is unmeasured. Records without the numbering (from
-        before the repeat existed) use the echo values: the Agent's
-        ``last_echo_ns`` must appear among that session's echoes (else
-        unmeasured) and an echo written at or after the cutoff with a value
-        not newer than it means answered. Echo values are Agent clock readings and are only
+        Agent's last echo). Both sides number the frames -- the receiver's
+        ``heartbeat_ack`` ``index`` (position among the session's written
+        frames, in stream order) and the Agent's ``echo_frames`` (frames it
+        received on the connection, the largest over its loss records) -- so
+        the Agent received exactly frames 1..k, and the session was answered
+        iff one of those was written at or after the cutoff. Unmeasured: an
+        ``echo_frames`` that is missing, not an integer or negative; a Main
+        reply without ``index``; a frame of 1..k not on record; or a largest
+        echo among frames 1..k that differs from the Agent's
+        ``last_echo_ns``. Records without the numbering (#222 era) are
+        unmeasured, not judged by echo values: a session kept alive by media
+        acknowledgements alone shows no post-cutoff echo there, so that rule
+        could pass a survivor. Echo values are Agent clock readings and are only
         compared with each other; ``heartbeat_ack`` times only with the Main
         windows. Bytes the receiver drains after SIGCONT (sent before the
         Agent dropped the connection) are not evidence either way. Returns
@@ -1151,13 +1153,18 @@ class RunSummary:
             if not _is_int(echo):
                 return None
             echoes[loss["session"]] = max(echo, echoes.get(loss["session"], echo))
-        # Frames the Agent received per session (None: records without it).
-        frames = None
-        if losses and all(_is_int(loss.get("echo_frames")) for loss in losses):
-            frames = {}
-            for loss in losses:
-                frames[loss["session"]] = max(loss["echo_frames"],
-                                              frames.get(loss["session"], 0))
+        # Frames the Agent received per session. Required: without the
+        # numbering only echo values remain, and a session kept alive after
+        # SIGCONT by media acknowledgements alone (Agent heartbeats queued
+        # behind its backlog, the #222-era receiver repeating no echo) shows
+        # no post-cutoff echo and would wrongly count as the outage's
+        # detection (false PASS). Such records are unmeasured (#237).
+        frames = {}
+        for loss in losses:
+            count = loss.get("echo_frames")
+            if not _is_int(count) or count < 0:
+                return None
+            frames[loss["session"]] = max(count, frames.get(loss["session"], 0))
         replies = {}
         for item in _kind(self.receiver, "heartbeat_ack"):
             if _is_int(item.get("session")) and _is_int(item.get("echo_ns")):
@@ -1167,31 +1174,25 @@ class RunSummary:
                 index = item["index"] if _is_int(item.get("index")) else None
                 replies.setdefault(item["session"], []).append((at, item["echo_ns"], index))
         cutoffs = self._main_reply_cutoffs()
-
-        def numbered(session):
-            return frames is not None and session in frames and all(
-                index is not None for _, _, index in replies.get(session, ()))
-
-        for session in set(echoes) | set(frames or ()):
-            if numbered(session):
-                written = {index for _, _, index in replies.get(session, ())}
-                if not set(range(1, frames[session] + 1)) <= written:
-                    # The Agent received a frame on this session that Main
-                    # has no (successfully written) record of.
-                    return None
-            elif session in echoes and echoes[session] not in {
-                    value for _, value, _ in replies.get(session, ())}:
-                # The Agent received a reply on this session that Main has no
-                # (successfully sent) record of: its Main clock time is unknown.
+        for session, count in frames.items():
+            mine = replies.get(session, ())
+            if any(index is None for _, _, index in mine):
+                return None  # Main replies without their frame position
+            received = [(index, value) for _, value, index in mine if index <= count]
+            if {index for index, _ in received} != set(range(1, count + 1)):
+                # The Agent received a frame on this session that Main has
+                # no (successfully written) record of.
+                return None
+            # The Agent's last echo must be the largest it could have read
+            # from frames 1..k (none: no echo), or the records disagree.
+            if max((value for _, value in received), default=None) != echoes.get(session):
                 return None
 
         def answered(session, cutoff):
-            mine = replies.get(session, ())
-            if numbered(session):
-                return any(at >= cutoff and index <= frames[session] for at, _, index in mine)
-            echo = echoes.get(session)
-            return echo is not None and any(
-                at >= cutoff and value <= echo for at, value, _ in mine)
+            # The Agent read exactly frames 1..k (in-order stream): answered
+            # iff one of those was written at or after the cutoff.
+            return any(at >= cutoff and index <= frames[session]
+                       for at, _, index in replies.get(session, ()))
         # A session ends at its close, or at the end of its receiver process
         # (an abruptly stopped receiver may not write every close; the
         # orchestrator's ``exit`` is written once the process is gone).
