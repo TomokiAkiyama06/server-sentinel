@@ -290,8 +290,11 @@ python3 scripts/manual/transport_poc/poc15.py summarize --two-host MAIN_OUT/<RUN
   後ろに並び、SIGCONT 後の Main の返信が media ACK だけになりえます（Agent はそれで受信ありとして
   生き延びるのに、最後の echo は停止前のまま）。receiver は、その session で heartbeat を受けたことが
   あり、0.5 s（`ECHO_REPEAT_S`）以上 echo を書いていない返信に、最新の echo を付け直して記録します。
-  付け直した echo は返信の先頭に置きます（heartbeat 応答も各返信の先頭）。Agent がその返信の一部でも
-  受け取れば、その frame も受け取っています（stream は順序どおりで、TLS record は丸ごと届く）。
+  付け直した echo は返信の先頭に置きます（heartbeat 応答も各返信の先頭）。`a_framed` / `b_chunked` では、
+  Agent が返信の一部でも受け取れば、その frame も受け取っています（stream は順序どおりで、TLS record
+  は丸ごと届く）。`b_segment` の sender は response body を全部読んでから frame を解釈するので、一部だけ
+  読んだ response は数えません（その byte でも Agent の read timeout は延びます）。そのため `b_segment`
+  の数は、全部読んだ response の分だけです。
   これで停止後の最初の返信は必ず echo を運び、生き延びた session は `answered` として除外されます。
   ただし付け直した echo は古い値なので、値だけでは Agent が受け取ったかどうかが分かりません。たとえば
   SIGCONT 後に、Agent が切断前に送った kernel buffer 上のデータへ返信した場合、Agent はもう読んでいない
@@ -299,8 +302,18 @@ python3 scripts/manual/transport_poc/poc15.py summarize --two-host MAIN_OUT/<RUN
   frame に書き込み順の番号 `index`（1 から）を付け、sender は接続ごとに受け取った frame 数
   `echo_frames` を `loss_detected` / `closed` に記録します。Agent が受け取ったのは frame 1..k
   （k = `echo_frames`）ちょうどなので、そのどれかが cutoff 以後に書かれていれば `answered` です。
-  1..k のどれかが Main の記録に無ければ `unmeasured` になります。番号の無い古い記録は、従来どおり
-  echo の値で判定します（保守側）。
+  次のどれかに当たる場合は `unmeasured` です。
+  - 1..k のどれかが Main の記録に無い
+  - `echo_frames` が無い、整数でない、または負
+  - Main の応答に `index` が無い
+  - frame 1..k の echo の最大値が Agent の `last_echo_ns` と一致しない
+
+  `echo_frames` は loss 記録ごとに出るので、その最大値を使います。番号の無い #222 時代の 2 host 記録も
+  `unmeasured` です。echo の値だけで判定すると、SIGCONT 後に media ACK だけで生き延びた session
+  （heartbeat が backlog の後ろに並び、当時の receiver は echo を付け直さない）を検知と誤認しうる
+  ためです（false PASS 側）。
+  `sendall()` が戻ってから `sent_ns` を取るまでの数 µs に SIGSTOP が入った場合、その応答は cutoff 後に
+  書かれたように見えます。これは稀な false FAIL で、false PASS にはなりません。
 
 2 host の残る制約（時計比較をしない代償）: Main の stale 閾値以上の proxy blackhole（G5 の Main
 `interrupted`）は、Agent 時計の blackhole window と Main の検知記録を対応付けられないため、
