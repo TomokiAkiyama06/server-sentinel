@@ -1264,18 +1264,20 @@ systemctl is-enabled systemd-time-wait-sync.service     # expect: enabled
 systemctl cat systemd-time-wait-sync.service            # note TimeoutStartSec=
 ```
 
-Recorded state of the Main host (read-only check, Ubuntu 26.04.1, before
-this change was deployed): chrony is enabled, systemd-timesyncd is not
-installed, and `chrony-wait.service` is disabled; its unit runs
+As shipped on Ubuntu 26.04, the `chrony-wait.service` unit runs
 `chronyc ... waitsync 0 0.1 0.0 1` (keep polling once a second, without a
 try limit, until chrony reports synchronized with a remaining correction
-below 0.1 s) with `TimeoutStartSec=180`. Until the Owner enables it, the
-ordering waits for nothing on that host and the installer warns (below).
+below 0.1 s) with `TimeoutStartSec=180`; confirm both on the host with the
+`systemctl cat` above. Until a wait service is enabled, the ordering waits
+for nothing and the installer warns (below). This document does not record
+whether a particular host has enabled it; check with `systemctl is-enabled`
+and keep that record in the host's operations log.
 
 After the next boot, confirm the ordering took effect:
 
 ```bash
-systemctl show -p ActiveState -p Result chrony-wait.service  # or systemd-time-wait-sync.service
+systemctl show -p ActiveState -p Result -p ActiveEnterTimestamp chrony-wait.service  # or systemd-time-wait-sync.service
+systemctl show -p ActiveEnterTimestamp server-sentinel.service  # expect: not earlier than the wait service's
 timedatectl show -p NTPSynchronized                     # expect: NTPSynchronized=yes
 systemd-analyze critical-chain server-sentinel.service  # time-sync.target precedes it
 ```
