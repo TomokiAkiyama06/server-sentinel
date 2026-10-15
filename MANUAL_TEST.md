@@ -2006,7 +2006,10 @@ and then on the Main Server (Owner, synthetic data only):
   (24), `npm ci --ignore-scripts` then `npm run build` in `web/`; build again
   and compare: `diff -r` of the two `web/dist` reports nothing and the two
   release manifests (`tar -xOzf <artifact> manifest.json`) list the same
-  `web/...` SHA-256 values;
+  `web/...` SHA-256 values; build the release artifact twice from the same
+  checkout, wheelhouse and `web/dist` (two `--output` paths) and confirm
+  `sha256sum` prints the same value for both `.tar.gz` files, equal to the
+  `sha256=` each build printed;
 - [ ] with the administrator umask at `0002` (`umask` prints `0002`), install
   or update with the installer: `stat -c '%U %a %h' ` on every entry of
   `<installation>/releases/<version>/web` prints `root 755` for directories

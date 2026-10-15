@@ -31,7 +31,9 @@ python3 build_installer.py \
 `--web-dist` is the absolute path of the `web/dist` directory that build just
 wrote (`manifest.json`, `shell/`, `app/`). The Web build is deterministic:
 building the same sources with the same lock again gives a byte-identical
-`web/dist`. `build_artifact.py` reads that directory without following any
+`web/dist`, and the release archive is reproducible too (no file name or time
+in its gzip header, fixed member metadata), so the same checkout, wheelhouse
+and `web/dist` give the same published SHA-256. `build_artifact.py` reads that directory without following any
 symbolic link, refuses anything but regular files and the two subdirectories,
 loads a private copy through the Main Server's own asset loader
 (`WebAssets.load`), and fails with a fixed, value-free reason
@@ -1148,7 +1150,10 @@ installer (as root) reads the release's `web/` back without following a
 symbolic link and compares it with the release manifest it kept in that
 release (`release-manifest.json`, root-owned `0444`): the same set of files,
 every SHA-256 equal, every file a singly linked root-owned `0444` regular
-file and every directory root-owned `0755`. Any difference refuses the
+file and every directory root-owned `0755`. Each name is compared with the
+manifest before anything is opened, files are hashed in chunks, and the check
+stops at the loader's caps (65 files including `web/manifest.json`, 32 MiB
+plus the manifest), so a directory flooded with files cannot exhaust memory. Any difference refuses the
 operation before anything changes, with the steps to follow: keep the release
 directory for inspection, and to use that version again move its directory
 out of `releases/` and install it again with `update` and the verified

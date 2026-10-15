@@ -60,6 +60,11 @@ MAX_WRAPPER_BYTES = 16 * 1024
 RELEASE_MANIFEST = "release-manifest.json"
 MAX_MANIFEST_BYTES = 256 * 1024
 WEB_DIRECTORY = "web"
+# Bounds of the Web build check (Issue #10 S5c), the asset loader's caps
+# (app/auth/web_assets.py: 64 files, 32 MiB in all, 64 KiB of manifest) plus
+# web/manifest.json itself; the standalone installer does not import it.
+MAX_WEB_FILES = 64 + 1
+MAX_WEB_BYTES = 32 * 1024 * 1024 + 64 * 1024
 # Every release file and directory belongs to root (the installer runs as
 # root) and has exactly these modes, whatever the administrator umask.
 RELEASE_OWNER_UID = 0
@@ -215,28 +220,51 @@ def _read_release_file(parent: int, name: str, mode: int, limit: int) -> bytes:
     return data
 
 
-def _web_tree(descriptor: int, prefix: str) -> dict[str, bytes]:
-    """Every file below an open Web directory: root-owned, exact modes, single link."""
-    files: dict[str, bytes] = {}
-    for name in sorted(os.listdir(descriptor)):
-        info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
-        if stat.S_ISDIR(info.st_mode):
-            if prefix.count("/") > 2:
-                raise ValueError("release entry differs")
-            child, _ = _open_release_entry(descriptor, name, directory=True)
-            try:
-                files.update(_web_tree(child, prefix + name + "/"))
-            finally:
-                os.close(child)
-        elif stat.S_ISREG(info.st_mode):
-            # Opened only after the type check: root never opens a device
-            # node, FIFO or socket placed in the tree; the descriptor's own
-            # fstat is checked again in _open_release_entry.
-            files[prefix + name] = _read_release_file(descriptor, name, RELEASE_FILE_MODE,
-                                                      MAX_ARTIFACT_BYTES)
-        else:
+def _hash_release_file(parent: int, name: str, budget: list[int]) -> str:
+    """SHA-256 of one release file, streamed; its bytes count against ``budget``."""
+    descriptor, info = _open_release_entry(parent, name, directory=False)
+    digest = hashlib.sha256()
+    with os.fdopen(descriptor, "rb") as stream:
+        if stat.S_IMODE(info.st_mode) != RELEASE_FILE_MODE or info.st_size > budget[0]:
             raise ValueError("release entry differs")
-    return files
+        while chunk := stream.read(min(1024 * 1024, budget[0] + 1)):
+            budget[0] -= len(chunk)
+            if budget[0] < 0:
+                raise ValueError("release entry differs")
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _check_web_tree(descriptor: int, prefix: str, expected: dict[str, str],
+                    seen: set[str], budget: list[int]) -> None:
+    """Compare an open Web directory with the manifest's entries, name first.
+
+    Every entry is checked against ``expected`` by name and type before it is
+    opened, so an unlisted file or directory is refused without being read
+    and the walk stops at the first one; listed files are hashed in chunks
+    within ``budget`` (bytes left of ``MAX_WEB_BYTES``). Files are root-owned
+    ``0444`` and singly linked, directories root-owned ``0755``, nothing is
+    followed through a symbolic link, and root never opens a device node,
+    FIFO or socket placed in the tree.
+    """
+    with os.scandir(descriptor) as entries:
+        for entry in entries:
+            relative = prefix + entry.name
+            info = os.stat(entry.name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                if not any(name.startswith(relative + "/") for name in expected):
+                    raise ValueError("release entry differs")
+                child, _ = _open_release_entry(descriptor, entry.name, directory=True)
+                try:
+                    _check_web_tree(child, relative + "/", expected, seen, budget)
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(info.st_mode) and relative in expected:
+                if _hash_release_file(descriptor, entry.name, budget) != expected[relative]:
+                    raise ValueError("release entry differs")
+                seen.add(relative)
+            else:
+                raise ValueError("release entry differs")
 
 
 def verify_release_web(release: Path) -> bool:
@@ -245,7 +273,9 @@ def verify_release_web(release: Path) -> bool:
     The build under ``web/`` must be exactly the manifest's ``web/`` entries:
     every SHA-256 equal, nothing extra or missing, every file a regular,
     singly linked, root-owned ``0444`` file and every directory root-owned
-    ``0755``, all opened without following a symbolic link. Returns ``False``
+    ``0755``, all opened without following a symbolic link. Names are
+    compared before anything is read, and the check is bounded by
+    ``MAX_WEB_FILES`` and ``MAX_WEB_BYTES``. Returns ``False``
     for a release from before S5c, which has neither the manifest copy nor
     ``web/``; raises ``ValueError`` for anything else.
     """
@@ -274,17 +304,19 @@ def verify_release_web(release: Path) -> bool:
             if WEB_DIRECTORY in entries:
                 raise ValueError("release entry differs")
             return False
+        if len(expected) > MAX_WEB_FILES:
+            raise ValueError("release entry differs")
+        seen: set[str] = set()
         web, _ = _open_release_entry(root, WEB_DIRECTORY, directory=True)
         try:
-            actual = _web_tree(web, "")
+            _check_web_tree(web, "", expected, seen, [MAX_WEB_BYTES])
         finally:
             os.close(web)
     except OSError:
         raise ValueError("release entry differs") from None
     finally:
         os.close(root)
-    if set(actual) != set(expected) or any(
-            hashlib.sha256(data).hexdigest() != expected[name] for name, data in actual.items()):
+    if seen != set(expected):
         raise ValueError("release entry differs")
     return True
 
@@ -308,27 +340,41 @@ def _require_release_web(args, release: Path, target: str) -> None:
             "(server/docs/DEPLOYMENT.md, Install, update, and rollback).\n") from None
 
 
-def _require_staged_web(staging: Path, version: str) -> None:
+class StagedWebDiffers(ValueError):
+    """The freshly staged Web build differs; ``_stage`` reports it after cleanup."""
+
+
+def _require_staged_web(staging: Path) -> None:
     """Refuse a staged release whose freshly written Web build already differs.
 
     The bytes were just written from the verified artifact, so a difference
     means the filesystem did not keep what the installer set (an owner other
     than root, as on NFS with root_squash or under uid mapping, or a mount
     option that changes modes) or an installer fault; nothing was switched.
+    ``_stage`` turns it into the Owner message once it knows whether the
+    staged directory could be removed (``_staged_web_differs``).
     """
     try:
         verify_release_web(staging)
     except ValueError:
-        raise ReleaseFilesDiffer(
-            "ServerSentinel release operation refused before any change: the Web build of\n"
-            f"release {version} differs from its release manifest right after it was written,\n"
-            "so the staged release was removed and nothing was switched.\n"
-            "As the Owner:\n"
-            "  1. check that the installation filesystem keeps root as owner and the\n"
-            "     modes the installer sets (for example not NFS with root_squash, no uid\n"
-            "     mapping, no mount option that changes modes)\n"
-            "  2. rerun the same command\n"
-            "(server/docs/DEPLOYMENT.md, Install, update, and rollback).\n") from None
+        raise StagedWebDiffers("staged web build differs") from None
+
+
+def _staged_web_differs(version: str, staging: Path) -> ReleaseFilesDiffer:
+    removed = not staging.exists() and not staging.is_symlink()
+    cleanup = ("so the staged release was removed and nothing was switched.\n" if removed else
+               "and nothing was switched, but the staged release could not be removed.\n")
+    steps = [] if removed else [f"remove the staged directory {staging} as root"]
+    steps += ["check that the installation filesystem keeps root as owner and the\n"
+              "     modes the installer sets (for example not NFS with root_squash, no uid\n"
+              "     mapping, no mount option that changes modes)",
+              "rerun the same command"]
+    return ReleaseFilesDiffer(
+        "ServerSentinel release operation refused before any change: the Web build of\n"
+        f"release {version} differs from its release manifest right after it was written,\n"
+        + cleanup + "As the Owner:\n"
+        + "".join(f"  {number}. {step}\n" for number, step in enumerate(steps, 1))
+        + "(server/docs/DEPLOYMENT.md, Install, update, and rollback).\n")
 
 
 def _quote(value: Path | str) -> str:
@@ -1081,7 +1127,7 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
             _extract(content, staging, args.version)
             # The placed Web build, read back from disk: exact modes, owner,
             # single links and the release manifest's digests (Issue #10 S5c).
-            _require_staged_web(staging, args.version)
+            _require_staged_web(staging)
             # Before the release's own --check, which would only fail without
             # saying why (Issue #109).
             _require_capture_ca_setting(args, staging, "releases/" + args.version, deployment)
@@ -1101,8 +1147,11 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
             _run_release_check(args, staging, account, runner)
             _replace_unit(staging / ".server-sentinel.service", unit_content, mode=0o444)
             staging.rename(final)
-        except Exception:
+        except Exception as error:
             shutil.rmtree(staging, ignore_errors=True)
+            if isinstance(error, StagedWebDiffers):
+                # Say "removed" only when it is really gone.
+                raise _staged_web_differs(args.version, staging) from None
             raise
     finally:
         os.umask(previous_umask)

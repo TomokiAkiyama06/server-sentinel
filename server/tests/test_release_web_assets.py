@@ -293,13 +293,29 @@ class InstalledWebBuildTests(ReleaseFixture):
             with self.assertRaises(ReleaseFilesDiffer) as refused:
                 self.perform(self.arguments("update", "1.1.0"))
         for phrase in ("before any change", "right after it was written", "root_squash",
-                       "rerun the same command"):
+                       "staged release was removed", "rerun the same command"):
             self.assertIn(phrase, str(refused.exception))
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
         self.assertFalse((self.installation / "releases/1.1.0").exists())
         self.assertFalse((self.installation / "releases/.1.1.0.staging").exists())
         if state is not None:
             self.assertEqual(state, self.state())
+
+    def test_a_staged_release_that_could_not_be_removed_is_named(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        arguments = self.arguments("update", "1.1.0")
+        real = install._release_mode
+        with patch("install._release_mode",
+                   side_effect=lambda name: 0o644 if name.startswith("web/") else real(name)), \
+                patch("install.shutil.rmtree"), self.assertRaises(ReleaseFilesDiffer) as refused:
+            self.perform(arguments)
+        staging = self.installation / "releases/.1.1.0.staging"
+        self.assertTrue(staging.exists())
+        message = str(refused.exception)
+        self.assertIn("could not be removed", message)
+        self.assertIn(f"1. remove the staged directory {staging} as root", message)
+        self.assertNotIn("was removed", message)
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
 
     def installed_two(self):
         self.perform(self.arguments("install", "1.0.0"))
@@ -374,10 +390,37 @@ class InstalledWebBuildTests(ReleaseFixture):
     def test_a_special_file_in_the_build_is_refused_without_being_opened(self):
         target = self.installed_two()
         os.mkfifo(target / "web" / "app" / "pipe.js")
-        with patch("install._read_release_file", wraps=install._read_release_file) as read, \
+        with patch("install._hash_release_file", wraps=install._hash_release_file) as read, \
                 self.assertRaises(ValueError):
             self.verify(target)
         self.assertNotIn("pipe.js", [c.args[1] for c in read.call_args_list])
+
+    def test_unlisted_entries_are_refused_before_anything_is_read(self):
+        # Review of PR #249: names are compared with the release manifest
+        # before a file is opened, so a flood of unlisted files is not read.
+        target = self.installed_two()
+        (target / "web" / "app" / "unlisted.js").write_bytes(b"x" * 4096)
+        (target / "web" / "extra").mkdir()
+        for name in ("unlisted.js", "extra"):
+            with self.subTest(name=name), patch(
+                    "install._hash_release_file", wraps=install._hash_release_file) as read, \
+                    self.assertRaises(ValueError):
+                self.verify(target)
+            self.assertNotIn(name, [c.args[1] for c in read.call_args_list])
+            path = target / "web" / ("app/unlisted.js" if name == "unlisted.js" else name)
+            path.unlink() if path.is_file() else path.rmdir()
+        self.assertTrue(self.verify(target))
+
+    def test_the_check_is_bounded_in_files_and_bytes(self):
+        target = self.installed_two()
+        total = sum(path.stat().st_size for path in (target / "web").rglob("*") if path.is_file())
+        count = len([path for path in (target / "web").rglob("*") if path.is_file()])
+        for constant, value in (("MAX_WEB_BYTES", total - 1), ("MAX_WEB_FILES", count - 1)):
+            with self.subTest(constant=constant), patch("install." + constant, value), \
+                    self.assertRaises(ValueError):
+                self.verify(target)
+        with patch("install.MAX_WEB_BYTES", total), patch("install.MAX_WEB_FILES", count):
+            self.assertTrue(self.verify(target))
 
     def test_an_invalid_web_assets_directory_is_refused_before_staging(self):
         base = json.loads(self.config.read_text())
