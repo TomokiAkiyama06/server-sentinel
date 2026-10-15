@@ -1549,6 +1549,12 @@ class SceneRuntimeOwnerDecisionTests(unittest.TestCase):
         self.assertIs(SceneSourceState.DEGRADED, source.state)
         self.assertEqual("source_unavailable", source.reason)
         self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN), (source.movement, source.tamper))
+        # Conclusions that are already unknown keep their own reasons.
+        with harness.runtime._lock:
+            published = harness.runtime._published[SOURCE]
+            expected = (published.movement_reason, published.tamper_reason)
+        self.assertNotIn("calibration_refresh_deferred", expected)
+        self.assertEqual(expected, (source.movement_reason, source.tamper_reason))
         for reason in ("frame_decoder_failing", "scene_evaluation_failed", "observation_stale",
                        "critical_backpressure"):
             with self.subTest(reason=reason):
@@ -1779,6 +1785,82 @@ class SceneRuntimeOwnerDecisionTests(unittest.TestCase):
             harness.runtime._submit([self._observation()])
         self.assertEqual([1], counts)
         self.assertIs(False, harness.runtime.status().undelivered_recorded)
+
+    def test_a_late_failure_during_the_stop_record_stays_reported(self):
+        # Codex P2 (#250): a late batch whose record fails while the stop
+        # total is being recorded keeps `undelivered_recorded` False.
+        observation = self._observation()
+        calls = []
+        harness = None
+
+        def sink(count):
+            calls.append(count)
+            if len(calls) == 1:
+                # An outliving worker's refusal arrives meanwhile.
+                harness.runtime._pump.submit([observation])
+                return
+            raise RuntimeError("synthetic marker write failure")
+
+        harness = Harness(undelivered=sink)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            status = harness.runtime.stop()
+        self.assertEqual([1, 1], calls)
+        self.assertIs(False, status.undelivered_recorded)
+
+    def test_a_retried_stop_hands_over_only_what_was_not_recorded(self):
+        # Codex P2 (#250): a second stop() never resends counts an earlier
+        # stop or a late batch already recorded, yet never drops a new one.
+        counts = []
+        harness = Harness(undelivered=counts.append)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        harness.runtime._contexts[SOURCE].unprocessed_loss = object()
+        harness.runtime._thread = _AliveWorker()
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            first = harness.runtime.stop()
+        self.assertEqual((1, 1), (first.critical_pending, first.losses_cleared))
+        self.assertEqual([2], counts)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime._submit([self._observation()])
+        self.assertEqual([2, 1], counts)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            again = harness.runtime.stop()
+        self.assertEqual([2, 1], counts)
+        self.assertEqual(1, again.losses_cleared)
+        # A loss lost after the first stop is still handed over.
+        with harness.runtime._lock:
+            harness.runtime._losses_failed += 1
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime.stop()
+        self.assertEqual([2, 1, 1], counts)
+
+    def test_a_retried_stop_resends_a_count_that_failed(self):
+        outcomes = [RuntimeError("synthetic marker write failure"), None]
+        counts = []
+
+        def sink(count):
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+            counts.append(count)
+
+        harness = Harness(undelivered=sink)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime.stop()
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            status = harness.runtime.stop()
+        self.assertEqual([1], counts)
+        self.assertIs(False, status.undelivered_recorded)
 
     def test_loss_taken_by_an_outliving_worker_is_counted(self):
         # Codex P2 (#250): a loss the worker already took from the slot but

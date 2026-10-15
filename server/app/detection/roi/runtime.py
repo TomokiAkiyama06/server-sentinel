@@ -513,6 +513,8 @@ class _Context:
         # not yet been handed to the detector and staged. A fault while it is
         # set means that loss is lost, and it is counted.
         self.unprocessed_loss = None
+        # The unprocessed loss `stop()` already counted in `losses_cleared`.
+        self.cleared_loss = None
 
 
 @dataclass(frozen=True)
@@ -549,6 +551,7 @@ class _CriticalPump:
         # `fence()`, which the caller's fenced count no longer includes.
         self.late = late
         self._fenced = False
+        self._fenced_refused = 0
         self._lock = threading.Lock()
         self._wake = threading.Condition(self._lock)
         self._pending = {}
@@ -609,14 +612,17 @@ class _CriticalPump:
         return True
 
     def fence(self):
-        """Return the refusals so far; every later refusal goes to `late`.
+        """Return the refusals before the first fence; later ones go to `late`.
 
         Taken under the same lock as each refusal, so a refusal is either in
         the returned count or reported through `late`, never both or neither.
+        A repeated fence (a retried `stop()`) returns the same count, because
+        the refusals after the first one were already reported.
         """
         with self._lock:
-            self._fenced = True
-            return self._refused
+            if not self._fenced:
+                self._fenced, self._fenced_refused = True, self._refused
+            return self._fenced_refused
 
     def kick(self):
         """Deliver now on an unthreaded pump; a threaded pump delivers on its
@@ -726,6 +732,8 @@ class SceneMonitoringRuntime:
         self._losses_failed = 0
         self._losses_cleared = 0
         self._undelivered_recorded = None
+        # The highest stop total already handed to the `undelivered` sink.
+        self._undelivered_handed = 0
         # Serial of the last recorder call reported as stalled.
         self._stall_logged_call = None
         # Set by `stop()` once every source is withdrawn: a worker that
@@ -845,7 +853,10 @@ class SceneMonitoringRuntime:
         with self._lock:
             if worker_alive:
                 for context in self._contexts.values():
-                    if context.unprocessed_loss is not None:
+                    loss = context.unprocessed_loss
+                    if loss is not None and loss is not context.cleared_loss:
+                        # Counted once, also across a retried `stop()`.
+                        context.cleared_loss = loss
                         # Already taken from its slot by a worker that is
                         # still running: it may never reach a detector, so it
                         # is counted (overstated if that worker later stages
@@ -877,10 +888,21 @@ class SceneMonitoringRuntime:
         refused = self._pump.fence()
         undelivered = (status.critical_pending + refused + status.losses_held
                        + status.losses_failed + status.losses_cleared)
-        if undelivered:
-            recorded = self._record_undelivered(undelivered)
+        # A retried `stop()` (for example after `stop_failed`) hands over only
+        # what an earlier stop did not: the total is compared with the highest
+        # total already recorded. Pending and held counts can only shrink by
+        # delivery after a stop, so the recorded total never falls below what
+        # is undelivered (overstated, never hidden). A failed record is not
+        # counted as handed over, so a retry sends it again.
+        delta = undelivered - self._undelivered_handed
+        if delta > 0:
+            recorded = self._record_undelivered(delta)
             with self._lock:
-                self._undelivered_recorded = recorded
+                if recorded:
+                    self._undelivered_handed = undelivered
+                # Once False (here or for a late batch), it stays False.
+                if self._undelivered_recorded is not False:
+                    self._undelivered_recorded = recorded
                 status = self._status_locked()
         if stalled:
             # Only a call that actually exceeded `recorder_stall_ns`.

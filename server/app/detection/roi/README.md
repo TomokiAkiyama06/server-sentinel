@@ -353,7 +353,9 @@ the fence is handed to the sink on its own. `undelivered_recorded` reports
 whether the sink took every count (one failure keeps it `False`); a missing or
 failing sink logs `scene_undelivered_unrecorded`. A count can be overstated (a
 loss counted in `losses_cleared` whose outliving worker later confirms evidence
-that is then refused), never hidden.
+that is then refused), never hidden. A retried `stop()` (for example after
+`stop_failed`) hands over only what no earlier stop or late batch recorded, and
+resends a count whose record failed.
 
 **Today Main passes no sink**, so the count is only logged
 (`scene_undelivered_unrecorded`) and nothing marks the stop as unclean. Once
