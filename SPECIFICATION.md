@@ -2009,9 +2009,11 @@ records the kernel boot id and `CLOCK_BOOTTIME` at issuance: on the same boot
 it is refused once the monotonic elapsed time reaches the lifetime, when that
 elapsed time is negative, and when the wall clock lags it by more than 30
 seconds (a rollback); after a reboot the wall-clock window decides, and the
-generated Main unit is ordered after `time-sync.target` so that this is a
-synchronized clock when the host enables a wait service (Issue #235 item 4,
-Owner decision 2026-10-14; `server/docs/DEPLOYMENT.md`); a row or
+generated Main unit is ordered after `time-sync.target`, so with an enabled
+wait service this is a synchronized clock unless the host fails to
+synchronize within that service's start limit (chrony-wait: 180 s), after
+which the service starts unsynchronized as before (Issue #235 item 4, Owner
+decision 2026-10-14; `server/docs/DEPLOYMENT.md`); a row or
 host without the pair is refused (fail closed). Redemption has its own
 per-source limiter keyed by the verified proxy identity (burst 5, one per 12
 seconds) and no global bucket (Owner decision 2026-10-11), charged before the

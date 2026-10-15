@@ -2004,38 +2004,43 @@ class TimeSyncOrderingTests(unittest.TestCase):
                 self.assertEqual(arguments[:2], ["systemctl", "is-enabled"], arguments)
                 self.assertEqual(len(arguments), 3, arguments)
 
-    def test_the_unit_is_ordered_after_and_wants_time_sync_target(self):
+    def test_the_unit_is_ordered_after_time_sync_target(self):
         self.perform_capturing(self.arguments("install", "1.0.0"))
         for unit in (self.unit.read_text(),
                      (self.installation / "releases/1.0.0/.server-sentinel.service").read_text()):
             lines = unit.splitlines()
             section = lines[lines.index("[Unit]"):lines.index("[Service]")]
             self.assertIn("After=time-sync.target", section)
-            self.assertIn("Wants=time-sync.target", section)
+            # Ordering only (systemd.special(7)): only the time daemons pull
+            # the target in, so the unit names it in no other directive.
+            self.assertEqual([line for line in lines if "time-sync.target" in line],
+                             ["After=time-sync.target"])
             # Existing ordering and settings are kept unchanged.
             self.assertIn("After=local-fs.target network.target", section)
             self.assertEqual([line for line in lines if line.startswith("TimeoutStop")],
                              ["TimeoutStopSec=90"])
             self.assertIn("TimeoutStartSec=60", lines)
             self.assertIn("Type=notify", lines)
-            # Only a want, never a hard requirement that would keep the
-            # service down when the target or a wait service fails.
-            self.assertFalse(any(line.startswith(("Requires=", "BindsTo=", "Requisite="))
-                                 and "time-sync" in line for line in lines))
 
     def test_no_warning_when_a_recognized_wait_service_is_enabled(self):
         for service in install.TIME_SYNC_WAIT_SERVICES:
-            for state in ("enabled", "enabled-runtime"):
-                with self.subTest(service=service, state=state):
-                    self.setUp()
-                    self.runner.wait_services = {service: state}
-                    self.assertEqual(self.perform_capturing(self.arguments("install", "1.0.0")), "")
-                    self.assert_only_queried_time_configuration()
+            with self.subTest(service=service):
+                self.setUp()
+                self.runner.wait_services = {service: "enabled"}
+                self.assertEqual(self.perform_capturing(self.arguments("install", "1.0.0")), "")
+                self.assert_only_queried_time_configuration()
 
     def test_no_enabled_wait_service_warns_without_refusing(self):
+        # PR #261 review: "enabled-runtime" lives in /run and is gone at the
+        # next boot, the moment the wait matters, so it warns like "disabled".
+        # Empty output (an older systemctl on a missing unit) is "not enabled".
         for states in ({}, {"systemd-time-wait-sync.service": "disabled"},
                        {"systemd-time-wait-sync.service": "static", "chrony-wait.service": "masked"},
-                       {"chrony-wait.service": "indirect", "ntp-wait.service": "enabled"}):
+                       {"chrony-wait.service": "indirect", "ntp-wait.service": "enabled"},
+                       {"chrony-wait.service": "enabled-runtime"},
+                       {"systemd-time-wait-sync.service": "enabled-runtime",
+                        "chrony-wait.service": "enabled-runtime"},
+                       {"chrony-wait.service": (1, "")}):
             with self.subTest(states=states):
                 self.setUp()
                 self.runner.wait_services = dict(states)
@@ -2045,8 +2050,9 @@ class TimeSyncOrderingTests(unittest.TestCase):
                 self.assertTrue(warning.startswith("ServerSentinel warning: none of "), warning)
                 for phrase in ("sudo systemctl enable systemd-time-wait-sync.service",
                                "sudo systemctl enable chrony-wait.service",
-                               "systemctl is-enabled", "changed nothing about time configuration",
-                               "Clock synchronization before start"):
+                               "systemctl is-enabled", "(expect: enabled)",
+                               "changed nothing about time configuration",
+                               "(chrony-wait: 180 s)", "Clock synchronization before start"):
                     self.assertIn(phrase, warning)
                 self.assert_only_queried_time_configuration()
                 queried = [arguments[2] for arguments in self.systemctl_calls()
@@ -2055,7 +2061,7 @@ class TimeSyncOrderingTests(unittest.TestCase):
 
     def test_an_unclear_query_warns_that_it_could_not_confirm(self):
         for unclear in (subprocess.TimeoutExpired(["systemctl"], 30), OSError("no systemctl"),
-                        (1, None)):
+                        subprocess.SubprocessError("synthetic")):
             with self.subTest(unclear=unclear):
                 self.setUp()
                 self.runner.wait_services = {"systemd-time-wait-sync.service": unclear}
@@ -2091,6 +2097,37 @@ class TimeSyncOrderingTests(unittest.TestCase):
         self.assertTrue(warning.startswith(
             "ServerSentinel warning: the active service unit is not ordered after"), warning)
 
+    def test_the_warning_follows_the_completed_switch(self):
+        # PR #261 review: the advice is printed only after the pointers moved
+        # and the service restarted, never before (or instead of) the switch.
+        seen = []
+        real_switch = install._switch
+
+        def switch(*args, **kwargs):
+            seen.append(("before", sys.stderr.getvalue()))
+            real_switch(*args, **kwargs)
+            seen.append(("after", sys.stderr.getvalue()))
+
+        self.runner.wait_services = {}
+        with patch("install._switch", side_effect=switch):
+            for arguments in (self.arguments("install", "1.0.0"),
+                              self.arguments("update", "1.1.0"), self.arguments("rollback")):
+                with self.subTest(command=arguments.command):
+                    seen.clear()
+                    warning = self.perform_capturing(arguments)
+                    self.assertEqual(seen, [("before", ""), ("after", "")])
+                    self.assertTrue(warning.startswith("ServerSentinel warning: none of "), warning)
+
+    def test_a_failed_switch_prints_no_warning(self):
+        self.runner.wait_services = {}
+        self.perform_capturing(self.arguments("install", "1.0.0"))
+        self.runner.fail_version = "1.1.0"
+        stderr = io.StringIO()
+        with patch("sys.stderr", stderr), self.assertRaises(OSError):
+            self.perform(self.arguments("update", "1.1.0"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+        self.assertEqual(stderr.getvalue(), "")
+
     def test_a_refused_operation_prints_no_warning(self):
         self.runner.wait_services = {}
         self.perform_capturing(self.arguments("install", "1.0.0"))
@@ -2113,8 +2150,8 @@ class TimeSyncOrderingTests(unittest.TestCase):
         runner = Runner(self.installation)
         runner.wait_services = {"chrony-wait.service": "enabled"}
         self.assertIsNone(install._time_sync_warning(
-            runner, "[Unit]\nAfter=time-sync.target\nWants=time-sync.target\n"))
-        for partial in ("[Unit]\nAfter=time-sync.target\n",
+            runner, "[Unit]\nAfter=time-sync.target\n"))
+        for partial in ("[Unit]\nWants=time-sync.target\n",
                         "[Unit]\n#After=time-sync.target\nWants=time-sync.target\n"):
             with self.subTest(unit=partial):
                 self.assertIn("not ordered after", install._time_sync_warning(runner, partial))

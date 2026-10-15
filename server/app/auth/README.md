@@ -850,15 +850,18 @@ ends the code earlier. After a reboot the readings are not comparable and the
 wall-clock window decides; the code itself does not detect a rollback across
 a reboot. The deployment mitigates the accidental case instead (Issue #235
 item 4, Owner decision 2026-10-14): the generated Main unit is ordered
-`After=`/`Wants=time-sync.target`, so on a host with an enabled wait service
-(`systemd-time-wait-sync.service`, `chrony-wait.service`) the service does
-not start, and decides nothing, on an unsynchronized real-time clock after a
-boot (a stale or flat RTC). It does not cover a clock set deliberately by
-root or an administrator (who can also write the database), a time source
-that answers with a wrong time (NTP spoofing, a misconfigured server), or a
-host without an enabled wait service, where the target does not wait and the
-installer only warns (`server/docs/DEPLOYMENT.md`, "Clock synchronization
-before start"). A
+`After=time-sync.target`, so on a host with an enabled wait service
+(`chrony-wait.service`, `systemd-time-wait-sync.service`) the service waits
+after a boot until the clock is synchronized or that service's own start
+limit ends (chrony-wait: `TimeoutStartSec=180`), which narrows the window in
+which it decides on a stale or flat RTC. It does not close it: when the host
+does not synchronize within the limit, the wait service fails, the target is
+still reached and the service starts on the unsynchronized clock, as before.
+It does not cover a clock set deliberately by root or an administrator (who
+can also write the database), a time source that answers with a wrong time
+(NTP spoofing, a misconfigured server), or a host without an enabled wait
+service, where the target does not wait and the installer only warns
+(`server/docs/DEPLOYMENT.md`, "Clock synchronization before start"). A
 row without the pair, or a host where it cannot be read now, is refused. Every
 refusal is the generic denial.
 
