@@ -35,9 +35,10 @@ _HELD: dict[tuple[int, int], int] = {}
 _DUPLICATES: list[int] = []
 # A serial per adopted descriptor, never reused. A holder of a descriptor
 # number (a pin) records it and later checks ``held_descriptor_is_current``:
-# a number that was closed (only by the test-only release below) and reused
-# for another adoption, even of a recreated file with the same inode, then no
-# longer matches.
+# a number that was closed (only by the test-only release below) and reused,
+# by another adoption or by any other descriptor such as a SQLite
+# connection's, even on a recreated file with the same inode, then no longer
+# matches.
 _SERIALS: dict[int, int] = {}
 _NEXT_SERIAL = itertools.count(1)
 _HOLD_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY | os.O_NONBLOCK
@@ -107,29 +108,21 @@ def read_database_prefix(path: Path, size: int) -> bytes | None:
         raise ValueError("database location is unavailable") from None
 
 
-def hold_database_file(path: Path) -> tuple[int, tuple[int, int]]:
-    """The process-held read descriptor and identity of the file at ``path``.
+def hold_database_file(path: Path) -> tuple[int, tuple[int, int], int]:
+    """The process-held read descriptor, identity and serial of ``path``'s file.
 
     For callers outside this module that must pin an existing database file
     (the pairing CLI's ledger). The descriptor belongs to the process-wide
     holder above: callers must never close it, and it stays open after their
-    use ends. Raises ``FileNotFoundError`` for a missing file and
-    ``ValueError`` for anything else unusable; nothing is ever created.
+    use ends. The serial is the descriptor's adoption serial, taken under the
+    same lock as the descriptor (as ``_hold_file`` does), so it can never be
+    the serial of a later adoption that reused the number. Raises
+    ``FileNotFoundError`` for a missing file and ``ValueError`` for anything
+    else unusable; nothing is ever created.
     """
     with _HELD_LOCK:
-        return _hold_locked(path)
-
-
-def held_descriptor_serial(descriptor: int) -> int:
-    """The adoption serial of a descriptor the process-wide holder keeps.
-
-    Raises ``ValueError`` if the holder does not keep ``descriptor``.
-    """
-    with _HELD_LOCK:
-        serial = _SERIALS.get(descriptor)
-    if serial is None:
-        raise ValueError("database location is unavailable")
-    return serial
+        descriptor, identity = _hold_locked(path)
+        return descriptor, identity, _SERIALS[descriptor]
 
 
 def held_descriptor_is_current(descriptor: int, serial: int) -> bool:

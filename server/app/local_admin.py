@@ -27,8 +27,7 @@ import threading
 from urllib.parse import quote
 
 from app.storage.database import (
-    Database, held_descriptor_is_current, held_descriptor_serial, held_descriptors,
-    hold_database_file,
+    Database, held_descriptor_is_current, held_descriptors, hold_database_file,
 )
 from app.storage.schema import APPLICATION_MIGRATIONS
 
@@ -304,15 +303,14 @@ def _existing_database(database_path: Path) -> _PinnedLedgerDatabase:
     # closed, not even when the file is refused below, because closing a
     # descriptor on a database file drops this process's SQLite locks on it.
     try:
-        descriptor, identity = hold_database_file(database_path)
+        descriptor, identity, serial = hold_database_file(database_path)
     except FileNotFoundError:
         raise CliRefused("database_not_found") from None
     except ValueError:
         raise CliRefused("database_rejected") from None
     try:
-        serial = held_descriptor_serial(descriptor)
         info = os.fstat(descriptor)
-    except (OSError, ValueError):
+    except OSError:
         raise CliRefused("database_rejected") from None
     if not _safe_database_file(info) or (info.st_dev, info.st_ino) != identity:
         raise CliRefused("database_rejected")
