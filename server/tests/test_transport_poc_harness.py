@@ -623,7 +623,7 @@ class SummarizerTests(unittest.TestCase):
                       {"kind": "impairment_end", "t_ns": 15 * second, "impairment": "blackhole",
                        "duration_ns": 5 * second, "rate_bytes": 0}]
         events = [{"kind": "start", "t_ns": 0, "loss_timeout_ns": 2 * second},
-                  {"kind": "loss_detected", "last_echo_ns": None,
+                  {"kind": "loss_detected", "last_echo_ns": None, "echo_frames": 0,
                    "t_ns": 12 * second, "source": 0, "idle_ns": 1,
                    "last_committed_capture_ns": 10 * second},
                   {"kind": "closed", "t_ns": 12 * second, "reason": "loss_timeout"},
@@ -666,7 +666,7 @@ class SummarizerTests(unittest.TestCase):
                 self.run_dir(name, orchestrator=orchestrator, receiver=receiver,
                              sender_rows=sender_rows + [start])
                 self.assertEqual("fail", self.report()[scenario]["g5"])
-                loss = {"kind": "loss_detected", "last_echo_ns": None,
+                loss = {"kind": "loss_detected", "last_echo_ns": None, "echo_frames": 0,
                         "t_ns": 15 * second, "source": 0,
                         "idle_ns": 5 * second, "connection": 1, "session": 11,
                         "last_committed_capture_ns": 9 * second}
@@ -927,7 +927,7 @@ class SummarizerTests(unittest.TestCase):
                       {"kind": "impairment_end", "t_ns": 13 * second, "impairment": "blackhole",
                        "duration_ns": 3 * second, "rate_bytes": 0}]
         events = [{"kind": "start", "t_ns": 0, "loss_timeout_ns": int(1.5 * second)},
-                  {"kind": "loss_detected", "last_echo_ns": None,
+                  {"kind": "loss_detected", "last_echo_ns": None, "echo_frames": 0,
                    "t_ns": 12 * second, "source": 0, "idle_ns": 1,
                    "last_committed_capture_ns": 10 * second},
                   {"kind": "closed", "t_ns": 12 * second, "reason": "loss_timeout"},
@@ -1005,7 +1005,7 @@ class SummarizerTests(unittest.TestCase):
         start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": 5 * second}
         # Agent-clock loss far outside the Main-clock window: fine on two hosts
         # (the lost connection was live at the stop on the Main clock)
-        loss = {"kind": "loss_detected", "last_echo_ns": None, "t_ns": 900 * second, "source": 0,
+        loss = {"kind": "loss_detected", "last_echo_ns": None, "echo_frames": 0, "t_ns": 900 * second, "source": 0,
                 "idle_ns": 5 * second, "connection": 1, "session": 11,
                 "last_committed_capture_ns": 1}
         self.run_dir("slow_stop_10s-a_framed", orchestrator=main,
@@ -1572,7 +1572,7 @@ class SummarizerTests(unittest.TestCase):
                        "duration_ns": 3 * second, "rate_bytes": 0}]
         events = [{"kind": "start", "t_ns": 0, "n_sources": 1,
                    "loss_timeout_ns": int(1.5 * second)},
-                  {"kind": "loss_detected", "last_echo_ns": None,
+                  {"kind": "loss_detected", "last_echo_ns": None, "echo_frames": 0,
                    "t_ns": 12 * second, "source": 0, "idle_ns": 1,
                    "last_committed_capture_ns": 10 * second},
                   {"kind": "closed", "t_ns": 12 * second, "reason": "loss_timeout"},
@@ -1668,7 +1668,7 @@ class SummarizerTests(unittest.TestCase):
         # Agent clock: the stopping receiver drops the live connection (11),
         # then accepts one more connection (12) and drops it in _finish, then
         # the new receiver accepts (13)
-        lost = {"kind": "loss_detected", "last_echo_ns": None,
+        lost = {"kind": "loss_detected", "last_echo_ns": None, "echo_frames": 0,
                 "t_ns": 500 * second, "source": 0, "idle_ns": 1,
                 "connection": 1, "session": 11, "last_committed_capture_ns": 1}
         burst = [{"kind": "closed", "t_ns": 500 * second, "reason": "peer_closed",
@@ -1707,7 +1707,7 @@ class SummarizerTests(unittest.TestCase):
                             "impairment": "reset", "duration_ns": 0, "rate_bytes": 0},
                            {"kind": "impairment_end", "t_ns": at * second,
                             "impairment": "reset", "duration_ns": 0, "rate_bytes": 0}]
-        losses = [{"kind": "loss_detected", "last_echo_ns": None,
+        losses = [{"kind": "loss_detected", "last_echo_ns": None, "echo_frames": 0,
                    "t_ns": at * second + 1, "source": 0, "idle_ns": 1,
                    "connection": index, "last_committed_capture_ns": 1}
                   for index, at in enumerate((10, 12), 1)]
@@ -1736,7 +1736,7 @@ class SummarizerTests(unittest.TestCase):
         start = {"kind": "start", "t_ns": 0, "n_sources": 2, "loss_timeout_ns": 2 * second}
 
         def loss(at, connection, source):
-            return {"kind": "loss_detected", "last_echo_ns": None,
+            return {"kind": "loss_detected", "last_echo_ns": None, "echo_frames": 0,
                     "t_ns": at, "source": source, "idle_ns": 1,
                     "connection": connection, "last_committed_capture_ns": 1}
 
@@ -1939,7 +1939,7 @@ class SummarizerTests(unittest.TestCase):
                 {"kind": "action", "t_ns": 10 * second, "action": "sigstop", "duration_ns": 0},
                 {"kind": "action", "t_ns": 20 * second, "action": "sigcont", "duration_ns": 0}]
         start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": 5 * second}
-        loss = {"kind": "loss_detected", "last_echo_ns": None, "t_ns": 900 * second, "source": 0,
+        loss = {"kind": "loss_detected", "last_echo_ns": None, "echo_frames": 0, "t_ns": 900 * second, "source": 0,
                 "idle_ns": 5 * second, "connection": 1, "session": 11,
                 "last_committed_capture_ns": 1}
         name = "slow_stop_10s-a_framed"
@@ -2032,7 +2032,7 @@ class SummarizerTests(unittest.TestCase):
                      "duration_ns": length, "rate_bytes": 0}]
 
         def loss(at, connection):
-            return {"kind": "loss_detected", "last_echo_ns": None,
+            return {"kind": "loss_detected", "last_echo_ns": None, "echo_frames": 0,
                     "t_ns": at, "source": 0, "idle_ns": 1,
                     "connection": connection, "last_committed_capture_ns": 1}
 
@@ -2128,7 +2128,7 @@ class SummarizerTests(unittest.TestCase):
                          "loss_timeout_ns": second // 2}
 
                 def lost(at, session, connection):
-                    return [{"kind": "loss_detected", "last_echo_ns": None,
+                    return [{"kind": "loss_detected", "last_echo_ns": None, "echo_frames": 0,
                              "t_ns": at * second, "source": 0,
                              "idle_ns": 2 * second, "connection": connection,
                              "session": session, "last_committed_capture_ns": 1},
@@ -2193,13 +2193,16 @@ class SummarizerTests(unittest.TestCase):
                 start = {"kind": "start", "t_ns": 0, "n_sources": 1,
                          "loss_timeout_ns": second // 2}
 
-                def lost(at, echo):
-                    # Agent clock (unrelated offset); echo: an Agent clock value
+                def lost(at, echo, frames=0):
+                    # Agent clock (unrelated offset); echo: an Agent clock value;
+                    # frames: heartbeat_ack frames the Agent received on 11
                     return [{"kind": "loss_detected", "t_ns": at * second, "source": 0,
                              "idle_ns": 2 * second, "connection": 1, "session": 11,
-                             "last_echo_ns": echo, "last_committed_capture_ns": 1},
+                             "last_echo_ns": echo, "echo_frames": frames,
+                             "last_committed_capture_ns": 1},
                             {"kind": "closed", "t_ns": at * second, "reason": "peer_closed",
-                             "connection": 1, "session": 11, "last_echo_ns": echo},
+                             "connection": 1, "session": 11, "last_echo_ns": echo,
+                             "echo_frames": frames},
                             {"kind": "connected", "t_ns": (at + 1) * second,
                              "connection": 2, "session": 12},
                             {"kind": "first_accept", "t_ns": (at + 2) * second,
@@ -2219,9 +2222,18 @@ class SummarizerTests(unittest.TestCase):
                     # after 11 closed); G4 adds 1 s connected -> accept
                     greeted = close_s + 1 if greeted is None else greeted
                     sessions = (_session(11, 1, close_s, 1) + _session(12, greeted, 90, 2))
+                    # Main numbers each session's frames in write order; the
+                    # Agent received them up to the one carrying its last echo
+                    # (5 when that frame is not on record)
+                    counts, numbered = {}, []
+                    for item in replies:
+                        counts[item["session"]] = counts.get(item["session"], 0) + 1
+                        numbered.append({**item, "index": counts[item["session"]]})
+                    frames = next((item["index"] for item in numbered if item["session"] == 11
+                                   and item["echo_ns"] == echo), 5)
                     self.run_dir(name, orchestrator=orchestrator, two_host=True,
-                                 receiver=receiver + self._durable(1) + sessions + replies,
-                                 sender_rows=[start] + sender_rows + lost(200, echo))
+                                 receiver=receiver + self._durable(1) + sessions + numbered,
+                                 sender_rows=[start] + sender_rows + lost(200, echo, frames))
                     row = self.report()[scenario]
                     for path in (self.root / name).iterdir():
                         path.unlink()
@@ -2289,7 +2301,7 @@ class SummarizerTests(unittest.TestCase):
             agent = [start] + sender_rows + [
                 {"kind": "loss_detected", "t_ns": 205 * second, "source": 0,
                  "idle_ns": 5 * second, "connection": 1, "session": 11,
-                 "last_echo_ns": None, "last_committed_capture_ns": 1},
+                 "last_echo_ns": None, "echo_frames": 0, "last_committed_capture_ns": 1},
                 {"kind": "closed", "t_ns": 205 * second, "reason": "loss_timeout",
                  "connection": 1, "session": 11, "last_echo_ns": None},
                 {"kind": "first_accept", "t_ns": accepted_ms * 10**6, "connection": 2,
@@ -2349,16 +2361,18 @@ class SummarizerTests(unittest.TestCase):
                 agent = [start] + sender_rows + [
                     {"kind": "loss_detected", "t_ns": 200 * second, "source": 0,
                      "idle_ns": 2 * second, "connection": 1, "session": 11,
-                     "last_echo_ns": 109 * second, "last_committed_capture_ns": 1},
+                     "last_echo_ns": 109 * second, "echo_frames": 6,
+                     "last_committed_capture_ns": 1},
                     {"kind": "closed", "t_ns": 200 * second, "reason": "peer_closed",
-                     "connection": 1, "session": 11, "last_echo_ns": 109 * second},
+                     "connection": 1, "session": 11, "last_echo_ns": 109 * second,
+                     "echo_frames": 6},
                     {"kind": "connected", "t_ns": 201 * second, "connection": 2,
                      "session": 12},
                     {"kind": "first_accept", "t_ns": 202 * second, "connection": 2,
                      "source": 0, "session": 12}]
                 before = [{"kind": "heartbeat_ack", "t_ns": at * second, "sent_ns": at * second,
-                           "connection": 1, "session": 11, "echo_ns": (100 + at) * second}
-                          for at in range(4, 9)]
+                           "connection": 1, "session": 11, "echo_ns": (100 + at) * second,
+                           "index": at - 3} for at in range(4, 9)]
 
                 def check(extra_main, sent_ms, expected, *, extra_orchestrator=(),
                           record_ms=None):
@@ -2366,7 +2380,7 @@ class SummarizerTests(unittest.TestCase):
                     # (Main clock); its record may be written later
                     last = {"kind": "heartbeat_ack", "t_ns": (record_ms or sent_ms) * ms,
                             "sent_ns": sent_ms * ms, "connection": 1, "session": 11,
-                            "echo_ns": 109 * second}
+                            "echo_ns": 109 * second, "index": 6}
                     main = (receiver + self._durable(1) + _session(11, 1, end + 1, 1)
                             + _session(12, end + 1, 90, 2) + before + [last]
                             + list(extra_main))
@@ -2422,19 +2436,24 @@ class SummarizerTests(unittest.TestCase):
                    "connection": 1, "session": 11, "echo_ns": echo}
             return row if index is None else {**row, "index": index}
 
-        def run(frames, *, numbered=True, repeat_index=6):
+        def run(frames, *, numbered=True, repeat_index=6, last_echo=108 * second,
+                more=None, repeat=True):
             # replies 1..5 before the stop echo Agent heartbeats 104..108; the
             # repeat of 108 is written at SIGCONT (20 s), after the cutoff
             replies = [ack(at, (100 + at) * second, (at - 3) if numbered else None)
                        for at in range(4, 9)]
-            replies.append(ack(20, 108 * second, repeat_index if numbered else None))
+            if repeat:
+                replies.append(ack(20, 108 * second, repeat_index if numbered else None))
             counted = {} if frames is None else {"echo_frames": frames}
-            agent = [start] + sender_rows + [
-                {"kind": "loss_detected", "t_ns": 200 * second, "source": 0,
-                 "idle_ns": 2 * second, "connection": 1, "session": 11,
-                 "last_echo_ns": 108 * second, "last_committed_capture_ns": 1, **counted},
+            loss = {"kind": "loss_detected", "t_ns": 200 * second, "source": 0,
+                    "idle_ns": 2 * second, "connection": 1, "session": 11,
+                    "last_echo_ns": last_echo, "last_committed_capture_ns": 1, **counted}
+            # ``more``: a second loss record of the same connection (one is
+            # written per source) carrying another count
+            extra = [] if more is None else [{**loss, "echo_frames": more}]
+            agent = [start] + sender_rows + [loss] + extra + [
                 {"kind": "closed", "t_ns": 200 * second, "reason": "peer_closed",
-                 "connection": 1, "session": 11, "last_echo_ns": 108 * second, **counted},
+                 "connection": 1, "session": 11, "last_echo_ns": last_echo, **counted},
                 {"kind": "connected", "t_ns": 201 * second, "connection": 2, "session": 12},
                 {"kind": "first_accept", "t_ns": 202 * second, "connection": 2,
                  "source": 0, "session": 12}]
@@ -2455,10 +2474,29 @@ class SummarizerTests(unittest.TestCase):
         # the Agent counts a frame Main has no record of: unmeasured
         self.assertEqual(("unmeasured", "unmeasured"), run(7))
         self.assertEqual(("unmeasured", "unmeasured"), run(6, repeat_index=7))
-        # without the numbering the echo value decides, conservatively: the
-        # repeat's value equals the Agent's last echo, so never a pass
-        self.assertEqual(("fail", "fail"), run(None))
-        self.assertEqual(("fail", "fail"), run(5, numbered=False))
+        # #222-era records without the numbering (either side): unmeasured,
+        # never judged by echo values
+        self.assertEqual(("unmeasured", "unmeasured"), run(None))
+        self.assertEqual(("unmeasured", "unmeasured"), run(5, numbered=False))
+        # the false-PASS lean the old echo-value rule had: a session kept
+        # alive after SIGCONT by media acknowledgements alone shows no echo
+        # after the cutoff, so that rule would pass it; unmeasured instead
+        self.assertEqual(("unmeasured", "unmeasured"),
+                         run(5, numbered=False, repeat=False))
+        self.assertEqual(("pass", "pass"), run(5, repeat=False))
+        # an ``echo_frames`` that is negative or not an integer: unmeasured
+        for bad in (-1, 5.5, True, None):  # (free strings never load at all)
+            with self.subTest(echo_frames=bad):
+                self.assertEqual(("unmeasured", "unmeasured"), run(bad))
+        # the Agent's last echo is not the largest echo of frames 1..k
+        self.assertEqual(("unmeasured", "unmeasured"), run(5, last_echo=107 * second))
+        self.assertEqual(("unmeasured", "unmeasured"), run(5, last_echo=None))
+        self.assertEqual(("unmeasured", "unmeasured"), run(0))  # k=0 but an echo
+        # loss records of one connection with different counts: the largest
+        # is what the Agent received (a smaller one never hides the repeat)
+        self.assertEqual(("fail", "fail"), run(5, more=6))
+        self.assertEqual(("fail", "fail"), run(6, more=5))
+        self.assertEqual(("pass", "pass"), run(5, more=5))
 
 
 def second_ns(value):
@@ -2476,6 +2514,36 @@ class SenderProducerTests(unittest.TestCase):
         with socket.socket() as probe:  # a closed loopback port: Main unreachable
             probe.bind(("127.0.0.1", 0))
             self.port = probe.getsockname()[1]
+
+    def test_echo_frames_count_reset_and_record(self):
+        # #237: the Agent counts every heartbeat_ack frame it parses on a
+        # connection (even a repeated, older echo), restarts the count on a
+        # new connection, and records it with each loss and close.
+        config = sender.SenderConfig(candidate="a_framed", host="127.0.0.1", port=self.port,
+                                     n_sources=2, fast=True)
+        out = self.root / "echo.jsonl"
+        writer = records.JsonlWriter(out, run_id=RUN, role="sender")
+        instance = sender.Sender(config, self.root / "m" / "nodes" / "good", 1, writer)
+        self.addCleanup(instance.wake_r.close)
+        self.addCleanup(instance.wake_w.close)
+        self.assertEqual((0, None), (instance.echo_frames, instance.last_echo_ns))
+        for echo in (5, 9, 9, 7):  # a repeat (9) and an older value (7) count too
+            instance._inbound(wire.FrameReader(64).feed(wire.heartbeat_ack_frame(echo))[0])
+        self.assertEqual((4, 9), (instance.echo_frames, instance.last_echo_ns))
+        instance._loss(123)
+        connection = mock.Mock()
+        with mock.patch("media_capture_agent.node_tls.connect_to_main",
+                        return_value=connection):
+            self.assertIs(connection, instance._connect())
+        self.assertEqual((0, None), (instance.echo_frames, instance.last_echo_ns))
+        instance._echo(11)
+        instance._loss(456)
+        writer.close()
+        losses = [(row["source"], row["echo_frames"], row["last_echo_ns"])
+                  for row in records.read_jsonl(out) if row["kind"] == "loss_detected"]
+        self.assertEqual([(0, 4, 9), (1, 4, 9), (0, 1, 11), (1, 1, 11)], losses)
+        # ``closed`` (written by ``run``) is checked on real records in
+        # LoopbackMatrixTests.test_two_host_roles_on_loopback
 
     def run_sender(self, source_kind, seconds=6.0, **config):
         config = sender.SenderConfig(candidate="a_framed", host="127.0.0.1", port=self.port,
@@ -2786,6 +2854,27 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
         self.assertLess(time.monotonic() - began, 1.0)
         self.assertTrue(nested.stop_coordinated)
 
+    def test_heartbeat_replies_come_first_for_mixed_bodies(self):
+        # #237: whatever the body order, the heartbeat replies lead the write
+        # (in body order), then the media acknowledgements (in body order).
+        log = []
+        instance = self._receiver("a_framed", log)
+        instance.counts, instance.last_rx_ns = {}, {}
+        instance.tracker.receive.return_value = mock.Mock(
+            outcome=mock.Mock(value="accepted"), reason=None)
+        source = uuid4()
+        stream = (wire.hello_frame(5)
+                  + wire.media_frame(source, 1, 0, 1000, b"a") + wire.heartbeat_frame(7)
+                  + wire.media_frame(source, 1, 1, 2000, b"b") + wire.heartbeat_frame(8))
+        bodies = wire.FrameReader(1024).feed(stream)
+        state = {"connection": 1, "session": None}
+        reply, echoes = instance._handle_bodies(bodies, object(), state)
+        expected = (wire.heartbeat_ack_frame(7) + wire.heartbeat_ack_frame(8)
+                    + wire.ack_frame(source, 1, 0, "accepted", "none")
+                    + wire.ack_frame(source, 1, 1, "accepted", "none"))
+        self.assertEqual((expected, [7, 8]), (reply, echoes))
+        self.assertEqual(8, state["echo"])
+
     def test_first_reply_after_a_pause_repeats_the_latest_echo(self):
         # #237: a reply holding only media acknowledgements (the Agent's
         # heartbeat still queued behind its backlog) after a pause carries the
@@ -3079,9 +3168,20 @@ class LoopbackMatrixTests(unittest.TestCase):
         stops = [(item["abrupt"], item["coordinated"]) for item in records.read_jsonl(
             Path(outs["main"]) / name / "receiver.jsonl") if item["kind"] == "stopping"]
         self.assertIn((True, True), stops)
-        connected = [item for item in records.read_jsonl(
-            Path(outs["agent"]) / name / "sender.jsonl") if item["kind"] == "connected"]
+        agent = records.read_jsonl(Path(outs["agent"]) / name / "sender.jsonl")
+        connected = [item for item in agent if item["kind"] == "connected"]
         self.assertGreaterEqual(len(connected), 2)
+        # every loss / close carries the received heartbeat_ack frame count,
+        # and the Main side numbered its heartbeat replies
+        counted = [item for item in agent if item["kind"] in ("loss_detected", "closed")]
+        self.assertTrue(counted)
+        for item in counted:
+            self.assertTrue(isinstance(item.get("echo_frames"), int)
+                            and item["echo_frames"] >= 0, item)
+        self.assertTrue(any(item["echo_frames"] > 0 for item in counted))
+        acks = [item for item in records.read_jsonl(Path(outs["main"]) / name / "receiver.jsonl")
+                if item["kind"] == "heartbeat_ack"]
+        self.assertTrue(acks and all(isinstance(item.get("index"), int) for item in acks))
         # one Main-side tree alone is incomplete, never a pass
         alone = summarize.summarize([outs["main"]])["runs"][0]
         self.assertEqual("unmeasured", alone["integrity"])
