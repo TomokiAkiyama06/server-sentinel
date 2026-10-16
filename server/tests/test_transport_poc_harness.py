@@ -24,12 +24,43 @@ from uuid import uuid4
 
 HARNESS = Path(__file__).resolve().parents[2] / "scripts" / "manual"
 AGENT = Path(__file__).resolve().parents[2] / "agent"
-for path in (str(HARNESS), str(AGENT)):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+_PATHS = (str(HARNESS), str(AGENT))
 
-from transport_poc import (holder, materials, matrix, proxy, receiver,  # noqa: E402
-                           records, sender, summarize, wire)
+
+def _add_paths():
+    """Put the harness and the agent first on ``sys.path``; return what was added."""
+    added = []
+    for path in _PATHS:
+        if path not in sys.path:
+            sys.path.insert(0, path)
+            added.append(path)
+    return added
+
+
+def _remove_paths(added):
+    for path in added:
+        while path in sys.path:
+            sys.path.remove(path)
+
+
+# Issue #284: discovery imports every test module before any test runs, so a
+# path left on ``sys.path`` here reaches every later test in the process. The
+# agent tree has its own ``tests`` package; with it first on the path, a
+# process spawned by another module (the isolated detector worker receives
+# the parent's ``sys.path``) resolves ``tests`` to the agent's package and
+# cannot import its ``tests.*`` factory. The paths are present only while this
+# module imports the harness and while its own tests run (``setUpModule``).
+_IMPORT_PATHS = _add_paths()
+try:
+    from transport_poc import (holder, materials, matrix, proxy, receiver,  # noqa: E402
+                               records, sender, summarize, wire)
+finally:
+    _remove_paths(_IMPORT_PATHS)
+
+
+def setUpModule():
+    # The harness imports media_capture_agent lazily while the tests run.
+    unittest.addModuleCleanup(_remove_paths, _add_paths())
 
 RUN = "r20261011t000000ab"
 

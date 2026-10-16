@@ -57,6 +57,13 @@ class IsolatedDetectorTests(unittest.TestCase):
     def assertUnknown(self, result, reason):
         self.assertEqual(Detection(Observation.UNKNOWN, reason), result)
 
+    def assertStarted(self, detector):
+        # A worker that never started is a failure with its status, not an
+        # AttributeError on the missing process handle (Issue #284).
+        status = detector.maintain()
+        self.assertEqual("running", status.state, status)
+        self.assertIsNotNone(detector._process)
+
     def test_evaluation_runs_in_child_and_returns_validated_result(self):
         detector = self.detector(spec())
         self.assertEqual("running", detector.maintain().state)
@@ -76,7 +83,7 @@ class IsolatedDetectorTests(unittest.TestCase):
 
     def test_hanging_plugin_is_killed_and_reported_unknown(self):
         detector = self.detector(spec("hang"))
-        detector.maintain()
+        self.assertStarted(detector)
         pid = detector._process.pid
         started = time.monotonic()
         self.assertUnknown(detector.evaluate(frame()), Reason.WORKER_TIMEOUT)
@@ -106,7 +113,7 @@ class IsolatedDetectorTests(unittest.TestCase):
 
     def test_idle_crash_is_detected_by_maintain(self):
         detector = self.detector(spec())
-        detector.maintain()
+        self.assertStarted(detector)
         detector._process.kill()
         detector._process.join(5)
         status = detector.maintain()
@@ -115,7 +122,7 @@ class IsolatedDetectorTests(unittest.TestCase):
 
     def test_idle_crash_is_never_replaced_in_the_same_maintain_call(self):
         detector = self.detector(spec(), restart_backoff_ns=1)
-        detector.maintain()
+        self.assertStarted(detector)
         detector._process.kill()
         detector._process.join(5)
         # Even when the backoff has already elapsed, the caller observes the
