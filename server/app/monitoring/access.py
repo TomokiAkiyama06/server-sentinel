@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID, uuid4, uuid5
 
 from app.notifications.service import NotificationKind, NotificationService
+from app.notifications.slack import DeliveryResult
 
 if TYPE_CHECKING:
     from app.auth.human_surface import HumanAccess
@@ -125,6 +126,9 @@ class AccessFaultMonitor:
         self._reasons_unknown = False
         self._unreported_fault = False
         self._sent: deque[float] = deque()
+        # A notification the service refused (``FAILED``), by kind: retried
+        # with the same time and event ID until accepted (Codex PR #271).
+        self._attempts: dict[NotificationKind, tuple[datetime, UUID]] = {}
         self._findings_pending = 0
         self._finding_sent_at: float | None = None
         self._finding_seen_at: float | None = None
@@ -252,11 +256,26 @@ class AccessFaultMonitor:
         return len(self._sent) < self.access_budget
 
     def _notify(self, notifications: NotificationService, kind: NotificationKind,
-                at: datetime) -> None:
-        # Any result is final here: a refused local write is retained and
-        # retried by the service itself, and a failed delivery stays visible
-        # (``delivery_failed``) without an automatic network resend.
-        notifications.record(kind, at=at, event_id=self._event_id(kind))
+                at: datetime, event_id: UUID | None = None) -> bool:
+        """Hand one notification to the service; ``True`` once it accepted it.
+
+        ``FAILED`` means the service kept nothing (its queue was full or
+        closed, or a refused local write found its retry buffer full): the
+        transition stays pending and the next drain retries the same time
+        and event ID, so a retry upserts one row instead of adding rows. Any
+        other result is final: a refused local write is retained and retried
+        by the service itself, and a failed network delivery stays visible
+        (``delivery_failed``) without an automatic resend.
+        """
+        attempt = self._attempts.get(kind)
+        if attempt is None or (event_id is not None and event_id != attempt[1]):
+            attempt = (at, event_id or self._event_id(kind))
+        result = notifications.record(kind, at=attempt[0], event_id=attempt[1])
+        if result == DeliveryResult.FAILED:
+            self._attempts[kind] = attempt
+            return False
+        self._attempts.pop(kind, None)
+        return True
 
     def drain(self, notifications: NotificationService, *, at: datetime,
               monotonic: float, finding_event_id=None) -> AccessFaultStatus:
@@ -304,22 +323,22 @@ class AccessFaultMonitor:
     def _access_notifications(self, notifications, at, now) -> None:
         if self._unreported_fault and self._notified is not AccessHealth.FAULT:
             # Into a fault, also one that already ended unreported.
-            if self._budget_available(now):
-                self._notify(notifications, NotificationKind.HUMAN_ACCESS_FAULT, at)
+            if (self._budget_available(now)
+                    and self._notify(notifications, NotificationKind.HUMAN_ACCESS_FAULT, at)):
                 self._record_sent(now)
                 self._notified = AccessHealth.FAULT
                 self._unreported_fault = False
                 self._new_reasons = False
             return
         if self._current is AccessHealth.FAULT and self._new_reasons:
-            if self._budget_available(now):
-                self._notify(notifications, NotificationKind.HUMAN_ACCESS_FAULT, at)
+            if (self._budget_available(now)
+                    and self._notify(notifications, NotificationKind.HUMAN_ACCESS_FAULT, at)):
                 self._record_sent(now)
                 self._new_reasons = False
             return
         if self._current is AccessHealth.HEALTHY and self._notified is AccessHealth.FAULT:
-            if self._budget_available(now):
-                self._notify(notifications, NotificationKind.HUMAN_ACCESS_RECOVERED, at)
+            if (self._budget_available(now)
+                    and self._notify(notifications, NotificationKind.HUMAN_ACCESS_RECOVERED, at)):
                 self._record_sent(now)
                 self._notified = AccessHealth.HEALTHY
 
@@ -339,9 +358,9 @@ class AccessFaultMonitor:
                     event_id = finding_event_id()
                 except Exception:
                     event_id = None
-            kind = NotificationKind.CREDENTIAL_FINDING
-            notifications.record(kind, at=at, event_id=event_id if isinstance(event_id, UUID)
-                                 else self._event_id(kind))
+            if not self._notify(notifications, NotificationKind.CREDENTIAL_FINDING, at,
+                                event_id if isinstance(event_id, UUID) else None):
+                return
             self._finding_sent_at = now if math.isfinite(now) else None
             self._findings_pending = 0
 

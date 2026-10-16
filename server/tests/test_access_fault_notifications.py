@@ -418,6 +418,34 @@ class MonitorValidationTests(TestCase):
         self.assertTrue(status.human_access_degraded)
         self.assertTrue(status.credential_finding_degraded)
 
+    def test_a_refused_notification_is_retried_with_the_same_event(self):
+        """Codex PR #271: ``FAILED`` means the service kept nothing."""
+        from app.notifications.slack import DeliveryResult
+
+        class Refusing(RecordingNotifications):
+            def __init__(self):
+                super().__init__()
+                self.refuse = 2
+
+            def record(self, kind, **values):
+                super().record(kind, **values)
+                if self.refuse:
+                    self.refuse -= 1
+                    return DeliveryResult.FAILED
+                return DeliveryResult.PENDING
+
+        monitor = AccessFaultMonitor()
+        notifications = Refusing()
+        monitor.emit(ReservationFault((Reason.UNEXPECTED_LISTENER,), CheckKind.STARTUP, NOW, 1, 0))
+        for step in range(3):
+            monitor.drain(notifications, at=AT + timedelta(minutes=step), monotonic=1.0 + step)
+        monitor.drain(notifications, at=AT + timedelta(minutes=5), monotonic=10.0)
+        self.assertEqual(notifications.kinds, [FAULT, FAULT, FAULT])
+        self.assertEqual(len({call["event_id"] for call in notifications.calls}), 1)
+        self.assertEqual({call["at"] for call in notifications.calls}, {AT})
+        # Refusals spent no budget: the accepted send was the first counted one.
+        self.assertEqual(len(monitor._sent), 1)
+
     def test_without_a_composition_an_emitted_fault_still_notifies(self):
         monitor = AccessFaultMonitor()
         notifications = RecordingNotifications()
@@ -579,9 +607,10 @@ class FindingRecoveryTests(RuntimeFixture):
         await self.cycle()
         self.audit_finding(self.clock.now - timedelta(minutes=10))
         with closing(sqlite3.connect(self.settings.database_path)) as db:
-            (rowid,) = db.execute("SELECT MAX(rowid) FROM security_admin_audit_records").fetchone()
+            (audit_id,) = db.execute(
+                "SELECT id FROM security_admin_audit_records ORDER BY rowid DESC LIMIT 1").fetchone()
             db.execute("INSERT INTO notification_events VALUES (?, 'credential_finding', ?, 0, 'pending')",
-                       (str(uuid5(EVENT_NAMESPACE, f"credential-finding-through:{rowid}")),
+                       (str(uuid5(EVENT_NAMESPACE, f"credential-finding-through:{audit_id}")),
                         (self.clock.now - timedelta(minutes=9)).isoformat()))
             db.commit()
         status = await self.cycle()
@@ -628,6 +657,24 @@ class FindingRecoveryTests(RuntimeFixture):
         status = await self.cycle()
         self.assertEqual(self.finding_texts(), 2)
         self.assertTrue(status.credential_finding_degraded)
+
+    async def test_a_reused_rowid_does_not_hide_a_new_finding(self):
+        """Codex PR #271: an emptied audit table reuses rowids; the event is
+        named after the record's immutable id instead."""
+        await self.cycle()
+        self.audit_finding(self.clock.now - timedelta(hours=1))
+        await self.cycle()
+        self.assertEqual(self.finding_texts(), 1)
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            db.execute("DELETE FROM security_admin_audit_records")
+            db.commit()
+        self.audit_finding(self.clock.now - timedelta(minutes=30))
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            (rowid,) = db.execute("SELECT MAX(rowid) FROM security_admin_audit_records").fetchone()
+        self.assertEqual(rowid, 1)
+        self.clock.advance(timedelta(minutes=5))
+        await self.cycle()
+        self.assertEqual(self.finding_texts(), 2)
 
     async def test_a_live_notification_is_not_repeated_after_restart(self):
         monitor = AccessFaultMonitor()

@@ -650,13 +650,14 @@ class MonitoringRuntime:
         self._set(human_access_degraded=status.human_access_degraded,
                   credential_finding_degraded=status.credential_finding_degraded)
 
-    def _latest_finding(self, *, since: datetime | None = None) -> tuple[int, int] | None:
-        """``(rowid, occurred_at_us)`` of the newest finding audit record.
+    def _latest_finding(self, *, since: datetime | None = None) -> tuple[str, int] | None:
+        """``(id, occurred_at_us)`` of the newest finding audit record.
 
-        The audit table's rowid only grows while its newest row exists
-        (retention removes the oldest), so it orders findings without
-        trusting the wall clock (Codex PR #271). ``None`` without a finding
-        or without an audit table.
+        The newest is the highest rowid: SQLite gives each insert a rowid
+        above every existing row, so it orders findings without trusting the
+        wall clock. The rowid itself is not a durable name (an emptied table
+        reuses it), so the record's immutable ``id`` names the notification
+        (Codex PR #271). ``None`` without a finding or without an audit table.
         """
         marks = ",".join("?" for _ in FINDING_AUDIT_ACTIONS)
         bound, values = "", tuple(action.value for action in FINDING_AUDIT_ACTIONS)
@@ -666,19 +667,19 @@ class MonitoringRuntime:
             values += ((since - epoch) // timedelta(microseconds=1),)
         try:
             row = self._connection.execute(
-                "SELECT rowid, occurred_at_us FROM security_admin_audit_records "
+                "SELECT id, occurred_at_us FROM security_admin_audit_records "
                 f"WHERE action IN ({marks}){bound} ORDER BY rowid DESC LIMIT 1",
                 values,
             ).fetchone()
         except sqlite3.OperationalError:
             # No audit table in this database: nothing was ever recorded.
             return None
-        return None if row is None else (int(row[0]), int(row[1]))
+        return None if row is None else (str(row[0]), int(row[1]))
 
     @staticmethod
-    def _finding_event(rowid: int) -> UUID:
-        """The event ID of a notification covering findings through ``rowid``."""
-        return uuid5(EVENT_NAMESPACE, f"credential-finding-through:{rowid}")
+    def _finding_event(audit_id: str) -> UUID:
+        """The event ID of a notification covering findings through ``audit_id``."""
+        return uuid5(EVENT_NAMESPACE, f"credential-finding-through:{audit_id}")
 
     def _finding_event_id(self) -> UUID | None:
         """Live path: name the notification by the newest finding it covers."""

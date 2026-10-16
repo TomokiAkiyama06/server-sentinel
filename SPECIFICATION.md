@@ -1370,7 +1370,8 @@ episode reported later. They set `human_access_degraded` /
 finding) and carry only the fixed kind. A finding committed before a restart
 whose notification had not been sent yet is recovered on the first running
 monitoring tick from its audit record: each `credential_finding` event ID
-names the newest finding audit rowid it covers; the newest retained finding
+names the immutable id of the newest (highest-rowid) finding audit record it
+covers; the newest retained finding
 restores the one-day hold and is notified once unless that event row
 exists with a final delivery state (rowid order, not wall-clock order). A fault
 episode whose newest access notification row is `human_access_fault` continues

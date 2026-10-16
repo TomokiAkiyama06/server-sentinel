@@ -963,8 +963,9 @@ monitoring runtime, the only thing that drains it, and a composition whose
 check or ceremonies report to a monitor the runtime was not given (Codex
 PR #271). A finding is committed with its audit record but latched only in
 memory until the next tick. Every `credential_finding` notification is named
-after the newest finding audit record it covers (its audit rowid, a durable
-cursor that does not depend on the wall clock), so after a restart the
+after the newest finding audit record it covers (newest by rowid, named by
+the record's immutable id, so neither the wall clock nor a reused rowid
+matters), so after a restart the
 runtime's first running tick restores the one-day hold from the newest
 retained finding's time and sends one notification unless that
 finding's notification row exists with a final delivery state (a `pending`
@@ -972,7 +973,9 @@ row is a delivery the stopped process never finished). It also continues an
 access fault episode: when the newest `human_access_fault` /
 `human_access_recovered` row (by rowid) is a fault, a check that now passes
 sends the recovery notice, a fault that persists is not notified again, and a
-fault row still `pending` is sent again first. A
+fault row still `pending` is sent again first. A notification the service
+refuses outright (`FAILED`: nothing kept) stays pending and is retried with the
+same time and event ID on the next tick, without spending the budget. A
 reservation fault needs no such recovery: the startup check re-detects it. Verified with synthetic checks, software
 authenticators and an intercepted Slack transport only
 (`server/tests/test_access_fault_notifications.py`).
