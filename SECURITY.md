@@ -319,7 +319,9 @@ adds only sign-out, S2 invitation redemption, S3 the Owner step-up and S4b
 the Owner's access administration; none makes any of the conditions below
 optional.
 Every session route commits its authorization inside the reservation gate
-(`admit(epoch)`), every Owner mutation does too (Owner decision D6), and a
+(`admit(epoch)`), every Owner mutation made through a session route does too
+(Owner decision D6; the host-local Owner commands described under the
+listener exceptions below are no session route and have neither), and a
 request already in flight when the composition stops or a periodic check
 fails is refused at that commit (Issue #228). A mutating session route also
 needs the exact `Origin` and an `X-CSRF-Token` equal to the session's
@@ -366,8 +368,12 @@ application data only when every one of these server-side conditions holds:
 - **Reserved secure-context origin.** The dashboard is served from its
   reserved origin over a secure context, and the latest startup/daily
   reservation check passed. That check detects; it does not prevent (below).
-- **Owner step-up.** Owner-only operations additionally require a fresh user
-  verification bound to the session's own credential.
+- **Owner step-up.** Owner-only operations over a session additionally
+  require a fresh user verification bound to the session's own credential.
+  The host-local Owner commands (`app.auth.bootstrap_cli`,
+  `app.auth.reservation_cli`) are not human requests: they run on the Main
+  Server as the service account, with no session, no WebAuthn and no step-up
+  (see the listener exceptions below).
 
 The only requests served without a credential are the enumerated
 pre-credential routes (enrollment-code redemption and authentication), which
@@ -431,6 +437,21 @@ and ADR-0003):
   an immediate second lookup confirms it, closes access as an exposure. The
   Main Server keeps `ssh.socket`; the exception is `tcp/22` created by
   `ssh.socket` as uid 0 (`server/docs/DEPLOYMENT.md`).
+- The Owner records the listener exceptions with a host-local command,
+  `python -m app.auth.reservation_cli set` (Owner decision D3, 2026-10-16),
+  not through a session route: no WebAuthn, no step-up and no reservation
+  gate. Its authority is the ability to run as the deployment's service
+  account on the Main Server (root and every other account are refused) plus
+  the word `CHANGE` read from the controlling terminal; it validates the set
+  against the reservation the deployment's `human_access` section states and
+  commits it with a `change_security_setting` audit record (actor `owner`,
+  no port, unit or address) in one transaction. This is no weaker than what
+  that account already has, since it can write the application database
+  directly, but it is a different protection from the session path: whoever
+  controls the service account (or root) can change the exceptions, and the
+  audit record attributes the change to the Owner without verifying a person.
+  The running service applies the stored set only after a restart, so
+  narrowing it takes effect then, not at once.
 - An exception covers a wildcard bind only, with one exception (Owner
   decision D1, 2026-10-16; ADR-0003): `tailscaled.service` (uid 0) TCP
   listeners bound directly on a configured reserved address on a recorded
