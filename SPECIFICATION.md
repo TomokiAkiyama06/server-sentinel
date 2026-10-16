@@ -1357,7 +1357,16 @@ after the local row exists. `CHANGED`/`MISSING`/storage-`UNVERIFIABLE` map to
 the immediate `hardware_integrity_failure`, other warnings to the local-only
 `hardware_integrity_warning`. Recording-health verdicts persist in
 `recording_health_status`; `FAILED` is the immediate `recording_health_failure`
-and `UNAVAILABLE` the local-only `recording_health_warning`. Without an actual
+and `UNAVAILABLE` the local-only `recording_health_warning`. Human-access faults
+(Issue #232 item 4, Owner decision 2026-10-16) use the same immediate path: a
+failing `HostnameReservationCheck` or human-access composition is
+`human_access_fault` on entering the fault and on a reason not yet reported in
+the episode, a passing check while serving is `human_access_recovered`, and a
+committed credential finding is `credential_finding` (coalesced to one per
+hour); at most four access notifications per rolling hour, with a held-back
+episode reported later. They set `human_access_degraded` /
+`credential_finding_degraded` (the latter for one day after the latest
+finding) and carry only the fixed kind. Without an actual
 capture-pipeline adapter the self-test is an explicit `UNAVAILABLE`, not
 healthy. Independently of that adapter, the runtime re-verifies the declared
 recording filesystem (UUID → device, major/minor, mounted mount point, pinned

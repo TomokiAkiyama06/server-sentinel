@@ -37,6 +37,7 @@ from app.storage.migrations import Migration, MigrationError, migrate
 from app.storage.policy import MainStoragePolicy, StorageState, StorageTransition
 from app.storage.retention import RetentionService, StorageAudit
 
+from .access import AccessFaultMonitor
 from .config import MonitoringConfiguration
 from .filesystem import IdentifiedRecordingFilesystem
 from .store import NotificationEventStore, RecordingHealthStatusStore
@@ -48,6 +49,7 @@ EVENT_NAMESPACE = UUID("3b0f6c52-7a1e-5d49-8e2c-0c7d4f1a9b63")
 CRITICAL_KINDS = (
     NotificationKind.HARDWARE_INTEGRITY_FAILURE, NotificationKind.RECORDING_HEALTH_FAILURE,
     NotificationKind.SERVER_MOVEMENT, NotificationKind.CAMERA_TAMPER,
+    NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.CREDENTIAL_FINDING,
 )
 WARNING_KINDS = (NotificationKind.HARDWARE_INTEGRITY_WARNING,
                  NotificationKind.RECORDING_HEALTH_WARNING)
@@ -80,6 +82,10 @@ class MonitoringStatus:
     summary_degraded: bool = False
     notification_local_failed: bool = False
     notification_delivery_failed: bool = False
+    # Issue #232 item 4: a failing reservation check / human-access
+    # composition, and a credential finding within the hold window.
+    human_access_degraded: bool = False
+    credential_finding_degraded: bool = False
 
 
 class RefuseUnvalidatedSegments:
@@ -119,11 +125,16 @@ class MonitoringDependencies:
     retry_seconds: float = 15 * 60.0
     integrity_max_pending_events: int = 64
     notification_queue_capacity: int = 16
+    # The composition root's single sink for the reservation check
+    # (``sink=``) and the passkey ceremonies (``findings=``) (Issue #232).
+    access_faults: AccessFaultMonitor | None = None
 
     def __post_init__(self):
         for value in (self.tick_seconds, self.retry_seconds):
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError("invalid monitoring interval")
+        if self.access_faults is not None and not isinstance(self.access_faults, AccessFaultMonitor):
+            raise ValueError("invalid access fault monitor")
 
 
 @contextmanager
@@ -583,7 +594,8 @@ class MonitoringRuntime:
         degraded = sum(bool(value) for value in (
             status.integrity_degraded, status.recording_health_degraded, status.retention_degraded,
             status.storage_audit_failed, status.notification_local_failed,
-            status.notification_delivery_failed,
+            status.notification_delivery_failed, status.human_access_degraded,
+            status.credential_finding_degraded,
         ))
         elapsed = self.dependencies.monotonic() - self._started_monotonic
         monitored = int(min(86400, max(0, elapsed))) if math.isfinite(elapsed) else 0
@@ -597,6 +609,27 @@ class MonitoringRuntime:
     def _summary_tick(self) -> None:
         now = self.dependencies.utcnow()
         self.scheduler.tick(now, self._summary(now))
+
+    def _access_tick(self) -> None:
+        """Human-access faults and credential findings (Issue #232 item 4).
+
+        Runs in every runtime state once the notification service exists:
+        Slack still receives the immediate alert while local persistence is
+        refused. The monitor never raises on its own; an unexpected failure
+        marks access degraded and is logged value-free.
+        """
+        monitor = self.dependencies.access_faults
+        if monitor is None or self.notifications is None:
+            return
+        try:
+            status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
+                                   monotonic=self.dependencies.monotonic())
+        except Exception:
+            self._set(human_access_degraded=True)
+            logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+            return
+        self._set(human_access_degraded=status.human_access_degraded,
+                  credential_finding_degraded=status.credential_finding_degraded)
 
     def _poll(self) -> None:
         if self.notifications is None:
@@ -612,6 +645,7 @@ class MonitoringRuntime:
             raise RuntimeError("monitoring owner thread required")
         if self.status.state != RuntimeState.RUNNING:
             if self.notifications is not None:
+                self._access_tick()
                 self._poll()
             if (self.status.state == RuntimeState.FAILED
                     and self._due("startup", self.dependencies.monotonic())):
@@ -623,6 +657,7 @@ class MonitoringRuntime:
         self._guarded("integrity", self.integrity.tick, "integrity_degraded")
         self._guarded("health", self.recording_health.tick, "recording_health_degraded")
         self._guarded("summary", self._summary_tick, "summary_degraded")
+        self._access_tick()
         self._poll()
 
     def _close(self) -> None:

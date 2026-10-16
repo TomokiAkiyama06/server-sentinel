@@ -140,11 +140,12 @@ Not implemented yet, and required before routes open in production:
   `GetaddrinfoResolver`), load the session-binding key with
   `SessionBindingKey.load_or_create(Settings.session_binding_key_path)` and
   pass a `HumanAccess` to `create_app` (no production path builds one yet);
-- delivery of `CredentialFindingSink`, `ReservationFault` and the
-  `HumanAccess.state` / `check_failures` lifecycle to the Owner notification
-  channel and health (Issue #232 item 4). `NotificationService` has no
-  human-access kind yet and no production composition builds the check, so
-  there is nothing to wire into until that composition exists.
+- passing one `app.monitoring.access.AccessFaultMonitor` from that
+  production composition as the check's `sink=`, the ceremonies' `findings=`
+  and `MonitoringDependencies(access_faults=)`. The monitor, its immediate
+  Owner notification and degraded health exist since Issue #232 item 4
+  (see "Owner notification of access faults" below); only the production
+  composition that hands it to the check is missing.
 
 Owner-only mutations — invitation (with its code), code re-issue, grant
 change, single credential revocation and principal revocation — are exposed
@@ -929,8 +930,36 @@ that ends with an unexpected exception sets `failed` and logs
 `human_access_run_failed`. A second `run()` while one is running raises
 `HumanAccessAlreadyRunning` and changes nothing. A failing expiry sweep logs
 `human_access_sweep_failed` when the streak starts and each time it doubles.
-No Owner notification is emitted yet; delivering it belongs with the other
-reservation faults (Issue #232 item 4, see "Not implemented yet").
+Their Owner notification is described next.
+
+Owner notification of access faults (Issue #232 item 4, Owner decision
+2026-10-16). Human access already fails closed; this makes the fault visible.
+`app.monitoring.access.AccessFaultMonitor` is the check's `FaultSink` and the
+ceremonies' `CredentialFindingSink`, and is drained on every monitoring tick
+(default 60 seconds) on the monitoring worker, the `NotificationService`
+owner thread. Its sinks only latch fixed values under a short lock: they keep
+the fault's `Reason` codes and discard a finding's principal. It sends the
+immediate fixed-category notifications `human_access_fault`,
+`human_access_recovered` and `credential_finding` through the same path as
+`hardware_integrity_failure` / `recording_health_failure`, and sets
+`MonitoringStatus.human_access_degraded` / `credential_finding_degraded`. A
+fault is a failing check (a `ReservationFault`, or a closed verdict with
+reasons), `check_failing`/`failed` or `check_failures > 0`; recovery is a
+passing check while the composition serves; `not_started`, `starting`,
+`stopped` and a check in progress after an open verdict decide nothing.
+Access notifies on entering a fault, on a reason the episode had not reported
+and on recovery, never on every failing check; a fault that ended between two
+ticks is still reported, at most four access notifications go out per rolling
+hour, and an episode the budget held back is reported once it allows.
+Credential findings are coalesced to at most one notification per hour, and
+`credential_finding_degraded` stays set for a day after the latest one (a
+finding has no recovery to observe). No hostname, address, route, identity,
+principal, credential or reason leaves the process; details stay in the audit
+log. With a monitor configured, `create_app` refuses a `HumanAccess` whose
+check or ceremonies report elsewhere and attaches the composition so
+recovery can be observed. Verified with synthetic checks, software
+authenticators and an intercepted Slack transport only
+(`server/tests/test_access_fault_notifications.py`).
 
 Owner operation and live authorization. `PasskeyCeremonies.authorize_owner_operation`
 commits `authorize_owner` inside `admit(epoch)` (#228 item 5), so the Owner

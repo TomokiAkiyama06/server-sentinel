@@ -2783,6 +2783,16 @@ by the Issue #6 synthetic policy model.
   listener is up: confirm the `invalidate_human_sessions` record is committed
   at once, so a restart after removing the listener cannot reopen with an
   earlier session.
+- Access-fault Owner notification (Issue #232 item 4; pending the production
+  composition that passes `AccessFaultMonitor` to the check and ceremonies,
+  so mock-verified only): with Slack configured to the Owner's own test
+  channel, cause one breach close as above and confirm exactly one
+  `ServerSentinel critical alert: human_access_fault` within one monitoring
+  tick, none for the following retries with the same reason, and one
+  `ServerSentinel recovery notice: human_access_recovered` after access
+  reopens. Confirm neither message nor the `notification_events` row contains
+  the hostname, an address, a viewer identity or a reason, and that the
+  monitoring status shows `human_access_degraded` only during the fault.
 - Listener owners through sock_diag (Issue #126, Owner decision 2026-10-07;
   mock and unprivileged local experiments only so far, not yet run on the
   Main Server). Production check procedure, all as the ServerSentinel service

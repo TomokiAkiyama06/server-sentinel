@@ -62,6 +62,16 @@ same alerting startup-failure path. Only the first failure of the episode alerts
 startup steps and binds admission. Slack remains optional and
 never determines local state.
 
+Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
+takes the `AccessFaultMonitor` the composition root also passes to the
+`HostnameReservationCheck` (`sink=`) and `PasskeyCeremonies` (`findings=`).
+Every tick, also while the runtime is `failed` (Slack still receives the
+alert), drains it: transitions become the immediate `human_access_fault` /
+`human_access_recovered` and coalesced `credential_finding` notifications, and
+`MonitoringStatus.human_access_degraded` / `credential_finding_degraded`
+follow it; both count as degraded in the daily summary. See
+`../auth/README.md` "Owner notification of access faults".
+
 `MonitoringDependencies` injects the probe, recorder self-test adapter factory,
 segment validator, Slack opener, clocks and intervals. Tests use a synthetic
 probe, disposable directories, a test clock and an intercepted transport; they

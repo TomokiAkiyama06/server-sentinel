@@ -221,7 +221,10 @@ If the owner enables Slack, configured event information/thumbnails may be sent 
 
 The initial internal adapter sends only fixed critical categories or aggregate
 daily counts/duration/storage state, never thumbnails, source names, hardware
-identifiers or arbitrary event text. It is disabled without deployment
+identifiers or arbitrary event text. Human-access faults (a failing hostname
+reservation check, its recovery, and a WebAuthn credential finding) are such
+fixed categories: no hostname, address, route, viewer identity, principal,
+credential or failure reason is sent or stored with them. It is disabled without deployment
 configuration. Person/motion/entry and ordinary camera-offline observations do not
 generate immediate Slack messages by default. Local fault reporting remains
 independent of Slack delivery: the Main Server runtime stores each fault or

@@ -123,6 +123,16 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # Issue #10 phase 2 S5b: the served Web build is the one the
         # deployment settings name, never one an embedder picked elsewhere.
         raise TypeError("human access composition is invalid")
+    access_faults = monitoring_dependencies.access_faults if monitoring_dependencies is not None else None
+    if human_access is not None and access_faults is not None:
+        # Issue #232 item 4 (Owner decision 2026-10-16): with a configured
+        # monitor, every reservation fault and credential finding of this
+        # composition must reach it, so none bypasses the immediate Owner
+        # notification and degraded health.
+        if (human_access.reservation.fault_sink is not access_faults
+                or human_access.ceremonies.findings is not access_faults):
+            raise TypeError("human access composition is invalid")
+        access_faults.attach(human_access)
     store = database or Database(settings.database_path)
     # Local UVC capture is driven only by the deployment's list of approved
     # logical sources. Frames go to a bounded preview hub that retains nothing
