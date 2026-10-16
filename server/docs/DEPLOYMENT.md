@@ -329,13 +329,27 @@ first**: `create-source` and `approve` refuse while it runs
 the service account that holds the application database open (every Main
 process keeps a descriptor on it for its whole lifetime): no camera is probed
 for that, and a crash leaves nothing behind that would block the command. A
-same-account process whose descriptors cannot be read refuses the command
-(`service_state_unavailable`). A process in another PID namespace (for
-example the service inside a VM/LXD guest while the command runs on the host)
-or hidden by a `hidepid` `/proc` cannot be seen, so run the command **inside
-the environment the service runs in**. The check runs before the confirmation
-and again inside the final transaction; a service started within that last
-transaction is not refused.
+same-account process whose `/proc/<pid>/status` or descriptors cannot be read
+refuses the command (`service_state_unavailable`). Any other process of the
+service account holding the database counts, so another local admin command
+still running (`bootstrap_cli`, `pairing_cli`, `reservation_cli`, a second
+`admin_cli`) also gives `service_running`: let it finish first. Only a
+descriptor whose link names a file with the database's file name is
+`stat`-ed, so a descriptor of a differently named file on a hung FUSE/NFS
+mount cannot block the check. A same-named file on a hung mount still can
+(the `stat` is not bounded): the command then waits instead of refusing
+until that mount answers or is recovered, and no signal is guaranteed to end
+it meanwhile, so check that it has exited (recover the mount if needed)
+before starting the service.
+Run the command **inside the environment the service runs in** (the VM/LXD
+guest, Owner decision D2), never from its host or from another container:
+a VM has its own kernel, so the host's `/proc` shows no guest process at all;
+an unprivileged LXD container shifts its uids, so on the host the service
+runs under a uid that is not the service account; and the command run inside
+a container sees only that container's processes. (A `hidepid` `/proc` does
+not hide processes of the same uid, so it is not a limit here.) The check
+runs before the confirmation and again inside the final transaction; a
+service started within that last transaction is not refused.
 
 ```sh
 cd /opt/server-sentinel-main/current
@@ -372,7 +386,13 @@ sudo systemctl start server-sentinel.service
   camera reports the same one), its advertised pixel formats and the source
   whose approval holds it. It never prints a serial, `/dev` path, by-id name
   or USB port. A label stays the same while the camera stays plugged in and
-  changes when it is re-plugged or the host reboots: list again then.
+  changes when it is re-plugged or the host reboots: list again then. The
+  label also covers the change time of the camera's sysfs entry
+  (`/sys/class/video4linux/videoN`, not the `/dev` node), so a change of that
+  sysfs entry's own owner or mode changes it without a re-plug; `approve`
+  then refuses the old label (`candidate_not_found`), which is the safe
+  direction: list again. A `chmod`, `setfacl` or udev permission change of
+  the `/dev/videoN` node does not change the label.
   `sources` prints each `local_uvc` source's UUID, enabled state, approval
   state (`approved`, `approval_required`, `none`), whether the deployment
   lists it, its profile and its name.

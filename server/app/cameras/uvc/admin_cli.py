@@ -41,18 +41,36 @@ state: unlike the UVC active-session marker it is never left behind by a
 crash and is present even when no source is approved, and unlike a
 device-busy probe it touches no camera. A same-account process whose
 descriptors cannot be read refuses the command (``service_state_unavailable``)
-instead of being assumed stopped. Limits: a process in another PID namespace
-(the service in a container while this runs on its host) or hidden by a
-``hidepid`` ``/proc`` is not seen, so run this inside the service's own
-environment (the VM/LXD guest); and a service started after the final check,
-inside the command's last transaction, is not refused (the check runs before
-the confirmation and again inside that transaction).
+instead of being assumed stopped. Only a descriptor whose link text ends in
+the database's file name is ``stat``-ed (``_may_name_database``), so a hung
+FUSE/NFS descriptor of a differently named file cannot block the check; one
+of a same-named file on a hung mount still can (``stat`` is not bounded):
+the command then waits instead of refusing until that mount answers or is
+recovered, and no signal is guaranteed to end it meanwhile: check that it
+exited before starting the service. Any other
+same-account process holding the database counts too, also another local
+admin command (``bootstrap_cli``, ``pairing_cli``, ``reservation_cli``, a
+second ``admin_cli``). Limits: run this inside the environment the service
+runs in (the VM/LXD guest, Owner decision D2), never from its host or from a
+container: a VM has its own kernel, so the host's ``/proc`` holds no guest
+process at all; an unprivileged LXD container maps its uids, so on the host
+the service runs under a shifted uid that is not the service account here;
+and this command itself inside a container sees only that container's PID
+namespace. (A ``hidepid`` ``/proc`` does not hide same-uid processes.) A
+service started after the final check, inside the command's last
+transaction, is not refused (the check runs before the confirmation and
+again inside that transaction).
 
 Output. ``candidates`` identifies each connected USB video-capture camera only
 by a short hashed label (``cam-`` and 10 hex digits of a SHA-256 over the
 device's live-instance evidence, so it stays the same between ``candidates``
 and ``approve`` while the camera stays plugged in, changes when it is
-re-plugged, and does not reveal the serial), its USB vendor:product ids,
+re-plugged, and does not reveal the serial; that evidence includes the
+``ctime`` of the camera's sysfs entry (``/sys/class/video4linux/videoN``, not
+the ``/dev`` node), so a change of that sysfs entry's own owner or mode also
+changes the label without a re-plug, and ``approve`` then refuses the old
+label as ``candidate_not_found``: list again. A ``chmod`` / ``setfacl`` /
+udev permission change of the ``/dev`` node does not change it), its USB vendor:product ids,
 whether it reports a serial (``present`` / ``absent`` / ``shared`` when another
 connected camera reports the same one), its advertised pixel formats and the
 source whose approval currently holds it. Never a serial, ``/dev`` path,
@@ -103,7 +121,7 @@ from app.local_admin import (
 )
 from .capture import VideoProfile
 from .discovery import LinuxDiscovery
-from .identity import DeviceEvidence, same_physical_camera
+from .identity import DeviceEvidence
 from .persistence import ApprovalConflictError, ApprovalStore
 from .registry_adapter import LocalUvcAdapter, capture_profile
 
@@ -121,7 +139,10 @@ _USB_ID = re.compile(r"[0-9a-f]{4}")
 _MAX_TEXT = 128
 _HINTS = {
     "service_running": ("stop the service (sudo systemctl stop server-sentinel.service), run the "
-                        "command, then start it again; changes apply on start"),
+                        "command, then start it again; changes apply on start. Any other process "
+                        "of the service account holding the database counts, also another local "
+                        "admin command (bootstrap_cli, pairing_cli, reservation_cli, a second "
+                        "admin_cli): let it finish first"),
     "camera_without_serial": ("a camera without a serial cannot be approved offline: stored evidence "
                               "cannot tell it from an identical one after the restart"),
     "camera_serial_not_unique": ("this serial is not unique to one camera, so stored evidence cannot "
@@ -174,12 +195,28 @@ def _process_uids(status_path: Path) -> set[int] | None:
     raise CliRefused("service_state_unavailable")
 
 
-def _database_holders(identity: tuple[int, int], *, proc_root: Path = Path("/proc"),
+def _may_name_database(target: str, name: str) -> bool:
+    """Whether a descriptor's link text can be the database file.
+
+    The database file has exactly one link and its pin requires that the
+    configured path still names it (``app.local_admin._existing_database``),
+    so a descriptor on it reads back as a path ending in that file name in
+    every mount namespace. Anything else (a pipe, socket or anonymous inode,
+    a differently named file) is never ``stat``-ed: a descriptor on a hung
+    FUSE or NFS mount would block that ``stat`` instead of refusing. A
+    same-named file elsewhere (a bind mount, another mount namespace) is
+    ``stat``-ed and compared by inode, so one on a hung mount still blocks.
+    """
+    return target.rpartition("/")[2] == name
+
+
+def _database_holders(identity: tuple[int, int], name: str, *, proc_root: Path = Path("/proc"),
                       own_pid: int | None = None, account: int | None = None) -> int:
     """How many other processes of this account hold the database file open.
 
-    Never assumes "stopped" for a same-account process it cannot inspect:
-    that refuses with ``service_state_unavailable``.
+    ``name`` is the database file's name. Never assumes "stopped" for a
+    same-account process it cannot inspect: that refuses with
+    ``service_state_unavailable``.
     """
     own_pid = os.getpid() if own_pid is None else own_pid
     account = os.geteuid() if account is None else account
@@ -201,9 +238,13 @@ def _database_holders(identity: tuple[int, int], *, proc_root: Path = Path("/pro
             continue  # exited meanwhile
         except OSError:
             raise CliRefused("service_state_unavailable") from None
-        for name in names:
+        for number in names:
             try:
-                info = os.stat(descriptors / name)
+                # The link text comes from the kernel's own record of the
+                # open file; reading it never reaches the file's file system.
+                if not _may_name_database(os.readlink(descriptors / number), name):
+                    continue
+                info = os.stat(descriptors / number)
             except (FileNotFoundError, ProcessLookupError):
                 continue  # closed meanwhile, or the process exited
             except OSError:
@@ -216,12 +257,13 @@ def _database_holders(identity: tuple[int, int], *, proc_root: Path = Path("/pro
 
 
 class _ServiceCheck:
-    def __init__(self, database, holders: Callable[[tuple[int, int]], int]):
+    def __init__(self, database, holders: Callable[[tuple[int, int], str], int]):
         self._identity = database._identity
+        self._name = database.path.name
         self._holders = holders
 
     def require_stopped(self) -> None:
-        if self._holders(self._identity):
+        if self._holders(self._identity, self._name):
             raise CliRefused("service_running")
 
 
@@ -317,15 +359,24 @@ def _held_approvals(database):
     return held
 
 
-def _holders_of(device: DeviceEvidence, held) -> list[UUID]:
+def _holders_of(device: DeviceEvidence, held, devices) -> list[UUID]:
+    """The sources whose approval conflicts with approving ``device`` now.
+
+    Both directions, exactly as ``ApprovalStore._conflicts`` refuses the
+    approval: the device compared in the mode it would be approved in (its
+    serial shared by another connected camera or not), and each holder in
+    its own recorded mode. A holder latched serial-ambiguous on one twin
+    still holds the other twin's serial once the first one is unplugged.
+    """
+    ambiguous = _serial_state(device, devices) == "shared"
     return [source_id for source_id, state in held
-            if same_physical_camera(state.approved, device, serial_ambiguous=state.serial_ambiguous)]
+            if ApprovalStore._conflicts(device, ambiguous, (state,))]
 
 
 def candidate_lines(devices, failures: int, held) -> list[str]:
     lines = []
     for device in devices:
-        holders = _holders_of(device, held)
+        holders = _holders_of(device, held, devices)
         lines.append(f"candidate {candidate_label(device)} usb={_usb_ids(device)} "
                      f"serial={_serial_state(device, devices)} formats={_formats(device)} "
                      f"approved_for={','.join(map(str, holders)) or '-'}")
@@ -524,7 +575,7 @@ def _approve(context: _Context, source_id: UUID, label: str) -> list[str]:
     if prior is not None and prior.serial_ambiguous and prior.approved.strong_key == candidate.strong_key:
         # The store keeps this latch for the same serial (ApprovalStore.approve_on).
         raise CliRefused("camera_serial_not_unique")
-    if any(holder != source_id for holder in _holders_of(candidate, held)):
+    if any(holder != source_id for holder in _holders_of(candidate, held, scan.devices)):
         raise CliRefused("camera_approved_for_another_source")
     grant = context.owner.confirm(
         context.terminal,
