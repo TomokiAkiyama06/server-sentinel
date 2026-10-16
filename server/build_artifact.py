@@ -13,7 +13,8 @@ import stat
 import tarfile
 import tempfile
 
-from app.auth.web_assets import MAX_FILES, MAX_TOTAL_BYTES, WebAssets, WebAssetsUnavailable
+from app.auth.web_assets import (APP_DIRECTORY, MAX_FILES, MAX_TOTAL_BYTES, SHELL_DIRECTORY, WebAssets,
+                                 WebAssetsUnavailable)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -40,7 +41,9 @@ def _web_files(web_dist: Path) -> list[tuple[str, bytes]]:
     are then written to a private copy with explicit modes (the builder's
     umask is not the deployment's) and must load through
     ``WebAssets.load``, so a release never ships a build the service would
-    refuse. The archive carries exactly these bytes.
+    refuse. A top-level directory other than ``shell/`` and ``app/``, which
+    the file-only copy would lose if it is empty, is refused on the real
+    tree, as the loader would. The archive carries exactly these bytes.
     """
     if not isinstance(web_dist, Path) or not web_dist.is_absolute():
         raise WebBuildRefused("web build directory must be absolute")
@@ -67,6 +70,12 @@ def _web_files(web_dist: Path) -> list[tuple[str, bytes]]:
             if stat.S_ISDIR(info.st_mode):
                 if len(relative.parts) > 1:
                     raise WebBuildRefused("web build is nested too deeply")
+                # The loader's layout, checked on the real tree (Issue #260):
+                # the private copy below is rebuilt from files only, so an
+                # empty extra directory would vanish from it and pass. An
+                # empty shell/ or app/ is refused by the loader on the copy.
+                if name not in (SHELL_DIRECTORY, APP_DIRECTORY):
+                    raise WebBuildRefused("web build refused by the asset loader (reason=set)")
                 child = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
                                 dir_fd=descriptor)
                 try:
