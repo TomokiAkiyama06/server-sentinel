@@ -201,8 +201,10 @@ therefore predicts refusal by simulating the sources' next appends.
   two configured sources whose batch histories align (the `j`-th most recent
   trusted segments of every configured source overlap in time and have one
   duration, for at least ten consecutive `j` from the most recent; another
-  cadence, a clock-uncertain segment, or a gap in any source's stored
-  segments, even one every source shares, ends the alignment), the sources'
+  cadence, a segment whose duration is not its profile's current cadence
+  (for example from before a reconfiguration), a clock-uncertain segment, or
+  a gap in any source's stored segments, even one every source shares, ends
+  the alignment), the sources'
   means `m'_s` and sample covariances `cov_st` are measured over the
   `k <= 16` aligned past batches, and
   `C(t) = min(sum(n_s * c_s), round_up(ceil(sum(n_s * m'_s)) + ceil(2 * sqrt(V * (1 + 1/k) * (k - 1) / (k - 3)))))`

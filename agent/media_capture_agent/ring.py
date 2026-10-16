@@ -384,8 +384,8 @@ class DiskRing:
         ``f_frsize`` units); the credit is the unrounded smallest sample.
         ``samples`` are the source's last ``BATCH_HISTORY_SEGMENTS`` stored
         allocations back to its most recent gap (a stored segment ending
-        before the next one starts) or clock-uncertain segment, most recent
-        first, as ``(start, end,
+        before the next one starts), clock-uncertain segment or segment of
+        another duration than the profile's cadence, most recent first, as ``(start, end,
         allocation)``, each rounded up to whole units and never above the
         bound (empty with ``at_bound``), from which ``_measured_charge``
         charges synchronized sources.
@@ -398,13 +398,16 @@ class DiskRing:
                 "SELECT id, start, end, clock_trusted FROM segments WHERE source=? AND state='stored' "
                 "ORDER BY end DESC LIMIT ?", (str(source), max(RECENT_ALLOCATION_SEGMENTS, BATCH_HISTORY_SEGMENTS)))]
             # The rounded samples of the longer batch history, never above the
-            # bound, up to the source's first gap or clock-uncertain row:
-            # stored rows on both sides of an interval every source missed
-            # would otherwise still align, and untrusted timestamps are not
-            # comparable with another source's.
+            # bound, up to the source's first gap, clock-uncertain row or
+            # segment of another cadence than the current profile's: stored
+            # rows on both sides of an interval every source missed would
+            # otherwise still align, untrusted timestamps are not comparable
+            # with another source's, and allocations of an earlier cadence do
+            # not estimate the current one.
             samples = []
             for start, end, trusted, size in rows:
-                if not trusted or (samples and end < samples[-1][0]):
+                if (not trusted or end - start != profile.segment_duration_us
+                        or (samples and end < samples[-1][0])):
                     break
                 samples.append((start, end, min(bound, round_up(size, unit))))
             samples = tuple(samples)

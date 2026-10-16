@@ -461,6 +461,39 @@ class VariableSegmentSizeTests(unittest.TestCase):
             bound = DiskRing._batch_charge(whole, unit)
         self.assertLess(DiskRing._batch_charge(whole, unit), bound)
 
+    def test_measured_history_stops_at_a_cadence_reconfiguration(self):
+        # Every source reconfigured together from 30 s to 60 s segments: one
+        # new 60 s batch after fifteen old 30 s batches still aligns by
+        # position and duration across sources, but the old allocations do
+        # not estimate the new cadence, so the history ends there and the
+        # perfectly correlated bound is charged (Codex review of PR #272).
+        _settings, _quota, store, ring = self.ring()
+        unit = store.allocation_unit
+        sources = [UUID(int=1440 + index) for index in range(2)]
+
+        def profiles(cadence):
+            return tuple(SegmentProfile(source, 34000 * 60 // cadence, 17000 * 60 // cadence, cadence * SECOND, 100)
+                         for source in sources)
+
+        old, new = profiles(30), profiles(60)
+        start = T0 - 16 * 30 * SECOND
+        ring.configure(RingConfig("duration", 900), old, now_us=start, clock_trusted=True)
+        for index in range(15):
+            end = start + (index + 1) * 30 * SECOND
+            for source, units in zip(sources, (30 + (index % 2), 31 - (index % 2))):
+                ring.append(source, end - 30 * SECOND, end, b"\x5a" * (units * unit), now_us=end, clock_trusted=True)
+        reconfigured = start + 15 * 30 * SECOND
+        ring.configure(RingConfig("duration", 900), new, now_us=reconfigured, clock_trusted=True)
+        end = reconfigured + 60 * SECOND
+        for source in sources:
+            ring.append(source, reconfigured, end, b"\x5a" * (30 * unit), now_us=end, clock_trusted=True)
+        recent = ring._recent_allocations(store.segment_allocations(), unit)
+        self.assertEqual([1, 1], [len(recent[source][4]) for source in sources])
+        appends = [(1, recent[source]) for source in sources]
+        with correlated_charge():
+            correlated = DiskRing._batch_charge(appends, unit)
+        self.assertEqual(correlated, DiskRing._batch_charge(appends, unit))
+
     def test_measured_batch_charge_never_decreases_as_appends_are_added(self):
         # The next-write check evaluates only the latest append between two
         # credit changes, so adding an append (another count of a source, or
