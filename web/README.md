@@ -14,8 +14,11 @@ Nodes, Live, and Access. Camera summaries are an ID-keyed collection
 with independent type/role, never fixed camera slots. These are foundation
 screens, not implemented live playback or access management.
 
-`src/domain.ts` defines an injectable session/source provider. The production
-entry uses `deniedServices`, makes no API requests, and grants no access.
+`src/domain.ts` defines an injectable session/source provider. Since #205
+CP-5 the production entry uses `createDashboardServices` (`src/shared/services.ts`,
+see "Live screen" below): it reads the caller's own session from
+`GET /api/session` and grants nothing itself; every route authorizes on the
+server. `deniedServices` remains the default of `App` when no provider is given.
 `tests/harness.tsx` supplies synthetic providers only in tests, never in `dist`.
 URL parameters/local storage cannot activate them. UI checks hide owner-only
 metadata from viewers and keep live/recordings permissions independent; they are
@@ -233,8 +236,8 @@ Straight from the `recordings` table: `id`, `source_id`, `status` and `starred`.
 
 `canVisit` keeps `storage` owner-only and `recordings` behind `recordings:view`;
 `live:view` alone reaches neither the recording list nor historical metadata.
-The production entry still uses `deniedServices`, which supplies no recording,
-storage or mutation provider. #21's server-side storage, retention and
+The production provider supplies no recording, storage or mutation function
+(only session, sign-out and live, #205 CP-5). #21's server-side storage, retention and
 notification core landed with #42; the authorized human provider that would feed
 these screens is still #10's human-access work, so no deployment serves them yet.
 
@@ -274,9 +277,110 @@ membership alone never grants access, and states that ServerSentinel never
 changes Tailscale ACLs/Grants or asks for Tailscale administrative credentials.
 
 `canVisit()` keeps `setup` owner-only. No route serves wizard progress yet:
-human routes stay blocked on ADR-0004 / #10, the production entry still uses
-`deniedServices` (no wizard provider), and only the test harness supplies a
-synthetic in-memory provider.
+the production provider has no wizard function, and only the test harness
+supplies a synthetic in-memory provider.
+
+## Live screen and production provider for #205 CP-5
+
+`src/shared/services.ts` is the production `DashboardServices`. Each request
+goes to the dashboard origin only, with `credentials: 'same-origin'`,
+`mode: 'same-origin'`, `cache: 'no-store'` and `redirect: 'error'`. A GET uses
+`referrerPolicy: 'no-referrer'`; a POST uses `referrer: ''` with
+`referrerPolicy: 'same-origin'` so Fetch sends the exact `Origin` the server
+requires (see the sign-in shell below) and still no `Referer`, and carries the
+session's `X-CSRF-Token` (Owner decision D2). The token comes from the latest
+`GET /api/session` answer and lives only in that closure, never in storage; no
+write is sent before a session supplied one. `401`, `403` and the server's
+generic `404` are `ApiError('unauthorized')`, and a refusal's body is never
+read or rendered. The session check, the live source list and the sign-out
+request are abandoned after 10 s (whether or not fetch honours the abort) and
+reported as failed, so the screen shows its retry instead of waiting forever.
+
+- `GET /api/session` `{csrf, role, permissions}`: `owner` ⇒ Owner,
+  `invited_user` ⇒ viewer; an unknown role or permission, a duplicate, or a
+  token that is not 43 base64url characters fails closed (`invalid_response`).
+  A refusal is the denied screen, which links back to the sign-in shell.
+- Sign-out: no new viewer open starts; every live viewer session this page
+  holds is closed at once, and each open still in flight closes its grant
+  when it lands, while the CSRF token is still known (bounded to 2 s in total, best effort; Codex PR #273), then
+  `POST /api/auth/sign-out` with no body (bounded as above) ⇒ `204` ⇒ `location.replace('/')`.
+  A refusal (the session is already gone) also goes to the sign-in shell; any
+  other failure is reported and the session stays.
+
+Live contract with the server routes of #205 CP-4 (the client side; the
+server owns authorization, leases and limits):
+
+```text
+GET  /api/live/sources                    200 {"sources":[{"id":"<uuid>","name":"<1-256 code points>","health":"online|degraded|offline|manual_intervention_required"}]}
+POST /api/live/sessions  {"source_id"}    200 {"session_id":"<uuid>","source_id":"<uuid>","lease_seconds":<n>,"frame_interval_ms":<n>}  (CSRF, JSON)
+GET  /api/live/sessions/<sid>/frame?after=<n>
+                                           200 image/jpeg, X-Frame-Sequence: <n' > n>  | 204 no newer frame
+POST /api/live/sessions/<sid>/close       204                                         (CSRF, no body, keepalive)
+every refusal                              404 (generic)
+```
+
+The server always sends `health` (an unknown state as `offline`); the client
+still shows nothing rather than guessing when it is absent. In the interim
+transport the list holds only `local_uvc` sources with an MJPG capture
+profile; `remote_agent` sources are not listed yet. Ids are lower-case UUIDs,
+checked before a URL is built. A body without a `sources` array fails closed;
+inside it, a malformed entry (bad or repeated id, a name that is not 1 to 256
+Unicode code points, the server's `text_value` bound, or an unknown health
+value) is dropped on its own, so one entry never hides the others. Any other
+field of a source (a device path, serial or node detail) is dropped, never
+rendered. A frame is accepted only as `image/jpeg` with a decimal
+`X-Frame-Sequence` larger than `after`, and only up to 8 MiB: a declared
+`Content-Length` above that is refused unread, and the body is read with the
+same cap whether or not the header is present (a proxy may re-chunk it). A
+refused frame's body is cancelled. `frame_interval_ms` (50 to 5000; otherwise
+200) sets the pull spacing; `lease_seconds` is not used by the client.
+
+`src/dashboard/live.tsx` is rendered only for `canVisit(session, 'live')`
+(`live:view`, or the Owner) and loads the sources only then: a
+`recordings:view`-only viewer makes no live request. It lists the sources as an
+ID-keyed collection (1 to 4, no fixed slots) and plays one at a time.
+`src/dashboard/live_loop.ts` runs the interim frame-pull loop (Owner decision
+D5): open a viewer session, pull with `after=<last sequence>`, and wait the
+server's `frame_interval_ms` (default 200 ms, about 5 fps) plus 20 ms after
+each answer, so a pull never reaches the server inside its interval; `204` ⇒
+wait the same. No newer frame for 5 s ⇒ the picture is
+marked not current and dimmed, by a timer of its own that fires even while a
+pull is still pending. An open, or a frame request together with its
+decode, unfinished after 4 s is abandoned as a transient failure (aborted
+whether or not the transport honours the signal; a grant that still arrives is
+closed at once), so a stalled connection or decode never leaves an old frame
+labelled current. A transient failure (network, `5xx`, an invalid
+answer, an undecodable frame) retries with backoff 0.5 s, 1 s, 2 s, 4 s, then
+8 s, keeping the session. A refusal ends the loop: the canvas is cleared, the
+session closed, and nothing is retried until the viewer presses Reconnect. The
+one exception is an open refused within 15 s of a close this page sent (the
+server may not have released that slot yet): it is retried once after 2 s,
+and a second refusal is final. A hidden page (`visibilitychange`, `pagehide`)
+closes the session and clears the picture, so nothing is requested while
+nobody looks, and a fresh session is opened once the page has been visible
+again for 1 s. Opens are coalesced: a player (a source switch, Reconnect)
+waits 300 ms before its first open, so tapping through sources or hiding and
+showing the page quickly spends no open per change. Leaving the screen, switching source,
+or a replaced provider closes the session; a session granted after that is
+closed at once, and a frame whose decode finishes after a pause, refusal or
+stop is dropped instead of drawn.
+
+A frame is decoded with `createImageBitmap(blob)` and drawn into a `<canvas>`;
+no object URL or data URL is created, so the dashboard policy (`img-src 'self'`,
+`connect-src 'self'`) is unchanged. The screen offers no download, export,
+history, timeline or recording control, and it states that browser display does
+not prevent screen recording or a photo of the screen. Its copy reports
+connection and picture state only and never names or characterizes a person.
+
+Tests: `tests/live.test.mjs` (fake `fetch` and a manual clock: request shapes,
+strict decoding, CSRF, backoff, refusal, pause/reopen, close after stop) and
+`tests/browser.mjs` (the production bundle in headless Chrome against
+synthetic answers shaped like the CP-4 routes: a generated solid-colour JPEG
+drawn into the canvas under the real policy, exact `Origin` and `X-CSRF-Token`
+on every POST, `after` sequence, at most about 5 pulls per second, close on
+leaving the screen, sign-out, and no live request for a `recordings:view`-only
+viewer). Neither proves the real routes, a real camera or a physical phone/Mac;
+see MANUAL_TEST.md section I.
 
 ## Sign-in shell and build split for #10 phase 2 S5a
 
