@@ -1839,6 +1839,82 @@ class SceneRuntimeOwnerDecisionTests(unittest.TestCase):
         with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
             harness.runtime.stop()
         self.assertEqual([2, 1, 1], counts)
+        # The highest recorded total, not the last delta, is what a fourth
+        # stop compares with (#259), so nothing already recorded is resent.
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            harness.runtime.stop()
+        self.assertEqual([2, 1, 1], counts)
+
+    def test_concurrent_stops_record_the_total_once(self):
+        # #259: two stop() calls racing on the hand-over never both record.
+        entered, release = threading.Event(), threading.Event()
+        counts = []
+
+        def sink(count):
+            counts.append(count)
+            entered.set()
+            release.wait(5)
+
+        harness = Harness(undelivered=sink)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        results = []
+
+        def stop():
+            results.append(harness.runtime.stop())
+
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            first = threading.Thread(target=stop)
+            first.start()
+            self.assertTrue(entered.wait(5))
+            second = threading.Thread(target=stop)
+            second.start()
+            # The second stop waits for the first hand-over to finish.
+            second.join(0.5)
+            self.assertTrue(second.is_alive())
+            release.set()
+            first.join(5)
+            second.join(5)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual([1], counts)
+        # The stop that found nothing left to hand over still reports the
+        # record the other one made, not the status it read before waiting.
+        self.assertEqual([True, True], [item.undelivered_recorded for item in results])
+
+    def test_a_retried_stop_reports_a_late_failure_since_its_status(self):
+        # Codex P2 (#265): a late batch whose record fails after the retried
+        # stop read its status, with nothing left to hand over, is reported.
+        harness = None
+        calls = []
+
+        def sink(count):
+            calls.append(count)
+            if len(calls) == 2:
+                raise RuntimeError("synthetic marker write failure")
+
+        harness = Harness(undelivered=sink)
+        harness.runtime.start()
+        harness.recorder.fail = True
+        for luma in (None, None, MOVED, MOVED):
+            harness.frame(luma)
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            self.assertIs(True, harness.runtime.stop().undelivered_recorded)
+        observation = self._observation()
+        fence = harness.runtime._pump.fence
+
+        def fence_then_late():
+            # The late batch arrives after the retried stop took its status.
+            refused = fence()
+            harness.runtime._submit([observation])
+            return refused
+
+        with mock.patch.object(harness.runtime._pump, "fence", side_effect=fence_then_late), \
+                self.assertLogs("app.detection.roi.runtime", level="ERROR"):
+            again = harness.runtime.stop()
+        self.assertEqual([1, 1], calls)
+        self.assertIs(False, again.undelivered_recorded)
 
     def test_a_retried_stop_resends_a_count_that_failed(self):
         outcomes = [RuntimeError("synthetic marker write failure"), None]
