@@ -412,6 +412,8 @@ The step-up shall be bound to the session: the challenge is issued for that sess
 
 These operations are unavailable through the dashboard while human access is denied by a storage refusal (STORE-006); the Owner then recovers over SSH on the Main Server host (Owner decision 2026-10-11).
 
+The freshness and session-binding requirements above apply to these operations when they are performed through a human session. Host-local Owner commands on the Main Server are not human sessions and do not use WebAuthn: the local Owner bootstrap/recovery command (AUTH-013), and the hostname-reservation listener exceptions, which the Owner records with a host-local command rather than through the dashboard (Owner decision D3, 2026-10-16). Such a command shall run only as the deployment's service account (never as root or any other account), shall require a confirmation read from the controlling terminal, shall leave state unchanged when refused or declined, and shall commit its change with an Owner audit record in one transaction. Its authority is control of that account on the Main Server host, which can already write the application database; it does not verify which person ran it.
+
 ### AUTH-009 Session lifetime and clock safety
 Server-side human sessions have a 30-minute idle lifetime and a 12-hour absolute lifetime. Authorized activity may renew the configured idle lifetime but never the absolute lifetime. A time before session establishment or before the last accepted activity invalidates authorization; restart or clock uncertainty shall fail closed rather than extend a session.
 
