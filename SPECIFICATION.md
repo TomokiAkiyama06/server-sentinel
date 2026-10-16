@@ -2241,7 +2241,9 @@ hub), otherwise the generic denial:
 ```text
 GET  /api/live/sources                      -> LIVE: {"sources": [{"id", "name",
                                                "health"}]} of configured, enabled
-                                               local sources; nothing else
+                                               local sources captured as MJPG
+                                               (others are neither listed nor
+                                               opened); nothing else
 POST /api/live/sessions  {"source_id"}      -> LIVE + CSRF: {"session_id",
                                                "source_id", "lease_seconds": 15,
                                                "frame_interval_ms": 200}

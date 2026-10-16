@@ -59,7 +59,8 @@ Limits (D10 and the D5 defaults): at most 4 live sessions in total, 2 per
 source and 2 per principal; at most one served frame per
 ``minimum_frame_interval_seconds`` (5 fps) per session; a frame that does not
 start with a JPEG SOI marker or exceeds ``maximum_frame_bytes`` is never
-served (counted, value-free). Nothing here logs an identity, token, session
+served (counted, value-free), and only a source whose capture profile is
+``MJPG`` is listed or can be opened. Nothing here logs an identity, token, session
 id or media byte.
 """
 
@@ -70,6 +71,7 @@ from contextlib import closing
 from dataclasses import dataclass
 import hashlib
 import hmac
+import json
 import math
 import threading
 import time
@@ -85,6 +87,8 @@ from .sessions import (
 
 
 _JPEG_SOI = b"\xff\xd8\xff"
+# The only capture format whose frames are served (passed through as JPEG).
+_MJPG = "MJPG"
 _HOLDER_DOMAIN = b"ServerSentinel live session holder v1\x00"
 _HEALTH = ("online", "degraded", "offline", "manual_intervention_required")
 
@@ -369,6 +373,11 @@ class LiveFrameService:
             raise LiveFrameUnavailable()
         try:
             with admit():
+                # Only a source this interim transport can serve (MJPG) is
+                # opened, so no session holds capacity while every frame
+                # would be refused.
+                if source_id not in {view.source_id for view in self._viewable()}:
+                    raise LiveFrameUnavailable()
                 session = self.preview.open(access, source_id)
         except (LiveSessionUnavailable, LiveSessionCapacityExceeded):
             raise LiveFrameUnavailable() from None
@@ -430,28 +439,41 @@ class LiveFrameService:
         self._release(session_id)
 
     def _sources(self, admit) -> tuple[LiveSourceView, ...]:
-        configured = set(self.hub.source_ids)
         try:
             with admit():
-                if not configured:
-                    return ()
-                # Read-only and never creating: a lost or replaced filesystem
-                # makes this a refusal, not a fallback database.
-                with closing(self._database.connect_read_only()) as connection:
-                    connection.execute("BEGIN")
-                    rows = connection.execute(
-                        "SELECT id, name, health_state FROM camera_sources"
-                        " WHERE enabled=1 AND source_type='local_uvc' ORDER BY created_at, id").fetchall()
-                    connection.execute("COMMIT")
+                return self._viewable()
         except Exception:
             raise LiveFrameUnavailable() from None
+
+    def _viewable(self) -> tuple[LiveSourceView, ...]:
+        """The configured, enabled local sources whose capture format is MJPG.
+
+        The interim frame pull passes the camera's own JPEG frames through
+        and never converts, so a source captured as ``YUYV`` or ``GREY`` is
+        not offered (and cannot be opened) rather than shown as available
+        while every frame would be refused. Called inside the caller's
+        ``admit``.
+        """
+        configured = set(self.hub.source_ids)
+        if not configured:
+            return ()
+        # Read-only and never creating: a lost or replaced filesystem makes
+        # this a refusal, not a fallback database.
+        with closing(self._database.connect_read_only()) as connection:
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                "SELECT id, name, health_state, desired_capture_profile FROM camera_sources"
+                " WHERE enabled=1 AND source_type='local_uvc' ORDER BY created_at, id").fetchall()
+            connection.execute("COMMIT")
         views = []
         for row in rows:
             try:
                 source_id = UUID(row[0])
+                profile = json.loads(row[3]) if row[3] else None
             except (TypeError, ValueError):
                 continue
-            if source_id not in configured or not isinstance(row[1], str):
+            if (source_id not in configured or not isinstance(row[1], str)
+                    or not isinstance(profile, dict) or profile.get("pixel_format") != _MJPG):
                 continue
             health = row[2] if row[2] in _HEALTH else "offline"
             if health == "online" and not self.hub.accepting(source_id):

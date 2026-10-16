@@ -1449,7 +1449,9 @@ route is the generic denial). The route table above lists the four routes.
   `recordings:view` alone reaches none of them. The source list returns only
   each configured, enabled local source's id, name and coarse health
   (`online` / `degraded` / `offline` / `manual_intervention_required`; never
-  `online` while the preview refuses its frames): no device path, serial,
+  `online` while the preview refuses its frames), and only sources captured
+  as `MJPG` (frames pass through as JPEG; a `YUYV` / `GREY` source is
+  neither listed nor opened): no device path, serial,
   profile, node, detection or storage detail, and nothing historical.
 - A live session is bound to the human access session that opened it
   (`BoundLiveAccess`). Each frame poll is admitted in memory first (an id the

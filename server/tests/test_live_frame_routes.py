@@ -28,9 +28,12 @@ from app.auth.rate_limit import SourceRateLimiter
 from app.auth.reservation import DAILY_SECONDS
 from app.auth.store import Requirement
 from app.cameras.registry import CameraRegistry, SourceHealthState, SourceType
+from app.cameras.registry.models import CaptureProfile
 from app.media.live.frame_pull import LiveFrameLimits, LiveFrameService, LiveFrameUnavailable
 from app.media.live.local_preview import LocalPreviewHub
 from app.storage.database import Database
+from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
 
 from tests.test_human_admin_routes import AdminRouteFixture
 from tests.test_human_surface import EXPOSED, call, header, payload, status
@@ -62,16 +65,27 @@ class LiveRouteFixture(AdminRouteFixture):
     def setUp(self):
         super().setUp()
         registry = CameraRegistry(self.database, unaudited_writes=True)
+        # Five enabled rows (three viewable, one YUYV, one not configured here)
+        # exceed the default active limit of 4; this test registry allows them.
+        registry.set_active_limit(8)
+        mjpg = CaptureProfile(width=1280, height=720, fps=30, pixel_format="MJPG")
         self.sources = [registry.create_source(source_type=SourceType.LOCAL_UVC, name=f"Synthetic camera {name}",
-                                               enabled=True).id for name in ("A", "B", "C")]
+                                               enabled=True, desired_capture_profile=mjpg).id
+                        for name in ("A", "B", "C")]
+        # Configured and enabled, but captured as YUYV: this interim transport
+        # cannot serve it, so it is neither listed nor opened.
+        self.yuyv = registry.create_source(
+            source_type=SourceType.LOCAL_UVC, name="Synthetic raw camera", enabled=True,
+            desired_capture_profile=CaptureProfile(width=640, height=480, fps=30, pixel_format="YUYV")).id
         for source_id in self.sources:
             registry.update_source_health(source_id, health_state=SourceHealthState.ONLINE)
         # Configured but disabled, and enabled but not configured: neither is listed.
         self.disabled = registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic disabled",
-                                               enabled=False).id
+                                               enabled=False, desired_capture_profile=mjpg).id
         self.unconfigured = registry.create_source(source_type=SourceType.LOCAL_UVC,
-                                                   name="Synthetic elsewhere", enabled=True).id
-        self.hub = LocalPreviewHub((*self.sources, self.disabled))
+                                                   name="Synthetic elsewhere", enabled=True,
+                                                   desired_capture_profile=mjpg).id
+        self.hub = LocalPreviewHub((*self.sources, self.disabled, self.yuyv))
         self.monotonic = Monotonic()
         self.live = LiveFrameService(self.hub, self.store, monotonic=self.monotonic,
                                      limits=LiveFrameLimits(sweep_interval_seconds=0.02))
@@ -212,7 +226,7 @@ class LiveViewTests(LiveRouteFixture):
     async def test_unknown_source_malformed_requests_and_missing_csrf_are_refused(self):
         expected = await self.denial()
         _, cookie, csrf = await self.viewer()
-        for source_id in (uuid4(), self.unconfigured):
+        for source_id in (uuid4(), self.unconfigured, self.disabled, self.yuyv):
             self.assertEqual(await self.open(cookie, csrf, source_id), expected)
         for raw in (b"{}", b'{"source_id": 1}', b'{"source_id": "x"}',
                     json.dumps({"source_id": str(self.sources[0]).upper()}).encode(),
@@ -503,12 +517,16 @@ class ServiceTests(unittest.TestCase):
                          (4, 2, 2, 15.0, 0.2, 60.0))
 
     def test_a_stopped_service_refuses_and_releases(self):
-        source = uuid4()
-        hub = LocalPreviewHub((source,))
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        store = SimpleNamespace(current_session=lambda *a, **k: None, now=lambda: None,
-                                database=Database(Path(temporary.name) / "synthetic.sqlite3"))
+        database = Database(Path(temporary.name) / "synthetic.sqlite3")
+        with closing(database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        source = CameraRegistry(database, unaudited_writes=True).create_source(
+            source_type=SourceType.LOCAL_UVC, name="Synthetic camera", enabled=True,
+            desired_capture_profile=CaptureProfile(width=640, height=480, fps=30, pixel_format="MJPG")).id
+        hub = LocalPreviewHub((source,))
+        store = SimpleNamespace(current_session=lambda *a, **k: None, now=lambda: None, database=database)
         service = LiveFrameService(hub, store, validator=lambda access, source_id: True)
         with self.assertRaises(LiveFrameUnavailable):
             service.status()
