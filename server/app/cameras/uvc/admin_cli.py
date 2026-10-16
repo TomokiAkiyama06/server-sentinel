@@ -203,8 +203,11 @@ def _database_holders(identity: tuple[int, int], *, proc_root: Path = Path("/pro
         for name in names:
             try:
                 info = os.stat(descriptors / name)
+            except (FileNotFoundError, ProcessLookupError):
+                continue  # closed meanwhile, or the process exited
             except OSError:
-                continue  # closed meanwhile
+                # Never counted as "not the database": fail closed.
+                raise CliRefused("service_state_unavailable") from None
             if (info.st_dev, info.st_ino) == identity:
                 holders += 1
                 break
@@ -484,9 +487,10 @@ def _approve(context: _Context, source_id: UUID, label: str) -> list[str]:
     if _serial_state(candidate, scan.devices) == "shared":
         raise CliRefused("camera_serial_not_unique")
     wanted = source.desired_capture_profile
-    if (wanted is not None and wanted.pixel_format is not None and candidate.formats
+    if (wanted is not None and wanted.pixel_format is not None
             and wanted.pixel_format not in candidate.formats):
-        # The service would only report capture_profile_unavailable.
+        # Also when the camera advertises no format at all: the service
+        # would only report capture_profile_unavailable.
         raise CliRefused("camera_format_unsupported")
     store = ApprovalStore(context.database)
     try:

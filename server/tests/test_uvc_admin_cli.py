@@ -338,6 +338,7 @@ class AdminCliTests(unittest.TestCase):
              "camera_serial_not_unique"),
             ([holder_camera], 0, "camera_approved_for_another_source"),
             ([camera(0, formats=("YUYV",))], 0, "camera_format_unsupported"),
+            ([camera(0, formats=())], 0, "camera_format_unsupported"),
             ([camera(0)], 1, "camera_scan_incomplete"),
         )
         for devices, failures, reason in cases:
@@ -440,6 +441,19 @@ class DatabaseHolderTests(unittest.TestCase):
         if os.access(directory / "fd", os.R_OK):
             self.skipTest("running with permission overrides")
         with self.assertRaises(CliRefused) as refused:
+            self.holders()
+        self.assertEqual("service_state_unavailable", refused.exception.reason)
+
+    def test_a_descriptor_that_cannot_be_inspected_refuses(self):
+        self.process(6, self.account, [self.other, self.database])
+        real_stat = os.stat
+
+        def failing(path, *args, **kwargs):
+            if str(path).endswith("/6/fd/1"):
+                raise PermissionError(13, "synthetic")
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(admin_cli.os, "stat", failing), self.assertRaises(CliRefused) as refused:
             self.holders()
         self.assertEqual("service_state_unavailable", refused.exception.reason)
 
