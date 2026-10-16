@@ -61,6 +61,47 @@ FINDING_AUDIT_ACTIONS = (AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
                          AuditAction.DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION)
 
 
+
+def admit_state_file(configuration: MonitoringConfiguration, path) -> None:
+    """Refuse to open or create a Main state file outside verified storage.
+
+    Before a missing file may be created the declared recording filesystem
+    identity is verified, the file's directory must be a private directory on
+    that same filesystem and the free space must cover the hard reserve plus
+    the write overhead. An existing file must be a regular file on the
+    verified filesystem, so a fallback file left under a missing mount is
+    never used. Raises `RecordingError("STORAGE_HARD_STOP")` otherwise. Used
+    for the database (re-verified by every later policy admission) and for
+    the session-binding key (`app.auth.composition`, Codex PR #282).
+    """
+    try:
+        existing = os.lstat(path)
+    except FileNotFoundError:
+        existing = None
+    except OSError:
+        raise RecordingError("STORAGE_HARD_STOP") from None
+    filesystem = IdentifiedRecordingFilesystem(configuration.recording_filesystem, path)
+    if existing is not None:
+        # An existing file is opened only while the declared filesystem is
+        # verified and the file is a regular file on it, so a fallback
+        # database left under a missing mount is never opened.
+        if not stat.S_ISREG(existing.st_mode) or existing.st_dev != filesystem.expected.device:
+            raise RecordingError("STORAGE_HARD_STOP")
+        return
+    limits = configuration.storage_limits
+    try:
+        parent = os.stat(path.parent, follow_symlinks=False)
+        space = os.statvfs(path.parent)
+    except OSError:
+        raise RecordingError("STORAGE_HARD_STOP") from None
+    if (not stat.S_ISDIR(parent.st_mode) or parent.st_dev != filesystem.expected.device
+            or parent.st_uid != os.geteuid() or parent.st_mode & 0o077
+            or space.f_flag & os.ST_RDONLY
+            or space.f_bavail * space.f_frsize - limits.write_overhead_bytes
+            < limits.hard_reserve_bytes):
+        raise RecordingError("STORAGE_HARD_STOP")
+
+
 class RuntimeState(StrEnum):
     # Storage thresholds are not configured: storage admission stays unbound,
     # every audited/metadata write is refused and no monitoring worker runs.
@@ -303,40 +344,9 @@ class MonitoringRuntime:
     def _admit_database_open(self) -> None:
         """Refuse to open or create the database outside verified storage.
 
-        `Database.connect()` creates a missing file. Before that is allowed the
-        declared recording filesystem identity is verified, the database
-        directory must be a private directory on that same filesystem and the
-        free space must cover the hard reserve plus the write overhead. An
-        existing file must be a regular file on the verified filesystem and is
-        re-verified by every later policy admission.
+        `Database.connect()` creates a missing file; see `admit_state_file`.
         """
-        path = self.database.path
-        try:
-            existing = os.lstat(path)
-        except FileNotFoundError:
-            existing = None
-        except OSError:
-            raise RecordingError("STORAGE_HARD_STOP") from None
-        filesystem = IdentifiedRecordingFilesystem(self.configuration.recording_filesystem, path)
-        if existing is not None:
-            # An existing file is opened only while the declared filesystem is
-            # verified and the file is a regular file on it, so a fallback
-            # database left under a missing mount is never opened.
-            if not stat.S_ISREG(existing.st_mode) or existing.st_dev != filesystem.expected.device:
-                raise RecordingError("STORAGE_HARD_STOP")
-            return
-        limits = self.configuration.storage_limits
-        try:
-            parent = os.stat(path.parent, follow_symlinks=False)
-            space = os.statvfs(path.parent)
-        except OSError:
-            raise RecordingError("STORAGE_HARD_STOP") from None
-        if (not stat.S_ISDIR(parent.st_mode) or parent.st_dev != filesystem.expected.device
-                or parent.st_uid != os.geteuid() or parent.st_mode & 0o077
-                or space.f_flag & os.ST_RDONLY
-                or space.f_bavail * space.f_frsize - limits.write_overhead_bytes
-                < limits.hard_reserve_bytes):
-            raise RecordingError("STORAGE_HARD_STOP")
+        admit_state_file(self.configuration, self.database.path)
 
     def _storage_transition(self, event: StorageTransition) -> None:
         self._set(storage_state=event.current)

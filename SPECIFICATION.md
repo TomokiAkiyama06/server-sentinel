@@ -2177,7 +2177,8 @@ the credential that local bootstrap provisions and that a session is bound to.
 Issue #10 phase 1 (human route foundation) and phase 2 S1 (gated
 authorization, CSRF, sign-out) define the first main-to-Web contract, opened
 only by an explicitly enabled composition behind a fully configured
-reservation check (no production entry point builds one yet):
+reservation check (the production launcher builds one only from an enabled
+`human_access` deployment section):
 
 ```text
 POST /api/auth/authentication/options -> pre-credential, rate-limited;
@@ -2253,7 +2254,22 @@ is not repeated at every start.
 `web_assets_directory` (`<installation>/current/web`, resolved against the
 running release's own `web/`); without it no human composition can be
 mounted, and with it the release's `--check` refuses to start unless the
-build loads. Every asset response has a
+build loads. The optional deployment key `human_access` (Issue #10,
+`app.auth.access_config`; `server/docs/DEPLOYMENT.md`) states the
+reservation (hostname, port, every reserved address, isolation
+`dedicated_network_identity` / `single_purpose_node` / `null`, any visible
+proxy socket and its creator, the absolute Tailscale CLI path and the
+device-bound policy); when enabled it requires `web_assets_directory`, and
+the launcher builds the production composition (`app.auth.composition`)
+with `/proc/net`, a bounded read-only `tailscale serve status --json`
+runner (fixed arguments, empty environment, 5-second timeout, 1 MiB output
+cap; any failure is an enumeration failure), `getaddrinfo` and sock_diag.
+A section that fails validation refuses startup with a value-free reason; a
+composition that cannot be built (`human_access_composition_failed`) keeps
+every human path closed while recording and the integrity and
+recording-health checks keep running, and notifies the Owner immediately
+(`human_access_fault`, monitoring health degraded until a restart composes
+access). Without the key every human path stays closed. Every asset response has a
 fixed header list: its `Content-Type` (the manifest's, from the S5a
 build policy `web/scripts/policy.mjs`), `Content-Length`,
 `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,

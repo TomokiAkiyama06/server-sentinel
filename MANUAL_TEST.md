@@ -1624,8 +1624,9 @@ secure-context origin, using synthetic test identities (`*.invalid`):
 
 `server/app/auth/human_surface.py` is verified only with a synthetic ASGI driver
 (`server/tests/test_human_surface.py`): no socket, Tailscale Serve, browser or
-real authenticator has exercised it, and no production entry point builds the
-composition yet. Once a deployment can enable it, verify on the Main Server
+real authenticator has exercised it. The production launcher builds the
+composition from an enabled `human_access` deployment section (CP-1), not yet
+exercised on real hosts. Once a deployment enables it, verify on the Main Server
 with synthetic `*.invalid` identities:
 
 - [ ] through the installed Tailscale Serve, record the `Host` header and peer
@@ -1659,9 +1660,9 @@ with synthetic `*.invalid` identities:
 Verified only with the synthetic ASGI driver and synthetic stores
 (`server/tests/test_human_gated_authorization.py`,
 `tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve or
-real authenticator has exercised sign-out or the CSRF header yet, and no
-production entry point builds the composition. Once a deployment can enable it,
-verify on a shared machine (one OS account and browser profile, the shared
+real authenticator has exercised sign-out or the CSRF header yet; the production launcher mounts the human routes only from an enabled
+`human_access` deployment section (CP-1), not yet exercised on real hosts.
+Once a deployment enables it, verify on a shared machine (one OS account and browser profile, the shared
 Tailscale login, synthetic `*.invalid` people with their own passkeys on
 roaming authenticators):
 
@@ -1696,8 +1697,9 @@ Verified only with the synthetic ASGI driver, software authenticators and a
 pseudo-terminal (`server/tests/test_invitation_redemption.py`,
 `server/tests/test_bootstrap_cli.py`, `tests/e2e/test_access_matrix_scenarios.py`);
 no real terminal session, browser, Tailscale Serve or authenticator has
-exercised them, and no production entry point mounts the human routes yet.
-Once a deployment can enable them, on the Main Server with a synthetic
+exercised them. The production launcher mounts the human routes only from an
+enabled `human_access` deployment section (CP-1), not yet exercised on real
+hosts. Once a deployment enables them, on the Main Server with a synthetic
 `*.invalid` Owner name:
 
 - [ ] over SSH, run `bootstrap` as the service account
@@ -1763,10 +1765,10 @@ Once a deployment can enable them, on the Main Server with a synthetic
 Verified only with the synthetic ASGI driver, software authenticators and a
 synthetic boot clock (`server/tests/test_human_step_up.py`,
 `tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve,
-real authenticator or real clock step has exercised it, no production entry
-point mounts the human routes yet; the `403 step_up_required` contract is
+real authenticator or real clock step has exercised it, and the production launcher mounts the human routes only from an enabled
+`human_access` deployment section (CP-1), not yet exercised on real hosts; the `403 step_up_required` contract is
 exercised through the S4b administration routes in the tests. Once a
-deployment can enable the routes, on a shared machine (one OS account and browser profile,
+deployment enables the routes, on a shared machine (one OS account and browser profile,
 the shared Tailscale login, a synthetic `*.invalid` Owner and a synthetic
 `*.invalid` invitee, each with their own passkey on a separate roaming
 authenticator):
@@ -1830,9 +1832,9 @@ Mock only: verified with the synthetic ASGI driver, software authenticators,
 a synthetic boot clock and patched storage failures
 (`server/tests/test_human_step_up.py` `FollowUpTests` and
 `StepUpFindingStoreTests`); no browser, real authenticator, real storage
-hard stop or real notification channel has exercised it, and no production
-entry point mounts the human routes yet. Once a deployment can enable the
-routes, with a synthetic `*.invalid` Owner whose passkey is on a roaming
+hard stop or real notification channel has exercised it, and the production launcher mounts the human routes only from an enabled
+`human_access` deployment section (CP-1), not yet exercised on real hosts.
+Once a deployment enables the routes, with a synthetic `*.invalid` Owner whose passkey is on a roaming
 authenticator usable from two separate browser profiles (A and B), on a
 disposable deployment:
 
@@ -1886,9 +1888,9 @@ Mock only: verified with the synthetic ASGI driver, software authenticators
 and a synthetic boot clock (`server/tests/test_human_admin_routes.py`,
 `server/tests/test_access_administration.py`,
 `tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve,
-real authenticator or real deployment has exercised them, no production
-entry point mounts the human routes yet, and the Owner's Web screen is S6.
-Once a deployment can enable the routes, with a synthetic `*.invalid` Owner
+real authenticator or real deployment has exercised them, the production launcher mounts the human routes only from an enabled
+`human_access` deployment section (CP-1), not yet exercised on real hosts, and the Owner's Web screen is S6.
+Once a deployment enables the routes, with a synthetic `*.invalid` Owner
 and synthetic invitees, each with their own passkey:
 
 - [ ] as the Owner (fresh), `POST /api/admin/principals` with a display name
@@ -1938,7 +1940,7 @@ synthetic ASGI driver with software authenticators
 (`server/tests/test_local_revocation_cli.py`); the command has not been run
 on the real Main Server or against any deployment database. These steps
 change real access state and need the Owner present; they were not executed
-as part of the S4c change. Once a deployment can enable the human routes, on
+as part of the S4c change. Once a deployment enables the human routes, on
 the Main Server, with synthetic `*.invalid` invitees and their own test
 passkeys (never a real person's credential):
 
@@ -2042,7 +2044,7 @@ loads the real S5a build through the same loader
 (`server/tests/test_web_build_contract.py`); no browser has loaded, rendered
 or enforced the response policies of the shell or the application, and no
 Tailscale Serve or real deployment has served them. The release ships the
-build since S5c (next section). Once a deployment can enable the human
+build since S5c (next section). Once a deployment enables the human
 routes with that build, from a browser on the shared account at the reserved
 name:
 
@@ -2836,6 +2838,28 @@ by the Issue #6 synthetic policy model.
   passing. Record whether empty config prints `{}`, nothing, or text, and
   whether reading status needs anything beyond local operator access (it must
   not need ACL/Grants changes or admin credentials).
+- Production composition (`human_access` deployment key, Issue #10;
+  `server/docs/DEPLOYMENT.md`, "Enabling human access through Tailscale
+  Serve"): its tests use synthetic enumerators, a synthetic Web build and
+  generated stand-in executables only; nothing below is verified yet. As the
+  service account, run `env -i <tailscale_executable> serve status --json`
+  and record whether it succeeds without any environment, how long it takes
+  and its size (the runner allows 5 seconds and 1 MiB). With
+  `"isolation": "dedicated_network_identity"`, run it inside the dedicated
+  VM/container against that environment's own `tailscaled` and confirm the
+  backend's `/proc/net` and sock_diag view is that environment's namespace.
+  Restart the service with the key and confirm the startup check opens access
+  only with the expected single Serve mapping, and that `"isolation": null`,
+  a missing Serve mapping, an extra path or port, or a stopped `tailscaled`
+  keeps it closed (generic denial on the shell `/`) and sends one
+  `human_access_fault` notification, and that a missing or group-writable
+  `tailscale_executable` makes the release's check refuse to start with
+  `human access refused (reason=executable)`. Make the composition itself
+  fail at start (for example a session-binding key that is not the service
+  account's own) and confirm the service keeps running and recording with
+  every human path closed, logs `human_access_composition_failed`, sends one
+  `human_access_fault` notification and reports `human_access_degraded`
+  until the cause is fixed and the service restarted.
 - On the target host, compare the parsed `/proc/net/tcp` and `/proc/net/tcp6`
   listeners with `ss -ltnH`, and the parsed `/proc/net/udp` and
   `/proc/net/udp6` unconnected sockets with `ss -lunH`, for IPv4, IPv6,

@@ -124,9 +124,9 @@ path, a non-string) is refused by the installer and by the release's check
 with `web assets refused (reason=setting)`. Without the key no Web build is
 configured, and no human composition can be mounted (`create_app` refuses
 one without `Settings.web_assets_dir`), so human access stays closed: fail
-closed, never a fallback to another directory. No deployment key enables
-human access yet; the key is read and its build checked now so a release
-that does can rely on it.
+closed, never a fallback to another directory. The optional
+`"human_access"` key requires it (see "Enabling human access through
+Tailscale Serve" below).
 
 When the key is present, the release's own check (`python -m app.deployment
 --config <config> --check`, the unit's `ExecStartPre`, and the installer's
@@ -629,6 +629,131 @@ Exceptions stored before this change (an executable path such as
 `LISTENER_EXCEPTIONS_OUTDATED` and keeps human access closed until the Owner
 enters them again through the audited Owner path.
 
+### Enabling human access through Tailscale Serve (Issue #10)
+
+Without the optional `"human_access"` key every human path stays closed
+(`ClosedHumanSurface`): the backend answers every request with the generic
+denial, exactly as before. The key records the Owner's reservation of the
+dashboard origin (ADR-0003) and makes the launcher build the production
+human-access composition (`server/app/auth/composition.py`): the hostname
+reservation check over this network namespace's `/proc/net`, Tailscale Serve
+status, the node's resolver and the sock_diag owner lookup; the audited access
+store with the session-binding key `state/session-binding.key` (created once,
+mode `0600`, and, like the database file, read or created only on the verified
+recording filesystem and never past the hard reserve); the passkey ceremonies for the reserved `https` origin; and the
+Web build named by `"web_assets_directory"`. One fault monitor receives every
+reservation fault and credential finding and turns them into immediate,
+value-free Owner notifications (Issue #232 item 4). The interim live frame
+pull (S7) is attached to the sources of the `"local_uvc"` section, so a
+person with `live:view` can watch them once signed in. Opening the key does not
+open access by itself: every request still needs a passing startup/daily
+reservation check, the trusted-proxy path, an invitation and the person's own
+passkey.
+
+```json
+"web_assets_directory": "/opt/server-sentinel-main/current/web",
+"human_access": {
+  "enabled": true,
+  "hostname": "sentinel.example-tailnet.ts.net",
+  "port": 443,
+  "reserved_addresses": ["100.64.0.10", "fd7a:115c:a1e0::10"],
+  "isolation": "dedicated_network_identity",
+  "tailscale_executable": "/usr/bin/tailscale",
+  "proxy_listeners": [],
+  "proxy_owner": null,
+  "require_device_bound": false
+}
+```
+
+The values are synthetic examples; keep the real hostname and addresses only
+in this private configuration.
+
+- `enabled` (required, `true`/`false`): `false` keeps human access closed
+  while the rest of the section is still validated, so it can be switched
+  off without deleting it.
+- `hostname` (required): the reserved name, in lower case without a trailing
+  dot, for example the node's MagicDNS name. It is also the WebAuthn
+  relying-party id, so changing it later invalidates every registered
+  passkey. Rename the Tailscale node to a neutral name before enabling HTTPS
+  certificates for it (Owner decision D6): the name appears in the public
+  certificate transparency log.
+- `port` (optional, default `443`): the HTTPS port Serve answers on; the
+  origin is `https://<hostname>` for 443 and `https://<hostname>:<port>`
+  otherwise.
+- `reserved_addresses` (required, 1 to 16): every address the name resolves
+  to on this node, IPv4 and IPv6 (`tailscale ip`; compare with
+  `getent ahosts <hostname>`). Each check re-resolves the name and keeps
+  access closed when the answer differs.
+- `isolation` (required): how the reservation is enforced outside the
+  application, as the Owner states it: `"dedicated_network_identity"` (the
+  backend and its own `tailscaled` run in a dedicated VM or container with
+  their own Tailscale node, so nothing else on the shared host answers on
+  that node's addresses) or `"single_purpose_node"` (the whole host serves
+  ServerSentinel alone, enforced by OS/service policy). `null` keeps access
+  closed (`ISOLATION_UNSTATED`, with an Owner notification) until the Owner
+  states one. The check only detects; it does not enforce either mode
+  (ADR-0003).
+- `tailscale_executable` (required): the absolute path of the `tailscale`
+  CLI of the `tailscaled` that serves this node. On every check the backend
+  runs exactly `<tailscale_executable> serve status --json`, as the service
+  account, with an empty environment, no stdin, a 5-second timeout and at
+  most 1 MiB of output; any failure keeps access closed. The release's
+  check refuses a path that is not a regular file owned by root (or the
+  administrator) and not writable by group or others, in an
+  administrator-controlled directory, and executable by the service
+  account; a symbolic link is resolved and its target checked. Nothing else
+  is ever run: no `tailscale up`, `serve` change, `cert`, ACL/Grants change
+  or administrative credential.
+- `proxy_listeners` (optional, default empty) and `proxy_owner`: when Serve
+  holds a visible TCP socket on a reserved address at `port` (check with
+  `sudo ss -ltnp` on the node; record the result in `MANUAL_TEST.md`), list
+  those addresses and name its creator as `{"unit": "tailscaled.service",
+  "uid": 0}`. `proxy_owner` is required exactly when addresses are listed.
+- `require_device_bound` (optional, default `false`): `true` refuses the
+  registration of a backup-eligible (synced) passkey with `409
+  device_bound_credential_required`.
+
+When `enabled` is `true`, `"web_assets_directory"` is required too. The
+release's own check (`python -m app.deployment --config <config> --check`,
+the unit's `ExecStartPre`, and the installer's staging and rollback checks)
+refuses an invalid section with one value-free reason and the service does
+not start:
+
+```text
+ServerSentinel deployment validation failed: human access refused (reason=<word>)
+```
+
+`<word>` is `setting` (an unknown or missing key, or an invalid value),
+`web_assets` (enabled without `"web_assets_directory"`) or `executable` (the
+Tailscale CLI path fails the checks above). It never names the hostname, an
+address or a path. If the composition itself cannot be built at start (for
+example the session-binding key or its directory is not the service
+account's own, or the recording filesystem is missing, replaced or at the hard
+reserve), the service logs `human_access_composition_failed` and keeps every
+human path closed (never a partial surface) while recording and the
+integrity and recording-health checks keep running; the Owner gets an
+immediate `human_access_fault` notification and the monitoring health stays
+degraded until the cause is fixed and the service restarted. A release
+from before this key refuses it as an unknown key (see "Install, update, and
+rollback"): remove the section before rolling back to one.
+
+Then, as the Owner, in this order:
+
+1. set up the human upstream through socket activation (above) and point the
+   Serve mapping for `https://<hostname>[:<port>]/` at
+   `http://127.0.0.1:<human_port>`, with no other path, port, TCP forward or
+   Funnel on the name;
+2. add the section and run the check above as the service account;
+3. restart the service and confirm that the startup check passes (no
+   `human_access_check_failed`, no `human_access_fault` notification), then
+   follow "Owner bootstrap and recovery" below to register the Owner's
+   passkey from a viewer device.
+
+The real `tailscale serve status --json` output, whether the service account
+can read it, and whether Serve holds a visible socket are unverified against
+the installed Tailscale version (`MANUAL_TEST.md`, "ADR-0003 follow-up");
+until confirmed there, a passing check on the real host is the evidence.
+
 ### Capture-node CA and Main listener certificate
 
 The local pairing CLI (`serversentinel-pairing` below: the
@@ -1026,9 +1151,10 @@ checks are MANUAL_TEST §B step 15 (not yet executed on real hosts).
 The first Owner, and an Owner who lost every passkey, get a single-use
 enrollment code from a local command on the Main Server (ADR-0003). There is
 no bootstrap web page or route: the code is redeemed through the ordinary
-invitation redemption at the reserved origin. No production entry point
-mounts the human routes yet, so until a deployment can enable them a code
-issued here cannot be redeemed (MANUAL_TEST §J, pending).
+invitation redemption at the reserved origin, so a code issued here can be
+redeemed only once the deployment has enabled human access (see "Enabling
+human access through Tailscale Serve (Issue #10)") and its reservation check
+passes (MANUAL_TEST §J, pending on real hosts).
 
 Run it **as the service account** that owns the application database, from
 an interactive SSH or console session of an administrator, with the installed

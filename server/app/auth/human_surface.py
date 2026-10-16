@@ -3,8 +3,9 @@
 The human listener stays closed (``ClosedHumanSurface`` in ``app.main``)
 unless the embedder passes a validated ``HumanAccess`` composition, which
 requires an explicit ``HumanAccessConfiguration(enabled=True)`` and a fully
-configured ``HostnameReservationCheck``. No deployment-file key enables it
-yet, so the production entry points keep every human path closed.
+configured ``HostnameReservationCheck``. In production only the deployment
+key ``human_access`` builds one (``app.auth.composition``); without it the
+production entry points keep every human path closed.
 
 When enabled, every HTTP request passes, server-side and in this order:
 

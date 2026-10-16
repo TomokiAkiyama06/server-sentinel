@@ -111,8 +111,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
                human_access: HumanAccess | None = None) -> FastAPI:
     # Closed unless the embedder passes a validated composition: it exists
     # only when the deployment explicitly enabled human access and the
-    # hostname reservation check is fully configured. No deployment-file key
-    # builds one yet, so `python -m app` / `app.deployment` stay closed.
+    # hostname reservation check is fully configured. In production only the
+    # deployment key `human_access` builds one (`app.auth.composition`, through
+    # `app.deployment`); without it, and for `python -m app`, it stays closed.
     if human_access is not None and not isinstance(human_access, HumanAccess):
         raise TypeError("human access composition is invalid")
     if human_access is not None and human_access.store.invitation_lifetime != settings.invitation_lifetime:
@@ -137,6 +138,13 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # Codex PR #271: a monitor installed as a sink but not handed to the
         # monitoring runtime is never drained, so its faults would be lost.
         raise TypeError("human access composition is invalid")
+    if (human_access is not None and access_faults is None
+            and monitoring is not None and monitoring.storage_configured):
+        # Issue #281 item 1: wherever a monitoring runtime runs (every
+        # production deployment, which refuses to start without one), a human
+        # composition must report to its AccessFaultMonitor; without one a
+        # closed check or a credential finding would never reach the Owner.
+        raise TypeError("human access composition requires the access fault monitor")
     if human_access is not None and access_faults is not None:
         # Issue #232 item 4 (Owner decision 2026-10-16): with a configured
         # monitor, every reservation fault and credential finding of this
