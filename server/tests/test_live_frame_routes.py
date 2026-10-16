@@ -30,7 +30,9 @@ from app.auth.reservation import DAILY_SECONDS
 from app.auth.store import Requirement
 from app.cameras.registry import CameraRegistry, SourceHealthState, SourceType
 from app.cameras.registry.models import CaptureProfile
-from app.media.live.frame_pull import LiveFrameLimits, LiveFrameService, LiveFrameUnavailable
+from app.media.live.frame_pull import (
+    MAX_PENDING_REQUESTS, LiveFrameLimits, LiveFrameService, LiveFrameUnavailable,
+)
 from app.media.live.local_preview import LocalPreviewHub
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -583,6 +585,18 @@ class ServiceTests(unittest.TestCase):
             stopper.join(10)
         service.stop(wait=True)
         self.assertEqual(hub.status.viewers, 0)
+        # A blocked executor admits a bounded number of request jobs only.
+        service.start()
+        gate = threading.Event()
+        service._submit(gate.wait, 10)
+        queued = [service.status() for _ in range(MAX_PENDING_REQUESTS)]
+        with self.assertRaises(LiveFrameUnavailable):
+            service.status()
+        gate.set()
+        for future in queued:
+            future.result(timeout=10)
+        service.status().result(timeout=10)
+        service.stop(wait=True)
         # A restart serves again, with nothing left over.
         service.start()
         self.addCleanup(service.stop, wait=True)

@@ -1475,6 +1475,9 @@ route is the generic denial). The route table above lists the four routes.
   stay inside it) after a read-only check, so a forged cookie takes no slot.
   A close is not charged: it reaches SQLite only for a live session held for
   the presented cookie, so closes are bounded by opens.
+  At most 32 request jobs (all viewers) are queued or running on the
+  service's executor at once; beyond that a request is the generic denial, so
+  a slow database cannot grow the queue, and sweeps never stack.
 - Demand ends when a session's viewer stops polling for 15 s (the lease),
   on close, on sign-out, at once for the affected principal after an Owner
   grant or revocation change (`AccessAdministration.principal_changed`), and

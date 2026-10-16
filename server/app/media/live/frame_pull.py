@@ -90,6 +90,9 @@ _JPEG_SOI = b"\xff\xd8\xff"
 # The only capture format whose frames are served (passed through as JPEG).
 _MJPG = "MJPG"
 _HOLDER_DOMAIN = b"ServerSentinel live session holder v1\x00"
+# Request jobs queued or running on the executor at once (all viewers);
+# beyond it a request is the generic refusal.
+MAX_PENDING_REQUESTS = 32
 _HEALTH = ("online", "degraded", "offline", "manual_intervention_required")
 
 
@@ -217,6 +220,7 @@ class LiveFrameService:
         # Serializes start() and stop() (a run() ending while a replacement
         # is attached stops the same service from two threads).
         self._lifecycle = threading.Lock()
+        self._pending = 0
         # Live-session id -> digest of the opening human session's token.
         self._holders: dict[UUID, bytes] = {}
         self._executor: ThreadPoolExecutor | None = None
@@ -307,20 +311,42 @@ class LiveFrameService:
                 if sweeper is not None:
                     sweeper.join(timeout=10)
 
-    def _submit(self, function, *args) -> Future:
+    def _submit(self, function, *args, bounded: bool = False) -> Future:
+        """Queue one job; a ``bounded`` (request) job only within the cap.
+
+        Request jobs (open, poll, close, source list, status) are admitted
+        only while fewer than ``MAX_PENDING_REQUESTS`` are queued or running,
+        so a slow or locked database cannot grow the queue without bound;
+        over the cap the request is the generic refusal. Internal jobs (the
+        sweep, at most one queued at a time, and the revocation/sign-out
+        releases, which follow rate-limited routes) are never refused by it.
+        """
         with self._lock:
             executor = self._executor
-            if executor is None:
+            if executor is None or (bounded and self._pending >= MAX_PENDING_REQUESTS):
                 raise LiveFrameUnavailable()
             try:
-                return executor.submit(function, *args)
+                future = executor.submit(function, *args)
             except RuntimeError:
                 raise LiveFrameUnavailable() from None
+            if bounded:
+                self._pending += 1
+        if bounded:
+            future.add_done_callback(self._request_done)
+        return future
+
+    def _request_done(self, _future) -> None:
+        with self._lock:
+            self._pending -= 1
 
     def _sweep_loop(self, stop: threading.Event) -> None:
+        queued = None
         while not stop.wait(self.limits.sweep_interval_seconds):
+            if queued is not None and not queued.done():
+                # One sweep at a time: a backlog never stacks sweeps.
+                continue
             try:
-                self._submit(self._sweep)
+                queued = self._submit(self._sweep)
             except LiveFrameUnavailable:
                 return
 
@@ -358,18 +384,18 @@ class LiveFrameService:
         """Open for the human session ``access`` names, presented as ``token``."""
         if not isinstance(token, bytes):
             raise LiveFrameUnavailable()
-        return self._submit(self._open, access, source_id, self._holder(token), admit)
+        return self._submit(self._open, access, source_id, self._holder(token), admit, bounded=True)
 
     def poll(self, token: bytes, proxy_identity: str, session_id: UUID, after: int, *,
              admit: Callable[[], ContextManager]) -> Future:
-        return self._submit(self._poll, token, proxy_identity, session_id, after, admit)
+        return self._submit(self._poll, token, proxy_identity, session_id, after, admit, bounded=True)
 
     def close(self, access_session_id: UUID, session_id: UUID) -> Future:
         """Close one live session of this human access session (trusted release)."""
-        return self._submit(self._close, access_session_id, session_id)
+        return self._submit(self._close, access_session_id, session_id, bounded=True)
 
     def sources(self, *, admit: Callable[[], ContextManager]) -> Future:
-        return self._submit(self._sources, admit)
+        return self._submit(self._sources, admit, bounded=True)
 
     def revalidate_principal(self, principal_id: UUID) -> None:
         """Re-check every live session of a changed principal; fire and forget."""
@@ -388,7 +414,7 @@ class LiveFrameService:
                 pass
 
     def status(self) -> Future:
-        return self._submit(self._status)
+        return self._submit(self._status, bounded=True)
 
     # -- executor jobs -----------------------------------------------------
 
