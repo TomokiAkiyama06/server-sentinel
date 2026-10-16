@@ -363,8 +363,9 @@ record.
   `-`); with stdout and stderr redirected to a file, confirm neither holds a
   serial, `/dev/video*`, a by-id name or a USB port; run it twice and confirm
   the labels are the same, then re-plug one camera and confirm only its
-  label changed (a change of a node's owner, mode or ACL also changes its
-  label without a re-plug; `approve` then refuses the old label as
+  label changed (a `chmod` / `setfacl` of `/dev/videoN` leaves the label
+  unchanged; only a change of the sysfs entry's own metadata changes it
+  without a re-plug, and `approve` then refuses the old label as
   `candidate_not_found`);
 - [ ] `create-source --name <name> --profile 1920x1080@30/MJPG`, type
   `CREATE`: stdout holds only the new UUID and the next steps, and the audit

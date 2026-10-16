@@ -382,10 +382,12 @@ sudo systemctl start server-sentinel.service
   whose approval holds it. It never prints a serial, `/dev` path, by-id name
   or USB port. A label stays the same while the camera stays plugged in and
   changes when it is re-plugged or the host reboots: list again then. The
-  label also covers the device node's change time, so a change of the node's
-  owner, mode or ACL (a udev rule, `setfacl`, a login seat change) changes it
-  without a re-plug; `approve` then refuses the old label
-  (`candidate_not_found`), which is the safe direction: list again.
+  label also covers the change time of the camera's sysfs entry
+  (`/sys/class/video4linux/videoN`, not the `/dev` node), so a change of that
+  sysfs entry's own owner or mode changes it without a re-plug; `approve`
+  then refuses the old label (`candidate_not_found`), which is the safe
+  direction: list again. A `chmod`, `setfacl` or udev permission change of
+  the `/dev/videoN` node does not change the label.
   `sources` prints each `local_uvc` source's UUID, enabled state, approval
   state (`approved`, `approval_required`, `none`), whether the deployment
   lists it, its profile and its name.

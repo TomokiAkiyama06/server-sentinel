@@ -61,10 +61,12 @@ Output. ``candidates`` identifies each connected USB video-capture camera only
 by a short hashed label (``cam-`` and 10 hex digits of a SHA-256 over the
 device's live-instance evidence, so it stays the same between ``candidates``
 and ``approve`` while the camera stays plugged in, changes when it is
-re-plugged, and does not reveal the serial; that evidence includes the device
-node's ``ctime``, so a change of the node's owner, mode or ACL (udev, ``setfacl``,
-a logind seat change) also changes the label without a re-plug, and ``approve``
-then refuses the old label as ``candidate_not_found``: list again), its USB vendor:product ids,
+re-plugged, and does not reveal the serial; that evidence includes the
+``ctime`` of the camera's sysfs entry (``/sys/class/video4linux/videoN``, not
+the ``/dev`` node), so a change of that sysfs entry's own owner or mode also
+changes the label without a re-plug, and ``approve`` then refuses the old
+label as ``candidate_not_found``: list again. A ``chmod`` / ``setfacl`` /
+udev permission change of the ``/dev`` node does not change it), its USB vendor:product ids,
 whether it reports a serial (``present`` / ``absent`` / ``shared`` when another
 connected camera reports the same one), its advertised pixel formats and the
 source whose approval currently holds it. Never a serial, ``/dev`` path,
