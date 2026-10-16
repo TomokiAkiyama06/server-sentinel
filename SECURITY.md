@@ -48,7 +48,10 @@ session description), and phase 2 S1 adds gated authorization, a per-session
 CSRF token and sign-out to it, S2 invitation redemption, S3 the Owner
 step-up routes and S4b the Owner's access administration routes (see
 `server/app/auth/README.md`); the
-production entry points do not build one yet. Its
+production launcher builds one only from an enabled `human_access` deployment
+section (`server/app/auth/composition.py`; absent or disabled, every human path
+stays closed, and an incomplete section refuses startup), and even then access
+opens only while the reservation check passes. Its
 documented launcher accepts only loopback bind settings, disables proxy-header
 parsing and access logs, and removes the server product header. The authorization
 adapter remains deny-all until the #6/#10 gates are met. Newly created SQLite

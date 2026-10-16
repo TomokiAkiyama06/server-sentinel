@@ -1148,9 +1148,10 @@ checks are MANUAL_TEST §B step 15 (not yet executed on real hosts).
 The first Owner, and an Owner who lost every passkey, get a single-use
 enrollment code from a local command on the Main Server (ADR-0003). There is
 no bootstrap web page or route: the code is redeemed through the ordinary
-invitation redemption at the reserved origin. No production entry point
-mounts the human routes yet, so until a deployment can enable them a code
-issued here cannot be redeemed (MANUAL_TEST §J, pending).
+invitation redemption at the reserved origin, so a code issued here can be
+redeemed only once the deployment has enabled human access (see "Enabling
+human access through Tailscale Serve (Issue #10)") and its reservation check
+passes (MANUAL_TEST §J, pending on real hosts).
 
 Run it **as the service account** that owns the application database, from
 an interactive SSH or console session of an administrator, with the installed

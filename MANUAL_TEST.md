@@ -1624,8 +1624,9 @@ secure-context origin, using synthetic test identities (`*.invalid`):
 
 `server/app/auth/human_surface.py` is verified only with a synthetic ASGI driver
 (`server/tests/test_human_surface.py`): no socket, Tailscale Serve, browser or
-real authenticator has exercised it, and no production entry point builds the
-composition yet. Once a deployment can enable it, verify on the Main Server
+real authenticator has exercised it. The production launcher builds the
+composition from an enabled `human_access` deployment section (CP-1), not yet
+exercised on real hosts. Once a deployment enables it, verify on the Main Server
 with synthetic `*.invalid` identities:
 
 - [ ] through the installed Tailscale Serve, record the `Host` header and peer
@@ -1696,8 +1697,9 @@ Verified only with the synthetic ASGI driver, software authenticators and a
 pseudo-terminal (`server/tests/test_invitation_redemption.py`,
 `server/tests/test_bootstrap_cli.py`, `tests/e2e/test_access_matrix_scenarios.py`);
 no real terminal session, browser, Tailscale Serve or authenticator has
-exercised them, and no production entry point mounts the human routes yet.
-Once a deployment can enable them, on the Main Server with a synthetic
+exercised them. The production launcher mounts the human routes only from an
+enabled `human_access` deployment section (CP-1), not yet exercised on real
+hosts. Once a deployment enables them, on the Main Server with a synthetic
 `*.invalid` Owner name:
 
 - [ ] over SSH, run `bootstrap` as the service account

@@ -2177,7 +2177,8 @@ the credential that local bootstrap provisions and that a session is bound to.
 Issue #10 phase 1 (human route foundation) and phase 2 S1 (gated
 authorization, CSRF, sign-out) define the first main-to-Web contract, opened
 only by an explicitly enabled composition behind a fully configured
-reservation check (no production entry point builds one yet):
+reservation check (the production launcher builds one only from an enabled
+`human_access` deployment section):
 
 ```text
 POST /api/auth/authentication/options -> pre-credential, rate-limited;
