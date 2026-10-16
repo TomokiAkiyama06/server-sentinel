@@ -551,7 +551,9 @@ the check (`ProcNetListeners` over bounded `/proc/net` reads,
 `ServeStatusRoutes` over `ServeStatusCommand`, `GetaddrinfoResolver`,
 `SockDiagOwners`, `ListenerExceptionStore`, `ReservationSessionRevocation`),
 the audited `AccessStore` with the deployment's invitation lifetime and
-`SessionBindingKey.load_or_create(Settings.session_binding_key_path)`, the
+`SessionBindingKey.load_or_create(Settings.session_binding_key_path)` (only
+after `app.monitoring.runtime.admit_state_file`, the database file's own
+filesystem-identity and hard-reserve check, Codex PR #282), the
 `PasskeyCeremonies` for the reserved origin, the `WebAssets` and the
 `HumanAccess`. `ServeStatusCommand` runs exactly `<tailscale_executable>
 serve status --json` with an empty environment, `/` as working directory, no

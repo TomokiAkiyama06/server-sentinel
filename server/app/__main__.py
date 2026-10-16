@@ -53,7 +53,8 @@ def run(settings: Settings, monitoring=None, local_uvc=None, *, human_access=Non
         try:
             composed = dict(
                 database=database,
-                human_access=build_human_access(human_access, settings, database, faults=faults),
+                human_access=build_human_access(human_access, settings, database, faults=faults,
+                                                monitoring=monitoring),
                 monitoring_dependencies=MonitoringDependencies(access_faults=faults),
             )
         except HumanAccessUnavailable:

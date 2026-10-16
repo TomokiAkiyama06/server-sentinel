@@ -215,24 +215,33 @@ def reservation_config(configuration: HumanAccessDeployment, human_host: str,
 
 
 def build_human_access(configuration: HumanAccessDeployment, settings: Settings,
-                       database: Database, *, faults, listeners=None, routes=None,
+                       database: Database, *, faults, monitoring=None, listeners=None, routes=None,
                        resolver=None, socket_owners=None,
                        session_binding: SessionBindingKey | None = None,
                        **check_options) -> HumanAccess:
     """Compose the production ``HumanAccess``; raise ``HumanAccessUnavailable`` otherwise.
 
-    ``faults`` is the single ``AccessFaultMonitor`` of this process. The
-    keyword overrides (``listeners``, ``routes``, ``resolver``,
-    ``socket_owners``, ``session_binding`` and further
-    ``HostnameReservationCheck`` options) exist for synthetic tests; the
-    launcher passes none of them. Reads the session-binding key (creating it
-    once, mode 0600) and the Web build; opens no socket and writes no
-    database row: the startup check runs in the application lifespan.
+    ``faults`` is the single ``AccessFaultMonitor`` of this process.
+    ``monitoring`` is the deployment's storage-configured
+    ``MonitoringConfiguration``: the session-binding key is read or created
+    only after ``admit_state_file`` verified the declared recording
+    filesystem identity and, for a creation, the hard reserve (Codex PR #282),
+    exactly like the database file, because this runs before the monitoring
+    runtime binds the storage admission. The keyword overrides
+    (``listeners``, ``routes``, ``resolver``, ``socket_owners``,
+    ``session_binding`` and further ``HostnameReservationCheck`` options)
+    exist for synthetic tests; the launcher passes none of them. Reads the
+    session-binding key (creating it once, mode 0600, under that check) and
+    the Web build; opens no socket and writes no database row: the startup
+    check runs in the application lifespan.
     """
     from app.monitoring.access import AccessFaultMonitor
+    from app.monitoring.config import MonitoringConfiguration
     if (not isinstance(configuration, HumanAccessDeployment) or configuration.enabled is not True
             or not isinstance(settings, Settings) or not isinstance(database, Database)
             or not isinstance(faults, AccessFaultMonitor)
+            or (session_binding is None and not (isinstance(monitoring, MonitoringConfiguration)
+                                                 and monitoring.storage_configured))
             or settings.web_assets_dir is None
             or configuration.upstream_host not in (None, settings.human_host)
             or configuration.upstream_port not in (None, settings.human_port)
@@ -241,8 +250,13 @@ def build_human_access(configuration: HumanAccessDeployment, settings: Settings,
     try:
         config = reservation_config(configuration, settings.human_host, settings.human_port)
         assets = WebAssets.load(settings.web_assets_dir)
-        binding = (session_binding if session_binding is not None
-                   else SessionBindingKey.load_or_create(settings.session_binding_key_path))
+        if session_binding is None:
+            from app.monitoring.runtime import admit_state_file
+            # Never spend the hard reserve or place the key on a fallback
+            # root filesystem under a missing or replaced mount.
+            admit_state_file(monitoring, settings.session_binding_key_path)
+            session_binding = SessionBindingKey.load_or_create(settings.session_binding_key_path)
+        binding = session_binding
         audit = AuditStore(database)
         store = AccessStore(database, audit=audit, session_binding=binding,
                             invitation_lifetime=settings.invitation_lifetime)

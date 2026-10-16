@@ -41,10 +41,11 @@ from app.monitoring.access import AccessFaultMonitor
 from app.monitoring.runtime import MonitoringDependencies
 from app.settings import ConfigurationError, Settings
 from app.storage.database import Database
+from app.storage.policy import StorageLimits
 
 from tests.test_hostname_reservation import HOST, V4, V6, Files, Owners, Resolver, Status
 from tests import test_release_web_assets as web_setting
-from tests.test_monitoring_runtime import RuntimeFixture, SyntheticValidator
+from tests.test_monitoring_runtime import STORAGE_LIMITS, RuntimeFixture, SyntheticValidator
 from tests.web_asset_fakes import write_build
 
 
@@ -511,9 +512,45 @@ class CompositionTests(RuntimeFixture):
         self.assertIsInstance(captured["socket_owners"], SockDiagOwners)
 
     def test_session_binding_key_is_loaded_from_the_state_directory(self):
-        self.build(session_binding=None)
+        self.build(session_binding=None, monitoring=self.configuration())
         info = self.settings.session_binding_key_path.stat()
         self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+        # A restart loads the same key under the same check.
+        self.build(session_binding=None, monitoring=self.configuration())
+
+    def test_session_binding_key_is_created_only_on_verified_storage(self):
+        """Codex PR #282: the key is written before the monitoring runtime binds
+        the storage admission, so it gets the database's own fresh check:
+        never past the hard reserve, never on a missing or replaced mount."""
+        path = self.settings.session_binding_key_path
+        cases = {
+            "no monitoring configuration": dict(monitoring=None),
+            "storage thresholds missing": dict(monitoring=self.configuration(
+                storage_limits=None, recording_limits=None, recording_filesystem=None)),
+            "hard reserve would be spent": dict(monitoring=self.configuration(
+                storage_limits=StorageLimits(**{
+                    **STORAGE_LIMITS, "hard_reserve_bytes": 2 ** 62,
+                    "pressure_free_bytes": 2 ** 62 + 1, "recovery_free_bytes": 2 ** 62 + 2}))),
+        }
+        for name, change in cases.items():
+            with self.subTest(name), self.assertRaises(HumanAccessUnavailable):
+                self.build(session_binding=None, **change)
+            self.assertFalse(path.exists())
+            self.assertEqual([entry for entry in path.parent.iterdir()
+                              if entry.name.startswith(".session-binding")], [])
+        # The approved filesystem is no longer the mounted one.
+        configuration = self.configuration()
+        self.approved_device = self.device + 1
+        with self.assertRaises(HumanAccessUnavailable):
+            self.build(session_binding=None, monitoring=configuration)
+        self.assertFalse(path.exists())
+        # An existing key is not used while the mount is replaced either.
+        self.approved_device = self.device
+        self.build(session_binding=None, monitoring=configuration)
+        self.assertTrue(path.exists())
+        self.approved_device = self.device + 1
+        with self.assertRaises(HumanAccessUnavailable):
+            self.build(session_binding=None, monitoring=configuration)
 
     def test_any_missing_or_invalid_piece_refuses_without_values(self):
         configuration = parse_human_access(section())
@@ -544,7 +581,7 @@ class CompositionTests(RuntimeFixture):
         (self.root / "state").chmod(0o777)
         self.addCleanup((self.root / "state").chmod, 0o700)
         with self.assertRaises(HumanAccessUnavailable):
-            self.build(session_binding=None)
+            self.build(session_binding=None, monitoring=self.configuration())
 
     async def serve(self, access, **options):
         return create_app(
@@ -642,8 +679,8 @@ class LauncherCompositionTests(unittest.TestCase):
     def test_enabled_section_passes_one_monitor_everywhere(self):
         built = {}
 
-        def fake_build(configuration, settings, database, *, faults):
-            built.update(faults=faults, database=database)
+        def fake_build(configuration, settings, database, *, faults, monitoring):
+            built.update(faults=faults, database=database, monitoring=monitoring)
             return "composition"
 
         code, create, build = self.run_launcher(
@@ -655,6 +692,8 @@ class LauncherCompositionTests(unittest.TestCase):
         self.assertIs(kwargs["monitoring_dependencies"].access_faults, built["faults"])
         self.assertIs(kwargs["database"], built["database"])
         self.assertEqual(built["database"].path, self.settings.database_path)
+        # The key is created under the deployment's storage check.
+        self.assertTrue(built["monitoring"].storage_configured)
         build.return_value.run.assert_called_once_with()
 
     def test_a_refused_composition_does_not_start(self):

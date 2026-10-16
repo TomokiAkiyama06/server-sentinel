@@ -639,7 +639,8 @@ human-access composition (`server/app/auth/composition.py`): the hostname
 reservation check over this network namespace's `/proc/net`, Tailscale Serve
 status, the node's resolver and the sock_diag owner lookup; the audited access
 store with the session-binding key `state/session-binding.key` (created once,
-mode `0600`); the passkey ceremonies for the reserved `https` origin; and the
+mode `0600`, and, like the database file, read or created only on the verified
+recording filesystem and never past the hard reserve); the passkey ceremonies for the reserved `https` origin; and the
 Web build named by `"web_assets_directory"`. One fault monitor receives every
 reservation fault and credential finding and turns them into immediate,
 value-free Owner notifications (Issue #232 item 4). The interim live frame
@@ -727,7 +728,8 @@ ServerSentinel deployment validation failed: human access refused (reason=<word>
 Tailscale CLI path fails the checks above). It never names the hostname, an
 address or a path. If the composition itself cannot be built at start (for
 example the session-binding key or its directory is not the service
-account's own), the service logs `human_access_composition_failed` and exits
+account's own, or the recording filesystem is missing, replaced or at the hard
+reserve), the service logs `human_access_composition_failed` and exits
 non-zero; it never falls back to a partial or a closed surface. A release
 from before this key refuses it as an unknown key (see "Install, update, and
 rollback"): remove the section before rolling back to one.
