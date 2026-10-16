@@ -209,6 +209,17 @@ class ReservationFaultTests(MonitoredAccessFixture):
         self.assertEqual(self.notifications.calls[0]["event_id"], stored)
         self.assertEqual(self.notifications.calls[0]["at"], at)
 
+    async def test_a_pending_fault_and_recovery_are_both_sent_in_order(self):
+        fault, fault_at = uuid4(), AT - timedelta(minutes=30)
+        recovery, recovery_at = uuid4(), AT - timedelta(minutes=20)
+        self.monitor.restore_pending_recovery(event_id=recovery, at=recovery_at,
+                                              fault_event_id=fault, fault_at=fault_at)
+        self.drain()
+        self.drain(60)
+        self.assertEqual(self.notifications.kinds, [FAULT, RECOVERED])
+        self.assertEqual([(call["event_id"], call["at"]) for call in self.notifications.calls],
+                         [(fault, fault_at), (recovery, recovery_at)])
+
     async def test_starting_or_stopped_composition_is_neither_fault_nor_recovery(self):
         await self.stop_serving()
         self.assertIs(self.access.state, HumanAccessState.STOPPED)
@@ -635,15 +646,20 @@ class FindingRecoveryTests(RuntimeFixture):
         """Codex PR #271: the newest fault/recovered row (by rowid) decides."""
         calls = []
         # Each later row is stamped earlier: only the insertion (rowid) order counts.
+        # Rows accumulate: in the "recovery" case the preceding row is a
+        # delivered recovery, so there is no fault to re-send.
         cases = ((("human_access_fault", "sent"),), [{"delivered": True, "event_id": None, "at": None}]), \
             ((("human_access_fault", "sent"), ("human_access_recovered", "sent")), []), \
+            ((("human_access_recovered", "pending"),), "recovery"), \
             ((("human_access_recovered", "sent"), ("human_access_fault", "pending")), "pending"), \
-            ((("human_access_recovered", "pending"),), "recovery")
+            ((("human_access_fault", "pending"), ("human_access_recovered", "pending")), "both")
         await self.cycle()
         for rows, expected in cases:
             with closing(sqlite3.connect(self.settings.database_path)) as db:
                 for index, (kind, delivery) in enumerate(rows):
                     at = self.clock.now - timedelta(minutes=10 + index)
+                    self.prior_event_id, self.prior_at = getattr(self, "last_event_id", None), \
+                        getattr(self, "last_at", None)
                     self.last_event_id, self.last_at = str(uuid4()), at
                     db.execute("INSERT INTO notification_events VALUES (?, ?, ?, 0, ?)",
                                (self.last_event_id, kind, at.isoformat(), delivery))
@@ -658,10 +674,15 @@ class FindingRecoveryTests(RuntimeFixture):
                     patch.object(AccessFaultMonitor, "_polled", lambda monitor: None):
                 await self.cycle()
             with self.subTest(rows=rows):
-                if expected == "recovery":
+                if expected in ("recovery", "both"):
                     (call,) = calls
                     self.assertEqual(str(call["recovery"]["event_id"]), self.last_event_id)
                     self.assertEqual(call["recovery"]["at"], self.last_at)
+                    if expected == "both":
+                        self.assertEqual(str(call["recovery"]["fault_event_id"]), self.prior_event_id)
+                        self.assertEqual(call["recovery"]["fault_at"], self.prior_at)
+                    else:
+                        self.assertIsNone(call["recovery"]["fault_event_id"])
                 elif expected == "pending":
                     # The stored row's own ID and time, so the retry updates it.
                     (call,) = calls

@@ -228,21 +228,28 @@ class AccessFaultMonitor:
             if event_id is not None:
                 self._attempts[NotificationKind.HUMAN_ACCESS_FAULT] = (at, event_id)
 
-    def restore_pending_recovery(self, *, event_id: UUID, at: datetime) -> None:
+    def restore_pending_recovery(self, *, event_id: UUID, at: datetime,
+                                 fault_event_id: UUID | None = None,
+                                 fault_at: datetime | None = None) -> None:
         """Owner thread: the last access notification was a recovery never delivered.
 
         Called once at startup by the monitoring runtime (Codex PR #271): the
         Owner's last delivered access message is the fault, so the episode is
         restored as notified and the recovery notice is sent again, under
         that ``pending`` row's own ``event_id`` and ``at``, once a check
-        passes while serving. Ignored once this process has notified access
-        state itself.
+        passes while serving. When the episode's fault row is still pending
+        too (``fault_event_id`` / ``fault_at``), that fault is sent first,
+        under its own row, so a recovery never arrives without its alert.
+        Ignored once this process has notified access state itself.
         """
         if not isinstance(event_id, UUID) or not isinstance(at, datetime):
             raise ValueError("invalid restored recovery")
         if self._sent or self._notified is not AccessHealth.HEALTHY:
             return
-        self.restore_fault_episode()
+        if fault_event_id is not None or fault_at is not None:
+            self.restore_fault_episode(delivered=False, event_id=fault_event_id, at=fault_at)
+        else:
+            self.restore_fault_episode()
         self._attempts[NotificationKind.HUMAN_ACCESS_RECOVERED] = (at, event_id)
 
     def _polled(self) -> AccessHealth | None:

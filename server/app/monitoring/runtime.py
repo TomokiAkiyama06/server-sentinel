@@ -707,7 +707,8 @@ class MonitoringRuntime:
         continues in this process, so recovery is still announced; a fault
         row still ``pending`` is sent again first. A newest recovery row
         still ``pending`` is sent again (under its own ID and time) once a
-        check passes.
+        check passes, after its episode's fault when that row is pending too.
+        Older episodes are superseded and not replayed.
         """
         now = self.dependencies.utcnow()
         # The whole retained audit history (Codex PR #271): a notification
@@ -722,18 +723,26 @@ class MonitoringRuntime:
             monitor.recover_finding(age_seconds=age, monotonic=self.dependencies.monotonic(),
                                     notify=not delivered)
         if monitor.attached is not None:
-            last = self._connection.execute(
+            rows = self._connection.execute(
                 "SELECT kind, delivery, event_id, at FROM notification_events WHERE kind IN (?, ?) "
-                "ORDER BY rowid DESC LIMIT 1",
+                "ORDER BY rowid DESC LIMIT 2",
                 (NotificationKind.HUMAN_ACCESS_FAULT.value,
                  NotificationKind.HUMAN_ACCESS_RECOVERED.value),
-            ).fetchone()
+            ).fetchall()
+            last = rows[0] if rows else None
             pending = last is not None and last[1] == DeliveryResult.PENDING.value
             if (last is not None and last[0] == NotificationKind.HUMAN_ACCESS_RECOVERED.value
                     and pending):
-                # A recovery notice the stopped process never delivered.
-                monitor.restore_pending_recovery(event_id=UUID(last[2]),
-                                                 at=datetime.fromisoformat(last[3]))
+                # A recovery notice the stopped process never delivered; its
+                # episode's fault row may be undelivered too (sent first).
+                prior = rows[1] if len(rows) > 1 else None
+                fault = (prior if prior is not None
+                         and prior[0] == NotificationKind.HUMAN_ACCESS_FAULT.value
+                         and prior[1] == DeliveryResult.PENDING.value else None)
+                monitor.restore_pending_recovery(
+                    event_id=UUID(last[2]), at=datetime.fromisoformat(last[3]),
+                    fault_event_id=UUID(fault[2]) if fault is not None else None,
+                    fault_at=datetime.fromisoformat(fault[3]) if fault is not None else None)
             elif last is not None and last[0] == NotificationKind.HUMAN_ACCESS_FAULT.value:
                 delivered = not pending
                 monitor.restore_fault_episode(
