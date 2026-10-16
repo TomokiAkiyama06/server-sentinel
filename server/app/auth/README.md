@@ -509,7 +509,8 @@ as identical `/proc/net` rows, and every extra copy is counted as an
 endpoint would receive requests and session cookies. The same applies to a
 wildcard endpoint covered by a listener exception: one exception allows one
 socket per distinct endpoint it covers (for example `0.0.0.0:22` and `:::22`),
-and each identical extra row is unexpected. An exception allows one socket per
+and each identical extra row is unexpected, whether or not either row's
+creator can be verified (PR #274 review). An exception allows one socket per
 endpoint even for its own process, so a service that opens several
 `SO_REUSEPORT` sockets on an excepted port keeps access closed.
 

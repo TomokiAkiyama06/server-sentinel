@@ -2068,6 +2068,24 @@ class ReservedAddressExceptionTests(ExceptionFixture):
         verdict, _, sink = self.set(files, {PEER_V4, PEER_V6})
         self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
         self.assertEqual(sink.events[-1].unexpected_listeners, 1)
+        # The extra row is an exposure even when a creator cannot be verified
+        # (PR #274 review): rows 1001 and 1002 share the endpoint.
+        for name, overrides in {"extra row unverified": {1002: None},
+                                "first row unverified": {1001: SocketCreator(None, 0)},
+                                "both unverified": {1001: None, 1002: SocketCreator("/init.scope", 0)}}.items():
+            with self.subTest(name):
+                revoker = FakeRevoker()
+                verdict, _, _ = self.set(files, {PEER_V4, PEER_V6}, session_revoker=revoker,
+                                         socket_owners=Owners(TAILSCALED_CREATOR, overrides=overrides))
+                self.assertIn(Reason.UNEXPECTED_LISTENER, verdict.reasons)
+                self.assertTrue(revoker.pending)
+        # Likewise for a duplicated wildcard endpoint (rows 1001 and 1002).
+        wildcard = Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("0.0.0.0", 22, "0A"), ("0.0.0.0", 22, "0A")))
+        revoker = FakeRevoker()
+        verdict, _, _ = self.set(wildcard, {SSH}, session_revoker=revoker,
+                                 socket_owners=Owners(SSHD_CREATOR, overrides={1002: None}))
+        self.assertIn(Reason.UNEXPECTED_LISTENER, verdict.reasons)
+        self.assertTrue(revoker.pending)
 
     def test_confirmed_other_creator_is_an_exposure(self):
         for creator in (INTRUDER, SSHD_CREATOR, SocketCreator("/system.slice/tailscaled.service", 1000),

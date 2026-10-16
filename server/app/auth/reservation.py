@@ -1073,18 +1073,21 @@ def evaluate(config: ReservationConfig, listeners, routes,
             covering = [item for item in exceptions
                         if item.matches(normalized, config.reserved_addresses)]
             if covering:
+                # Counted before the creator is judged (PR #274 review): an
+                # identical extra row is another socket on the endpoint whether
+                # or not its creator can be verified, as for the upstream and
+                # the proxy sockets, so it is an exposure, not only unverified.
+                if normalized in seen_excepted:
+                    unexpected_listeners += 1
+                    continue
+                seen_excepted.add(normalized)
                 creator = known.get(listener.inode) if listener.inode else None
                 status = _creator_status([item.owner for item in covering], creator)
                 if status == _UNVERIFIED:
                     # No verified creator: it may be any process answering here.
                     unverified += 1
-                    continue
-                if status == _UNEXPECTED:
+                elif status == _UNEXPECTED:
                     unexpected_listeners += 1
-                    continue
-                if normalized in seen_excepted:
-                    unexpected_listeners += 1
-                seen_excepted.add(normalized)
                 continue
             if address.is_unspecified or address in reserved:
                 if normalized in config.proxy_listeners and normalized not in seen_proxies:
