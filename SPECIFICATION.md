@@ -1386,7 +1386,7 @@ notification per finding up to four per rolling hour, the ones over that cap
 batched into one notification once the hour allows (its own budget, outside
 the access budget; Owner decision 2026-10-16); at most four `human_access_fault` /
 `human_access_recovered` notifications per rolling hour, with a held-back
-episode reported later. They set `human_access_degraded` /
+episode reported later. Both rolling hours continue across a restart: the first running tick re-seeds them from the accepted (non-`pending`) notification rows of the last hour by the wall-clock time since their acceptance (`notification_events.accepted_at`, the row's latest local write, migration 25; a row written before it counts from its event time), filtering the hour before taking the newest rows and ignoring a row stamped in the future, so a restored row counts for at most an hour after the restart (Issue #281 item 2, Issue #287). A notification retried long after its event therefore counts from the retry. When the process started with monitoring `failed` and notified before storage recovered, the stored rows are merged into its window by event ID, so its own rows are not counted twice and the earlier process's rows are not skipped (Issue #287). They set `human_access_degraded` /
 `credential_finding_degraded` (the latter for one day after the latest
 finding) and carry only the fixed kind. A finding committed before a restart
 whose notification had not been sent yet is recovered on the first running
@@ -1731,8 +1731,9 @@ decisions, 2026-10-01 and 2026-10-07). The only exception that covers a bind
 directly on a reserved address is a `reserved_address` exception for
 `tailscaled.service` with uid 0 over TCP on one recorded port other than the
 dashboard, upstream and proxy ports (its plain-HTTP peerAPI; Owner decision
-D1, 2026-10-16, ADR-0003); it covers only the configured reserved addresses
-and is verified the same way. The Owner records the set with the local command
+D1, 2026-10-16, ADR-0003); it covers only the configured reserved addresses,
+at most one such exception covers each family (Issue #278), and it is
+verified the same way. The Owner records the set with the local command
 `python -m app.auth.reservation_cli show|set --config <deployment.json>` (Owner
 decision D3, 2026-10-16): run as the service account with the same checks as
 `bootstrap_cli` (no root, the configuration's service uid, a controlling
@@ -2276,7 +2277,12 @@ with `/proc/net`, a bounded read-only `tailscale serve status --json`
 runner (fixed arguments, empty environment, 5-second timeout, 1 MiB output
 cap; any failure is an enumeration failure), `getaddrinfo` and sock_diag.
 A section that fails validation refuses startup with a value-free reason; a
-composition that cannot be built (`human_access_composition_failed`) keeps
+valid section whose Tailscale CLI fails the launcher's executable check at
+start does not (Issue #283): `--check` passes with a value-free
+`reason=executable` warning on stderr and the start is handled like a
+composition that cannot be built. Such a composition, including one
+`create_app` refuses with `HumanAccessCompositionRefused` (any other
+exception propagates), logs `human_access_composition_failed`, keeps
 every human path closed while recording and the integrity and
 recording-health checks keep running, and notifies the Owner immediately
 (`human_access_fault`, monitoring health degraded until a restart composes
@@ -2339,8 +2345,11 @@ or `Content-Type` and is not rate-limited, while opens are charged per session
 (a burst of 20, one more every 3 s; only a session of the Owner or a
 `live:view` holder takes a limiter slot) and a refused open leaves no demand.
 Limits: 4 sessions in total, 2 per source, 2 per person, 5 served
-frames per second per session, 8 MiB and a JPEG SOI marker per frame; over a
-limit the generic denial (pacing: `204`). Demand ends after 15 s without an
+frames per second per session, 8 MiB and a JPEG SOI marker per frame; at most
+32 live request jobs pending on the server, at most 8 of them per human
+session (Issue #279 item 1, Owner decision 2026-10-16), so one session cannot
+fill the shared queue; over a limit the generic denial, overload included,
+with no distinct overload response (pacing: `204`). Demand ends after 15 s without an
 authorized poll, on close and sign-out, at once after an Owner grant or
 revocation change, and for every session while access is closed or the
 composition stopped; a poll queued before the service stopped is refused.

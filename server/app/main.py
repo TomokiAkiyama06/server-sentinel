@@ -64,6 +64,19 @@ class RuntimeStorageAdmission:
         return runtime.reservation()
 
 
+class HumanAccessCompositionRefused(TypeError):
+    """``create_app`` refused the ``human_access`` composition it was given.
+
+    A ``TypeError`` (the existing contract for an invalid argument), but its
+    own class, so the launcher serves closed and alerts only on this refusal
+    and an unrelated ``TypeError`` from a bug still propagates (Issue #283
+    item 2). Carries no configuration value.
+    """
+
+    def __init__(self, message: str = "human access composition is invalid") -> None:
+        super().__init__(message)
+
+
 class ClosedHumanSurface:
     """Keep every HTTP and WebSocket path closed (the default).
 
@@ -115,17 +128,17 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # deployment key `human_access` builds one (`app.auth.composition`, through
     # `app.deployment`); without it, and for `python -m app`, it stays closed.
     if human_access is not None and not isinstance(human_access, HumanAccess):
-        raise TypeError("human access composition is invalid")
+        raise HumanAccessCompositionRefused()
     if human_access is not None and human_access.store.invitation_lifetime != settings.invitation_lifetime:
         # Issue #235 item 3: Owner-issued invitations expire after the
         # deployment's ``invitation_lifetime_hours``; a store left at another
         # lifetime (the 24-hour default, say) would issue codes with the
         # wrong expiry or refuse every one.
-        raise TypeError("human access composition is invalid")
+        raise HumanAccessCompositionRefused()
     if human_access is not None and not _assets_from_settings(human_access, settings):
         # Issue #10 phase 2 S5b: the served Web build is the one the
         # deployment settings name, never one an embedder picked elsewhere.
-        raise TypeError("human access composition is invalid")
+        raise HumanAccessCompositionRefused()
     access_faults = monitoring_dependencies.access_faults if monitoring_dependencies is not None else None
     if access_faults is not None and (monitoring is None or not monitoring.storage_configured):
         # Only the monitoring runtime drains the monitor (Codex PR #271):
@@ -137,14 +150,15 @@ def create_app(settings: Settings, *, database: Database | None = None,
                     (human_access.reservation.fault_sink, human_access.ceremonies.findings))):
         # Codex PR #271: a monitor installed as a sink but not handed to the
         # monitoring runtime is never drained, so its faults would be lost.
-        raise TypeError("human access composition is invalid")
+        raise HumanAccessCompositionRefused()
     if (human_access is not None and access_faults is None
             and monitoring is not None and monitoring.storage_configured):
         # Issue #281 item 1: wherever a monitoring runtime runs (every
         # production deployment, which refuses to start without one), a human
         # composition must report to its AccessFaultMonitor; without one a
         # closed check or a credential finding would never reach the Owner.
-        raise TypeError("human access composition requires the access fault monitor")
+        raise HumanAccessCompositionRefused(
+            "human access composition requires the access fault monitor")
     if human_access is not None and access_faults is not None:
         # Issue #232 item 4 (Owner decision 2026-10-16): with a configured
         # monitor, every reservation fault and credential finding of this
@@ -153,7 +167,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
         if (human_access.reservation.fault_sink is not access_faults
                 or human_access.ceremonies.findings is not access_faults
                 or access_faults.attached not in (None, human_access)):
-            raise TypeError("human access composition is invalid")
+            raise HumanAccessCompositionRefused()
     store = database or Database(settings.database_path)
     # Local UVC capture is driven only by the deployment's list of approved
     # logical sources. Frames go to a bounded preview hub that retains nothing

@@ -12,11 +12,12 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
-from contextlib import closing
+from contextlib import closing, nullcontext
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from unittest import TestCase
 from unittest.mock import PropertyMock, patch
 from uuid import UUID, uuid4, uuid5
@@ -30,14 +31,19 @@ from app.auth.passkeys import CredentialFinding, PasskeyCeremonies
 from app.auth.reservation import (
     DAILY_SECONDS, RETRY_WHILE_CLOSED_SECONDS, CheckKind, Reason, ReservationFault,
 )
-from app.main import create_app
+from app.main import HumanAccessCompositionRefused, create_app
 from app.media.recording.model import Limits
 from app.monitoring.config import MonitoringConfiguration, RecordingFilesystem
 from app.storage.policy import StorageLimits
+from app.local_admin import CliRefused, _require_current_schema
 from app.monitoring.access import AccessFaultMonitor
 from app.monitoring.runtime import EVENT_NAMESPACE, MonitoringDependencies, RuntimeState
-from app.notifications.service import NotificationKind, NotificationService
-from app.notifications.slack import SlackDelivery
+from app.monitoring.store import NotificationEventStore
+from app.notifications.service import NotificationEvent, NotificationKind, NotificationService
+from app.notifications.slack import DeliveryResult, SlackDelivery
+from app.storage.database import Database
+from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
 
 from tests.test_hostname_reservation import HOST, NOW, checker
 from tests.test_human_surface import (
@@ -54,6 +60,7 @@ AT = datetime(2026, 10, 16, 9, 0, tzinfo=timezone.utc)
 FAULT = NotificationKind.HUMAN_ACCESS_FAULT
 RECOVERED = NotificationKind.HUMAN_ACCESS_RECOVERED
 FINDING = NotificationKind.CREDENTIAL_FINDING
+HOUR = 3600.0
 
 
 class RecordingNotifications:
@@ -415,7 +422,8 @@ class CompositionTests(MonitoredAccessFixture):
         """Issue #281 item 1: with a monitoring runtime (every production
         deployment), a human composition without the monitor is refused."""
         for dependencies in (None, MonitoringDependencies()):
-            with self.subTest(dependencies=dependencies), self.assertRaises(TypeError):
+            with self.subTest(dependencies=dependencies), self.assertRaises(
+                    HumanAccessCompositionRefused):
                 create_app(self.settings(), database=self.database, human_access=self.access,
                            storage_reservation=self.admission, monitoring=self.monitoring(),
                            monitoring_dependencies=dependencies)
@@ -428,11 +436,14 @@ class CompositionTests(MonitoredAccessFixture):
                              store=self.store, reservation=check,
                              ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=check,
                                                           clock=self.ceremony_clock, findings=monitor))
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError) as refused:
             create_app(self.settings(), database=self.database, human_access=access,
                        storage_reservation=self.admission, monitoring=self.monitoring(),
                        monitoring_dependencies=MonitoringDependencies(access_faults=monitor),
                        local_uvc="not a configuration")
+        # Issue #283 item 2: not a refusal of the human composition, so the
+        # launcher lets it propagate instead of serving closed.
+        self.assertNotIsInstance(refused.exception, HumanAccessCompositionRefused)
         self.assertIsNone(monitor.attached)
         create_app(self.settings(), database=self.database, human_access=access,
                    storage_reservation=self.admission, monitoring=self.monitoring(),
@@ -489,7 +500,6 @@ class MonitorValidationTests(TestCase):
 
     def test_a_refused_notification_is_retried_with_the_same_event(self):
         """Codex PR #271: ``FAILED`` means the service kept nothing."""
-        from app.notifications.slack import DeliveryResult
 
         class Refusing(RecordingNotifications):
             def __init__(self):
@@ -539,6 +549,138 @@ class MonitorValidationTests(TestCase):
         # Recovery cannot be observed without the composition: stays degraded.
         self.assertTrue(monitor.drain(notifications, at=AT, monotonic=2.0).human_access_degraded)
         self.assertEqual(notifications.kinds, [FAULT])
+
+
+    def test_restored_windows_keep_the_hourly_budgets_across_a_restart(self):
+        """Issue #281 item 2: the previous process's accepted rows of the last
+        hour count against both budgets, from their wall-clock ages."""
+        monitor = AccessFaultMonitor(access_budget=2, finding_budget=1)
+        notifications = RecordingNotifications()
+        monitor.restore_windows(access_rows=[(uuid4(), 100.0), (uuid4(), 200)],
+                                finding_rows=[(uuid4(), 1800.0)], monotonic=10_000.0)
+        monitor.composition_failed()
+        monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, uuid4())
+        status = monitor.drain(notifications, at=AT, monotonic=10_000.0)
+        self.assertEqual(notifications.kinds, [])
+        self.assertTrue(status.human_access_degraded)
+        self.assertTrue(status.credential_finding_degraded)
+        # Held back, never lost: sent once the restored rows leave the hour.
+        monitor.drain(notifications, at=AT, monotonic=10_000.0 - 1800.0 + HOUR)
+        self.assertEqual(notifications.kinds, [FINDING])
+        monitor.drain(notifications, at=AT, monotonic=10_000.0 - 200.0 + HOUR)
+        self.assertEqual(notifications.kinds, [FINDING, FAULT])
+
+    def test_restored_windows_ignore_rows_outside_the_hour(self):
+        monitor = AccessFaultMonitor(access_budget=1, finding_budget=1)
+        notifications = RecordingNotifications()
+        monitor.restore_windows(access_rows=[(uuid4(), -5.0)], finding_rows=[(uuid4(), HOUR)],
+                                monotonic=50.0)
+        monitor.composition_failed()
+        monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, uuid4())
+        monitor.drain(notifications, at=AT, monotonic=50.0)
+        self.assertEqual(notifications.kinds, [FAULT, FINDING])
+
+    def test_a_window_this_process_used_is_merged_with_the_restored_rows(self):
+        """Issue #287 (Codex PR #285): a process that started in ``FAILED``
+        and notified before storage recovered keeps its own entries and adds
+        the previous process's rows; its own rows are not counted twice."""
+        monitor = AccessFaultMonitor(access_budget=3, finding_budget=2)
+        notifications = RecordingNotifications()
+        monitor.composition_failed()
+        monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, uuid4())
+        monitor.drain(notifications, at=AT, monotonic=1000.0)
+        own_access, own_finding = (call["event_id"] for call in notifications.calls)
+        previous = uuid4()
+        monitor.restore_windows(
+            # The stored row of this process's own fault (its event ID), and
+            # one row of the previous process; a third outside the hour.
+            access_rows=[(own_access, 5.0), (previous, 600.0), (uuid4(), HOUR)],
+            finding_rows=[(own_finding, 5.0), (uuid4(), 900.0)], monotonic=1010.0)
+        self.assertEqual(list(monitor._sent), [(410.0, previous), (1000.0, own_access)])
+        self.assertEqual([entry[0] for entry in monitor._finding_sent], [110.0, 1000.0])
+        # The finding budget of two is used up by the merge: a new finding
+        # waits until the previous process's row leaves the hour, then goes.
+        monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, uuid4())
+        monitor.drain(notifications, at=AT, monotonic=1020.0)
+        self.assertEqual(notifications.kinds, [FAULT, FINDING])
+        monitor.drain(notifications, at=AT, monotonic=110.0 + HOUR)
+        self.assertEqual(notifications.kinds, [FAULT, FINDING, FINDING])
+        # A non-finite monotonic clock restores nothing (it never postpones).
+        other = AccessFaultMonitor()
+        other.restore_windows(access_rows=[(uuid4(), 10.0)], finding_rows=[(uuid4(), 10.0)],
+                              monotonic=float("inf"))
+        self.assertEqual((list(other._sent), list(other._finding_sent)), ([], []))
+
+    def test_a_merged_window_keeps_only_the_newest_budget_entries(self):
+        monitor = AccessFaultMonitor(access_budget=2)
+        notifications = RecordingNotifications()
+        monitor.composition_failed()
+        monitor.drain(notifications, at=AT, monotonic=100.0)
+        (own,) = (call["event_id"] for call in notifications.calls)
+        newer, newest = uuid4(), uuid4()
+        monitor.restore_windows(access_rows=[(newest, 10.0), (newer, 20.0)], finding_rows=[],
+                                monotonic=200.0)
+        # Equivalent to keeping all three: the window opens once the second
+        # newest entry leaves the hour.
+        self.assertEqual(list(monitor._sent), [(180.0, newer), (190.0, newest)])
+
+    def test_restored_windows_are_validated(self):
+        monitor = AccessFaultMonitor(access_budget=2)
+        row = (uuid4(), 1.0)
+        for values in ({"access_rows": [row, row, row], "finding_rows": [], "monotonic": 1.0},
+                       {"access_rows": [(uuid4(), float("nan"))], "finding_rows": [],
+                        "monotonic": 1.0},
+                       {"access_rows": [(uuid4(), True)], "finding_rows": [], "monotonic": 1.0},
+                       {"access_rows": [(uuid4(), "1")], "finding_rows": [], "monotonic": 1.0},
+                       {"access_rows": [("id", 1.0)], "finding_rows": [], "monotonic": 1.0},
+                       {"access_rows": [1.0], "finding_rows": [], "monotonic": 1.0},
+                       {"access_rows": [], "finding_rows": [], "monotonic": "1"}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                monitor.restore_windows(**values)
+        self.assertEqual(list(monitor._sent), [])
+
+class NotificationAcceptanceMigrationTests(TestCase):
+    """Migration 25 (Issue #287): ``notification_events.accepted_at``."""
+
+    def test_existing_rows_are_kept_and_read_as_their_event_time(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        database = Database(Path(temporary.name) / "synthetic.sqlite3")
+        event_id = str(uuid4())
+        with closing(database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS[:24])
+            connection.execute(
+                "INSERT INTO notification_events VALUES (?, 'human_access_fault', ?, 0, 'sent')",
+                (event_id, AT.isoformat()))
+            connection.commit()
+            # A local administrative command never migrates: it refuses the
+            # database until the application's startup has applied 25.
+            with self.assertRaises(CliRefused) as refused:
+                _require_current_schema(connection)
+            self.assertEqual(str(refused.exception), "database_schema_outdated")
+            migrate(connection, APPLICATION_MIGRATIONS)
+            _require_current_schema(connection)
+            self.assertEqual(
+                tuple(connection.execute("SELECT version, name FROM schema_migrations "
+                                         "ORDER BY version DESC LIMIT 1").fetchone()),
+                (25, "notification_acceptance_time"))
+            self.assertEqual(
+                [tuple(row) for row in connection.execute(
+                    "SELECT event_id, kind, at, confirmed, delivery, accepted_at "
+                    "FROM notification_events")],
+                [(event_id, "human_access_fault", AT.isoformat(), 0, "sent", None)])
+            # A later write of the same row stamps it and changes nothing else.
+            store = NotificationEventStore(connection, nullcontext)
+            later = AT + timedelta(hours=2)
+            store.upsert(NotificationEvent(FAULT, AT + timedelta(minutes=1), True,
+                                           UUID(event_id), DeliveryResult.FAILED),
+                         accepted_at=later)
+            self.assertEqual(
+                [tuple(row) for row in connection.execute(
+                    "SELECT kind, at, confirmed, delivery, accepted_at FROM notification_events")],
+                [("human_access_fault", AT.isoformat(), 0, "failed", later.isoformat())])
+            with self.assertRaises(ValueError):
+                store.upsert(NotificationEvent(FAULT, AT, False), accepted_at=later.replace(tzinfo=None))
 
 
 class StandardLibraryImportTests(TestCase):
@@ -715,7 +857,7 @@ class FindingRecoveryTests(RuntimeFixture):
         with closing(sqlite3.connect(self.settings.database_path)) as db:
             (audit_id,) = db.execute(
                 "SELECT id FROM security_admin_audit_records ORDER BY rowid DESC LIMIT 1").fetchone()
-            db.execute("INSERT INTO notification_events VALUES (?, 'credential_finding', ?, 0, 'pending')",
+            db.execute("INSERT INTO notification_events(event_id, kind, at, confirmed, delivery) VALUES (?, 'credential_finding', ?, 0, 'pending')",
                        (str(uuid5(EVENT_NAMESPACE, f"credential-finding-through:{audit_id}")),
                         (self.clock.now - timedelta(minutes=9)).isoformat()))
             db.commit()
@@ -744,7 +886,7 @@ class FindingRecoveryTests(RuntimeFixture):
                     self.prior_event_id, self.prior_at = getattr(self, "last_event_id", None), \
                         getattr(self, "last_at", None)
                     self.last_event_id, self.last_at = str(uuid4()), at
-                    db.execute("INSERT INTO notification_events VALUES (?, ?, ?, 0, ?)",
+                    db.execute("INSERT INTO notification_events(event_id, kind, at, confirmed, delivery) VALUES (?, ?, ?, 0, ?)",
                                (self.last_event_id, kind, at.isoformat(), delivery))
                 db.commit()
             calls.clear()
@@ -885,3 +1027,163 @@ class FindingRecoveryTests(RuntimeFixture):
         status = await self.cycle()
         self.assertEqual(self.finding_texts(), 1)
         self.assertFalse(status.credential_finding_degraded)
+
+
+class RateWindowRecoveryTests(RuntimeFixture):
+    """Issue #281 item 2: a restart keeps the access budget's rolling hour."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock.now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    def access_row(self, minutes_ago, delivery="sent", kind="human_access_recovered",
+                   accepted_minutes_ago=None):
+        """A stored row; ``accepted_minutes_ago=None`` leaves ``accepted_at``
+        ``NULL``, as on a row written before migration 25."""
+        accepted = (None if accepted_minutes_ago is None else
+                    (self.clock.now - timedelta(minutes=accepted_minutes_ago)).isoformat())
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            db.execute("INSERT INTO notification_events(event_id, kind, at, confirmed, delivery, "
+                       "accepted_at) VALUES (?, ?, ?, 0, ?, ?)",
+                       (str(uuid4()), kind,
+                        (self.clock.now - timedelta(minutes=minutes_ago)).isoformat(), delivery,
+                        accepted))
+            db.commit()
+
+    async def failed_composition_cycle(self):
+        monitor = AccessFaultMonitor()
+        monitor.composition_failed()
+        application = self.application(access_faults=monitor)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            return runtime.status
+
+    def fault_texts(self):
+        return self.slack_texts().count("ServerSentinel critical alert: human_access_fault")
+
+    async def test_a_restart_does_not_reset_the_access_budget(self):
+        await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 1)
+        # Three more accepted rows in the last hour: the budget of four is used.
+        for minutes in (10, 20, 30):
+            self.access_row(minutes)
+        status = await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 1)
+        self.assertTrue(status.human_access_degraded)
+
+    async def test_rows_count_from_their_acceptance_not_the_event_time(self):
+        """Issue #287 (Codex PR #285): a notification accepted on a retry long
+        after its event keeps the event's ``at``; the budget counts it from
+        its acceptance."""
+        await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 1)
+        for minutes in (10, 20, 30):
+            self.access_row(180, accepted_minutes_ago=minutes)
+        status = await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 1)
+        self.assertTrue(status.human_access_degraded)
+
+    async def test_an_event_time_within_the_hour_does_not_count_an_old_acceptance(self):
+        await self.failed_composition_cycle()
+        # Event times in the hour, but accepted more than an hour ago (the
+        # clock moved forward meanwhile) or in the future: none counts.
+        for accepted in (70, 90, -10):
+            self.access_row(5, accepted_minutes_ago=accepted)
+        await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 2)
+
+    async def test_the_hour_is_filtered_before_the_newest_rows_are_taken(self):
+        """Issue #287 (Codex PR #285): rows inserted later (higher rowid) but
+        accepted outside the hour do not push the recent rows out."""
+        await self.failed_composition_cycle()
+        for minutes in (10, 20, 30):
+            self.access_row(minutes, accepted_minutes_ago=minutes)
+        for minutes in (90, 100, 110, 120):
+            self.access_row(minutes, accepted_minutes_ago=minutes)
+        for minutes in (-5, -10, -15, -20):
+            self.access_row(minutes, accepted_minutes_ago=minutes)
+        status = await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 1)
+        self.assertTrue(status.human_access_degraded)
+
+    async def test_every_write_stamps_its_own_acceptance_time(self):
+        monitor = AccessFaultMonitor()
+        monitor.composition_failed()
+        application = self.application(access_faults=monitor)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            accepted = self.clock.now
+            await runtime.call(runtime.tick)
+            self.clock.advance(timedelta(seconds=7))
+            # The delivery result is written at the later time.
+            await self.settle(runtime)
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            ((at, stamp, delivery),) = db.execute(
+                "SELECT at, accepted_at, delivery FROM notification_events "
+                "WHERE kind = 'human_access_fault'").fetchall()
+        self.assertEqual(delivery, "sent")
+        self.assertEqual(datetime.fromisoformat(at), accepted)
+        self.assertEqual(datetime.fromisoformat(stamp), accepted + timedelta(seconds=7))
+
+    async def test_a_process_that_notified_while_failed_merges_the_stored_rows(self):
+        """Issue #287 (Codex PR #285): monitoring starts ``FAILED`` and sends a
+        fault before storage recovers; the previous process's rows of the
+        hour still count, and this process's own row is not counted twice."""
+        await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 1)
+        for minutes in (10, 20):
+            self.access_row(minutes, accepted_minutes_ago=minutes)
+        monitor = AccessFaultMonitor()
+        monitor.composition_failed()
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        application = create_app(
+            self.settings, database=FlakyDatabase(self.settings.database_path, failures=1),
+            monitoring=self.configuration(),
+            monitoring_dependencies=MonitoringDependencies(
+                integrity_probe=self.probe, segment_validator=SyntheticValidator(),
+                slack_opener=self.transport, utcnow=self.clock.utcnow,
+                monotonic=lambda: self.clock.monotonic, tick_seconds=3600.0,
+                access_faults=monitor))
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertEqual(self.fault_texts(), 2)
+            # Storage recovers on the startup retry; the next tick restores.
+            self.clock.advance(timedelta(minutes=16))
+            await runtime.call(runtime.tick)
+            self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertTrue(runtime._findings_recovered)
+            # Own fault + the first cycle's fault + two stored rows: four.
+            self.assertEqual(len(monitor._sent), 4)
+            self.assertEqual(len({entry[1] for entry in monitor._sent}), 4)
+            # A new reason in the episode is held back by the restored budget.
+            monitor.emit(ReservationFault((Reason.UNEXPECTED_LISTENER,), CheckKind.DAILY, NOW,
+                                          1, 0))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertEqual(self.fault_texts(), 2)
+
+    async def test_pending_and_old_rows_do_not_count(self):
+        await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 1)
+        self.access_row(10, delivery="pending")
+        self.access_row(20)
+        self.access_row(90)
+        self.access_row(5, kind="credential_finding")
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            # Unreadable or naive times are left out instead of raising.
+            for at in ("not a time", "2026-10-16T09:00:00"):
+                db.execute("INSERT INTO notification_events(event_id, kind, at, confirmed, delivery) VALUES (?, 'human_access_fault', ?, 0, "
+                           "'sent')", (str(uuid4()), at))
+            db.commit()
+        status = await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 2)
+        self.assertTrue(status.human_access_degraded)

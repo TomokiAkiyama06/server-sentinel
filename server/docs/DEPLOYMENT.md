@@ -637,7 +637,10 @@ node's Tailscale name. A wildcard exception never covers that; record it as a
 D1, 2026-10-16; ADR-0003): TCP,
 the observed port, the family of the address it is bound on (or none when the
 same port is bound on both), unit `tailscaled.service`, uid `0`. Nothing else
-is accepted in that scope. Find the port with
+is accepted in that scope, and at most one such exception per family (Issue
+#278): if `ss` shows more than one `tailscaled` port on an address family of
+the Tailscale addresses besides the Serve socket, stop and find out what the
+other one is rather than recording it. Find the port with
 `sudo ss -ltnp --cgroup` (rows on the Tailscale addresses with
 `cgroup:/system.slice/tailscaled.service`) and run the `MANUAL_TEST.md` peerAPI
 steps first. If `tailscaled` binds another port after a restart, the check
@@ -675,7 +678,8 @@ sudo systemctl restart server-sentinel.service
   and `uid` are required, `family` (`ipv4`, `ipv6`, `any`) and `scope`
   (`wildcard`, `reserved_address`) are optional. Anything else, a port of the
   dashboard, upstream or proxy, a `reserved_address` exception other than
-  `tailscaled.service`/uid `0`/TCP, more than 16 exceptions or a repeated one
+  `tailscaled.service`/uid `0`/TCP, a second `reserved_address` exception for
+  the same family, more than 16 exceptions or a repeated one
   is refused (`listener_exception_rejected`) before anything is asked.
 - `set` shows the stored and the new set and asks for the word `CHANGE`; the
   set and its `change_security_setting` audit record (actor `owner`, no port
@@ -768,11 +772,13 @@ in this private configuration.
   CLI of the `tailscaled` that serves this node. On every check the backend
   runs exactly `<tailscale_executable> serve status --json`, as the service
   account, with an empty environment, no stdin, a 5-second timeout and at
-  most 1 MiB of output; any failure keeps access closed. The release's
-  check refuses a path that is not a regular file owned by root (or the
+  most 1 MiB of output; any failure keeps access closed. At every start
+  the launcher accepts only a regular file owned by root (or the
   administrator) and not writable by group or others, in an
   administrator-controlled directory, and executable by the service
-  account; a symbolic link is resolved and its target checked. Nothing else
+  account; a symbolic link is resolved and its target checked. A path that
+  fails this is a change on the host, not an invalid section, so it does not
+  stop the service: see `executable` below. Nothing else
   is ever run: no `tailscale up`, `serve` change, `cert`, ACL/Grants change
   or administrative credential.
 - `proxy_listeners` (optional, default empty) and `proxy_owner`: when Serve
@@ -794,10 +800,29 @@ not start:
 ServerSentinel deployment validation failed: human access refused (reason=<word>)
 ```
 
-`<word>` is `setting` (an unknown or missing key, or an invalid value),
-`web_assets` (enabled without `"web_assets_directory"`) or `executable` (the
-Tailscale CLI path fails the checks above). It never names the hostname, an
-address or a path. If the composition itself cannot be built at start (for
+`<word>` is `setting` (an unknown or missing key, or an invalid value) or
+`web_assets` (enabled without `"web_assets_directory"`). It never names the
+hostname, an address or a path.
+
+A valid section whose `tailscale_executable` fails the checks above at start
+(the CLI was removed, replaced or its permissions changed) does not refuse
+the start, since that would also stop recording, the integrity and
+recording-health checks and the Owner notification (Issue #283). The check
+still passes, and it and the service print one value-free line on stderr (in
+the journal for `ExecStartPre` and the service; the installer's staging and
+rollback checks discard it):
+
+```text
+ServerSentinel deployment warning: human access stays closed (reason=executable); recording and monitoring start
+```
+
+The service then starts exactly as when the composition cannot be built
+(below): every human path closed, `human_access_composition_failed` logged,
+an immediate `human_access_fault` notification and degraded monitoring
+health until the CLI is fixed and the service restarted. Run the check as
+the service account after changing the CLI and look for this line.
+
+If the composition itself cannot be built at start (for
 example the session-binding key or its directory is not the service
 account's own, or the recording filesystem is missing, replaced or at the hard
 reserve), the service logs `human_access_composition_failed` and keeps every
@@ -1736,6 +1761,15 @@ Releases and runtime data are never deleted by these operations; only a staged
 release whose own installation failed is removed. Database migrations are
 forward-only, so an older application may reject a newer database; that failed
 rollback restores the release that was running before the attempt.
+For example, migration 25 (Issue #287) adds the nullable
+`notification_events.accepted_at` column on the first start of a release that
+includes it: it rewrites and deletes no row, runs inside the storage admission
+(filesystem identity and hard reserve) like every migration, and a refused
+admission is a startup failure that is retried, never a partial schema. Until
+that first start the local administrative commands refuse the database with
+`database_schema_outdated`. A release from before it refuses the migrated
+database at startup (newer schema), so a rollback across it fails and
+restores the running release.
 
 Release trees therefore accumulate under the installation root. Keep the
 installation filesystem separate from the runtime filesystem so release growth
@@ -2076,7 +2110,9 @@ the tables #132 added:
 Values a correct service rewrites across a restart or a daily run are not
 compared for equality; the output lists them under `declared_mutable`:
 `notification_events.delivery` (a pending Slack delivery completes, a
-presence notification is retried), `uvc_approvals.session_token` (cleared at
+presence notification is retried), `notification_events.accepted_at` (the
+row's latest local write, rewritten with each delivery result or retried
+write; `NULL` on rows written before migration 25), `uvc_approvals.session_token` (cleared at
 a clean stop and replaced at every start; the Owner re-approval latch it arms
 is compared through the camera source's `requires_approval`, but a token
 cleared while the service was down after an unclean stop cannot be told from

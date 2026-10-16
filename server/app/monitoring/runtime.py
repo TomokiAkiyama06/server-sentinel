@@ -39,7 +39,7 @@ from app.storage.migrations import Migration, MigrationError, migrate
 from app.storage.policy import MainStoragePolicy, StorageState, StorageTransition
 from app.storage.retention import RetentionService, StorageAudit
 
-from .access import AccessFaultMonitor
+from .access import HOUR_SECONDS, AccessFaultMonitor
 from .config import MonitoringConfiguration
 from .filesystem import IdentifiedRecordingFilesystem
 from .store import NotificationEventStore, RecordingHealthStatusStore
@@ -339,7 +339,7 @@ class MonitoringRuntime:
         if self.notification_events is None:
             # The database was not opened yet; Slack still gets the alert.
             raise RecordingError("NOTIFICATION_STORE_UNAVAILABLE")
-        self.notification_events.upsert(event)
+        self.notification_events.upsert(event, accepted_at=self.dependencies.utcnow())
 
     def _admit_database_open(self) -> None:
         """Refuse to open or create the database outside verified storage.
@@ -727,6 +727,12 @@ class MonitoringRuntime:
         still ``pending`` is sent again (under its own ID and time) once a
         check passes, after its episode's fault when that row is pending too.
         Older episodes are superseded and not replayed.
+
+        Rate windows: the accepted access and finding notification rows of
+        the last hour re-seed both hourly budgets (``restore_windows``,
+        Issue #281 item 2), so a restart does not reset them. This process's
+        own rows (accepted while it started in ``FAILED``) are merged by
+        event ID, never counted twice (Issue #287).
         """
         now = self.dependencies.utcnow()
         # The whole retained audit history (Codex PR #271): a notification
@@ -768,6 +774,58 @@ class MonitoringRuntime:
                     # A pending row is retried under its own ID and time.
                     event_id=None if delivered else UUID(last[2]),
                     at=None if delivered else datetime.fromisoformat(last[3]))
+        # Issue #281 item 2: the rolling hours of both budgets continue
+        # across the restart. Only accepted rows count, as in the process
+        # that sent them; a pending row is sent again and counted then.
+        monitor.restore_windows(
+            access_rows=self._notification_window(
+                (NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.HUMAN_ACCESS_RECOVERED),
+                monitor.access_budget, now),
+            finding_rows=self._notification_window(
+                (NotificationKind.CREDENTIAL_FINDING,), monitor.finding_budget, now),
+            monotonic=self.dependencies.monotonic())
+
+    def _notification_window(self, kinds, limit: int, now: datetime) -> list[tuple[UUID, float]]:
+        """``(event ID, age)`` of the newest ``limit`` rows of ``kinds`` accepted
+        in the hour before ``now`` (Issue #287).
+
+        The age runs from ``accepted_at``, the row's latest write, so a
+        notification accepted on a retry long after its event's ``at`` counts
+        from the retry; a row written before that column (``NULL``) counts
+        from ``at``. Rows are filtered to the hour before they are limited
+        and taken newest first by that time, so neither an old row inserted
+        late nor a row stamped in the future (the clock moved back) displaces
+        a recent one. The text comparison is the time order for the UTC text
+        ``NotificationEventStore`` writes, and every row is parsed again here.
+        """
+        marks = ",".join("?" for _ in kinds)
+        rows = self._connection.execute(
+            "SELECT event_id, COALESCE(accepted_at, at) AS accepted FROM notification_events "
+            f"WHERE kind IN ({marks}) AND delivery != ? AND accepted > ? AND accepted <= ? "
+            "ORDER BY accepted DESC",
+            (*(kind.value for kind in kinds), DeliveryResult.PENDING.value,
+             (now - timedelta(seconds=HOUR_SECONDS)).astimezone(timezone.utc).isoformat(),
+             now.astimezone(timezone.utc).isoformat()),
+        )
+        window = []
+        try:
+            for event_id, accepted in rows:
+                # A row whose ID or time cannot be read is left out (at worst
+                # a notification goes out early) rather than raising, which
+                # would repeat the whole recovery on every tick.
+                try:
+                    age = (now - datetime.fromisoformat(accepted)).total_seconds()
+                    event = UUID(event_id)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= age < HOUR_SECONDS:
+                    window.append((event, age))
+                    if len(window) == limit:
+                        break
+        finally:
+            # An unfinished statement would keep its read lock.
+            rows.close()
+        return window
 
     def _poll(self) -> None:
         if self.notifications is None:

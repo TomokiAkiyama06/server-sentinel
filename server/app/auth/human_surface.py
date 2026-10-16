@@ -90,7 +90,8 @@ WebSocket and error path gets the same generic denial):
   session is no longer current for the presented cookie and proxy identity
   ends that live session; Issue #279 item 2); the idle expiry moves
   at most once per 60 s per live session; capacity (4 in total, 2 per
-  source, 2 per person) is the generic denial. See
+  source, 2 per person) and a full request backlog (32 jobs, at most 8 of
+  them per human session; Issue #279 item 1) are the generic denial. See
   ``app.media.live.frame_pull``.
 
 The four ceremony routes run before a credential exists (AUTH-013). Each is
@@ -1549,9 +1550,11 @@ class HumanSurface:
         """
         live = self._live_service()
         authorized = await self._authorize(request, Requirement.LIVE)
+        token = session_token(request.headers)
         access = self.access
         try:
-            sources = await asyncio.wrap_future(live.sources(admit=lambda: access.admit(authorized.epoch)))
+            sources = await asyncio.wrap_future(
+                live.sources(token, admit=lambda: access.admit(authorized.epoch)))
         except Exception:
             raise _Denied() from None
         await self._json(request.send, 200, {"sources": [
@@ -1685,7 +1688,7 @@ class HumanSurface:
             raise _Denied()
         authorized = await self._authorize(request, Requirement.SESSION, touch=False)
         try:
-            await asyncio.wrap_future(live.close(authorized.session.session_id, session_id))
+            await asyncio.wrap_future(live.close(token, authorized.session.session_id, session_id))
         except Exception:
             raise _Denied() from None
         await self._no_content(request.send)

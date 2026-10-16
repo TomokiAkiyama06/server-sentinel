@@ -2861,8 +2861,11 @@ by the Issue #6 synthetic policy model.
   a missing Serve mapping, an extra path or port, or a stopped `tailscaled`
   keeps it closed (generic denial on the shell `/`) and sends one
   `human_access_fault` notification, and that a missing or group-writable
-  `tailscale_executable` makes the release's check refuse to start with
-  `human access refused (reason=executable)`. Make the composition itself
+  `tailscale_executable` (Issue #283) lets the release's check pass with the
+  warning `human access stays closed (reason=executable)` on stderr, and the
+  service start and keep recording with every human path closed, log
+  `human_access_composition_failed`, send one `human_access_fault`
+  notification and report `human_access_degraded`. Make the composition itself
   fail at start (for example a session-binding key that is not the service
   account's own) and confirm the service keeps running and recording with
   every human path closed, logs `human_access_composition_failed`, sends one
@@ -2916,17 +2919,33 @@ by the Issue #6 synthetic policy model.
     `http://<reserved name>:<port>/` in the same browser and confirm in the
     browser's network panel that the request carries no `__Host-session`
     cookie (the cookie is `Secure`); record the browser and version;
-  - [ ] record the port before and after `sudo systemctl restart
-    tailscaled` (and after a reboot): whether it stays the same decides
-    whether the recorded exception survives restarts or a follow-up Owner
-    decision is needed;
+  - [ ] record whether the IPv4 and IPv6 rows use the same port (one
+    exception without a family) or different ports (one `ipv4` and one
+    `ipv6` exception), and that each family has exactly one `tailscaled`
+    port besides the Serve socket: the command refuses a second
+    `reserved_address` exception for a family (Issue #278);
+  - [ ] record the port per family before and after `sudo systemctl restart
+    tailscaled`, after `tailscale down` followed by `tailscale up`, and after
+    a reboot: whether it stays the same decides whether the recorded
+    exception survives restarts or a follow-up Owner decision is needed (a
+    port that changes every time would revoke every human session on every
+    restart). The belief that the port is derived from a hash of the
+    Tailscale address and moves to another candidate when that one is in use
+    is unverified recollection, not a documented guarantee; record what the
+    installed version actually does;
+  - [ ] confirm the port serves no page or script whose content another
+    node or a user chooses (ADR-0003 same-site assumption): record the
+    response to `/` and an unknown path from another Tailscale node;
   - [ ] without the exception, confirm access closes with
     `UNEXPECTED_LISTENER`; record the `reserved_address` exception for the
     observed port(s) with `app.auth.reservation_cli set`, restart the
     service and confirm access opens;
     confirm a test TCP listener on the same address and another port, and
     one on the recorded port started by another unit after `tailscaled` is
-    stopped, each close access.
+    stopped, each close access; on a disposable node, add a Serve HTTPS
+    listener on another port and confirm access closes with
+    `UNEXPECTED_ROUTE`, plus `UNEXPECTED_LISTENER` when `ss` shows a socket
+    for it (record which).
 - Local listener-exception command (`app.auth.reservation_cli`, Owner
   decision D3, 2026-10-16; synthetic tests only so far, not run on any host):
   - [ ] as the service account over SSH, `show` prints the stored set (or
@@ -2972,6 +2991,17 @@ by the Issue #6 synthetic policy model.
   reopens. Confirm neither message nor the `notification_events` row contains
   the hostname, an address, a viewer identity or a reason, and that the
   monitoring status shows `human_access_degraded` only during the fault.
+  Hourly budget across a restart (Issue #281 item 2, Issue #287; mock-verified
+  only), on a disposable copy of the database, never the production one:
+  after the update, confirm with `sqlite3` that `notification_events` has the
+  `accepted_at` column and that rows written before the update kept every
+  value with `accepted_at` empty. Cause four access notifications within an
+  hour, restart the service and cause a fifth: confirm it arrives only once
+  the oldest of the four is an hour old (counted from each row's
+  `accepted_at`), never earlier and not more than an hour after the restart.
+  Repeat with the state mount unavailable at start (monitoring `failed`) and
+  one notification sent before the mount returns: after it returns, the
+  earlier rows of the hour still count and that notification counts once.
 - Listener owners through sock_diag (Issue #126, Owner decision 2026-10-07;
   mock and unprivileged local experiments only so far, not yet run on the
   Main Server). Production check procedure, all as the ServerSentinel service

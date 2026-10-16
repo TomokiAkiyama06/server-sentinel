@@ -397,13 +397,27 @@ optionally a family (`ipv4` or `ipv6`: a reserved-address bind is not
 dual-stack, so either may be named), covers only the configured reserved
 addresses (not one the name gained, and never a wildcard bind), allows one
 socket per address and port, and, like every exception, never the dashboard,
-upstream or proxy port. Its creator is verified on every check exactly like a
-wildcard exception's. The rationale is that the peerAPI is plain HTTP and the
-`__Host-session` cookie is `Secure`, so it is never sent there; that is an
-assumption about the installed `tailscaled` that `MANUAL_TEST.md` verifies,
-together with whether the peerAPI port changes across `tailscaled` restarts
-(a changed port is an unexpected listener on a reserved address, an
-exposure, until the Owner records the new one).
+upstream or proxy port. At most one `reserved_address` exception covers each
+family (one without a family counts for both; Issue #278):
+`validate_listener_exceptions` refuses a second one, so neither the Owner
+command nor the administration path stores it and a stored set holding one
+fails closed as `LISTENER_EXCEPTIONS_UNREADABLE`. The peerAPI is expected on
+one port per family, and that the recorded port is the peerAPI is confirmed only
+by hand (`MANUAL_TEST.md`), so a second port would except a socket nobody
+confirmed. A Serve listener added on another port is a proxy route the route
+comparison reports as `UNEXPECTED_ROUTE` on its own, besides any socket it
+adds on a reserved address (an unexpected listener). Its creator is verified on every check exactly
+like a wildcard exception's. The rationale is that the peerAPI is plain HTTP
+and the `__Host-session` cookie is `Secure`, so it is never sent there; that
+is an assumption about the installed `tailscaled` that `MANUAL_TEST.md`
+verifies, together with whether the peerAPI port is the same in both families
+and stays the same across `tailscaled` restarts, `tailscale down`/`up` and
+reboots (a changed port is an unexpected listener on a reserved address, an
+exposure, until the Owner records the new one). `SameSite` does not separate
+the peerAPI origin from the dashboard (a browser without schemeful same-site
+treats it as the same site); the exact `Origin` check, the CSRF token and
+WebAuthn's secure-context requirement do, assuming the peerAPI serves no
+active content an attacker controls (ADR-0003).
 
 Each check reads the socket inode from `/proc/net` (listener enumeration stays
 there) and asks the injected `socket_owners` for each verified socket's
@@ -472,7 +486,8 @@ allowed, the Main Server keeps Ubuntu's `ssh.socket`; the exception is
 `tcp/22` created by `ssh.socket` as uid 0 (steps in `server/docs/DEPLOYMENT.md`). `/proc/net` does not
 show `IPV6_V6ONLY` and a `::` socket may also accept IPv4, so a `::` bind is
 treated as dual-stack: only an exception without a family covers it, an `ipv4`
-exception covers `0.0.0.0` only, and an `ipv6`-only exception is rejected. The set is empty
+exception covers `0.0.0.0` only, and an `ipv6`-only wildcard exception is
+rejected (a `reserved_address` exception may name `ipv6`). The set is empty
 by default, typed, bounded to 16 entries, and is never read from deployment
 configuration. An exception never matches the dashboard port, the loopback
 human listener port or a recorded proxy socket port (for either protocol, so
@@ -555,9 +570,13 @@ access closed with `ISOLATION_UNSTATED`), the optional visible
 `proxy_listeners` with their `proxy_owner`, the absolute
 `tailscale_executable` and `require_device_bound` (default false). Refusals
 are `HumanAccessRefused` with one value-free reason (`setting`,
-`web_assets`, `executable`); enabled without `web_assets_directory` is
-refused, and the release's `--check` requires the CLI to be an
-administrator-controlled executable the service account can run.
+`web_assets`); enabled without `web_assets_directory` is refused. At every
+start the launcher (`app.deployment`) requires the CLI to be an
+administrator-controlled executable the service account can run; a valid
+section whose CLI fails that (`reason=executable`, a change on the host) does
+not refuse the start: `--check` passes with a value-free warning on stderr and
+the launcher calls `run(..., human_access_unavailable=True)`, which builds
+nothing and is handled like a failed composition below (Issue #283 item 1).
 `composition.build_human_access` then builds, with the production inputs,
 the check (`ProcNetListeners` over bounded `/proc/net` reads,
 `ServeStatusRoutes` over `ServeStatusCommand`, `GetaddrinfoResolver`,
@@ -575,8 +594,11 @@ cap; a failure to start, a timeout, more output, a non-zero exit or non-UTF-8
 text is a `ReservationEnumerationError`, so the check fails closed. The
 launcher (`app.__main__.run`) passes one `AccessFaultMonitor` as the check's
 `sink`, the ceremonies' `findings` and `MonitoringDependencies(access_faults=)`
-(Issue #232 item 4); any failure to compose (`HumanAccessUnavailable`, or
-`create_app` refusing it) logs `human_access_composition_failed`, latches the
+(Issue #232 item 4); any failure to compose (`HumanAccessUnavailable`,
+the unusable CLI above, or `create_app` refusing it with
+`HumanAccessCompositionRefused`, a `TypeError` subclass; any other exception
+from `create_app` propagates, Issue #283 item 2) logs
+`human_access_composition_failed`, latches the
 fault in that monitor (`AccessFaultMonitor.composition_failed`) and serves
 with `ClosedHumanSurface`, so the monitoring runtime notifies the Owner
 (`human_access_fault`) and keeps the health degraded until a restart composes
@@ -1022,6 +1044,7 @@ Access notifies on entering a fault, on a reason the episode had not reported
 and on recovery, never on every failing check; a fault that ended between two
 ticks is still reported, at most four access notifications go out per rolling
 hour, and an episode the budget held back is reported once it allows.
+Both rolling hours continue across a restart: the first running tick re-seeds them from the accepted (non-`pending`) notification rows of the last hour by the wall-clock time since their acceptance (`notification_events.accepted_at`, the row's latest local write, migration 25; a row written before it counts from its event time), filtering the hour before taking the newest rows and ignoring a row stamped in the future, so a restored row counts for at most an hour after the restart (Issue #281 item 2, Issue #287). A notification retried long after its event therefore counts from the retry. When the process started with monitoring `failed` and notified before storage recovered, the stored rows are merged into its window by event ID, so its own rows are not counted twice and the earlier process's rows are not skipped (Issue #287).
 Credential findings do not share that budget, so access flapping cannot hold
 one back. Each finding notifies immediately with its own notification, up to
 four per rolling hour; only the ones over that cap are batched into one
@@ -1606,8 +1629,17 @@ route is the generic denial). The route table above lists the four routes.
   A close is not charged: it reaches SQLite only for a live session held for
   the presented cookie, so closes are bounded by opens.
   At most 32 request jobs (all viewers) are queued or running on the
-  service's executor at once; beyond that a request is the generic denial, so
-  a slow database cannot grow the queue, and sweeps never stack.
+  service's executor at once, and at most 8 of them for one human session
+  (Issue #279 item 1, Owner decision 2026-10-16: open, poll, close and the
+  source list are charged to the session's in-memory token digest, never a
+  logged value); beyond either a request is the generic denial (no distinct
+  overload response), so a slow database cannot grow the queue, one
+  session's poll burst cannot fill it and end other viewers (it takes four
+  sessions at their full share), and sweeps never stack. A share is returned
+  when its job completes, fails or is cancelled; a stop drains every queued
+  job. 8 covers a paced viewer's one poll in flight per live session (at
+  most 2 per person) plus an open, close or source list, with room for an
+  abandoned and retried poll per live session.
 - Demand ends when a session's viewer stops polling for 15 s (the lease),
   on close, on sign-out, at once for the affected principal after an Owner
   grant or revocation change (`AccessAdministration.principal_changed`), and
