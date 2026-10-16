@@ -29,6 +29,11 @@ STORE_KEY = "auth.reservation.listener_exceptions"
 REVOCATION_PENDING_KEY = "auth.reservation.session_revocation_pending"
 # Fixed logical ID for "every human session"; the audit record names no person.
 HUMAN_SESSIONS_ID = UUID("0b6f3f64-54a9-4e0f-8f5e-7d2c9a4b1e37")
+# Fixed logical ID for the Owner's hostname-reservation listener exceptions,
+# the target of both the Web (``app.audit.integration.ReservationAdministration``)
+# and the local (``app.auth.reservation_cli``) change; no port, address or
+# service name reaches the audit log.
+RESERVATION_LISTENER_EXCEPTIONS_ID = UUID("1c18dba3-1e38-4e1d-9d2f-70e078205a41")
 # Version 1 held port-only exceptions, version 2 an owning executable path or
 # unit without a uid. Neither is migrated: the creating unit and uid cannot be
 # inferred, so a stored version 1 or 2 set fails closed as outdated until the
