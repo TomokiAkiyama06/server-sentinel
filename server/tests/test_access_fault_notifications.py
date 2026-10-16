@@ -12,7 +12,9 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
+from contextlib import closing
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 from unittest import TestCase
@@ -304,6 +306,35 @@ class CompositionTests(MonitoredAccessFixture):
         with self.assertRaises(ValueError):
             fresh.attach(self.access)
 
+    async def test_a_monitor_left_out_of_the_runtime_is_refused(self):
+        """Codex PR #271 (P2): a monitor installed as a sink but not handed to
+        the monitoring runtime would never be drained."""
+        monitor = AccessFaultMonitor()
+        check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker, sink=monitor)
+        for findings in (monitor, None):
+            access = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets,
+                                 store=self.store, reservation=check,
+                                 ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=check,
+                                                              clock=self.ceremony_clock,
+                                                              findings=findings))
+            for dependencies in (None, MonitoringDependencies()):
+                with self.subTest(findings=findings, dependencies=dependencies), \
+                        self.assertRaises(TypeError):
+                    create_app(self.settings(), database=self.database, human_access=access,
+                               storage_reservation=self.admission, monitoring=self.monitoring(),
+                               monitoring_dependencies=dependencies)
+        # Only the check's sink being a monitor is refused too.
+        other_check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker)
+        only_findings = HumanAccess(
+            HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
+            reservation=other_check,
+            ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=other_check,
+                                         clock=self.ceremony_clock, findings=AccessFaultMonitor()))
+        with self.assertRaises(TypeError):
+            create_app(self.settings(), database=self.database, human_access=only_findings,
+                       storage_reservation=self.admission)
+        self.assertIsNone(monitor.attached)
+
     async def test_a_refused_create_app_leaves_the_monitor_unattached(self):
         """PR #271 review: the monitor is attached only after every check passed."""
         monitor = AccessFaultMonitor()
@@ -475,3 +506,67 @@ class RuntimeTests(RuntimeFixture):
             texts = self.slack_texts()
             self.assertIn("ServerSentinel critical alert: human_access_fault", texts)
             self.assertIn("ServerSentinel critical alert: credential_finding", texts)
+
+
+class FindingRecoveryTests(RuntimeFixture):
+    """Codex PR #271 (P2): a finding committed (with its audit record) but not
+    yet notified when the process stopped is notified after the restart."""
+
+    def setUp(self):
+        super().setUp()
+        # The audit retention cleanup runs on the real clock: a synthetic
+        # finding dated by the fixture's fixed clock would already be expired.
+        self.clock.now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    def application_with(self, monitor):
+        return self.application(access_faults=monitor)
+
+    def audit_finding(self, at, action="mark_principal_credential_inconsistent"):
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            db.execute(
+                "INSERT INTO security_admin_audit_records VALUES (?, 'system', ?, 'principal', ?, ?, ?)",
+                (str(uuid4()), action, str(uuid4()), (at - epoch) // timedelta(microseconds=1),
+                 "succeeded" if action.startswith("mark") else "failed"))
+            db.commit()
+
+    async def cycle(self):
+        monitor = AccessFaultMonitor()
+        application = self.application_with(monitor)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            return runtime.status
+
+    def finding_texts(self):
+        return self.slack_texts().count("ServerSentinel critical alert: credential_finding")
+
+    async def test_an_unnotified_audited_finding_is_notified_once_after_restart(self):
+        await self.cycle()
+        self.assertEqual(self.finding_texts(), 0)
+        self.audit_finding(self.clock.now - timedelta(hours=1))
+        status = await self.cycle()
+        self.assertEqual(self.finding_texts(), 1)
+        self.assertTrue(status.credential_finding_degraded)
+        # Already notified: a further restart sends nothing more.
+        self.clock.advance(timedelta(minutes=5))
+        await self.cycle()
+        self.assertEqual(self.finding_texts(), 1)
+
+    async def test_an_old_finding_is_notified_but_not_held_degraded(self):
+        await self.cycle()
+        self.audit_finding(self.clock.now - timedelta(days=2),
+                           action="detect_principal_credential_sign_count_regression")
+        status = await self.cycle()
+        self.assertEqual(self.finding_texts(), 1)
+        self.assertFalse(status.credential_finding_degraded)
+
+    async def test_findings_outside_the_lookback_or_other_actions_are_ignored(self):
+        await self.cycle()
+        self.audit_finding(self.clock.now - timedelta(days=8))
+        self.audit_finding(self.clock.now - timedelta(hours=1), action="authenticate_principal")
+        status = await self.cycle()
+        self.assertEqual(self.finding_texts(), 0)
+        self.assertFalse(status.credential_finding_degraded)

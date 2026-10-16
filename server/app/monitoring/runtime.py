@@ -16,12 +16,14 @@ from enum import StrEnum
 import logging
 import math
 import os
+import sqlite3
 import stat
 import threading
 import time
 from typing import Callable
 from uuid import UUID, uuid5
 
+from app.audit.model import AuditAction
 from app.audit.store import DEFAULT_RETENTION, UnboundStorageAdmission
 from app.integrity.service import IntegrityService
 from app.integrity.store import IntegrityStore, OwnerApproval
@@ -53,6 +55,13 @@ CRITICAL_KINDS = (
 )
 WARNING_KINDS = (NotificationKind.HARDWARE_INTEGRITY_WARNING,
                  NotificationKind.RECORDING_HEALTH_WARNING)
+# The audited credential findings (``AccessStore``); their records are the
+# durable evidence a restart recovers an undelivered notification from.
+FINDING_AUDIT_ACTIONS = (AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
+                         AuditAction.DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION)
+# How far back a restart looks for a finding committed after the last
+# ``credential_finding`` notification (well inside the 90-day row retention).
+FINDING_RECOVERY_LOOKBACK = timedelta(days=7)
 
 
 class RuntimeState(StrEnum):
@@ -170,6 +179,10 @@ class MonitoringRuntime:
         # row could not be persisted, so a denied write does not re-alert on
         # every 15-minute retry of the same failing self-test.
         self._unpersisted_health: tuple[HealthState, datetime] | None = None
+        # Issue #232 / Codex PR #271: once per process, a credential finding
+        # committed but not yet notified before a restart is recovered from
+        # the audit log on the first running access tick.
+        self._findings_recovered = False
         self.notifications: NotificationService | None = None
         self.notification_events: NotificationEventStore | None = None
         self.recordings: RecordingStore | None = None
@@ -621,6 +634,14 @@ class MonitoringRuntime:
         monitor = self.dependencies.access_faults
         if monitor is None or self.notifications is None:
             return
+        if not self._findings_recovered and self.status.state == RuntimeState.RUNNING:
+            try:
+                self._recover_findings(monitor)
+            except Exception:
+                # Retried on the next running tick; nothing is lost meanwhile.
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+            else:
+                self._findings_recovered = True
         try:
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
                                    monotonic=self.dependencies.monotonic())
@@ -630,6 +651,42 @@ class MonitoringRuntime:
             return
         self._set(human_access_degraded=status.human_access_degraded,
                   credential_finding_degraded=status.credential_finding_degraded)
+
+    def _recover_findings(self, monitor: AccessFaultMonitor) -> None:
+        """Re-arm a finding notification lost to a restart (Codex PR #271).
+
+        The finding commits with its audit record; its notification was only
+        latched in memory until the next tick. A finding record later than
+        the last ``credential_finding`` notification row (within
+        ``FINDING_RECOVERY_LOOKBACK``) was therefore not notified: the
+        monitor sends one coalesced notification and restores the hold from
+        the finding's age. Only the action and time are read, never the
+        principal.
+        """
+        now = self.dependencies.utcnow()
+        since = now - FINDING_RECOVERY_LOOKBACK
+        last = self._connection.execute(
+            "SELECT MAX(at) FROM notification_events WHERE kind=?",
+            (NotificationKind.CREDENTIAL_FINDING.value,),
+        ).fetchone()[0]
+        if last is not None:
+            since = max(since, datetime.fromisoformat(last))
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        threshold = (since - epoch) // timedelta(microseconds=1)
+        marks = ",".join("?" for _ in FINDING_AUDIT_ACTIONS)
+        try:
+            latest = self._connection.execute(
+                "SELECT MAX(occurred_at_us) FROM security_admin_audit_records "
+                f"WHERE occurred_at_us > ? AND action IN ({marks})",
+                (threshold, *(action.value for action in FINDING_AUDIT_ACTIONS)),
+            ).fetchone()[0]
+        except sqlite3.OperationalError:
+            # No audit table in this database: nothing was ever recorded.
+            return
+        if latest is None:
+            return
+        age = (now - (epoch + timedelta(microseconds=int(latest)))).total_seconds()
+        monitor.recover_finding(age_seconds=age, monotonic=self.dependencies.monotonic())
 
     def _poll(self) -> None:
         if self.notifications is None:

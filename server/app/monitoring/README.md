@@ -69,7 +69,11 @@ Every tick, also while the runtime is `failed` (Slack still receives the
 alert), drains it: transitions become the immediate `human_access_fault` /
 `human_access_recovered` and coalesced `credential_finding` notifications, and
 `MonitoringStatus.human_access_degraded` / `credential_finding_degraded`
-follow it; both count as degraded in the daily summary. See
+follow it; both count as degraded in the daily summary. Once per process,
+the first running tick recovers a credential finding whose audit record is
+later than the last `credential_finding` notification row (seven-day
+lookback), so a restart between the finding's commit and the next tick does
+not lose its notification; only the audit action and time are read. See
 `../auth/README.md` "Owner notification of access faults".
 
 `MonitoringDependencies` injects the probe, recorder self-test adapter factory,

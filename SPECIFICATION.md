@@ -1366,7 +1366,10 @@ committed credential finding is `credential_finding` (coalesced to one per
 hour); at most four access notifications per rolling hour, with a held-back
 episode reported later. They set `human_access_degraded` /
 `credential_finding_degraded` (the latter for one day after the latest
-finding) and carry only the fixed kind. Without an actual
+finding) and carry only the fixed kind. A finding committed before a restart
+whose notification had not been sent yet is recovered on the first running
+monitoring tick from its audit record (later than the last
+`credential_finding` notification row, seven-day lookback). Without an actual
 capture-pipeline adapter the self-test is an explicit `UNAVAILABLE`, not
 healthy. Independently of that adapter, the runtime re-verifies the declared
 recording filesystem (UUID → device, major/minor, mounted mount point, pinned

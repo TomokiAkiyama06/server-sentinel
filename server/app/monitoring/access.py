@@ -172,6 +172,22 @@ class AccessFaultMonitor:
 
     # -- owner thread --------------------------------------------------------
 
+    def recover_finding(self, *, age_seconds: float, monotonic: float) -> None:
+        """Owner thread: a committed finding a restart left unnotified.
+
+        Called once at startup by the monitoring runtime from the audit log
+        (Codex PR #271). The next ``drain`` notifies it like a new arrival;
+        the degraded hold runs from the finding's own time.
+        """
+        if (type(age_seconds) not in (int, float) or not math.isfinite(age_seconds)
+                or type(monotonic) not in (int, float)):
+            raise ValueError("invalid recovered finding")
+        self._findings_pending = min(self._findings_pending + 1, _MAX_COUNT)
+        if math.isfinite(monotonic):
+            seen = monotonic - max(0.0, float(age_seconds))
+            if self._finding_seen_at is None or seen > self._finding_seen_at:
+                self._finding_seen_at = seen
+
     def _polled(self) -> AccessHealth | None:
         """Current composition health, or ``None`` while indeterminate.
 

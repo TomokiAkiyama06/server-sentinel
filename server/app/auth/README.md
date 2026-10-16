@@ -958,7 +958,14 @@ principal, credential or reason leaves the process; details stay in the audit
 log. With a monitor configured, `create_app` refuses a `HumanAccess` whose
 check or ceremonies report elsewhere and attaches the composition so
 recovery can be observed. It also refuses a monitor without a storage-configured
-monitoring runtime, the only thing that drains it (Codex PR #271). Verified with synthetic checks, software
+monitoring runtime, the only thing that drains it, and a composition whose
+check or ceremonies report to a monitor the runtime was not given (Codex
+PR #271). A finding is committed with its audit record but latched only in
+memory until the next tick; after a restart the runtime's first running tick
+looks for a finding audit record later than the last `credential_finding`
+notification (at most seven days back) and, if one exists, sends one
+notification and restores the one-day hold from the finding's time. A
+reservation fault needs no such recovery: the startup check re-detects it. Verified with synthetic checks, software
 authenticators and an intercepted Slack transport only
 (`server/tests/test_access_fault_notifications.py`).
 
