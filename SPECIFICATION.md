@@ -2253,7 +2253,18 @@ is not repeated at every start.
 `web_assets_directory` (`<installation>/current/web`, resolved against the
 running release's own `web/`); without it no human composition can be
 mounted, and with it the release's `--check` refuses to start unless the
-build loads. Every asset response has a
+build loads. The optional deployment key `human_access` (Issue #10,
+`app.auth.access_config`; `server/docs/DEPLOYMENT.md`) states the
+reservation (hostname, port, every reserved address, isolation
+`dedicated_network_identity` / `single_purpose_node` / `null`, any visible
+proxy socket and its creator, the absolute Tailscale CLI path and the
+device-bound policy); when enabled it requires `web_assets_directory`, and
+the launcher builds the production composition (`app.auth.composition`)
+with `/proc/net`, a bounded read-only `tailscale serve status --json`
+runner (fixed arguments, empty environment, 5-second timeout, 1 MiB output
+cap; any failure is an enumeration failure), `getaddrinfo` and sock_diag, or
+refuses to start with a value-free reason. Without the key every human path
+stays closed. Every asset response has a
 fixed header list: its `Content-Type` (the manifest's, from the S5a
 build policy `web/scripts/policy.mjs`), `Content-Length`,
 `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,

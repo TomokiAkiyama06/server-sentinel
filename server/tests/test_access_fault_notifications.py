@@ -411,6 +411,15 @@ class CompositionTests(MonitoredAccessFixture):
                        storage_reservation=self.admission)
         self.assertIsNone(monitor.attached)
 
+    async def test_a_monitoring_runtime_requires_a_monitor_for_human_access(self):
+        """Issue #281 item 1: with a monitoring runtime (every production
+        deployment), a human composition without the monitor is refused."""
+        for dependencies in (None, MonitoringDependencies()):
+            with self.subTest(dependencies=dependencies), self.assertRaises(TypeError):
+                create_app(self.settings(), database=self.database, human_access=self.access,
+                           storage_reservation=self.admission, monitoring=self.monitoring(),
+                           monitoring_dependencies=dependencies)
+
     async def test_a_refused_create_app_leaves_the_monitor_unattached(self):
         """PR #271 review: the monitor is attached only after every check passed."""
         monitor = AccessFaultMonitor()

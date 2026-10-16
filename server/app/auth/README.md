@@ -134,18 +134,14 @@ Not implemented yet, and required before routes open in production:
   S2, the Owner step-up routes since S3, and the Owner's access
   administration routes A1-A6 since S4b (below);
 - the local `list` / `revoke-principal` / `revoke-credential` commands
-  (S4c) and the Owner's administration screen in the Web UI (S6);
-- the deployment-file key and production composition that build the
-  `HostnameReservationCheck` (Serve status source, `SockDiagOwners`,
-  `GetaddrinfoResolver`), load the session-binding key with
-  `SessionBindingKey.load_or_create(Settings.session_binding_key_path)` and
-  pass a `HumanAccess` to `create_app` (no production path builds one yet);
-- passing one `app.monitoring.access.AccessFaultMonitor` from that
-  production composition as the check's `sink=`, the ceremonies' `findings=`
-  and `MonitoringDependencies(access_faults=)`. The monitor, its immediate
-  Owner notification and degraded health exist since Issue #232 item 4
-  (see "Owner notification of access faults" below); only the production
-  composition that hands it to the check is missing.
+  (S4c) and the Owner's administration screen in the Web UI (S6).
+
+The deployment key `human_access` and its production composition, which
+passes one `AccessFaultMonitor` as the check's `sink=`, the ceremonies'
+`findings=` and `MonitoringDependencies(access_faults=)`, exist since
+Issue #10 CP-1 ("Production composition" below). Wherever a monitoring
+runtime runs, `create_app` refuses a composition without that monitor
+(Issue #281 item 1).
 
 Owner-only mutations — invitation (with its code), code re-issue, grant
 change, single credential revocation and principal revocation — are exposed
@@ -518,8 +514,9 @@ endpoint even for its own process, so a service that opens several
 Nothing here reads the host implicitly, runs `tailscale`, changes Tailscale
 ACLs/Grants, or needs Tailscale administrative credentials. The check is wired
 into the application only through the phase 1 `HumanAccess` composition below,
-whose lifespan task runs `startup()` and then `tick()` every 30 seconds; no
-production path builds one yet. The assumed `tailscale serve status --json`
+whose lifespan task runs `startup()` and then `tick()` every 30 seconds; in
+production that composition is built only from the `human_access` deployment
+key (`composition.py`, below). The assumed `tailscale serve status --json`
 shape is unverified against an installed Tailscale; unrecognised keys fail
 closed.
 
@@ -535,7 +532,38 @@ whose origin is the reserved `https://<hostname>[:<port>]` of the check, and
 a verified `WebAssets` set (`assets=`, S5b below). Any
 other combination raises `HumanAccessUnavailable` and the listener stays
 closed. `create_app` also refuses a composition whose assets were not loaded
-from `Settings.web_assets_dir`. No deployment-file key builds a `HumanAccess` yet.
+from `Settings.web_assets_dir`.
+
+Production composition (Issue #10). `access_config.py` (standard library
+only; the installer bundles it) validates the optional `human_access`
+deployment key into a `HumanAccessDeployment`: `enabled`, `hostname`, `port`
+(default 443), `reserved_addresses`, `isolation`
+(`dedicated_network_identity`, `single_purpose_node` or `null`, which keeps
+access closed with `ISOLATION_UNSTATED`), the optional visible
+`proxy_listeners` with their `proxy_owner`, the absolute
+`tailscale_executable` and `require_device_bound` (default false). Refusals
+are `HumanAccessRefused` with one value-free reason (`setting`,
+`web_assets`, `executable`); enabled without `web_assets_directory` is
+refused, and the release's `--check` requires the CLI to be an
+administrator-controlled executable the service account can run.
+`composition.build_human_access` then builds, with the production inputs,
+the check (`ProcNetListeners` over bounded `/proc/net` reads,
+`ServeStatusRoutes` over `ServeStatusCommand`, `GetaddrinfoResolver`,
+`SockDiagOwners`, `ListenerExceptionStore`, `ReservationSessionRevocation`),
+the audited `AccessStore` with the deployment's invitation lifetime and
+`SessionBindingKey.load_or_create(Settings.session_binding_key_path)`, the
+`PasskeyCeremonies` for the reserved origin, the `WebAssets` and the
+`HumanAccess`. `ServeStatusCommand` runs exactly `<tailscale_executable>
+serve status --json` with an empty environment, `/` as working directory, no
+stdin, stderr discarded, its own session (a timeout kills the process group),
+a 5-second timeout (below the check's enumeration timeout) and a 1 MiB output
+cap; a failure to start, a timeout, more output, a non-zero exit or non-UTF-8
+text is a `ReservationEnumerationError`, so the check fails closed. The
+launcher (`app.__main__.run`) passes one `AccessFaultMonitor` as the check's
+`sink`, the ceremonies' `findings` and `MonitoringDependencies(access_faults=)`
+(Issue #232 item 4); any failure to compose (`HumanAccessUnavailable`, or
+`create_app` refusing it) logs `human_access_composition_failed` and exits
+non-zero. Without the key nothing is built and `ClosedHumanSurface` stays.
 
 Every HTTP request passes, in this order, before any handler runs:
 

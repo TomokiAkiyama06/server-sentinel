@@ -2836,6 +2836,23 @@ by the Issue #6 synthetic policy model.
   passing. Record whether empty config prints `{}`, nothing, or text, and
   whether reading status needs anything beyond local operator access (it must
   not need ACL/Grants changes or admin credentials).
+- Production composition (`human_access` deployment key, Issue #10;
+  `server/docs/DEPLOYMENT.md`, "Enabling human access through Tailscale
+  Serve"): its tests use synthetic enumerators, a synthetic Web build and
+  generated stand-in executables only; nothing below is verified yet. As the
+  service account, run `env -i <tailscale_executable> serve status --json`
+  and record whether it succeeds without any environment, how long it takes
+  and its size (the runner allows 5 seconds and 1 MiB). With
+  `"isolation": "dedicated_network_identity"`, run it inside the dedicated
+  VM/container against that environment's own `tailscaled` and confirm the
+  backend's `/proc/net` and sock_diag view is that environment's namespace.
+  Restart the service with the key and confirm the startup check opens access
+  only with the expected single Serve mapping, and that `"isolation": null`,
+  a missing Serve mapping, an extra path or port, or a stopped `tailscaled`
+  keeps it closed (generic denial on the shell `/`) and sends one
+  `human_access_fault` notification, and that a missing or group-writable
+  `tailscale_executable` makes the release's check refuse to start with
+  `human access refused (reason=executable)`.
 - On the target host, compare the parsed `/proc/net/tcp` and `/proc/net/tcp6`
   listeners with `ss -ltnH`, and the parsed `/proc/net/udp` and
   `/proc/net/udp6` unconnected sockets with `ss -lunH`, for IPv4, IPv6,

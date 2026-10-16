@@ -1,6 +1,6 @@
 """Validated stable-deployment configuration and launcher."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import argparse
 import json
 import os
@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import stat
 
+from app.auth.access_config import HumanAccessDeployment, HumanAccessRefused, parse_human_access
 from app.cameras.uvc.config import LocalUvcConfiguration, parse_local_uvc
 from app.detection.foundation.config import DetectionConfiguration, parse_detection
 from app.monitoring.config import MonitoringConfiguration, parse_monitoring
@@ -316,6 +317,34 @@ def _load_web_assets(directory: Path, code_root: Path) -> None:
         raise WebAssetsRefused(refused.reason) from None
 
 
+def _tailscale_executable(path: Path) -> Path:
+    """The ``human_access.tailscale_executable`` the service may run, resolved, or refuse.
+
+    The Serve status runner executes it with the service account's
+    privileges on every check, so, like the configuration itself, it must be
+    a regular file owned by the administrator (or root) that neither group nor
+    others can write, in a directory whose every component is
+    administrator-controlled, and the service account must be able to
+    execute it. Symbolic links (``/usr/bin/tailscale`` on some packagings)
+    are resolved and the target is checked. Value-free reason ``executable``.
+    """
+    try:
+        resolved = path.resolve(strict=True)
+        info = resolved.lstat()
+    except (OSError, RuntimeError, ValueError):
+        raise HumanAccessRefused("executable") from None
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid not in {ADMINISTRATOR_UID, 0}
+            or info.st_mode & 0o022):
+        raise HumanAccessRefused("executable")
+    try:
+        _administrator_directory(resolved.parent)
+    except ConfigurationError:
+        raise HumanAccessRefused("executable") from None
+    if not _effective_access(resolved, os.X_OK):
+        raise HumanAccessRefused("executable")
+    return resolved
+
+
 def _read_configuration(path: Path) -> tuple[dict, os.stat_result]:
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -382,6 +411,10 @@ class Deployment:
     # all (``null`` counts). The installer compares it with the release it
     # switches to (Issue #109, review of PR #177).
     capture_ca_configured: bool = field(default=True, repr=False)
+    # The optional ``human_access`` section (Issue #10). Absent keeps every
+    # human path closed (``ClosedHumanSurface``); enabled, the launcher builds
+    # the production composition (``app.auth.composition``) or refuses to start.
+    human_access: HumanAccessDeployment | None = field(default=None, repr=False)
 
     @property
     def state_directory(self) -> Path:
@@ -411,7 +444,7 @@ class Deployment:
                 or not set(value) <= allowed | {"monitoring", "local_uvc", "detection",
                                                 "capture_ca_directory",
                                                 "invitation_lifetime_hours",
-                                                "web_assets_directory"}
+                                                "web_assets_directory", "human_access"}
                 or type(value.get("service_uid")) is not int):
             raise ConfigurationError("invalid deployment configuration")
         # Required (Owner decision 2026-10-07, Issue #109): every configuration
@@ -495,6 +528,17 @@ class Deployment:
         # without ``Settings.web_assets_dir``), so human access stays closed.
         web_assets = (_web_assets_directory(value["web_assets_directory"], code_root, install_root)
                       if "web_assets_directory" in value else None)
+        # Optional (Issue #10): the Owner's reservation of the human origin.
+        # Enabled, it needs the release's Web build: the composition serves
+        # nothing else, and create_app refuses one without it.
+        human_access = (parse_human_access(value["human_access"])
+                        if "human_access" in value else None)
+        if human_access is not None and human_access.enabled and web_assets is None:
+            raise HumanAccessRefused("web_assets")
+        if human_access is not None:
+            # Validated as a loopback literal and a port by Settings below.
+            human_access = replace(human_access, upstream_host=value["human_host"],
+                                   upstream_port=value["human_port"])
         settings = Settings(
             directories[0], human_host=value["human_host"],
             human_port=value["human_port"], log_level=value["log_level"],
@@ -519,7 +563,7 @@ class Deployment:
             raise ConfigurationError("capture CA directory must be outside runtime data and code")
         return cls(runtime_root, uid, settings, directories[1], directories[2], monitoring,
                    local_uvc=local_uvc, detection=detection, capture_ca_directory=capture_ca,
-                   capture_ca_configured=configured)
+                   capture_ca_configured=configured, human_access=human_access)
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -550,6 +594,12 @@ def main(arguments: list[str] | None = None) -> int:
         # and in the installer's staging and rollback checks.
         if deployment.settings.web_assets_dir is not None:
             _load_web_assets(deployment.settings.web_assets_dir, code_root)
+        # Issue #10: the Serve status runner executes the Tailscale CLI as
+        # this account on every reservation check; check it as this account.
+        human_access = deployment.human_access
+        if human_access is not None and human_access.enabled:
+            human_access = replace(human_access, tailscale_executable=_tailscale_executable(
+                human_access.tailscale_executable))
     except CaptureCaSettingMissing:
         parser.exit(1, "ServerSentinel deployment validation failed: "
                        + CaptureCaSettingMissing.REASON + "\n")
@@ -558,13 +608,18 @@ def main(arguments: list[str] | None = None) -> int:
         # no client ever sees it.
         parser.exit(1, "ServerSentinel deployment validation failed: web assets refused "
                        f"(reason={refused.reason})\n")
+    except HumanAccessRefused as refused:
+        # One value-free word (setting, web_assets or executable).
+        parser.exit(1, "ServerSentinel deployment validation failed: human access refused "
+                       f"(reason={refused.reason})\n")
     except ConfigurationError:
         parser.exit(1, "ServerSentinel deployment validation failed\n")
     if args.check:
         print("ServerSentinel deployment validation passed")
         return 0
     from app.__main__ import run
-    return run(deployment.settings, deployment.monitoring, deployment.local_uvc)
+    return run(deployment.settings, deployment.monitoring, deployment.local_uvc,
+               human_access=human_access)
 
 
 if __name__ == "__main__":
