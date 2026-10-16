@@ -25,6 +25,8 @@ export const LIVE_SESSIONS_PATH = '/api/live/sessions';
 export const FRAME_SEQUENCE_HEADER = 'X-Frame-Sequence';
 /** A frame larger than this is refused unread into a canvas. */
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+/** Sign-out waits at most this long for viewer opens and closes, then proceeds. */
+export const SIGN_OUT_CLEANUP_MS = 2000;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CSRF = /^[A-Za-z0-9_-]{43}$/;
@@ -75,7 +77,8 @@ interface Send {
   keepalive?: boolean;
 }
 
-export function createDashboardServices(origin: string, request: typeof fetch = (...args) => fetch(...args)): DashboardServices {
+export function createDashboardServices(origin: string, request: typeof fetch = (...args) => fetch(...args),
+  { cleanupMs = SIGN_OUT_CLEANUP_MS }: { cleanupMs?: number } = {}): DashboardServices {
   const deployment = new URL(origin);
   if (!['http:', 'https:'].includes(deployment.protocol)) throw new ApiError('invalid_request');
   let csrf: string | null = null;
@@ -83,6 +86,18 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
   // them first: once the token is gone a later close could not be sent, and
   // the viewer slot would stay taken until the server's lease ends it.
   const viewers = new Set<string>();
+  // Opens in flight: sign-out waits for them so a session granted meanwhile
+  // is closed too, and no new open starts while it runs.
+  const opening = new Set<Promise<unknown>>();
+  let signingOut = false;
+
+  async function closeWith(id: string, header: string): Promise<void> {
+    viewers.delete(id);
+    try {
+      const response = await send({ method: 'POST', path: sessionPath(id, 'close'), accept: 'application/json', csrf: header, keepalive: true });
+      void response.body?.cancel().catch(() => undefined);
+    } catch { /* best effort: the server's lease ends it */ }
+  }
 
   async function send({ method, path, accept, signal, csrf: token, body, keepalive }: Send): Promise<Response> {
     const url = new URL(path, deployment.origin);
@@ -127,6 +142,20 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
     return `${LIVE_SESSIONS_PATH}/${sessionId}/${action}`;
   }
 
+  async function open(sourceId: string, header: string, signal: AbortSignal): Promise<string> {
+    const response = await send({
+      method: 'POST', path: LIVE_SESSIONS_PATH, accept: 'application/json', signal, csrf: header,
+      body: { source_id: sourceId },
+    });
+    if (response.status !== 200 && response.status !== 201) throw new ApiError('unavailable');
+    const value = await json(response, signal);
+    if (!record(value) || typeof value.session_id !== 'string' || !UUID.test(value.session_id)) {
+      throw new ApiError('invalid_response');
+    }
+    viewers.add(value.session_id);
+    return value.session_id;
+  }
+
   return {
     async loadSession(signal) {
       csrf = null;
@@ -146,16 +175,21 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
 
     async signOut(signal) {
       const header = token();
-      await Promise.all([...viewers].map(async id => {
-        viewers.delete(id);
-        try {
-          const closed = await send({ method: 'POST', path: sessionPath(id, 'close'), accept: 'application/json', csrf: header, keepalive: true });
-          void closed.body?.cancel().catch(() => undefined);
-        } catch { /* the lease ends it; sign-out proceeds */ }
-      }));
-      const response = await send({ method: 'POST', path: SIGN_OUT_PATH, accept: 'application/json', signal, csrf: token() });
-      if (response.status !== 204) throw new ApiError('unavailable');
-      csrf = null;
+      signingOut = true;
+      try {
+        // Bounded best effort: a hung open or close never holds the sign-out.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const limit = new Promise<void>(resolve => { timer = setTimeout(resolve, cleanupMs); });
+        const cleanup = (async () => {
+          await Promise.allSettled([...opening]);
+          await Promise.allSettled([...viewers].map(id => closeWith(id, header)));
+        })();
+        await Promise.race([cleanup, limit]);
+        clearTimeout(timer);
+        const response = await send({ method: 'POST', path: SIGN_OUT_PATH, accept: 'application/json', signal, csrf: header });
+        if (response.status !== 204) throw new ApiError('unavailable');
+        csrf = null;
+      } finally { signingOut = false; }
     },
 
     async loadLiveSources(signal) {
@@ -166,17 +200,11 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
 
     async openLiveSession(sourceId, signal) {
       if (!UUID.test(sourceId)) throw new ApiError('invalid_request');
-      const response = await send({
-        method: 'POST', path: LIVE_SESSIONS_PATH, accept: 'application/json', signal, csrf: token(),
-        body: { source_id: sourceId },
-      });
-      if (response.status !== 200 && response.status !== 201) throw new ApiError('unavailable');
-      const value = await json(response, signal);
-      if (!record(value) || typeof value.session_id !== 'string' || !UUID.test(value.session_id)) {
-        throw new ApiError('invalid_response');
-      }
-      viewers.add(value.session_id);
-      return value.session_id;
+      if (signingOut) throw new ApiError('unauthorized');
+      const header = token();
+      const pending = open(sourceId, header, signal);
+      opening.add(pending);
+      try { return await pending; } finally { opening.delete(pending); }
     },
 
     async readLiveFrame(sessionId, after, signal): Promise<LiveFrame | null> {

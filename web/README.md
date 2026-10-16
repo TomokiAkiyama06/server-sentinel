@@ -298,8 +298,9 @@ read or rendered.
   `invited_user` ⇒ viewer; an unknown role or permission, a duplicate, or a
   token that is not 43 base64url characters fails closed (`invalid_response`).
   A refusal is the denied screen, which links back to the sign-in shell.
-- Sign-out: first a close of every live viewer session this page still holds
-  (while the CSRF token is still known; Codex PR #273), then
+- Sign-out: no new viewer open starts; opens in flight are awaited and every
+  live viewer session this page still holds is closed while the CSRF token is
+  still known (bounded to 2 s in total, best effort; Codex PR #273), then
   `POST /api/auth/sign-out` with no body ⇒ `204` ⇒ `location.replace('/')`.
   A refusal (the session is already gone) also goes to the sign-in shell; any
   other failure is reported and the session stays.
@@ -328,7 +329,10 @@ ID-keyed collection (1 to 4, no fixed slots) and plays one at a time.
 `src/dashboard/live_loop.ts` runs the interim frame-pull loop (Owner decision
 D5): open a viewer session, pull with `after=<last sequence>` at most every
 200 ms (about 5 fps), `204` ⇒ wait. No newer frame for 5 s ⇒ the picture is
-marked not current and dimmed. A transient failure (network, `5xx`, an invalid
+marked not current and dimmed. An open or frame request unanswered for 4 s
+is abandoned as a transient failure (aborted whether or not the transport
+honours the signal), so a stalled connection never leaves an old frame
+labelled current. A transient failure (network, `5xx`, an invalid
 answer, an undecodable frame) retries with backoff 0.5 s, 1 s, 2 s, 4 s, then
 8 s, keeping the session. A refusal ends the loop: the canvas is cleared, the
 session closed, and nothing is retried until the viewer presses Reconnect. A
@@ -336,7 +340,8 @@ hidden page (`visibilitychange`, `pagehide`) closes the session and clears the
 picture, so nothing is requested while nobody looks, and a fresh session is
 opened when the page is visible again. Leaving the screen, switching source,
 or a replaced provider closes the session; a session granted after that is
-closed at once.
+closed at once, and a frame whose decode finishes after a pause, refusal or
+stop is dropped instead of drawn.
 
 A frame is decoded with `createImageBitmap(blob)` and drawn into a `<canvas>`;
 no object URL or data URL is created, so the dashboard policy (`img-src 'self'`,

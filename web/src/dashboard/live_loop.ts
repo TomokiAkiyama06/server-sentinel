@@ -23,6 +23,10 @@ export { ApiError };
 export const FRAME_INTERVAL_MS = 200;
 /** Without a newer frame for this long the shown frame is marked not current. */
 export const STALE_AFTER_MS = 5000;
+/** An open or frame request unanswered for this long is abandoned as a
+ *  transient failure, so a stalled connection never keeps an old frame
+ *  labelled current (it is shorter than STALE_AFTER_MS). */
+export const REQUEST_TIMEOUT_MS = 4000;
 export const BACKOFF_BASE_MS = 500;
 export const BACKOFF_MAX_MS = 8000;
 
@@ -49,8 +53,10 @@ export interface Clock {
 export interface LiveLoopOptions {
   transport: LiveTransport;
   sourceId: string;
-  /** Draw one frame; a rejection counts as a transient failure. */
-  onFrame(frame: LiveFrame): Promise<void> | void;
+  /** Draw one frame; a rejection counts as a transient failure. `current()`
+   *  turns false once the frame belongs to a paused, ended or stopped
+   *  session: check it after any await and draw nothing then. */
+  onFrame(frame: LiveFrame, current: () => boolean): Promise<void> | void;
   /** `paused` and `ended` also mean: drop whatever frame is shown. */
   onStatus(status: LiveStatus): void;
   visibility: Visibility;
@@ -77,6 +83,7 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
   let session: string | null = null;
   let controller: AbortController | null = null;
   let timer: unknown = null;
+  let deadline: unknown = null;
   let after = 0;
   let failures = 0;
   let lastFrame = 0;
@@ -94,7 +101,25 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
     controller?.abort();
     controller = null;
     if (timer !== null) { clock.clear(timer); timer = null; }
+    disarm();
     if (session !== null) { transport.close(session); session = null; }
+  }
+
+  function disarm() {
+    if (deadline !== null) { clock.clear(deadline); deadline = null; }
+  }
+
+  /** `request` bounded by REQUEST_TIMEOUT_MS whether or not it honours the signal. */
+  function bounded<T>(request: Promise<T>, attempt: AbortController): Promise<T> {
+    disarm();
+    const expired = new Promise<never>((_, reject) => {
+      deadline = clock.set(() => {
+        deadline = null;
+        attempt.abort();
+        reject(new ApiError('unavailable'));
+      }, REQUEST_TIMEOUT_MS);
+    });
+    return Promise.race([request, expired]).finally(() => { if (controller === attempt) disarm(); });
   }
 
   function schedule(run: (current: number) => void, ms: number, current: number) {
@@ -120,7 +145,7 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
     void (async () => {
       let granted: string;
       try {
-        granted = await transport.open(sourceId, attempt.signal);
+        granted = await bounded(transport.open(sourceId, attempt.signal), attempt);
       } catch (error) {
         if (current !== generation) return;
         if (refused(error)) { end(); return; }
@@ -144,10 +169,10 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
     if (id === null) return;
     void (async () => {
       try {
-        const frame = await transport.read(id, after, attempt.signal);
+        const frame = await bounded(transport.read(id, after, attempt.signal), attempt);
         if (current !== generation) return;
         if (frame) {
-          await onFrame(frame);
+          await onFrame(frame, () => !stopped && current === generation);
           if (current !== generation) return;
           after = frame.sequence;
           lastFrame = clock.now();

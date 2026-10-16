@@ -89,12 +89,13 @@ function LivePlayer({ transport, source, t }: { transport: LiveTransport; source
     };
     const stop = startLiveLoop({
       transport, sourceId: source.id, visibility: documentVisibility(),
-      async onFrame(frame) {
+      async onFrame(frame, current) {
         const bitmap = await createImageBitmap(frame.data);
         try {
           const element = canvas.current;
           const context = element?.getContext('2d');
-          if (!active || !element || !context) return;
+          // A decode that finishes after a pause, refusal or unmount is dropped.
+          if (!active || !current() || !element || !context) return;
           if (element.width !== bitmap.width || element.height !== bitmap.height) {
             element.width = bitmap.width;
             element.height = bitmap.height;

@@ -420,3 +420,76 @@ test('sign-out first closes every viewer session this page still holds', async (
   await again.services.signOut(signal());
   assert.equal(again.calls.filter(call => call.key === close).length, 1);
 });
+
+test('a hung close or open never holds the sign-out; an open granted meanwhile is closed first', async () => {
+  const close = `POST /api/live/sessions/${sessionId}/close`;
+  // A close that never answers: sign-out still goes out after the bound.
+  const hung = fake({ 'GET /api/session': json(ownerBody), 'POST /api/live/sessions': json({ session_id: sessionId }),
+    [close]: () => new Promise(() => {}), 'POST /api/auth/sign-out': new Response(null, { status: 204 }) });
+  const services = createDashboardServices(origin, hung.request, { cleanupMs: 20 });
+  await services.loadSession(signal());
+  await services.openLiveSession(source, signal());
+  await services.signOut(signal());
+  assert.deepEqual(hung.calls.slice(-2).map(call => call.key), [close, 'POST /api/auth/sign-out']);
+  // An open in flight when sign-out starts: its grant is closed before the
+  // sign-out request, and no new open starts meanwhile.
+  let grant;
+  const racing = fake({ 'GET /api/session': json(ownerBody),
+    'POST /api/live/sessions': () => new Promise(resolve => { grant = resolve; }),
+    [close]: new Response(null, { status: 204 }), 'POST /api/auth/sign-out': new Response(null, { status: 204 }) });
+  const other = createDashboardServices(origin, racing.request, { cleanupMs: 1000 });
+  await other.loadSession(signal());
+  const opened = other.openLiveSession(source, signal());
+  await flush();
+  const signingOut = other.signOut(signal());
+  await assert.rejects(other.openLiveSession(source, signal()), { code: 'unauthorized' });
+  grant(json({ session_id: sessionId }));
+  await signingOut;
+  assert.equal(await opened, sessionId);
+  assert.deepEqual(racing.calls.map(call => call.key), ['GET /api/session', 'POST /api/live/sessions', close, 'POST /api/auth/sign-out']);
+});
+
+test('a stalled frame request is abandoned: the picture is never left labelled live', async () => {
+  let aborted = null;
+  let reads = 0;
+  const stalled = transport();
+  stalled.read = async (id, after, abort) => {
+    reads += 1;
+    if (reads === 1) return frame(1);
+    aborted = abort;
+    return new Promise(() => {});
+  };
+  const loop = run({ transport: stalled });
+  await loop.clock.advance(live.FRAME_INTERVAL_MS);
+  assert.equal(loop.statuses.at(-1), 'live');
+  await loop.clock.advance(live.REQUEST_TIMEOUT_MS - 1);
+  assert.equal(loop.statuses.at(-1), 'live');
+  await loop.clock.advance(1);
+  assert.equal(loop.statuses.at(-1), 'retrying');
+  assert.equal(aborted.aborted, true);
+  assert.ok(live.REQUEST_TIMEOUT_MS < live.STALE_AFTER_MS);
+  // A stalled open is bounded the same way.
+  const hungOpen = transport({ open: () => new Promise(() => {}) });
+  const second = run({ transport: hungOpen });
+  await second.clock.advance(live.REQUEST_TIMEOUT_MS);
+  assert.equal(second.statuses.at(-1), 'retrying');
+  loop.stop();
+  second.stop();
+});
+
+test('a frame decoded after a pause is reported as no longer current', async () => {
+  let release;
+  const checks = [];
+  const fakeTransport = transport({ reads: [frame(1), null] });
+  const clock = manualClock();
+  const view = visibility();
+  const stop = live.startLiveLoop({ transport: fakeTransport, sourceId: source, visibility: view, clock,
+    onStatus: () => undefined,
+    onFrame: (_, current) => new Promise(resolve => { release = () => { checks.push(current()); resolve(); }; }) });
+  await clock.advance(0);
+  view.set(true);
+  release();
+  await clock.advance(0);
+  assert.deepEqual(checks, [false]);
+  stop();
+});
