@@ -666,8 +666,14 @@ sudo systemctl restart server-sentinel.service
   startup only. Restart it; the first check after the restart applies the
   set (a narrower set can close human access then). `show` prints the stored
   set, not necessarily the one in force.
-- `set` needs the deployment's human access configuration
-  (`human_access_not_configured` otherwise); `show` does not. A stored set
+- `set` validates against the reservation the deployment's `"human_access"`
+  section states (below: `hostname`, `port`, `reserved_addresses`,
+  `proxy_listeners`, `proxy_owner`, `isolation`, and the `human_host` /
+  `human_port` upstream), the same one the service's check uses, whether the
+  section is enabled or not. Without the section it refuses
+  (`human_access_not_configured`); a section that states no usable
+  reservation refuses with `human_access_configuration_rejected`. Neither
+  refusal prints a configured value. `show` needs neither. A stored set
   that cannot be read is not printed (`stored_exceptions_unreadable` /
   `stored_exceptions_outdated`); `set` replaces it.
 - `committed_verification_failed` means the change was committed, but the

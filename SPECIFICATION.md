@@ -1737,7 +1737,9 @@ and is verified the same way. The Owner records the set with the local command
 decision D3, 2026-10-16): run as the service account with the same checks as
 `bootstrap_cli` (no root, the configuration's service uid, a controlling
 terminal, the pinned existing database of exactly the current schema), it
-validates the set against the deployment's reservation, reads the word
+validates the set against the reservation the deployment's `human_access`
+section states (`HumanAccessDeployment.reservation_config()`, the one the
+service's check uses), reads the word
 `CHANGE` from the terminal and commits the set with its
 `change_security_setting` audit record (actor `owner`, the fixed
 listener-exceptions id) in one transaction; the running service applies it

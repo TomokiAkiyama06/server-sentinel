@@ -482,7 +482,11 @@ is allowed. Only a `reserved_address` exception (above) covers such a bind,
 and only `tailscaled.service`'s TCP on its recorded port. Two paths change
 it. Offline, the local Owner command `app.auth.reservation_cli set` (Owner
 decision D3, 2026-10-16; run as the service account with a controlling
-terminal, like `bootstrap_cli`) writes the set and the same
+terminal, like `bootstrap_cli`) validates the set against the reservation
+the deployment's `human_access` section states
+(`HumanAccessDeployment.reservation_config()`, the same `ReservationConfig`
+`composition.py` builds; value-free `human_access_not_configured` /
+`human_access_configuration_rejected` otherwise), then writes the set and the same
 `change_security_setting` audit record (actor `owner`) in one transaction,
 after re-reading the stored value inside it; the running check does not see
 it until the service restarts and `startup()` loads it. The only runtime path is

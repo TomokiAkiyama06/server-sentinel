@@ -47,9 +47,12 @@ deployment configuration is loaded and validated as the launcher loads it
 (``controlling_terminal_required``); the application database is the existing
 file pinned by ``app.local_admin._existing_database`` for the whole command,
 re-verified before each commit, and its schema must be exactly this
-release's (``_require_current_schema``). ``set`` also needs the deployment's
-reservation (``human_access_not_configured`` until the deployment configures
-human access).
+release's (``_require_current_schema``). ``set`` also needs the reservation the
+deployment's ``human_access`` section states, read through
+``HumanAccessDeployment.reservation_config()``
+(``human_access_not_configured`` without the section,
+``human_access_configuration_rejected`` when it states no usable
+reservation; neither prints a value).
 
 ``set`` shows the stored set and the new set on the terminal and reads the
 word ``CHANGE``; anything else is ``owner_confirmation_declined``. The stored
@@ -88,6 +91,7 @@ from typing import Callable
 
 from app.audit.model import ActorCategory, AuditAction, AuditOutcome, TargetKind
 from app.audit.store import AuditStore
+from app.auth.access_config import HumanAccessDeployment, HumanAccessRefused
 from app.deployment import Deployment, _runtime_roots
 from app.local_admin import (
     CliRefused, ControllingTerminal, _existing_database, _LedgerDatabaseChanged,
@@ -116,7 +120,9 @@ _HINTS = {
                                       "run 'show' and repeat 'set' if the stored set is not the new one"),
     "stored_exceptions_unreadable": "the check keeps human access closed; replace the stored set with 'set'",
     "stored_exceptions_outdated": "the check keeps human access closed; enter the exceptions again with 'set'",
-    "human_access_not_configured": "the deployment configuration has no human access section yet",
+    "human_access_not_configured": "the deployment configuration has no human_access section",
+    "human_access_configuration_rejected": ("the deployment's human_access section does not state a usable "
+                                            "reservation"),
 }
 
 
@@ -173,21 +179,24 @@ def parse_exceptions(arguments, config: ReservationConfig) -> frozenset:
 def deployment_reservation(deployment) -> ReservationConfig:
     """The deployment's ``ReservationConfig``, the one the service's check uses.
 
-    Read from ``deployment.human_access.reservation_config`` (a
-    ``ReservationConfig``, or a callable returning one). A deployment without
-    human access is refused: no reservation exists to validate against.
+    Read from the deployment's ``human_access`` section through
+    ``HumanAccessDeployment.reservation_config()`` (the section plus the
+    deployment's loopback upstream, as ``app.auth.composition`` builds it). A
+    deployment without the section is refused: no reservation exists to
+    validate against. The section's ``enabled`` flag does not matter here; the
+    stated reservation is the same either way. Every refusal is value-free.
     """
     human_access = getattr(deployment, "human_access", None)
     if human_access is None:
         raise CliRefused("human_access_not_configured")
-    try:
-        config = getattr(human_access, "reservation_config")
-        if callable(config):
-            config = config()
-    except Exception:
-        raise CliRefused("deployment_configuration_rejected") from None
-    if not isinstance(config, ReservationConfig):
+    if not isinstance(human_access, HumanAccessDeployment):
         raise CliRefused("deployment_configuration_rejected")
+    try:
+        config = human_access.reservation_config()
+    except (HumanAccessRefused, ValueError):
+        raise CliRefused("human_access_configuration_rejected") from None
+    if not isinstance(config, ReservationConfig):
+        raise CliRefused("human_access_configuration_rejected")
     return config
 
 

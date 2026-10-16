@@ -2932,7 +2932,12 @@ by the Issue #6 synthetic policy model.
   - [ ] run as root, as another account, without a controlling terminal
     (`systemd-run`, `cron`), with a dashboard or upstream port, and with a
     `reserved_address` exception for another unit: each refuses and changes
-    nothing.
+    nothing;
+  - [ ] with the deployment's real `human_access` section, an exception for
+    its `port` or for `human_port` is refused; with the section removed
+    from a copy of the configuration, `set` refuses with
+    `human_access_not_configured` and no refusal prints a hostname,
+    address, unit or port.
 - Breach recovery (Owner decision 2026-09-30): with an Owner and an invited
   viewer signed in, bind a test listener to the Tailscale address on another
   port, wait for the check to close access, then stop it. Confirm access

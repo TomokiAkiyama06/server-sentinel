@@ -8,6 +8,7 @@ deployment database; mock only.
 """
 
 from contextlib import closing, redirect_stderr, redirect_stdout
+from dataclasses import replace
 import io
 import json
 import os
@@ -20,6 +21,7 @@ from unittest.mock import patch
 
 from app.audit.store import AuditStore
 from app.auth import reservation_cli
+from app.auth.access_config import parse_human_access
 from app.auth.reservation import (
     AddressFamily, BindScope, CheckKind, ListenerException, MAX_LISTENER_EXCEPTIONS, TransportProtocol,
 )
@@ -33,7 +35,7 @@ from app.storage.schema import APPLICATION_MIGRATIONS
 
 from tests.test_bootstrap_cli import AUDIT, NOW, Console
 from tests.test_hostname_reservation import (
-    TAILSCALED_CREATOR, FakeRevoker, Files, Owners, Sink, checker, config, proc, V6,
+    HOST, HUMAN, TAILSCALED_CREATOR, FakeRevoker, Files, Owners, Sink, checker, config, proc, V4, V6,
 )
 
 
@@ -48,6 +50,15 @@ SSH_LINE = "scope=wildcard,protocol=tcp,port=22,family=any,unit=ssh.socket,uid=0
 WG_LINE = "scope=wildcard,protocol=udp,port=41641,family=any,unit=tailscaled.service,uid=0"
 PEER_LINE = "scope=reserved_address,protocol=tcp,port=43210,family=ipv4,unit=tailscaled.service,uid=0"
 CHANGE = (reservation_cli.CHANGE_WORD,)
+# The ``human_access`` section stating ``config()``'s reservation, with the
+# upstream ``Deployment.load`` sets from ``human_host`` / ``human_port``.
+SECTION = {"enabled": True, "hostname": HOST, "reserved_addresses": [str(V4), str(V6)],
+           "isolation": "single_purpose_node", "tailscale_executable": "/usr/bin/tailscale"}
+
+
+def human_access(**changes):
+    return replace(parse_human_access({**SECTION, **changes}),
+                   upstream_host=str(HUMAN.address), upstream_port=HUMAN.port)
 
 
 class ListenerExceptionCliTests(unittest.TestCase):
@@ -62,7 +73,7 @@ class ListenerExceptionCliTests(unittest.TestCase):
         self.clock = lambda: NOW
         self.config = self.root / "deployment.json"
         self.service_uid = os.geteuid()
-        self.human_access = SimpleNamespace(reservation_config=config())
+        self.human_access = human_access()
         self.loaded = []
 
     def deployment(self, path):
@@ -229,12 +240,32 @@ class ListenerExceptionCliTests(unittest.TestCase):
         self.assert_unchanged()
         # show does not: it only reads the stored set.
         self.assertEqual(self.run_cli("show")[0], 0)
-        for broken in (SimpleNamespace(), SimpleNamespace(reservation_config="not a config"),
-                       SimpleNamespace(reservation_config=lambda: (_ for _ in ()).throw(OSError("synthetic")))):
+        # Anything but the parsed section is refused.
+        for broken in (SimpleNamespace(), SimpleNamespace(reservation_config=config)):
             with self.subTest(broken=broken):
                 self.human_access = broken
                 self.assert_refused(self.run_cli("set", SSH_ARG, lines=CHANGE), "deployment_configuration_rejected")
                 self.assert_unchanged()
+        # A section that states no usable reservation (its upstream unset,
+        # so not loaded through ``Deployment.load``): refused, value-free.
+        self.human_access = parse_human_access(SECTION)
+        result = self.run_cli("set", SSH_ARG, lines=CHANGE)
+        self.assert_refused(result, "human_access_configuration_rejected")
+        self.assert_unchanged()
+        for value in (HOST, str(V4), str(V6), "tailscale", str(HUMAN.port)):
+            self.assertNotIn(value, result[2])
+
+    def test_set_reads_the_reservation_the_section_states(self):
+        self.assertEqual(self.human_access.reservation_config(), config())
+        # A disabled section states the same reservation; the CLI accepts it.
+        self.human_access = human_access(enabled=False)
+        self.assertEqual(self.run_cli("set", SSH_ARG, lines=CHANGE)[0], 0)
+        self.assertEqual(decode(self.stored()), frozenset({SSH}))
+        # The section's port is the reservation's: an exception for it is refused.
+        self.human_access = human_access(port=8443)
+        self.assert_refused(self.run_cli("set", "protocol=tcp,port=8443,unit=ssh.socket,uid=0", lines=CHANGE),
+                            "listener_exception_rejected")
+        self.assertEqual(self.run_cli("set", "protocol=tcp,port=443,unit=ssh.socket,uid=0", lines=CHANGE)[0], 0)
 
     def test_the_stored_value_is_compared_again_inside_the_transaction(self):
         self.run_cli("set", SSH_ARG, lines=CHANGE)
