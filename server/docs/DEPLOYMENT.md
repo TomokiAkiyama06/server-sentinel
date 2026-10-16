@@ -617,7 +617,10 @@ node's Tailscale name. A wildcard exception never covers that; record it as a
 D1, 2026-10-16; ADR-0003): TCP,
 the observed port, the family of the address it is bound on (or none when the
 same port is bound on both), unit `tailscaled.service`, uid `0`. Nothing else
-is accepted in that scope. Find the port with
+is accepted in that scope, and at most one such exception per family (Issue
+#278): if `ss` shows more than one `tailscaled` port on an address family of
+the Tailscale addresses besides the Serve socket, stop and find out what the
+other one is rather than recording it. Find the port with
 `sudo ss -ltnp --cgroup` (rows on the Tailscale addresses with
 `cgroup:/system.slice/tailscaled.service`) and run the `MANUAL_TEST.md` peerAPI
 steps first. If `tailscaled` binds another port after a restart, the check
@@ -655,7 +658,8 @@ sudo systemctl restart server-sentinel.service
   and `uid` are required, `family` (`ipv4`, `ipv6`, `any`) and `scope`
   (`wildcard`, `reserved_address`) are optional. Anything else, a port of the
   dashboard, upstream or proxy, a `reserved_address` exception other than
-  `tailscaled.service`/uid `0`/TCP, more than 16 exceptions or a repeated one
+  `tailscaled.service`/uid `0`/TCP, a second `reserved_address` exception for
+  the same family, more than 16 exceptions or a repeated one
   is refused (`listener_exception_rejected`) before anything is asked.
 - `set` shows the stored and the new set and asks for the word `CHANGE`; the
   set and its `change_security_setting` audit record (actor `owner`, no port

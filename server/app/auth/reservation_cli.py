@@ -29,7 +29,8 @@ What a scope accepts is ``ListenerException``'s rule (a ``reserved_address``
 exception only for ``tailscaled.service``, uid 0, TCP; Owner decision D1,
 2026-10-16), and the whole set is checked with
 ``validate_listener_exceptions`` against this deployment's reservation (never
-the dashboard, upstream or proxy port; at most ``MAX_LISTENER_EXCEPTIONS``).
+the dashboard, upstream or proxy port; at most ``MAX_LISTENER_EXCEPTIONS``;
+at most one ``reserved_address`` exception per family, Issue #278).
 A field that is unknown, repeated, empty or not canonical refuses the command
 (``listener_exception_rejected``), as does a repeated exception.
 
