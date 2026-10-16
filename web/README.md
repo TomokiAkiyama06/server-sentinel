@@ -298,9 +298,9 @@ read or rendered.
   `invited_user` ⇒ viewer; an unknown role or permission, a duplicate, or a
   token that is not 43 base64url characters fails closed (`invalid_response`).
   A refusal is the denied screen, which links back to the sign-in shell.
-- Sign-out: no new viewer open starts; opens in flight are awaited and every
-  live viewer session this page still holds is closed while the CSRF token is
-  still known (bounded to 2 s in total, best effort; Codex PR #273), then
+- Sign-out: no new viewer open starts; every live viewer session this page
+  holds is closed at once, and each open still in flight closes its grant
+  when it lands, while the CSRF token is still known (bounded to 2 s in total, best effort; Codex PR #273), then
   `POST /api/auth/sign-out` with no body (abandoned after 10 s and reported
   as failed, so it can be retried) ⇒ `204` ⇒ `location.replace('/')`.
   A refusal (the session is already gone) also goes to the sign-in shell; any

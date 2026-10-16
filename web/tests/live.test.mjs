@@ -567,3 +567,22 @@ test('the picture turns stale STALE_AFTER_MS after the last frame even while a p
   // Only the fake read's own answer timer may remain.
   assert.equal(clock.pending(), 1);
 });
+
+test('a hung open does not delay closing the viewers already known at sign-out', async () => {
+  const close = `POST /api/live/sessions/${sessionId}/close`;
+  let opens = 0;
+  const closedAt = [];
+  const started = Date.now();
+  const hung = fake({ 'GET /api/session': json(ownerBody),
+    'POST /api/live/sessions': () => (++opens === 1 ? new Promise(() => {}) : json({ session_id: sessionId })),
+    [close]: () => { closedAt.push(Date.now() - started); return new Response(null, { status: 204 }); },
+    'POST /api/auth/sign-out': new Response(null, { status: 204 }) });
+  const services = createDashboardServices(origin, hung.request, { cleanupMs: 300 });
+  await services.loadSession(signal());
+  void services.openLiveSession(source, signal()).catch(() => undefined);
+  assert.equal(await services.openLiveSession(source, signal()), sessionId);
+  await services.signOut(signal());
+  assert.deepEqual(hung.calls.slice(-2).map(call => call.key), [close, 'POST /api/auth/sign-out']);
+  assert.equal(closedAt.length, 1);
+  assert.ok(closedAt[0] < 250, 'the known viewer is closed without waiting for the hung open');
+});

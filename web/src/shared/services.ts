@@ -90,7 +90,7 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
   const viewers = new Set<string>();
   // Opens in flight: sign-out waits for them so a session granted meanwhile
   // is closed too, and no new open starts while it runs.
-  const opening = new Set<Promise<unknown>>();
+  const opening = new Set<Promise<string>>();
   let signingOut = false;
 
   async function closeWith(id: string, header: string): Promise<void> {
@@ -182,10 +182,12 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
         // Bounded best effort: a hung open or close never holds the sign-out.
         let timer: ReturnType<typeof setTimeout> | undefined;
         const limit = new Promise<void>(resolve => { timer = setTimeout(resolve, cleanupMs); });
-        const cleanup = (async () => {
-          await Promise.allSettled([...opening]);
-          await Promise.allSettled([...viewers].map(id => closeWith(id, header)));
-        })();
+        // Known viewers close now; each open still in flight closes its
+        // grant when it lands. Neither waits for the other.
+        const cleanup = Promise.allSettled([
+          ...[...viewers].map(id => closeWith(id, header)),
+          ...[...opening].map(pending => pending.then(id => closeWith(id, header))),
+        ]);
         await Promise.race([cleanup, limit]);
         clearTimeout(timer);
         // Bounded too, whether or not fetch honours the abort: a stalled
