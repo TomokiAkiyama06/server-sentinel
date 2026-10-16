@@ -2911,17 +2911,33 @@ by the Issue #6 synthetic policy model.
     `http://<reserved name>:<port>/` in the same browser and confirm in the
     browser's network panel that the request carries no `__Host-session`
     cookie (the cookie is `Secure`); record the browser and version;
-  - [ ] record the port before and after `sudo systemctl restart
-    tailscaled` (and after a reboot): whether it stays the same decides
-    whether the recorded exception survives restarts or a follow-up Owner
-    decision is needed;
+  - [ ] record whether the IPv4 and IPv6 rows use the same port (one
+    exception without a family) or different ports (one `ipv4` and one
+    `ipv6` exception), and that each family has exactly one `tailscaled`
+    port besides the Serve socket: the command refuses a second
+    `reserved_address` exception for a family (Issue #278);
+  - [ ] record the port per family before and after `sudo systemctl restart
+    tailscaled`, after `tailscale down` followed by `tailscale up`, and after
+    a reboot: whether it stays the same decides whether the recorded
+    exception survives restarts or a follow-up Owner decision is needed (a
+    port that changes every time would revoke every human session on every
+    restart). The belief that the port is derived from a hash of the
+    Tailscale address and moves to another candidate when that one is in use
+    is unverified recollection, not a documented guarantee; record what the
+    installed version actually does;
+  - [ ] confirm the port serves no page or script whose content another
+    node or a user chooses (ADR-0003 same-site assumption): record the
+    response to `/` and an unknown path from another Tailscale node;
   - [ ] without the exception, confirm access closes with
     `UNEXPECTED_LISTENER`; record the `reserved_address` exception for the
     observed port(s) with `app.auth.reservation_cli set`, restart the
     service and confirm access opens;
     confirm a test TCP listener on the same address and another port, and
     one on the recorded port started by another unit after `tailscaled` is
-    stopped, each close access.
+    stopped, each close access; on a disposable node, add a Serve HTTPS
+    listener on another port and confirm access closes with
+    `UNEXPECTED_ROUTE`, plus `UNEXPECTED_LISTENER` when `ss` shows a socket
+    for it (record which).
 - Local listener-exception command (`app.auth.reservation_cli`, Owner
   decision D3, 2026-10-16; synthetic tests only so far, not run on any host):
   - [ ] as the service account over SSH, `show` prints the stored set (or

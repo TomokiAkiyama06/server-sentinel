@@ -456,9 +456,16 @@ and ADR-0003):
   decision D1, 2026-10-16; ADR-0003): `tailscaled.service` (uid 0) TCP
   listeners bound directly on a configured reserved address on a recorded
   port that is not the dashboard, upstream or proxy port, for `tailscaled`'s
-  plain-HTTP peerAPI. The `Secure` `__Host-session` cookie is not sent to a
-  plain-HTTP port; that the peerAPI stays plain HTTP is verified manually
-  (`MANUAL_TEST.md`), not by the check, which still only detects.
+  plain-HTTP peerAPI, at most one such exception per family (Issue #278).
+  The `Secure` `__Host-session` cookie is not sent to a plain-HTTP port; that
+  the recorded port is the peerAPI and stays plain HTTP is verified manually
+  (`MANUAL_TEST.md`), not by the check, which still only detects. `SameSite`
+  does not separate that origin from the dashboard (a browser without
+  schemeful same-site treats it as the same site): the exact `Origin` check,
+  the CSRF token and WebAuthn's secure-context requirement do, on the
+  assumption that the peerAPI serves no active content an attacker controls
+  (ADR-0003). A Serve listener added on another port is also reported as
+  `UNEXPECTED_ROUTE` by the route comparison.
 - Every recorded proxy socket must be present and created by the recorded
   proxy unit and uid (for example `tailscaled.service`, uid 0), verified the
   same way. A confirmed other creator is an exposure; a missing recorded

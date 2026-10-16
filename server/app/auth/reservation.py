@@ -270,9 +270,14 @@ class ListenerException:
     Tailscale addresses. Any other protocol, unit or uid is rejected, a
     wildcard bind is never covered by it, and ``validate_listener_exceptions``
     refuses the dashboard, upstream and proxy ports, so the served HTTPS port
-    is never excepted. The rationale (the ``__Host-``/``Secure`` session
-    cookie is never sent to a plain-HTTP port) is in ADR-0003; the check
-    still only detects, and does not prevent, another answer on the name.
+    is never excepted, and more than one such exception per family (Issue
+    #278). Whether the recorded port is the peerAPI is checked by hand
+    (``MANUAL_TEST.md``), not here. A Serve listener the Owner adds on another
+    port is also a proxy route, which the route comparison reports as
+    ``UNEXPECTED_ROUTE`` independently of this exception. The rationale (the
+    ``__Host-``/``Secure`` session cookie is never sent to a plain-HTTP port,
+    and the same-site caveat) is in ADR-0003; the check still only detects,
+    and does not prevent, another answer on the name.
 
     The port alone never exempts a socket (Owner decision, 2026-10-01): the
     exception names the creating systemd system ``unit`` and ``uid`` (Owner
@@ -864,7 +869,11 @@ def validate_listener_exceptions(config: ReservationConfig, exceptions) -> froze
     """Typed, bounded exceptions that never cover the dashboard or human listener.
 
     No exception of either scope may name the served HTTPS port, the loopback
-    upstream port or a recorded proxy socket port, for either protocol.
+    upstream port or a recorded proxy socket port, for either protocol. At most
+    one ``RESERVED_ADDRESS`` exception covers each family (one without a family
+    covers both; Issue #278): the peerAPI is expected on one port per family
+    (``MANUAL_TEST.md`` records it), so a second recorded port in a family
+    would except a TCP socket nobody verified is the peerAPI.
     """
     try:
         values = frozenset(exceptions)
@@ -875,6 +884,10 @@ def validate_listener_exceptions(config: ReservationConfig, exceptions) -> froze
     forbidden = {config.port, config.human_listener.port} | {item.port for item in config.proxy_listeners}
     for item in values:
         if not isinstance(item, ListenerException) or item.port in forbidden:
+            raise ValueError("INVALID_LISTENER_EXCEPTION")
+    for family in AddressFamily:
+        if sum(1 for item in values if item.scope is BindScope.RESERVED_ADDRESS
+               and item.family in (None, family)) > 1:
             raise ValueError("INVALID_LISTENER_EXCEPTION")
     return values
 

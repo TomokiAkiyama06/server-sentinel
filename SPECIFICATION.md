@@ -1731,8 +1731,9 @@ decisions, 2026-10-01 and 2026-10-07). The only exception that covers a bind
 directly on a reserved address is a `reserved_address` exception for
 `tailscaled.service` with uid 0 over TCP on one recorded port other than the
 dashboard, upstream and proxy ports (its plain-HTTP peerAPI; Owner decision
-D1, 2026-10-16, ADR-0003); it covers only the configured reserved addresses
-and is verified the same way. The Owner records the set with the local command
+D1, 2026-10-16, ADR-0003); it covers only the configured reserved addresses,
+at most one such exception covers each family (Issue #278), and it is
+verified the same way. The Owner records the set with the local command
 `python -m app.auth.reservation_cli show|set --config <deployment.json>` (Owner
 decision D3, 2026-10-16): run as the service account with the same checks as
 `bootstrap_cli` (no root, the configuration's service uid, a controlling

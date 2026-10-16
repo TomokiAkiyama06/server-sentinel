@@ -228,6 +228,10 @@ class ListenerExceptionCliTests(unittest.TestCase):
                 "too many": tuple(f"protocol=tcp,port={port},unit=ssh.socket,uid=0"
                                   for port in range(1000, 1001 + MAX_LISTENER_EXCEPTIONS)),
                 "clear and a set": ("--clear", SSH_ARG),
+                # Issue #278: one reserved-address exception per family.
+                "second peer port": (PEER_ARG, PEER_ARG.replace("port=43210", "port=43211")),
+                "peer port for both and ipv4": (PEER_ARG, PEER_ARG.replace(",family=ipv4", "").replace(
+                    "port=43210", "port=43211")),
                 "neither": ()}
         for name, arguments in sets.items():
             with self.subTest(name):

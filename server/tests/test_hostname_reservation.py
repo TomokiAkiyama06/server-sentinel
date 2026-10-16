@@ -23,7 +23,7 @@ from app.auth.reservation import (
     RETRY_WHILE_CLOSED_SECONDS, ProcNetListeners, ProxyRoute, Reason, ReservationConfig,
     ReservationEnumerationError,
     ReservationFault, RouteKind, ServeStatusRoutes, TransportProtocol, evaluate, parse_proc_net_tcp,
-    parse_proc_net_udp, parse_serve_status,
+    parse_proc_net_udp, parse_serve_status, validate_listener_exceptions,
 )
 from app.auth.model import AccessValidationError, Permission
 from app.auth.reservation_store import (
@@ -2046,13 +2046,66 @@ class ReservedAddressExceptionTests(ExceptionFixture):
 
     def test_address_the_name_gained_is_not_covered(self):
         gained = ipaddress.IPv4Address("100.64.0.11")
-        files = peer_files(extra_tcp=((str(gained), PEER_V4_PORT, "0A"),))
         any_family = ListenerException(PEER_V4_PORT, scope=BindScope.RESERVED_ADDRESS,
                                        unit="tailscaled.service", uid=0)
-        verdict, _, sink = self.set(files, {any_family, PEER_V6}, resolver=Resolver((V4, V6, gained)))
+        files = peer_files(v6=(str(V6), PEER_V4_PORT), extra_tcp=((str(gained), PEER_V4_PORT, "0A"),))
+        verdict, _, sink = self.set(files, {any_family}, resolver=Resolver((V4, V6, gained)))
         self.assertIn(Reason.RESERVED_ADDRESSES_CHANGED, verdict.reasons)
         self.assertIn(Reason.UNEXPECTED_LISTENER, verdict.reasons)
         self.assertEqual(sink.events[-1].unexpected_listeners, 1)
+
+    def test_at_most_one_recorded_port_per_family(self):
+        # Issue #278: the peerAPI is expected on one port per family, so a second
+        # port in a family (or a family-less exception beside a family one)
+        # would except a socket nobody verified is the peerAPI.
+        def peer(port, family=None):
+            return ListenerException(port, family=family, scope=BindScope.RESERVED_ADDRESS,
+                                     unit="tailscaled.service", uid=0)
+        other = PEER_V4_PORT + 1
+        rejected = {"two ipv4": {PEER_V4, peer(other, AddressFamily.IPV4)},
+                    "two ipv6": {PEER_V6, peer(other, AddressFamily.IPV6)},
+                    "any and ipv4": {peer(other), PEER_V4},
+                    "any and ipv6": {peer(other), PEER_V6},
+                    "two any": {peer(PEER_V4_PORT), peer(other)}}
+        for name, values in rejected.items():
+            with self.subTest(name):
+                with self.assertRaises(ValueError):
+                    validate_listener_exceptions(config(), values)
+                admin, check, _ = self.admin(peer_files(), socket_owners=Owners(TAILSCALED_CREATOR))
+                with self.assertRaises(ValueError):
+                    admin.set_listener_exceptions("synthetic-owner-session", values)
+                self.assertIsNone(self.stored())
+                self.assertEqual(check.listener_exceptions, frozenset())
+        # One per family, or one for both, with wildcard exceptions beside them.
+        wildcard = ListenerException(PEER_V4_PORT, unit="tailscaled.service", uid=0)
+        for values in ({PEER_V4, PEER_V6}, {PEER_V4}, {PEER_V6}, {peer(other)}, {PEER_V4, PEER_V6, wildcard}):
+            with self.subTest(values=values):
+                self.assertEqual(validate_listener_exceptions(config(), values), frozenset(values))
+
+    def test_a_stored_second_port_in_a_family_fails_closed(self):
+        second = ListenerException(PEER_V4_PORT + 1, family=AddressFamily.IPV4,
+                                   scope=BindScope.RESERVED_ADDRESS, unit="tailscaled.service", uid=0)
+        self.store_raw(encode({PEER_V4, PEER_V6, second}))
+        _, check, sink = self.admin(peer_files(), socket_owners=Owners(TAILSCALED_CREATOR))
+        verdict = check.startup()
+        self.assertFalse(verdict.open)
+        self.assertEqual(check.listener_exceptions, frozenset())
+        self.assertEqual(verdict.reasons[0], Reason.LISTENER_EXCEPTIONS_UNREADABLE)
+
+    def test_a_serve_listener_on_another_port_is_also_an_unexpected_route(self):
+        # Issue #278: an HTTPS Serve on another port of the reserved name is a
+        # TCP socket the recorded peerAPI port does not cover and a route the
+        # route comparison reports on its own.
+        port = PEER_V4_PORT + 1
+        document = json.loads(serve())
+        document["TCP"][str(port)] = {"HTTPS": True}
+        document["Web"][f"{HOST}:{port}"] = {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}}}
+        files = peer_files(extra_tcp=(("100.64.0.10", port, "0A"),))
+        verdict, _, _ = self.set(files, {PEER_V4, PEER_V6}, status=Status(json.dumps(document)))
+        self.assertEqual(set(verdict.reasons), {Reason.UNEXPECTED_LISTENER, Reason.UNEXPECTED_ROUTE})
+        # The route alone is reported even when no extra socket is seen.
+        verdict, _, _ = self.set(peer_files(), {PEER_V4, PEER_V6}, status=Status(json.dumps(document)))
+        self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_ROUTE,))
 
     def test_a_changed_port_or_family_closes(self):
         # tailscaled may pick another port after a restart (MANUAL_TEST.md):
