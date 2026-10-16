@@ -658,7 +658,13 @@ incoming webhooks, follows no redirect, ignores environment proxies and closes
 error responses. Credential URLs, remote bodies and raw exceptions never enter
 its result/log surface. Unset configuration constructs no transport. Current
 payloads are fixed categories/validated aggregates, without media or arbitrary
-event details. Tests use generated dummy components and intercepted transports.
+event details. A failing hostname reservation check or human-access
+composition, its recovery, and a committed WebAuthn credential finding are the
+immediate fixed categories `human_access_fault`, `human_access_recovered` and
+`credential_finding` (Issue #232 item 4): sent on the transition, not on every
+check, rate-limited, and marking monitoring health degraded. They add Owner
+visibility only; human access was already closed by the check, and the
+notification carries no hostname, identity, principal, credential or reason. Tests use generated dummy components and intercepted transports.
 The webhook is read only from the administrator-owned, non-world-readable
 deployment configuration (`monitoring.slack_webhook_url`); it never enters
 repr, validation messages or logs. The monitoring runtime binds the Main

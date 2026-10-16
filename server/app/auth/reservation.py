@@ -1320,6 +1320,11 @@ class HostnameReservationCheck:
         return self._verdict
 
     @property
+    def fault_sink(self) -> FaultSink:
+        """The Owner fault sink given at construction (read-only; Issue #232)."""
+        return self._sink
+
+    @property
     def access_open(self) -> bool:
         """Precedes identity, session and permission evaluation (ADR-0003).
 

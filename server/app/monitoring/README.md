@@ -62,6 +62,26 @@ same alerting startup-failure path. Only the first failure of the episode alerts
 startup steps and binds admission. Slack remains optional and
 never determines local state.
 
+Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
+takes the `AccessFaultMonitor` the composition root also passes to the
+`HostnameReservationCheck` (`sink=`) and `PasskeyCeremonies` (`findings=`).
+Every tick, also while the runtime is `failed` (Slack still receives the
+alert), drains it: transitions become the immediate `human_access_fault` /
+`human_access_recovered` and the `credential_finding` notifications (one
+immediate notification per finding, up to four per rolling hour, the ones over
+that cap batched; a budget separate from the access one), and
+`MonitoringStatus.human_access_degraded` / `credential_finding_degraded`
+follow it; both count as degraded in the daily summary. Once per process,
+the first running tick recovers a credential finding whose notification was
+lost to a restart: each `credential_finding` event ID names the immutable id
+of the newest (highest-rowid) finding audit record it covers; the newest retained finding always restores the one-day hold and is notified once unless that row exists
+with a final delivery state. A fault episode whose newest access row (by
+rowid) is `human_access_fault` continues after the restart, so its recovery
+is still announced. The rowid, not the wall clock, orders
+them, so a clock rollback cannot hide a finding; only the audit action, time
+and rowid are read. See
+`../auth/README.md` "Owner notification of access faults".
+
 `MonitoringDependencies` injects the probe, recorder self-test adapter factory,
 segment validator, Slack opener, clocks and intervals. Tests use a synthetic
 probe, disposable directories, a test clock and an intercepted transport; they

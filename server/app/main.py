@@ -28,6 +28,7 @@ from app.diagnostics import DiagnosticExportEndpoint
 from app.logging import Event
 from app.media.live.frame_pull import LiveFrameService
 from app.media.live.local_preview import LocalPreviewHub
+from app.monitoring.access import AccessFaultMonitor
 from app.monitoring.config import MonitoringConfiguration
 from app.monitoring.runtime import MonitoringDependencies, MonitoringRuntime, RuntimeState
 from app.settings import Settings
@@ -124,6 +125,27 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # Issue #10 phase 2 S5b: the served Web build is the one the
         # deployment settings name, never one an embedder picked elsewhere.
         raise TypeError("human access composition is invalid")
+    access_faults = monitoring_dependencies.access_faults if monitoring_dependencies is not None else None
+    if access_faults is not None and (monitoring is None or not monitoring.storage_configured):
+        # Only the monitoring runtime drains the monitor (Codex PR #271):
+        # without one an emitted fault would leave the check's retry queue
+        # and never reach the Owner or the health status.
+        raise TypeError("access fault monitor requires the monitoring runtime")
+    if (human_access is not None and access_faults is None
+            and any(isinstance(sink, AccessFaultMonitor) for sink in
+                    (human_access.reservation.fault_sink, human_access.ceremonies.findings))):
+        # Codex PR #271: a monitor installed as a sink but not handed to the
+        # monitoring runtime is never drained, so its faults would be lost.
+        raise TypeError("human access composition is invalid")
+    if human_access is not None and access_faults is not None:
+        # Issue #232 item 4 (Owner decision 2026-10-16): with a configured
+        # monitor, every reservation fault and credential finding of this
+        # composition must reach it, so none bypasses the immediate Owner
+        # notification and degraded health.
+        if (human_access.reservation.fault_sink is not access_faults
+                or human_access.ceremonies.findings is not access_faults
+                or access_faults.attached not in (None, human_access)):
+            raise TypeError("human access composition is invalid")
     store = database or Database(settings.database_path)
     # Local UVC capture is driven only by the deployment's list of approved
     # logical sources. Frames go to a bounded preview hub that retains nothing
@@ -544,4 +566,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
         application.add_middleware(ClosedHumanSurface)
     else:
         application.add_middleware(HumanSurface, access=human_access)
+    if human_access is not None and access_faults is not None:
+        # Last, after every check above passed (PR #271 review): a refused
+        # create_app leaves the monitor unattached.
+        access_faults.attach(human_access)
     return application
