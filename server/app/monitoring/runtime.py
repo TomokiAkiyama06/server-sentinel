@@ -791,7 +791,16 @@ class MonitoringRuntime:
             "ORDER BY rowid DESC LIMIT ?",
             (*(kind.value for kind in kinds), DeliveryResult.PENDING.value, limit),
         ).fetchall()
-        return [(now - datetime.fromisoformat(row[0])).total_seconds() for row in rows]
+        ages = []
+        for (at,) in rows:
+            # A row whose time cannot be read is left out (at worst a
+            # notification goes out early) rather than raising, which would
+            # repeat the whole recovery on every tick.
+            try:
+                ages.append((now - datetime.fromisoformat(at)).total_seconds())
+            except (TypeError, ValueError):
+                continue
+        return ages
 
     def _poll(self) -> None:
         if self.notifications is None:

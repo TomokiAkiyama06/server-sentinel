@@ -988,5 +988,12 @@ class RateWindowRecoveryTests(RuntimeFixture):
         self.access_row(20)
         self.access_row(90)
         self.access_row(5, kind="credential_finding")
-        await self.failed_composition_cycle()
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            # Unreadable or naive times are left out instead of raising.
+            for at in ("not a time", "2026-10-16T09:00:00"):
+                db.execute("INSERT INTO notification_events VALUES (?, 'human_access_fault', ?, 0, "
+                           "'sent')", (str(uuid4()), at))
+            db.commit()
+        status = await self.failed_composition_cycle()
         self.assertEqual(self.fault_texts(), 2)
+        self.assertTrue(status.human_access_degraded)
