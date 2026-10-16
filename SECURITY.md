@@ -50,7 +50,8 @@ step-up routes and S4b the Owner's access administration routes (see
 `server/app/auth/README.md`); the
 production launcher builds one only from an enabled `human_access` deployment
 section (`server/app/auth/composition.py`; absent or disabled, every human path
-stays closed, and an incomplete section refuses startup), and even then access
+stays closed, an incomplete section refuses startup, and a composition that
+cannot be built keeps every human path closed and notifies the Owner), and even then access
 opens only while the reservation check passes. Its
 documented launcher accepts only loopback bind settings, disables proxy-header
 parsing and access logs, and removes the server product header. The authorization

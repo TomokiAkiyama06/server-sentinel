@@ -29,7 +29,8 @@ other combination.
 Nothing here runs ``tailscale`` with any argument other than the fixed
 read-only status query, changes Tailscale ACLs/Grants, or needs a Tailscale
 administrative credential. Every failure raises ``HumanAccessUnavailable``,
-which carries no value; the launcher then refuses to start.
+which carries no value; the launcher then serves with every human path
+closed and notifies the Owner (``AccessFaultMonitor.composition_failed``).
 """
 
 from __future__ import annotations

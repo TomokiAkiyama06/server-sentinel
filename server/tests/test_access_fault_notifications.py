@@ -608,6 +608,27 @@ class RuntimeTests(RuntimeFixture):
             self.assertEqual(1, self.slack_texts().count(
                 "ServerSentinel critical alert: human_access_fault"))
 
+    async def test_a_failed_composition_alerts_and_stays_degraded(self):
+        """Codex PR #282: the launcher serves closed when the composition
+        cannot be built; the latched fault reaches the Owner once and the
+        health stays degraded, since no composition polls healthy again."""
+        monitor = AccessFaultMonitor()
+        monitor.composition_failed()
+        application = self.application(access_faults=monitor)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertTrue(runtime.status.human_access_degraded)
+            self.assertEqual(1, self.slack_texts().count(
+                "ServerSentinel critical alert: human_access_fault"))
+            self.clock.advance(timedelta(minutes=10))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertTrue(runtime.status.human_access_degraded)
+            self.assertEqual(1, self.slack_texts().count(
+                "ServerSentinel critical alert: human_access_fault"))
+
     async def test_a_failed_runtime_still_alerts_and_marks_health(self):
         """PR #271 review: while the runtime is not RUNNING (here the database
         cannot be opened, so local persistence is refused) the access faults

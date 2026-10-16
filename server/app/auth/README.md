@@ -564,8 +564,12 @@ text is a `ReservationEnumerationError`, so the check fails closed. The
 launcher (`app.__main__.run`) passes one `AccessFaultMonitor` as the check's
 `sink`, the ceremonies' `findings` and `MonitoringDependencies(access_faults=)`
 (Issue #232 item 4); any failure to compose (`HumanAccessUnavailable`, or
-`create_app` refusing it) logs `human_access_composition_failed` and exits
-non-zero. Without the key nothing is built and `ClosedHumanSurface` stays.
+`create_app` refusing it) logs `human_access_composition_failed`, latches the
+fault in that monitor (`AccessFaultMonitor.composition_failed`) and serves
+with `ClosedHumanSurface`, so the monitoring runtime notifies the Owner
+(`human_access_fault`) and keeps the health degraded until a restart composes
+access, while recording keeps running (Codex PR #282). Without the key
+nothing is built and `ClosedHumanSurface` stays.
 
 Every HTTP request passes, in this order, before any handler runs:
 

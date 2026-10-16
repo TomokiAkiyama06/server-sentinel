@@ -413,7 +413,8 @@ class Deployment:
     capture_ca_configured: bool = field(default=True, repr=False)
     # The optional ``human_access`` section (Issue #10). Absent keeps every
     # human path closed (``ClosedHumanSurface``); enabled, the launcher builds
-    # the production composition (``app.auth.composition``) or refuses to start.
+    # the production composition (``app.auth.composition``); one it cannot
+    # build keeps every human path closed and notifies the Owner.
     human_access: HumanAccessDeployment | None = field(default=None, repr=False)
 
     @property

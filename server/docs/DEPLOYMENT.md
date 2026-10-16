@@ -729,8 +729,11 @@ Tailscale CLI path fails the checks above). It never names the hostname, an
 address or a path. If the composition itself cannot be built at start (for
 example the session-binding key or its directory is not the service
 account's own, or the recording filesystem is missing, replaced or at the hard
-reserve), the service logs `human_access_composition_failed` and exits
-non-zero; it never falls back to a partial or a closed surface. A release
+reserve), the service logs `human_access_composition_failed` and keeps every
+human path closed (never a partial surface) while recording and the
+integrity and recording-health checks keep running; the Owner gets an
+immediate `human_access_fault` notification and the monitoring health stays
+degraded until the cause is fixed and the service restarted. A release
 from before this key refuses it as an unknown key (see "Install, update, and
 rollback"): remove the section before rolling back to one.
 

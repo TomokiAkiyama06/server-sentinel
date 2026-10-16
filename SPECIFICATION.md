@@ -2263,9 +2263,13 @@ device-bound policy); when enabled it requires `web_assets_directory`, and
 the launcher builds the production composition (`app.auth.composition`)
 with `/proc/net`, a bounded read-only `tailscale serve status --json`
 runner (fixed arguments, empty environment, 5-second timeout, 1 MiB output
-cap; any failure is an enumeration failure), `getaddrinfo` and sock_diag, or
-refuses to start with a value-free reason. Without the key every human path
-stays closed. Every asset response has a
+cap; any failure is an enumeration failure), `getaddrinfo` and sock_diag.
+A section that fails validation refuses startup with a value-free reason; a
+composition that cannot be built (`human_access_composition_failed`) keeps
+every human path closed while recording and the integrity and
+recording-health checks keep running, and notifies the Owner immediately
+(`human_access_fault`, monitoring health degraded until a restart composes
+access). Without the key every human path stays closed. Every asset response has a
 fixed header list: its `Content-Type` (the manifest's, from the S5a
 build policy `web/scripts/policy.mjs`), `Content-Length`,
 `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,

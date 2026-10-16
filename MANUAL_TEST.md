@@ -2854,7 +2854,12 @@ by the Issue #6 synthetic policy model.
   keeps it closed (generic denial on the shell `/`) and sends one
   `human_access_fault` notification, and that a missing or group-writable
   `tailscale_executable` makes the release's check refuse to start with
-  `human access refused (reason=executable)`.
+  `human access refused (reason=executable)`. Make the composition itself
+  fail at start (for example a session-binding key that is not the service
+  account's own) and confirm the service keeps running and recording with
+  every human path closed, logs `human_access_composition_failed`, sends one
+  `human_access_fault` notification and reports `human_access_degraded`
+  until the cause is fixed and the service restarted.
 - On the target host, compare the parsed `/proc/net/tcp` and `/proc/net/tcp6`
   listeners with `ss -ltnH`, and the parsed `/proc/net/udp` and
   `/proc/net/udp6` unconnected sockets with `ss -lunH`, for IPv4, IPv6,

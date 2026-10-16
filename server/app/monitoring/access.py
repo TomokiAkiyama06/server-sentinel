@@ -178,6 +178,17 @@ class AccessFaultMonitor:
             self._latched = True
             self._latched_reasons |= reasons
 
+    def composition_failed(self) -> None:
+        """Latch a human-access composition the launcher could not build.
+
+        Codex PR #282: the launcher then serves with every human path closed
+        and no composition attached, so nothing polls healthy again and the
+        fault (``human_access_fault``, no reason) stays until a restart
+        composes access. Keeps nothing but the latch.
+        """
+        with self._lock:
+            self._latched = True
+
     def credential_finding(self, kind: "CredentialFinding", principal_id: UUID) -> None:
         """``CredentialFindingSink``: count one committed finding.
 

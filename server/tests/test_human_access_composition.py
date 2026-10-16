@@ -696,29 +696,64 @@ class LauncherCompositionTests(unittest.TestCase):
         self.assertTrue(built["monitoring"].storage_configured)
         build.return_value.run.assert_called_once_with()
 
-    def test_a_refused_composition_does_not_start(self):
+    def assert_served_closed_with_alert(self, create, build, logs):
+        """Codex PR #282: no human composition, the monitor still handed to the
+        monitoring runtime with the fault latched, the server started."""
+        from datetime import datetime, timezone
+        kwargs = create.call_args.kwargs
+        self.assertNotIn("human_access", kwargs)
+        monitor = kwargs["monitoring_dependencies"].access_faults
+        self.assertIsInstance(monitor, AccessFaultMonitor)
+        self.assertIsNone(monitor.attached)
+        build.return_value.run.assert_called_once_with()
+        self.assertEqual([record.msg for record in logs.records],
+                         [Event.HUMAN_ACCESS_COMPOSITION_FAILED])
+        calls = []
+
+        class Notifications:
+            def record(self, kind, **_options):
+                calls.append(kind)
+
+        status = monitor.drain(Notifications(), at=datetime(2026, 10, 16, tzinfo=timezone.utc),
+                               monotonic=100.0)
+        self.assertTrue(status.human_access_degraded)
+        self.assertEqual([kind.value for kind in calls], ["human_access_fault"])
+
+    def test_a_refused_composition_serves_closed_and_alerts(self):
         def refuse(*_arguments, **_options):
             raise HumanAccessUnavailable()
 
         with self.assertLogs("app.__main__", level="ERROR") as logs:
             code, create, build = self.run_launcher(
                 parse_human_access(section()), **{"app.auth.composition.build_human_access": refuse})
-        self.assertEqual(code, 1)
-        create.assert_not_called()
-        build.assert_not_called()
-        self.assertEqual([record.msg for record in logs.records],
-                         [Event.HUMAN_ACCESS_COMPOSITION_FAILED])
+        self.assertEqual(code, 0)
+        create.assert_called_once()
+        self.assert_served_closed_with_alert(create, build, logs)
 
-    def test_create_app_refusal_does_not_start(self):
+    def test_create_app_refusal_serves_closed_and_alerts(self):
         from types import SimpleNamespace
+        from unittest.mock import MagicMock
         from app.__main__ import run
+        refusals = []
+
+        def create(*_arguments, **options):
+            if "human_access" in options:
+                refusals.append(options)
+                raise TypeError("human access composition is invalid")
+            return "application"
+
+        create_app_mock = MagicMock(side_effect=create)
         with patch("app.auth.composition.build_human_access", return_value="composition"), patch(
-                "app.__main__.create_app", side_effect=TypeError("human access composition is invalid")), patch(
-                "app.systemd.build_server") as build, self.assertLogs("app.__main__", level="ERROR"):
+                "app.__main__.create_app", create_app_mock), patch(
+                "app.systemd.build_server") as build, self.assertLogs("app.__main__", level="ERROR") as logs:
             code = run(self.settings, SimpleNamespace(storage_configured=True), None,
                        human_access=parse_human_access(section()))
-        self.assertEqual(code, 1)
-        build.assert_not_called()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(refusals), 1)
+        self.assertEqual(create_app_mock.call_count, 2)
+        self.assertIs(refusals[0]["monitoring_dependencies"].access_faults,
+                      create_app_mock.call_args.kwargs["monitoring_dependencies"].access_faults)
+        self.assert_served_closed_with_alert(create_app_mock, build, logs)
 
 
 if __name__ == "__main__":
