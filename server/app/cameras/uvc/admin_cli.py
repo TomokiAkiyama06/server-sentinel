@@ -240,6 +240,22 @@ class _StoppedServiceRegistry(CameraRegistry):
         return super().update_source_on(connection, source_id, **changes)
 
 
+class _OfflineApprovalAdapter(LocalUvcAdapter):
+    """The adapter whose audited rescan also refuses a serial that became shared.
+
+    The selection was checked before the confirmation; a twin connected while
+    the Owner was at the prompt would otherwise be committed as a
+    serial-ambiguous approval that the restarted service can only latch to
+    ``manual_intervention_required``.
+    """
+
+    def prepare_approval(self, source_id, candidate):
+        prepared = super().prepare_approval(source_id, candidate)
+        if prepared.serial_ambiguous:
+            raise CliRefused("camera_serial_not_unique")
+        return prepared
+
+
 # -- presentation --------------------------------------------------------
 
 def candidate_label(device: DeviceEvidence) -> str:
@@ -508,7 +524,7 @@ def _approve(context: _Context, source_id: UUID, label: str) -> list[str]:
         f"Approve camera {label} usb={_usb_ids(candidate)} for source {source_id} "
         f"name={_quoted(source.name)}; the service uses it from its next start. "
         f"Type {APPROVE_WORD} to confirm: ", APPROVE_WORD)
-    adapter = LocalUvcAdapter(context.registry, emit_audit=lambda event: None,
+    adapter = _OfflineApprovalAdapter(context.registry, emit_audit=lambda event: None,
                               on_frame=lambda source_id, frame: None, discovery=context.discovery)
     try:
         context.admin.approve_uvc(grant, adapter, source_id, candidate)

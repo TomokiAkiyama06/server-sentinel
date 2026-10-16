@@ -379,6 +379,25 @@ class AdminCliTests(unittest.TestCase):
         self.assertIsNone(self.approval(source.id))
         self.assertEqual([], self.rows(AUDIT))
 
+    def test_a_serial_twin_connected_during_the_confirmation_is_refused(self):
+        source = self.local_source()
+        selected = camera(0)
+        twin = camera(3, port="1-6")
+        label = admin_cli.candidate_label(selected)
+
+        class Twin(FakeDiscovery):
+            def scan(inner):
+                inner.scans += 1
+                return DiscoveryResult((selected,) if inner.scans == 1 else (selected, twin), 0)
+
+        self.discovery = Twin()
+        code, stdout, stderr, _ = self.run_cli("approve", str(source.id), label, lines=("APPROVE",))
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("refused: camera_serial_not_unique", stderr)
+        self.assertIsNone(self.approval(source.id))
+        self.assertEqual([("owner", "approve_camera", "camera", str(source.id), "failed")],
+                         self.rows(AUDIT))
+
     def test_a_camera_that_changed_before_the_audited_rescan_is_refused(self):
         source = self.local_source()
         devices = self.discovery.devices
