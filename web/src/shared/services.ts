@@ -27,8 +27,9 @@ export const FRAME_SEQUENCE_HEADER = 'X-Frame-Sequence';
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 /** Sign-out waits at most this long for viewer opens and closes, then proceeds. */
 export const SIGN_OUT_CLEANUP_MS = 2000;
-/** The sign-out request itself is abandoned (reported as failed) after this. */
-export const SIGN_OUT_TIMEOUT_MS = 10000;
+/** A session check, source list or sign-out request unfinished after this is
+ *  abandoned and reported as failed, so the screen offers its retry. */
+export const REQUEST_TIMEOUT_MS = 10000;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CSRF = /^[A-Za-z0-9_-]{43}$/;
@@ -80,7 +81,7 @@ interface Send {
 }
 
 export function createDashboardServices(origin: string, request: typeof fetch = (...args) => fetch(...args),
-  { cleanupMs = SIGN_OUT_CLEANUP_MS, signOutMs = SIGN_OUT_TIMEOUT_MS }: { cleanupMs?: number; signOutMs?: number } = {}): DashboardServices {
+  { cleanupMs = SIGN_OUT_CLEANUP_MS, requestMs = REQUEST_TIMEOUT_MS }: { cleanupMs?: number; requestMs?: number } = {}): DashboardServices {
   const deployment = new URL(origin);
   if (!['http:', 'https:'].includes(deployment.protocol)) throw new ApiError('invalid_request');
   let csrf: string | null = null;
@@ -144,6 +145,25 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
     return `${LIVE_SESSIONS_PATH}/${sessionId}/${action}`;
   }
 
+  /** Run `work` with a signal that also aborts after `requestMs`; the result
+   *  is bounded whether or not fetch honours the abort. */
+  async function bounded<T>(signal: AbortSignal, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const deadline = new AbortController();
+    const forward = () => deadline.abort();
+    if (signal.aborted) deadline.abort();
+    signal.addEventListener('abort', forward);
+    let expiry: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<never>((_, reject) => {
+      expiry = setTimeout(() => { deadline.abort(); reject(new ApiError('unavailable')); }, requestMs);
+    });
+    try {
+      return await Promise.race([work(deadline.signal), expired]);
+    } finally {
+      clearTimeout(expiry);
+      signal.removeEventListener('abort', forward);
+    }
+  }
+
   async function open(sourceId: string, header: string, signal: AbortSignal): Promise<string> {
     const response = await send({
       method: 'POST', path: LIVE_SESSIONS_PATH, accept: 'application/json', signal, csrf: header,
@@ -161,17 +181,21 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
   return {
     async loadSession(signal) {
       csrf = null;
-      let response: Response;
-      try {
-        response = await send({ method: 'GET', path: SESSION_PATH, accept: 'application/json', signal });
-      } catch (error) {
-        // The generic refusal: no current session for this browser.
-        if (error instanceof ApiError && error.code === 'unauthorized') return { state: 'denied' };
-        throw error;
-      }
-      if (response.status !== 200) throw new ApiError('unavailable');
-      const parsed = parseSession(await json(response, signal));
-      if (!signal.aborted) csrf = parsed.csrf;
+      const parsed = await bounded(signal, async bound => {
+        let response: Response;
+        try {
+          response = await send({ method: 'GET', path: SESSION_PATH, accept: 'application/json', signal: bound });
+        } catch (error) {
+          // The generic refusal: no current session for this browser.
+          if (error instanceof ApiError && error.code === 'unauthorized') return null;
+          throw error;
+        }
+        if (response.status !== 200) throw new ApiError('unavailable');
+        return parseSession(await json(response, bound));
+      });
+      if (parsed === null) return { state: 'denied' };
+      if (signal.aborted) throw new ApiError('cancelled');
+      csrf = parsed.csrf;
       return parsed.session;
     },
 
@@ -190,33 +214,21 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
         ]);
         await Promise.race([cleanup, limit]);
         clearTimeout(timer);
-        // Bounded too, whether or not fetch honours the abort: a stalled
-        // request is reported as failed so the person can retry.
-        const deadline = new AbortController();
-        const forward = () => deadline.abort();
-        signal.addEventListener('abort', forward);
-        let expiry: ReturnType<typeof setTimeout> | undefined;
-        const expired = new Promise<never>((_, reject) => {
-          expiry = setTimeout(() => { deadline.abort(); reject(new ApiError('unavailable')); }, signOutMs);
-        });
-        try {
-          const response = await Promise.race([
-            send({ method: 'POST', path: SIGN_OUT_PATH, accept: 'application/json', signal: deadline.signal, csrf: header }),
-            expired,
-          ]);
-          if (response.status !== 204) throw new ApiError('unavailable');
-          csrf = null;
-        } finally {
-          clearTimeout(expiry);
-          signal.removeEventListener('abort', forward);
-        }
+        // Bounded too: a stalled request is reported as failed so the person
+        // can retry.
+        const response = await bounded(signal, bound =>
+          send({ method: 'POST', path: SIGN_OUT_PATH, accept: 'application/json', signal: bound, csrf: header }));
+        if (response.status !== 204) throw new ApiError('unavailable');
+        csrf = null;
       } finally { signingOut = false; }
     },
 
     async loadLiveSources(signal) {
-      const response = await send({ method: 'GET', path: LIVE_SOURCES_PATH, accept: 'application/json', signal });
-      if (response.status !== 200) throw new ApiError('unavailable');
-      return parseLiveSources(await json(response, signal));
+      return bounded(signal, async bound => {
+        const response = await send({ method: 'GET', path: LIVE_SOURCES_PATH, accept: 'application/json', signal: bound });
+        if (response.status !== 200) throw new ApiError('unavailable');
+        return parseLiveSources(await json(response, bound));
+      });
     },
 
     async openLiveSession(sourceId, signal) {

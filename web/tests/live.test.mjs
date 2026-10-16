@@ -75,6 +75,7 @@ test('session read is a same-origin, uncached, redirect-refusing GET without a t
   assert.equal(calls[0].url.href, `${origin}/api/session`);
   const { signal: passed, ...init } = calls[0].init;
   assert.ok(passed instanceof AbortSignal);
+  assert.equal(passed.aborted, false);
   assert.deepEqual(init, { method: 'GET', credentials: 'same-origin', mode: 'same-origin', cache: 'no-store',
     redirect: 'error', referrerPolicy: 'no-referrer', headers: { Accept: 'application/json' } });
 });
@@ -534,7 +535,7 @@ test('a session granted after the open timed out is closed at once', async () =>
 test('a stalled sign-out request is abandoned and reported, and can be retried', async () => {
   let answer = () => new Promise(() => {});
   const stalled = fake({ 'GET /api/session': json(ownerBody), 'POST /api/auth/sign-out': (url, init) => answer(url, init) });
-  const services = createDashboardServices(origin, stalled.request, { cleanupMs: 10, signOutMs: 30 });
+  const services = createDashboardServices(origin, stalled.request, { cleanupMs: 10, requestMs: 30 });
   await services.loadSession(signal());
   await assert.rejects(services.signOut(signal()), { code: 'unavailable' });
   answer = () => new Response(null, { status: 204 });
@@ -585,4 +586,12 @@ test('a hung open does not delay closing the viewers already known at sign-out',
   assert.deepEqual(hung.calls.slice(-2).map(call => call.key), [close, 'POST /api/auth/sign-out']);
   assert.equal(closedAt.length, 1);
   assert.ok(closedAt[0] < 250, 'the known viewer is closed without waiting for the hung open');
+});
+
+test('a stalled session check or source list is abandoned and reported, so the screen can retry', async () => {
+  const stalled = fake({ 'GET /api/session': () => new Promise(() => {}), 'GET /api/live/sources': () => new Promise(() => {}) });
+  const services = createDashboardServices(origin, stalled.request, { requestMs: 20 });
+  await assert.rejects(services.loadSession(signal()), { code: 'unavailable' });
+  await assert.rejects(services.loadLiveSources(signal()), { code: 'unavailable' });
+  for (const call of stalled.calls) assert.equal(call.init.signal.aborted, true);
 });

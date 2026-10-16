@@ -292,7 +292,9 @@ session's `X-CSRF-Token` (Owner decision D2). The token comes from the latest
 `GET /api/session` answer and lives only in that closure, never in storage; no
 write is sent before a session supplied one. `401`, `403` and the server's
 generic `404` are `ApiError('unauthorized')`, and a refusal's body is never
-read or rendered.
+read or rendered. The session check, the live source list and the sign-out
+request are abandoned after 10 s (whether or not fetch honours the abort) and
+reported as failed, so the screen shows its retry instead of waiting forever.
 
 - `GET /api/session` `{csrf, role, permissions}`: `owner` ⇒ Owner,
   `invited_user` ⇒ viewer; an unknown role or permission, a duplicate, or a
@@ -301,8 +303,7 @@ read or rendered.
 - Sign-out: no new viewer open starts; every live viewer session this page
   holds is closed at once, and each open still in flight closes its grant
   when it lands, while the CSRF token is still known (bounded to 2 s in total, best effort; Codex PR #273), then
-  `POST /api/auth/sign-out` with no body (abandoned after 10 s and reported
-  as failed, so it can be retried) ⇒ `204` ⇒ `location.replace('/')`.
+  `POST /api/auth/sign-out` with no body (bounded as above) ⇒ `204` ⇒ `location.replace('/')`.
   A refusal (the session is already gone) also goes to the sign-in shell; any
   other failure is reported and the session stays.
 
