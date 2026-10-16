@@ -567,7 +567,7 @@ def _null():
 
 
 class AttachTests(LiveRouteFixture):
-    async def test_attach_refuses_another_database_and_replaces_while_running(self):
+    async def test_attach_refuses_another_database_and_replacement_while_running(self):
         other = Database(self.temporary / "other.sqlite3")
         foreign = LiveFrameService(self.hub, SimpleNamespace(
             current_session=self.store.current_session, now=self.store.now, database=other))
@@ -580,14 +580,27 @@ class AttachTests(LiveRouteFixture):
         _, cookie, csrf = await self.viewer()
         await self.opened(cookie, csrf, self.sources[0])
         replacement = LiveFrameService(self.hub, self.store, monotonic=self.monotonic)
+        # Two services over one hub could exceed the D10 limits: refused while running.
+        with self.assertRaises(HumanAccessUnavailable):
+            self.access.attach_live(replacement)
+        self.assertIs(self.access.live, self.live)
+        self.assertEqual(self.hub.status.viewers, 1)
+        await self.stop_serving()
+        # Not running: the previous service has released everything first.
         self.access.attach_live(replacement)
-        # The previous service released its demand; the new one is running.
-        await self.until(lambda: self.hub.status.viewers == 0)
-        self.assertFalse(self.live.running)
-        self.assertTrue(replacement.running)
-        await self.opened(cookie, csrf, self.sources[0])
+        self.assertEqual(self.hub.status.viewers, 0)
+        self.assertIs(self.access.live, replacement)
         self.live = replacement
 
+    async def test_the_first_service_attached_while_running_starts_at_once(self):
+        self.access.live = None
+        self.live.stop(wait=True)
+        service = LiveFrameService(self.hub, self.store, monotonic=self.monotonic)
+        self.access.attach_live(service)
+        self.live = service
+        self.assertTrue(service.running)
+        _, cookie, csrf = await self.viewer()
+        await self.opened(cookie, csrf, self.sources[0])
 
 if __name__ == "__main__":
     unittest.main()

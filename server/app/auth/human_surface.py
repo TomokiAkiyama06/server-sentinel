@@ -784,8 +784,11 @@ class HumanAccess:
         (its sweeper reads ``epoch()``), Owner grant and revocation changes
         re-check the affected principal's live sessions at once
         (``AccessAdministration.principal_changed``), and ``run()`` starts
-        and stops it (a service attached while ``run()`` is running starts at
-        once and replaces the previous one, which is stopped).
+        and stops it. The first service attached while ``run()`` is running
+        starts at once; replacing an attached service is refused while
+        ``run()`` is running (two services over one hub could together exceed
+        the D10 limits while the old one drains), and otherwise waits until
+        the previous service has released all of its demand.
         """
         if not isinstance(live, LiveFrameService):
             raise HumanAccessUnavailable()
@@ -794,7 +797,9 @@ class HumanAccess:
             raise HumanAccessUnavailable()
         previous = self.live
         if previous is not None and previous is not live:
-            previous.stop()
+            if self._running:
+                raise HumanAccessUnavailable()
+            previous.stop(wait=True)
         live.bind_closed(lambda: self.epoch() is None)
         self.live = live
         self.administration.principal_changed = live.revalidate_principal
