@@ -91,6 +91,13 @@ simplejpeg wheel bundles them) is tracked in a follow-up issue, to be done
 before or soon after enabling MJPG on a production host; until then the pinned
 3.1.2 is what runs, isolated as above.
 
+2026-10-16 update: the review was done in Issue #233 (no 3.1.3–3.2.1 fix
+reachable here; the lossless-scaling overrun of 3.1.4 is blocked by the
+pre-decode `unsupported_process` refusal, now regression-tested for every
+non-baseline `SOF`). The Owner allowed MJPG scene detection on simplejpeg
+1.9.0 / libjpeg-turbo 3.1.2; tracking of 3.1.5 ESR / a newer simplejpeg moved
+to Issue #268 and child isolation hardening to Issue #269.
+
 ### License gate record for the adoption (Issue #217)
 
 For item 3 the Owner approved `IJG` **for this component only**, as an exact

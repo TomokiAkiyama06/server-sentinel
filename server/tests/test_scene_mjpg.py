@@ -95,6 +95,31 @@ def segment_count(data):
         position += 2 + int.from_bytes(data[position + 2:position + 4], "big")
 
 
+# Start-of-frame markers by coding process (ITU-T T.81 Table B.1). Only
+# baseline and extended-sequential Huffman frames (0xC0, 0xC1) are reviewed;
+# every other process must be refused before the decoder child is reached
+# (Issue #233: the lossless-with-scaling overrun fixed in libjpeg-turbo 3.1.4
+# is unreachable only because lossless frames never reach simplejpeg 1.9.0).
+LOSSLESS_SOF = (0xC3, 0xC7, 0xCB, 0xCF)
+ARITHMETIC_SOF = (0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF)
+PROGRESSIVE_SOF = (0xC2, 0xC6, 0xCA, 0xCE)
+HIERARCHICAL_SOF = (0xC5, 0xC6, 0xC7, 0xCD, 0xCE, 0xCF)
+UNSUPPORTED_SOF = tuple(sorted(set(LOSSLESS_SOF + ARITHMETIC_SOF + PROGRESSIVE_SOF
+                                   + HIERARCHICAL_SOF)))
+DAC = 0xCC  # arithmetic conditioning table: only meaningful for arithmetic coding
+
+
+def with_sof_marker(data, marker):
+    """The frame with its `SOF0` marker replaced, header bytes unchanged."""
+    offset = segment(data, 0xC0) + 1
+    return data[:offset] + bytes((marker,)) + data[offset + 1:]
+
+
+def with_sof_precision(data, precision):
+    offset = segment(data, 0xC0) + 4
+    return data[:offset] + bytes((precision,)) + data[offset + 1:]
+
+
 def with_sof(data, width, height):
     offset = segment(data, 0xC0) + 5
     return (data[:offset] + height.to_bytes(2, "big") + width.to_bytes(2, "big")
@@ -496,6 +521,46 @@ class MjpgPrecheckTests(DecoderCase):
         double = self.frame[:2] + self.frame[2:-2] + self.frame[2:]
         self.assertIn(self.refused_before_decoding(double), ("scan_invalid", "sof_invalid"))
         self.assertEqual("marker_invalid", self.refused_before_decoding(b"\xff\xd8\xff\xd9"))
+
+    def test_lossless_arithmetic_and_other_non_baseline_sof_are_refused_before_decoding(self):
+        self.assertEqual(frozenset(UNSUPPORTED_SOF), mjpg.OTHER_SOF)
+        self.assertEqual(frozenset({0xC0, 0xC1}), mjpg.SUPPORTED_SOF)
+        for marker in UNSUPPORTED_SOF:
+            with self.subTest(marker=hex(marker)):
+                frame = with_sof_marker(self.frame, marker)
+                self.assertEqual("unsupported_process", self.refused_before_decoding(frame))
+                with self.assertRaises(MjpgFrameRejected) as caught:
+                    inspect_frame(frame, width=CAPTURE_WIDTH, height=CAPTURE_HEIGHT)
+                self.assertEqual("unsupported_process", caught.exception.reason)
+        sof = segment(self.frame, 0xC0)
+        length = 2 + int.from_bytes(self.frame[sof + 2:sof + 4], "big")
+        for marker in LOSSLESS_SOF + ARITHMETIC_SOF:
+            with self.subTest(after_baseline_sof=hex(marker)):
+                # A second, non-baseline SOF after a valid one is refused as
+                # well, never decoded as the baseline frame.
+                second = b"\xff" + bytes((marker,)) + self.frame[sof + 2:sof + length]
+                hidden = self.frame[:sof + length] + second + self.frame[sof + length:]
+                self.assertEqual("unsupported_process", self.refused_before_decoding(hidden))
+            with self.subTest(fill_bytes=hex(marker)):
+                filled = self.frame[:sof] + b"\xff\xff" + with_sof_marker(self.frame, marker)[sof:]
+                self.assertEqual("unsupported_process", self.refused_before_decoding(filled))
+        # An arithmetic conditioning table is refused even before any SOF.
+        dac = b"\xff" + bytes((DAC,)) + b"\x00\x04\x00\x10"
+        self.assertEqual("unsupported_process",
+                         self.refused_before_decoding(self.frame[:2] + dac + self.frame[2:]))
+        # The reserved JPG marker is not a frame header this reader accepts.
+        self.assertEqual("marker_invalid",
+                         self.refused_before_decoding(with_sof_marker(self.frame, 0xC8)))
+        # Extended sequential Huffman is accepted at 8-bit precision only; a
+        # 12-bit (or lossless 2-16-bit) sample precision is refused.
+        extended = with_sof_marker(self.frame, 0xC1)
+        self.assertEqual(3, inspect_frame(extended, width=CAPTURE_WIDTH,
+                                          height=CAPTURE_HEIGHT).components)
+        for marker in (0xC0, 0xC1):
+            for precision in (2, 12, 16):
+                with self.subTest(marker=hex(marker), precision=precision):
+                    frame = with_sof_marker(with_sof_precision(self.frame, precision), marker)
+                    self.assertEqual("sof_invalid", self.refused_before_decoding(frame))
 
     def test_missing_or_unreviewed_decoder_is_unavailable(self):
         self.assertTrue(self.layout.available())
@@ -1201,6 +1266,32 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         # The other source keeps running.
         self.assertEqual(Observation.ABSENT, harness.source().movement)
         self.assertEqual((), harness.source().undecodable_reasons)
+        self.assertEqual([], harness.recorder.items)
+
+    def test_non_baseline_sof_frame_is_unknown_and_never_reaches_the_child(self):
+        harness = self.harness(binding(layout=MJPG_LAYOUT), binding(OTHER, layout=MJPG_LAYOUT))
+        harness.start()
+        for _ in range(2):
+            harness.frame(source=OTHER, advance=0)
+            harness.frame()
+        decoder = harness.runtime._contexts[OTHER].decoder
+        good = encode(pixels())
+        markers = sorted(set(LOSSLESS_SOF + ARITHMETIC_SOF))
+        with mock.patch.object(decoder, "decode", wraps=decoder.decode) as decode:
+            for index, marker in enumerate(markers, 1):
+                with self.subTest(marker=hex(marker)):
+                    harness.frame(source=OTHER, advance=0, data=with_sof_marker(good, marker))
+                    harness.frame()
+                    refused = harness.source(OTHER)
+                    self.assertEqual("frame_undecodable", refused.reason)
+                    self.assertIs(SceneSourceState.DEGRADED, refused.state)
+                    self.assertEqual((Observation.UNKNOWN, Observation.UNKNOWN),
+                                     (refused.movement, refused.tamper))
+                    self.assertEqual(index, refused.unusable)
+            decode.assert_not_called()
+        self.assertEqual((("unsupported_process", len(markers)),),
+                         harness.source(OTHER).undecodable_reasons)
+        self.assertEqual(Observation.ABSENT, harness.source().movement)
         self.assertEqual([], harness.recorder.items)
 
     def test_child_crash_is_unknown_and_a_replacement_resumes(self):
