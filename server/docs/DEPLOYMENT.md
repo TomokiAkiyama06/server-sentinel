@@ -391,8 +391,12 @@ sudo systemctl start server-sentinel.service
   would never open the camera), and a camera that changed between the
   selection and the audited rescan (`candidate_unavailable`, recorded
   `failed`; a serial that became shared meanwhile is
-  `camera_serial_not_unique`, recorded `failed`). Approving clears a source's
-  `manual_intervention_required` latch and a marker a crashed service left.
+  `camera_serial_not_unique`, recorded `failed`). Approving clears the
+  active-session marker a crashed service left. It clears a
+  `manual_intervention_required` latch only by binding a camera this command
+  accepts (a unique serial, not one the source latched as ambiguous); an
+  ambiguity latch on a camera without a serial or with a shared serial cannot
+  be cleared with this command and needs the live Owner approval.
 - Exit status `0` done, `2` refused (a fixed word on stderr).
   `committed_verification_failed` means the change and its audit record were
   committed but re-verifying the pinned database afterwards failed: run
