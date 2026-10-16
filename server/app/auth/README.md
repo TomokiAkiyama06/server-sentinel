@@ -1568,9 +1568,11 @@ route is the generic denial). The route table above lists the four routes.
   `recordings:view` alone reaches none of them. The source list returns only
   each configured, enabled local source's id, name and coarse health
   (`online` / `degraded` / `offline` / `manual_intervention_required`; never
-  `online` while the preview refuses its frames), and only sources captured
-  as `MJPG` (frames pass through as JPEG; a `YUYV` / `GREY` source is
-  neither listed nor opened): no device path, serial,
+  `online` while the preview refuses its frames), and only sources configured
+  and negotiated as `MJPG` (frames pass through as JPEG; a `YUYV` / `GREY`
+  source, or one whose capture negotiated another format, is neither listed
+  nor opened, and a source without a recorded negotiated `MJPG` is never
+  `online`): no device path, serial,
   profile, node, detection or storage detail, and nothing historical.
 - A live session is bound to the human access session that opened it
   (`BoundLiveAccess`). Each frame poll is admitted in memory first (an id the
@@ -1580,8 +1582,14 @@ route is the generic denial). The route table above lists the four routes.
   exactly that human session (token digest and keyed proxy-identity binding;
   a live-session id copied to any other session is refused) and the read
   re-runs `live_view_validator`. A refused poll never renews the lease; one
-  whose own grant no longer validates also releases the demand.
-- Nothing is written per frame. The idle expiry moves at most once per 60 s
+  whose own grant no longer validates also releases the demand, and so does
+  one whose human session is no longer current for the presented cookie and
+  proxy identity (Issue #279 item 2). The executor checks the holder again,
+  so a poll queued before the service stopped is refused (item 3).
+- Nothing is written per frame. The one exception is a binding mismatch:
+  `current_session` records it (coalesced) and the live session ends with
+  that poll, so every later poll is refused in memory and the write happens
+  at most once per live session. The idle expiry moves at most once per 60 s
   per live session (D5 default), through the gated
   `authorize_request(..., LIVE, touch=True)`; its failure only skips that
   extension.
@@ -1591,7 +1599,10 @@ route is the generic denial). The route table above lists the four routes.
   Over a limit: the generic denial (or `204` for pacing). Opens are
   charged to `HumanAccess.live_limiter` (per session a burst of 20 and one
   more every 3 s, so switching sources, hiding/showing the tab and reconnecting
-  stay inside it) after a read-only check, so a forged cookie takes no slot.
+  stay inside it) after a read-only check that also requires the Owner or
+  `live:view` (`session_may_be_current(token, permission=LIVE_VIEW)`, Issue
+  #279 item 6), so neither a forged cookie nor a session without `live:view`
+  takes a slot.
   A close is not charged: it reaches SQLite only for a live session held for
   the presented cookie, so closes are bounded by opens.
   At most 32 request jobs (all viewers) are queued or running on the
@@ -1606,7 +1617,8 @@ route is the generic denial). The route table above lists the four routes.
 - Contract for the Web (CP-5): `health` is always present (one of the four
   camera values); only local `MJPG` sources are listed in this interim
   transport; an open always answers `200` with `session_id`, `source_id`,
-  `lease_seconds` and `frame_interval_ms` (the pacing interval; poll at that
+  `lease_seconds` (a JSON number, `15.0`) and `frame_interval_ms` (an
+  integer, the pacing interval; poll at that
   interval plus some slack); a close needs no body and no `Content-Type`
   (keepalive fetch) and is never rate-limited. An open refused by the
   limiter, the capacity or the source check creates no demand.

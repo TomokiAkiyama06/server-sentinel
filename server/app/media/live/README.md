@@ -72,6 +72,10 @@ source, 2 per person, at most 5 served frames per second per session, 8 MiB per
 frame, a 15 s lease and at most one idle extension of the human session per
 60 s per live session. A session whose viewer stops polling is disconnected by
 the sweeper (released demand, so the hub retains nothing), as is every session
-while human access is closed or the composition is stopped. Nothing is written
-per frame. Mock verified only; a browser decoding real MJPG frames is a manual
+while human access is closed or the composition is stopped; a poll queued
+before a stop is refused, and a poll whose human session is no longer current
+for its cookie and proxy identity ends its live session. Only sources
+configured and negotiated as MJPG are listed. Nothing is written per frame
+(a binding mismatch is recorded once, coalesced, and ends the live session).
+Mock verified only; a browser decoding real MJPG frames is a manual
 check.

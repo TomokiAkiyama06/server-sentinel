@@ -333,7 +333,8 @@ rendered. A frame is accepted only as `image/jpeg` with a decimal
 `Content-Length` above that is refused unread, and the body is read with the
 same cap whether or not the header is present (a proxy may re-chunk it). A
 refused frame's body is cancelled. `frame_interval_ms` (50 to 5000; otherwise
-200) sets the pull spacing; `lease_seconds` is not used by the client.
+200) sets the pull spacing; `lease_seconds` (a JSON number such as `15.0`) is
+not used by the client.
 
 `src/dashboard/live.tsx` is rendered only for `canVisit(session, 'live')`
 (`live:view`, or the Owner) and loads the sources only then: a

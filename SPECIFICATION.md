@@ -2307,11 +2307,13 @@ hub), otherwise the generic denial:
 ```text
 GET  /api/live/sources                      -> LIVE: {"sources": [{"id", "name",
                                                "health"}]} of configured, enabled
-                                               local sources captured as MJPG
-                                               (others are neither listed nor
-                                               opened); nothing else
+                                               local sources configured and
+                                               negotiated as MJPG (others are
+                                               neither listed nor opened; not
+                                               "online" without a negotiated
+                                               MJPG); nothing else
 POST /api/live/sessions  {"source_id"}      -> LIVE + CSRF: {"session_id",
-                                               "source_id", "lease_seconds": 15,
+                                               "source_id", "lease_seconds": 15.0,
                                                "frame_interval_ms": 200}
 GET  /api/live/sessions/<sid>/frame?after=n -> LIVE, the opening human session
                                                only: 200 image/jpeg with
@@ -2325,18 +2327,24 @@ POST /api/live/sessions/<sid>/close         -> SESSION + CSRF, own sessions: 204
 human access session that opened it: each poll is admitted in memory (a held
 id, a per-(human session, live session) budget), then inside `admit(epoch)`
 the read-only session lookup must be that human session (a copied id is
-refused) and the read re-runs the `live:view` validator; nothing is written
-per frame, and the idle expiry is extended at most once per 60 s per live
-session. `health` is always present; an open always answers `200`, and the Web
+refused) and the read re-runs the `live:view` validator. If the opening
+human session is no longer current for the presented cookie and proxy
+identity (ended, or a binding mismatch), the live session ends with that poll.
+Nothing is written per frame (a binding mismatch is recorded once, coalesced,
+and ends the live session), and the idle expiry is extended at most once per
+60 s per live session. `lease_seconds` is a JSON number of seconds
+(`frame_interval_ms` an integer). `health` is always present; an open always answers `200`, and the Web
 paces its polls with `frame_interval_ms` plus some slack; a close needs no body
 or `Content-Type` and is not rate-limited, while opens are charged per session
-(a burst of 20, one more every 3 s) and a refused open leaves no demand.
+(a burst of 20, one more every 3 s; only a session of the Owner or a
+`live:view` holder takes a limiter slot) and a refused open leaves no demand.
 Limits: 4 sessions in total, 2 per source, 2 per person, 5 served
 frames per second per session, 8 MiB and a JPEG SOI marker per frame; over a
 limit the generic denial (pacing: `204`). Demand ends after 15 s without an
 authorized poll, on close and sign-out, at once after an Owner grant or
 revocation change, and for every session while access is closed or the
-composition stopped. Responses are `no-store`, `nosniff`,
+composition stopped; a poll queued before the service stopped is refused.
+Responses are `no-store`, `nosniff`,
 `Cross-Origin-Resource-Policy: same-origin` and never an attachment, `ETag`,
 range or cookie; there is no download or export.
 
