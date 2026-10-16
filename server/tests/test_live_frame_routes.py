@@ -31,7 +31,8 @@ from app.auth.store import Requirement
 from app.cameras.registry import CameraRegistry, SourceHealthState, SourceType
 from app.cameras.registry.models import CaptureProfile
 from app.media.live.frame_pull import (
-    MAX_PENDING_REQUESTS, LiveFrameLimits, LiveFrameService, LiveFrameUnavailable,
+    MAX_PENDING_REQUESTS, MAX_PENDING_REQUESTS_PER_SESSION, LiveFrameLimits, LiveFrameService,
+    LiveFrameUnavailable,
 )
 from app.media.live.local_preview import LocalPreviewHub
 from app.storage.database import Database
@@ -749,6 +750,167 @@ class ServiceTests(unittest.TestCase):
             LiveFrameService(object(), None)
         with self.assertRaises(ValueError):
             LiveFrameService(LocalPreviewHub(()), None)
+
+
+class RequestShareTests(unittest.TestCase):
+    """Issue #279 item 1 (Owner decision 2026-10-16): a per-session share.
+
+    Each human session (one session token) may hold at most
+    ``MAX_PENDING_REQUESTS_PER_SESSION`` of the ``MAX_PENDING_REQUESTS``
+    request jobs, so one session's burst cannot fill the shared queue; a
+    share is returned on completion, failure, cancellation and stop.
+    """
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        database = Database(Path(temporary.name) / "synthetic.sqlite3")
+        with closing(database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        mjpg = CaptureProfile(width=640, height=480, fps=30, pixel_format="MJPG")
+        registry = CameraRegistry(database, unaudited_writes=True)
+        self.source = registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic camera",
+                                             enabled=True, desired_capture_profile=mjpg).id
+        registry.update_source_health(self.source, health_state=SourceHealthState.ONLINE,
+                                      negotiated_capture_profile=mjpg)
+        self.hub = LocalPreviewHub((self.source,))
+        self.hub.on_health(health(self.source, "online"))
+        store = SimpleNamespace(current_session=lambda *a, **k: None, now=lambda: None, database=database)
+        self.service = LiveFrameService(self.hub, store, validator=lambda access, source_id: True)
+        self.service.start()
+        self.addCleanup(self.service.stop, wait=True)
+
+    def block(self):
+        """Hold the executor with an internal (unshared) job until released."""
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.service._submit(gate.wait, 10)
+        return gate
+
+    def held(self):
+        with self.service._lock:
+            return self.service._pending, dict(self.service._shares)
+
+    def fill(self, token):
+        """Queue one session's full share of polls; the next one is refused."""
+        queued = [self.service.poll(token, "synthetic", uuid4(), 0, admit=_null)
+                  for _ in range(MAX_PENDING_REQUESTS_PER_SESSION)]
+        with self.assertRaises(LiveFrameUnavailable):
+            self.service.poll(token, "synthetic", uuid4(), 0, admit=_null)
+        return queued
+
+    def test_the_share_fits_the_shared_queue_and_the_d10_limits(self):
+        limits = LiveFrameLimits()
+        self.assertEqual(MAX_PENDING_REQUESTS_PER_SESSION, 8)
+        # One session alone never fills the queue; it takes as many sessions
+        # at their full share as D10 allows live sessions in total.
+        self.assertLess(MAX_PENDING_REQUESTS_PER_SESSION, MAX_PENDING_REQUESTS)
+        self.assertEqual(MAX_PENDING_REQUESTS // MAX_PENDING_REQUESTS_PER_SESSION,
+                         limits.maximum_total_viewers)
+        # A paced viewer's 2 live sessions (one poll in flight each, plus one
+        # abandoned and retried each) and an open, close and source list fit.
+        self.assertGreaterEqual(MAX_PENDING_REQUESTS_PER_SESSION,
+                                2 * limits.maximum_viewers_per_principal + 3)
+
+    def test_one_session_cannot_fill_the_queue_and_others_keep_being_served(self):
+        gate = self.block()
+        first, second = bytes(32), bytes([1]) * 32
+        queued = self.fill(first)
+        # Opens, closes and source lists of the same session are charged too.
+        with self.assertRaises(LiveFrameUnavailable):
+            self.service.sources(first, admit=_null)
+        with self.assertRaises(LiveFrameUnavailable):
+            self.service.close(first, uuid4(), uuid4())
+        with self.assertRaises(LiveFrameUnavailable):
+            self.service.open(BoundLiveAccess(uuid4(), 1, uuid4()), self.source, first, admit=_null)
+        # Another session is still admitted, also for an open.
+        other = self.service.sources(second, admit=_null)
+        access = BoundLiveAccess(uuid4(), 1, uuid4())
+        opened = self.service.open(access, self.source, second, admit=_null)
+        self.assertEqual(self.held(), (MAX_PENDING_REQUESTS_PER_SESSION + 2, {
+            self.service._holder(first): MAX_PENDING_REQUESTS_PER_SESSION,
+            self.service._holder(second): 2}))
+        gate.set()
+        # Polls of unknown live sessions fail (the error path) and return
+        # their share as well as the successful jobs do.
+        for future in queued:
+            with self.assertRaises(LiveFrameUnavailable):
+                future.result(timeout=10)
+        self.assertEqual([view.source_id for view in other.result(timeout=10)], [self.source])
+        session = opened.result(timeout=10)
+        self.assertEqual(self.held(), (0, {}))
+        # The full share is available again after the release.
+        gate = self.block()
+        queued = self.fill(first)
+        gate.set()
+        for future in queued:
+            with self.assertRaises(LiveFrameUnavailable):
+                future.result(timeout=10)
+        self.service.close(second, access.access_session_id, session.session_id).result(timeout=10)
+        self.assertEqual(self.held(), (0, {}))
+        self.assertEqual(self.hub.status.viewers, 0)
+
+    def test_the_shared_cap_still_bounds_every_session_together(self):
+        gate = self.block()
+        tokens = [bytes([index]) * 32 for index in range(MAX_PENDING_REQUESTS // MAX_PENDING_REQUESTS_PER_SESSION)]
+        queued = [future for token in tokens for future in self.fill(token)]
+        self.assertEqual(len(queued), MAX_PENDING_REQUESTS)
+        with self.assertRaises(LiveFrameUnavailable):
+            self.service.sources(bytes([200]) * 32, admit=_null)
+        with self.assertRaises(LiveFrameUnavailable):
+            self.service.status()
+        gate.set()
+        for future in queued:
+            with self.assertRaises(LiveFrameUnavailable):
+                future.result(timeout=10)
+        self.assertEqual(self.held(), (0, {}))
+
+    def test_a_cancelled_request_returns_its_share(self):
+        gate = self.block()
+        token = bytes(32)
+        queued = self.fill(token)
+        for future in queued:
+            self.assertTrue(future.cancel())
+        self.assertEqual(self.held(), (0, {}))
+        later = self.service.sources(token, admit=_null)
+        gate.set()
+        later.result(timeout=10)
+        self.assertEqual(self.held(), (0, {}))
+
+    def test_a_stop_drains_the_queue_and_leaks_no_share(self):
+        gate = self.block()
+        token = bytes(32)
+        queued = self.fill(token)
+        stopping = threading.Thread(target=self.service.stop, kwargs={"wait": True})
+        stopping.start()
+        gate.set()
+        stopping.join(10)
+        self.assertFalse(stopping.is_alive())
+        for future in queued:
+            self.assertTrue(future.done())
+        self.assertEqual(self.held(), (0, {}))
+        # A restart starts with the whole share.
+        self.service.start()
+        gate = self.block()
+        queued = self.fill(token)
+        gate.set()
+        for future in queued:
+            with self.assertRaises(LiveFrameUnavailable):
+                future.result(timeout=10)
+        self.assertEqual(self.held(), (0, {}))
+
+    def test_a_request_without_a_session_token_is_refused_and_charges_nothing(self):
+        for token in (None, "not-bytes", 32):
+            with self.subTest(token=token):
+                with self.assertRaises(LiveFrameUnavailable):
+                    self.service.poll(token, "synthetic", uuid4(), 0, admit=_null)
+                with self.assertRaises(LiveFrameUnavailable):
+                    self.service.sources(token, admit=_null)
+                with self.assertRaises(LiveFrameUnavailable):
+                    self.service.close(token, uuid4(), uuid4())
+                with self.assertRaises(LiveFrameUnavailable):
+                    self.service.open(BoundLiveAccess(uuid4(), 1, uuid4()), self.source, token, admit=_null)
+        self.assertEqual(self.held(), (0, {}))
 
 
 class _Null:

@@ -1629,8 +1629,17 @@ route is the generic denial). The route table above lists the four routes.
   A close is not charged: it reaches SQLite only for a live session held for
   the presented cookie, so closes are bounded by opens.
   At most 32 request jobs (all viewers) are queued or running on the
-  service's executor at once; beyond that a request is the generic denial, so
-  a slow database cannot grow the queue, and sweeps never stack.
+  service's executor at once, and at most 8 of them for one human session
+  (Issue #279 item 1, Owner decision 2026-10-16: open, poll, close and the
+  source list are charged to the session's in-memory token digest, never a
+  logged value); beyond either a request is the generic denial (no distinct
+  overload response), so a slow database cannot grow the queue, one
+  session's poll burst cannot fill it and end other viewers (it takes four
+  sessions at their full share), and sweeps never stack. A share is returned
+  when its job completes, fails or is cancelled; a stop drains every queued
+  job. 8 covers a paced viewer's one poll in flight per live session (at
+  most 2 per person) plus an open, close or source list, with room for an
+  abandoned and retried poll per live session.
 - Demand ends when a session's viewer stops polling for 15 s (the lease),
   on close, on sign-out, at once for the affected principal after an Owner
   grant or revocation change (`AccessAdministration.principal_changed`), and
