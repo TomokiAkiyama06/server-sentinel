@@ -2767,6 +2767,31 @@ by the Issue #6 synthetic policy model.
   closes access. Confirm on the host whether its `::` listeners are dual-stack
   (`net.ipv6.bindv6only`, per-socket `IPV6_V6ONLY`); the check assumes they
   are and needs an exception without a family for them.
+- `tailscaled` peerAPI reserved-address exception (Owner decision D1,
+  2026-10-16; ADR-0003; synthetic tests only so far, not run on any host).
+  On the node whose Tailscale name is the reserved name:
+  - [ ] list the TCP listeners on the Tailscale addresses (`sudo ss -ltnp
+    --cgroup`) and confirm each row other than the Serve socket on the
+    dashboard port is created in `/system.slice/tailscaled.service` by uid 0
+    and is the peerAPI (`tailscaled` debug output or upstream documentation
+    for the installed version), and record its port per address family;
+  - [ ] from another Tailscale node, request `http://<address>:<port>/` and
+    `https://<reserved name>:<port>/` and record that the port answers plain
+    HTTP only (no TLS handshake);
+  - [ ] with a dashboard session established in a browser, open
+    `http://<reserved name>:<port>/` in the same browser and confirm in the
+    browser's network panel that the request carries no `__Host-session`
+    cookie (the cookie is `Secure`); record the browser and version;
+  - [ ] record the port before and after `sudo systemctl restart
+    tailscaled` (and after a reboot): whether it stays the same decides
+    whether the recorded exception survives restarts or a follow-up Owner
+    decision is needed;
+  - [ ] without the exception, confirm access closes with
+    `UNEXPECTED_LISTENER`; record the `reserved_address` exception for the
+    observed port(s) through the audited Owner path and confirm access opens;
+    confirm a test TCP listener on the same address and another port, and
+    one on the recorded port started by another unit after `tailscaled` is
+    stopped, each close access.
 - Breach recovery (Owner decision 2026-09-30): with an Owner and an invited
   viewer signed in, bind a test listener to the Tailscale address on another
   port, wait for the check to close access, then stop it. Confirm access

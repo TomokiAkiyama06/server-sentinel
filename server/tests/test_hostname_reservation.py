@@ -17,7 +17,7 @@ from app.audit import (
 )
 from app.audit.integration import RESERVATION_LISTENER_EXCEPTIONS_ID, ReservationAdministration
 from app.auth.reservation import (
-    DAILY_SECONDS, EXPOSURE_REASONS, AddressFamily, CheckKind, GetaddrinfoResolver, OwnSocketInodes, ProcessIdentity,
+    DAILY_SECONDS, EXPOSURE_REASONS, AddressFamily, BindScope, CheckKind, GetaddrinfoResolver, OwnSocketInodes, ProcessIdentity,
     SocketCreator, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
     UPSTREAM_SOCKET_UNIT, read_unprivileged_port_start, unit_from_cgroup,
     RETRY_WHILE_CLOSED_SECONDS, ProcNetListeners, ProxyRoute, Reason, ReservationConfig,
@@ -1949,6 +1949,199 @@ class ListenerOwnershipTests(ExceptionFixture):
         self.assertEqual(decode(encode(values)), frozenset(values))
         self.assertIn('"uid":103', encode(values))
         self.assertNotIn("executable", encode(values))
+
+
+PEER_V4_PORT, PEER_V6_PORT = 43210, 51234
+PEER_V4 = ListenerException(PEER_V4_PORT, family=AddressFamily.IPV4, scope=BindScope.RESERVED_ADDRESS,
+                            unit="tailscaled.service", uid=0)
+PEER_V6 = ListenerException(PEER_V6_PORT, family=AddressFamily.IPV6, scope=BindScope.RESERVED_ADDRESS,
+                            unit="tailscaled.service", uid=0)
+
+
+def peer_files(v4=("100.64.0.10", PEER_V4_PORT), v6=(str(V6), PEER_V6_PORT), extra_tcp=(), extra_tcp6=()):
+    """Upstream 1000, the IPv4 peerAPI row 1001, the IPv6 peerAPI row 2000."""
+    return Files(tcp=proc(("127.0.0.1", 8080, "0A"), *([(*v4, "0A")] if v4 else []), *extra_tcp),
+                 tcp6=proc(*([(*v6, "0A")] if v6 else []), *extra_tcp6, ipv6=True))
+
+
+class ReservedAddressExceptionTests(ExceptionFixture):
+    """Owner decision D1 (2026-10-16): ``tailscaled.service`` (uid 0) TCP
+    listeners bound directly on the reserved addresses (its plain-HTTP
+    peerAPI) may be excepted, never on the served port, never a wildcard,
+    never another unit, uid or protocol."""
+
+    def set(self, files, exceptions, **kwargs):
+        kwargs.setdefault("socket_owners", Owners(TAILSCALED_CREATOR))
+        admin, check, sink = self.admin(files, **kwargs)
+        return admin.set_listener_exceptions("synthetic-owner-session", exceptions), check, sink
+
+    def test_recorded_peerapi_listeners_open(self):
+        owners = Owners(TAILSCALED_CREATOR)
+        verdict, check, _ = self.set(peer_files(), {PEER_V4, PEER_V6}, socket_owners=owners)
+        self.assertTrue(verdict.open)
+        # Both peerAPI sockets had their creator verified with the upstream.
+        self.assertEqual(owners.calls[-1], frozenset({1000, 1001, 2000}))
+        # One exception without a family covers either reserved address on its port.
+        both = ListenerException(PEER_V4_PORT, scope=BindScope.RESERVED_ADDRESS, unit="tailscaled.service", uid=0)
+        files = peer_files(v6=(str(V6), PEER_V4_PORT))
+        self.assertTrue(self.set(files, {both})[0].open)
+        # An IPv4-mapped bind of a reserved address is that address.
+        mapped = Files(tcp6=proc(("::ffff:100.64.0.10", PEER_V4_PORT, "0A"), ipv6=True))
+        self.assertTrue(self.set(mapped, {PEER_V4})[0].open)
+
+    def test_without_the_exception_the_peerapi_is_an_unexpected_listener(self):
+        verdict, _, _ = self.set(peer_files(), ())
+        self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+        # A wildcard-scope exception on the same port never covers a reserved-address bind.
+        wildcard = ListenerException(PEER_V4_PORT, unit="tailscaled.service", uid=0)
+        verdict, _, _ = self.set(peer_files(v6=None), {wildcard})
+        self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+
+    def test_only_tailscaled_tcp_as_root_may_be_recorded(self):
+        for kwargs in (dict(protocol=TransportProtocol.UDP),
+                       dict(unit="ssh.socket"), dict(unit="tailscaled.socket"),
+                       dict(unit="other.service"), dict(uid=1000), dict(uid=None), dict(unit=None),
+                       dict(family="ipv4"), dict(scope="reserved_address")):
+            values = dict(port=PEER_V4_PORT, scope=BindScope.RESERVED_ADDRESS,
+                          unit="tailscaled.service", uid=0)
+            values.update(kwargs)
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                ListenerException(**values)
+        # An IPv6 family is fine here: a reserved-address bind is not dual-stack.
+        self.assertEqual(PEER_V6.family, AddressFamily.IPV6)
+
+    def test_never_the_served_upstream_or_proxy_port(self):
+        proxy = dict(proxy_listeners=frozenset({Listener(V4, 443)}), proxy_owner=TAILSCALED)
+        for cfg, port in ((config(), 443), (config(), 8080), (config(**proxy), 443)):
+            with self.subTest(port=port):
+                item = ListenerException(port, scope=BindScope.RESERVED_ADDRESS, unit="tailscaled.service", uid=0)
+                with self.assertRaises(ValueError):
+                    evaluate(cfg, (HUMAN,), (cfg.expected_route,), {item})
+        admin, check, _ = self.admin(peer_files(), socket_owners=Owners(TAILSCALED_CREATOR))
+        served = ListenerException(443, scope=BindScope.RESERVED_ADDRESS, unit="tailscaled.service", uid=0)
+        with self.assertRaises(ValueError):
+            admin.set_listener_exceptions("synthetic-owner-session", {served})
+        self.assertIsNone(self.stored())
+        self.assertEqual(check.listener_exceptions, frozenset())
+
+    def test_never_a_wildcard_or_unreserved_address(self):
+        reserved = frozenset({V4, V6})
+        for address in ("0.0.0.0", "::", "192.0.2.7", "127.0.0.1", "100.64.0.11"):
+            with self.subTest(address=address):
+                listener = Listener(ipaddress.ip_address(address), PEER_V4_PORT)
+                self.assertFalse(PEER_V4.matches(listener, reserved))
+                self.assertFalse(PEER_V6.matches(Listener(ipaddress.ip_address(address), PEER_V6_PORT), reserved))
+        # Without the reserved set nothing is covered.
+        self.assertFalse(PEER_V4.matches(Listener(V4, PEER_V4_PORT)))
+        self.assertTrue(PEER_V4.matches(Listener(V4, PEER_V4_PORT), reserved))
+        # Protocol, port and family must match too.
+        self.assertFalse(PEER_V4.matches(Listener(V4, PEER_V4_PORT, TransportProtocol.UDP), reserved))
+        self.assertFalse(PEER_V4.matches(Listener(V4, PEER_V4_PORT + 1), reserved))
+        self.assertFalse(PEER_V4.matches(Listener(V6, PEER_V4_PORT), reserved))
+        self.assertFalse(PEER_V6.matches(Listener(V4, PEER_V6_PORT), reserved))
+        # A wildcard bind on the recorded port stays an unexpected listener.
+        files = peer_files(extra_tcp=(("0.0.0.0", PEER_V4_PORT, "0A"),))
+        verdict, _, _ = self.set(files, {PEER_V4, PEER_V6})
+        self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+
+    def test_address_the_name_gained_is_not_covered(self):
+        gained = ipaddress.IPv4Address("100.64.0.11")
+        files = peer_files(extra_tcp=((str(gained), PEER_V4_PORT, "0A"),))
+        any_family = ListenerException(PEER_V4_PORT, scope=BindScope.RESERVED_ADDRESS,
+                                       unit="tailscaled.service", uid=0)
+        verdict, _, sink = self.set(files, {any_family, PEER_V6}, resolver=Resolver((V4, V6, gained)))
+        self.assertIn(Reason.RESERVED_ADDRESSES_CHANGED, verdict.reasons)
+        self.assertIn(Reason.UNEXPECTED_LISTENER, verdict.reasons)
+        self.assertEqual(sink.events[-1].unexpected_listeners, 1)
+
+    def test_a_changed_port_or_family_closes(self):
+        # tailscaled may pick another port after a restart (MANUAL_TEST.md):
+        # the recorded port no longer matches and the new one is unexpected.
+        for files in (peer_files(v4=("100.64.0.10", PEER_V4_PORT + 1)),
+                      peer_files(v6=(str(V6), PEER_V4_PORT))):
+            with self.subTest(files=files.files):
+                verdict, _, _ = self.set(files, {PEER_V4, PEER_V6})
+                self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+
+    def test_one_socket_per_recorded_endpoint(self):
+        files = peer_files(extra_tcp=(("100.64.0.10", PEER_V4_PORT, "0A"),))
+        verdict, _, sink = self.set(files, {PEER_V4, PEER_V6})
+        self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual(sink.events[-1].unexpected_listeners, 1)
+        # The extra row is an exposure even when a creator cannot be verified
+        # (PR #274 review): rows 1001 and 1002 share the endpoint.
+        for name, overrides in {"extra row unverified": {1002: None},
+                                "first row unverified": {1001: SocketCreator(None, 0)},
+                                "both unverified": {1001: None, 1002: SocketCreator("/init.scope", 0)}}.items():
+            with self.subTest(name):
+                revoker = FakeRevoker()
+                verdict, _, _ = self.set(files, {PEER_V4, PEER_V6}, session_revoker=revoker,
+                                         socket_owners=Owners(TAILSCALED_CREATOR, overrides=overrides))
+                self.assertIn(Reason.UNEXPECTED_LISTENER, verdict.reasons)
+                self.assertTrue(revoker.pending)
+        # Likewise for a duplicated wildcard endpoint (rows 1001 and 1002).
+        wildcard = Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("0.0.0.0", 22, "0A"), ("0.0.0.0", 22, "0A")))
+        revoker = FakeRevoker()
+        verdict, _, _ = self.set(wildcard, {SSH}, session_revoker=revoker,
+                                 socket_owners=Owners(SSHD_CREATOR, overrides={1002: None}))
+        self.assertIn(Reason.UNEXPECTED_LISTENER, verdict.reasons)
+        self.assertTrue(revoker.pending)
+
+    def test_confirmed_other_creator_is_an_exposure(self):
+        for creator in (INTRUDER, SSHD_CREATOR, SocketCreator("/system.slice/tailscaled.service", 1000),
+                        SocketCreator(None, 1000)):
+            with self.subTest(creator=creator):
+                revoker = FakeRevoker()
+                owners = Owners(TAILSCALED_CREATOR, overrides={1001: creator})
+                verdict, _, _ = self.set(peer_files(), {PEER_V4, PEER_V6}, socket_owners=owners,
+                                         session_revoker=revoker)
+                self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+                self.assertTrue(revoker.pending)
+                self.assertEqual(owners.calls[-1], frozenset({1001}))
+
+    def test_unverified_creator_stays_closed_without_revocation(self):
+        cases = {"not in the dump": Owners(TAILSCALED_CREATOR, overrides={2000: None}),
+                 "no cgroup": Owners(TAILSCALED_CREATOR, overrides={2000: SocketCreator(None, 0)}),
+                 "init.scope": Owners(TAILSCALED_CREATOR, overrides={2000: SocketCreator("/init.scope", 0)}),
+                 "unconfirmed mismatch": Owners(TAILSCALED_CREATOR, overrides={2000: [INTRUDER, None]}),
+                 "sock_diag fails": Owners(OSError("synthetic netlink failure")),
+                 "no resolver": None}
+        for name, owners in cases.items():
+            with self.subTest(name):
+                revoker = FakeRevoker()
+                verdict, _, _ = self.set(peer_files(), {PEER_V4, PEER_V6}, socket_owners=owners,
+                                         session_revoker=revoker)
+                self.assertFalse(verdict.open)
+                self.assertIn(Reason.LISTENER_OWNER_UNVERIFIED, verdict.reasons)
+                self.assertNotIn(Reason.UNEXPECTED_LISTENER, verdict.reasons)
+                self.assertEqual((revoker.pending, revoker.revocations), (False, 0))
+        # A kernel-owned socket (inode 0) has no creator to verify.
+        listeners = (HUMAN, Listener(V4, PEER_V4_PORT, inode=0))
+        reasons, _, _ = evaluate(config(), listeners, (config().expected_route,), {PEER_V4},
+                                 owners={0: TAILSCALED_CREATOR})
+        self.assertEqual(reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+
+    def test_persisted_and_reloaded(self):
+        verdict, _, _ = self.set(peer_files(), {PEER_V4, PEER_V6})
+        self.assertTrue(verdict.open)
+        self.assertEqual(decode(self.stored()), frozenset({PEER_V4, PEER_V6}))
+        self.assertIn('"scope":"reserved_address"', self.stored())
+        _, check, _ = self.admin(peer_files(), socket_owners=Owners(TAILSCALED_CREATOR))
+        self.assertTrue(check.startup().open)
+        self.assertEqual(check.listener_exceptions, frozenset({PEER_V4, PEER_V6}))
+
+    def test_stored_entry_outside_the_decision_fails_closed(self):
+        entry = {"protocol": "tcp", "port": PEER_V4_PORT, "family": "ipv4", "scope": "reserved_address",
+                 "unit": "tailscaled.service", "uid": 0}
+        for change in ({"protocol": "udp"}, {"unit": "ssh.socket"}, {"uid": 1000}, {"port": 443},
+                       {"scope": "reserved"}):
+            with self.subTest(change=change):
+                self.store_raw(json.dumps({"version": 3, "exceptions": [dict(entry, **change)]}))
+                _, check, _ = self.admin(peer_files(), socket_owners=Owners(TAILSCALED_CREATOR))
+                verdict = check.startup()
+                self.assertFalse(verdict.open)
+                self.assertEqual(verdict.reasons[0], Reason.LISTENER_EXCEPTIONS_UNREADABLE)
+                self.assertEqual(check.listener_exceptions, frozenset())
 
 
 class ProcNetInodeTests(TestCase):

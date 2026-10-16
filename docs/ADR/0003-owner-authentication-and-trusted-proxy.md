@@ -590,3 +590,39 @@ checks its own permission and the assets carry no application data. They are
 served from the backend's verified, in-memory copy of the build, since the
 reservation check accepts exactly one proxy route; the current contract is
 in `server/app/auth/README.md`.
+
+Owner decision D1, 2026-10-16 (Issue #10): one recorded listener exception
+may cover a socket bound directly on a reserved address, which the
+2026-10-01 rule above otherwise never excepts. `tailscaled` listens for its
+peerAPI on the node's own Tailscale addresses, and those are the reserved
+addresses whenever the dashboard name is the node's Tailscale name, so
+without this no such node could ever open human access. The exception
+(`BindScope.RESERVED_ADDRESS`) is narrow:
+
+- only TCP, only the creating unit `tailscaled.service` with uid 0, verified
+  on every check through the same sock_diag creator lookup as every other
+  exception; a confirmed other creator is an exposure, and a creator that
+  cannot be verified keeps access closed without revocation;
+- only one of the configured reserved addresses (an address the name gained
+  is not covered and closes access anyway), only the recorded port, in the
+  recorded family or both, one socket per address and port;
+- never the served HTTPS port, the loopback upstream port or a recorded
+  proxy socket port, and never a wildcard bind, which stays the wildcard
+  exception's case.
+
+Rationale: the peerAPI answers plain HTTP. The dashboard's session cookie is
+`__Host-session` with `Secure`, so a browser sends it only over HTTPS to the
+reserved name and never to a plain-HTTP port of it; the peerAPI is not an
+HTTPS answer on the name that could collect a session cookie. That rests on
+the peerAPI staying plain HTTP, which is an assumption about the installed
+`tailscaled`, not something the check verifies: `MANUAL_TEST.md` records
+that it is the peerAPI, that it answers plain HTTP, that the browser does not
+send the cookie to it, and whether its port changes across `tailscaled`
+restarts. A changed port is another listener on a reserved address
+(`UNEXPECTED_LISTENER`, an exposure: every human session is revoked before
+access reopens) until the Owner records the new port; if the port does
+change on every restart, a follow-up Owner decision is needed rather than a
+wider exception. The reservation check remains detection, not prevention: it
+sees the peerAPI socket only at startup, daily and retry checks, and the
+exception is a statement about which answer is acceptable, not a guarantee
+that only `tailscaled` can bind there.
