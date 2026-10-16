@@ -427,6 +427,13 @@ and ADR-0003):
   an immediate second lookup confirms it, closes access as an exposure. The
   Main Server keeps `ssh.socket`; the exception is `tcp/22` created by
   `ssh.socket` as uid 0 (`server/docs/DEPLOYMENT.md`).
+- An exception covers a wildcard bind only, with one exception (Owner
+  decision D1, 2026-10-16; ADR-0003): `tailscaled.service` (uid 0) TCP
+  listeners bound directly on a configured reserved address on a recorded
+  port that is not the dashboard, upstream or proxy port, for `tailscaled`'s
+  plain-HTTP peerAPI. The `Secure` `__Host-session` cookie is not sent to a
+  plain-HTTP port; that the peerAPI stays plain HTTP is verified manually
+  (`MANUAL_TEST.md`), not by the check, which still only detects.
 - Every recorded proxy socket must be present and created by the recorded
   proxy unit and uid (for example `tailscaled.service`, uid 0), verified the
   same way. A confirmed other creator is an exposure; a missing recorded

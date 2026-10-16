@@ -1688,7 +1688,12 @@ socket's creating cgroup (`INET_DIAG_CGROUP_ID`, matched to
 or uid is an exposure reason (`UNEXPECTED_LISTENER`) once an immediate second
 dump in the same check confirms it, and stored port-only or executable-path
 exceptions fail closed (`LISTENER_EXCEPTIONS_OUTDATED`) until re-entered (Owner
-decisions, 2026-10-01 and 2026-10-07). Each recorded proxy socket requires a
+decisions, 2026-10-01 and 2026-10-07). The only exception that covers a bind
+directly on a reserved address is a `reserved_address` exception for
+`tailscaled.service` with uid 0 over TCP on one recorded port other than the
+dashboard, upstream and proxy ports (its plain-HTTP peerAPI; Owner decision
+D1, 2026-10-16, ADR-0003); it covers only the configured reserved addresses
+and is verified the same way. Each recorded proxy socket requires a
 recorded proxy identity (`proxy_owner`: systemd unit and uid) and must be
 present and created by it: a missing recorded socket keeps access closed
 without revocation, and another creator is an exposure (Owner decision,

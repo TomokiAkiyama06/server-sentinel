@@ -2,7 +2,8 @@
 
 The hostname reservation check (``reservation.py``) asks which systemd unit and
 uid *created* each socket it must verify: an excepted wildcard system
-listener, a recorded proxy socket and the human upstream. Reading another
+listener, an excepted ``tailscaled`` peerAPI listener on a reserved address,
+a recorded proxy socket and the human upstream. Reading another
 account's ``/proc/<pid>/fd`` needs ptrace-level privilege, so the non-root
 backend does not ask which processes *hold* a socket. It asks the kernel's
 socket diagnostics instead (Owner decision, 2026-10-07): an unprivileged

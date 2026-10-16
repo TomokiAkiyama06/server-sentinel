@@ -515,6 +515,20 @@ without privilege, as the service account, with the Issue #126 procedure in
 `MANUAL_TEST.md` (section "ADR-0003 follow-up: accepted human-access
 boundary").
 
+`tailscaled`'s peerAPI listens on TCP directly on the node's Tailscale
+addresses, which are the reserved addresses when the dashboard name is the
+node's Tailscale name. A wildcard exception never covers that; record it as a
+`reserved_address` exception through the audited Owner path (Owner decision
+D1, 2026-10-16; ADR-0003): TCP,
+the observed port, the family of the address it is bound on (or none when the
+same port is bound on both), unit `tailscaled.service`, uid `0`. Nothing else
+is accepted in that scope. Find the port with
+`sudo ss -ltnp --cgroup` (rows on the Tailscale addresses with
+`cgroup:/system.slice/tailscaled.service`) and run the `MANUAL_TEST.md` peerAPI
+steps first. If `tailscaled` binds another port after a restart, the check
+closes human access as `UNEXPECTED_LISTENER` (every human session is revoked
+before it reopens) until the new port is recorded.
+
 Exceptions stored before this change (an executable path such as
 `/usr/sbin/sshd`, or a unit without a uid) are not migrated: the check reports
 `LISTENER_EXCEPTIONS_OUTDATED` and keeps human access closed until the Owner

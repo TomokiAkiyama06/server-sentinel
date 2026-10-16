@@ -158,8 +158,12 @@ class AddressFamily(StrEnum):
 
 
 class BindScope(StrEnum):
-    # Only a wildcard bind may be excepted; a bind to a reserved address never is.
+    # A wildcard bind (``0.0.0.0`` / ``::``) of a system listener.
     WILDCARD = "wildcard"
+    # A TCP bind directly on a reserved address, allowed only for
+    # ``tailscaled.service`` (uid 0) on a port other than the dashboard,
+    # upstream and proxy ports (its peerAPI; Owner decision D1, 2026-10-16).
+    RESERVED_ADDRESS = "reserved_address"
 
 
 MAX_LISTENER_EXCEPTIONS = 16
@@ -175,6 +179,11 @@ _SLICE = re.compile(r"[A-Za-z0-9:_.\\@-]{1,250}\.slice")
 # (Owner decision, 2026-10-07).
 UNRESOLVED_CGROUPS = frozenset({"/", "/init.scope"})
 UPSTREAM_SOCKET_UNIT = "server-sentinel-upstream.socket"
+# The only creator a ``BindScope.RESERVED_ADDRESS`` exception may name (Owner
+# decision D1, 2026-10-16): tailscaled's peerAPI listens on the node's own
+# Tailscale addresses, which are the reserved addresses.
+RESERVED_ADDRESS_UNIT = "tailscaled.service"
+RESERVED_ADDRESS_UID = 0
 
 
 def unit_from_cgroup(path: str | None) -> str | None:
@@ -247,11 +256,23 @@ class ProcessIdentity:
 
 @dataclass(frozen=True)
 class ListenerException:
-    """One Owner-allowed wildcard system listener, for example ``ssh.socket`` on 22.
+    """One Owner-allowed system listener, for example ``ssh.socket`` on 22.
 
-    It matches only a wildcard (``0.0.0.0`` / ``::``) bind of ``protocol`` on
-    ``port`` in ``family`` (``None`` for both). A bind of the same port to a
-    reserved address still closes access, as does every port not listed.
+    With ``scope`` ``WILDCARD`` (the default) it matches only a wildcard
+    (``0.0.0.0`` / ``::``) bind of ``protocol`` on ``port`` in ``family``
+    (``None`` for both). A bind of the same port to a reserved address still
+    closes access, as does every port not listed.
+
+    With ``scope`` ``RESERVED_ADDRESS`` (Owner decision D1, 2026-10-16) it
+    matches only a TCP bind directly on one of the configured reserved
+    addresses on ``port`` (in ``family``, ``None`` for both), and only for
+    ``tailscaled.service`` with uid 0: its peerAPI, plain HTTP on the node's
+    Tailscale addresses. Any other protocol, unit or uid is rejected, a
+    wildcard bind is never covered by it, and ``validate_listener_exceptions``
+    refuses the dashboard, upstream and proxy ports, so the served HTTPS port
+    is never excepted. The rationale (the ``__Host-``/``Secure`` session
+    cookie is never sent to a plain-HTTP port) is in ADR-0003; the check
+    still only detects, and does not prevent, another answer on the name.
 
     The port alone never exempts a socket (Owner decision, 2026-10-01): the
     exception names the creating systemd system ``unit`` and ``uid`` (Owner
@@ -265,7 +286,9 @@ class ListenerException:
     ``/proc/net/{tcp6,udp6}`` does not show ``IPV6_V6ONLY``, and a ``::``
     socket also accepts IPv4 unless that option is set, so a ``::`` bind is
     treated as dual-stack: only an exception without a family covers it. An
-    IPv6-only exception could therefore never be verified and is rejected.
+    IPv6-only wildcard exception could therefore never be verified and is
+    rejected. A reserved-address bind has a definite family, so a
+    ``RESERVED_ADDRESS`` exception may name either one.
     """
 
     port: int
@@ -279,24 +302,41 @@ class ListenerException:
         if (type(self.port) is not int or not 1 <= self.port <= 65535
                 or not isinstance(self.protocol, TransportProtocol)
                 or (self.family is not None and not isinstance(self.family, AddressFamily))
-                or self.family is AddressFamily.IPV6
                 or not isinstance(self.scope, BindScope)):
+            raise ValueError("INVALID_LISTENER_EXCEPTION")
+        if self.scope is BindScope.WILDCARD and self.family is AddressFamily.IPV6:
             raise ValueError("INVALID_LISTENER_EXCEPTION")
         if not _valid_unit_identity(self.unit, self.uid):
             # A creator identity is required; a port-only exception is refused.
+            raise ValueError("INVALID_LISTENER_EXCEPTION")
+        if self.scope is BindScope.RESERVED_ADDRESS and (
+                self.protocol is not TransportProtocol.TCP or self.unit != RESERVED_ADDRESS_UNIT
+                or self.uid != RESERVED_ADDRESS_UID):
+            # Owner decision D1 (2026-10-16): tailscaled's TCP peerAPI only.
             raise ValueError("INVALID_LISTENER_EXCEPTION")
 
     @property
     def owner(self) -> ProcessIdentity:
         return ProcessIdentity(self.unit, self.uid)
 
-    def matches(self, listener: "Listener") -> bool:
+    def matches(self, listener: "Listener", reserved: frozenset = frozenset()) -> bool:
+        """Whether this exception covers ``listener`` (address already normalized).
+
+        ``reserved`` is the configured reserved address set; without it a
+        ``RESERVED_ADDRESS`` exception covers nothing.
+        """
         address = listener.address
-        # A ``::`` bind may be dual-stack, so only an unrestricted exception covers it.
-        family = AddressFamily.IPV4 if address.version == 4 else None
-        return (self.protocol is listener.protocol and self.scope is BindScope.WILDCARD
-                and address.is_unspecified and listener.port == self.port
-                and (self.family is None or self.family is family))
+        if self.protocol is not listener.protocol or listener.port != self.port:
+            return False
+        if self.scope is BindScope.WILDCARD:
+            # A ``::`` bind may be dual-stack, so only an unrestricted exception covers it.
+            family = AddressFamily.IPV4 if address.version == 4 else None
+            return address.is_unspecified and (self.family is None or self.family is family)
+        if self.scope is BindScope.RESERVED_ADDRESS:
+            family = AddressFamily.IPV4 if address.version == 4 else AddressFamily.IPV6
+            return (self.protocol is TransportProtocol.TCP and not address.is_unspecified
+                    and address in reserved and (self.family is None or self.family is family))
+        return False
 
 
 @dataclass(frozen=True)
@@ -821,7 +861,11 @@ CLOSED = ReservationVerdict(False, (), None, None)
 
 
 def validate_listener_exceptions(config: ReservationConfig, exceptions) -> frozenset:
-    """Typed, bounded exceptions that never cover the dashboard or human listener."""
+    """Typed, bounded exceptions that never cover the dashboard or human listener.
+
+    No exception of either scope may name the served HTTPS port, the loopback
+    upstream port or a recorded proxy socket port, for either protocol.
+    """
     try:
         values = frozenset(exceptions)
     except TypeError:
@@ -853,7 +897,8 @@ def expected_creators(config: ReservationConfig, listeners, exceptions: frozense
             identities.add(config.upstream_owner)
         if normalized in config.proxy_listeners:
             identities.add(config.proxy_owner)
-        identities.update(item.owner for item in exceptions if item.matches(normalized))
+        identities.update(item.owner for item in exceptions
+                          if item.matches(normalized, config.reserved_addresses))
         if identities:
             expected.setdefault(listener.inode, set()).update(identities)
     return {inode: frozenset(identities) for inode, identities in expected.items()}
@@ -1022,8 +1067,11 @@ def evaluate(config: ReservationConfig, listeners, routes,
             # included, unless the Owner explicitly allowed that port. The
             # exception allows one socket per covered endpoint (for example
             # both ``0.0.0.0`` and ``::``); an identical extra row is another
-            # SO_REUSEPORT socket sharing the port and is unexpected.
-            covering = [item for item in exceptions if item.matches(normalized)]
+            # SO_REUSEPORT socket sharing the port and is unexpected. A
+            # reserved-address exception covers only the configured reserved
+            # addresses, never one the name gained (that closes access anyway).
+            covering = [item for item in exceptions
+                        if item.matches(normalized, config.reserved_addresses)]
             if covering:
                 creator = known.get(listener.inode) if listener.inode else None
                 status = _creator_status([item.owner for item in covering], creator)

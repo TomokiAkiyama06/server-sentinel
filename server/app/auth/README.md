@@ -388,6 +388,24 @@ is rejected, and a stored executable-path or unit-without-uid set (store
 format version 1 or 2) fails closed as `LISTENER_EXCEPTIONS_OUTDATED` until the
 Owner re-enters it.
 
+One further scope exists (Owner decision D1, 2026-10-16; ADR-0003): a
+`reserved_address` exception covers a TCP socket bound directly on one of the
+configured reserved addresses, for `tailscaled`'s peerAPI. It is accepted only
+with protocol `tcp`, unit `tailscaled.service` and uid `0`; any other
+protocol, unit or uid is rejected when the exception is built, and a stored
+one fails closed as `LISTENER_EXCEPTIONS_UNREADABLE`. It names one port and
+optionally a family (`ipv4` or `ipv6`: a reserved-address bind is not
+dual-stack, so either may be named), covers only the configured reserved
+addresses (not one the name gained, and never a wildcard bind), allows one
+socket per address and port, and, like every exception, never the dashboard,
+upstream or proxy port. Its creator is verified on every check exactly like a
+wildcard exception's. The rationale is that the peerAPI is plain HTTP and the
+`__Host-session` cookie is `Secure`, so it is never sent there; that is an
+assumption about the installed `tailscaled` that `MANUAL_TEST.md` verifies,
+together with whether the peerAPI port changes across `tailscaled` restarts
+(a changed port is an unexpected listener on a reserved address, an
+exposure, until the Owner records the new one).
+
 Each check reads the socket inode from `/proc/net` (listener enumeration stays
 there) and asks the injected `socket_owners` for each verified socket's
 creator. In production that is `app.auth.sock_diag.SockDiagOwners`: the
@@ -459,9 +477,10 @@ exception covers `0.0.0.0` only, and an `ipv6`-only exception is rejected. The s
 by default, typed, bounded to 16 entries, and is never read from deployment
 configuration. An exception never matches the dashboard port, the loopback
 human listener port or a recorded proxy socket port (for either protocol, so
-UDP/443 is never exempt), and never matches a bind
+UDP/443 is never exempt), and a wildcard exception never matches a bind
 to a reserved address: `100.64.x.y:22` still closes access when `0.0.0.0:22`
-is allowed. The only runtime path that changes it is
+is allowed. Only a `reserved_address` exception (above) covers such a bind,
+and only `tailscaled.service`'s TCP on its recorded port. The only runtime path that changes it is
 `app.audit.integration.ReservationAdministration`, which authorizes the Owner,
 writes the set and a `change_security_setting` audit record in one SQLite
 transaction, then applies the set and re-checks immediately so narrowing it
