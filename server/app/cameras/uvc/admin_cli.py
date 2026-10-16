@@ -45,8 +45,9 @@ instead of being assumed stopped. Only a descriptor whose link text ends in
 the database's file name is ``stat``-ed (``_may_name_database``), so a hung
 FUSE/NFS descriptor of a differently named file cannot block the check; one
 of a same-named file on a hung mount still can (``stat`` is not bounded):
-the command then waits instead of refusing, ``Ctrl-C`` may not end it, and
-``Ctrl-\\`` or ``kill`` does (a transaction it ends is rolled back). Any other
+the command then waits instead of refusing until that mount answers or is
+recovered, and no signal is guaranteed to end it meanwhile: check that it
+exited before starting the service. Any other
 same-account process holding the database counts too, also another local
 admin command (``bootstrap_cli``, ``pairing_cli``, ``reservation_cli``, a
 second ``admin_cli``). Limits: run this inside the environment the service

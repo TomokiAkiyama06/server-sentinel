@@ -337,9 +337,10 @@ still running (`bootstrap_cli`, `pairing_cli`, `reservation_cli`, a second
 descriptor whose link names a file with the database's file name is
 `stat`-ed, so a descriptor of a differently named file on a hung FUSE/NFS
 mount cannot block the check. A same-named file on a hung mount still can
-(the `stat` is not bounded): the command then waits instead of refusing;
-`Ctrl-C` may not end it, `Ctrl-\` or `kill` does, and a transaction it ends
-is rolled back.
+(the `stat` is not bounded): the command then waits instead of refusing
+until that mount answers or is recovered, and no signal is guaranteed to end
+it meanwhile, so check that it has exited (recover the mount if needed)
+before starting the service.
 Run the command **inside the environment the service runs in** (the VM/LXD
 guest, Owner decision D2), never from its host or from another container:
 a VM has its own kernel, so the host's `/proc` shows no guest process at all;
