@@ -14,6 +14,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -549,6 +550,22 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(service.holds(token, session.session_id))
         with self.assertRaises(LiveFrameUnavailable):
             service.open(access, source, token, admit=_null)
+        # A non-waiting stop retires the executor; a later waiting stop
+        # drains it before returning.
+        service.start()
+        gate = threading.Event()
+        service._submit(gate.wait, 10)
+        service.open(access, source, token, admit=_null)
+        service.stop()
+        self.assertEqual(hub.status.viewers, 0)
+        releasing = threading.Thread(target=service.stop, kwargs={"wait": True})
+        releasing.start()
+        releasing.join(0.2)
+        self.assertTrue(releasing.is_alive())
+        gate.set()
+        releasing.join(10)
+        self.assertFalse(releasing.is_alive())
+        self.assertEqual(hub.status.viewers, 0)
         # A restart serves again, with nothing left over.
         service.start()
         self.addCleanup(service.stop, wait=True)

@@ -264,7 +264,8 @@ class LiveFrameService:
         """Refuse every later call and release every session's demand.
 
         The release runs as the executor's last job; ``wait=True`` waits for
-        it (tests, a synchronous embedder). Idempotent.
+        it (tests, a synchronous embedder, a replacement), also when an
+        earlier ``stop()`` without waiting retired the executor. Idempotent.
         """
         with self._lock:
             executor, self._executor = self._executor, None
@@ -273,7 +274,16 @@ class LiveFrameService:
             self._holders.clear()
             if executor is not None:
                 self._retired = executor
+                retired = None
+            else:
+                retired = self._retired if wait else None
+                if retired is not None:
+                    self._retired = None
         if executor is None:
+            if retired is not None:
+                # Drain the earlier stop's release (and any job queued
+                # before it) before reporting this service as released.
+                retired.shutdown(wait=True)
             return
         executor.submit(self._end_all)
         executor.shutdown(wait=wait)
