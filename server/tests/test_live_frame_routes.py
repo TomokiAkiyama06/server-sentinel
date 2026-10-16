@@ -86,6 +86,9 @@ class LiveRouteFixture(AdminRouteFixture):
                                                    name="Synthetic elsewhere", enabled=True,
                                                    desired_capture_profile=mjpg).id
         self.hub = LocalPreviewHub((*self.sources, self.disabled, self.yuyv))
+        # Capture started: each viewable camera reported ``online``.
+        for source_id in self.sources:
+            self.hub.on_health(health(source_id, "online"))
         self.monotonic = Monotonic()
         self.live = LiveFrameService(self.hub, self.store, monotonic=self.monotonic,
                                      limits=LiveFrameLimits(sweep_interval_seconds=0.02))
@@ -413,12 +416,16 @@ class LimitTests(LiveRouteFixture):
         # Fifteen seconds of watching at 4 fps: not one storage-admitted write.
         self.assertEqual(self.admission.admitted, writes)
         self.assertEqual(self.session_times(cookie), times)
-        self.tick(60)
-        self.ceremony_clock.advance(seconds=75)
-        self.assertEqual(status(await self.frame(cookie, session_id, 1000)), 204)
+        # Keep polling inside the 15 s lease until 60 s have passed since the
+        # open's own idle touch: exactly one extension in that time.
+        for index in range(4):
+            self.tick(14)
+            self.ceremony_clock.advance(seconds=14)
+            self.assertEqual(status(await self.frame(cookie, session_id, 1000)), 204)
         self.assertEqual(self.admission.admitted, writes + 1)
         self.assertNotEqual(self.session_times(cookie), times)
-        self.tick(1)
+        self.tick(14)
+        self.ceremony_clock.advance(seconds=14)
         self.assertEqual(status(await self.frame(cookie, session_id, 1000)), 204)
         self.assertEqual(self.admission.admitted, writes + 1)
 
@@ -564,6 +571,23 @@ class _Null:
 
 def _null():
     return _Null()
+
+
+class StartupHealthTests(LiveRouteFixture):
+    async def test_a_source_without_an_online_transition_is_never_reported_online(self):
+        # A capture startup that failed before its first transition: the
+        # durable row still says online, but nothing is captured.
+        hub = LocalPreviewHub(tuple(self.sources))
+        self.assertFalse(hub.accepting(self.sources[0]))
+        hub.on_frame(self.sources[0], frame(JPEG))
+        self.assertEqual(hub.status.retained_bytes, 0)
+        await self.stop_serving()
+        self.access.attach_live(LiveFrameService(hub, self.store, monotonic=self.monotonic))
+        self.hub, self.live = hub, self.access.live
+        await self.start_serving()
+        _, cookie, _ = await self.viewer()
+        listed = {item["id"]: item["health"] for item in payload(await self.sources_of(cookie))["sources"]}
+        self.assertEqual(set(listed.values()), {"offline"})
 
 
 class AttachTests(LiveRouteFixture):

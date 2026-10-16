@@ -52,9 +52,12 @@ class _PreviewSource:
         self.viewers: set[UUID] = set()
         self.latest: PreviewFrame | None = None
         self.sequence = 0
-        # Cleared by any non-online camera transition: a retained frame from
-        # before a disconnect or capture failure is never served as live.
-        self.live = True
+        # Set only by an explicit ``online`` camera transition and cleared by
+        # any other one: a source whose capture never started (or failed
+        # before its first transition) accepts no frame and is never reported
+        # as live, and a retained frame from before a disconnect or capture
+        # failure is never served as live.
+        self.live = False
 
     def add_viewer(self, subscriber_id: UUID) -> None:
         with self._hub._lock:

@@ -36,7 +36,9 @@ that source has viewer demand, so zero subscribers retain nothing.
 listener (`on_camera_state`): any non-`online` transition (disconnect, capture
 failure, frame stall, manual intervention) drops the retained frame and
 refuses new frames until the camera is `online` again, so a pre-loss image is
-never served as current live video. It runs in transition order with the
+never served as current live video. A source also starts non-live: it accepts no frame and
+is never reported as live until its first `online` transition, so a capture
+startup that failed before any transition never looks healthy. It runs in transition order with the
 runtime's in-memory health record, not behind the optional downstream health
 sink, so a slow or hung sink cannot delay the invalidation.
 `LocalPreviewHub.clear()` runs when capture stops and permanently marks every
