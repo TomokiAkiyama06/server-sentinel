@@ -412,6 +412,13 @@ class VariableSegmentSizeTests(unittest.TestCase):
                 (recent_of(sizes, unit), recent_of(mirrored, unit), [1, 0])):
             current, correlated = charges(first, second, counts=counts)
             self.assertEqual(correlated, current)
+        # 60 s and 61 s segments whose latest ends coincide overlap through
+        # all sixteen samples, but another cadence is not one synchronized
+        # batch: the perfectly correlated bound is charged (Codex review of
+        # PR #272).
+        drifting = (recent_of(sizes * 2, unit), recent_of(mirrored * 2, unit, cadence=61 * SECOND))
+        current, correlated = charges(*drifting)
+        self.assertEqual((correlated, 76 * unit), (current, correlated))
         # A phase offset within one cadence still aligns the past batches.
         self.assertEqual(60 * unit, charges(recent_of(sizes, unit),
                                             recent_of(mirrored, unit, offset=-30 * SECOND))[0])
@@ -443,6 +450,13 @@ class VariableSegmentSizeTests(unittest.TestCase):
             correlated = DiskRing._batch_charge(appends, unit)
         self.assertEqual(correlated, DiskRing._batch_charge(appends, unit))
         self.assertGreater(correlated, 60 * unit)
+        # A clock-uncertain row ends the history too: its timestamps are not
+        # comparable with the other source's (Codex review of PR #272).
+        rows = ring.db.execute("SELECT id FROM segments WHERE source=? ORDER BY end DESC",
+                               (str(profiles[0].source_id),)).fetchall()
+        ring.db.execute("UPDATE segments SET clock_trusted=0 WHERE id=?", (rows[1][0],))
+        recent = ring._recent_allocations(store.segment_allocations(), unit)
+        self.assertEqual([1, 3], [len(recent[profile.source_id][4]) for profile in profiles])
         # Without the gap the same history is measured: 60 units.
         whole = [(1, recent_of([size * unit for size in units[:12]], unit)),
                  (1, recent_of([(60 - size) * unit for size in units[:12]], unit))]

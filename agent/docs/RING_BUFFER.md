@@ -199,10 +199,10 @@ therefore predicts refusal by simulating the sources' next appends.
   ratios.
 - **Measured charge for synchronized sources** (Issue #130). When at least
   two sources append through `t` and their batch histories align (the `j`-th
-  most recent segments of those sources overlap in time, for at least ten
-  consecutive `j` from the most recent; another cadence, or a gap in any of
-  those sources' stored segments, even one every source shares, ends the
-  alignment), their past batch totals `T_j = sum(n_s * a_s,j)` are measured
+  most recent segments of those sources overlap in time and have one
+  duration, for at least ten consecutive `j` from the most recent; another
+  cadence, a clock-uncertain segment, or a gap in any of those sources'
+  stored segments, even one every source shares, ends the alignment), their past batch totals `T_j = sum(n_s * a_s,j)` are measured
   directly, and
   `C(t) = min(sum(n_s * c_s), round_up(ceil(mean(T)) + ceil(2 * sqrt(var(T) * (1 + 1/k) * (k - 1) / (k - 3)))))`
   over the `k <= 16` aligned totals: a prediction bound for one further
