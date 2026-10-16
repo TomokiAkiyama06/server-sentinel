@@ -1362,8 +1362,10 @@ and `UNAVAILABLE` the local-only `recording_health_warning`. Human-access faults
 failing `HostnameReservationCheck` or human-access composition is
 `human_access_fault` on entering the fault and on a reason not yet reported in
 the episode, a passing check while serving is `human_access_recovered`, and a
-committed credential finding is `credential_finding` (coalesced to one per
-hour, outside the access budget); at most four `human_access_fault` /
+committed credential finding is `credential_finding`, one immediate
+notification per finding up to four per rolling hour, the ones over that cap
+batched into one notification once the hour allows (its own budget, outside
+the access budget; Owner decision 2026-10-16); at most four `human_access_fault` /
 `human_access_recovered` notifications per rolling hour, with a held-back
 episode reported later. They set `human_access_degraded` /
 `credential_finding_degraded` (the latter for one day after the latest

@@ -672,8 +672,16 @@ class MonitoringRuntime:
                 values,
             ).fetchone()
         except sqlite3.OperationalError:
-            # No audit table in this database: nothing was ever recorded.
-            return None
+            # Only a missing audit table means nothing was ever recorded. Any
+            # other error (disk I/O, a locked database) re-raises, so the
+            # recovery is retried on the next tick instead of being read as
+            # "no finding" and marked done (PR #271 review).
+            exists = self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='security_admin_audit_records'").fetchone()
+            if exists is None:
+                return None
+            raise
         return None if row is None else (str(row[0]), int(row[1]))
 
     @staticmethod

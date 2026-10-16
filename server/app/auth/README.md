@@ -952,7 +952,10 @@ and on recovery, never on every failing check; a fault that ended between two
 ticks is still reported, at most four access notifications go out per rolling
 hour, and an episode the budget held back is reported once it allows.
 Credential findings do not share that budget, so access flapping cannot hold
-one back; they are coalesced to at most one notification per hour, and
+one back. Each finding notifies immediately with its own notification, up to
+four per rolling hour; only the ones over that cap are batched into one
+notification sent once the hour allows (Owner decision 2026-10-16, PR #271
+提案4), and
 `credential_finding_degraded` stays set for a day after the latest one (a
 finding has no recovery to observe). No hostname, address, route, identity,
 principal, credential or reason leaves the process; details stay in the audit

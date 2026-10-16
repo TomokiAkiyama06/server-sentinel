@@ -251,21 +251,57 @@ class AccessBudgetTests(MonitoredAccessFixture):
 
 
 class CredentialFindingTests(MonitoredAccessFixture):
-    async def test_findings_are_coalesced_and_hold_degraded(self):
+    async def test_each_finding_notifies_immediately(self):
+        """Owner decision 2026-10-16 (提案4): one notification per finding."""
         principal = uuid4()
         for _ in range(3):
             self.monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, principal)
         self.assertTrue(self.drain().credential_finding_degraded)
-        self.assertEqual(self.notifications.kinds, [FINDING])
+        self.assertEqual(self.notifications.kinds, [FINDING] * 3)
+        self.assertEqual(len({call["event_id"] for call in self.notifications.calls}), 3)
         self.assertNotIn(str(principal), repr(vars(self.monitor)))
         self.monitor.credential_finding(CredentialFinding.BACKUP_ELIGIBILITY_CHANGED, uuid4())
-        self.assertTrue(self.drain(60).credential_finding_degraded)
-        self.assertEqual(self.notifications.kinds, [FINDING])
-        self.drain(3600)
-        self.assertEqual(self.notifications.kinds, [FINDING, FINDING])
+        self.drain(60)
+        self.assertEqual(self.notifications.kinds, [FINDING] * 4)
         self.assertTrue(self.drain(3600).credential_finding_degraded)
         self.assertFalse(self.drain(24 * 3600).credential_finding_degraded)
-        self.assertEqual(self.notifications.kinds, [FINDING, FINDING])
+        self.assertEqual(self.notifications.kinds, [FINDING] * 4)
+
+    async def test_only_findings_over_the_cap_are_batched(self):
+        for _ in range(6):
+            self.monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, uuid4())
+        self.drain()
+        self.assertEqual(self.notifications.kinds, [FINDING] * 4)
+        # Two over the cap: held, still degraded, more arrivals join them.
+        self.monitor.credential_finding(CredentialFinding.BACKUP_ELIGIBILITY_CHANGED, uuid4())
+        self.assertTrue(self.drain(60).credential_finding_degraded)
+        self.assertEqual(self.notifications.kinds, [FINDING] * 4)
+        # Once the rolling hour allows: one batched notification for all three.
+        self.drain(3600)
+        self.assertEqual(self.notifications.kinds, [FINDING] * 5)
+        # Afterwards a new finding is immediate again.
+        self.monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, uuid4())
+        self.drain(60)
+        self.assertEqual(self.notifications.kinds, [FINDING] * 6)
+
+    async def test_finding_and_access_budgets_are_separate(self):
+        for _ in range(2):
+            self.fail_check()
+            self.drain(1)
+            self.recover_check()
+            self.drain(1)
+        self.assertEqual(self.notifications.kinds, [FAULT, RECOVERED] * 2)
+        # The access budget is spent; a finding still goes out at once.
+        self.monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, uuid4())
+        self.drain(1)
+        self.assertEqual(self.notifications.kinds[-1], FINDING)
+        # And spent finding budget never holds an access fault back.
+        for _ in range(4):
+            self.monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, uuid4())
+        self.drain(3600)
+        self.fail_check()
+        self.drain(1)
+        self.assertEqual(self.notifications.kinds[-1], FAULT)
 
     async def test_a_real_ceremony_finding_reaches_the_monitor(self):
         _, authenticator, _ = self.enroll()
@@ -403,7 +439,8 @@ class CompositionTests(MonitoredAccessFixture):
 class MonitorValidationTests(TestCase):
     def test_settings_and_inputs_are_validated(self):
         for options in ({"access_budget": 0}, {"access_budget": True}, {"access_budget": 2000},
-                        {"finding_interval_seconds": 0}, {"finding_hold_seconds": float("nan")}):
+                        {"finding_budget": 0}, {"finding_budget": 1.5},
+                        {"finding_hold_seconds": float("nan")}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 AccessFaultMonitor(**options)
         monitor = AccessFaultMonitor()
@@ -468,6 +505,22 @@ class MonitorValidationTests(TestCase):
         self.assertEqual({call["at"] for call in notifications.calls}, {AT})
         # Refusals spent no budget: the accepted send was the first counted one.
         self.assertEqual(len(monitor._sent), 1)
+
+    def test_a_reused_cursor_is_not_given_to_a_second_notification(self):
+        """PR #271 review: a drain between a finding's audit commit and its
+        sink call names an earlier notification after it; the later one gets
+        its own ID instead of being coalesced into the delivered event."""
+        monitor = AccessFaultMonitor()
+        notifications = RecordingNotifications()
+        cursor = uuid4()
+        for step in range(2):
+            monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, uuid4())
+            monitor.drain(notifications, at=AT, monotonic=1.0 + step,
+                          finding_event_id=lambda: cursor)
+        ids = [call["event_id"] for call in notifications.calls]
+        self.assertEqual(notifications.kinds, [FINDING, FINDING])
+        self.assertEqual(ids[0], cursor)
+        self.assertNotEqual(ids[1], cursor)
 
     def test_without_a_composition_an_emitted_fault_still_notifies(self):
         monitor = AccessFaultMonitor()
@@ -723,6 +776,46 @@ class FindingRecoveryTests(RuntimeFixture):
         self.clock.advance(timedelta(minutes=5))
         await self.cycle()
         self.assertEqual(self.finding_texts(), 2)
+
+    async def test_a_transient_database_error_retries_the_recovery(self):
+        """PR #271 review (重要1): only a missing audit table means "no
+        finding"; a disk I/O or lock error is retried on the next tick."""
+
+        class Flaky:
+            def __init__(self, connection):
+                self.connection, self.failures = connection, 1
+
+            def execute(self, sql, *values):
+                if self.failures and "security_admin_audit_records" in sql:
+                    self.failures -= 1
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self.connection.execute(sql, *values)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+        await self.cycle()
+        self.audit_finding(self.clock.now - timedelta(minutes=10))
+        monitor = AccessFaultMonitor()
+        application = self.application_with(monitor)
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            real = runtime._connection
+            runtime._connection = Flaky(real)
+            try:
+                await runtime.call(runtime.tick)
+                await self.settle(runtime)
+                self.assertEqual(self.finding_texts(), 0)
+                self.assertFalse(runtime._findings_recovered)
+                self.clock.advance(timedelta(minutes=1))
+                await runtime.call(runtime.tick)
+                await self.settle(runtime)
+            finally:
+                runtime._connection = real
+            self.assertEqual(self.finding_texts(), 1)
+            self.assertTrue(runtime.status.credential_finding_degraded)
 
     async def test_a_live_notification_is_not_repeated_after_restart(self):
         monitor = AccessFaultMonitor()

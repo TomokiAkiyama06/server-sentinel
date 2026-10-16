@@ -67,7 +67,9 @@ takes the `AccessFaultMonitor` the composition root also passes to the
 `HostnameReservationCheck` (`sink=`) and `PasskeyCeremonies` (`findings=`).
 Every tick, also while the runtime is `failed` (Slack still receives the
 alert), drains it: transitions become the immediate `human_access_fault` /
-`human_access_recovered` and coalesced `credential_finding` notifications, and
+`human_access_recovered` and the `credential_finding` notifications (one
+immediate notification per finding, up to four per rolling hour, the ones over
+that cap batched; a budget separate from the access one), and
 `MonitoringStatus.human_access_degraded` / `credential_finding_degraded`
 follow it; both count as degraded in the daily summary. Once per process,
 the first running tick recovers a credential finding whose notification was

@@ -35,8 +35,11 @@ fault that started and ended between two drains is still reported (the
 emitted fault is latched). At most ``access_budget`` access notifications go
 out per rolling hour; past that the latest state is sent once the budget
 allows, and a fault episode that ended unreported is reported first.
-Credential findings are coalesced: the first goes out at once, later ones at
-most once per ``finding_interval_seconds`` as one notification. A finding has
+Credential findings (Owner decision 2026-10-16, PR #271 提案4) notify
+immediately, one notification each, up to ``finding_budget`` per rolling
+hour; only the ones over that cap are batched into one notification sent
+once the budget allows. The finding budget is separate from the access
+budget, so neither can hold the other back. A finding has
 no recovery to observe, so ``credential_finding_degraded`` stays set for
 ``finding_hold_seconds`` (default one day) after the latest one.
 """
@@ -71,7 +74,7 @@ if TYPE_CHECKING:
 ACCESS_EVENT_NAMESPACE = UUID("8d3c2f1e-5b7a-5c49-9e10-4a6b2d8c7f35")
 HOUR_SECONDS = 3600.0
 DEFAULT_ACCESS_BUDGET = 4
-DEFAULT_FINDING_INTERVAL_SECONDS = HOUR_SECONDS
+DEFAULT_FINDING_BUDGET = 4
 DEFAULT_FINDING_HOLD_SECONDS = 24 * HOUR_SECONDS
 _MAX_COUNT = 2**31
 
@@ -99,13 +102,13 @@ class AccessFaultMonitor:
     """``FaultSink`` + ``CredentialFindingSink`` feeding the monitoring runtime."""
 
     def __init__(self, *, access_budget: int = DEFAULT_ACCESS_BUDGET,
-                 finding_interval_seconds: float = DEFAULT_FINDING_INTERVAL_SECONDS,
+                 finding_budget: int = DEFAULT_FINDING_BUDGET,
                  finding_hold_seconds: float = DEFAULT_FINDING_HOLD_SECONDS):
-        if (not _positive(access_budget, integer=True) or not _positive(finding_interval_seconds)
+        if (not _positive(access_budget, integer=True) or not _positive(finding_budget, integer=True)
                 or not _positive(finding_hold_seconds)):
             raise ValueError("invalid access fault monitor setting")
         self.access_budget = access_budget
-        self.finding_interval = float(finding_interval_seconds)
+        self.finding_budget = finding_budget
         self.finding_hold = float(finding_hold_seconds)
         self._lock = threading.Lock()
         self._nonce = uuid4()
@@ -130,7 +133,19 @@ class AccessFaultMonitor:
         # with the same time and event ID until accepted (Codex PR #271).
         self._attempts: dict[NotificationKind, tuple[datetime, UUID]] = {}
         self._findings_pending = 0
-        self._finding_sent_at: float | None = None
+        # Monotonic times of finding notifications in the rolling hour.
+        self._finding_sent: deque[float] = deque()
+        # Set once a finding exceeded the cap: the pending ones then go out
+        # as one batched notification when the budget allows.
+        self._findings_batched = False
+        # A finding the restart recovery found unnotified (counted at drain,
+        # unless that drain already has a live arrival for it).
+        self._recovered_finding = False
+        # The cursor event ID of the last accepted finding notification: a
+        # drain that runs after a finding's audit commit but before its sink
+        # call names an earlier finding's notification after it, so the
+        # later notification must not reuse that ID (PR #271 review).
+        self._last_cursor: UUID | None = None
         self._finding_seen_at: float | None = None
 
     # -- composition -------------------------------------------------------
@@ -193,7 +208,7 @@ class AccessFaultMonitor:
                 or type(monotonic) not in (int, float) or type(notify) is not bool):
             raise ValueError("invalid recovered finding")
         if notify:
-            self._findings_pending = min(self._findings_pending + 1, _MAX_COUNT)
+            self._recovered_finding = True
         if math.isfinite(monotonic):
             seen = monotonic - max(0.0, float(age_seconds))
             if self._finding_seen_at is None or seen > self._finding_seen_at:
@@ -278,12 +293,16 @@ class AccessFaultMonitor:
         return uuid5(ACCESS_EVENT_NAMESPACE, f"access:{self._nonce}:{self._sequence}:{kind.value}")
 
     def _budget_available(self, now: float) -> bool:
+        return self._window_open(self._sent, self.access_budget, now)
+
+    @staticmethod
+    def _window_open(sent: deque, budget: int, now: float) -> bool:
         if not math.isfinite(now):
             return True
-        while self._sent and not (self._sent[0] <= now < self._sent[0] + HOUR_SECONDS):
+        while sent and not (sent[0] <= now < sent[0] + HOUR_SECONDS):
             # Expired, or a backwards clock: never postpone indefinitely.
-            self._sent.popleft()
-        return len(self._sent) < self.access_budget
+            sent.popleft()
+        return len(sent) < budget
 
     def _notify(self, notifications: NotificationService, kind: NotificationKind,
                 at: datetime, event_id: UUID | None = None) -> bool:
@@ -326,6 +345,11 @@ class AccessFaultMonitor:
             self._findings_pending = min(self._findings_pending + arrivals, _MAX_COUNT)
             if math.isfinite(monotonic):
                 self._finding_seen_at = monotonic
+        elif self._recovered_finding:
+            # The newest audited finding, unnotified before a restart; a live
+            # arrival in the same drain is most likely that same finding.
+            self._findings_pending = min(self._findings_pending + 1, _MAX_COUNT)
+        self._recovered_finding = False
         polled = self._polled()
         if latched or polled is AccessHealth.FAULT:
             if self._current is not AccessHealth.FAULT:
@@ -377,22 +401,39 @@ class AccessFaultMonitor:
             self._sent.append(now)
 
     def _finding_notifications(self, notifications, at, now, finding_event_id=None) -> None:
-        if not self._findings_pending:
-            return
-        last = self._finding_sent_at
-        if (last is None or not math.isfinite(now) or now < last
-                or now - last >= self.finding_interval):
+        """One immediate notification per finding up to the hourly cap.
+
+        Past the cap the pending findings are batched into one notification,
+        sent as soon as the rolling hour allows. The last notification of a
+        drain, which covers the newest finding, is named by
+        ``finding_event_id()`` (the restart recovery's durable cursor); the
+        others get per-process IDs, so no two sends share one event.
+        """
+        while self._findings_pending:
+            if not self._window_open(self._finding_sent, self.finding_budget, now):
+                self._findings_batched = True
+                return
+            batch = self._findings_batched
+            newest = batch or self._findings_pending == 1
             event_id = None
-            if finding_event_id is not None:
+            if newest and finding_event_id is not None:
                 try:
                     event_id = finding_event_id()
                 except Exception:
                     event_id = None
-            if not self._notify(notifications, NotificationKind.CREDENTIAL_FINDING, at,
-                                event_id if isinstance(event_id, UUID) else None):
+            if not isinstance(event_id, UUID) or event_id == self._last_cursor:
+                event_id = None
+            if not self._notify(notifications, NotificationKind.CREDENTIAL_FINDING, at, event_id):
                 return
-            self._finding_sent_at = now if math.isfinite(now) else None
-            self._findings_pending = 0
+            if event_id is not None:
+                self._last_cursor = event_id
+            if math.isfinite(now):
+                self._finding_sent.append(now)
+            if batch:
+                self._findings_pending = 0
+                self._findings_batched = False
+            else:
+                self._findings_pending -= 1
 
     def _finding_degraded(self, now: float) -> bool:
         seen = self._finding_seen_at
