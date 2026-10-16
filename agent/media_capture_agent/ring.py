@@ -383,10 +383,11 @@ class DiskRing:
         append on a filesystem whose 512-byte block counts are not whole
         ``f_frsize`` units); the credit is the unrounded smallest sample.
         ``samples`` are the source's last ``BATCH_HISTORY_SEGMENTS`` stored
-        allocations, most recent first, as ``(start, end, allocation)``, each
-        rounded up to whole units and never above the bound (empty with
-        ``at_bound``), from which ``_measured_charge`` charges synchronized
-        sources.
+        allocations back to its most recent gap (a stored segment ending
+        before the next one starts), most recent first, as ``(start, end,
+        allocation)``, each rounded up to whole units and never above the
+        bound (empty with ``at_bound``), from which ``_measured_charge``
+        charges synchronized sources.
         """
         recent = {}
         for source, profile in self.profiles.items():
@@ -395,8 +396,15 @@ class DiskRing:
                                         for row in self.db.execute(
                 "SELECT id, start, end FROM segments WHERE source=? AND state='stored' ORDER BY end DESC LIMIT ?",
                 (str(source), max(RECENT_ALLOCATION_SEGMENTS, BATCH_HISTORY_SEGMENTS)))]
-            # The rounded samples of the longer batch history, never above the bound.
-            samples = tuple((start, end, min(bound, round_up(size, unit))) for start, end, size in rows)
+            # The rounded samples of the longer batch history, never above the
+            # bound, up to the source's first gap: stored rows on both sides of
+            # an interval every source missed would otherwise still align.
+            samples = []
+            for start, end, size in rows:
+                if samples and end < samples[-1][0]:
+                    break
+                samples.append((start, end, min(bound, round_up(size, unit))))
+            samples = tuple(samples)
             sizes = [size for _start, _end, size in rows[:RECENT_ALLOCATION_SEGMENTS]]
             if not sizes:
                 recent[source] = (Fraction(bound), Fraction(0), bound, bound, ())

@@ -416,6 +416,38 @@ class VariableSegmentSizeTests(unittest.TestCase):
         self.assertEqual(60 * unit, charges(recent_of(sizes, unit),
                                             recent_of(mirrored, unit, offset=-30 * SECOND))[0])
 
+    def test_measured_history_stops_at_a_gap_every_source_shares(self):
+        # Twelve stored minutes of offsetting sizes, but the minute four
+        # steps back is missing for both sources (every write refused): the
+        # stored rows on both sides of it still align by position, yet only
+        # three consecutive batches follow the gap, so the perfectly
+        # correlated bound is charged, not the measured 60 units (Codex
+        # review of PR #272).
+        _settings, _quota, store, ring = self.ring()
+        unit = store.allocation_unit
+        profiles = tuple(SegmentProfile(UUID(int=1430 + index), 34000, 17000, 60 * SECOND, 100)
+                         for index in range(2))
+        ring.configure(RingConfig("duration", 900), profiles, now_us=T0, clock_trusted=True)
+        units = [30, 34, 26, 38, 22, 32, 28, 36, 24, 30, 33, 27, 31]
+        for index in reversed(range(len(units))):
+            if index == 3:
+                continue  # The shared gap.
+            end = T0 - index * 60 * SECOND
+            for profile, size in zip(profiles, (units[index], 60 - units[index])):
+                ring.append(profile.source_id, end - 60 * SECOND, end, b"\x5a" * (size * unit),
+                            now_us=end, clock_trusted=True)
+        recent = ring._recent_allocations(store.segment_allocations(), unit)
+        appends = [(1, recent[profile.source_id]) for profile in profiles]
+        self.assertEqual([3, 3], [len(recent[profile.source_id][4]) for profile in profiles])
+        with correlated_charge():
+            correlated = DiskRing._batch_charge(appends, unit)
+        self.assertEqual(correlated, DiskRing._batch_charge(appends, unit))
+        self.assertGreater(correlated, 60 * unit)
+        # Without the gap the same history is measured: 60 units.
+        whole = [(1, recent_of([size * unit for size in units[:12]], unit)),
+                 (1, recent_of([(60 - size) * unit for size in units[:12]], unit))]
+        self.assertEqual(60 * unit, DiskRing._batch_charge(whole, unit))
+
     def test_measured_batch_charge_is_whole_units_and_never_below_its_prediction_bound(self):
         unit = 4096
         generator = random.Random(1301)
