@@ -961,10 +961,12 @@ recovery can be observed. It also refuses a monitor without a storage-configured
 monitoring runtime, the only thing that drains it, and a composition whose
 check or ceremonies report to a monitor the runtime was not given (Codex
 PR #271). A finding is committed with its audit record but latched only in
-memory until the next tick; after a restart the runtime's first running tick
-looks for a finding audit record later than the last `credential_finding`
-notification (at most seven days back) and, if one exists, sends one
-notification and restores the one-day hold from the finding's time. A
+memory until the next tick. Every `credential_finding` notification is named
+after the newest finding audit record it covers (its audit rowid, a durable
+cursor that does not depend on the wall clock), so after a restart the
+runtime's first running tick checks whether the newest finding (at most seven
+days old) has its notification row and, if not, sends one notification and
+restores the one-day hold from the finding's time. A
 reservation fault needs no such recovery: the startup check re-detects it. Verified with synthetic checks, software
 authenticators and an intercepted Slack transport only
 (`server/tests/test_access_fault_notifications.py`).

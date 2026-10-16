@@ -555,6 +555,36 @@ class FindingRecoveryTests(RuntimeFixture):
         await self.cycle()
         self.assertEqual(self.finding_texts(), 1)
 
+    async def test_a_clock_rollback_does_not_hide_a_later_finding(self):
+        """Codex PR #271: recovery compares the audit rowid, not wall times."""
+        await self.cycle()
+        self.audit_finding(self.clock.now - timedelta(hours=1))
+        await self.cycle()
+        self.assertEqual(self.finding_texts(), 1)
+        # Committed later, but stamped earlier than the notification (the
+        # wall clock moved back), and the process stopped before notifying.
+        self.audit_finding(self.clock.now - timedelta(hours=3))
+        self.clock.advance(timedelta(minutes=5))
+        status = await self.cycle()
+        self.assertEqual(self.finding_texts(), 2)
+        self.assertTrue(status.credential_finding_degraded)
+
+    async def test_a_live_notification_is_not_repeated_after_restart(self):
+        monitor = AccessFaultMonitor()
+        application = self.application_with(monitor)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await runtime.call(runtime.tick)
+            self.audit_finding(self.clock.now)
+            monitor.credential_finding(CredentialFinding.BACKUP_ELIGIBILITY_CHANGED, uuid4())
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+        self.assertEqual(self.finding_texts(), 1)
+        self.clock.advance(timedelta(minutes=5))
+        await self.cycle()
+        self.assertEqual(self.finding_texts(), 1)
+
     async def test_an_old_finding_is_notified_but_not_held_degraded(self):
         await self.cycle()
         self.audit_finding(self.clock.now - timedelta(days=2),

@@ -644,7 +644,8 @@ class MonitoringRuntime:
                 self._findings_recovered = True
         try:
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
-                                   monotonic=self.dependencies.monotonic())
+                                   monotonic=self.dependencies.monotonic(),
+                                   finding_event_id=self._finding_event_id)
         except Exception:
             self._set(human_access_degraded=True)
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
@@ -652,40 +653,63 @@ class MonitoringRuntime:
         self._set(human_access_degraded=status.human_access_degraded,
                   credential_finding_degraded=status.credential_finding_degraded)
 
+    def _latest_finding(self, *, since: datetime | None = None) -> tuple[int, int] | None:
+        """``(rowid, occurred_at_us)`` of the newest finding audit record.
+
+        The audit table's rowid only grows while its newest row exists
+        (retention removes the oldest), so it orders findings without
+        trusting the wall clock (Codex PR #271). ``None`` without a finding
+        or without an audit table.
+        """
+        marks = ",".join("?" for _ in FINDING_AUDIT_ACTIONS)
+        bound, values = "", tuple(action.value for action in FINDING_AUDIT_ACTIONS)
+        if since is not None:
+            epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            bound = " AND occurred_at_us > ?"
+            values += ((since - epoch) // timedelta(microseconds=1),)
+        try:
+            row = self._connection.execute(
+                "SELECT rowid, occurred_at_us FROM security_admin_audit_records "
+                f"WHERE action IN ({marks}){bound} ORDER BY rowid DESC LIMIT 1",
+                values,
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # No audit table in this database: nothing was ever recorded.
+            return None
+        return None if row is None else (int(row[0]), int(row[1]))
+
+    @staticmethod
+    def _finding_event(rowid: int) -> UUID:
+        """The event ID of a notification covering findings through ``rowid``."""
+        return uuid5(EVENT_NAMESPACE, f"credential-finding-through:{rowid}")
+
+    def _finding_event_id(self) -> UUID | None:
+        """Live path: name the notification by the newest finding it covers."""
+        if self._connection is None or self.status.state != RuntimeState.RUNNING:
+            return None
+        latest = self._latest_finding()
+        return None if latest is None else self._finding_event(latest[0])
+
     def _recover_findings(self, monitor: AccessFaultMonitor) -> None:
         """Re-arm a finding notification lost to a restart (Codex PR #271).
 
         The finding commits with its audit record; its notification was only
-        latched in memory until the next tick. A finding record later than
-        the last ``credential_finding`` notification row (within
-        ``FINDING_RECOVERY_LOOKBACK``) was therefore not notified: the
-        monitor sends one coalesced notification and restores the hold from
-        the finding's age. Only the action and time are read, never the
+        latched in memory until the next tick. Every ``credential_finding``
+        notification is named after the newest finding audit record it
+        covers (``_finding_event``), so the newest finding (within
+        ``FINDING_RECOVERY_LOOKBACK``) was notified exactly when that event
+        row exists. This compares the audit rowid, never wall-clock times,
+        so a clock rollback cannot hide a finding. Otherwise the monitor
+        sends one coalesced notification and restores the hold from the
+        finding's age. Only the action, time and rowid are read, never the
         principal.
         """
         now = self.dependencies.utcnow()
-        since = now - FINDING_RECOVERY_LOOKBACK
-        last = self._connection.execute(
-            "SELECT MAX(at) FROM notification_events WHERE kind=?",
-            (NotificationKind.CREDENTIAL_FINDING.value,),
-        ).fetchone()[0]
-        if last is not None:
-            since = max(since, datetime.fromisoformat(last))
+        latest = self._latest_finding(since=now - FINDING_RECOVERY_LOOKBACK)
+        if latest is None or self.notification_events.get(self._finding_event(latest[0])) is not None:
+            return
         epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-        threshold = (since - epoch) // timedelta(microseconds=1)
-        marks = ",".join("?" for _ in FINDING_AUDIT_ACTIONS)
-        try:
-            latest = self._connection.execute(
-                "SELECT MAX(occurred_at_us) FROM security_admin_audit_records "
-                f"WHERE occurred_at_us > ? AND action IN ({marks})",
-                (threshold, *(action.value for action in FINDING_AUDIT_ACTIONS)),
-            ).fetchone()[0]
-        except sqlite3.OperationalError:
-            # No audit table in this database: nothing was ever recorded.
-            return
-        if latest is None:
-            return
-        age = (now - (epoch + timedelta(microseconds=int(latest)))).total_seconds()
+        age = (now - (epoch + timedelta(microseconds=latest[1]))).total_seconds()
         monitor.recover_finding(age_seconds=age, monotonic=self.dependencies.monotonic())
 
     def _poll(self) -> None:

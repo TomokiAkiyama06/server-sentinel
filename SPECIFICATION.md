@@ -1368,8 +1368,10 @@ episode reported later. They set `human_access_degraded` /
 `credential_finding_degraded` (the latter for one day after the latest
 finding) and carry only the fixed kind. A finding committed before a restart
 whose notification had not been sent yet is recovered on the first running
-monitoring tick from its audit record (later than the last
-`credential_finding` notification row, seven-day lookback). Without an actual
+monitoring tick from its audit record: each `credential_finding` event ID
+names the newest finding audit rowid it covers, and a newest finding (seven-day
+lookback) without that event row is notified once (rowid order, not wall-clock
+order). Without an actual
 capture-pipeline adapter the self-test is an explicit `UNAVAILABLE`, not
 healthy. Independently of that adapter, the runtime re-verifies the declared
 recording filesystem (UUID → device, major/minor, mounted mount point, pinned

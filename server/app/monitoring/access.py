@@ -229,8 +229,14 @@ class AccessFaultMonitor:
         notifications.record(kind, at=at, event_id=self._event_id(kind))
 
     def drain(self, notifications: NotificationService, *, at: datetime,
-              monotonic: float) -> AccessFaultStatus:
-        """Apply latched events and the polled state; notify transitions."""
+              monotonic: float, finding_event_id=None) -> AccessFaultStatus:
+        """Apply latched events and the polled state; notify transitions.
+
+        ``finding_event_id()``, when given, names a ``credential_finding``
+        notification after the newest finding audit record it covers, the
+        durable cursor the runtime's restart recovery compares (Codex PR
+        #271); a failure or ``None`` falls back to a per-process ID.
+        """
         with self._lock:
             latched, reasons = self._latched, self._latched_reasons
             self._latched, self._latched_reasons = False, frozenset()
@@ -255,7 +261,7 @@ class AccessFaultMonitor:
         elif polled is AccessHealth.HEALTHY:
             self._current = AccessHealth.HEALTHY
         self._access_notifications(notifications, at, monotonic)
-        self._finding_notifications(notifications, at, monotonic)
+        self._finding_notifications(notifications, at, monotonic, finding_event_id)
         return AccessFaultStatus(
             human_access_degraded=self._current is AccessHealth.FAULT,
             credential_finding_degraded=self._finding_degraded(monotonic),
@@ -287,13 +293,21 @@ class AccessFaultMonitor:
         if math.isfinite(now):
             self._sent.append(now)
 
-    def _finding_notifications(self, notifications, at, now) -> None:
+    def _finding_notifications(self, notifications, at, now, finding_event_id=None) -> None:
         if not self._findings_pending:
             return
         last = self._finding_sent_at
         if (last is None or not math.isfinite(now) or now < last
                 or now - last >= self.finding_interval):
-            self._notify(notifications, NotificationKind.CREDENTIAL_FINDING, at)
+            event_id = None
+            if finding_event_id is not None:
+                try:
+                    event_id = finding_event_id()
+                except Exception:
+                    event_id = None
+            kind = NotificationKind.CREDENTIAL_FINDING
+            notifications.record(kind, at=at, event_id=event_id if isinstance(event_id, UUID)
+                                 else self._event_id(kind))
             self._finding_sent_at = now if math.isfinite(now) else None
             self._findings_pending = 0
 
