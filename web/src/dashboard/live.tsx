@@ -17,11 +17,14 @@ import type { Catalog } from '../i18n';
 import { documentVisibility, startLiveLoop, type LiveStatus, type LiveTransport } from './live_loop';
 
 type Sources = { state: 'loading' | 'failed' } | { state: 'ready'; items: readonly LiveSource[] };
+/** A player waits this long before opening, so tapping through sources (or
+ *  Reconnect) quickly opens only for the one finally shown. */
+export const START_DELAY_MS = 300;
 
 export function liveTransport(services: DashboardServices): LiveTransport | null {
-  const { openLiveSession: open, readLiveFrame: read, closeLiveSession: close } = services;
+  const { openLiveSession: open, readLiveFrame: read, closeLiveSession: close, liveClosedRecently } = services;
   if (!open || !read || !close) return null;
-  return { open, read, close };
+  return { open, read, close, closedRecently: () => liveClosedRecently?.() ?? false };
 }
 
 export function LiveScreen({ services, t }: { services: DashboardServices; t: Catalog }) {
@@ -88,7 +91,7 @@ function LivePlayer({ transport, source, t }: { transport: LiveTransport; source
       setShown(false);
     };
     const stop = startLiveLoop({
-      transport, sourceId: source.id, visibility: documentVisibility(),
+      transport, sourceId: source.id, visibility: documentVisibility(), startDelayMs: START_DELAY_MS,
       async onFrame(frame, current) {
         const bitmap = await createImageBitmap(frame.data);
         try {

@@ -94,6 +94,13 @@ export interface LiveFrame {
   data: Blob;
 }
 
+/** A granted viewer session (`POST /api/live/sessions`). */
+export interface LiveGrant {
+  sessionId: string;
+  /** The server's minimum frame spacing, or `null` when absent or implausible. */
+  frameIntervalMs: number | null;
+}
+
 export interface DashboardServices {
   loadSession(signal: AbortSignal): Promise<Session>;
   /** End the caller's own session (`POST /api/auth/sign-out`, CSRF). */
@@ -101,7 +108,10 @@ export interface DashboardServices {
   /** Live view (`live:view`; the server repeats every check). A refusal of
    *  any of these rejects with `ApiError('unauthorized')`. */
   loadLiveSources?(signal: AbortSignal): Promise<readonly LiveSource[]>;
-  openLiveSession?(sourceId: string, signal: AbortSignal): Promise<string>;
+  openLiveSession?(sourceId: string, signal: AbortSignal): Promise<LiveGrant>;
+  /** True shortly after this page sent a close (an open refusal may be the
+   *  server still releasing that slot). */
+  liveClosedRecently?(): boolean;
   /** `null`: no frame newer than `after` yet (`204`). */
   readLiveFrame?(sessionId: string, after: number, signal: AbortSignal): Promise<LiveFrame | null>;
   /** Best effort and fire-and-forget: it must also work while the page unloads. */

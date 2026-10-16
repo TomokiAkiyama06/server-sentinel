@@ -111,11 +111,22 @@ test('live sources decode strictly and drop every other field', async () => {
     { id: source, name: '生成カメラ 1', health: 'online', serial: 'synthetic', device_path: '/dev/video0' },
     { id: '00000000-0000-4000-8000-00000000a002', name: 'generated 2' },
   ] }), [{ id: source, name: '生成カメラ 1', health: 'online' }, { id: '00000000-0000-4000-8000-00000000a002', name: 'generated 2', health: null }]);
-  for (const body of [[], {}, { sources: {} }, { sources: [{ id: 'not-a-uuid', name: 'x' }] },
-    { sources: [{ id: source.toUpperCase(), name: 'x' }] }, { sources: [{ id: source, name: '' }] },
-    { sources: [{ id: source, name: 'x'.repeat(201) }] }, { sources: [{ id: source, name: 'x', health: 'healthy' }] },
-    { sources: [{ id: source, name: 'a' }, { id: source, name: 'b' }] }]) {
+  for (const body of [[], {}, null, { sources: {} }, { sources: 'x' }]) {
     assert.throws(() => parseLiveSources(body), { code: 'invalid_response' });
+  }
+  // A malformed entry is dropped on its own; the rest stays visible.
+  const kept = { id: '00000000-0000-4000-8000-00000000a009', name: 'kept', health: 'offline' };
+  for (const bad of [null, 'x', { id: 'not-a-uuid', name: 'x' }, { id: source.toUpperCase(), name: 'x' },
+    { id: source, name: '' }, { id: source, name: 'x'.repeat(257) }, { id: source, name: '😀'.repeat(257) },
+    { id: source, name: 7 }, { id: source, name: 'x', health: 'healthy' }]) {
+    assert.deepEqual(parseLiveSources({ sources: [bad, kept] }), [kept]);
+  }
+  assert.deepEqual(parseLiveSources({ sources: [{ id: source, name: 'a' }, { id: source, name: 'b' }, kept] }),
+    [{ id: source, name: 'a', health: null }, kept]);
+  // The bound is the server's 256 code points, not UTF-16 units: 256 emoji
+  // (512 units) and 256 ASCII characters are both accepted.
+  for (const name of ['😀'.repeat(256), 'x'.repeat(256), '生'.repeat(256)]) {
+    assert.deepEqual(parseLiveSources({ sources: [{ id: source, name, health: 'online' }] }), [{ id: source, name, health: 'online' }]);
   }
   const { services } = await signedIn({ 'GET /api/live/sources': json({ sources: [{ id: source, name: 'g', health: 'degraded' }] }) });
   assert.deepEqual(await services.loadLiveSources(signal()), [{ id: source, name: 'g', health: 'degraded' }]);
@@ -124,8 +135,9 @@ test('live sources decode strictly and drop every other field', async () => {
 });
 
 test('opening a viewer session posts only the source id with the CSRF token', async () => {
-  const { services, calls } = await signedIn({ 'POST /api/live/sessions': json({ session_id: sessionId, source_id: source }) });
-  assert.equal(await services.openLiveSession(source, signal()), sessionId);
+  const { services, calls } = await signedIn({ 'POST /api/live/sessions': json({ session_id: sessionId, source_id: source,
+    lease_seconds: 15, frame_interval_ms: 250 }) });
+  assert.deepEqual(await services.openLiveSession(source, signal()), { sessionId, frameIntervalMs: 250 });
   const call = calls.at(-1);
   assert.equal(call.init.body, JSON.stringify({ source_id: source }));
   assert.deepEqual(call.init.headers, { Accept: 'application/json', 'X-CSRF-Token': csrf, 'Content-Type': 'application/json' });
@@ -136,6 +148,13 @@ test('opening a viewer session posts only the source id with the CSRF token', as
     const other = await signedIn({ 'POST /api/live/sessions': json(body) });
     await assert.rejects(other.services.openLiveSession(source, signal()), { code: 'invalid_response' });
   }
+  // An absent or implausible interval falls back to the default.
+  for (const frame_interval_ms of [undefined, 0, 10, 99999, 1.5, '200']) {
+    const other = await signedIn({ 'POST /api/live/sessions': json({ session_id: sessionId, frame_interval_ms }) });
+    assert.deepEqual(await other.services.openLiveSession(source, signal()), { sessionId, frameIntervalMs: null });
+  }
+  const created = await signedIn({ 'POST /api/live/sessions': json({ session_id: sessionId }, 201) });
+  await assert.rejects(created.services.openLiveSession(source, signal()), { code: 'unavailable' });
   const refused = await signedIn();
   await assert.rejects(refused.services.openLiveSession(source, signal()), { code: 'unauthorized' });
 });
@@ -160,12 +179,29 @@ test('a frame is a fresh JPEG with a larger X-Frame-Sequence; 204 means none yet
     new Response(new Uint8Array(4), { headers: { 'Content-Type': 'image/jpeg', 'X-Frame-Sequence': '99999999999999999' } }),
     new Response(new Uint8Array(0), { headers: { 'Content-Type': 'image/jpeg', 'X-Frame-Sequence': '9' } }),
     new Response(new Uint8Array(4), { headers: { 'Content-Type': 'image/jpeg', 'X-Frame-Sequence': '9', 'Content-Length': String(MAX_FRAME_BYTES + 1) } }),
+    new Response(new Uint8Array(4), { headers: { 'Content-Type': 'image/jpeg', 'X-Frame-Sequence': '9', 'Content-Length': '4x' } }),
+    // No Content-Length (a re-chunking proxy): the streamed body is capped.
     jpeg(9, MAX_FRAME_BYTES + 1),
   ];
   for (const response of invalid) {
     const other = await signedIn({ [path]: response });
     await assert.rejects(other.services.readLiveFrame(sessionId, 3, signal()), { code: 'invalid_response' });
   }
+  // A refused stale sequence is not read: its body is cancelled.
+  let cancelled = false;
+  const stale = new Response(new ReadableStream({ pull: controller => controller.enqueue(new Uint8Array(1)), cancel: () => { cancelled = true; } }),
+    { headers: { 'Content-Type': 'image/jpeg', 'X-Frame-Sequence': '3' } });
+  const staleSession = await signedIn({ [path]: () => stale });
+  await assert.rejects(staleSession.services.readLiveFrame(sessionId, 3, signal()), { code: 'invalid_response' });
+  await flush();
+  assert.equal(cancelled, true);
+  // A body with no length header within the cap is accepted.
+  const chunked = await signedIn({ [path]: () => new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(3)); controller.enqueue(new Uint8Array(2)); controller.close(); },
+  }), { headers: { 'Content-Type': 'image/jpeg', 'X-Frame-Sequence': '4' } }) });
+  const streamed = await chunked.services.readLiveFrame(sessionId, 3, signal());
+  assert.equal(streamed.data.size, 5);
+  assert.equal(streamed.data.type, 'image/jpeg');
   const refused = await signedIn();
   await assert.rejects(refused.services.readLiveFrame(sessionId, 0, signal()), { code: 'unauthorized' });
   const failing = await signedIn({ [path]: new Response('', { status: 503 }) });
@@ -233,8 +269,8 @@ function transport({ reads = [], open } = {}) {
     log,
     open: async (id, abort) => {
       log.push(['open', id]);
-      if (open) return open(abort);
-      return `00000000-0000-4000-8000-0000000c000${++opened}`;
+      const value = open ? await open(abort) : `00000000-0000-4000-8000-0000000c000${++opened}`;
+      return typeof value === 'string' ? { sessionId: value, frameIntervalMs: null } : value;
     },
     read: async (id, after) => {
       log.push(['read', id, after]);
@@ -246,6 +282,7 @@ function transport({ reads = [], open } = {}) {
   };
 }
 const frame = sequence => ({ sequence, data: new Blob([new Uint8Array(1)]) });
+const step = live.FRAME_INTERVAL_MS + live.FRAME_SLACK_MS;
 const refusal = () => { throw new ApiError('unauthorized'); };
 const outage = () => { throw new ApiError('unavailable'); };
 
@@ -259,13 +296,13 @@ function run(options) {
   return { clock, view, statuses, frames, stop };
 }
 
-test('loop pulls newer frames at most every FRAME_INTERVAL_MS and reports live', async () => {
+test('loop pulls newer frames one interval plus slack after each answer and reports live', async () => {
   const fakeTransport = transport({ reads: [frame(1), frame(2), null] });
   const loop = run({ transport: fakeTransport });
   await loop.clock.advance(0);
   assert.deepEqual(loop.frames, [1]);
   assert.deepEqual(loop.statuses, ['connecting', 'live']);
-  await loop.clock.advance(live.FRAME_INTERVAL_MS - 1);
+  await loop.clock.advance(step - 1);
   assert.deepEqual(loop.frames, [1]);
   await loop.clock.advance(1);
   assert.deepEqual(loop.frames, [1, 2]);
@@ -281,7 +318,7 @@ test('no newer frame for STALE_AFTER_MS marks the picture not current', async ()
   const loop = run({ transport: transport({ reads: [frame(1), null] }) });
   await loop.clock.advance(live.STALE_AFTER_MS - 1);
   assert.equal(loop.statuses.at(-1), 'live');
-  await loop.clock.advance(live.FRAME_INTERVAL_MS);
+  await loop.clock.advance(step);
   assert.equal(loop.statuses.at(-1), 'stale');
   loop.stop();
 });
@@ -291,7 +328,7 @@ test('transient failures back off exponentially, capped, and recover', async () 
   const fakeTransport = transport({ reads: [frame(1), outage, outage, outage, frame(2), null] });
   const loop = run({ transport: fakeTransport });
   await loop.clock.advance(0);
-  await loop.clock.advance(live.FRAME_INTERVAL_MS);
+  await loop.clock.advance(step);
   assert.equal(loop.statuses.at(-1), 'retrying');
   const readsAt = () => fakeTransport.log.filter(entry => entry[0] === 'read').length;
   assert.equal(readsAt(), 2);
@@ -314,7 +351,7 @@ test('a refusal ends the loop for good: session closed, frame dropped, nothing r
     const fakeTransport = at === 'read' ? transport({ reads: [frame(1), refusal] })
       : transport({ open: () => { throw new ApiError('unauthorized'); } });
     const loop = run({ transport: fakeTransport });
-    await loop.clock.advance(live.FRAME_INTERVAL_MS);
+    await loop.clock.advance(step);
     assert.equal(loop.statuses.at(-1), 'ended');
     const before = fakeTransport.log.length;
     await loop.clock.advance(60_000);
@@ -348,7 +385,9 @@ test('a transient open failure retries with backoff; a hidden page pauses and re
   await loop.clock.advance(60_000);
   assert.equal(fakeTransport.log.length, paused, 'nothing is requested while hidden');
   loop.view.set(false);
-  await loop.clock.advance(0);
+  await loop.clock.advance(live.REOPEN_DELAY_MS - 1);
+  assert.equal(fakeTransport.log.length, paused, 'the reopen is coalesced');
+  await loop.clock.advance(1);
   assert.deepEqual(fakeTransport.log.slice(paused, paused + 2), [['open', source], ['read', '00000000-0000-4000-8000-0000000d0003', 0]]);
   loop.stop();
 });
@@ -446,7 +485,7 @@ test('a hung close or open never holds the sign-out; an open granted meanwhile i
   await assert.rejects(other.openLiveSession(source, signal()), { code: 'unauthorized' });
   grant(json({ session_id: sessionId }));
   await signingOut;
-  assert.equal(await opened, sessionId);
+  assert.equal((await opened).sessionId, sessionId);
   assert.deepEqual(racing.calls.map(call => call.key), ['GET /api/session', 'POST /api/live/sessions', close, 'POST /api/auth/sign-out']);
 });
 
@@ -461,7 +500,7 @@ test('a stalled frame request is abandoned: the picture is never left labelled l
     return new Promise(() => {});
   };
   const loop = run({ transport: stalled });
-  await loop.clock.advance(live.FRAME_INTERVAL_MS);
+  await loop.clock.advance(step);
   assert.equal(loop.statuses.at(-1), 'live');
   await loop.clock.advance(live.REQUEST_TIMEOUT_MS - 1);
   assert.equal(loop.statuses.at(-1), 'live');
@@ -510,7 +549,7 @@ test('a stalled decode shares the request deadline and is then no longer current
       if (calls === 1) return undefined;
       return new Promise(resolve => { finish = () => { checks.push(current()); resolve(); }; });
     } });
-  await clock.advance(live.FRAME_INTERVAL_MS);
+  await clock.advance(step);
   assert.equal(statuses.at(-1), 'live');
   await clock.advance(live.REQUEST_TIMEOUT_MS);
   assert.equal(statuses.at(-1), 'retrying');
@@ -581,7 +620,7 @@ test('a hung open does not delay closing the viewers already known at sign-out',
   const services = createDashboardServices(origin, hung.request, { cleanupMs: 300 });
   await services.loadSession(signal());
   void services.openLiveSession(source, signal()).catch(() => undefined);
-  assert.equal(await services.openLiveSession(source, signal()), sessionId);
+  assert.equal((await services.openLiveSession(source, signal())).sessionId, sessionId);
   await services.signOut(signal());
   assert.deepEqual(hung.calls.slice(-2).map(call => call.key), [close, 'POST /api/auth/sign-out']);
   assert.equal(closedAt.length, 1);
@@ -594,4 +633,73 @@ test('a stalled session check or source list is abandoned and reported, so the s
   await assert.rejects(services.loadSession(signal()), { code: 'unavailable' });
   await assert.rejects(services.loadLiveSources(signal()), { code: 'unavailable' });
   for (const call of stalled.calls) assert.equal(call.init.signal.aborted, true);
+});
+
+test('reopens are coalesced: quick source switches and hide/show cycles spend no open', async () => {
+  const fakeTransport = transport({ reads: [frame(1), null] });
+  const clock = manualClock();
+  const view = visibility();
+  const start = () => live.startLiveLoop({ transport: fakeTransport, sourceId: source, visibility: view, clock,
+    onFrame: () => undefined, onStatus: () => undefined, startDelayMs: 300 });
+  // Three players replaced within the start delay: no open at all.
+  for (let index = 0; index < 3; index++) { const stop = start(); await clock.advance(100); stop(); }
+  assert.deepEqual(fakeTransport.log, []);
+  const stop = start();
+  await clock.advance(300);
+  assert.equal(fakeTransport.log.filter(entry => entry[0] === 'open').length, 1);
+  // Hidden and shown again three times quickly: one close each, no reopen
+  // until the page stays visible for REOPEN_DELAY_MS.
+  for (let index = 0; index < 3; index++) { view.set(true); view.set(false); await clock.advance(live.REOPEN_DELAY_MS / 2); }
+  assert.equal(fakeTransport.log.filter(entry => entry[0] === 'open').length, 1);
+  await clock.advance(live.REOPEN_DELAY_MS);
+  assert.equal(fakeTransport.log.filter(entry => entry[0] === 'open').length, 2);
+  stop();
+});
+
+test('an open refused right after a close is retried once; a repeated refusal is final', async () => {
+  for (const [recent, outcomes] of [[true, ['grant']], [true, ['refuse', 'refuse']], [false, ['refuse']]]) {
+    const answers = [...(recent && outcomes[0] === 'grant' ? ['refuse', 'grant'] : outcomes)];
+    const fakeTransport = transport({ reads: [frame(1), null], open: () => {
+      const next = answers.shift() ?? 'refuse';
+      if (next === 'refuse') throw new ApiError('unauthorized');
+      return '00000000-0000-4000-8000-0000000a0001';
+    } });
+    fakeTransport.closedRecently = () => recent;
+    const loop = run({ transport: fakeTransport });
+    await loop.clock.advance(0);
+    const opens = () => fakeTransport.log.filter(entry => entry[0] === 'open').length;
+    if (!recent) {
+      assert.equal(loop.statuses.at(-1), 'ended');
+      assert.equal(opens(), 1);
+    } else {
+      assert.equal(loop.statuses.at(-1), 'retrying');
+      await loop.clock.advance(live.OPEN_RETRY_MS);
+      assert.equal(opens(), 2);
+      assert.equal(loop.statuses.at(-1), outcomes[0] === 'grant' ? 'live' : 'ended');
+      await loop.clock.advance(60_000);
+      assert.equal(opens(), 2, 'never more than one retry');
+    }
+    loop.stop();
+  }
+});
+
+test('the server frame interval paces the pulls', async () => {
+  const fakeTransport = transport({ reads: [frame(1), frame(2), frame(3)],
+    open: () => ({ sessionId: '00000000-0000-4000-8000-0000000b0001', frameIntervalMs: 500 }) });
+  const loop = run({ transport: fakeTransport });
+  await loop.clock.advance(0);
+  const reads = () => fakeTransport.log.filter(entry => entry[0] === 'read').length;
+  assert.equal(reads(), 1);
+  await loop.clock.advance(500 + live.FRAME_SLACK_MS - 1);
+  assert.equal(reads(), 1);
+  await loop.clock.advance(1);
+  assert.equal(reads(), 2);
+  loop.stop();
+});
+
+test('services report a recent close for the single open retry', async () => {
+  const { services } = await signedIn({ [`POST /api/live/sessions/${sessionId}/close`]: new Response(null, { status: 204 }) });
+  assert.equal(services.liveClosedRecently(), false);
+  services.closeLiveSession(sessionId);
+  assert.equal(services.liveClosedRecently(), true);
 });

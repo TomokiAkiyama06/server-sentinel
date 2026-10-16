@@ -2,11 +2,20 @@
  * One viewer's frame-pull loop for one Camera Source (#205 CP-5).
  *
  * Interim transport (Owner decision D5): open a viewer session, then pull the
- * newest frame with `after=<last sequence>` at most every `FRAME_INTERVAL_MS`
- * (about 5 fps). A `204` means no newer frame yet. A refusal (the server's
- * generic `404`: no permission any more, revoked, lease expired, source not
- * live, over the viewer limit) ends the loop for good: it is never retried
- * automatically. Any other failure is retried with exponential backoff.
+ * newest frame with `after=<last sequence>`, waiting the server's
+ * `frame_interval_ms` (default `FRAME_INTERVAL_MS`, about 5 fps) plus
+ * `FRAME_SLACK_MS` after each answer, so a pull never arrives early. A `204`
+ * means no newer frame yet. A refusal (the server's generic `404`: no
+ * permission any more, revoked, lease expired, source not live, over a limit)
+ * ends the loop for good, with one exception: an open refused shortly after
+ * this page closed a session is retried once after `OPEN_RETRY_MS`, since the
+ * server may still be releasing that slot. Any other failure is retried with
+ * exponential backoff.
+ *
+ * Opens are coalesced: a new player waits `startDelayMs` before its first
+ * open, and a page that becomes visible again waits `REOPEN_DELAY_MS`, so
+ * quickly switching sources or hiding and showing the page does not spend an
+ * open per change.
  *
  * Viewer-only work stops while nobody looks (SPECIFICATION 6.5): when the
  * document is hidden the session is closed and the frame is dropped, and a
@@ -15,12 +24,17 @@
  * at once, so no viewer slot is left behind.
  */
 import { ApiError } from '../api';
-import type { LiveFrame } from '../domain';
+import type { LiveFrame, LiveGrant } from '../domain';
 
 // Re-exported so a separately bundled test raises the class this loop checks.
 export { ApiError };
 
 export const FRAME_INTERVAL_MS = 200;
+export const FRAME_SLACK_MS = 20;
+/** Delay before reopening when the page is visible again. */
+export const REOPEN_DELAY_MS = 1000;
+/** Delay before the single retry of an open refused right after a close. */
+export const OPEN_RETRY_MS = 2000;
 /** Without a newer frame for this long the shown frame is marked not current. */
 export const STALE_AFTER_MS = 5000;
 /** An open, or a frame request with its decode, unfinished after this long
@@ -33,7 +47,9 @@ export const BACKOFF_MAX_MS = 8000;
 export type LiveStatus = 'connecting' | 'live' | 'stale' | 'retrying' | 'paused' | 'ended';
 
 export interface LiveTransport {
-  open(sourceId: string, signal: AbortSignal): Promise<string>;
+  open(sourceId: string, signal: AbortSignal): Promise<LiveGrant>;
+  /** True shortly after a close this page sent (see OPEN_RETRY_MS). */
+  closedRecently?(): boolean;
   read(sessionId: string, after: number, signal: AbortSignal): Promise<LiveFrame | null>;
   close(sessionId: string): void;
 }
@@ -61,6 +77,8 @@ export interface LiveLoopOptions {
   onStatus(status: LiveStatus): void;
   visibility: Visibility;
   clock?: Clock;
+  /** Wait this long before the first open (coalesces quick source changes). */
+  startDelayMs?: number;
 }
 
 const systemClock: Clock = {
@@ -76,7 +94,7 @@ export function backoff(failures: number): number {
 const refused = (error: unknown) => error instanceof ApiError && error.code === 'unauthorized';
 
 /** Start the loop; the returned function stops it and closes its session. */
-export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibility, clock = systemClock }: LiveLoopOptions): () => void {
+export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibility, clock = systemClock, startDelayMs = 0 }: LiveLoopOptions): () => void {
   let generation = 0;
   let stopped = false;
   let ended = false;
@@ -86,6 +104,8 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
   let deadline: unknown = null;
   let watchdog: unknown = null;
   let after = 0;
+  let interval = FRAME_INTERVAL_MS;
+  let openRetried = false;
   let failures = 0;
   let lastFrame = 0;
   let status: LiveStatus | null = null;
@@ -155,21 +175,32 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
     const attempt = new AbortController();
     controller = attempt;
     void (async () => {
-      let granted: string;
+      let granted: LiveGrant;
       const request = transport.open(sourceId, attempt.signal);
       try {
         granted = await bounded(request, attempt);
       } catch (error) {
         // A grant that still arrives after the timeout is given back at once.
-        request.then(late => transport.close(late), () => undefined);
+        request.then(late => transport.close(late.sessionId), () => undefined);
         if (current !== generation) return;
-        if (refused(error)) { end(); return; }
+        if (refused(error)) {
+          if (!openRetried && transport.closedRecently?.()) {
+            openRetried = true;
+            report('retrying');
+            schedule(connect, OPEN_RETRY_MS, current);
+            return;
+          }
+          end();
+          return;
+        }
         fail(current, connect);
         return;
       }
       // Granted after a stop, pause or newer attempt: give the slot back now.
-      if (current !== generation) { transport.close(granted); return; }
-      session = granted;
+      if (current !== generation) { transport.close(granted.sessionId); return; }
+      session = granted.sessionId;
+      interval = granted.frameIntervalMs ?? FRAME_INTERVAL_MS;
+      openRetried = false;
       after = 0;
       lastFrame = clock.now();
       watch(current);
@@ -180,7 +211,6 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
   function pull(current: number) {
     const attempt = new AbortController();
     controller = attempt;
-    const started = clock.now();
     const id = session;
     if (id === null) return;
     void (async () => {
@@ -205,7 +235,9 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
           report('connecting');
         }
         failures = 0;
-        schedule(pull, Math.max(0, FRAME_INTERVAL_MS - (clock.now() - started)), current);
+        // Counted from the answer, which the server sent after it served the
+        // previous frame: the next pull never reaches it inside its interval.
+        schedule(pull, interval + FRAME_SLACK_MS, current);
       } catch (error) {
         if (current !== generation) return;
         if (refused(error)) { end(); return; }
@@ -221,9 +253,12 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
       return;
     }
     if (status === 'paused' || status === null) {
+      const delay = status === null ? startDelayMs : REOPEN_DELAY_MS;
       release();
       failures = 0;
-      connect(generation);
+      report('connecting');
+      if (delay > 0) schedule(connect, delay, generation);
+      else connect(generation);
     }
   }
 

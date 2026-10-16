@@ -15,7 +15,7 @@
  * decides who may see what.
  */
 import { ApiError } from '../api';
-import { type CameraHealth, type DashboardServices, type LiveFrame, type LiveSource, type Permission, type Session } from '../domain';
+import { type CameraHealth, type DashboardServices, type LiveFrame, type LiveGrant, type LiveSource, type Permission, type Session } from '../domain';
 
 /** Agreed with the server routes (#205 CP-4). */
 export const SESSION_PATH = '/api/session';
@@ -36,7 +36,14 @@ const CSRF = /^[A-Za-z0-9_-]{43}$/;
 const SEQUENCE = /^(0|[1-9][0-9]{0,15})$/;
 const HEALTH: readonly CameraHealth[] = ['online', 'degraded', 'offline', 'manual_intervention_required'];
 const PERMISSIONS: readonly Permission[] = ['live:view', 'recordings:view'];
-const MAX_NAME = 200;
+/** The server's `text_value` bound, in Unicode code points (not UTF-16 units). */
+const MAX_NAME = 256;
+/** A `frame_interval_ms` outside this range is ignored (the default applies). */
+const MIN_INTERVAL_MS = 50;
+const MAX_INTERVAL_MS = 5000;
+/** A close within this long (about one server lease) makes one open refusal
+ *  worth one delayed retry: the server may not have released the slot yet. */
+export const RECENT_CLOSE_MS = 15000;
 
 const record = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -53,21 +60,52 @@ export function parseSession(value: unknown): { session: Session; csrf: string }
   return { session: { state: 'allowed', role: mapped, permissions: [...permissions] as Permission[] }, csrf };
 }
 
-/** `GET /api/live/sources` body `{"sources":[{id,name,health?}]}`; extra fields are dropped. */
+/** `GET /api/live/sources` body `{"sources":[{id,name,health}]}`.
+ *
+ * A body without a `sources` array fails closed. Within it, a malformed entry
+ * (bad or repeated id, a name that is not 1..256 code points, an unknown
+ * health value) is dropped on its own, so one entry never hides the rest.
+ * Every other field is dropped too. */
 export function parseLiveSources(value: unknown): LiveSource[] {
   if (!record(value) || !Array.isArray(value.sources)) throw new ApiError('invalid_response');
   const seen = new Set<string>();
-  return value.sources.map((item: unknown): LiveSource => {
-    if (!record(item)) throw new ApiError('invalid_response');
+  const sources: LiveSource[] = [];
+  for (const item of value.sources as unknown[]) {
+    if (!record(item)) continue;
     const { id, name, health } = item;
-    if (typeof id !== 'string' || !UUID.test(id) || seen.has(id) || typeof name !== 'string'
-        || name.length === 0 || name.length > MAX_NAME
-        || (health !== undefined && health !== null && !HEALTH.includes(health as CameraHealth))) {
-      throw new ApiError('invalid_response');
-    }
+    if (typeof id !== 'string' || !UUID.test(id) || seen.has(id) || typeof name !== 'string') continue;
+    const points = [...name].length;
+    if (points === 0 || points > MAX_NAME) continue;
+    if (health !== undefined && health !== null && !HEALTH.includes(health as CameraHealth)) continue;
     seen.add(id);
-    return { id, name, health: (health ?? null) as CameraHealth | null };
-  });
+    sources.push({ id, name, health: (health ?? null) as CameraHealth | null });
+  }
+  return sources;
+}
+
+/** Read at most `limit` bytes of `response`'s body, whatever its headers say. */
+async function cappedBody(response: Response, limit: number, signal: AbortSignal): Promise<Uint8Array[]> {
+  if (!response.body) throw new ApiError('invalid_response');
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        void reader.cancel().catch(() => undefined);
+        throw new ApiError('invalid_response');
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(signal.aborted ? 'cancelled' : 'unavailable');
+  }
+  if (total === 0) throw new ApiError('invalid_response');
+  return chunks;
 }
 
 interface Send {
@@ -91,11 +129,13 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
   const viewers = new Set<string>();
   // Opens in flight: sign-out waits for them so a session granted meanwhile
   // is closed too, and no new open starts while it runs.
-  const opening = new Set<Promise<string>>();
+  const opening = new Set<Promise<LiveGrant>>();
   let signingOut = false;
+  let lastClose = -Infinity;
 
   async function closeWith(id: string, header: string): Promise<void> {
     viewers.delete(id);
+    lastClose = Date.now();
     try {
       const response = await send({ method: 'POST', path: sessionPath(id, 'close'), accept: 'application/json', csrf: header, keepalive: true });
       void response.body?.cancel().catch(() => undefined);
@@ -164,18 +204,21 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
     }
   }
 
-  async function open(sourceId: string, header: string, signal: AbortSignal): Promise<string> {
+  async function open(sourceId: string, header: string, signal: AbortSignal): Promise<LiveGrant> {
     const response = await send({
       method: 'POST', path: LIVE_SESSIONS_PATH, accept: 'application/json', signal, csrf: header,
       body: { source_id: sourceId },
     });
-    if (response.status !== 200 && response.status !== 201) throw new ApiError('unavailable');
+    if (response.status !== 200) throw new ApiError('unavailable');
     const value = await json(response, signal);
     if (!record(value) || typeof value.session_id !== 'string' || !UUID.test(value.session_id)) {
       throw new ApiError('invalid_response');
     }
     viewers.add(value.session_id);
-    return value.session_id;
+    const interval = value.frame_interval_ms;
+    const frameIntervalMs = typeof interval === 'number' && Number.isSafeInteger(interval)
+      && interval >= MIN_INTERVAL_MS && interval <= MAX_INTERVAL_MS ? interval : null;
+    return { sessionId: value.session_id, frameIntervalMs };
   }
 
   return {
@@ -210,7 +253,7 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
         // grant when it lands. Neither waits for the other.
         const cleanup = Promise.allSettled([
           ...[...viewers].map(id => closeWith(id, header)),
-          ...[...opening].map(pending => pending.then(id => closeWith(id, header))),
+          ...[...opening].map(pending => pending.then(grant => closeWith(grant.sessionId, header))),
         ]);
         await Promise.race([cleanup, limit]);
         clearTimeout(timer);
@@ -249,18 +292,22 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
       if (response.status !== 200) throw new ApiError('unavailable');
       const type = response.headers.get('Content-Type')?.split(';')[0]?.trim().toLowerCase();
       const raw = response.headers.get(FRAME_SEQUENCE_HEADER) ?? '';
-      const length = Number(response.headers.get('Content-Length') ?? '0');
-      if (type !== 'image/jpeg' || !SEQUENCE.test(raw) || !(length <= MAX_FRAME_BYTES)) {
+      const declared = response.headers.get('Content-Length');
+      const sequence = Number(raw);
+      // The declared length is checked first, and the body is read with the
+      // same cap, so a missing or wrong header (a proxy re-chunking it) never
+      // lets more than MAX_FRAME_BYTES in.
+      if (type !== 'image/jpeg' || !SEQUENCE.test(raw) || !Number.isSafeInteger(sequence) || sequence <= after
+          || (declared !== null && !(/^[0-9]{1,10}$/.test(declared) && Number(declared) <= MAX_FRAME_BYTES))) {
         void response.body?.cancel().catch(() => undefined);
         throw new ApiError('invalid_response');
       }
-      const sequence = Number(raw);
-      if (!Number.isSafeInteger(sequence) || sequence <= after) throw new ApiError('invalid_response');
-      let data: Blob;
-      try { data = await response.blob(); }
-      catch { throw new ApiError(signal.aborted ? 'cancelled' : 'unavailable'); }
-      if (data.size === 0 || data.size > MAX_FRAME_BYTES) throw new ApiError('invalid_response');
+      const data = new Blob(await cappedBody(response, MAX_FRAME_BYTES, signal) as BlobPart[], { type: 'image/jpeg' });
       return { sequence, data };
+    },
+
+    liveClosedRecently() {
+      return Date.now() - lastClose < RECENT_CLOSE_MS;
     },
 
     closeLiveSession(sessionId) {
@@ -270,6 +317,7 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
       let header: string;
       try { path = sessionPath(sessionId, 'close'); header = token(); } catch { return; }
       viewers.delete(sessionId);
+      lastClose = Date.now();
       void send({ method: 'POST', path, accept: 'application/json', csrf: header, keepalive: true })
         .then(response => { void response.body?.cancel().catch(() => undefined); }, () => undefined);
     },

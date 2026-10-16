@@ -311,26 +311,39 @@ Live contract with the server routes of #205 CP-4 (the client side; the
 server owns authorization, leases and limits):
 
 ```text
-GET  /api/live/sources                    200 {"sources":[{"id":"<uuid>","name":"<1-200 chars>","health"?:"online|degraded|offline|manual_intervention_required"}]}
-POST /api/live/sessions  {"source_id"}    200|201 {"session_id":"<uuid>"}            (CSRF, JSON)
+GET  /api/live/sources                    200 {"sources":[{"id":"<uuid>","name":"<1-256 code points>","health":"online|degraded|offline|manual_intervention_required"}]}
+POST /api/live/sessions  {"source_id"}    200 {"session_id":"<uuid>","source_id":"<uuid>","lease_seconds":<n>,"frame_interval_ms":<n>}  (CSRF, JSON)
 GET  /api/live/sessions/<sid>/frame?after=<n>
                                            200 image/jpeg, X-Frame-Sequence: <n' > n>  | 204 no newer frame
 POST /api/live/sessions/<sid>/close       204                                         (CSRF, no body, keepalive)
 every refusal                              404 (generic)
 ```
 
-Ids are lower-case UUIDs, checked before a URL is built. Any other field of a
-source (a device path, serial or node detail) is dropped, never rendered. A
-frame is accepted only as `image/jpeg` of 1 byte to 8 MiB with a decimal
-`X-Frame-Sequence` larger than `after`.
+The server always sends `health` (an unknown state as `offline`); the client
+still shows nothing rather than guessing when it is absent. In the interim
+transport the list holds only `local_uvc` sources with an MJPG capture
+profile; `remote_agent` sources are not listed yet. Ids are lower-case UUIDs,
+checked before a URL is built. A body without a `sources` array fails closed;
+inside it, a malformed entry (bad or repeated id, a name that is not 1 to 256
+Unicode code points, the server's `text_value` bound, or an unknown health
+value) is dropped on its own, so one entry never hides the others. Any other
+field of a source (a device path, serial or node detail) is dropped, never
+rendered. A frame is accepted only as `image/jpeg` with a decimal
+`X-Frame-Sequence` larger than `after`, and only up to 8 MiB: a declared
+`Content-Length` above that is refused unread, and the body is read with the
+same cap whether or not the header is present (a proxy may re-chunk it). A
+refused frame's body is cancelled. `frame_interval_ms` (50 to 5000; otherwise
+200) sets the pull spacing; `lease_seconds` is not used by the client.
 
 `src/dashboard/live.tsx` is rendered only for `canVisit(session, 'live')`
 (`live:view`, or the Owner) and loads the sources only then: a
 `recordings:view`-only viewer makes no live request. It lists the sources as an
 ID-keyed collection (1 to 4, no fixed slots) and plays one at a time.
 `src/dashboard/live_loop.ts` runs the interim frame-pull loop (Owner decision
-D5): open a viewer session, pull with `after=<last sequence>` at most every
-200 ms (about 5 fps), `204` ⇒ wait. No newer frame for 5 s ⇒ the picture is
+D5): open a viewer session, pull with `after=<last sequence>`, and wait the
+server's `frame_interval_ms` (default 200 ms, about 5 fps) plus 20 ms after
+each answer, so a pull never reaches the server inside its interval; `204` ⇒
+wait the same. No newer frame for 5 s ⇒ the picture is
 marked not current and dimmed, by a timer of its own that fires even while a
 pull is still pending. An open, or a frame request together with its
 decode, unfinished after 4 s is abandoned as a transient failure (aborted
@@ -339,10 +352,15 @@ closed at once), so a stalled connection or decode never leaves an old frame
 labelled current. A transient failure (network, `5xx`, an invalid
 answer, an undecodable frame) retries with backoff 0.5 s, 1 s, 2 s, 4 s, then
 8 s, keeping the session. A refusal ends the loop: the canvas is cleared, the
-session closed, and nothing is retried until the viewer presses Reconnect. A
-hidden page (`visibilitychange`, `pagehide`) closes the session and clears the
-picture, so nothing is requested while nobody looks, and a fresh session is
-opened when the page is visible again. Leaving the screen, switching source,
+session closed, and nothing is retried until the viewer presses Reconnect. The
+one exception is an open refused within 15 s of a close this page sent (the
+server may not have released that slot yet): it is retried once after 2 s,
+and a second refusal is final. A hidden page (`visibilitychange`, `pagehide`)
+closes the session and clears the picture, so nothing is requested while
+nobody looks, and a fresh session is opened once the page has been visible
+again for 1 s. Opens are coalesced: a player (a source switch, Reconnect)
+waits 300 ms before its first open, so tapping through sources or hiding and
+showing the page quickly spends no open per change. Leaving the screen, switching source,
 or a replaced provider closes the session; a session granted after that is
 closed at once, and a frame whose decode finishes after a pause, refusal or
 stop is dropped instead of drawn.

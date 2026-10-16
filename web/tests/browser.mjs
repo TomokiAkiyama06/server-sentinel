@@ -120,7 +120,9 @@ function liveApi(permissions, log, jpeg) {
       return [JSON.stringify({ sources: liveSources.map((id, index) => ({ id, name: `生成カメラ ${index + 1}`,
         health: index ? 'offline' : 'online', device_path: 'synthetic-not-rendered' })) }), 'application/json'];
     }
-    if (key === 'POST /api/live/sessions') return [JSON.stringify({ session_id: liveSession }), 'application/json'];
+    if (key === 'POST /api/live/sessions') {
+      return [JSON.stringify({ session_id: liveSession, source_id: liveSources[0], lease_seconds: 15, frame_interval_ms: 200 }), 'application/json'];
+    }
     if (key === `GET /api/live/sessions/${liveSession}/frame`) {
       sequence += 1;
       return [jpeg, 'image/jpeg', 200, [{ name: 'X-Frame-Sequence', value: String(sequence) }]];
