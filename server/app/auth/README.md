@@ -1044,7 +1044,7 @@ Access notifies on entering a fault, on a reason the episode had not reported
 and on recovery, never on every failing check; a fault that ended between two
 ticks is still reported, at most four access notifications go out per rolling
 hour, and an episode the budget held back is reported once it allows.
-Both rolling hours continue across a restart: the first running tick re-seeds them from the accepted (non-`pending`) notification rows of the last hour by their wall-clock age, ignoring a row stamped in the future, so a restored row counts for at most an hour after the restart (Issue #281 item 2).
+Both rolling hours continue across a restart: the first running tick re-seeds them from the accepted (non-`pending`) notification rows of the last hour by the wall-clock time since their acceptance (`notification_events.accepted_at`, the row's latest local write, migration 25; a row written before it counts from its event time), filtering the hour before taking the newest rows and ignoring a row stamped in the future, so a restored row counts for at most an hour after the restart (Issue #281 item 2, Issue #287). A notification retried long after its event therefore counts from the retry. When the process started with monitoring `failed` and notified before storage recovered, the stored rows are merged into its window by event ID, so its own rows are not counted twice and the earlier process's rows are not skipped (Issue #287).
 Credential findings do not share that budget, so access flapping cannot hold
 one back. Each finding notifies immediately with its own notification, up to
 four per rolling hour; only the ones over that cap are batched into one

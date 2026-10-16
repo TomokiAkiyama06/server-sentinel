@@ -35,7 +35,8 @@ fault that started and ended between two drains is still reported (the
 emitted fault is latched). At most ``access_budget`` access notifications go
 out per rolling hour; past that the latest state is sent once the budget
 allows, and a fault episode that ended unreported is reported first. Both
-rolling hours survive a restart (``restore_windows``, Issue #281 item 2).
+rolling hours survive a restart (``restore_windows``, Issue #281 item 2),
+counted from each row's acceptance and merged by event ID (Issue #287).
 Credential findings (Owner decision 2026-10-16, PR #271 提案4) notify
 immediately, one notification each, up to ``finding_budget`` per rolling
 hour; only the ones over that cap are batched into one notification sent
@@ -129,13 +130,16 @@ class AccessFaultMonitor:
         # the baseline rather than "new" (Codex PR #271).
         self._reasons_unknown = False
         self._unreported_fault = False
-        self._sent: deque[float] = deque()
+        # (monotonic time, event ID) of the access notifications in the
+        # rolling hour, oldest first; the event ID lets a restart merge the
+        # stored rows without counting this process's own twice (Issue #287).
+        self._sent: deque[tuple[float, UUID]] = deque()
         # A notification the service refused (``FAILED``), by kind: retried
         # with the same time and event ID until accepted (Codex PR #271).
         self._attempts: dict[NotificationKind, tuple[datetime, UUID]] = {}
         self._findings_pending = 0
-        # Monotonic times of finding notifications in the rolling hour.
-        self._finding_sent: deque[float] = deque()
+        # (monotonic time, event ID) of finding notifications in the rolling hour.
+        self._finding_sent: deque[tuple[float, UUID]] = deque()
         # Set once a finding exceeded the cap: the pending ones then go out
         # as one batched notification when the budget allows.
         self._findings_batched = False
@@ -279,39 +283,51 @@ class AccessFaultMonitor:
             self.restore_fault_episode()
         self._attempts[NotificationKind.HUMAN_ACCESS_RECOVERED] = (at, event_id)
 
-    def restore_windows(self, *, access_ages, finding_ages, monotonic: float) -> None:
+    def restore_windows(self, *, access_rows, finding_rows, monotonic: float) -> None:
         """Owner thread: re-seed both rolling hours after a restart (Issue #281 item 2).
 
-        Called once at startup by the monitoring runtime with the ages, in
-        seconds by the wall clock, of the previous processes' accepted
-        (non-``pending``) notification rows, so a restart does not reset the
-        hourly budgets. Converted to this process's monotonic clock as
+        Called once at startup by the monitoring runtime with ``(event ID,
+        age)`` of the accepted (non-``pending``) notification rows of the
+        last hour, the age in seconds by the wall clock since the row was
+        accepted (Issue #287), so a restart does not reset the hourly
+        budgets. Converted to this process's monotonic clock as
         ``monotonic - age``, like ``recover_finding``. An age that is
         negative (a row stamped in the future, so the clock moved back) or a
         full hour or more is ignored, which at worst sends a notification
         early, as before this recovery; a clock moved back by less than a
         row's age keeps that row counted longer than its real age, but no
         restored row counts for more than an hour after the restart, so a
-        held-back notification is delayed at most that hour, never lost. A
-        window this process already used is left as it is (its own rows are
-        in it).
+        held-back notification is delayed at most that hour, never lost.
+
+        A window this process already used (it started in ``FAILED`` and
+        notified before storage recovered) is merged, not replaced or
+        skipped (Issue #287): a row with the event ID of one of its own
+        entries is that entry, already counted at its acceptance; every
+        other row joins the window. Only the newest ``budget`` entries are
+        kept, which opens the window at the same moment as keeping them all.
         """
         if type(monotonic) not in (int, float):
             raise ValueError("invalid restored window")
-        windows = ((self._sent, access_ages, self.access_budget),
-                   (self._finding_sent, finding_ages, self.finding_budget))
+        windows = ((self._sent, access_rows, self.access_budget),
+                   (self._finding_sent, finding_rows, self.finding_budget))
         restored = []
-        for _sent, ages, budget in windows:
-            ages = tuple(ages)
-            if (len(ages) > budget
-                    or any(type(age) not in (int, float) or not math.isfinite(age) for age in ages)):
+        for _sent, rows, budget in windows:
+            rows = tuple(rows)
+            if len(rows) > budget or any(
+                    type(row) is not tuple or len(row) != 2 or not isinstance(row[0], UUID)
+                    or type(row[1]) not in (int, float) or not math.isfinite(row[1])
+                    for row in rows):
                 raise ValueError("invalid restored window")
-            restored.append(sorted(monotonic - age for age in ages if 0 <= age < HOUR_SECONDS))
+            restored.append([(monotonic - age, event_id) for event_id, age in rows
+                             if 0 <= age < HOUR_SECONDS])
         if not math.isfinite(monotonic):
             return
-        for (sent, _ages, _budget), times in zip(windows, restored):
-            if not sent:
-                sent.extend(times)
+        for (sent, _rows, budget), entries in zip(windows, restored):
+            own = {event_id for _time, event_id in sent}
+            merged = sorted([*sent, *(entry for entry in entries if entry[1] not in own)],
+                            key=lambda entry: entry[0])
+            sent.clear()
+            sent.extend(merged[-budget:])
 
     def _polled(self) -> AccessHealth | None:
         """Current composition health, or ``None`` while indeterminate.
@@ -345,14 +361,14 @@ class AccessFaultMonitor:
     def _window_open(sent: deque, budget: int, now: float) -> bool:
         if not math.isfinite(now):
             return True
-        while sent and not (sent[0] <= now < sent[0] + HOUR_SECONDS):
+        while sent and not (sent[0][0] <= now < sent[0][0] + HOUR_SECONDS):
             # Expired, or a backwards clock: never postpone indefinitely.
             sent.popleft()
         return len(sent) < budget
 
     def _notify(self, notifications: NotificationService, kind: NotificationKind,
-                at: datetime, event_id: UUID | None = None) -> bool:
-        """Hand one notification to the service; ``True`` once it accepted it.
+                at: datetime, event_id: UUID | None = None) -> UUID | None:
+        """Hand one notification to the service; its event ID once accepted.
 
         ``FAILED`` means the service kept nothing (its queue was full or
         closed, or a refused local write found its retry buffer full): the
@@ -368,9 +384,9 @@ class AccessFaultMonitor:
         result = notifications.record(kind, at=attempt[0], event_id=attempt[1])
         if result == DeliveryResult.FAILED:
             self._attempts[kind] = attempt
-            return False
+            return None
         self._attempts.pop(kind, None)
-        return True
+        return attempt[1]
 
     def drain(self, notifications: NotificationService, *, at: datetime,
               monotonic: float, finding_event_id=None) -> AccessFaultStatus:
@@ -423,28 +439,29 @@ class AccessFaultMonitor:
     def _access_notifications(self, notifications, at, now) -> None:
         if self._unreported_fault and self._notified is not AccessHealth.FAULT:
             # Into a fault, also one that already ended unreported.
-            if (self._budget_available(now)
-                    and self._notify(notifications, NotificationKind.HUMAN_ACCESS_FAULT, at)):
-                self._record_sent(now)
+            if self._budget_available(now) and self._record_sent(now, self._notify(
+                    notifications, NotificationKind.HUMAN_ACCESS_FAULT, at)):
                 self._notified = AccessHealth.FAULT
                 self._unreported_fault = False
                 self._new_reasons = False
             return
         if self._current is AccessHealth.FAULT and self._new_reasons:
-            if (self._budget_available(now)
-                    and self._notify(notifications, NotificationKind.HUMAN_ACCESS_FAULT, at)):
-                self._record_sent(now)
+            if self._budget_available(now) and self._record_sent(now, self._notify(
+                    notifications, NotificationKind.HUMAN_ACCESS_FAULT, at)):
                 self._new_reasons = False
             return
         if self._current is AccessHealth.HEALTHY and self._notified is AccessHealth.FAULT:
-            if (self._budget_available(now)
-                    and self._notify(notifications, NotificationKind.HUMAN_ACCESS_RECOVERED, at)):
-                self._record_sent(now)
+            if self._budget_available(now) and self._record_sent(now, self._notify(
+                    notifications, NotificationKind.HUMAN_ACCESS_RECOVERED, at)):
                 self._notified = AccessHealth.HEALTHY
 
-    def _record_sent(self, now: float) -> None:
+    def _record_sent(self, now: float, event_id: UUID | None) -> bool:
+        """Count an accepted access notification; ``False`` if it was refused."""
+        if event_id is None:
+            return False
         if math.isfinite(now):
-            self._sent.append(now)
+            self._sent.append((now, event_id))
+        return True
 
     def _finding_notifications(self, notifications, at, now, finding_event_id=None) -> None:
         """One immediate notification per finding up to the hourly cap.
@@ -469,12 +486,14 @@ class AccessFaultMonitor:
                     event_id = None
             if not isinstance(event_id, UUID) or event_id == self._last_cursor:
                 event_id = None
-            if not self._notify(notifications, NotificationKind.CREDENTIAL_FINDING, at, event_id):
+            accepted = self._notify(notifications, NotificationKind.CREDENTIAL_FINDING, at,
+                                    event_id)
+            if accepted is None:
                 return
             if event_id is not None:
                 self._last_cursor = event_id
             if math.isfinite(now):
-                self._finding_sent.append(now)
+                self._finding_sent.append((now, accepted))
             if batch:
                 self._findings_pending = 0
                 self._findings_batched = False

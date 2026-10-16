@@ -80,7 +80,8 @@ class RecordingTests(unittest.TestCase):
              (19, "pairing_credential_renewal"), (20, "presence_timeline_gap"),
              (21, "pairing_renewal_certificate"), (22, "human_access_invitation_clock"),
              (23, "human_access_step_up_clock"),
-             (24, "human_access_credential_handle")],
+             (24, "human_access_credential_handle"),
+             (25, "notification_acceptance_time")],
         )
         self.policy = Reservation()
         self.validator = SyntheticValidator()

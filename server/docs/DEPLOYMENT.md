@@ -1741,6 +1741,15 @@ Releases and runtime data are never deleted by these operations; only a staged
 release whose own installation failed is removed. Database migrations are
 forward-only, so an older application may reject a newer database; that failed
 rollback restores the release that was running before the attempt.
+For example, migration 25 (Issue #287) adds the nullable
+`notification_events.accepted_at` column on the first start of a release that
+includes it: it rewrites and deletes no row, runs inside the storage admission
+(filesystem identity and hard reserve) like every migration, and a refused
+admission is a startup failure that is retried, never a partial schema. Until
+that first start the local administrative commands refuse the database with
+`database_schema_outdated`. A release from before it refuses the migrated
+database at startup (newer schema), so a rollback across it fails and
+restores the running release.
 
 Release trees therefore accumulate under the installation root. Keep the
 installation filesystem separate from the runtime filesystem so release growth
@@ -2081,7 +2090,9 @@ the tables #132 added:
 Values a correct service rewrites across a restart or a daily run are not
 compared for equality; the output lists them under `declared_mutable`:
 `notification_events.delivery` (a pending Slack delivery completes, a
-presence notification is retried), `uvc_approvals.session_token` (cleared at
+presence notification is retried), `notification_events.accepted_at` (the
+row's latest local write, rewritten with each delivery result or retried
+write; `NULL` on rows written before migration 25), `uvc_approvals.session_token` (cleared at
 a clean stop and replaced at every start; the Owner re-approval latch it arms
 is compared through the camera source's `requires_approval`, but a token
 cleared while the service was down after an unclean stop cannot be told from

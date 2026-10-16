@@ -3387,7 +3387,7 @@ class LifecycleInventoryTests(unittest.TestCase):
 
         def accept(row_id):
             self.runtime.execute(
-                "INSERT INTO notification_events VALUES (?, 'hardware_integrity_failure', "
+                "INSERT INTO notification_events(event_id, kind, at, confirmed, delivery) VALUES (?, 'hardware_integrity_failure', "
                 "'2026-01-01T00:00:00+00:00', 1, 'sent')",
                 (str(uuid5(EVENT_NAMESPACE, f"integrity-outbox:{row_id}")),))
         # Row 1 delivered and accepted; the CPU slot promoted into row 4.
@@ -3438,7 +3438,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         for row_id, (kind, at) in events.items():
             self.runtime.execute("DELETE FROM integrity_outbox WHERE id=?", (row_id,))
             self.runtime.execute(
-                "INSERT INTO notification_events VALUES (?, ?, ?, 1, 'sent')",
+                "INSERT INTO notification_events(event_id, kind, at, confirmed, delivery) VALUES (?, ?, ?, 1, 'sent')",
                 (str(uuid5(EVENT_NAMESPACE, f"integrity-outbox:{row_id}")), kind, at))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
@@ -3577,7 +3577,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         def deliver(row_id, kind, at):
             self.runtime.execute("DELETE FROM integrity_outbox WHERE id=?", (row_id,))
             self.runtime.execute(
-                "INSERT INTO notification_events VALUES (?, ?, ?, 1, 'sent')",
+                "INSERT INTO notification_events(event_id, kind, at, confirmed, delivery) VALUES (?, ?, ?, 1, 'sent')",
                 (str(uuid5(EVENT_NAMESPACE, f"integrity-outbox:{row_id}")), kind, at))
         self.runtime.execute("DELETE FROM integrity_overflow")
         outbox([{"kind": "GPU", "state": "UNVERIFIABLE", "reason": "x"}],
@@ -3612,7 +3612,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             (when, json.dumps([{"kind": "GPU", "state": "CHANGED", "reason": "x"}])))
         self.runtime.execute("DELETE FROM integrity_outbox WHERE id=1")
         self.runtime.execute(
-            "INSERT INTO notification_events VALUES (?, 'hardware_integrity_failure', ?, 1, 'sent')",
+            "INSERT INTO notification_events(event_id, kind, at, confirmed, delivery) VALUES (?, 'hardware_integrity_failure', ?, 1, 'sent')",
             (str(uuid5(EVENT_NAMESPACE, "integrity-outbox:1")), when))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
@@ -6615,10 +6615,11 @@ class LifecycleInventoryTests(unittest.TestCase):
             self.assertIn(name, inventory.INVENTORIED_TABLES)
             self.assertIn(name, report["sections"]["tables"]["preserved"])
         # Values the services rewrite are declared, in the files and on the console.
-        for name in ("notification_events.delivery", "uvc_approvals.session_token",
-                     "integrity_status", "recording_health_status"):
+        for name in ("notification_events.delivery", "notification_events.accepted_at",
+                     "uvc_approvals.session_token", "integrity_status",
+                     "recording_health_status"):
             note = inventory.DECLARED_MUTABLE[name]
-            self.assertTrue(note.startswith("declared_mutable (#132)"), name)
+            self.assertTrue(note.startswith("declared_mutable (#132"), name)
             self.assertEqual(report["declared_mutable"][name], note)
             self.assertEqual(recorded["declared_mutable"][name], note)
             self.assertIn(f"{name}: {note}", stdout)
@@ -6833,7 +6834,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                  DeliveryResult.SUPPRESSED)):
             event = NotificationEvent(kind, self.now - age, label == "movement",
                                       delivery=delivery)
-            events.upsert(event)
+            events.upsert(event, accepted_at=self.now)
             made[label] = str(event.event_id)
         _, baseline = self.record()
         # The real retention at the verify time and a completed delivery
@@ -6842,7 +6843,8 @@ class LifecycleInventoryTests(unittest.TestCase):
         events.upsert(NotificationEvent(NotificationKind.SERVER_MOVEMENT,
                                         self.now - timedelta(days=1), True,
                                         event_id=UUID(made["movement"]),
-                                        delivery=DeliveryResult.SENT))
+                                        delivery=DeliveryResult.SENT),
+                      accepted_at=self.now)
         code, report, _ = self.verify(baseline)
         section = report["sections"]["notification_events"]
         self.assertEqual(code, inventory.EXIT_PRESERVED, section)
@@ -6872,7 +6874,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                        (str(uuid4()), "camera_tamper", "2026-01-01 00:00:00")):
             with self.subTest(values=values):
                 self.runtime.execute("DELETE FROM notification_events")
-                self.runtime.execute("INSERT INTO notification_events VALUES (?,?,?,0,'sent')",
+                self.runtime.execute("INSERT INTO notification_events(event_id, kind, at, confirmed, delivery) VALUES (?,?,?,0,'sent')",
                                      values)
                 self.assert_record_refused("notification_events:invalid_value")
 
@@ -7181,13 +7183,13 @@ class LifecycleInventoryTests(unittest.TestCase):
         skewed = NotificationEvent(NotificationKind.CAMERA_TAMPER,
                                    self.now + timedelta(minutes=4), False,
                                    delivery=DeliveryResult.SUPPRESSED)
-        events.upsert(skewed)
+        events.upsert(skewed, accepted_at=self.now)
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"])
         future = NotificationEvent(NotificationKind.CAMERA_TAMPER,
                                    self.now + timedelta(days=365), False,
                                    delivery=DeliveryResult.SUPPRESSED)
-        events.upsert(future)
+        events.upsert(future, accepted_at=self.now)
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertEqual(report["sections"]["notification_events"]["failed"],
