@@ -1660,9 +1660,9 @@ with synthetic `*.invalid` identities:
 Verified only with the synthetic ASGI driver and synthetic stores
 (`server/tests/test_human_gated_authorization.py`,
 `tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve or
-real authenticator has exercised sign-out or the CSRF header yet, and no
-production entry point builds the composition. Once a deployment can enable it,
-verify on a shared machine (one OS account and browser profile, the shared
+real authenticator has exercised sign-out or the CSRF header yet; the production launcher mounts the human routes only from an enabled
+`human_access` deployment section (CP-1), not yet exercised on real hosts.
+Once a deployment enables it, verify on a shared machine (one OS account and browser profile, the shared
 Tailscale login, synthetic `*.invalid` people with their own passkeys on
 roaming authenticators):
 
@@ -1765,10 +1765,10 @@ hosts. Once a deployment enables them, on the Main Server with a synthetic
 Verified only with the synthetic ASGI driver, software authenticators and a
 synthetic boot clock (`server/tests/test_human_step_up.py`,
 `tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve,
-real authenticator or real clock step has exercised it, no production entry
-point mounts the human routes yet; the `403 step_up_required` contract is
+real authenticator or real clock step has exercised it, and the production launcher mounts the human routes only from an enabled
+`human_access` deployment section (CP-1), not yet exercised on real hosts; the `403 step_up_required` contract is
 exercised through the S4b administration routes in the tests. Once a
-deployment can enable the routes, on a shared machine (one OS account and browser profile,
+deployment enables the routes, on a shared machine (one OS account and browser profile,
 the shared Tailscale login, a synthetic `*.invalid` Owner and a synthetic
 `*.invalid` invitee, each with their own passkey on a separate roaming
 authenticator):
@@ -1832,9 +1832,9 @@ Mock only: verified with the synthetic ASGI driver, software authenticators,
 a synthetic boot clock and patched storage failures
 (`server/tests/test_human_step_up.py` `FollowUpTests` and
 `StepUpFindingStoreTests`); no browser, real authenticator, real storage
-hard stop or real notification channel has exercised it, and no production
-entry point mounts the human routes yet. Once a deployment can enable the
-routes, with a synthetic `*.invalid` Owner whose passkey is on a roaming
+hard stop or real notification channel has exercised it, and the production launcher mounts the human routes only from an enabled
+`human_access` deployment section (CP-1), not yet exercised on real hosts.
+Once a deployment enables the routes, with a synthetic `*.invalid` Owner whose passkey is on a roaming
 authenticator usable from two separate browser profiles (A and B), on a
 disposable deployment:
 
@@ -1888,9 +1888,9 @@ Mock only: verified with the synthetic ASGI driver, software authenticators
 and a synthetic boot clock (`server/tests/test_human_admin_routes.py`,
 `server/tests/test_access_administration.py`,
 `tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve,
-real authenticator or real deployment has exercised them, no production
-entry point mounts the human routes yet, and the Owner's Web screen is S6.
-Once a deployment can enable the routes, with a synthetic `*.invalid` Owner
+real authenticator or real deployment has exercised them, the production launcher mounts the human routes only from an enabled
+`human_access` deployment section (CP-1), not yet exercised on real hosts, and the Owner's Web screen is S6.
+Once a deployment enables the routes, with a synthetic `*.invalid` Owner
 and synthetic invitees, each with their own passkey:
 
 - [ ] as the Owner (fresh), `POST /api/admin/principals` with a display name
@@ -1940,7 +1940,7 @@ synthetic ASGI driver with software authenticators
 (`server/tests/test_local_revocation_cli.py`); the command has not been run
 on the real Main Server or against any deployment database. These steps
 change real access state and need the Owner present; they were not executed
-as part of the S4c change. Once a deployment can enable the human routes, on
+as part of the S4c change. Once a deployment enables the human routes, on
 the Main Server, with synthetic `*.invalid` invitees and their own test
 passkeys (never a real person's credential):
 
@@ -2044,7 +2044,7 @@ loads the real S5a build through the same loader
 (`server/tests/test_web_build_contract.py`); no browser has loaded, rendered
 or enforced the response policies of the shell or the application, and no
 Tailscale Serve or real deployment has served them. The release ships the
-build since S5c (next section). Once a deployment can enable the human
+build since S5c (next section). Once a deployment enables the human
 routes with that build, from a browser on the shared account at the reserved
 name:
 

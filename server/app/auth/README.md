@@ -23,7 +23,9 @@ Owns owner invitations/allowlists, independent `live:view` and `recordings:view`
 ## Current foundation
 
 ADR-0004 (per-person WebAuthn/passkey credentials) was accepted on 2026-09-30,
-alongside ADR-0003. The production entry points still mount no human route.
+alongside ADR-0003. The production launcher mounts the human routes only
+from an enabled `human_access` deployment section (CP-1, `composition.py`
+below), not yet exercised on real hosts; without it no human route is mounted.
 Issue #10 phase 1 adds the human route foundation (`human_surface.py`, below):
 an embedder can open the passkey sign-in ceremony and a session
 self-description route only through a validated composition that the
