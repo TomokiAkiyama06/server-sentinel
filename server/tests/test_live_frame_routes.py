@@ -385,12 +385,13 @@ class LimitTests(LiveRouteFixture):
         self.tick(1.0)
         self.assertEqual(status(await self.frame(cookie, session_id)), 204)
 
-    async def test_open_and_close_are_rate_limited_per_session(self):
+    async def test_opens_are_rate_limited_per_session_and_closes_are_not_charged(self):
         self.access.live_limiter = SourceRateLimiter(per_source_capacity=2, per_source_refill_seconds=6.0,
                                                      global_capacity=None, monotonic=self.limit_clock)
         _, cookie, csrf = await self.viewer()
-        session_id = await self.opened(cookie, csrf, self.sources[0])
-        self.assertEqual(status(await self.close(cookie, csrf, session_id)), 204)
+        for _ in range(2):
+            session_id = await self.opened(cookie, csrf, self.sources[0])
+            self.assertEqual(status(await self.close(cookie, csrf, session_id)), 204)
         writes = self.admission.admitted
         self.assertEqual(await self.open(cookie, csrf, self.sources[0]), await self.denial())
         self.assertEqual(self.admission.admitted, writes)
@@ -565,6 +566,20 @@ class ServiceTests(unittest.TestCase):
         gate.set()
         releasing.join(10)
         self.assertFalse(releasing.is_alive())
+        self.assertEqual(hub.status.viewers, 0)
+        # Concurrent stops (run() ending while a replacement is attached)
+        # never lose the release.
+        service.start()
+        gate = threading.Event()
+        service._submit(gate.wait, 10)
+        service.open(access, source, token, admit=_null)
+        stoppers = [threading.Thread(target=service.stop, kwargs={"wait": wait}) for wait in (False, True, True)]
+        for stopper in stoppers:
+            stopper.start()
+        gate.set()
+        for stopper in stoppers:
+            stopper.join(10)
+        service.stop(wait=True)
         self.assertEqual(hub.status.viewers, 0)
         # A restart serves again, with nothing left over.
         service.start()

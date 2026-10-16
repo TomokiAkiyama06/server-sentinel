@@ -123,11 +123,12 @@ cannot spend the Owner's. The inventory read A1 is not charged. Beyond the
 limiter, only a fresh Owner session with its CSRF token reaches an
 administration write or its audit record (every other caller is refused
 inside the authorization), their state is bounded by the S4-8 limits, and
-every write goes through the storage admission. Live session opens and
-closes are charged to a fifth, separate limiter (``HumanAccess.live_limiter``:
+every write goes through the storage admission. Live session opens are
+charged to a fifth, separate limiter (``HumanAccess.live_limiter``:
 per session a burst of 10 and one more every 6 seconds), keyed on a
-domain-separated digest of a token a read-only check found current or that
-names a live session the service holds for that token; frame polls to the
+domain-separated digest of a token a read-only check found current (a close
+reaches SQLite only for a live session held for that token, so closes are
+bounded by opens); frame polls to the
 service's own in-memory budget per live session, charged only to its holder. No recording,
 timeline, event, health or version route is mounted here. The step-up routes require ``OWNER_READ`` (an Owner
 session, fresh or stale),
@@ -767,8 +768,8 @@ class HumanAccess:
         # S7 interim live (optional component, ``attach_live``): without it
         # every live route is the generic denial.
         self.live: LiveFrameService | None = None
-        # Opening/closing live sessions, per session token digest: a burst of
-        # 10 and one more every 6 seconds, so an open/close loop cannot churn
+        # Opening live sessions, per session token digest: a burst of 10 and
+        # one more every 6 seconds, so an open/close loop cannot churn
         # the gate, the storage admission or the frame executor.
         self.live_limiter = SourceRateLimiter(per_source_capacity=10, per_source_refill_seconds=6.0,
                                               global_capacity=None, max_sources=64)
@@ -986,9 +987,11 @@ class HumanAccess:
             raise
         finally:
             self._serving = False
-            self._running = False
+            # Stopped before ``_running`` clears, so a replacement attached
+            # right after this run() ends always finds it stopped.
             if self.live is not None:
                 self.live.stop()
+            self._running = False
             self._state = HumanAccessState.FAILED if failed else HumanAccessState.STOPPED
 
     def _check_failed(self) -> None:
@@ -1511,12 +1514,11 @@ class HumanSurface:
         return live
 
     def _limit_live(self, token: bytes) -> None:
-        """Charge one live-session open/close to its session's bucket.
+        """Charge one live-session open to its session's bucket.
 
         Keyed like ``_limit_admin`` on a domain-separated digest of a token
-        that a read-only check has just found current (an open) or that
-        names a live session this service holds (a close), so a forged
-        cookie never takes a slot. Over the limit: the generic denial.
+        that a read-only check has just found current, so a forged cookie
+        never takes a slot. Over the limit: the generic denial.
         """
         key = hashlib.sha256(_LIVE_LIMIT_DOMAIN + token).hexdigest()
         if not self.access.live_limiter.allow(key):
@@ -1653,8 +1655,11 @@ class HumanSurface:
         token = session_token(request.headers)
         session_id = UUID(request.params["session"])
         if not live.holds(token, session_id):
+            # Only a held id presented with its opening cookie reaches SQLite,
+            # so closes are bounded by the (rate-limited) opens and are not
+            # charged themselves: a viewer closing on every hidden tab never
+            # spends its open budget twice.
             raise _Denied()
-        self._limit_live(token)
         authorized = await self._authorize(request, Requirement.SESSION, touch=False)
         try:
             await asyncio.wrap_future(live.close(authorized.session.session_id, session_id))

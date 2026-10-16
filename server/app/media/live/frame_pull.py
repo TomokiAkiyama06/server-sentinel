@@ -214,6 +214,9 @@ class LiveFrameService:
         self._expiries = 0
         # Shared with request threads under ``_lock``.
         self._lock = threading.Lock()
+        # Serializes start() and stop() (a run() ending while a replacement
+        # is attached stops the same service from two threads).
+        self._lifecycle = threading.Lock()
         # Live-session id -> digest of the opening human session's token.
         self._holders: dict[UUID, bytes] = {}
         self._executor: ThreadPoolExecutor | None = None
@@ -243,52 +246,54 @@ class LiveFrameService:
             return self._executor is not None
 
     def start(self) -> None:
-        """Start the executor and the lease sweeper; idempotent."""
-        with self._lock:
-            if self._executor is not None:
-                return
-            retired, self._retired = self._retired, None
-        if retired is not None:
-            retired.shutdown(wait=True)
-        with self._lock:
-            if self._executor is not None:
-                return
-            self._stop = threading.Event()
-            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="live-frame")
-            stop = self._stop
-            self._sweeper = threading.Thread(target=self._sweep_loop, args=(stop,),
-                                             name="live-frame-sweeper", daemon=True)
-            self._sweeper.start()
+        """Start the executor and the lease sweeper; idempotent.
+
+        A restart first drains the executor an earlier ``stop()`` retired, so
+        two threads never share the state above.
+        """
+        with self._lifecycle:
+            with self._lock:
+                if self._executor is not None:
+                    return
+                retired, self._retired = self._retired, None
+            if retired is not None:
+                retired.shutdown(wait=True)
+            with self._lock:
+                self._stop = threading.Event()
+                self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="live-frame")
+                stop = self._stop
+                self._sweeper = threading.Thread(target=self._sweep_loop, args=(stop,),
+                                                 name="live-frame-sweeper", daemon=True)
+                self._sweeper.start()
 
     def stop(self, *, wait: bool = False) -> None:
         """Refuse every later call and release every session's demand.
 
-        The release runs as the executor's last job; ``wait=True`` waits for
-        it (tests, a synchronous embedder, a replacement), also when an
-        earlier ``stop()`` without waiting retired the executor. Idempotent.
+        The release is queued as the executor's last job before the executor
+        is retired, so it always runs. ``wait=True`` waits for it (tests, a
+        synchronous embedder, a replacement), also when an earlier
+        ``stop()`` without waiting retired the executor. Start and stop are
+        serialized; idempotent.
         """
-        with self._lock:
-            executor, self._executor = self._executor, None
-            sweeper, self._sweeper = self._sweeper, None
-            self._stop.set()
-            self._holders.clear()
-            if executor is not None:
-                self._retired = executor
-                retired = None
-            else:
+        with self._lifecycle:
+            with self._lock:
+                executor, self._executor = self._executor, None
+                sweeper, self._sweeper = self._sweeper, None
+                self._stop.set()
+                self._holders.clear()
+                if executor is not None:
+                    executor.submit(self._end_all)
+                    executor.shutdown(wait=False)
+                    self._retired = executor
                 retired = self._retired if wait else None
                 if retired is not None:
                     self._retired = None
-        if executor is None:
             if retired is not None:
-                # Drain the earlier stop's release (and any job queued
-                # before it) before reporting this service as released.
+                # Drain the release (and any job queued before it) before
+                # reporting this service as released.
                 retired.shutdown(wait=True)
-            return
-        executor.submit(self._end_all)
-        executor.shutdown(wait=wait)
-        if wait and sweeper is not None:
-            sweeper.join(timeout=10)
+                if sweeper is not None:
+                    sweeper.join(timeout=10)
 
     def _submit(self, function, *args) -> Future:
         with self._lock:

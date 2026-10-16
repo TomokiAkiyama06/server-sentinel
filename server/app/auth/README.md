@@ -568,7 +568,7 @@ OpenAPI or error handler is reachable):
 | `GET /api/live/sources` | `LIVE` (the Owner or `live:view`) | `{"sources": [{"id", "name", "health"}]}` (S7, below) |
 | `POST /api/live/sessions` | `LIVE` + exact `Origin` + `X-CSRF-Token` (live limiter) | `{"session_id", "source_id", "lease_seconds", "frame_interval_ms"}` (S7) |
 | `GET /api/live/sessions/<session>/frame?after=<n>` | `LIVE`, the opening human session only | `200 image/jpeg` + `X-Frame-Sequence`, or `204` (S7) |
-| `POST /api/live/sessions/<session>/close` | `SESSION` + exact `Origin` + `X-CSRF-Token` (live limiter) | `204` (S7) |
+| `POST /api/live/sessions/<session>/close` | `SESSION` + exact `Origin` + `X-CSRF-Token`; only a held id with its opening cookie | `204` (S7) |
 
 The session route grants nothing and returns only the caller's own role,
 permissions (the Owner holds both) and CSRF token. Apart from sign-out, the
@@ -1469,9 +1469,11 @@ route is the generic denial). The route table above lists the four routes.
 - Limits (D10, D5 defaults): 4 live sessions in total, 2 per source, 2 per
   person; at most 5 served frames per second per session; a frame that does
   not start with a JPEG SOI marker or is larger than 8 MiB is never served.
-  Over a limit: the generic denial (or `204` for pacing). Opens and closes are
+  Over a limit: the generic denial (or `204` for pacing). Opens are
   charged to `HumanAccess.live_limiter` (per session a burst of 10 and one
   more every 6 s) after a read-only check, so a forged cookie takes no slot.
+  A close is not charged: it reaches SQLite only for a live session held for
+  the presented cookie, so closes are bounded by opens.
 - Demand ends when a session's viewer stops polling for 15 s (the lease),
   on close, on sign-out, at once for the affected principal after an Owner
   grant or revocation change (`AccessAdministration.principal_changed`), and
