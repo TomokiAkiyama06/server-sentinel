@@ -201,6 +201,14 @@ class ReservationFaultTests(MonitoredAccessFixture):
         self.assertEqual(self.notifications.calls[0]["event_id"], stored)
         self.assertEqual(self.notifications.calls[0]["at"], at)
 
+    async def test_a_restored_pending_recovery_is_sent_again_under_its_row(self):
+        stored, at = uuid4(), AT - timedelta(minutes=20)
+        self.monitor.restore_pending_recovery(event_id=stored, at=at)
+        self.assertFalse(self.drain().human_access_degraded)
+        self.assertEqual(self.notifications.kinds, [RECOVERED])
+        self.assertEqual(self.notifications.calls[0]["event_id"], stored)
+        self.assertEqual(self.notifications.calls[0]["at"], at)
+
     async def test_starting_or_stopped_composition_is_neither_fault_nor_recovery(self):
         await self.stop_serving()
         self.assertIs(self.access.state, HumanAccessState.STOPPED)
@@ -629,7 +637,8 @@ class FindingRecoveryTests(RuntimeFixture):
         # Each later row is stamped earlier: only the insertion (rowid) order counts.
         cases = ((("human_access_fault", "sent"),), [{"delivered": True, "event_id": None, "at": None}]), \
             ((("human_access_fault", "sent"), ("human_access_recovered", "sent")), []), \
-            ((("human_access_recovered", "sent"), ("human_access_fault", "pending")), "pending")
+            ((("human_access_recovered", "sent"), ("human_access_fault", "pending")), "pending"), \
+            ((("human_access_recovered", "pending"),), "recovery")
         await self.cycle()
         for rows, expected in cases:
             with closing(sqlite3.connect(self.settings.database_path)) as db:
@@ -644,10 +653,16 @@ class FindingRecoveryTests(RuntimeFixture):
                               return_value=object()), \
                     patch.object(AccessFaultMonitor, "restore_fault_episode",
                                  lambda monitor, **values: calls.append(values)), \
+                    patch.object(AccessFaultMonitor, "restore_pending_recovery",
+                                 lambda monitor, **values: calls.append({"recovery": values})), \
                     patch.object(AccessFaultMonitor, "_polled", lambda monitor: None):
                 await self.cycle()
             with self.subTest(rows=rows):
-                if expected == "pending":
+                if expected == "recovery":
+                    (call,) = calls
+                    self.assertEqual(str(call["recovery"]["event_id"]), self.last_event_id)
+                    self.assertEqual(call["recovery"]["at"], self.last_at)
+                elif expected == "pending":
                     # The stored row's own ID and time, so the retry updates it.
                     (call,) = calls
                     self.assertEqual(call["delivered"], False)

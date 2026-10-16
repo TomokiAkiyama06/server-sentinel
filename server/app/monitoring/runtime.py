@@ -705,7 +705,9 @@ class MonitoringRuntime:
         Access episode: when the newest ``human_access_fault`` /
         ``human_access_recovered`` row (by rowid) is a fault, the episode
         continues in this process, so recovery is still announced; a fault
-        row still ``pending`` is sent again first.
+        row still ``pending`` is sent again first. A newest recovery row
+        still ``pending`` is sent again (under its own ID and time) once a
+        check passes.
         """
         now = self.dependencies.utcnow()
         # The whole retained audit history (Codex PR #271): a notification
@@ -726,8 +728,14 @@ class MonitoringRuntime:
                 (NotificationKind.HUMAN_ACCESS_FAULT.value,
                  NotificationKind.HUMAN_ACCESS_RECOVERED.value),
             ).fetchone()
-            if last is not None and last[0] == NotificationKind.HUMAN_ACCESS_FAULT.value:
-                delivered = last[1] != DeliveryResult.PENDING.value
+            pending = last is not None and last[1] == DeliveryResult.PENDING.value
+            if (last is not None and last[0] == NotificationKind.HUMAN_ACCESS_RECOVERED.value
+                    and pending):
+                # A recovery notice the stopped process never delivered.
+                monitor.restore_pending_recovery(event_id=UUID(last[2]),
+                                                 at=datetime.fromisoformat(last[3]))
+            elif last is not None and last[0] == NotificationKind.HUMAN_ACCESS_FAULT.value:
+                delivered = not pending
                 monitor.restore_fault_episode(
                     delivered=delivered,
                     # A pending row is retried under its own ID and time.

@@ -973,7 +973,9 @@ row is a delivery the stopped process never finished). It also continues an
 access fault episode: when the newest `human_access_fault` /
 `human_access_recovered` row (by rowid) is a fault, a check that now passes
 sends the recovery notice, a fault that persists is not notified again, and a
-fault row still `pending` is sent again first. A notification the service
+fault row still `pending` is sent again first; a newest recovery row still
+`pending` is sent again once a check passes. Both retries reuse the row's own
+event ID and time, so they update it. A notification the service
 refuses outright (`FAILED`: nothing kept) stays pending and is retried with the
 same time and event ID on the next tick, without spending the budget. A
 reservation fault needs no such recovery: the startup check re-detects it. Verified with synthetic checks, software
