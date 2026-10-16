@@ -67,7 +67,7 @@
     },
     {
       "path": "web/tests/live.test.mjs",
-      "sha256": "sha256:bc1f25947d17c90d9c6d5dc1c87beede06330b9f62146cf462ada8301f31f48a"
+      "sha256": "sha256:401984a94cd23a7cec472abc43a4887c4c9751859cc9c984b4168a7032850173"
     }
   ],
   "inputs": [

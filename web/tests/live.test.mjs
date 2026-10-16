@@ -394,3 +394,29 @@ test('live screen offers no download, export, link or media element and stays ne
     assert.match(messages[locale].liveViewOnly, locale === 'ja' ? /防ぐものではありません/ : /does not prevent/);
   }
 });
+
+test('sign-out first closes every viewer session this page still holds', async () => {
+  const close = `POST /api/live/sessions/${sessionId}/close`;
+  const { services, calls } = await signedIn({
+    'POST /api/live/sessions': json({ session_id: sessionId }),
+    [close]: new Response(null, { status: 204 }),
+    'POST /api/auth/sign-out': new Response(null, { status: 204 }),
+  });
+  await services.openLiveSession(source, signal());
+  await services.signOut(signal());
+  assert.deepEqual(calls.slice(-2).map(call => call.key), [close, 'POST /api/auth/sign-out']);
+  assert.deepEqual(calls.at(-2).init.headers, { Accept: 'application/json', 'X-CSRF-Token': csrf });
+  // A close already sent is not repeated, and a later close sends nothing.
+  services.closeLiveSession(sessionId);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.filter(call => call.key === close).length, 1);
+  const again = await signedIn({
+    'POST /api/live/sessions': json({ session_id: sessionId }),
+    [close]: new Response(null, { status: 204 }),
+    'POST /api/auth/sign-out': new Response(null, { status: 204 }),
+  });
+  await again.services.openLiveSession(source, signal());
+  again.services.closeLiveSession(sessionId);
+  await again.services.signOut(signal());
+  assert.equal(again.calls.filter(call => call.key === close).length, 1);
+});

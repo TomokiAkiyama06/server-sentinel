@@ -79,6 +79,10 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
   const deployment = new URL(origin);
   if (!['http:', 'https:'].includes(deployment.protocol)) throw new ApiError('invalid_request');
   let csrf: string | null = null;
+  // Viewer sessions this page opened and has not closed yet. Sign-out closes
+  // them first: once the token is gone a later close could not be sent, and
+  // the viewer slot would stay taken until the server's lease ends it.
+  const viewers = new Set<string>();
 
   async function send({ method, path, accept, signal, csrf: token, body, keepalive }: Send): Promise<Response> {
     const url = new URL(path, deployment.origin);
@@ -141,6 +145,14 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
     },
 
     async signOut(signal) {
+      const header = token();
+      await Promise.all([...viewers].map(async id => {
+        viewers.delete(id);
+        try {
+          const closed = await send({ method: 'POST', path: sessionPath(id, 'close'), accept: 'application/json', csrf: header, keepalive: true });
+          void closed.body?.cancel().catch(() => undefined);
+        } catch { /* the lease ends it; sign-out proceeds */ }
+      }));
       const response = await send({ method: 'POST', path: SIGN_OUT_PATH, accept: 'application/json', signal, csrf: token() });
       if (response.status !== 204) throw new ApiError('unavailable');
       csrf = null;
@@ -163,6 +175,7 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
       if (!record(value) || typeof value.session_id !== 'string' || !UUID.test(value.session_id)) {
         throw new ApiError('invalid_response');
       }
+      viewers.add(value.session_id);
       return value.session_id;
     },
 
@@ -195,6 +208,7 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
       let path: string;
       let header: string;
       try { path = sessionPath(sessionId, 'close'); header = token(); } catch { return; }
+      viewers.delete(sessionId);
       void send({ method: 'POST', path, accept: 'application/json', csrf: header, keepalive: true })
         .then(response => { void response.body?.cancel().catch(() => undefined); }, () => undefined);
     },

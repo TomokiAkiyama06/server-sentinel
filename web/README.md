@@ -298,8 +298,11 @@ read or rendered.
   `invited_user` ⇒ viewer; an unknown role or permission, a duplicate, or a
   token that is not 43 base64url characters fails closed (`invalid_response`).
   A refusal is the denied screen, which links back to the sign-in shell.
-- Sign-out: `POST /api/auth/sign-out` with no body ⇒ `204` ⇒
-  `location.replace('/')`. A failed sign-out is reported and the session stays.
+- Sign-out: first a close of every live viewer session this page still holds
+  (while the CSRF token is still known; Codex PR #273), then
+  `POST /api/auth/sign-out` with no body ⇒ `204` ⇒ `location.replace('/')`.
+  A refusal (the session is already gone) also goes to the sign-in shell; any
+  other failure is reported and the session stays.
 
 Live contract with the server routes of #205 CP-4 (the client side; the
 server owns authorization, leases and limits):
