@@ -95,7 +95,9 @@ function LivePlayer({ transport, source, t }: { transport: LiveTransport; source
           const element = canvas.current;
           const context = element?.getContext('2d');
           // A decode that finishes after a pause, refusal or unmount is dropped.
-          if (!active || !current() || !element || !context) return;
+          if (!active || !current()) return;
+          // Nothing drawn is a failure, never a current picture.
+          if (!element || !context) throw new Error('canvas unavailable');
           if (element.width !== bitmap.width || element.height !== bitmap.height) {
             element.width = bitmap.width;
             element.height = bitmap.height;
