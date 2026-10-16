@@ -493,3 +493,51 @@ test('a frame decoded after a pause is reported as no longer current', async () 
   assert.deepEqual(checks, [false]);
   stop();
 });
+
+test('a stalled decode shares the request deadline and is then no longer current', async () => {
+  const checks = [];
+  let finish;
+  let calls = 0;
+  const fakeTransport = transport({ reads: [frame(1), frame(2)] });
+  const clock = manualClock();
+  const view = visibility();
+  const statuses = [];
+  const stop = live.startLiveLoop({ transport: fakeTransport, sourceId: source, visibility: view, clock,
+    onStatus: value => statuses.push(value),
+    onFrame: (_, current) => {
+      calls += 1;
+      if (calls === 1) return undefined;
+      return new Promise(resolve => { finish = () => { checks.push(current()); resolve(); }; });
+    } });
+  await clock.advance(live.FRAME_INTERVAL_MS);
+  assert.equal(statuses.at(-1), 'live');
+  await clock.advance(live.REQUEST_TIMEOUT_MS);
+  assert.equal(statuses.at(-1), 'retrying');
+  finish();
+  await clock.advance(0);
+  assert.deepEqual(checks, [false]);
+  stop();
+});
+
+test('a session granted after the open timed out is closed at once', async () => {
+  let grant;
+  const fakeTransport = transport({ open: () => new Promise(resolve => { grant = resolve; }) });
+  const loop = run({ transport: fakeTransport });
+  await loop.clock.advance(live.REQUEST_TIMEOUT_MS);
+  assert.equal(loop.statuses.at(-1), 'retrying');
+  grant('00000000-0000-4000-8000-0000000f0001');
+  await loop.clock.advance(0);
+  assert.deepEqual(fakeTransport.log.filter(entry => entry[0] === 'close'), [['close', '00000000-0000-4000-8000-0000000f0001']]);
+  loop.stop();
+});
+
+test('a stalled sign-out request is abandoned and reported, and can be retried', async () => {
+  let answer = () => new Promise(() => {});
+  const stalled = fake({ 'GET /api/session': json(ownerBody), 'POST /api/auth/sign-out': (url, init) => answer(url, init) });
+  const services = createDashboardServices(origin, stalled.request, { cleanupMs: 10, signOutMs: 30 });
+  await services.loadSession(signal());
+  await assert.rejects(services.signOut(signal()), { code: 'unavailable' });
+  answer = () => new Response(null, { status: 204 });
+  await services.signOut(signal());
+  assert.equal(stalled.calls.filter(call => call.key === 'POST /api/auth/sign-out').length, 2);
+});

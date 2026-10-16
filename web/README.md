@@ -301,7 +301,8 @@ read or rendered.
 - Sign-out: no new viewer open starts; opens in flight are awaited and every
   live viewer session this page still holds is closed while the CSRF token is
   still known (bounded to 2 s in total, best effort; Codex PR #273), then
-  `POST /api/auth/sign-out` with no body ⇒ `204` ⇒ `location.replace('/')`.
+  `POST /api/auth/sign-out` with no body (abandoned after 10 s and reported
+  as failed, so it can be retried) ⇒ `204` ⇒ `location.replace('/')`.
   A refusal (the session is already gone) also goes to the sign-in shell; any
   other failure is reported and the session stays.
 
@@ -329,9 +330,10 @@ ID-keyed collection (1 to 4, no fixed slots) and plays one at a time.
 `src/dashboard/live_loop.ts` runs the interim frame-pull loop (Owner decision
 D5): open a viewer session, pull with `after=<last sequence>` at most every
 200 ms (about 5 fps), `204` ⇒ wait. No newer frame for 5 s ⇒ the picture is
-marked not current and dimmed. An open or frame request unanswered for 4 s
-is abandoned as a transient failure (aborted whether or not the transport
-honours the signal), so a stalled connection never leaves an old frame
+marked not current and dimmed. An open, or a frame request together with its
+decode, unfinished after 4 s is abandoned as a transient failure (aborted
+whether or not the transport honours the signal; a grant that still arrives is
+closed at once), so a stalled connection or decode never leaves an old frame
 labelled current. A transient failure (network, `5xx`, an invalid
 answer, an undecodable frame) retries with backoff 0.5 s, 1 s, 2 s, 4 s, then
 8 s, keeping the session. A refusal ends the loop: the canvas is cleared, the

@@ -23,9 +23,9 @@ export { ApiError };
 export const FRAME_INTERVAL_MS = 200;
 /** Without a newer frame for this long the shown frame is marked not current. */
 export const STALE_AFTER_MS = 5000;
-/** An open or frame request unanswered for this long is abandoned as a
- *  transient failure, so a stalled connection never keeps an old frame
- *  labelled current (it is shorter than STALE_AFTER_MS). */
+/** An open, or a frame request with its decode, unfinished after this long
+ *  is abandoned as a transient failure, so a stalled connection or decode
+ *  never keeps an old frame labelled current (shorter than STALE_AFTER_MS). */
 export const REQUEST_TIMEOUT_MS = 4000;
 export const BACKOFF_BASE_MS = 500;
 export const BACKOFF_MAX_MS = 8000;
@@ -144,9 +144,12 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
     controller = attempt;
     void (async () => {
       let granted: string;
+      const request = transport.open(sourceId, attempt.signal);
       try {
-        granted = await bounded(transport.open(sourceId, attempt.signal), attempt);
+        granted = await bounded(request, attempt);
       } catch (error) {
+        // A grant that still arrives after the timeout is given back at once.
+        request.then(late => transport.close(late), () => undefined);
         if (current !== generation) return;
         if (refused(error)) { end(); return; }
         fail(current, connect);
@@ -169,11 +172,16 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
     if (id === null) return;
     void (async () => {
       try {
-        const frame = await bounded(transport.read(id, after, attempt.signal), attempt);
+        // Read and decode share one deadline; a decode that ends after it
+        // (or after a pause, refusal or stop) is no longer current.
+        const isCurrent = () => !stopped && current === generation && !attempt.signal.aborted;
+        const frame = await bounded((async () => {
+          const value = await transport.read(id, after, attempt.signal);
+          if (value && isCurrent()) await onFrame(value, isCurrent);
+          return value;
+        })(), attempt);
         if (current !== generation) return;
         if (frame) {
-          await onFrame(frame, () => !stopped && current === generation);
-          if (current !== generation) return;
           after = frame.sequence;
           lastFrame = clock.now();
           report('live');

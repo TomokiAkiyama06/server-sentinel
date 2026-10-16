@@ -27,6 +27,8 @@ export const FRAME_SEQUENCE_HEADER = 'X-Frame-Sequence';
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 /** Sign-out waits at most this long for viewer opens and closes, then proceeds. */
 export const SIGN_OUT_CLEANUP_MS = 2000;
+/** The sign-out request itself is abandoned (reported as failed) after this. */
+export const SIGN_OUT_TIMEOUT_MS = 10000;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const CSRF = /^[A-Za-z0-9_-]{43}$/;
@@ -78,7 +80,7 @@ interface Send {
 }
 
 export function createDashboardServices(origin: string, request: typeof fetch = (...args) => fetch(...args),
-  { cleanupMs = SIGN_OUT_CLEANUP_MS }: { cleanupMs?: number } = {}): DashboardServices {
+  { cleanupMs = SIGN_OUT_CLEANUP_MS, signOutMs = SIGN_OUT_TIMEOUT_MS }: { cleanupMs?: number; signOutMs?: number } = {}): DashboardServices {
   const deployment = new URL(origin);
   if (!['http:', 'https:'].includes(deployment.protocol)) throw new ApiError('invalid_request');
   let csrf: string | null = null;
@@ -186,9 +188,26 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
         })();
         await Promise.race([cleanup, limit]);
         clearTimeout(timer);
-        const response = await send({ method: 'POST', path: SIGN_OUT_PATH, accept: 'application/json', signal, csrf: header });
-        if (response.status !== 204) throw new ApiError('unavailable');
-        csrf = null;
+        // Bounded too, whether or not fetch honours the abort: a stalled
+        // request is reported as failed so the person can retry.
+        const deadline = new AbortController();
+        const forward = () => deadline.abort();
+        signal.addEventListener('abort', forward);
+        let expiry: ReturnType<typeof setTimeout> | undefined;
+        const expired = new Promise<never>((_, reject) => {
+          expiry = setTimeout(() => { deadline.abort(); reject(new ApiError('unavailable')); }, signOutMs);
+        });
+        try {
+          const response = await Promise.race([
+            send({ method: 'POST', path: SIGN_OUT_PATH, accept: 'application/json', signal: deadline.signal, csrf: header }),
+            expired,
+          ]);
+          if (response.status !== 204) throw new ApiError('unavailable');
+          csrf = null;
+        } finally {
+          clearTimeout(expiry);
+          signal.removeEventListener('abort', forward);
+        }
       } finally { signingOut = false; }
     },
 
