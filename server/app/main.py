@@ -135,9 +135,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # composition must reach it, so none bypasses the immediate Owner
         # notification and degraded health.
         if (human_access.reservation.fault_sink is not access_faults
-                or human_access.ceremonies.findings is not access_faults):
+                or human_access.ceremonies.findings is not access_faults
+                or access_faults.attached not in (None, human_access)):
             raise TypeError("human access composition is invalid")
-        access_faults.attach(human_access)
     store = database or Database(settings.database_path)
     # Local UVC capture is driven only by the deployment's list of approved
     # logical sources. Frames go to a bounded preview hub that retains nothing
@@ -553,4 +553,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
         application.add_middleware(ClosedHumanSurface)
     else:
         application.add_middleware(HumanSurface, access=human_access)
+    if human_access is not None and access_faults is not None:
+        # Last, after every check above passed (PR #271 review): a refused
+        # create_app leaves the monitor unattached.
+        access_faults.attach(human_access)
     return application

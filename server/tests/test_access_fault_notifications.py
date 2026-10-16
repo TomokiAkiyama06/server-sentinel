@@ -12,6 +12,9 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
+from pathlib import Path
+import subprocess
+import sys
 from unittest import TestCase
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -38,7 +41,10 @@ from tests.test_hostname_reservation import HOST, NOW, checker
 from tests.test_human_surface import (
     EXPOSED, ORIGIN, HumanSurfaceFixture, call, payload, status,
 )
-from tests.test_monitoring_runtime import RECORDING_LIMITS, STORAGE_LIMITS, RuntimeFixture
+from tests.test_monitoring_runtime import (
+    RECORDING_LIMITS, STORAGE_LIMITS, FlakyDatabase, RuntimeFixture,
+)
+from tests.test_recording import SyntheticValidator
 from tests.test_storage_notifications import Transport, drain, endpoint
 
 
@@ -298,6 +304,30 @@ class CompositionTests(MonitoredAccessFixture):
         with self.assertRaises(ValueError):
             fresh.attach(self.access)
 
+    async def test_a_refused_create_app_leaves_the_monitor_unattached(self):
+        """PR #271 review: the monitor is attached only after every check passed."""
+        monitor = AccessFaultMonitor()
+        check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker, sink=monitor)
+        access = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets,
+                             store=self.store, reservation=check,
+                             ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=check,
+                                                          clock=self.ceremony_clock, findings=monitor))
+        with self.assertRaises(TypeError):
+            create_app(self.settings(), database=self.database, human_access=access,
+                       storage_reservation=self.admission, monitoring=self.monitoring(),
+                       monitoring_dependencies=MonitoringDependencies(access_faults=monitor),
+                       local_uvc="not a configuration")
+        self.assertIsNone(monitor.attached)
+        create_app(self.settings(), database=self.database, human_access=access,
+                   storage_reservation=self.admission, monitoring=self.monitoring(),
+                   monitoring_dependencies=MonitoringDependencies(access_faults=monitor))
+        self.assertIs(monitor.attached, access)
+        # A monitor already attached to another composition: the same TypeError.
+        with self.assertRaises(TypeError):
+            create_app(self.settings(), database=self.database, human_access=self.access,
+                       storage_reservation=self.admission, monitoring=self.monitoring(),
+                       monitoring_dependencies=MonitoringDependencies(access_faults=monitor))
+
 
 class MonitorValidationTests(TestCase):
     def test_settings_and_inputs_are_validated(self):
@@ -315,6 +345,31 @@ class MonitorValidationTests(TestCase):
         with self.assertRaises(ValueError):
             MonitoringDependencies(access_faults=object())
 
+    def test_a_raising_record_loses_no_finding_or_fault(self):
+        """PR #271 review: arrivals taken from the latch survive a raising drain."""
+
+        class Flaky(RecordingNotifications):
+            def __init__(self):
+                super().__init__()
+                self.fail = True
+
+            def record(self, kind, **values):
+                if self.fail:
+                    self.fail = False
+                    raise RuntimeError("synthetic")
+                super().record(kind, **values)
+
+        monitor = AccessFaultMonitor()
+        notifications = Flaky()
+        monitor.emit(ReservationFault((Reason.UNEXPECTED_LISTENER,), CheckKind.STARTUP, NOW, 1, 0))
+        monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, uuid4())
+        with self.assertRaises(RuntimeError):
+            monitor.drain(notifications, at=AT, monotonic=1.0)
+        status = monitor.drain(notifications, at=AT, monotonic=2.0)
+        self.assertEqual(notifications.kinds, [FAULT, FINDING])
+        self.assertTrue(status.human_access_degraded)
+        self.assertTrue(status.credential_finding_degraded)
+
     def test_without_a_composition_an_emitted_fault_still_notifies(self):
         monitor = AccessFaultMonitor()
         notifications = RecordingNotifications()
@@ -323,6 +378,31 @@ class MonitorValidationTests(TestCase):
         # Recovery cannot be observed without the composition: stays degraded.
         self.assertTrue(monitor.drain(notifications, at=AT, monotonic=2.0).human_access_degraded)
         self.assertEqual(notifications.kinds, [FAULT])
+
+
+class StandardLibraryImportTests(TestCase):
+    """PR #271 review: the monitoring runtime stays importable without the
+    application's dependencies (the installer and lifecycle inventory)."""
+
+    def test_runtime_and_monitor_import_with_the_standard_library_only(self):
+        server = Path(__file__).resolve().parents[1]
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(server)!r})\n"
+            "import app.monitoring.access, app.monitoring.runtime\n"
+            "loaded = sorted(name for name in sys.modules if name.split('.')[0] in "
+            "{'starlette', 'fastapi', 'cryptography', 'uvicorn', 'pydantic'} "
+            "or name == 'app.auth' or name.startswith('app.auth.'))\n"
+            "assert not loaded, loaded\n"
+            "import app.lifecycle_inventory\n"
+            "print('stdlib-only')\n")
+        # -S: no site-packages, so a third-party import fails as on a host
+        # without the application's environment; -I: no user site, no cwd.
+        result = subprocess.run([sys.executable, "-S", "-I", "-c", script],
+                                capture_output=True, text=True, timeout=60,
+                                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "stdlib-only")
 
 
 class NotificationServiceTests(TestCase):
@@ -366,3 +446,32 @@ class RuntimeTests(RuntimeFixture):
             await self.settle(runtime)
             self.assertEqual(1, self.slack_texts().count(
                 "ServerSentinel critical alert: human_access_fault"))
+
+    async def test_a_failed_runtime_still_alerts_and_marks_health(self):
+        """PR #271 review: while the runtime is not RUNNING (here the database
+        cannot be opened, so local persistence is refused) the access faults
+        are still drained, sent to Slack and marked degraded."""
+        monitor = AccessFaultMonitor()
+        database = FlakyDatabase(self.settings.database_path, failures=1000)
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        application = create_app(
+            self.settings, database=database, monitoring=self.configuration(),
+            monitoring_dependencies=MonitoringDependencies(
+                integrity_probe=self.probe, segment_validator=SyntheticValidator(),
+                slack_opener=self.transport, utcnow=self.clock.utcnow,
+                monotonic=lambda: self.clock.monotonic, tick_seconds=3600.0,
+                access_faults=monitor))
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            monitor.emit(ReservationFault((Reason.UNEXPECTED_LISTENER,), CheckKind.DAILY, NOW, 1, 0))
+            monitor.credential_finding(CredentialFinding.BACKUP_ELIGIBILITY_CHANGED, uuid4())
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            self.assertTrue(runtime.status.human_access_degraded)
+            self.assertTrue(runtime.status.credential_finding_degraded)
+            texts = self.slack_texts()
+            self.assertIn("ServerSentinel critical alert: human_access_fault", texts)
+            self.assertIn("ServerSentinel critical alert: credential_finding", texts)

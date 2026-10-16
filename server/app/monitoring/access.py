@@ -219,6 +219,12 @@ class AccessFaultMonitor:
             latched, reasons = self._latched, self._latched_reasons
             self._latched, self._latched_reasons = False, frozenset()
             arrivals, self._finding_arrivals = self._finding_arrivals, 0
+        # Before any notification: a raising ``record`` must not lose the
+        # arrivals already taken out of the latch (PR #271 review).
+        if arrivals:
+            self._findings_pending = min(self._findings_pending + arrivals, _MAX_COUNT)
+            if math.isfinite(monotonic):
+                self._finding_seen_at = monotonic
         polled = self._polled()
         if latched or polled is AccessHealth.FAULT:
             if self._current is not AccessHealth.FAULT:
@@ -233,7 +239,7 @@ class AccessFaultMonitor:
         elif polled is AccessHealth.HEALTHY:
             self._current = AccessHealth.HEALTHY
         self._access_notifications(notifications, at, monotonic)
-        self._finding_notifications(notifications, at, monotonic, arrivals)
+        self._finding_notifications(notifications, at, monotonic)
         return AccessFaultStatus(
             human_access_degraded=self._current is AccessHealth.FAULT,
             credential_finding_degraded=self._finding_degraded(monotonic),
@@ -265,10 +271,7 @@ class AccessFaultMonitor:
         if math.isfinite(now):
             self._sent.append(now)
 
-    def _finding_notifications(self, notifications, at, now, arrivals: int) -> None:
-        if arrivals:
-            self._findings_pending = min(self._findings_pending + arrivals, _MAX_COUNT)
-            self._finding_seen_at = now if math.isfinite(now) else self._finding_seen_at
+    def _finding_notifications(self, notifications, at, now) -> None:
         if not self._findings_pending:
             return
         last = self._finding_sent_at
