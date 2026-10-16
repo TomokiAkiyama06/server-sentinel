@@ -59,9 +59,6 @@ WARNING_KINDS = (NotificationKind.HARDWARE_INTEGRITY_WARNING,
 # durable evidence a restart recovers an undelivered notification from.
 FINDING_AUDIT_ACTIONS = (AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
                          AuditAction.DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION)
-# How far back a restart looks for a finding committed after the last
-# ``credential_finding`` notification (well inside the 90-day row retention).
-FINDING_RECOVERY_LOOKBACK = timedelta(days=7)
 
 
 class RuntimeState(StrEnum):
@@ -696,8 +693,8 @@ class MonitoringRuntime:
         Findings: the finding commits with its audit record, but its
         notification was only latched in memory until the next tick. Every
         ``credential_finding`` notification is named after the newest finding
-        audit record it covers (``_finding_event``). The newest finding
-        within ``FINDING_RECOVERY_LOOKBACK`` always restores the degraded hold
+        audit record it covers (``_finding_event``). The newest retained
+        finding always restores the degraded hold
         from its age, and is notified again unless that event row exists with
         a final delivery state: a ``pending`` row is a delivery the previous
         process never finished. The audit rowid, never the wall clock, orders
@@ -710,7 +707,10 @@ class MonitoringRuntime:
         row still ``pending`` is sent again first.
         """
         now = self.dependencies.utcnow()
-        latest = self._latest_finding(since=now - FINDING_RECOVERY_LOOKBACK)
+        # The whole retained audit history (Codex PR #271): a notification
+        # row is stamped after its finding and shares the 90-day retention,
+        # so a finding that was notified never outlives its event row.
+        latest = self._latest_finding()
         if latest is not None:
             row = self.notification_events.get(self._finding_event(latest[0]))
             delivered = row is not None and row["delivery"] is not DeliveryResult.PENDING

@@ -1363,14 +1363,15 @@ failing `HostnameReservationCheck` or human-access composition is
 `human_access_fault` on entering the fault and on a reason not yet reported in
 the episode, a passing check while serving is `human_access_recovered`, and a
 committed credential finding is `credential_finding` (coalesced to one per
-hour); at most four access notifications per rolling hour, with a held-back
+hour, outside the access budget); at most four `human_access_fault` /
+`human_access_recovered` notifications per rolling hour, with a held-back
 episode reported later. They set `human_access_degraded` /
 `credential_finding_degraded` (the latter for one day after the latest
 finding) and carry only the fixed kind. A finding committed before a restart
 whose notification had not been sent yet is recovered on the first running
 monitoring tick from its audit record: each `credential_finding` event ID
-names the newest finding audit rowid it covers; the newest finding (seven-day
-lookback) restores the one-day hold and is notified once unless that event row
+names the newest finding audit rowid it covers; the newest retained finding
+restores the one-day hold and is notified once unless that event row
 exists with a final delivery state (rowid order, not wall-clock order). A fault
 episode whose newest access notification row is `human_access_fault` continues
 after a restart, so its recovery is still announced. Without an actual

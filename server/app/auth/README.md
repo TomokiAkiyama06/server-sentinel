@@ -951,7 +951,8 @@ Access notifies on entering a fault, on a reason the episode had not reported
 and on recovery, never on every failing check; a fault that ended between two
 ticks is still reported, at most four access notifications go out per rolling
 hour, and an episode the budget held back is reported once it allows.
-Credential findings are coalesced to at most one notification per hour, and
+Credential findings do not share that budget, so access flapping cannot hold
+one back; they are coalesced to at most one notification per hour, and
 `credential_finding_degraded` stays set for a day after the latest one (a
 finding has no recovery to observe). No hostname, address, route, identity,
 principal, credential or reason leaves the process; details stay in the audit
@@ -965,7 +966,7 @@ memory until the next tick. Every `credential_finding` notification is named
 after the newest finding audit record it covers (its audit rowid, a durable
 cursor that does not depend on the wall clock), so after a restart the
 runtime's first running tick restores the one-day hold from the newest
-finding's time (at most seven days old) and sends one notification unless that
+retained finding's time and sends one notification unless that
 finding's notification row exists with a final delivery state (a `pending`
 row is a delivery the stopped process never finished). It also continues an
 access fault episode: when the newest `human_access_fault` /

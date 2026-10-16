@@ -653,10 +653,17 @@ class FindingRecoveryTests(RuntimeFixture):
         self.assertEqual(self.finding_texts(), 1)
         self.assertFalse(status.credential_finding_degraded)
 
-    async def test_findings_outside_the_lookback_or_other_actions_are_ignored(self):
+    async def test_other_audit_actions_are_ignored(self):
         await self.cycle()
-        self.audit_finding(self.clock.now - timedelta(days=8))
         self.audit_finding(self.clock.now - timedelta(hours=1), action="authenticate_principal")
         status = await self.cycle()
         self.assertEqual(self.finding_texts(), 0)
+        self.assertFalse(status.credential_finding_degraded)
+
+    async def test_a_finding_from_a_long_stop_is_still_notified(self):
+        """Codex PR #271: no lookback shorter than the audit retention."""
+        await self.cycle()
+        self.audit_finding(self.clock.now - timedelta(days=8))
+        status = await self.cycle()
+        self.assertEqual(self.finding_texts(), 1)
         self.assertFalse(status.credential_finding_degraded)

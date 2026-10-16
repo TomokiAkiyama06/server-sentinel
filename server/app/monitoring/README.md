@@ -72,8 +72,7 @@ alert), drains it: transitions become the immediate `human_access_fault` /
 follow it; both count as degraded in the daily summary. Once per process,
 the first running tick recovers a credential finding whose notification was
 lost to a restart: each `credential_finding` event ID names the newest
-finding audit rowid it covers; the newest finding (seven-day lookback)
-always restores the one-day hold and is notified once unless that row exists
+finding audit rowid it covers; the newest retained finding always restores the one-day hold and is notified once unless that row exists
 with a final delivery state. A fault episode whose newest access row (by
 rowid) is `human_access_fault` continues after the restart, so its recovery
 is still announced. The rowid, not the wall clock, orders
