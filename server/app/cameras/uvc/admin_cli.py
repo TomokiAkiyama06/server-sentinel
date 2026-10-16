@@ -43,7 +43,10 @@ device-busy probe it touches no camera. A same-account process whose
 descriptors cannot be read refuses the command (``service_state_unavailable``)
 instead of being assumed stopped. Only a descriptor whose link text ends in
 the database's file name is ``stat``-ed (``_may_name_database``), so a hung
-FUSE/NFS descriptor of an unrelated file cannot block the check. Any other
+FUSE/NFS descriptor of a differently named file cannot block the check; one
+of a same-named file on a hung mount still can (``stat`` is not bounded):
+the command then waits instead of refusing, ``Ctrl-C`` may not end it, and
+``Ctrl-\\`` or ``kill`` does (a transaction it ends is rolled back). Any other
 same-account process holding the database counts too, also another local
 admin command (``bootstrap_cli``, ``pairing_cli``, ``reservation_cli``, a
 second ``admin_cli``). Limits: run this inside the environment the service
@@ -198,8 +201,10 @@ def _may_name_database(target: str, name: str) -> bool:
     configured path still names it (``app.local_admin._existing_database``),
     so a descriptor on it reads back as a path ending in that file name in
     every mount namespace. Anything else (a pipe, socket or anonymous inode,
-    another file) is never ``stat``-ed: a descriptor on a hung FUSE or NFS
-    mount would block that ``stat`` instead of refusing.
+    a differently named file) is never ``stat``-ed: a descriptor on a hung
+    FUSE or NFS mount would block that ``stat`` instead of refusing. A
+    same-named file elsewhere (a bind mount, another mount namespace) is
+    ``stat``-ed and compared by inode, so one on a hung mount still blocks.
     """
     return target.rpartition("/")[2] == name
 

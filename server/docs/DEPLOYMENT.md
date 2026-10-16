@@ -335,7 +335,11 @@ service account holding the database counts, so another local admin command
 still running (`bootstrap_cli`, `pairing_cli`, `reservation_cli`, a second
 `admin_cli`) also gives `service_running`: let it finish first. Only a
 descriptor whose link names a file with the database's file name is
-`stat`-ed, so a descriptor on a hung FUSE/NFS mount cannot block the check.
+`stat`-ed, so a descriptor of a differently named file on a hung FUSE/NFS
+mount cannot block the check. A same-named file on a hung mount still can
+(the `stat` is not bounded): the command then waits instead of refusing;
+`Ctrl-C` may not end it, `Ctrl-\` or `kill` does, and a transaction it ends
+is rolled back.
 Run the command **inside the environment the service runs in** (the VM/LXD
 guest, Owner decision D2), never from its host or from another container:
 a VM has its own kernel, so the host's `/proc` shows no guest process at all;
