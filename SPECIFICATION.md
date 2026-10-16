@@ -906,6 +906,11 @@ If an already encoded source can be safely relayed in a browser-compatible form,
 
 Viewer-only processing should scale down or stop when subscriber count is zero.
 
+Interim (Owner decision D10, Issue #10 S7, pending #19): local UVC live video is
+served as an authorized MJPEG frame pull of native camera JPEG frames, without
+transcoding, through the human surface (§11.9, "S7 interim live"). Its viewer
+demand ends without polls, so with no viewer nothing is retained.
+
 ### 6.6 Durable recording
 
 The main host is authoritative durable storage for normal operation. Recording metadata includes:
@@ -2169,9 +2174,9 @@ server-side session and its binding with a `sign_out_principal` audit record
 holding only the principal's logical UUID (D7); it ends that session, not the
 credential, and is refused while human access is closed. Invitation
 redemption (S2), the Owner step-up (S3) and the Owner access administration
-(S4b, §11.5 above) are mounted; all live/recording/timeline routes and the
-other admin routes are later phases. Details:
-`server/app/auth/README.md`.
+(S4b, §11.5 above) are mounted, and so are the S7 interim live routes
+below; all recording/timeline routes and the other admin routes are later
+phases. Details: `server/app/auth/README.md`.
 
 Issue #10 phase 2 S5b serves the Web build through the same surface (Owner
 decisions D1 and S5-1 .. S5-5; the reservation check accepts exactly one Serve
@@ -2227,6 +2232,41 @@ application sets `referrer: ''` and `referrerPolicy: 'same-origin'`, so the
 `POST` carries the exact `Origin` the mutating routes require (not `null`). The shell's bytes
 identify the software to anyone on the shared account (accepted, S5-5), so it
 carries no version marker.
+
+S7 interim live (Owner decision D10, D5 defaults; pending #19, mock verified
+only). Mounted when the composition has a `LiveFrameService`
+(`HumanAccess.attach_live`; `create_app` attaches one over its local preview
+hub), otherwise the generic denial:
+
+```text
+GET  /api/live/sources                      -> LIVE: {"sources": [{"id", "name",
+                                               "health"}]} of configured, enabled
+                                               local sources; nothing else
+POST /api/live/sessions  {"source_id"}      -> LIVE + CSRF: {"session_id",
+                                               "source_id", "lease_seconds": 15,
+                                               "frame_interval_ms": 200}
+GET  /api/live/sessions/<sid>/frame?after=n -> LIVE, the opening human session
+                                               only: 200 image/jpeg with
+                                               X-Frame-Sequence, or 204 (none
+                                               newer, camera not online, paced)
+POST /api/live/sessions/<sid>/close         -> SESSION + CSRF, own sessions: 204
+```
+
+`live:view` (or the Owner) is checked server-side on every request;
+`recordings:view` alone reaches none of these. A live session is bound to the
+human access session that opened it: each poll is admitted in memory (a held
+id, a per-(human session, live session) budget), then inside `admit(epoch)`
+the read-only session lookup must be that human session (a copied id is
+refused) and the read re-runs the `live:view` validator; nothing is written
+per frame, and the idle expiry is extended at most once per 60 s per live
+session. Limits: 4 sessions in total, 2 per source, 2 per person, 5 served
+frames per second per session, 8 MiB and a JPEG SOI marker per frame; over a
+limit the generic denial (pacing: `204`). Demand ends after 15 s without an
+authorized poll, on close and sign-out, at once after an Owner grant or
+revocation change, and for every session while access is closed or the
+composition stopped. Responses are `no-store`, `nosniff`,
+`Cross-Origin-Resource-Policy: same-origin` and never an attachment, `ETag`,
+range or cookie; there is no download or export.
 
 ## 12. Dashboard UI
 

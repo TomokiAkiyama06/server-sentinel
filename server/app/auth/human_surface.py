@@ -74,7 +74,21 @@ WebSocket and error path gets the same generic denial):
   gates above only, byte-identical for everyone who passes them), and the
   application ``GET /app/`` and ``GET /app/<name>`` (any active session,
   ``touch=False``). Each carries a fixed header list with ``no-store`` and a
-  strict ``Content-Security-Policy``.
+  strict ``Content-Security-Policy``;
+- the S7 interim live frame pull (Owner decision D10, D5 defaults), mounted
+  only when the embedder attached a ``LiveFrameService``
+  (``HumanAccess.attach_live``; otherwise the generic denial):
+  ``GET /api/live/sources`` (``LIVE``: id, name and health only),
+  ``POST /api/live/sessions`` (``LIVE``, CSRF, body ``{"source_id"}``),
+  ``GET /api/live/sessions/<session>/frame?after=<n>`` (``LIVE``: ``200``
+  ``image/jpeg`` or ``204``, never an attachment) and
+  ``POST /api/live/sessions/<session>/close`` (``SESSION``, CSRF, only the
+  caller's own). Live sessions are bound to the opening human session, so
+  a copied id is refused; every frame read re-runs the ``live:view``
+  validator inside ``admit(epoch)`` without a write; the idle expiry moves
+  at most once per 60 s per live session; capacity (4 in total, 2 per
+  source, 2 per person) is the generic denial. See
+  ``app.media.live.frame_pull``.
 
 The four ceremony routes run before a credential exists (AUTH-013). Each is
 rate-limited per verified proxy identity before the request body is parsed
@@ -109,7 +123,12 @@ cannot spend the Owner's. The inventory read A1 is not charged. Beyond the
 limiter, only a fresh Owner session with its CSRF token reaches an
 administration write or its audit record (every other caller is refused
 inside the authorization), their state is bounded by the S4-8 limits, and
-every write goes through the storage admission. No live, recording,
+every write goes through the storage admission. Live session opens and
+closes are charged to a fifth, separate limiter (``HumanAccess.live_limiter``:
+per session a burst of 10 and one more every 6 seconds), keyed on a
+domain-separated digest of a token a read-only check found current or that
+names a live session the service holds for that token; frame polls to the
+service's own in-memory budget per live session, charged only to its holder. No recording,
 timeline, event, health or version route is mounted here. The step-up routes require ``OWNER_READ`` (an Owner
 session, fresh or stale),
 so a non-Owner gets the generic denial inside the authorization transaction.
@@ -136,6 +155,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import suppress
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -154,8 +174,10 @@ from app.audit.integration import AccessAdministration
 from app.audit.service import OwnerAuditService
 from app.completion import run_to_completion
 from app.logging import Event
+from app.media.live.frame_pull import LiveFrameService
 from app.storage.database import Database, PinnedDatabase
 from .invitation_code import InvalidInvitationCode, parse_invitation_code
+from .live_access import BoundLiveAccess
 from .model import Credential, Permission
 from .owner_operation import HumanOwnerAuthorizer, OwnerOperationContext
 from .passkeys import DeviceBoundCredentialRequired, PasskeyCeremonies, SessionGrant
@@ -191,6 +213,10 @@ SHELL_PATH = "/"
 SHELL_SCRIPT_PATH = "/s.js"
 SHELL_STYLE_PATH = "/s.css"
 APP_PATH = "/app/"
+# S7, the interim live frame pull (Owner decision D10, Issue #10/#19).
+LIVE_SOURCES_PATH = "/api/live/sources"
+LIVE_SESSIONS_PATH = "/api/live/sessions"
+MAX_LIVE_OPEN_BODY = 128
 MAX_OPTIONS_BODY = 1024
 MAX_ASSERTION_BODY = 64 * 1024
 MAX_REGISTRATION_BODY = 64 * 1024
@@ -207,6 +233,10 @@ _TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
 # an upper-case, brace, URN or hex-only spelling matches no route.
 _UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _ADMIN_LIMIT_DOMAIN = b"ServerSentinel admin change rate limit v1\x00"
+_LIVE_LIMIT_DOMAIN = b"ServerSentinel live session change rate limit v1\x00"
+_UUID_VALUE = re.compile(_UUID)
+# ``after``: a nonnegative frame sequence, canonical decimal, at most 18 digits.
+_SEQUENCE = re.compile(r"0|[1-9][0-9]{0,17}")
 _DENIAL_BODY = b'{"detail":"Not Found"}'
 _STEP_UP_BODY = b'{"detail":"step_up_required"}'
 _DEVICE_BOUND_BODY = b'{"detail":"device_bound_credential_required"}'
@@ -396,6 +426,18 @@ ROUTES: tuple[Route, ...] = (
           mutating=False, csrf=False, body_limit=0),
     Route("GET", re.compile(re.escape(APP_PATH) + f"(?P<name>{APP_NAME.pattern})"), Requirement.SESSION,
           "_app_asset", mutating=False, csrf=False, body_limit=0),
+    # S7, the interim live frame pull (D10, D5 defaults). LIVE: the Owner or
+    # ``live:view``; ``recordings:view`` alone never. The close is SESSION so
+    # that a person whose grant was just withdrawn can still release demand,
+    # and it only ever closes a live session of the caller's own session.
+    Route("GET", _exact(LIVE_SOURCES_PATH), Requirement.LIVE, "_live_sources",
+          mutating=False, csrf=False, body_limit=0),
+    Route("POST", _exact(LIVE_SESSIONS_PATH), Requirement.LIVE, "_live_open",
+          mutating=True, csrf=True, body_limit=MAX_LIVE_OPEN_BODY),
+    Route("GET", _with_ids(LIVE_SESSIONS_PATH, "/", ("session",), "/frame"), Requirement.LIVE,
+          "_live_frame", mutating=False, csrf=False, body_limit=0, query=(("after", _SEQUENCE),)),
+    Route("POST", _with_ids(LIVE_SESSIONS_PATH, "/", ("session",), "/close"), Requirement.SESSION,
+          "_live_close", mutating=True, csrf=True, body_limit=MAX_EMPTY_BODY),
 )
 
 
@@ -722,9 +764,42 @@ class HumanAccess:
         # records share the access store's database and storage admission.
         self.administration = AccessAdministration(
             OwnerAuditService(store.audit, HumanOwnerAuthorizer()), store, session_gate=self.gate)
+        # S7 interim live (optional component, ``attach_live``): without it
+        # every live route is the generic denial.
+        self.live: LiveFrameService | None = None
+        # Opening/closing live sessions, per session token digest: a burst of
+        # 10 and one more every 6 seconds, so an open/close loop cannot churn
+        # the gate, the storage admission or the frame executor.
+        self.live_limiter = SourceRateLimiter(per_source_capacity=10, per_source_refill_seconds=6.0,
+                                              global_capacity=None, max_sources=64)
         # Last: everything above validated, so a refused composition leaves
         # the ceremonies untouched.
         ceremonies.guard_session_gate(self.gate)
+
+    def attach_live(self, live: LiveFrameService) -> None:
+        """Mount the S7 interim live frame pull over ``live`` (Issue #10/#19, D10).
+
+        The service must read this composition's access database. Its
+        sessions end while access is closed or this composition is stopped
+        (its sweeper reads ``epoch()``), Owner grant and revocation changes
+        re-check the affected principal's live sessions at once
+        (``AccessAdministration.principal_changed``), and ``run()`` starts
+        and stops it (a service attached while ``run()`` is running starts at
+        once and replaces the previous one, which is stopped).
+        """
+        if not isinstance(live, LiveFrameService):
+            raise HumanAccessUnavailable()
+        database = live.database
+        if not isinstance(database, (Database, PinnedDatabase)) or database.path != self.store.database.path:
+            raise HumanAccessUnavailable()
+        previous = self.live
+        if previous is not None and previous is not live:
+            previous.stop()
+        live.bind_closed(lambda: self.epoch() is None)
+        self.live = live
+        self.administration.principal_changed = live.revalidate_principal
+        if self._running:
+            live.start()
 
     def note_refused_redemption(self) -> None:
         """Count one refused redemption; log the value-free event at 1, 2, 4, 8, ..."""
@@ -860,6 +935,11 @@ class HumanAccess:
         self._halted = False
         self._serving = False
         self._state = HumanAccessState.STARTING
+        live = self.live
+        if live is not None:
+            # Its sweeper ends every live session while this composition is
+            # not serving; ``stop()`` below releases what is left.
+            live.start()
         log = logging.getLogger(__name__)
         failed = False
         try:
@@ -902,6 +982,8 @@ class HumanAccess:
         finally:
             self._serving = False
             self._running = False
+            if self.live is not None:
+                self.live.stop()
             self._state = HumanAccessState.FAILED if failed else HumanAccessState.STOPPED
 
     def _check_failed(self) -> None:
@@ -1276,6 +1358,9 @@ class HumanSurface:
                                     admit=lambda: access.admit(authorized.epoch))
         except Exception:
             raise _Denied() from None
+        if access.live is not None:
+            # The ended session's live sessions release their demand now.
+            access.live.end_access_session(authorized.session.session_id)
         await request.send({"type": "http.response.start", "status": 204, "headers": [
             (b"cache-control", b"no-store"),
             (b"set-cookie", _CLEARED_COOKIE),
@@ -1411,6 +1496,166 @@ class HumanSurface:
         if asset is None:
             raise _Denied()
         await self._asset(request.send, asset)
+
+    # -- S7 interim live frame pull (D10, D5 defaults) ---------------------
+
+    def _live_service(self) -> LiveFrameService:
+        live = self.access.live
+        if live is None:
+            raise _Denied()
+        return live
+
+    def _limit_live(self, token: bytes) -> None:
+        """Charge one live-session open/close to its session's bucket.
+
+        Keyed like ``_limit_admin`` on a domain-separated digest of a token
+        that a read-only check has just found current (an open) or that
+        names a live session this service holds (a close), so a forged
+        cookie never takes a slot. Over the limit: the generic denial.
+        """
+        key = hashlib.sha256(_LIVE_LIMIT_DOMAIN + token).hexdigest()
+        if not self.access.live_limiter.allow(key):
+            raise _Denied()
+
+    async def _live_sources(self, request: _Request) -> None:
+        """``GET /api/live/sources`` (``LIVE``): id, name and health only.
+
+        The configured local sources that are enabled in the registry; no
+        device path, serial, profile, node, detection or storage detail. The
+        read runs inside ``admit`` of the authorization's epoch.
+        """
+        live = self._live_service()
+        authorized = await self._authorize(request, Requirement.LIVE)
+        access = self.access
+        try:
+            sources = await asyncio.wrap_future(live.sources(admit=lambda: access.admit(authorized.epoch)))
+        except Exception:
+            raise _Denied() from None
+        await self._json(request.send, 200, {"sources": [
+            {"id": str(item.source_id), "name": item.name, "health": item.health} for item in sources
+        ]})
+
+    async def _live_open(self, request: _Request) -> None:
+        """``POST /api/live/sessions`` (``LIVE``, CSRF): open one live session.
+
+        Body ``{"source_id": <lower-case UUID>}``. Order: the strict body; a
+        read-only session pre-check; the live open/close limiter; the gated
+        ``LIVE`` authorization (its idle touch: opening is activity); then
+        the open on the service's executor inside ``admit`` of the same
+        epoch, bound to this human access session, which re-runs the
+        ``live:view`` validator and applies the D10 limits (4 in total, 2 per
+        source, 2 per principal). An unknown source, a refusal and a full
+        capacity are the same generic denial. ``200 {"session_id",
+        "source_id", "lease_seconds", "frame_interval_ms"}``.
+        """
+        live = self._live_service()
+        body = _json_object(await self._body(request, json_required=True))
+        value = body.get("source_id") if set(body) == {"source_id"} else None
+        if not isinstance(value, str) or not _UUID_VALUE.fullmatch(value):
+            raise _Denied()
+        source_id = UUID(value)
+        token = session_token(request.headers)
+        try:
+            known = await asyncio.to_thread(self.access.store.session_may_be_current, token)
+        except Exception:
+            raise _Denied() from None
+        if known is not True:
+            raise _Denied()
+        self._limit_live(token)
+        authorized = await self._authorize(request, Requirement.LIVE)
+        view = authorized.session
+        access = self.access
+        try:
+            bound = BoundLiveAccess(view.principal_id, view.authorization_revision, view.session_id)
+            session = await asyncio.wrap_future(
+                live.open(bound, source_id, token, admit=lambda: access.admit(authorized.epoch)))
+        except Exception:
+            raise _Denied() from None
+        limits = live.limits
+        await self._json(request.send, 200, {
+            "session_id": str(session.session_id), "source_id": str(session.source_id),
+            "lease_seconds": limits.lease_seconds,
+            "frame_interval_ms": round(limits.minimum_frame_interval_seconds * 1000),
+        })
+
+    async def _live_frame(self, request: _Request) -> None:
+        """``GET /api/live/sessions/<session>/frame?after=<n>``: the newest frame.
+
+        ``200`` with one ``image/jpeg`` frame newer than ``after`` and its
+        sequence in ``X-Frame-Sequence``, or ``204`` when there is none yet
+        (no viewer frame, camera not online, paced to 5 fps). No
+        ``Content-Disposition``, ``ETag``, range or cookie; ``no-store`` and
+        ``nosniff``. Order: the session id must be one the service holds,
+        presented with the cookie that opened it, and the poll within its
+        in-memory budget (no SQLite before that); the
+        gate epoch; then on the executor inside ``admit(epoch)`` the
+        read-only ``current_session`` must be the human session the live
+        session is bound to (a copied id is refused), and the read re-runs
+        the ``live:view`` validator. Nothing is written per frame: at most
+        once per 60 s per live session the gated ``LIVE`` authorization with
+        its idle touch runs, so a watching viewer's session does not idle
+        out (D5); its failure only skips that extension.
+        """
+        live = self._live_service()
+        token = session_token(request.headers)
+        session_id = UUID(request.params["session"])
+        after = int(request.query.get("after", "0"))
+        if not live.charge_poll(token, session_id):
+            raise _Denied()
+        access = self.access
+        epoch = await asyncio.to_thread(access.epoch)
+        if epoch is None:
+            raise _Denied()
+        try:
+            poll = await asyncio.wrap_future(
+                live.poll(token, request.identity, session_id, after, admit=lambda: access.admit(epoch)))
+        except Exception:
+            raise _Denied() from None
+        if poll.extend_idle:
+            with suppress(Exception):
+                await asyncio.to_thread(access.store.authorize_request, token, request.identity,
+                                        Requirement.LIVE, admit=lambda: access.admit(epoch), touch=True)
+        frame = poll.frame
+        if frame is None:
+            await request.send({"type": "http.response.start", "status": 204, "headers": [
+                (b"cache-control", b"no-store"),
+                (b"x-content-type-options", b"nosniff"),
+            ]})
+            await request.send({"type": "http.response.body", "body": b""})
+            return
+        await request.send({"type": "http.response.start", "status": 200, "headers": [
+            (b"content-type", b"image/jpeg"),
+            (b"content-length", str(len(frame.data)).encode()),
+            (b"cache-control", b"no-store"),
+            (b"x-content-type-options", b"nosniff"),
+            (b"cross-origin-resource-policy", b"same-origin"),
+            (b"x-frame-sequence", str(frame.sequence).encode()),
+        ]})
+        await request.send({"type": "http.response.body", "body": frame.data})
+
+    async def _live_close(self, request: _Request) -> None:
+        """``POST /api/live/sessions/<session>/close`` (``SESSION``, CSRF); ``204``.
+
+        Releases one live session opened under the caller's own human
+        session (``touch=False``: closing is not activity). An id the service
+        does not hold, or one presented with another session's cookie, is the
+        generic denial before any SQLite read.
+        """
+        live = self._live_service()
+        body = await self._body(request, json_required=False)
+        if body not in (b"", b"{}"):
+            raise _Denied()
+        token = session_token(request.headers)
+        session_id = UUID(request.params["session"])
+        if not live.holds(token, session_id):
+            raise _Denied()
+        self._limit_live(token)
+        authorized = await self._authorize(request, Requirement.SESSION, touch=False)
+        try:
+            await asyncio.wrap_future(live.close(authorized.session.session_id, session_id))
+        except Exception:
+            raise _Denied() from None
+        await self._no_content(request.send)
 
     # -- Owner access administration (S4b, A1-A6) ----------------------
 

@@ -389,7 +389,9 @@ class RouteTableTests(GatedFixture):
                   query=(("a", pattern), ("a", pattern)))
         for route in ROUTES:
             with self.subTest(route=route.path.pattern):
-                self.assertEqual(route.query, ())
+                # The S7 frame route is the one route with a query (``after``).
+                expected = ("after",) if route.handler == "_live_frame" else ()
+                self.assertEqual(tuple(name for name, _ in route.query), expected)
                 if route.mutating and route.requirement is not Requirement.PRE_CREDENTIAL:
                     self.assertTrue(route.csrf)
 
