@@ -199,7 +199,8 @@ class AccessFaultMonitor:
             if self._finding_seen_at is None or seen > self._finding_seen_at:
                 self._finding_seen_at = seen
 
-    def restore_fault_episode(self, *, delivered: bool = True) -> None:
+    def restore_fault_episode(self, *, delivered: bool = True, event_id: UUID | None = None,
+                              at: datetime | None = None) -> None:
         """Owner thread: the last access notification before a restart was a fault.
 
         Called once at startup by the monitoring runtime from the durable
@@ -207,10 +208,13 @@ class AccessFaultMonitor:
         this process: the episode continues, so a fault that persists is not
         re-notified and a check that now passes sends the recovery notice.
         A fault whose delivery never finished (``delivered=False``, a
-        ``pending`` row) is sent again first. Ignored once this process has
-        notified access state itself.
+        ``pending`` row) is sent again first, reusing that row's ``event_id``
+        and ``at`` so the retry updates it instead of adding a second fault.
+        Ignored once this process has notified access state itself.
         """
-        if type(delivered) is not bool:
+        if (type(delivered) is not bool or (event_id is None) != (at is None)
+                or event_id is not None and not isinstance(event_id, UUID)
+                or at is not None and not isinstance(at, datetime)):
             raise ValueError("invalid restored episode")
         if self._sent or self._notified is not AccessHealth.HEALTHY:
             return
@@ -221,6 +225,8 @@ class AccessFaultMonitor:
             self._unreported_fault = False
         else:
             self._unreported_fault = True
+            if event_id is not None:
+                self._attempts[NotificationKind.HUMAN_ACCESS_FAULT] = (at, event_id)
 
     def _polled(self) -> AccessHealth | None:
         """Current composition health, or ``None`` while indeterminate.

@@ -192,10 +192,14 @@ class ReservationFaultTests(MonitoredAccessFixture):
         self.assertEqual(self.notifications.kinds, [])
 
     async def test_a_restored_undelivered_fault_is_sent_before_the_recovery(self):
-        self.monitor.restore_fault_episode(delivered=False)
+        stored, at = uuid4(), AT - timedelta(minutes=30)
+        self.monitor.restore_fault_episode(delivered=False, event_id=stored, at=at)
         self.drain()
         self.drain(60)
         self.assertEqual(self.notifications.kinds, [FAULT, RECOVERED])
+        # The retry updates the stored pending row instead of adding a fault.
+        self.assertEqual(self.notifications.calls[0]["event_id"], stored)
+        self.assertEqual(self.notifications.calls[0]["at"], at)
 
     async def test_starting_or_stopped_composition_is_neither_fault_nor_recovery(self):
         await self.stop_serving()
@@ -623,16 +627,17 @@ class FindingRecoveryTests(RuntimeFixture):
         """Codex PR #271: the newest fault/recovered row (by rowid) decides."""
         calls = []
         # Each later row is stamped earlier: only the insertion (rowid) order counts.
-        cases = ((("human_access_fault", "sent"),), [{"delivered": True}]), \
+        cases = ((("human_access_fault", "sent"),), [{"delivered": True, "event_id": None, "at": None}]), \
             ((("human_access_fault", "sent"), ("human_access_recovered", "sent")), []), \
-            ((("human_access_recovered", "sent"), ("human_access_fault", "pending")), [{"delivered": False}])
+            ((("human_access_recovered", "sent"), ("human_access_fault", "pending")), "pending")
         await self.cycle()
         for rows, expected in cases:
             with closing(sqlite3.connect(self.settings.database_path)) as db:
                 for index, (kind, delivery) in enumerate(rows):
                     at = self.clock.now - timedelta(minutes=10 + index)
+                    self.last_event_id, self.last_at = str(uuid4()), at
                     db.execute("INSERT INTO notification_events VALUES (?, ?, ?, 0, ?)",
-                               (str(uuid4()), kind, at.isoformat(), delivery))
+                               (self.last_event_id, kind, at.isoformat(), delivery))
                 db.commit()
             calls.clear()
             with patch.object(AccessFaultMonitor, "attached", new_callable=PropertyMock,
@@ -642,7 +647,14 @@ class FindingRecoveryTests(RuntimeFixture):
                     patch.object(AccessFaultMonitor, "_polled", lambda monitor: None):
                 await self.cycle()
             with self.subTest(rows=rows):
-                self.assertEqual(calls, expected)
+                if expected == "pending":
+                    # The stored row's own ID and time, so the retry updates it.
+                    (call,) = calls
+                    self.assertEqual(call["delivered"], False)
+                    self.assertEqual(str(call["event_id"]), self.last_event_id)
+                    self.assertEqual(call["at"], self.last_at)
+                else:
+                    self.assertEqual(calls, expected)
 
     async def test_a_clock_rollback_does_not_hide_a_later_finding(self):
         """Codex PR #271: recovery compares the audit rowid, not wall times."""

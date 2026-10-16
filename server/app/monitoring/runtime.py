@@ -721,13 +721,18 @@ class MonitoringRuntime:
                                     notify=not delivered)
         if monitor.attached is not None:
             last = self._connection.execute(
-                "SELECT kind, delivery FROM notification_events WHERE kind IN (?, ?) "
+                "SELECT kind, delivery, event_id, at FROM notification_events WHERE kind IN (?, ?) "
                 "ORDER BY rowid DESC LIMIT 1",
                 (NotificationKind.HUMAN_ACCESS_FAULT.value,
                  NotificationKind.HUMAN_ACCESS_RECOVERED.value),
             ).fetchone()
             if last is not None and last[0] == NotificationKind.HUMAN_ACCESS_FAULT.value:
-                monitor.restore_fault_episode(delivered=last[1] != DeliveryResult.PENDING.value)
+                delivered = last[1] != DeliveryResult.PENDING.value
+                monitor.restore_fault_episode(
+                    delivered=delivered,
+                    # A pending row is retried under its own ID and time.
+                    event_id=None if delivered else UUID(last[2]),
+                    at=None if delivered else datetime.fromisoformat(last[3]))
 
     def _poll(self) -> None:
         if self.notifications is None:
