@@ -150,7 +150,7 @@ credential を人に紐づけるための条件も守ってください。登録
 
 credential がまだ存在しない request の例外は、local の owner bootstrap（console にだけ表示する使い捨て authorization を発行し、予約済み origin の browser から通常の redemption 経路で 1 回だけ使う）、短命・使い捨て enrollment code による招待 redemption、認証 route 自体の 3 つだけです。これらは application data を返さず、無効 / 期限切れ / 使用済み code には未招待と同じ汎用応答を返します。AUTH-008 の owner 操作には fresh な user verification を要求し、step-up 失敗 / キャンセル時は何も実行しないでください。
 
-dashboard は ServerSentinel 専用に予約した origin で、かつ secure context（HTTPS、または厳密に local な browser の `http://localhost`）で提供してください。browser はそれ以外で WebAuthn を提供しません。origin の予約自体は deployment 側の責任（専用 host / VM / namespace、または OS / service policy）で、application が startup と daily に行うのは実 listener と全 scheme・全 port の proxy route を列挙する「検出」です。防止ではなく、検査間に bind された process は次の検査まで cookie を受け取りうることを必ず明記してください。
+dashboard は ServerSentinel 専用に予約した origin で、かつ secure context である `https` origin（例: Tailscale Serve で公開する Main Server の tailnet hostname）で提供し、Main Server 外の viewer 端末（Tailscale 参加端末を想定）から URL で到達できるようにしてください。`http://localhost` などの loopback origin は human dashboard origin として扱いません（Owner decision, 2026-10-11 / 2026-10-16）。browser は secure context 以外で WebAuthn を提供しません。URL に到達できることは network 上の前提条件にすぎず人物の特定ではないため、invitation と本人の WebAuthn credential は引き続き必須です。origin の予約自体は deployment 側の責任（専用 host / VM / namespace、または OS / service policy）で、application が startup と daily に行うのは実 listener と全 scheme・全 port の proxy route を列挙する「検出」です。防止ではなく、検査間に bind された process は次の検査まで cookie を受け取りうることを必ず明記してください。
 
 2 つの gate 自体は弱めません。共有 account で変わるのは、network gate が個人を区別しなくなる点だけです。
 
