@@ -1731,12 +1731,17 @@ That bounds the exposure window rather
 than preventing the bind: a process that binds between two checks receives
 credentials and cookies for that origin until the next check.
 
-The origin must also be a secure context — HTTPS, or `http://localhost` for a
-strictly local browser — because browsers expose WebAuthn only there. Plain
-HTTP on a non-loopback host leaves every human route unreachable in practice,
-since nobody can register or authenticate. The current human composition
-accepts only the reserved `https` origin; there is no `http://localhost` Owner
-route (Owner decision, 2026-10-11, see `SECURITY.md`).
+The origin is the reserved `https` origin, which viewer devices outside the
+Main Server reach by URL — for example the Main Server's tailnet hostname
+served through Tailscale Serve to Tailscale-joined viewer devices. It must be a
+secure context because browsers expose WebAuthn only there; plain HTTP on a
+non-loopback host leaves every human route unreachable in practice, since
+nobody can register or authenticate. `http://localhost` is not a human
+dashboard origin: the human composition accepts only the reserved `https`
+origin, and there is no `http://localhost` Owner route (Owner decisions,
+2026-10-11 and 2026-10-16, see `SECURITY.md`). Reaching the URL is a network
+precondition, not identification; the invitation and per-person WebAuthn
+credential are still required.
 
 Initial non-owner permissions:
 
