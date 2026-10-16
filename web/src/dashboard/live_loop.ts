@@ -84,6 +84,7 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
   let controller: AbortController | null = null;
   let timer: unknown = null;
   let deadline: unknown = null;
+  let watchdog: unknown = null;
   let after = 0;
   let failures = 0;
   let lastFrame = 0;
@@ -102,6 +103,7 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
     controller = null;
     if (timer !== null) { clock.clear(timer); timer = null; }
     disarm();
+    if (watchdog !== null) { clock.clear(watchdog); watchdog = null; }
     if (session !== null) { transport.close(session); session = null; }
   }
 
@@ -120,6 +122,16 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
       }, REQUEST_TIMEOUT_MS);
     });
     return Promise.race([request, expired]).finally(() => { if (controller === attempt) disarm(); });
+  }
+
+  /** Independent of any request in flight: STALE_AFTER_MS after the last
+   *  shown frame (or the open), the picture is marked not current. */
+  function watch(current: number) {
+    if (watchdog !== null) clock.clear(watchdog);
+    watchdog = clock.set(() => {
+      watchdog = null;
+      if (current === generation && (status === 'live' || status === 'connecting')) report('stale');
+    }, STALE_AFTER_MS);
   }
 
   function schedule(run: (current: number) => void, ms: number, current: number) {
@@ -160,6 +172,7 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
       session = granted;
       after = 0;
       lastFrame = clock.now();
+      watch(current);
       pull(current);
     })();
   }
@@ -184,6 +197,7 @@ export function startLiveLoop({ transport, sourceId, onFrame, onStatus, visibili
         if (frame) {
           after = frame.sequence;
           lastFrame = clock.now();
+          watch(current);
           report('live');
         } else if (clock.now() - lastFrame >= STALE_AFTER_MS) {
           report('stale');

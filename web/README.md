@@ -330,7 +330,8 @@ ID-keyed collection (1 to 4, no fixed slots) and plays one at a time.
 `src/dashboard/live_loop.ts` runs the interim frame-pull loop (Owner decision
 D5): open a viewer session, pull with `after=<last sequence>` at most every
 200 ms (about 5 fps), `204` ⇒ wait. No newer frame for 5 s ⇒ the picture is
-marked not current and dimmed. An open, or a frame request together with its
+marked not current and dimmed, by a timer of its own that fires even while a
+pull is still pending. An open, or a frame request together with its
 decode, unfinished after 4 s is abandoned as a transient failure (aborted
 whether or not the transport honours the signal; a grant that still arrives is
 closed at once), so a stalled connection or decode never leaves an old frame

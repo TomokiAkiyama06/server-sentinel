@@ -541,3 +541,29 @@ test('a stalled sign-out request is abandoned and reported, and can be retried',
   await services.signOut(signal());
   assert.equal(stalled.calls.filter(call => call.key === 'POST /api/auth/sign-out').length, 2);
 });
+
+test('the picture turns stale STALE_AFTER_MS after the last frame even while a pull is pending', async () => {
+  const clock = manualClock();
+  const view = visibility();
+  const statuses = [];
+  let reads = 0;
+  const slow = transport();
+  // Every pull after the first answers 204 just before the request deadline.
+  slow.read = () => {
+    reads += 1;
+    if (reads === 1) return Promise.resolve(frame(1));
+    return new Promise(resolve => { clock.set(() => resolve(null), live.REQUEST_TIMEOUT_MS - 100); });
+  };
+  const stop = live.startLiveLoop({ transport: slow, sourceId: source, visibility: view, clock,
+    onFrame: () => undefined, onStatus: value => statuses.push(value) });
+  await clock.advance(0);
+  assert.equal(statuses.at(-1), 'live');
+  await clock.advance(live.STALE_AFTER_MS - 1);
+  assert.equal(statuses.at(-1), 'live');
+  await clock.advance(1);
+  assert.equal(statuses.at(-1), 'stale');
+  assert.equal(reads, 3, 'the third pull is still pending when the picture turns stale');
+  stop();
+  // Only the fake read's own answer timer may remain.
+  assert.equal(clock.pending(), 1);
+});
