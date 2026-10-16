@@ -2368,6 +2368,75 @@ class SummarizerTests(unittest.TestCase):
         self.assertEqual("unmeasured",
                          run(70_400, 270_300, 270_500, connected=False)["g4"])
 
+    def test_two_host_failure_on_record_is_fail_without_session_matching(self):
+        """#237: when the two-host session matching is not possible (here the
+        Agent's ``echo_frames`` is missing), a failure the records show anyway
+        is ``fail``, not ``unmeasured``: G4 when Main greeted no connection
+        after a window the Agent had to reconnect after, G5 when there are
+        fewer Agent loss episodes than Main windows or an episode detected
+        later than 15 s. Otherwise both stay ``unmeasured``."""
+        second = 10**9
+        for scenario, actions in (
+                ("slow_stop_10s", [("sigstop", 10), ("sigcont", 20)]),
+                ("main_restart", [("restart_receiver", 10), ("ready", 12)])):
+            with self.subTest(scenario=scenario):
+                name = f"{scenario}-a_framed"
+                orchestrator, receiver, sender_rows = _base(scenario)
+                end = actions[1][1]
+                start = {"kind": "start", "t_ns": 0, "n_sources": 1,
+                         "loss_timeout_ns": second // 2}
+
+                def lost(connection, session, idle_s=2):
+                    # Agent clock; no ``echo_frames``: the matching is impossible
+                    return [{"kind": "loss_detected", "t_ns": (200 + connection) * second,
+                             "source": 0, "idle_ns": idle_s * second,
+                             "connection": connection, "session": session,
+                             "last_echo_ns": None, "last_committed_capture_ns": 1},
+                            {"kind": "closed", "t_ns": (200 + connection) * second,
+                             "reason": "peer_closed", "connection": connection,
+                             "session": session, "last_echo_ns": None}]
+
+                reconnect = [{"kind": "connected", "t_ns": 210 * second, "connection": 9,
+                              "session": 12},
+                             {"kind": "first_accept", "t_ns": 211 * second, "connection": 9,
+                              "source": 0, "session": 12}]
+
+                def run(sessions, agent, windows=1):
+                    rows = list(orchestrator)
+                    for repeat in range(windows):
+                        rows += [{"kind": "action", "t_ns": (at + 100 * repeat) * second,
+                                  "action": action, "duration_ns": 0}
+                                 for action, at in actions]
+                    self.run_dir(name, orchestrator=rows, two_host=True,
+                                 receiver=receiver + self._durable(1) + sessions,
+                                 sender_rows=[start] + sender_rows + agent)
+                    row = self.report()[scenario]
+                    for path in (self.root / name).iterdir():
+                        path.unlink()
+                    return row["g4"], row["g5"]
+
+                # Main greeted the reconnect after the window end: no failure on
+                # record, the matching decides -> unmeasured
+                greeted = _session(11, 1, end + 1, 1) + _session(12, end + 1, 90, 2)
+                self.assertEqual(("unmeasured", "unmeasured"),
+                                 run(greeted, lost(1, 11) + reconnect))
+                # no HELLO after the window end: the Agent never reconnected
+                alone = _session(11, 1, end + 1, 1)
+                self.assertEqual(("fail", "unmeasured"), run(alone, lost(1, 11)))
+                # a HELLO before the window end is not a reconnect
+                early = alone + _session(12, end - 1, 90, 2)
+                self.assertEqual(("fail", "unmeasured"), run(early, lost(1, 11) + reconnect))
+                # the Agent detected the loss after 20 s (> 15 s)
+                self.assertEqual(("unmeasured", "fail"),
+                                 run(greeted, lost(1, 11, idle_s=20) + reconnect))
+                # two Main windows, one Agent loss episode: one went undetected
+                # (G4: the recorded windows do not pair with the plan's one
+                # action, so it is left to the matching)
+                self.assertEqual(("unmeasured", "fail"),
+                                 run(greeted, lost(1, 11) + reconnect, windows=2))
+                # receiver records from before ``session_hello``: unmeasured
+                self.assertEqual(("unmeasured", "unmeasured"), run([], lost(1, 11)))
+
     def test_main_reply_cutoff_needs_proof_that_main_had_stopped(self):
         """#237: a heartbeat reply written after the orchestrator recorded the
         stop/restart but before the receiver actually stopped is no survival
@@ -2549,7 +2618,9 @@ class SenderProducerTests(unittest.TestCase):
     def test_echo_frames_count_reset_and_record(self):
         # #237: the Agent counts every heartbeat_ack frame it parses on a
         # connection (even a repeated, older echo), restarts the count on a
-        # new connection, and records it with each loss and close.
+        # new connection, and records it with each loss and close. The
+        # summarizer relies on this: a missed repeat (an old value) would not
+        # change ``last_echo_ns``, so its echo check could not notice it.
         config = sender.SenderConfig(candidate="a_framed", host="127.0.0.1", port=self.port,
                                      n_sources=2, fast=True)
         out = self.root / "echo.jsonl"
@@ -2567,7 +2638,9 @@ class SenderProducerTests(unittest.TestCase):
                         return_value=connection):
             self.assertIs(connection, instance._connect())
         self.assertEqual((0, None), (instance.echo_frames, instance.last_echo_ns))
-        instance._echo(11)
+        # b_segment parses whole responses and counts their frames the same way
+        body = wire.FrameReader(64).feed(wire.heartbeat_ack_frame(11))[0]
+        instance._apply_segment_acks([], [wire.parse_body(body)])
         instance._loss(456)
         writer.close()
         losses = [(row["source"], row["echo_frames"], row["last_echo_ns"])
