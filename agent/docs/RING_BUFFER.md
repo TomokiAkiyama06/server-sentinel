@@ -169,7 +169,9 @@ therefore predicts refusal by simulating the sources' next appends.
   consumed in whole units, and rounding only the batch total could charge up
   to about `n - 1` units less than `n` appends consume (Claude review of
   PR #143). Where every allocation is already whole units (ext4) it changes
-  nothing.
+  nothing. The last sixteen stored segments of each source, each rounded up
+  to whole units, also form the source's batch history for the measured
+  charge below.
 - **Charge `C(t)`** (Issue #130). All simulated appends at or before `t`,
   `n_s` of each source `s`, are charged together:
   `C(t) = min(sum(n_s * c_s), round_up(ceil(sum(n_s * m_s)) + sum(ceil(2 * n_s * sqrt(v_s)))))`,
@@ -195,6 +197,23 @@ therefore predicts refusal by simulating the sources' next appends.
   directly and only the latest append between two credit changes needs
   checking: the work is bounded by stored rows and sources, not by cadence
   ratios.
+- **Measured charge for synchronized sources** (Issue #130). When at least
+  two sources append through `t` and their batch histories align (the `j`-th
+  most recent segments of those sources overlap in time, for at least ten
+  consecutive `j` from the most recent; a gap or another cadence ends the
+  alignment), their past batch totals `T_j = sum(n_s * a_s,j)` are measured
+  directly, and
+  `C(t) = min(sum(n_s * c_s), round_up(ceil(mean(T)) + ceil(2 * sqrt(var(T) * (1 + 1/k) * (k - 1) / (k - 3)))))`
+  over the `k <= 16` aligned totals: a prediction bound for one further
+  total, widened for the mean (`1 + 1/k`) and the deviation (the Student t
+  to normal variance ratio `(k - 1) / (k - 3)`) both being estimated from
+  `k` samples. The totals carry the sources' real covariance: independent
+  sources are no longer charged as if perfectly correlated (their total
+  deviates about `sqrt(S)`, not `S`, per-source deviations), while
+  correlated sources still are, and chained appends of one source are still
+  taken as perfectly correlated (`n_s * a_s,j`). `C(t)` stays at most the
+  pre-#130 charge. Otherwise (one source, too short or misaligned histories,
+  `at_bound`) the perfectly correlated charge above applies unchanged.
 - **`STORAGE_HARD_STOP / segment_write_refused_at_reserve`** (writes refused
   at the recent real bitrate). Appends at the same instant form one batch that
   must fit as a whole, so the result never depends on profile order. Status
@@ -217,20 +236,36 @@ therefore predicts refusal by simulating the sources' next appends.
   Segments vary around half their bound (normal, standard deviation 8 % of
   the bound) in a 600 s duration FIFO near the reserve. False hard stops
   (hard stop read before a step whose every write succeeded), pre-#130 →
-  correlated two-deviation charge: two 60 s sources 47 → 47 of 400 samples,
-  four 60 s sources 26 → 26 of 120, a 10 s and a 60 s source 96 → 96 of 360;
-  with 10 % spikes up to the bound 47 → 46. For normally distributed sizes
-  the mean plus two deviations of eight samples is almost always at or above
-  their maximum, so the charge equals the pre-#130 recent maximum and these
-  runs gain nothing. (An earlier revision that added variances, valid only
-  for independent appends, measured 47 → 41, 26 → 8 and 96 → 55; it
-  undercharged correlated batches and was replaced.) The charge is lower
-  only for skewed recent histories, such as one outlier among eight
-  segments. Every real refusal in those runs (9, 1 and 5) was preceded by a
-  hard stop; with spikes, 1 of 17 refusals followed only the maximum-bitrate
-  pressure, as with the pre-#130 charge, and none followed a healthy status.
+  perfectly correlated two-deviation charge → measured charge: two 60 s
+  sources 47 → 47 → 42 of 400 samples, four 60 s sources 26 → 26 → 19 of
+  120, a 10 s and a 60 s source 96 → 96 → 96 of 360 (never aligned); with
+  10 % spikes up to the bound 47 → 46 → 46. For normally distributed sizes
+  the mean plus two perfectly correlated deviations of eight samples is
+  almost always at or above their maximum, so that charge equals the
+  pre-#130 recent maximum; the measured charge gains where it no longer
+  assumes independent sources to be perfectly correlated. (An earlier
+  revision that added variances, valid only for independent appends,
+  measured 47 → 41, 26 → 8 and 96 → 55; it undercharged correlated batches
+  and was replaced.) With the measured charge the four-source and
+  mixed-cadence refusals (1 and 5) were each preceded by a hard stop; of the
+  two-source refusals 8 of 9 were, and one batch above its estimate read
+  `STORAGE_PRESSURE` first (the perfectly correlated charge announced all 9
+  in these seeds); with spikes, 1 of 17 refusals followed only pressure, as
+  with every charge. Two sources writing the same size at every instant
+  (seed 133) are charged exactly as by the perfectly correlated bound: 2 of
+  4 refusals there followed pressure under every charge, including the
+  pre-#130 one. No refusal followed a healthy status. Over long runs every
+  estimate below the bound misses some tails: in a simple model of this
+  FIFO (independent normal sizes, 20 000 steps per source count) the
+  perfectly correlated charge let 4.5 % (two sources), 0.9 % (three) and
+  0.9 % (four) of refusals follow pressure rather than a hard stop, and the
+  measured charge 4.9 %, 1.8 % and 1.8 %, while reading 3 %, 7 % and 11 %
+  fewer false hard stops; with a 90-segment FIFO the figures were 3.5 % /
+  3.6 % / 1.0 % against 3.5 % / 4.9 % / 2.5 % and 7 %, 16 % and 20 % fewer
+  false hard stops. The deviation factor (2) remains the Owner decision to
+  be tuned with real section Q data.
 - **Premise of "no more hard stops than before Issue #130".** `C(t)` is never
-  above the pre-#130 charge `sum(n_s * c_s)`, and the credits `R(t)` do not
+  above the pre-#130 charge `sum(n_s * c_s)` (measured or not), and the credits `R(t)` do not
   depend on which charge is used, so the hard stop can only be read in fewer
   states than before. The simulated-append credit path is, in addition,
   practically unused: the FIFO window is at least `PRE` (duration mode accepts

@@ -32,7 +32,30 @@ def legacy_charge():
     """The pre-#130 charge: every simulated append at the largest of the
     source's last eight real allocations (an unbounded deviation factor
     always selects the per-append recent-maximum cap)."""
-    return patch.multiple(ring_module, RECENT_ALLOCATION_SEGMENTS=8, DEVIATION_FACTOR=Fraction(10 ** 9))
+    return patch.multiple(ring_module, RECENT_ALLOCATION_SEGMENTS=8, DEVIATION_FACTOR=Fraction(10 ** 9),
+                          MINIMUM_MEASURED_BATCHES=10 ** 9)
+
+
+def correlated_charge():
+    """The charge before measured batch totals: deviations of every batch
+    added as if perfectly correlated, never above the recent maxima."""
+    return patch.multiple(ring_module, MINIMUM_MEASURED_BATCHES=10 ** 9)
+
+
+def samples(sizes, cadence=60 * SECOND, offset=0):
+    """Rounded ``(start, end, allocation)`` samples, most recent first."""
+    return tuple((-(index + 1) * cadence + offset, -index * cadence + offset, size)
+                 for index, size in enumerate(sizes))
+
+
+def recent_of(sizes, unit, **alignment):
+    """``_recent_allocations`` of one source whose recent history is ``sizes``
+    (most recent first, whole units)."""
+    recent = [round_up(size, unit) for size in sizes[:8]]
+    mean = Fraction(sum(recent), len(recent))
+    variance = sum((size - mean) ** 2 for size in recent) / (len(recent) - 1)
+    cap = max(recent)
+    return (mean, variance, min(recent), cap, samples(sizes, **alignment))
 
 
 class VariableSegmentSizeTests(unittest.TestCase):
@@ -52,9 +75,11 @@ class VariableSegmentSizeTests(unittest.TestCase):
         self.addCleanup(ring.close)
         return settings, quota, store, ring
 
-    def run_fifo(self, *, seed, cadences, minutes, slack_units, spread=0.08, spikes=0.0):
+    def run_fifo(self, *, seed, cadences, minutes, slack_units, spread=0.08, spikes=0.0, correlated=False):
         """A duration-mode FIFO whose real segments vary around half their
-        bound (seeded normal sizes, optional spikes up to the bound). After
+        bound (seeded normal sizes, optional spikes up to the bound; with
+        ``correlated`` every source appending at an instant writes the same
+        size, as synchronized cameras filming one changing scene may). After
         warm-up, other consumers leave ``slack_units`` above the reserve and
         ledger headroom. Status is sampled after every step, then the next
         step's appends are attempted."""
@@ -94,8 +119,9 @@ class VariableSegmentSizeTests(unittest.TestCase):
                 recent = ring._recent_allocations(store.segment_allocations(), unit)
                 estimate = ring._batch_charge([(1, recent[profile.source_id]) for profile in profiles], unit)
             refused, actual = False, 0
+            shared = payload(batch[0]) if correlated and batch else None
             for profile in batch:
-                data = payload(profile)
+                data = shared if correlated else payload(profile)
                 actual += round_up(len(data), unit)
                 try:
                     ring.append(profile.source_id, at - profile.segment_duration_us, at, data,
@@ -127,14 +153,14 @@ class VariableSegmentSizeTests(unittest.TestCase):
             self.assertIn(state, {"STORAGE_HARD_STOP", "STORAGE_PRESSURE"}, (state, reason))
         self.assertEqual(0, result["within_estimate_unannounced"])
 
-    def compare(self, scenarios):
-        """Totals of the current and the legacy charge over seeded runs."""
+    def compare(self, scenarios, baseline=legacy_charge):
+        """Totals of the current and a baseline charge over seeded runs."""
         totals = []
         for legacy in (False, True):
             total = {"false_hard_stop": 0, "refused": 0, "announced_hard_stop": 0}
             for scenario in scenarios:
                 if legacy:
-                    with legacy_charge():
+                    with baseline():
                         result = self.run_fifo(**scenario)
                 else:
                     result = self.run_fifo(**scenario)
@@ -154,7 +180,7 @@ class VariableSegmentSizeTests(unittest.TestCase):
         sizes = [30 * unit] * 7 + [50 * unit]
         mean = Fraction(sum(sizes), 8)
         variance = sum((size - mean) ** 2 for size in sizes) / 7
-        recent = (mean, variance, 30 * unit, 50 * unit)
+        recent = (mean, variance, 30 * unit, 50 * unit, ())
         self.assertEqual(variance, 50 * unit * unit)
         # Two synchronized sources with this same history: their sizes may be
         # perfectly correlated, so deviations add, 65 units + 2 * 2 *
@@ -168,27 +194,27 @@ class VariableSegmentSizeTests(unittest.TestCase):
         # the 195 + 2 * sqrt(300) = 229.6 of independent appends, nor 6 * 50.
         self.assertEqual(280 * unit, DiskRing._batch_charge([(6, recent)], unit))
         # Never above every append at its recent maximum.
-        wide = (Fraction(10 * unit), Fraction(400 * unit * unit), 1 * unit, 20 * unit)
+        wide = (Fraction(10 * unit), Fraction(400 * unit * unit), 1 * unit, 20 * unit, ())
         self.assertEqual(20 * unit, DiskRing._batch_charge([(1, wide)], unit))
-        fixed = (Fraction(7 * unit), Fraction(0), 7 * unit, 7 * unit)
+        fixed = (Fraction(7 * unit), Fraction(0), 7 * unit, 7 * unit, ())
         self.assertEqual(14 * unit, DiskRing._batch_charge([(2, fixed)], unit))
 
     def test_batch_charge_rounding_is_pinned_and_never_below_the_exact_charge(self):
         unit = 4096
         # The summed mean is rounded up to whole bytes once: two means of
         # 10 units plus half a byte need 20 units plus one byte, so 21 units.
-        half = (Fraction(20 * unit + 1, 2), Fraction(0), 10 * unit, 11 * unit)
+        half = (Fraction(20 * unit + 1, 2), Fraction(0), 10 * unit, 11 * unit, ())
         self.assertEqual(21 * unit, DiskRing._batch_charge([(1, half), (1, half)], unit))
         # Each source's deviation term is rounded up to whole bytes on its
         # own: 2 * sqrt(1/16) = 0.5 byte becomes 1 byte per source, so means
         # of 10 units - 1 byte and 10 units need 20 units + 1 byte, that is
         # 21 units (one rounding of the summed 1-byte deviation would give
         # exactly 20 units).
-        low = (Fraction(10 * unit - 1), Fraction(1, 16), 9 * unit, 11 * unit)
-        high = (Fraction(10 * unit), Fraction(1, 16), 9 * unit, 11 * unit)
+        low = (Fraction(10 * unit - 1), Fraction(1, 16), 9 * unit, 11 * unit, ())
+        high = (Fraction(10 * unit), Fraction(1, 16), 9 * unit, 11 * unit, ())
         self.assertEqual(21 * unit, DiskRing._batch_charge([(1, low), (1, high)], unit))
         # Whole-unit means with no spread are charged exactly, not a unit more.
-        exact = (Fraction(10 * unit), Fraction(0), 10 * unit, 10 * unit)
+        exact = (Fraction(10 * unit), Fraction(0), 10 * unit, 10 * unit, ())
         self.assertEqual(30 * unit, DiskRing._batch_charge([(3, exact)], unit))
         # Seeded property: a whole number of units, never below the exact
         # rational charge, never above every append at its recent maximum.
@@ -199,7 +225,7 @@ class VariableSegmentSizeTests(unittest.TestCase):
                 cap = sizes.randint(1, 64) * unit
                 mean = Fraction(sizes.randint(1, cap), sizes.randint(1, 7))
                 variance = Fraction(sizes.randint(0, (cap // 2) ** 2), sizes.randint(1, 7))
-                appends.append((sizes.randint(0, 6), (min(mean, Fraction(cap)), variance, 1, cap)))
+                appends.append((sizes.randint(0, 6), (min(mean, Fraction(cap)), variance, 1, cap, ())))
             charge = DiskRing._batch_charge(appends, unit)
             cap = sum(count * recent[3] for count, recent in appends)
             self.assertEqual(0, charge % unit)
@@ -238,13 +264,14 @@ class VariableSegmentSizeTests(unittest.TestCase):
         recent = ring._recent_allocations(allocations, unit)
         for profile in profiles:
             self.assertEqual((Fraction(31 * unit), Fraction(0), 30 * unit + 512, 31 * unit),
-                             recent[profile.source_id])
+                             recent[profile.source_id][:4])
+            self.assertEqual([31 * unit] * 8, [size for _start, _end, size in recent[profile.source_id][4]])
         self.assertEqual(62 * unit, ring._batch_charge([(1, recent[profile.source_id]) for profile in profiles],
                                                        unit))
         # Whole-unit allocations (ext4-like) are unchanged by the rounding.
         whole = {identifier: 30 * unit for identifier in allocations}
         self.assertEqual((Fraction(30 * unit), Fraction(0), 30 * unit, 30 * unit),
-                         ring._recent_allocations(whole, unit)[profiles[0].source_id])
+                         ring._recent_allocations(whole, unit)[profiles[0].source_id][:4])
 
     def test_one_large_recent_segment_no_longer_reads_hard_stop_while_typical_writes_fit(self):
         # Each source's recent history: seven 30-unit segments and one
@@ -314,26 +341,27 @@ class VariableSegmentSizeTests(unittest.TestCase):
                         now_us=end, clock_trusted=True)
         allocations = store.segment_allocations()
         self.assertEqual((40 * unit, 0, 10 * unit, 40 * unit),
-                         ring._recent_allocations(allocations, unit)[profile.source_id])
+                         ring._recent_allocations(allocations, unit)[profile.source_id][:4])
         bound = round_up(profile.segment_bytes(), unit)
-        self.assertEqual((bound, 0, bound, bound),
+        self.assertEqual((bound, 0, bound, bound, ()),
                          ring._recent_allocations(allocations, unit, at_bound=True)[profile.source_id])
 
     def test_two_sources_variable_sizes_no_more_false_hard_stops_and_no_unannounced_refusal(self):
-        # Normally distributed sizes: with two deviations, perfectly
-        # correlated, the charge per append is at least the sample maximum of
-        # eight recent sizes almost always, so it equals the pre-#130 charge
-        # here (47 false hard stops of 400 samples, both).
+        # Normally distributed sizes of two independent sources: their total
+        # deviates about sqrt(2), not two, per-source deviations, so the
+        # measured prediction bound reads hard stop before 42, not 47, of 400
+        # minutes whose every append succeeded. Every refusal is announced,
+        # never after a healthy status: by a hard stop, except one batch (seed
+        # 131) above its estimate, a tail the two-deviation factor accepts,
+        # which read pressure. The perfectly correlated charge misses such
+        # tails too (seed 133 below).
         current, legacy = self.compare([
             {"seed": 130, "cadences": (60, 60), "minutes": 200, "slack_units": 24},
             {"seed": 131, "cadences": (60, 60), "minutes": 200, "slack_units": 40},
         ])
-        self.assertGreater(legacy["refused"], 0)
-        self.assertEqual(legacy["refused"], current["refused"])
-        # Every real refusal of these seeded runs was announced by a hard stop.
-        self.assertEqual(current["refused"], current["announced_hard_stop"])
-        self.assertEqual(legacy["refused"], legacy["announced_hard_stop"])
-        self.assertLessEqual(current["false_hard_stop"], legacy["false_hard_stop"])
+        self.assertEqual((42, 47), (current["false_hard_stop"], legacy["false_hard_stop"]))
+        self.assertEqual((9, 9), (current["refused"], legacy["refused"]))
+        self.assertEqual((8, 9), (current["announced_hard_stop"], legacy["announced_hard_stop"]))
 
     def test_four_sources_variable_sizes_no_more_false_hard_stops(self):
         current, legacy = self.compare([
@@ -343,6 +371,103 @@ class VariableSegmentSizeTests(unittest.TestCase):
         self.assertEqual(legacy["refused"], current["refused"])
         self.assertEqual(current["refused"], current["announced_hard_stop"])
         self.assertLessEqual(current["false_hard_stop"], legacy["false_hard_stop"])
+
+    def test_measured_batch_totals_charge_the_real_covariance_of_synchronized_sources(self):
+        unit = 4096
+        # Ten aligned recent allocations (most recent first), mean 30 units,
+        # sample variance 240 / 9 units squared.
+        units = [30, 34, 26, 38, 22, 32, 28, 36, 24, 30]
+        sizes = [size * unit for size in units]
+        mirrored = [(60 - size) * unit for size in units]
+
+        def charges(*sources, counts=None):
+            appends = [(1 if counts is None else count, recent) for count, recent
+                       in zip(counts or [1] * len(sources), sources)]
+            with correlated_charge():
+                correlated = DiskRing._batch_charge(appends, unit)
+            return DiskRing._batch_charge(appends, unit), correlated
+
+        # Sizes that offset each other: every past batch totalled 60 units, so
+        # the measured spread is zero and the batch is charged 60 units, where
+        # the perfectly correlated bound charged both recent maxima (76).
+        self.assertEqual((60 * unit, 76 * unit), charges(recent_of(sizes, unit), recent_of(mirrored, unit)))
+        # Perfectly correlated sizes keep the full charge: the measured total
+        # deviates 2 * sqrt(4 * 240 / 9 * 99 / 70) = 24.6 units above its 60,
+        # so both sources are charged their largest allocation (76 units),
+        # as the perfectly correlated bound charges them.
+        self.assertEqual((76 * unit, 76 * unit), charges(recent_of(sizes, unit), recent_of(sizes, unit)))
+        # Chained appends of one source still count as perfectly correlated:
+        # two appends of each mirrored source are charged 120 units.
+        self.assertEqual(120 * unit, charges(recent_of(sizes, unit), recent_of(mirrored, unit),
+                                             counts=[2, 2])[0])
+        # Without enough aligned past batches the perfectly correlated bound
+        # is charged: nine samples, another cadence, a gap after three
+        # segments, a single appending source.
+        for first, second, counts in (
+                (recent_of(sizes[:9], unit), recent_of(mirrored[:9], unit), None),
+                (recent_of(sizes, unit), recent_of(mirrored, unit, cadence=30 * SECOND), None),
+                (recent_of(sizes, unit), recent_of(mirrored, unit)[:4] + (
+                    recent_of(mirrored, unit)[4][:3] + recent_of(mirrored, unit, offset=-60 * SECOND)[4][3:],),
+                 None),
+                (recent_of(sizes, unit), recent_of(mirrored, unit), [1, 0])):
+            current, correlated = charges(first, second, counts=counts)
+            self.assertEqual(correlated, current)
+        # A phase offset within one cadence still aligns the past batches.
+        self.assertEqual(60 * unit, charges(recent_of(sizes, unit),
+                                            recent_of(mirrored, unit, offset=-30 * SECOND))[0])
+
+    def test_measured_batch_charge_is_whole_units_and_never_below_its_prediction_bound(self):
+        unit = 4096
+        generator = random.Random(1301)
+        for _ in range(200):
+            history = [[generator.randint(1, 64 * unit) for _ in range(generator.randint(10, 16))]
+                       for _source in range(generator.randint(2, 4))]
+            length = min(len(sizes) for sizes in history)
+            counts = [generator.randint(1, 3) for _sizes in history]
+            recent = [recent_of([round_up(size, unit) for size in sizes], unit) for sizes in history]
+            charge = DiskRing._batch_charge(list(zip(counts, recent)), unit)
+            totals = [sum(count * round_up(sizes[index], unit) for count, sizes in zip(counts, history))
+                      for index in range(length)]
+            cap = sum(count * source[3] for count, source in zip(counts, recent))
+            mean = Fraction(sum(totals), length)
+            variance = sum((total - mean) ** 2 for total in totals) / (length - 1)
+            # From below, each root rounded down: never under the exact bound.
+            floor = math.isqrt(math.floor(variance * 4 * Fraction((length + 1) * (length - 1),
+                                                                    length * (length - 3))))
+            # Whole units, never above every append at its recent maximum
+            # (the pre-#130 charge).
+            self.assertEqual(0, charge % unit)
+            self.assertLessEqual(charge, cap)
+            self.assertGreaterEqual(charge, min(cap, mean + floor))
+
+    def test_four_sources_measured_totals_read_fewer_false_hard_stops_than_the_correlated_bound(self):
+        # Independent sizes of four synchronized sources: the perfectly
+        # correlated bound charged a batch about four per-source deviations
+        # above its mean, where its total deviates about two. Measured from
+        # the recent batch totals, the 120 minutes read hard stop before 19,
+        # not 26, minutes whose every append succeeded; the one refusal is
+        # still announced by a hard stop.
+        current, correlated = self.compare([
+            {"seed": 130, "cadences": (60, 60, 60, 60), "minutes": 120, "slack_units": 48},
+        ], baseline=correlated_charge)
+        self.assertEqual((19, 26), (current["false_hard_stop"], correlated["false_hard_stop"]))
+        self.assertEqual((1, 1), (current["refused"], correlated["refused"]))
+        self.assertEqual(current["refused"], current["announced_hard_stop"])
+
+    def test_correlated_sources_are_charged_no_less_than_by_the_correlated_bound(self):
+        # Two synchronized sources writing the same size at every instant:
+        # the measured totals carry that correlation, so the batch is charged
+        # as by the perfectly correlated bound, with the same outcome. Of four
+        # refusals two followed a hard stop and two a batch above every
+        # estimate (both sources' largest recent allocations), which read
+        # pressure under each charge, never healthy.
+        for baseline in (correlated_charge, legacy_charge):
+            current, previous = self.compare([
+                {"seed": 133, "cadences": (60, 60), "minutes": 200, "slack_units": 24, "correlated": True},
+            ], baseline=baseline)
+            self.assertEqual(previous, current)
+            self.assertEqual((7, 4, 2), (current["false_hard_stop"], current["refused"],
+                                         current["announced_hard_stop"]))
 
     def test_mixed_cadence_chained_appends_no_more_false_hard_stops(self):
         # The 10 s source appends six times per 60 s source append; its

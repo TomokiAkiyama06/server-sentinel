@@ -30,6 +30,11 @@ MINIMUM_SPREAD_SAMPLES = 4
 # Standard deviations of a simulated batch's total real allocation charged
 # above its mean (never above every append at its recent maximum).
 DEVIATION_FACTOR = Fraction(2)
+# Stored segments per source whose aligned real allocations form the recent
+# batch totals of synchronized sources (Issue #130), and the fewest such past
+# batches whose spread is trusted instead of the perfectly correlated bound.
+BATCH_HISTORY_SEGMENTS = 16
+MINIMUM_MEASURED_BATCHES = 10
 
 
 class DiskRing:
@@ -364,7 +369,7 @@ class DiskRing:
         }
 
     def _recent_allocations(self, allocations, unit, *, at_bound=False):
-        """Per-source ``(mean, variance, credit, cap)`` of one simulated append.
+        """Per-source ``(mean, variance, credit, cap, samples)`` of one simulated append.
 
         From the source's last ``RECENT_ALLOCATION_SEGMENTS`` stored
         allocations: their mean and sample variance, the smallest of them
@@ -377,21 +382,30 @@ class DiskRing:
         each rounded up to whole allocation units (never under-charging an
         append on a filesystem whose 512-byte block counts are not whole
         ``f_frsize`` units); the credit is the unrounded smallest sample.
+        ``samples`` are the source's last ``BATCH_HISTORY_SEGMENTS`` stored
+        allocations, most recent first, as ``(start, end, allocation)``, each
+        rounded up to whole units and never above the bound (empty with
+        ``at_bound``), from which ``_measured_charge`` charges synchronized
+        sources.
         """
         recent = {}
         for source, profile in self.profiles.items():
             bound = round_up(profile.segment_bytes(), unit)
-            sizes = [] if at_bound else [allocations.get(UUID(row[0]), bound) for row in self.db.execute(
-                "SELECT id FROM segments WHERE source=? AND state='stored' "
-                "ORDER BY end DESC LIMIT ?", (str(source), RECENT_ALLOCATION_SEGMENTS))]
+            rows = [] if at_bound else [(row[1], row[2], allocations.get(UUID(row[0]), bound))
+                                        for row in self.db.execute(
+                "SELECT id, start, end FROM segments WHERE source=? AND state='stored' ORDER BY end DESC LIMIT ?",
+                (str(source), max(RECENT_ALLOCATION_SEGMENTS, BATCH_HISTORY_SEGMENTS)))]
+            # The rounded samples of the longer batch history, never above the bound.
+            samples = tuple((start, end, min(bound, round_up(size, unit))) for start, end, size in rows)
+            sizes = [size for _start, _end, size in rows[:RECENT_ALLOCATION_SEGMENTS]]
             if not sizes:
-                recent[source] = (Fraction(bound), Fraction(0), bound, bound)
+                recent[source] = (Fraction(bound), Fraction(0), bound, bound, ())
                 continue
             cap = min(bound, round_up(max(sizes), unit))
             credit = min(cap, min(sizes))
             count = len(sizes)
             if count < MINIMUM_SPREAD_SAMPLES:
-                recent[source] = (Fraction(cap), Fraction(0), credit, cap)
+                recent[source] = (Fraction(cap), Fraction(0), credit, cap, samples)
                 continue
             # Free space is consumed in whole allocation units, but
             # ``st_blocks * 512`` need not be a multiple of ``f_frsize`` on
@@ -403,16 +417,63 @@ class DiskRing:
             sizes = [round_up(size, unit) for size in sizes]
             mean = Fraction(sum(sizes), count)
             variance = sum((size - mean) ** 2 for size in sizes) / (count - 1)
-            recent[source] = (min(mean, Fraction(cap)), variance, credit, cap)
+            recent[source] = (min(mean, Fraction(cap)), variance, credit, cap, samples)
         return recent
+
+    @staticmethod
+    def _ceil_root(square):
+        """``ceil(sqrt(square))`` of a non-negative rational, exactly."""
+        square = math.ceil(square)
+        root = math.isqrt(square)
+        return root + (root * root < square)
+
+    @staticmethod
+    def _measured_charge(appends):
+        """Space for synchronized sources' appends measured from their recent
+        batch totals, in whole bytes, or ``None`` (Issue #130).
+
+        The ``j``-th most recent samples of the batch's sources form one past
+        batch while their intervals all overlap (synchronized sources of one
+        cadence; a gap or another cadence ends the alignment). Its total is
+        ``sum(count * allocation)``, each source's chained appends still taken
+        as perfectly correlated. The ``n`` totals carry the sources' real
+        covariance, so independent sources are no longer charged as if
+        perfectly correlated while correlated ones still are. The charge is
+        the totals' mean plus ``DEVIATION_FACTOR`` sample deviations widened
+        to a prediction bound for one further total from ``n`` samples:
+        ``sqrt(1 + 1/n)`` for the estimated mean and ``sqrt((n - 1) / (n -
+        3))``, the ratio of a Student t variance to a normal one, for the
+        estimated deviation. ``None`` (charge the perfectly correlated bound)
+        for fewer than two sources or fewer than ``MINIMUM_MEASURED_BATCHES``
+        aligned past batches.
+        """
+        active = [(count, samples) for count, (*_statistics, samples) in appends if count]
+        if len(active) < 2:
+            return None
+        totals = []
+        for past in zip(*(samples for _count, samples in active)):
+            if max(start for start, _end, _size in past) >= min(end for _start, end, _size in past):
+                break
+            totals.append(sum(count * size for (count, _samples), (_start, _end, size) in zip(active, past)))
+        count = len(totals)
+        if count < MINIMUM_MEASURED_BATCHES:
+            return None
+        mean = Fraction(sum(totals), count)
+        variance = sum((total - mean) ** 2 for total in totals) / (count - 1)
+        # ceil(DEVIATION_FACTOR * sqrt(variance * (1 + 1/n) * (n - 1) / (n - 3))), exactly.
+        deviation = DiskRing._ceil_root(variance * DEVIATION_FACTOR ** 2
+                                        * Fraction((count + 1) * (count - 1), count * (count - 3)))
+        return math.ceil(mean) + deviation
 
     @staticmethod
     def _batch_charge(appends, unit):
         """Space for ``(count, recent)`` simulated appends of every source.
 
-        The sum of the means plus ``DEVIATION_FACTOR`` standard deviations of
-        that sum, in whole allocation units, never above every append at its
-        source's recent maximum. The deviation of the sum is bounded as if
+        Synchronized sources with enough aligned history are charged
+        ``_measured_charge`` in whole allocation units, never above every
+        append at its source's recent maximum. Otherwise the charge is the sum of the means plus ``DEVIATION_FACTOR`` standard
+        deviations of that sum, in whole allocation units, never above every
+        append at its source's recent maximum. The deviation of the sum is bounded as if
         every append were perfectly correlated (synchronized sources, and
         temporally correlated VBR within one source): the per-append standard
         deviations add, ``sum(count * sqrt(variance))``, rather than the
@@ -434,14 +495,15 @@ class DiskRing:
         units per append.
         """
         mean, deviation, cap = Fraction(0), 0, 0
-        for count, (append_mean, append_variance, _credit, append_cap) in appends:
+        for count, (append_mean, append_variance, _credit, append_cap, _samples) in appends:
             mean += count * append_mean
             cap += count * append_cap
             # ceil(DEVIATION_FACTOR * count * sqrt(variance)), exactly: the
             # smallest integer whose square is at least the (rational) square.
-            square = math.ceil(append_variance * (DEVIATION_FACTOR * count) ** 2)
-            root = math.isqrt(square)
-            deviation += root + (root * root < square)
+            deviation += DiskRing._ceil_root(append_variance * (DEVIATION_FACTOR * count) ** 2)
+        measured = DiskRing._measured_charge(appends)
+        if measured is not None:
+            return min(cap, round_up(measured, unit))
         return min(cap, round_up(math.ceil(mean) + deviation, unit))
 
     def _next_write_refused(self, now, budget, *, clock_trusted, at_bound=False):
@@ -480,7 +542,9 @@ class DiskRing:
         of that sum, bounded as if every append were perfectly correlated
         (per-append deviations add), in whole allocation units, never above
         every append at its source's recent maximum (the bound without
-        history; the recent maximum while the history is too short).
+        history; the recent maximum while the history is too short), or, for
+        synchronized sources with enough aligned history, at a prediction
+        bound measured from their recent batch totals (``_measured_charge``).
         Charging every append the recent maximum instead let the sample
         maximum's excess compound across sources and chained appends into a
         hard stop while writes kept succeeding near the reserve. A refusal here means writes are refused at the recent real
