@@ -522,7 +522,7 @@ class MjpgPrecheckTests(DecoderCase):
         self.assertIn(self.refused_before_decoding(double), ("scan_invalid", "sof_invalid"))
         self.assertEqual("marker_invalid", self.refused_before_decoding(b"\xff\xd8\xff\xd9"))
 
-    def test_lossless_arithmetic_and_other_non_baseline_sof_are_refused_before_decoding(self):
+    def test_lossless_arithmetic_and_other_unreviewed_sof_are_refused_before_decoding(self):
         self.assertEqual(frozenset(UNSUPPORTED_SOF), mjpg.OTHER_SOF)
         self.assertEqual(frozenset({0xC0, 0xC1}), mjpg.SUPPORTED_SOF)
         for marker in UNSUPPORTED_SOF:
@@ -1268,7 +1268,7 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         self.assertEqual((), harness.source().undecodable_reasons)
         self.assertEqual([], harness.recorder.items)
 
-    def test_non_baseline_sof_frame_is_unknown_and_never_reaches_the_child(self):
+    def test_lossless_or_arithmetic_sof_frame_is_unknown_and_never_reaches_the_child(self):
         harness = self.harness(binding(layout=MJPG_LAYOUT), binding(OTHER, layout=MJPG_LAYOUT))
         harness.start()
         for _ in range(2):
