@@ -82,7 +82,8 @@ class AdminCliTests(unittest.TestCase):
             service_uid=self.service_uid, settings=SimpleNamespace(database_path=self.path),
             local_uvc=SimpleNamespace(source_ids=tuple(self.configured)) if self.configured else None)
 
-    def holders(self, identity):
+    def holders(self, identity, name):
+        self.assertEqual(self.path.name, name)
         return self.running.pop(0) if self.running else 0
 
     def run_cli(self, *argv, lines=(), console=None, terminal_factory=None):
@@ -163,6 +164,40 @@ class AdminCliTests(unittest.TestCase):
         self.assertIn(f"serial=present formats=MJPG,YUYV approved_for={source.id}", lines[3])
         self.assertEqual("devices not inspected: 1", lines[4])
         self.assertPrivateAbsent(stdout)
+
+    def test_a_twin_left_by_a_serial_ambiguous_holder_is_held_both_ways(self):
+        # Issue #280 item 1: another source holds twin A as serial-ambiguous;
+        # A is unplugged and only its twin B (same serial) remains. The
+        # store refuses B in the reverse direction (by serial), so the
+        # listing and the pre-confirmation check must say so too, instead
+        # of failing after the confirmation with a recorded ``failed``.
+        source = self.local_source()
+        other = self.local_source("Other")
+        twin_a = camera(7, "SYNTHSERIALTWIN", port="2-4")
+        twin_b = camera(8, "SYNTHSERIALTWIN", port="2-5")
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            ApprovalStore.approve_on(connection, other.id, twin_a, serial_ambiguous=True)
+            connection.execute("COMMIT")
+        self.assertTrue(ApprovalStore(self.database).approved_elsewhere(source.id, twin_b))
+        self.discovery = FakeDiscovery([twin_b])
+        code, stdout, stderr, _ = self.run_cli("candidates")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(f"serial=present formats=MJPG,YUYV approved_for={other.id}", stdout)
+        code, stdout, stderr, terminal = self.run_cli(
+            "approve", str(source.id), admin_cli.candidate_label(twin_b))
+        self.assertEqual((code, stdout, terminal), (2, "", ""))
+        self.assertIn("refused: camera_approved_for_another_source", stderr)
+        self.assertIsNone(self.approval(source.id))
+        self.assertEqual([], self.rows(AUDIT))
+        # With both twins connected each is told apart by its live instance:
+        # only A is held, and B's serial is shared.
+        self.discovery = FakeDiscovery([twin_a, twin_b])
+        code, stdout, _, _ = self.run_cli("candidates")
+        lines = stdout.splitlines()
+        self.assertEqual(0, code)
+        self.assertIn(f"serial=shared formats=MJPG,YUYV approved_for={other.id}", lines[0])
+        self.assertIn("serial=shared formats=MJPG,YUYV approved_for=-", lines[1])
 
     def test_untrusted_device_text_is_never_printed_raw(self):
         odd = DeviceEvidence("/dev/video9", "SYNTH\u001b[2J", "x", "SYNTHSERIAL0003", "0", (),
@@ -245,6 +280,9 @@ class AdminCliTests(unittest.TestCase):
                 self.assertEqual((code, stdout, terminal), (2, "", ""))
                 self.assertIn("refused: service_running", stderr)
                 self.assertIn("systemctl stop", stderr)
+                # Another local admin command holding the database also counts.
+                self.assertIn("bootstrap_cli", stderr)
+                self.assertIn("a second admin_cli", stderr)
         self.assertEqual(1, len(self.fixture.list_sources()))
         self.assertIsNone(self.approval(source.id))
         self.assertEqual([], self.rows(AUDIT))
@@ -451,8 +489,8 @@ class DatabaseHolderTests(unittest.TestCase):
         return directory
 
     def holders(self, own_pid=1):
-        return admin_cli._database_holders(self.identity, proc_root=self.proc, own_pid=own_pid,
-                                           account=self.account)
+        return admin_cli._database_holders(self.identity, self.database.name, proc_root=self.proc,
+                                           own_pid=own_pid, account=self.account)
 
     def test_counts_other_processes_of_this_account_holding_the_database(self):
         self.process(1, self.account, [self.database])       # this process
@@ -470,6 +508,86 @@ class DatabaseHolderTests(unittest.TestCase):
         if os.access(directory / "fd", os.R_OK):
             self.skipTest("running with permission overrides")
         with self.assertRaises(CliRefused) as refused:
+            self.holders()
+        self.assertEqual("service_state_unavailable", refused.exception.reason)
+
+    def test_an_unreadable_status_of_a_process_refuses(self):
+        # Issue #280 item 2: a process whose uids cannot be read might be the
+        # service; it is never skipped as "another account" or "gone".
+        self.process(7, self.account, [self.database])
+        real_open = Path.open
+
+        def failing(path, *args, **kwargs):
+            if str(path).endswith("/7/status"):
+                raise PermissionError(13, "synthetic")
+            return real_open(path, *args, **kwargs)
+
+        with patch.object(Path, "open", failing), self.assertRaises(CliRefused) as refused:
+            self.holders()
+        self.assertEqual("service_state_unavailable", refused.exception.reason)
+
+    def test_an_unreadable_status_file_refuses_and_a_vanished_one_is_skipped(self):
+        directory = self.process(8, self.account, [self.database])
+        os.chmod(directory / "status", 0)
+        try:
+            if os.access(directory / "status", os.R_OK):
+                self.skipTest("running with permission overrides")
+            with self.assertRaises(CliRefused) as refused:
+                self.holders()
+        finally:
+            os.chmod(directory / "status", 0o600)
+        self.assertEqual("service_state_unavailable", refused.exception.reason)
+        (directory / "status").unlink()   # the process exited meanwhile
+        self.assertEqual(0, self.holders())
+
+    def test_a_status_without_uids_refuses(self):
+        directory = self.process(9, self.account, [self.database])
+        (directory / "status").write_text("Name:\tsynthetic\n")
+        with self.assertRaises(CliRefused) as refused:
+            self.holders()
+        self.assertEqual("service_state_unavailable", refused.exception.reason)
+
+    def test_only_descriptors_named_like_the_database_are_stat_ed(self):
+        # Issue #280 item 6: a stat on a hung FUSE/NFS descriptor would block
+        # instead of refusing, so other files are never stat-ed.
+        hung = self.root / "mnt" / "hung-fuse-file"
+        hung.parent.mkdir()
+        hung.write_bytes(b"synthetic")
+        self.process(10, self.account, [hung, self.other, self.database])
+        stat_ed = []
+        real_stat = os.stat
+
+        def recording(path, *args, **kwargs):
+            stat_ed.append(str(path))
+            if not str(path).endswith("/10/fd/2"):
+                raise AssertionError("a descriptor of another file was stat-ed")
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(admin_cli.os, "stat", recording):
+            self.assertEqual(1, self.holders())
+        self.assertEqual([str(self.proc / "10" / "fd" / "2")], stat_ed)
+        # A same-named file of another directory (a bind mount, another
+        # mount namespace) is stat-ed and compared by inode, not by name.
+        twin = self.root / "mnt" / self.database.name
+        twin.write_bytes(b"other")
+        self.process(11, self.account, [twin])
+        self.assertEqual(1, self.holders())
+        self.assertFalse(admin_cli._may_name_database("pipe:[4242]", self.database.name))
+        self.assertFalse(admin_cli._may_name_database("socket:[4242]", self.database.name))
+        self.assertFalse(admin_cli._may_name_database(str(self.root / "state.sqlite3-wal"),
+                                                      self.database.name))
+
+    def test_a_descriptor_link_that_cannot_be_read_refuses(self):
+        self.process(12, self.account, [self.other])
+        real_readlink = os.readlink
+
+        def failing(path, *args, **kwargs):
+            if str(path).endswith("/12/fd/0"):
+                raise PermissionError(13, "synthetic")
+            return real_readlink(path, *args, **kwargs)
+
+        with patch.object(admin_cli.os, "readlink", failing), \
+                self.assertRaises(CliRefused) as refused:
             self.holders()
         self.assertEqual("service_state_unavailable", refused.exception.reason)
 
@@ -500,13 +618,14 @@ class DatabaseHolderTests(unittest.TestCase):
         view = self.root / "view"
         view.mkdir()
         (view / str(child.pid)).symlink_to(f"/proc/{child.pid}")
-        self.assertEqual(1, admin_cli._database_holders(self.identity, proc_root=view))
-        self.assertEqual(0, admin_cli._database_holders(self.identity, proc_root=view,
+        name = self.database.name
+        self.assertEqual(1, admin_cli._database_holders(self.identity, name, proc_root=view))
+        self.assertEqual(0, admin_cli._database_holders(self.identity, name, proc_root=view,
                                                         own_pid=os.getpid(),
                                                         account=self.account + 1))
         child.kill()
         child.wait()
-        self.assertEqual(0, admin_cli._database_holders(self.identity, proc_root=view))
+        self.assertEqual(0, admin_cli._database_holders(self.identity, name, proc_root=view))
 
 
 if __name__ == "__main__":

@@ -363,7 +363,9 @@ record.
   `-`); with stdout and stderr redirected to a file, confirm neither holds a
   serial, `/dev/video*`, a by-id name or a USB port; run it twice and confirm
   the labels are the same, then re-plug one camera and confirm only its
-  label changed;
+  label changed (a change of a node's owner, mode or ACL also changes its
+  label without a re-plug; `approve` then refuses the old label as
+  `candidate_not_found`);
 - [ ] `create-source --name <name> --profile 1920x1080@30/MJPG`, type
   `CREATE`: stdout holds only the new UUID and the next steps, and the audit
   log holds one `create_source` record (actor `owner`) with that UUID; type
@@ -389,7 +391,12 @@ record.
   `controlling_terminal_required`, each changing nothing;
 - [ ] with the service inside a VM/LXD guest (Owner decision D2), confirm the
   command is run inside that guest; from the host it cannot see the guest's
-  service (documented limit).
+  service (documented limit: a VM's own kernel, an unprivileged LXD
+  container's shifted uids);
+- [ ] while another local admin command of the service account holds the
+  database (for example `bootstrap_cli` waiting at its confirmation), run
+  `create-source`: `service_running`, with the hint naming the other admin
+  commands.
 
 #### 実機記録 2026-09-30（Main Server 候補、serial 付き同型 UVC × 2）
 
