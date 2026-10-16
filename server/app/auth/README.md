@@ -479,7 +479,17 @@ human listener port or a recorded proxy socket port (for either protocol, so
 UDP/443 is never exempt), and a wildcard exception never matches a bind
 to a reserved address: `100.64.x.y:22` still closes access when `0.0.0.0:22`
 is allowed. Only a `reserved_address` exception (above) covers such a bind,
-and only `tailscaled.service`'s TCP on its recorded port. The only runtime path that changes it is
+and only `tailscaled.service`'s TCP on its recorded port. Two paths change
+it. Offline, the local Owner command `app.auth.reservation_cli set` (Owner
+decision D3, 2026-10-16; run as the service account with a controlling
+terminal, like `bootstrap_cli`) validates the set against the reservation
+the deployment's `human_access` section states
+(`HumanAccessDeployment.reservation_config()`, the same `ReservationConfig`
+`composition.py` builds; value-free `human_access_not_configured` /
+`human_access_configuration_rejected` otherwise), then writes the set and the same
+`change_security_setting` audit record (actor `owner`) in one transaction,
+after re-reading the stored value inside it; the running check does not see
+it until the service restarts and `startup()` loads it. The only runtime path is
 `app.audit.integration.ReservationAdministration`, which authorizes the Owner,
 writes the set and a `change_security_setting` audit record in one SQLite
 transaction, then applies the set and re-checks immediately so narrowing it

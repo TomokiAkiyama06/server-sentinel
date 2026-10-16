@@ -2914,10 +2914,30 @@ by the Issue #6 synthetic policy model.
     decision is needed;
   - [ ] without the exception, confirm access closes with
     `UNEXPECTED_LISTENER`; record the `reserved_address` exception for the
-    observed port(s) through the audited Owner path and confirm access opens;
+    observed port(s) with `app.auth.reservation_cli set`, restart the
+    service and confirm access opens;
     confirm a test TCP listener on the same address and another port, and
     one on the recorded port started by another unit after `tailscaled` is
     stopped, each close access.
+- Local listener-exception command (`app.auth.reservation_cli`, Owner
+  decision D3, 2026-10-16; synthetic tests only so far, not run on any host):
+  - [ ] as the service account over SSH, `show` prints the stored set (or
+    `no listener exceptions`) and nothing else; `set` with the host's
+    exceptions shows the stored and new sets, asks for `CHANGE`, and adds one
+    `change_security_setting` audit record (actor `owner`) holding no port,
+    unit or address;
+  - [ ] the running service keeps its startup set until
+    `systemctl restart server-sentinel.service`; after the restart the new
+    set is in force (a removed exception closes access);
+  - [ ] run as root, as another account, without a controlling terminal
+    (`systemd-run`, `cron`), with a dashboard or upstream port, and with a
+    `reserved_address` exception for another unit: each refuses and changes
+    nothing;
+  - [ ] with the deployment's real `human_access` section, an exception for
+    its `port` or for `human_port` is refused; with the section removed
+    from a copy of the configuration, `set` refuses with
+    `human_access_not_configured` and no refusal prints a hostname,
+    address, unit or port.
 - Breach recovery (Owner decision 2026-09-30): with an Owner and an invited
   viewer signed in, bind a test listener to the Tailscale address on another
   port, wait for the check to close access, then stop it. Confirm access
@@ -2979,8 +2999,8 @@ by the Issue #6 synthetic policy model.
      is greater than the port, `ss -ltne 'sport = :<port>'` shows one row whose
      inode is in `/proc/<service pid>/fd`, the backend runs without
      capabilities (`grep Cap /proc/<service pid>/status` all zero), and access
-     opens with the `tcp/22` `ssh.socket` (uid 0) exception entered through
-     the audited Owner path.
+     opens with the `tcp/22` `ssh.socket` (uid 0) exception entered with
+     `app.auth.reservation_cli set` and a service restart.
   4. Mismatching listener → revoke: on a disposable node or during a
      maintenance window, with an Owner and an invited viewer signed in, stop
      `ssh.socket` and `ssh.service`, start a wildcard listener on 22 from a

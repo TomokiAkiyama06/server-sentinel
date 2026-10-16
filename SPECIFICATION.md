@@ -1732,7 +1732,18 @@ directly on a reserved address is a `reserved_address` exception for
 `tailscaled.service` with uid 0 over TCP on one recorded port other than the
 dashboard, upstream and proxy ports (its plain-HTTP peerAPI; Owner decision
 D1, 2026-10-16, ADR-0003); it covers only the configured reserved addresses
-and is verified the same way. Each recorded proxy socket requires a
+and is verified the same way. The Owner records the set with the local command
+`python -m app.auth.reservation_cli show|set --config <deployment.json>` (Owner
+decision D3, 2026-10-16): run as the service account with the same checks as
+`bootstrap_cli` (no root, the configuration's service uid, a controlling
+terminal, the pinned existing database of exactly the current schema), it
+validates the set against the reservation the deployment's `human_access`
+section states (`HumanAccessDeployment.reservation_config()`, the one the
+service's check uses), reads the word
+`CHANGE` from the terminal and commits the set with its
+`change_security_setting` audit record (actor `owner`, the fixed
+listener-exceptions id) in one transaction; the running service applies it
+only after a restart. Each recorded proxy socket requires a
 recorded proxy identity (`proxy_owner`: systemd unit and uid) and must be
 present and created by it: a missing recorded socket keeps access closed
 without revocation, and another creator is an exposure (Owner decision,

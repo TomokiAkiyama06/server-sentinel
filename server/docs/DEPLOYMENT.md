@@ -613,7 +613,7 @@ boundary").
 `tailscaled`'s peerAPI listens on TCP directly on the node's Tailscale
 addresses, which are the reserved addresses when the dashboard name is the
 node's Tailscale name. A wildcard exception never covers that; record it as a
-`reserved_address` exception through the audited Owner path (Owner decision
+`reserved_address` exception with the command below (Owner decision
 D1, 2026-10-16; ADR-0003): TCP,
 the observed port, the family of the address it is bound on (or none when the
 same port is bound on both), unit `tailscaled.service`, uid `0`. Nothing else
@@ -627,7 +627,58 @@ before it reopens) until the new port is recorded.
 Exceptions stored before this change (an executable path such as
 `/usr/sbin/sshd`, or a unit without a uid) are not migrated: the check reports
 `LISTENER_EXCEPTIONS_OUTDATED` and keeps human access closed until the Owner
-enters them again through the audited Owner path.
+enters them again with the command below.
+
+#### Recording listener exceptions (Issue #10, Owner decision D3)
+
+The Owner records the exceptions on the Main Server host, over SSH or the
+console, as the service account with the installed release's interpreter,
+like `bootstrap_cli` (no root, no `sudo` to root, a controlling terminal, the
+existing database of exactly this release's schema). There is no WebAuthn
+step-up: running as the service account already means being able to write the
+database. `set` replaces the whole set, so list every exception the host needs
+in one command:
+
+```sh
+cd /opt/server-sentinel-main/current
+sudo -u <service account> ./venv/bin/python -m app.auth.reservation_cli \
+  show --config /etc/server-sentinel/deployment.json
+sudo -u <service account> ./venv/bin/python -m app.auth.reservation_cli \
+  set --config /etc/server-sentinel/deployment.json \
+  protocol=tcp,port=22,unit=ssh.socket,uid=0 \
+  protocol=udp,port=<wireguard port>,unit=tailscaled.service,uid=0 \
+  scope=reserved_address,protocol=tcp,port=<peerAPI port>,family=ipv4,unit=tailscaled.service,uid=0
+sudo systemctl restart server-sentinel.service
+```
+
+- Each exception is one argument: `protocol` (`tcp`/`udp`), `port`, `unit`
+  and `uid` are required, `family` (`ipv4`, `ipv6`, `any`) and `scope`
+  (`wildcard`, `reserved_address`) are optional. Anything else, a port of the
+  dashboard, upstream or proxy, a `reserved_address` exception other than
+  `tailscaled.service`/uid `0`/TCP, more than 16 exceptions or a repeated one
+  is refused (`listener_exception_rejected`) before anything is asked.
+- `set` shows the stored and the new set and asks for the word `CHANGE`; the
+  set and its `change_security_setting` audit record (actor `owner`, no port
+  or unit in it) commit together. `set --clear` stores the empty set. If the
+  stored set changed after it was shown, the command refuses
+  (`listener_exceptions_changed`) and writes nothing.
+- The running service does not see the change: it loads the stored set at
+  startup only. Restart it; the first check after the restart applies the
+  set (a narrower set can close human access then). `show` prints the stored
+  set, not necessarily the one in force.
+- `set` validates against the reservation the deployment's `"human_access"`
+  section states (below: `hostname`, `port`, `reserved_addresses`,
+  `proxy_listeners`, `proxy_owner`, `isolation`, and the `human_host` /
+  `human_port` upstream), the same one the service's check uses, whether the
+  section is enabled or not. Without the section it refuses
+  (`human_access_not_configured`); a section that states no usable
+  reservation refuses with `human_access_configuration_rejected`. Neither
+  refusal prints a configured value. `show` needs neither. A stored set
+  that cannot be read is not printed (`stored_exceptions_unreadable` /
+  `stored_exceptions_outdated`); `set` replaces it.
+- `committed_verification_failed` means the change was committed, but the
+  database file at the path was replaced meanwhile: run `show` and repeat
+  `set` if the stored set is not the new one.
 
 ### Enabling human access through Tailscale Serve (Issue #10)
 

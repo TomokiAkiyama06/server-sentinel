@@ -8,7 +8,9 @@ from app.auth.invitation_code import new_invitation_code
 from app.auth.model import AccessValidationError
 from app.auth.owner_operation import OwnerOperationContext
 from app.auth.reservation import HostnameReservationCheck
-from app.auth.reservation_store import ListenerExceptionStore
+# The fixed listener-exceptions id lives with the store, so the local Owner
+# command (``app.auth.reservation_cli``) records the same target.
+from app.auth.reservation_store import RESERVATION_LISTENER_EXCEPTIONS_ID, ListenerExceptionStore
 from app.auth.serving_gate import ServingGate
 from app.cameras.registry import NodeHealthState
 from .model import AuditAction, TargetKind
@@ -18,9 +20,6 @@ ACTIVE_SOURCE_LIMIT_ID = UUID("ed83d8b4-ec44-4e27-b197-8603c03d8fd2")
 # The Main Server holds one approved hardware baseline; this fixed logical ID
 # names it without exposing any hardware serial or device identifier.
 HARDWARE_BASELINE_ID = UUID("6f5f5a2e-3f0e-4a3a-9a4c-2b0f1c7d5e41")
-# Fixed logical ID for the Owner's hostname-reservation listener exceptions;
-# no port, address or service name reaches the audit log.
-RESERVATION_LISTENER_EXCEPTIONS_ID = UUID("1c18dba3-1e38-4e1d-9d2f-70e078205a41")
 
 
 class OwnerAdministration:
