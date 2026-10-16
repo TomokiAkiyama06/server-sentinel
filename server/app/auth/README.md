@@ -964,9 +964,14 @@ PR #271). A finding is committed with its audit record but latched only in
 memory until the next tick. Every `credential_finding` notification is named
 after the newest finding audit record it covers (its audit rowid, a durable
 cursor that does not depend on the wall clock), so after a restart the
-runtime's first running tick checks whether the newest finding (at most seven
-days old) has its notification row and, if not, sends one notification and
-restores the one-day hold from the finding's time. A
+runtime's first running tick restores the one-day hold from the newest
+finding's time (at most seven days old) and sends one notification unless that
+finding's notification row exists with a final delivery state (a `pending`
+row is a delivery the stopped process never finished). It also continues an
+access fault episode: when the newest `human_access_fault` /
+`human_access_recovered` row (by rowid) is a fault, a check that now passes
+sends the recovery notice, a fault that persists is not notified again, and a
+fault row still `pending` is sent again first. A
 reservation fault needs no such recovery: the startup check re-detects it. Verified with synthetic checks, software
 authenticators and an intercepted Slack transport only
 (`server/tests/test_access_fault_notifications.py`).

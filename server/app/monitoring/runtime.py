@@ -33,7 +33,7 @@ from app.media.recording.model import RecordingError, SegmentValidator
 from app.media.recording.store import RecordingStore
 from app.notifications.schedule import DailySummaryScheduler
 from app.notifications.service import DailySummary, NotificationKind, NotificationService
-from app.notifications.slack import SlackDelivery
+from app.notifications.slack import DeliveryResult, SlackDelivery
 from app.storage.database import Database
 from app.storage.migrations import Migration, MigrationError, migrate
 from app.storage.policy import MainStoragePolicy, StorageState, StorageTransition
@@ -636,7 +636,7 @@ class MonitoringRuntime:
             return
         if not self._findings_recovered and self.status.state == RuntimeState.RUNNING:
             try:
-                self._recover_findings(monitor)
+                self._recover_access_state(monitor)
             except Exception:
                 # Retried on the next running tick; nothing is lost meanwhile.
                 logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
@@ -690,27 +690,43 @@ class MonitoringRuntime:
         latest = self._latest_finding()
         return None if latest is None else self._finding_event(latest[0])
 
-    def _recover_findings(self, monitor: AccessFaultMonitor) -> None:
-        """Re-arm a finding notification lost to a restart (Codex PR #271).
+    def _recover_access_state(self, monitor: AccessFaultMonitor) -> None:
+        """Restore what a restart took from the in-memory monitor (Codex PR #271).
 
-        The finding commits with its audit record; its notification was only
-        latched in memory until the next tick. Every ``credential_finding``
-        notification is named after the newest finding audit record it
-        covers (``_finding_event``), so the newest finding (within
-        ``FINDING_RECOVERY_LOOKBACK``) was notified exactly when that event
-        row exists. This compares the audit rowid, never wall-clock times,
-        so a clock rollback cannot hide a finding. Otherwise the monitor
-        sends one coalesced notification and restores the hold from the
-        finding's age. Only the action, time and rowid are read, never the
-        principal.
+        Findings: the finding commits with its audit record, but its
+        notification was only latched in memory until the next tick. Every
+        ``credential_finding`` notification is named after the newest finding
+        audit record it covers (``_finding_event``). The newest finding
+        within ``FINDING_RECOVERY_LOOKBACK`` always restores the degraded hold
+        from its age, and is notified again unless that event row exists with
+        a final delivery state: a ``pending`` row is a delivery the previous
+        process never finished. The audit rowid, never the wall clock, orders
+        findings, so a clock rollback cannot hide one. Only the action, time
+        and rowid are read, never the principal.
+
+        Access episode: when the newest ``human_access_fault`` /
+        ``human_access_recovered`` row (by rowid) is a fault, the episode
+        continues in this process, so recovery is still announced; a fault
+        row still ``pending`` is sent again first.
         """
         now = self.dependencies.utcnow()
         latest = self._latest_finding(since=now - FINDING_RECOVERY_LOOKBACK)
-        if latest is None or self.notification_events.get(self._finding_event(latest[0])) is not None:
-            return
-        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-        age = (now - (epoch + timedelta(microseconds=latest[1]))).total_seconds()
-        monitor.recover_finding(age_seconds=age, monotonic=self.dependencies.monotonic())
+        if latest is not None:
+            row = self.notification_events.get(self._finding_event(latest[0]))
+            delivered = row is not None and row["delivery"] is not DeliveryResult.PENDING
+            epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            age = (now - (epoch + timedelta(microseconds=latest[1]))).total_seconds()
+            monitor.recover_finding(age_seconds=age, monotonic=self.dependencies.monotonic(),
+                                    notify=not delivered)
+        if monitor.attached is not None:
+            last = self._connection.execute(
+                "SELECT kind, delivery FROM notification_events WHERE kind IN (?, ?) "
+                "ORDER BY rowid DESC LIMIT 1",
+                (NotificationKind.HUMAN_ACCESS_FAULT.value,
+                 NotificationKind.HUMAN_ACCESS_RECOVERED.value),
+            ).fetchone()
+            if last is not None and last[0] == NotificationKind.HUMAN_ACCESS_FAULT.value:
+                monitor.restore_fault_episode(delivered=last[1] != DeliveryResult.PENDING.value)
 
     def _poll(self) -> None:
         if self.notifications is None:

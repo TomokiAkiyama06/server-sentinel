@@ -120,6 +120,9 @@ class AccessFaultMonitor:
         self._notified = AccessHealth.HEALTHY
         self._episode_reasons: "frozenset[Reason]" = frozenset()
         self._new_reasons = False
+        # A restored episode's reasons are unknown: its first reasons become
+        # the baseline rather than "new" (Codex PR #271).
+        self._reasons_unknown = False
         self._unreported_fault = False
         self._sent: deque[float] = deque()
         self._findings_pending = 0
@@ -172,21 +175,48 @@ class AccessFaultMonitor:
 
     # -- owner thread --------------------------------------------------------
 
-    def recover_finding(self, *, age_seconds: float, monotonic: float) -> None:
-        """Owner thread: a committed finding a restart left unnotified.
+    def recover_finding(self, *, age_seconds: float, monotonic: float,
+                        notify: bool = True) -> None:
+        """Owner thread: restore the newest committed finding after a restart.
 
         Called once at startup by the monitoring runtime from the audit log
-        (Codex PR #271). The next ``drain`` notifies it like a new arrival;
-        the degraded hold runs from the finding's own time.
+        (Codex PR #271). The degraded hold always runs from the finding's own
+        time, also when it was already notified; ``notify`` (its notification
+        was never delivered) makes the next ``drain`` notify it like a new
+        arrival.
         """
         if (type(age_seconds) not in (int, float) or not math.isfinite(age_seconds)
-                or type(monotonic) not in (int, float)):
+                or type(monotonic) not in (int, float) or type(notify) is not bool):
             raise ValueError("invalid recovered finding")
-        self._findings_pending = min(self._findings_pending + 1, _MAX_COUNT)
+        if notify:
+            self._findings_pending = min(self._findings_pending + 1, _MAX_COUNT)
         if math.isfinite(monotonic):
             seen = monotonic - max(0.0, float(age_seconds))
             if self._finding_seen_at is None or seen > self._finding_seen_at:
                 self._finding_seen_at = seen
+
+    def restore_fault_episode(self, *, delivered: bool = True) -> None:
+        """Owner thread: the last access notification before a restart was a fault.
+
+        Called once at startup by the monitoring runtime from the durable
+        notification rows (Codex PR #271), before any access notification of
+        this process: the episode continues, so a fault that persists is not
+        re-notified and a check that now passes sends the recovery notice.
+        A fault whose delivery never finished (``delivered=False``, a
+        ``pending`` row) is sent again first. Ignored once this process has
+        notified access state itself.
+        """
+        if type(delivered) is not bool:
+            raise ValueError("invalid restored episode")
+        if self._sent or self._notified is not AccessHealth.HEALTHY:
+            return
+        self._current = AccessHealth.FAULT
+        self._reasons_unknown = True
+        if delivered:
+            self._notified = AccessHealth.FAULT
+            self._unreported_fault = False
+        else:
+            self._unreported_fault = True
 
     def _polled(self) -> AccessHealth | None:
         """Current composition health, or ``None`` while indeterminate.
@@ -252,8 +282,12 @@ class AccessFaultMonitor:
             if self._current is not AccessHealth.FAULT:
                 self._episode_reasons = frozenset()
                 self._new_reasons = False
+            elif self._reasons_unknown:
+                pass
             elif reasons - self._episode_reasons:
                 self._new_reasons = True
+            if reasons:
+                self._reasons_unknown = False
             self._episode_reasons |= reasons
             self._current = AccessHealth.FAULT
             if self._notified is not AccessHealth.FAULT:

@@ -18,8 +18,8 @@ import sqlite3
 import subprocess
 import sys
 from unittest import TestCase
-from unittest.mock import patch
-from uuid import UUID, uuid4
+from unittest.mock import PropertyMock, patch
+from uuid import UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
 
 from app.auth.human_surface import (
@@ -35,7 +35,7 @@ from app.media.recording.model import Limits
 from app.monitoring.config import MonitoringConfiguration, RecordingFilesystem
 from app.storage.policy import StorageLimits
 from app.monitoring.access import AccessFaultMonitor
-from app.monitoring.runtime import MonitoringDependencies, RuntimeState
+from app.monitoring.runtime import EVENT_NAMESPACE, MonitoringDependencies, RuntimeState
 from app.notifications.service import NotificationKind, NotificationService
 from app.notifications.slack import SlackDelivery
 
@@ -179,6 +179,23 @@ class ReservationFaultTests(MonitoredAccessFixture):
             await self.until(lambda: self.access.state is HumanAccessState.CHECK_FAILING)
         self.assertTrue(self.drain().human_access_degraded)
         self.assertEqual(self.notifications.kinds, [FAULT])
+
+    async def test_a_restored_episode_announces_recovery_and_not_the_fault_again(self):
+        self.monitor.restore_fault_episode()
+        self.assertFalse(self.drain().human_access_degraded)
+        self.assertEqual(self.notifications.kinds, [RECOVERED])
+
+    async def test_a_restored_persisting_fault_is_not_notified_again(self):
+        self.monitor.restore_fault_episode()
+        self.fail_check()
+        self.assertTrue(self.drain().human_access_degraded)
+        self.assertEqual(self.notifications.kinds, [])
+
+    async def test_a_restored_undelivered_fault_is_sent_before_the_recovery(self):
+        self.monitor.restore_fault_episode(delivered=False)
+        self.drain()
+        self.drain(60)
+        self.assertEqual(self.notifications.kinds, [FAULT, RECOVERED])
 
     async def test_starting_or_stopped_composition_is_neither_fault_nor_recovery(self):
         await self.stop_serving()
@@ -550,10 +567,53 @@ class FindingRecoveryTests(RuntimeFixture):
         status = await self.cycle()
         self.assertEqual(self.finding_texts(), 1)
         self.assertTrue(status.credential_finding_degraded)
-        # Already notified: a further restart sends nothing more.
+        # Already notified: a further restart sends nothing more, but the
+        # one-day hold is restored from the finding's time (Codex PR #271 P1).
         self.clock.advance(timedelta(minutes=5))
+        status = await self.cycle()
+        self.assertEqual(self.finding_texts(), 1)
+        self.assertTrue(status.credential_finding_degraded)
+
+    async def test_a_pending_notification_row_is_sent_again(self):
+        """Codex PR #271: a delivery the stopped process never finished."""
+        await self.cycle()
+        self.audit_finding(self.clock.now - timedelta(minutes=10))
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            (rowid,) = db.execute("SELECT MAX(rowid) FROM security_admin_audit_records").fetchone()
+            db.execute("INSERT INTO notification_events VALUES (?, 'credential_finding', ?, 0, 'pending')",
+                       (str(uuid5(EVENT_NAMESPACE, f"credential-finding-through:{rowid}")),
+                        (self.clock.now - timedelta(minutes=9)).isoformat()))
+            db.commit()
+        status = await self.cycle()
+        self.assertEqual(self.finding_texts(), 1)
+        self.assertTrue(status.credential_finding_degraded)
         await self.cycle()
         self.assertEqual(self.finding_texts(), 1)
+
+    async def test_the_last_access_notification_restores_the_episode(self):
+        """Codex PR #271: the newest fault/recovered row (by rowid) decides."""
+        calls = []
+        # Each later row is stamped earlier: only the insertion (rowid) order counts.
+        cases = ((("human_access_fault", "sent"),), [{"delivered": True}]), \
+            ((("human_access_fault", "sent"), ("human_access_recovered", "sent")), []), \
+            ((("human_access_recovered", "sent"), ("human_access_fault", "pending")), [{"delivered": False}])
+        await self.cycle()
+        for rows, expected in cases:
+            with closing(sqlite3.connect(self.settings.database_path)) as db:
+                for index, (kind, delivery) in enumerate(rows):
+                    at = self.clock.now - timedelta(minutes=10 + index)
+                    db.execute("INSERT INTO notification_events VALUES (?, ?, ?, 0, ?)",
+                               (str(uuid4()), kind, at.isoformat(), delivery))
+                db.commit()
+            calls.clear()
+            with patch.object(AccessFaultMonitor, "attached", new_callable=PropertyMock,
+                              return_value=object()), \
+                    patch.object(AccessFaultMonitor, "restore_fault_episode",
+                                 lambda monitor, **values: calls.append(values)), \
+                    patch.object(AccessFaultMonitor, "_polled", lambda monitor: None):
+                await self.cycle()
+            with self.subTest(rows=rows):
+                self.assertEqual(calls, expected)
 
     async def test_a_clock_rollback_does_not_hide_a_later_finding(self):
         """Codex PR #271: recovery compares the audit rowid, not wall times."""
