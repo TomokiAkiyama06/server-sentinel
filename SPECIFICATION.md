@@ -2344,8 +2344,11 @@ or `Content-Type` and is not rate-limited, while opens are charged per session
 (a burst of 20, one more every 3 s; only a session of the Owner or a
 `live:view` holder takes a limiter slot) and a refused open leaves no demand.
 Limits: 4 sessions in total, 2 per source, 2 per person, 5 served
-frames per second per session, 8 MiB and a JPEG SOI marker per frame; over a
-limit the generic denial (pacing: `204`). Demand ends after 15 s without an
+frames per second per session, 8 MiB and a JPEG SOI marker per frame; at most
+32 live request jobs pending on the server, at most 8 of them per human
+session (Issue #279 item 1, Owner decision 2026-10-16), so one session cannot
+fill the shared queue; over a limit the generic denial, overload included,
+with no distinct overload response (pacing: `204`). Demand ends after 15 s without an
 authorized poll, on close and sign-out, at once after an Owner grant or
 revocation change, and for every session while access is closed or the
 composition stopped; a poll queued before the service stopped is refused.

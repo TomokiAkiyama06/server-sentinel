@@ -74,7 +74,11 @@ frame, a 15 s lease and at most one idle extension of the human session per
 the sweeper (released demand, so the hub retains nothing), as is every session
 while human access is closed or the composition is stopped; a poll queued
 before a stop is refused, and a poll whose human session is no longer current
-for its cookie and proxy identity ends its live session. Only sources
+for its cookie and proxy identity ends its live session. At most 32 request
+jobs are pending on the executor, and at most 8 per human session (keyed on
+its in-memory token digest; Issue #279 item 1), so one session cannot fill
+the queue and end other viewers; over either cap the request is the generic
+denial. Only sources
 configured and negotiated as MJPG are listed. Nothing is written per frame
 (a binding mismatch is recorded once, coalesced, and ends the live session).
 Mock verified only; a browser decoding real MJPG frames is a manual

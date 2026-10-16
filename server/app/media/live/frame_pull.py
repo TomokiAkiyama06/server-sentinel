@@ -42,6 +42,17 @@ Authorization of a frame read (every poll):
 Every refusal is the same ``LiveFrameUnavailable``; the surface turns it into
 the generic not-found denial, capacity included.
 
+Request backlog (Issue #279 item 1, Owner decision 2026-10-16). At most
+``MAX_PENDING_REQUESTS`` (32) request jobs are queued or running at once, and
+each human session may hold at most ``MAX_PENDING_REQUESTS_PER_SESSION`` (8)
+of them, keyed on the in-memory domain-separated digest of its session token
+(the same holder digest as above; never logged). One session's poll burst
+against a slow database therefore cannot fill the shared queue and end other
+viewers; it takes four sessions at their full share to fill it. A share is
+returned when its job completes, fails or is cancelled, and a stop drains
+every queued job, so no share outlives its job. Over either cap the request
+is the same generic refusal (no distinct overload response).
+
 Per-frame SQLite cost is two read-only transactions; nothing is written per
 frame. The one exception is a binding mismatch: ``current_session`` records
 it (coalesced, ``AccessStore._record_binding_mismatch``) and the live
@@ -77,6 +88,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass
+from functools import partial
 import hashlib
 import hmac
 import json
@@ -101,6 +113,12 @@ _HOLDER_DOMAIN = b"ServerSentinel live session holder v1\x00"
 # Request jobs queued or running on the executor at once (all viewers);
 # beyond it a request is the generic refusal.
 MAX_PENDING_REQUESTS = 32
+# Of those, the most one human session (one session token) may hold at once
+# (Issue #279 item 1). A paced viewer has one poll in flight per live session
+# (at most 2 per person under D10) plus an open, close or source list, so 8
+# leaves room for an abandoned and retried poll per live session, while
+# 32 / 8 = 4 (the D10 total) sessions are needed to fill the shared queue.
+MAX_PENDING_REQUESTS_PER_SESSION = 8
 _HEALTH = ("online", "degraded", "offline", "manual_intervention_required")
 
 
@@ -229,6 +247,9 @@ class LiveFrameService:
         # is attached stops the same service from two threads).
         self._lifecycle = threading.Lock()
         self._pending = 0
+        # Holder digest -> request jobs of that human session queued or
+        # running (Issue #279 item 1); a key is dropped at zero.
+        self._shares: dict[bytes, int] = {}
         # Live-session id -> digest of the opening human session's token.
         self._holders: dict[UUID, bytes] = {}
         self._executor: ThreadPoolExecutor | None = None
@@ -319,19 +340,27 @@ class LiveFrameService:
                 if sweeper is not None:
                     sweeper.join(timeout=10)
 
-    def _submit(self, function, *args, bounded: bool = False) -> Future:
-        """Queue one job; a ``bounded`` (request) job only within the cap.
+    def _submit(self, function, *args, bounded: bool = False, share: bytes | None = None) -> Future:
+        """Queue one job; a ``bounded`` (request) job only within the caps.
 
         Request jobs (open, poll, close, source list, status) are admitted
         only while fewer than ``MAX_PENDING_REQUESTS`` are queued or running,
-        so a slow or locked database cannot grow the queue without bound;
-        over the cap the request is the generic refusal. Internal jobs (the
-        sweep, at most one queued at a time, and the revocation/sign-out
-        releases, which follow rate-limited routes) are never refused by it.
+        so a slow or locked database cannot grow the queue without bound,
+        and a human request (``share``: its session's holder digest) only
+        while its session holds fewer than
+        ``MAX_PENDING_REQUESTS_PER_SESSION`` of them (Issue #279 item 1);
+        over either cap the request is the generic refusal. Both counts are
+        returned by the job's done callback, which runs on completion,
+        failure and cancellation alike. Internal jobs (the sweep, at most one
+        queued at a time, and the revocation/sign-out releases, which follow
+        rate-limited routes) are never refused by them.
         """
         with self._lock:
             executor = self._executor
-            if executor is None or (bounded and self._pending >= MAX_PENDING_REQUESTS):
+            if executor is None or (bounded and (
+                    self._pending >= MAX_PENDING_REQUESTS
+                    or (share is not None
+                        and self._shares.get(share, 0) >= MAX_PENDING_REQUESTS_PER_SESSION))):
                 raise LiveFrameUnavailable()
             try:
                 future = executor.submit(function, *args)
@@ -339,13 +368,21 @@ class LiveFrameService:
                 raise LiveFrameUnavailable() from None
             if bounded:
                 self._pending += 1
+                if share is not None:
+                    self._shares[share] = self._shares.get(share, 0) + 1
         if bounded:
-            future.add_done_callback(self._request_done)
+            future.add_done_callback(partial(self._request_done, share))
         return future
 
-    def _request_done(self, _future) -> None:
+    def _request_done(self, share: bytes | None, _future) -> None:
         with self._lock:
             self._pending -= 1
+            if share is not None:
+                held = self._shares.get(share, 0) - 1
+                if held > 0:
+                    self._shares[share] = held
+                else:
+                    self._shares.pop(share, None)
 
     def _sweep_loop(self, stop: threading.Event) -> None:
         queued = None
@@ -363,6 +400,12 @@ class LiveFrameService:
     @staticmethod
     def _holder(token: bytes) -> bytes:
         return hashlib.sha256(_HOLDER_DOMAIN + token).digest()
+
+    def _share(self, token: object) -> bytes:
+        """The pending-request share key of a human session: its holder digest."""
+        if not isinstance(token, bytes):
+            raise LiveFrameUnavailable()
+        return self._holder(token)
 
     def holds(self, token: object, session_id: object) -> bool:
         """Whether ``session_id`` is held and was opened with this session token.
@@ -392,18 +435,25 @@ class LiveFrameService:
         """Open for the human session ``access`` names, presented as ``token``."""
         if not isinstance(token, bytes):
             raise LiveFrameUnavailable()
-        return self._submit(self._open, access, source_id, self._holder(token), admit, bounded=True)
+        holder = self._holder(token)
+        return self._submit(self._open, access, source_id, holder, admit, bounded=True, share=holder)
 
     def poll(self, token: bytes, proxy_identity: str, session_id: UUID, after: int, *,
              admit: Callable[[], ContextManager]) -> Future:
-        return self._submit(self._poll, token, proxy_identity, session_id, after, admit, bounded=True)
+        return self._submit(self._poll, token, proxy_identity, session_id, after, admit,
+                            bounded=True, share=self._share(token))
 
-    def close(self, access_session_id: UUID, session_id: UUID) -> Future:
-        """Close one live session of this human access session (trusted release)."""
-        return self._submit(self._close, access_session_id, session_id, bounded=True)
+    def close(self, token: bytes, access_session_id: UUID, session_id: UUID) -> Future:
+        """Close one live session of this human access session (trusted release).
 
-    def sources(self, *, admit: Callable[[], ContextManager]) -> Future:
-        return self._submit(self._sources, admit, bounded=True)
+        Charged to the share of the presenting session ``token``.
+        """
+        return self._submit(self._close, access_session_id, session_id, bounded=True,
+                            share=self._share(token))
+
+    def sources(self, token: bytes, *, admit: Callable[[], ContextManager]) -> Future:
+        """The viewable sources, charged to the share of the session ``token``."""
+        return self._submit(self._sources, admit, bounded=True, share=self._share(token))
 
     def revalidate_principal(self, principal_id: UUID) -> None:
         """Re-check every live session of a changed principal; fire and forget."""
