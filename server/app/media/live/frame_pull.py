@@ -24,12 +24,16 @@ Authorization of a frame read (every poll):
 2. the live-session id is one this service issued and still holds, presented
    with the cookie of the human session that opened it (a domain-separated
    token digest kept in memory, compared in constant time), and the poll is
-   within that live session's poll budget (all in memory, no SQLite);
-3. inside ``admit(epoch)`` of the request's gate epoch, on the executor:
-   ``AccessStore.current_session`` (read-only: token digest, keyed
+   within that live session's poll budget (all in memory, no SQLite); a
+   live-session id copied to another person's browser or another sign-in
+   is refused here;
+3. on the executor the holder is checked again (a poll queued before
+   ``stop()`` is refused), then inside ``admit(epoch)`` of the request's
+   gate epoch ``AccessStore.current_session`` (read-only: token digest, keyed
    proxy-identity binding, idle/absolute lifetime) must name exactly the
-   human access session and principal the live session was opened under, so
-   a live-session id copied to another person's browser is refused; then
+   human access session and principal the live session was opened under;
+   if it does not (the session ended, or the cookie is presented under
+   another proxy identity) the live session ends at once; then
    ``AuthorizedLocalPreview.read`` re-runs ``live_view_validator`` (current
    principal, credential, deployment generation, exact authorization
    revision, ``live:view`` or the Owner). ``recordings:view`` alone never
@@ -39,7 +43,10 @@ Every refusal is the same ``LiveFrameUnavailable``; the surface turns it into
 the generic not-found denial, capacity included.
 
 Per-frame SQLite cost is two read-only transactions; nothing is written per
-frame. The human session's idle expiry is extended by a live viewer at most
+frame. The one exception is a binding mismatch: ``current_session`` records
+it (coalesced, ``AccessStore._record_binding_mismatch``) and the live
+session ends with that poll, so it is written at most once per live session,
+never per poll (Issue #279 item 2). The human session's idle expiry is extended by a live viewer at most
 once per ``idle_extension_interval_seconds`` per live session (Owner default
 D5: 60 s), through the normal gated ``authorize_request(..., touch=True)``
 the surface performs when ``LivePoll.extend_idle`` is set, so a 5 fps viewer
@@ -59,8 +66,9 @@ Limits (D10 and the D5 defaults): at most 4 live sessions in total, 2 per
 source and 2 per principal; at most one served frame per
 ``minimum_frame_interval_seconds`` (5 fps) per session; a frame that does not
 start with a JPEG SOI marker or exceeds ``maximum_frame_bytes`` is never
-served (counted, value-free), and only a source whose capture profile is
-``MJPG`` is listed or can be opened. Nothing here logs an identity, token, session
+served (counted, value-free), and only a source whose configured and
+negotiated capture format is ``MJPG`` is listed or can be opened (``online``
+only with a recorded negotiated ``MJPG``). Nothing here logs an identity, token, session
 id or media byte.
 """
 
@@ -444,18 +452,28 @@ class LiveFrameService:
 
     def _poll(self, token, proxy_identity, session_id, after, admit) -> LivePoll:
         entry = self._entries.get(session_id)
-        if entry is None or type(after) is not int or after < 0:
+        # The holder is checked again here, on the executor (Issue #279 item
+        # 3): ``stop()`` forgets every holder before it queues the release,
+        # so a poll queued before the stop is refused rather than served
+        # after it. Only the opening session's cookie gets past this, so a
+        # copied id never reaches the release below.
+        if (entry is None or type(after) is not int or after < 0
+                or not self.holds(token, session_id)):
             raise LiveFrameUnavailable()
         try:
             with admit():
                 view = self._store.current_session(token, proxy_identity, at=self._store.now())
                 if (view is None or view.session_id != entry.access.access_session_id
                         or view.principal_id != entry.access.principal_id):
-                    # Another person's browser (a copied id) or an ended human
-                    # session: refused. The live session is kept only while
-                    # its own grant still validates (a copied id must not end
-                    # the owner's viewing); otherwise its demand ends now.
-                    self._revalidate_one(session_id, entry)
+                    # The opening session's own cookie, but that human
+                    # session is no longer current for this proxy identity:
+                    # ended, expired, revoked, or presented under another
+                    # identity (a binding mismatch). The live session ends
+                    # now (Issue #279 item 2), so its demand is released and
+                    # every later poll is refused in memory: a binding
+                    # mismatch costs at most one coalesced audit write per
+                    # live session, never one per poll.
+                    self._release(session_id)
                     raise LiveFrameUnavailable()
                 try:
                     frame = self.preview.read(entry.access, session_id, after)
@@ -502,10 +520,11 @@ class LiveFrameService:
         """The configured, enabled local sources whose capture format is MJPG.
 
         The interim frame pull passes the camera's own JPEG frames through
-        and never converts, so a source captured as ``YUYV`` or ``GREY`` is
-        not offered (and cannot be opened) rather than shown as available
-        while every frame would be refused. Called inside the caller's
-        ``admit``.
+        and never converts, so a source configured as ``YUYV`` or ``GREY``,
+        or whose capture negotiated another format, is not offered (and
+        cannot be opened) rather than shown as available while every frame
+        would be refused. Without a recorded negotiated format the source is
+        listed but never ``online``. Called inside the caller's ``admit``.
         """
         configured = set(self.hub.source_ids)
         if not configured:
@@ -515,21 +534,29 @@ class LiveFrameService:
         with closing(self._database.connect_read_only()) as connection:
             connection.execute("BEGIN")
             rows = connection.execute(
-                "SELECT id, name, health_state, desired_capture_profile FROM camera_sources"
-                " WHERE enabled=1 AND source_type='local_uvc' ORDER BY created_at, id").fetchall()
+                "SELECT id, name, health_state, desired_capture_profile, negotiated_capture_profile"
+                " FROM camera_sources WHERE enabled=1 AND source_type='local_uvc'"
+                " ORDER BY created_at, id").fetchall()
             connection.execute("COMMIT")
         views = []
         for row in rows:
             try:
                 source_id = UUID(row[0])
                 profile = json.loads(row[3]) if row[3] else None
+                negotiated = json.loads(row[4]) if row[4] else None
             except (TypeError, ValueError):
                 continue
             if (source_id not in configured or not isinstance(row[1], str)
                     or not isinstance(profile, dict) or profile.get("pixel_format") != _MJPG):
                 continue
+            # The format actually in use (Issue #279 item 5): a capture that
+            # negotiated anything but MJPG is neither listed nor opened, and
+            # a source is ``online`` only while MJPG is known to be in use.
+            if negotiated is not None and (not isinstance(negotiated, dict)
+                                           or negotiated.get("pixel_format") != _MJPG):
+                continue
             health = row[2] if row[2] in _HEALTH else "offline"
-            if health == "online" and not self.hub.accepting(source_id):
+            if health == "online" and (negotiated is None or not self.hub.accepting(source_id)):
                 # Never report a source as online while its frames are refused.
                 health = "offline"
             views.append(LiveSourceView(source_id, row[1], health))

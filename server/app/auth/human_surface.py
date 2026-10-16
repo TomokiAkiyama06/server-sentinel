@@ -86,7 +86,9 @@ WebSocket and error path gets the same generic denial):
   ``POST /api/live/sessions/<session>/close`` (``SESSION``, CSRF, only the
   caller's own). Live sessions are bound to the opening human session, so
   a copied id is refused; every frame read re-runs the ``live:view``
-  validator inside ``admit(epoch)`` without a write; the idle expiry moves
+  validator inside ``admit(epoch)`` without a write (a poll whose human
+  session is no longer current for the presented cookie and proxy identity
+  ends that live session; Issue #279 item 2); the idle expiry moves
   at most once per 60 s per live session; capacity (4 in total, 2 per
   source, 2 per person) is the generic denial. See
   ``app.media.live.frame_pull``.
@@ -127,7 +129,8 @@ inside the authorization), their state is bounded by the S4-8 limits, and
 every write goes through the storage admission. Live session opens are
 charged to a fifth, separate limiter (``HumanAccess.live_limiter``:
 per session a burst of 20 and one more every 3 seconds), keyed on a
-domain-separated digest of a token a read-only check found current (a close
+domain-separated digest of a token a read-only check found current for the
+Owner or a ``live:view`` holder (a close
 reaches SQLite only for a live session held for that token, so closes are
 bounded by opens); frame polls to the
 service's own in-memory budget per live session, charged only to its holder. No recording,
@@ -1528,8 +1531,10 @@ class HumanSurface:
         """Charge one live-session open to its session's bucket.
 
         Keyed like ``_limit_admin`` on a domain-separated digest of a token
-        that a read-only check has just found current, so a forged cookie
-        never takes a slot. Over the limit: the generic denial.
+        that a read-only check has just found current for the Owner or a
+        ``live:view`` holder, so neither a forged cookie nor a session
+        without ``live:view`` takes a slot. Over the limit: the generic
+        denial.
         """
         key = hashlib.sha256(_LIVE_LIMIT_DOMAIN + token).hexdigest()
         if not self.access.live_limiter.allow(key):
@@ -1557,14 +1562,18 @@ class HumanSurface:
         """``POST /api/live/sessions`` (``LIVE``, CSRF): open one live session.
 
         Body ``{"source_id": <lower-case UUID>}``. Order: the strict body; a
-        read-only session pre-check; the live open/close limiter; the gated
+        read-only session pre-check that also requires the Owner or
+        ``live:view`` (Issue #279 item 6: a session without it never takes a
+        slot of the live limiter's table); the live open limiter; the gated
         ``LIVE`` authorization (its idle touch: opening is activity); then
         the open on the service's executor inside ``admit`` of the same
         epoch, bound to this human access session, which re-runs the
         ``live:view`` validator and applies the D10 limits (4 in total, 2 per
         source, 2 per principal). An unknown source, a refusal and a full
         capacity are the same generic denial. ``200 {"session_id",
-        "source_id", "lease_seconds", "frame_interval_ms"}``.
+        "source_id", "lease_seconds", "frame_interval_ms"}``; ``lease_seconds``
+        is a JSON number (``15.0`` by default), ``frame_interval_ms`` an
+        integer.
         """
         live = self._live_service()
         body = _json_object(await self._body(request, json_required=True))
@@ -1574,7 +1583,8 @@ class HumanSurface:
         source_id = UUID(value)
         token = session_token(request.headers)
         try:
-            known = await asyncio.to_thread(self.access.store.session_may_be_current, token)
+            known = await asyncio.to_thread(self.access.store.session_may_be_current, token,
+                                            permission=Permission.LIVE_VIEW)
         except Exception:
             raise _Denied() from None
         if known is not True:
@@ -1608,8 +1618,10 @@ class HumanSurface:
         in-memory budget (no SQLite before that); the
         gate epoch; then on the executor inside ``admit(epoch)`` the
         read-only ``current_session`` must be the human session the live
-        session is bound to (a copied id is refused), and the read re-runs
-        the ``live:view`` validator. Nothing is written per frame: at most
+        session is bound to (otherwise the live session ends: Issue #279
+        item 2), and the read re-runs the ``live:view`` validator. Nothing is
+        written per frame (a binding mismatch is recorded once, coalesced,
+        and ends the live session, so later polls never reach SQLite): at most
         once per 60 s per live session the gated ``LIVE`` authorization with
         its idle touch runs, so a watching viewer's session does not idle
         out (D5); its failure only skips that extension.
