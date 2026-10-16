@@ -727,6 +727,10 @@ class MonitoringRuntime:
         still ``pending`` is sent again (under its own ID and time) once a
         check passes, after its episode's fault when that row is pending too.
         Older episodes are superseded and not replayed.
+
+        Rate windows: the accepted access and finding notification rows of
+        the last hour re-seed both hourly budgets (``restore_windows``,
+        Issue #281 item 2), so a restart does not reset them.
         """
         now = self.dependencies.utcnow()
         # The whole retained audit history (Codex PR #271): a notification
@@ -768,6 +772,35 @@ class MonitoringRuntime:
                     # A pending row is retried under its own ID and time.
                     event_id=None if delivered else UUID(last[2]),
                     at=None if delivered else datetime.fromisoformat(last[3]))
+        # Issue #281 item 2: the rolling hours of both budgets continue
+        # across the restart. Only accepted rows count, as in the process
+        # that sent them; a pending row is sent again and counted then.
+        monitor.restore_windows(
+            access_ages=self._notification_ages(
+                (NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.HUMAN_ACCESS_RECOVERED),
+                monitor.access_budget, now),
+            finding_ages=self._notification_ages(
+                (NotificationKind.CREDENTIAL_FINDING,), monitor.finding_budget, now),
+            monotonic=self.dependencies.monotonic())
+
+    def _notification_ages(self, kinds, limit: int, now: datetime) -> list[float]:
+        """Wall-clock ages of the newest ``limit`` accepted rows of ``kinds``."""
+        marks = ",".join("?" for _ in kinds)
+        rows = self._connection.execute(
+            f"SELECT at FROM notification_events WHERE kind IN ({marks}) AND delivery != ? "
+            "ORDER BY rowid DESC LIMIT ?",
+            (*(kind.value for kind in kinds), DeliveryResult.PENDING.value, limit),
+        ).fetchall()
+        ages = []
+        for (at,) in rows:
+            # A row whose time cannot be read is left out (at worst a
+            # notification goes out early) rather than raising, which would
+            # repeat the whole recovery on every tick.
+            try:
+                ages.append((now - datetime.fromisoformat(at)).total_seconds())
+            except (TypeError, ValueError):
+                continue
+        return ages
 
     def _poll(self) -> None:
         if self.notifications is None:

@@ -30,7 +30,7 @@ from app.auth.passkeys import CredentialFinding, PasskeyCeremonies
 from app.auth.reservation import (
     DAILY_SECONDS, RETRY_WHILE_CLOSED_SECONDS, CheckKind, Reason, ReservationFault,
 )
-from app.main import create_app
+from app.main import HumanAccessCompositionRefused, create_app
 from app.media.recording.model import Limits
 from app.monitoring.config import MonitoringConfiguration, RecordingFilesystem
 from app.storage.policy import StorageLimits
@@ -54,6 +54,7 @@ AT = datetime(2026, 10, 16, 9, 0, tzinfo=timezone.utc)
 FAULT = NotificationKind.HUMAN_ACCESS_FAULT
 RECOVERED = NotificationKind.HUMAN_ACCESS_RECOVERED
 FINDING = NotificationKind.CREDENTIAL_FINDING
+HOUR = 3600.0
 
 
 class RecordingNotifications:
@@ -415,7 +416,8 @@ class CompositionTests(MonitoredAccessFixture):
         """Issue #281 item 1: with a monitoring runtime (every production
         deployment), a human composition without the monitor is refused."""
         for dependencies in (None, MonitoringDependencies()):
-            with self.subTest(dependencies=dependencies), self.assertRaises(TypeError):
+            with self.subTest(dependencies=dependencies), self.assertRaises(
+                    HumanAccessCompositionRefused):
                 create_app(self.settings(), database=self.database, human_access=self.access,
                            storage_reservation=self.admission, monitoring=self.monitoring(),
                            monitoring_dependencies=dependencies)
@@ -428,11 +430,14 @@ class CompositionTests(MonitoredAccessFixture):
                              store=self.store, reservation=check,
                              ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=check,
                                                           clock=self.ceremony_clock, findings=monitor))
-        with self.assertRaises(TypeError):
+        with self.assertRaises(TypeError) as refused:
             create_app(self.settings(), database=self.database, human_access=access,
                        storage_reservation=self.admission, monitoring=self.monitoring(),
                        monitoring_dependencies=MonitoringDependencies(access_faults=monitor),
                        local_uvc="not a configuration")
+        # Issue #283 item 2: not a refusal of the human composition, so the
+        # launcher lets it propagate instead of serving closed.
+        self.assertNotIsInstance(refused.exception, HumanAccessCompositionRefused)
         self.assertIsNone(monitor.attached)
         create_app(self.settings(), database=self.database, human_access=access,
                    storage_reservation=self.admission, monitoring=self.monitoring(),
@@ -540,6 +545,57 @@ class MonitorValidationTests(TestCase):
         self.assertTrue(monitor.drain(notifications, at=AT, monotonic=2.0).human_access_degraded)
         self.assertEqual(notifications.kinds, [FAULT])
 
+
+    def test_restored_windows_keep_the_hourly_budgets_across_a_restart(self):
+        """Issue #281 item 2: the previous process's accepted rows of the last
+        hour count against both budgets, from their wall-clock ages."""
+        monitor = AccessFaultMonitor(access_budget=2, finding_budget=1)
+        notifications = RecordingNotifications()
+        monitor.restore_windows(access_ages=[100.0, 200], finding_ages=[1800.0],
+                                monotonic=10_000.0)
+        monitor.composition_failed()
+        monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, uuid4())
+        status = monitor.drain(notifications, at=AT, monotonic=10_000.0)
+        self.assertEqual(notifications.kinds, [])
+        self.assertTrue(status.human_access_degraded)
+        self.assertTrue(status.credential_finding_degraded)
+        # Held back, never lost: sent once the restored rows leave the hour.
+        monitor.drain(notifications, at=AT, monotonic=10_000.0 - 1800.0 + HOUR)
+        self.assertEqual(notifications.kinds, [FINDING])
+        monitor.drain(notifications, at=AT, monotonic=10_000.0 - 200.0 + HOUR)
+        self.assertEqual(notifications.kinds, [FINDING, FAULT])
+
+    def test_restored_windows_ignore_rows_outside_the_hour(self):
+        monitor = AccessFaultMonitor(access_budget=1, finding_budget=1)
+        notifications = RecordingNotifications()
+        monitor.restore_windows(access_ages=[-5.0], finding_ages=[HOUR], monotonic=50.0)
+        monitor.composition_failed()
+        monitor.credential_finding(CredentialFinding.SIGN_COUNT_REGRESSION, uuid4())
+        monitor.drain(notifications, at=AT, monotonic=50.0)
+        self.assertEqual(notifications.kinds, [FAULT, FINDING])
+
+    def test_a_window_this_process_used_is_not_restored_over(self):
+        monitor = AccessFaultMonitor(access_budget=2)
+        notifications = RecordingNotifications()
+        monitor.composition_failed()
+        monitor.drain(notifications, at=AT, monotonic=1.0)
+        monitor.restore_windows(access_ages=[10.0, 20.0], finding_ages=[], monotonic=2.0)
+        self.assertEqual(list(monitor._sent), [1.0])
+        # A non-finite monotonic clock restores nothing (it never postpones).
+        other = AccessFaultMonitor()
+        other.restore_windows(access_ages=[10.0], finding_ages=[10.0], monotonic=float("inf"))
+        self.assertEqual((list(other._sent), list(other._finding_sent)), ([], []))
+
+    def test_restored_windows_are_validated(self):
+        monitor = AccessFaultMonitor(access_budget=2)
+        for values in ({"access_ages": [1.0, 2.0, 3.0], "finding_ages": [], "monotonic": 1.0},
+                       {"access_ages": [float("nan")], "finding_ages": [], "monotonic": 1.0},
+                       {"access_ages": [True], "finding_ages": [], "monotonic": 1.0},
+                       {"access_ages": ["1"], "finding_ages": [], "monotonic": 1.0},
+                       {"access_ages": [], "finding_ages": [], "monotonic": "1"}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                monitor.restore_windows(**values)
+        self.assertEqual(list(monitor._sent), [])
 
 class StandardLibraryImportTests(TestCase):
     """PR #271 review: the monitoring runtime stays importable without the
@@ -885,3 +941,59 @@ class FindingRecoveryTests(RuntimeFixture):
         status = await self.cycle()
         self.assertEqual(self.finding_texts(), 1)
         self.assertFalse(status.credential_finding_degraded)
+
+
+class RateWindowRecoveryTests(RuntimeFixture):
+    """Issue #281 item 2: a restart keeps the access budget's rolling hour."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock.now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    def access_row(self, minutes_ago, delivery="sent", kind="human_access_recovered"):
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            db.execute("INSERT INTO notification_events VALUES (?, ?, ?, 0, ?)",
+                       (str(uuid4()), kind,
+                        (self.clock.now - timedelta(minutes=minutes_ago)).isoformat(), delivery))
+            db.commit()
+
+    async def failed_composition_cycle(self):
+        monitor = AccessFaultMonitor()
+        monitor.composition_failed()
+        application = self.application(access_faults=monitor)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            return runtime.status
+
+    def fault_texts(self):
+        return self.slack_texts().count("ServerSentinel critical alert: human_access_fault")
+
+    async def test_a_restart_does_not_reset_the_access_budget(self):
+        await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 1)
+        # Three more accepted rows in the last hour: the budget of four is used.
+        for minutes in (10, 20, 30):
+            self.access_row(minutes)
+        status = await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 1)
+        self.assertTrue(status.human_access_degraded)
+
+    async def test_pending_and_old_rows_do_not_count(self):
+        await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 1)
+        self.access_row(10, delivery="pending")
+        self.access_row(20)
+        self.access_row(90)
+        self.access_row(5, kind="credential_finding")
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            # Unreadable or naive times are left out instead of raising.
+            for at in ("not a time", "2026-10-16T09:00:00"):
+                db.execute("INSERT INTO notification_events VALUES (?, 'human_access_fault', ?, 0, "
+                           "'sent')", (str(uuid4()), at))
+            db.commit()
+        status = await self.failed_composition_cycle()
+        self.assertEqual(self.fault_texts(), 2)
+        self.assertTrue(status.human_access_degraded)
