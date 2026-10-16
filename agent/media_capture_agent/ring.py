@@ -31,7 +31,7 @@ MINIMUM_SPREAD_SAMPLES = 4
 # above its mean (never above every append at its recent maximum).
 DEVIATION_FACTOR = Fraction(2)
 # Stored segments per source whose aligned real allocations form the recent
-# batch totals of synchronized sources (Issue #130), and the fewest such past
+# batch history of synchronized sources (Issue #130), and the fewest such past
 # batches whose spread is trusted instead of the perfectly correlated bound.
 BATCH_HISTORY_SEGMENTS = 16
 MINIMUM_MEASURED_BATCHES = 10
@@ -441,38 +441,55 @@ class DiskRing:
     @staticmethod
     def _measured_charge(appends):
         """Space for synchronized sources' appends measured from their recent
-        batch totals, in whole bytes, or ``None`` (Issue #130).
+        batch history, in whole bytes, or ``None`` (Issue #130).
 
-        The ``j``-th most recent samples of the batch's sources form one past
-        batch while their intervals all overlap and have one duration
-        (synchronized sources of one cadence; a gap, a clock-uncertain segment
-        or another cadence ends the alignment). Its total is
-        ``sum(count * allocation)``, each source's chained appends still taken
-        as perfectly correlated. The ``n`` totals carry the sources' real
-        covariance, so independent sources are no longer charged as if
-        perfectly correlated while correlated ones still are. The charge is
-        the totals' mean plus ``DEVIATION_FACTOR`` sample deviations widened
-        to a prediction bound for one further total from ``n`` samples:
-        ``sqrt(1 + 1/n)`` for the estimated mean and ``sqrt((n - 1) / (n -
-        3))``, the ratio of a Student t variance to a normal one, for the
-        estimated deviation. ``None`` (charge the perfectly correlated bound)
-        for fewer than two sources or fewer than ``MINIMUM_MEASURED_BATCHES``
-        aligned past batches.
+        The ``j``-th most recent samples of every configured source (appending
+        through this instant or not) form one past batch while their
+        intervals all overlap and have one duration (synchronized sources of
+        one cadence; a gap, a clock-uncertain segment or another cadence ends
+        the alignment). From the ``n`` past batches the sources' means and
+        sample covariances are measured, and a batch of ``count`` appends per
+        source is charged ``sum(count * mean)`` plus ``DEVIATION_FACTOR``
+        deviations of ``sum(count * allocation)``, its variance
+        ``sum(count_s * count_t * max(0, covariance_st))``: each source's
+        chained appends still taken as perfectly correlated, correlated
+        sources charged as such, independent ones no longer as if perfectly
+        correlated. A negative covariance is never credited, so the charge
+        never decreases as appends are added, which the next-write check
+        relies on, and alignment over every configured source does not depend
+        on which of them append. The deviation is widened to a prediction
+        bound for one further batch from ``n`` samples: ``sqrt(1 + 1/n)`` for
+        the estimated mean and ``sqrt((n - 1) / (n - 3))``, the ratio of a
+        Student t variance to a normal one, for the estimated deviation.
+        ``None`` (charge the perfectly correlated bound) for fewer than two
+        sources or fewer than ``MINIMUM_MEASURED_BATCHES`` aligned past
+        batches.
         """
-        active = [(count, samples) for count, (*_statistics, samples) in appends if count]
-        if len(active) < 2:
+        if len(appends) < 2:
             return None
-        totals = []
-        for past in zip(*(samples for _count, samples in active)):
+        aligned = []
+        for past in zip(*(samples for _count, (*_statistics, samples) in appends)):
             if (max(start for start, _end, _size in past) >= min(end for _start, end, _size in past)
                     or len({end - start for start, end, _size in past}) != 1):
                 break
-            totals.append(sum(count * size for (count, _samples), (_start, _end, size) in zip(active, past)))
-        count = len(totals)
+            aligned.append([size for _start, _end, size in past])
+        count = len(aligned)
         if count < MINIMUM_MEASURED_BATCHES:
             return None
-        mean = Fraction(sum(totals), count)
-        variance = sum((total - mean) ** 2 for total in totals) / (count - 1)
+        sizes = list(zip(*aligned))
+        means = [Fraction(sum(source), count) for source in sizes]
+        counts = [append_count for append_count, _recent in appends]
+        mean = sum(append_count * source_mean for append_count, source_mean in zip(counts, means))
+        variance = Fraction(0)
+        sources = range(len(appends))
+        for first in sources:
+            for second in sources[first:]:
+                if not counts[first] or not counts[second]:
+                    continue
+                covariance = sum((one - means[first]) * (other - means[second])
+                                 for one, other in zip(sizes[first], sizes[second])) / (count - 1)
+                pairs = 1 if first == second else 2
+                variance += pairs * counts[first] * counts[second] * max(Fraction(0), covariance)
         # ceil(DEVIATION_FACTOR * sqrt(variance * (1 + 1/n) * (n - 1) / (n - 3))), exactly.
         deviation = DiskRing._ceil_root(variance * DEVIATION_FACTOR ** 2
                                         * Fraction((count + 1) * (count - 1), count * (count - 3)))
@@ -557,7 +574,7 @@ class DiskRing:
         every append at its source's recent maximum (the bound without
         history; the recent maximum while the history is too short), or, for
         synchronized sources with enough aligned history, at a prediction
-        bound measured from their recent batch totals (``_measured_charge``).
+        bound measured from their recent batch history (``_measured_charge``).
         Charging every append the recent maximum instead let the sample
         maximum's excess compound across sources and chained appends into a
         hard stop while writes kept succeeding near the reserve. A refusal here means writes are refused at the recent real

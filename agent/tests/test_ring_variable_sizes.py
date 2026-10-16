@@ -347,21 +347,18 @@ class VariableSegmentSizeTests(unittest.TestCase):
                          ring._recent_allocations(allocations, unit, at_bound=True)[profile.source_id])
 
     def test_two_sources_variable_sizes_no_more_false_hard_stops_and_no_unannounced_refusal(self):
-        # Normally distributed sizes of two independent sources: their total
-        # deviates about sqrt(2), not two, per-source deviations, so the
-        # measured prediction bound reads hard stop before 42, not 47, of 400
-        # minutes whose every append succeeded. Every refusal is announced,
-        # never after a healthy status: by a hard stop, except one batch (seed
-        # 131) above its estimate, a tail the two-deviation factor accepts,
-        # which read pressure. The perfectly correlated charge misses such
-        # tails too (seed 133 below).
+        # Normally distributed sizes of two independent sources: measured
+        # from the recent batch history (covariance never credited below
+        # zero), the charge reads hard stop before 45, not 47, of 400 minutes
+        # whose every append succeeded, and every refusal still follows a
+        # hard stop.
         current, legacy = self.compare([
             {"seed": 130, "cadences": (60, 60), "minutes": 200, "slack_units": 24},
             {"seed": 131, "cadences": (60, 60), "minutes": 200, "slack_units": 40},
         ])
-        self.assertEqual((42, 47), (current["false_hard_stop"], legacy["false_hard_stop"]))
+        self.assertEqual((45, 47), (current["false_hard_stop"], legacy["false_hard_stop"]))
         self.assertEqual((9, 9), (current["refused"], legacy["refused"]))
-        self.assertEqual((8, 9), (current["announced_hard_stop"], legacy["announced_hard_stop"]))
+        self.assertEqual((9, 9), (current["announced_hard_stop"], legacy["announced_hard_stop"]))
 
     def test_four_sources_variable_sizes_no_more_false_hard_stops(self):
         current, legacy = self.compare([
@@ -372,76 +369,78 @@ class VariableSegmentSizeTests(unittest.TestCase):
         self.assertEqual(current["refused"], current["announced_hard_stop"])
         self.assertLessEqual(current["false_hard_stop"], legacy["false_hard_stop"])
 
-    def test_measured_batch_totals_charge_the_real_covariance_of_synchronized_sources(self):
+    def test_measured_batch_history_charges_the_real_covariance_of_synchronized_sources(self):
         unit = 4096
-        # Ten aligned recent allocations (most recent first), mean 30 units,
-        # sample variance 240 / 9 units squared.
-        units = [30, 34, 26, 38, 22, 32, 28, 36, 24, 30]
-        sizes = [size * unit for size in units]
-        mirrored = [(60 - size) * unit for size in units]
+        # Ten aligned recent allocations (most recent first) of 30 units with
+        # one 40-unit segment each, at different minutes: mean 31 units,
+        # sample variance 10 units squared, sample covariance negative.
+        first = [30 * unit] * 10
+        first[2] = 40 * unit
+        second = [30 * unit] * 10
+        second[5] = 40 * unit
 
         def charges(*sources, counts=None):
-            appends = [(1 if counts is None else count, recent) for count, recent
-                       in zip(counts or [1] * len(sources), sources)]
+            appends = list(zip(counts or [1] * len(sources), sources))
             with correlated_charge():
                 correlated = DiskRing._batch_charge(appends, unit)
             return DiskRing._batch_charge(appends, unit), correlated
 
-        # Sizes that offset each other: every past batch totalled 60 units, so
-        # the measured spread is zero and the batch is charged 60 units, where
-        # the perfectly correlated bound charged both recent maxima (76).
-        self.assertEqual((60 * unit, 76 * unit), charges(recent_of(sizes, unit), recent_of(mirrored, unit)))
-        # Perfectly correlated sizes keep the full charge: the measured total
-        # deviates 2 * sqrt(4 * 240 / 9 * 99 / 70) = 24.6 units above its 60,
-        # so both sources are charged their largest allocation (76 units),
-        # as the perfectly correlated bound charges them.
-        self.assertEqual((76 * unit, 76 * unit), charges(recent_of(sizes, unit), recent_of(sizes, unit)))
+        # Independent outliers: 62 + 2 * sqrt((10 + 10) * 99 / 70) = 72.6,
+        # so 73 units, where the perfectly correlated bound charged 62.5 + 2 *
+        # 2 * sqrt(12.5) = 76.6, so 77 units. The negative covariance is
+        # never credited.
+        self.assertEqual((73 * unit, 77 * unit), charges(recent_of(first, unit), recent_of(second, unit)))
+        # Perfectly correlated sizes are charged at least as much as by the
+        # perfectly correlated bound: 62 + 2 * sqrt(4 * 10 * 99 / 70) = 77.04,
+        # so 78 units (the prediction-bound widening for ten samples).
+        self.assertEqual((78 * unit, 77 * unit), charges(recent_of(first, unit), recent_of(first, unit)))
         # Chained appends of one source still count as perfectly correlated:
-        # two appends of each mirrored source are charged 120 units.
-        self.assertEqual(120 * unit, charges(recent_of(sizes, unit), recent_of(mirrored, unit),
-                                             counts=[2, 2])[0])
+        # two appends each, 124 + 2 * sqrt(4 * 20 * 99 / 70) = 145.3, so 146
+        # units, not 154.
+        self.assertEqual((146 * unit, 154 * unit), charges(recent_of(first, unit), recent_of(second, unit),
+                                                           counts=[2, 2]))
         # Without enough aligned past batches the perfectly correlated bound
         # is charged: nine samples, another cadence, a gap after three
-        # segments, a single appending source.
-        for first, second, counts in (
-                (recent_of(sizes[:9], unit), recent_of(mirrored[:9], unit), None),
-                (recent_of(sizes, unit), recent_of(mirrored, unit, cadence=30 * SECOND), None),
-                (recent_of(sizes, unit), recent_of(mirrored, unit)[:4] + (
-                    recent_of(mirrored, unit)[4][:3] + recent_of(mirrored, unit, offset=-60 * SECOND)[4][3:],),
-                 None),
-                (recent_of(sizes, unit), recent_of(mirrored, unit), [1, 0])):
-            current, correlated = charges(first, second, counts=counts)
+        # segments, a single source.
+        gapped = recent_of(second, unit)[:4] + (
+            recent_of(second, unit)[4][:3] + recent_of(second, unit, offset=-60 * SECOND)[4][3:],)
+        for sources in (
+                (recent_of(first[:9], unit), recent_of(second[:9], unit)),
+                (recent_of(first, unit), recent_of(second, unit, cadence=30 * SECOND)),
+                (recent_of(first, unit), gapped),
+                (recent_of(first, unit),)):
+            current, correlated = charges(*sources)
             self.assertEqual(correlated, current)
         # 60 s and 61 s segments whose latest ends coincide overlap through
         # all sixteen samples, but another cadence is not one synchronized
-        # batch: the perfectly correlated bound is charged (Codex review of
-        # PR #272).
-        drifting = (recent_of(sizes * 2, unit), recent_of(mirrored * 2, unit, cadence=61 * SECOND))
-        current, correlated = charges(*drifting)
-        self.assertEqual((correlated, 76 * unit), (current, correlated))
+        # batch (Codex review of PR #272).
+        current, correlated = charges(recent_of(first * 2, unit), recent_of(second * 2, unit, cadence=61 * SECOND))
+        self.assertEqual((correlated, 77 * unit), (current, correlated))
         # A phase offset within one cadence still aligns the past batches.
-        self.assertEqual(60 * unit, charges(recent_of(sizes, unit),
-                                            recent_of(mirrored, unit, offset=-30 * SECOND))[0])
+        self.assertEqual(73 * unit, charges(recent_of(first, unit),
+                                            recent_of(second, unit, offset=-30 * SECOND))[0])
 
     def test_measured_history_stops_at_a_gap_every_source_shares(self):
-        # Twelve stored minutes of offsetting sizes, but the minute four
-        # steps back is missing for both sources (every write refused): the
-        # stored rows on both sides of it still align by position, yet only
-        # three consecutive batches follow the gap, so the perfectly
-        # correlated bound is charged, not the measured 60 units (Codex
-        # review of PR #272).
+        # Thirteen minutes of 30-unit segments with one 40-unit segment per
+        # source, but the minute four steps back is missing for both sources
+        # (every write refused): the stored rows on both sides of it still
+        # align by position, yet only three consecutive batches follow the
+        # gap, so the perfectly correlated bound is charged (Codex review of
+        # PR #272).
         _settings, _quota, store, ring = self.ring()
         unit = store.allocation_unit
         profiles = tuple(SegmentProfile(UUID(int=1430 + index), 34000, 17000, 60 * SECOND, 100)
                          for index in range(2))
         ring.configure(RingConfig("duration", 900), profiles, now_us=T0, clock_trusted=True)
-        units = [30, 34, 26, 38, 22, 32, 28, 36, 24, 30, 33, 27, 31]
-        for index in reversed(range(len(units))):
+        histories = [[30] * 13, [30] * 13]
+        histories[0][1] = 40
+        histories[1][6] = 40
+        for index in reversed(range(13)):
             if index == 3:
                 continue  # The shared gap.
             end = T0 - index * 60 * SECOND
-            for profile, size in zip(profiles, (units[index], 60 - units[index])):
-                ring.append(profile.source_id, end - 60 * SECOND, end, b"\x5a" * (size * unit),
+            for profile, history in zip(profiles, histories):
+                ring.append(profile.source_id, end - 60 * SECOND, end, b"\x5a" * (history[index] * unit),
                             now_us=end, clock_trusted=True)
         recent = ring._recent_allocations(store.segment_allocations(), unit)
         appends = [(1, recent[profile.source_id]) for profile in profiles]
@@ -449,7 +448,6 @@ class VariableSegmentSizeTests(unittest.TestCase):
         with correlated_charge():
             correlated = DiskRing._batch_charge(appends, unit)
         self.assertEqual(correlated, DiskRing._batch_charge(appends, unit))
-        self.assertGreater(correlated, 60 * unit)
         # A clock-uncertain row ends the history too: its timestamps are not
         # comparable with the other source's (Codex review of PR #272).
         rows = ring.db.execute("SELECT id FROM segments WHERE source=? ORDER BY end DESC",
@@ -457,10 +455,36 @@ class VariableSegmentSizeTests(unittest.TestCase):
         ring.db.execute("UPDATE segments SET clock_trusted=0 WHERE id=?", (rows[1][0],))
         recent = ring._recent_allocations(store.segment_allocations(), unit)
         self.assertEqual([1, 3], [len(recent[profile.source_id][4]) for profile in profiles])
-        # Without the gap the same history is measured: 60 units.
-        whole = [(1, recent_of([size * unit for size in units[:12]], unit)),
-                 (1, recent_of([(60 - size) * unit for size in units[:12]], unit))]
-        self.assertEqual(60 * unit, DiskRing._batch_charge(whole, unit))
+        # Without the gap the same history is measured, below that bound.
+        whole = [(1, recent_of([size * unit for size in history[:12]], unit)) for history in histories]
+        with correlated_charge():
+            bound = DiskRing._batch_charge(whole, unit)
+        self.assertLess(DiskRing._batch_charge(whole, unit), bound)
+
+    def test_measured_batch_charge_never_decreases_as_appends_are_added(self):
+        # The next-write check evaluates only the latest append between two
+        # credit changes, so adding an append (another count of a source, or
+        # a source that did not append yet) must never lower the charge, even
+        # where sources' sizes offset each other (Codex review of PR #272:
+        # staggered sources, 176 units for counts (1, 1, 0) but 102 for
+        # (1, 1, 1)).
+        unit = 4096
+        generator = random.Random(1302)
+        for _ in range(300):
+            length = generator.randint(10, 16)
+            history = [[generator.randint(1, 64) * unit for _ in range(length)]
+                       for _source in range(generator.randint(2, 4))]
+            if generator.random() < 0.5:
+                # Offsetting sizes of the first two sources.
+                history[1] = [65 * unit - size for size in history[0]]
+            recent = [recent_of(sizes, unit) for sizes in history]
+            counts = [generator.randint(0, 3) for _sizes in history]
+            charge = DiskRing._batch_charge(list(zip(counts, recent)), unit)
+            for source in range(len(history)):
+                more = list(counts)
+                more[source] += 1
+                self.assertLessEqual(charge, DiskRing._batch_charge(list(zip(more, recent)), unit),
+                                     (counts, source))
 
     def test_measured_batch_charge_is_whole_units_and_never_below_its_prediction_bound(self):
         unit = 4096
@@ -490,13 +514,13 @@ class VariableSegmentSizeTests(unittest.TestCase):
         # Independent sizes of four synchronized sources: the perfectly
         # correlated bound charged a batch about four per-source deviations
         # above its mean, where its total deviates about two. Measured from
-        # the recent batch totals, the 120 minutes read hard stop before 19,
+        # the recent batch history, the 120 minutes read hard stop before 23,
         # not 26, minutes whose every append succeeded; the one refusal is
         # still announced by a hard stop.
         current, correlated = self.compare([
             {"seed": 130, "cadences": (60, 60, 60, 60), "minutes": 120, "slack_units": 48},
         ], baseline=correlated_charge)
-        self.assertEqual((19, 26), (current["false_hard_stop"], correlated["false_hard_stop"]))
+        self.assertEqual((23, 26), (current["false_hard_stop"], correlated["false_hard_stop"]))
         self.assertEqual((1, 1), (current["refused"], correlated["refused"]))
         self.assertEqual(current["refused"], current["announced_hard_stop"])
 
