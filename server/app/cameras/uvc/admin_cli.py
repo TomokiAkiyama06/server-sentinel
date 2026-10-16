@@ -70,7 +70,8 @@ camera that does not advertise the source's pixel format is refused
 ``capture_profile_unavailable``. The adapter rescans in the audited
 preparation and refuses a camera that changed or vanished since the selection
 (``candidate_unavailable``, recorded ``failed``), and it refuses a camera already approved for another enabled source and a
-disabled or non-``local_uvc`` source; the registry refuses an enabled source
+disabled or non-``local_uvc`` source (and the command refuses a source
+without a complete, supported capture profile, ``source_profile_unusable``); the registry refuses an enabled source
 beyond the active-source limit (1 to 4).
 
 Exit status: ``0`` done, ``2`` refused (a fixed word on stderr).
@@ -104,7 +105,7 @@ from .capture import VideoProfile
 from .discovery import LinuxDiscovery
 from .identity import DeviceEvidence, same_physical_camera
 from .persistence import ApprovalConflictError, ApprovalStore
-from .registry_adapter import LocalUvcAdapter
+from .registry_adapter import LocalUvcAdapter, capture_profile
 
 
 PROG = "python -m app.cameras.uvc.admin_cli"
@@ -496,15 +497,21 @@ def _approve(context: _Context, source_id: UUID, label: str) -> list[str]:
         raise CliRefused("source_not_local_uvc")
     if not source.enabled:
         raise CliRefused("source_disabled")
+    try:
+        # The profile the capture worker will request; without a complete,
+        # supported one it would never open the camera.
+        wanted = capture_profile(source.desired_capture_profile)
+    except ValueError:
+        wanted = None
+    if wanted is None:
+        raise CliRefused("source_profile_unusable")
     scan = _scan(context)
     candidate = _select_candidate(scan, label)
     if candidate.strong_key is None:
         raise CliRefused("camera_without_serial")
     if _serial_state(candidate, scan.devices) == "shared":
         raise CliRefused("camera_serial_not_unique")
-    wanted = source.desired_capture_profile
-    if (wanted is not None and wanted.pixel_format is not None
-            and wanted.pixel_format not in candidate.formats):
+    if wanted.pixel_format not in candidate.formats:
         # Also when the camera advertises no format at all: the service
         # would only report capture_profile_unavailable.
         raise CliRefused("camera_format_unsupported")

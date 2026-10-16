@@ -363,13 +363,23 @@ class AdminCliTests(unittest.TestCase):
     def test_approve_refuses_bad_targets_before_any_change(self):
         source = self.local_source()
         disabled = self.local_source("Disabled", enabled=False)
+        bare = self.fixture.create_source(source_type=SourceType.LOCAL_UVC, name="Bare", enabled=True)
+        partial = self.fixture.create_source(
+            source_type=SourceType.LOCAL_UVC, name="Partial", enabled=True,
+            desired_capture_profile=CaptureProfile(1920, 1080, None, "MJPG"))
+        coded = self.fixture.create_source(
+            source_type=SourceType.LOCAL_UVC, name="Coded", enabled=True,
+            desired_capture_profile=CaptureProfile(1920, 1080, 30, "MJPG", codec="h264"))
         label = self.labels()[0]
         for argv, reason in (
                 ((str(source.id).upper()[:-1], label), "source_id_rejected"),
                 ((str(source.id), "video0"), "candidate_label_rejected"),
                 ((str(source.id), "cam-0000000000"), "candidate_not_found"),
                 ((str(uuid4()), label), "source_not_found"),
-                ((str(disabled.id), label), "source_disabled")):
+                ((str(disabled.id), label), "source_disabled"),
+                ((str(bare.id), label), "source_profile_unusable"),
+                ((str(partial.id), label), "source_profile_unusable"),
+                ((str(coded.id), label), "source_profile_unusable")):
             with self.subTest(reason=reason):
                 code, stdout, stderr, terminal = self.run_cli("approve", *argv)
                 self.assertEqual((code, stdout, terminal), (2, "", ""))

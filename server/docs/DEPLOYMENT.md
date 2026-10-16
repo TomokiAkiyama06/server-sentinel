@@ -386,9 +386,12 @@ sudo systemctl start server-sentinel.service
   (`camera_approved_for_another_source`), one that does not advertise the
   source's pixel format (`camera_format_unsupported`), a scan with a device
   it could not inspect (`camera_scan_incomplete`), an unknown label
-  (`candidate_not_found`), a disabled or missing source and a camera that
-  changed between the selection and the audited rescan
-  (`candidate_unavailable`, recorded `failed`). Approving clears a source's
+  (`candidate_not_found`), a disabled or missing source, a source without a
+  complete, supported capture profile (`source_profile_unusable`; the worker
+  would never open the camera), and a camera that changed between the
+  selection and the audited rescan (`candidate_unavailable`, recorded
+  `failed`; a serial that became shared meanwhile is
+  `camera_serial_not_unique`, recorded `failed`). Approving clears a source's
   `manual_intervention_required` latch and a marker a crashed service left.
 - Exit status `0` done, `2` refused (a fixed word on stderr).
   `committed_verification_failed` means the change and its audit record were
