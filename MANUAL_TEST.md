@@ -2983,6 +2983,17 @@ by the Issue #6 synthetic policy model.
   reopens. Confirm neither message nor the `notification_events` row contains
   the hostname, an address, a viewer identity or a reason, and that the
   monitoring status shows `human_access_degraded` only during the fault.
+  Hourly budget across a restart (Issue #281 item 2, Issue #287; mock-verified
+  only), on a disposable copy of the database, never the production one:
+  after the update, confirm with `sqlite3` that `notification_events` has the
+  `accepted_at` column and that rows written before the update kept every
+  value with `accepted_at` empty. Cause four access notifications within an
+  hour, restart the service and cause a fifth: confirm it arrives only once
+  the oldest of the four is an hour old (counted from each row's
+  `accepted_at`), never earlier and not more than an hour after the restart.
+  Repeat with the state mount unavailable at start (monitoring `failed`) and
+  one notification sent before the mount returns: after it returns, the
+  earlier rows of the hour still count and that notification counts once.
 - Listener owners through sock_diag (Issue #126, Owner decision 2026-10-07;
   mock and unprivileged local experiments only so far, not yet run on the
   Main Server). Production check procedure, all as the ServerSentinel service

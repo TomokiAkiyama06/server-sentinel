@@ -236,8 +236,10 @@ credential or failure reason is sent or stored with them. It is disabled without
 configuration. Person/motion/entry and ordinary camera-offline observations do not
 generate immediate Slack messages by default. Local fault reporting remains
 independent of Slack delivery: the Main Server runtime stores each fault or
-notification locally as fixed kind/time/delivery-state values only (no message
-text, media or hardware identifiers) and removes that history after the shared
+notification locally as fixed kind/time/delivery-state values only, plus the time
+the row was last written (`accepted_at`, used only to keep the hourly
+notification bounds across a restart; no message text, media or hardware
+identifiers) and removes that history after the shared
 90-day audit-retention period.
 
 ## Diagnostics
