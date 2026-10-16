@@ -494,6 +494,49 @@ class VariableSegmentSizeTests(unittest.TestCase):
             correlated = DiskRing._batch_charge(appends, unit)
         self.assertEqual(correlated, DiskRing._batch_charge(appends, unit))
 
+    def test_raised_profile_bound_restarts_the_allocation_history(self):
+        # Two sources wrote fifteen 10-unit segments, then their bound rose
+        # with the same cadence. The old allocations do not estimate the new
+        # profile: until segments are written under it, each next append is
+        # charged its new bound, not the 20 units of the old history, and
+        # the history survives a restart (Codex review of PR #272).
+        settings, _quota, store, ring = self.ring()
+        unit = store.allocation_unit
+        sources = [UUID(int=1450 + index) for index in range(2)]
+
+        def profiles(maximum):
+            return tuple(SegmentProfile(source, maximum, maximum // 2, 60 * SECOND, 100) for source in sources)
+
+        start = T0 - 15 * 60 * SECOND
+        ring.configure(RingConfig("duration", 900), profiles(8000), now_us=start, clock_trusted=True)
+        for index in range(15):
+            end = start + (index + 1) * 60 * SECOND
+            for source in sources:
+                ring.append(source, end - 60 * SECOND, end, b"\x5a" * (10 * unit), now_us=end, clock_trusted=True)
+
+        def charge(ring):
+            recent = ring._recent_allocations(store.segment_allocations(), unit)
+            return DiskRing._batch_charge([(1, recent[source]) for source in sources], unit)
+
+        self.assertEqual(20 * unit, charge(ring))
+        raised = profiles(32000)
+        ring.configure(RingConfig("duration", 900), raised, now_us=T0, clock_trusted=True)
+        bound = sum(round_up(profile.segment_bytes(), unit) for profile in raised)
+        self.assertGreater(bound, 20 * unit)
+        self.assertEqual(bound, charge(ring))
+        ring.close()
+        reopened = DiskRing(settings, store, ledger_maximum_bytes=LEDGER_BYTES, authority=AllowControls())
+        self.addCleanup(reopened.close)
+        self.assertEqual(bound, charge(reopened))
+        # Segments written under the new profile form its history; an
+        # unchanged reconfiguration keeps it.
+        for source in sources:
+            reopened.append(source, T0, T0 + 60 * SECOND, b"\x5a" * (12 * unit), now_us=T0 + 60 * SECOND,
+                            clock_trusted=True)
+        self.assertEqual(24 * unit, charge(reopened))
+        reopened.configure(RingConfig("duration", 900), raised, now_us=T0 + 60 * SECOND, clock_trusted=True)
+        self.assertEqual(24 * unit, charge(reopened))
+
     def test_measured_batch_charge_never_decreases_as_appends_are_added(self):
         # The next-write check evaluates only the latest append between two
         # credit changes, so adding an append (another count of a source, or

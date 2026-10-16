@@ -171,7 +171,12 @@ therefore predicts refusal by simulating the sources' next appends.
   PR #143). Where every allocation is already whole units (ext4) it changes
   nothing. The last sixteen stored segments of each source, each rounded up
   to whole units, also form the source's batch history for the measured
-  charge below.
+  charge below. Only segments stored after the source's current profile was
+  configured count: configuring a new or changed profile (another bitrate
+  bound, overhead or cadence) records the source's latest segment end with
+  the configuration, and earlier allocations no longer estimate its appends,
+  so until new segments exist the charge is the bound (Codex review of
+  PR #272). An unchanged profile keeps its history.
 - **Charge `C(t)`** (Issue #130). All simulated appends at or before `t`,
   `n_s` of each source `s`, are charged together:
   `C(t) = min(sum(n_s * c_s), round_up(ceil(sum(n_s * m_s)) + sum(ceil(2 * n_s * sqrt(v_s)))))`,

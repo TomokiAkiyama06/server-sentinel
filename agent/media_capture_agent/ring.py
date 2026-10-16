@@ -45,6 +45,9 @@ class DiskRing:
         self.ledger = Ledger(settings, maximum_bytes=ledger_maximum_bytes, space=ledger_space)
         self.db = self.ledger.connection
         self.config, self.profiles = None, {}
+        # Per source, the last segment end stored before its current profile
+        # was configured: earlier allocations do not estimate that profile.
+        self.history_after = {}
         self.connected = False
         self.state, self.reason = "degraded", "not_configured"
         try:
@@ -57,6 +60,7 @@ class DiskRing:
                 self.profiles = {UUID(item["source_id"]): SegmentProfile(
                     **{**item, "source_id": UUID(item["source_id"])}
                 ) for item in value["profiles"]}
+                self.history_after = {UUID(source): end for source, end in value.get("history_after", {}).items()}
                 self._ledger_capacity(self.config, self.profiles)
             self._recover()
         except BaseException:
@@ -372,7 +376,8 @@ class DiskRing:
         """Per-source ``(mean, variance, credit, cap, samples)`` of one simulated append.
 
         From the source's last ``RECENT_ALLOCATION_SEGMENTS`` stored
-        allocations: their mean and sample variance, the smallest of them
+        allocations written under its current profile (``history_after``):
+        their mean and sample variance, the smallest of them
         (credited when a simulated append ages out) and the largest in whole
         allocation units (the per-append cap), all never above the bound.
         With fewer than ``MINIMUM_SPREAD_SAMPLES`` the mean is the cap and the
@@ -395,8 +400,9 @@ class DiskRing:
             bound = round_up(profile.segment_bytes(), unit)
             rows = [] if at_bound else [(row[1], row[2], row[3], allocations.get(UUID(row[0]), bound))
                                         for row in self.db.execute(
-                "SELECT id, start, end, clock_trusted FROM segments WHERE source=? AND state='stored' "
-                "ORDER BY end DESC LIMIT ?", (str(source), max(RECENT_ALLOCATION_SEGMENTS, BATCH_HISTORY_SEGMENTS)))]
+                "SELECT id, start, end, clock_trusted FROM segments WHERE source=? AND state='stored' AND end>? "
+                "ORDER BY end DESC LIMIT ?", (str(source), self.history_after.get(source, -MAX_INTEGER - 1),
+                                              max(RECENT_ALLOCATION_SEGMENTS, BATCH_HISTORY_SEGMENTS)))]
             # The rounded samples of the longer batch history, never above the
             # bound, up to the source's first gap, clock-uncertain row or
             # segment of another cadence than the current profile's: stored
@@ -729,13 +735,25 @@ class DiskRing:
             self.store.check(budget["required_additional"])
             self._selected_target_fits(config, mapping)
             self._duration_transition_fits(config, mapping, now_us, clock_trusted)
+            # A changed or new profile starts a new allocation history: the
+            # recent-allocation charge must not estimate it from segments of
+            # another bound or cadence (Codex review of PR #272).
+            history_after = {}
+            for item in profiles:
+                if self.profiles.get(item.source_id) == item:
+                    end = self.history_after.get(item.source_id)
+                else:
+                    end = self.db.execute("SELECT max(end) FROM segments WHERE source=?",
+                                          (str(item.source_id),)).fetchone()[0]
+                if end is not None:
+                    history_after[item.source_id] = end
             value = {"config": asdict(config), "profiles": [
                 {**asdict(item), "source_id": str(item.source_id)} for item in profiles
-            ]}
+            ], "history_after": {str(source): end for source, end in history_after.items()}}
             with self.ledger.transaction():
                 self.db.execute("INSERT OR REPLACE INTO settings VALUES ('configuration', ?)",
                                 (json.dumps(value, separators=(",", ":")),))
-            self.config, self.profiles = config, mapping
+            self.config, self.profiles, self.history_after = config, mapping, history_after
             self._trim(now_us, trusted=clock_trusted)
             return self._status(now_us, clock_trusted=clock_trusted)
 
