@@ -20,7 +20,8 @@ not add a lock that could suggest codec operations are safe on request threads.
 An HTTP/WebSocket/WebRTC/HLS route must dispatch work to that scheduler.
 
 No browser protocol, route, media URL, codec adapter, or deployment default is
-selected here. FastAPI's human surface remains closed. Browser playback,
+selected in `sessions.py`; the S7 interim frame pull below is the only
+transport, pending #19. Browser playback,
 reconnect/adaptation measurements, private-network authorization, and phone/Mac/
 desktop acceptance remain required before Issue #19 can close.
 
@@ -35,7 +36,9 @@ that source has viewer demand, so zero subscribers retain nothing.
 listener (`on_camera_state`): any non-`online` transition (disconnect, capture
 failure, frame stall, manual intervention) drops the retained frame and
 refuses new frames until the camera is `online` again, so a pre-loss image is
-never served as current live video. It runs in transition order with the
+never served as current live video. A source also starts non-live: it accepts no frame and
+is never reported as live until its first `online` transition, so a capture
+startup that failed before any transition never looks healthy. It runs in transition order with the
 runtime's in-memory health record, not behind the optional downstream health
 sink, so a slow or hung sink cannot delay the invalidation.
 `LocalPreviewHub.clear()` runs when capture stops and permanently marks every
@@ -54,5 +57,21 @@ credential, an idle/absolute-expired session, a copied session identifier or a
 storage error all fail with the same generic refusal and release demand. The
 validator does not refresh the idle deadline, so a long-lived transport must
 re-authorize through `authorize_live_access` to keep its session current. Browser
-transport, codec and viewer limits remain #19 decisions; the human surface stays
-closed.
+transport and codec remain #19 decisions.
+
+## S7 interim frame pull (Issue #10 S7, Owner decision D10)
+
+`frame_pull.LiveFrameService` owns one `AuthorizedLocalPreview` on a
+single-thread executor (every open, read, close, disconnect, revalidation and
+lease sweep runs there) and is the only reader of the hub. The human surface
+mounts it through `HumanAccess.attach_live` (routes and authorization order:
+`server/app/auth/README.md`, "S7 interim live frame pull"). A viewer pulls
+"the newest frame after sequence n": one native camera JPEG, never transcoded,
+or nothing yet. Limits (D10 and the D5 defaults): 4 sessions in total, 2 per
+source, 2 per person, at most 5 served frames per second per session, 8 MiB per
+frame, a 15 s lease and at most one idle extension of the human session per
+60 s per live session. A session whose viewer stops polling is disconnected by
+the sweeper (released demand, so the hub retains nothing), as is every session
+while human access is closed or the composition is stopped. Nothing is written
+per frame. Mock verified only; a browser decoding real MJPG frames is a manual
+check.

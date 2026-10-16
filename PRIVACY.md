@@ -99,6 +99,14 @@ Every preview read re-checks the viewer's current `live:view` grant and the
 validity of the human access session it was opened from server-side, so revoking
 a lost device's credential also ends that device's live preview.
 
+The interim live view (Issue #10 S7, until #19 selects the final transport)
+sends those frames to an authorized browser one JPEG at a time, as received
+from the camera. Nothing is written to disk or the database per frame, no
+frame history is kept, and a viewer that stops asking for frames for 15
+seconds is disconnected, after which the frame is discarded. The source list a
+`live:view` viewer sees holds only each camera's name and coarse health. A
+viewer can still capture their own screen; live viewing does not prevent that.
+
 ## Human viewer credentials
 
 The target deployment shares one Tailscale account across the research room, so a Tailscale login identifies the account rather than the person. ServerSentinel therefore issues each invited person its own credential from an owner invitation and verifies it on every human request; verified Tailscale login/device information is at most supplementary context.

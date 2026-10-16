@@ -26,6 +26,7 @@ from app.detection.roi.runtime import (
 )
 from app.diagnostics import DiagnosticExportEndpoint
 from app.logging import Event
+from app.media.live.frame_pull import LiveFrameService
 from app.media.live.local_preview import LocalPreviewHub
 from app.monitoring.config import MonitoringConfiguration
 from app.monitoring.runtime import MonitoringDependencies, MonitoringRuntime, RuntimeState
@@ -126,7 +127,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
     store = database or Database(settings.database_path)
     # Local UVC capture is driven only by the deployment's list of approved
     # logical sources. Frames go to a bounded preview hub that retains nothing
-    # without authorized live viewer demand; no route reads it (#10/#19).
+    # without authorized live viewer demand; only the S7 frame pull reads it.
     if local_uvc is not None and not isinstance(local_uvc, LocalUvcConfiguration):
         raise TypeError("local UVC configuration is invalid")
     uvc_dependencies = local_uvc_dependencies or LocalUvcDependencies()
@@ -193,6 +194,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # That admission verifies this application's database only, so an
         # access store on any other database is refused here.
         human_access.bind_storage_admission(storage_reservation or runtime_admission, database=store)
+        # S7 interim live (Owner decision D10, #10/#19): the authorized frame
+        # pull is the only reader of the preview hub; it retains nothing
+        # without polling live:view viewers and starts/stops with run().
+        human_access.attach_live(LiveFrameService(local_preview, human_access.store))
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(
@@ -517,7 +522,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
         RuntimeState.STARTING if monitoring_runtime is not None else RuntimeState.UNCONFIGURED
     )
     application.state.owner_administration = owner_administration
-    # Internal only: no route exposes local capture state or preview frames.
+    # Internal only: no route exposes local capture state; preview frames reach
+    # only the authorized S7 live routes through `human_access.live`.
     application.state.local_uvc = local_uvc_runtime
     application.state.local_uvc_state = (
         LocalUvcRuntimeState.STARTING if local_uvc_runtime is not None

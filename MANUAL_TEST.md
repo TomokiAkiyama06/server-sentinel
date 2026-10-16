@@ -2038,6 +2038,43 @@ and then on the Main Server (Owner, synthetic data only):
   refused before any change with the "differs from its release manifest"
   steps; `current`, `previous` and the unit are unchanged.
 
+### Issue #10 S7 interim live (pending)
+
+Mock only: the routes, authorization, limits, lease and retention are verified
+with synthetic JPEG-shaped bytes, the synthetic ASGI driver and software
+authenticators (`server/tests/test_live_frame_routes.py`). No browser has
+decoded a real camera frame, no Web live screen exists yet (CP-5), and no real
+deployment has served the routes. Once a deployment enables the human routes
+with an approved `local_uvc` camera, from browsers on the shared account at
+the reserved name:
+
+- [ ] a test invitee with `live:view` only: the source list shows each
+  approved camera's name and health only, a session opens and frames decode
+  in Safari (iPhone), Safari (Mac) and Chrome/Firefox (desktop); record
+  whether the camera's MJPG frames without a Huffman table (DHT) decode in
+  each browser;
+- [ ] a test invitee with `recordings:view` only: every live route is the
+  generic `404`;
+- [ ] copy the frame URL from the developer tools into another invitee's
+  browser and into a second sign-in of the same invitee: the generic `404`;
+  the original viewer keeps receiving frames;
+- [ ] measured frame rate per viewer stays at or below 5 fps; record latency
+  and the Main Server CPU with 1, 2 and 4 viewers;
+- [ ] a third viewer on one camera, and a fifth in total, gets the generic
+  `404`; a person's third session is refused too;
+- [ ] close the viewer's tab: within about 15 seconds the preview reports no
+  viewer (no retained frame); revoke the invitee (or withdraw `live:view`) in
+  the Owner administration while watching: frames stop at once;
+- [ ] unplug the camera while watching: the frame route answers `204` and the
+  source list shows it offline; no pre-loss frame is shown as live; replug and
+  re-approve: frames resume;
+- [ ] watch for more than 30 minutes: the session does not idle out while
+  frames are pulled; then stop pulling and do nothing else: the session ends
+  at its idle limit;
+- [ ] the frame response has `Cache-Control: no-store`,
+  `X-Content-Type-Options: nosniff` and no `Content-Disposition`; the browser
+  offers no download button in the application.
+
 ### Uninvited ordinary Tailnet member
 
 - [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;

@@ -9,7 +9,8 @@ the frame is dropped immediately, so no decoded-frame history exists.
 every read goes through ``LiveViewerSessions``, whose validator re-checks the
 principal's current ``live:view`` grant, so possession of a session identifier
 is never sufficient.  No route, socket, codec or media URL exists here; the
-human surface stays closed until the authorized viewer route lands (#10/#19).
+S7 interim frame pull (``frame_pull.LiveFrameService``) is the only reader,
+behind the authorized human routes (#10/#19).
 """
 
 from dataclasses import dataclass
@@ -51,9 +52,12 @@ class _PreviewSource:
         self.viewers: set[UUID] = set()
         self.latest: PreviewFrame | None = None
         self.sequence = 0
-        # Cleared by any non-online camera transition: a retained frame from
-        # before a disconnect or capture failure is never served as live.
-        self.live = True
+        # Set only by an explicit ``online`` camera transition and cleared by
+        # any other one: a source whose capture never started (or failed
+        # before its first transition) accepts no frame and is never reported
+        # as live, and a retained frame from before a disconnect or capture
+        # failure is never served as live.
+        self.live = False
 
     def add_viewer(self, subscriber_id: UUID) -> None:
         with self._hub._lock:
@@ -87,6 +91,19 @@ class LocalPreviewHub:
             if not isinstance(source_id, UUID):
                 raise ValueError("preview source identity is invalid")
             self._sources[source_id] = _PreviewSource(self, source_id)
+
+    @property
+    def source_ids(self) -> tuple[UUID, ...]:
+        """The configured logical sources (fixed at construction)."""
+        return tuple(self._sources)
+
+    def accepting(self, source_id: UUID) -> bool:
+        """Whether frames of this source are currently accepted as live."""
+        source = self._sources.get(source_id) if isinstance(source_id, UUID) else None
+        if source is None:
+            return False
+        with self._lock:
+            return source.live and not self._closed
 
     def source(self, source_id: UUID) -> _PreviewSource:
         source = self._sources.get(source_id) if isinstance(source_id, UUID) else None

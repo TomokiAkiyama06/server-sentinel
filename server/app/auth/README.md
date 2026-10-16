@@ -585,12 +585,17 @@ OpenAPI or error handler is reachable):
 | `POST /api/auth/step-up` | the same, and the assertion of the session's own credential (step-up rate limit) | `204`, no body, no cookie (S3, below) |
 | `GET /`, `GET /s.js`, `GET /s.css` | none (`PRE_CREDENTIAL`; the gates above only, no limiter) | the sign-in shell, byte-identical for every caller (S5b, below) |
 | `GET /app/`, `GET /app/<name>` | any active session (`SESSION`, `touch=False`) | the application assets (S5b, below) |
+| `GET /api/live/sources` | `LIVE` (the Owner or `live:view`) | `{"sources": [{"id", "name", "health"}]}` (S7, below) |
+| `POST /api/live/sessions` | `LIVE` + exact `Origin` + `X-CSRF-Token` (live limiter) | `{"session_id", "source_id", "lease_seconds", "frame_interval_ms"}` (S7) |
+| `GET /api/live/sessions/<session>/frame?after=<n>` | `LIVE`, the opening human session only | `200 image/jpeg` + `X-Frame-Sequence`, or `204` (S7) |
+| `POST /api/live/sessions/<session>/close` | `SESSION` + exact `Origin` + `X-CSRF-Token`; only a held id with its opening cookie | `204` (S7) |
 
 The session route grants nothing and returns only the caller's own role,
-permissions (the Owner holds both) and CSRF token. With sign-out it is the
-only route a non-Owner session reaches in this phase (the step-up routes
-are Owner-only), so a `live:view`-only or
-`recordings:view`-only person reaches nothing they lack. Bodies are bounded (1 KiB options, 64 KiB assertion or registration), JSON
+permissions (the Owner holds both) and CSRF token. Apart from sign-out, the
+application assets and the S7 live routes (`live:view` only), it is the only
+route a non-Owner session reaches in this phase (the step-up routes are
+Owner-only), so a `live:view`-only or `recordings:view`-only person reaches
+nothing they lack. Bodies are bounded (1 KiB options, 64 KiB assertion or registration), JSON
 with duplicate members is refused, and a ceremony refusal never sets a cookie.
 
 Accepted disclosure: `POST /api/auth/authentication/options` answers `200`
@@ -1452,6 +1457,68 @@ policies or rendered the build (`MANUAL_TEST.md`). The wire-shape test sends
 registration and assertion bodies with exactly the members of
 `web/src/shared/webauthn.ts` through the real routes and verifiers, but from a
 software authenticator, not a browser.
+
+### S7 interim live frame pull (Issue #10 S7, Owner decision D10)
+
+Until #19 selects the browser live transport, `HumanAccess.attach_live`
+mounts the interim MJPEG frame pull of `app.media.live.frame_pull`
+(`create_app` attaches one over its local preview hub; without one every live
+route is the generic denial). The route table above lists the four routes.
+
+- `live:view` (or the Owner) is enforced server-side on every request;
+  `recordings:view` alone reaches none of them. The source list returns only
+  each configured, enabled local source's id, name and coarse health
+  (`online` / `degraded` / `offline` / `manual_intervention_required`; never
+  `online` while the preview refuses its frames), and only sources captured
+  as `MJPG` (frames pass through as JPEG; a `YUYV` / `GREY` source is
+  neither listed nor opened): no device path, serial,
+  profile, node, detection or storage detail, and nothing historical.
+- A live session is bound to the human access session that opened it
+  (`BoundLiveAccess`). Each frame poll is admitted in memory first (an id the
+  service holds, within a per-(human session, live session) budget of a burst
+  of 20 and one more every 0.1 s), then, inside `admit(epoch)` on the
+  service's single executor thread, the read-only `current_session` must be
+  exactly that human session (token digest and keyed proxy-identity binding;
+  a live-session id copied to any other session is refused) and the read
+  re-runs `live_view_validator`. A refused poll never renews the lease; one
+  whose own grant no longer validates also releases the demand.
+- Nothing is written per frame. The idle expiry moves at most once per 60 s
+  per live session (D5 default), through the gated
+  `authorize_request(..., LIVE, touch=True)`; its failure only skips that
+  extension.
+- Limits (D10, D5 defaults): 4 live sessions in total, 2 per source, 2 per
+  person; at most 5 served frames per second per session; a frame that does
+  not start with a JPEG SOI marker or is larger than 8 MiB is never served.
+  Over a limit: the generic denial (or `204` for pacing). Opens are
+  charged to `HumanAccess.live_limiter` (per session a burst of 20 and one
+  more every 3 s, so switching sources, hiding/showing the tab and reconnecting
+  stay inside it) after a read-only check, so a forged cookie takes no slot.
+  A close is not charged: it reaches SQLite only for a live session held for
+  the presented cookie, so closes are bounded by opens.
+  At most 32 request jobs (all viewers) are queued or running on the
+  service's executor at once; beyond that a request is the generic denial, so
+  a slow database cannot grow the queue, and sweeps never stack.
+- Demand ends when a session's viewer stops polling for 15 s (the lease),
+  on close, on sign-out, at once for the affected principal after an Owner
+  grant or revocation change (`AccessAdministration.principal_changed`), and
+  for everyone while access is closed or the composition is stopped. A
+  change committed outside this process (the local CLI) is caught by the next
+  poll's validator or by the lease.
+- Contract for the Web (CP-5): `health` is always present (one of the four
+  camera values); only local `MJPG` sources are listed in this interim
+  transport; an open always answers `200` with `session_id`, `source_id`,
+  `lease_seconds` and `frame_interval_ms` (the pacing interval; poll at that
+  interval plus some slack); a close needs no body and no `Content-Type`
+  (keepalive fetch) and is never rate-limited. An open refused by the
+  limiter, the capacity or the source check creates no demand.
+- Responses: `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
+  `Cross-Origin-Resource-Policy: same-origin`; never `Content-Disposition`,
+  `ETag`, ranges or a cookie. There is no recording, export or download
+  semantics; browser viewing does not prevent screen capture.
+
+Synthetic/mock verified only (`server/tests/test_live_frame_routes.py`, with
+JPEG-shaped synthetic bytes); no browser has decoded a real camera frame
+(`MANUAL_TEST.md`, "S7 interim live").
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 
