@@ -8,6 +8,7 @@ and nothing reads the host's ``/proc/net``.
 """
 
 import asyncio
+import io
 from dataclasses import replace
 from uuid import uuid4
 import json
@@ -36,7 +37,7 @@ from app.auth.reservation import (
 from app.auth.session_binding import SessionBindingKey
 from app.deployment import _tailscale_executable, main as deployment_main
 from app.logging import Event
-from app.main import ClosedHumanSurface, create_app
+from app.main import ClosedHumanSurface, HumanAccessCompositionRefused, create_app
 from app.monitoring.access import AccessFaultMonitor
 from app.monitoring.runtime import MonitoringDependencies
 from app.settings import ConfigurationError, Settings
@@ -248,8 +249,6 @@ class DeploymentKeyTests(unittest.TestCase):
         cases = (
             ({"human_access": self.access(hostname="Upper.example.invalid")}, "setting"),
             ({"human_access": self.access()}, "web_assets"),
-            ({"human_access": self.access(tailscale_executable=str(self.root / "missing")),
-              "web_assets_directory": self.web}, "executable"),
         )
         for extra, reason in cases:
             with self.subTest(reason=reason):
@@ -258,8 +257,44 @@ class DeploymentKeyTests(unittest.TestCase):
                 self.assertEqual(stderr, "ServerSentinel deployment validation failed: human "
                                          f"access refused (reason={reason})\n")
                 self.assertNotIn(str(self.root), stderr)
-        code, stdout, _ = self.check(human_access=self.access(), web_assets_directory=self.web)
-        self.assertEqual((code, stdout), (0, "ServerSentinel deployment validation passed\n"))
+        code, stdout, stderr = self.check(human_access=self.access(), web_assets_directory=self.web)
+        self.assertEqual((code, stdout, stderr),
+                         (0, "ServerSentinel deployment validation passed\n", ""))
+
+    def test_an_unusable_executable_passes_the_check_with_a_warning(self):
+        """Issue #283 item 1: a valid section whose Tailscale CLI fails the
+        check on this host does not stop the unit (recording, the integrity
+        and recording-health checks and the Owner notification keep running);
+        the operator still reads the value-free reason."""
+        missing = str(self.root / "missing")
+        self.executable.chmod(0o775)
+        for path in (missing, str(self.executable)):
+            with self.subTest(missing=path == missing):
+                code, stdout, stderr = self.check(
+                    human_access=self.access(tailscale_executable=path),
+                    web_assets_directory=self.web)
+                self.assertEqual(code, 0)
+                self.assertEqual(stdout, "ServerSentinel deployment validation passed\n")
+                self.assertEqual(stderr, "ServerSentinel deployment warning: human access stays "
+                                         "closed (reason=executable); recording and monitoring "
+                                         "start\n")
+                self.assertNotIn(str(self.root), stderr)
+        # Disabled, the CLI is not checked at all.
+        code, stdout, stderr = self.check(
+            human_access=self.access(enabled=False, tailscale_executable=missing),
+            web_assets_directory=self.web)
+        self.assertEqual((code, stderr), (0, ""))
+
+    def test_launcher_starts_closed_when_the_executable_is_unusable(self):
+        self.write(human_access=self.access(tailscale_executable=str(self.root / "missing")),
+                   web_assets_directory=self.web)
+        with patch("app.deployment.__file__", str(self.module)), patch(
+                "app.__main__.run", return_value=0) as run, patch(
+                "sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(deployment_main(["--config", str(self.config)]), 0)
+        self.assertIs(run.call_args.kwargs["human_access_unavailable"], True)
+        self.assertTrue(run.call_args.kwargs["human_access"].enabled)
+        self.assertIn("(reason=executable)", stderr.getvalue())
 
     def test_launcher_passes_the_checked_section_to_run(self):
         link = self.root / "bin/tailscale-link"
@@ -270,6 +305,7 @@ class DeploymentKeyTests(unittest.TestCase):
                 "app.__main__.run", return_value=0) as run:
             self.assertEqual(deployment_main(["--config", str(self.config)]), 0)
         passed = run.call_args.kwargs["human_access"]
+        self.assertIs(run.call_args.kwargs["human_access_unavailable"], False)
         # The symbolic link is resolved and its target is what runs.
         self.assertEqual(passed.tailscale_executable, self.executable.resolve())
 
@@ -655,7 +691,7 @@ class LauncherCompositionTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.settings = Settings(self.root, web_assets_dir=self.root / "web")
 
-    def run_launcher(self, human_access, **patches):
+    def run_launcher(self, human_access, *, unavailable=False, **patches):
         from types import SimpleNamespace
         from app.__main__ import run
         monitoring = SimpleNamespace(storage_configured=True)
@@ -665,7 +701,8 @@ class LauncherCompositionTests(unittest.TestCase):
                 patcher = patch(name, value)
                 patcher.start()
                 self.addCleanup(patcher.stop)
-            code = run(self.settings, monitoring, None, human_access=human_access)
+            code = run(self.settings, monitoring, None, human_access=human_access,
+                       human_access_unavailable=unavailable)
         return code, create, build
 
     def test_absent_or_disabled_section_builds_nothing(self):
@@ -730,6 +767,34 @@ class LauncherCompositionTests(unittest.TestCase):
         create.assert_called_once()
         self.assert_served_closed_with_alert(create, build, logs)
 
+    def test_an_unusable_executable_serves_closed_and_alerts(self):
+        """Issue #283 item 1: like a failed composition; nothing is built."""
+        from unittest.mock import MagicMock
+        build_human_access = MagicMock()
+        with self.assertLogs("app.__main__", level="ERROR") as logs:
+            code, create, build = self.run_launcher(
+                parse_human_access(section()), unavailable=True,
+                **{"app.auth.composition.build_human_access": build_human_access})
+        self.assertEqual(code, 0)
+        build_human_access.assert_not_called()
+        create.assert_called_once()
+        self.assert_served_closed_with_alert(create, build, logs)
+
+    def test_an_unrelated_create_app_error_propagates(self):
+        """Issue #283 item 2: only HumanAccessCompositionRefused is a refused
+        composition; any other TypeError (a bug) is not turned into a closed
+        start."""
+        from types import SimpleNamespace
+        from app.__main__ import run
+        with patch("app.auth.composition.build_human_access", return_value="composition"), patch(
+                "app.__main__.create_app", side_effect=TypeError("bug")) as create, patch(
+                "app.systemd.build_server") as build, self.assertRaises(TypeError) as raised:
+            run(self.settings, SimpleNamespace(storage_configured=True), None,
+                human_access=parse_human_access(section()))
+        self.assertEqual(str(raised.exception), "bug")
+        create.assert_called_once()
+        build.assert_not_called()
+
     def test_create_app_refusal_serves_closed_and_alerts(self):
         from types import SimpleNamespace
         from unittest.mock import MagicMock
@@ -739,7 +804,7 @@ class LauncherCompositionTests(unittest.TestCase):
         def create(*_arguments, **options):
             if "human_access" in options:
                 refusals.append(options)
-                raise TypeError("human access composition is invalid")
+                raise HumanAccessCompositionRefused()
             return "application"
 
         create_app_mock = MagicMock(side_effect=create)

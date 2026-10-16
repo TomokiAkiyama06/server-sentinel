@@ -1386,7 +1386,7 @@ notification per finding up to four per rolling hour, the ones over that cap
 batched into one notification once the hour allows (its own budget, outside
 the access budget; Owner decision 2026-10-16); at most four `human_access_fault` /
 `human_access_recovered` notifications per rolling hour, with a held-back
-episode reported later. They set `human_access_degraded` /
+episode reported later. Both rolling hours continue across a restart: the first running tick re-seeds them from the accepted (non-`pending`) notification rows of the last hour by their wall-clock age, ignoring a row stamped in the future, so a restored row counts for at most an hour after the restart (Issue #281 item 2). They set `human_access_degraded` /
 `credential_finding_degraded` (the latter for one day after the latest
 finding) and carry only the fixed kind. A finding committed before a restart
 whose notification had not been sent yet is recovered on the first running
@@ -2276,7 +2276,12 @@ with `/proc/net`, a bounded read-only `tailscale serve status --json`
 runner (fixed arguments, empty environment, 5-second timeout, 1 MiB output
 cap; any failure is an enumeration failure), `getaddrinfo` and sock_diag.
 A section that fails validation refuses startup with a value-free reason; a
-composition that cannot be built (`human_access_composition_failed`) keeps
+valid section whose Tailscale CLI fails the launcher's executable check at
+start does not (Issue #283): `--check` passes with a value-free
+`reason=executable` warning on stderr and the start is handled like a
+composition that cannot be built. Such a composition, including one
+`create_app` refuses with `HumanAccessCompositionRefused` (any other
+exception propagates), logs `human_access_composition_failed`, keeps
 every human path closed while recording and the integrity and
 recording-health checks keep running, and notifies the Owner immediately
 (`human_access_fault`, monitoring health degraded until a restart composes

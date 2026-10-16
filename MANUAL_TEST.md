@@ -2853,8 +2853,11 @@ by the Issue #6 synthetic policy model.
   a missing Serve mapping, an extra path or port, or a stopped `tailscaled`
   keeps it closed (generic denial on the shell `/`) and sends one
   `human_access_fault` notification, and that a missing or group-writable
-  `tailscale_executable` makes the release's check refuse to start with
-  `human access refused (reason=executable)`. Make the composition itself
+  `tailscale_executable` (Issue #283) lets the release's check pass with the
+  warning `human access stays closed (reason=executable)` on stderr, and the
+  service start and keep recording with every human path closed, log
+  `human_access_composition_failed`, send one `human_access_fault`
+  notification and report `human_access_degraded`. Make the composition itself
   fail at start (for example a session-binding key that is not the service
   account's own) and confirm the service keeps running and recording with
   every human path closed, logs `human_access_composition_failed`, sends one

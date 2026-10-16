@@ -748,11 +748,13 @@ in this private configuration.
   CLI of the `tailscaled` that serves this node. On every check the backend
   runs exactly `<tailscale_executable> serve status --json`, as the service
   account, with an empty environment, no stdin, a 5-second timeout and at
-  most 1 MiB of output; any failure keeps access closed. The release's
-  check refuses a path that is not a regular file owned by root (or the
+  most 1 MiB of output; any failure keeps access closed. At every start
+  the launcher accepts only a regular file owned by root (or the
   administrator) and not writable by group or others, in an
   administrator-controlled directory, and executable by the service
-  account; a symbolic link is resolved and its target checked. Nothing else
+  account; a symbolic link is resolved and its target checked. A path that
+  fails this is a change on the host, not an invalid section, so it does not
+  stop the service: see `executable` below. Nothing else
   is ever run: no `tailscale up`, `serve` change, `cert`, ACL/Grants change
   or administrative credential.
 - `proxy_listeners` (optional, default empty) and `proxy_owner`: when Serve
@@ -774,10 +776,29 @@ not start:
 ServerSentinel deployment validation failed: human access refused (reason=<word>)
 ```
 
-`<word>` is `setting` (an unknown or missing key, or an invalid value),
-`web_assets` (enabled without `"web_assets_directory"`) or `executable` (the
-Tailscale CLI path fails the checks above). It never names the hostname, an
-address or a path. If the composition itself cannot be built at start (for
+`<word>` is `setting` (an unknown or missing key, or an invalid value) or
+`web_assets` (enabled without `"web_assets_directory"`). It never names the
+hostname, an address or a path.
+
+A valid section whose `tailscale_executable` fails the checks above at start
+(the CLI was removed, replaced or its permissions changed) does not refuse
+the start, since that would also stop recording, the integrity and
+recording-health checks and the Owner notification (Issue #283). The check
+still passes, and it and the service print one value-free line on stderr (in
+the journal for `ExecStartPre` and the service; the installer's staging and
+rollback checks discard it):
+
+```text
+ServerSentinel deployment warning: human access stays closed (reason=executable); recording and monitoring start
+```
+
+The service then starts exactly as when the composition cannot be built
+(below): every human path closed, `human_access_composition_failed` logged,
+an immediate `human_access_fault` notification and degraded monitoring
+health until the CLI is fixed and the service restarted. Run the check as
+the service account after changing the CLI and look for this line.
+
+If the composition itself cannot be built at start (for
 example the session-binding key or its directory is not the service
 account's own, or the recording filesystem is missing, replaced or at the hard
 reserve), the service logs `human_access_composition_failed` and keeps every

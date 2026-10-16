@@ -555,9 +555,13 @@ access closed with `ISOLATION_UNSTATED`), the optional visible
 `proxy_listeners` with their `proxy_owner`, the absolute
 `tailscale_executable` and `require_device_bound` (default false). Refusals
 are `HumanAccessRefused` with one value-free reason (`setting`,
-`web_assets`, `executable`); enabled without `web_assets_directory` is
-refused, and the release's `--check` requires the CLI to be an
-administrator-controlled executable the service account can run.
+`web_assets`); enabled without `web_assets_directory` is refused. At every
+start the launcher (`app.deployment`) requires the CLI to be an
+administrator-controlled executable the service account can run; a valid
+section whose CLI fails that (`reason=executable`, a change on the host) does
+not refuse the start: `--check` passes with a value-free warning on stderr and
+the launcher calls `run(..., human_access_unavailable=True)`, which builds
+nothing and is handled like a failed composition below (Issue #283 item 1).
 `composition.build_human_access` then builds, with the production inputs,
 the check (`ProcNetListeners` over bounded `/proc/net` reads,
 `ServeStatusRoutes` over `ServeStatusCommand`, `GetaddrinfoResolver`,
@@ -575,8 +579,11 @@ cap; a failure to start, a timeout, more output, a non-zero exit or non-UTF-8
 text is a `ReservationEnumerationError`, so the check fails closed. The
 launcher (`app.__main__.run`) passes one `AccessFaultMonitor` as the check's
 `sink`, the ceremonies' `findings` and `MonitoringDependencies(access_faults=)`
-(Issue #232 item 4); any failure to compose (`HumanAccessUnavailable`, or
-`create_app` refusing it) logs `human_access_composition_failed`, latches the
+(Issue #232 item 4); any failure to compose (`HumanAccessUnavailable`,
+the unusable CLI above, or `create_app` refusing it with
+`HumanAccessCompositionRefused`, a `TypeError` subclass; any other exception
+from `create_app` propagates, Issue #283 item 2) logs
+`human_access_composition_failed`, latches the
 fault in that monitor (`AccessFaultMonitor.composition_failed`) and serves
 with `ClosedHumanSurface`, so the monitoring runtime notifies the Owner
 (`human_access_fault`) and keeps the health degraded until a restart composes
@@ -1022,6 +1029,7 @@ Access notifies on entering a fault, on a reason the episode had not reported
 and on recovery, never on every failing check; a fault that ended between two
 ticks is still reported, at most four access notifications go out per rolling
 hour, and an episode the budget held back is reported once it allows.
+Both rolling hours continue across a restart: the first running tick re-seeds them from the accepted (non-`pending`) notification rows of the last hour by their wall-clock age, ignoring a row stamped in the future, so a restored row counts for at most an hour after the restart (Issue #281 item 2).
 Credential findings do not share that budget, so access flapping cannot hold
 one back. Each finding notifies immediately with its own notification, up to
 four per rolling hour; only the ones over that cap are batched into one

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 
 from app.auth.access_config import HumanAccessDeployment, HumanAccessRefused, parse_human_access
 from app.cameras.uvc.config import LocalUvcConfiguration, parse_local_uvc
@@ -597,10 +598,22 @@ def main(arguments: list[str] | None = None) -> int:
             _load_web_assets(deployment.settings.web_assets_dir, code_root)
         # Issue #10: the Serve status runner executes the Tailscale CLI as
         # this account on every reservation check; check it as this account.
+        # The section itself is valid here, so a CLI that fails the check is
+        # a change on the host (removed, replaced, permissions changed), not
+        # a configuration error: refusing to start would also stop recording
+        # and the integrity and recording-health checks, and with them the
+        # Owner notification (Issue #283 item 1). The service starts with
+        # every human path closed instead, handled like a composition failure
+        # (immediate human_access_fault, degraded health), and the check and
+        # the launcher print the value-free reason for the operator.
         human_access = deployment.human_access
+        human_access_unavailable = None
         if human_access is not None and human_access.enabled:
-            human_access = replace(human_access, tailscale_executable=_tailscale_executable(
-                human_access.tailscale_executable))
+            try:
+                human_access = replace(human_access, tailscale_executable=_tailscale_executable(
+                    human_access.tailscale_executable))
+            except HumanAccessRefused as refused:
+                human_access_unavailable = refused.reason
     except CaptureCaSettingMissing:
         parser.exit(1, "ServerSentinel deployment validation failed: "
                        + CaptureCaSettingMissing.REASON + "\n")
@@ -615,12 +628,19 @@ def main(arguments: list[str] | None = None) -> int:
                        f"(reason={refused.reason})\n")
     except ConfigurationError:
         parser.exit(1, "ServerSentinel deployment validation failed\n")
+    if human_access_unavailable is not None:
+        # One value-free word, on stderr (the journal for ExecStartPre and
+        # the service); the check still passes so the unit starts.
+        sys.stderr.write("ServerSentinel deployment warning: human access stays closed "
+                         f"(reason={human_access_unavailable}); recording and monitoring "
+                         "start\n")
     if args.check:
         print("ServerSentinel deployment validation passed")
         return 0
     from app.__main__ import run
     return run(deployment.settings, deployment.monitoring, deployment.local_uvc,
-               human_access=human_access)
+               human_access=human_access,
+               human_access_unavailable=human_access_unavailable is not None)
 
 
 if __name__ == "__main__":

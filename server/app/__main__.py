@@ -3,11 +3,12 @@
 import logging
 
 from app.logging import Event, configure_logging
-from app.main import create_app
+from app.main import HumanAccessCompositionRefused, create_app
 from app.settings import ConfigurationError, Settings
 
 
-def run(settings: Settings, monitoring=None, local_uvc=None, *, human_access=None) -> int:
+def run(settings: Settings, monitoring=None, local_uvc=None, *, human_access=None,
+        human_access_unavailable: bool = False) -> int:
     """Serve the Main Server; `monitoring` comes from the deployment.
 
     Without a storage-configured monitoring section the mandatory startup/daily
@@ -21,8 +22,11 @@ def run(settings: Settings, monitoring=None, local_uvc=None, *, human_access=Non
     closed. Enabled, the production composition (`app.auth.composition`) is
     built with one `AccessFaultMonitor` as the reservation check's fault sink,
     the passkey ceremonies' finding sink and the monitoring runtime's
-    `access_faults` (Issue #232 item 4). If any part of it cannot be built, or
-    `create_app` refuses it, the value-free `human_access_composition_failed`
+    `access_faults` (Issue #232 item 4). If any part of it cannot be built,
+    `create_app` refuses it (`HumanAccessCompositionRefused`; any other
+    exception propagates, Issue #283 item 2), or the launcher already found
+    the host's Tailscale CLI unusable (`human_access_unavailable`, Issue #283
+    item 1), the value-free `human_access_composition_failed`
     event is logged and the service runs with every human path closed (never
     a partial surface) while that monitor, still handed to the monitoring
     runtime, notifies the Owner immediately (`human_access_fault`) and keeps
@@ -56,23 +60,29 @@ def run(settings: Settings, monitoring=None, local_uvc=None, *, human_access=Non
         faults = AccessFaultMonitor()
         database = Database(settings.database_path)
         closed = dict(monitoring_dependencies=MonitoringDependencies(access_faults=faults))
-        try:
-            composed = dict(
-                database=database,
-                human_access=build_human_access(human_access, settings, database, faults=faults,
-                                                monitoring=monitoring),
-                **closed,
-            )
-        except HumanAccessUnavailable:
+        if human_access_unavailable:
+            # Issue #283 item 1: the section is valid but the host's
+            # Tailscale CLI failed the launcher's check; nothing is built.
             composed = None
+        else:
+            try:
+                composed = dict(
+                    database=database,
+                    human_access=build_human_access(human_access, settings, database,
+                                                    faults=faults, monitoring=monitoring),
+                    **closed,
+                )
+            except HumanAccessUnavailable:
+                composed = None
     application = None
     if composed is not None:
         try:
             application = create_app(settings, monitoring=monitoring, local_uvc=local_uvc,
                                      **composed)
-        except TypeError:
+        except HumanAccessCompositionRefused:
             # create_app refused the composition (for example a Web build or
             # fault monitor that does not match): handled like a failed build.
+            # Any other error, a bug included, propagates (Issue #283 item 2).
             if not composed:
                 raise
     if application is None:
