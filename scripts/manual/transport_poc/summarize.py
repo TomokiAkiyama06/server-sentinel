@@ -946,15 +946,27 @@ class RunSummary:
         loss_timeout = self._loss_timeout_ns()
         if plan is None or loss_timeout is None:
             return None
-        required = 0
-        for item in plan.get("proxy", []) + plan.get("actions", []):
-            action, length = item[1], (item[2] if len(item) > 2 else 0)
-            if action in ("reset", "restart_receiver"):
-                required += 1
-            elif (action in ("blackhole", "sigstop")
-                  and length * SECOND >= loss_timeout + LOSS_MARGIN_NS):
-                required += 1
-        return required
+        return sum(_must_disconnect(item, loss_timeout)
+                   for item in plan.get("proxy", []) + plan.get("actions", []))
+
+    def _required_main_windows(self):
+        """The recorded Main-side windows after which the Agent must have
+        reconnected (the ``_required_disconnects`` rule), in time order.
+
+        The plan's Main actions are paired with the recorded windows in
+        order; None when that pairing or the loss timeout is not on record.
+        """
+        plan = self.plan()
+        loss_timeout = self._loss_timeout_ns()
+        if plan is None or loss_timeout is None:
+            return None
+        planned = [item for item in plan.get("actions", [])
+                   if item[1] in ("sigstop", "restart_receiver")]
+        recorded = sorted(self._main_windows())
+        if [item[1] for item in planned] != [kind for *_, kind in recorded]:
+            return None
+        return [(start, end) for (start, end, _origin, _kind), item in zip(recorded, planned)
+                if _must_disconnect(item, loss_timeout)]
 
     def g4(self, single_host):
         if self.scenario not in DISCONNECT_SCENARIOS:
@@ -1037,15 +1049,17 @@ class RunSummary:
 
         Only windows matched to a live, lost session
         (``_main_session_matches``) are measured. Returns ``unmeasured`` when
-        the records carry no session nonces or the chosen connection has no
-        ``connected`` record (older records), ``fail`` when a matched window
-        has no later accepted connection, else None (the caller checks the
-        required count).
+        the matching is not possible (no session nonces or echo evidence) or
+        the chosen connection has no ``connected`` record (older records),
+        ``fail`` when a matched window has no later accepted connection --
+        also without the matching when a required window has no later HELLO
+        at all (``_main_reconnect_missing``) -- else None (the caller checks
+        the required count).
         """
         matches = self._main_session_matches()
         if matches is None:
             self.metrics.update(main_session_correlation=False)
-            return "unmeasured"
+            return "fail" if self._main_reconnect_missing() else "unmeasured"
         closed = {}
         for item in _kind(self.sender, "closed"):
             if _is_int(item.get("session")) and item.get("reason") != "shutdown":
@@ -1082,6 +1096,32 @@ class RunSummary:
                 return "unmeasured"  # inconsistent Agent records
             times.append(greeted - end + agent_part)
         return None
+
+    def _main_reconnect_missing(self):
+        """Two hosts, without the session matching: a failure the records
+        show anyway (#237).
+
+        True when a Main-side window after which the Agent must have
+        reconnected (``_required_main_windows``) has no Main ``session_hello``
+        at or after its end, each greeting used for one window only. Any
+        reconnect is a new connection whose HELLO Main receives after the
+        window end, so none means none at all; matched or not, that window
+        fails G4 (no reconnect, or a scheduled disconnect with no reconnect
+        episode). Only a count of Main-clock records: a reconnect that is
+        present never turns this into a pass.
+        """
+        required = self._required_main_windows()
+        hellos = sorted(item["t_ns"] for item in _kind(self.receiver, "session_hello"))
+        if not required or not hellos:
+            return False  # nothing required, or records from before ``session_hello``
+        used = set()
+        for _start, end in required:
+            hello = next((i for i, t in enumerate(hellos) if i not in used and t >= end), None)
+            if hello is None:
+                self.metrics.update(reconnect_missing=True)
+                return True
+            used.add(hello)
+        return False
 
     def _main_session_matches(self):
         """Two hosts: tie each Main-side stop/restart to an Agent loss episode.
@@ -1324,8 +1364,13 @@ class RunSummary:
             # its detection. Delay: that episode's ``idle_ns`` (Agent clock).
             matches = self._main_session_matches()
             if matches is None:
-                self.metrics.update(main_session_correlation=False)
-                return "unmeasured" if episodes else "fail"
+                # A failure the records show without the matching still
+                # fails (#237): each window needs its own episode, and every
+                # episode's delay is checked, matched or not.
+                self.metrics.update(main_session_correlation=False, main_outages=len(windows),
+                                    agent_loss_episodes=len(episodes))
+                late = any(_is_int(d) and d > DETECTION_NS for d in delays)
+                return "fail" if len(episodes) < len(windows) or late else "unmeasured"
             first = {}
             for loss in sorted(losses, key=lambda item: item["t_ns"]):
                 first.setdefault(loss["session"], loss)
@@ -1565,6 +1610,16 @@ class RunSummary:
                             inputs_consistent=self.inputs_consistent,
                             exercised_sources=self.exercised_sources())
         return self
+
+
+def _must_disconnect(item, loss_timeout):
+    """Whether a scheduled impairment ``[at, action, length?]`` must make the
+    Agent drop the connection (G4): every reset / restart, and a silent
+    window at least the Agent loss timeout + ``LOSS_MARGIN_NS`` long."""
+    action, length = item[1], (item[2] if len(item) > 2 else 0)
+    if action in ("reset", "restart_receiver"):
+        return True
+    return action in ("blackhole", "sigstop") and length * SECOND >= loss_timeout + LOSS_MARGIN_NS
 
 
 def _is_int(value):
