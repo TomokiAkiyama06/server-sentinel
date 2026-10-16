@@ -341,6 +341,56 @@ For each tested camera:
       （同記録 手順 4: 逆順再列挙 + runtime 再起動。host 再起動は未実施）
 - [ ] no unnecessary privileged container is required.
 
+#### Issue #11 / D3 local camera admin CLI on the Main Server (pending; requires the Owner)
+
+Verified only with a temporary SQLite database, a pseudo-terminal, a fake
+device discovery with invented USB ids/serials/paths and a fake `/proc` tree
+(`server/tests/test_uvc_admin_cli.py`; one test checks the real `/proc` of the
+CI container with a child process holding a temporary file). The command has
+not been run on the real Main Server, against a deployment database or with a
+real camera. These steps change the real registry and approvals and restart
+the production service, so they need the Owner present
+(`server/docs/DEPLOYMENT.md`, "Creating sources and approving cameras
+locally"). Record serials, ports and device paths only in the private local
+record.
+
+- [ ] with the service running, run `create-source` and `approve` as the
+  service account: each refuses `service_running` before asking for the
+  confirmation and changes nothing; `candidates` and `sources` still work;
+- [ ] stop the service; run `candidates` with both C960 connected: two lines,
+  each a `cam-` label, `usb=<vendor>:<product>`, `serial=present`, the
+  advertised formats and `approved_for=` the source currently approved (or
+  `-`); with stdout and stderr redirected to a file, confirm neither holds a
+  serial, `/dev/video*`, a by-id name or a USB port; run it twice and confirm
+  the labels are the same, then re-plug one camera and confirm only its
+  label changed;
+- [ ] `create-source --name <name> --profile 1920x1080@30/MJPG`, type
+  `CREATE`: stdout holds only the new UUID and the next steps, and the audit
+  log holds one `create_source` record (actor `owner`) with that UUID; type
+  anything else: `owner_confirmation_declined`, nothing changes; with four
+  enabled sources a fifth refuses `active_source_limit_reached`;
+- [ ] add the UUID to `local_uvc.source_ids`, `--check`, then `approve <uuid>
+  <label>`, type `APPROVE`: one `approve_camera` record; `sources` shows
+  `approval=approved configured=yes`; start the service and confirm the
+  source goes `degraded` then `online` with that camera (MANUAL_TEST §A
+  runtime procedure steps 4–6), and that the other camera's source is
+  untouched;
+- [ ] approve the camera already held by another enabled source:
+  `camera_approved_for_another_source`; an unknown or stale label (after a
+  re-plug): `candidate_not_found`; a source whose profile's pixel format the
+  camera does not advertise: `camera_format_unsupported`;
+- [ ] when a camera without a serial or two cameras sharing one serial are
+  available: `candidates` shows `serial=absent` / `serial=shared` and
+  `approve` refuses `camera_without_serial` / `camera_serial_not_unique`
+  (until then accepted with the mock, Owner decision 2026-10-11 for §A
+  step 7);
+- [ ] run as root, as another account and without a controlling terminal
+  (`systemd-run`, `cron`): `run_as_service_account` /
+  `controlling_terminal_required`, each changing nothing;
+- [ ] with the service inside a VM/LXD guest (Owner decision D2), confirm the
+  command is run inside that guest; from the host it cannot see the guest's
+  service (documented limit).
+
 #### 実機記録 2026-09-30（Main Server 候補、serial 付き同型 UVC × 2）
 
 ```text

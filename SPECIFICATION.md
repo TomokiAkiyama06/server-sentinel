@@ -264,6 +264,20 @@ evidence, so each twin can be mapped to its own source); a
 conflicting approval is refused, and a pre-existing duplicate makes every
 conflicting source `manual_intervention_required` rather than letting startup
 order decide.
+Until the Owner Web UI exists, `local_uvc` sources are created and cameras
+approved with the local command `python -m app.cameras.uvc.admin_cli
+sources|candidates|create-source|approve --config <deployment.json>` (Owner
+decision D3, 2026-10-16): the `bootstrap_cli` trust model (service account,
+never root, the pinned existing database of exactly the current schema, no
+WebAuthn step-up), one confirmation word read from `/dev/tty` per audited
+`OwnerAdministration.create_source` / `approve_uvc` operation (actor `owner`,
+the source's logical UUID only), and refusal (`service_running`) while any
+other process of the service account holds the application database open; the
+change applies when the service starts. Cameras are listed only by a hashed
+live-instance label, USB vendor:product ids, serial `present`/`absent`/`shared`
+and formats, never a serial or path. An offline approval is refused for a
+camera without a serial or whose serial is not unique, because stored
+evidence could not identify it after the restart.
 Unsupported multi-planar capture or codec/bitrate controls fail explicitly.
 An open capture that delivers no frame for the configured stall window
 (`frame_stall_seconds`, never shorter than 10 negotiated frame intervals) is

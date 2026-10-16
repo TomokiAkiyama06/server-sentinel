@@ -307,6 +307,101 @@ startup and reported, never silently skipped. Without the object the backend
 logs `local_uvc_unconfigured` and keeps an explicit `unconfigured` local capture
 state; remote-agent-only deployments need no `local_uvc` object.
 
+#### Creating sources and approving cameras locally (Issue #11, Owner decision D3)
+
+Until the Owner Web UI exists, `local_uvc` sources are created and their
+cameras approved with a local command on the Main Server
+(`python -m app.cameras.uvc.admin_cli`). The trust model is the one of the
+Owner bootstrap command below: run it **as the service account**, from an
+interactive SSH or console session of an administrator, with the installed
+release's interpreter, never as root or from a checkout. There is no WebAuthn
+step-up; each change needs a confirmation word typed on the controlling
+terminal (`/dev/tty`), and that confirmation authorizes exactly one audited
+Owner operation: the change and its audit record (actor `owner`,
+`create_source` / `approve_camera`, target the source's logical UUID only)
+commit in one transaction. `--config` is the deployment configuration the
+service runs with; the database is that deployment's existing one, of exactly
+this release's schema (never created or migrated).
+
+The service reads its sources and approvals when it starts, so **stop it
+first**: `create-source` and `approve` refuse while it runs
+(`service_running`). The running service is detected as any other process of
+the service account that holds the application database open (every Main
+process keeps a descriptor on it for its whole lifetime): no camera is probed
+for that, and a crash leaves nothing behind that would block the command. A
+same-account process whose descriptors cannot be read refuses the command
+(`service_state_unavailable`). A process in another PID namespace (for
+example the service inside a VM/LXD guest while the command runs on the host)
+or hidden by a `hidepid` `/proc` cannot be seen, so run the command **inside
+the environment the service runs in**. The check runs before the confirmation
+and again inside the final transaction; a service started within that last
+transaction is not refused.
+
+```sh
+cd /opt/server-sentinel-main/current
+sudo systemctl stop server-sentinel.service
+# 1. create a source (repeat for up to 4); prints its UUID
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  create-source --config /etc/server-sentinel/deployment.json \
+  --name "<display name>" --profile 1920x1080@30/MJPG
+#    prints: source created: source_id=<uuid>
+# 2. add that UUID to "local_uvc": {"source_ids": [...]} in the deployment
+#    configuration and run --check
+# 3. list the connected cameras by label, and the sources
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  candidates --config /etc/server-sentinel/deployment.json
+#    prints: candidate cam-<10 hex> usb=<vendor>:<product> serial=present formats=MJPG,YUYV approved_for=-
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  sources --config /etc/server-sentinel/deployment.json
+# 4. approve one camera for one source (type APPROVE on the terminal)
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  approve --config /etc/server-sentinel/deployment.json <source uuid> cam-<10 hex>
+sudo systemctl start server-sentinel.service
+```
+
+- `create-source` creates an **enabled** `local_uvc` source with that
+  explicit capture profile (`WIDTHxHEIGHT@FPS/FOURCC`). The registry refuses
+  one beyond the active-source limit (`active_source_limit_reached`; 1 to 4,
+  enabled sources of every type count). The source does nothing until its
+  UUID is listed in `local_uvc.source_ids` and a camera is approved for it.
+- `candidates` (read-only, allowed while the service runs; it opens each
+  video node read-only for the same capability query the service's discovery
+  uses) names each connected USB video-capture camera only by a short hashed
+  label of its current device instance, its USB vendor:product ids, whether
+  it reports a serial (`present`, `absent`, or `shared` when another connected
+  camera reports the same one), its advertised pixel formats and the source
+  whose approval holds it. It never prints a serial, `/dev` path, by-id name
+  or USB port. A label stays the same while the camera stays plugged in and
+  changes when it is re-plugged or the host reboots: list again then.
+  `sources` prints each `local_uvc` source's UUID, enabled state, approval
+  state (`approved`, `approval_required`, `none`), whether the deployment
+  lists it, its profile and its name.
+- `approve` rescans and binds exactly that camera. It refuses a camera without
+  a serial (`camera_without_serial`) and one whose serial is not unique
+  (`camera_serial_not_unique`): stored evidence cannot tell such a camera from
+  an identical one, so after the restart the service would put the source in
+  `manual_intervention_required` anyway; such a camera needs a live Owner
+  approval on the running service (not available yet). It also refuses a
+  camera already approved for another enabled source
+  (`camera_approved_for_another_source`), one that does not advertise the
+  source's pixel format (`camera_format_unsupported`), a scan with a device
+  it could not inspect (`camera_scan_incomplete`), an unknown label
+  (`candidate_not_found`), a disabled or missing source, a source without a
+  complete, supported capture profile (`source_profile_unusable`; the worker
+  would never open the camera), and a camera that changed between the
+  selection and the audited rescan (`candidate_unavailable`, recorded
+  `failed`; a serial that became shared meanwhile is
+  `camera_serial_not_unique`, recorded `failed`). Approving clears the
+  active-session marker a crashed service left. It clears a
+  `manual_intervention_required` latch only by binding a camera this command
+  accepts (a unique serial, not one the source latched as ambiguous); an
+  ambiguity latch on a camera without a serial or with a shared serial cannot
+  be cleared with this command and needs the live Owner approval.
+- Exit status `0` done, `2` refused (a fixed word on stderr).
+  `committed_verification_failed` means the change and its audit record were
+  committed but re-verifying the pinned database afterwards failed: run
+  `sources` and investigate the state directory if the change is missing.
+
 ### Detection section (optional; inference stays unavailable without it)
 
 The optional `detection` object binds reviewed detectors to sources. Values
