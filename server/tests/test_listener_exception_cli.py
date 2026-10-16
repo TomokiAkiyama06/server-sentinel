@@ -23,7 +23,7 @@ from app.audit.store import AuditStore
 from app.auth import reservation_cli
 from app.auth.access_config import parse_human_access
 from app.auth.reservation import (
-    AddressFamily, BindScope, CheckKind, ListenerException, MAX_LISTENER_EXCEPTIONS, TransportProtocol,
+    AddressFamily, BindScope, CheckKind, ListenerException, MAX_LISTENER_EXCEPTIONS, MAX_UID, TransportProtocol,
 )
 from app.auth.reservation_store import (
     RESERVATION_LISTENER_EXCEPTIONS_ID, STORE_KEY, ListenerExceptionStore, decode,
@@ -385,6 +385,13 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(reservation_cli.parse_exception(SSH_ARG), SSH)
         self.assertEqual(reservation_cli.parse_exception("uid=0,unit=ssh.socket,port=22,protocol=tcp"), SSH)
         self.assertEqual(reservation_cli.parse_exception(SSH_ARG + ",family=any,scope=wildcard"), SSH)
+        # The longest valid exception (250-character unit stem, largest uid)
+        # round-trips too: what ``show`` prints, ``set`` accepts.
+        longest = ListenerException(65535, TransportProtocol.UDP, AddressFamily.IPV4,
+                                    unit="u" * 250 + ".service", uid=MAX_UID)
+        text = reservation_cli.format_exception(longest)
+        self.assertLessEqual(len(text), reservation_cli.MAX_ARGUMENT_LENGTH)
+        self.assertEqual(reservation_cli.parse_exception(text), longest)
 
     def test_non_string_or_empty_is_refused(self):
         for value in (None, 22, "", ",", "="):

@@ -111,7 +111,10 @@ PROG = "python -m app.auth.reservation_cli"
 CHANGE_WORD = "CHANGE"
 RESTART_NOTE = ("the running service applies this only after 'systemctl restart server-sentinel.service'; "
                 "until then it keeps the set it loaded at startup")
-MAX_ARGUMENT_LENGTH = 320
+# Above the longest canonical form (a 250-character unit stem with
+# ``.service``, uid ``MAX_UID``: 329 characters), so every exception ``show``
+# prints is accepted again by ``set``.
+MAX_ARGUMENT_LENGTH = 384
 _FIELDS = ("scope", "protocol", "port", "family", "unit", "uid")
 _REQUIRED = frozenset({"protocol", "port", "unit", "uid"})
 _NUMBER = re.compile(r"0|[1-9][0-9]{0,9}")
