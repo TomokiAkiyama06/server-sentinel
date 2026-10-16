@@ -265,7 +265,15 @@ source; the worker still closes its descriptor and releases its session when
 it returns.
 `LocalUvcRuntime.reapprove()` stops the one source's worker, runs the audited
 `OwnerAdministration.approve_uvc()`, and restarts the worker whether the
-ceremony committed or was refused. Health transitions go to a bounded
+ceremony committed or was refused. With the service stopped, the local
+command `admin_cli.py` (Owner decision D3; `server/docs/DEPLOYMENT.md`,
+"Creating sources and approving cameras locally") creates `local_uvc`
+sources through `OwnerAdministration.create_source()` and approves a camera
+through the same `approve_uvc()` boundary, one typed terminal confirmation
+per audited operation. It lists cameras only by a hashed live-instance label
+and coarse facts (USB ids, serial present/absent/shared, formats), never a
+serial or path, and refuses cameras whose stored evidence could not identify
+them after the restart (no serial, or a serial that is not unique). Health transitions go to a bounded
 in-memory buffer, an optional injected sink, and a rate-limited value-free log
 event (`local_uvc_source_health_changed`); durable timeline/audit ingestion of
 these camera-health events is a follow-up. The optional sink never runs on a
