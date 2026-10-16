@@ -85,11 +85,59 @@ const storageFixture = (state, available_bytes = 21_474_836_480, faults = false)
   notification_delivery_failed: faults, notification_log_failed: faults,
 });
 let cases = 0;
+// Live view (#205 CP-5) against synthetic answers shaped like the CP-4 routes.
+const liveSources = ['00000000-0000-4000-8000-00000000a001', '00000000-0000-4000-8000-00000000a002'];
+const liveSession = '00000000-0000-4000-8000-00000000b001';
+const liveCsrf = `${'A'.repeat(42)}b`;
+const header = (headers, name) => Object.entries(headers).find(([key]) => key.toLowerCase() === name)?.[1];
+/** A generated solid-colour JPEG, made by the browser itself: no media fixture. */
+async function syntheticJpeg() {
+  const page = await pageFor(browser, sizes[0]);
+  try {
+    return Buffer.from(await page.evaluate(`(async () => {
+      const canvas = new OffscreenCanvas(32, 18);
+      const context = canvas.getContext('2d');
+      context.fillStyle = '#3a6070';
+      context.fillRect(0, 0, 32, 18);
+      const bytes = new Uint8Array(await (await canvas.convertToBlob({ type: 'image/jpeg' })).arrayBuffer());
+      let text = '';
+      for (const byte of bytes) text += String.fromCharCode(byte);
+      return btoa(text);
+    })()`), 'base64');
+  } finally { await page.close(); }
+}
+function liveApi(permissions, log, jpeg) {
+  let sequence = 0;
+  return (url, request) => {
+    const key = `${request.method} ${url.pathname}`;
+    log.push({ key, search: url.search, headers: request.headers, body: request.postData ?? '' });
+    if (key === 'GET /api/session') {
+      return [JSON.stringify({ csrf: liveCsrf, role: 'invited_user', permissions }), 'application/json'];
+    }
+    if (key === 'POST /api/auth/sign-out') return ['', 'text/plain', 204];
+    if (!permissions.includes('live:view')) return null;
+    if (key === 'GET /api/live/sources') {
+      return [JSON.stringify({ sources: liveSources.map((id, index) => ({ id, name: `生成カメラ ${index + 1}`,
+        health: index ? 'offline' : 'online', device_path: 'synthetic-not-rendered' })) }), 'application/json'];
+    }
+    if (key === 'POST /api/live/sessions') return [JSON.stringify({ session_id: liveSession }), 'application/json'];
+    if (key === `GET /api/live/sessions/${liveSession}/frame`) {
+      sequence += 1;
+      return [jpeg, 'image/jpeg', 200, [{ name: 'X-Frame-Sequence', value: String(sequence) }]];
+    }
+    if (key === `POST /api/live/sessions/${liveSession}/close`) return ['', 'text/plain', 204];
+    return null;
+  };
+}
+async function until(check) {
+  for (let attempt = 0; attempt < 100 && !check(); attempt++) await delay(50);
+  assert.ok(check(), 'expected request was not observed');
+}
 
 async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false,
   sourceStatus = 200, initialViewFailures = false, positiveControl = false, recordings = 3, recordingStatus = 200,
   storageState = 'STORAGE_PRESSURE', storageAvailable, storageFaults = false, storageStatus = 200,
-  storageDelay = 0, mutationStatus = 200 } = {}, assertions) {
+  storageDelay = 0, mutationStatus = 200, api = null } = {}, assertions) {
   const page = await pageFor(browser, viewport);
   // Chrome applies bypass when parsing a document's policy. Set it before
   // navigation, only for the dedicated interception positive control.
@@ -115,6 +163,16 @@ async function scenario(viewport, { production = false, status = 200, session = 
     async function fulfill(body, contentType, responseCode = 200, headers = []) {
       await page.command('Fetch.fulfillRequest', { requestId, responseCode,
         responseHeaders: [{ name: 'Content-Type', value: contentType }, ...headers], body: Buffer.from(body).toString('base64') });
+    }
+    // Production bundle (src/shared/services.ts) against synthetic answers in
+    // the shape of the Main Server routes; by default every one is the
+    // server's generic, empty 404.
+    if (production && url.origin === origin && url.pathname.startsWith('/api/')) {
+      const answer = api?.(url, request) ?? ['', 'text/plain', 404];
+      await fulfill(...answer); return;
+    }
+    if (production && api && url.origin === origin && url.pathname === '/' && request.method === 'GET') {
+      await fulfill('<!doctype html><title>s</title><link rel="icon" href="data:,">', 'text/html'); return;
     }
     if (url.origin !== origin || request.method !== 'GET') {
       unexpected.push('unexpected origin or method');
@@ -199,7 +257,8 @@ try {
         await page.heading('アクセスの確認が必要です');
         assert.equal(await page.evaluate('document.documentElement.lang'), 'ja');
         assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 10);
-        assert.equal(requests.some(path => path.startsWith('/api/')), false);
+        // The only request: the session check, refused with the generic 404.
+        assert.deepEqual(requests.filter(path => path.startsWith('/api/')), ['/api/session']);
       });
       await scenario(viewport, { status: 500, optIn }, async page => {
         await page.heading('接続を確認できません');
@@ -589,6 +648,55 @@ try {
       });
     }
     process.stdout.write(`${name}: responsive synthetic UI and request interception passed\n`);
+  }
+  const jpeg = await syntheticJpeg();
+  for (const { name, ...viewport } of [sizes[0], sizes[2]]) {
+    const log = [];
+    await scenario(viewport, { production: true, api: liveApi(['live:view'], log, jpeg) }, async page => {
+      await page.heading('概要');
+      assert.equal(await page.enabled('録画'), false);
+      assert.equal(await page.enabled('タイムライン'), false);
+      await page.click('ライブ');
+      await page.wait("document.querySelector('[data-live-status]')?.dataset.liveStatus === 'live'");
+      await page.wait("(() => { const c = document.querySelector('.live-frame canvas'); return Boolean(c) && !c.hidden && c.width === 32 && c.height === 18; })()");
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-live-source]').length"), 2);
+      assert.doesNotMatch(await page.evaluate('document.body.innerText'), /synthetic-not-rendered/);
+      // Current picture only: no link, download, media element or history.
+      assert.equal(await page.evaluate("document.querySelectorAll('#main a[href], [download], video, img, iframe, source').length"), 0);
+      const open = log.find(entry => entry.key === 'POST /api/live/sessions');
+      assert.equal(header(open.headers, 'x-csrf-token'), liveCsrf);
+      assert.equal(header(open.headers, 'origin'), origin);
+      assert.equal(header(open.headers, 'referer'), undefined);
+      assert.equal(open.body, JSON.stringify({ source_id: liveSources[0] }));
+      const frames = () => log.filter(entry => entry.key.endsWith('/frame'));
+      await until(() => frames().length >= 3);
+      assert.deepEqual(frames().slice(0, 3).map(entry => entry.search), ['?after=0', '?after=1', '?after=2']);
+      for (const entry of frames()) assert.equal(header(entry.headers, 'x-csrf-token'), undefined);
+      const before = frames().length;
+      await delay(1000);
+      assert.ok(frames().length - before <= 7, 'frame pulls stay near 5 per second');
+      // Leaving the screen closes the viewer session with the CSRF token.
+      await page.click('概要');
+      await until(() => log.some(entry => entry.key.endsWith('/close')));
+      assert.equal(header(log.find(entry => entry.key.endsWith('/close')).headers, 'x-csrf-token'), liveCsrf);
+      const closed = frames().length;
+      await delay(500);
+      assert.equal(frames().length, closed, 'no frame is pulled after the close');
+      assert.equal(log.some(entry => entry.key.startsWith('GET /api/recordings') || entry.key.includes('timeline')), false);
+      // Sign-out: the caller's own session, then the sign-in shell.
+      await page.evaluate("document.querySelector('.sign-out').click()");
+      await until(() => log.some(entry => entry.key === 'POST /api/auth/sign-out'));
+      assert.equal(header(log.find(entry => entry.key === 'POST /api/auth/sign-out').headers, 'x-csrf-token'), liveCsrf);
+      await page.wait("location.pathname === '/'");
+    });
+    const recordingsOnly = [];
+    await scenario(viewport, { production: true, api: liveApi(['recordings:view'], recordingsOnly, jpeg) }, async page => {
+      await page.heading('概要');
+      assert.equal(await page.enabled('ライブ'), false);
+      await delay(200);
+      assert.deepEqual(recordingsOnly.map(entry => entry.key), ['GET /api/session']);
+    });
+    process.stdout.write(`${name}: production live view against synthetic route answers passed\n`);
   }
   await scenario({ width: 390, height: 844 }, { production: true, positiveControl: true }, page => page.heading('アクセスの確認が必要です'));
   process.stdout.write(`${cases} browser scenarios passed; viewport emulation is not physical phone/Mac acceptance.\n`);

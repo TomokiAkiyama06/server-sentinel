@@ -1447,6 +1447,21 @@ Local/private path:
 - [ ] adaptive quality works;
 - [ ] one bad source does not hide health of others.
 
+### Issue #205 CP-5 Web live screen (pending; needs the CP-4 routes)
+
+Mock-verified only: `web/tests/live.test.mjs` and `web/tests/browser.mjs`
+(headless Chrome, synthetic route answers, a generated JPEG). Not yet run
+against the real Main Server routes, a real camera or a physical device.
+
+- [ ] phone (Safari) and Mac/desktop browser over the reserved HTTPS origin: Live shows each permitted source and a moving picture from one `local_uvc` source;
+- [ ] a `live:view`-only viewer sees Live and no recording, timeline or history; a `recordings:view`-only viewer has Live disabled and the browser sends no `/api/live/` request;
+- [ ] the picture is drawn without a CSP violation report (developer console) on Safari and Chrome;
+- [ ] putting the tab in the background or locking the phone closes the viewer session (server viewer count drops) and returns it on return;
+- [ ] unplugging the camera marks the picture not current or ends the view; it never keeps showing an old frame as current;
+- [ ] revoking `live:view` or the person while watching ends the view and clears the picture;
+- [ ] sign-out from the dashboard returns to the sign-in shell and the old cookie no longer opens `/app/`;
+- [ ] no download, save or export control is offered (browser capture of the screen remains possible and is not claimed otherwise).
+
 Demand-driven processing:
 
 - [ ] no-viewer state does not perform unnecessary viewer-only transcoding;

@@ -77,8 +77,35 @@ export interface StorageSummary {
   notification_log_failed: boolean;
 }
 
+/** A Camera Source a `live:view` principal may watch (`GET /api/live/sources`).
+ *  Current state only: no history, device path, serial or node detail. */
+export interface LiveSource {
+  id: string;
+  name: string;
+  /** Absent when the server does not report it; never guessed as online. */
+  health: CameraHealth | null;
+}
+
+/** One frame of the interim frame-pull transport (#205 CP-4/CP-5). */
+export interface LiveFrame {
+  /** Strictly increasing per viewer session (`X-Frame-Sequence`). */
+  sequence: number;
+  /** A JPEG body; decoded only into a canvas, never offered as a file. */
+  data: Blob;
+}
+
 export interface DashboardServices {
   loadSession(signal: AbortSignal): Promise<Session>;
+  /** End the caller's own session (`POST /api/auth/sign-out`, CSRF). */
+  signOut?(signal: AbortSignal): Promise<void>;
+  /** Live view (`live:view`; the server repeats every check). A refusal of
+   *  any of these rejects with `ApiError('unauthorized')`. */
+  loadLiveSources?(signal: AbortSignal): Promise<readonly LiveSource[]>;
+  openLiveSession?(sourceId: string, signal: AbortSignal): Promise<string>;
+  /** `null`: no frame newer than `after` yet (`204`). */
+  readLiveFrame?(sessionId: string, after: number, signal: AbortSignal): Promise<LiveFrame | null>;
+  /** Best effort and fire-and-forget: it must also work while the page unloads. */
+  closeLiveSession?(sessionId: string): void;
   loadSources?(signal: AbortSignal): Promise<readonly CameraSourceSummary[]>;
   loadTimeline?(signal: AbortSignal, after?: TimelineCursor | null): Promise<TimelinePage>;
   loadPresence?(signal: AbortSignal): Promise<PresenceReport>;
