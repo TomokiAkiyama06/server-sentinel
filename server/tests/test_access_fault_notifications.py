@@ -11,9 +11,11 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import os
 from unittest import TestCase
 from unittest.mock import patch
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from app.auth.human_surface import (
     AUTHENTICATION_OPTIONS_PATH, AUTHENTICATION_PATH, HumanAccess, HumanAccessConfiguration,
@@ -24,6 +26,9 @@ from app.auth.reservation import (
     DAILY_SECONDS, RETRY_WHILE_CLOSED_SECONDS, CheckKind, Reason, ReservationFault,
 )
 from app.main import create_app
+from app.media.recording.model import Limits
+from app.monitoring.config import MonitoringConfiguration, RecordingFilesystem
+from app.storage.policy import StorageLimits
 from app.monitoring.access import AccessFaultMonitor
 from app.monitoring.runtime import MonitoringDependencies, RuntimeState
 from app.notifications.service import NotificationKind, NotificationService
@@ -33,7 +38,7 @@ from tests.test_hostname_reservation import HOST, NOW, checker
 from tests.test_human_surface import (
     EXPOSED, ORIGIN, HumanSurfaceFixture, call, payload, status,
 )
-from tests.test_monitoring_runtime import RuntimeFixture
+from tests.test_monitoring_runtime import RECORDING_LIMITS, STORAGE_LIMITS, RuntimeFixture
 from tests.test_storage_notifications import Transport, drain, endpoint
 
 
@@ -228,6 +233,36 @@ class CredentialFindingTests(MonitoredAccessFixture):
 
 
 class CompositionTests(MonitoredAccessFixture):
+    def monitoring(self):
+        """A storage-configured monitoring section; the runtime is never started."""
+        recordings = self.temporary / "recordings"
+        recordings.mkdir(mode=0o700, exist_ok=True)
+        device = recordings.stat().st_dev
+        filesystem = RecordingFilesystem(
+            recordings, "00000000-1111-2222-3333-444444444444",
+            (os.major(device), os.minor(device)), recordings.parent,
+            lambda uuid: device, lambda path: True)
+        return MonitoringConfiguration(
+            ZoneInfo("UTC"), storage_limits=StorageLimits(**STORAGE_LIMITS),
+            recording_limits=Limits(**RECORDING_LIMITS), recording_filesystem=filesystem)
+
+    async def test_a_monitor_without_the_monitoring_runtime_is_refused(self):
+        """Codex PR #271 (P2): nothing would drain it, so faults would be lost."""
+        monitor = AccessFaultMonitor()
+        check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker, sink=monitor)
+        access = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets,
+                             store=self.store, reservation=check,
+                             ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=check,
+                                                          clock=self.ceremony_clock, findings=monitor))
+        for monitoring in (None, MonitoringConfiguration(ZoneInfo("UTC"))):
+            for human_access in (access, None):
+                with self.subTest(monitoring=monitoring, human_access=human_access), \
+                        self.assertRaises(TypeError):
+                    create_app(self.settings(), database=self.database, human_access=human_access,
+                               storage_reservation=self.admission, monitoring=monitoring,
+                               monitoring_dependencies=MonitoringDependencies(access_faults=monitor))
+        self.assertIsNone(monitor.attached)
+
     async def test_create_app_requires_the_monitor_as_both_sinks_and_attaches(self):
         other_check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker)
         other_ceremonies = PasskeyCeremonies(self.store, self.rp, session_gate=other_check,
@@ -237,7 +272,7 @@ class CompositionTests(MonitoredAccessFixture):
         monitor = AccessFaultMonitor()
         with self.assertRaises(TypeError):
             create_app(self.settings(), database=self.database, human_access=other,
-                       storage_reservation=self.admission,
+                       storage_reservation=self.admission, monitoring=self.monitoring(),
                        monitoring_dependencies=MonitoringDependencies(access_faults=monitor))
         self.assertIsNone(monitor.attached)
         # The monitor given to the check only: the findings still bypass it.
@@ -248,7 +283,7 @@ class CompositionTests(MonitoredAccessFixture):
                                                         clock=self.ceremony_clock))
         with self.assertRaises(TypeError):
             create_app(self.settings(), database=self.database, human_access=half,
-                       storage_reservation=self.admission,
+                       storage_reservation=self.admission, monitoring=self.monitoring(),
                        monitoring_dependencies=MonitoringDependencies(access_faults=monitor))
         fresh = AccessFaultMonitor()
         check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker, sink=fresh)
@@ -257,7 +292,7 @@ class CompositionTests(MonitoredAccessFixture):
                              ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=check,
                                                           clock=self.ceremony_clock, findings=fresh))
         create_app(self.settings(), database=self.database, human_access=access,
-                   storage_reservation=self.admission,
+                   storage_reservation=self.admission, monitoring=self.monitoring(),
                    monitoring_dependencies=MonitoringDependencies(access_faults=fresh))
         self.assertIs(fresh.attached, access)
         with self.assertRaises(ValueError):

@@ -957,7 +957,8 @@ finding has no recovery to observe). No hostname, address, route, identity,
 principal, credential or reason leaves the process; details stay in the audit
 log. With a monitor configured, `create_app` refuses a `HumanAccess` whose
 check or ceremonies report elsewhere and attaches the composition so
-recovery can be observed. Verified with synthetic checks, software
+recovery can be observed. It also refuses a monitor without a storage-configured
+monitoring runtime, the only thing that drains it (Codex PR #271). Verified with synthetic checks, software
 authenticators and an intercepted Slack transport only
 (`server/tests/test_access_fault_notifications.py`).
 

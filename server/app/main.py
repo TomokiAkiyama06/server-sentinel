@@ -124,6 +124,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # deployment settings name, never one an embedder picked elsewhere.
         raise TypeError("human access composition is invalid")
     access_faults = monitoring_dependencies.access_faults if monitoring_dependencies is not None else None
+    if access_faults is not None and (monitoring is None or not monitoring.storage_configured):
+        # Only the monitoring runtime drains the monitor (Codex PR #271):
+        # without one an emitted fault would leave the check's retry queue
+        # and never reach the Owner or the health status.
+        raise TypeError("access fault monitor requires the monitoring runtime")
     if human_access is not None and access_faults is not None:
         # Issue #232 item 4 (Owner decision 2026-10-16): with a configured
         # monitor, every reservation fault and credential finding of this

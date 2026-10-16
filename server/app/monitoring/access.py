@@ -49,12 +49,20 @@ from datetime import datetime
 from enum import Enum
 import math
 import threading
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4, uuid5
 
-from app.auth.human_surface import HumanAccess, HumanAccessState
-from app.auth.passkeys import CredentialFinding
-from app.auth.reservation import Reason, ReservationFault
 from app.notifications.service import NotificationKind, NotificationService
+
+if TYPE_CHECKING:
+    from app.auth.human_surface import HumanAccess
+    from app.auth.passkeys import CredentialFinding
+    from app.auth.reservation import Reason, ReservationFault
+
+# ``app.monitoring.runtime`` imports this module and must stay importable
+# with the standard library alone (the installer and the lifecycle inventory
+# run it without the application's dependencies), so the human-access types
+# are imported where they are used, never at module import time.
 
 
 # Fixed namespace for this monitor's event IDs; a per-process nonce keeps a
@@ -101,16 +109,16 @@ class AccessFaultMonitor:
         self._lock = threading.Lock()
         self._nonce = uuid4()
         self._sequence = 0
-        self._access: HumanAccess | None = None
+        self._access: "HumanAccess | None" = None
         # Latched by emit() (any thread) until the next drain.
         self._latched = False
-        self._latched_reasons: frozenset[Reason] = frozenset()
+        self._latched_reasons: "frozenset[Reason]" = frozenset()
         # Arrivals since the last drain; the principal is never kept.
         self._finding_arrivals = 0
         # Owner-thread state (drain only).
         self._current = AccessHealth.HEALTHY
         self._notified = AccessHealth.HEALTHY
-        self._episode_reasons: frozenset[Reason] = frozenset()
+        self._episode_reasons: "frozenset[Reason]" = frozenset()
         self._new_reasons = False
         self._unreported_fault = False
         self._sent: deque[float] = deque()
@@ -120,8 +128,10 @@ class AccessFaultMonitor:
 
     # -- composition -------------------------------------------------------
 
-    def attach(self, access: HumanAccess) -> None:
+    def attach(self, access: "HumanAccess") -> None:
         """Observe ``access`` for recovery; one composition per monitor."""
+        from app.auth.human_surface import HumanAccess
+
         if not isinstance(access, HumanAccess):
             raise ValueError("human access composition required")
         with self._lock:
@@ -130,13 +140,15 @@ class AccessFaultMonitor:
             self._access = access
 
     @property
-    def attached(self) -> HumanAccess | None:
+    def attached(self) -> "HumanAccess | None":
         return self._access
 
     # -- sinks (any thread; never block or raise on valid input) ------------
 
-    def emit(self, fault: ReservationFault) -> None:
+    def emit(self, fault: "ReservationFault") -> None:
         """``FaultSink``: latch one failing check; keeps only its reason codes."""
+        from app.auth.reservation import Reason, ReservationFault
+
         if not isinstance(fault, ReservationFault):
             raise ValueError("reservation fault required")
         reasons = frozenset(reason for reason in fault.reasons if isinstance(reason, Reason))
@@ -144,12 +156,14 @@ class AccessFaultMonitor:
             self._latched = True
             self._latched_reasons |= reasons
 
-    def credential_finding(self, kind: CredentialFinding, principal_id: UUID) -> None:
+    def credential_finding(self, kind: "CredentialFinding", principal_id: UUID) -> None:
         """``CredentialFindingSink``: count one committed finding.
 
         ``principal_id`` is accepted for the protocol and discarded: the Owner
         notification names no person, and the audit record already exists.
         """
+        from app.auth.passkeys import CredentialFinding
+
         if not isinstance(kind, CredentialFinding):
             raise ValueError("credential finding required")
         del principal_id
@@ -168,6 +182,8 @@ class AccessFaultMonitor:
         access = self._access
         if access is None:
             return None
+        from app.auth.human_surface import HumanAccessState
+
         state = access.state
         verdict = access.reservation.verdict
         if (state in (HumanAccessState.CHECK_FAILING, HumanAccessState.FAILED)
