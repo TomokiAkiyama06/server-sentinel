@@ -395,6 +395,8 @@ class LimitTests(LiveRouteFixture):
         writes = self.admission.admitted
         self.assertEqual(await self.open(cookie, csrf, self.sources[0]), await self.denial())
         self.assertEqual(self.admission.admitted, writes)
+        # A refused open leaves no demand behind.
+        self.assertEqual((self.hub.status.viewers, self.live_status().active_sessions), (0, 0))
 
     async def test_non_jpeg_and_oversized_frames_are_never_served(self):
         _, cookie, csrf = await self.viewer()
@@ -585,6 +587,20 @@ class ServiceTests(unittest.TestCase):
         service.start()
         self.addCleanup(service.stop, wait=True)
         self.assertEqual(service.status().result(timeout=10).active_sessions, 0)
+
+    def test_a_sweeper_that_cannot_start_rolls_the_service_back(self):
+        service = LiveFrameService(LocalPreviewHub(()), SimpleNamespace(
+            current_session=lambda *a, **k: None, now=lambda: None, database=object()),
+            validator=lambda access, source_id: True)
+        with patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start new thread")):
+            with self.assertRaises(RuntimeError):
+                service.start()
+        self.assertFalse(service.running)
+        with self.assertRaises(LiveFrameUnavailable):
+            service.status()
+        service.start()
+        self.addCleanup(service.stop, wait=True)
+        self.assertTrue(service.running)
 
     def test_construction_requires_a_hub_and_an_access_store(self):
         with self.assertRaises(ValueError):

@@ -258,13 +258,25 @@ class LiveFrameService:
                 retired, self._retired = self._retired, None
             if retired is not None:
                 retired.shutdown(wait=True)
+            stop = threading.Event()
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="live-frame")
+            sweeper = threading.Thread(target=self._sweep_loop, args=(stop,),
+                                       name="live-frame-sweeper", daemon=True)
             with self._lock:
-                self._stop = threading.Event()
-                self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="live-frame")
-                stop = self._stop
-                self._sweeper = threading.Thread(target=self._sweep_loop, args=(stop,),
-                                                 name="live-frame-sweeper", daemon=True)
-                self._sweeper.start()
+                self._stop, self._executor = stop, executor
+            try:
+                sweeper.start()
+            except BaseException:
+                # No lease sweep would exist: roll back, so the service is
+                # not running (and refuses every call) rather than running
+                # without its sweeper.
+                with self._lock:
+                    self._executor = None
+                stop.set()
+                executor.shutdown(wait=False)
+                raise
+            with self._lock:
+                self._sweeper = sweeper
 
     def stop(self, *, wait: bool = False) -> None:
         """Refuse every later call and release every session's demand.

@@ -1470,8 +1470,9 @@ route is the generic denial). The route table above lists the four routes.
   person; at most 5 served frames per second per session; a frame that does
   not start with a JPEG SOI marker or is larger than 8 MiB is never served.
   Over a limit: the generic denial (or `204` for pacing). Opens are
-  charged to `HumanAccess.live_limiter` (per session a burst of 10 and one
-  more every 6 s) after a read-only check, so a forged cookie takes no slot.
+  charged to `HumanAccess.live_limiter` (per session a burst of 20 and one
+  more every 3 s, so switching sources, hiding/showing the tab and reconnecting
+  stay inside it) after a read-only check, so a forged cookie takes no slot.
   A close is not charged: it reaches SQLite only for a live session held for
   the presented cookie, so closes are bounded by opens.
 - Demand ends when a session's viewer stops polling for 15 s (the lease),
@@ -1480,6 +1481,13 @@ route is the generic denial). The route table above lists the four routes.
   for everyone while access is closed or the composition is stopped. A
   change committed outside this process (the local CLI) is caught by the next
   poll's validator or by the lease.
+- Contract for the Web (CP-5): `health` is always present (one of the four
+  camera values); only local `MJPG` sources are listed in this interim
+  transport; an open always answers `200` with `session_id`, `source_id`,
+  `lease_seconds` and `frame_interval_ms` (the pacing interval; poll at that
+  interval plus some slack); a close needs no body and no `Content-Type`
+  (keepalive fetch) and is never rate-limited. An open refused by the
+  limiter, the capacity or the source check creates no demand.
 - Responses: `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
   `Cross-Origin-Resource-Policy: same-origin`; never `Content-Disposition`,
   `ETag`, ranges or a cookie. There is no recording, export or download

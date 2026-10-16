@@ -125,7 +125,7 @@ administration write or its audit record (every other caller is refused
 inside the authorization), their state is bounded by the S4-8 limits, and
 every write goes through the storage admission. Live session opens are
 charged to a fifth, separate limiter (``HumanAccess.live_limiter``:
-per session a burst of 10 and one more every 6 seconds), keyed on a
+per session a burst of 20 and one more every 3 seconds), keyed on a
 domain-separated digest of a token a read-only check found current (a close
 reaches SQLite only for a live session held for that token, so closes are
 bounded by opens); frame polls to the
@@ -768,10 +768,13 @@ class HumanAccess:
         # S7 interim live (optional component, ``attach_live``): without it
         # every live route is the generic denial.
         self.live: LiveFrameService | None = None
-        # Opening live sessions, per session token digest: a burst of 10 and
-        # one more every 6 seconds, so an open/close loop cannot churn
-        # the gate, the storage admission or the frame executor.
-        self.live_limiter = SourceRateLimiter(per_source_capacity=10, per_source_refill_seconds=6.0,
+        # Serializes ``attach_live`` with the start and the end of ``run()``.
+        self._live_lock = threading.Lock()
+        # Opening live sessions, per session token digest: a burst of 20 and
+        # one more every 3 seconds (a viewer switching sources, hiding and
+        # showing the tab or reconnecting stays inside it), so an open loop
+        # cannot churn the gate, the storage admission or the frame executor.
+        self.live_limiter = SourceRateLimiter(per_source_capacity=20, per_source_refill_seconds=3.0,
                                               global_capacity=None, max_sources=64)
         # Last: everything above validated, so a refused composition leaves
         # the ceremonies untouched.
@@ -796,6 +799,10 @@ class HumanAccess:
         database = live.database
         if not isinstance(database, (Database, PinnedDatabase)) or database.path != self.store.database.path:
             raise HumanAccessUnavailable()
+        with self._live_lock:
+            self._attach_live(live)
+
+    def _attach_live(self, live: LiveFrameService) -> None:
         previous = self.live
         if previous is not None and previous is not live:
             if self._running:
@@ -941,14 +948,15 @@ class HumanAccess:
         self._halted = False
         self._serving = False
         self._state = HumanAccessState.STARTING
-        live = self.live
-        if live is not None:
-            # Its sweeper ends every live session while this composition is
-            # not serving; ``stop()`` below releases what is left.
-            live.start()
         log = logging.getLogger(__name__)
         failed = False
         try:
+            with self._live_lock:
+                if self.live is not None:
+                    # Its sweeper ends every live session while this
+                    # composition is not serving; ``stop()`` below releases
+                    # what is left. A failed start is a failed run().
+                    self.live.start()
             started = await self._startup(log)
             while True:
                 await sleep(self.tick_seconds)
@@ -987,11 +995,13 @@ class HumanAccess:
             raise
         finally:
             self._serving = False
-            # Stopped before ``_running`` clears, so a replacement attached
-            # right after this run() ends always finds it stopped.
-            if self.live is not None:
-                self.live.stop()
-            self._running = False
+            # Under the attach lock and before ``_running`` clears, so a
+            # service attached concurrently is either stopped here or sees
+            # this run() ended and is not started.
+            with self._live_lock:
+                if self.live is not None:
+                    self.live.stop()
+                self._running = False
             self._state = HumanAccessState.FAILED if failed else HumanAccessState.STOPPED
 
     def _check_failed(self) -> None:

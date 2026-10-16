@@ -2261,7 +2261,11 @@ id, a per-(human session, live session) budget), then inside `admit(epoch)`
 the read-only session lookup must be that human session (a copied id is
 refused) and the read re-runs the `live:view` validator; nothing is written
 per frame, and the idle expiry is extended at most once per 60 s per live
-session. Limits: 4 sessions in total, 2 per source, 2 per person, 5 served
+session. `health` is always present; an open always answers `200`, and the Web
+paces its polls with `frame_interval_ms` plus some slack; a close needs no body
+or `Content-Type` and is not rate-limited, while opens are charged per session
+(a burst of 20, one more every 3 s) and a refused open leaves no demand.
+Limits: 4 sessions in total, 2 per source, 2 per person, 5 served
 frames per second per session, 8 MiB and a JPEG SOI marker per frame; over a
 limit the generic denial (pacing: `204`). Demand ends after 15 s without an
 authorized poll, on close and sign-out, at once after an Owner grant or
