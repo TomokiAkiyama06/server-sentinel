@@ -71,7 +71,7 @@ alert), drains it: transitions become the immediate `human_access_fault` /
 immediate notification per finding, up to four per rolling hour, the ones over
 that cap batched; a budget separate from the access one), and
 `MonitoringStatus.human_access_degraded` / `credential_finding_degraded`
-follow it; both count as degraded in the daily summary. Once per process,
+follow it; both count as degraded in the daily summary. Both rolling hours continue across a restart: the first running tick re-seeds them from the accepted (non-`pending`) notification rows of the last hour by their wall-clock age, ignoring a row stamped in the future, so a restored row counts for at most an hour after the restart (Issue #281 item 2). Once per process,
 the first running tick recovers a credential finding whose notification was
 lost to a restart: each `credential_finding` event ID names the immutable id
 of the newest (highest-rowid) finding audit record it covers; the newest retained finding always restores the one-day hold and is notified once unless that row exists

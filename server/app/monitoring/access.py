@@ -34,7 +34,8 @@ that passed while the composition serves), never on every failing check. A
 fault that started and ended between two drains is still reported (the
 emitted fault is latched). At most ``access_budget`` access notifications go
 out per rolling hour; past that the latest state is sent once the budget
-allows, and a fault episode that ended unreported is reported first.
+allows, and a fault episode that ended unreported is reported first. Both
+rolling hours survive a restart (``restore_windows``, Issue #281 item 2).
 Credential findings (Owner decision 2026-10-16, PR #271 提案4) notify
 immediately, one notification each, up to ``finding_budget`` per rolling
 hour; only the ones over that cap are batched into one notification sent
@@ -277,6 +278,40 @@ class AccessFaultMonitor:
         else:
             self.restore_fault_episode()
         self._attempts[NotificationKind.HUMAN_ACCESS_RECOVERED] = (at, event_id)
+
+    def restore_windows(self, *, access_ages, finding_ages, monotonic: float) -> None:
+        """Owner thread: re-seed both rolling hours after a restart (Issue #281 item 2).
+
+        Called once at startup by the monitoring runtime with the ages, in
+        seconds by the wall clock, of the previous processes' accepted
+        (non-``pending``) notification rows, so a restart does not reset the
+        hourly budgets. Converted to this process's monotonic clock as
+        ``monotonic - age``, like ``recover_finding``. An age that is
+        negative (a row stamped in the future, so the clock moved back) or a
+        full hour or more is ignored, which at worst sends a notification
+        early, as before this recovery; a clock moved back by less than a
+        row's age keeps that row counted longer than its real age, but no
+        restored row counts for more than an hour after the restart, so a
+        held-back notification is delayed at most that hour, never lost. A
+        window this process already used is left as it is (its own rows are
+        in it).
+        """
+        if type(monotonic) not in (int, float):
+            raise ValueError("invalid restored window")
+        windows = ((self._sent, access_ages, self.access_budget),
+                   (self._finding_sent, finding_ages, self.finding_budget))
+        restored = []
+        for _sent, ages, budget in windows:
+            ages = tuple(ages)
+            if (len(ages) > budget
+                    or any(type(age) not in (int, float) or not math.isfinite(age) for age in ages)):
+                raise ValueError("invalid restored window")
+            restored.append(sorted(monotonic - age for age in ages if 0 <= age < HOUR_SECONDS))
+        if not math.isfinite(monotonic):
+            return
+        for (sent, _ages, _budget), times in zip(windows, restored):
+            if not sent:
+                sent.extend(times)
 
     def _polled(self) -> AccessHealth | None:
         """Current composition health, or ``None`` while indeterminate.
