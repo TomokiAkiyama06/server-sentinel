@@ -30,6 +30,11 @@ MINIMUM_SPREAD_SAMPLES = 4
 # Standard deviations of a simulated batch's total real allocation charged
 # above its mean (never above every append at its recent maximum).
 DEVIATION_FACTOR = Fraction(2)
+# Stored segments per source whose aligned real allocations form the recent
+# batch history of synchronized sources (Issue #130), and the fewest such past
+# batches whose spread is trusted instead of the perfectly correlated bound.
+BATCH_HISTORY_SEGMENTS = 16
+MINIMUM_MEASURED_BATCHES = 10
 
 
 class DiskRing:
@@ -40,6 +45,9 @@ class DiskRing:
         self.ledger = Ledger(settings, maximum_bytes=ledger_maximum_bytes, space=ledger_space)
         self.db = self.ledger.connection
         self.config, self.profiles = None, {}
+        # Per source, the last segment end stored before its current profile
+        # was configured: earlier allocations do not estimate that profile.
+        self.history_after = {}
         self.connected = False
         self.state, self.reason = "degraded", "not_configured"
         try:
@@ -52,6 +60,7 @@ class DiskRing:
                 self.profiles = {UUID(item["source_id"]): SegmentProfile(
                     **{**item, "source_id": UUID(item["source_id"])}
                 ) for item in value["profiles"]}
+                self.history_after = {UUID(source): end for source, end in value.get("history_after", {}).items()}
                 self._ledger_capacity(self.config, self.profiles)
             self._recover()
         except BaseException:
@@ -364,10 +373,11 @@ class DiskRing:
         }
 
     def _recent_allocations(self, allocations, unit, *, at_bound=False):
-        """Per-source ``(mean, variance, credit, cap)`` of one simulated append.
+        """Per-source ``(mean, variance, credit, cap, samples)`` of one simulated append.
 
         From the source's last ``RECENT_ALLOCATION_SEGMENTS`` stored
-        allocations: their mean and sample variance, the smallest of them
+        allocations written under its current profile (``history_after``):
+        their mean and sample variance, the smallest of them
         (credited when a simulated append ages out) and the largest in whole
         allocation units (the per-append cap), all never above the bound.
         With fewer than ``MINIMUM_SPREAD_SAMPLES`` the mean is the cap and the
@@ -377,21 +387,45 @@ class DiskRing:
         each rounded up to whole allocation units (never under-charging an
         append on a filesystem whose 512-byte block counts are not whole
         ``f_frsize`` units); the credit is the unrounded smallest sample.
+        ``samples`` are the source's last ``BATCH_HISTORY_SEGMENTS`` stored
+        allocations back to its most recent gap (a stored segment ending
+        before the next one starts), clock-uncertain segment or segment of
+        another duration than the profile's cadence, most recent first, as ``(start, end,
+        allocation)``, each rounded up to whole units and never above the
+        bound (empty with ``at_bound``), from which ``_measured_charge``
+        charges synchronized sources.
         """
         recent = {}
         for source, profile in self.profiles.items():
             bound = round_up(profile.segment_bytes(), unit)
-            sizes = [] if at_bound else [allocations.get(UUID(row[0]), bound) for row in self.db.execute(
-                "SELECT id FROM segments WHERE source=? AND state='stored' "
-                "ORDER BY end DESC LIMIT ?", (str(source), RECENT_ALLOCATION_SEGMENTS))]
+            rows = [] if at_bound else [(row[1], row[2], row[3], allocations.get(UUID(row[0]), bound))
+                                        for row in self.db.execute(
+                "SELECT id, start, end, clock_trusted FROM segments WHERE source=? AND state='stored' AND end>? "
+                "ORDER BY end DESC LIMIT ?", (str(source), self.history_after.get(source, -MAX_INTEGER - 1),
+                                              max(RECENT_ALLOCATION_SEGMENTS, BATCH_HISTORY_SEGMENTS)))]
+            # The rounded samples of the longer batch history, never above the
+            # bound, up to the source's first gap, clock-uncertain row or
+            # segment of another cadence than the current profile's: stored
+            # rows on both sides of an interval every source missed would
+            # otherwise still align, untrusted timestamps are not comparable
+            # with another source's, and allocations of an earlier cadence do
+            # not estimate the current one.
+            samples = []
+            for start, end, trusted, size in rows:
+                if (not trusted or end - start != profile.segment_duration_us
+                        or (samples and end < samples[-1][0])):
+                    break
+                samples.append((start, end, min(bound, round_up(size, unit))))
+            samples = tuple(samples)
+            sizes = [size for _start, _end, _trusted, size in rows[:RECENT_ALLOCATION_SEGMENTS]]
             if not sizes:
-                recent[source] = (Fraction(bound), Fraction(0), bound, bound)
+                recent[source] = (Fraction(bound), Fraction(0), bound, bound, ())
                 continue
             cap = min(bound, round_up(max(sizes), unit))
             credit = min(cap, min(sizes))
             count = len(sizes)
             if count < MINIMUM_SPREAD_SAMPLES:
-                recent[source] = (Fraction(cap), Fraction(0), credit, cap)
+                recent[source] = (Fraction(cap), Fraction(0), credit, cap, samples)
                 continue
             # Free space is consumed in whole allocation units, but
             # ``st_blocks * 512`` need not be a multiple of ``f_frsize`` on
@@ -403,16 +437,82 @@ class DiskRing:
             sizes = [round_up(size, unit) for size in sizes]
             mean = Fraction(sum(sizes), count)
             variance = sum((size - mean) ** 2 for size in sizes) / (count - 1)
-            recent[source] = (min(mean, Fraction(cap)), variance, credit, cap)
+            recent[source] = (min(mean, Fraction(cap)), variance, credit, cap, samples)
         return recent
+
+    @staticmethod
+    def _ceil_root(square):
+        """``ceil(sqrt(square))`` of a non-negative rational, exactly."""
+        square = math.ceil(square)
+        root = math.isqrt(square)
+        return root + (root * root < square)
+
+    @staticmethod
+    def _measured_charge(appends):
+        """Space for synchronized sources' appends measured from their recent
+        batch history, in whole bytes, or ``None`` (Issue #130).
+
+        The ``j``-th most recent samples of every configured source (appending
+        through this instant or not) form one past batch while their
+        intervals all overlap and have one duration (synchronized sources of
+        one cadence; a gap, a clock-uncertain segment or another cadence ends
+        the alignment). From the ``n`` past batches the sources' means and
+        sample covariances are measured, and a batch of ``count`` appends per
+        source is charged ``sum(count * mean)`` plus ``DEVIATION_FACTOR``
+        deviations of ``sum(count * allocation)``, its variance
+        ``sum(count_s * count_t * max(0, covariance_st))``: each source's
+        chained appends still taken as perfectly correlated, correlated
+        sources charged as such, independent ones no longer as if perfectly
+        correlated. A negative covariance is never credited, so the charge
+        never decreases as appends are added, which the next-write check
+        relies on, and alignment over every configured source does not depend
+        on which of them append. The deviation is widened to a prediction
+        bound for one further batch from ``n`` samples: ``sqrt(1 + 1/n)`` for
+        the estimated mean and ``sqrt((n - 1) / (n - 3))``, the ratio of a
+        Student t variance to a normal one, for the estimated deviation.
+        ``None`` (charge the perfectly correlated bound) for fewer than two
+        sources or fewer than ``MINIMUM_MEASURED_BATCHES`` aligned past
+        batches.
+        """
+        if len(appends) < 2:
+            return None
+        aligned = []
+        for past in zip(*(samples for _count, (*_statistics, samples) in appends)):
+            if (max(start for start, _end, _size in past) >= min(end for _start, end, _size in past)
+                    or len({end - start for start, end, _size in past}) != 1):
+                break
+            aligned.append([size for _start, _end, size in past])
+        count = len(aligned)
+        if count < MINIMUM_MEASURED_BATCHES:
+            return None
+        sizes = list(zip(*aligned))
+        means = [Fraction(sum(source), count) for source in sizes]
+        counts = [append_count for append_count, _recent in appends]
+        mean = sum(append_count * source_mean for append_count, source_mean in zip(counts, means))
+        variance = Fraction(0)
+        sources = range(len(appends))
+        for first in sources:
+            for second in sources[first:]:
+                if not counts[first] or not counts[second]:
+                    continue
+                covariance = sum((one - means[first]) * (other - means[second])
+                                 for one, other in zip(sizes[first], sizes[second])) / (count - 1)
+                pairs = 1 if first == second else 2
+                variance += pairs * counts[first] * counts[second] * max(Fraction(0), covariance)
+        # ceil(DEVIATION_FACTOR * sqrt(variance * (1 + 1/n) * (n - 1) / (n - 3))), exactly.
+        deviation = DiskRing._ceil_root(variance * DEVIATION_FACTOR ** 2
+                                        * Fraction((count + 1) * (count - 1), count * (count - 3)))
+        return math.ceil(mean) + deviation
 
     @staticmethod
     def _batch_charge(appends, unit):
         """Space for ``(count, recent)`` simulated appends of every source.
 
-        The sum of the means plus ``DEVIATION_FACTOR`` standard deviations of
-        that sum, in whole allocation units, never above every append at its
-        source's recent maximum. The deviation of the sum is bounded as if
+        Synchronized sources with enough aligned history are charged
+        ``_measured_charge`` in whole allocation units, never above every
+        append at its source's recent maximum. Otherwise the charge is the sum of the means plus ``DEVIATION_FACTOR`` standard
+        deviations of that sum, in whole allocation units, never above every
+        append at its source's recent maximum. The deviation of the sum is bounded as if
         every append were perfectly correlated (synchronized sources, and
         temporally correlated VBR within one source): the per-append standard
         deviations add, ``sum(count * sqrt(variance))``, rather than the
@@ -434,14 +534,15 @@ class DiskRing:
         units per append.
         """
         mean, deviation, cap = Fraction(0), 0, 0
-        for count, (append_mean, append_variance, _credit, append_cap) in appends:
+        for count, (append_mean, append_variance, _credit, append_cap, _samples) in appends:
             mean += count * append_mean
             cap += count * append_cap
             # ceil(DEVIATION_FACTOR * count * sqrt(variance)), exactly: the
             # smallest integer whose square is at least the (rational) square.
-            square = math.ceil(append_variance * (DEVIATION_FACTOR * count) ** 2)
-            root = math.isqrt(square)
-            deviation += root + (root * root < square)
+            deviation += DiskRing._ceil_root(append_variance * (DEVIATION_FACTOR * count) ** 2)
+        measured = DiskRing._measured_charge(appends)
+        if measured is not None:
+            return min(cap, round_up(measured, unit))
         return min(cap, round_up(math.ceil(mean) + deviation, unit))
 
     def _next_write_refused(self, now, budget, *, clock_trusted, at_bound=False):
@@ -480,7 +581,9 @@ class DiskRing:
         of that sum, bounded as if every append were perfectly correlated
         (per-append deviations add), in whole allocation units, never above
         every append at its source's recent maximum (the bound without
-        history; the recent maximum while the history is too short).
+        history; the recent maximum while the history is too short), or, for
+        synchronized sources with enough aligned history, at a prediction
+        bound measured from their recent batch history (``_measured_charge``).
         Charging every append the recent maximum instead let the sample
         maximum's excess compound across sources and chained appends into a
         hard stop while writes kept succeeding near the reserve. A refusal here means writes are refused at the recent real
@@ -632,13 +735,25 @@ class DiskRing:
             self.store.check(budget["required_additional"])
             self._selected_target_fits(config, mapping)
             self._duration_transition_fits(config, mapping, now_us, clock_trusted)
+            # A changed or new profile starts a new allocation history: the
+            # recent-allocation charge must not estimate it from segments of
+            # another bound or cadence (Codex review of PR #272).
+            history_after = {}
+            for item in profiles:
+                if self.profiles.get(item.source_id) == item:
+                    end = self.history_after.get(item.source_id)
+                else:
+                    end = self.db.execute("SELECT max(end) FROM segments WHERE source=?",
+                                          (str(item.source_id),)).fetchone()[0]
+                if end is not None:
+                    history_after[item.source_id] = end
             value = {"config": asdict(config), "profiles": [
                 {**asdict(item), "source_id": str(item.source_id)} for item in profiles
-            ]}
+            ], "history_after": {str(source): end for source, end in history_after.items()}}
             with self.ledger.transaction():
                 self.db.execute("INSERT OR REPLACE INTO settings VALUES ('configuration', ?)",
                                 (json.dumps(value, separators=(",", ":")),))
-            self.config, self.profiles = config, mapping
+            self.config, self.profiles, self.history_after = config, mapping, history_after
             self._trim(now_us, trusted=clock_trusted)
             return self._status(now_us, clock_trusted=clock_trusted)
 
