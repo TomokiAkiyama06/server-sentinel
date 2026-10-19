@@ -135,16 +135,23 @@ def _retention_rules(now: datetime) -> dict:
     interrupted recordings whose ended_ms is at most now - 20 days.
     OwnerTemplateStore.cleanup_expired_batch() deletes Owner-template audit
     rows older than the store's own retention when the store is registered
-    for audit retention. Presence audit retention and timeline expiry
-    (PresenceService.expire_audit() / expire_history()) are not run by Main
-    and so accept nothing.
+    for audit retention. PresenceService.expire_audit() deletes
+    presence_audit rows whose ``at`` lies before now - 90 days, and
+    expire_history() removes observations received before now - 20 days
+    (before now - 90 days while a delivery is unfinished); Main schedules
+    both for its scene timeline (Issue #205).
     """
     periods = RetentionPeriods()
     cutoff = now - AUDIT_RETENTION
     cutoff_us = int(cutoff.timestamp()) * 1_000_000 + cutoff.microsecond
     now_ms = int(now.timestamp() * 1000)
     audit_ms = now_ms - periods.audit_days * DAY_MS
+    presence_audit = now - timedelta(days=periods.audit_days)
     return {
+        "presence_audit": lambda value: (_presence_instant(value) is not None
+                                         and _presence_instant(value) < presence_audit),
+        "presence_expiry": {"recording": now - timedelta(days=periods.recording_days),
+                            "audit": presence_audit},
         "security_admin": lambda value: isinstance(value, int) and value < cutoff_us,
         "integrity": lambda value: (_utc_instant(value) is not None
                                     and _utc_instant(value) < cutoff),

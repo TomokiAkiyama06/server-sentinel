@@ -114,7 +114,6 @@ from .integrity import (_compare_integrity_delivery, _compare_notification_event
                         _compare_status_rows, _integrity_baseline, _integrity_delivery,
                         _notification_events, _status_rows)
 from .output import read_private, safe_output_path, write_private
-from .template_store import _compare_owner_template, _owner_template
 from .pairing import _compare_security_state, _security_state
 from .presence import (_compare_presence, _compare_timeline_gap, _outbox_live, _presence,
                        _timeline_gap)
@@ -124,6 +123,7 @@ from .recordings import (_compare_recordings, _compare_source_discontinuities, _
                          _spool_segments)
 from .schema import _compare_migrations, _schema_drift
 from .sources import _compare_sources, _registry_settings, _roi_history, _sources
+from .template_store import _compare_owner_template, _owner_template
 from .timing import CLOCK_SKEW_ALLOWANCE, _future_times, _retention_rules, _written_after
 
 
@@ -415,7 +415,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
             baseline["audit"].get("integrity"), current["audit"].get("integrity"),
             rules["integrity"], fresh["iso"]),
         "audit_presence": _compare_audit(
-            baseline["audit"].get("presence"), current["audit"].get("presence")),
+            baseline["audit"].get("presence"), current["audit"].get("presence"),
+            rules["presence_audit"]),
         "audit_storage_state": _compare_audit(
             baseline["audit"].get("storage_state"), current["audit"].get("storage_state"),
             rules["storage_state"], fresh["ms"]),
@@ -427,7 +428,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
             baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap")),
         "presence": _compare_presence(
             baseline.get("presence"), current.get("presence"),
-            baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap")),
+            baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap"),
+            rules["presence_expiry"]),
         "integrity_baseline": _compare_keyed(
             {"baseline": baseline["integrity_baseline"]}
             if baseline.get("integrity_baseline") is not None else None,

@@ -1079,7 +1079,24 @@ environment and only a private `AF_UNIX` socketpair inherited; before importing
 the decoder it sets `no_new_privs`, a parent-death `SIGKILL`, non-dumpable, a
 lower CPU priority and equal soft/hard rlimits (address space, descriptors, no
 new process, no core, no file writes), and it runs as the same unprivileged
-service account. Every exchange has a hard per-frame deadline that covers the
+service account. After importing the decoder and decoding one generated warm-up
+frame, and before it reports ready, the child confines itself irreversibly
+(Issue #269, Owner decision 2026-10-16 on #233 (B)): a Landlock ruleset that
+handles every filesystem right of the kernel's ABI and grants none (no path can
+be opened, created, executed or listed; TCP bind/connect denied at ABI >= 4;
+abstract UNIX socket and signal scoping at ABI >= 6), then a seccomp allowlist
+built without dependencies (x86-64 and aarch64; socket I/O on the inherited
+socket, memory management without `PROT_EXEC`, futex, signal return and exit
+only). Any other system call, and any call through another architecture or
+numbering (i386, AArch32, x32), kills the child with `SIGSYS`, which is a child
+crash (`unknown`). The sandbox is fail closed: where either layer cannot be
+applied (no Landlock, no seccomp filter mode or kill-process action, another
+architecture, a multi-threaded child), the child reports a fixed refusal code
+instead of ready and exits without decoding; the decoder then reports
+`failing` at once and the source is `degraded` with
+`frame_decoder_sandbox_unavailable` (logged once, value-free), every frame
+`unknown`, never a negative. No setting runs the decoder unconfined. Every
+exchange has a hard per-frame deadline that covers the
 transfer. Any pre-check refusal, strict decode error, decoded-shape mismatch or
 mid-grey undecoded band, and any child crash, kill (including OOM), exit,
 timeout (the child is killed) or malformed reply is `unknown`
@@ -1110,17 +1127,35 @@ stop bound in `losses_cleared`. Their total, and separately each batch refused
 after `stop()` fenced the count, is handed to an injected count-only durable
 sink (Owner decision 2026-10-14, #224), so each refusal is counted once; a count
 may be overstated, never hidden. A missing or failing sink is reported
-(`undelivered_recorded`, `scene_undelivered_unrecorded`). Main does not pass a
-sink yet, so today the count is only logged. Once Main wires the timeline outbox
-(follow-up, #205), the sink is to add the count as lost facts to the presence
-timeline gap marker through the open outbox session, without observation
-content, identifiers or sources, so that a failed outbox close leaves an
-interrupted gap for the next start and Owner status reports `timeline_gap` until
-the Owner clears it. That wiring stops scene monitoring before the outbox
-closes, and does not close the outbox cleanly when `stop()` returns
-`stop_failed` or `undelivered_recorded` is false. A count handed over after the
-outbox closed or before it opened is refused and only logged; the next start
-then shows no unclean stop.
+(`undelivered_recorded`, `scene_undelivered_unrecorded`).
+
+When the embedder passes `scene_timeline` (a `SceneTimelineConfiguration` with
+an explicit source latency bound and main-host clock port, no default),
+`create_app()` owns the presence timeline for this evidence
+(`app.presence.runtime.SceneTimeline`, Issue #205): a `PresenceService` over the
+application database pinned under the storage admission, a `TimelineOutbox`
+and a `CriticalTimelineRecorder`, which is the scene runtime's durable recorder;
+its `record_undelivered` is the `undelivered` sink, an in-memory count that never
+blocks and does no I/O. An embedder-supplied recorder or sink is then refused.
+The lifespan opens the outbox session before it starts scene monitoring; while
+the open is refused (for example storage not yet admitted) scene monitoring is
+not started, the application reports it `unavailable`, every conclusion stays
+`unknown`, and the open is retried until it succeeds. While running, counted
+loss is written to the durable gap marker at the flush interval. At shutdown
+scene `stop()` returns first; the outbox is then flushed (so a count handed over
+at stop reaches the marker even when the session stays open) and closed
+cleanly only when `stop()` returned `stopped` and `undelivered_recorded` is not
+false. After `stop_failed`, an `unavailable` runtime, a stop that raised or an
+unrecorded count, `close()` is never called: the session row stays, the next
+start records an interrupted gap and Owner status reports `timeline_gap` until
+the Owner clears it. A count handed over after the outbox closed or before it
+opened would be refused and only logged; this ordering prevents both. Presence
+reports `critical_detection` armed only while the scene runtime is `running`.
+No evidence-preservation or notification port is wired yet (#21), so those
+critical paths stay `unavailable` in Owner status, and the production launcher
+does not build scene monitoring yet (the calibration route and the deployment
+section are follow-ups of #205). Without `scene_timeline` the count is only
+logged, as before.
 
 A camera loss (`offline`, `manual_intervention_required` or `degraded`, that is
 every non-`online` state) lowers the source to `degraded` until a new evaluated
@@ -1150,7 +1185,8 @@ measured from the first waiting request) sets `refresh_deferred`, lowers the
 source to `degraded` (`calibration_refresh_deferred`) with `unknown` movement
 and tamper conclusions, and is logged once (Owner decision 2026-10-14); a source
 already `degraded` for another reason (such as `critical_backpressure`,
-`source_unavailable`, `frame_decoder_failing`, `scene_evaluation_failed` or
+`source_unavailable`, `frame_decoder_failing`,
+`frame_decoder_sandbox_unavailable`, `scene_evaluation_failed` or
 `observation_stale`) or inactive keeps that reason, with `refresh_deferred`
 alongside and `unknown` conclusions. The refresh
 still waits for the loss, and the state clears when it runs.
@@ -1394,7 +1430,14 @@ monitoring tick from its audit record: each `credential_finding` event ID
 names the immutable id of the newest (highest-rowid) finding audit record it
 covers; the newest retained finding
 restores the one-day hold and is notified once unless that event row
-exists with a final delivery state (rowid order, not wall-clock order). A fault
+exists with a final delivery state (rowid order, not wall-clock order).
+Several findings committed after the last tick and lost to a crash before
+the drain are therefore recovered as one notification, not one each; every
+finding stays in the audit log (Issue #281 item 4, Owner decision 2026-10-16
+in Issue #287). A notification whose local row was refused and that had not
+reached Slack before a crash is not recovered; a persisting fault is detected
+again after the restart (Issue #281 item 3, same decision; the critical
+notification contract still attempts Slack while local storage refuses). A fault
 episode whose newest access notification row is `human_access_fault` continues
 after a restart, so its recovery is still announced. Without an actual
 capture-pipeline adapter the self-test is an explicit `UNAVAILABLE`, not

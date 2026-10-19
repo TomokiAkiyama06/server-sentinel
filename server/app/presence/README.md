@@ -205,6 +205,29 @@ route, worker thread or default timing policy:
   every doubling, `timeline_flush_recovered` at the first later write, so a
   stuck outbox is visible to the runtime and the Owner without flooding logs.
 
+### Main runtime ownership for scene evidence (#205)
+
+`runtime.py` provides `SceneTimeline`, which `app.main.create_app()` builds when
+the embedder passes `scene_timeline` together with `scene_monitoring`. It owns
+one `PresenceService` over the application database (a `PinnedDatabase` pinned
+under the storage admission, so a lost or replaced file is refused rather than
+created), one `TimelineOutbox` and one `CriticalTimelineRecorder`, which are the
+scene runtime's durable recorder and count-only `undelivered` sink. There is no
+default source latency bound or clock trust: `SceneTimelineConfiguration`
+requires both. The lifespan opens the outbox before scene monitoring starts (a
+refused open is logged once per doubling streak and retried; scene monitoring
+stays unstarted meanwhile), flushes at `flush_interval_seconds`, and at shutdown
+ends it only after scene `stop()` returned: flush first, then `close()` only for
+a `stopped` result whose undelivered count was recorded. Every other outcome
+leaves the session row for the next start to record as interrupted
+(`timeline_outbox_left_open`). No evidence or notification port is configured
+there yet (#21), so those critical paths stay `unavailable`, and no route reads
+this service (Owner status and timeline routes are follow-ups). Its
+`retention_stores` are registered with the application's scheduled cleanup
+(`AuditRetentionRuntime`: at startup, daily, sooner after a failure), so
+`expire_history()` and `expire_audit()` apply the shared `RetentionPeriods`
+(20-day recording, 90-day audit) to this database.
+
 ### Entrance gate quality
 
 An empty crossing list from an `UNKNOWN` gate and one from a sufficient gate

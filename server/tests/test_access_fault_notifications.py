@@ -850,6 +850,28 @@ class FindingRecoveryTests(RuntimeFixture):
         self.assertEqual(self.finding_texts(), 1)
         self.assertTrue(status.credential_finding_degraded)
 
+    async def test_several_unnotified_findings_are_recovered_as_one_notification(self):
+        """Issue #281 item 4 (Owner decision 2026-10-16, Issue #287 (a)): two
+        findings committed after the last tick and lost to a crash before the
+        drain are recovered as one notification, not two; both stay in the
+        audit log, and the alert and the one-day hold are restored."""
+        await self.cycle()
+        self.audit_finding(self.clock.now - timedelta(minutes=20))
+        self.audit_finding(self.clock.now - timedelta(minutes=10),
+                           action="detect_principal_credential_sign_count_regression")
+        status = await self.cycle()
+        self.assertEqual(self.finding_texts(), 1)
+        self.assertTrue(status.credential_finding_degraded)
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            (audited,) = db.execute(
+                "SELECT COUNT(*) FROM security_admin_audit_records WHERE action IN (?, ?)",
+                ("mark_principal_credential_inconsistent",
+                 "detect_principal_credential_sign_count_regression")).fetchone()
+        self.assertEqual(audited, 2)
+        self.clock.advance(timedelta(minutes=5))
+        await self.cycle()
+        self.assertEqual(self.finding_texts(), 1)
+
     async def test_a_pending_notification_row_is_sent_again(self):
         """Codex PR #271: a delivery the stopped process never finished."""
         await self.cycle()

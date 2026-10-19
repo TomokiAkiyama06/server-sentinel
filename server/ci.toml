@@ -6,7 +6,10 @@ lint = ["python", "-m", "tests.lint"]
 # usually far higher, and tests/__init__.py raises the soft limit up to it).
 # Setting both soft and hard to 1024 here keeps that raise from hiding a
 # held-descriptor leak; exec keeps SIGABRT on timeout reaching faulthandler.
-test = ["sh", "-c", "ulimit -n 1024 && exec python -m unittest discover -s tests -p 'test_*.py' -v"]
+# Issue #269: MJPG_SANDBOX_REQUIRED=1 turns a missing Landlock / seccomp on
+# the runner into failures instead of skips, so the decode-child sandbox
+# tests always run in CI.
+test = ["sh", "-c", "ulimit -n 1024 && export MJPG_SANDBOX_REQUIRED=1 && exec python -m unittest discover -s tests -p 'test_*.py' -v"]
 
 [smoke]
 dockerfile = "Dockerfile.ci"
