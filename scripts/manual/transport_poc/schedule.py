@@ -186,8 +186,12 @@ def render(slots, role):
 
 
 def _timeout(limit, unit, quota, memory, *, nice=False):
+    # ``--collect``: a scope that ended failed (e.g. a MemoryMax OOM kill) is
+    # unloaded instead of kept, so the next slot can create the same fixed
+    # unit name. The fixed names still refuse a second scope while the
+    # previous one is active (no overlap).
     argv = ["timeout", "-k", str(KILL_AFTER_S), f"{int(limit)}s", "systemd-run", "--user",
-            "--scope", f"--unit={unit}", "-p", f"CPUQuota={quota}", "-p", f"MemoryMax={memory}"]
+            "--scope", "--collect", f"--unit={unit}", "-p", f"CPUQuota={quota}", "-p", f"MemoryMax={memory}"]
     return argv + (["nice", "-n", "10", "ionice", "-c", "3"] if nice else [])
 
 

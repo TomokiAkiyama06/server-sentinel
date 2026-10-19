@@ -209,7 +209,7 @@ class CommandTests(unittest.TestCase):
                         # the README's Main command: scope, limits, nice/ionice, timeout
                         self.assertEqual(["timeout", "-k", "30",
                                           f"{slot.duration + schedule.RUN_LIMIT_EXTRA_S}s",
-                                          "systemd-run", "--user", "--scope",
+                                          "systemd-run", "--user", "--scope", "--collect",
                                           "--unit=ss-poc15-main", "-p", "CPUQuota=200%",
                                           "-p", "MemoryMax=1G", "nice", "-n", "10", "ionice",
                                           "-c", "3", "py"], main[:main.index("py") + 1])
@@ -218,6 +218,9 @@ class CommandTests(unittest.TestCase):
                         self.assertEqual(["agent"], agent[agent.index("--role") + 1:][:1])
             holder = schedule.holder_command(slots[0], agent_args, "py")
             self.assertIn("--unit=ss-poc15-holder", holder)
+            # failed scopes are unloaded so the next slot can reuse the name
+            for argv in (holder, schedule.agent_command(slots[0], agent_args, "py")):
+                self.assertIn("--collect", argv[:argv.index("py")])
             self.assertIn("--dev-checkout-helper", holder)
             self.assertEqual(str(Path(directory) / "out" / f"holder-{slots[0].run_id}.jsonl"),
                              holder[holder.index("--out") + 1])

@@ -210,6 +210,9 @@ agent 側を 2 回起動して integrity `fail`）、`poc15.py schedule` で両 
 自動で起動します。1 slot の中身は上の手動手順と同じ単一 scenario・単一候補の `matrix --role`
 （同じ scope 名 `ss-poc15-main` / `ss-poc15-holder` / `ss-poc15-agent`、同じ CPU / memory 上限、
 Main は `nice` / `ionice` と `CUDA_VISIBLE_DEVICES=` 空）で、run 自体の動作は変わりません。
+scheduler は `systemd-run` に `--collect` を付けます（OOM などで failed になった scope を残さず、
+次の slot が同じ scope 名を使えるようにする。前の scope が動作中なら同名の scope は作れないので、
+slot の重複起動は従来どおり拒否される）。
 
 - 両 host で `--role` 以外を同じにする: `--start`（UTC、例 `2026-10-21T01:00:00Z`。過去と
   24 時間より先は拒否）、`--candidates`、`--scenarios`（既定は soak と `auth_revoked_live` を除く
