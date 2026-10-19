@@ -82,6 +82,15 @@ This is fault isolation of the Main process (sessions, database, capture),
 not an untrusted-code sandbox: a compromised child keeps the service account's
 filesystem view inside the systemd unit and could return wrong pixels.
 
+Update (Issue #269, Owner decision 2026-10-16 on #233 (B)): the child now also
+confines itself before its ready message, with a Landlock ruleset granting no
+filesystem access and a dependency-free seccomp allowlist (no file open or
+creation, no socket, no process creation, no executable mapping), fail closed
+(`frame_decoder_sandbox_unavailable` where either cannot be applied). A
+compromised child no longer has the service account's filesystem view; it can
+still return wrong pixels. See `server/app/detection/roi/README.md` and
+`SECURITY.md`. The paragraphs above describe the 2026-10-11 state.
+
 ### Decoder version follow-up
 
 simplejpeg 1.9.0 bundles libjpeg-turbo 3.1.2. Upstream libjpeg-turbo has
