@@ -1394,7 +1394,14 @@ monitoring tick from its audit record: each `credential_finding` event ID
 names the immutable id of the newest (highest-rowid) finding audit record it
 covers; the newest retained finding
 restores the one-day hold and is notified once unless that event row
-exists with a final delivery state (rowid order, not wall-clock order). A fault
+exists with a final delivery state (rowid order, not wall-clock order).
+Several findings committed after the last tick and lost to a crash before
+the drain are therefore recovered as one notification, not one each; every
+finding stays in the audit log (Issue #281 item 4, Owner decision 2026-10-16
+in Issue #287). A notification whose local row was refused and that had not
+reached Slack before a crash is not recovered; a persisting fault is detected
+again after the restart (Issue #281 item 3, same decision; the critical
+notification contract still attempts Slack while local storage refuses). A fault
 episode whose newest access notification row is `human_access_fault` continues
 after a restart, so its recovery is still announced. Without an actual
 capture-pipeline adapter the self-test is an explicit `UNAVAILABLE`, not
