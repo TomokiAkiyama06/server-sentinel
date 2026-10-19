@@ -12,6 +12,7 @@ Subcommands:
   proxy      loopback impairment proxy (blackhole / reset / rate cap)
   holder     capture-host camera holder (product UvcCapture, video only)
   matrix     run the scenario matrix (role both|main|agent)
+  schedule   two-host timetable: one matrix --role run per slot at fixed UTC times
   summarize  evaluate G1-G6 and secondary metrics from JSONL
 """
 import argparse
@@ -130,6 +131,26 @@ def build_parser():
     x.add_argument("--fast", action="store_true")
     x.add_argument("--summarize", action="store_true")
 
+    t = commands.add_parser("schedule")
+    t.add_argument("--role", choices=("main", "agent"), required=True)
+    t.add_argument("--start", required=True, help="UTC slot-0 start, e.g. 2026-10-21T01:00:00Z")
+    t.add_argument("--candidates", required=True, help="comma list (same on both hosts)")
+    t.add_argument("--scenarios", default="default",
+                   help="comma list or 'default' (all but soak and auth_revoked_live)")
+    t.add_argument("--real-camera", action="store_true",
+                   help="1-source media scenarios use the holder and --real-inputs (both hosts)")
+    t.add_argument("--print", action="store_true", help="print the timetable and exit")
+    t.add_argument("--materials", help="main: disposable materials root")
+    t.add_argument("--node-root", help="agent: node bundles")
+    t.add_argument("--state")
+    t.add_argument("--out")
+    t.add_argument("--bind", help="main: receiver IP literal")
+    t.add_argument("--upstream-host", help="agent: Main LAN IP")
+    t.add_argument("--holder-state-dir", help="agent with --real-camera")
+    t.add_argument("--holder-socket-dir", help="agent with --real-camera")
+    t.add_argument("--dev-checkout-helper", action="store_true",
+                   help="agent: passed through to the holder")
+
     y = commands.add_parser("summarize")
     y.add_argument("runs", nargs="+")
     y.add_argument("--json")
@@ -233,6 +254,11 @@ def _matrix(args):
     return 0
 
 
+def _schedule(args):
+    from transport_poc import schedule
+    return schedule.run(args)
+
+
 def _summarize(args):
     from transport_poc import summarize
     report = summarize.summarize(args.runs, rss_limit=args.rss_limit_mib * 1024 * 1024,
@@ -248,7 +274,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     handler = {"materials": _materials, "receiver": _receiver, "sender": _sender,
                "proxy": _proxy, "holder": _holder, "matrix": _matrix,
-               "summarize": _summarize}[args.command]
+               "schedule": _schedule, "summarize": _summarize}[args.command]
     return handler(args)
 
 
