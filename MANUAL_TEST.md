@@ -2166,6 +2166,8 @@ serials, disk ids, addresses and the node name only in the private record.
   distinct non-empty serials on the host; each `usb` device names
   `vendorid`, `productid` and `serial`; after the VM starts the host no
   longer lists them and the guest's `v4l2-ctl --list-devices` lists both;
+  the guest service account is in `video` (not `audio`) and can open each
+  camera node read-write and no `/dev/snd/*`;
 - [ ] passthrough identity: swap the two cameras between USB ports (VM
   running and again after a VM restart) and confirm each `usb` device still
   follows its serial and that `admin_cli candidates` / the approvals keep
