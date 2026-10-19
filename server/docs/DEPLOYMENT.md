@@ -124,9 +124,9 @@ path, a non-string) is refused by the installer and by the release's check
 with `web assets refused (reason=setting)`. Without the key no Web build is
 configured, and no human composition can be mounted (`create_app` refuses
 one without `Settings.web_assets_dir`), so human access stays closed: fail
-closed, never a fallback to another directory. No deployment key enables
-human access yet; the key is read and its build checked now so a release
-that does can rely on it.
+closed, never a fallback to another directory. The optional
+`"human_access"` key requires it (see "Enabling human access through
+Tailscale Serve" below).
 
 When the key is present, the release's own check (`python -m app.deployment
 --config <config> --check`, the unit's `ExecStartPre`, and the installer's
@@ -306,6 +306,121 @@ often the full device scan runs while a capture is live. A UUID that is not a `l
 startup and reported, never silently skipped. Without the object the backend
 logs `local_uvc_unconfigured` and keeps an explicit `unconfigured` local capture
 state; remote-agent-only deployments need no `local_uvc` object.
+
+#### Creating sources and approving cameras locally (Issue #11, Owner decision D3)
+
+Until the Owner Web UI exists, `local_uvc` sources are created and their
+cameras approved with a local command on the Main Server
+(`python -m app.cameras.uvc.admin_cli`). The trust model is the one of the
+Owner bootstrap command below: run it **as the service account**, from an
+interactive SSH or console session of an administrator, with the installed
+release's interpreter, never as root or from a checkout. There is no WebAuthn
+step-up; each change needs a confirmation word typed on the controlling
+terminal (`/dev/tty`), and that confirmation authorizes exactly one audited
+Owner operation: the change and its audit record (actor `owner`,
+`create_source` / `approve_camera`, target the source's logical UUID only)
+commit in one transaction. `--config` is the deployment configuration the
+service runs with; the database is that deployment's existing one, of exactly
+this release's schema (never created or migrated).
+
+The service reads its sources and approvals when it starts, so **stop it
+first**: `create-source` and `approve` refuse while it runs
+(`service_running`). The running service is detected as any other process of
+the service account that holds the application database open (every Main
+process keeps a descriptor on it for its whole lifetime): no camera is probed
+for that, and a crash leaves nothing behind that would block the command. A
+same-account process whose `/proc/<pid>/status` or descriptors cannot be read
+refuses the command (`service_state_unavailable`). Any other process of the
+service account holding the database counts, so another local admin command
+still running (`bootstrap_cli`, `pairing_cli`, `reservation_cli`, a second
+`admin_cli`) also gives `service_running`: let it finish first. Only a
+descriptor whose link names a file with the database's file name is
+`stat`-ed, so a descriptor of a differently named file on a hung FUSE/NFS
+mount cannot block the check. A same-named file on a hung mount still can
+(the `stat` is not bounded): the command then waits instead of refusing
+until that mount answers or is recovered, and no signal is guaranteed to end
+it meanwhile, so check that it has exited (recover the mount if needed)
+before starting the service.
+Run the command **inside the environment the service runs in** (the VM/LXD
+guest, Owner decision D2), never from its host or from another container:
+a VM has its own kernel, so the host's `/proc` shows no guest process at all;
+an unprivileged LXD container shifts its uids, so on the host the service
+runs under a uid that is not the service account; and the command run inside
+a container sees only that container's processes. (A `hidepid` `/proc` does
+not hide processes of the same uid, so it is not a limit here.) The check
+runs before the confirmation and again inside the final transaction; a
+service started within that last transaction is not refused.
+
+```sh
+cd /opt/server-sentinel-main/current
+sudo systemctl stop server-sentinel.service
+# 1. create a source (repeat for up to 4); prints its UUID
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  create-source --config /etc/server-sentinel/deployment.json \
+  --name "<display name>" --profile 1920x1080@30/MJPG
+#    prints: source created: source_id=<uuid>
+# 2. add that UUID to "local_uvc": {"source_ids": [...]} in the deployment
+#    configuration and run --check
+# 3. list the connected cameras by label, and the sources
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  candidates --config /etc/server-sentinel/deployment.json
+#    prints: candidate cam-<10 hex> usb=<vendor>:<product> serial=present formats=MJPG,YUYV approved_for=-
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  sources --config /etc/server-sentinel/deployment.json
+# 4. approve one camera for one source (type APPROVE on the terminal)
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  approve --config /etc/server-sentinel/deployment.json <source uuid> cam-<10 hex>
+sudo systemctl start server-sentinel.service
+```
+
+- `create-source` creates an **enabled** `local_uvc` source with that
+  explicit capture profile (`WIDTHxHEIGHT@FPS/FOURCC`). The registry refuses
+  one beyond the active-source limit (`active_source_limit_reached`; 1 to 4,
+  enabled sources of every type count). The source does nothing until its
+  UUID is listed in `local_uvc.source_ids` and a camera is approved for it.
+- `candidates` (read-only, allowed while the service runs; it opens each
+  video node read-only for the same capability query the service's discovery
+  uses) names each connected USB video-capture camera only by a short hashed
+  label of its current device instance, its USB vendor:product ids, whether
+  it reports a serial (`present`, `absent`, or `shared` when another connected
+  camera reports the same one), its advertised pixel formats and the source
+  whose approval holds it. It never prints a serial, `/dev` path, by-id name
+  or USB port. A label stays the same while the camera stays plugged in and
+  changes when it is re-plugged or the host reboots: list again then. The
+  label also covers the change time of the camera's sysfs entry
+  (`/sys/class/video4linux/videoN`, not the `/dev` node), so a change of that
+  sysfs entry's own owner or mode changes it without a re-plug; `approve`
+  then refuses the old label (`candidate_not_found`), which is the safe
+  direction: list again. A `chmod`, `setfacl` or udev permission change of
+  the `/dev/videoN` node does not change the label.
+  `sources` prints each `local_uvc` source's UUID, enabled state, approval
+  state (`approved`, `approval_required`, `none`), whether the deployment
+  lists it, its profile and its name.
+- `approve` rescans and binds exactly that camera. It refuses a camera without
+  a serial (`camera_without_serial`) and one whose serial is not unique
+  (`camera_serial_not_unique`): stored evidence cannot tell such a camera from
+  an identical one, so after the restart the service would put the source in
+  `manual_intervention_required` anyway; such a camera needs a live Owner
+  approval on the running service (not available yet). It also refuses a
+  camera already approved for another enabled source
+  (`camera_approved_for_another_source`), one that does not advertise the
+  source's pixel format (`camera_format_unsupported`), a scan with a device
+  it could not inspect (`camera_scan_incomplete`), an unknown label
+  (`candidate_not_found`), a disabled or missing source, a source without a
+  complete, supported capture profile (`source_profile_unusable`; the worker
+  would never open the camera), and a camera that changed between the
+  selection and the audited rescan (`candidate_unavailable`, recorded
+  `failed`; a serial that became shared meanwhile is
+  `camera_serial_not_unique`, recorded `failed`). Approving clears the
+  active-session marker a crashed service left. It clears a
+  `manual_intervention_required` latch only by binding a camera this command
+  accepts (a unique serial, not one the source latched as ambiguous); an
+  ambiguity latch on a camera without a serial or with a shared serial cannot
+  be cleared with this command and needs the live Owner approval.
+- Exit status `0` done, `2` refused (a fixed word on stderr).
+  `committed_verification_failed` means the change and its audit record were
+  committed but re-verifying the pinned database afterwards failed: run
+  `sources` and investigate the state directory if the change is missing.
 
 ### Detection section (optional; inference stays unavailable without it)
 
@@ -515,10 +630,225 @@ without privilege, as the service account, with the Issue #126 procedure in
 `MANUAL_TEST.md` (section "ADR-0003 follow-up: accepted human-access
 boundary").
 
+`tailscaled`'s peerAPI listens on TCP directly on the node's Tailscale
+addresses, which are the reserved addresses when the dashboard name is the
+node's Tailscale name. A wildcard exception never covers that; record it as a
+`reserved_address` exception with the command below (Owner decision
+D1, 2026-10-16; ADR-0003): TCP,
+the observed port, the family of the address it is bound on (or none when the
+same port is bound on both), unit `tailscaled.service`, uid `0`. Nothing else
+is accepted in that scope, and at most one such exception per family (Issue
+#278): if `ss` shows more than one `tailscaled` port on an address family of
+the Tailscale addresses besides the Serve socket, stop and find out what the
+other one is rather than recording it. Find the port with
+`sudo ss -ltnp --cgroup` (rows on the Tailscale addresses with
+`cgroup:/system.slice/tailscaled.service`) and run the `MANUAL_TEST.md` peerAPI
+steps first. If `tailscaled` binds another port after a restart, the check
+closes human access as `UNEXPECTED_LISTENER` (every human session is revoked
+before it reopens) until the new port is recorded.
+
 Exceptions stored before this change (an executable path such as
 `/usr/sbin/sshd`, or a unit without a uid) are not migrated: the check reports
 `LISTENER_EXCEPTIONS_OUTDATED` and keeps human access closed until the Owner
-enters them again through the audited Owner path.
+enters them again with the command below.
+
+#### Recording listener exceptions (Issue #10, Owner decision D3)
+
+The Owner records the exceptions on the Main Server host, over SSH or the
+console, as the service account with the installed release's interpreter,
+like `bootstrap_cli` (no root, no `sudo` to root, a controlling terminal, the
+existing database of exactly this release's schema). There is no WebAuthn
+step-up: running as the service account already means being able to write the
+database. `set` replaces the whole set, so list every exception the host needs
+in one command:
+
+```sh
+cd /opt/server-sentinel-main/current
+sudo -u <service account> ./venv/bin/python -m app.auth.reservation_cli \
+  show --config /etc/server-sentinel/deployment.json
+sudo -u <service account> ./venv/bin/python -m app.auth.reservation_cli \
+  set --config /etc/server-sentinel/deployment.json \
+  protocol=tcp,port=22,unit=ssh.socket,uid=0 \
+  protocol=udp,port=<wireguard port>,unit=tailscaled.service,uid=0 \
+  scope=reserved_address,protocol=tcp,port=<peerAPI port>,family=ipv4,unit=tailscaled.service,uid=0
+sudo systemctl restart server-sentinel.service
+```
+
+- Each exception is one argument: `protocol` (`tcp`/`udp`), `port`, `unit`
+  and `uid` are required, `family` (`ipv4`, `ipv6`, `any`) and `scope`
+  (`wildcard`, `reserved_address`) are optional. Anything else, a port of the
+  dashboard, upstream or proxy, a `reserved_address` exception other than
+  `tailscaled.service`/uid `0`/TCP, a second `reserved_address` exception for
+  the same family, more than 16 exceptions or a repeated one
+  is refused (`listener_exception_rejected`) before anything is asked.
+- `set` shows the stored and the new set and asks for the word `CHANGE`; the
+  set and its `change_security_setting` audit record (actor `owner`, no port
+  or unit in it) commit together. `set --clear` stores the empty set. If the
+  stored set changed after it was shown, the command refuses
+  (`listener_exceptions_changed`) and writes nothing.
+- The running service does not see the change: it loads the stored set at
+  startup only. Restart it; the first check after the restart applies the
+  set (a narrower set can close human access then). `show` prints the stored
+  set, not necessarily the one in force.
+- `set` validates against the reservation the deployment's `"human_access"`
+  section states (below: `hostname`, `port`, `reserved_addresses`,
+  `proxy_listeners`, `proxy_owner`, `isolation`, and the `human_host` /
+  `human_port` upstream), the same one the service's check uses, whether the
+  section is enabled or not. Without the section it refuses
+  (`human_access_not_configured`); a section that states no usable
+  reservation refuses with `human_access_configuration_rejected`. Neither
+  refusal prints a configured value. `show` needs neither. A stored set
+  that cannot be read is not printed (`stored_exceptions_unreadable` /
+  `stored_exceptions_outdated`); `set` replaces it.
+- `committed_verification_failed` means the change was committed, but the
+  database file at the path was replaced meanwhile: run `show` and repeat
+  `set` if the stored set is not the new one.
+
+### Enabling human access through Tailscale Serve (Issue #10)
+
+Without the optional `"human_access"` key every human path stays closed
+(`ClosedHumanSurface`): the backend answers every request with the generic
+denial, exactly as before. The key records the Owner's reservation of the
+dashboard origin (ADR-0003) and makes the launcher build the production
+human-access composition (`server/app/auth/composition.py`): the hostname
+reservation check over this network namespace's `/proc/net`, Tailscale Serve
+status, the node's resolver and the sock_diag owner lookup; the audited access
+store with the session-binding key `state/session-binding.key` (created once,
+mode `0600`, and, like the database file, read or created only on the verified
+recording filesystem and never past the hard reserve); the passkey ceremonies for the reserved `https` origin; and the
+Web build named by `"web_assets_directory"`. One fault monitor receives every
+reservation fault and credential finding and turns them into immediate,
+value-free Owner notifications (Issue #232 item 4). The interim live frame
+pull (S7) is attached to the sources of the `"local_uvc"` section, so a
+person with `live:view` can watch them once signed in. Opening the key does not
+open access by itself: every request still needs a passing startup/daily
+reservation check, the trusted-proxy path, an invitation and the person's own
+passkey.
+
+```json
+"web_assets_directory": "/opt/server-sentinel-main/current/web",
+"human_access": {
+  "enabled": true,
+  "hostname": "sentinel.example-tailnet.ts.net",
+  "port": 443,
+  "reserved_addresses": ["100.64.0.10", "fd7a:115c:a1e0::10"],
+  "isolation": "dedicated_network_identity",
+  "tailscale_executable": "/usr/bin/tailscale",
+  "proxy_listeners": [],
+  "proxy_owner": null,
+  "require_device_bound": false
+}
+```
+
+The values are synthetic examples; keep the real hostname and addresses only
+in this private configuration.
+
+- `enabled` (required, `true`/`false`): `false` keeps human access closed
+  while the rest of the section is still validated, so it can be switched
+  off without deleting it.
+- `hostname` (required): the reserved name, in lower case without a trailing
+  dot, for example the node's MagicDNS name. It is also the WebAuthn
+  relying-party id, so changing it later invalidates every registered
+  passkey. Rename the Tailscale node to a neutral name before enabling HTTPS
+  certificates for it (Owner decision D6): the name appears in the public
+  certificate transparency log.
+- `port` (optional, default `443`): the HTTPS port Serve answers on; the
+  origin is `https://<hostname>` for 443 and `https://<hostname>:<port>`
+  otherwise.
+- `reserved_addresses` (required, 1 to 16): every address the name resolves
+  to on this node, IPv4 and IPv6 (`tailscale ip`; compare with
+  `getent ahosts <hostname>`). Each check re-resolves the name and keeps
+  access closed when the answer differs.
+- `isolation` (required): how the reservation is enforced outside the
+  application, as the Owner states it: `"dedicated_network_identity"` (the
+  backend and its own `tailscaled` run in a dedicated VM or container with
+  their own Tailscale node, so nothing else on the shared host answers on
+  that node's addresses) or `"single_purpose_node"` (the whole host serves
+  ServerSentinel alone, enforced by OS/service policy). `null` keeps access
+  closed (`ISOLATION_UNSTATED`, with an Owner notification) until the Owner
+  states one. The check only detects; it does not enforce either mode
+  (ADR-0003).
+- `tailscale_executable` (required): the absolute path of the `tailscale`
+  CLI of the `tailscaled` that serves this node. On every check the backend
+  runs exactly `<tailscale_executable> serve status --json`, as the service
+  account, with an empty environment, no stdin, a 5-second timeout and at
+  most 1 MiB of output; any failure keeps access closed. At every start
+  the launcher accepts only a regular file owned by root (or the
+  administrator) and not writable by group or others, in an
+  administrator-controlled directory, and executable by the service
+  account; a symbolic link is resolved and its target checked. A path that
+  fails this is a change on the host, not an invalid section, so it does not
+  stop the service: see `executable` below. Nothing else
+  is ever run: no `tailscale up`, `serve` change, `cert`, ACL/Grants change
+  or administrative credential.
+- `proxy_listeners` (optional, default empty) and `proxy_owner`: when Serve
+  holds a visible TCP socket on a reserved address at `port` (check with
+  `sudo ss -ltnp` on the node; record the result in `MANUAL_TEST.md`), list
+  those addresses and name its creator as `{"unit": "tailscaled.service",
+  "uid": 0}`. `proxy_owner` is required exactly when addresses are listed.
+- `require_device_bound` (optional, default `false`): `true` refuses the
+  registration of a backup-eligible (synced) passkey with `409
+  device_bound_credential_required`.
+
+When `enabled` is `true`, `"web_assets_directory"` is required too. The
+release's own check (`python -m app.deployment --config <config> --check`,
+the unit's `ExecStartPre`, and the installer's staging and rollback checks)
+refuses an invalid section with one value-free reason and the service does
+not start:
+
+```text
+ServerSentinel deployment validation failed: human access refused (reason=<word>)
+```
+
+`<word>` is `setting` (an unknown or missing key, or an invalid value) or
+`web_assets` (enabled without `"web_assets_directory"`). It never names the
+hostname, an address or a path.
+
+A valid section whose `tailscale_executable` fails the checks above at start
+(the CLI was removed, replaced or its permissions changed) does not refuse
+the start, since that would also stop recording, the integrity and
+recording-health checks and the Owner notification (Issue #283). The check
+still passes, and it and the service print one value-free line on stderr (in
+the journal for `ExecStartPre` and the service; the installer's staging and
+rollback checks discard it):
+
+```text
+ServerSentinel deployment warning: human access stays closed (reason=executable); recording and monitoring start
+```
+
+The service then starts exactly as when the composition cannot be built
+(below): every human path closed, `human_access_composition_failed` logged,
+an immediate `human_access_fault` notification and degraded monitoring
+health until the CLI is fixed and the service restarted. Run the check as
+the service account after changing the CLI and look for this line.
+
+If the composition itself cannot be built at start (for
+example the session-binding key or its directory is not the service
+account's own, or the recording filesystem is missing, replaced or at the hard
+reserve), the service logs `human_access_composition_failed` and keeps every
+human path closed (never a partial surface) while recording and the
+integrity and recording-health checks keep running; the Owner gets an
+immediate `human_access_fault` notification and the monitoring health stays
+degraded until the cause is fixed and the service restarted. A release
+from before this key refuses it as an unknown key (see "Install, update, and
+rollback"): remove the section before rolling back to one.
+
+Then, as the Owner, in this order:
+
+1. set up the human upstream through socket activation (above) and point the
+   Serve mapping for `https://<hostname>[:<port>]/` at
+   `http://127.0.0.1:<human_port>`, with no other path, port, TCP forward or
+   Funnel on the name;
+2. add the section and run the check above as the service account;
+3. restart the service and confirm that the startup check passes (no
+   `human_access_check_failed`, no `human_access_fault` notification), then
+   follow "Owner bootstrap and recovery" below to register the Owner's
+   passkey from a viewer device.
+
+The real `tailscale serve status --json` output, whether the service account
+can read it, and whether Serve holds a visible socket are unverified against
+the installed Tailscale version (`MANUAL_TEST.md`, "ADR-0003 follow-up");
+until confirmed there, a passing check on the real host is the evidence.
 
 ### Capture-node CA and Main listener certificate
 
@@ -917,9 +1247,10 @@ checks are MANUAL_TEST §B step 15 (not yet executed on real hosts).
 The first Owner, and an Owner who lost every passkey, get a single-use
 enrollment code from a local command on the Main Server (ADR-0003). There is
 no bootstrap web page or route: the code is redeemed through the ordinary
-invitation redemption at the reserved origin. No production entry point
-mounts the human routes yet, so until a deployment can enable them a code
-issued here cannot be redeemed (MANUAL_TEST §J, pending).
+invitation redemption at the reserved origin, so a code issued here can be
+redeemed only once the deployment has enabled human access (see "Enabling
+human access through Tailscale Serve (Issue #10)") and its reservation check
+passes (MANUAL_TEST §J, pending on real hosts).
 
 Run it **as the service account** that owns the application database, from
 an interactive SSH or console session of an administrator, with the installed
@@ -1430,6 +1761,15 @@ Releases and runtime data are never deleted by these operations; only a staged
 release whose own installation failed is removed. Database migrations are
 forward-only, so an older application may reject a newer database; that failed
 rollback restores the release that was running before the attempt.
+For example, migration 25 (Issue #287) adds the nullable
+`notification_events.accepted_at` column on the first start of a release that
+includes it: it rewrites and deletes no row, runs inside the storage admission
+(filesystem identity and hard reserve) like every migration, and a refused
+admission is a startup failure that is retried, never a partial schema. Until
+that first start the local administrative commands refuse the database with
+`database_schema_outdated`. A release from before it refuses the migrated
+database at startup (newer schema), so a rollback across it fails and
+restores the running release.
 
 Release trees therefore accumulate under the installation root. Keep the
 installation filesystem separate from the runtime filesystem so release growth
@@ -1770,7 +2110,9 @@ the tables #132 added:
 Values a correct service rewrites across a restart or a daily run are not
 compared for equality; the output lists them under `declared_mutable`:
 `notification_events.delivery` (a pending Slack delivery completes, a
-presence notification is retried), `uvc_approvals.session_token` (cleared at
+presence notification is retried), `notification_events.accepted_at` (the
+row's latest local write, rewritten with each delivery result or retried
+write; `NULL` on rows written before migration 25), `uvc_approvals.session_token` (cleared at
 a clean stop and replaced at every start; the Owner re-approval latch it arms
 is compared through the camera source's `requires_approval`, but a token
 cleared while the service was down after an unclean stop cannot be told from

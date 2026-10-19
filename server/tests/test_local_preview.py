@@ -41,6 +41,13 @@ def frame(data=b"synthetic-frame"):
     return VideoFrame(data, 0, 1.0)
 
 
+def online(hub, source):
+    """The capture worker's first ``online`` transition: a preview source
+    accepts frames only after one (PR #277 review)."""
+    from app.cameras.uvc.identity import CameraState, HealthEvent
+    hub.on_health(HealthEvent(source, CameraState.ONLINE, "video_capture_ready"))
+
+
 class AccessFixture:
     def __init__(self, database):
         self.store = AccessStore(database, clock=lambda: NOW,
@@ -87,6 +94,16 @@ class PreviewHubTests(unittest.TestCase):
     def test_zero_viewers_retain_nothing_and_frames_are_bounded(self):
         source = uuid4()
         hub = LocalPreviewHub((source,), max_frame_bytes=16)
+        preview = hub.source(source)
+        viewer = uuid4()
+        preview.add_viewer(viewer)
+        # No ``online`` transition yet: capture never started, nothing accepted.
+        self.assertFalse(hub.accepting(source))
+        hub.on_frame(source, frame())
+        self.assertEqual(0, hub.status.retained_bytes)
+        self.assertTrue(preview.remove_viewer(viewer))
+        online(hub, source)
+        self.assertTrue(hub.accepting(source))
         hub.on_frame(source, frame())
         self.assertEqual(0, hub.status.retained_bytes)
         preview = hub.source(source)
@@ -120,6 +137,7 @@ class LiveViewEnforcementTests(unittest.TestCase):
         self.access = AccessFixture(self.database)
         self.source = uuid4()
         self.hub = LocalPreviewHub((self.source,))
+        online(self.hub, self.source)
         self.preview = AuthorizedLocalPreview(self.hub, LIMITS,
                                               live_view_validator(self.database, clock=lambda: NOW))
 
@@ -263,7 +281,7 @@ class RuntimePreviewTests(RuntimeFixture):
         source = self.source()
         hub = LocalPreviewHub((source.id,))
         self.on_frame = hub.on_frame
-        runtime = self.runtime(source.id)
+        runtime = self.runtime(source.id, health_sink=hub.on_health)
         runtime.start()
         admin = OwnerAdministration(
             OwnerAuditService(AuditStore(self.database), PermitOwner()), self.registry,
@@ -323,6 +341,7 @@ class RuntimePreviewTests(RuntimeFixture):
         source = uuid4()
         hub = LocalPreviewHub((source,))
         hub.source(source).add_viewer(uuid4())
+        online(hub, source)
         hub.on_frame(source, frame())
         self.assertIsNotNone(hub.latest(source))
         for state in (CameraState.OFFLINE, CameraState.DEGRADED, CameraState.MANUAL):
@@ -344,6 +363,7 @@ class RuntimePreviewTests(RuntimeFixture):
         source = uuid4()
         hub = LocalPreviewHub((source,))
         hub.source(source).add_viewer(uuid4())
+        online(hub, source)
         hub.on_frame(source, frame())
         self.assertIsNotNone(hub.latest(source))
         hub.clear()

@@ -1,6 +1,8 @@
 import { Component, useEffect, useState, type ReactNode } from 'react';
 import { flushSync } from 'react-dom';
 import { canVisit, deniedServices, parseWizard, views, type CameraSourceSummary, type DashboardServices, type RecordingSummary, type Session, type StorageSummary, type View, type WizardSnapshot, type WizardStatus, type WizardStepState } from './domain';
+import { ApiError } from './api';
+import { LiveScreen } from './dashboard/live';
 import { messages, type Locale } from './i18n';
 import { RecordingsView } from './recordings/view';
 import { StorageView } from './setup/storage';
@@ -55,6 +57,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const [mutations] = useState(() => new MutationQueue());
   const [loadedFor, setLoadedFor] = useState({ services, attempt });
   const [openedView, setOpenedView] = useState<View>('overview');
+  const [signOut, setSignOut] = useState<'idle' | 'busy' | 'failed'>('idle');
   const t = messages[locale];
 
   // Replacing the provider or retrying must not paint the previous session's
@@ -72,6 +75,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
     setView('overview');
     setBusy([]);
     setFailures([]);
+    setSignOut('idle');
   }
 
   // Re-opening a screen must not paint the snapshot loaded last time while the
@@ -183,6 +187,22 @@ export function App({ services = deniedServices }: { services?: DashboardService
   }, [services, access, attempt, mutations]);
 
   const session: Session = access.state === 'allowed' ? access : { state: 'denied' };
+  const endSession = services.signOut;
+  // Ends only the caller's own session; the sign-in shell is the next step.
+  const signOutAction = access.state === 'allowed' && endSession ? () => {
+    if (signOut === 'busy') return;
+    setSignOut('busy');
+    void (async () => {
+      try {
+        await endSession(new AbortController().signal);
+        window.location.replace('/');
+      } catch (error) {
+        // A refusal means this session is already gone: sign-in is next too.
+        if (error instanceof ApiError && error.code === 'unauthorized') window.location.replace('/');
+        else setSignOut('failed');
+      }
+    })();
+  } : undefined;
   const selected = canVisit(session, view) ? view : 'overview';
   const hint = `${selected}Hint` as const;
   const star = services.starRecording;
@@ -247,6 +267,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
       <label className="language">{t.language}<select value={locale} onChange={event => setLocale(event.target.value as Locale)}>
         <option value="ja">日本語</option><option value="en">English</option>
       </select></label>
+      {signOutAction && <button type="button" className="sign-out" disabled={signOut === 'busy'} onClick={signOutAction}>{t.signOut}</button>}
     </header>
     <div className="workspace">
       <nav aria-label={t.navigation} className="navigation">
@@ -257,11 +278,13 @@ export function App({ services = deniedServices }: { services?: DashboardService
       <main id="main" tabIndex={-1}>
         <LocalBoundary message={t.failed}>
           {access.state === 'loading' && <section className="notice" role="status"><h1>{t.checking}</h1></section>}
-          {access.state === 'denied' && <section className="notice"><span className="eyebrow">ServerSentinel</span><h1>{t.deniedTitle}</h1><p>{t.denied}</p><p className="muted">{t.privateGate}</p></section>}
+          {access.state === 'denied' && <section className="notice"><span className="eyebrow">ServerSentinel</span><h1>{t.deniedTitle}</h1><p>{t.denied}</p><p className="muted">{t.privateGate}</p>{services.signOut && <p><a href="/">{t.signInAgain}</a></p>}</section>}
           {access.state === 'failed' && <section className="notice" role="alert"><h1>{t.failedTitle}</h1><p>{t.failed}</p><button className="primary" onClick={() => setAttempt(value => value + 1)}>{t.retry}</button></section>}
           {access.state === 'allowed' && <>
+            {signOut === 'failed' && <p role="alert" className="notice-inline">{t.signOutFailed}</p>}
             <div className="page-heading"><div><span className="eyebrow">{t[access.role]}</span><h1>{t[selected]}</h1><p>{t[hint]}</p></div><span className="badge">{t.pending}</span></div>
-            {selected === 'timeline' && canVisit(session, 'timeline') ? <TimelineScreen services={services} t={t} />
+            {selected === 'live' && canVisit(session, 'live') ? <LiveScreen services={services} t={t} />
+              : selected === 'timeline' && canVisit(session, 'timeline') ? <TimelineScreen services={services} t={t} />
               : selected === 'presence' && access.role === 'owner' ? <PresenceScreen services={services} t={t} />
                 : selected === 'sources' && access.role === 'owner' && sources.state === 'ready' ? <>
               <p className="source-count">{t.sourceCount}: {sources.items.length}</p>

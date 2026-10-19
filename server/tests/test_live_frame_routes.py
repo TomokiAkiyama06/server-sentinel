@@ -1,0 +1,982 @@
+"""Issue #10 S7 (Owner decision D10, D5 defaults): the interim live frame pull.
+
+Synthetic only: software authenticators, synthetic ``/proc/net`` rows, a
+temporary SQLite database, the in-process ASGI driver of
+``test_human_surface`` and synthetic JPEG-shaped bytes (an SOI marker, an
+ASCII filler and an EOI marker; no image of anything). No camera, browser,
+proxy or Tailscale is involved, so browser decoding of real camera MJPG
+frames remains a manual check (``MANUAL_TEST.md``).
+"""
+
+import asyncio
+from contextlib import closing
+import hashlib
+import json
+from pathlib import Path
+import tempfile
+import threading
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+from uuid import UUID, uuid4
+
+from app.auth.human_surface import (
+    LIVE_SESSIONS_PATH, LIVE_SOURCES_PATH, SIGN_OUT_PATH, HumanAccessUnavailable, match_route,
+)
+from app.auth.live_access import BoundLiveAccess
+from app.auth.model import Permission
+from app.auth.rate_limit import SourceRateLimiter
+from app.auth.reservation import DAILY_SECONDS
+from app.auth.store import Requirement
+from app.cameras.registry import CameraRegistry, SourceHealthState, SourceType
+from app.cameras.registry.models import CaptureProfile
+from app.media.live.frame_pull import (
+    MAX_PENDING_REQUESTS, MAX_PENDING_REQUESTS_PER_SESSION, LiveFrameLimits, LiveFrameService,
+    LiveFrameUnavailable,
+)
+from app.media.live.local_preview import LocalPreviewHub
+from app.storage.database import Database
+from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
+
+from tests.test_human_admin_routes import AdminRouteFixture
+from tests.test_human_surface import EXPOSED, call, header, payload, status
+
+
+JPEG = b"\xff\xd8\xff\xe0" + b"synthetic-not-an-image" + b"\xff\xd9"
+OTHER_JPEG = b"\xff\xd8\xff\xdb" + b"synthetic-second-frame" + b"\xff\xd9"
+
+
+class Monotonic:
+    """A monotonic clock that moves only when a test says so."""
+
+    def __init__(self):
+        self.value = 1000.0
+
+    def __call__(self):
+        return self.value
+
+
+def frame(data):
+    return SimpleNamespace(data=data)
+
+
+def health(source_id, value):
+    return SimpleNamespace(source_id=source_id, state=SimpleNamespace(value=value))
+
+
+class LiveRouteFixture(AdminRouteFixture):
+    def setUp(self):
+        super().setUp()
+        registry = CameraRegistry(self.database, unaudited_writes=True)
+        # Five enabled rows (three viewable, one YUYV, one not configured here)
+        # exceed the default active limit of 4; this test registry allows them.
+        registry.set_active_limit(8)
+        mjpg = CaptureProfile(width=1280, height=720, fps=30, pixel_format="MJPG")
+        self.sources = [registry.create_source(source_type=SourceType.LOCAL_UVC, name=f"Synthetic camera {name}",
+                                               enabled=True, desired_capture_profile=mjpg).id
+                        for name in ("A", "B", "C")]
+        # Configured and enabled, but captured as YUYV: this interim transport
+        # cannot serve it, so it is neither listed nor opened.
+        self.yuyv = registry.create_source(
+            source_type=SourceType.LOCAL_UVC, name="Synthetic raw camera", enabled=True,
+            desired_capture_profile=CaptureProfile(width=640, height=480, fps=30, pixel_format="YUYV")).id
+        # Capture negotiated the configured MJPG profile (Issue #279 item 5).
+        for source_id in self.sources:
+            registry.update_source_health(source_id, health_state=SourceHealthState.ONLINE,
+                                          negotiated_capture_profile=mjpg)
+        self.registry = registry
+        # Configured but disabled, and enabled but not configured: neither is listed.
+        self.disabled = registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic disabled",
+                                               enabled=False, desired_capture_profile=mjpg).id
+        self.unconfigured = registry.create_source(source_type=SourceType.LOCAL_UVC,
+                                                   name="Synthetic elsewhere", enabled=True,
+                                                   desired_capture_profile=mjpg).id
+        self.hub = LocalPreviewHub((*self.sources, self.disabled, self.yuyv))
+        # Capture started: each viewable camera reported ``online``.
+        for source_id in self.sources:
+            self.hub.on_health(health(source_id, "online"))
+        self.monotonic = Monotonic()
+        self.live = LiveFrameService(self.hub, self.store, monotonic=self.monotonic,
+                                     limits=LiveFrameLimits(sweep_interval_seconds=0.02))
+        self.access.attach_live(self.live)
+        self.access.live_limiter = SourceRateLimiter(per_source_capacity=1000, global_capacity=None,
+                                                     monotonic=self.limit_clock)
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.addAsyncCleanup(self.wait_stopped)
+
+    async def wait_stopped(self):
+        await self.stop_serving()
+        self.assertFalse(self.live.running)
+        await self.until(lambda: self.hub.status.viewers == 0)
+
+    # -- requests ------------------------------------------------------
+
+    async def sources_of(self, cookie):
+        return await call(self.surface, "GET", LIVE_SOURCES_PATH, cookie=cookie)
+
+    async def open(self, cookie, csrf, source_id, *, raw=None):
+        body = raw if raw is not None else json.dumps({"source_id": str(source_id)}).encode()
+        return await call(self.surface, "POST", LIVE_SESSIONS_PATH, cookie=cookie, body=body,
+                          headers=[(b"x-csrf-token", csrf.encode())])
+
+    async def opened(self, cookie, csrf, source_id):
+        result = await self.open(cookie, csrf, source_id)
+        self.assertEqual(status(result), 200)
+        return UUID(payload(result)["session_id"])
+
+    async def frame(self, cookie, session_id, after=0, *, query=None, identity=None):
+        options = {} if identity is None else {"identity": identity}
+        return await call(self.surface, "GET", f"{LIVE_SESSIONS_PATH}/{session_id}/frame", cookie=cookie,
+                          query=f"after={after}".encode() if query is None else query, **options)
+
+    async def close(self, cookie, csrf, session_id):
+        return await call(self.surface, "POST", f"{LIVE_SESSIONS_PATH}/{session_id}/close", cookie=cookie,
+                          headers=[(b"x-csrf-token", csrf.encode())], content_type=None)
+
+    async def viewer(self, permissions=(Permission.LIVE_VIEW,)):
+        principal, key, _ = self.enroll(permissions)
+        cookie = await self.sign_in(key)
+        return principal, cookie, await self.csrf(cookie)
+
+    def tick(self, seconds=1.0):
+        self.monotonic.value += seconds
+
+    def live_status(self):
+        return self.live.status().result(timeout=10)
+
+
+class LiveViewTests(LiveRouteFixture):
+    def test_routes_are_mounted_with_their_requirements(self):
+        session = str(uuid4())
+        expected = {
+            ("GET", LIVE_SOURCES_PATH): Requirement.LIVE,
+            ("POST", LIVE_SESSIONS_PATH): Requirement.LIVE,
+            ("GET", f"{LIVE_SESSIONS_PATH}/{session}/frame"): Requirement.LIVE,
+            ("POST", f"{LIVE_SESSIONS_PATH}/{session}/close"): Requirement.SESSION,
+        }
+        for (method, path), requirement in expected.items():
+            route = match_route({"method": method, "path": path, "raw_path": path.encode()})
+            self.assertIsNotNone(route)
+            self.assertIs(route.requirement, requirement)
+            self.assertEqual(route.csrf, method == "POST")
+        for path in (f"{LIVE_SESSIONS_PATH}/{session.upper()}/frame", f"{LIVE_SESSIONS_PATH}/{session}",
+                     f"{LIVE_SESSIONS_PATH}/{session}/frame/", f"{LIVE_SESSIONS_PATH}/{session}/download",
+                     f"{LIVE_SOURCES_PATH}/{session}", "/api/live/1"):
+            self.assertIsNone(match_route({"method": "GET", "path": path, "raw_path": path.encode()}))
+
+    async def test_live_view_lists_sources_opens_and_pulls_frames(self):
+        _, cookie, csrf = await self.viewer()
+        listed = await self.sources_of(cookie)
+        self.assertEqual(status(listed), 200)
+        self.assertEqual(sorted(payload(listed)["sources"], key=lambda item: item["id"]), sorted((
+            {"id": str(source_id), "name": f"Synthetic camera {name}", "health": "online"}
+            for source_id, name in zip(self.sources, "ABC")), key=lambda item: item["id"]))
+        self.assertEqual(set(payload(listed)), {"sources"})
+        # No demand yet: a frame offered now is dropped, never retained.
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        self.assertEqual(self.hub.status.retained_bytes, 0)
+        opened = await self.open(cookie, csrf, self.sources[0])
+        self.assertEqual(status(opened), 200)
+        body = payload(opened)
+        self.assertEqual(set(body), {"session_id", "source_id", "lease_seconds", "frame_interval_ms"})
+        self.assertEqual((body["source_id"], body["lease_seconds"], body["frame_interval_ms"]),
+                         (str(self.sources[0]), 15.0, 200))
+        session_id = UUID(body["session_id"])
+        waiting = await self.frame(cookie, session_id)
+        self.assertEqual(status(waiting), 204)
+        self.assertEqual(waiting[1]["body"], b"")
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        served = await self.frame(cookie, session_id)
+        self.assertEqual(status(served), 200)
+        self.assertEqual(served[1]["body"], JPEG)
+        names = [key for key, _ in served[0]["headers"]]
+        self.assertEqual(names, [b"content-type", b"content-length", b"cache-control", b"x-content-type-options",
+                                 b"cross-origin-resource-policy", b"x-frame-sequence"])
+        self.assertEqual(header(served, b"content-type"), [b"image/jpeg"])
+        self.assertEqual(header(served, b"cache-control"), [b"no-store"])
+        self.assertEqual(header(served, b"x-content-type-options"), [b"nosniff"])
+        self.assertEqual(header(served, b"content-disposition"), [])
+        sequence = int(header(served, b"x-frame-sequence")[0])
+        self.tick()
+        self.assertEqual(status(await self.frame(cookie, session_id, sequence)), 204)
+        self.hub.on_frame(self.sources[0], frame(OTHER_JPEG))
+        self.assertEqual((await self.frame(cookie, session_id, sequence))[1]["body"], OTHER_JPEG)
+
+    async def test_owner_holds_live_implicitly(self):
+        session_id = await self.opened(self.owner_cookie, self.owner_csrf, self.sources[0])
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        self.assertEqual(status(await self.frame(self.owner_cookie, session_id)), 200)
+
+    async def test_recordings_view_alone_is_refused_everywhere(self):
+        expected = await self.denial()
+        _, cookie, csrf = await self.viewer((Permission.RECORDINGS_VIEW,))
+        _, live_cookie, live_csrf = await self.viewer()
+        session_id = await self.opened(live_cookie, live_csrf, self.sources[0])
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        self.assertEqual(await self.sources_of(cookie), expected)
+        self.assertEqual(await self.open(cookie, csrf, self.sources[0]), expected)
+        self.assertEqual(await self.frame(cookie, session_id), expected)
+        self.assertEqual(await self.close(cookie, csrf, session_id), expected)
+        self.assertEqual(self.live_status().active_sessions, 1)
+
+    async def test_uninvited_and_forged_callers_get_the_generic_denial(self):
+        expected = await self.denial()
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        forged = "__Host-session=" + "B" * 43
+        self.assertEqual(await self.sources_of(None), expected)
+        self.assertEqual(await self.sources_of(forged), expected)
+        self.assertEqual(await self.frame(forged, session_id), expected)
+        self.assertEqual(await self.frame(None, session_id), expected)
+        self.assertEqual(await self.open(forged, csrf, self.sources[1]), expected)
+
+    async def test_unknown_source_malformed_requests_and_missing_csrf_are_refused(self):
+        expected = await self.denial()
+        _, cookie, csrf = await self.viewer()
+        for source_id in (uuid4(), self.unconfigured, self.disabled, self.yuyv):
+            self.assertEqual(await self.open(cookie, csrf, source_id), expected)
+        for raw in (b"{}", b'{"source_id": 1}', b'{"source_id": "x"}',
+                    json.dumps({"source_id": str(self.sources[0]).upper()}).encode(),
+                    json.dumps({"source_id": str(self.sources[0]), "extra": 1}).encode(),
+                    b'{"source_id": "%s", "source_id": "%s"}' % (str(self.sources[0]).encode(),
+                                                                 str(self.sources[0]).encode())):
+            self.assertEqual(await self.open(cookie, csrf, None, raw=raw), expected)
+        no_csrf = await call(self.surface, "POST", LIVE_SESSIONS_PATH, cookie=cookie,
+                             body=json.dumps({"source_id": str(self.sources[0])}).encode())
+        self.assertEqual(no_csrf, expected)
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        for query in (b"after=-1", b"after=01", b"after=x", b"after=0&after=0", b"other=1",
+                      b"after=" + b"9" * 19):
+            self.assertEqual(await self.frame(cookie, session_id, query=query), expected)
+        self.assertEqual(status(await self.frame(cookie, session_id, query=b"")), 204)
+        self.assertEqual(await self.frame(cookie, uuid4()), expected)
+        self.assertEqual(await self.close(cookie, csrf, uuid4()), expected)
+
+    async def test_copied_session_id_is_refused_and_the_owner_keeps_watching(self):
+        expected = await self.denial()
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        # Another invited live viewer pasting the id into their own browser.
+        _, other_cookie, other_csrf = await self.viewer()
+        self.assertEqual(await self.frame(other_cookie, session_id), expected)
+        self.assertEqual(await self.close(other_cookie, other_csrf, session_id), expected)
+        self.assertEqual(status(await self.frame(cookie, session_id)), 200)
+        self.assertEqual(self.live_status().active_sessions, 1)
+
+    async def test_copied_session_id_of_the_same_person_in_another_session_is_refused(self):
+        expected = await self.denial()
+        _, key, _ = self.enroll((Permission.LIVE_VIEW,))
+        cookie = await self.sign_in(key)
+        csrf = await self.csrf(cookie)
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        second = await self.sign_in(key)
+        self.assertEqual(await self.frame(second, session_id), expected)
+        self.assertEqual(status(await self.frame(cookie, session_id)), 204)
+
+    async def test_a_binding_mismatch_ends_the_live_session_and_writes_once(self):
+        # Issue #279 item 2: the opening cookie presented under another proxy
+        # identity is refused and ends the live session, so the mismatch is
+        # recorded (coalesced) once and later polls never reach SQLite.
+        expected = await self.denial()
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        writes = self.admission.admitted
+        audits = self.audit_rows()
+        self.assertEqual(await self.frame(cookie, session_id, identity="synthetic-other@example.invalid"),
+                         expected)
+        self.assertEqual((self.hub.status.viewers, self.hub.status.retained_bytes), (0, 0))
+        self.assertEqual(self.live_status().active_sessions, 0)
+        self.assertEqual(self.admission.admitted, writes + 1)
+        self.assertEqual(self.audit_rows(), audits + 1)
+        with patch.object(self.store, "current_session", side_effect=AssertionError("must not read")):
+            for identity in ("synthetic-other@example.invalid", None):
+                self.assertEqual(await self.frame(cookie, session_id, identity=identity), expected)
+        self.assertEqual(self.admission.admitted, writes + 1)
+        self.assertEqual(self.mismatch_counter(cookie), 0)
+        # The human session itself is neither revoked nor ended: it opens again.
+        self.assertEqual(status(await self.frame(cookie, await self.opened(cookie, csrf, self.sources[0]))), 204)
+
+    def mismatch_counter(self, cookie):
+        digest = hashlib.sha256(self.token(cookie)).digest()
+        with closing(self.database.connect()) as connection:
+            return connection.execute("SELECT binding_mismatch_suppressed FROM access_sessions WHERE token_digest=?",
+                                      (digest,)).fetchone()[0]
+
+
+class RevocationTests(LiveRouteFixture):
+    async def test_owner_revocation_of_the_person_releases_demand_at_once(self):
+        expected = await self.denial()
+        session_id = await self.opened(self.target_cookie, self.target_csrf, self.sources[0])
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        self.assertEqual(self.hub.status.viewers, 1)
+        revoked = await self.admin("POST", f"/api/admin/principals/{self.target.id}/revoke", {})
+        self.assertEqual(status(revoked), 204)
+        await self.until(lambda: self.hub.status.viewers == 0)
+        self.assertEqual(self.hub.status.retained_bytes, 0)
+        self.assertEqual(await self.frame(self.target_cookie, session_id), expected)
+
+    async def test_withdrawing_live_view_releases_demand_at_once(self):
+        session_id = await self.opened(self.target_cookie, self.target_csrf, self.sources[0])
+        withdrawn = await self.admin("POST", f"/api/admin/principals/{self.target.id}/permissions",
+                                     {"permission": "live:view", "granted": False})
+        self.assertEqual(status(withdrawn), 204)
+        await self.until(lambda: self.hub.status.viewers == 0)
+        self.assertEqual(await self.frame(self.target_cookie, session_id), await self.denial())
+
+    async def test_unrelated_grant_change_keeps_other_principals_watching(self):
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        changed = await self.admin("POST", f"/api/admin/principals/{self.target.id}/permissions",
+                                   {"permission": "recordings:view", "granted": True})
+        self.assertEqual(status(changed), 204)
+        await asyncio.wrap_future(self.live.status())
+        self.assertEqual(status(await self.frame(cookie, session_id)), 204)
+
+    async def test_credential_revocation_releases_its_live_sessions(self):
+        session_id = await self.opened(self.target_cookie, self.target_csrf, self.sources[0])
+        handle = self.handle(self.target.id)
+        revoked = await self.admin(
+            "POST", f"/api/admin/principals/{self.target.id}/credentials/{handle}/revoke", {})
+        self.assertEqual(status(revoked), 204)
+        await self.until(lambda: self.hub.status.viewers == 0)
+        self.assertEqual(await self.frame(self.target_cookie, session_id), await self.denial())
+
+    async def test_revocation_outside_the_surface_is_caught_by_the_next_poll(self):
+        # The local CLI commits outside this process' observer.
+        session_id = await self.opened(self.target_cookie, self.target_csrf, self.sources[0])
+        self.store.revoke_principal(self.target.id)
+        self.assertEqual(self.hub.status.viewers, 1)
+        self.assertEqual(await self.frame(self.target_cookie, session_id), await self.denial())
+        self.assertEqual(self.hub.status.viewers, 0)
+        self.assertEqual(self.live_status().active_sessions, 0)
+
+    async def test_sign_out_releases_the_sessions_live_sessions(self):
+        await self.opened(self.target_cookie, self.target_csrf, self.sources[0])
+        signed_out = await call(self.surface, "POST", SIGN_OUT_PATH, cookie=self.target_cookie,
+                                headers=[(b"x-csrf-token", self.target_csrf.encode())], content_type=None)
+        self.assertEqual(status(signed_out), 204)
+        await self.until(lambda: self.hub.status.viewers == 0)
+
+    async def test_close_releases_and_a_second_close_is_refused(self):
+        session_id = await self.opened(self.target_cookie, self.target_csrf, self.sources[0])
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        self.assertGreater(self.hub.status.retained_bytes, 0)
+        self.assertEqual(status(await self.close(self.target_cookie, self.target_csrf, session_id)), 204)
+        self.assertEqual((self.hub.status.viewers, self.hub.status.retained_bytes), (0, 0))
+        expected = await self.denial()
+        self.assertEqual(await self.close(self.target_cookie, self.target_csrf, session_id), expected)
+        self.assertEqual(await self.frame(self.target_cookie, session_id), expected)
+
+
+class LimitTests(LiveRouteFixture):
+    async def test_d10_limits_total_per_source_and_per_principal(self):
+        expected = await self.denial()
+        viewers = [await self.viewer() for _ in range(3)]
+        (_, a, a_csrf), (_, b, b_csrf), (_, c, c_csrf) = viewers
+        await self.opened(a, a_csrf, self.sources[0])
+        await self.opened(b, b_csrf, self.sources[0])
+        # Two per source.
+        self.assertEqual(await self.open(c, c_csrf, self.sources[0]), expected)
+        await self.opened(a, a_csrf, self.sources[1])
+        # Two per principal.
+        self.assertEqual(await self.open(a, a_csrf, self.sources[2]), expected)
+        await self.opened(b, b_csrf, self.sources[1])
+        # Four in total.
+        self.assertEqual(await self.open(c, c_csrf, self.sources[2]), expected)
+        self.assertEqual((self.live_status().active_sessions, self.hub.status.viewers), (4, 4))
+
+    async def test_frames_are_paced_to_five_per_second(self):
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        self.assertEqual(status(await self.frame(cookie, session_id)), 200)
+        self.hub.on_frame(self.sources[0], frame(OTHER_JPEG))
+        self.tick(0.15)
+        self.assertEqual(status(await self.frame(cookie, session_id)), 204)
+        self.tick(0.15)
+        self.assertEqual(status(await self.frame(cookie, session_id)), 200)
+
+    async def test_a_tight_poll_loop_is_refused_before_any_sqlite_read(self):
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        expected = await self.denial()
+        for _ in range(self.live.limits.poll_burst):
+            self.assertEqual(status(await self.frame(cookie, session_id)), 204)
+        with patch.object(self.store, "current_session", side_effect=AssertionError("must not read")):
+            self.assertEqual(await self.frame(cookie, session_id), expected)
+        # The budget refills with the limiter's (here: the service's) clock.
+        self.tick(1.0)
+        self.assertEqual(status(await self.frame(cookie, session_id)), 204)
+
+    async def test_opens_are_rate_limited_per_session_and_closes_are_not_charged(self):
+        self.access.live_limiter = SourceRateLimiter(per_source_capacity=2, per_source_refill_seconds=6.0,
+                                                     global_capacity=None, monotonic=self.limit_clock)
+        _, cookie, csrf = await self.viewer()
+        for _ in range(2):
+            session_id = await self.opened(cookie, csrf, self.sources[0])
+            self.assertEqual(status(await self.close(cookie, csrf, session_id)), 204)
+        writes = self.admission.admitted
+        self.assertEqual(await self.open(cookie, csrf, self.sources[0]), await self.denial())
+        self.assertEqual(self.admission.admitted, writes)
+        # A refused open leaves no demand behind.
+        self.assertEqual((self.hub.status.viewers, self.live_status().active_sessions), (0, 0))
+
+    async def test_a_session_without_live_view_takes_no_open_limiter_slot(self):
+        # Issue #279 item 6: the read-only pre-check before the live limiter
+        # requires the Owner or ``live:view``.
+        expected = await self.denial()
+        _, cookie, csrf = await self.viewer((Permission.RECORDINGS_VIEW,))
+        _, none_cookie, none_csrf = await self.viewer(())
+        charged = []
+        real = self.access.live_limiter.allow
+
+        def allow(key):
+            charged.append(key)
+            return real(key)
+
+        _, live_cookie, live_csrf = await self.viewer()
+        with patch.object(self.access.live_limiter, "allow", side_effect=allow):
+            self.assertEqual(await self.open(cookie, csrf, self.sources[0]), expected)
+            self.assertEqual(await self.open(none_cookie, none_csrf, self.sources[0]), expected)
+            self.assertEqual(charged, [])
+            await self.opened(live_cookie, live_csrf, self.sources[0])
+            await self.opened(self.owner_cookie, self.owner_csrf, self.sources[1])
+        self.assertEqual(len(charged), 2)
+        self.assertEqual(len(set(charged)), 2)
+
+    async def test_the_permission_pre_check_requires_an_active_holder(self):
+        live, live_cookie, _ = await self.viewer()
+        _, recordings_cookie, _ = await self.viewer((Permission.RECORDINGS_VIEW,))
+        check = self.store.session_may_be_current
+        live_token, owner_token = self.token(live_cookie), self.token(self.owner_cookie)
+        self.assertTrue(check(live_token, permission=Permission.LIVE_VIEW))
+        self.assertTrue(check(owner_token, permission=Permission.LIVE_VIEW))
+        self.assertFalse(check(self.token(recordings_cookie), permission=Permission.LIVE_VIEW))
+        self.assertTrue(check(self.token(recordings_cookie)))
+        # Never combined with ``owner``, and only a ``Permission``.
+        self.assertFalse(check(owner_token, owner=True, permission=Permission.LIVE_VIEW))
+        self.assertFalse(check(live_token, permission="live:view"))
+        self.store.revoke_principal(live.id)
+        self.assertFalse(check(live_token, permission=Permission.LIVE_VIEW))
+
+    async def test_non_jpeg_and_oversized_frames_are_never_served(self):
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        self.hub.on_frame(self.sources[0], frame(b"synthetic raw YUYV bytes"))
+        self.assertEqual(status(await self.frame(cookie, session_id)), 204)
+        self.tick()
+        self.hub.on_frame(self.sources[0], frame(JPEG[:3] + b"x" * self.live.limits.maximum_frame_bytes))
+        self.assertEqual(status(await self.frame(cookie, session_id)), 204)
+        self.assertEqual(self.live_status().unservable_frames, 2)
+
+    async def test_no_per_frame_writes_and_a_rate_limited_idle_extension(self):
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        times = self.session_times(cookie)
+        writes = self.admission.admitted
+        for index in range(60):
+            self.hub.on_frame(self.sources[0], frame(JPEG))
+            self.tick(0.25)
+            self.assertEqual(status(await self.frame(cookie, session_id, index)), 200)
+        # Fifteen seconds of watching at 4 fps: not one storage-admitted write.
+        self.assertEqual(self.admission.admitted, writes)
+        self.assertEqual(self.session_times(cookie), times)
+        # Keep polling inside the 15 s lease until 60 s have passed since the
+        # open's own idle touch: exactly one extension in that time.
+        for index in range(4):
+            self.tick(14)
+            self.ceremony_clock.advance(seconds=14)
+            self.assertEqual(status(await self.frame(cookie, session_id, 1000)), 204)
+        self.assertEqual(self.admission.admitted, writes + 1)
+        self.assertNotEqual(self.session_times(cookie), times)
+        self.tick(14)
+        self.ceremony_clock.advance(seconds=14)
+        self.assertEqual(status(await self.frame(cookie, session_id, 1000)), 204)
+        self.assertEqual(self.admission.admitted, writes + 1)
+
+    def session_times(self, cookie):
+        digest = hashlib.sha256(self.token(cookie)).digest()
+        with closing(self.database.connect()) as connection:
+            return tuple(connection.execute(
+                "SELECT last_seen_at_us, idle_expires_at_us FROM access_sessions WHERE token_digest=?",
+                (digest,)).fetchone())
+
+
+class RetentionAndHealthTests(LiveRouteFixture):
+    async def test_a_lease_without_polls_releases_demand_and_retains_nothing(self):
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        self.assertGreater(self.hub.status.retained_bytes, 0)
+        self.tick(10)
+        self.assertEqual(status(await self.frame(cookie, session_id)), 200)
+        self.tick(14)
+        await asyncio.sleep(0.1)
+        self.assertEqual(self.hub.status.viewers, 1)
+        self.tick(2)
+        await self.until(lambda: self.hub.status.viewers == 0)
+        self.assertEqual(self.hub.status.retained_bytes, 0)
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        self.assertEqual(self.hub.status.retained_bytes, 0)
+        self.assertEqual(await self.frame(cookie, session_id), await self.denial())
+        self.assertEqual(self.live_status().lease_expiries, 1)
+
+    async def test_refused_polls_never_renew_the_lease(self):
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        _, other, _ = await self.viewer()
+        for _ in range(4):
+            self.tick(5)
+            await self.frame(other, session_id)
+        await self.until(lambda: self.hub.status.viewers == 0)
+
+    async def test_offline_camera_drops_the_frame_and_reports_offline(self):
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        self.hub.on_health(health(self.sources[0], "offline"))
+        self.assertEqual(self.hub.status.retained_bytes, 0)
+        self.assertEqual(status(await self.frame(cookie, session_id)), 204)
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        self.assertEqual(status(await self.frame(cookie, session_id)), 204)
+        listed = {item["id"]: item["health"] for item in payload(await self.sources_of(cookie))["sources"]}
+        self.assertEqual(listed[str(self.sources[0])], "offline")
+        self.hub.on_health(health(self.sources[0], "online"))
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        self.tick()
+        self.assertEqual(status(await self.frame(cookie, session_id)), 200)
+
+    async def test_the_negotiated_format_decides_the_listing(self):
+        # Issue #279 item 5: a capture that negotiated anything but MJPG is
+        # neither listed nor opened, and without a recorded negotiated format
+        # the source is listed but never online.
+        expected = await self.denial()
+        _, cookie, csrf = await self.viewer()
+        yuyv = CaptureProfile(width=1280, height=720, fps=30, pixel_format="YUYV")
+        self.registry.update_source_health(self.sources[0], health_state=SourceHealthState.ONLINE,
+                                           negotiated_capture_profile=yuyv)
+        self.registry.update_source_health(self.sources[1], health_state=SourceHealthState.ONLINE,
+                                           negotiated_capture_profile=None)
+        listed = {item["id"]: item["health"] for item in payload(await self.sources_of(cookie))["sources"]}
+        self.assertEqual(listed, {str(self.sources[1]): "offline", str(self.sources[2]): "online"})
+        self.assertEqual(await self.open(cookie, csrf, self.sources[0]), expected)
+        self.assertEqual(self.hub.status.viewers, 0)
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE camera_sources SET negotiated_capture_profile='[]' WHERE id=?",
+                               (str(self.sources[2]),))
+            connection.commit()
+        listed = {item["id"] for item in payload(await self.sources_of(cookie))["sources"]}
+        self.assertEqual(listed, {str(self.sources[1])})
+
+    async def test_a_closed_gate_refuses_and_ends_every_live_session(self):
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        expected = await self.denial()
+        self.files.files["tcp"] = EXPOSED
+        self.clock.value += DAILY_SECONDS
+        self.assertFalse(self.check.tick().open)
+        self.assertEqual(await self.frame(cookie, session_id), expected)
+        await self.until(lambda: self.hub.status.viewers == 0)
+        self.assertEqual(self.hub.status.retained_bytes, 0)
+
+    async def test_an_epoch_change_during_the_poll_is_refused(self):
+        _, cookie, csrf = await self.viewer()
+        session_id = await self.opened(cookie, csrf, self.sources[0])
+        self.hub.on_frame(self.sources[0], frame(JPEG))
+        real = self.access.epoch
+        with patch.object(self.access, "epoch", side_effect=lambda: (real() or 0) + 1):
+            self.assertEqual(await self.frame(cookie, session_id), await self.denial())
+
+    async def test_stopping_the_composition_ends_live_sessions(self):
+        _, cookie, csrf = await self.viewer()
+        await self.opened(cookie, csrf, self.sources[0])
+        await self.stop_serving()
+        await self.until(lambda: self.hub.status.viewers == 0)
+        self.assertFalse(self.live.running)
+
+
+class ServiceTests(unittest.TestCase):
+    def test_limits_are_validated(self):
+        for changes in ({"maximum_total_viewers": 0}, {"maximum_viewers_per_source": 5},
+                        {"maximum_viewers_per_principal": 5}, {"lease_seconds": 0},
+                        {"lease_seconds": float("nan")}, {"minimum_frame_interval_seconds": True},
+                        {"sweep_interval_seconds": 20}, {"maximum_frame_bytes": 65 * 1024 * 1024}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                LiveFrameLimits(**changes)
+        defaults = LiveFrameLimits()
+        self.assertEqual((defaults.maximum_total_viewers, defaults.maximum_viewers_per_source,
+                          defaults.maximum_viewers_per_principal, defaults.lease_seconds,
+                          defaults.minimum_frame_interval_seconds, defaults.idle_extension_interval_seconds),
+                         (4, 2, 2, 15.0, 0.2, 60.0))
+
+    def test_a_stopped_service_refuses_and_releases(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        database = Database(Path(temporary.name) / "synthetic.sqlite3")
+        with closing(database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        source = CameraRegistry(database, unaudited_writes=True).create_source(
+            source_type=SourceType.LOCAL_UVC, name="Synthetic camera", enabled=True,
+            desired_capture_profile=CaptureProfile(width=640, height=480, fps=30, pixel_format="MJPG")).id
+        hub = LocalPreviewHub((source,))
+        store = SimpleNamespace(current_session=lambda *a, **k: None, now=lambda: None, database=database)
+        service = LiveFrameService(hub, store, validator=lambda access, source_id: True)
+        with self.assertRaises(LiveFrameUnavailable):
+            service.status()
+        service.start()
+        access = BoundLiveAccess(uuid4(), 1, uuid4())
+        token = bytes(32)
+        session = service.open(access, source, token, admit=_null).result(timeout=10)
+        self.assertEqual(hub.status.viewers, 1)
+        self.assertTrue(service.holds(token, session.session_id))
+        self.assertFalse(service.holds(bytes([1]) * 32, session.session_id))
+        service.stop(wait=True)
+        self.assertEqual(hub.status.viewers, 0)
+        self.assertFalse(service.holds(token, session.session_id))
+        with self.assertRaises(LiveFrameUnavailable):
+            service.open(access, source, token, admit=_null)
+        # A non-waiting stop retires the executor; a later waiting stop
+        # drains it before returning.
+        service.start()
+        gate = threading.Event()
+        service._submit(gate.wait, 10)
+        service.open(access, source, token, admit=_null)
+        service.stop()
+        self.assertEqual(hub.status.viewers, 0)
+        releasing = threading.Thread(target=service.stop, kwargs={"wait": True})
+        releasing.start()
+        releasing.join(0.2)
+        self.assertTrue(releasing.is_alive())
+        gate.set()
+        releasing.join(10)
+        self.assertFalse(releasing.is_alive())
+        self.assertEqual(hub.status.viewers, 0)
+        # Concurrent stops (run() ending while a replacement is attached)
+        # never lose the release.
+        service.start()
+        gate = threading.Event()
+        service._submit(gate.wait, 10)
+        service.open(access, source, token, admit=_null)
+        stoppers = [threading.Thread(target=service.stop, kwargs={"wait": wait}) for wait in (False, True, True)]
+        for stopper in stoppers:
+            stopper.start()
+        gate.set()
+        for stopper in stoppers:
+            stopper.join(10)
+        service.stop(wait=True)
+        self.assertEqual(hub.status.viewers, 0)
+        # A blocked executor admits a bounded number of request jobs only.
+        service.start()
+        gate = threading.Event()
+        service._submit(gate.wait, 10)
+        queued = [service.status() for _ in range(MAX_PENDING_REQUESTS)]
+        with self.assertRaises(LiveFrameUnavailable):
+            service.status()
+        gate.set()
+        for future in queued:
+            future.result(timeout=10)
+        service.status().result(timeout=10)
+        service.stop(wait=True)
+        # A restart serves again, with nothing left over.
+        service.start()
+        self.addCleanup(service.stop, wait=True)
+        self.assertEqual(service.status().result(timeout=10).active_sessions, 0)
+
+    def test_a_poll_queued_before_stop_is_refused(self):
+        # Issue #279 item 3: a poll already on the executor's queue when the
+        # service stops never serves a frame after the stop.
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        database = Database(Path(temporary.name) / "synthetic.sqlite3")
+        with closing(database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        mjpg = CaptureProfile(width=640, height=480, fps=30, pixel_format="MJPG")
+        registry = CameraRegistry(database, unaudited_writes=True)
+        source = registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic camera", enabled=True,
+                                        desired_capture_profile=mjpg).id
+        hub = LocalPreviewHub((source,))
+        hub.on_health(health(source, "online"))
+        access = BoundLiveAccess(uuid4(), 1, uuid4())
+        view = SimpleNamespace(session_id=access.access_session_id, principal_id=access.principal_id)
+        reads = []
+
+        def current_session(*args, **kwargs):
+            reads.append(1)
+            return view
+
+        store = SimpleNamespace(current_session=current_session, now=lambda: None, database=database)
+        service = LiveFrameService(hub, store, validator=lambda access, source_id: True)
+        service.start()
+        self.addCleanup(service.stop, wait=True)
+        token = bytes(32)
+        session = service.open(access, source, token, admit=_null).result(timeout=10)
+        hub.on_frame(source, frame(JPEG))
+        self.assertIsNotNone(service.poll(token, "synthetic", session.session_id, 0,
+                                          admit=_null).result(timeout=10).frame)
+        gate = threading.Event()
+        service._submit(gate.wait, 10)
+        hub.on_frame(source, frame(OTHER_JPEG))
+        queued = service.poll(token, "synthetic", session.session_id, 0, admit=_null)
+        service.stop()
+        gate.set()
+        with self.assertRaises(LiveFrameUnavailable):
+            queued.result(timeout=10)
+        self.assertEqual(len(reads), 1)
+        service.stop(wait=True)
+        self.assertEqual(hub.status.viewers, 0)
+
+    def test_a_sweeper_that_cannot_start_rolls_the_service_back(self):
+        service = LiveFrameService(LocalPreviewHub(()), SimpleNamespace(
+            current_session=lambda *a, **k: None, now=lambda: None, database=object()),
+            validator=lambda access, source_id: True)
+        with patch.object(threading.Thread, "start", side_effect=RuntimeError("can't start new thread")):
+            with self.assertRaises(RuntimeError):
+                service.start()
+        self.assertFalse(service.running)
+        with self.assertRaises(LiveFrameUnavailable):
+            service.status()
+        service.start()
+        self.addCleanup(service.stop, wait=True)
+        self.assertTrue(service.running)
+
+    def test_construction_requires_a_hub_and_an_access_store(self):
+        with self.assertRaises(ValueError):
+            LiveFrameService(object(), None)
+        with self.assertRaises(ValueError):
+            LiveFrameService(LocalPreviewHub(()), None)
+
+
+class RequestShareTests(unittest.TestCase):
+    """Issue #279 item 1 (Owner decision 2026-10-16): a per-session share.
+
+    Each human session (one session token) may hold at most
+    ``MAX_PENDING_REQUESTS_PER_SESSION`` of the ``MAX_PENDING_REQUESTS``
+    request jobs, so one session's burst cannot fill the shared queue; a
+    share is returned on completion, failure, cancellation and stop.
+    """
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        database = Database(Path(temporary.name) / "synthetic.sqlite3")
+        with closing(database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        mjpg = CaptureProfile(width=640, height=480, fps=30, pixel_format="MJPG")
+        registry = CameraRegistry(database, unaudited_writes=True)
+        self.source = registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic camera",
+                                             enabled=True, desired_capture_profile=mjpg).id
+        registry.update_source_health(self.source, health_state=SourceHealthState.ONLINE,
+                                      negotiated_capture_profile=mjpg)
+        self.hub = LocalPreviewHub((self.source,))
+        self.hub.on_health(health(self.source, "online"))
+        store = SimpleNamespace(current_session=lambda *a, **k: None, now=lambda: None, database=database)
+        self.service = LiveFrameService(self.hub, store, validator=lambda access, source_id: True)
+        self.service.start()
+        self.addCleanup(self.service.stop, wait=True)
+
+    def block(self):
+        """Hold the executor with an internal (unshared) job until released."""
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.service._submit(gate.wait, 10)
+        return gate
+
+    def held(self):
+        with self.service._lock:
+            return self.service._pending, dict(self.service._shares)
+
+    def fill(self, token):
+        """Queue one session's full share of polls; the next one is refused."""
+        queued = [self.service.poll(token, "synthetic", uuid4(), 0, admit=_null)
+                  for _ in range(MAX_PENDING_REQUESTS_PER_SESSION)]
+        with self.assertRaises(LiveFrameUnavailable):
+            self.service.poll(token, "synthetic", uuid4(), 0, admit=_null)
+        return queued
+
+    def test_the_share_fits_the_shared_queue_and_the_d10_limits(self):
+        limits = LiveFrameLimits()
+        self.assertEqual(MAX_PENDING_REQUESTS_PER_SESSION, 8)
+        # One session alone never fills the queue; it takes as many sessions
+        # at their full share as D10 allows live sessions in total.
+        self.assertLess(MAX_PENDING_REQUESTS_PER_SESSION, MAX_PENDING_REQUESTS)
+        self.assertEqual(MAX_PENDING_REQUESTS // MAX_PENDING_REQUESTS_PER_SESSION,
+                         limits.maximum_total_viewers)
+        # A paced viewer's 2 live sessions (one poll in flight each, plus one
+        # abandoned and retried each) and an open, close and source list fit.
+        self.assertGreaterEqual(MAX_PENDING_REQUESTS_PER_SESSION,
+                                2 * limits.maximum_viewers_per_principal + 3)
+
+    def test_one_session_cannot_fill_the_queue_and_others_keep_being_served(self):
+        gate = self.block()
+        first, second = bytes(32), bytes([1]) * 32
+        queued = self.fill(first)
+        # Opens, closes and source lists of the same session are charged too.
+        with self.assertRaises(LiveFrameUnavailable):
+            self.service.sources(first, admit=_null)
+        with self.assertRaises(LiveFrameUnavailable):
+            self.service.close(first, uuid4(), uuid4())
+        with self.assertRaises(LiveFrameUnavailable):
+            self.service.open(BoundLiveAccess(uuid4(), 1, uuid4()), self.source, first, admit=_null)
+        # Another session is still admitted, also for an open.
+        other = self.service.sources(second, admit=_null)
+        access = BoundLiveAccess(uuid4(), 1, uuid4())
+        opened = self.service.open(access, self.source, second, admit=_null)
+        self.assertEqual(self.held(), (MAX_PENDING_REQUESTS_PER_SESSION + 2, {
+            self.service._holder(first): MAX_PENDING_REQUESTS_PER_SESSION,
+            self.service._holder(second): 2}))
+        gate.set()
+        # Polls of unknown live sessions fail (the error path) and return
+        # their share as well as the successful jobs do.
+        for future in queued:
+            with self.assertRaises(LiveFrameUnavailable):
+                future.result(timeout=10)
+        self.assertEqual([view.source_id for view in other.result(timeout=10)], [self.source])
+        session = opened.result(timeout=10)
+        self.assertEqual(self.held(), (0, {}))
+        # The full share is available again after the release.
+        gate = self.block()
+        queued = self.fill(first)
+        gate.set()
+        for future in queued:
+            with self.assertRaises(LiveFrameUnavailable):
+                future.result(timeout=10)
+        self.service.close(second, access.access_session_id, session.session_id).result(timeout=10)
+        self.assertEqual(self.held(), (0, {}))
+        self.assertEqual(self.hub.status.viewers, 0)
+
+    def test_the_shared_cap_still_bounds_every_session_together(self):
+        gate = self.block()
+        tokens = [bytes([index]) * 32 for index in range(MAX_PENDING_REQUESTS // MAX_PENDING_REQUESTS_PER_SESSION)]
+        queued = [future for token in tokens for future in self.fill(token)]
+        self.assertEqual(len(queued), MAX_PENDING_REQUESTS)
+        with self.assertRaises(LiveFrameUnavailable):
+            self.service.sources(bytes([200]) * 32, admit=_null)
+        with self.assertRaises(LiveFrameUnavailable):
+            self.service.status()
+        gate.set()
+        for future in queued:
+            with self.assertRaises(LiveFrameUnavailable):
+                future.result(timeout=10)
+        self.assertEqual(self.held(), (0, {}))
+
+    def test_a_cancelled_request_returns_its_share(self):
+        gate = self.block()
+        token = bytes(32)
+        queued = self.fill(token)
+        for future in queued:
+            self.assertTrue(future.cancel())
+        self.assertEqual(self.held(), (0, {}))
+        later = self.service.sources(token, admit=_null)
+        gate.set()
+        later.result(timeout=10)
+        self.assertEqual(self.held(), (0, {}))
+
+    def test_a_stop_drains_the_queue_and_leaks_no_share(self):
+        gate = self.block()
+        token = bytes(32)
+        queued = self.fill(token)
+        stopping = threading.Thread(target=self.service.stop, kwargs={"wait": True})
+        stopping.start()
+        gate.set()
+        stopping.join(10)
+        self.assertFalse(stopping.is_alive())
+        for future in queued:
+            self.assertTrue(future.done())
+        self.assertEqual(self.held(), (0, {}))
+        # A restart starts with the whole share.
+        self.service.start()
+        gate = self.block()
+        queued = self.fill(token)
+        gate.set()
+        for future in queued:
+            with self.assertRaises(LiveFrameUnavailable):
+                future.result(timeout=10)
+        self.assertEqual(self.held(), (0, {}))
+
+    def test_a_request_without_a_session_token_is_refused_and_charges_nothing(self):
+        for token in (None, "not-bytes", 32):
+            with self.subTest(token=token):
+                with self.assertRaises(LiveFrameUnavailable):
+                    self.service.poll(token, "synthetic", uuid4(), 0, admit=_null)
+                with self.assertRaises(LiveFrameUnavailable):
+                    self.service.sources(token, admit=_null)
+                with self.assertRaises(LiveFrameUnavailable):
+                    self.service.close(token, uuid4(), uuid4())
+                with self.assertRaises(LiveFrameUnavailable):
+                    self.service.open(BoundLiveAccess(uuid4(), 1, uuid4()), self.source, token, admit=_null)
+        self.assertEqual(self.held(), (0, {}))
+
+
+class _Null:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _null():
+    return _Null()
+
+
+class StartupHealthTests(LiveRouteFixture):
+    async def test_a_source_without_an_online_transition_is_never_reported_online(self):
+        # A capture startup that failed before its first transition: the
+        # durable row still says online, but nothing is captured.
+        hub = LocalPreviewHub(tuple(self.sources))
+        self.assertFalse(hub.accepting(self.sources[0]))
+        hub.on_frame(self.sources[0], frame(JPEG))
+        self.assertEqual(hub.status.retained_bytes, 0)
+        await self.stop_serving()
+        self.access.attach_live(LiveFrameService(hub, self.store, monotonic=self.monotonic))
+        self.hub, self.live = hub, self.access.live
+        await self.start_serving()
+        _, cookie, _ = await self.viewer()
+        listed = {item["id"]: item["health"] for item in payload(await self.sources_of(cookie))["sources"]}
+        self.assertEqual(set(listed.values()), {"offline"})
+
+
+class AttachTests(LiveRouteFixture):
+    async def test_attach_refuses_another_database_and_replacement_while_running(self):
+        other = Database(self.temporary / "other.sqlite3")
+        foreign = LiveFrameService(self.hub, SimpleNamespace(
+            current_session=self.store.current_session, now=self.store.now, database=other))
+        with self.assertRaises(HumanAccessUnavailable):
+            self.access.attach_live(foreign)
+        with self.assertRaises(HumanAccessUnavailable):
+            self.access.attach_live(object())
+        self.assertIs(self.access.live, self.live)
+        self.assertEqual(self.access.administration.principal_changed, self.live.revalidate_principal)
+        _, cookie, csrf = await self.viewer()
+        await self.opened(cookie, csrf, self.sources[0])
+        replacement = LiveFrameService(self.hub, self.store, monotonic=self.monotonic)
+        # Two services over one hub could exceed the D10 limits: refused while running.
+        with self.assertRaises(HumanAccessUnavailable):
+            self.access.attach_live(replacement)
+        self.assertIs(self.access.live, self.live)
+        self.assertEqual(self.hub.status.viewers, 1)
+        await self.stop_serving()
+        # Not running: the previous service has released everything first.
+        self.access.attach_live(replacement)
+        self.assertEqual(self.hub.status.viewers, 0)
+        self.assertIs(self.access.live, replacement)
+        self.live = replacement
+
+    async def test_the_first_service_attached_while_running_starts_at_once(self):
+        self.access.live = None
+        self.live.stop(wait=True)
+        service = LiveFrameService(self.hub, self.store, monotonic=self.monotonic)
+        self.access.attach_live(service)
+        self.live = service
+        self.assertTrue(service.running)
+        _, cookie, csrf = await self.viewer()
+        await self.opened(cookie, csrf, self.sources[0])
+
+if __name__ == "__main__":
+    unittest.main()

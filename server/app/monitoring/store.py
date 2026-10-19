@@ -23,6 +23,24 @@ def monitoring_migration(version: int) -> Migration:
     ))
 
 
+def notification_acceptance_migration(version: int) -> Migration:
+    """When the service last took each notification row (Issue #287).
+
+    ``accepted_at`` is the wall-clock time of a row's latest local write: the
+    notification service accepting the notification, or a later write of the
+    same row (its delivery result, a refused write retried). It is never
+    earlier than the acceptance, so the restart recovery of the hourly access
+    and finding budgets (``MonitoringRuntime._notification_window``) counts a
+    row at least as long as the process that sent it did. ``at`` stays the
+    event's own time, which a retry keeps. Existing rows keep ``NULL``, read
+    as ``at`` (the recovery before this column). ``ADD COLUMN`` rewrites no
+    row and deletes nothing.
+    """
+    return Migration(version, "notification_acceptance_time", (
+        "ALTER TABLE notification_events ADD COLUMN accepted_at TEXT",
+    ))
+
+
 def _utc(at: datetime) -> str:
     if not isinstance(at, datetime) or at.tzinfo is None or at.utcoffset() is None:
         raise ValueError("AWARE_TIME_REQUIRED")
@@ -50,14 +68,21 @@ class NotificationEventStore(_Autocommit):
     kind/time/delivery values are stored; no message text, media or identity.
     """
 
-    def upsert(self, event: NotificationEvent) -> None:
+    def upsert(self, event: NotificationEvent, *, accepted_at: datetime) -> None:
+        """Write ``event``; ``accepted_at`` is now (the time of this write).
+
+        Every write of the row moves ``accepted_at`` to its own time, so a
+        retry accepted hours after the event's ``at`` is counted from the
+        retry (Issue #287); kind, time and confirmed flag never change.
+        """
         if not isinstance(event, NotificationEvent):
             raise ValueError("invalid notification event")
         self._write(
-            "INSERT INTO notification_events(event_id,kind,at,confirmed,delivery) VALUES (?,?,?,?,?) "
-            "ON CONFLICT(event_id) DO UPDATE SET delivery=excluded.delivery",
+            "INSERT INTO notification_events(event_id,kind,at,confirmed,delivery,accepted_at) "
+            "VALUES (?,?,?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET "
+            "delivery=excluded.delivery,accepted_at=excluded.accepted_at",
             (str(event.event_id), event.kind.value, _utc(event.at), int(event.confirmed),
-             event.delivery.value),
+             event.delivery.value, _utc(accepted_at)),
         )
 
     def get(self, event_id: UUID) -> dict | None:

@@ -14,7 +14,7 @@ from app.detection.roi.schema import roi_calibration_migration
 from app.integrity.store import integrity_migration
 from app.media.health.artifacts import recording_health_migration
 from app.media.recording.schema import recording_migration
-from app.monitoring.store import monitoring_migration
+from app.monitoring.store import monitoring_migration, notification_acceptance_migration
 from app.notifications.schedule import notification_migration
 from app.presence.schema import presence_gap_migration, presence_migration
 from app.storage.migrations import BUILTIN_MIGRATIONS
@@ -68,4 +68,8 @@ APPLICATION_MIGRATIONS = (
     # Issue #10 phase 2 S4: a random, non-secret handle names each credential
     # in the Owner's inventory and revocation instead of its WebAuthn id.
     access_credential_handle_migration(24),
+    # Issue #287: when each notification row was last accepted, so a restart
+    # restores the hourly access and finding budgets from the acceptance
+    # rather than from the event time a retry keeps.
+    notification_acceptance_migration(25),
 )

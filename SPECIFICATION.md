@@ -264,6 +264,20 @@ evidence, so each twin can be mapped to its own source); a
 conflicting approval is refused, and a pre-existing duplicate makes every
 conflicting source `manual_intervention_required` rather than letting startup
 order decide.
+Until the Owner Web UI exists, `local_uvc` sources are created and cameras
+approved with the local command `python -m app.cameras.uvc.admin_cli
+sources|candidates|create-source|approve --config <deployment.json>` (Owner
+decision D3, 2026-10-16): the `bootstrap_cli` trust model (service account,
+never root, the pinned existing database of exactly the current schema, no
+WebAuthn step-up), one confirmation word read from `/dev/tty` per audited
+`OwnerAdministration.create_source` / `approve_uvc` operation (actor `owner`,
+the source's logical UUID only), and refusal (`service_running`) while any
+other process of the service account holds the application database open; the
+change applies when the service starts. Cameras are listed only by a hashed
+live-instance label, USB vendor:product ids, serial `present`/`absent`/`shared`
+and formats, never a serial or path. An offline approval is refused for a
+camera without a serial or whose serial is not unique, because stored
+evidence could not identify it after the restart.
 Unsupported multi-planar capture or codec/bitrate controls fail explicitly.
 An open capture that delivers no frame for the configured stall window
 (`frame_stall_seconds`, never shorter than 10 negotiated frame intervals) is
@@ -906,6 +920,11 @@ If an already encoded source can be safely relayed in a browser-compatible form,
 
 Viewer-only processing should scale down or stop when subscriber count is zero.
 
+Interim (Owner decision D10, Issue #10 S7, pending #19): local UVC live video is
+served as an authorized MJPEG frame pull of native camera JPEG frames, without
+transcoding, through the human surface (§11.9, "S7 interim live"). Its viewer
+demand ends without polls, so with no viewer nothing is retained.
+
 ### 6.6 Durable recording
 
 The main host is authoritative durable storage for normal operation. Recording metadata includes:
@@ -1357,7 +1376,27 @@ after the local row exists. `CHANGED`/`MISSING`/storage-`UNVERIFIABLE` map to
 the immediate `hardware_integrity_failure`, other warnings to the local-only
 `hardware_integrity_warning`. Recording-health verdicts persist in
 `recording_health_status`; `FAILED` is the immediate `recording_health_failure`
-and `UNAVAILABLE` the local-only `recording_health_warning`. Without an actual
+and `UNAVAILABLE` the local-only `recording_health_warning`. Human-access faults
+(Issue #232 item 4, Owner decision 2026-10-16) use the same immediate path: a
+failing `HostnameReservationCheck` or human-access composition is
+`human_access_fault` on entering the fault and on a reason not yet reported in
+the episode, a passing check while serving is `human_access_recovered`, and a
+committed credential finding is `credential_finding`, one immediate
+notification per finding up to four per rolling hour, the ones over that cap
+batched into one notification once the hour allows (its own budget, outside
+the access budget; Owner decision 2026-10-16); at most four `human_access_fault` /
+`human_access_recovered` notifications per rolling hour, with a held-back
+episode reported later. Both rolling hours continue across a restart: the first running tick re-seeds them from the accepted (non-`pending`) notification rows of the last hour by the wall-clock time since their acceptance (`notification_events.accepted_at`, the row's latest local write, migration 25; a row written before it counts from its event time), filtering the hour before taking the newest rows and ignoring a row stamped in the future, so a restored row counts for at most an hour after the restart (Issue #281 item 2, Issue #287). A notification retried long after its event therefore counts from the retry. When the process started with monitoring `failed` and notified before storage recovered, the stored rows are merged into its window by event ID, so its own rows are not counted twice and the earlier process's rows are not skipped (Issue #287). They set `human_access_degraded` /
+`credential_finding_degraded` (the latter for one day after the latest
+finding) and carry only the fixed kind. A finding committed before a restart
+whose notification had not been sent yet is recovered on the first running
+monitoring tick from its audit record: each `credential_finding` event ID
+names the immutable id of the newest (highest-rowid) finding audit record it
+covers; the newest retained finding
+restores the one-day hold and is notified once unless that event row
+exists with a final delivery state (rowid order, not wall-clock order). A fault
+episode whose newest access notification row is `human_access_fault` continues
+after a restart, so its recovery is still announced. Without an actual
 capture-pipeline adapter the self-test is an explicit `UNAVAILABLE`, not
 healthy. Independently of that adapter, the runtime re-verifies the declared
 recording filesystem (UUID → device, major/minor, mounted mount point, pinned
@@ -1688,7 +1727,24 @@ socket's creating cgroup (`INET_DIAG_CGROUP_ID`, matched to
 or uid is an exposure reason (`UNEXPECTED_LISTENER`) once an immediate second
 dump in the same check confirms it, and stored port-only or executable-path
 exceptions fail closed (`LISTENER_EXCEPTIONS_OUTDATED`) until re-entered (Owner
-decisions, 2026-10-01 and 2026-10-07). Each recorded proxy socket requires a
+decisions, 2026-10-01 and 2026-10-07). The only exception that covers a bind
+directly on a reserved address is a `reserved_address` exception for
+`tailscaled.service` with uid 0 over TCP on one recorded port other than the
+dashboard, upstream and proxy ports (its plain-HTTP peerAPI; Owner decision
+D1, 2026-10-16, ADR-0003); it covers only the configured reserved addresses,
+at most one such exception covers each family (Issue #278), and it is
+verified the same way. The Owner records the set with the local command
+`python -m app.auth.reservation_cli show|set --config <deployment.json>` (Owner
+decision D3, 2026-10-16): run as the service account with the same checks as
+`bootstrap_cli` (no root, the configuration's service uid, a controlling
+terminal, the pinned existing database of exactly the current schema), it
+validates the set against the reservation the deployment's `human_access`
+section states (`HumanAccessDeployment.reservation_config()`, the one the
+service's check uses), reads the word
+`CHANGE` from the terminal and commits the set with its
+`change_security_setting` audit record (actor `owner`, the fixed
+listener-exceptions id) in one transaction; the running service applies it
+only after a restart. Each recorded proxy socket requires a
 recorded proxy identity (`proxy_owner`: systemd unit and uid) and must be
 present and created by it: a missing recorded socket keeps access closed
 without revocation, and another creator is an exposure (Owner decision,
@@ -1731,12 +1787,17 @@ That bounds the exposure window rather
 than preventing the bind: a process that binds between two checks receives
 credentials and cookies for that origin until the next check.
 
-The origin must also be a secure context — HTTPS, or `http://localhost` for a
-strictly local browser — because browsers expose WebAuthn only there. Plain
-HTTP on a non-loopback host leaves every human route unreachable in practice,
-since nobody can register or authenticate. The current human composition
-accepts only the reserved `https` origin; there is no `http://localhost` Owner
-route (Owner decision, 2026-10-11, see `SECURITY.md`).
+The origin is the reserved `https` origin, which viewer devices outside the
+Main Server reach by URL — for example the Main Server's tailnet hostname
+served through Tailscale Serve to Tailscale-joined viewer devices. It must be a
+secure context because browsers expose WebAuthn only there; plain HTTP on a
+non-loopback host leaves every human route unreachable in practice, since
+nobody can register or authenticate. `http://localhost` is not a human
+dashboard origin: the human composition accepts only the reserved `https`
+origin, and there is no `http://localhost` Owner route (Owner decisions,
+2026-10-11 and 2026-10-16, see `SECURITY.md`). Reaching the URL is a network
+precondition, not identification; the invitation and per-person WebAuthn
+credential are still required.
 
 Initial non-owner permissions:
 
@@ -2128,7 +2189,8 @@ the credential that local bootstrap provisions and that a session is bound to.
 Issue #10 phase 1 (human route foundation) and phase 2 S1 (gated
 authorization, CSRF, sign-out) define the first main-to-Web contract, opened
 only by an explicitly enabled composition behind a fully configured
-reservation check (no production entry point builds one yet):
+reservation check (the production launcher builds one only from an enabled
+`human_access` deployment section):
 
 ```text
 POST /api/auth/authentication/options -> pre-credential, rate-limited;
@@ -2164,9 +2226,9 @@ server-side session and its binding with a `sign_out_principal` audit record
 holding only the principal's logical UUID (D7); it ends that session, not the
 credential, and is refused while human access is closed. Invitation
 redemption (S2), the Owner step-up (S3) and the Owner access administration
-(S4b, §11.5 above) are mounted; all live/recording/timeline routes and the
-other admin routes are later phases. Details:
-`server/app/auth/README.md`.
+(S4b, §11.5 above) are mounted, and so are the S7 interim live routes
+below; all recording/timeline routes and the other admin routes are later
+phases. Details: `server/app/auth/README.md`.
 
 Issue #10 phase 2 S5b serves the Web build through the same surface (Owner
 decisions D1 and S5-1 .. S5-5; the reservation check accepts exactly one Serve
@@ -2204,7 +2266,27 @@ is not repeated at every start.
 `web_assets_directory` (`<installation>/current/web`, resolved against the
 running release's own `web/`); without it no human composition can be
 mounted, and with it the release's `--check` refuses to start unless the
-build loads. Every asset response has a
+build loads. The optional deployment key `human_access` (Issue #10,
+`app.auth.access_config`; `server/docs/DEPLOYMENT.md`) states the
+reservation (hostname, port, every reserved address, isolation
+`dedicated_network_identity` / `single_purpose_node` / `null`, any visible
+proxy socket and its creator, the absolute Tailscale CLI path and the
+device-bound policy); when enabled it requires `web_assets_directory`, and
+the launcher builds the production composition (`app.auth.composition`)
+with `/proc/net`, a bounded read-only `tailscale serve status --json`
+runner (fixed arguments, empty environment, 5-second timeout, 1 MiB output
+cap; any failure is an enumeration failure), `getaddrinfo` and sock_diag.
+A section that fails validation refuses startup with a value-free reason; a
+valid section whose Tailscale CLI fails the launcher's executable check at
+start does not (Issue #283): `--check` passes with a value-free
+`reason=executable` warning on stderr and the start is handled like a
+composition that cannot be built. Such a composition, including one
+`create_app` refuses with `HumanAccessCompositionRefused` (any other
+exception propagates), logs `human_access_composition_failed`, keeps
+every human path closed while recording and the integrity and
+recording-health checks keep running, and notifies the Owner immediately
+(`human_access_fault`, monitoring health degraded until a restart composes
+access). Without the key every human path stays closed. Every asset response has a
 fixed header list: its `Content-Type` (the manifest's, from the S5a
 build policy `web/scripts/policy.mjs`), `Content-Length`,
 `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
@@ -2222,6 +2304,58 @@ application sets `referrer: ''` and `referrerPolicy: 'same-origin'`, so the
 `POST` carries the exact `Origin` the mutating routes require (not `null`). The shell's bytes
 identify the software to anyone on the shared account (accepted, S5-5), so it
 carries no version marker.
+
+S7 interim live (Owner decision D10, D5 defaults; pending #19, mock verified
+only). Mounted when the composition has a `LiveFrameService`
+(`HumanAccess.attach_live`; `create_app` attaches one over its local preview
+hub), otherwise the generic denial:
+
+```text
+GET  /api/live/sources                      -> LIVE: {"sources": [{"id", "name",
+                                               "health"}]} of configured, enabled
+                                               local sources configured and
+                                               negotiated as MJPG (others are
+                                               neither listed nor opened; not
+                                               "online" without a negotiated
+                                               MJPG); nothing else
+POST /api/live/sessions  {"source_id"}      -> LIVE + CSRF: {"session_id",
+                                               "source_id", "lease_seconds": 15.0,
+                                               "frame_interval_ms": 200}
+GET  /api/live/sessions/<sid>/frame?after=n -> LIVE, the opening human session
+                                               only: 200 image/jpeg with
+                                               X-Frame-Sequence, or 204 (none
+                                               newer, camera not online, paced)
+POST /api/live/sessions/<sid>/close         -> SESSION + CSRF, own sessions: 204
+```
+
+`live:view` (or the Owner) is checked server-side on every request;
+`recordings:view` alone reaches none of these. A live session is bound to the
+human access session that opened it: each poll is admitted in memory (a held
+id, a per-(human session, live session) budget), then inside `admit(epoch)`
+the read-only session lookup must be that human session (a copied id is
+refused) and the read re-runs the `live:view` validator. If the opening
+human session is no longer current for the presented cookie and proxy
+identity (ended, or a binding mismatch), the live session ends with that poll.
+Nothing is written per frame (a binding mismatch is recorded once, coalesced,
+and ends the live session), and the idle expiry is extended at most once per
+60 s per live session. `lease_seconds` is a JSON number of seconds
+(`frame_interval_ms` an integer). `health` is always present; an open always answers `200`, and the Web
+paces its polls with `frame_interval_ms` plus some slack; a close needs no body
+or `Content-Type` and is not rate-limited, while opens are charged per session
+(a burst of 20, one more every 3 s; only a session of the Owner or a
+`live:view` holder takes a limiter slot) and a refused open leaves no demand.
+Limits: 4 sessions in total, 2 per source, 2 per person, 5 served
+frames per second per session, 8 MiB and a JPEG SOI marker per frame; at most
+32 live request jobs pending on the server, at most 8 of them per human
+session (Issue #279 item 1, Owner decision 2026-10-16), so one session cannot
+fill the shared queue; over a limit the generic denial, overload included,
+with no distinct overload response (pacing: `204`). Demand ends after 15 s without an
+authorized poll, on close and sign-out, at once after an Owner grant or
+revocation change, and for every session while access is closed or the
+composition stopped; a poll queued before the service stopped is refused.
+Responses are `no-store`, `nosniff`,
+`Cross-Origin-Resource-Policy: same-origin` and never an attachment, `ETag`,
+range or cookie; there is no download or export.
 
 ## 12. Dashboard UI
 

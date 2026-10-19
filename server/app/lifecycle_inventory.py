@@ -169,6 +169,11 @@ DECLARED_MUTABLE = {
         "declared_mutable (#132): the delivery result is rewritten when a pending Slack "
         "delivery completes or a presence notification is retried; kind, time and "
         "confirmed flag never change and every row stays until its 90-day retention"),
+    "notification_events.accepted_at": (
+        "declared_mutable (#132, #287): the time of the row's latest local write, rewritten "
+        "with every delivery result or retried write; it only re-seeds the hourly access and "
+        "finding notification budgets after a restart, and is NULL on rows written before "
+        "migration 25"),
     "uvc_approvals.session_token": (
         "declared_mutable (#132): a per-run marker, cleared at a clean stop and replaced at "
         "every start; the Owner re-approval latch it arms (requires_approval) is compared "
@@ -2114,7 +2119,8 @@ def _notification_events(connection, tables) -> dict | None:
     """The local fault / notification history, every kind (#132).
 
     NotificationEventStore.upsert() writes kind, time and confirmed flag
-    once and later rewrites only the delivery result (DECLARED_MUTABLE);
+    once and later rewrites only the delivery result and accepted_at
+    (DECLARED_MUTABLE);
     expire() removes rows older than the shared 90-day retention. The daily
     summary counts these rows, and the deterministic event IDs deduplicate
     redelivery, so a lost row hides a fault and may repeat an alert.

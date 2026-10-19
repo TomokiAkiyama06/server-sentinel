@@ -116,6 +116,22 @@ class DiscoveryTests(unittest.TestCase):
         self.assertNotEqual(before.instance_token, after.instance_token)
         self.assertIsNone(after.strong_key)
 
+    def test_instance_covers_the_sysfs_entry_metadata_not_the_dev_node(self):
+        # Issue #280 item 4 / PR #288 review: the instance (and the admin
+        # CLI's candidate label) covers the sysfs entry's ctime, so a
+        # permission change of /dev/videoN keeps it and a metadata change of
+        # the sysfs entry itself changes it without a re-plug.
+        self.add_node("video0", 0)
+        discovery = LinuxDiscovery(sys_root=self.sys, dev_root=self.dev, probe=self.probe)
+        before = discovery.scan().devices[0]
+        os.chmod(self.dev / "video0", 0o600)
+        self.assertEqual(before.instance_token, discovery.scan().devices[0].instance_token)
+        node = self.usb / "video0"
+        changed = os.stat(node).st_ctime_ns
+        while os.stat(node).st_ctime_ns == changed:
+            os.chmod(node, os.stat(node).st_mode ^ 0o001)
+        self.assertNotEqual(before.instance_token, discovery.scan().devices[0].instance_token)
+
     def test_missing_sysfs_tree_is_empty(self):
         result = LinuxDiscovery(sys_root=self.sys / "absent", dev_root=self.dev, probe=self.probe).scan()
         self.assertEqual(result.devices, ())

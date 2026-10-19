@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parent
 REPOSITORY = ROOT.parent
 INSTALLER_MODULES = (
     "__init__.py", "deployment.py", "settings.py",
+    # The optional human_access section (Issue #10); standard library only.
+    "auth/__init__.py", "auth/access_config.py",
     "cameras/uvc/config.py",
     "monitoring/__init__.py", "monitoring/config.py",
     "media/recording/__init__.py", "media/recording/model.py", "media/recording/store.py",

@@ -23,7 +23,9 @@ Owns owner invitations/allowlists, independent `live:view` and `recordings:view`
 ## Current foundation
 
 ADR-0004 (per-person WebAuthn/passkey credentials) was accepted on 2026-09-30,
-alongside ADR-0003. The production entry points still mount no human route.
+alongside ADR-0003. The production launcher mounts the human routes only
+from an enabled `human_access` deployment section (CP-1, `composition.py`
+below), not yet exercised on real hosts; without it no human route is mounted.
 Issue #10 phase 1 adds the human route foundation (`human_surface.py`, below):
 an embedder can open the passkey sign-in ceremony and a session
 self-description route only through a validated composition that the
@@ -134,17 +136,14 @@ Not implemented yet, and required before routes open in production:
   S2, the Owner step-up routes since S3, and the Owner's access
   administration routes A1-A6 since S4b (below);
 - the local `list` / `revoke-principal` / `revoke-credential` commands
-  (S4c) and the Owner's administration screen in the Web UI (S6);
-- the deployment-file key and production composition that build the
-  `HostnameReservationCheck` (Serve status source, `SockDiagOwners`,
-  `GetaddrinfoResolver`), load the session-binding key with
-  `SessionBindingKey.load_or_create(Settings.session_binding_key_path)` and
-  pass a `HumanAccess` to `create_app` (no production path builds one yet);
-- delivery of `CredentialFindingSink`, `ReservationFault` and the
-  `HumanAccess.state` / `check_failures` lifecycle to the Owner notification
-  channel and health (Issue #232 item 4). `NotificationService` has no
-  human-access kind yet and no production composition builds the check, so
-  there is nothing to wire into until that composition exists.
+  (S4c) and the Owner's administration screen in the Web UI (S6).
+
+The deployment key `human_access` and its production composition, which
+passes one `AccessFaultMonitor` as the check's `sink=`, the ceremonies'
+`findings=` and `MonitoringDependencies(access_faults=)`, exist since
+Issue #10 CP-1 ("Production composition" below). Wherever a monitoring
+runtime runs, `create_app` refuses a composition without that monitor
+(Issue #281 item 1).
 
 Owner-only mutations — invitation (with its code), code re-issue, grant
 change, single credential revocation and principal revocation — are exposed
@@ -388,6 +387,38 @@ is rejected, and a stored executable-path or unit-without-uid set (store
 format version 1 or 2) fails closed as `LISTENER_EXCEPTIONS_OUTDATED` until the
 Owner re-enters it.
 
+One further scope exists (Owner decision D1, 2026-10-16; ADR-0003): a
+`reserved_address` exception covers a TCP socket bound directly on one of the
+configured reserved addresses, for `tailscaled`'s peerAPI. It is accepted only
+with protocol `tcp`, unit `tailscaled.service` and uid `0`; any other
+protocol, unit or uid is rejected when the exception is built, and a stored
+one fails closed as `LISTENER_EXCEPTIONS_UNREADABLE`. It names one port and
+optionally a family (`ipv4` or `ipv6`: a reserved-address bind is not
+dual-stack, so either may be named), covers only the configured reserved
+addresses (not one the name gained, and never a wildcard bind), allows one
+socket per address and port, and, like every exception, never the dashboard,
+upstream or proxy port. At most one `reserved_address` exception covers each
+family (one without a family counts for both; Issue #278):
+`validate_listener_exceptions` refuses a second one, so neither the Owner
+command nor the administration path stores it and a stored set holding one
+fails closed as `LISTENER_EXCEPTIONS_UNREADABLE`. The peerAPI is expected on
+one port per family, and that the recorded port is the peerAPI is confirmed only
+by hand (`MANUAL_TEST.md`), so a second port would except a socket nobody
+confirmed. A Serve listener added on another port is a proxy route the route
+comparison reports as `UNEXPECTED_ROUTE` on its own, besides any socket it
+adds on a reserved address (an unexpected listener). Its creator is verified on every check exactly
+like a wildcard exception's. The rationale is that the peerAPI is plain HTTP
+and the `__Host-session` cookie is `Secure`, so it is never sent there; that
+is an assumption about the installed `tailscaled` that `MANUAL_TEST.md`
+verifies, together with whether the peerAPI port is the same in both families
+and stays the same across `tailscaled` restarts, `tailscale down`/`up` and
+reboots (a changed port is an unexpected listener on a reserved address, an
+exposure, until the Owner records the new one). `SameSite` does not separate
+the peerAPI origin from the dashboard (a browser without schemeful same-site
+treats it as the same site); the exact `Origin` check, the CSRF token and
+WebAuthn's secure-context requirement do, assuming the peerAPI serves no
+active content an attacker controls (ADR-0003).
+
 Each check reads the socket inode from `/proc/net` (listener enumeration stays
 there) and asks the injected `socket_owners` for each verified socket's
 creator. In production that is `app.auth.sock_diag.SockDiagOwners`: the
@@ -455,13 +486,25 @@ allowed, the Main Server keeps Ubuntu's `ssh.socket`; the exception is
 `tcp/22` created by `ssh.socket` as uid 0 (steps in `server/docs/DEPLOYMENT.md`). `/proc/net` does not
 show `IPV6_V6ONLY` and a `::` socket may also accept IPv4, so a `::` bind is
 treated as dual-stack: only an exception without a family covers it, an `ipv4`
-exception covers `0.0.0.0` only, and an `ipv6`-only exception is rejected. The set is empty
+exception covers `0.0.0.0` only, and an `ipv6`-only wildcard exception is
+rejected (a `reserved_address` exception may name `ipv6`). The set is empty
 by default, typed, bounded to 16 entries, and is never read from deployment
 configuration. An exception never matches the dashboard port, the loopback
 human listener port or a recorded proxy socket port (for either protocol, so
-UDP/443 is never exempt), and never matches a bind
+UDP/443 is never exempt), and a wildcard exception never matches a bind
 to a reserved address: `100.64.x.y:22` still closes access when `0.0.0.0:22`
-is allowed. The only runtime path that changes it is
+is allowed. Only a `reserved_address` exception (above) covers such a bind,
+and only `tailscaled.service`'s TCP on its recorded port. Two paths change
+it. Offline, the local Owner command `app.auth.reservation_cli set` (Owner
+decision D3, 2026-10-16; run as the service account with a controlling
+terminal, like `bootstrap_cli`) validates the set against the reservation
+the deployment's `human_access` section states
+(`HumanAccessDeployment.reservation_config()`, the same `ReservationConfig`
+`composition.py` builds; value-free `human_access_not_configured` /
+`human_access_configuration_rejected` otherwise), then writes the set and the same
+`change_security_setting` audit record (actor `owner`) in one transaction,
+after re-reading the stored value inside it; the running check does not see
+it until the service restarts and `startup()` loads it. The only runtime path is
 `app.audit.integration.ReservationAdministration`, which authorizes the Owner,
 writes the set and a `change_security_setting` audit record in one SQLite
 transaction, then applies the set and re-checks immediately so narrowing it
@@ -490,15 +533,17 @@ as identical `/proc/net` rows, and every extra copy is counted as an
 endpoint would receive requests and session cookies. The same applies to a
 wildcard endpoint covered by a listener exception: one exception allows one
 socket per distinct endpoint it covers (for example `0.0.0.0:22` and `:::22`),
-and each identical extra row is unexpected. An exception allows one socket per
+and each identical extra row is unexpected, whether or not either row's
+creator can be verified (PR #274 review). An exception allows one socket per
 endpoint even for its own process, so a service that opens several
 `SO_REUSEPORT` sockets on an excepted port keeps access closed.
 
 Nothing here reads the host implicitly, runs `tailscale`, changes Tailscale
 ACLs/Grants, or needs Tailscale administrative credentials. The check is wired
 into the application only through the phase 1 `HumanAccess` composition below,
-whose lifespan task runs `startup()` and then `tick()` every 30 seconds; no
-production path builds one yet. The assumed `tailscale serve status --json`
+whose lifespan task runs `startup()` and then `tick()` every 30 seconds; in
+production that composition is built only from the `human_access` deployment
+key (`composition.py`, below). The assumed `tailscale serve status --json`
 shape is unverified against an installed Tailscale; unrecognised keys fail
 closed.
 
@@ -514,7 +559,51 @@ whose origin is the reserved `https://<hostname>[:<port>]` of the check, and
 a verified `WebAssets` set (`assets=`, S5b below). Any
 other combination raises `HumanAccessUnavailable` and the listener stays
 closed. `create_app` also refuses a composition whose assets were not loaded
-from `Settings.web_assets_dir`. No deployment-file key builds a `HumanAccess` yet.
+from `Settings.web_assets_dir`.
+
+Production composition (Issue #10). `access_config.py` (standard library
+only; the installer bundles it) validates the optional `human_access`
+deployment key into a `HumanAccessDeployment`: `enabled`, `hostname`, `port`
+(default 443), `reserved_addresses`, `isolation`
+(`dedicated_network_identity`, `single_purpose_node` or `null`, which keeps
+access closed with `ISOLATION_UNSTATED`), the optional visible
+`proxy_listeners` with their `proxy_owner`, the absolute
+`tailscale_executable` and `require_device_bound` (default false). Refusals
+are `HumanAccessRefused` with one value-free reason (`setting`,
+`web_assets`); enabled without `web_assets_directory` is refused. At every
+start the launcher (`app.deployment`) requires the CLI to be an
+administrator-controlled executable the service account can run; a valid
+section whose CLI fails that (`reason=executable`, a change on the host) does
+not refuse the start: `--check` passes with a value-free warning on stderr and
+the launcher calls `run(..., human_access_unavailable=True)`, which builds
+nothing and is handled like a failed composition below (Issue #283 item 1).
+`composition.build_human_access` then builds, with the production inputs,
+the check (`ProcNetListeners` over bounded `/proc/net` reads,
+`ServeStatusRoutes` over `ServeStatusCommand`, `GetaddrinfoResolver`,
+`SockDiagOwners`, `ListenerExceptionStore`, `ReservationSessionRevocation`),
+the audited `AccessStore` with the deployment's invitation lifetime and
+`SessionBindingKey.load_or_create(Settings.session_binding_key_path)` (only
+after `app.monitoring.runtime.admit_state_file`, the database file's own
+filesystem-identity and hard-reserve check, Codex PR #282), the
+`PasskeyCeremonies` for the reserved origin, the `WebAssets` and the
+`HumanAccess`. `ServeStatusCommand` runs exactly `<tailscale_executable>
+serve status --json` with an empty environment, `/` as working directory, no
+stdin, stderr discarded, its own session (a timeout kills the process group),
+a 5-second timeout (below the check's enumeration timeout) and a 1 MiB output
+cap; a failure to start, a timeout, more output, a non-zero exit or non-UTF-8
+text is a `ReservationEnumerationError`, so the check fails closed. The
+launcher (`app.__main__.run`) passes one `AccessFaultMonitor` as the check's
+`sink`, the ceremonies' `findings` and `MonitoringDependencies(access_faults=)`
+(Issue #232 item 4); any failure to compose (`HumanAccessUnavailable`,
+the unusable CLI above, or `create_app` refusing it with
+`HumanAccessCompositionRefused`, a `TypeError` subclass; any other exception
+from `create_app` propagates, Issue #283 item 2) logs
+`human_access_composition_failed`, latches the
+fault in that monitor (`AccessFaultMonitor.composition_failed`) and serves
+with `ClosedHumanSurface`, so the monitoring runtime notifies the Owner
+(`human_access_fault`) and keeps the health degraded until a restart composes
+access, while recording keeps running (Codex PR #282). Without the key
+nothing is built and `ClosedHumanSurface` stays.
 
 Every HTTP request passes, in this order, before any handler runs:
 
@@ -565,12 +654,17 @@ OpenAPI or error handler is reachable):
 | `POST /api/auth/step-up` | the same, and the assertion of the session's own credential (step-up rate limit) | `204`, no body, no cookie (S3, below) |
 | `GET /`, `GET /s.js`, `GET /s.css` | none (`PRE_CREDENTIAL`; the gates above only, no limiter) | the sign-in shell, byte-identical for every caller (S5b, below) |
 | `GET /app/`, `GET /app/<name>` | any active session (`SESSION`, `touch=False`) | the application assets (S5b, below) |
+| `GET /api/live/sources` | `LIVE` (the Owner or `live:view`) | `{"sources": [{"id", "name", "health"}]}` (S7, below) |
+| `POST /api/live/sessions` | `LIVE` + exact `Origin` + `X-CSRF-Token` (live limiter) | `{"session_id", "source_id", "lease_seconds", "frame_interval_ms"}` (S7) |
+| `GET /api/live/sessions/<session>/frame?after=<n>` | `LIVE`, the opening human session only | `200 image/jpeg` + `X-Frame-Sequence`, or `204` (S7) |
+| `POST /api/live/sessions/<session>/close` | `SESSION` + exact `Origin` + `X-CSRF-Token`; only a held id with its opening cookie | `204` (S7) |
 
 The session route grants nothing and returns only the caller's own role,
-permissions (the Owner holds both) and CSRF token. With sign-out it is the
-only route a non-Owner session reaches in this phase (the step-up routes
-are Owner-only), so a `live:view`-only or
-`recordings:view`-only person reaches nothing they lack. Bodies are bounded (1 KiB options, 64 KiB assertion or registration), JSON
+permissions (the Owner holds both) and CSRF token. Apart from sign-out, the
+application assets and the S7 live routes (`live:view` only), it is the only
+route a non-Owner session reaches in this phase (the step-up routes are
+Owner-only), so a `live:view`-only or `recordings:view`-only person reaches
+nothing they lack. Bodies are bounded (1 KiB options, 64 KiB assertion or registration), JSON
 with duplicate members is refused, and a ceremony refusal never sets a cookie.
 
 Accepted disclosure: `POST /api/auth/authentication/options` answers `200`
@@ -929,8 +1023,61 @@ that ends with an unexpected exception sets `failed` and logs
 `human_access_run_failed`. A second `run()` while one is running raises
 `HumanAccessAlreadyRunning` and changes nothing. A failing expiry sweep logs
 `human_access_sweep_failed` when the streak starts and each time it doubles.
-No Owner notification is emitted yet; delivering it belongs with the other
-reservation faults (Issue #232 item 4, see "Not implemented yet").
+Their Owner notification is described next.
+
+Owner notification of access faults (Issue #232 item 4, Owner decision
+2026-10-16). Human access already fails closed; this makes the fault visible.
+`app.monitoring.access.AccessFaultMonitor` is the check's `FaultSink` and the
+ceremonies' `CredentialFindingSink`, and is drained on every monitoring tick
+(default 60 seconds) on the monitoring worker, the `NotificationService`
+owner thread. Its sinks only latch fixed values under a short lock: they keep
+the fault's `Reason` codes and discard a finding's principal. It sends the
+immediate fixed-category notifications `human_access_fault`,
+`human_access_recovered` and `credential_finding` through the same path as
+`hardware_integrity_failure` / `recording_health_failure`, and sets
+`MonitoringStatus.human_access_degraded` / `credential_finding_degraded`. A
+fault is a failing check (a `ReservationFault`, or a closed verdict with
+reasons), `check_failing`/`failed` or `check_failures > 0`; recovery is a
+passing check while the composition serves; `not_started`, `starting`,
+`stopped` and a check in progress after an open verdict decide nothing.
+Access notifies on entering a fault, on a reason the episode had not reported
+and on recovery, never on every failing check; a fault that ended between two
+ticks is still reported, at most four access notifications go out per rolling
+hour, and an episode the budget held back is reported once it allows.
+Both rolling hours continue across a restart: the first running tick re-seeds them from the accepted (non-`pending`) notification rows of the last hour by the wall-clock time since their acceptance (`notification_events.accepted_at`, the row's latest local write, migration 25; a row written before it counts from its event time), filtering the hour before taking the newest rows and ignoring a row stamped in the future, so a restored row counts for at most an hour after the restart (Issue #281 item 2, Issue #287). A notification retried long after its event therefore counts from the retry. When the process started with monitoring `failed` and notified before storage recovered, the stored rows are merged into its window by event ID, so its own rows are not counted twice and the earlier process's rows are not skipped (Issue #287).
+Credential findings do not share that budget, so access flapping cannot hold
+one back. Each finding notifies immediately with its own notification, up to
+four per rolling hour; only the ones over that cap are batched into one
+notification sent once the hour allows (Owner decision 2026-10-16, PR #271
+提案4), and
+`credential_finding_degraded` stays set for a day after the latest one (a
+finding has no recovery to observe). No hostname, address, route, identity,
+principal, credential or reason leaves the process; details stay in the audit
+log. With a monitor configured, `create_app` refuses a `HumanAccess` whose
+check or ceremonies report elsewhere and attaches the composition so
+recovery can be observed. It also refuses a monitor without a storage-configured
+monitoring runtime, the only thing that drains it, and a composition whose
+check or ceremonies report to a monitor the runtime was not given (Codex
+PR #271). A finding is committed with its audit record but latched only in
+memory until the next tick. Every `credential_finding` notification is named
+after the newest finding audit record it covers (newest by rowid, named by
+the record's immutable id, so neither the wall clock nor a reused rowid
+matters), so after a restart the
+runtime's first running tick restores the one-day hold from the newest
+retained finding's time and sends one notification unless that
+finding's notification row exists with a final delivery state (a `pending`
+row is a delivery the stopped process never finished). It also continues an
+access fault episode: when the newest `human_access_fault` /
+`human_access_recovered` row (by rowid) is a fault, a check that now passes
+sends the recovery notice, a fault that persists is not notified again, and a
+fault row still `pending` is sent again first; a newest recovery row still
+`pending` is sent again once a check passes. Both retries reuse the row's own
+event ID and time, so they update it. A notification the service
+refuses outright (`FAILED`: nothing kept) stays pending and is retried with the
+same time and event ID on the next tick, without spending the budget. A
+reservation fault needs no such recovery: the startup check re-detects it. Verified with synthetic checks, software
+authenticators and an intercepted Slack transport only
+(`server/tests/test_access_fault_notifications.py`).
 
 Owner operation and live authorization. `PasskeyCeremonies.authorize_owner_operation`
 commits `authorize_owner` inside `admit(epoch)` (#228 item 5), so the Owner
@@ -1432,6 +1579,89 @@ policies or rendered the build (`MANUAL_TEST.md`). The wire-shape test sends
 registration and assertion bodies with exactly the members of
 `web/src/shared/webauthn.ts` through the real routes and verifiers, but from a
 software authenticator, not a browser.
+
+### S7 interim live frame pull (Issue #10 S7, Owner decision D10)
+
+Until #19 selects the browser live transport, `HumanAccess.attach_live`
+mounts the interim MJPEG frame pull of `app.media.live.frame_pull`
+(`create_app` attaches one over its local preview hub; without one every live
+route is the generic denial). The route table above lists the four routes.
+
+- `live:view` (or the Owner) is enforced server-side on every request;
+  `recordings:view` alone reaches none of them. The source list returns only
+  each configured, enabled local source's id, name and coarse health
+  (`online` / `degraded` / `offline` / `manual_intervention_required`; never
+  `online` while the preview refuses its frames), and only sources configured
+  and negotiated as `MJPG` (frames pass through as JPEG; a `YUYV` / `GREY`
+  source, or one whose capture negotiated another format, is neither listed
+  nor opened, and a source without a recorded negotiated `MJPG` is never
+  `online`): no device path, serial,
+  profile, node, detection or storage detail, and nothing historical.
+- A live session is bound to the human access session that opened it
+  (`BoundLiveAccess`). Each frame poll is admitted in memory first (an id the
+  service holds, within a per-(human session, live session) budget of a burst
+  of 20 and one more every 0.1 s), then, inside `admit(epoch)` on the
+  service's single executor thread, the read-only `current_session` must be
+  exactly that human session (token digest and keyed proxy-identity binding;
+  a live-session id copied to any other session is refused) and the read
+  re-runs `live_view_validator`. A refused poll never renews the lease; one
+  whose own grant no longer validates also releases the demand, and so does
+  one whose human session is no longer current for the presented cookie and
+  proxy identity (Issue #279 item 2). The executor checks the holder again,
+  so a poll queued before the service stopped is refused (item 3).
+- Nothing is written per frame. The one exception is a binding mismatch:
+  `current_session` records it (coalesced) and the live session ends with
+  that poll, so every later poll is refused in memory and the write happens
+  at most once per live session. The idle expiry moves at most once per 60 s
+  per live session (D5 default), through the gated
+  `authorize_request(..., LIVE, touch=True)`; its failure only skips that
+  extension.
+- Limits (D10, D5 defaults): 4 live sessions in total, 2 per source, 2 per
+  person; at most 5 served frames per second per session; a frame that does
+  not start with a JPEG SOI marker or is larger than 8 MiB is never served.
+  Over a limit: the generic denial (or `204` for pacing). Opens are
+  charged to `HumanAccess.live_limiter` (per session a burst of 20 and one
+  more every 3 s, so switching sources, hiding/showing the tab and reconnecting
+  stay inside it) after a read-only check that also requires the Owner or
+  `live:view` (`session_may_be_current(token, permission=LIVE_VIEW)`, Issue
+  #279 item 6), so neither a forged cookie nor a session without `live:view`
+  takes a slot.
+  A close is not charged: it reaches SQLite only for a live session held for
+  the presented cookie, so closes are bounded by opens.
+  At most 32 request jobs (all viewers) are queued or running on the
+  service's executor at once, and at most 8 of them for one human session
+  (Issue #279 item 1, Owner decision 2026-10-16: open, poll, close and the
+  source list are charged to the session's in-memory token digest, never a
+  logged value); beyond either a request is the generic denial (no distinct
+  overload response), so a slow database cannot grow the queue, one
+  session's poll burst cannot fill it and end other viewers (it takes four
+  sessions at their full share), and sweeps never stack. A share is returned
+  when its job completes, fails or is cancelled; a stop drains every queued
+  job. 8 covers a paced viewer's one poll in flight per live session (at
+  most 2 per person) plus an open, close or source list, with room for an
+  abandoned and retried poll per live session.
+- Demand ends when a session's viewer stops polling for 15 s (the lease),
+  on close, on sign-out, at once for the affected principal after an Owner
+  grant or revocation change (`AccessAdministration.principal_changed`), and
+  for everyone while access is closed or the composition is stopped. A
+  change committed outside this process (the local CLI) is caught by the next
+  poll's validator or by the lease.
+- Contract for the Web (CP-5): `health` is always present (one of the four
+  camera values); only local `MJPG` sources are listed in this interim
+  transport; an open always answers `200` with `session_id`, `source_id`,
+  `lease_seconds` (a JSON number, `15.0`) and `frame_interval_ms` (an
+  integer, the pacing interval; poll at that
+  interval plus some slack); a close needs no body and no `Content-Type`
+  (keepalive fetch) and is never rate-limited. An open refused by the
+  limiter, the capacity or the source check creates no demand.
+- Responses: `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`,
+  `Cross-Origin-Resource-Policy: same-origin`; never `Content-Disposition`,
+  `ETag`, ranges or a cookie. There is no recording, export or download
+  semantics; browser viewing does not prevent screen capture.
+
+Synthetic/mock verified only (`server/tests/test_live_frame_routes.py`, with
+JPEG-shaped synthetic bytes); no browser has decoded a real camera frame
+(`MANUAL_TEST.md`, "S7 interim live").
 
 ### Bootstrap and recovery commands and the session gate (Issue #181 item 2)
 

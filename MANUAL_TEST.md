@@ -341,6 +341,64 @@ For each tested camera:
       （同記録 手順 4: 逆順再列挙 + runtime 再起動。host 再起動は未実施）
 - [ ] no unnecessary privileged container is required.
 
+#### Issue #11 / D3 local camera admin CLI on the Main Server (pending; requires the Owner)
+
+Verified only with a temporary SQLite database, a pseudo-terminal, a fake
+device discovery with invented USB ids/serials/paths and a fake `/proc` tree
+(`server/tests/test_uvc_admin_cli.py`; one test checks the real `/proc` of the
+CI container with a child process holding a temporary file). The command has
+not been run on the real Main Server, against a deployment database or with a
+real camera. These steps change the real registry and approvals and restart
+the production service, so they need the Owner present
+(`server/docs/DEPLOYMENT.md`, "Creating sources and approving cameras
+locally"). Record serials, ports and device paths only in the private local
+record.
+
+- [ ] with the service running, run `create-source` and `approve` as the
+  service account: each refuses `service_running` before asking for the
+  confirmation and changes nothing; `candidates` and `sources` still work;
+- [ ] stop the service; run `candidates` with both C960 connected: two lines,
+  each a `cam-` label, `usb=<vendor>:<product>`, `serial=present`, the
+  advertised formats and `approved_for=` the source currently approved (or
+  `-`); with stdout and stderr redirected to a file, confirm neither holds a
+  serial, `/dev/video*`, a by-id name or a USB port; run it twice and confirm
+  the labels are the same, then re-plug one camera and confirm only its
+  label changed (a `chmod` / `setfacl` of `/dev/videoN` leaves the label
+  unchanged; only a change of the sysfs entry's own metadata changes it
+  without a re-plug, and `approve` then refuses the old label as
+  `candidate_not_found`);
+- [ ] `create-source --name <name> --profile 1920x1080@30/MJPG`, type
+  `CREATE`: stdout holds only the new UUID and the next steps, and the audit
+  log holds one `create_source` record (actor `owner`) with that UUID; type
+  anything else: `owner_confirmation_declined`, nothing changes; with four
+  enabled sources a fifth refuses `active_source_limit_reached`;
+- [ ] add the UUID to `local_uvc.source_ids`, `--check`, then `approve <uuid>
+  <label>`, type `APPROVE`: one `approve_camera` record; `sources` shows
+  `approval=approved configured=yes`; start the service and confirm the
+  source goes `degraded` then `online` with that camera (MANUAL_TEST §A
+  runtime procedure steps 4–6), and that the other camera's source is
+  untouched;
+- [ ] approve the camera already held by another enabled source:
+  `camera_approved_for_another_source`; an unknown or stale label (after a
+  re-plug): `candidate_not_found`; a source whose profile's pixel format the
+  camera does not advertise: `camera_format_unsupported`;
+- [ ] when a camera without a serial or two cameras sharing one serial are
+  available: `candidates` shows `serial=absent` / `serial=shared` and
+  `approve` refuses `camera_without_serial` / `camera_serial_not_unique`
+  (until then accepted with the mock, Owner decision 2026-10-11 for §A
+  step 7);
+- [ ] run as root, as another account and without a controlling terminal
+  (`systemd-run`, `cron`): `run_as_service_account` /
+  `controlling_terminal_required`, each changing nothing;
+- [ ] with the service inside a VM/LXD guest (Owner decision D2), confirm the
+  command is run inside that guest; from the host it cannot see the guest's
+  service (documented limit: a VM's own kernel, an unprivileged LXD
+  container's shifted uids);
+- [ ] while another local admin command of the service account holds the
+  database (for example `bootstrap_cli` waiting at its confirmation), run
+  `create-source`: `service_running`, with the hint naming the other admin
+  commands.
+
 #### 実機記録 2026-09-30（Main Server 候補、serial 付き同型 UVC × 2）
 
 ```text
@@ -1447,6 +1505,21 @@ Local/private path:
 - [ ] adaptive quality works;
 - [ ] one bad source does not hide health of others.
 
+### Issue #205 CP-5 Web live screen (pending; needs the CP-4 routes)
+
+Mock-verified only: `web/tests/live.test.mjs` and `web/tests/browser.mjs`
+(headless Chrome, synthetic route answers, a generated JPEG). Not yet run
+against the real Main Server routes, a real camera or a physical device.
+
+- [ ] phone (Safari) and Mac/desktop browser over the reserved HTTPS origin: Live shows each permitted source and a moving picture from one `local_uvc` source;
+- [ ] a `live:view`-only viewer sees Live and no recording, timeline or history; a `recordings:view`-only viewer has Live disabled and the browser sends no `/api/live/` request;
+- [ ] the picture is drawn without a CSP violation report (developer console) on Safari and Chrome;
+- [ ] putting the tab in the background or locking the phone closes the viewer session (server viewer count drops) and returns it on return;
+- [ ] unplugging the camera marks the picture not current or ends the view; it never keeps showing an old frame as current;
+- [ ] revoking `live:view` or the person while watching ends the view and clears the picture;
+- [ ] sign-out from the dashboard returns to the sign-in shell and the old cookie no longer opens `/app/`;
+- [ ] no download, save or export control is offered (browser capture of the screen remains possible and is not claimed otherwise).
+
 Demand-driven processing:
 
 - [ ] no-viewer state does not perform unnecessary viewer-only transcoding;
@@ -1500,7 +1573,7 @@ The research-room Tailnet is shared, so run these with two people (or two browse
   it, and that the key does not appear in logs, the database or a diagnostic
   export;
 - [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding;
-- [ ] the dashboard origin is reserved for ServerSentinel and is a secure context (HTTPS; the human composition accepts only the reserved `https` origin and there is no `http://localhost` Owner route, Owner decision 2026-10-11); confirm WebAuthn registration and sign-in actually work there, and record that an ordinary-HTTP non-loopback origin makes them impossible;
+- [ ] the dashboard origin is reserved for ServerSentinel and is a secure context (HTTPS; the human composition accepts only the reserved `https` origin and there is no `http://localhost` Owner route, Owner decisions 2026-10-11 and 2026-10-16); open it by URL from a Tailscale-joined viewer device outside the Main Server (phone, Mac or desktop), confirm WebAuthn registration and sign-in actually work there, and record that an ordinary-HTTP non-loopback origin makes them impossible;
 - [ ] the startup and daily reservation check enumerates the real listeners and every proxy route for the whole name across all schemes and ports, and closes human access and notifies the Owner on any other answer it can see; confirm separately (kernel forwarding step) that no DNAT/REDIRECT/TPROXY/`sk_lookup`/IPVS forwarding reaches the reserved address, and record that this bounds rather than prevents, so a process binding between checks can collect credentials until the next check;
 - [ ] the first owner redeems a console-displayed single-use authorization once from a browser at the reserved origin, and it cannot be redeemed again;
 - [ ] record the configured entropy of enrollment codes and bootstrap authorizations and confirm it meets the stated minimum; guessing attempts against a wrong code are rate-limited and give the same generic response;
@@ -1559,8 +1632,9 @@ secure-context origin, using synthetic test identities (`*.invalid`):
 
 `server/app/auth/human_surface.py` is verified only with a synthetic ASGI driver
 (`server/tests/test_human_surface.py`): no socket, Tailscale Serve, browser or
-real authenticator has exercised it, and no production entry point builds the
-composition yet. Once a deployment can enable it, verify on the Main Server
+real authenticator has exercised it. The production launcher builds the
+composition from an enabled `human_access` deployment section (CP-1), not yet
+exercised on real hosts. Once a deployment enables it, verify on the Main Server
 with synthetic `*.invalid` identities:
 
 - [ ] through the installed Tailscale Serve, record the `Host` header and peer
@@ -1594,9 +1668,9 @@ with synthetic `*.invalid` identities:
 Verified only with the synthetic ASGI driver and synthetic stores
 (`server/tests/test_human_gated_authorization.py`,
 `tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve or
-real authenticator has exercised sign-out or the CSRF header yet, and no
-production entry point builds the composition. Once a deployment can enable it,
-verify on a shared machine (one OS account and browser profile, the shared
+real authenticator has exercised sign-out or the CSRF header yet; the production launcher mounts the human routes only from an enabled
+`human_access` deployment section (CP-1), not yet exercised on real hosts.
+Once a deployment enables it, verify on a shared machine (one OS account and browser profile, the shared
 Tailscale login, synthetic `*.invalid` people with their own passkeys on
 roaming authenticators):
 
@@ -1631,8 +1705,9 @@ Verified only with the synthetic ASGI driver, software authenticators and a
 pseudo-terminal (`server/tests/test_invitation_redemption.py`,
 `server/tests/test_bootstrap_cli.py`, `tests/e2e/test_access_matrix_scenarios.py`);
 no real terminal session, browser, Tailscale Serve or authenticator has
-exercised them, and no production entry point mounts the human routes yet.
-Once a deployment can enable them, on the Main Server with a synthetic
+exercised them. The production launcher mounts the human routes only from an
+enabled `human_access` deployment section (CP-1), not yet exercised on real
+hosts. Once a deployment enables them, on the Main Server with a synthetic
 `*.invalid` Owner name:
 
 - [ ] over SSH, run `bootstrap` as the service account
@@ -1698,10 +1773,10 @@ Once a deployment can enable them, on the Main Server with a synthetic
 Verified only with the synthetic ASGI driver, software authenticators and a
 synthetic boot clock (`server/tests/test_human_step_up.py`,
 `tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve,
-real authenticator or real clock step has exercised it, no production entry
-point mounts the human routes yet; the `403 step_up_required` contract is
+real authenticator or real clock step has exercised it, and the production launcher mounts the human routes only from an enabled
+`human_access` deployment section (CP-1), not yet exercised on real hosts; the `403 step_up_required` contract is
 exercised through the S4b administration routes in the tests. Once a
-deployment can enable the routes, on a shared machine (one OS account and browser profile,
+deployment enables the routes, on a shared machine (one OS account and browser profile,
 the shared Tailscale login, a synthetic `*.invalid` Owner and a synthetic
 `*.invalid` invitee, each with their own passkey on a separate roaming
 authenticator):
@@ -1765,9 +1840,9 @@ Mock only: verified with the synthetic ASGI driver, software authenticators,
 a synthetic boot clock and patched storage failures
 (`server/tests/test_human_step_up.py` `FollowUpTests` and
 `StepUpFindingStoreTests`); no browser, real authenticator, real storage
-hard stop or real notification channel has exercised it, and no production
-entry point mounts the human routes yet. Once a deployment can enable the
-routes, with a synthetic `*.invalid` Owner whose passkey is on a roaming
+hard stop or real notification channel has exercised it, and the production launcher mounts the human routes only from an enabled
+`human_access` deployment section (CP-1), not yet exercised on real hosts.
+Once a deployment enables the routes, with a synthetic `*.invalid` Owner whose passkey is on a roaming
 authenticator usable from two separate browser profiles (A and B), on a
 disposable deployment:
 
@@ -1821,9 +1896,9 @@ Mock only: verified with the synthetic ASGI driver, software authenticators
 and a synthetic boot clock (`server/tests/test_human_admin_routes.py`,
 `server/tests/test_access_administration.py`,
 `tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve,
-real authenticator or real deployment has exercised them, no production
-entry point mounts the human routes yet, and the Owner's Web screen is S6.
-Once a deployment can enable the routes, with a synthetic `*.invalid` Owner
+real authenticator or real deployment has exercised them, the production launcher mounts the human routes only from an enabled
+`human_access` deployment section (CP-1), not yet exercised on real hosts, and the Owner's Web screen is S6.
+Once a deployment enables the routes, with a synthetic `*.invalid` Owner
 and synthetic invitees, each with their own passkey:
 
 - [ ] as the Owner (fresh), `POST /api/admin/principals` with a display name
@@ -1873,7 +1948,7 @@ synthetic ASGI driver with software authenticators
 (`server/tests/test_local_revocation_cli.py`); the command has not been run
 on the real Main Server or against any deployment database. These steps
 change real access state and need the Owner present; they were not executed
-as part of the S4c change. Once a deployment can enable the human routes, on
+as part of the S4c change. Once a deployment enables the human routes, on
 the Main Server, with synthetic `*.invalid` invitees and their own test
 passkeys (never a real person's credential):
 
@@ -1977,7 +2052,7 @@ loads the real S5a build through the same loader
 (`server/tests/test_web_build_contract.py`); no browser has loaded, rendered
 or enforced the response policies of the shell or the application, and no
 Tailscale Serve or real deployment has served them. The release ships the
-build since S5c (next section). Once a deployment can enable the human
+build since S5c (next section). Once a deployment enables the human
 routes with that build, from a browser on the shared account at the reserved
 name:
 
@@ -2037,6 +2112,43 @@ and then on the Main Server (Owner, synthetic data only):
   under `releases/<older version>/web/` as root and run `rollback`: it is
   refused before any change with the "differs from its release manifest"
   steps; `current`, `previous` and the unit are unchanged.
+
+### Issue #10 S7 interim live (pending)
+
+Mock only: the routes, authorization, limits, lease and retention are verified
+with synthetic JPEG-shaped bytes, the synthetic ASGI driver and software
+authenticators (`server/tests/test_live_frame_routes.py`). No browser has
+decoded a real camera frame, no Web live screen exists yet (CP-5), and no real
+deployment has served the routes. Once a deployment enables the human routes
+with an approved `local_uvc` camera, from browsers on the shared account at
+the reserved name:
+
+- [ ] a test invitee with `live:view` only: the source list shows each
+  approved camera's name and health only, a session opens and frames decode
+  in Safari (iPhone), Safari (Mac) and Chrome/Firefox (desktop); record
+  whether the camera's MJPG frames without a Huffman table (DHT) decode in
+  each browser;
+- [ ] a test invitee with `recordings:view` only: every live route is the
+  generic `404`;
+- [ ] copy the frame URL from the developer tools into another invitee's
+  browser and into a second sign-in of the same invitee: the generic `404`;
+  the original viewer keeps receiving frames;
+- [ ] measured frame rate per viewer stays at or below 5 fps; record latency
+  and the Main Server CPU with 1, 2 and 4 viewers;
+- [ ] a third viewer on one camera, and a fifth in total, gets the generic
+  `404`; a person's third session is refused too;
+- [ ] close the viewer's tab: within about 15 seconds the preview reports no
+  viewer (no retained frame); revoke the invitee (or withdraw `live:view`) in
+  the Owner administration while watching: frames stop at once;
+- [ ] unplug the camera while watching: the frame route answers `204` and the
+  source list shows it offline; no pre-loss frame is shown as live; replug and
+  re-approve: frames resume;
+- [ ] watch for more than 30 minutes: the session does not idle out while
+  frames are pulled; then stop pulling and do nothing else: the session ends
+  at its idle limit;
+- [ ] the frame response has `Cache-Control: no-store`,
+  `X-Content-Type-Options: nosniff` and no `Content-Disposition`; the browser
+  offers no download button in the application.
 
 ### Uninvited ordinary Tailnet member
 
@@ -2734,6 +2846,31 @@ by the Issue #6 synthetic policy model.
   passing. Record whether empty config prints `{}`, nothing, or text, and
   whether reading status needs anything beyond local operator access (it must
   not need ACL/Grants changes or admin credentials).
+- Production composition (`human_access` deployment key, Issue #10;
+  `server/docs/DEPLOYMENT.md`, "Enabling human access through Tailscale
+  Serve"): its tests use synthetic enumerators, a synthetic Web build and
+  generated stand-in executables only; nothing below is verified yet. As the
+  service account, run `env -i <tailscale_executable> serve status --json`
+  and record whether it succeeds without any environment, how long it takes
+  and its size (the runner allows 5 seconds and 1 MiB). With
+  `"isolation": "dedicated_network_identity"`, run it inside the dedicated
+  VM/container against that environment's own `tailscaled` and confirm the
+  backend's `/proc/net` and sock_diag view is that environment's namespace.
+  Restart the service with the key and confirm the startup check opens access
+  only with the expected single Serve mapping, and that `"isolation": null`,
+  a missing Serve mapping, an extra path or port, or a stopped `tailscaled`
+  keeps it closed (generic denial on the shell `/`) and sends one
+  `human_access_fault` notification, and that a missing or group-writable
+  `tailscale_executable` (Issue #283) lets the release's check pass with the
+  warning `human access stays closed (reason=executable)` on stderr, and the
+  service start and keep recording with every human path closed, log
+  `human_access_composition_failed`, send one `human_access_fault`
+  notification and report `human_access_degraded`. Make the composition itself
+  fail at start (for example a session-binding key that is not the service
+  account's own) and confirm the service keeps running and recording with
+  every human path closed, logs `human_access_composition_failed`, sends one
+  `human_access_fault` notification and reports `human_access_degraded`
+  until the cause is fixed and the service restarted.
 - On the target host, compare the parsed `/proc/net/tcp` and `/proc/net/tcp6`
   listeners with `ss -ltnH`, and the parsed `/proc/net/udp` and
   `/proc/net/udp6` unconnected sockets with `ss -lunH`, for IPv4, IPv6,
@@ -2767,6 +2904,67 @@ by the Issue #6 synthetic policy model.
   closes access. Confirm on the host whether its `::` listeners are dual-stack
   (`net.ipv6.bindv6only`, per-socket `IPV6_V6ONLY`); the check assumes they
   are and needs an exception without a family for them.
+- `tailscaled` peerAPI reserved-address exception (Owner decision D1,
+  2026-10-16; ADR-0003; synthetic tests only so far, not run on any host).
+  On the node whose Tailscale name is the reserved name:
+  - [ ] list the TCP listeners on the Tailscale addresses (`sudo ss -ltnp
+    --cgroup`) and confirm each row other than the Serve socket on the
+    dashboard port is created in `/system.slice/tailscaled.service` by uid 0
+    and is the peerAPI (`tailscaled` debug output or upstream documentation
+    for the installed version), and record its port per address family;
+  - [ ] from another Tailscale node, request `http://<address>:<port>/` and
+    `https://<reserved name>:<port>/` and record that the port answers plain
+    HTTP only (no TLS handshake);
+  - [ ] with a dashboard session established in a browser, open
+    `http://<reserved name>:<port>/` in the same browser and confirm in the
+    browser's network panel that the request carries no `__Host-session`
+    cookie (the cookie is `Secure`); record the browser and version;
+  - [ ] record whether the IPv4 and IPv6 rows use the same port (one
+    exception without a family) or different ports (one `ipv4` and one
+    `ipv6` exception), and that each family has exactly one `tailscaled`
+    port besides the Serve socket: the command refuses a second
+    `reserved_address` exception for a family (Issue #278);
+  - [ ] record the port per family before and after `sudo systemctl restart
+    tailscaled`, after `tailscale down` followed by `tailscale up`, and after
+    a reboot: whether it stays the same decides whether the recorded
+    exception survives restarts or a follow-up Owner decision is needed (a
+    port that changes every time would revoke every human session on every
+    restart). The belief that the port is derived from a hash of the
+    Tailscale address and moves to another candidate when that one is in use
+    is unverified recollection, not a documented guarantee; record what the
+    installed version actually does;
+  - [ ] confirm the port serves no page or script whose content another
+    node or a user chooses (ADR-0003 same-site assumption): record the
+    response to `/` and an unknown path from another Tailscale node;
+  - [ ] without the exception, confirm access closes with
+    `UNEXPECTED_LISTENER`; record the `reserved_address` exception for the
+    observed port(s) with `app.auth.reservation_cli set`, restart the
+    service and confirm access opens;
+    confirm a test TCP listener on the same address and another port, and
+    one on the recorded port started by another unit after `tailscaled` is
+    stopped, each close access; on a disposable node, add a Serve HTTPS
+    listener on another port and confirm access closes with
+    `UNEXPECTED_ROUTE`, plus `UNEXPECTED_LISTENER` when `ss` shows a socket
+    for it (record which).
+- Local listener-exception command (`app.auth.reservation_cli`, Owner
+  decision D3, 2026-10-16; synthetic tests only so far, not run on any host):
+  - [ ] as the service account over SSH, `show` prints the stored set (or
+    `no listener exceptions`) and nothing else; `set` with the host's
+    exceptions shows the stored and new sets, asks for `CHANGE`, and adds one
+    `change_security_setting` audit record (actor `owner`) holding no port,
+    unit or address;
+  - [ ] the running service keeps its startup set until
+    `systemctl restart server-sentinel.service`; after the restart the new
+    set is in force (a removed exception closes access);
+  - [ ] run as root, as another account, without a controlling terminal
+    (`systemd-run`, `cron`), with a dashboard or upstream port, and with a
+    `reserved_address` exception for another unit: each refuses and changes
+    nothing;
+  - [ ] with the deployment's real `human_access` section, an exception for
+    its `port` or for `human_port` is refused; with the section removed
+    from a copy of the configuration, `set` refuses with
+    `human_access_not_configured` and no refusal prints a hostname,
+    address, unit or port.
 - Breach recovery (Owner decision 2026-09-30): with an Owner and an invited
   viewer signed in, bind a test listener to the Tailscale address on another
   port, wait for the check to close access, then stop it. Confirm access
@@ -2783,6 +2981,27 @@ by the Issue #6 synthetic policy model.
   listener is up: confirm the `invalidate_human_sessions` record is committed
   at once, so a restart after removing the listener cannot reopen with an
   earlier session.
+- Access-fault Owner notification (Issue #232 item 4; pending the production
+  composition that passes `AccessFaultMonitor` to the check and ceremonies,
+  so mock-verified only): with Slack configured to the Owner's own test
+  channel, cause one breach close as above and confirm exactly one
+  `ServerSentinel critical alert: human_access_fault` within one monitoring
+  tick, none for the following retries with the same reason, and one
+  `ServerSentinel recovery notice: human_access_recovered` after access
+  reopens. Confirm neither message nor the `notification_events` row contains
+  the hostname, an address, a viewer identity or a reason, and that the
+  monitoring status shows `human_access_degraded` only during the fault.
+  Hourly budget across a restart (Issue #281 item 2, Issue #287; mock-verified
+  only), on a disposable copy of the database, never the production one:
+  after the update, confirm with `sqlite3` that `notification_events` has the
+  `accepted_at` column and that rows written before the update kept every
+  value with `accepted_at` empty. Cause four access notifications within an
+  hour, restart the service and cause a fifth: confirm it arrives only once
+  the oldest of the four is an hour old (counted from each row's
+  `accepted_at`), never earlier and not more than an hour after the restart.
+  Repeat with the state mount unavailable at start (monitoring `failed`) and
+  one notification sent before the mount returns: after it returns, the
+  earlier rows of the hour still count and that notification counts once.
 - Listener owners through sock_diag (Issue #126, Owner decision 2026-10-07;
   mock and unprivileged local experiments only so far, not yet run on the
   Main Server). Production check procedure, all as the ServerSentinel service
@@ -2818,8 +3037,8 @@ by the Issue #6 synthetic policy model.
      is greater than the port, `ss -ltne 'sport = :<port>'` shows one row whose
      inode is in `/proc/<service pid>/fd`, the backend runs without
      capabilities (`grep Cap /proc/<service pid>/status` all zero), and access
-     opens with the `tcp/22` `ssh.socket` (uid 0) exception entered through
-     the audited Owner path.
+     opens with the `tcp/22` `ssh.socket` (uid 0) exception entered with
+     `app.auth.reservation_cli set` and a service restart.
   4. Mismatching listener → revoke: on a disposable node or during a
      maintenance window, with an Owner and an invited viewer signed in, stop
      `ssh.socket` and `ssh.service`, start a wildcard listener on 22 from a

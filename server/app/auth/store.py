@@ -1223,7 +1223,7 @@ class AccessStore:
             self._audited_write(write)
 
     def session_may_be_current(self, token: object, *, now: datetime | None = None,
-                               owner: bool = False) -> bool:
+                               owner: bool = False, permission: Permission | None = None) -> bool:
         """Read-only pre-check of a presented session token.
 
         It takes no session gate lock and no SQLite write lock; the deferred
@@ -1252,8 +1252,16 @@ class AccessStore:
         refused before it can take a limiter slot and can never fill the
         table against the Owner. Still only a pre-check: it grants nothing,
         and ``authorize_request`` decides the role again inside the gate.
+
+        ``permission`` (the live open only, Issue #279 item 6) likewise
+        requires an active principal that is the Owner or holds that
+        permission, in the same read, so a session without ``live:view``
+        never takes a slot of the live limiter. It cannot be combined with
+        ``owner``.
         """
         if type(owner) is not bool:
+            return False
+        if permission is not None and (not isinstance(permission, Permission) or owner):
             return False
         try:
             at = utc_time(self._clock() if now is None else now)
@@ -1267,6 +1275,11 @@ class AccessStore:
             query += (" AND EXISTS (SELECT 1 FROM access_principals p WHERE p.id=s.principal_id "
                       "AND p.role=? AND p.status=?)")
             parameters += (PrincipalRole.OWNER.value, PrincipalStatus.ACTIVE.value)
+        elif permission is not None:
+            query += (" AND EXISTS (SELECT 1 FROM access_principals p WHERE p.id=s.principal_id AND p.status=? "
+                      "AND (p.role=? OR EXISTS (SELECT 1 FROM access_principal_permissions g "
+                      "WHERE g.principal_id=p.id AND g.permission=?)))")
+            parameters += (PrincipalStatus.ACTIVE.value, PrincipalRole.OWNER.value, permission.value)
         try:
             with self._transaction() as connection:
                 row = connection.execute(query, parameters).fetchone()

@@ -48,7 +48,11 @@ session description), and phase 2 S1 adds gated authorization, a per-session
 CSRF token and sign-out to it, S2 invitation redemption, S3 the Owner
 step-up routes and S4b the Owner's access administration routes (see
 `server/app/auth/README.md`); the
-production entry points do not build one yet. Its
+production launcher builds one only from an enabled `human_access` deployment
+section (`server/app/auth/composition.py`; absent or disabled, every human path
+stays closed, an incomplete section refuses startup, and a composition that
+cannot be built keeps every human path closed and notifies the Owner), and even then access
+opens only while the reservation check passes. Its
 documented launcher accepts only loopback bind settings, disables proxy-header
 parsing and access logs, and removes the server product header. The authorization
 adapter remains deny-all until the #6/#10 gates are met. Newly created SQLite
@@ -315,7 +319,9 @@ adds only sign-out, S2 invitation redemption, S3 the Owner step-up and S4b
 the Owner's access administration; none makes any of the conditions below
 optional.
 Every session route commits its authorization inside the reservation gate
-(`admit(epoch)`), every Owner mutation does too (Owner decision D6), and a
+(`admit(epoch)`), every Owner mutation made through a session route does too
+(Owner decision D6; the host-local Owner commands described under the
+listener exceptions below are no session route and have neither), and a
 request already in flight when the composition stops or a periodic check
 fails is refused at that commit (Issue #228). A mutating session route also
 needs the exact `Origin` and an `X-CSRF-Token` equal to the session's
@@ -362,8 +368,12 @@ application data only when every one of these server-side conditions holds:
 - **Reserved secure-context origin.** The dashboard is served from its
   reserved origin over a secure context, and the latest startup/daily
   reservation check passed. That check detects; it does not prevent (below).
-- **Owner step-up.** Owner-only operations additionally require a fresh user
-  verification bound to the session's own credential.
+- **Owner step-up.** Owner-only operations over a session additionally
+  require a fresh user verification bound to the session's own credential.
+  The host-local Owner commands (`app.auth.bootstrap_cli`,
+  `app.auth.reservation_cli`) are not human requests: they run on the Main
+  Server as the service account, with no session, no WebAuthn and no step-up
+  (see the listener exceptions below).
 
 The only requests served without a credential are the enumerated
 pre-credential routes (enrollment-code redemption and authentication), which
@@ -427,6 +437,35 @@ and ADR-0003):
   an immediate second lookup confirms it, closes access as an exposure. The
   Main Server keeps `ssh.socket`; the exception is `tcp/22` created by
   `ssh.socket` as uid 0 (`server/docs/DEPLOYMENT.md`).
+- The Owner records the listener exceptions with a host-local command,
+  `python -m app.auth.reservation_cli set` (Owner decision D3, 2026-10-16),
+  not through a session route: no WebAuthn, no step-up and no reservation
+  gate. Its authority is the ability to run as the deployment's service
+  account on the Main Server (root and every other account are refused) plus
+  the word `CHANGE` read from the controlling terminal; it validates the set
+  against the reservation the deployment's `human_access` section states and
+  commits it with a `change_security_setting` audit record (actor `owner`,
+  no port, unit or address) in one transaction. This is no weaker than what
+  that account already has, since it can write the application database
+  directly, but it is a different protection from the session path: whoever
+  controls the service account (or root) can change the exceptions, and the
+  audit record attributes the change to the Owner without verifying a person.
+  The running service applies the stored set only after a restart, so
+  narrowing it takes effect then, not at once.
+- An exception covers a wildcard bind only, with one exception (Owner
+  decision D1, 2026-10-16; ADR-0003): `tailscaled.service` (uid 0) TCP
+  listeners bound directly on a configured reserved address on a recorded
+  port that is not the dashboard, upstream or proxy port, for `tailscaled`'s
+  plain-HTTP peerAPI, at most one such exception per family (Issue #278).
+  The `Secure` `__Host-session` cookie is not sent to a plain-HTTP port; that
+  the recorded port is the peerAPI and stays plain HTTP is verified manually
+  (`MANUAL_TEST.md`), not by the check, which still only detects. `SameSite`
+  does not separate that origin from the dashboard (a browser without
+  schemeful same-site treats it as the same site): the exact `Origin` check,
+  the CSRF token and WebAuthn's secure-context requirement do, on the
+  assumption that the peerAPI serves no active content an attacker controls
+  (ADR-0003). A Serve listener added on another port is also reported as
+  `UNEXPECTED_ROUTE` by the route comparison.
 - Every recorded proxy socket must be present and created by the recorded
   proxy unit and uid (for example `tailscaled.service`, uid 0), verified the
   same way. A confirmed other creator is an exposure; a missing recorded
@@ -478,7 +517,7 @@ Consequences to keep in mind while reviewing code:
 - no fingerprint or face template reaches ServerSentinel: it never leaves the authenticator. Credential records are not an identity or biometric database;
 - relying-party checks only hold if the dashboard owns its browser origin, with no other application sharing it, as AUTH-012 requires; a co-hosted application on that origin would put the credential within its reach;
 - reserving the origin is a deployment obligation, described above and in ADR-0003. The startup and daily check closes human access and notifies the Owner when it sees anything else answering on that name (listening sockets and proxy routes only; kernel forwarding to the reserved address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF `sk_lookup`, IPVS) is verified by the operator), which bounds the exposure window rather than preventing the bind: a process binding between two checks collects credentials and cookies for that origin until the next one;
-- the origin must be a secure context (HTTPS, or `http://localhost` for a strictly local browser). Browsers withhold WebAuthn otherwise, so plain HTTP on a non-loopback host is not a usable human path. The current human composition accepts only the reserved `https` origin; no `http://localhost` Owner route exists (Owner decision, 2026-10-11);
+- the origin must be the reserved `https` origin, reachable by URL from viewer devices outside the Main Server (for example the tailnet hostname served through Tailscale Serve to Tailscale-joined viewer devices). It must be a secure context because browsers withhold WebAuthn otherwise, so plain HTTP on a non-loopback host is not a usable human path. `http://localhost` is not a human dashboard origin: the human composition accepts only the reserved `https` origin and no `http://localhost` Owner route exists (Owner decisions, 2026-10-11 and 2026-10-16). Reaching the URL identifies nobody; the invitation and per-person credential above are still required;
 - the pending challenge lives server-side for one bounded, single-use ceremony and is then dropped;
 - the signature counter persists as `principal_credential.sign_count` and advances only on an accepted assertion. The comparison applies whenever the stored or the received counter is non-zero, and the received value must be strictly greater: a received 0 after a stored non-zero is a regression, not an exemption. A regression refuses the assertion and notifies the Owner as a possible cloned authenticator. Only a stored-and-received 0 is exempt, which is the ordinary passkey case;
 - a retained proxy identity is bounded: the principal keeps at most the last observed raw value, stored but never returned or shown, not even to the Owner (Owner decision D14), cleared on revocation or deletion and kept out of diagnostic exports, with longer history in the audit log. A session stores only a deployment-keyed HMAC binding for constant-time equality checks; it is cleared with session invalidation, never displayed and excluded from diagnostics/exports. The key is a 32-byte file in the data directory, created once with mode `0600`, refused (not replaced) when its ownership, mode, link count or size is wrong, and never logged, exported or stored in the database;
@@ -509,6 +548,8 @@ Issue #10 phase 2 S3 implements this as `POST /api/auth/step-up/options` and `PO
 Issue #238 follow-ups to the step-up (synthetic/mock verified only, `server/tests/test_human_step_up.py` `FollowUpTests` and `StepUpFindingStoreTests`, with no browser or real authenticator). A refused step-up finish spends its challenge only when the challenge is bound to the refused request's own current session: a submission from another session, even another session of the same Owner that learned the challenge value, and a submission whose request has no current session at all (the session's proxy identity binding does not match, or the session expired or was signed out) is the generic denial and deletes nothing, so the challenge stays pending and is still usable only by the session it was issued to, until its normal expiry (or until a close that revokes sessions deletes it). This is an availability protection, not a weakening of single use: a challenge still verifies only for its own session and its own credential, and every refusal of the own session's request spends it as before (except a session-gate refusal, which leaves it pending, as before). A detected credential finding (changed backup eligibility or a signature counter that does not advance) whose write fails, for example a storage admission refused under `STORAGE_HARD_STOP`, has neither an audit record nor an Owner notification; it is counted in the value-free in-process counter `PasskeyCeremonies.unrecorded_findings` (not persisted; a session-gate refusal of the finding is not counted) and logged as the WARNING event `credential_finding_unrecorded` on the first failure and at each power of two (1, 2, 4, 8, ...), carrying only the event name, never a kind, principal, credential, challenge, token, identity or reason. The finding itself is not lost: the stored credential is unchanged, so the next assertion of that credential detects it again, and an operator who sees the event should treat it as a credential finding that could not be recorded and resolve the storage condition. A changed backup eligibility detected by two sessions' step-ups, or by a step-up and a sign-in, at the same time is recorded, audited and notified once: the first transaction to mark the credential writes the mark, its session invalidation and its audit record and is the only one that notifies the Owner; a later one finds the credential already marked, still spends its own challenge (a sign-in's was consumed before verification) and writes, audits and notifies nothing more.
 
 Issue #10 phase 2 S4b mounts the Owner's access administration: `GET /api/admin/principals` (`OWNER_READ`, the inventory, which never returns a proxy identity, credential id, public key, counter, digest or session data) and five `OWNER_OP` changes — invite with one code, re-issue the code, grant or withdraw one of `live:view` / `recordings:view` as a delta, revoke a person, and revoke one credential by its random handle (credential-scoped: a synced passkey is revoked on all synced devices that hold it; it is not per-device revocation). Path ids match only the canonical lower-case UUID form with the raw path equal to the decoded one, bodies are strict bounded JSON checked before any session work, every change needs the exact `Origin` and `X-CSRF-Token`, and every refusal (a non-Owner, a revoked or Owner target, another principal's handle, a limit of S4-8, a gate change or a session that no longer holds at the commit) is the generic not-found response, except `403 step_up_required` for a stale Owner, decided before anything is written and without extending the session. An invitation code is shown only in the response that issued it and stored only as its digest and lookup key; no code, display name, handle, credential id or identity is logged, and audit records carry the principal's logical UUID only. The inventory re-checks the Owner session inside its own read transaction, so a local recover or revocation committed after the authorization (outside the gate) returns nothing. The changes are charged to their own per-session rate limiter (Owner decision 2026-10-13: burst 20, one per 3 seconds, a bounded table, keyed on a server-side digest of the session token after a read-only pre-check that the session is current and its principal the active Owner (so a non-Owner session is refused uncharged and cannot fill the table against the Owner, PR #242 review) and before any gate, SQLite or audit work, a `SourceRateLimiter` object `HumanAccess` refuses to share), so a fresh Owner session cannot grow the audit table without bound with repeated no-op or unknown-target changes, and another person's session cannot spend the Owner's bucket; over the limit nothing is written or audited. This is synthetic/mock verified only (`server/tests/test_human_admin_routes.py`), with no browser or real authenticator.
+
+Issue #10 S7 mounts the interim live frame pull (Owner decision D10, pending #19): `GET /api/live/sources`, `POST /api/live/sessions`, `GET /api/live/sessions/<sid>/frame` and `POST /api/live/sessions/<sid>/close`. Every request needs `live:view` (or the Owner) server-side, except the close, which only releases a live session of the caller's own human session; `recordings:view` alone reaches none of them, and the source list returns only id, name and coarse health. A live session is bound to the human access session that opened it, so a live-session id copied to another person's browser, or to another sign-in of the same person, is refused; every frame read re-checks, inside the gate epoch, that the presented session is that human session (token digest and proxy-identity binding) and re-runs the `live:view` validator (current principal, credential, deployment generation, authorization revision). Nothing is written per frame: the idle expiry is extended at most once per 60 s per live session, a poll whose human session is no longer current for the presented cookie and proxy identity (including a proxy-identity binding mismatch, recorded once and coalesced) ends that live session so later polls never reach SQLite, a poll queued before the service stopped is refused, and polls are admitted in memory against a per-(human session, live session) budget before any SQLite read, while opens are charged to a per-session limiter after a read-only check that also requires the Owner or `live:view` (a close reaches SQLite only for a live session held for the presented cookie, so closes are bounded by opens). Capacity (4 sessions in total, 2 per source, 2 per person) and a full request backlog (32 pending jobs, at most 8 per human session, keyed on the session's in-memory token digest, so one session cannot fill the shared queue and end other viewers; Issue #279 item 1) are the generic denial, with no distinct overload response. Viewer demand ends after a 15 s lease without an authorized poll, on close and sign-out, at once after an Owner grant or revocation change, and for every session while access is closed; a revocation by the local CLI is caught by the next poll or the lease. Frames are served only as `image/jpeg` with `nosniff`, `no-store` and `Cross-Origin-Resource-Policy: same-origin`, never as an attachment; this is browser viewing, not a download, and it does not prevent screen capture by a viewer. Synthetic/mock verified only (`server/tests/test_live_frame_routes.py`).
 
 ## Capture-node pairing
 
@@ -649,7 +690,13 @@ incoming webhooks, follows no redirect, ignores environment proxies and closes
 error responses. Credential URLs, remote bodies and raw exceptions never enter
 its result/log surface. Unset configuration constructs no transport. Current
 payloads are fixed categories/validated aggregates, without media or arbitrary
-event details. Tests use generated dummy components and intercepted transports.
+event details. A failing hostname reservation check or human-access
+composition, its recovery, and a committed WebAuthn credential finding are the
+immediate fixed categories `human_access_fault`, `human_access_recovered` and
+`credential_finding` (Issue #232 item 4): sent on the transition, not on every
+check, rate-limited, and marking monitoring health degraded. They add Owner
+visibility only; human access was already closed by the check, and the
+notification carries no hostname, identity, principal, credential or reason. Tests use generated dummy components and intercepted transports.
 The webhook is read only from the administrator-owned, non-world-readable
 deployment configuration (`monitoring.slack_webhook_url`); it never enters
 repr, validation messages or logs. The monitoring runtime binds the Main

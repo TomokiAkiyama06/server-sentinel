@@ -16,12 +16,14 @@ from enum import StrEnum
 import logging
 import math
 import os
+import sqlite3
 import stat
 import threading
 import time
 from typing import Callable
 from uuid import UUID, uuid5
 
+from app.audit.model import AuditAction
 from app.audit.store import DEFAULT_RETENTION, UnboundStorageAdmission
 from app.integrity.service import IntegrityService
 from app.integrity.store import IntegrityStore, OwnerApproval
@@ -31,12 +33,13 @@ from app.media.recording.model import RecordingError, SegmentValidator
 from app.media.recording.store import RecordingStore
 from app.notifications.schedule import DailySummaryScheduler
 from app.notifications.service import DailySummary, NotificationKind, NotificationService
-from app.notifications.slack import SlackDelivery
+from app.notifications.slack import DeliveryResult, SlackDelivery
 from app.storage.database import Database
 from app.storage.migrations import Migration, MigrationError, migrate
 from app.storage.policy import MainStoragePolicy, StorageState, StorageTransition
 from app.storage.retention import RetentionService, StorageAudit
 
+from .access import HOUR_SECONDS, AccessFaultMonitor
 from .config import MonitoringConfiguration
 from .filesystem import IdentifiedRecordingFilesystem
 from .store import NotificationEventStore, RecordingHealthStatusStore
@@ -48,9 +51,55 @@ EVENT_NAMESPACE = UUID("3b0f6c52-7a1e-5d49-8e2c-0c7d4f1a9b63")
 CRITICAL_KINDS = (
     NotificationKind.HARDWARE_INTEGRITY_FAILURE, NotificationKind.RECORDING_HEALTH_FAILURE,
     NotificationKind.SERVER_MOVEMENT, NotificationKind.CAMERA_TAMPER,
+    NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.CREDENTIAL_FINDING,
 )
 WARNING_KINDS = (NotificationKind.HARDWARE_INTEGRITY_WARNING,
                  NotificationKind.RECORDING_HEALTH_WARNING)
+# The audited credential findings (``AccessStore``); their records are the
+# durable evidence a restart recovers an undelivered notification from.
+FINDING_AUDIT_ACTIONS = (AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
+                         AuditAction.DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION)
+
+
+
+def admit_state_file(configuration: MonitoringConfiguration, path) -> None:
+    """Refuse to open or create a Main state file outside verified storage.
+
+    Before a missing file may be created the declared recording filesystem
+    identity is verified, the file's directory must be a private directory on
+    that same filesystem and the free space must cover the hard reserve plus
+    the write overhead. An existing file must be a regular file on the
+    verified filesystem, so a fallback file left under a missing mount is
+    never used. Raises `RecordingError("STORAGE_HARD_STOP")` otherwise. Used
+    for the database (re-verified by every later policy admission) and for
+    the session-binding key (`app.auth.composition`, Codex PR #282).
+    """
+    try:
+        existing = os.lstat(path)
+    except FileNotFoundError:
+        existing = None
+    except OSError:
+        raise RecordingError("STORAGE_HARD_STOP") from None
+    filesystem = IdentifiedRecordingFilesystem(configuration.recording_filesystem, path)
+    if existing is not None:
+        # An existing file is opened only while the declared filesystem is
+        # verified and the file is a regular file on it, so a fallback
+        # database left under a missing mount is never opened.
+        if not stat.S_ISREG(existing.st_mode) or existing.st_dev != filesystem.expected.device:
+            raise RecordingError("STORAGE_HARD_STOP")
+        return
+    limits = configuration.storage_limits
+    try:
+        parent = os.stat(path.parent, follow_symlinks=False)
+        space = os.statvfs(path.parent)
+    except OSError:
+        raise RecordingError("STORAGE_HARD_STOP") from None
+    if (not stat.S_ISDIR(parent.st_mode) or parent.st_dev != filesystem.expected.device
+            or parent.st_uid != os.geteuid() or parent.st_mode & 0o077
+            or space.f_flag & os.ST_RDONLY
+            or space.f_bavail * space.f_frsize - limits.write_overhead_bytes
+            < limits.hard_reserve_bytes):
+        raise RecordingError("STORAGE_HARD_STOP")
 
 
 class RuntimeState(StrEnum):
@@ -80,6 +129,10 @@ class MonitoringStatus:
     summary_degraded: bool = False
     notification_local_failed: bool = False
     notification_delivery_failed: bool = False
+    # Issue #232 item 4: a failing reservation check / human-access
+    # composition, and a credential finding within the hold window.
+    human_access_degraded: bool = False
+    credential_finding_degraded: bool = False
 
 
 class RefuseUnvalidatedSegments:
@@ -119,11 +172,16 @@ class MonitoringDependencies:
     retry_seconds: float = 15 * 60.0
     integrity_max_pending_events: int = 64
     notification_queue_capacity: int = 16
+    # The composition root's single sink for the reservation check
+    # (``sink=``) and the passkey ceremonies (``findings=``) (Issue #232).
+    access_faults: AccessFaultMonitor | None = None
 
     def __post_init__(self):
         for value in (self.tick_seconds, self.retry_seconds):
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError("invalid monitoring interval")
+        if self.access_faults is not None and not isinstance(self.access_faults, AccessFaultMonitor):
+            raise ValueError("invalid access fault monitor")
 
 
 @contextmanager
@@ -159,6 +217,10 @@ class MonitoringRuntime:
         # row could not be persisted, so a denied write does not re-alert on
         # every 15-minute retry of the same failing self-test.
         self._unpersisted_health: tuple[HealthState, datetime] | None = None
+        # Issue #232 / Codex PR #271: once per process, a credential finding
+        # committed but not yet notified before a restart is recovered from
+        # the audit log on the first running access tick.
+        self._findings_recovered = False
         self.notifications: NotificationService | None = None
         self.notification_events: NotificationEventStore | None = None
         self.recordings: RecordingStore | None = None
@@ -277,45 +339,14 @@ class MonitoringRuntime:
         if self.notification_events is None:
             # The database was not opened yet; Slack still gets the alert.
             raise RecordingError("NOTIFICATION_STORE_UNAVAILABLE")
-        self.notification_events.upsert(event)
+        self.notification_events.upsert(event, accepted_at=self.dependencies.utcnow())
 
     def _admit_database_open(self) -> None:
         """Refuse to open or create the database outside verified storage.
 
-        `Database.connect()` creates a missing file. Before that is allowed the
-        declared recording filesystem identity is verified, the database
-        directory must be a private directory on that same filesystem and the
-        free space must cover the hard reserve plus the write overhead. An
-        existing file must be a regular file on the verified filesystem and is
-        re-verified by every later policy admission.
+        `Database.connect()` creates a missing file; see `admit_state_file`.
         """
-        path = self.database.path
-        try:
-            existing = os.lstat(path)
-        except FileNotFoundError:
-            existing = None
-        except OSError:
-            raise RecordingError("STORAGE_HARD_STOP") from None
-        filesystem = IdentifiedRecordingFilesystem(self.configuration.recording_filesystem, path)
-        if existing is not None:
-            # An existing file is opened only while the declared filesystem is
-            # verified and the file is a regular file on it, so a fallback
-            # database left under a missing mount is never opened.
-            if not stat.S_ISREG(existing.st_mode) or existing.st_dev != filesystem.expected.device:
-                raise RecordingError("STORAGE_HARD_STOP")
-            return
-        limits = self.configuration.storage_limits
-        try:
-            parent = os.stat(path.parent, follow_symlinks=False)
-            space = os.statvfs(path.parent)
-        except OSError:
-            raise RecordingError("STORAGE_HARD_STOP") from None
-        if (not stat.S_ISDIR(parent.st_mode) or parent.st_dev != filesystem.expected.device
-                or parent.st_uid != os.geteuid() or parent.st_mode & 0o077
-                or space.f_flag & os.ST_RDONLY
-                or space.f_bavail * space.f_frsize - limits.write_overhead_bytes
-                < limits.hard_reserve_bytes):
-            raise RecordingError("STORAGE_HARD_STOP")
+        admit_state_file(self.configuration, self.database.path)
 
     def _storage_transition(self, event: StorageTransition) -> None:
         self._set(storage_state=event.current)
@@ -583,7 +614,8 @@ class MonitoringRuntime:
         degraded = sum(bool(value) for value in (
             status.integrity_degraded, status.recording_health_degraded, status.retention_degraded,
             status.storage_audit_failed, status.notification_local_failed,
-            status.notification_delivery_failed,
+            status.notification_delivery_failed, status.human_access_degraded,
+            status.credential_finding_degraded,
         ))
         elapsed = self.dependencies.monotonic() - self._started_monotonic
         monitored = int(min(86400, max(0, elapsed))) if math.isfinite(elapsed) else 0
@@ -597,6 +629,203 @@ class MonitoringRuntime:
     def _summary_tick(self) -> None:
         now = self.dependencies.utcnow()
         self.scheduler.tick(now, self._summary(now))
+
+    def _access_tick(self) -> None:
+        """Human-access faults and credential findings (Issue #232 item 4).
+
+        Runs in every runtime state once the notification service exists:
+        Slack still receives the immediate alert while local persistence is
+        refused. The monitor never raises on its own; an unexpected failure
+        marks access degraded and is logged value-free.
+        """
+        monitor = self.dependencies.access_faults
+        if monitor is None or self.notifications is None:
+            return
+        if not self._findings_recovered and self.status.state == RuntimeState.RUNNING:
+            try:
+                self._recover_access_state(monitor)
+            except Exception:
+                # Retried on the next running tick; nothing is lost meanwhile.
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+            else:
+                self._findings_recovered = True
+        try:
+            status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
+                                   monotonic=self.dependencies.monotonic(),
+                                   finding_event_id=self._finding_event_id)
+        except Exception:
+            self._set(human_access_degraded=True)
+            logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+            return
+        self._set(human_access_degraded=status.human_access_degraded,
+                  credential_finding_degraded=status.credential_finding_degraded)
+
+    def _latest_finding(self, *, since: datetime | None = None) -> tuple[str, int] | None:
+        """``(id, occurred_at_us)`` of the newest finding audit record.
+
+        The newest is the highest rowid: SQLite gives each insert a rowid
+        above every existing row, so it orders findings without trusting the
+        wall clock. The rowid itself is not a durable name (an emptied table
+        reuses it), so the record's immutable ``id`` names the notification
+        (Codex PR #271). ``None`` without a finding or without an audit table.
+        """
+        marks = ",".join("?" for _ in FINDING_AUDIT_ACTIONS)
+        bound, values = "", tuple(action.value for action in FINDING_AUDIT_ACTIONS)
+        if since is not None:
+            epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            bound = " AND occurred_at_us > ?"
+            values += ((since - epoch) // timedelta(microseconds=1),)
+        try:
+            row = self._connection.execute(
+                "SELECT id, occurred_at_us FROM security_admin_audit_records "
+                f"WHERE action IN ({marks}){bound} ORDER BY rowid DESC LIMIT 1",
+                values,
+            ).fetchone()
+        except sqlite3.OperationalError:
+            # Only a missing audit table means nothing was ever recorded. Any
+            # other error (disk I/O, a locked database) re-raises, so the
+            # recovery is retried on the next tick instead of being read as
+            # "no finding" and marked done (PR #271 review).
+            exists = self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='security_admin_audit_records'").fetchone()
+            if exists is None:
+                return None
+            raise
+        return None if row is None else (str(row[0]), int(row[1]))
+
+    @staticmethod
+    def _finding_event(audit_id: str) -> UUID:
+        """The event ID of a notification covering findings through ``audit_id``."""
+        return uuid5(EVENT_NAMESPACE, f"credential-finding-through:{audit_id}")
+
+    def _finding_event_id(self) -> UUID | None:
+        """Live path: name the notification by the newest finding it covers."""
+        if self._connection is None or self.status.state != RuntimeState.RUNNING:
+            return None
+        latest = self._latest_finding()
+        return None if latest is None else self._finding_event(latest[0])
+
+    def _recover_access_state(self, monitor: AccessFaultMonitor) -> None:
+        """Restore what a restart took from the in-memory monitor (Codex PR #271).
+
+        Findings: the finding commits with its audit record, but its
+        notification was only latched in memory until the next tick. Every
+        ``credential_finding`` notification is named after the newest finding
+        audit record it covers (``_finding_event``). The newest retained
+        finding always restores the degraded hold
+        from its age, and is notified again unless that event row exists with
+        a final delivery state: a ``pending`` row is a delivery the previous
+        process never finished. The audit rowid, never the wall clock, orders
+        findings, so a clock rollback cannot hide one. Only the action, time
+        and rowid are read, never the principal.
+
+        Access episode: when the newest ``human_access_fault`` /
+        ``human_access_recovered`` row (by rowid) is a fault, the episode
+        continues in this process, so recovery is still announced; a fault
+        row still ``pending`` is sent again first. A newest recovery row
+        still ``pending`` is sent again (under its own ID and time) once a
+        check passes, after its episode's fault when that row is pending too.
+        Older episodes are superseded and not replayed.
+
+        Rate windows: the accepted access and finding notification rows of
+        the last hour re-seed both hourly budgets (``restore_windows``,
+        Issue #281 item 2), so a restart does not reset them. This process's
+        own rows (accepted while it started in ``FAILED``) are merged by
+        event ID, never counted twice (Issue #287).
+        """
+        now = self.dependencies.utcnow()
+        # The whole retained audit history (Codex PR #271): a notification
+        # row is stamped after its finding and shares the 90-day retention,
+        # so a finding that was notified never outlives its event row.
+        latest = self._latest_finding()
+        if latest is not None:
+            row = self.notification_events.get(self._finding_event(latest[0]))
+            delivered = row is not None and row["delivery"] is not DeliveryResult.PENDING
+            epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+            age = (now - (epoch + timedelta(microseconds=latest[1]))).total_seconds()
+            monitor.recover_finding(age_seconds=age, monotonic=self.dependencies.monotonic(),
+                                    notify=not delivered)
+        if monitor.attached is not None:
+            rows = self._connection.execute(
+                "SELECT kind, delivery, event_id, at FROM notification_events WHERE kind IN (?, ?) "
+                "ORDER BY rowid DESC LIMIT 2",
+                (NotificationKind.HUMAN_ACCESS_FAULT.value,
+                 NotificationKind.HUMAN_ACCESS_RECOVERED.value),
+            ).fetchall()
+            last = rows[0] if rows else None
+            pending = last is not None and last[1] == DeliveryResult.PENDING.value
+            if (last is not None and last[0] == NotificationKind.HUMAN_ACCESS_RECOVERED.value
+                    and pending):
+                # A recovery notice the stopped process never delivered; its
+                # episode's fault row may be undelivered too (sent first).
+                prior = rows[1] if len(rows) > 1 else None
+                fault = (prior if prior is not None
+                         and prior[0] == NotificationKind.HUMAN_ACCESS_FAULT.value
+                         and prior[1] == DeliveryResult.PENDING.value else None)
+                monitor.restore_pending_recovery(
+                    event_id=UUID(last[2]), at=datetime.fromisoformat(last[3]),
+                    fault_event_id=UUID(fault[2]) if fault is not None else None,
+                    fault_at=datetime.fromisoformat(fault[3]) if fault is not None else None)
+            elif last is not None and last[0] == NotificationKind.HUMAN_ACCESS_FAULT.value:
+                delivered = not pending
+                monitor.restore_fault_episode(
+                    delivered=delivered,
+                    # A pending row is retried under its own ID and time.
+                    event_id=None if delivered else UUID(last[2]),
+                    at=None if delivered else datetime.fromisoformat(last[3]))
+        # Issue #281 item 2: the rolling hours of both budgets continue
+        # across the restart. Only accepted rows count, as in the process
+        # that sent them; a pending row is sent again and counted then.
+        monitor.restore_windows(
+            access_rows=self._notification_window(
+                (NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.HUMAN_ACCESS_RECOVERED),
+                monitor.access_budget, now),
+            finding_rows=self._notification_window(
+                (NotificationKind.CREDENTIAL_FINDING,), monitor.finding_budget, now),
+            monotonic=self.dependencies.monotonic())
+
+    def _notification_window(self, kinds, limit: int, now: datetime) -> list[tuple[UUID, float]]:
+        """``(event ID, age)`` of the newest ``limit`` rows of ``kinds`` accepted
+        in the hour before ``now`` (Issue #287).
+
+        The age runs from ``accepted_at``, the row's latest write, so a
+        notification accepted on a retry long after its event's ``at`` counts
+        from the retry; a row written before that column (``NULL``) counts
+        from ``at``. Rows are filtered to the hour before they are limited
+        and taken newest first by that time, so neither an old row inserted
+        late nor a row stamped in the future (the clock moved back) displaces
+        a recent one. The text comparison is the time order for the UTC text
+        ``NotificationEventStore`` writes, and every row is parsed again here.
+        """
+        marks = ",".join("?" for _ in kinds)
+        rows = self._connection.execute(
+            "SELECT event_id, COALESCE(accepted_at, at) AS accepted FROM notification_events "
+            f"WHERE kind IN ({marks}) AND delivery != ? AND accepted > ? AND accepted <= ? "
+            "ORDER BY accepted DESC",
+            (*(kind.value for kind in kinds), DeliveryResult.PENDING.value,
+             (now - timedelta(seconds=HOUR_SECONDS)).astimezone(timezone.utc).isoformat(),
+             now.astimezone(timezone.utc).isoformat()),
+        )
+        window = []
+        try:
+            for event_id, accepted in rows:
+                # A row whose ID or time cannot be read is left out (at worst
+                # a notification goes out early) rather than raising, which
+                # would repeat the whole recovery on every tick.
+                try:
+                    age = (now - datetime.fromisoformat(accepted)).total_seconds()
+                    event = UUID(event_id)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= age < HOUR_SECONDS:
+                    window.append((event, age))
+                    if len(window) == limit:
+                        break
+        finally:
+            # An unfinished statement would keep its read lock.
+            rows.close()
+        return window
 
     def _poll(self) -> None:
         if self.notifications is None:
@@ -612,6 +841,7 @@ class MonitoringRuntime:
             raise RuntimeError("monitoring owner thread required")
         if self.status.state != RuntimeState.RUNNING:
             if self.notifications is not None:
+                self._access_tick()
                 self._poll()
             if (self.status.state == RuntimeState.FAILED
                     and self._due("startup", self.dependencies.monotonic())):
@@ -623,6 +853,7 @@ class MonitoringRuntime:
         self._guarded("integrity", self.integrity.tick, "integrity_degraded")
         self._guarded("health", self.recording_health.tick, "recording_health_degraded")
         self._guarded("summary", self._summary_tick, "summary_degraded")
+        self._access_tick()
         self._poll()
 
     def _close(self) -> None:

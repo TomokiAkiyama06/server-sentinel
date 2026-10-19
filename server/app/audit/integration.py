@@ -1,13 +1,16 @@
 """Runtime integration for Owner-authorized administrative mutations."""
 
 from datetime import datetime
+from typing import Callable
 from uuid import UUID, uuid4
 
 from app.auth.invitation_code import new_invitation_code
 from app.auth.model import AccessValidationError
 from app.auth.owner_operation import OwnerOperationContext
 from app.auth.reservation import HostnameReservationCheck
-from app.auth.reservation_store import ListenerExceptionStore
+# The fixed listener-exceptions id lives with the store, so the local Owner
+# command (``app.auth.reservation_cli``) records the same target.
+from app.auth.reservation_store import RESERVATION_LISTENER_EXCEPTIONS_ID, ListenerExceptionStore
 from app.auth.serving_gate import ServingGate
 from app.cameras.registry import NodeHealthState
 from .model import AuditAction, TargetKind
@@ -17,9 +20,6 @@ ACTIVE_SOURCE_LIMIT_ID = UUID("ed83d8b4-ec44-4e27-b197-8603c03d8fd2")
 # The Main Server holds one approved hardware baseline; this fixed logical ID
 # names it without exposing any hardware serial or device identifier.
 HARDWARE_BASELINE_ID = UUID("6f5f5a2e-3f0e-4a3a-9a4c-2b0f1c7d5e41")
-# Fixed logical ID for the Owner's hostname-reservation listener exceptions;
-# no port, address or service name reaches the audit log.
-RESERVATION_LISTENER_EXCEPTIONS_ID = UUID("1c18dba3-1e38-4e1d-9d2f-70e078205a41")
 
 
 class OwnerAdministration:
@@ -242,6 +242,20 @@ class AccessAdministration:
         self.access = access_store
         self.session_gate = session_gate
         self._new_code = new_code
+        # Optional observer of committed grant/revocation changes (the S7
+        # interim live service re-checks or ends that principal's live
+        # sessions at once). Called after the commit, best effort: it can
+        # neither refuse nor undo the committed change.
+        self.principal_changed: Callable[[UUID], None] | None = None
+
+    def _changed(self, principal_id, result):
+        observer = self.principal_changed
+        if observer is not None:
+            try:
+                observer(principal_id)
+            except Exception:
+                pass
+        return result
 
     def _execute(self, actor_context, action, principal_id, operation, *, epoch, followed_by=()):
         def run(connection):
@@ -314,13 +328,13 @@ class AccessAdministration:
 
     def set_permissions(self, actor_context, principal_id, permissions, *, epoch):
         """Set the grants; ``True`` when they changed (a no-op ends no session)."""
-        return self._execute(
+        return self._changed(principal_id, self._execute(
             actor_context, AuditAction.CHANGE_PRINCIPAL_PERMISSIONS, principal_id,
             lambda connection, at: self.access.set_permissions_on(
                 connection, principal_id, permissions, at=at,
             ),
             epoch=epoch,
-        )
+        ))
 
     def change_permission(self, actor_context, principal_id, permission, granted, *, epoch):
         """Grant or withdraw one permission as a delta; ``True`` when the grants changed.
@@ -328,32 +342,32 @@ class AccessAdministration:
         A request that changes nothing still commits its one ``succeeded``
         record, read as "requested, no change" (Issue #240 item 4).
         """
-        return self._execute(
+        return self._changed(principal_id, self._execute(
             actor_context, AuditAction.CHANGE_PRINCIPAL_PERMISSIONS, principal_id,
             lambda connection, at: self.access.change_permission_on(
                 connection, principal_id, permission, granted, at=at,
             ),
             epoch=epoch,
-        )
+        ))
 
     def revoke_principal(self, actor_context, principal_id, *, epoch):
-        return self._execute(
+        return self._changed(principal_id, self._execute(
             actor_context, AuditAction.REVOKE_PRINCIPAL, principal_id,
             lambda connection, at: self.access.revoke_principal_on(
                 connection, principal_id, at=at,
             ),
             epoch=epoch,
-        )
+        ))
 
     def revoke_credential(self, actor_context, principal_id, handle, *, epoch):
         """Credential-scoped, by handle: a synced passkey is revoked on every device it exists on."""
-        return self._execute(
+        return self._changed(principal_id, self._execute(
             actor_context, AuditAction.REVOKE_PRINCIPAL_CREDENTIAL, principal_id,
             lambda connection, at: self.access.revoke_credential_on(
                 connection, principal_id, handle, at=at,
             ),
             epoch=epoch,
-        )
+        ))
 
 
 class ReservationAdministration:

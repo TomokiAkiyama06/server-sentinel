@@ -17,6 +17,13 @@ class NotificationKind(StrEnum):
     CAMERA_TAMPER = "camera_tamper"
     HARDWARE_INTEGRITY_FAILURE = "hardware_integrity_failure"
     RECORDING_HEALTH_FAILURE = "recording_health_failure"
+    # Human access faults (Issue #232 item 4, Owner decision 2026-10-16): a
+    # failing hostname reservation check or human-access composition, its
+    # recovery, and a committed WebAuthn credential finding. Immediate and
+    # value-free: no hostname, identity, principal, credential or reason.
+    HUMAN_ACCESS_FAULT = "human_access_fault"
+    HUMAN_ACCESS_RECOVERED = "human_access_recovered"
+    CREDENTIAL_FINDING = "credential_finding"
     # Visible local warnings (NEW_DEVICE/UNVERIFIABLE hardware, unavailable
     # recording-health verdict). They are never an immediate Slack message.
     HARDWARE_INTEGRITY_WARNING = "hardware_integrity_warning"
@@ -33,6 +40,16 @@ class NotificationKind(StrEnum):
     ENTRY = "entry"
     CAMERA_OFFLINE = "camera_offline"
     DAILY_SUMMARY = "daily_summary"
+
+
+# Always an immediate Slack message (when configured), independent of presence.
+IMMEDIATE_KINDS = frozenset({
+    NotificationKind.HARDWARE_INTEGRITY_FAILURE, NotificationKind.RECORDING_HEALTH_FAILURE,
+    NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.HUMAN_ACCESS_RECOVERED,
+    NotificationKind.CREDENTIAL_FINDING,
+})
+# Immediate, but the end of a fault rather than an alert.
+RECOVERY_KINDS = frozenset({NotificationKind.HUMAN_ACCESS_RECOVERED})
 
 
 def aware(value: datetime) -> None:
@@ -245,8 +262,7 @@ class NotificationService:
                 return DeliveryResult.FAILED
             del self._unpersisted[event.event_id]
             return prior.delivery
-        immediate = (kind in {NotificationKind.HARDWARE_INTEGRITY_FAILURE,
-                              NotificationKind.RECORDING_HEALTH_FAILURE}
+        immediate = (kind in IMMEDIATE_KINDS
                      or confirmed and kind in {NotificationKind.SERVER_MOVEMENT,
                                                NotificationKind.CAMERA_TAMPER})
         if not immediate:
@@ -256,8 +272,9 @@ class NotificationService:
             if not self._local(event) and not self._retain(event):
                 return DeliveryResult.FAILED
             return DeliveryResult.SUPPRESSED
-        return self._enqueue(event, f"ServerSentinel critical alert: {kind.value}", on_complete,
-                             retain=True)
+        prefix = ("ServerSentinel recovery notice" if kind in RECOVERY_KINDS
+                  else "ServerSentinel critical alert")
+        return self._enqueue(event, f"{prefix}: {kind.value}", on_complete, retain=True)
 
     def daily(self, summary: DailySummary, *, at: datetime, on_complete=None) -> DeliveryResult:
         self._check()

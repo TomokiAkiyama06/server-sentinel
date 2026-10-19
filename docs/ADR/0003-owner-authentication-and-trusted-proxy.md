@@ -590,3 +590,73 @@ checks its own permission and the assets carry no application data. They are
 served from the backend's verified, in-memory copy of the build, since the
 reservation check accepts exactly one proxy route; the current contract is
 in `server/app/auth/README.md`.
+
+Owner decision D1, 2026-10-16 (Issue #10): one recorded listener exception
+may cover a socket bound directly on a reserved address, which the
+2026-10-01 rule above otherwise never excepts. `tailscaled` listens for its
+peerAPI on the node's own Tailscale addresses, and those are the reserved
+addresses whenever the dashboard name is the node's Tailscale name, so
+without this no such node could ever open human access. The exception
+(`BindScope.RESERVED_ADDRESS`) is narrow:
+
+- only TCP, only the creating unit `tailscaled.service` with uid 0, verified
+  on every check through the same sock_diag creator lookup as every other
+  exception; a confirmed other creator is an exposure, and a creator that
+  cannot be verified keeps access closed without revocation;
+- only one of the configured reserved addresses (an address the name gained
+  is not covered and closes access anyway), only the recorded port, in the
+  recorded family or both, one socket per address and port, and at most one
+  such exception per family (one without a family counts for both; Issue
+  #278), since the peerAPI is expected on one port per family. That the
+  recorded port is the peerAPI is confirmed by hand (`MANUAL_TEST.md`), not
+  by the check; the limit keeps an unverified second port of `tailscaled`
+  from being excepted beside it. A Serve listener the Owner adds on another
+  port is also a proxy route, which the route comparison reports as
+  `UNEXPECTED_ROUTE` independently of the listener exception;
+- never the served HTTPS port, the loopback upstream port or a recorded
+  proxy socket port, and never a wildcard bind, which stays the wildcard
+  exception's case.
+
+Rationale: the peerAPI answers plain HTTP. The dashboard's session cookie is
+`__Host-session` with `Secure`, so a browser sends it only over HTTPS to the
+reserved name and never to a plain-HTTP port of it; the peerAPI is not an
+HTTPS answer on the name that could collect a session cookie. That rests on
+the peerAPI staying plain HTTP, which is an assumption about the installed
+`tailscaled`, not something the check verifies: `MANUAL_TEST.md` records
+that it is the peerAPI, that it answers plain HTTP, that the browser does not
+send the cookie to it, and whether its port changes across `tailscaled`
+restarts. A changed port is another listener on a reserved address
+(`UNEXPECTED_LISTENER`, an exposure: every human session is revoked before
+access reopens) until the Owner records the new port; if the port does
+change on every restart, a follow-up Owner decision is needed rather than a
+wider exception. The reservation check remains detection, not prevention: it
+sees the peerAPI socket only at startup, daily and retry checks, and the
+exception is a statement about which answer is acceptable, not a guarantee
+that only `tailscaled` can bind there.
+
+Same-site (Issue #278): the cookie argument above covers only what the
+peerAPI receives, not what it could send. A site is the scheme and
+registrable domain without the port, so `http://<reserved name>:<peerAPI
+port>` is the same site as the dashboard in a browser that does not
+implement schemeful same-site (and would be in any browser if the peerAPI
+served HTTPS). A request a page from the peerAPI origin started towards the
+dashboard could then carry the `SameSite=Strict` cookie, so `SameSite` is not
+what separates them. What does is the following, none of which depends on
+the site:
+
+- the exact `Origin` comparison above: a request carrying the peerAPI origin
+  is refused on every route, reads included, and every establishment,
+  state-changing request and WebSocket handshake needs the exact dashboard
+  origin, so it is refused without one;
+- the session-bound CSRF token, which only `GET /api/session` returns and
+  which a different origin cannot read (no CORS is granted);
+- WebAuthn needs a secure context, which a plain-HTTP origin on the reserved
+  name is not, so a page there cannot run a registration or authentication
+  ceremony for the dashboard's RP id.
+
+This rests on one more assumption about the installed `tailscaled`, recorded
+next to the plain-HTTP one: the peerAPI returns no active content an attacker
+controls (no page or script whose content another node or a user chooses).
+Neither the check nor ServerSentinel verifies that; if a future `tailscaled`
+served such content there, the Owner decides again rather than the exception
+being widened or kept silently.

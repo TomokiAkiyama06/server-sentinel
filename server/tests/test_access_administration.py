@@ -69,6 +69,16 @@ CREDENTIAL_KEYS = {"handle", "label", "status", "inconsistency_reason", "backup_
 class AdministrationFixture(GatedFixture):
     """A signed-in, fresh Owner whose OWNER_OP context comes from the surface."""
 
+    def setUp(self):
+        super().setUp()
+        # A synthetic boot clock from the start (Issue #279): the wall clock
+        # here is synthetic and frozen, so with the host's real
+        # ``CLOCK_BOOTTIME`` a slow run (more than the 1 s rollback
+        # tolerance between the sign-in and an Owner operation) looked like
+        # a wall clock stepped back and made the Owner session stale.
+        self.boot = BootClock()
+        self.store._boot_clock = self.boot
+
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.admin = self.access.administration
@@ -860,12 +870,8 @@ class PendingConditionTests(AdministrationFixture):
     """Issue #240 items 1 and 2: "pending" is exactly what a redemption accepts,
     for the inventory and for the one-pending-code cap alike."""
 
-    def setUp(self):
-        super().setUp()
-        # A synthetic boot clock from the start, so the Owner's sign-in and
-        # every invitation carry its readings.
-        self.boot = BootClock()
-        self.store._boot_clock = self.boot
+    # The fixture's synthetic boot clock is in place from the start, so the
+    # Owner's sign-in and every invitation carry its readings.
 
     async def asyncSetUp(self):
         await super().asyncSetUp()

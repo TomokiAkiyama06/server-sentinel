@@ -26,7 +26,9 @@ from app.detection.roi.runtime import (
 )
 from app.diagnostics import DiagnosticExportEndpoint
 from app.logging import Event
+from app.media.live.frame_pull import LiveFrameService
 from app.media.live.local_preview import LocalPreviewHub
+from app.monitoring.access import AccessFaultMonitor
 from app.monitoring.config import MonitoringConfiguration
 from app.monitoring.runtime import MonitoringDependencies, MonitoringRuntime, RuntimeState
 from app.settings import Settings
@@ -60,6 +62,19 @@ class RuntimeStorageAdmission:
         if runtime is None or not runtime.bound:
             return UnboundStorageAdmission()()
         return runtime.reservation()
+
+
+class HumanAccessCompositionRefused(TypeError):
+    """``create_app`` refused the ``human_access`` composition it was given.
+
+    A ``TypeError`` (the existing contract for an invalid argument), but its
+    own class, so the launcher serves closed and alerts only on this refusal
+    and an unrelated ``TypeError`` from a bug still propagates (Issue #283
+    item 2). Carries no configuration value.
+    """
+
+    def __init__(self, message: str = "human access composition is invalid") -> None:
+        super().__init__(message)
 
 
 class ClosedHumanSurface:
@@ -109,24 +124,54 @@ def create_app(settings: Settings, *, database: Database | None = None,
                human_access: HumanAccess | None = None) -> FastAPI:
     # Closed unless the embedder passes a validated composition: it exists
     # only when the deployment explicitly enabled human access and the
-    # hostname reservation check is fully configured. No deployment-file key
-    # builds one yet, so `python -m app` / `app.deployment` stay closed.
+    # hostname reservation check is fully configured. In production only the
+    # deployment key `human_access` builds one (`app.auth.composition`, through
+    # `app.deployment`); without it, and for `python -m app`, it stays closed.
     if human_access is not None and not isinstance(human_access, HumanAccess):
-        raise TypeError("human access composition is invalid")
+        raise HumanAccessCompositionRefused()
     if human_access is not None and human_access.store.invitation_lifetime != settings.invitation_lifetime:
         # Issue #235 item 3: Owner-issued invitations expire after the
         # deployment's ``invitation_lifetime_hours``; a store left at another
         # lifetime (the 24-hour default, say) would issue codes with the
         # wrong expiry or refuse every one.
-        raise TypeError("human access composition is invalid")
+        raise HumanAccessCompositionRefused()
     if human_access is not None and not _assets_from_settings(human_access, settings):
         # Issue #10 phase 2 S5b: the served Web build is the one the
         # deployment settings name, never one an embedder picked elsewhere.
-        raise TypeError("human access composition is invalid")
+        raise HumanAccessCompositionRefused()
+    access_faults = monitoring_dependencies.access_faults if monitoring_dependencies is not None else None
+    if access_faults is not None and (monitoring is None or not monitoring.storage_configured):
+        # Only the monitoring runtime drains the monitor (Codex PR #271):
+        # without one an emitted fault would leave the check's retry queue
+        # and never reach the Owner or the health status.
+        raise TypeError("access fault monitor requires the monitoring runtime")
+    if (human_access is not None and access_faults is None
+            and any(isinstance(sink, AccessFaultMonitor) for sink in
+                    (human_access.reservation.fault_sink, human_access.ceremonies.findings))):
+        # Codex PR #271: a monitor installed as a sink but not handed to the
+        # monitoring runtime is never drained, so its faults would be lost.
+        raise HumanAccessCompositionRefused()
+    if (human_access is not None and access_faults is None
+            and monitoring is not None and monitoring.storage_configured):
+        # Issue #281 item 1: wherever a monitoring runtime runs (every
+        # production deployment, which refuses to start without one), a human
+        # composition must report to its AccessFaultMonitor; without one a
+        # closed check or a credential finding would never reach the Owner.
+        raise HumanAccessCompositionRefused(
+            "human access composition requires the access fault monitor")
+    if human_access is not None and access_faults is not None:
+        # Issue #232 item 4 (Owner decision 2026-10-16): with a configured
+        # monitor, every reservation fault and credential finding of this
+        # composition must reach it, so none bypasses the immediate Owner
+        # notification and degraded health.
+        if (human_access.reservation.fault_sink is not access_faults
+                or human_access.ceremonies.findings is not access_faults
+                or access_faults.attached not in (None, human_access)):
+            raise HumanAccessCompositionRefused()
     store = database or Database(settings.database_path)
     # Local UVC capture is driven only by the deployment's list of approved
     # logical sources. Frames go to a bounded preview hub that retains nothing
-    # without authorized live viewer demand; no route reads it (#10/#19).
+    # without authorized live viewer demand; only the S7 frame pull reads it.
     if local_uvc is not None and not isinstance(local_uvc, LocalUvcConfiguration):
         raise TypeError("local UVC configuration is invalid")
     uvc_dependencies = local_uvc_dependencies or LocalUvcDependencies()
@@ -193,6 +238,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # That admission verifies this application's database only, so an
         # access store on any other database is refused here.
         human_access.bind_storage_admission(storage_reservation or runtime_admission, database=store)
+        # S7 interim live (Owner decision D10, #10/#19): the authorized frame
+        # pull is the only reader of the preview hub; it retains nothing
+        # without polling live:view viewers and starts/stops with run().
+        human_access.attach_live(LiveFrameService(local_preview, human_access.store))
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(
@@ -517,7 +566,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
         RuntimeState.STARTING if monitoring_runtime is not None else RuntimeState.UNCONFIGURED
     )
     application.state.owner_administration = owner_administration
-    # Internal only: no route exposes local capture state or preview frames.
+    # Internal only: no route exposes local capture state; preview frames reach
+    # only the authorized S7 live routes through `human_access.live`.
     application.state.local_uvc = local_uvc_runtime
     application.state.local_uvc_state = (
         LocalUvcRuntimeState.STARTING if local_uvc_runtime is not None
@@ -538,4 +588,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
         application.add_middleware(ClosedHumanSurface)
     else:
         application.add_middleware(HumanSurface, access=human_access)
+    if human_access is not None and access_faults is not None:
+        # Last, after every check above passed (PR #271 review): a refused
+        # create_app leaves the monitor unattached.
+        access_faults.attach(human_access)
     return application
