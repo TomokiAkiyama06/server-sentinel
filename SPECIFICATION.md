@@ -1110,17 +1110,35 @@ stop bound in `losses_cleared`. Their total, and separately each batch refused
 after `stop()` fenced the count, is handed to an injected count-only durable
 sink (Owner decision 2026-10-14, #224), so each refusal is counted once; a count
 may be overstated, never hidden. A missing or failing sink is reported
-(`undelivered_recorded`, `scene_undelivered_unrecorded`). Main does not pass a
-sink yet, so today the count is only logged. Once Main wires the timeline outbox
-(follow-up, #205), the sink is to add the count as lost facts to the presence
-timeline gap marker through the open outbox session, without observation
-content, identifiers or sources, so that a failed outbox close leaves an
-interrupted gap for the next start and Owner status reports `timeline_gap` until
-the Owner clears it. That wiring stops scene monitoring before the outbox
-closes, and does not close the outbox cleanly when `stop()` returns
-`stop_failed` or `undelivered_recorded` is false. A count handed over after the
-outbox closed or before it opened is refused and only logged; the next start
-then shows no unclean stop.
+(`undelivered_recorded`, `scene_undelivered_unrecorded`).
+
+When the embedder passes `scene_timeline` (a `SceneTimelineConfiguration` with
+an explicit source latency bound and main-host clock port, no default),
+`create_app()` owns the presence timeline for this evidence
+(`app.presence.runtime.SceneTimeline`, Issue #205): a `PresenceService` over the
+application database pinned under the storage admission, a `TimelineOutbox`
+and a `CriticalTimelineRecorder`, which is the scene runtime's durable recorder;
+its `record_undelivered` is the `undelivered` sink, an in-memory count that never
+blocks and does no I/O. An embedder-supplied recorder or sink is then refused.
+The lifespan opens the outbox session before it starts scene monitoring; while
+the open is refused (for example storage not yet admitted) scene monitoring is
+not started, the application reports it `unavailable`, every conclusion stays
+`unknown`, and the open is retried until it succeeds. While running, counted
+loss is written to the durable gap marker at the flush interval. At shutdown
+scene `stop()` returns first; the outbox is then flushed (so a count handed over
+at stop reaches the marker even when the session stays open) and closed
+cleanly only when `stop()` returned `stopped` and `undelivered_recorded` is not
+false. After `stop_failed`, an `unavailable` runtime, a stop that raised or an
+unrecorded count, `close()` is never called: the session row stays, the next
+start records an interrupted gap and Owner status reports `timeline_gap` until
+the Owner clears it. A count handed over after the outbox closed or before it
+opened would be refused and only logged; this ordering prevents both. Presence
+reports `critical_detection` armed only while the scene runtime is `running`.
+No evidence-preservation or notification port is wired yet (#21), so those
+critical paths stay `unavailable` in Owner status, and the production launcher
+does not build scene monitoring yet (the calibration route and the deployment
+section are follow-ups of #205). Without `scene_timeline` the count is only
+logged, as before.
 
 A camera loss (`offline`, `manual_intervention_required` or `degraded`, that is
 every non-`online` state) lowers the source to `degraded` until a new evaluated
