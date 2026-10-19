@@ -3,8 +3,11 @@
 このディレクトリは Issue #15 / ADR-0007 の transport 比較を **同じ決定的 impairment
 matrix と同じ Main 側判定** で測るためのハーネスです。製品ではありません。
 `server/` と `agent/` の package はここを import せず、release artifact にも含めません。
-**本 README の実機手順はまだ一度も実行していません**（PR 時点の確認は loopback の
-synthetic 実行のみ）。実機の結果は `MANUAL_TEST.md` §G の記録テンプレートと
+**本 README の実機手順は測定として一度も完了していません**（PR 時点の確認は loopback の
+synthetic 実行のみ。2026-10-20 に 2 host の smoke 1 run を手動 hand-off で行ったが、同じ run id で
+agent 側を 2 回起動したため integrity `fail` で、測定には数えない。MANUAL_TEST §G 参照）。
+`schedule`（下記）は mock の clock / process でのみ試験済みで、実機ではまだ実行していません。
+実機の結果は `MANUAL_TEST.md` §G の記録テンプレートと
 ADR-0007 Validation 表へ記入し、未実施の構成を検証済みと書かないでください。
 
 ## 何を使い、何を測るか
@@ -42,6 +45,14 @@ QUIC / WebRTC は今回対象外です。SRT は passphrase 方式で ADR-0006 �
 
 `<MAIN_LAN_IP>` は private LAN の IP literal（Tailscale 範囲は product validation が拒否）。
 実 IP / hostname / 経路は repository・Issue・PR に書かず、私的な手元記録にのみ残します。
+**Main host の firewall（Owner の root 作業）**: Main host の firewall（例: ufw の default deny）は
+PoC の期間だけ、capture host からの receiver port 47200–47201/tcp **だけ**を許可する必要があります。
+ハーネス自身は firewall を一切変更しません。規則の追加と削除は Owner が root で行い（例:
+`sudo ufw allow proto tcp from <CAPTURE_LAN_IP> to <MAIN_LAN_IP> port 47200:47201` と、終了時の
+`sudo ufw delete allow proto tcp from <CAPTURE_LAN_IP> to <MAIN_LAN_IP> port 47200:47201`）、
+送信元を capture host の IP literal に限定します（範囲や `any` にしない）。削除は下の cleanup
+checklist に含まれます。
+
 receiver は product の bind 検証を通した上で `SO_REUSEADDR` 付きで bind します（product の
 `open_ingest_listener` には無く、TIME_WAIT 中の Main 再起動で再 bind できないため。product 側の対応は
 Issue #223 で追跡）。
@@ -51,14 +62,17 @@ Issue #223 で追跡）。
 - Main host は production（GPU benchmark が同居）。Main 側は必ず
   `CUDA_VISIBLE_DEVICES=` と `systemd-run --user --scope -p CPUQuota=200% -p MemoryMax=1G`
   + `nice -n 10 ionice -c 3` + `timeout -k 30 <上限>` の下で動かす。scope 名は `ss-poc15-*`。
-- sudo / root / `tc` / firewall 変更 / Tailscale 設定変更はしない。Main から capture host へ SSH しない。
+- ハーネスと PoC の実行手順は sudo / root / `tc` / firewall 変更 / Tailscale 設定変更をしない（上の
+  firewall 許可規則は Owner が PoC の前後に別途 root で追加・削除する）。Main から capture host へ
+  SSH しない（`schedule` も host 間通信をしない）。
 - 1 日の合計実行は **3 時間まで**（scenario 長の合計 + 起動・停止の余裕。`timeout` は暴走時の
   上限）。soak は下の「soak の上限」の通り、上限値の 1 run 45 分で数える。
 - `--materials` / `--state` / `--out` / holder の state・socket は repository の外の 0700 directory
   （ハーネスは repository 内の path を拒否）。
 - 実カメラ frame は holder → sender の unix socket（0700 directory 内）経由で memory 上のみ。
   映像を見る・保存する操作はしない。実在人物が映る場合は撮影範囲に人がいない時間に行う。
-- 緊急停止（kill switch）: 両 host で `systemctl --user stop 'ss-poc15-*'`。
+- 緊急停止（kill switch）: 両 host で `systemctl --user stop 'ss-poc15-*'`（`schedule` を
+  `ss-poc15-schedule` scope で動かしていれば scheduler 自身も止まり、以後の slot は起動しない）。
   `timeout -k` は二重の上限です。
 
 ## Step 0: read-only inventory（変更なし）
@@ -71,6 +85,7 @@ systemd-run --version | head -1; systemctl --user is-system-running
 ss -ltnu '( sport >= :47200 and sport <= :47214 )'   # 何も表示されないこと
 command -v ss gst-launch-1.0
 cat /sys/fs/cgroup/user.slice/cpu.max 2>/dev/null
+timedatectl show -p NTPSynchronized --value   # schedule を使う場合は両 host で yes
 ```
 
 capture host のみ（実カメラ時）: `id -nG` に `video` があること、`ls /dev/video* | wc -l`
@@ -78,15 +93,18 @@ capture host のみ（実カメラ時）: `id -nG` に `video` があること�
 
 ## Step 1: 使い捨て materials
 
-Main（`R=~/poc15/materials` など repository 外）:
+Main（`R=~/poc15/materials` など repository 外。ハーネスは親 directory を作らないので先に作る）:
 
 ```sh
+install -d -m 700 ~/poc15
 python3 scripts/manual/transport_poc/poc15.py materials init --root "$R" --negatives-only
 ```
 
-capture host（正規 node の鍵は capture host から出さない）:
+capture host（正規 node の鍵は capture host から出さない。`node-key` は `--root` の親 directory を
+作らないので、先に private な親 directory を作る。無いと `FileNotFoundError`）:
 
 ```sh
+install -d -m 700 ~/poc15 ~/poc15/nodes
 python3 scripts/manual/transport_poc/poc15.py materials node-key --root ~/poc15/nodes/good
 python3 scripts/manual/transport_poc/poc15.py materials node-key --root ~/poc15/nodes/revoked_live
 ```
@@ -109,6 +127,13 @@ directory へ戻す。否定試験用 `$R/nodes/{unpaired,other_ca,revoked}`（�
 loopback（1 host）は `materials init --root "$R"` だけで全 bundle を作ります。
 
 ## Step 2: 実行
+
+両 host で、無ければ先に state / out の private directory を作る（`--state` / `--out` の親は
+ハーネスが作らない）:
+
+```sh
+install -d -m 700 ~/poc15 ~/poc15/state ~/poc15/out
+```
 
 ### loopback synthetic（1 host、CI と同じ形）
 
@@ -177,6 +202,97 @@ real / synthetic の内訳を記録に明記します。
 
 `--role agent` の `--materials` は capture host 側では使われない（node bundle は `--node-root`）。
 
+### 実機 2 host の時刻指定実行（`schedule`、手動 hand-off なし）
+
+1 scenario ずつの手動 hand-off（Main の `ready` を見て 10 秒以内に capture host を起動）を
+約 60 回繰り返すと起動の重複や取り違えが起きやすいため（2026-10-20 の smoke run は同じ run id で
+agent 側を 2 回起動して integrity `fail`）、`poc15.py schedule` で両 host が同じ時刻表に従って
+自動で起動します。1 slot の中身は上の手動手順と同じ単一 scenario・単一候補の `matrix --role`
+（同じ scope 名 `ss-poc15-main` / `ss-poc15-holder` / `ss-poc15-agent`、同じ CPU / memory 上限、
+Main は `nice` / `ionice` と `CUDA_VISIBLE_DEVICES=` 空）で、run 自体の動作は変わりません。
+
+- 両 host で `--role` 以外を同じにする: `--start`（UTC、例 `2026-10-21T01:00:00Z`。過去と
+  24 時間より先は拒否）、`--candidates`、`--scenarios`（既定は soak と `auth_revoked_live` を除く
+  既定 matrix の 19 scenario）、`--real-camera`。各 host はこの引数だけから同じ時刻表を計算し、
+  host 間で通信しない（SSH なし）。
+- 時刻表: slot 0 は `--start`、slot i+1 は slot i の開始 + scenario の full 長 + 90 s。順序は
+  `matrix` と同じ（候補ごとに scenario 順）。各 slot の run id は slot の開始時刻
+  （`r` + UTC `YYYYMMDD` + `t` + `HHMMSS`）で、両 host で一致する。開始時刻の比較に両 host の
+  wall clock を使うので、両 host とも NTP 同期済み（Step 0 の `timedatectl`）であること。測定値は
+  従来どおり 1 host の時計内だけで比較します。
+- 余裕 90 s の理由: Main の orchestrator は scenario 長 + receiver 起動 + `--main-grace` 20 s +
+  receiver 停止（最大 15 s）で約 scenario 長 + 37 s かかる。各起動は slot 開始から scenario 長 +
+  55 s の `timeout -k 30` で上限を付けるので、暴走して SIGKILL が要る run も slot 開始 + scenario 長
+  + 85 s までに必ず終わり、次の slot の receiver の bind・Agent の接続と重ならない（60 s では通常の
+  run の余裕とこの上限を両立できない）。
+- 入力: `--real-camera` を付けると、1 source で media を流す scenario（`normal`、通信断・停止・
+  再起動・`bandwidth_cap`・`slow_drain`、`soak`）は capture host が slot 開始時に holder（上と同じ
+  scope・上限、`--approve`、run ごとの `holder-<RUN_ID>.jsonl`）を起動し、両側に `--real-inputs` を
+  付けます。2〜5 source の scenario、否定認証、`route_probe` は `--source-kind gst`（synthetic）で
+  `--real-inputs` なし。`--real-camera` なしでは全 slot が `gst`。
+- capture host は slot 開始 + 5 s に agent を起動する（Main はそれまでに `ready`）。real の slot で
+  その時点に holder が終了している、または holder socket（`frames.sock`）が無ければ、agent を
+  起動せずその slot を失敗として記録する（sender は holder socket に再接続しないため）。agent の
+  終了後に holder を SIGTERM で止め（15 s で終わらなければ SIGKILL）、holder の終了コードも slot の
+  結果に含める。
+- fail-closed: slot は重ならない（各 slot は自分の process の終了を待つ）。前の slot が延びて次の
+  slot の開始を 5 s より過ぎた場合は schedule 全体を非 0（3）で止め、以後の slot は起動しない
+  （相手 host の run は接続できずに失敗し、記録に残る）。この場合は両 host で kill switch を
+  使って止める。slot の失敗（非 0 終了）では時刻表はずれず、次の slot は予定どおり起動する
+  （schedule の終了コードは 1）。SIGINT / SIGTERM では実行中の slot の process を止め、以後の slot は
+  起動しない（終了コード 130）。
+- 既存の記録を上書きしない: 時刻表のどれかの run id の `--out/<RUN_ID>` または
+  `holder-<RUN_ID>.jsonl` が既にあれば起動しない（同じ `--start` の再実行は記録が追記されて
+  integrity `fail` になるため、新しい `--start` を選ぶ）。
+- 1 日 3 時間上限: 時刻表の合計（最後の slot の終わりまで）が 3 時間を超える schedule は拒否します
+  （既定 matrix は 1 候補 1 時間 3 分 30 秒、2 候補 2 時間 7 分、3 候補 3 時間 10 分 30 秒で拒否）。
+  scheduler が数えるのは自分の時刻表だけなので、同じ日の手動 run（`auth_revoked_live` など）も
+  合わせて 3 時間以内に収める。
+
+日程の分け方（例）:
+
+| 日 | 内容 | 合計 |
+| --- | --- | --- |
+| 1 日目 | `schedule --candidates a_framed,b_chunked` | 2 時間 7 分 |
+| 2 日目 | `schedule --candidates b_segment` + 3 候補の `auth_revoked_live`（候補ごとに新しい `revoked_live` bundle で手動実行） | 約 1 時間 20 分 |
+| 別の日 | soak: `schedule --candidates a_framed,b_chunked,b_segment --scenarios soak` | 1 時間 34 分 30 秒 |
+
+`auth_revoked_live` は実行のたびに `revoked_live` の bundle を作り直す必要があるため（Step 1）、
+`schedule` は指定を拒否します。上の手動 2 host 手順で 1 run ずつ実行してください。
+
+まず両 host で `--print`（時刻表を表示して終了。何も起動しない）を実行し、時刻表が一致することを
+確かめます（1 行目は role を含むので 2 行目以降を比べる。例:
+`... --print | tail -n +2 | sha256sum` が両 host で同じ）。
+
+Main:
+
+```sh
+S=2026-10-21T01:00:00Z   # 両 host で同じ値
+systemd-run --user --scope --unit=ss-poc15-schedule -p CPUQuota=20% -p MemoryMax=256M \
+  python3 scripts/manual/transport_poc/poc15.py schedule --role main --start "$S" \
+  --candidates a_framed,b_chunked --real-camera \
+  --bind <MAIN_LAN_IP> --materials "$R" --state ~/poc15/state --out ~/poc15/out
+```
+
+capture host:
+
+```sh
+S=2026-10-21T01:00:00Z
+systemd-run --user --scope --unit=ss-poc15-schedule -p CPUQuota=20% -p MemoryMax=256M \
+  python3 scripts/manual/transport_poc/poc15.py schedule --role agent --start "$S" \
+  --candidates a_framed,b_chunked --real-camera \
+  --upstream-host <MAIN_LAN_IP> --node-root ~/poc15/nodes --state ~/poc15/state --out ~/poc15/out \
+  --holder-state-dir ~/poc15/holder-state --holder-socket-dir ~/poc15/holder-sock \
+  --dev-checkout-helper
+```
+
+scheduler は開始前に時刻表を表示し、slot ごとに 1 行（slot 番号、run id、scenario、候補、
+real / synthetic、終了コード。capture host の real slot は holder の終了コードも）を出します。
+scheduler 自身は待機が主で、各 slot の process は上の scope に移るので、`ss-poc15-schedule` の
+上限は scheduler だけに掛かります。`--dev-checkout-helper` は holder へそのまま渡します（下記）。
+終了後の集計は両 host の `~/poc15/out` を 1 か所に集め、Step 3 の `summarize --two-host` に全 run
+directory と全 `holder-<RUN_ID>.jsonl` を渡します。
+
 #### soak の上限
 
 上の `timeout -k 30 15m` と holder の `--seconds 1100` は soak 以外の 1 scenario（最長
@@ -194,6 +310,9 @@ scenario 長の合計が 1 候補あたり約 36 分だが、2 host では scena
 grace を含めて 1 候補あたり約 42 分、3 候補で約 2 時間 7 分かかる。soak 1 run（45 分）を足すと
 約 2 時間 52 分で 3 時間上限に余裕が無いため、**soak は full matrix と別の日に行う**。soak の日は
 1 日最大 3 run（3 × 45 分 = 2 時間 15 分）。
+`schedule` では各 slot の `timeout` 上限と holder の `--seconds` を scenario 長から自動で決める
+（slot 開始から scenario 長 + 55 s、holder は scenario 長 + 45 s）ので、上の 45 分 / 2700 s の値は
+手動実行用です。schedule の 3 時間上限は時刻表の合計（soak 1 run = 31 分 30 秒）で数えます。
 loopback の `timeout -k 30 90m` も soak を含めない既定の matrix 用で、`--scenarios soak` を
 加えるときは soak 1 run につき 45 分を足す。
 
@@ -419,4 +538,6 @@ loss 時刻の比較だけで行い、host 間の時計差を使いません。
 - [ ] capture host: `~/poc15/nodes`（node 鍵）、holder の state・socket directory を削除（holder の camera 承認も消える）
 - [ ] 残すのは数値 JSONL / summary だけ。private な値（IP、hostname、serial、path）が無いことを確認
 - [ ] `git status` に PoC 出力が無い（ハーネスは repository 内 path を拒否する）
-- [ ] system 設定・firewall・Tailscale・udev は一切変更していないことを確認
+- [ ] PoC 終了時: Owner が Main host の firewall に追加した PoC 用の許可規則（capture host →
+  47200–47201/tcp）を root で削除し、他に PoC 用の規則が残っていないことを確認（Owner の作業）
+- [ ] それ以外の system 設定・firewall・Tailscale・udev は一切変更していないことを確認

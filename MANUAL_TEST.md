@@ -1439,6 +1439,15 @@ attach private addresses, credentials or real footage.
 （step 0 の read-only inventory、使い捨て materials、1 scenario ずつの実行、kill switch
 `systemctl --user stop 'ss-poc15-*'`、1 日 3 時間上限、cleanup checklist）。ハーネスの PR
 時点の確認は同一 host の loopback・synthetic 入力だけで、以下は**どれも実機では未実施**です。
+2 host の実行は 1 scenario ずつ手動 hand-off でも、`poc15.py schedule`（両 host が同じ `--start` /
+`--candidates` / `--scenarios` / `--real-camera` から同じ時刻表を計算して 1 slot ずつ起動。mock の
+clock / process でのみ試験済み）でもよく、どちらで実行したかと `--start` を記録に書きます。
+
+- 2026-10-20 smoke run（測定には数えない）: Main host と capture host の private LAN、1 scenario・
+  1 run、手動 hand-off。報告 gap と実欠落が 267 / 267 で一致、`drop_accounting` は `pass` だったが、
+  同じ run id で agent 側を 2 回起動したため integrity が `fail`。この run は G1〜G6 のどの判定にも
+  使わない（手動 hand-off の起動誤りを避けるため `schedule` を追加）。
+
 TCP の packet loss / jitter は root の `netem` を使わないため `unmeasured` のまま残し、
 QUIC / WebRTC はこのハーネスの対象外です。
 
@@ -1450,6 +1459,7 @@ Candidate(s): a_framed / b_chunked / b_segment
 Sources: n=  real cameras=  synthetic (gst / builtin)=
 Profile / bitrate:
 CPU cap (Main CPUQuota / capture CPUQuota):
+Launch: manual hand-off / schedule (--start, --candidates, --scenarios, --real-camera)
 Run id(s):
 Total run time today (≤ 3 h):
 ```
