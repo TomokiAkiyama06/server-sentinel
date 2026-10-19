@@ -2150,6 +2150,83 @@ the reserved name:
   `X-Content-Type-Options: nosniff` and no `Content-Disposition`; the browser
   offers no download button in the application.
 
+### Issue #205 remote live view in the dedicated environment (pending; requires the Owner)
+
+Procedure: `server/docs/REMOTE_LIVE_VIEW_SETUP.md` (Owner decisions D1, D2,
+D3, D6 of 2026-10-16). Documentation only so far: nothing in it has been run
+on the Main host, in an LXD VM, with the C960 passthrough or from a viewer
+device. Every step changes the production host and needs the Owner. Record
+serials, disk ids, addresses and the node name only in the private record.
+
+- [ ] host: `/dev/kvm` present; LXD state recorded before the change (already
+  initialized or not; `lxd init` was not re-run on an initialized LXD); the
+  VM is `Type: virtual-machine` with `boot.autostart=true`, fixed
+  `limits.cpu` / `limits.memory`, and no GPU device;
+- [ ] passthrough: both C960 report the same `vendor:product` and two
+  distinct non-empty serials on the host; each `usb` device names
+  `vendorid`, `productid` and `serial`; after the VM starts the host no
+  longer lists them and the guest's `v4l2-ctl --list-devices` lists both;
+  the guest service account is in `video` (not `audio`) and can open each
+  camera node read-write and no `/dev/snd/*`;
+- [ ] passthrough identity: swap the two cameras between USB ports (VM
+  running and again after a VM restart) and confirm each `usb` device still
+  follows its serial and that `admin_cli candidates` / the approvals keep
+  each source on its own camera; unplug and replug one camera: it returns to
+  the guest only (hotplug), its source goes `offline` then back, and the
+  other source is untouched;
+- [ ] storage: the runtime filesystem is the passed host disk (not the guest
+  root, not a `dir`-pool volume on the host root filesystem); with the disk
+  device removed and the VM restarted, the service refuses to start (no
+  write to the empty `/srv/ss-data` on the guest root filesystem); record
+  whether a 9p/virtiofs directory share is refused as expected, if tried on a
+  disposable VM only;
+- [ ] network: the VM's macvlan address is on `192.168.250.0/24`, outside the
+  Tailscale ranges; the capture host reaches `<vm lan ip>:<port>` during
+  `pairing_cli approve --listen` without Tailscale; the human upstream
+  (`127.0.0.1:880`) is not reachable from the LAN or from the host; no LXD
+  `proxy` device or host DNAT points at the VM;
+- [ ] cgroup-BPF in the VM: `ss -ltn --cgroup 'sport = :880'` shows
+  `cgroup:/system.slice/server-sentinel-upstream.socket`, not `/init.scope`;
+- [ ] D6 ordering: record that the node's MagicDNS name was the neutral name
+  (no collision suffix) before the first `tailscale serve` and the first
+  HTTPS request, and that `tailscale cert` was never run; look up the name in
+  a public Certificate Transparency search afterwards and record that only
+  the neutral name appears;
+- [ ] D2 isolation: from a process on the host, binding a VM Tailscale
+  address fails (`Cannot assign requested address`); the host's own
+  Tailscale node is a different node with a different name; the deployment
+  states `"isolation": "dedicated_network_identity"`, never
+  `"single_purpose_node"`;
+- [ ] Serve status as the service account inside the VM (`env -i
+  /usr/bin/tailscale serve status --json`) works without operator rights;
+  record the output shape (sanitized) for the existing ADR-0003 follow-up;
+- [ ] listener inventory inside the VM (`ss -ltnup --cgroup`): record every
+  wildcard and reserved-address row; only `tailscaled` rows (WireGuard UDP,
+  peerAPI TCP, optional Serve socket) remain; SSH in the guest disabled or
+  recorded as an exception; then run the D1 peerAPI checks (section
+  "ADR-0003 follow-up") inside the VM and record the exceptions with
+  `reservation_cli set` (D3);
+- [ ] `lxc exec <vm> -- bash` gives the controlling terminal the D3 CLIs
+  require (`admin_cli`, `reservation_cli`, `bootstrap_cli` accept the typed
+  confirmation; without a terminal, `lxc exec <vm> -T -- …`, they refuse
+  `controlling_terminal_required`);
+- [ ] the startup check opens human access; Owner bootstrap code redeemed
+  once from a phone at `https://<neutral name>.<tailnet>.ts.net/`; the Owner
+  watches the live view of both cameras from phone (Safari), Mac and desktop;
+  a second device on the same shared Tailscale login without a passkey gets
+  only the sign-in shell and generic denials;
+- [ ] hardware integrity inside the VM: record the baseline the VM reports
+  (virtual CPU/memory/disk/display, passed cameras) and note that physical
+  host GPU/memory/disk changes are not visible to it (open Owner decision);
+  daily recording self-test passes in the VM;
+- [ ] host load: with GPU benchmark sessions running on the host, record the
+  VM's detection cadence/drops and the live frame rate; the VM's vCPU limit
+  holds;
+- [ ] rollback on the real host: close human access, stop the VM, remove the
+  `usb` devices, confirm the cameras reappear on the host, start the host
+  deployment (if any) and confirm its sources and approvals; the VM's disk
+  and data are left intact.
+
 ### Uninvited ordinary Tailnet member
 
 - [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;
