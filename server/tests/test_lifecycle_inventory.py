@@ -25,6 +25,9 @@ from unittest import mock
 from uuid import UUID, uuid4, uuid5
 
 from app import lifecycle_inventory as inventory
+from app.lifecycle_inventory import (_common as inventory_common,
+                                     recordings as inventory_recordings,
+                                     schema as inventory_schema)
 from app.audit.store import AuditStore
 from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingError, PairingLedger
 from app.detection.owner import store as owner_store
@@ -306,7 +309,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         # Verify time for the service retention and future-time rules: the
         # wall clock (real ledger audit rows use it); tests move it explicitly.
         self.now = datetime.now(timezone.utc)
-        patcher = mock.patch.object(inventory, "_utcnow", lambda: self.now, create=True)
+        patcher = mock.patch.object(inventory_common, "_utcnow", lambda: self.now)
         patcher.start()
         self.addCleanup(patcher.stop)
         self._directory = TemporaryDirectory()
@@ -569,7 +572,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             "deployment_generation, issued_at_us, expires_at_us, redeemed_at_us, revoked_at_us) "
             "VALUES (?, ?, ?, 0, 0, 1, 2, NULL, NULL)",
             (invitation, bytes(reversed(SECRET_DIGEST)), live))
-        with mock.patch.object(inventory, "APPLICATION_MIGRATIONS", earlier):
+        with mock.patch.object(inventory_schema, "APPLICATION_MIGRATIONS", earlier):
             output = self.notes / "before-webauthn.json"
             code, _, stderr = run("record", "--runtime-root", str(self.runtime.root),
                                   "--output", str(output))
@@ -846,7 +849,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.runtime = Runtime(self.base / "one-release-earlier", APPLICATION_MIGRATIONS[:-1])
         self.runtime.seed()
         # record runs with the installed (earlier) release's own tool.
-        with mock.patch.object(inventory, "APPLICATION_MIGRATIONS", APPLICATION_MIGRATIONS[:-1]):
+        with mock.patch.object(inventory_schema, "APPLICATION_MIGRATIONS", APPLICATION_MIGRATIONS[:-1]):
             _, baseline = self.record()
         with closing(Database(self.runtime.database).connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
@@ -882,7 +885,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                     tail = APPLICATION_MIGRATIONS[-2:]
                     values = {"v1": tail[0].version, "n1": tail[0].name, "c1": tail[0].checksum,
                               "v2": tail[1].version, "n2": tail[1].name, "c2": tail[1].checksum}
-                    with mock.patch.object(inventory, "APPLICATION_MIGRATIONS",
+                    with mock.patch.object(inventory_schema, "APPLICATION_MIGRATIONS",
                                            APPLICATION_MIGRATIONS[:-2]):
                         _, recorded = self.record(f"migrations-{index}.json")
                     with closing(sqlite3.connect(runtime.database,
@@ -3298,7 +3301,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         # across file hashing would make service writers hit "database is
         # locked". Files are hashed only after the snapshot transaction ends.
         self.runtime.seed()
-        hash_file = inventory._file_digest
+        hash_file = inventory_recordings._file_digest
         outcomes = []
 
         def hash_while_writing(directory, segment_id):
@@ -3316,7 +3319,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                 finally:
                     writer.close()
             return hash_file(directory, segment_id)
-        with mock.patch.object(inventory, "_file_digest", hash_while_writing):
+        with mock.patch.object(inventory_recordings, "_file_digest", hash_while_writing):
             code, _ = self.record()
         self.assertEqual(code, inventory.EXIT_PRESERVED)
         self.assertEqual(outcomes, ["committed"])
@@ -4785,7 +4788,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         worktree = self.base / "worktree"
         worktree.mkdir()
         (worktree / ".git").write_text("gitdir: elsewhere\n")
-        repository = Path(inventory.__file__).resolve().parents[1]
+        repository = Path(inventory.__file__).resolve().parents[2]
         for target in (checkout / "notes" / "inventory.json", worktree / "inventory.json",
                        repository / "inventory-refused.json"):
             code, _, stderr = run("record", "--runtime-root", str(self.runtime.root),
@@ -5907,10 +5910,13 @@ class LifecycleInventoryTests(unittest.TestCase):
         # fail an ordinary update. A critical recording leaves partial
         # evidence: append() marks a segment critical while an overlapping
         # active recording is critical, so the lost-link segment keeps
-        # critical=1 and the later one has 0. That evidence is not a rule
-        # (overlapping recordings, early stops and deletion are unassessed);
-        # both stay preserved until the stream_id contract decides it
-        # (DEPLOYMENT.md). Update this test when 1(b) is implemented.
+        # critical=1 and the later one has 0. That evidence is not a rule:
+        # a critical recording started after the restart and then deleted
+        # or stopped early leaves the same unlinked critical=1 segment
+        # (#256, test_a_critical_unlinked_segment_does_not_prove_a_lost_link
+        # in test_lifecycle_inventory_contracts.py). Both stay preserved
+        # until the stream_id contract decides it (DEPLOYMENT.md). Update
+        # this test when 1(b) is implemented.
         import zlib
         from app.media.recording import Segment
         payload = zlib.compress(b"generated geometric test payload" * 4)
@@ -6296,7 +6302,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                         code, report, _ = self.verify(baseline)
                     except Exception as exc:  # noqa: BLE001 - collected for the report
                         frame = [item for item in traceback.extract_tb(exc.__traceback__)
-                                 if item.filename.endswith("lifecycle_inventory.py")][-1]
+                                 if "lifecycle_inventory" in Path(item.filename).parts][-1]
                         crashes.append(f"{table}.{column}={label}: {type(exc).__name__} "
                                        f"at {frame.name}:{frame.lineno}")
                         continue
@@ -6398,7 +6404,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, _, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED)
         self.assertEqual(tree(), before)
-        source = inventory._connect_read_only(self.runtime.database)
+        source = inventory_common._connect_read_only(self.runtime.database)
         try:
             self.assertEqual(source.execute("PRAGMA query_only").fetchone()[0], 1)
             source.execute("PRAGMA query_only = OFF")
@@ -6473,7 +6479,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         spooled = str(store.append(Segment(source, stream_id, 0, base, base + 10_000,
                                            "synthetic", "deflate", payload)))
         _, baseline = self.record()
-        matches = inventory._spool_file_matches
+        matches = inventory_recordings._spool_file_matches
 
         def evicting(evict):
             def hashed(directory, segment_id, catalog):
@@ -6485,7 +6491,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                     return False  # the file vanished under the hash
                 return matches(directory, segment_id, catalog)
             hashed.done = False
-            return mock.patch.object(inventory, "_spool_file_matches", hashed)
+            return mock.patch.object(inventory_recordings, "_spool_file_matches", hashed)
         with evicting(evict=True):
             code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
@@ -6956,12 +6962,12 @@ class LifecycleInventoryTests(unittest.TestCase):
             self.runtime.execute("INSERT INTO recording_links VALUES (?, ?)",
                                  (recording_id, segment))
         hashed = Counter()
-        digest = inventory._file_digest
+        digest = inventory_recordings._file_digest
 
         def counting(directory, segment_id):
             hashed[segment_id] += 1
             return digest(directory, segment_id)
-        with mock.patch.object(inventory, "_file_digest", counting):
+        with mock.patch.object(inventory_recordings, "_file_digest", counting):
             collected = inventory.collect(self.runtime.root)
         self.assertEqual(hashed[segment], 1)
         self.assertTrue(all(hashed[key] == 1 for key in hashed), hashed)
@@ -7096,28 +7102,28 @@ class LifecycleInventoryTests(unittest.TestCase):
         # released).
         source, other, end = str(uuid4()), str(uuid4()), 1_000_000
         marker = (source, end, end, "stream_discontinuity")
-        past = {source: {"active": 1, "end_ms": end + inventory._PRE_ROLL_MS}}
+        past = {source: {"active": 1, "end_ms": end + inventory_recordings._PRE_ROLL_MS}}
         released = {source: {"active": 0, "end_ms": end + 1}}
         for cursor_rows in (past, released):
             with self.subTest(cursor=cursor_rows[source]):
-                self.assertTrue(inventory._marker_trimmed(marker, {}, cursor_rows))
+                self.assertTrue(inventory_recordings._marker_trimmed(marker, {}, cursor_rows))
                 # Later spool segments and other sources do not matter.
-                self.assertTrue(inventory._marker_trimmed(marker, {
+                self.assertTrue(inventory_recordings._marker_trimmed(marker, {
                     "a": {"source_id": source, "end_ms": end + 1},
                     "b": {"source_id": other, "end_ms": end}}, cursor_rows))
                 for spool_end in (end, end - 1, None, True):
                     with self.subTest(spool_end=spool_end):
-                        self.assertFalse(inventory._marker_trimmed(marker, {
+                        self.assertFalse(inventory_recordings._marker_trimmed(marker, {
                             "a": {"source_id": source, "end_ms": spool_end}}, cursor_rows))
         # The cursor still short of the cutoff.
-        self.assertFalse(inventory._marker_trimmed(
-            marker, {}, {source: {"active": 1, "end_ms": end + inventory._PRE_ROLL_MS - 1}}))
+        self.assertFalse(inventory_recordings._marker_trimmed(
+            marker, {}, {source: {"active": 1, "end_ms": end + inventory_recordings._PRE_ROLL_MS - 1}}))
 
     def test_pre_roll_cutoff_is_the_store_default_main_cannot_configure(self):
         from app.media.recording.model import Limits
         from app.monitoring.config import RECORDING_LIMIT_FIELDS
         self.assertNotIn("pre_roll_ms", RECORDING_LIMIT_FIELDS)
-        self.assertEqual(inventory._PRE_ROLL_MS,
+        self.assertEqual(inventory_recordings._PRE_ROLL_MS,
                          Limits(1, 1, 1, 1, 1, 1).pre_roll_ms)
 
     def test_duration_ceiling_is_the_one_limits_enforces(self):
@@ -7125,8 +7131,8 @@ class LifecycleInventoryTests(unittest.TestCase):
         # bounds use the ceiling Limits.__post_init__ enforces, not a copy.
         from app.media.recording import model
         ceiling = model.MAX_LIMIT_DURATION_MS
-        self.assertIs(inventory.MAX_LIMIT_DURATION_MS, ceiling)
-        self.assertEqual(inventory._SEGMENT_BOUNDS.max_segment_ms, ceiling)
+        self.assertIs(inventory_recordings.MAX_LIMIT_DURATION_MS, ceiling)
+        self.assertEqual(inventory_recordings._SEGMENT_BOUNDS.max_segment_ms, ceiling)
         smallest = dict(pre_roll_bytes=1, max_segment_bytes=1, max_segment_ms=1,
                         max_active_recordings=1, max_spool_segments=1,
                         max_segments_per_recording=1)
@@ -7206,12 +7212,12 @@ class LifecycleInventoryTests(unittest.TestCase):
                                  (seeded["ordinary"],)).fetchone()[0]
         self.runtime.execute("UPDATE recording_segments SET spool=1 WHERE id=?", (segment,))
         hashed = Counter()
-        digest = inventory._file_digest
+        digest = inventory_recordings._file_digest
 
         def counting(directory, segment_id):
             hashed[segment_id] += 1
             return digest(directory, segment_id)
-        with mock.patch.object(inventory, "_file_digest", counting):
+        with mock.patch.object(inventory_recordings, "_file_digest", counting):
             collected = inventory.collect(self.runtime.root)
         self.assertIn(segment, collected["spool_segments"])
         self.assertTrue(collected["spool_segments"][segment]["catalog_match"])
@@ -7221,11 +7227,11 @@ class LifecycleInventoryTests(unittest.TestCase):
         path = self.runtime.segment_path(seeded["ordinary"])
         original = path.read_bytes()
         path.write_bytes(original + b"x")
-        with mock.patch.object(inventory, "_file_digest", counting):
+        with mock.patch.object(inventory_recordings, "_file_digest", counting):
             spool = {segment: {"_catalog": [hashlib.sha256(original).hexdigest(),
                                             len(original)],
                                "source_id": None}}
-            cache = {segment: inventory._file_digest(path.parent, segment)}
+            cache = {segment: inventory_recordings._file_digest(path.parent, segment)}
             hashed.clear()
             still = inventory._hash_spool(spool, path.parent, self.runtime.database, cache)
         self.assertEqual(still, [segment])
@@ -7265,7 +7271,7 @@ class DocumentedCommandTests(unittest.TestCase):
             release = installation / "releases" / "1.0.0"
             (release / "venv/bin").mkdir(parents=True)
             (release / "venv/bin/python").symlink_to(sys.executable)
-            (release / "app").symlink_to(Path(inventory.__file__).resolve().parent)
+            (release / "app").symlink_to(Path(inventory.__file__).resolve().parents[1])
             (installation / "current").symlink_to("releases/1.0.0")
             hostile = base / "hostile"
             (hostile / "app").mkdir(parents=True)
