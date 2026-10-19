@@ -401,17 +401,20 @@ class DiskRing:
         for source, profile in self.profiles.items():
             bound = round_up(profile.segment_bytes(), unit)
             after = self.history_after.get(source, -MAX_INTEGER - 1)
-            # The end of the source's latest refused (``missing``) or
-            # unverified (``uncertain``) segment: no stored row after it shows
-            # the gap when the latest batch was refused for every source.
-            cut = None if at_bound else self.db.execute(
-                "SELECT max(end) FROM segments WHERE source=? AND state IN ('missing','uncertain') AND end>?",
-                (str(source), after)).fetchone()[0]
             rows = [] if at_bound else [(row[1], row[2], row[3], allocations.get(UUID(row[0]), bound))
                                         for row in self.db.execute(
                 "SELECT id, start, end, clock_trusted FROM segments WHERE source=? AND state='stored' AND end>? "
                 "ORDER BY end DESC LIMIT ?", (str(source), after,
                                               max(RECENT_ALLOCATION_SEGMENTS, BATCH_HISTORY_SEGMENTS)))]
+            # The end of the source's latest refused (``missing``) or
+            # unverified (``uncertain``) segment: no stored row after it shows
+            # the gap when the latest batch was refused for every source. Only
+            # one ending after the oldest of those rows starts can cut the
+            # history, so the ``(source, end)`` index bounds the lookup to
+            # that window, not the whole retained ledger.
+            cut = None if not rows else self.db.execute(
+                "SELECT max(end) FROM segments WHERE source=? AND state IN ('missing','uncertain') AND end>?",
+                (str(source), max(after, min(start for start, _end, _trusted, _size in rows)))).fetchone()[0]
             # The rounded samples of the longer batch history, never above the
             # bound, up to the source's first gap (including its latest
             # refused or unverified segment), clock-uncertain row or
