@@ -1289,6 +1289,28 @@ with each EMEET C960 negotiated as `MJPG` (1080p30 and 720p30), still to do:
   simplejpeg and numpy wheels import inside it (the source does not report
   `frame_decoder_unavailable` or `frame_decoder_failing`) and a real frame
   decodes; check the journal for `SIGSYS`/seccomp or address-space denials;
+- [ ] **decode child sandbox on the Main host (Issue #269)**: mock-verified
+  only (CPU-limited container on the Main host's Linux 7.0 kernel, Landlock
+  ABI 8, CPython 3.12 and 3.14; GitHub Actions `ubuntu-24.04`); not yet run
+  inside the deployed unit with a real camera. As the service user, never with
+  sudo, with one MJPG source active and decoding:
+  - record `uname -r`, the Landlock ABI (`/sys/kernel/security/lsm` contains
+    `landlock`) and the deployed interpreter version;
+  - each `mjpg_child.py` process shows `Seccomp: 2` and one more
+    `Seccomp_filters` than the Main process in `/proc/<pid>/status`, and
+    `NoNewPrivs: 1`;
+  - the source stays `active` (not `frame_decoder_sandbox_unavailable` /
+    `frame_decoder_failing`), real frames decode at 1 sample/s for at least
+    one hour with `decoder_crashed` = 0, and the journal / `dmesg` / audit log
+    show no `SIGSYS` (`audit: type=1326`) for `mjpg_child.py`; a non-zero
+    count means the deployed interpreter or library makes a system call the
+    allowlist lacks: record the syscall number from the audit line (not the
+    frame) and report it, do not widen the filter in place;
+  - the 4K and 1/8-scale reference decodes from the decode-time item above
+    still succeed (allocation paths under the filter);
+  - `scene_frame_decoder_sandbox_unavailable` is absent from the journal; on a
+    kernel without Landlock (not the Main host) it must appear once and the
+    source must be `degraded` with every frame `unknown`;
 - [ ] **child failure handling on the real host** (as the service user, never
   with sudo; cameras untouched): `kill -KILL <child pid>` gives one
   `decoder_crashed` refusal and a new child pid after about 1 s;

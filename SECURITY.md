@@ -658,6 +658,43 @@ For remote-agent media enforce:
 - no client-controlled arbitrary output path;
 - explicit degraded/offline state on known loss.
 
+### Local UVC MJPG decode child (Issues #217, #233, #269)
+
+Camera-supplied MJPG bytes reach native code (simplejpeg 1.9.0 with its bundled
+libjpeg-turbo 3.1.2) only after the structural pre-check on the scene worker,
+and only in a separate per-source decode child, never in the Main process. The
+child sets `no_new_privs`, a parent-death `SIGKILL`, non-dumpable and equal
+soft/hard rlimits (address space 256 MiB, descriptors, no new process, no core,
+no file writes), and every exchange has a 500 ms deadline; any failure is
+`unknown`.
+
+Before it reports ready, the child also confines itself (Owner decision
+2026-10-16 on #233 (B)): a Landlock ruleset that grants no filesystem access
+(and no TCP bind/connect at ABI >= 4, abstract UNIX socket and signal scoping at
+ABI >= 6), then a seccomp allowlist built in the child without any new
+dependency (x86-64 and aarch64) that leaves only `recvfrom` / `sendto` on its
+already-open descriptors (the private socket and `/dev/null` stdio),
+non-executable memory management, futex, signal return and exit;
+anything else (opening or creating a file, creating or connecting a socket,
+`fork` / `clone` / `execve`, `ptrace`, executable mappings, calls through
+another architecture) kills it. So a memory-corruption bug in the decoder that
+reaches code execution is contained to computing on the memory the child
+already holds and writing to its private socket; the parent still checks
+every reply's type, request id and exact size, and decoded pixels are never
+trusted as proof of frame integrity. What remains: the child runs as the same
+service account in the Main's network namespace, the kernel itself is attack
+surface for
+the allowed calls, and Landlock rights introduced by an ABI newer than this
+code knows are not handled (the seccomp layer still refuses every open).
+
+The sandbox is fail closed: where either layer cannot be applied, the child
+refuses to start and the source is `degraded`
+(`frame_decoder_sandbox_unavailable`) with every frame `unknown`; there is no
+setting that decodes unconfined. Whether a kernel without Landlock should
+instead keep decoding with seccomp only, with an Owner-visible warning, is an
+open Owner decision (Issue #269); until it is made, such a kernel cannot use
+MJPG scene detection.
+
 ## Web/API
 
 - typed validation;

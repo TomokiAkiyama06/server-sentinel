@@ -1079,7 +1079,24 @@ environment and only a private `AF_UNIX` socketpair inherited; before importing
 the decoder it sets `no_new_privs`, a parent-death `SIGKILL`, non-dumpable, a
 lower CPU priority and equal soft/hard rlimits (address space, descriptors, no
 new process, no core, no file writes), and it runs as the same unprivileged
-service account. Every exchange has a hard per-frame deadline that covers the
+service account. After importing the decoder and decoding one generated warm-up
+frame, and before it reports ready, the child confines itself irreversibly
+(Issue #269, Owner decision 2026-10-16 on #233 (B)): a Landlock ruleset that
+handles every filesystem right of the kernel's ABI and grants none (no path can
+be opened, created, executed or listed; TCP bind/connect denied at ABI >= 4;
+abstract UNIX socket and signal scoping at ABI >= 6), then a seccomp allowlist
+built without dependencies (x86-64 and aarch64; socket I/O on the inherited
+socket, memory management without `PROT_EXEC`, futex, signal return and exit
+only). Any other system call, and any call through another architecture or
+numbering (i386, AArch32, x32), kills the child with `SIGSYS`, which is a child
+crash (`unknown`). The sandbox is fail closed: where either layer cannot be
+applied (no Landlock, no seccomp filter mode or kill-process action, another
+architecture, a multi-threaded child), the child reports a fixed refusal code
+instead of ready and exits without decoding; the decoder then reports
+`failing` at once and the source is `degraded` with
+`frame_decoder_sandbox_unavailable` (logged once, value-free), every frame
+`unknown`, never a negative. No setting runs the decoder unconfined. Every
+exchange has a hard per-frame deadline that covers the
 transfer. Any pre-check refusal, strict decode error, decoded-shape mismatch or
 mid-grey undecoded band, and any child crash, kill (including OOM), exit,
 timeout (the child is killed) or malformed reply is `unknown`
@@ -1150,7 +1167,8 @@ measured from the first waiting request) sets `refresh_deferred`, lowers the
 source to `degraded` (`calibration_refresh_deferred`) with `unknown` movement
 and tamper conclusions, and is logged once (Owner decision 2026-10-14); a source
 already `degraded` for another reason (such as `critical_backpressure`,
-`source_unavailable`, `frame_decoder_failing`, `scene_evaluation_failed` or
+`source_unavailable`, `frame_decoder_failing`,
+`frame_decoder_sandbox_unavailable`, `scene_evaluation_failed` or
 `observation_stale`) or inactive keeps that reason, with `refresh_deferred`
 alongside and `unknown` conclusions. The refresh
 still waits for the loss, and the state clears when it runs.
