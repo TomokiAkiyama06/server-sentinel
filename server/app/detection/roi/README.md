@@ -385,21 +385,21 @@ outbox cleanly and the next start still records an interrupted gap. The sink is
 called synchronously (from `stop()` and the delivery thread), so it must not
 block and must do no I/O.
 
-**Today Main passes no sink**, so the count is only logged
-(`scene_undelivered_unrecorded`) and nothing marks the stop as unclean. Once
-Main wires the timeline outbox (follow-up, #205), the sink is meant to be
-`CriticalTimelineRecorder.record_undelivered`, which adds the count as lost
-facts to the presence timeline gap marker through the open outbox session (no
-observation content, identifier or source). The marker is then written by the
-outbox's next flush or at its clean close; a close that fails leaves the session
-row, so the next start records an interrupted gap, and Owner status reports
-`timeline_gap` until the Owner clears it. A count handed over after the outbox
-closed (or before it opened) is refused and only logged, and the next start then
-shows no unclean stop. The wiring therefore has to stop scene monitoring before
-it closes the outbox, and must not close the outbox cleanly when `stop()`
-returned `stop_failed` or `undelivered_recorded is False`, so the session row
-stays and the next start records an interrupted gap. A direct Owner notification
-for an unclean stop is a follow-up.
+With `create_app(scene_timeline=...)` (`app.presence.runtime.SceneTimeline`,
+#205) Main passes `CriticalTimelineRecorder.record_undelivered` as the sink and
+the same `CriticalTimelineRecorder` as the durable recorder (an embedder-supplied
+recorder or sink is then refused). It adds the count as lost facts to the
+presence timeline gap marker through the open outbox session (no observation
+content, identifier or source). The marker is written by the outbox's next
+flush (the lifespan flushes at `flush_interval_seconds` and once more at
+shutdown) or at its clean close. The lifespan opens the outbox before it starts
+scene monitoring (a refused open keeps scene monitoring unstarted, `unknown`
+and retried), stops scene monitoring before it ends the outbox, and calls
+`close()` only when `stop()` returned `stopped` and `undelivered_recorded` is not
+`False`; otherwise the session row stays, the next start records an interrupted
+gap, and Owner status reports `timeline_gap` until the Owner clears it. Without
+`scene_timeline` the count is only logged (`scene_undelivered_unrecorded`). A
+direct Owner notification for an unclean stop is a follow-up.
 
 After a worker failure the final pass still stages that
 evidence, but every source stays withdrawn as `worker_failed`. The runtime is

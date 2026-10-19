@@ -1218,8 +1218,11 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   undelivered (recorder storage stalled) adds that count as `lost` to the
   presence timeline gap marker, and Owner status reports `timeline_gap` after
   restart; with the outbox close made to fail (for example a refused storage
-  admission), the next start reports an interrupted gap instead. This needs
-  the outbox wired into Main first (follow-up).
+  admission), the next start reports an interrupted gap instead. The outbox
+  is wired in `create_app()` (`scene_timeline`, Issue #205; synthetic
+  verification in `server/tests/test_scene_timeline.py`), but the production
+  launcher does not build scene monitoring yet, so this needs the deployment
+  section and the Owner calibration route first (follow-up).
 
 ### Issue #217 MJPG decoder on real C960 frames (pending physical execution)
 

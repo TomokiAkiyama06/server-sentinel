@@ -288,14 +288,13 @@ class SceneMonitoringDependencies:
     # deliver (Owner decision 2026-10-14, #224): called with the number of
     # undelivered observations and losses at `stop()`, and with each batch a
     # worker that outlived its stop bound could no longer stage after that.
-    # Main does not pass one yet, so today the count is only logged
-    # (`scene_undelivered_unrecorded`). Once Main wires the timeline outbox
-    # (follow-up, #205) it is meant to be
-    # `CriticalTimelineRecorder.record_undelivered`, which adds the count to
-    # the presence timeline gap marker through the open outbox session; a
-    # failed outbox close then leaves the session row and the next start
-    # records an interrupted gap. A count handed over after the outbox closed
-    # (or before it opened) is refused and only logged. The sink is called
+    # With `create_app(scene_timeline=...)` Main passes
+    # `CriticalTimelineRecorder.record_undelivered` (`app.presence.runtime`,
+    # #205), which adds the count to the presence timeline gap marker through
+    # the open outbox session; an unclean stop leaves the session row and the
+    # next start records an interrupted gap. Without it the count is only
+    # logged (`scene_undelivered_unrecorded`). A count handed over after the
+    # outbox closed (or before it opened) is refused and only logged. The sink is called
     # synchronously from `stop()` and from the delivery thread, so it must
     # not block and must do no I/O (that record only adds to a count in
     # memory); a blocking sink would hold `stop()` past its bound.

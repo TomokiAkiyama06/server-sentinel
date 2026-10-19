@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager, closing, suppress
+from dataclasses import replace
 import logging
 from typing import Callable, ContextManager, Iterable
 
@@ -31,6 +32,7 @@ from app.media.live.local_preview import LocalPreviewHub
 from app.monitoring.access import AccessFaultMonitor
 from app.monitoring.config import MonitoringConfiguration
 from app.monitoring.runtime import MonitoringDependencies, MonitoringRuntime, RuntimeState
+from app.presence.runtime import SceneTimeline, SceneTimelineConfiguration
 from app.settings import Settings
 from app.storage.database import Database, PinnedDatabase
 from app.storage.migrations import migrate
@@ -121,6 +123,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
                local_uvc_dependencies: LocalUvcDependencies | None = None,
                scene_monitoring: SceneMonitoringConfiguration | None = None,
                scene_monitoring_dependencies: SceneMonitoringDependencies | None = None,
+               scene_timeline: SceneTimelineConfiguration | None = None,
                human_access: HumanAccess | None = None) -> FastAPI:
     # Closed unless the embedder passes a validated composition: it exists
     # only when the deployment explicitly enabled human access and the
@@ -183,8 +186,44 @@ def create_app(settings: Settings, *, database: Database | None = None,
     if scene_monitoring is not None and not isinstance(scene_monitoring,
                                                        SceneMonitoringConfiguration):
         raise TypeError("scene monitoring configuration is invalid")
+    # The Main Server storage policy is bound by the monitoring runtime when
+    # the deployment configures storage thresholds, so audit writes and
+    # retention cleanup cannot spend the hard filesystem reserve. Without those
+    # thresholds the admission stays unbound: writes are refused rather than
+    # admitted against a reserve this process cannot verify.
+    runtime_admission = RuntimeStorageAdmission()
+    # Presence timeline for scene evidence (#205): with `scene_timeline` the
+    # application owns the durable critical recorder, the count-only
+    # undelivered sink and the outbox session lifecycle (see lifespan).
+    timeline = None
+    if scene_timeline is not None:
+        if not isinstance(scene_timeline, SceneTimelineConfiguration):
+            raise TypeError("scene timeline configuration is invalid")
+        if scene_monitoring is None:
+            raise TypeError("scene timeline requires scene monitoring")
+        if scene_monitoring_dependencies is not None and (
+                scene_monitoring_dependencies.recorder is not None
+                or scene_monitoring_dependencies.undelivered is not None):
+            # The recorder and the sink must both be this outbox's, or the
+            # stop/close ordering below would not cover what they record.
+            raise TypeError("scene timeline owns the critical recorder and undelivered sink")
+        scene_holder = []
+
+        def scene_detection_armed() -> bool:
+            # Presence `critical_detection`: armed only while the scene
+            # runtime is running; degraded, unavailable or stopped is not.
+            return bool(scene_holder) and (scene_holder[0].status().state
+                                           is SceneRuntimeState.RUNNING)
+
+        timeline = SceneTimeline(scene_timeline, store, storage_reservation or runtime_admission,
+                                 detection=scene_detection_armed)
+        scene_monitoring_dependencies = replace(
+            scene_monitoring_dependencies or SceneMonitoringDependencies(),
+            recorder=timeline.recorder, undelivered=timeline.undelivered)
     scene_runtime = (SceneMonitoringRuntime(scene_monitoring, scene_monitoring_dependencies)
                      if scene_monitoring is not None else None)
+    if timeline is not None:
+        scene_holder.append(scene_runtime)
 
     def on_local_frame(source_id, frame) -> None:
         # Both sinks are non-blocking and never raise into the capture worker.
@@ -196,12 +235,6 @@ def create_app(settings: Settings, *, database: Database | None = None,
         local_preview.on_health(event)
         if scene_runtime is not None:
             scene_runtime.on_uvc_health(event)
-    # The Main Server storage policy is bound by the monitoring runtime when
-    # the deployment configures storage thresholds, so audit writes and
-    # retention cleanup cannot spend the hard filesystem reserve. Without those
-    # thresholds the admission stays unbound: writes are refused rather than
-    # admitted against a reserve this process cannot verify.
-    runtime_admission = RuntimeStorageAdmission()
     # Capture workers write source health, negotiated profiles, last-seen
     # timestamps and approval session markers continuously. They are admitted
     # exactly like audit writes, so a hard stop or a missing/replaced recording
@@ -246,6 +279,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(
         audit_store, *tuple(audit_retention_stores),
+        # The owned presence timeline expires with the same schedule (Codex
+        # PR #296): timeline payloads after the recording retention, Owner
+        # control audit rows after the audit retention.
+        *(timeline.retention_stores if timeline is not None else ()),
         interval_seconds=audit_cleanup_interval_seconds,
     )
 
@@ -279,7 +316,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
         cleanup_task = None
         uvc_watch_task = None
         human_task = None
-        scene_watch_task = None
+        # The scene watcher may be started late, by the timeline task, once
+        # a deferred outbox open succeeds; shutdown reads it from here.
+        scene_lifecycle = {"watch": None, "timeline": None, "stopping": False}
 
         uvc_lifecycle = {"deferred": None, "stopping": False}
 
@@ -339,15 +378,57 @@ def create_app(settings: Settings, *, database: Database | None = None,
                     logging.getLogger(__name__).error(Event.SCENE_MONITORING_UNAVAILABLE)
                 application.state.scene_monitoring_state = state
 
-        async def stop_scene_monitoring() -> None:
+        async def stop_scene_monitoring():
+            """Stop scene monitoring; the returned status (None if it raised)
+            decides whether the timeline outbox may close cleanly."""
             if scene_runtime is None:
-                return
+                return None
             try:
                 status = await run_to_completion(asyncio.to_thread(scene_runtime.stop))
                 application.state.scene_monitoring_state = status.state
             except Exception:
                 application.state.scene_monitoring_state = SceneRuntimeState.STOP_FAILED
                 logging.getLogger(__name__).error(Event.SCENE_MONITORING_STOP_FAILED)
+                return None
+            return status
+
+        async def launch_scene_monitoring() -> None:
+            await start_scene_monitoring()
+            if scene_runtime is not None and not scene_lifecycle["stopping"]:
+                scene_lifecycle["watch"] = asyncio.create_task(watch_scene_monitoring())
+
+        async def open_timeline() -> bool:
+            # Issue #205 condition 5: scene monitoring starts only after the
+            # outbox session is open, so no undelivered count can reach an
+            # outbox that would refuse it.
+            return await run_to_completion(asyncio.to_thread(timeline.open))
+
+        async def run_timeline() -> None:
+            # Retries a deferred outbox open (storage not yet admitted, for
+            # example a monitoring runtime still retrying its startup open)
+            # and then starts scene monitoring; afterwards it writes counted
+            # loss to the durable gap marker on every interval.
+            configuration = timeline.configuration
+            while not timeline.opened:
+                await asyncio.sleep(configuration.open_retry_seconds)
+                if scene_lifecycle["stopping"]:
+                    return
+                if await open_timeline() and not scene_lifecycle["stopping"]:
+                    await launch_scene_monitoring()
+            while True:
+                await asyncio.sleep(configuration.flush_interval_seconds)
+                await run_to_completion(asyncio.to_thread(timeline.flush))
+
+        async def finish_timeline(scene_status) -> None:
+            # Issue #205 conditions 2, 3, 6 and 8: only after scene stop()
+            # returned; flushed first; closed only after a clean stop whose
+            # undelivered count was recorded, otherwise left open so the
+            # next start records an interrupted gap.
+            if timeline is None:
+                return
+            with suppress(Exception):
+                application.state.scene_timeline_finish = await run_to_completion(
+                    asyncio.to_thread(timeline.finish, scene_status))
 
         async def start_local_uvc() -> None:
             # Never a silent default: every outcome is an explicit state.
@@ -460,10 +541,16 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 human_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await human_task
-            if scene_watch_task is not None:
-                scene_watch_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await scene_watch_task
+            scene_lifecycle["stopping"] = True
+            for name in ("timeline", "watch"):
+                # The timeline task first: a deferred start it is running
+                # finishes (cancellation is deferred) before stop() below,
+                # and it can then create no new watcher.
+                task = scene_lifecycle[name]
+                if task is not None:
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
             if uvc_watch_task is not None:
                 uvc_watch_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -476,7 +563,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
             await stop_local_uvc()
             # After capture stops, so no frame is offered to a stopped worker;
             # its final pass retries staged critical observations.
-            await stop_scene_monitoring()
+            scene_status = await stop_scene_monitoring()
+            # After scene stop() returned and while storage is still admitted
+            # (the monitoring runtime stops below).
+            await finish_timeline(scene_status)
             if cleanup_task is not None:
                 cleanup_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -524,9 +614,17 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 # retention state stays visible and the scheduled run retries it.
                 logging.getLogger(__name__).error(Event.AUDIT_RETENTION_DEGRADED)
             # Before capture, so the first frames already reach the detector.
-            await start_scene_monitoring()
-            if scene_runtime is not None:
-                scene_watch_task = asyncio.create_task(watch_scene_monitoring())
+            if timeline is None:
+                await launch_scene_monitoring()
+            else:
+                if await open_timeline():
+                    await launch_scene_monitoring()
+                else:
+                    # Not started: every scene conclusion stays unknown until
+                    # the timeline task's retried open succeeds.
+                    application.state.scene_monitoring_state = SceneRuntimeState.UNAVAILABLE
+                    logging.getLogger(__name__).error(Event.SCENE_MONITORING_UNAVAILABLE)
+                scene_lifecycle["timeline"] = asyncio.create_task(run_timeline())
             await start_local_uvc()
             if local_uvc_runtime is not None:
                 uvc_watch_task = asyncio.create_task(watch_local_uvc())
@@ -580,6 +678,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
         SceneRuntimeState.CONFIGURED if scene_runtime is not None
         else SceneRuntimeState.UNCONFIGURED
     )
+    # Internal only: the presence timeline composition for scene evidence and
+    # how its outbox ended at the last shutdown (`TimelineFinish`). No route
+    # reads either; Owner status through a reviewed route is a follow-up.
+    application.state.scene_timeline = timeline
+    application.state.scene_timeline_finish = None
     application.state.diagnostic_export_endpoint = diagnostic_export_endpoint
     application.state.human_access = human_access
     # No FastAPI human router is ever included: the surface below answers

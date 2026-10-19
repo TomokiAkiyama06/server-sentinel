@@ -905,6 +905,12 @@ def _presence(connection, tables, salt: str, live_outbox: bool | None) -> dict:
             "SELECT id, kind, source, received, payload FROM presence_observations",
             lambda row: row[0],
             lambda row: _keyed(salt, ["presence-observation-v1", *tuple(row)[1:]])),
+        # The main-host receipt time timeline retention compares (not
+        # secret, like the audit row times), so verification can tell an
+        # observation expire_history() removed from one that was lost.
+        "observation_received": keyed_rows(
+            "presence_observations", "SELECT id, received FROM presence_observations",
+            lambda row: row[0], lambda row: row[1]),
         # Observations the Owner released (clear_unresolved_critical_event()
         # appends this audit row in the same transaction).
         "cleared_events": None if "presence_audit" not in tables else sorted(
@@ -1030,8 +1036,25 @@ def _delivery_advanced(before: dict, after: dict) -> bool:
 
 
 def _compare_presence(baseline: dict | None, current: dict | None,
-                      gap_before: dict | None, gap_now: dict | None) -> dict:
-    """Allow only the transitions PresenceService itself performs."""
+                      gap_before: dict | None, gap_now: dict | None,
+                      expiry: dict | None = None) -> dict:
+    """Allow only the transitions PresenceService itself performs.
+
+    ``expiry`` holds the timeline retention cutoffs at verify time
+    (``recording`` and ``audit`` instants, see `_retention_rules`). Since Main
+    schedules `PresenceService.expire_history()` for its scene timeline
+    (Issue #205, Codex PR #296), a recorded observation may leave through it
+    too: received before the audit horizon, or before the recording cutoff
+    with every recorded delivery job finished (delivered or disabled). Its
+    jobs and source fact go with it, a recorded job leaves its tombstone, and
+    every recorded job not delivered adds one expired-unresolved event. A job
+    finished after the record but before expiry is judged as recorded and
+    fails closed, as does a baseline without recorded receipt times. The
+    cutoffs come from the verifier's own clock, never the service's: Main
+    expires only while its clock is trusted, and a removal of anything younger
+    than these cutoffs (as a future-skewed service clock would cause) stays
+    `missing`.
+    """
     baseline, current = baseline or {}, current or {}
     failed = []
 
@@ -1066,10 +1089,9 @@ def _compare_presence(baseline: dict | None, current: dict | None,
         elif now["since"] != value["since"] or now["events"] < value["events"]:
             fail("expired_unresolved", key)
     # An observation (with its jobs and source fact) leaves only through the
-    # Owner's audited clear_unresolved_critical_event(), listed as released.
-    # PresenceService.expire_history() is not run by Main, so a removal it
-    # would make is still a loss here; if Main ever schedules it, this rule
-    # must be revisited.
+    # Owner's audited clear_unresolved_critical_event(), listed as released,
+    # or through PresenceService.expire_history() past its retention, listed
+    # as expired (see ``expiry`` above).
     observations = current.get("observations") or {}
     recorded_jobs: dict = {}
     for job in (baseline.get("deliveries") or {}).values():
@@ -1089,6 +1111,7 @@ def _compare_presence(baseline: dict | None, current: dict | None,
     owners = set(baseline.get("owner_actors") or ()) | set(current.get("owner_actors") or ())
     control_at = _presence_instant((current.get("clocks") or {}).get("control"))
     path = {}
+    received = baseline.get("observation_received") or {}
     for key, value in (baseline.get("observations") or {}).items():
         if key in observations:
             if observations[key] != value:
@@ -1096,6 +1119,12 @@ def _compare_presence(baseline: dict | None, current: dict | None,
             continue
         jobs = recorded_jobs.get(key, [])
         unfinished = [state for state in jobs if state not in ("delivered", "disabled")]
+        at = _presence_instant(received.get(key))
+        if (expiry is not None and at is not None and key not in cleared_now
+                and (at < expiry["audit"] or (at < expiry["recording"] and not unfinished))
+                and (not jobs or _presence_instant(completed.get(key)) is not None)):
+            path[key] = "expired"
+            continue
         # Owner release: at least one unfinished job (its precondition), a
         # single new clear row naming it, and the tombstone it wrote then.
         rows = cleared_now.get(key, [])
@@ -1132,6 +1161,11 @@ def _compare_presence(baseline: dict | None, current: dict | None,
         if key not in deliveries:
             if job["observation"] not in path:
                 fail("deliveries", key, "missing")
+            elif path[job["observation"]] == "expired":
+                # expire_history() counts every job not delivered, a
+                # disabled one included.
+                if job["state"] != "delivered":
+                    needed[key.rsplit(":", 1)[1]] += 1
             elif job["state"] not in ("delivered", "disabled"):
                 needed[key.rsplit(":", 1)[1]] += 1
         elif job["observation"] in path:
@@ -1212,7 +1246,9 @@ def _compare_presence(baseline: dict | None, current: dict | None,
         "completed_events", "expired_unresolved", "observations", "deliveries",
         "source_facts", "clocks", "outbox_sessions", "override"))
     status = "failed" if failed else ("preserved" if has_rows else "empty")
-    return {"status": status, "failed": failed, "released": sorted(path)}
+    return {"status": status, "failed": failed,
+            "released": sorted(key for key, how in path.items() if how == "released"),
+            "retention_expired": sorted(key for key, how in path.items() if how == "expired")}
 
 
 # The actor PairingLedger records for each of its audit actions.
@@ -3969,16 +4005,23 @@ def _retention_rules(now: datetime) -> dict:
     interrupted recordings whose ended_ms is at most now - 20 days.
     OwnerTemplateStore.cleanup_expired_batch() deletes Owner-template audit
     rows older than the store's own retention when the store is registered
-    for audit retention. Presence audit retention and timeline expiry
-    (PresenceService.expire_audit() / expire_history()) are not run by Main
-    and so accept nothing.
+    for audit retention. PresenceService.expire_audit() deletes
+    presence_audit rows whose ``at`` lies before now - 90 days, and
+    expire_history() removes observations received before now - 20 days
+    (before now - 90 days while a delivery is unfinished); Main schedules
+    both for its scene timeline (Issue #205).
     """
     periods = RetentionPeriods()
     cutoff = now - AUDIT_RETENTION
     cutoff_us = int(cutoff.timestamp()) * 1_000_000 + cutoff.microsecond
     now_ms = int(now.timestamp() * 1000)
     audit_ms = now_ms - periods.audit_days * DAY_MS
+    presence_audit = now - timedelta(days=periods.audit_days)
     return {
+        "presence_audit": lambda value: (_presence_instant(value) is not None
+                                         and _presence_instant(value) < presence_audit),
+        "presence_expiry": {"recording": now - timedelta(days=periods.recording_days),
+                            "audit": presence_audit},
         "security_admin": lambda value: isinstance(value, int) and value < cutoff_us,
         "integrity": lambda value: (_utc_instant(value) is not None
                                     and _utc_instant(value) < cutoff),
@@ -4240,7 +4283,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
             baseline["audit"].get("integrity"), current["audit"].get("integrity"),
             rules["integrity"], fresh["iso"]),
         "audit_presence": _compare_audit(
-            baseline["audit"].get("presence"), current["audit"].get("presence")),
+            baseline["audit"].get("presence"), current["audit"].get("presence"),
+            rules["presence_audit"]),
         "audit_storage_state": _compare_audit(
             baseline["audit"].get("storage_state"), current["audit"].get("storage_state"),
             rules["storage_state"], fresh["ms"]),
@@ -4252,7 +4296,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
             baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap")),
         "presence": _compare_presence(
             baseline.get("presence"), current.get("presence"),
-            baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap")),
+            baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap"),
+            rules["presence_expiry"]),
         "integrity_baseline": _compare_keyed(
             {"baseline": baseline["integrity_baseline"]}
             if baseline.get("integrity_baseline") is not None else None,
