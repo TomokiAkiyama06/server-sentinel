@@ -65,6 +65,19 @@ DEFAULT_OPEN_RETRY_SECONDS = 15.0
 RETENTION_BATCH = 1000
 
 
+class RetentionClockUntrusted(RuntimeError):
+    """Presence expiry refused: the main-host clock is not trusted now.
+
+    A future-skewed clock would move both retention cutoffs forward and
+    delete timeline or audit rows early, so nothing is deleted. Raising
+    makes the scheduled cleanup report degraded retention and retry on its
+    shorter interval, like any other failed cleanup.
+    """
+
+    def __init__(self):
+        super().__init__("presence retention clock untrusted")
+
+
 class _PresenceRetention:
     """One presence retention operation as an `AuditRetentionRuntime` store.
 
@@ -73,7 +86,8 @@ class _PresenceRetention:
     at once while a batch came back full (`cleanup_batch_size`). The windows
     are the presence service's shared `RetentionPeriods` (20-day recording
     retention for timeline payloads, 90-day audit retention for Owner-control
-    audit rows); nothing here chooses its own.
+    audit rows); nothing here chooses its own. A deletion is dated only by a
+    trusted main-host clock (`RetentionClockUntrusted` otherwise).
     """
 
     cleanup_batch_size = RETENTION_BATCH
@@ -83,10 +97,18 @@ class _PresenceRetention:
 
     def cleanup_expired_batch(self) -> int:
         timeline = self._timeline
+        # Only a trusted, aware main-host time may date a deletion (Codex PR
+        # #296); a raising, malformed or untrusted clock deletes nothing.
+        try:
+            now, trusted = timeline.configuration.clock()
+            aware = now.utcoffset() is not None
+        except Exception:
+            raise RetentionClockUntrusted() from None
+        if trusted is not True or not aware:
+            raise RetentionClockUntrusted()
         # Expiry is a write like any other: the database is pinned under the
         # storage admission first, never created or opened unpinned.
         timeline._pin()
-        now, _ = timeline.configuration.clock()
         expire = getattr(timeline.presence, self._operation)
         return expire(now=now, limit=self.cleanup_batch_size)
 

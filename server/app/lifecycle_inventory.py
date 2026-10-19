@@ -1049,7 +1049,11 @@ def _compare_presence(baseline: dict | None, current: dict | None,
     jobs and source fact go with it, a recorded job leaves its tombstone, and
     every recorded job not delivered adds one expired-unresolved event. A job
     finished after the record but before expiry is judged as recorded and
-    fails closed, as does a baseline without recorded receipt times.
+    fails closed, as does a baseline without recorded receipt times. The
+    cutoffs come from the verifier's own clock, never the service's: Main
+    expires only while its clock is trusted, and a removal of anything younger
+    than these cutoffs (as a future-skewed service clock would cause) stays
+    `missing`.
     """
     baseline, current = baseline or {}, current or {}
     failed = []

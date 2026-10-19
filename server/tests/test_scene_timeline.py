@@ -26,8 +26,9 @@ from app.detection.roi.runtime import (
     SceneMonitoringConfiguration, SceneMonitoringDependencies, SceneRuntimeState,
 )
 from app.main import create_app
+from app.audit.runtime import AuditRetentionHealth, AuditRetentionRuntime
 from app.presence.runtime import (
-    SceneTimeline, SceneTimelineConfiguration, TimelineFinish,
+    RetentionClockUntrusted, SceneTimeline, SceneTimelineConfiguration, TimelineFinish,
 )
 from app.settings import Settings
 from app.storage.database import Database
@@ -289,6 +290,50 @@ class SceneTimelineRetentionTests(Fixture, unittest.TestCase):
         self.assertEqual((1, 1), self.cleanup())
         self.assertEqual([], self.critical_kinds())
         self.assertEqual([], self.rows("SELECT * FROM presence_audit"))
+
+    def seed_expired(self):
+        self.assertTrue(self.timeline.open())
+        self.timeline.recorder(critical(at=PRESENCE_NOW))
+        self.audit_row(PRESENCE_NOW)
+        self.timeline.finish(scene_status(SceneRuntimeState.STOPPED))
+
+    def test_untrusted_clock_deletes_nothing(self):
+        # Codex PR #296 P1: a skewed, untrusted clock must not move the
+        # cutoffs forward and delete rows early.
+        self.seed_expired()
+        audit = self.rows("SELECT count(*) FROM presence_audit")[0][0]
+        far = PRESENCE_NOW + timedelta(days=400)
+        for clock in (lambda: (far, False), lambda: (far.replace(tzinfo=None), True),
+                      lambda: (far, 1), lambda: None):
+            with self.subTest(clock=clock):
+                self.timeline.configuration = replace(self.timeline.configuration, clock=clock)
+                for store in self.timeline.retention_stores:
+                    with self.assertRaises(RetentionClockUntrusted):
+                        store.cleanup_expired_batch()
+                self.assertEqual(1, len(self.critical_kinds()))
+                self.assertEqual(audit, self.rows("SELECT count(*) FROM presence_audit")[0][0])
+        # Trusted again: the same rows expire as before.
+        self.timeline.configuration = replace(self.timeline.configuration,
+                                              clock=lambda: (far, True))
+        self.assertEqual((1, 1), self.cleanup())
+
+    def test_scheduled_cleanup_reports_and_retries_an_untrusted_clock(self):
+        self.seed_expired()
+        far = PRESENCE_NOW + timedelta(days=400)
+        self.timeline.configuration = replace(self.timeline.configuration,
+                                              clock=lambda: (far, False))
+        retention = AuditRetentionRuntime(*self.timeline.retention_stores,
+                                          interval_seconds=3600, retry_seconds=60)
+        with self.assertRaises(RetentionClockUntrusted):
+            asyncio.run(retention.startup_cleanup())
+        self.assertEqual(AuditRetentionHealth.DEGRADED, retention.health)
+        # Retried on the shorter interval, never abandoned.
+        self.assertEqual(60, retention.retry_seconds)
+        self.assertEqual(1, len(self.critical_kinds()))
+        self.timeline.configuration = replace(self.timeline.configuration,
+                                              clock=lambda: (far, True))
+        self.assertEqual(2, asyncio.run(retention.startup_cleanup()))
+        self.assertEqual(AuditRetentionHealth.HEALTHY, retention.health)
 
     def test_expiry_is_refused_without_storage_admission(self):
         self.admission.refuse = True
