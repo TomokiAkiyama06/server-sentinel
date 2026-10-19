@@ -20,9 +20,10 @@ Tailscale. It follows the Owner decisions of 2026-10-16 (Issue #10, Issue
   is issued for it, because the name is published in the public Certificate
   Transparency logs.
 
-Nothing in this document has been run on the real hosts yet. Every step is
-unverified until the matching `MANUAL_TEST.md` entries (section J, "Issue #205
-remote live view in the dedicated environment") are recorded. The commands are
+Steps 0-9 were run once on the real Main host on 2026-10-19 (partial record
+in `MANUAL_TEST.md`, section J, "Issue #205 remote live view in the dedicated
+environment"); step 10 and most verification items are still unrun. A step
+counts as verified only where that record says so. The commands are
 written for an Ubuntu 24.04 LTS or later host and an Ubuntu 24.04 LTS guest.
 
 This document orders and connects the existing procedures; it does not
@@ -245,6 +246,15 @@ sudo lxc config device add <vm> eth0 nic nictype=macvlan parent=<lan nic>
    camera, and LXD hotplugs the camera when it is plugged in. The serial
    stays in the host's LXD configuration (readable by root and the `lxd`
    group); keep it out of GitHub.
+
+   Observed on the real host (2026-10-19, Issue #301): when the host
+   re-enumerated one camera (`USB disconnect` and reconnect in the same
+   second, no unplug), LXD did **not** pass it back to the running VM; the
+   guest lost the camera and its source stayed `offline` until the device was
+   re-added. Until #301 is resolved, recover with
+   `sudo lxc config device remove <vm> cam1` followed by the same
+   `lxc config device add` line (no VM restart; the service rebinds the
+   serial-identified camera by itself), and watch the source state.
 3. Up to 4 cameras are supported by ServerSentinel; add `cam3` / `cam4` the
    same way if more `local_uvc` cameras are used. Nothing in this procedure
    assumes exactly two.
@@ -261,7 +271,14 @@ numbers. In the VM, give it a separate block device:
   exhaustion stays on that disk.
 - An LXD custom block volume in the default `dir` pool would sit on the host
   root filesystem; do not use it for recordings unless the pool is on a
-  dedicated disk.
+  dedicated disk. On a dedicated data filesystem (for example a `dir` pool
+  under the host's `/data`) it works, but the volume file is sparse: the
+  guest then sees free space the host filesystem may not have. Preallocate
+  it on the host (`sudo fallocate -l <size> <pool dir>/custom/default_<volume>/root.img`,
+  then `du -h` shows the full size), format it in step 4 with
+  `mkfs.ext4 -E nodiscard`, and disable `fstrim.timer` in the guest
+  (`systemctl disable --now fstrim.timer`): a discard deallocates the file
+  again (observed 2026-10-19: `mkfs` discard left 4.2G of 2 TiB allocated).
 - A shared host directory (`disk source=<directory>`, 9p/virtiofs) has no
   filesystem UUID in `/dev/disk/by-uuid` inside the guest and is expected to
   be refused by the runtime identity check; do not use it.
@@ -301,6 +318,8 @@ sudo lxc exec <vm> -- bash         # opens the guest root shell for the steps be
    apt-get update && apt-get -y full-upgrade
    apt-get install -y python3-venv dmidecode v4l-utils
    python3 --version                       # 3.12.x on 24.04 (supported: >=3.12,<3.15, not 3.13)
+   modinfo uvcvideo >/dev/null || apt-get install -y linux-generic "linux-modules-extra-$(uname -r)"
+   modprobe uvcvideo
    ```
 2. Neutral OS hostname (the same name as the Tailscale node in step 5):
    ```sh
@@ -461,6 +480,7 @@ Follow `server/docs/DEPLOYMENT.md` inside the guest. VM-specific points:
      install --version <ver> \
      --artifact /tmp/server-sentinel-main-<ver>.tar.gz --sha256 <published sha256>
    systemctl enable --now server-sentinel-upstream.socket
+   systemctl enable server-sentinel.service    # the installer does not enable it; without this it does not start at boot
    systemctl restart server-sentinel.service
    systemctl status server-sentinel.service --no-pager
    ss -ltn --cgroup 'sport = :880'     # expect cgroup:/system.slice/server-sentinel-upstream.socket
@@ -549,6 +569,10 @@ same cameras by the same serials.
    those addresses in `proxy_listeners` and set
    `"proxy_owner": {"unit": "tailscaled.service", "uid": 0}`.
    Do not use `"single_purpose_node"` (D2).
+   `reserved_addresses` must equal the address set `getent ahosts` printed
+   in step 3: when the name resolves to IPv4 only (observed 2026-10-19),
+   list only the IPv4 address. Moving the node to another Tailnet changes
+   the name, the addresses and usually the peerAPI port: repeat steps 3-7.
 6. [guest, service account] Record the listener exceptions (D3; "Recording
    listener exceptions"). `set` replaces the whole set; type `CHANGE`:
    ```sh
@@ -581,7 +605,10 @@ same cameras by the same serials.
      bootstrap --config /etc/server-sentinel/deployment.json
    ```
    The code appears only on this terminal and is valid for
-   `invitation_lifetime_hours` (default 24).
+   `invitation_lifetime_hours` (default 24). Copy it rather than retyping
+   it: every refusal is the same generic message, and a code takes at most
+   5 redemption attempts. A lost or exhausted code is replaced with
+   `bootstrap_cli recover` (before any passkey exists it revokes nothing).
 2. [viewer] On a phone, Mac or desktop logged in to the lab Tailnet, open
    `https://<neutral name>.<tailnet>.ts.net/` (only this `https` origin
    works; there is no `http://localhost` Owner route), enter the code and

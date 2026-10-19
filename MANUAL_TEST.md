@@ -2178,9 +2178,9 @@ the reserved name:
 ### Issue #205 remote live view in the dedicated environment (pending; requires the Owner)
 
 Procedure: `server/docs/REMOTE_LIVE_VIEW_SETUP.md` (Owner decisions D1, D2,
-D3, D6 of 2026-10-16). Documentation only so far: nothing in it has been run
-on the Main host, in an LXD VM, with the C960 passthrough or from a viewer
-device. Every step changes the production host and needs the Owner. Record
+D3, D6 of 2026-10-16). First built on the real host on 2026-10-19 (record
+below the checklist; partial). Every step changes the production host and
+needs the Owner. Record
 serials, disk ids, addresses and the node name only in the private record.
 
 - [ ] host: `/dev/kvm` present; LXD state recorded before the change (already
@@ -2251,6 +2251,65 @@ serials, disk ids, addresses and the node name only in the private record.
   `usb` devices, confirm the cameras reappear on the host, start the host
   deployment (if any) and confirm its sources and approvals; the VM's disk
   and data are left intact.
+
+Record of the first build (2026-10-19, Owner at the console; real host, real
+C960 cameras, real Tailnet; release `0.1.0` from `main` 3f04816). Partial:
+the items above stay unchecked until every part of each is done. Node name,
+addresses, serials and disk ids are in the private record only.
+
+- Done and observed: LXD 5.21 snap installed fresh (`lxd init --minimal`);
+  `virtual-machine` with `boot.autostart`, 8 vCPU / 16 GiB, 64 GiB root, no
+  GPU; macvlan on the LAN NIC with a DHCP reservation on `192.168.250.0/24`;
+  both C960 passed by `vendorid`/`productid`/`serial` and listed by the
+  guest's `v4l2-ctl`; SSH disabled in the guest; time-wait-sync enabled;
+  recording filesystem ext4 mounted by UUID with `nofail`; the upstream
+  socket in `cgroup:/system.slice/server-sentinel-upstream.socket`; two
+  `local_uvc` sources created and approved through `lxc exec` (the D3 CLIs
+  accepted the typed confirmations); `tailscale serve status --json` as the
+  service account with `env -i` worked without operator rights (the startup
+  check passed); listener inventory only `tailscaled` rows (WireGuard UDP
+  wildcard, peerAPI TCP and Serve 443 on the Tailscale addresses); exceptions
+  stored with `reservation_cli set`; the startup check opened human access;
+  the Owner code was redeemed and a passkey registered from Mac Chrome; the
+  live view showed both sources online.
+- D1 peerAPI checks, partial: from the host, peerAPI answered plain HTTP only
+  (TLS handshake failed), `/` returned `tailscaled`'s fixed page and unknown
+  paths 404. Port stability across `tailscaled` restart, `down`/`up` and a VM
+  reboot, and the cookie check, are not done (Owner postponed them).
+- Deviations from the procedure (folded into
+  `server/docs/REMOTE_LIVE_VIEW_SETUP.md` in the same change):
+  - recording volume: an LXD custom block volume (2 TiB) in a `dir` pool on
+    the host's `/data` filesystem, not a whole disk. It was sparse; `mkfs`
+    discard deallocated it again after a first `fallocate` (4.2G allocated),
+    so it was preallocated again on the host and `fstrim.timer` was disabled
+    in the guest;
+  - the Ubuntu cloud image kernel had no `uvcvideo`; `linux-generic` and
+    `linux-modules-extra-$(uname -r)` were installed;
+  - the installer left `server-sentinel.service` disabled; it was enabled by
+    hand;
+  - the name resolved to IPv4 only, so `reserved_addresses` and
+    `proxy_listeners` hold the IPv4 address only;
+  - the node joined two Tailnets in turn (the Owner's personal one, then the
+    lab's shared one, which the Owner chose for the viewers). The neutral
+    name never took a collision suffix, but Serve obtained a certificate for
+    the neutral name under **both** Tailnet domains, so both appear in
+    Certificate Transparency (not yet looked up). The move changed the
+    addresses and the peerAPI port; steps 8.3-8.7 were repeated;
+  - the first Owner code was lost and a hand-typed one was refused four or
+    more times (`invitation_redemption_refused`, no detail, as designed);
+    `bootstrap_cli recover` issued a new code, which worked when pasted.
+- Failure found: a host USB re-enumeration of one camera (disconnect and
+  reconnect in the same second) was not passed back to the VM by LXD; that
+  source stayed `offline` for about six hours with no Owner notification
+  (no notification channel configured yet) until `cam1` was removed and
+  re-added on the host, after which the service rebound it without a restart.
+  This contradicts the hotplug expectation of the passthrough-identity item
+  (Issue #301).
+- Not done yet: passthrough identity (port swap, unplug/replug), host access
+  to the camera nodes and `/dev/snd`, the disk-removed refusal, capture-host
+  pairing over the LAN (step 10), D2 host bind check, CT lookup, phone and
+  desktop viewers and the second-device denial, hardware-integrity baseline
+  in the VM, host-load measurements, rollback.
 
 ### Uninvited ordinary Tailnet member
 
