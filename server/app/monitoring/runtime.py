@@ -718,7 +718,11 @@ class MonitoringRuntime:
         a final delivery state: a ``pending`` row is a delivery the previous
         process never finished. The audit rowid, never the wall clock, orders
         findings, so a clock rollback cannot hide one. Only the action, time
-        and rowid are read, never the principal.
+        and rowid are read, never the principal. Several findings committed
+        after the last tick and lost to a crash before the drain are
+        recovered as this one notification, not one each; every finding stays
+        in the audit log, and the alert and the degraded hold are restored
+        (Issue #281 item 4, Owner decision 2026-10-16 in Issue #287).
 
         Access episode: when the newest ``human_access_fault`` /
         ``human_access_recovered`` row (by rowid) is a fault, the episode
