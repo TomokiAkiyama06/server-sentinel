@@ -421,6 +421,9 @@ Follow `server/docs/DEPLOYMENT.md` inside the guest. VM-specific points:
    preparation"):
    ```sh
    useradd --system --user-group --no-create-home --shell /usr/sbin/nologin server-sentinel
+   usermod -aG video server-sentinel          # UVC nodes are root:video; never add audio
+   id server-sentinel                         # groups include video, not audio
+   for v in /dev/video*; do sudo -u server-sentinel test -r "$v" -a -w "$v" && echo "$v rw-ok"; done
    install -d -o server-sentinel -g server-sentinel -m 0700 \
      /srv/ss-data/server-sentinel /srv/ss-data/server-sentinel/state \
      /srv/ss-data/server-sentinel/recordings /srv/ss-data/server-sentinel/audit
@@ -436,8 +439,9 @@ Follow `server/docs/DEPLOYMENT.md` inside the guest. VM-specific points:
    `runtime_mount_point` `/srv/ss-data`, the UUID and decimal device numbers
    from step 4.6, `service_uid`, `"human_host": "127.0.0.1"`,
    `"human_port": 880`, the `monitoring` section sized for the disk,
-   `"capture_ca_directory"` (`/var/lib/serversentinel-ca` when this VM will
-   pair capture nodes, otherwise `null`), and
+   `"capture_ca_directory": null` (the release refuses a configured CA
+   path that does not exist yet; step 10 creates the CA account and
+   directory and then sets the path), and
    `"web_assets_directory": "/opt/server-sentinel-main/current/web"`. Leave
    `human_access` and `local_uvc` out for now.
 4. [guest, root] Human upstream socket ("Human upstream through socket
@@ -594,8 +598,13 @@ non-owners is 未実装 (see the top of this document).
 
 Pairing works now; the ingest of their video is 未実装 (#14/#15). Follow
 "Capture-node CA and Main listener certificate" in `DEPLOYMENT.md` inside the
-VM (the CA account `serversentinel-ca` and `/var/lib/serversentinel-ca` are
-created in the guest), with `approve --listen <vm lan ip>:<port>` and
+VM. In order: stop the service, create the CA account `serversentinel-ca`
+and `/var/lib/serversentinel-ca` in the guest and run `serversentinel-pairing
+init` as described there, then set `"capture_ca_directory":
+"/var/lib/serversentinel-ca"` in `deployment.json`, run the release's
+`--check` as the service account and start the service again (the check
+refuses a missing CA directory, and one the service account can reach).
+Pair with `approve --listen <vm lan ip>:<port>` and
 `export-bundle --endpoint <vm lan ip>:<port>`, a port at or above
 `ip_unprivileged_port_start`. On the capture host, the bundle endpoint is the
 VM's LAN IP literal (not a MagicDNS name; no Tailscale on the capture host is
