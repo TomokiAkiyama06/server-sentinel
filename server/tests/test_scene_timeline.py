@@ -34,7 +34,11 @@ from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
+from app.presence.models import timestamp
+from app.storage.retention import RetentionPeriods
+
 from tests.test_detector_roi import HEIGHT, WIDTH, pixels, policy
+from tests.test_presence_adapters import NOW as PRESENCE_NOW, critical
 from tests.test_scene_runtime import MOVED, OTHER, Recorder, binding, calibration_for
 
 
@@ -235,6 +239,71 @@ class SceneTimelineLifecycleTests(Fixture, unittest.TestCase):
         self.assertFalse(self.settings.database_path.exists())
 
 
+class MutableClock:
+    def __init__(self, at):
+        self.at = at
+
+    def __call__(self):
+        return self.at, True
+
+
+class SceneTimelineRetentionTests(Fixture, unittest.TestCase):
+    """Codex PR #296: the owned presence timeline expires on the schedule."""
+
+    def setUp(self):
+        Fixture.setUp(self)
+        self.clock = MutableClock(PRESENCE_NOW + timedelta(seconds=1))
+        self.timeline = SceneTimeline(
+            timeline_configuration(clock=self.clock, maximum_source_latency=timedelta(days=2)),
+            self.database, self.admission)
+
+    def audit_row(self, at):
+        with closing(self.database.connect()) as connection:
+            connection.execute("INSERT INTO presence_audit(action,actor,at) VALUES (?,?,?)",
+                               ("synthetic", "owner", timestamp(at)))
+            connection.commit()
+
+    def cleanup(self):
+        history, audit = self.timeline.retention_stores
+        return history.cleanup_expired_batch(), audit.cleanup_expired_batch()
+
+    def test_windows_are_the_shared_retention_periods(self):
+        self.assertEqual(RetentionPeriods(), self.timeline.presence.periods)
+        self.assertEqual((20, 90), (self.timeline.presence.periods.recording_days,
+                                    self.timeline.presence.periods.audit_days))
+        for store in self.timeline.retention_stores:
+            self.assertEqual(1000, store.cleanup_batch_size)
+
+    def test_timeline_and_audit_rows_expire_after_their_retention(self):
+        self.assertTrue(self.timeline.open())
+        # A critical observation with its delivery still unfinished (no
+        # evidence or notification port yet) is held to the audit horizon.
+        self.timeline.recorder(critical(at=PRESENCE_NOW))
+        self.audit_row(PRESENCE_NOW)
+        self.timeline.finish(scene_status(SceneRuntimeState.STOPPED))
+        self.assertEqual(1, len(self.critical_kinds()))
+        self.clock.at = PRESENCE_NOW + timedelta(days=21)
+        self.assertEqual((0, 0), self.cleanup())
+        self.assertEqual(1, len(self.critical_kinds()))
+        self.clock.at = PRESENCE_NOW + timedelta(days=91)
+        self.assertEqual((1, 1), self.cleanup())
+        self.assertEqual([], self.critical_kinds())
+        self.assertEqual([], self.rows("SELECT * FROM presence_audit"))
+
+    def test_expiry_is_refused_without_storage_admission(self):
+        self.admission.refuse = True
+        history, audit = self.timeline.retention_stores
+        for store in (history, audit):
+            with self.assertRaises(Exception):
+                store.cleanup_expired_batch()
+
+    def test_missing_database_is_never_created_by_expiry(self):
+        self.settings.database_path.unlink()
+        with self.assertRaises(Exception):
+            self.timeline.retention_stores[0].cleanup_expired_batch()
+        self.assertFalse(self.settings.database_path.exists())
+
+
 class SceneTimelineApplicationTests(Fixture, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         Fixture.setUp(self)
@@ -419,6 +488,22 @@ class SceneTimelineApplicationTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertIs(SceneRuntimeState.STOPPED, runtime.status().state)
         self.assertFalse(runtime.status().worker_running)
         self.assertEqual(0, self.sessions())
+
+    async def test_scheduled_retention_includes_the_presence_timeline(self):
+        application = self.application()
+        timeline = application.state.scene_timeline
+        retention = application.state.audit_retention
+        operations = [getattr(store, "_operation", None) for store in retention.stores]
+        self.assertEqual(["expire_history", "expire_audit"], operations[-2:])
+        calls = []
+        for name in ("expire_history", "expire_audit"):
+            real = getattr(timeline.presence, name)
+            setattr(timeline.presence, name,
+                    lambda real=real, name=name, **options: calls.append((name, options["limit"]))
+                    or real(**options))
+        async with asyncio.timeout(20), application.router.lifespan_context(application):
+            # The startup cleanup ran both before serving.
+            self.assertEqual([("expire_history", 1000), ("expire_audit", 1000)], calls)
 
     async def test_counts_are_flushed_while_running(self):
         application = self.application()

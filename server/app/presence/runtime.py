@@ -60,6 +60,35 @@ DEFAULT_OUTBOX_CAPACITY = 256
 # (`TimelineOutbox.flush`) and retries an outbox open that failed.
 DEFAULT_FLUSH_INTERVAL_SECONDS = 5.0
 DEFAULT_OPEN_RETRY_SECONDS = 15.0
+# Rows one scheduled retention batch may delete per presence table; the
+# largest limit `PresenceService.expire_history` / `expire_audit` accept.
+RETENTION_BATCH = 1000
+
+
+class _PresenceRetention:
+    """One presence retention operation as an `AuditRetentionRuntime` store.
+
+    The application's scheduled cleanup calls `cleanup_expired_batch()` at
+    startup, daily, on the shorter retry interval after a failure, and again
+    at once while a batch came back full (`cleanup_batch_size`). The windows
+    are the presence service's shared `RetentionPeriods` (20-day recording
+    retention for timeline payloads, 90-day audit retention for Owner-control
+    audit rows); nothing here chooses its own.
+    """
+
+    cleanup_batch_size = RETENTION_BATCH
+
+    def __init__(self, timeline: "SceneTimeline", operation: str):
+        self._timeline, self._operation = timeline, operation
+
+    def cleanup_expired_batch(self) -> int:
+        timeline = self._timeline
+        # Expiry is a write like any other: the database is pinned under the
+        # storage admission first, never created or opened unpinned.
+        timeline._pin()
+        now, _ = timeline.configuration.clock()
+        expire = getattr(timeline.presence, self._operation)
+        return expire(now=now, limit=self.cleanup_batch_size)
 
 
 @dataclass(frozen=True)
@@ -132,6 +161,7 @@ class SceneTimeline:
         self.recorder = CriticalTimelineRecorder(
             self.outbox, maximum_source_latency=configuration.maximum_source_latency)
         self._lock = threading.Lock()
+        self._pin_lock = threading.Lock()
         self._opened = False
         self._finished = False
         self._open_failures = 0
@@ -140,6 +170,19 @@ class SceneTimeline:
     def undelivered(self) -> Callable[[int], None]:
         """The scene runtime's `undelivered` sink (Issue #205 condition 1)."""
         return self.recorder.record_undelivered
+
+    def _pin(self) -> None:
+        # Pinned once, under the same admission every write takes; a missing
+        # database file is refused, never created here.
+        with self._pin_lock:
+            if not self._pinned.pinned:
+                self._pinned.pin(self._reservation)
+
+    @property
+    def retention_stores(self) -> tuple:
+        """Presence timeline and audit expiry for the scheduled retention cleanup."""
+        return (_PresenceRetention(self, "expire_history"),
+                _PresenceRetention(self, "expire_audit"))
 
     @property
     def opened(self) -> bool:
@@ -160,10 +203,7 @@ class SceneTimeline:
             if self._opened:
                 return True
         try:
-            if not self._pinned.pinned:
-                # Pinned once, under the same admission every write takes; a
-                # missing database file is refused, never created here.
-                self._pinned.pin(self._reservation)
+            self._pin()
             self.outbox.open()
         except Exception:
             with self._lock:

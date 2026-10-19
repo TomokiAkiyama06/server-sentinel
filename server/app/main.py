@@ -279,6 +279,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(
         audit_store, *tuple(audit_retention_stores),
+        # The owned presence timeline expires with the same schedule (Codex
+        # PR #296): timeline payloads after the recording retention, Owner
+        # control audit rows after the audit retention.
+        *(timeline.retention_stores if timeline is not None else ()),
         interval_seconds=audit_cleanup_interval_seconds,
     )
 

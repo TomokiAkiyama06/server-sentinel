@@ -222,7 +222,11 @@ a `stopped` result whose undelivered count was recorded. Every other outcome
 leaves the session row for the next start to record as interrupted
 (`timeline_outbox_left_open`). No evidence or notification port is configured
 there yet (#21), so those critical paths stay `unavailable`, and no route reads
-this service (Owner status and timeline routes are follow-ups).
+this service (Owner status and timeline routes are follow-ups). Its
+`retention_stores` are registered with the application's scheduled cleanup
+(`AuditRetentionRuntime`: at startup, daily, sooner after a failure), so
+`expire_history()` and `expire_audit()` apply the shared `RetentionPeriods`
+(20-day recording, 90-day audit) to this database.
 
 ### Entrance gate quality
 
