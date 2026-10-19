@@ -75,7 +75,9 @@ follow it; both count as degraded in the daily summary. Both rolling hours conti
 the first running tick recovers a credential finding whose notification was
 lost to a restart: each `credential_finding` event ID names the immutable id
 of the newest (highest-rowid) finding audit record it covers; the newest retained finding always restores the one-day hold and is notified once unless that row exists
-with a final delivery state. A fault episode whose newest access row (by
+with a final delivery state. Several findings lost to one crash are thus
+recovered as one notification, not one each, and all stay in the audit log
+(Issue #281 item 4, Owner decision 2026-10-16 in Issue #287). A fault episode whose newest access row (by
 rowid) is `human_access_fault` continues after the restart, so its recovery
 is still announced. The rowid, not the wall clock, orders
 them, so a clock rollback cannot hide a finding; only the audit action, time
