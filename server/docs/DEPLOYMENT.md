@@ -706,6 +706,11 @@ sudo systemctl restart server-sentinel.service
 
 ### Enabling human access through Tailscale Serve (Issue #10)
 
+On the shared GPU Main host, ServerSentinel runs in a dedicated LXD VM with
+its own `tailscaled` (Owner decision D2, 2026-10-16); the step-by-step Owner
+procedure for that environment, the camera passthrough and the order of the
+steps below is `server/docs/REMOTE_LIVE_VIEW_SETUP.md`.
+
 Without the optional `"human_access"` key every human path stays closed
 (`ClosedHumanSurface`): the backend answers every request with the generic
 denial, exactly as before. The key records the Owner's reservation of the

@@ -660,3 +660,17 @@ controls (no page or script whose content another node or a user chooses).
 Neither the check nor ServerSentinel verifies that; if a future `tailscaled`
 served such content there, the Owner decides again rather than the exception
 being widened or kept silently.
+
+Owner decisions D2 and D6, 2026-10-16 (Issue #10, Issue #205): the shared
+GPU Main host, where other work runs, is not declared a single-purpose node.
+ServerSentinel runs in a dedicated virtual machine with its own `tailscaled`
+and Tailscale node, the deployment records `"isolation":
+"dedicated_network_identity"`, and the USB cameras are passed into the VM by
+vendor, product and serial. The reserved name is that node's MagicDNS name,
+and the node is given a neutral name before any HTTPS certificate is issued
+for it, because certificate transparency logs publish the name. The check
+stays detection; the VM's own network stack is what keeps host processes
+from binding the reserved addresses. A consequence the Owner still has to
+accept or address: the Main Server's hardware integrity check inside the VM
+sees the VM's view of the hardware, not the physical host. The procedure is
+`server/docs/REMOTE_LIVE_VIEW_SETUP.md`.
