@@ -461,6 +461,39 @@ class VariableSegmentSizeTests(unittest.TestCase):
             bound = DiskRing._batch_charge(whole, unit)
         self.assertLess(DiskRing._batch_charge(whole, unit), bound)
 
+    def test_measured_history_stops_at_a_trailing_refused_batch(self):
+        # Twelve aligned minutes, then the latest minute refused for both
+        # sources: its rows are ``missing``, so no newer stored row shows the
+        # gap, yet the history before it must not be measured until ten new
+        # aligned batches exist (Codex review of PR #272).
+        _settings, _quota, store, ring = self.ring()
+        unit = store.allocation_unit
+        profiles = tuple(SegmentProfile(UUID(int=1450 + index), 34000, 17000, 60 * SECOND, 100)
+                         for index in range(2))
+        ring.configure(RingConfig("duration", 900), profiles, now_us=T0, clock_trusted=True)
+        histories = [[30] * 13, [30] * 13]
+        histories[0][1] = 40
+        histories[1][6] = 40
+        for index in reversed(range(13)):
+            end = T0 - index * 60 * SECOND
+            for profile, history in zip(profiles, histories):
+                ring.append(profile.source_id, end - 60 * SECOND, end, b"\x5a" * (history[index] * unit),
+                            now_us=end, clock_trusted=True)
+        recent = ring._recent_allocations(store.segment_allocations(), unit)
+        appends = [(1, recent[profile.source_id]) for profile in profiles]
+        with correlated_charge():
+            correlated = DiskRing._batch_charge(appends, unit)
+        self.assertLess(DiskRing._batch_charge(appends, unit), correlated)
+        for profile in profiles:
+            ring.db.execute("UPDATE segments SET state='missing' WHERE source=? AND end=?",
+                            (str(profile.source_id), T0))
+        recent = ring._recent_allocations(store.segment_allocations(), unit)
+        appends = [(1, recent[profile.source_id]) for profile in profiles]
+        self.assertEqual([0, 0], [len(recent[profile.source_id][4]) for profile in profiles])
+        with correlated_charge():
+            correlated = DiskRing._batch_charge(appends, unit)
+        self.assertEqual(correlated, DiskRing._batch_charge(appends, unit))
+
     def test_measured_history_stops_at_a_cadence_reconfiguration(self):
         # Every source reconfigured together from 30 s to 60 s segments: one
         # new 60 s batch after fifteen old 30 s batches still aligns by

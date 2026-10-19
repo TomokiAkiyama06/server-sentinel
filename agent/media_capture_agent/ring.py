@@ -389,8 +389,10 @@ class DiskRing:
         ``f_frsize`` units); the credit is the unrounded smallest sample.
         ``samples`` are the source's last ``BATCH_HISTORY_SEGMENTS`` stored
         allocations back to its most recent gap (a stored segment ending
-        before the next one starts), clock-uncertain segment or segment of
-        another duration than the profile's cadence, most recent first, as ``(start, end,
+        before the next one starts, or one starting before the end of the
+        source's latest refused or unverified segment), clock-uncertain
+        segment or segment of another duration than the profile's cadence,
+        most recent first, as ``(start, end,
         allocation)``, each rounded up to whole units and never above the
         bound (empty with ``at_bound``), from which ``_measured_charge``
         charges synchronized sources.
@@ -398,13 +400,21 @@ class DiskRing:
         recent = {}
         for source, profile in self.profiles.items():
             bound = round_up(profile.segment_bytes(), unit)
+            after = self.history_after.get(source, -MAX_INTEGER - 1)
+            # The end of the source's latest refused (``missing``) or
+            # unverified (``uncertain``) segment: no stored row after it shows
+            # the gap when the latest batch was refused for every source.
+            cut = None if at_bound else self.db.execute(
+                "SELECT max(end) FROM segments WHERE source=? AND state IN ('missing','uncertain') AND end>?",
+                (str(source), after)).fetchone()[0]
             rows = [] if at_bound else [(row[1], row[2], row[3], allocations.get(UUID(row[0]), bound))
                                         for row in self.db.execute(
                 "SELECT id, start, end, clock_trusted FROM segments WHERE source=? AND state='stored' AND end>? "
-                "ORDER BY end DESC LIMIT ?", (str(source), self.history_after.get(source, -MAX_INTEGER - 1),
+                "ORDER BY end DESC LIMIT ?", (str(source), after,
                                               max(RECENT_ALLOCATION_SEGMENTS, BATCH_HISTORY_SEGMENTS)))]
             # The rounded samples of the longer batch history, never above the
-            # bound, up to the source's first gap, clock-uncertain row or
+            # bound, up to the source's first gap (including its latest
+            # refused or unverified segment), clock-uncertain row or
             # segment of another cadence than the current profile's: stored
             # rows on both sides of an interval every source missed would
             # otherwise still align, untrusted timestamps are not comparable
@@ -413,6 +423,7 @@ class DiskRing:
             samples = []
             for start, end, trusted, size in rows:
                 if (not trusted or end - start != profile.segment_duration_us
+                        or (cut is not None and start < cut)
                         or (samples and end < samples[-1][0])):
                     break
                 samples.append((start, end, min(bound, round_up(size, unit))))
