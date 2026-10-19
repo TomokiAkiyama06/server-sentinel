@@ -2464,10 +2464,34 @@ that a link lost just before the restart leaves, so the rule would fail an
 ordinary update. A critical recording leaves partial evidence only: `append()`
 marks a segment `critical` while an overlapping active recording is critical,
 so a segment whose link was lost before the restart keeps `critical = 1`
-while a later one has `0`; that evidence is not turned into a rule (overlapping
-recordings, early stops and deletion are not assessed).
+while a later one has `0`. That evidence was assessed in #256 and is not safe
+as a rule: `critical = 1` only says that *some* critical recording of the
+source overlapped the segment and was active when it was published, not that
+the interrupted one was. A critical recording started after the restart links
+the next publication (`critical = 1`) and can then lose that link without any
+loss: the Owner deletes it, or its own early stop unlinks a segment that
+starts at or after the stop. Either leaves a ready, unlinked `critical = 1`
+segment inside the interrupted recording's window, the same catalog a lost
+link leaves, and a deleted recording leaves no row to tell them apart.
 `test_an_interrupted_recording_cannot_tell_a_lost_link_from_a_later_publication`
-pins both cases, manual and critical, as preserved. Because every update
+pins both cases, manual and critical, as preserved, and
+`test_a_critical_unlinked_segment_does_not_prove_a_lost_link`
+(`tests/test_lifecycle_inventory_contracts.py`) pins the two counterexamples
+through the real store.
+
+Proposal (#256, not decided; to settle with the ingest wiring of #14 / #15):
+either (a) the ingest contract states that every Main start begins a new
+`stream_id` for every source (Main mints the stream identity per ingest
+session, so a source that resumes after a Main restart, e.g. a ring-buffer
+backfill, still publishes under a new one); 1(b) then becomes "a publication
+since the record, overlapping an `interrupted` recording that was active at
+record time, unlinked, and on the stream of a segment linked to it or of the
+cursor recorded at record time, is a lost link"; or (b) the store records explicit restart evidence, a
+startup generation that `_recover()` advances and `append()` writes with
+each segment (and that `_recover()` writes on the rows it interrupts), so a
+publication made before the interrupting restart is identified whatever the
+stream does; this needs a migration and a `RecordingStore` change. Until one
+of them is adopted, the limit above stays. Because every update
 restarts Main and startup recovery turns every active recording `interrupted`,
 the cursor rule above (#161 item 1(a)) judges only recordings stopped early
 when verifying across an update.
