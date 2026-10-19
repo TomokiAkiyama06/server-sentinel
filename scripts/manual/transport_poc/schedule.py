@@ -204,14 +204,24 @@ def main_command(slot, args, python=sys.executable):
     return argv + (["--real-inputs"] if slot.real else [])
 
 
-def holder_socket(args):
-    return str(Path(args.holder_socket_dir) / "frames.sock")
+def holder_socket_dir(slot, args):
+    """A fresh private directory per slot (``<--holder-socket-dir>/<RUN_ID>``).
+
+    A holder that is SIGKILLed or OOM-killed never unlinks its socket; with
+    one shared path the next holder's ``bind()`` would fail and every later
+    real slot would be lost. Nothing is ever deleted to recover from that.
+    """
+    return str(Path(args.holder_socket_dir) / slot.run_id)
+
+
+def holder_socket(slot, args):
+    return str(Path(holder_socket_dir(slot, args)) / "frames.sock")
 
 
 def holder_command(slot, args, python=sys.executable):
     argv = _timeout(slot.duration + RUN_LIMIT_EXTRA_S, "ss-poc15-holder", "100%", "512M")
     argv += [python, str(POC), "holder", "--state-dir", args.holder_state_dir,
-             "--socket-dir", args.holder_socket_dir, "--sources", "1",
+             "--socket-dir", holder_socket_dir(slot, args), "--sources", "1",
              "--profile", "1280x720@30", "--approve",
              "--seconds", str(slot.duration + HOLDER_EXTRA_S),
              "--out", str(Path(args.out) / f"holder-{slot.run_id}.jsonl"),
@@ -227,7 +237,7 @@ def agent_command(slot, args, python=sys.executable):
              args.upstream_host, "--node-root", args.node_root, "--materials", args.node_root,
              "--state", args.state, "--out", args.out]
     if slot.real:
-        argv += ["--source-kind", "holder", "--holder-socket", holder_socket(args),
+        argv += ["--source-kind", "holder", "--holder-socket", holder_socket(slot, args),
                  "--real-inputs"]
     else:
         argv += ["--source-kind", "gst"]
@@ -249,6 +259,9 @@ def preflight(slots, args):
     if args.role == "agent" and not args.upstream_host:
         raise SystemExit("--upstream-host is required for --role agent")
     out = materials.private_directory(args.out, exist_ok=True)
+    if args.role == "agent" and any(slot.real for slot in slots):
+        # Parent of the per-slot socket directories (the holder creates only the leaf).
+        materials.private_directory(args.holder_socket_dir, exist_ok=True)
     for slot in slots:
         if (out / slot.run_id).exists() or (out / f"holder-{slot.run_id}.jsonl").exists():
             # Records append: a rerun under one run id fails that run's integrity.
@@ -344,7 +357,7 @@ class Scheduler:
             if not self._sleep_until(slot.start + AGENT_OFFSET_S):
                 return 1, "stopped before the agent launch"
             if holder is not None and (holder.poll() is not None
-                                       or not os.path.exists(holder_socket(self.args))):
+                                       or not os.path.exists(holder_socket(slot, self.args))):
                 # The sender does not retry the holder socket: launching it now
                 # could only produce a failed run.
                 return 1, f"holder not ready (holder={holder.poll()}): agent not started"
@@ -353,6 +366,10 @@ class Scheduler:
         finally:
             if holder is not None:
                 holder_code = self._terminate(holder, HOLDER_STOP_S)
+                try:
+                    os.rmdir(holder_socket_dir(slot, self.args))  # only if empty
+                except OSError:
+                    pass  # a socket left by a killed holder stays (cleanup checklist)
         if holder is not None:
             detail += f" holder={holder_code}"
             # The holder exits 0 on SIGTERM; anything else breaks the run's linkage.

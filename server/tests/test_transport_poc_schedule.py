@@ -352,7 +352,8 @@ class SchedulerTests(unittest.TestCase):
 
         def runtime(kind, n):
             if kind == "holder":
-                Path(args.holder_socket_dir, "frames.sock").touch()
+                os.mkdir(schedule.holder_socket_dir(slots[0], args), 0o700)
+                Path(schedule.holder_socket(slots[0], args)).touch()
                 return 10_000  # runs until the scheduler stops it
             return 300 + 10
         scheduler = self._scheduler(slots, args, runtime)
@@ -372,6 +373,25 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(f"slot 0 {slots[0].run_id} normal a_framed real exit=0 holder=0",
                          lines[0])
 
+    def test_each_real_slot_gets_its_own_holder_socket(self):
+        """PR #303 review: a killed holder leaves its socket; a shared path
+        would make every later holder fail to bind."""
+        with tempfile.TemporaryDirectory() as directory:
+            args = _args("agent", directory)
+            slots = schedule.timetable(START, ["a_framed"], ["normal", "rst"], True)
+            sockets = []
+            for slot in slots:
+                holder = schedule.holder_command(slot, args, "py")
+                agent = schedule.agent_command(slot, args, "py")
+                socket_dir = holder[holder.index("--socket-dir") + 1]
+                self.assertEqual(str(Path(args.holder_socket_dir) / slot.run_id), socket_dir)
+                self.assertEqual(str(Path(socket_dir) / "frames.sock"),
+                                 agent[agent.index("--holder-socket") + 1])
+                sockets.append(socket_dir)
+            self.assertEqual(len(slots), len(set(sockets)))
+            schedule.preflight(slots, args)
+            self.assertEqual(0o700, os.stat(args.holder_socket_dir).st_mode & 0o777)
+
     def test_holder_not_ready_skips_the_agent(self):
         args = _args("agent", self.directory.name)
         slots = schedule.timetable(START, ["a_framed"], ["normal"], True)
@@ -388,9 +408,9 @@ class SchedulerTests(unittest.TestCase):
 
     def test_holder_failure_fails_the_slot(self):
         args = _args("agent", self.directory.name)
-        os.mkdir(args.holder_socket_dir, 0o700)
-        Path(args.holder_socket_dir, "frames.sock").touch()
         slots = schedule.timetable(START, ["a_framed"], ["rst"], True)
+        os.makedirs(schedule.holder_socket_dir(slots[0], args), 0o700)
+        Path(schedule.holder_socket(slots[0], args)).touch()
         scheduler = self._scheduler(slots, args, lambda kind, n: 10_000 if n == 0 else 20)
         original = scheduler.spawn
 

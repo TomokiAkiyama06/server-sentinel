@@ -234,7 +234,9 @@ slot の重複起動は従来どおり拒否される）。
   付けます。2〜5 source の scenario、否定認証、`route_probe` は `--source-kind gst`（synthetic）で
   `--real-inputs` なし。`--real-camera` なしでは全 slot が `gst`。
 - capture host は slot 開始 + 5 s に agent を起動する（Main はそれまでに `ready`）。real の slot で
-  その時点に holder が終了している、または holder socket（`frames.sock`）が無ければ、agent を
+  その時点に holder が終了している、または holder socket（slot ごとの
+`<--holder-socket-dir>/<RUN_ID>/frames.sock`。SIGKILL / OOM で終わった holder の socket が後の slot の
+bind を妨げないよう slot ごとに別 directory にし、空になった directory だけ消す）が無ければ、agent を
   起動せずその slot を失敗として記録する（sender は holder socket に再接続しないため）。agent の
   終了後に holder を SIGTERM で止め（15 s で終わらなければ SIGKILL）、holder の終了コードも slot の
   結果に含める。
