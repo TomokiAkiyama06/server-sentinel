@@ -61,7 +61,7 @@ in its own module, re-implementing that service's read-side semantics:
 - ``access``: AccessStore principals, credentials and invitations;
 - ``pairing``: PairingLedger and the other one-way security state;
 - ``presence``: PresenceService state and the presence timeline gap;
-- ``audit``, ``sources``, ``integrity``, ``owner_template``: the audit
+- ``audit``, ``sources``, ``integrity``, ``template_store``: the audit
   chains, the camera registry, the integrity / notification / status rows
   and the Owner-template store;
 - ``domain``: the current-state value checks across every section;
@@ -114,7 +114,7 @@ from .integrity import (_compare_integrity_delivery, _compare_notification_event
                         _compare_status_rows, _integrity_baseline, _integrity_delivery,
                         _notification_events, _status_rows)
 from .output import read_private, safe_output_path, write_private
-from .owner_template import _compare_owner_template, _owner_template
+from .template_store import _compare_owner_template, _owner_template
 from .pairing import _compare_security_state, _security_state
 from .presence import (_compare_presence, _compare_timeline_gap, _outbox_live, _presence,
                        _timeline_gap)

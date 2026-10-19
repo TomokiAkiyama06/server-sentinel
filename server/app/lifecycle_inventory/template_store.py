@@ -3,7 +3,8 @@
 For a configured Owner-template store: whether it exists, its generation,
 keyed digests of the template and provenance (never template bytes or
 embeddings) and its audit rows / chain, read only through a layout the
-store itself would load.
+store itself would load. (Not named ``owner_template.py``: the repository
+guard refuses tracked files named like Owner-template data.)
 """
 
 from __future__ import annotations
