@@ -1877,8 +1877,14 @@ allowed only the transitions the presence service performs: completed-event
 tombstones and expired-unresolved markers (kept; a new tombstone and every
 added marker event must come from an Owner release below),
 retained observations as keyed digests (never their content) with their
-delivery jobs and source-fact digests (Main does not run timeline expiry, so
-an observation may leave only through the Owner's audited release of
+delivery jobs and source-fact digests (an observation may leave through the
+service's timeline expiry, which Main schedules for its scene timeline
+(Issue #205): received before verify time minus 90 days, or minus 20 days with
+every recorded job delivered or disabled, together with its jobs, a tombstone
+for a recorded job and one expired-unresolved event per job not delivered,
+listed as `retention_expired`; a baseline without receipt times fails closed;
+`presence_audit` rows likewise leave only past the 90-day audit retention; or
+through the Owner's audited release of
 unresolved critical work, which needs a recorded job neither delivered nor
 disabled and appends one `critical_event_cleared` audit row naming it (no
 state, the actor an Owner principal, keyed) at the same time as its
@@ -1893,7 +1899,7 @@ one event fewer and fails closed); an observation created after the record
 and released inside the window is accepted on the same audit row, tombstone
 and clock evidence, its events bounded to at least one per such release and
 at most one per action (evidence, notification), since its jobs were never
-recorded; any other removal, however old the observation, is `missing`,
+recorded; any other removal is `missing`,
 a job or source fact left behind for a released observation is `retained`,
 and a job or source fact whose observation is gone is `orphaned`);
 a job's state, attempts and generation may only move forward: a claim, a

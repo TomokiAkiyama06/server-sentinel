@@ -1701,11 +1701,13 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
 
-    def test_observation_removal_needs_an_owner_clear(self):
-        # Main removes an observation (with its jobs and source fact) only in
-        # the audited clear_unresolved_critical_event(); expire_history() is
-        # not run by Main, so even an old, resolved observation removed as it
-        # would remove it is a loss, as is a forged tombstone and marker.
+    def test_observation_removal_needs_an_owner_clear_or_its_retention(self):
+        # Main removes an observation (with its jobs and source fact) in the
+        # audited clear_unresolved_critical_event() or, since it schedules
+        # expire_history() for its scene timeline (Codex PR #296), past the
+        # 20-day recording retention once every job finished. A fresh one,
+        # or an old one with an unfinished job before the 90-day horizon,
+        # removed that way is a loss, as is a forged tombstone and marker.
         seeded = self.runtime.seed()
         now = self.now
         fresh = (now - timedelta(days=1)).isoformat(timespec="microseconds")
@@ -1745,10 +1747,89 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         failed = report["sections"]["presence"]["failed"]
-        for label in ("forged", "expired-unresolved", "expired-resolved", "expired-plain"):
+        for label in ("forged", "expired-unresolved"):
             self.assertIn({"id": f"observations:{ids[label]}", "reason": "missing"}, failed)
-        self.assertNotIn({"id": f"observations:{ids['cleared']}", "reason": "missing"}, failed)
+        for label in ("cleared", "expired-resolved", "expired-plain"):
+            self.assertNotIn({"id": f"observations:{ids[label]}", "reason": "missing"}, failed)
         self.assertEqual(report["sections"]["presence"]["released"], [ids["cleared"]])
+        self.assertEqual(report["sections"]["presence"]["retention_expired"],
+                         sorted([ids["expired-resolved"], ids["expired-plain"]]))
+
+    def test_presence_retention_mirrors_expire_history_and_expire_audit(self):
+        # Codex PR #296: the real expire_history() / expire_audit() run past
+        # their retention leave a baseline that still verifies; everything
+        # they would not remove fails closed.
+        from app.presence.service import PresenceService
+        from app.storage.database import Database as PlainDatabase
+        self.runtime.seed()
+        now = self.now
+
+        def stamp(days):
+            return (now - timedelta(days=days)).isoformat(timespec="microseconds")
+
+        cases = {"old-resolved": (21, "delivered"), "old-disabled": (21, "disabled"),
+                 "old-plain": (21, None), "ancient-unresolved": (91, "failed"),
+                 "old-unresolved": (21, "failed"), "fresh": (1, None)}
+        ids = {}
+        for label, (days, state) in cases.items():
+            ids[label] = str(uuid4())
+            self.runtime.observation(ids[label], stamp(days))
+            if state is not None:
+                self.runtime.execute(
+                    "INSERT INTO presence_deliveries (observation, action, state, attempts, "
+                    "generation) VALUES (?, 'notification', ?, 1, 1)", (ids[label], state))
+        for days in (91, 89):
+            self.runtime.execute(
+                "INSERT INTO presence_audit (action, actor, at, state, target) "
+                "VALUES ('override_set', '00000000-0000-4000-8000-0000000000aa', ?, 'away', NULL)",
+                (stamp(days),))
+        _, baseline = self.record()
+
+        @contextmanager
+        def admitted():
+            yield
+
+        service = PresenceService(PlainDatabase(self.runtime.database), reservation=admitted)
+        self.assertEqual(4, service.expire_history(now=now))
+        self.assertEqual(1, service.expire_audit(now=now))
+        code, report, stdout = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
+        presence = report["sections"]["presence"]
+        self.assertEqual(presence["retention_expired"], sorted(
+            ids[label] for label in ("old-resolved", "old-disabled", "old-plain",
+                                     "ancient-unresolved")))
+        self.assertEqual(report["sections"]["audit_presence"]["preserved_rows"], 1)
+        self.assertEqual(len(report["sections"]["audit_presence"]["retention_expired"]), 1)
+        # The same removal of a row neither rule removes fails closed.
+        for table, column in (("presence_deliveries", "observation"),
+                              ("presence_observations", "id")):
+            self.runtime.execute(f"DELETE FROM {table} WHERE {column}=?",
+                                 (ids["old-unresolved"],))
+        self.runtime.execute("DELETE FROM presence_observations WHERE id=?", (ids["fresh"],))
+        self.runtime.execute("DELETE FROM presence_audit WHERE at=?", (stamp(89),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["presence"]["failed"]
+        for label in ("old-unresolved", "fresh"):
+            self.assertIn({"id": f"observations:{ids[label]}", "reason": "missing"}, failed)
+        self.assertEqual("failed", report["sections"]["audit_presence"]["status"])
+
+    def test_presence_expiry_needs_recorded_receipt_times(self):
+        # A baseline without receipt times (an older inventory) cannot tell
+        # an expired observation from a lost one: it fails closed.
+        self.runtime.seed()
+        identifier = str(uuid4())
+        self.runtime.observation(identifier, (self.now - timedelta(days=21)).isoformat(
+            timespec="microseconds"))
+        _, baseline = self.record()
+        recorded = json.loads(baseline.read_text())
+        recorded["presence"].pop("observation_received")
+        baseline.write_text(json.dumps(recorded))
+        self.runtime.execute("DELETE FROM presence_observations WHERE id=?", (identifier,))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": f"observations:{identifier}", "reason": "missing"},
+                      report["sections"]["presence"]["failed"])
 
     def test_owner_clear_mirrors_the_service_exactly(self):
         # clear_unresolved_critical_event(): needs a job neither delivered nor
