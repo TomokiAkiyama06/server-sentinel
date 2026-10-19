@@ -2205,7 +2205,7 @@ serials, disk ids, addresses and the node name only in the private record.
   write to the empty `/srv/ss-data` on the guest root filesystem); record
   whether a 9p/virtiofs directory share is refused as expected, if tried on a
   disposable VM only;
-- [ ] network: the VM's macvlan address is on `192.168.250.0/24`, outside the
+- [ ] network: the VM's macvlan address is on the private LAN (`<lan subnet>`), outside the
   Tailscale ranges; the capture host reaches `<vm lan ip>:<port>` during
   `pairing_cli approve --listen` without Tailscale; the human upstream
   (`127.0.0.1:880`) is not reachable from the LAN or from the host; no LXD
@@ -2259,7 +2259,7 @@ addresses, serials and disk ids are in the private record only.
 
 - Done and observed: LXD 5.21 snap installed fresh (`lxd init --minimal`);
   `virtual-machine` with `boot.autostart`, 8 vCPU / 16 GiB, 64 GiB root, no
-  GPU; macvlan on the LAN NIC with a DHCP reservation on `192.168.250.0/24`;
+  GPU; macvlan on the LAN NIC with a DHCP reservation on the private LAN;
   both C960 passed by `vendorid`/`productid`/`serial` and listed by the
   guest's `v4l2-ctl`; SSH disabled in the guest; time-wait-sync enabled;
   recording filesystem ext4 mounted by UUID with `nofail`; the upstream

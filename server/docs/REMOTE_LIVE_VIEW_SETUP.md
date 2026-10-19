@@ -136,7 +136,7 @@ Each step is marked with where it runs and with which privilege:
 Placeholders: `<vm>` is the LXD instance name (for example `ss-main`; it is
 local to the host and never published), `<neutral name>` is the Tailscale
 node name (see step 5), `<lan nic>` is the host's network interface on
-`192.168.250.0/24`, `<vm lan ip>` is the address the Owner reserves for the VM
+the private LAN (`<lan subnet>`), `<vm lan ip>` is the address the Owner reserves for the VM
 on that LAN. Keep real names, addresses, serials and disk identifiers in the
 private operations record only, never in GitHub.
 
@@ -196,13 +196,13 @@ without the Owner.
 
 ### LAN interface for capture agents (macvlan)
 
-The capture agents on `192.168.250.0/24` must reach the VM directly, without
+The capture agents on the private LAN must reach the VM directly, without
 Tailscale. Give the VM its own address on that LAN with a macvlan NIC on the
 host's LAN interface. A local device named `eth0` replaces the `eth0` of the
 default profile:
 
 ```sh
-ip -br addr            # [host] find <lan nic>: the interface holding 192.168.250.x
+ip -br addr            # [host] find <lan nic>: the interface on <lan subnet>
 sudo lxc config device add <vm> eth0 nic nictype=macvlan parent=<lan nic>
 ```
 
@@ -252,7 +252,8 @@ sudo lxc config device add <vm> eth0 nic nictype=macvlan parent=<lan nic>
    second, no unplug), LXD did **not** pass it back to the running VM; the
    guest lost the camera and its source stayed `offline` until the device was
    re-added. Until #301 is resolved, recover with
-   `sudo lxc config device remove <vm> cam1` followed by the same
+   `sudo lxc config device remove <vm> <camN>` (the device whose serial
+   belongs to the offline source) followed by its
    `lxc config device add` line (no VM restart; the service rebinds the
    serial-identified camera by itself), and watch the source state.
 3. Up to 4 cameras are supported by ServerSentinel; add `cam3` / `cam4` the
@@ -370,7 +371,7 @@ sudo lxc exec <vm> -- bash         # opens the guest root shell for the steps be
    ```sh
    lsblk -o NAME,SIZE,TYPE,MOUNTPOINTS,FSTYPE
    ls -l /dev/disk/by-id/ | grep lxd_recdisk
-   mkfs.ext4 -L ss-recordings /dev/disk/by-id/<…lxd_recdisk>     # destroys the disk's contents
+   mkfs.ext4 -E nodiscard -L ss-recordings /dev/disk/by-id/<…lxd_recdisk>   # destroys the disk's contents
    blkid /dev/disk/by-id/<…lxd_recdisk>                          # note UUID=
    mkdir -p /srv/ss-data
    echo 'UUID=<uuid> /srv/ss-data ext4 defaults,nofail 0 2' >> /etc/fstab
