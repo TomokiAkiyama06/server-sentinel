@@ -40,6 +40,7 @@ from app.detection.roi.runtime import (
 )
 
 from tests.test_detector_roi import HEIGHT, SOURCE, WIDTH, pixels
+from tests.test_mjpg_sandbox import require_sandbox
 from tests.test_scene_runtime import (
     INTERVAL, MOVED, OTHER, THIRD, Harness, binding, wait_for,
 )
@@ -227,6 +228,9 @@ class DecoderCase(unittest.TestCase):
     def decoder(self, limits=None, *, behaviour=None, clock=None, start=True):
         """A decode child supervisor; with `start`, its child is started (or
         its start has failed) before it is returned."""
+        if behaviour is None:
+            # The real child decodes only once its sandbox is in force.
+            require_sandbox(self)
         decoder = MjpgDecoderProcess(limits or MjpgDecoderLimits(), MAXIMUM_FRAME_BYTES,
                                      clock_ns=clock or Clock(),
                                      command=fake(behaviour) if behaviour else None)
@@ -708,10 +712,48 @@ class MjpgDecoderProcessTests(DecoderCase):
         self.assertEqual(["0", "0"], values["Max core file size"])
         self.assertEqual(["0", "0"], values["Max file size"])
         self.assertEqual(10, os.getpriority(os.PRIO_PROCESS, decoder.pid))
+        # Issue #269: the child that just decoded runs under a seccomp filter
+        # of its own (on top of any filter this test process inherited).
+        with open("/proc/self/status") as status:
+            own = dict(line.split(":", 1) for line in status)
+        self.assertEqual("2", fields["Seccomp"].strip())
+        self.assertEqual(int(own.get("Seccomp_filters", "0")) + 1,
+                         int(fields["Seccomp_filters"]))
+        self.assertIsNone(decoder.status().sandbox_refusal)
         # Not dumpable: another process of the service account cannot read
         # its memory or environment.
         with self.assertRaises(PermissionError):
             open(f"/proc/{decoder.pid}/environ").close()
+
+    def test_sandbox_refusal_is_failing_at_once_and_frames_are_unknown(self):
+        # Issue #269, fail closed: a child that cannot confine itself never
+        # decodes, and the decoder names the fixed reason at once.
+        clock = Clock()
+        for behaviour, expected in (("sandbox_refused_2", "landlock_unavailable"),
+                                    ("sandbox_refused_3", "seccomp_unavailable"),
+                                    ("sandbox_refused_1", "unsupported_architecture"),
+                                    ("sandbox_refused_9", "sandbox_not_applied"),
+                                    ("real_without_landlock", "landlock_unavailable")):
+            with self.subTest(behaviour=behaviour):
+                decoder = self.decoder(behaviour=behaviour, clock=clock)
+                self.assertEqual("backoff", settle(decoder))
+                status = decoder.status()
+                self.assertEqual((expected, True, 1, 0),
+                                 (status.sandbox_refusal, status.failing,
+                                  status.start_failures, status.starts))
+                self.assertEqual("decoder_unavailable", self.refused(decoder))
+                self.assertIsNone(decoder.pid)
+        # The respawn after the backoff is a fresh attempt: a child that does
+        # confine itself clears the refusal.
+        decoder = self.decoder(FAST, behaviour="sandbox_refused_2", clock=clock)
+        self.assertEqual("landlock_unavailable", decoder.status().sandbox_refusal)
+        decoder._command = None
+        clock.value += 10
+        require_sandbox(self)
+        self.assertEqual("running", ready(decoder))
+        self.assertEqual(WIDTH * HEIGHT, len(self.layout.luma(self.frame, WIDTH, HEIGHT, decoder)))
+        status = decoder.status()
+        self.assertEqual((None, False), (status.sandbox_refusal, status.failing))
 
     def test_child_gets_minimal_environment_and_only_its_socket(self):
         decoder = self.decoder(behaviour="inspect", start=False)
@@ -1206,6 +1248,7 @@ FAST_LAYOUT = MjpgLumaLayout(CAPTURE_WIDTH, CAPTURE_HEIGHT, decoder=FAST)
 
 class SceneRuntimeMjpgTests(unittest.TestCase):
     def harness(self, *bindings, **options):
+        require_sandbox(self)
         harness = MjpgHarness(*bindings, **options)
         self.addCleanup(harness.runtime.stop)
         return harness
@@ -1421,6 +1464,24 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
             recovered = harness.frame()
         self.assertEqual(1, sum("scene_frame_decoder_recovered" in line for line in logs.output))
         self.assertIs(SceneSourceState.ACTIVE, recovered.state)
+        self.assertEqual([], harness.recorder.items)
+
+    def test_sandbox_refusal_lowers_the_source_with_its_reason(self):
+        harness = self.harness(binding(layout=FAST_LAYOUT))
+        harness.use(SOURCE, "sandbox_refused_2")
+        harness.start()
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            for luma in (None, MOVED, MOVED, MOVED):
+                harness.warm(SOURCE)
+                source = harness.frame(luma)
+        self.assertEqual(1, sum("scene_frame_decoder_sandbox_unavailable" in line
+                                for line in logs.output))
+        self.assertEqual(1, sum("scene_frame_decoder_failing" in line for line in logs.output))
+        self.assertEqual((SceneSourceState.DEGRADED, "frame_decoder_sandbox_unavailable",
+                          Observation.UNKNOWN, Observation.UNKNOWN),
+                         (source.state, source.reason, source.movement, source.tamper))
+        self.assertEqual(0, source.evaluated)
+        self.assertIs(SceneRuntimeState.DEGRADED, harness.runtime.status().state)
         self.assertEqual([], harness.recorder.items)
 
     def test_decoder_unavailable_keeps_source_inactive(self):

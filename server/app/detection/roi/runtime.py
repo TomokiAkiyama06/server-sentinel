@@ -492,6 +492,7 @@ class _Context:
                                            clock_ns=clock)
                         if isinstance(binding.layout, MjpgLumaLayout) else None)
         self.decoder_failing = False
+        self.decoder_sandbox_refused = False
         self.calibration = None
         self.detector = None
         self.movement_gate = self.tamper_gate = None
@@ -1484,6 +1485,14 @@ class SceneMonitoringRuntime:
             logging.getLogger(__name__).error(
                 Event.SCENE_FRAME_DECODER_FAILING if failing
                 else Event.SCENE_FRAME_DECODER_RECOVERED)
+        # The decode child refused to run without its sandbox (Issue #269):
+        # logged once per transition, value-free; the fixed refusal code is
+        # in the decoder status.
+        refusal = context.decoder.sandbox_refusal is not None and failing
+        if refusal != context.decoder_sandbox_refused:
+            context.decoder_sandbox_refused = refusal
+            if refusal:
+                logging.getLogger(__name__).error(Event.SCENE_FRAME_DECODER_SANDBOX_UNAVAILABLE)
 
     def _handle(self, context, result, monotonic_ns, *, reason):
         if result.critical:
@@ -1591,8 +1600,12 @@ class SceneMonitoringRuntime:
             if (decoder is not None and decoder.failing and state is not SceneSourceState.INACTIVE
                     and self._state is SceneRuntimeState.RUNNING):
                 # Repeated decode child failures: the source is lowered until
-                # one frame is exchanged successfully again.
-                state, reason = SceneSourceState.DEGRADED, "frame_decoder_failing"
+                # one frame is exchanged successfully again. A child that
+                # refused to decode without its sandbox (Issue #269, fail
+                # closed) is named as such for the Owner.
+                state, reason = SceneSourceState.DEGRADED, (
+                    "frame_decoder_sandbox_unavailable" if decoder.sandbox_refusal is not None
+                    else "frame_decoder_failing")
             refresh_deferred = self._refresh_deferred(context, now)
             if refresh_deferred:
                 # The Owner asked for a new calibration, but the refresh is

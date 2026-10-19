@@ -3,7 +3,9 @@
 Run as ``python -I -B mjpg_child_fakes.py <behaviour> <child arguments...>``.
 Standard library only; no decoder and no image data. Each behaviour breaks
 the decode-child contract in one way, so the parent's failure handling can be
-exercised without a real libjpeg fault.
+exercised without a real libjpeg fault. ``sandbox_refused_<code>`` sends the
+child's sandbox refusal (Issue #269); ``real_without_landlock`` runs the real
+child as on a kernel that reports no Landlock.
 """
 
 import os
@@ -27,8 +29,27 @@ def _send(connection, body):
     connection.sendall(len(body).to_bytes(4, "big") + body)
 
 
+def real_child_without_landlock(argv):
+    """The real child on a kernel that reports no Landlock (Issue #269)."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "app" / "detection" / "roi" / "mjpg_child.py"
+    spec = importlib.util.spec_from_file_location("mjpg_child_without_landlock", path)
+    child = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(child)
+    child.landlock_abi = lambda libc: 0
+    try:
+        child.main([str(path)] + argv[2:])
+    except BaseException:
+        os._exit(3)
+    os._exit(0)
+
+
 def main(argv):
     import ctypes
+    if argv[1] == "real_without_landlock":
+        real_child_without_landlock(argv)
     # Like the real child: never outlive the test process.
     ctypes.CDLL(None).prctl(1, signal.SIGKILL, 0, 0, 0)
     behaviour = argv[1]
@@ -42,6 +63,10 @@ def main(argv):
     if behaviour == "wrong_ready":
         _send(connection, b"R0.0 0.0")
         time.sleep(3600)
+    if behaviour.startswith("sandbox_refused_"):
+        # The child's sandbox refusal message, then its exit status.
+        _send(connection, b"S" + bytes((int(behaviour[16:]),)))
+        os._exit(5)
     _send(connection, b"R" + expected)
     count = 0
     while True:

@@ -39,6 +39,7 @@ class Event(StrEnum):
     SCENE_CRITICAL_IN_FLIGHT_AT_STOP = "scene_critical_in_flight_at_stop"
     SCENE_FRAME_DECODER_FAILING = "scene_frame_decoder_failing"
     SCENE_FRAME_DECODER_RECOVERED = "scene_frame_decoder_recovered"
+    SCENE_FRAME_DECODER_SANDBOX_UNAVAILABLE = "scene_frame_decoder_sandbox_unavailable"
     SCENE_CALIBRATION_REFRESH_DEFERRED = "scene_calibration_refresh_deferred"
     SCENE_STREAM_HISTORY_EXHAUSTED = "scene_stream_history_exhausted"
     SCENE_UNDELIVERED_UNRECORDED = "scene_undelivered_unrecorded"

@@ -164,11 +164,33 @@ process:
   that its parent is still the Main process), non-dumpable, nice 10, and equal
   soft/hard `RLIMIT_AS` (default 256 MiB), `RLIMIT_NOFILE` (16),
   `RLIMIT_NPROC=0`, `RLIMIT_CORE=0` and `RLIMIT_FSIZE=0`; it checks the
-  imported simplejpeg/numpy versions against the pins and opens no socket or
-  file afterwards. It runs as the same unprivileged service account inside the
-  same systemd unit; seccomp / Landlock are not used (the isolated inference
-  worker does not use them either), so this is fault isolation, not an
-  untrusted-code sandbox;
+  imported simplejpeg/numpy versions against the pins and decodes one
+  generated 32 x 32 warm-up frame (DCT scale 1/2), so every lazy initialisation
+  (libjpeg-turbo SIMD detection, numpy first-use paths) happens before the
+  sandbox. Then, before the ready message (Issue #269), it confines itself for
+  good: a Landlock ruleset handling every filesystem right of the kernel's ABI
+  with no rule (no path can be opened, created, executed or listed; TCP
+  bind/connect denied at ABI >= 4; abstract UNIX socket / signal scoping at
+  ABI >= 6), then a seccomp classic-BPF allowlist built in `mjpg_child.py`
+  with no dependency, for x86-64 and aarch64 (`recvfrom`, `sendto`, `mmap` /
+  `mprotect` without `PROT_EXEC`, `munmap`, `mremap`, `brk`, `madvise`,
+  `futex`, `rt_sigreturn`, `rt_sigprocmask`, `restart_syscall`, `exit`,
+  `exit_group`; the decode loop was traced with strace on CPython 3.12 and
+  3.14 and uses only `recvfrom`, `sendto`, `brk`, `mmap`, `munmap`). Every
+  other call, and every call through another architecture (i386, AArch32) or
+  x32 numbering, kills the child with `SIGSYS` (a crash: `unknown`). Fail
+  closed: when Landlock is unavailable (ABI 0), seccomp has no filter mode or
+  kill-process action, the architecture is not one of the two, or the child is
+  not single-threaded, the child sends `S` + a fixed code instead of ready and
+  exits; the decoder counts a start failure, reports `failing` at once and
+  `sandbox_refusal` (`landlock_unavailable`, `seccomp_unavailable`,
+  `unsupported_architecture`, `sandbox_not_applied`); the source is `degraded`
+  with `frame_decoder_sandbox_unavailable` and
+  `scene_frame_decoder_sandbox_unavailable` is logged once (value-free). No
+  setting decodes unconfined (keeping seccomp only on a kernel without
+  Landlock is an open Owner decision). The child still runs as the same
+  unprivileged service account inside the same systemd unit (same network
+  namespace);
 - the child decodes with simplejpeg `strict=True` (libjpeg warnings such as a
   premature end of data or extraneous bytes raise) to luma with the accurate
   integer IDCT and libjpeg DCT scaling to the smallest power of two (1/8 to 1)
@@ -307,7 +329,8 @@ once per request. The refresh still waits for the loss, so no evidence is
 dropped. A reason the source already reports is the cause and is kept, with
 `refresh_deferred` alongside it: behind a held loss that is
 `critical_backpressure` (its later samples are already dropped), and likewise
-`source_unavailable`, `frame_decoder_failing`, `scene_evaluation_failed`,
+`source_unavailable`, `frame_decoder_failing`,
+`frame_decoder_sandbox_unavailable`, `scene_evaluation_failed`,
 `observation_stale` or an inactive source; only an otherwise active source takes
 `calibration_refresh_deferred`. Either way its conclusions are `unknown`.
 The state clears when the refresh runs. When the refresh runs, a pending

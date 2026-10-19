@@ -48,10 +48,19 @@ The parent never unpickles or evaluates child output: a reply is a length-
 prefixed byte message whose type, request id and exact pixel count are
 checked.
 
-This is fault isolation, not an untrusted-code sandbox: the child runs as the
-same unprivileged service account, keeps its filesystem view and network
-namespace (it opens no socket itself), and confinement beyond the rlimits and
-prctl flags belongs to the systemd unit.
+Sandbox (Issue #269): before its ready message the child confines itself
+with Landlock (no filesystem access, no TCP bind/connect) and a seccomp
+allowlist (no file open or creation, no socket, no process or thread creation,
+no `execve`, no executable mapping; anything else kills it), see
+`mjpg_child.py`. The sandbox is fail closed: a child that cannot apply it
+sends a fixed refusal code instead of the ready message and exits. That start
+counts as failed, the decoder reports `failing` at once (not only after
+`failing_after` failures) and `sandbox_refusal` names the code, so the
+runtime lowers the source to `degraded` (`frame_decoder_sandbox_unavailable`)
+and every frame stays `unknown`; the respawn backoff above still applies.
+The child still runs as the same unprivileged service account and in the
+service's network namespace; the systemd unit's own confinement stays in
+place.
 """
 
 from dataclasses import dataclass
@@ -91,6 +100,10 @@ CHILD_ENVIRONMENT = {
     "MKL_NUM_THREADS": "1",
 }
 REFUSALS = {1: "decode_failed", 2: "decoded_shape_mismatch", 3: "undecoded_band"}
+# The child's sandbox refusal codes (`mjpg_child.SANDBOX_REFUSALS`; the Main
+# process never imports the child).
+SANDBOX_REFUSALS = {1: "unsupported_architecture", 2: "landlock_unavailable",
+                    3: "seccomp_unavailable", 4: "sandbox_not_applied"}
 
 # Child lifecycle phases (guarded by `MjpgDecoderProcess._state`).
 _IDLE, _STARTING, _READY, _DYING = "idle", "starting", "ready", "dying"
@@ -179,6 +192,8 @@ class MjpgDecoderStatus:
     protocol_errors: int
     consecutive_failures: int
     failing: bool
+    # The last child's sandbox refusal (fixed code) until a child starts.
+    sandbox_refusal: str | None = None
 
     @property
     def failures(self) -> int:
@@ -266,6 +281,7 @@ class MjpgDecoderProcess:
         self._retired = False
         self._stopping = False
         self._reap_failed = False
+        self._sandbox_refusal = None
         self._starts = self._start_failures = self._crashes = 0
         self._timeouts = self._protocol_errors = self._consecutive = 0
 
@@ -277,6 +293,11 @@ class MjpgDecoderProcess:
     @property
     def failing(self) -> bool:
         return self._consecutive >= self._limits.failing_after
+
+    @property
+    def sandbox_refusal(self) -> str | None:
+        """Why the last child could not confine itself (fixed code), or None."""
+        return self._sandbox_refusal
 
     def status(self) -> MjpgDecoderStatus:
         with self._state:
@@ -296,7 +317,7 @@ class MjpgDecoderProcess:
                 state = "stopped"
             return MjpgDecoderStatus(state, self._starts, self._start_failures, self._crashes,
                                      self._timeouts, self._protocol_errors, self._consecutive,
-                                     self.failing)
+                                     self.failing, self._sandbox_refusal)
 
     # -- scene worker -----------------------------------------------------
     def prepare(self) -> None:
@@ -475,7 +496,7 @@ class MjpgDecoderProcess:
                 self._supervisor_locked()
         else:
             self._phase = _IDLE
-        if kind == "start":
+        if kind in ("start", "sandbox"):
             self._start_failures += 1
         elif kind == "timeout":
             self._timeouts += 1
@@ -484,6 +505,10 @@ class MjpgDecoderProcess:
         else:
             self._crashes += 1
         self._consecutive += 1
+        if kind == "sandbox":
+            # Deterministic (kernel or architecture), not a transient fault:
+            # the source is lowered at once.
+            self._consecutive = max(self._consecutive, self._limits.failing_after)
         exponent = min(self._consecutive - 1, 32)
         backoff = min(self._limits.restart_backoff_ns << exponent, self._limits.maximum_backoff_ns)
         self._retry_at = self._clock() + backoff
@@ -568,7 +593,7 @@ class MjpgDecoderProcess:
             cancelled = self._cancelled()
         if cancelled:
             _signal(process)
-        ready = False
+        ready, refusal = False, None
         if not cancelled:
             expected = f"R{SIMPLEJPEG_VERSION} {NUMPY_VERSION}".encode("ascii")
             deadline = time.monotonic() + self._limits.start_timeout_ns / 1e9
@@ -576,19 +601,25 @@ class MjpgDecoderProcess:
                 size = int.from_bytes(_read_exact(parent, 4, deadline, self._cancelled), "big")
                 if size == len(expected):
                     ready = _read_exact(parent, size, deadline, self._cancelled) == expected
+                elif size == 2:
+                    # The child could not apply its sandbox (it exits).
+                    body = _read_exact(parent, size, deadline, self._cancelled)
+                    if body[:1] == b"S":
+                        refusal = SANDBOX_REFUSALS.get(body[1], "sandbox_not_applied")
             except (EOFError, OSError, ValueError, TimeoutError):
                 ready = False
         with self._state:
             if ready and not self._cancelled():
                 self._connection, self._phase = parent, _READY
                 self._retry_at = None
+                self._sandbox_refusal = None
                 self._starts += 1
                 self._state.notify_all()
                 return
-            self._start_abandoned_locked()
+            self._start_abandoned_locked(refusal)
         parent.close()
 
-    def _start_abandoned_locked(self) -> None:
+    def _start_abandoned_locked(self, sandbox_refusal: str | None = None) -> None:
         if self._cancelled():
             # Shutdown, not a child failure: kill whatever was started.
             if self._process is not None:
@@ -599,9 +630,14 @@ class MjpgDecoderProcess:
             self._state.notify_all()
         else:
             # A child that failed hardening, could not import the reviewed
-            # pair, reported other versions or did not report in time is
-            # never used.
-            self._failed_locked("start")
+            # pair, could not apply its sandbox, reported other versions or
+            # did not report in time is never used.
+            # The refusal names only the latest start.
+            self._sandbox_refusal = sandbox_refusal
+            if sandbox_refusal is not None:
+                self._failed_locked("sandbox")
+            else:
+                self._failed_locked("start")
 
     def _reap(self, process) -> None:
         _signal(process)
