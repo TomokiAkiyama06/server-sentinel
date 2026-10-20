@@ -3058,6 +3058,27 @@ class MiscTests(unittest.TestCase):
         right.close()
         self.assertEqual(payloads, received)
 
+    def test_holder_launch_trust_problem_uses_the_holder_launcher(self):
+        """The schedule preflight runs the holder's own launcher construction
+        (mocked here: no GStreamer, no camera) and reports its refusal."""
+        from media_capture_agent import uvc_pipeline
+        with mock.patch.object(uvc_pipeline, "GStreamerLauncher") as launcher:
+            self.assertIsNone(holder.launch_trust_problem("/usr/bin/gst",
+                                                          dev_checkout_helper=False))
+            self.assertIs(uvc_pipeline.require_trusted_file,
+                          launcher.call_args.kwargs["trust_file"])
+            self.assertIsNone(holder.launch_trust_problem("/usr/bin/gst",
+                                                          dev_checkout_helper=True))
+            self.assertIs(holder._dev_trust, launcher.call_args.kwargs["trust_file"])
+            self.assertEqual(("/usr/bin/gst",), launcher.call_args.args)
+            for error, text in ((uvc_pipeline.PipelineError("sandbox helper is writable by "
+                                                            "others"), "writable by others"),
+                                (FileNotFoundError("gone"), "FileNotFoundError")):
+                launcher.side_effect = error
+                with self.subTest(error=text):
+                    self.assertIn(text, holder.launch_trust_problem(
+                        "/usr/bin/gst", dev_checkout_helper=True))
+
     def test_holder_never_auto_binds_ambiguous_cameras(self):
         from media_capture_agent.uvc_identity import DeviceEvidence
 
