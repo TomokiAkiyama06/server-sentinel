@@ -26,7 +26,7 @@ sys.path.insert(0, str(_HERE.parents[1]))  # scripts/manual -> package ``transpo
 sys.path.insert(0, os.environ.get("AGENT_DIR", str(_REPOSITORY / "agent")))
 sys.path.insert(0, os.environ.get("SERVER_DIR", str(_REPOSITORY / "server")))
 
-from transport_poc import materials, records  # noqa: E402
+from transport_poc import holder, materials, records  # noqa: E402
 
 
 def _profile(text):
@@ -99,7 +99,7 @@ def build_parser():
     h.add_argument("--socket-dir", required=True)
     h.add_argument("--sources", type=int, default=1)
     h.add_argument("--profile", type=_profile, default=(1280, 720, 30))
-    h.add_argument("--gst", default="/usr/bin/gst-launch-1.0")
+    h.add_argument("--gst", default=holder.DEFAULT_GST)
     h.add_argument("--approve", action="store_true")
     h.add_argument("--dev-checkout-helper", action="store_true")
     h.add_argument("--seconds", type=float, required=True)
@@ -212,7 +212,6 @@ def _proxy(args):
 
 
 def _holder(args):
-    from transport_poc import holder
     materials.require_outside_repository(args.out)
     writer = records.JsonlWriter(args.out, run_id=args.run_id, role="holder")
     try:

@@ -21,7 +21,7 @@ HARNESS = Path(__file__).resolve().parents[2] / "scripts" / "manual"
 _SAVED_PATH = list(sys.path)
 sys.path.insert(0, str(HARNESS))
 try:
-    from transport_poc import matrix, poc15, records, schedule  # noqa: E402
+    from transport_poc import holder, matrix, poc15, records, schedule  # noqa: E402
 finally:
     # ``poc15`` puts the harness, agent and server trees on ``sys.path`` when
     # imported; none is needed here, and a path left behind reaches every
@@ -422,6 +422,61 @@ class SchedulerTests(unittest.TestCase):
         scheduler.spawn = spawn
         self.assertEqual(1, scheduler.run())
         self.assertIn("exit=0 holder=1", self.output.getvalue())
+
+
+class HolderTrustPreflightTests(unittest.TestCase):
+    """2026-10-20 real-host run: every holder refused a group-writable sandbox
+    helper and all 24 real slots failed one by one. The schedule must refuse
+    before slot 0 instead. The trust check itself is mocked: no camera, no
+    GStreamer, no process."""
+
+    REFUSAL = "PipelineError: sandbox helper is writable by others"
+
+    def _run(self, args, problem):
+        with mock.patch.object(holder, "launch_trust_problem",
+                               return_value=problem) as check, \
+                mock.patch.object(schedule.Scheduler, "run", return_value=0) as started, \
+                mock.patch.object(schedule.subprocess, "Popen") as popen:
+            try:
+                code = schedule.run(args, clock=lambda: NOW, output=io.StringIO())
+            except SystemExit as refusal:
+                code = refusal
+        popen.assert_not_called()
+        return code, check, started
+
+    def test_failed_trust_check_refuses_before_any_slot(self):
+        for dev in (False, True):
+            with self.subTest(dev_checkout_helper=dev), tempfile.TemporaryDirectory() as directory:
+                args = _args("agent", directory, real_camera=True, scenarios="normal,sources_2",
+                             dev_checkout_helper=dev)
+                code, check, started = self._run(args, self.REFUSAL)
+                self.assertIsInstance(code, SystemExit)
+                self.assertIn("holder launch trust check failed", str(code))
+                self.assertIn("writable by others", str(code))
+                self.assertIn("no slot is started", str(code))
+                started.assert_not_called()
+                check.assert_called_once_with(holder.DEFAULT_GST, dev_checkout_helper=dev)
+
+    def test_passing_trust_check_starts_the_schedule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = _args("agent", directory, real_camera=True, scenarios="normal")
+            code, check, started = self._run(args, None)
+        self.assertEqual(0, code)
+        check.assert_called_once()
+        started.assert_called_once()
+
+    def test_not_run_for_main_or_synthetic_only_schedules(self):
+        for role, overrides in (("main", dict(real_camera=True, scenarios="normal")),
+                                ("agent", dict(real_camera=False, scenarios="normal")),
+                                ("agent", dict(real_camera=True,
+                                               scenarios="sources_2,auth_unpaired"))):
+            with self.subTest(role=role, **overrides), \
+                    tempfile.TemporaryDirectory() as directory:
+                code, check, started = self._run(_args(role, directory, **overrides),
+                                                 self.REFUSAL)
+                self.assertEqual(0, code)
+                check.assert_not_called()
+                started.assert_called_once()
 
 
 class CliTests(unittest.TestCase):

@@ -1447,6 +1447,10 @@ clock / process でのみ試験済み）でもよく、どちらで実行した�
   1 run、手動 hand-off。報告 gap と実欠落が 267 / 267 で一致、`drop_accounting` は `pass` だったが、
   同じ run id で agent 側を 2 回起動したため integrity が `fail`。この run は G1〜G6 のどの判定にも
   使わない（手動 hand-off の起動誤りを避けるため `schedule` を追加）。
+- 2026-10-20 `schedule` 1 日目（`--real-camera --dev-checkout-helper`、38 slot）: synthetic / 否定認証の
+  14 slot は時刻表どおり実行。real camera の 24 slot は未実行（holder が起動直後に終了: archive 由来の
+  mode で sandbox helper が group 書込可能）。real slot は再実行が必要（以後 `schedule` は slot 0 の前に
+  holder の信頼検査で拒否する。README Step 0）。
 
 TCP の packet loss / jitter は root の `netem` を使わないため `unmeasured` のまま残し、
 QUIC / WebRTC はこのハーネスの対象外です。

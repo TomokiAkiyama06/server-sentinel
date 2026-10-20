@@ -32,7 +32,9 @@ with a non-zero exit, and the other host then simply fails to connect, which
 the records show. A schedule longer than the README's 3 h/day budget is
 refused (split the candidates across days). ``auth_revoked_live`` needs a
 fresh ``revoked_live`` bundle per candidate and stays a manual run. SIGINT /
-SIGTERM stop the current slot's processes and start no further slot. The
+SIGTERM stop the current slot's processes and start no further slot. An
+Agent schedule with a real slot first runs the holder's launch trust checks
+and refuses to start at all when they fail. The
 scheduler never uses sudo, ``tc``, the firewall, Tailscale or SSH.
 """
 from dataclasses import dataclass
@@ -268,6 +270,30 @@ def preflight(slots, args):
             raise SystemExit("records for a slot's run id already exist: choose a new --start")
 
 
+def holder_trust_preflight(slots, args):
+    """Agent role with a real slot: the holder's launch trust must hold before slot 0.
+
+    A holder that refuses its sandbox helper, interpreter or GStreamer files
+    exits at once and every real slot then fails one by one ("holder not
+    ready"), wasting the day's budget (2026-10-20: a group-writable helper
+    extracted from an archive built with tar.umask 002). This runs the
+    holder's own ``trusted_launcher`` (the same ``GStreamerLauncher``
+    construction, with ``--dev-checkout-helper`` semantics when given) in this
+    process, under the interpreter the holder is launched with: trust checks
+    only, no camera, no GStreamer process.
+    """
+    if args.role != "agent" or not any(slot.real for slot in slots):
+        return
+    from . import holder
+    problem = holder.launch_trust_problem(holder.DEFAULT_GST,
+                                          dev_checkout_helper=args.dev_checkout_helper)
+    if problem:
+        raise SystemExit(f"holder launch trust check failed ({problem}): no slot is started. "
+                         "Make the harness source non-group/other-writable (chmod -R go-w, "
+                         "see README) and check the GStreamer install, then choose a new "
+                         "--start")
+
+
 class Scheduler:
     """Run the slots of one role in order; clock, sleep and spawn are injectable."""
 
@@ -387,6 +413,7 @@ def run(args, *, clock=None, output=None):
     if args.print:
         return 0
     preflight(slots, args)
+    holder_trust_preflight(slots, args)
     scheduler = Scheduler(slots, args, clock=clock, output=output)
     previous = {sig: signal.signal(sig, scheduler.request_stop)
                 for sig in (signal.SIGINT, signal.SIGTERM)}

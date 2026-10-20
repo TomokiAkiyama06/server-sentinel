@@ -6,7 +6,8 @@ matrix と同じ Main 側判定** で測るためのハーネスです。製品�
 **本 README の実機手順は測定として一度も完了していません**（PR 時点の確認は loopback の
 synthetic 実行のみ。2026-10-20 に 2 host の smoke 1 run を手動 hand-off で行ったが、同じ run id で
 agent 側を 2 回起動したため integrity `fail` で、測定には数えない。MANUAL_TEST §G 参照）。
-`schedule`（下記）は mock の clock / process でのみ試験済みで、実機ではまだ実行していません。
+`schedule`（下記）は 2026-10-20 に実機で 1 日目を実行したが、real camera の slot は holder の起動拒否で
+未実行（MANUAL_TEST §G）。holder の信頼検査の preflight は mock でのみ試験済みです。
 実機の結果は `MANUAL_TEST.md` §G の記録テンプレートと
 ADR-0007 Validation 表へ記入し、未実施の構成を検証済みと書かないでください。
 
@@ -90,6 +91,23 @@ timedatectl show -p NTPSynchronized --value   # schedule を使う場合は両 h
 
 capture host のみ（実カメラ時）: `id -nG` に `video` があること、`ls /dev/video* | wc -l`
 （件数だけ）、Landlock 有無（MANUAL_TEST §B の記録と同じ方法）。
+
+capture host へハーネスの source（この checkout の export。例 `~/poc15/src`）を渡すときは、group /
+other が書き込めない mode にします。holder は sandbox helper（`--dev-checkout-helper` の場合も
+「本人所有かつ他者書込不可」）とその親 directory に group / other の書込権限があると起動を拒否します
+（2026-10-20: `git archive` の既定 `tar.umask` 002 で 664 / 775 になった tarball を umask 002 の
+一般ユーザーで展開し、real slot の holder がすべて `sandbox helper is writable by others` で終了）。
+
+```sh
+git -c tar.umask=022 archive --format=tar.gz -o poc15-src.tar.gz HEAD   # Main（export 側）
+chmod -R go-w ~/poc15/src                 # capture host（展開後。umask に依らず必ず実行）
+find ~/poc15/src -perm /022 | wc -l       # 0 であること
+```
+
+`schedule --role agent` は real slot がある時刻表なら slot 0 の前に holder と同じ起動時の信頼検査
+（`GStreamerLauncher` の構築: interpreter・sandbox helper・GStreamer 本体と plugin・Landlock。
+カメラは開かず GStreamer も起動しない）を行い、失敗すれば理由を表示して slot を 1 つも起動せず
+非 0（1）で終了します。
 
 ## Step 1: 使い捨て materials
 

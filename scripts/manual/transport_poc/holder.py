@@ -43,6 +43,7 @@ from . import materials, records
 FRAME_HEADER = struct.Struct(">BQI")
 HELLO = struct.Struct(">Q")
 MAX_FRAME_BYTES = 8 * 1024 * 1024
+DEFAULT_GST = "/usr/bin/gst-launch-1.0"
 
 
 def read_frames(connection, deliver, stop):
@@ -124,12 +125,36 @@ def _dev_trust(path):
     return require_trusted_file(path)
 
 
+def trusted_launcher(gst, *, dev_checkout_helper):
+    """The holder's sandboxed ``GStreamerLauncher``.
+
+    Its constructor only runs the launch trust checks (GStreamer executable
+    and plugins, this interpreter, the sandbox helper, Landlock ABI) and
+    raises ``PipelineError`` on any failure; it opens no camera and starts no
+    process, so ``schedule`` also calls it as a preflight.
+    """
+    from media_capture_agent.uvc_pipeline import GStreamerLauncher, require_trusted_file
+    return GStreamerLauncher(
+        gst, trust_file=_dev_trust if dev_checkout_helper else require_trusted_file)
+
+
+def launch_trust_problem(gst, *, dev_checkout_helper):
+    """None if ``trusted_launcher`` would accept this host, else the reason."""
+    try:
+        from media_capture_agent.uvc_pipeline import PipelineError
+    except ImportError as error:
+        return f"media_capture_agent is not importable ({error.__class__.__name__})"
+    try:
+        trusted_launcher(gst, dev_checkout_helper=dev_checkout_helper)
+    except (PipelineError, OSError) as error:
+        return f"{error.__class__.__name__}: {error}"
+    return None
+
+
 def build_capture(state_dir, n_sources, profile, *, gst, dev_checkout_helper, **inject):
     from media_capture_agent.uvc_capture import UvcCapture, UvcSourceConfig
-    from media_capture_agent.uvc_pipeline import (GStreamerLauncher, require_trusted_file)
     if "launcher" not in inject:
-        inject["launcher"] = GStreamerLauncher(
-            gst, trust_file=_dev_trust if dev_checkout_helper else require_trusted_file)
+        inject["launcher"] = trusted_launcher(gst, dev_checkout_helper=dev_checkout_helper)
     settings = SimpleNamespace(runtime_root=Path(state_dir), service_uid=os.geteuid())
     sources = [UvcSourceConfig(uuid4(), profile) for _ in range(n_sources)]
     return UvcCapture(settings, sources, **inject), [source.source_id for source in sources]
