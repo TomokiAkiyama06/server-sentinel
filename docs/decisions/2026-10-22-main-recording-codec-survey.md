@@ -15,7 +15,7 @@ Owner は 2026-10-22 に、§12 の問いについて次のとおり決めまし
 | Q1 保存の codec | **H.264** で保存する。 |
 | Q2（D13）container と再生 | **fragmented MP4** で保存し、**そのまま browser へ配る**（MSE / HLS(fMP4)。§6 の P3）。録画の一覧・再生・playlist・segment は、server 側で `recordings:view` を確認してから返す。download / export は提供しない。 |
 | Q3 encoder | **GStreamer の nvcodec（NVENC）**。 |
-| Q4 NVENC が無い・失敗したとき | **MJPEG の保存に fallback する**。そのとき録画を **degraded** にし、**Owner に通知する**。黙って fallback しない。segment は `codec` / `container` を持つので、形式の混在は manifest で区別できる。fallback の区間にも、認可付きの browser 再生の経路を必ず用意する（T3）。 |
+| Q4 NVENC が無い・失敗したとき | **MJPEG の保存に fallback する**。そのとき録画を **degraded** にし、**Owner に通知する**。黙って fallback しない。segment は `codec` / `container` を持つので、形式の混在は manifest で区別できる。（以下は Owner の回答そのものではなく、AUTH-007 と Q4 から導く要件。T3）fallback の区間にも、認可付きの browser 再生の経路を必ず用意する。 |
 | Q5 validator | **全 frame の decode による検証を必須**とする。録画の検証専用の子プロセスで行い、ROI 用の子プロセスとは分ける。CPU の割り当ては、実機で測ってから決める。 |
 | Q6 self-test | **実 pipeline の sample** を使う（capture → packet adapter → muxer → validator）。既存の `.selftest` の契約に従って扱う。 |
 | Q7 容量と上限 | recording root は **HDD**。segment の長さは、実機で同期 I/O の負荷を測ってから決める。§8.6 の上限は、H.264 と MJPEG の fallback のそれぞれについて、negotiated bound から計算し直す。 |
