@@ -21,6 +21,8 @@ Owner は 2026-10-22 に、§12 の問いについて次のとおり決めまし
 | Q7 容量と上限 | recording root は **HDD**。segment の長さは、実機で同期 I/O の負荷を測ってから決める。§8.6 の上限は、H.264 と MJPEG の fallback のそれぞれについて、negotiated bound から計算し直す。 |
 | Q8 AVC の特許 | 研究室内での使用として、**Owner の責任で受け入れる**。 |
 
+**MEDIA-003 / SPEC §6.2 との関係**: MEDIA-003 は「source の codec / profile が suitable なら stream copy を優先し、そうでなければ（Otherwise）encode する」としています。MJPEG は browser の `<video>` で再生できないので（§4 A）、browser で再生するという用途には suitable ではありません。そのため H.264 への transcode は、MEDIA-003 の「Otherwise」に当たります。また、NVENC が無い・失敗したときは MJPEG の保存に fallback するので（Q4）、録画の correctness は GPU に依存しません（SPEC §6.2 の「Do not require a specific GPU vendor for correctness」）。
+
 この判断により、§4 の B（software encode。x264 / OpenH264）、§7 の V3（FFmpeg の CLI）と V4（PyAV）、§6 の P1 / P2 を主な経路とする案は、採用しません。§11 の推奨（MJPEG で保存し、P1 で再生する案）は、判断の前の提案として残しています。
 
 ### 0.1 判断を受けて残る技術的な問い（実装の前に決める）
@@ -31,8 +33,12 @@ Owner は 2026-10-22 に、§12 の問いについて次のとおり決めまし
   - `openh264dec`（gst-plugins-bad）。OpenH264 の特許 license は、Cisco が配布する binary に限られます（§4 B）。Q8 で特許は Owner の責任で受け入れましたが、binary の入手方法と表示の条件は別に確認が要ります。
   - MJPEG の fallback の segment は、これまでどおり simplejpeg で検証します。
 - **T2: fMP4 の muxer**。Main host には `mp4mux` / `qtmux`（gst-plugins-good。`fragment-duration` を持ちます）があります。`isofmp4mux`（gst-plugins-rs）はありません。GStreamer の muxer を使うか、自前の stdlib の ISO BMFF writer を使うかは、まだ決まっていません。どちらの場合も、segment ごとに init（`ftyp` + `moov`）を持たせて、単独で decode できるようにします。
+  - そのような自己完結した segment file を HLS(fMP4) でそのまま配るには、playlist で同じ file の中の範囲を指す必要があります。init 部分は `EXT-X-MAP` の `BYTERANGE` で、media 部分（`moof` + `mdat`）は `EXT-X-BYTERANGE` で指します [RFC8216]。そのため、認可付きの再生 route は **HTTP の byte-range request（`Range` / `206 Partial Content`）に対応する**必要があります。iOS も、media の server に byte-range への対応を求めています [Apple-byterange]。認可は、range ごとの request にも同じように掛けます。
 - **T3: MJPEG の fallback の segment の container と再生**。MJPEG は `<video>` で再生できません（§4 A）。fallback の区間をどの container（Matroska `V_MJPEG` など）で保存し、browser でどう見せるか（frame pull、または「この区間は再生できない」と表示するか）を決める必要があります。
-- **T4: bitrate の上限の強制**。§8.6 の上限は、negotiated bound（`VideoFormat.maximum_bitrate`）が実際に守られることを前提にしています。H.264 は NVENC の rate control（最大 bitrate と VBV buffer）で守らせます。MJPEG は camera が bitrate を制御しないので、fallback で使う上限を設定で決め、それを超える segment は拒否して gap にし、degraded にする必要があります（§8.6）。
+- **T4: bitrate の上限の強制**。§8.6 の上限は、negotiated bound（`VideoFormat.maximum_bitrate`）が実際に守られることを前提にしています。ただし、`VideoFormat.maximum_bitrate`（`server/app/media/profiles/model.py`）は**宣言されているだけで、今はどこでも強制されていません**（読んでいるのは synthetic の harness の fixture だけです）。
+  - そのため、**H.264 でも MJPEG の fallback でも、segment ごとに byte 数の上限を強制します**。muxer か validator が、segment の byte 数を `B_s` × segment の長さ ÷ 8 × (1 + o) + `V_s` + `H` と比べ、超えた segment は拒否して gap にし、録画を degraded にします。黙って保存することはしません。
+  - H.264 では、これに加えて NVENC の rate control（最大 bitrate と VBV buffer）で、上限を超えないようにします。rate control だけに頼ることはしません。
+  - MJPEG は camera が bitrate を制御しないので、fallback で使う上限を設定で決めます（§8.6）。
 - **T5: GStreamer の導入**。Main の runtime に、operator が導入する GStreamer（core、base、good、bad の nvcodec）を入れることになります。`agent/docs/DEPENDENCIES.md` の前例（絶対 path、root 所有の確認、使う plugin を限る、Landlock）に合わせた閉じ込めと、package の inventory の review が要ります。NVENC は `/dev/nvidia*` への access を必要とします。
 
 ### 0.2 実機で測ってから決めるもの
