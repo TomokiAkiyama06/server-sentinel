@@ -35,15 +35,38 @@ Q5 と Q6 は未決です。
 
 ### 実施条件（この PR の提案）
 
-次の 3 点は Owner が判断した内容ではなく、上の判断を実施するためにこの PR が提案する条件です。
+次の 5 点は Owner が判断した内容ではなく、上の判断を実施するためにこの PR が提案する条件です。
 
 - Q4 の D-FINE の評価は、YOLOX と同じ扱いにします：重みはリポジトリ外、digest 固定、
   CI での download なし、deployment schema では拒否。
 - Q1 に関連して、`server/docs/RTDETR_RUNTIME_AUDIT.md` の「Official model」という記述は、
   別の follow-up で訂正します。
-- Q2 の承認は、`license/owner-approvals.json` にはまだ入れません。重みの `model_weight`
-  component を追加する PR で、この文書を参照する approval entry として記録します。
-- Q4 の export は、Q5（export 用の環境）が決まってから行います。
+- Q2 の承認は、YOLOX と同じく、この decision 文書（と、後に作る D-FINE の評価 audit）に
+  記録します。`license/owner-approvals.json` と `license/components.json` には入れません。
+  license gate は、`model_weight` の component を、予約ディレクトリに commit された実体と
+  SHA-256 で照合し（実体がなければ `missing model artifact`）、存在しない component を指す
+  approval を `owner approval references an absent component` で拒否します。重みを
+  リポジトリ外に置く限り、gate の inventory には記録できません。重みを本番用に commit する
+  ことになった場合にだけ、その PR で `model_weight` の記録と、この文書を参照する approval entry
+  を追加します（2026-09-30 の YOLOX の判断と同じ扱い）。
+- Q4 の export は、Q5（export 用の環境）が決まってから行います。また、upstream の
+  `tools/deployment/export_onnx.py` をそのまま使ってはいけません。
+  [`956d170` の該当行](https://github.com/Peterande/D-FINE/blob/956d1709314c2c6a4df6f34de232054578a7449f/tools/deployment/export_onnx.py#L30)
+  は `torch.load(args.resume, map_location="cpu")` で、`weights_only` を指定していません。
+  [`requirements.txt`](https://github.com/Peterande/D-FINE/blob/956d1709314c2c6a4df6f34de232054578a7449f/requirements.txt#L1) は
+  `torch>=2.0.1` を許しており、PyTorch 2.6 より前の版では `torch.load` の既定は制限のない
+  pickle の読み込みです（既定が `weights_only=True` に変わったのは 2.6。PyTorch の release notes に
+  基づく記述で、この調査では再確認していません）。そのため、export は次の条件で行います。
+  - checkpoint を読むのは、自前の小さな wrapper（または upstream の呼び出しを patch したもの）で、
+    `torch.load(path, map_location="cpu", weights_only=True)` を**明示的に**渡します。既定値には頼りません。
+  - PyTorch は exact version で固定し、その版で `weights_only=True` が有効なことを、手順書に記録します。
+  - `weights_only=True` で読めない checkpoint（独自 class などを含むもの）は、その場で export を中止します。
+    `weights_only=False` に戻すことはしません。
+  - D-FINE のコードは、下記の固定 revision だけを使います。
+- D-FINE の upstream は、この調査で確認した revision
+  **`956d1709314c2c6a4df6f34de232054578a7449f`**（master、2026-08-19 の commit。README の Objects365 note を含む）に固定します。
+  コードのライセンス（LICENSE）、export script、`requirements.txt` の確認は、この revision に
+  対して行いました。別の revision を使うときは、改めて確認します。
 
 ### Q1 と D-FINE の関係
 
@@ -125,7 +148,7 @@ AP<sup>val</sup> です。**この調査では測定していません。** pers
 
 | 候補 | コード | 重みのライセンスと根拠 | 学習データ | 判定 |
 | --- | --- | --- | --- | --- |
-| **D-FINE（`*_coco` のみ）** | Apache-2.0（[Peterande/D-FINE](https://github.com/Peterande/D-FINE)） | **Apache-2.0（upstream の maintainer が明示）**。書き込み権限を持ち現在も活動している maintainer の RicePasteM（Zhangchi Hu, USTC。GitHub 上の関係は `COLLABORATOR`。2026-07 に PR #355 を merge し、2026-08-19 に README を更新）が、[Issue #357 のコメント](https://github.com/Peterande/D-FINE/issues/357#issuecomment-5344034723)（2026-08-19）で「COCO-only checkpoints (`*_coco.pth`) are also released by us under Apache-2.0」と明言。ただしこの人は論文の著者でも、重みを upload した人（`Peterande`）でもない。README にあるのは Objects365 系の重みについての否定的な note だけで、COCO-only の重みを Apache-2.0 とする文はない。重みの release を持つ [Peterande/storage](https://github.com/Peterande/storage) は Apache-2.0 の LICENSE を持つが、release 自体には重みのライセンスの記載がない。HF の [ustc-community/dfine-small-coco](https://huggingface.co/ustc-community/dfine-small-coco) の `apache-2.0` は変換者（card では contributed by VladOS95-cyber）が付けた metadata | COCO train2017。backbone は HGNetv2 の ImageNet 系事前学習（`PPHGNetV2_*_stage1.pth`、詳細な系譜は未検証） | **候補（最有力）** |
+| **D-FINE（`*_coco` のみ）** | Apache-2.0（[`956d170` の LICENSE](https://github.com/Peterande/D-FINE/blob/956d1709314c2c6a4df6f34de232054578a7449f/LICENSE)） | **Apache-2.0（upstream の maintainer が明示）**。書き込み権限を持ち現在も活動している maintainer の RicePasteM（Zhangchi Hu, USTC。GitHub 上の関係は `COLLABORATOR`。2026-07 に PR #355 を merge し、2026-08-19 に README を更新）が、[Issue #357 のコメント](https://github.com/Peterande/D-FINE/issues/357#issuecomment-5344034723)（2026-08-19）で「COCO-only checkpoints (`*_coco.pth`) are also released by us under Apache-2.0」と明言。ただしこの人は論文の著者でも、重みを upload した人（`Peterande`）でもない。README にあるのは Objects365 系の重みについての否定的な note だけで、COCO-only の重みを Apache-2.0 とする文はない。重みの release を持つ [Peterande/storage](https://github.com/Peterande/storage) は Apache-2.0 の LICENSE を持つが、release 自体には重みのライセンスの記載がない。HF の [ustc-community/dfine-small-coco](https://huggingface.co/ustc-community/dfine-small-coco) の `apache-2.0` は変換者（card では contributed by VladOS95-cyber）が付けた metadata | COCO train2017。backbone は HGNetv2 の ImageNet 系事前学習（`PPHGNetV2_*_stage1.pth`、詳細な系譜は未検証） | **候補（最有力）** |
 | D-FINE（`*_obj365` / `*_obj2coco`） | 同上 | 同じコメントで「should not be considered commercially cleared」。README にも同趣旨の [License note](https://github.com/Peterande/D-FINE/blob/956d1709314c2c6a4df6f34de232054578a7449f/README.md)（commit `956d170`） | Objects365 → COCO | 除外（Objects365 は academic only） |
 | **RT-DETRv2-S（r18vd、COCO）** | Apache-2.0（[lyuwenyu/RT-DETR](https://github.com/lyuwenyu/RT-DETR)。maintainer が [#433](https://github.com/lyuwenyu/RT-DETR/issues/433) で「entire codebase is licensed under Apache 2.0」と回答） | **HF metadata で `apache-2.0`**（[PekingU/rtdetr_v2_r18vd](https://huggingface.co/PekingU/rtdetr_v2_r18vd/blob/5650961749fa93567c0d46fc7f43ea4f9e914107/README.md)。card には「contributed by @jadechoghari」とあり、Hugging Face 側の変換）。採用済み adapter が使う [onnx-community 変換](https://huggingface.co/onnx-community/rtdetr_v2_r18vd-ONNX/blob/936f90b6a476c6da4dfe053fc521af55285976ba/README.md)も `apache-2.0`。**原著者による重みの表明はない**：元の `.pth` を置く [lyuwenyu/storage](https://github.com/lyuwenyu/storage) には LICENSE がなく、重みについて尋ねる [Issue #685](https://github.com/lyuwenyu/RT-DETR/issues/685)（2026-08-19）は回答 0 件で open | COCO train2017。backbone は ImageNet 系事前学習（未検証） | **候補（既存の比較基準）** |
 | RT-DETR / RT-DETRv2 の Objects365 版 | 同上 | 明示なし | Objects365 → COCO | 除外 |
@@ -151,7 +174,7 @@ real-time 用ではなく CPU の負荷が大きいため、比較から外し�
 
 | 候補 | COCO AP<sup>val</sup> | Params | 入力 | ONNX / 既存 runtime との適合 | 保守 |
 | --- | ---: | ---: | --- | --- | --- |
-| D-FINE-N（`dfine_n_coco`） | 42.8 | 4M | 640 | upstream に `tools/deployment/export_onnx.py`（opset 16。出力は `labels/boxes/scores` で後処理込み）。HF 変換版は RT-DETRv2 と同じ `RTDetrImageProcessor` 設定（640×640 直接 resize、/255、normalize なし、300 query、class 0 = person）。**ライセンス metadata のある ONNX は配布されていない**（`onnx-community/dfine_*_coco-ONNX` は license 欄が空）ので、自前で export が必要 | 最終 push 2026-10-05 |
+| D-FINE-N（`dfine_n_coco`） | 42.8 | 4M | 640 | upstream に [`tools/deployment/export_onnx.py`](https://github.com/Peterande/D-FINE/blob/956d1709314c2c6a4df6f34de232054578a7449f/tools/deployment/export_onnx.py)（revision `956d170`。opset 16。checkpoint の読み込みに `weights_only` を指定していない。出力は `labels/boxes/scores` で後処理込み）。HF 変換版は RT-DETRv2 と同じ `RTDetrImageProcessor` 設定（640×640 直接 resize、/255、normalize なし、300 query、class 0 = person）。**ライセンス metadata のある ONNX は配布されていない**（`onnx-community/dfine_*_coco-ONNX` は license 欄が空）ので、自前で export が必要 | 最終 push 2026-10-05 |
 | D-FINE-S（`dfine_s_coco`） | 48.5 | 10M | 640 | 同上 | 同上 |
 | D-FINE-M（`dfine_m_coco`） | 52.3 | 19M | 640 | 同上 | 同上 |
 | RT-DETRv2-S（r18vd） | 48.1（GitHub の再学習版）。HF card は数値なし | 20M | 640 | **adapter 実装済み**（`rtdetr-v2-r18vd-onnx-cpu`、onnx-community 変換、81,057,510 bytes、SHA-256 固定）。ORT 1.28 CPU で動作確認済み | 最終 push 2026-10-09 |
@@ -189,10 +212,12 @@ GPU：どの候補も upstream は ONNX → TensorRT の手順を示していま
   品質ゲート後だけ評価、異常時は `unknown`）。
 - 残る課題：
   - **ONNX は自前で作る必要があります。** 方法は 2 つあります。
-    (a) 元の `dfine_{n,s}_coco.pth` を upstream の `export_onnx.py` で export する。
+    (a) 元の `dfine_{n,s}_coco.pth` を、固定 revision の D-FINE のコードで export する。
     GitHub release は `digest: null` で checksum を配っていないので、size と SHA-256 は
-    download 後にローカルで計算するしかありません。`torch.load` は pickle を読むので、
-    `weights_only=True` で、隔離した scratch 環境で行います。
+    download 後にローカルで計算するしかありません。upstream の `export_onnx.py` は
+    `torch.load` に `weights_only` を指定していないので、そのまま使わず、`weights_only=True` を
+    明示する自前の wrapper（または patch）で、隔離した scratch 環境で行います
+    （上の「実施条件」を参照）。
     (b) HF の `ustc-community/dfine-{nano,small}-coco` の `model.safetensors`（LFS SHA-256 あり、
     pickle なし）から export する。HF 変換が元の `.pth` と同じ値かどうかは**未検証**です。
   - export には PyTorch などが要ります。runtime の依存にはせず、GPU 評価と同じく

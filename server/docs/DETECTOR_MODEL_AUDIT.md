@@ -22,6 +22,12 @@
 > is not approved. The export environment (Q5) and the YOLOX adapter's future
 > (Q6) are still undecided; the D-FINE export can only be carried out after Q5
 > is decided.
+> The upstream exporter at the reviewed revision `956d170` calls `torch.load`
+> without `weights_only`, so the export must use our own wrapper that passes
+> `weights_only=True` explicitly with a pinned PyTorch version. As with YOLOX,
+> the residual-risk approval stays in the decision record: externally kept
+> weights cannot be listed in `license/components.json` /
+> `license/owner-approvals.json`.
 
 Decision for this implementation: **evaluation candidate only; no YOLOX package,
 pretrained weights, exported ONNX model, or automatic download is approved or
