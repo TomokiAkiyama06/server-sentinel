@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { launchChrome, pageFor } from './chrome.mjs';
+import { describeCommandError, launchChrome, pageFor } from './chrome.mjs';
 import { compile } from './compile.mjs';
 import { APP_CSP } from '../scripts/policy.mjs';
 
@@ -85,6 +85,7 @@ const storageFixture = (state, available_bytes = 21_474_836_480, faults = false)
   notification_delivery_failed: faults, notification_log_failed: faults,
 });
 let cases = 0;
+let abandonedTotal = 0;
 // Live view (#205 CP-5) against synthetic answers shaped like the CP-4 routes.
 const liveSources = ['00000000-0000-4000-8000-00000000a001', '00000000-0000-4000-8000-00000000a002'];
 const liveSession = '00000000-0000-4000-8000-00000000b001';
@@ -148,6 +149,7 @@ async function scenario(viewport, { production = false, status = 200, session = 
   const unexpected = [];
   const exceptions = [];
   const routeErrors = [];
+  const abandoned = [];
   let timelineLoads = 0;
   let presenceLoads = 0;
   const cleanup = [
@@ -159,13 +161,20 @@ async function scenario(viewport, { production = false, status = 200, session = 
     document.addEventListener('securitypolicyviolation', () => window.__policyViolations.push('CSP violation'));
     if (${optIn}) for (const key of ['telemetryOptIn', 'analyticsEnabled', 'crashUpload', 'trackingOptIn']) localStorage.setItem(key, 'true');
   ` });
-  async function route({ requestId, request }) {
+  async function route({ requestId, networkId, request }) {
     const url = new URL(request.url);
     requests.push(url.pathname);
+    // The page may cancel a request while it is paused here (#326): leaving a
+    // view aborts its load. Such a request can no longer be answered; it is
+    // recorded as abandoned, while any other refusal stays a harness error.
+    async function send(method, params) {
+      if (!await page.answer(networkId, method, { requestId, ...params })) abandoned.push(url.pathname);
+    }
     async function fulfill(body, contentType, responseCode = 200, headers = []) {
-      await page.command('Fetch.fulfillRequest', { requestId, responseCode,
+      await send('Fetch.fulfillRequest', { responseCode,
         responseHeaders: [{ name: 'Content-Type', value: contentType }, ...headers], body: Buffer.from(body).toString('base64') });
     }
+    const block = () => send('Fetch.failRequest', { errorReason: 'BlockedByClient' });
     // Production bundle (src/shared/services.ts) against synthetic answers in
     // the shape of the Main Server routes; by default every one is the
     // server's generic, empty 404.
@@ -178,7 +187,7 @@ async function scenario(viewport, { production = false, status = 200, session = 
     }
     if (url.origin !== origin || request.method !== 'GET') {
       unexpected.push('unexpected origin or method');
-      await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }); return;
+      await block(); return;
     }
     if (url.pathname === '/app/') {
       // The Main Server sends the dashboard policy as a header (S5b); so does this test.
@@ -224,10 +233,10 @@ async function scenario(viewport, { production = false, status = 200, session = 
       await fulfill(JSON.stringify(storageStatus === 200 ? storageFixture(storageState, storageAvailable, storageFaults) : { detail: 'synthetic private error' }), 'application/json', storageStatus); return;
     }
     unexpected.push('unexpected path');
-    await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' });
+    await block();
   }
   cleanup.push(browser.on('Fetch.requestPaused', (params, sessionId) => {
-    if (sessionId === page.sessionId) void route(params).catch(() => routeErrors.push('interception failed'));
+    if (sessionId === page.sessionId) void route(params).catch(error => routeErrors.push(describeCommandError(error)));
   }));
   await page.command('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
   try {
@@ -239,6 +248,9 @@ async function scenario(viewport, { production = false, status = 200, session = 
     assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'no horizontal document overflow');
     assert.deepEqual(exceptions, [], 'no unhandled browser errors');
     assert.deepEqual(routeErrors, [], 'request interception must succeed');
+    // Only API reads are ever abandoned; the document and its assets are always delivered.
+    assert.deepEqual(abandoned.filter(path => !path.startsWith('/api/')), [], 'only API requests may be abandoned by the page');
+    abandonedTotal += abandoned.length;
     assert.deepEqual(await page.evaluate('window.__policyViolations'), [], 'no CSP-blocked reporting attempts');
     assert.doesNotMatch(await page.evaluate('document.body.innerText'), /synthetic private error/);
     if (positiveControl) {
@@ -701,5 +713,5 @@ try {
     process.stdout.write(`${name}: production live view against synthetic route answers passed\n`);
   }
   await scenario({ width: 390, height: 844 }, { production: true, positiveControl: true }, page => page.heading('アクセスの確認が必要です'));
-  process.stdout.write(`${cases} browser scenarios passed; viewport emulation is not physical phone/Mac acceptance.\n`);
+  process.stdout.write(`${cases} browser scenarios passed (${abandonedTotal} API requests abandoned by the page before their answer); viewport emulation is not physical phone/Mac acceptance.\n`);
 } finally { await browser.close(); }
