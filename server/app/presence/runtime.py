@@ -83,7 +83,8 @@ DISPATCH_BATCH = 50
 # How soon a confirmed critical observation is submitted to its ports, the
 # ceiling of the backoff after a failed step (storage refused, database
 # busy), and how long shutdown waits for submitted notifications to finish.
-DEFAULT_DISPATCH_INTERVAL_SECONDS = 1.0
+# The 5 s interval is an Owner decision (2026-10-22).
+DEFAULT_DISPATCH_INTERVAL_SECONDS = 5.0
 DEFAULT_DISPATCH_BACKOFF_SECONDS = 60.0
 # The settle wait exceeds the Slack transport timeout (10 s by default), so a
 # slow POST still completes. It is bounded to 30 s because the whole shutdown

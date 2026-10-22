@@ -1240,7 +1240,7 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   section and the Owner calibration route first (follow-up).
 - [ ] (#26) a confirmed server movement or camera tamper on the deployment
   sends exactly one `ServerSentinel critical alert: server_movement` /
-  `camera_tamper` to the configured Slack within a few seconds, in every
+  `camera_tamper` to the configured Slack within about 5 s (the dispatch interval), in every
   presence state, with no image, source name, person or cause in it; its
   `notification_events` row is `sent` and the presence `notification`
   delivery `delivered`; a service restart afterwards sends nothing again;

@@ -250,7 +250,7 @@ database: `open()` and the retention cleanup pin it on other threads while
 holding `_pin_lock` and waiting in the storage admission for that same worker,
 so a step blocking on that lock would deadlock the worker. Until the database
 is pinned a step raises `TimelineNotPinned` and backs off. Steps run every
-`dispatch_interval_seconds` (default 1 s), at once again only after a batch in
+`dispatch_interval_seconds` (default 5 s, Owner decision 2026-10-22), at once again only after a batch in
 which every one of `DISPATCH_BATCH` rows made progress; a failing step
 (storage refused, database not pinned yet) backs off exponentially up to `dispatch_backoff_seconds` (default 60 s),
 logging `critical_dispatch_failing` at the first failure of a streak and at
@@ -305,7 +305,10 @@ filesystem) a confirmed observation cannot be written to the timeline, so it
 is not dispatched either: it waits only within the scene runtime's bounded
 in-memory critical staging, and confirmations beyond that bound are counted
 as undelivered loss. Unlike recording-health and integrity alerts, no Slack
-attempt is made for it meanwhile (an open Owner question).
+attempt is made for it meanwhile yet. The Owner decided on 2026-10-22 that
+scene critical alerts shall attempt Slack during a hard stop like
+recording-health does, accepting the duplicate risk; that is implemented in a
+follow-up issue, not here.
 
 ### Entrance gate quality
 

@@ -459,10 +459,13 @@ class ReconciliationTests(Fixture, unittest.TestCase):
                         dict(dispatch_settle_seconds=-1), dict(dispatch_settle_seconds=31)):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 configuration(**changes)
-        # The default shutdown wait outlasts the Slack transport timeout.
-        self.assertGreater(SceneTimelineConfiguration(
-            maximum_source_latency=timedelta(seconds=30), clock=lambda: None
-        ).dispatch_settle_seconds, 10)
+        defaults = SceneTimelineConfiguration(
+            maximum_source_latency=timedelta(seconds=30), clock=lambda: None)
+        # Owner decision 2026-10-22: 5 s dispatch interval, 60 s backoff cap;
+        # the shutdown wait (12 s) outlasts the 10 s Slack transport timeout.
+        self.assertEqual((5.0, 60.0, 12.0), (defaults.dispatch_interval_seconds,
+                                             defaults.dispatch_backoff_seconds,
+                                             defaults.dispatch_settle_seconds))
 
     def test_dispatch_on_the_worker_never_waits_for_a_pin_held_by_another_thread(self):
         """Review of PR #316: `open()` holds `_pin_lock` while its admission
@@ -730,9 +733,15 @@ class LifespanTests(RuntimeFixture):
                 self.assertFalse(dispatcher.failing)
             self.assertTrue(any(Event.CRITICAL_DISPATCH_FAILING.value in line for line in logs.output))
             self.assertTrue(await self.until(lambda: self.critical_texts() == [ALERT + "camera_tamper"]))
-            self.assertTrue(await self.until(lambda: self.rows(
-                f"SELECT delivery FROM notification_events WHERE event_id='{item.identifier}'")
-                == [("sent",)]))
+            # Neither the dispatch loop nor the monitoring tick runs here, so
+            # the completion is persisted by an explicit poll on the worker;
+            # the POST may finish after the poll that followed the step.
+            monitoring = application.state.monitoring
+            self.assertEqual(0, await monitoring.call(monitoring.settle_notifications, 10))
+            self.assertEqual([("sent",)], self.rows(
+                f"SELECT delivery FROM notification_events WHERE event_id='{item.identifier}'"))
+            self.assertEqual([("delivered",)], self.rows(
+                "SELECT state FROM presence_deliveries WHERE action='notification'"))
 
     async def test_settle_waits_for_a_slow_delivery_and_gives_up_at_its_bound(self):
         self.transport = GatedTransport()

@@ -1167,7 +1167,7 @@ keyed by the observation identity, and the same optional immediate Slack
 message (`ServerSentinel critical alert: server_movement` / `camera_tamper`,
 fixed category only, no image, source, person or cause) as a hardware-integrity
 or recording-health failure, in every presence state. A `CriticalDispatcher`
-runs `dispatch_pending()` on the monitoring worker every second (at once again
+runs `dispatch_pending()` on the monitoring worker every 5 s (Owner decision 2026-10-22; at once again
 after a batch in which every row made progress; a failing step backs off
 exponentially up to 60 s and is logged value-free); unclaimed work stays
 `pending`, and a full or closed notification queue (or, without Slack, a full
@@ -1176,7 +1176,9 @@ by a later step, and ends that action's batch. A step never pins the database
 (the outbox open does), so it cannot deadlock the monitoring worker. While
 storage is refused a confirmed observation cannot be recorded and waits only
 within the scene runtime's bounded critical staging; no Slack attempt is made
-for it meanwhile. A claimed submission is never retried automatically: `failed`
+for it meanwhile yet (Owner decision 2026-10-22: it shall attempt Slack during
+a hard stop like recording-health, accepting the duplicate risk; implemented
+in a follow-up issue). A claimed submission is never retried automatically: `failed`
 or `uncertain` outcomes, and claims an earlier process left `submitting` or
 `queued` whose `notification_events` row is still `pending` (or absent), stay
 unresolved for an audited Owner requeue; a final `sent`/`failed`/`disabled` row
