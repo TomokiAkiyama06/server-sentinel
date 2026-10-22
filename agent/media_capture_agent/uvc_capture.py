@@ -576,7 +576,10 @@ class UvcCapture:
             if descriptor is not None:
                 self._release_descriptor(source, descriptor)
         source.generation += 1
-        parser = MjpegFrameParser(self.limits.max_frame_bytes)
+        # The gap bound follows the negotiated profile: a camera may pad a JPEG
+        # up to a full raw-size buffer (Issue #305); past it framing is lost.
+        parser = MjpegFrameParser(self.limits.max_frame_bytes,
+                                  max_gap_bytes=profile.max_padding_bytes)
         # startup_timeout counts from the launch, not from before the bounded
         # open/re-scan, so a slow open cannot expire it before any frame.
         active = _Active(candidate, process, parser, source.queue, source.generation,

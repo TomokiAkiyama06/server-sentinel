@@ -114,8 +114,15 @@ gst-launch-1.0 -q --gst-plugin-load=<dir>/libgstcoreelements.so,<dir>/libgstvide
 
 MJPEG output is split structurally into complete JPEG frames (per-frame byte
 bound, bounded inter-frame padding, malformed stream = failure) and placed in a
-bounded drop-oldest per-source `FrameQueue`. Memory is bounded by
-`(queue_frames + 1) * max_frame_bytes` plus one read chunk per source.
+bounded drop-oldest per-source `FrameQueue`. The inter-frame padding bound is
+`MjpegProfile.max_padding_bytes` of the matched profile (`width * height * 2`,
+the raw buffer size, clamped to `DEFAULT_MAX_GAP_BYTES`..`MAX_GAP_BYTES`): some
+cameras (Issue #305) deliver a full-size buffer holding one JPEG and non-JPEG
+padding, and `fdsink` loses buffer boundaries. Skipped padding is discarded as it
+is read; a longer gap without an SOI, or an SOI in the padding followed by an
+invalid structure, is a malformed stream (`capture_failed`, backoff relaunch).
+Memory is bounded by `(queue_frames + 1) * max_frame_bytes` plus one read chunk
+per source.
 
 ## Health
 
