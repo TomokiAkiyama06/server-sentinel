@@ -41,10 +41,14 @@ SCENARIOS = dict((
                                           [80, "blackhole", 1]]},
               {"duration": 10, "proxy": [[3, "blackhole", 0.5], [6, "blackhole", 0.5]]},
               silent=True),
-    _scenario("outage_5s",
-              {"duration": 140, "proxy": [[20, "blackhole", 5], [60, "blackhole", 5],
-                                          [100, "blackhole", 5]]},
-              {"duration": 10, "proxy": [[3, "blackhole", 3]]}, silent=True),
+    # Like the Main stops below, each blackhole is at least the Agent loss
+    # timeout + 2.5 s, so every candidate must detect it (G4/G5). A blackhole
+    # equal to the 5 s timeout was detected only when inbound had already
+    # paused before it: 3/2/0 of 3 on a real run (#308).
+    _scenario("outage_8s",
+              {"duration": 140, "proxy": [[20, "blackhole", 8], [60, "blackhole", 8],
+                                          [100, "blackhole", 8]]},
+              {"duration": 10, "proxy": [[3, "blackhole", 4]]}, silent=True),
     _scenario("outage_120s", {"duration": 200, "proxy": [[20, "blackhole", 120]]},
               {"duration": 14, "proxy": [[3, "blackhole", 6]]}, silent=True),
     _scenario("rst", {"duration": 110, "proxy": [[20, "reset"], [50, "reset"], [80, "reset"]]},
