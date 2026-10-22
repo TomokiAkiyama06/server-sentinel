@@ -377,7 +377,11 @@ record.
   `approval=approved configured=yes`; start the service and confirm the
   source goes `degraded` then `online` with that camera (MANUAL_TEST §A
   runtime procedure steps 4–6), and that the other camera's source is
-  untouched;
+  untouched; with the service running `sources` shows
+  `approval=approved_in_use` for it (never `approval_required`, Issue #300);
+  after `sudo systemctl kill -s KILL server-sentinel.service` (no clean
+  session end) `sources` shows `approval=approval_required` until it is
+  approved again;
 - [ ] approve the camera already held by another enabled source:
   `camera_approved_for_another_source`; an unknown or stale label (after a
   re-plug): `candidate_not_found`; a source whose profile's pixel format the

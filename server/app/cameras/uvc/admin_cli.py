@@ -75,6 +75,14 @@ whether it reports a serial (``present`` / ``absent`` / ``shared`` when another
 connected camera reports the same one), its advertised pixel formats and the
 source whose approval currently holds it. Never a serial, ``/dev`` path,
 by-id name or USB port. Names are printed quoted, escaped and bounded.
+``sources`` prints each ``local_uvc`` source's approval state (``none``,
+``approved``, ``approved_in_use`` or ``approval_required``; ``approval_state``)
+and is allowed while the service runs: ``approved_in_use`` is an approved,
+configured source with an active-session marker while a process of the
+service account holds the database (most likely the running service's
+session; not proof of it), and a marker of a source the deployment does not
+list or left while no process holds the database (a crash) is
+``approval_required`` because the next start requires the approval again.
 
 Ambiguity (AGENTS.md section 7). ``approve`` refuses a camera without a serial
 (``camera_without_serial``) and one whose serial is not unique
@@ -262,8 +270,12 @@ class _ServiceCheck:
         self._name = database.path.name
         self._holders = holders
 
+    def running(self) -> bool:
+        """Whether another process of the service account holds the database."""
+        return bool(self._holders(self._identity, self._name))
+
     def require_stopped(self) -> None:
-        if self._holders(self._identity, self._name):
+        if self.running():
             raise CliRefused("service_running")
 
 
@@ -387,15 +399,52 @@ def candidate_lines(devices, failures: int, held) -> list[str]:
     return lines
 
 
-def source_lines(registry: CameraRegistry, store: ApprovalStore, configured) -> list[str]:
+def approval_state(approval, configured: bool, service_running: Callable[[], bool]) -> str:
+    """The ``sources`` approval state of one stored approval (Issue #300).
+
+    ``approval_required`` when the source needs an Owner approval now or on
+    the next start: the row requires approval (never approved, or the service
+    latched ``manual_intervention_required``), or it still carries an
+    active-session marker the service may not have armed in its current run:
+    no process holds the database, or the deployment does not list the
+    source (the service starts sessions only for ``local_uvc.source_ids``),
+    i.e. a session that was not ended (a crash), which
+    ``ApprovalStore.start_session`` turns into "approval required" on the
+    next start. ``approved_in_use`` is an approved row with a marker, of a
+    listed source, while a process of the service account holds the
+    database: most likely the running service armed it in ``start_session``
+    for its session. It is not proof: the command cannot tell a marker of the
+    current run from one a crash left when the restarted service has not
+    (yet) started local UVC capture, and it does not mean the camera is
+    capturing (see the source's health). ``service_running`` is asked only
+    for such a row; a process state it cannot read refuses
+    (``service_state_unavailable``) instead of guessing either way.
+    """
+    if approval is None:
+        return "none"
+    if approval.requires_approval:
+        return "approval_required"
+    if approval.session_token is None:
+        return "approved"
+    if not configured:
+        return "approval_required"
+    return "approved_in_use" if service_running() else "approval_required"
+
+
+def source_lines(registry: CameraRegistry, store: ApprovalStore, configured,
+                 service_running: Callable[[], bool]) -> list[str]:
     lines = []
+    running = []
+
+    def holds() -> bool:
+        if not running:  # one /proc scan per listing
+            running.append(service_running())
+        return running[0]
+
     for source in registry.list_sources():
         if source.source_type is not SourceType.LOCAL_UVC:
             continue
-        approval = store.load(source.id)
-        state = ("none" if approval is None
-                 else "approval_required" if approval.requires_approval or approval.session_token
-                 else "approved")
+        state = approval_state(store.load(source.id), source.id in configured, holds)
         profile = source.desired_capture_profile
         wanted = ("-" if profile is None else
                   f"{profile.width}x{profile.height}@{profile.fps:g}/{profile.pixel_format}"
@@ -482,7 +531,10 @@ def _scan(context: _Context):
 
 def _sources(context: _Context) -> list[str]:
     try:
-        lines = source_lines(context.registry, ApprovalStore(context.database), context.configured)
+        lines = source_lines(context.registry, ApprovalStore(context.database), context.configured,
+                             context.check.running)
+    except CliRefused:
+        raise  # service_state_unavailable
     except Exception:
         raise _storage_refusal(context.database) from None
     _verify_pinned(context.database)
