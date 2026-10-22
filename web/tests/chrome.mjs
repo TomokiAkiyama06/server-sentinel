@@ -149,6 +149,25 @@ async function startChrome(executable, options) {
   };
 }
 
+/**
+ * A value-free description of a CDP `exceptionDetails` (#322): the error class
+ * and the first line of its engine message, with every quoted literal that is
+ * not a plain identifier (an engine message may quote page or input text, e.g.
+ * JSON.parse) and every invitation-code-shaped token replaced. A thrown
+ * non-Error value is described by its type only.
+ */
+export function describeException(details) {
+  const exception = details?.exception;
+  if (exception?.type !== 'object' || exception.subtype !== 'error') {
+    return `non-Error value thrown (${exception?.type ?? 'unknown'})`;
+  }
+  const line = String(exception.description ?? '').split('\n', 1)[0]
+    .replace(/(["'`])(.*?)\1/g, (quoted, mark, inner) => (/^[A-Za-z_$][\w$]{0,63}$/.test(inner) ? quoted : `${mark}…${mark}`))
+    .replace(/\b[0-9A-Z]{4}(?:[-\s\u3000\u30fc][0-9A-Z]{4}){2,}\b|\b[0-9A-Z]{20,}\b/gi, '<code>')
+    .slice(0, 200);
+  return line || String(exception.className ?? 'Error');
+}
+
 export async function pageFor(browser, viewport) {
   const { browserContextId } = await browser.command('Target.createBrowserContext');
   const { targetId } = await browser.command('Target.createTarget', { url: 'about:blank', browserContextId });
@@ -161,18 +180,64 @@ export async function pageFor(browser, viewport) {
   await command('Emulation.setDeviceMetricsOverride', { ...viewport, deviceScaleFactor: 1, mobile: false });
   async function evaluate(expression) {
     const result = await command('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
-    if (result.exceptionDetails) throw new Error('Browser evaluation failed');
+    if (result.exceptionDetails) throw new Error(`Browser evaluation failed: ${describeException(result.exceptionDetails)}`);
     return result.result.value;
   }
+  // A poll may span a navigation the page makes itself (e.g. a redirect to
+  // /app/): CDP then refuses the evaluation because the document's context is
+  // gone, which is not an answer, so the poll goes on until its deadline. An
+  // exception thrown by the expression itself stays fatal.
+  const NAVIGATING = /^(Execution context was destroyed|Cannot find default execution context|Inspected target navigated or closed)\b/;
   async function wait(expression) {
     for (let i = 0; i < 100; i++) {
-      if (await evaluate(expression)) return;
+      try {
+        if (await evaluate(expression)) return;
+      } catch (error) {
+        if (!NAVIGATING.test(error.message)) throw error;
+      }
       await delay(50);
     }
     throw new Error('Browser DOM assertion timed out');
   }
+  /**
+   * Navigates the top frame and resolves once that navigation's document has
+   * committed and parsed (DOMContentLoaded). `Page.navigate` answers before the
+   * commit, so an evaluation sent right after it can still run in the previous
+   * document (#322: `about:blank`, where `getElementById` returns null).
+   */
+  async function navigate(url, timeoutMilliseconds = 10000) {
+    // Events may arrive before the command's answer, so every parsed top-level
+    // document is recorded by loader and matched once the loader is known.
+    let committed;
+    let wanted;
+    let reached;
+    const parsed = new Set();
+    const ready = new Promise(resolve => { reached = resolve; });
+    const cleanup = [
+      browser.on('Page.frameNavigated', ({ frame }, from) => { if (from === sessionId && !frame.parentId) committed = frame.loaderId; }),
+      browser.on('Page.domContentEventFired', (_, from) => {
+        if (from !== sessionId || !committed) return;
+        parsed.add(committed);
+        if (committed === wanted) reached();
+      }),
+    ];
+    let timer;
+    try {
+      const { loaderId, errorText } = await command('Page.navigate', { url });
+      if (errorText) throw new Error(`Navigation failed: ${errorText}`);
+      if (!loaderId) throw new Error('Navigation started no new document');
+      wanted = loaderId;
+      if (parsed.has(loaderId)) return;
+      await Promise.race([ready, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Navigation did not reach DOMContentLoaded within ${timeoutMilliseconds} ms`)), timeoutMilliseconds);
+      })]);
+    } finally {
+      clearTimeout(timer);
+      cleanup.forEach(remove => remove());
+    }
+  }
   return {
-    command, evaluate, wait, sessionId,
+    command, evaluate, wait, navigate, sessionId,
     async heading(title) { await wait(`Array.from(document.querySelectorAll('h1')).some(el => el.textContent === ${JSON.stringify(title)})`); },
     async click(title) {
       const selector = `Array.from(document.querySelectorAll('nav button')).find(el => el.textContent === ${JSON.stringify(title)})`;

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { launchChrome } from './chrome.mjs';
+import { describeException, launchChrome, pageFor } from './chrome.mjs';
 
 // Synthetic stand-ins for Chrome's --remote-debugging-pipe transport (#197).
 // Each launch appends its pid to a ledger so the tests can prove that hung
@@ -98,4 +98,90 @@ test('commands after readiness keep a plain timeout and are never retried', { ti
     await assert.rejects(browser.command('Target.createBrowserContext'), /Chrome command timeout: Target\.createBrowserContext \(300 ms\)/);
   } finally { await browser.close(); }
   assert.equal((await fake.pids()).length, 1, 'a post-readiness failure must not relaunch Chrome');
+});
+
+// An in-process stand-in for a launched browser (#322): `pageFor` needs only
+// `command` and `on`. `answer` decides each command's result; `emit` delivers
+// a CDP event on the page's session.
+function fakeBrowser(answer) {
+  const listeners = new Map();
+  const browser = {
+    calls: [],
+    async command(method, params) { browser.calls.push(method); return answer(method, params) ?? {}; },
+    on(method, listener) {
+      if (!listeners.has(method)) listeners.set(method, new Set());
+      listeners.get(method).add(listener);
+      return () => listeners.get(method).delete(listener);
+    },
+    emit(method, params) { for (const listener of listeners.get(method) ?? []) listener(params, 'session-1'); },
+  };
+  return browser;
+}
+const setup = method => ({
+  'Target.createBrowserContext': { browserContextId: 'context-1' },
+  'Target.createTarget': { targetId: 'target-1' },
+  'Target.attachToTarget': { sessionId: 'session-1' },
+})[method];
+const viewport = { width: 390, height: 844 };
+const thrown = description => ({ exceptionDetails: { exception: { type: 'object', subtype: 'error', className: 'TypeError', description } } });
+
+test('evaluation failures are described without page values', () => {
+  const describe = description => describeException(thrown(description).exceptionDetails);
+  assert.equal(describe("TypeError: Cannot read properties of null (reading 'textContent')\n    at <anonymous>:1:26"),
+    "TypeError: Cannot read properties of null (reading 'textContent')");
+  assert.equal(describe('SyntaxError: Unexpected token \'a\', "a private value" is not valid JSON'),
+    'SyntaxError: Unexpected token \'a\', "…" is not valid JSON');
+  for (const code of ['0123-4567-89AB-CDEF-GHJK-MNPQ-RSTV-WXYZ', 'o123 4567 89ab cdef', '0123456789ABCDEFGHJKMNPQRSTVWXYZ']) {
+    assert.equal(describe(`Error: refused ${code}.`), 'Error: refused <code>.');
+  }
+  assert.equal(describeException({ exception: { type: 'string', value: 'a private value' } }), 'non-Error value thrown (string)');
+  assert.equal(describeException({ text: 'Uncaught' }), 'non-Error value thrown (unknown)');
+});
+
+test('wait keeps polling across a navigation but fails on an expression error', async () => {
+  let evaluations = 0;
+  const navigating = fakeBrowser(method => {
+    if (method !== 'Runtime.evaluate') return setup(method);
+    evaluations++;
+    if (evaluations === 1) throw new Error('Execution context was destroyed.');
+    return { result: { value: evaluations === 3 } };
+  });
+  await (await pageFor(navigating, viewport)).wait("location.pathname === '/app/'");
+  assert.equal(evaluations, 3);
+
+  const failing = fakeBrowser(method => (method === 'Runtime.evaluate'
+    ? thrown("TypeError: Cannot read properties of null (reading 'textContent')") : setup(method)));
+  await assert.rejects((await pageFor(failing, viewport)).wait("document.getElementById('m').textContent === 'x'"),
+    { message: "Browser evaluation failed: TypeError: Cannot read properties of null (reading 'textContent')" });
+  assert.equal(failing.calls.filter(method => method === 'Runtime.evaluate').length, 1, 'an expression error is not retried');
+});
+
+test('navigate resolves only once the new document has parsed', async () => {
+  let release;
+  const browser = fakeBrowser(method => {
+    if (method !== 'Page.navigate') return setup(method);
+    // The previous document finishes parsing while the navigation is pending;
+    // that must not count for the new one.
+    browser.emit('Page.frameNavigated', { frame: { id: 'frame-1', loaderId: 'loader-old' } });
+    browser.emit('Page.domContentEventFired', { timestamp: 1 });
+    release = () => {
+      browser.emit('Page.frameNavigated', { frame: { id: 'child', parentId: 'frame-1', loaderId: 'loader-child' } });
+      browser.emit('Page.frameNavigated', { frame: { id: 'frame-1', loaderId: 'loader-new' } });
+      browser.emit('Page.domContentEventFired', { timestamp: 2 });
+    };
+    return { frameId: 'frame-1', loaderId: 'loader-new' };
+  });
+  const page = await pageFor(browser, viewport);
+  let settled = false;
+  const navigation = page.navigate('http://localhost/').then(() => { settled = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false, 'the previous document does not satisfy the navigation');
+  release();
+  await navigation;
+
+  const refused = fakeBrowser(method => (method === 'Page.navigate'
+    ? { frameId: 'frame-1', loaderId: 'l', errorText: 'net::ERR_BLOCKED_BY_CLIENT' } : setup(method)));
+  await assert.rejects((await pageFor(refused, viewport)).navigate('http://localhost/'), /Navigation failed: net::ERR_BLOCKED_BY_CLIENT/);
+  const silent = fakeBrowser(method => (method === 'Page.navigate' ? { frameId: 'frame-1', loaderId: 'l' } : setup(method)));
+  await assert.rejects((await pageFor(silent, viewport)).navigate('http://localhost/', 50), /did not reach DOMContentLoaded within 50 ms/);
 });
