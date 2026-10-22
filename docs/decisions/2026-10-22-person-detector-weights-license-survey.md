@@ -1,6 +1,6 @@
 # 2026-10-22: 重みのライセンスが明確な人物検出モデルの調査（Issue #20）
 
-- Status: **Accepted（Q1〜Q4、Owner 判断 2026-10-22）／ Q5・Q6 は未決**。
+- Status: **Accepted（Q1〜Q6、Owner 判断 2026-10-22）**。
   下の「Owner 判断（2026-10-22）」の節を見てください。D-FINE の評価は承認済みですが、本番採用はまだ承認されていません。
 - Date: 2026-10-22
 - Related: Issue #20、`docs/THIRD_PARTY_POLICY.md`、
@@ -13,8 +13,8 @@
 
 ## Owner 判断（2026-10-22）
 
-Owner は 2026-10-22 に、下の「Owner への質問」の Q1〜Q4 について次のとおり判断しました。
-Q5 と Q6 は未決です。
+Owner は 2026-10-22 に、下の「Owner への質問」の Q1〜Q6 について次のとおり判断しました
+（Q5・Q6 は同日に PR #319 のコメントで追加）。
 
 - **Q1（重みのライセンスの基準）**：**新しく本番採用する重みには、配布元による明示を必須とします。**
   RT-DETRv2-S は維持します。ただし、根拠が弱いことを既知の弱点として記録します
@@ -30,12 +30,18 @@ Q5 と Q6 は未決です。
   artifact は upstream の元の `dfine_{n,s}_coco.pth`（`Peterande/storage` の release `dfinev1.0`）から作ります。
   `torch.load(..., weights_only=True)` を使い、隔離した環境で ONNX に export します。
   HF の `ustc-community/dfine-{nano,small}-coco` の safetensors は、値が一致するかの照合だけに使います。
-- **Q5（export 用の環境）**：未決です。
-- **Q6（YOLOX の評価用 adapter）**：未決です。
+- **Q5（export 用の環境）**：commit しない、CPU を制限した container の中で、export のために
+  PyTorch を使うことを許可します。PyTorch の version を固定し、`weights_only=True` を明示し、
+  使った tool の version と出力した ONNX の SHA-256 を記録します。
+- **Q6（YOLOX の評価用 adapter）**：D-FINE の評価が終わるまで残します。
 
 ### 実施条件（この PR の提案）
 
 次の 5 点は Owner が判断した内容ではなく、上の判断を実施するためにこの PR が提案する条件です。
+Q5 の export については、Owner の条件（version 固定、`weights_only=True` の明示、tool の version と
+出力 SHA-256 の記録、commit しない CPU 制限 container）に、この PR が次の条件を加えます：
+PyTorch 2.10.0 以上、network なし・memory 制限・non-root の使い捨て container、固定 revision の
+code と checkpoint だけを使うこと。
 
 - Q4 の D-FINE の評価は、YOLOX と同じ扱いにします：重みはリポジトリ外、digest 固定、
   CI での download なし、deployment schema では拒否。
@@ -49,7 +55,7 @@ Q5 と Q6 は未決です。
   リポジトリ外に置く限り、gate の inventory には記録できません。重みを本番用に commit する
   ことになった場合にだけ、その PR で `model_weight` の記録と、この文書を参照する approval entry
   を追加します（2026-09-30 の YOLOX の判断と同じ扱い）。
-- Q4 の export は、Q5（export 用の環境）が決まってから行います。また、upstream の
+- Q4 の export は、Q5 で許可された環境で行います。また、upstream の
   `tools/deployment/export_onnx.py` をそのまま使ってはいけません。
   [`956d170` の該当行](https://github.com/Peterande/D-FINE/blob/956d1709314c2c6a4df6f34de232054578a7449f/tools/deployment/export_onnx.py#L30)
   は `torch.load(args.resume, map_location="cpu")` で、`weights_only` を指定していません。
@@ -57,10 +63,10 @@ Q5 と Q6 は未決です。
   `torch>=2.0.1` を許しており、PyTorch 2.6 より前の版では `torch.load` の既定は制限のない
   pickle の読み込みです（既定が `weights_only=True` に変わったのは 2.6。PyTorch の release notes に
   基づく記述で、この調査では再確認していません）。そのため、export は次の条件で行います。
-  - checkpoint を読むのは、自前の小さな wrapper（または upstream の呼び出しを patch したもの）で、
+  - （Q5 の Owner 条件）checkpoint を読むのは、自前の小さな wrapper（または upstream の呼び出しを patch したもの）で、
     `torch.load(path, map_location="cpu", weights_only=True)` を**明示的に**渡します。既定値には頼りません。
-  - PyTorch は exact version で固定し、その版で `weights_only=True` が有効なことを、手順書に記録します。
-    さらに、その版は **2.10.0 以上**でなければなりません。PyTorch の security advisory
+  - （Q5 の Owner 条件）PyTorch は exact version で固定し、その版で `weights_only=True` が有効なことを、手順書に記録します。
+    （この PR の追加条件）さらに、その版は **2.10.0 以上**でなければなりません。PyTorch の security advisory
     [GHSA-63cw-57p8-fm3p](https://github.com/pytorch/pytorch/security/advisories/GHSA-63cw-57p8-fm3p)
     （CVE-2026-24747、2026-01-26 公開、severity high）は、細工した `.pth` を
     `torch.load(..., weights_only=True)` で読むと、`weights_only` の unpickler の検証漏れにより
@@ -68,10 +74,13 @@ Q5 と Q6 は未決です。
     修正版は `>=2.10.0` です（2026-10-22 に advisory の原文と GitHub Advisory Database の記録を確認）。
     upstream の下限 `torch>=2.0.1` の版はすべて影響を受けます。実装の時点で、選んだ版に
     この advisory 以降の同種の advisory がないことも確認し、版と確認日を手順書に記録します。
-  - それでも `weights_only=True` だけには頼りません（多層防御）。export は、固定 revision の
+  - （この PR の追加条件）それでも `weights_only=True` だけには頼りません（多層防御）。export は、固定 revision の
     checkpoint（size と SHA-256 をローカルで記録したもの）だけを対象に、network なし
     （`--network none`）、CPU と memory を制限した、non-root の使い捨て container の中で行います。
-    container の外へ持ち出すのは、出力した ONNX とその SHA-256 だけです。
+    container の外へ持ち出すのは、出力した ONNX とその SHA-256 だけです。CPU の制限と、container を
+    commit しないことは Q5 の Owner 条件です。
+  - （Q5 の Owner 条件）使った tool（PyTorch、ONNX、D-FINE の revision など）の version と、
+    出力した ONNX の SHA-256 を記録します。
   - `weights_only=True` で読めない checkpoint（独自 class などを含むもの）は、その場で export を中止します。
     `weights_only=False` に戻すことはしません。
   - D-FINE のコードは、下記の固定 revision だけを使います。
@@ -309,7 +318,7 @@ Owner の同意のもとで Main host のローカルだけで使い、結果の
 
 ## Owner への質問
 
-Q1〜Q4 は 2026-10-22 に判断済みです（冒頭の節）。Q5・Q6 は未決です。記録のため、質問は元の文のまま残します。
+Q1〜Q6 は 2026-10-22 に判断済みです（冒頭の節）。記録のため、質問は元の文のまま残します。
 
 1. **重みのライセンスの基準**：本番採用には「配布元（原著者・公式組織）の明示」を必須に
    しますか。それとも、RT-DETRv2 のような Hugging Face 変換者の metadata でも十分としますか。

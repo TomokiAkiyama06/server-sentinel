@@ -19,15 +19,17 @@
 > excluded for now; D-FINE-N/S COCO-only checkpoints are approved for
 > **evaluation only**, exported from the original `.pth` with
 > `weights_only=True` in an isolated environment. Production adoption of D-FINE
-> is not approved. The export environment (Q5) and the YOLOX adapter's future
-> (Q6) are still undecided; the D-FINE export can only be carried out after Q5
-> is decided.
+> is not approved. Q5: PyTorch may be used for the export in an uncommitted,
+> CPU-limited container (pinned version, explicit `weights_only=True`, tool
+> versions and output SHA-256 recorded). Q6: the YOLOX evaluation adapter stays
+> until the D-FINE evaluation is done.
 > The upstream exporter at the reviewed revision `956d170` calls `torch.load`
 > without `weights_only`, so the export must use our own wrapper that passes
 > `weights_only=True` explicitly with an exact PyTorch version of at least
 > 2.10.0 (advisory GHSA-63cw-57p8-fm3p / CVE-2026-24747: `weights_only=True`
 > loading is exploitable in `<=2.9.1`), inside an isolated, network-less,
-> CPU-limited, non-root container as defence in depth. As with YOLOX,
+> CPU-limited, non-root container as defence in depth (the >=2.10.0, network-less
+> and non-root conditions are added by the survey on top of Q5). As with YOLOX,
 > the residual-risk approval stays in the decision record: externally kept
 > weights cannot be listed in `license/components.json` /
 > `license/owner-approvals.json`.
