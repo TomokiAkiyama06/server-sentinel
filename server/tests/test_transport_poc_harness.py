@@ -8,10 +8,12 @@ LAN, capture host, camera or transport choice.
 """
 import argparse
 import contextlib
+import errno
 import io
 import json
 import os
 from pathlib import Path
+import selectors
 import socket
 import stat
 import sys
@@ -2680,6 +2682,16 @@ class SenderProducerTests(unittest.TestCase):
         self.assertTrue(all(row["generated"] == 0 and row["first_offer_delay_ns"] is None
                             for row in ends))
 
+    def test_holder_socket_error_records_its_errno(self):
+        # #307: the record names the OS error by number only (no message/path)
+        code, elapsed, rows = self.run_sender("holder", holder_socket=self.root / "absent.sock")
+        failed = [row for row in rows if row["kind"] == "producer_failed"]
+        self.assertEqual(1, code)
+        self.assertLess(elapsed, 5.0)
+        self.assertEqual({("exception", errno.ENOENT)},
+                         {(row["reason"], row["errno"]) for row in failed})
+        self.assertEqual({0, 1}, {row["source"] for row in failed})
+
     def test_producer_exception_is_fatal_and_normal_runs_exit_zero(self):
         calls = []
 
@@ -2695,8 +2707,9 @@ class SenderProducerTests(unittest.TestCase):
         with mock.patch.object(sender.Sender, "_builtin", few_then_raise):
             code, elapsed, rows = self.run_sender("builtin")
         failed = [row for row in rows if row["kind"] == "producer_failed"]
-        self.assertEqual((1, [1], ["exception"]), (code, [r["source"] for r in failed],
-                                                    [r["reason"] for r in failed]))
+        self.assertEqual((1, [1], ["exception"], [None]),
+                         (code, [r["source"] for r in failed], [r["reason"] for r in failed],
+                          [r["errno"] for r in failed]))
         self.assertLess(elapsed, 5.0)
         # a healthy producer stops only with the sender: exit 0, production on record
         code, elapsed, rows = self.run_sender("builtin", seconds=2.0)
@@ -3191,6 +3204,85 @@ class MiscTests(unittest.TestCase):
             self.assertEqual([(4242, 0)], [(row["nonce"], row["source"]) for row in forwarded])
             self.assertGreaterEqual(forwarded[0]["frames"], 1)
             self.assertEqual(1, sum(1 for row in rows if row["kind"] == "session_close"))
+
+    def _idle_holder(self, directory):
+        """A holder whose camera delivers no frame (as during a capture stall)."""
+        queue = mock.Mock()
+        queue.get.side_effect = lambda timeout: None
+        queue.drop_stats.return_value = (0, None)
+        capture = mock.Mock()
+        capture.frames.return_value = queue
+        out = Path(directory) / "h.jsonl"
+        writer = records.JsonlWriter(out, run_id=RUN, role="holder")
+        return holder.Holder(capture, [uuid4()], Path(directory) / "sock", writer), writer, out
+
+    def _hello(self, instance, nonce):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(client.close)
+        client.connect(str(instance.path))
+        holder.send_hello(client, nonce)
+        return client
+
+    def test_holder_ends_a_session_at_sender_eof_without_frames(self):
+        # #307: with no frame to send, the holder still sees the sender's EOF
+        with tempfile.TemporaryDirectory() as directory:
+            instance, writer, out = self._idle_holder(directory)
+            first = self._hello(instance, 11)
+            runner = threading.Thread(target=instance.run, args=(3.0,))
+            runner.start()
+            deadline = time.monotonic() + 2
+            while instance.client is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIsNotNone(instance.client)
+            first.close()
+            while instance.client is not None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            ended = instance.client is None
+            instance.stop.set()
+            runner.join(5)
+            writer.close()
+            self.assertTrue(ended)
+            rows = records.read_jsonl(out)
+            self.assertEqual([("session_open", 11), ("forwarded", 11), ("session_close", 11)],
+                             [(row["kind"], row["nonce"]) for row in rows if "nonce" in row])
+            self.assertEqual(0, instance.forward_drops)
+
+    def test_holder_serves_a_restarted_sender_and_refuses_a_concurrent_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            instance, writer, out = self._idle_holder(directory)
+            instance.listener.setblocking(False)
+            instance.selector.register(instance.listener, selectors.EVENT_READ)
+            first = self._hello(instance, 11)
+            instance._accept()
+            self.assertEqual(11, instance.client_nonce)
+            # the restarted sender connects before the holder handled the EOF
+            first.close()
+            second = self._hello(instance, 22)
+            instance._accept()
+            self.assertEqual(22, instance.client_nonce)
+            # a second sender while the current one is alive is refused
+            third = self._hello(instance, 33)
+            instance._accept()
+            self.assertEqual(22, instance.client_nonce)
+            third.settimeout(2)
+            try:
+                self.assertEqual(b"", third.recv(1))
+            except ConnectionResetError:
+                pass  # closed with its HELLO unread
+            self.assertFalse(holder.peer_gone(instance.client))
+            second.close()
+            self.assertTrue(holder.peer_gone(instance.client))
+            instance.close()
+            writer.close()
+            rows = records.read_jsonl(out)
+            self.assertEqual([("session_open", 11), ("forwarded", 11), ("session_close", 11),
+                              ("session_open", 22), ("refused", None), ("forwarded", 22),
+                              ("session_close", 22)],
+                             [(row["kind"], row.get("nonce")) for row in rows
+                              if row["kind"] in ("session_open", "session_close", "forwarded",
+                                                 "refused")])
+            self.assertEqual("connection_limit",
+                             next(row for row in rows if row["kind"] == "refused")["reason"])
 
 
 def _free_offset():
