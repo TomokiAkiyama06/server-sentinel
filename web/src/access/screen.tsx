@@ -55,6 +55,9 @@ export function AccessScreen({ services, t }: { services: DashboardServices; t: 
   const [nameInvalid, setNameInvalid] = useState(false);
   const operation = useRef<AbortController | null>(null);
   const answer = useRef<((confirmed: boolean) => void) | null>(null);
+  /** Where the change in flight stands: `stale` from its `step_up_required`
+   *  refusal until the one retry is sent, `sent` otherwise. */
+  const phase = useRef<'idle' | 'sent' | 'stale'>('idle');
   const load = services.loadPrincipals;
 
   useEffect(() => {
@@ -84,9 +87,11 @@ export function AccessScreen({ services, t }: { services: DashboardServices; t: 
     // keep it shown (PR #315 review).
     const hide = () => {
       const pending = operation.current;
-      // The step-up question is open: the change was refused before any
-      // commit (`step_up_required`) and is not sent again, so nothing changed.
-      const unanswered = answer.current !== null;
+      // Refused with `step_up_required` (nothing committed) and the one retry
+      // not sent yet — the question open, or the step-up ceremony still
+      // running: abandoning it now means nothing changed (Codex PR #315).
+      const unanswered = phase.current === 'stale';
+      phase.current = 'idle';
       operation.current = null;
       pending?.abort();
       answer.current?.(false);
@@ -122,6 +127,7 @@ export function AccessScreen({ services, t }: { services: DashboardServices; t: 
     if (busy !== null || !run) return;
     const controller = new AbortController();
     operation.current = controller;
+    phase.current = 'sent';
     if (invalidates !== undefined) setIssued(current => current?.principalId === invalidates ? null : current);
     setBusy(key);
     setConfirming(null);
@@ -135,15 +141,19 @@ export function AccessScreen({ services, t }: { services: DashboardServices; t: 
             resolve(confirmed);
           };
           answer.current = settle;
+          // Asked only after a `step_up_required` refusal.
+          if (operation.current === controller) phase.current = 'stale';
           setPrompt(() => settle);
         }),
         stepUp: services.stepUp,
         onCeremony: () => setCeremony(true),
+        onRetry: () => { if (operation.current === controller) phase.current = 'sent'; },
       }, controller.signal);
       // A late answer after pagehide, unmount or abort is dropped, even one
       // that resolved although its signal was aborted.
       if (outcome.state === 'aborted' || controller.signal.aborted || operation.current !== controller) return;
       operation.current = null;
+      phase.current = 'idle';
       setCeremony(false);
       setBusy(null);
       setResult(outcome.state);

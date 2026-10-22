@@ -281,6 +281,19 @@ test('an Owner change runs once, asks before a step-up and retries exactly once'
   assert.deepEqual(await runOwnerChange(async () => { runs += 1; if (runs === 1) throw stale(); return 'ok'; }, hooks(true), signal()),
     { state: 'done', value: 'ok' });
   assert.deepEqual([runs, asked, ceremonies], [2, 1, 1]);
+  // onRetry fires once, after the ceremony and right before the retry is sent.
+  const order = [];
+  runs = 0;
+  await runOwnerChange(async () => { runs += 1; order.push(`run${runs}`); if (runs === 1) throw stale(); return 'ok'; }, {
+    confirm: async () => { order.push('confirm'); return true; }, stepUp: async () => { order.push('ceremony'); },
+    onRetry: () => order.push('retry'),
+  }, signal());
+  assert.deepEqual(order, ['run1', 'confirm', 'ceremony', 'retry', 'run2']);
+  // A failed ceremony never reaches the retry.
+  const none = [];
+  await runOwnerChange(async () => { throw stale(); }, { confirm: async () => true,
+    stepUp: async () => { throw new Error('synthetic'); }, onRetry: () => none.push('retry') }, signal());
+  assert.deepEqual(none, []);
   // Still stale after one step-up: no loop.
   runs = 0; asked = 0; ceremonies = 0;
   assert.deepEqual(await runOwnerChange(async () => { runs += 1; throw stale(); }, hooks(true), signal()), { state: 'not_performed' });

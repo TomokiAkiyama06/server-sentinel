@@ -434,8 +434,10 @@ built.
   synchronously). `pagehide` also aborts a change still in flight and drops
   its late answer, so a code returned after the page was hidden is never
   shown; that change is reported as unknown and the list reloaded, except
-  while the step-up question is open (refused before any commit, never
-  resent), which is reported as not performed. A tab or app switch
+  between its `step_up_required` refusal and the moment its one retry is
+  sent (the question open, or the step-up ceremony still running: refused
+  before any commit and now never resent), which is reported as not
+  performed (`onRetry` in `step_up.ts` marks that moment). A tab or app switch
   (`visibilitychange`) deliberately clears nothing, so the Owner can paste
   the code into another app. A shown
   code is dropped as soon as a re-issue or revocation of the same person

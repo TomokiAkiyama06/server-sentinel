@@ -306,6 +306,42 @@ try {
     assert.deepEqual(posts().map(item => item.path), [`/api/admin/principals/${personId}/permissions`]);
   });
 
+  await scenario('pagehide during the step-up ceremony, before the retry, reports that nothing changed', {
+    handlers: (json, stepUpRequired) => ({
+      [`POST /api/admin/principals/${personId}/permissions`]: stepUpRequired,
+      'POST /api/auth/step-up': async () => { await delay(800); return [204, '', null]; },
+    }),
+  }, async ({ page, ui, posts }) => {
+    await ui.open();
+    await ui.button('付与する');
+    await ui.button(TEXT.confirm);
+    // The assertion is posted and its answer is still pending: hide now.
+    for (let attempt = 0; attempt < 100 && !posts().some(item => item.path === '/api/auth/step-up'); attempt++) await delay(20);
+    await page.evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }))");
+    await ui.text(TEXT.notPerformed);
+    await delay(1200);
+    // The change itself was never resent.
+    assert.deepEqual(posts().map(item => item.path), [`/api/admin/principals/${personId}/permissions`,
+      '/api/auth/step-up/options', '/api/auth/step-up']);
+  });
+
+  await scenario('pagehide after the retry was sent reports an unknown result', {
+    handlers: (json, stepUpRequired) => {
+      let grants = 0;
+      return { [`POST /api/admin/principals/${personId}/permissions`]: () => (grants += 1) === 1
+        ? stepUpRequired() : delay(800).then(() => [204, '', null]) };
+    },
+  }, async ({ page, ui, posts }) => {
+    await ui.open();
+    await ui.button('付与する');
+    await ui.button(TEXT.confirm);
+    const path = `/api/admin/principals/${personId}/permissions`;
+    for (let attempt = 0; attempt < 100 && posts().filter(item => item.path === path).length < 2; attempt++) await delay(20);
+    await page.evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }))");
+    await ui.text(TEXT.unknown);
+    assert.deepEqual(posts().map(item => item.path), [path, '/api/auth/step-up/options', '/api/auth/step-up', path]);
+  });
+
   await scenario('an invitation answered after pagehide never shows its code', {
     handlers: json => ({ 'POST /api/admin/principals': async () => {
       await delay(800);

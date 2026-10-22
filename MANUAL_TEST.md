@@ -2252,8 +2252,11 @@ Chrome (record the browser and OS versions used):
   may be restored from the back-forward cache; also close the tab and
   reopen `/app/`): on return no code is shown, a restored page reports the
   result as unknown and reloads the list; re-issue to obtain a usable code;
-- [ ] with the step-up question open, navigate away and come back with Back:
-  the page reports that nothing was changed and nothing was sent again;
+- [ ] with the step-up question open, and again while the passkey prompt is
+  showing (after "パスキーで確認して続ける"), navigate away and come back with
+  Back: the page reports that nothing was changed and the change was not
+  sent again (check the network panel); navigating away only after the
+  retried change was sent reports the result as unknown;
 - [ ] with a code shown, switch to another tab or app (for example the chat
   app the code is pasted into) and return: the code is still shown. This is
   intended: only leaving the page (`pagehide`) clears it, not a tab or app

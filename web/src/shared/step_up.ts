@@ -28,6 +28,9 @@ export interface StepUpHooks {
   stepUp?: ((signal: AbortSignal) => Promise<void>) | undefined;
   /** Called after the Owner confirmed, while the ceremony runs. */
   onCeremony?: () => void;
+  /** Called right before the one retry is sent. Until then the change was
+   *  refused before any commit, so abandoning it means "not performed". */
+  onRetry?: () => void;
 }
 
 const stale = (error: unknown) => error instanceof ApiError && error.code === 'step_up_required';
@@ -50,6 +53,7 @@ export async function runOwnerChange<T>(run: (signal: AbortSignal) => Promise<T>
     return signal.aborted ? { state: 'aborted' } : { state: 'not_performed' };
   }
   if (signal.aborted) return { state: 'aborted' };
+  hooks.onRetry?.();
   try {
     return { state: 'done', value: await run(signal) };
   } catch (error) {
