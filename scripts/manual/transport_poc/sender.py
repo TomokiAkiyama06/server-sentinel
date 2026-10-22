@@ -256,8 +256,8 @@ class Sender:
     def _holder(self):
         from .holder import read_frames, send_hello
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        connection.connect(str(self.config.holder_socket))
         try:
+            connection.connect(str(self.config.holder_socket))
             send_hello(connection, self.holder_nonce)
             read_frames(connection, self._offer, self.stop)
         finally:
@@ -272,16 +272,18 @@ class Sender:
         ``producer_failed`` for each source it fed and stop the sender, which
         then exits non-zero.
         """
-        reason = "eof"
+        reason, errno = "eof", None
         try:
             target(*arguments)
-        except Exception:  # noqa: BLE001 - any producer error is a failed run
+        except Exception as error:  # noqa: BLE001 - any producer error is a failed run
             reason = "exception"
+            # numeric only (no message or path): e.g. 104 for a holder reset (#307)
+            errno = error.errno if isinstance(error, OSError) else None
         if self.stop.is_set():
             return  # normal shutdown (deadline or SIGTERM)
         self.producer_failed = True
         for index in indexes:
-            self.writer.write("producer_failed", source=index, reason=reason)
+            self.writer.write("producer_failed", source=index, reason=reason, errno=errno)
         self.stop.set()
         try:
             self.wake_w.send(b"x")

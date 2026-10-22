@@ -509,7 +509,8 @@ source 数も変わるので、既定のまま実行してください。
 media を流す scenario（否定認証と `route_probe` 以外）では、各 source が run の間ずっと生成し続けた
 ことも `integrity` の条件です（`production`）。durable unit が 1 つ届いただけでは source を
 「exercised」とは数えません。sender は producer（`gst-launch` の EOF、holder socket の EOF、
-producer thread の例外）が run 途中で終わると `producer_failed` を記録して停止し、非 0 で終了します。
+producer thread の例外）が run 途中で終わると `producer_failed` を記録して停止し、非 0 で終了します
+（例外が `OSError` ならその `errno` を数値で記録し、それ以外は `null`。メッセージや path は記録しない）。
 summarizer は `producer_failed` があれば `fail`、さらに sender の `end`（source・epoch ごと、sender
 時計）で、`generated` ≥ 0.8 × 申告 fps ×（生成時間 − 3 s）、最初の unit が生成開始から 3 s 以内、
 unit 間の最長空白と最後の unit から生成終了までが 2 s 以内、source ごとの生成時間の合計が予定
@@ -534,6 +535,11 @@ secondary の `agent_cpu` は real 入力の run が 1 つでも holder CPU を�
 real 入力の run は holder 側の記録との対応（`holder_linkage`）も必要です。sender は holder socket に
 接続すると最初に自分の start nonce（8 byte）を送り、holder はその nonce で `session_open` /
 `session_close` と source ごとの `forwarded`（その session で送信完了した frame 数）を記録します。
+holder が同時に扱う sender は 1 つです。sender は nonce の後は何も送らないので、holder は session の
+socket を監視し、EOF（または想定外の受信）で frame の送信を待たずに session を閉じます。session が
+開いている間に来た接続は、その session の sender がすでに切断していれば古い session を閉じて受け付け、
+まだ接続中なら閉じて `refused`（`connection_limit`）を記録します（Issue #307: camera frame が止まって
+いる間の `capture_restart` で、再起動後の sender が古い session のせいで拒否されていた）。
 集計は sender の各 `start`（= 1 epoch）について、同じ `run_id` の holder ファイルにその nonce の
 session が 1 回だけ開閉され、宣言した全 source で `forwarded` ≥ sender `end` の `generated`、かつ
 超過分の合計が `HOLDER_INFLIGHT_SLACK`（64 frame。sender 停止時に socket に残った分）以下であることを
