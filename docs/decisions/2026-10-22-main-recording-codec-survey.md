@@ -1,10 +1,47 @@
 # 2026-10-22: Main の録画 codec / container / muxer / validator の調査（D13）
 
-- Status: **Proposed（調査のみ。Owner はまだ決めていません）**。この文書は判断の材料です。Accepted な決定ではありません。
+- Status: **Owner 判断を記録済み（2026-10-22）**。判断の内容は §0 にあります。§1〜§10 の比較は、判断の背景として残しています。実機で測る必要がある項目（同期 I/O、CPU / GPU、bitrate の上限、browser の挙動など）は、§0 と §13 に「実機で測る」と明記しており、その値はまだ決まっていません。
 - Date: 2026-10-22
 - Related: Issue #313（本調査の Issue）、#10 Phase 2 の D13 と S9、#17、#18、#19、#21、#23、#26、#47、#28、#15 / ADR-0007、#16
 - Scope: 文書だけです。runtime の依存、lock、`license/components.json` / `license/owner-approvals.json` の記録、code は追加しません。
 - 実測について: **この文書のために新しく測った値はありません**。数値は、既存の記録（`MANUAL_TEST.md`、`docs/decisions/2026-10-11-mjpg-decoder-survey.md`）から引用するか、明記した仮定から計算した **推定** です。Main host と capture host は本番環境なので、この調査ではカメラにも稼働中のサービスにも触れていません。Main host で行ったのは、読み取りだけの `gst-inspect-1.0` と `dpkg -l` による package の確認だけです。
+
+## 0. Owner 判断（2026-10-22）
+
+Owner は 2026-10-22 に、§12 の問いについて次のとおり決めました。
+
+| 問い | 判断 |
+| --- | --- |
+| Q1 保存の codec | **H.264** で保存する。 |
+| Q2（D13）container と再生 | **fragmented MP4** で保存し、**そのまま browser へ配る**（MSE / HLS(fMP4)。§6 の P3）。録画の一覧・再生・playlist・segment は、server 側で `recordings:view` を確認してから返す。download / export は提供しない。 |
+| Q3 encoder | **GStreamer の nvcodec（NVENC）**。 |
+| Q4 NVENC が無い・失敗したとき | **MJPEG の保存に fallback する**。そのとき録画を **degraded** にし、**Owner に通知する**。黙って fallback しない。segment は `codec` / `container` を持つので、形式の混在は manifest で区別できる。 |
+| Q5 validator | **全 frame の decode による検証を必須**とする。録画の検証専用の子プロセスで行い、ROI 用の子プロセスとは分ける。CPU の割り当ては、実機で測ってから決める。 |
+| Q6 self-test | **実 pipeline の sample** を使う（capture → packet adapter → muxer → validator）。既存の `.selftest` の契約に従って扱う。 |
+| Q7 容量と上限 | recording root は **HDD**。segment の長さは、実機で同期 I/O の負荷を測ってから決める。§8.6 の上限は、H.264 と MJPEG の fallback のそれぞれについて、negotiated bound から計算し直す。 |
+| Q8 AVC の特許 | 研究室内での使用として、**Owner の責任で受け入れる**。 |
+
+この判断により、§4 の B（software encode。x264 / OpenH264）、§7 の V3（FFmpeg の CLI）と V4（PyAV）、§6 の P1 / P2 を主な経路とする案は、採用しません。§11 の推奨（MJPEG で保存し、P1 で再生する案）は、判断の前の提案として残しています。
+
+### 0.1 判断を受けて残る技術的な問い（実装の前に決める）
+
+- **T1: H.264 の validator に使う decoder**。全 frame の decode を、閉じ込めた子プロセスで行う必要があります（Q5）。候補は次のとおりで、**まだ決まっていません**。
+  - `nvh264dec`（gst-plugins-bad の nvcodec。encoder と同じ plugin です。gst-plugins-bad は LGPL です（採用のときに COPYING で確認します））。子プロセスに `/dev/nvidia*` と CUDA の library への access を許す必要があり、Landlock / seccomp の閉じ込めが ROI の子プロセスより広くなります。また、encode と同じ GPU と driver で decode するので、GPU や driver の不具合が encode 側と検証側の両方に同時に出ると、検証で見逃すおそれがあります。
+  - `avdec_h264`（gst-libav。FFmpeg の H.264 decoder を CPU で使います）。FFmpeg は既定の build なら LGPL-2.1-or-later ですが、`--enable-gpl` で build すると GPL になります [FFmpeg-legal]。distribution package の build 構成を監査する必要があります。Main host には入っていません。GPU から独立して検証でき、閉じ込めの範囲も狭くできます。CPU 負荷は測っていません。
+  - `openh264dec`（gst-plugins-bad）。OpenH264 の特許 license は、Cisco が配布する binary に限られます（§4 B）。Q8 で特許は Owner の責任で受け入れましたが、binary の入手方法と表示の条件は別に確認が要ります。
+  - MJPEG の fallback の segment は、これまでどおり simplejpeg で検証します。
+- **T2: fMP4 の muxer**。Main host には `mp4mux` / `qtmux`（gst-plugins-good。`fragment-duration` を持ちます）があります。`isofmp4mux`（gst-plugins-rs）はありません。GStreamer の muxer を使うか、自前の stdlib の ISO BMFF writer を使うかは、まだ決まっていません。どちらの場合も、segment ごとに init（`ftyp` + `moov`）を持たせて、単独で decode できるようにします。
+- **T3: MJPEG の fallback の segment の container と再生**。MJPEG は `<video>` で再生できません（§4 A）。fallback の区間をどの container（Matroska `V_MJPEG` など）で保存し、browser でどう見せるか（frame pull、または「この区間は再生できない」と表示するか）を決める必要があります。
+- **T4: bitrate の上限の強制**。§8.6 の上限は、negotiated bound（`VideoFormat.maximum_bitrate`）が実際に守られることを前提にしています。H.264 は NVENC の rate control（最大 bitrate と VBV buffer）で守らせます。MJPEG は camera が bitrate を制御しないので、fallback で使う上限を設定で決め、それを超える segment は拒否して gap にし、degraded にする必要があります（§8.6）。
+- **T5: GStreamer の導入**。Main の runtime に、operator が導入する GStreamer（core、base、good、bad の nvcodec）を入れることになります。`agent/docs/DEPENDENCIES.md` の前例（絶対 path、root 所有の確認、使う plugin を限る、Landlock）に合わせた閉じ込めと、package の inventory の review が要ります。NVENC は `/dev/nvidia*` への access を必要とします。
+
+### 0.2 実機で測ってから決めるもの
+
+- HDD 上での append の遅延、fsync と SQLite の commit の時間（§8.4）。これを測ってから segment の長さを決めます。
+- NVENC の encode と validator の decode の CPU / GPU / VRAM、遅延（§8.5）。
+- H.264 の実際の bitrate と画質。これをもとに、NVENC の最大 bitrate（negotiated bound）を決めます。
+- iPhone Safari での HLS(fMP4) / ManagedMediaSource の再生と、cookie による認可（§6、§13）。
+- Firefox on Linux で H.264 を再生できるか。
 
 ## 1. 問題（main `833c492` 時点）
 
@@ -258,34 +295,48 @@ segment の長さを決めるときの trade-off は次のとおりです。
 | B（x264 / OpenH264） | decode + 色変換 + encode | **測っていません**。1080p30 では source ごとに数 core 規模の可能性がある（仮定） |
 | C（NVENC） | decode（CPU か `nvjpegdec`）+ upload + encode | CPU は decode の分（約 0.12 core / source）+ α。NVENC は 4 基あり、session の上限はありません [NVIDIA-matrix]。throughput と VRAM は**測っていません** |
 
-### 8.6 30 秒の pre-roll に必要な運用上限
+### 8.6 30 秒の pre-roll に必要な運用上限（negotiated bound から計算する）
 
-`Limits` の `pre_roll_bytes`、`max_spool_segments`、`max_segment_bytes` は、**source ごとではなく、store 全体で共有される上限**です（`store.py` の `_trim()` は、全 source の spool の合計 byte 数と合計 segment 数を比べます）。`_trim()` は、各 source の最新の `end_ms` から `pre_roll_ms` より前に終わった segment を spool から外します。このため、spool には source ごとに 30 秒分と、境界の 1 segment が残ります。
+`Limits` の `pre_roll_bytes`、`max_spool_segments`、`max_segment_bytes` は、**source ごとではなく、store 全体で共有される上限**です（`store.py` の `_trim()` は、全 source の spool の合計 byte 数と合計 segment 数を比べます）。`_trim()` は、各 source の最新の `end_ms` から `pre_roll_ms` より前に終わった segment を spool から外します。このため、spool には source ごとに 30 秒分と、境界の 1 segment が残ります。合計がどちらかの上限を超えると、`_trim()` は古い segment から spool の印を外します。そのため、上限が足りないと、**30 秒より新しい segment まで追い出され、pre-roll が短くなります**。
 
 `server/docs/DEPLOYMENT.md` の例の値は、`pre_roll_bytes` = 67,108,864（64 MiB）、`max_spool_segments` = 64、`max_segment_bytes` = 8,388,608（8 MiB）、`max_segment_ms` = 10,000 です。また、`max_segment_bytes` は storage の `max_request_bytes`（例では 16 MiB）以下でなければ、設定が拒否されます（`server/app/monitoring/config.py`）。
 
-MJPEG で 30 秒の pre-roll を保つのに必要な値は、次の式で計算できます（推定。§3 の bitrate を使います）。
+#### 計算の式
 
-- `pre_roll_bytes` ≥ N × (30 秒 + segment の秒数) × bitrate ÷ 8
-- `max_spool_segments` ≥ N × (30 ÷ segment の秒数 + 1)
-- `max_segment_bytes` ≥ segment の秒数 × 最大 bitrate ÷ 8 に、frame の大きさの揺れ分の余裕を足した値
+観測した平均の bitrate（§3）では、30 秒を保証できません。上限は、**source ごとの negotiated bound** から計算します。
 
-| 条件（4 source、MJPEG 1080p30） | `pre_roll_bytes` | `max_spool_segments` | `max_segment_bytes` |
-| --- | --- | --- | --- |
-| 1 秒 segment、40.7 Mbps | 約 0.63 GB | 124 以上 | 約 5.1 MB + 余裕 |
-| 1 秒 segment、60 Mbps | 約 0.93 GB | 124 以上 | 約 7.5 MB + 余裕 |
-| 2 秒 segment、40.7 Mbps | 約 0.65 GB | 64 以上（余裕なし） | 約 10.2 MB + 余裕 |
-| 2 秒 segment、60 Mbps | 約 0.96 GB | 64 以上（余裕なし） | 約 15 MB + 余裕 |
-| DEPLOYMENT.md の例 | 64 MiB（約 0.067 GB） | 64 | 8 MiB |
+- 記号:
+  - `P` = `pre_roll_ms`（30 秒）
+  - `B_s` = source s の `VideoFormat.maximum_bitrate`（bit/s）。H.264 では NVENC の rate control で守らせる最大 bitrate です。
+  - `V_s` = encoder の VBV buffer の大きさ（byte）。rate control が許す一時的な超過の上限です。MJPEG では 0 とし、`B_s` を超える segment は拒否します（T4）。
+  - `o` = mux の overhead の割合（`moof` / sample table など）
+  - `H` = segment ごとの固定の overhead（自己完結させるための init segment など）
+  - `D_s` = 通常の segment の長さ。`Dmax_s` = その最大値（`max_segment_ms` 以下）
+  - `R_s` = 1 つの pre-roll の窓の中で許す、reset / discontinuity による早い区切りの回数。区切りが起きると、短い segment ができます。
+- 式:
+  - `pre_roll_bytes` ≥ Σ_s [ (P + Dmax_s) × B_s ÷ 8 × (1 + o) + V_s + n_s × H ]
+  - `max_spool_segments` ≥ Σ_s n_s。ここで n_s = ⌈P ÷ D_s⌉ + 1 + R_s
+  - `max_segment_bytes` ≥ max_s [ Dmax_s × B_s ÷ 8 × (1 + o) + V_s + H ]。また、`max_request_bytes` ≥ `max_segment_bytes`
+- reset / discontinuity が窓の中で `R_s` 回を超えると、segment の数が上限を超えて、pre-roll が短くなります。これは manifest で short buffer として報告され（recording README）、録画の health では degraded として扱う必要があります。`R_s` の値は、muxer の区切りの規則と合わせて実装のときに決めます。
+
+#### 例（値はすべて仮定。実機で決め直します）
+
+`P` = 30 秒、4 source、`D_s` = `Dmax_s` = 2 秒、`R_s` = 2、`o` = 2 %、`H` = 2 KB としました。
+
+| 条件 | `B_s` | `V_s` | `pre_roll_bytes` | `max_spool_segments` | `max_segment_bytes` |
+| --- | --- | --- | --- | --- | --- |
+| H.264（NVENC、決定済みの形式） | 8 Mbps（仮定） | 1 MB（仮定） | 約 0.14 GB | 72 以上 | 約 3.0 MB |
+| MJPEG の fallback（上限を設定で強制） | 60 Mbps（仮定） | 0 | 約 0.98 GB | 72 以上 | 約 15.3 MB（16 MiB 以上を推奨） |
+| MJPEG の fallback（上限を強制しない場合） | 約 995 Mbps（1 frame の上限を V4L2 の MJPG buffer の大きさ 1920×1080×2 byte とし、30 fps とした場合） | 0 | 約 16 GB | 72 以上 | 約 254 MB（`max_request_bytes` を大きく超える） |
+| DEPLOYMENT.md の例 | — | — | 64 MiB（約 0.067 GB） | 64 | 8 MiB |
 
 このことから、次の点が分かります。
 
-- **例の `pre_roll_bytes`（64 MiB）では、4 source の MJPEG 1080p は、各 source で約 2〜3 秒分（40.7〜60 Mbps）しか残りません。** 30 秒の pre-roll（MEDIA-009）を満たせません。
-- **例の `max_segment_bytes`（8 MiB）では、60 Mbps の 2 秒 segment（約 15 MB）は、append の前に `Segment.validate()` で拒否されます。** 2 秒 segment にするなら、`max_segment_bytes` を約 16 MiB 以上にし、`max_request_bytes` もそれ以上に上げる必要があります。1 秒 segment なら 8 MiB に収まりますが、余裕は小さくなります。
-- `max_spool_segments` は、1 秒 segment なら 124 以上、2 秒 segment なら 64 ちょうどで余裕がありません。
-- `max_segments_per_recording`（例では 8,640）は、20 分の録画を 1 秒 segment で記録する場合でも足ります（約 1,200）。
+- H.264 でも、例の `pre_roll_bytes`（64 MiB）と `max_spool_segments`（64）では、4 source で 30 秒の pre-roll を保証できません。例の値を、上の式で計算した値に更新する必要があります。
+- **MJPEG の fallback は、上限を強制しないと、現実的な値で 30 秒を保証できません。** camera が bitrate を制御しないためです。fallback 用の最大 bitrate を設定し、それを超える segment は拒否して gap にし、degraded にする必要があります（T4）。fallback に切り替わったときは、`pre_roll_bytes` が fallback の bound でも足りるように、最初から大きい方の値で設定します。
+- `max_segments_per_recording`（例では 8,640）は、20 分の録画を 1 秒 segment で記録する場合でも足ります（約 1,200 + R）。
 
-MJPEG を採用する場合は、Q7 で容量と媒体を決めるのと同時に、これらの上限値を決め、`server/docs/DEPLOYMENT.md` の例の値も更新する必要があります。例の値のまま運用すると、30 秒の pre-roll が欠けるか、segment が拒否されて録画が止まります。H.264（6 Mbps の仮定）であれば、4 source・2 秒 segment で `pre_roll_bytes` は約 0.1 GB、`max_segment_bytes` は約 1.5 MB です。
+上限値と segment の長さは、実機で同期 I/O（§8.4、HDD）と bitrate を測ってから決め、`server/docs/DEPLOYMENT.md` の例の値も更新します（Q7）。
 
 ## 9. segment の integrity 検証
 
@@ -326,7 +377,7 @@ MJPEG を採用する場合は、Q7 で容量と媒体を決めるのと同時�
   - Main が H.264 で保存する場合は、Agent の証拠（MJPEG を前提とする）と形式が分かれます。
 - LAN の帯域は、MJPEG 1080p × 4 source で約 160〜240 Mbps です。これに対し、TCP の実測は 940 Mbps です（`MANUAL_TEST.md` の LAN baseline）。
 
-## 11. 推奨（Proposed）
+## 11. 判断の前の推奨（背景として残す。§0 の Owner 判断が優先します）
 
 **段階的に進める案を推奨します。**
 
@@ -351,37 +402,27 @@ MJPEG を採用する場合は、Q7 で容量と媒体を決めるのと同時�
 - MPEG-TS
 - NVENC だけ（fallback 無し）で correctness を成り立たせること（SPEC §6.2 と相反します）
 
-## 12. Owner に決めていただきたいこと
+## 12. Owner に尋ねた問い（2026-10-22 に判断済み。判断は §0）
 
-- **Q1（codec）**: Main の durable recording を、当面 **MJPEG の stream copy（A）**にしてよいでしょうか。それとも、最初から H.264（C: NVENC、または B: software）で保存しますか。
-- **Q2（D13: container / 再生）**:
-  - A の場合: 保存の container を **Matroska（`V_MJPEG`）**、自前の frame index 形式、MP4（QuickTime `jpeg`）のどれにしますか。
-  - 再生を当面 **P1（frame pull）** にしてよいでしょうか。
-  - H.264 の場合: **fragmented MP4 + HLS(fMP4) / MSE** でよいでしょうか。
-- **Q3（依存）**: 次のうち、どれを採用候補として認めますか。
-  - (a) 自前の stdlib muxer / parser（新しい依存なし）
-  - (b) operator が導入する GStreamer（good、bad の nvcodec）を Main の runtime に入れること
-  - (c) FFmpeg の CLI
-  - (d) PyAV
-  - あわせて、x264（GPL）と OpenH264（Cisco binary の条件）を、候補から外してよいでしょうか。
-- **Q4（hardware と fallback）**: H.264 を使う場合、NVENC が無いか失敗したときの動作を次のどれにしますか。
-  - (a) software encode に fallback する（B の依存が要る）
-  - (b) MJPEG の保存に fallback する（形式が混在する）
-  - (c) `adapter_unavailable` で録画を止めて、Owner に通知する
-- **Q5（validator の資源）**: 保存の前に全 frame を decode することは必須とします（§9。一部の frame だけの decode は不採用）。そのための CPU（4 source で約 0.5 core の推定）を割り当ててよいでしょうか。また、検証用の子プロセスを ROI 用と共有しますか、それとも専用にしますか。
-- **Q6（self-test の sample）**: 既存の契約により、日次の self-test は直近の実 pipeline の出力を使います（合成 frame は使いません。§9）。実際の部屋の映像を含む一時 segment を、既存の `.selftest` の契約（journal、検証後の削除、起動時の回収、結果に media を含めない）で扱うことを確認していただけますか。sample の長さと byte の上限も決めていただく必要があります。
-- **Q7（容量と上限）**: MJPEG を選ぶ場合、§8 の推定（4 source × 50 event / 日 × 20 日で約 3〜4.5 TB）を前提に、recording root の容量と媒体（HDD / SSD）、pre-roll を disk に置くか memory に置くかを決めていただけますか。あわせて、30 秒の pre-roll を保つための `pre_roll_bytes`（4 source で約 0.65〜0.96 GB）、`max_spool_segments`、`max_segment_bytes` / `max_request_bytes`、segment の長さ（§8.4、§8.6）も決める必要があります。
-- **Q8（AVC の特許）**: H.264 を使う場合、Via LA の AVC license の当てはまり方（self-hosted で、配布しない研究室の deployment）を Owner 側で判断していただけますか。この調査では判断できません。
+- **Q1（codec）**: MJPEG の stream copy にするか、H.264 にするか。→ **H.264**
+- **Q2（D13: container / 再生）**: MJPEG なら Matroska / 自前の形式 / MP4 のどれか、P1 でよいか。H.264 なら fragmented MP4 + HLS(fMP4) / MSE でよいか。→ **fragmented MP4 をそのまま browser へ配る（P3）。server 側で `recordings:view` を確認し、download / export は提供しない**
+- **Q3（依存）**: 自前の stdlib 実装 / GStreamer / FFmpeg の CLI / PyAV のどれを認めるか。x264 と OpenH264 を外してよいか。→ **encoder は GStreamer の nvcodec（NVENC）**。muxer と validator の decoder は、T1 / T2 で決めます。
+- **Q4（hardware と fallback）**: NVENC が無い・失敗したときの動作。→ **MJPEG の保存に fallback し、degraded にして Owner に通知する（黙って fallback しない）**
+- **Q5（validator）**: 全 frame の decode に必要な CPU と、子プロセスを共有するか専用にするか。→ **全 frame の decode は必須。録画の検証専用の子プロセスで行う。CPU は実機で測る**
+- **Q6（self-test の sample）**: 実 pipeline の sample を `.selftest` の契約で扱うこと。→ **実 pipeline の sample を使い、`.selftest` の契約に従う**
+- **Q7（容量と上限）**: recording root の容量と媒体、pre-roll の置き場所、上限値と segment の長さ。→ **HDD。segment の長さは実機で同期 I/O を測ってから決める。§8.6 の上限は negotiated bound から計算し直す**
+- **Q8（AVC の特許）**: → **研究室内での使用として、Owner の責任で受け入れる**
 
 ## 13. 未検証のこと
 
 - 実 camera、実 encoder、実 browser での測定は、一切行っていません（CPU / GPU / VRAM、encode の遅延、画質、bitrate、Safari / iPhone の HLS と cookie、Firefox on Linux の H.264）。
 - H.264 の bitrate、software encode の CPU、NVENC の throughput は仮定です。
 - distribution package の GStreamer bad / FFmpeg の build 構成と license、gst-plugins-rs の fmp4 の正確な license（distribution の metadata には MPL-2.0 とある）、PyAV の wheel に同梱された FFmpeg の構成は、pinning のときに一次資料で確認する必要があります。
-- 法務の判断（AVC の特許、OpenH264 の binary license の適用範囲）は、この調査の範囲外です。
+- 法務の判断（AVC の特許、OpenH264 の binary license の適用範囲）は、この調査の範囲外です。AVC の特許は、Owner が研究室内での使用として自身の責任で受け入れました（§0 Q8）。
 - recording root の実際の媒体（HDD / SSD）での append の遅延、fsync と SQLite の commit の回数・時間（§8.4）は測っていません。segment の長さ（1〜2 秒）は、この実機の測定を経てから決めます。
 - iPhone Safari の ManagedMediaSource が、AirPlay の代替 source を置いたとき、または `disableRemotePlayback` を `true` にしたときにだけ開くこと（[MDN-MMS] の条件）を、実機で確かめていません。
-- 検証用の decode の子プロセスが、ROI 用と並んで動いたときの CPU と遅延（§9）は測っていません。
+- 検証用の decode の子プロセスが、ROI 用と並んで動いたときの CPU と遅延（§9）は測っていません。H.264 の validator に使う decoder（T1）はまだ決まっておらず、その license（gst-libav / FFmpeg の build 構成など）と閉じ込めの方式も確認していません。
+- NVENC の最大 bitrate と VBV を設定したときの、実際の segment の大きさ（§8.6 の bound が守られるか）は測っていません。
 
 ## 14. 出典（2026-10-22 に参照）
 
