@@ -234,14 +234,15 @@ class Sender:
                 next_at = time.monotonic()  # do not burst after a stall
 
     def _gst(self, index):
-        from media_capture_agent.uvc_pipeline import MjpegFrameParser
+        from media_capture_agent.uvc_pipeline import MjpegFrameParser, MjpegProfile
         command = [self.config.gst, "-q", "videotestsrc", "is-live=true", f"pattern={index % 20}",
                    "!", f"video/x-raw,width={self.config.width},height={self.config.height},"
                    f"framerate={self.config.fps}/1", "!", "jpegenc", "!", "fdsink", "fd=1"]
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    stdin=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin"})
         self.children.append(process)
-        parser = MjpegFrameParser(8 * 1024 * 1024)
+        gap = MjpegProfile(self.config.width, self.config.height, self.config.fps).max_padding_bytes
+        parser = MjpegFrameParser(8 * 1024 * 1024, max_gap_bytes=gap)
         try:
             while not self.stop.is_set():
                 data = process.stdout.read1(65536)

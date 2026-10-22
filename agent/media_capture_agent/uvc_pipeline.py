@@ -29,6 +29,13 @@ from . import uvc_sandbox
 
 
 MAX_FRAME_BYTES = 32 * 1024 * 1024
+# Bytes the parser may skip between an EOI and the next SOI. The default
+# covers ordinary UVC payload padding; a capture profile raises it to the
+# profile's raw buffer size (``MjpegProfile.max_padding_bytes``) because some
+# cameras hand over a full-size buffer whose JPEG is followed by padding, and
+# ``fdsink`` does not keep buffer boundaries. Never above ``MAX_GAP_BYTES``.
+DEFAULT_MAX_GAP_BYTES = 4096
+MAX_GAP_BYTES = MAX_FRAME_BYTES
 MAX_QUEUE_FRAMES = 64
 READ_CHUNK_BYTES = 65536
 _STANDALONE = frozenset({0x01, *range(0xD0, 0xD8)})
@@ -61,6 +68,16 @@ class MjpegProfile:
         if not 0 < self.fps_numerator / self.fps_denominator <= 240:
             raise ValueError("invalid video frame rate")
 
+    @property
+    def max_padding_bytes(self):
+        """Inter-frame gap bound for this profile.
+
+        A UVC driver sizes an MJPEG buffer for an uncompressed 2-byte-per-pixel
+        frame (``width * height * 2``), so trailing padding after one JPEG can
+        never exceed that. Clamped to ``[DEFAULT_MAX_GAP_BYTES, MAX_GAP_BYTES]``.
+        """
+        return min(max(self.width * self.height * 2, DEFAULT_MAX_GAP_BYTES), MAX_GAP_BYTES)
+
     def caps(self):
         return (f"image/jpeg,width={self.width},height={self.height},"
                 f"framerate={self.fps_numerator}/{self.fps_denominator}")
@@ -75,10 +92,10 @@ class MjpegFrameParser:
     the caller restarts capture rather than emitting a guessed frame.
     """
 
-    def __init__(self, max_frame_bytes, *, max_gap_bytes=4096):
+    def __init__(self, max_frame_bytes, *, max_gap_bytes=DEFAULT_MAX_GAP_BYTES):
         if type(max_frame_bytes) is not int or not 64 <= max_frame_bytes <= MAX_FRAME_BYTES:
             raise ValueError("invalid frame bound")
-        if type(max_gap_bytes) is not int or not 0 <= max_gap_bytes <= 65536:
+        if type(max_gap_bytes) is not int or not 0 <= max_gap_bytes <= MAX_GAP_BYTES:
             raise ValueError("invalid gap bound")
         self.max_frame_bytes = max_frame_bytes
         self.max_gap_bytes = max_gap_bytes
@@ -87,26 +104,35 @@ class MjpegFrameParser:
         self._entropy = False
         self._scans = 0
         self._position = 0
+        self._gap = 0  # bytes already discarded since the last EOI (or start)
 
     @property
     def partial(self):
-        return bool(self._buffer)
+        # Skipped padding still counts: EOF there is not a clean frame boundary.
+        return bool(self._buffer) or self._gap > 0
 
     def feed(self, data):
         self._buffer += data
         frames = []
         while True:
             if not self._in_frame:
+                # Between images only padding is skipped, and only up to
+                # max_gap_bytes in total; skipped bytes are discarded at once,
+                # so a large bound never lets the buffer grow. Exceeding the
+                # bound without an SOI is a framing loss (fail closed).
                 start = self._buffer.find(b"\xff\xd8")
                 if start < 0:
                     keep = 1 if self._buffer.endswith(b"\xff") else 0
-                    if len(self._buffer) - keep > self.max_gap_bytes:
+                    skipped = len(self._buffer) - keep
+                    if self._gap + skipped > self.max_gap_bytes:
                         raise FrameError("video stream lost JPEG framing")
+                    self._gap += skipped
+                    del self._buffer[:skipped]
                     return frames
-                # UVC payloads may pad between images; bound what is skipped.
-                if start > self.max_gap_bytes:
+                if self._gap + start > self.max_gap_bytes:
                     raise FrameError("video stream lost JPEG framing")
                 del self._buffer[:start]
+                self._gap = 0
                 self._in_frame, self._entropy, self._scans, self._position = True, False, 0, 2
             end = self._scan()
             if end is None:

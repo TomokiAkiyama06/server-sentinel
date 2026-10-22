@@ -1078,6 +1078,17 @@ Installation/service checkboxes above remain open.
       to the approved source, and a second identical camera
       (duplicate/no-serial ambiguity) requires manual intervention.
 
+### Issue #305 padding 付き MJPG buffer での連続 capture（未実施）
+
+unit test（synthetic な JPEG 形の byte 列と非 0 の padding）でのみ確認済み。以下の実機確認はまだ実施していない。
+カメラは無人の壁またはテストチャートに向け、映像は保存・表示しない。serial・by-id 名・IP・hostname は記録しない。
+
+- [ ] 未実施: Yamaha CS-800、MJPG 1280x720@30 で、製品の `UvcCapture` + `GStreamerLauncher` を 5 分以上連続実行し、GStreamer child の再起動が 0 回（`stream_invalid` / `capture_failed` が出ない）。
+- [ ] 未実施: 同じ実行で実効 frame rate が約 30 fps（frame 数 / 経過時間を記録）。
+- [ ] 未実施: 照明あり、およびレンズを覆った暗い状態の両方で上の 2 点を確認。
+- [ ] 未実施: 取り出した frame に 10 KB 未満などの不自然に小さい frame が無い（padding からの誤切り出しが無い目安）。
+- [ ] 未実施: 確認後、Issue #15 の実カメラ slot を再実行し §G に記録。
+
 ## C. Room-overview camera placement
 
 For the intended wide room view:

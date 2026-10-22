@@ -454,6 +454,15 @@ environment, not by the kernel, because `/usr` stays readable. The child gets a 
 environment, its own process group, no stdin, discarded stderr, and is
 terminated with SIGTERM then SIGKILL of the whole group before reaping. MJPEG output is split structurally into complete
 JPEG frames with a per-frame byte bound and queued in a bounded drop-oldest queue.
+Because `fdsink` does not keep V4L2 buffer boundaries, bytes after an EOI that
+precede the next SOI are skipped as padding up to the negotiated profile's raw
+buffer size (`width * height * 2`, clamped to 4 KiB–32 MiB; Issue #305: some
+cameras hand over a full-size buffer whose JPEG is followed by non-JPEG padding).
+Skipped bytes are discarded as they are read, so the bound does not grow the
+parser's memory. A gap beyond the bound without an SOI, and any structural
+error after an SOI (including an SOI found inside padding), is a malformed stream:
+the pipeline is torn down and relaunched with backoff, and no guessed frame is
+emitted.
 Before starting a pipeline the Agent checks the explicit profile against the MJPEG
 frame sizes and intervals the opened approved node advertises (read-only
 `VIDIOC_ENUM_FMT`/`ENUM_FRAMESIZES`/`ENUM_FRAMEINTERVALS` on that descriptor only,
