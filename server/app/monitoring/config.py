@@ -26,7 +26,16 @@ RECORDING_LIMIT_FIELDS = (
 MONITORING_KEYS = frozenset({
     "time_zone", "daily_summary_time", "slack_webhook_url",
     "storage_limits", "recording_limits", "recording_filesystem",
+    "camera_offline_notification",
 })
+CAMERA_OFFLINE_KEYS = frozenset({"after_seconds", "hourly_limit"})
+# Issue #301 item 2 (Owner decision 2026-10-22): five minutes, at most four
+# notifications per rolling hour. Kept here (standard library only) because
+# the installer validates the deployment with this module.
+CAMERA_OFFLINE_SECONDS = 300.0
+CAMERA_OFFLINE_SECONDS_BOUNDS = (60.0, 86400.0)
+CAMERA_OFFLINE_HOURLY_LIMIT = 4
+CAMERA_OFFLINE_HOURLY_LIMIT_BOUNDS = (1, 60)
 STORAGE_SECTIONS = ("storage_limits", "recording_limits", "recording_filesystem")
 SUMMARY_TIME = re.compile(r"([01][0-9]|2[0-3]):([0-5][0-9])")
 
@@ -52,6 +61,30 @@ class RecordingFilesystem:
 
 
 @dataclass(frozen=True)
+class CameraOfflineNotification:
+    """When a camera source that stays offline notifies the Owner (Issue #301).
+
+    ``after_seconds``: how long a source must stay not online (default 300 s,
+    60 s to one day; the monitoring tick, 60 s by default, drains it).
+    ``hourly_limit``: notifications per rolling hour for all sources together
+    (default 4, 1 to 60).
+    """
+
+    after_seconds: float = CAMERA_OFFLINE_SECONDS
+    hourly_limit: int = CAMERA_OFFLINE_HOURLY_LIMIT
+
+    def __post_init__(self):
+        low, high = CAMERA_OFFLINE_SECONDS_BOUNDS
+        first, last = CAMERA_OFFLINE_HOURLY_LIMIT_BOUNDS
+        if (type(self.after_seconds) not in (int, float)
+                or not low <= self.after_seconds <= high
+                or type(self.hourly_limit) is not int
+                or not first <= self.hourly_limit <= last):
+            raise ConfigurationError("invalid camera offline notification")
+        object.__setattr__(self, "after_seconds", float(self.after_seconds))
+
+
+@dataclass(frozen=True)
 class MonitoringConfiguration:
     time_zone: ZoneInfo
     summary_hour: int = 23
@@ -60,6 +93,7 @@ class MonitoringConfiguration:
     storage_limits: StorageLimits | None = field(default=None, repr=False)
     recording_limits: Limits | None = field(default=None, repr=False)
     recording_filesystem: RecordingFilesystem | None = field(default=None, repr=False)
+    camera_offline: CameraOfflineNotification = field(default_factory=CameraOfflineNotification)
 
     def __post_init__(self):
         storage = (self.storage_limits, self.recording_limits, self.recording_filesystem)
@@ -72,7 +106,8 @@ class MonitoringConfiguration:
                 or self.recording_limits is not None
                 and not isinstance(self.recording_limits, Limits)
                 or self.recording_filesystem is not None
-                and not isinstance(self.recording_filesystem, RecordingFilesystem)):
+                and not isinstance(self.recording_filesystem, RecordingFilesystem)
+                or not isinstance(self.camera_offline, CameraOfflineNotification)):
             raise ConfigurationError("invalid monitoring configuration")
         if any(item is None for item in storage) and any(item is not None for item in storage):
             raise ConfigurationError("incomplete monitoring storage configuration")
@@ -88,6 +123,18 @@ def _integers(value: object, names: tuple[str, ...]) -> dict[str, int]:
             or any(type(item) is not int for item in value.values())):
         raise ConfigurationError("invalid monitoring limits")
     return dict(value)
+
+
+def _camera_offline(value: object) -> CameraOfflineNotification:
+    """The optional ``camera_offline_notification`` object; both keys optional.
+
+    ``after_seconds`` is an integer number of seconds; booleans, floats and
+    unknown keys are refused, like every other monitoring value.
+    """
+    if (not isinstance(value, dict) or not set(value) <= CAMERA_OFFLINE_KEYS
+            or any(type(item) is not int for item in value.values())):
+        raise ConfigurationError("invalid camera offline notification")
+    return CameraOfflineNotification(**value)
 
 
 def _time_zone(value: object) -> ZoneInfo:
@@ -163,9 +210,10 @@ def parse_monitoring(value: object, *, recordings_directory: Path,
             slack = SlackEndpoint(value["slack_webhook_url"])
         except ValueError:
             raise ConfigurationError("invalid Slack endpoint") from None
+    camera_offline = _camera_offline(value.get("camera_offline_notification", {}))
     present = [name for name in STORAGE_SECTIONS if name in value]
     if not present:
-        return MonitoringConfiguration(zone, hour, minute, slack)
+        return MonitoringConfiguration(zone, hour, minute, slack, camera_offline=camera_offline)
     if len(present) != len(STORAGE_SECTIONS):
         raise ConfigurationError("incomplete monitoring storage configuration")
     try:
@@ -180,4 +228,5 @@ def parse_monitoring(value: object, *, recordings_directory: Path,
     filesystem = _recording_filesystem(value["recording_filesystem"], recordings_directory,
                                        resolve_device=resolve_device,
                                        root_device=root_device, is_mount=is_mount)
-    return MonitoringConfiguration(zone, hour, minute, slack, storage, recording, filesystem)
+    return MonitoringConfiguration(zone, hour, minute, slack, storage, recording, filesystem,
+                                   camera_offline=camera_offline)

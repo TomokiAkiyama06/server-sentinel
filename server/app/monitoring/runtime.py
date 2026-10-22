@@ -40,6 +40,7 @@ from app.storage.policy import MainStoragePolicy, StorageState, StorageTransitio
 from app.storage.retention import RetentionService, StorageAudit
 
 from .access import HOUR_SECONDS, AccessFaultMonitor
+from .cameras import CameraOfflineMonitor
 from .config import MonitoringConfiguration
 from .filesystem import IdentifiedRecordingFilesystem
 from .store import NotificationEventStore, RecordingHealthStatusStore
@@ -133,6 +134,13 @@ class MonitoringStatus:
     # composition, and a credential finding within the hold window.
     human_access_degraded: bool = False
     credential_finding_degraded: bool = False
+    # Issue #301 item 2: a camera source has stayed not online past the
+    # deployment threshold (`camera_offline_notification.after_seconds`).
+    camera_offline_degraded: bool = False
+    # Whether that Owner notification reaches the Owner outside the local
+    # store: False without a configured Slack endpoint (the local row is then
+    # `disabled`) or without a camera offline monitor.
+    camera_offline_notifications: bool = False
 
 
 class RefuseUnvalidatedSegments:
@@ -175,6 +183,9 @@ class MonitoringDependencies:
     # The composition root's single sink for the reservation check
     # (``sink=``) and the passkey ceremonies (``findings=``) (Issue #232).
     access_faults: AccessFaultMonitor | None = None
+    # Issue #301 item 2: per-source offline episodes, drained on every tick.
+    # `create_app` builds it for the configured local UVC sources.
+    camera_offline: CameraOfflineMonitor | None = None
 
     def __post_init__(self):
         for value in (self.tick_seconds, self.retry_seconds):
@@ -182,6 +193,9 @@ class MonitoringDependencies:
                 raise ValueError("invalid monitoring interval")
         if self.access_faults is not None and not isinstance(self.access_faults, AccessFaultMonitor):
             raise ValueError("invalid access fault monitor")
+        if (self.camera_offline is not None
+                and not isinstance(self.camera_offline, CameraOfflineMonitor)):
+            raise ValueError("invalid camera offline monitor")
 
 
 @contextmanager
@@ -202,7 +216,10 @@ class MonitoringRuntime:
         self._executor: ThreadPoolExecutor | None = None
         self._owner: int | None = None
         self._lock = threading.Lock()
-        self._status = MonitoringStatus(RuntimeState.STARTING)
+        self._status = MonitoringStatus(
+            RuntimeState.STARTING,
+            camera_offline_notifications=(self.dependencies.camera_offline is not None
+                                          and configuration.slack is not None))
         self._policy: MainStoragePolicy | None = None
         self._connection = None
         self._retry_at: dict[str, float] = {}
@@ -221,6 +238,9 @@ class MonitoringRuntime:
         # committed but not yet notified before a restart is recovered from
         # the audit log on the first running access tick.
         self._findings_recovered = False
+        # Issue #301 item 2: the camera offline hourly cap is re-seeded from
+        # the stored rows once, on the first running tick.
+        self._camera_window_restored = False
         self.notifications: NotificationService | None = None
         self.notification_events: NotificationEventStore | None = None
         self.recordings: RecordingStore | None = None
@@ -615,7 +635,7 @@ class MonitoringRuntime:
             status.integrity_degraded, status.recording_health_degraded, status.retention_degraded,
             status.storage_audit_failed, status.notification_local_failed,
             status.notification_delivery_failed, status.human_access_degraded,
-            status.credential_finding_degraded,
+            status.credential_finding_degraded, status.camera_offline_degraded,
         ))
         elapsed = self.dependencies.monotonic() - self._started_monotonic
         monitored = int(min(86400, max(0, elapsed))) if math.isfinite(elapsed) else 0
@@ -659,6 +679,57 @@ class MonitoringRuntime:
             return
         self._set(human_access_degraded=status.human_access_degraded,
                   credential_finding_degraded=status.credential_finding_degraded)
+
+    def _camera_tick(self) -> None:
+        """Camera sources offline past the threshold (Issue #301 item 2).
+
+        Runs in every runtime state once the notification service exists,
+        like the access tick: Slack still receives the notification while
+        local persistence is refused. The monitor never raises on its own; an
+        unexpected failure is logged value-free and retried on the next tick.
+        """
+        monitor = self.dependencies.camera_offline
+        if monitor is None or self.notifications is None:
+            return
+        running = self.status.state == RuntimeState.RUNNING
+        try:
+            if running and not self._camera_window_restored:
+                # The rolling hour continues across a restart (as Issue #281
+                # item 2 for the access budgets).
+                monitor.restore_window(self._notification_window(
+                    (NotificationKind.CAMERA_OFFLINE,), monitor.hourly_limit,
+                    self.dependencies.utcnow()), monotonic=self.dependencies.monotonic())
+                self._camera_window_restored = True
+            status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
+                                   monotonic=self.dependencies.monotonic(),
+                                   durable_id=self._camera_offline_event if running else None,
+                                   known=self._notification_known if running else None)
+        except Exception:
+            logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+            return
+        self._set(camera_offline_degraded=status.offline_sources > 0)
+
+    def _camera_offline_event(self, source_id: UUID) -> UUID | None:
+        """The event ID of ``source_id``'s offline episode in progress.
+
+        Named after the source and its registry ``last_seen_at`` (the last
+        frame time, unchanged while no frame arrives), so a restarted process
+        that finds the same outage computes the same ID. ``None`` (a
+        per-process ID) when the source has no registry row.
+        """
+        row = self._connection.execute(
+            "SELECT last_seen_at FROM camera_sources WHERE id=?", (str(source_id),)).fetchone()
+        if row is None:
+            return None
+        return uuid5(EVENT_NAMESPACE, f"camera-offline:{source_id}:{row[0] or 'never'}")
+
+    def _notification_known(self, event_id: UUID) -> bool:
+        """Whether a `notification_events` row with ``event_id`` exists (any state).
+
+        A `pending` row is an earlier process's uncertain delivery: it is not
+        sent again (no duplicate), as for the presence critical claims.
+        """
+        return self.notification_events.get(event_id) is not None
 
     def _latest_finding(self, *, since: datetime | None = None) -> tuple[str, int] | None:
         """``(id, occurred_at_us)`` of the newest finding audit record.
@@ -904,6 +975,7 @@ class MonitoringRuntime:
         if self.status.state != RuntimeState.RUNNING:
             if self.notifications is not None:
                 self._access_tick()
+                self._camera_tick()
                 self._poll()
             if (self.status.state == RuntimeState.FAILED
                     and self._due("startup", self.dependencies.monotonic())):
@@ -916,6 +988,7 @@ class MonitoringRuntime:
         self._guarded("health", self.recording_health.tick, "recording_health_degraded")
         self._guarded("summary", self._summary_tick, "summary_degraded")
         self._access_tick()
+        self._camera_tick()
         self._poll()
 
     def _close(self) -> None:
