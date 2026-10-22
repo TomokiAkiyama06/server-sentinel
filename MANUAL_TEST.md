@@ -341,6 +341,32 @@ For each tested camera:
       （同記録 手順 4: 逆順再列挙 + runtime 再起動。host 再起動は未実施）
 - [ ] no unnecessary privileged container is required.
 
+#### Issue #301 camera offline notification (pending, not executed)
+
+Mock-verified only (`server/tests/test_camera_offline_notifications.py`:
+synthetic UVC discovery/capture, a generated clock and an intercepted Slack
+transport). On the deployment, with Slack configured and the default
+`camera_offline_notification` (or a temporarily shorter `after_seconds`, at
+least 60):
+
+- [ ] unplug an approved, `online` camera and leave it out: exactly one
+  `ServerSentinel critical alert: camera_offline` reaches Slack between
+  `after_seconds` and `after_seconds` + 60 s (one monitoring tick), with no
+  source name, UUID, device path, serial or image; its `notification_events`
+  row is `sent` and `confirmed`;
+- [ ] replug it before `after_seconds`: nothing is sent; replug it after the
+  notification: no recovery message is sent;
+- [ ] restart the service while the camera is still unplugged: no second
+  notification for the same outage;
+- [ ] unplug and replug repeatedly (each time past `after_seconds`): at most
+  `hourly_limit` notifications per hour, and the journal shows only the fixed
+  `camera_offline_notification_rate_limited` / `_dropped` events;
+- [ ] `systemctl stop` / restart with every camera connected sends nothing;
+- [ ] with Slack unconfigured the row is `disabled`;
+- [ ] LXD VM configuration (D2): reproduce the host USB re-enumeration of
+  Issue #301 (the VM loses the camera) and confirm the notification arrives;
+  the host-side automatic re-pass (Issue #301 item 1) is separate.
+
 #### Issue #11 / D3 local camera admin CLI on the Main Server (pending; requires the Owner)
 
 Verified only with a temporary SQLite database, a pseudo-terminal, a fake

@@ -30,6 +30,7 @@ from app.logging import Event
 from app.media.live.frame_pull import LiveFrameService
 from app.media.live.local_preview import LocalPreviewHub
 from app.monitoring.access import AccessFaultMonitor
+from app.monitoring.cameras import CameraOfflineMonitor
 from app.monitoring.config import MonitoringConfiguration
 from app.monitoring.runtime import MonitoringDependencies, MonitoringRuntime, RuntimeState
 from app.notifications.service import NotificationKind
@@ -39,6 +40,13 @@ from app.settings import Settings
 from app.storage.database import Database, PinnedDatabase
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
+
+
+# Issue #301 item 2: without a scene critical dispatcher (whose shutdown
+# settle already waits for every pending notification), shutdown waits at
+# most this long for a camera offline notification still being delivered,
+# longer than the 10 s Slack timeout, before the monitoring runtime stops.
+CAMERA_OFFLINE_SETTLE_SECONDS = 12.0
 
 
 class RuntimeStorageAdmission:
@@ -194,6 +202,26 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # thresholds the admission stays unbound: writes are refused rather than
     # admitted against a reserve this process cannot verify.
     runtime_admission = RuntimeStorageAdmission()
+    # Issue #301 item 2 (Owner decision 2026-10-22): a configured local UVC
+    # source that stays offline for `camera_offline_notification.after_seconds`
+    # notifies the Owner through the monitoring runtime's
+    # `NotificationService`, the same durable row and optional Slack delivery
+    # as a hardware-integrity failure. The monitor is fed by the capture
+    # runtime's health sink and status (below) and drained on the monitoring
+    # worker. Without a monitoring runtime there is no notification service.
+    if monitoring_dependencies is not None and monitoring_dependencies.camera_offline is not None:
+        # Owned here, like the scene timeline's recorder: it must observe
+        # exactly the capture runtime this application starts and stops.
+        raise TypeError("the application owns the camera offline monitor")
+    camera_offline = None
+    if (local_uvc is not None and monitoring is not None
+            and monitoring.storage_configured):
+        dependencies = monitoring_dependencies or MonitoringDependencies()
+        camera_offline = CameraOfflineMonitor(
+            local_uvc.source_ids, after_seconds=monitoring.camera_offline.after_seconds,
+            hourly_limit=monitoring.camera_offline.hourly_limit,
+            monotonic=dependencies.monotonic)
+        monitoring_dependencies = replace(dependencies, camera_offline=camera_offline)
     # Built before the scene timeline, whose critical notification port
     # submits through this runtime's `NotificationService` (Issue #26).
     monitoring_runtime = (
@@ -271,6 +299,18 @@ def create_app(settings: Settings, *, database: Database | None = None,
         local_preview.on_health(event)
         if scene_runtime is not None:
             scene_runtime.on_uvc_health(event)
+
+    injected_health_sink = uvc_dependencies.health_sink
+
+    def monitored_health_sink(event) -> None:
+        # On the capture runtime's health-sink delivery thread, never a
+        # capture worker; the monitor only latches state and never raises.
+        camera_offline.health_sink(event)
+        if injected_health_sink is not None:
+            injected_health_sink(event)
+
+    local_health_sink = (monitored_health_sink if camera_offline is not None
+                         else injected_health_sink)
     # Capture workers write source health, negotiated profiles, last-seen
     # timestamps and approval session markers continuously. They are admitted
     # exactly like audit writes, so a hard stop or a missing/replaced recording
@@ -290,7 +330,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # the optional downstream sink, which may be slow or hang; so it
             # is never served as live.
             on_camera_state=on_local_camera_state,
-            health_sink=uvc_dependencies.health_sink,
+            health_sink=local_health_sink,
             discovery=uvc_dependencies.discovery,
             capture_factory=uvc_dependencies.capture_factory,
         ) if local_uvc is not None else None
@@ -481,6 +521,21 @@ def create_app(settings: Settings, *, database: Database | None = None,
             if unsettled != 0:
                 logging.getLogger(__name__).error(Event.CRITICAL_NOTIFICATIONS_UNSETTLED)
 
+        async def settle_camera_offline() -> None:
+            # Issue #301 item 2: a camera offline notification submitted by
+            # the last monitoring tick still completes and is recorded when
+            # the endpoint answers in time. The critical settle above already
+            # waits for every pending notification when it ran.
+            if camera_offline is None or monitoring_runtime is None or critical_dispatcher is not None:
+                return
+            try:
+                unsettled = await run_to_completion(monitoring_runtime.call(
+                    monitoring_runtime.settle_notifications, CAMERA_OFFLINE_SETTLE_SECONDS))
+            except Exception:
+                unsettled = None
+            if unsettled != 0:
+                logging.getLogger(__name__).error(Event.CAMERA_OFFLINE_NOTIFICATIONS_UNSETTLED)
+
         async def start_local_uvc() -> None:
             # Never a silent default: every outcome is an explicit state.
             if local_uvc_runtime is None:
@@ -564,10 +619,16 @@ def create_app(settings: Settings, *, database: Database | None = None,
                     return
                 if (application.state.local_uvc_state
                         in (LocalUvcRuntimeState.RUNNING, LocalUvcRuntimeState.DEGRADED)):
+                    # Read before the status, so a camera transition the
+                    # monitor receives meanwhile is not overwritten by it.
+                    versions = camera_offline.version() if camera_offline is not None else None
                     try:
                         status = await asyncio.to_thread(local_uvc_runtime.status)
                     except Exception:
                         status = None
+                    if status is not None and versions is not None and not uvc_lifecycle["stopping"]:
+                        # A worker that is no longer running is not online.
+                        camera_offline.observe_runtime(status.sources, versions)
                     if not uvc_lifecycle["stopping"]:
                         application.state.local_uvc_state = (
                             status.state if status is not None
@@ -577,6 +638,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
 
         async def shutdown() -> None:
             uvc_lifecycle["stopping"] = True
+            if camera_offline is not None:
+                # Issue #301 item 2: capture stopping lowers every source; no
+                # episode starts and nothing more is notified from here on.
+                # An outage that continues is found again by the next start
+                # under the same event ID (`MonitoringRuntime`).
+                camera_offline.stop()
             if human_task is not None:
                 # Requests are denied from here on and run() starts no
                 # further step. The check's startup/tick and the expiry sweep
@@ -622,6 +689,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # Before the monitoring runtime (and its notification service)
             # stops below.
             await settle_critical_dispatch()
+            await settle_camera_offline()
             if cleanup_task is not None:
                 cleanup_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -743,6 +811,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # reads either; Owner status through a reviewed route is a follow-up.
     application.state.scene_timeline = timeline
     application.state.scene_timeline_finish = None
+    # Internal only: camera offline episodes (Issue #301 item 2).
+    application.state.camera_offline = camera_offline
     # Internal only: drives presence critical notifications (Issue #26).
     application.state.critical_dispatcher = critical_dispatcher
     application.state.diagnostic_export_endpoint = diagnostic_export_endpoint
