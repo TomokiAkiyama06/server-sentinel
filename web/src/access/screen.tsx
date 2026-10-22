@@ -26,7 +26,8 @@ import { runOwnerChange, type OwnerOutcome } from '../shared/step_up';
 
 type Inventory = { state: 'loading' | 'failed' } | { state: 'ready'; items: readonly AccessPrincipal[] };
 type Result = Exclude<OwnerOutcome<unknown>['state'], 'aborted'>;
-export interface Issued extends IssuedInvitation { name: string }
+/** A shown code and the person it admits (to drop it when that person changes). */
+export interface Issued extends IssuedInvitation { name: string; principalId: string }
 
 const PERMISSIONS: readonly Permission[] = ['live:view', 'recordings:view'];
 
@@ -76,7 +77,25 @@ export function AccessScreen({ services, t }: { services: DashboardServices; t: 
   // back-forward cache must not hold the code either.
   useEffect(() => {
     // Synchronous, so the DOM no longer holds the code when the page is frozen.
-    const hide = () => flushSync(() => { setIssued(null); setCopied('idle'); });
+    // A change still in flight is abandoned too (Codex PR #315): its late
+    // answer, a code included, is never applied, and its outcome is unknown.
+    const hide = () => {
+      const pending = operation.current;
+      operation.current = null;
+      pending?.abort();
+      answer.current?.(false);
+      flushSync(() => {
+        setIssued(null);
+        setCopied('idle');
+        if (pending) {
+          setPrompt(null);
+          setCeremony(false);
+          setBusy(null);
+          setResult('unknown');
+          setReload(value => value + 1);
+        }
+      });
+    };
     addEventListener('pagehide', hide);
     return () => {
       removeEventListener('pagehide', hide);
@@ -89,10 +108,15 @@ export function AccessScreen({ services, t }: { services: DashboardServices; t: 
     return <section className="placeholder"><span className="placeholder-mark" aria-hidden="true">◇</span><h2>{t.access}</h2><p>{t.foundation}</p></section>;
   }
 
-  function change<T>(key: string, run: ((signal: AbortSignal) => Promise<T>) | undefined, done?: (value: T) => void) {
+  /** `invalidates`: the person whose shown code this change may revoke
+   *  (re-issue, revocation); that code is dropped before the request is sent,
+   *  whatever its outcome (Codex PR #315). */
+  function change<T>(key: string, run: ((signal: AbortSignal) => Promise<T>) | undefined, done?: (value: T) => void,
+    invalidates?: string) {
     if (busy !== null || !run) return;
     const controller = new AbortController();
     operation.current = controller;
+    if (invalidates !== undefined) setIssued(current => current?.principalId === invalidates ? null : current);
     setBusy(key);
     setConfirming(null);
     setResult(null);
@@ -110,7 +134,9 @@ export function AccessScreen({ services, t }: { services: DashboardServices; t: 
         stepUp: services.stepUp,
         onCeremony: () => setCeremony(true),
       }, controller.signal);
-      if (outcome.state === 'aborted' || operation.current !== controller) return;
+      // A late answer after pagehide, unmount or abort is dropped, even one
+      // that resolved although its signal was aborted.
+      if (outcome.state === 'aborted' || controller.signal.aborted || operation.current !== controller) return;
       operation.current = null;
       setCeremony(false);
       setBusy(null);
@@ -136,7 +162,7 @@ export function AccessScreen({ services, t }: { services: DashboardServices; t: 
     setNameInvalid(false);
     const chosen = PERMISSIONS.filter(permission => grants.includes(permission));
     change('invite', signal => invite(trimmed, chosen, signal), value => {
-      setIssued({ name: trimmed, code: value.code, expires_at: value.expires_at });
+      setIssued({ name: trimmed, principalId: value.principal_id, code: value.code, expires_at: value.expires_at });
       setCopied('idle');
       setName('');
       setGrants([]);
@@ -197,12 +223,13 @@ export function AccessScreen({ services, t }: { services: DashboardServices; t: 
           grant: grant && ((permission, granted) => change(`permission:${permission}:${person.id}`,
             signal => grant(person.id, permission, granted, signal))),
           reissue: reissue && (() => change(`reissue:${person.id}`, signal => reissue(person.id, signal), value => {
-            setIssued({ name: person.display_name, code: value.code, expires_at: value.expires_at });
+            setIssued({ name: person.display_name, principalId: person.id, code: value.code, expires_at: value.expires_at });
             setCopied('idle');
-          })),
+          }, person.id)),
           revokeCredential: revokeKey && (credential => change(`credential:${credential.handle}:${person.id}`,
             signal => revokeKey(person.id, credential.handle, signal))),
-          revokePerson: revokePerson && (() => change(`principal:${person.id}`, signal => revokePerson(person.id, signal))),
+          revokePerson: revokePerson && (() => change(`principal:${person.id}`, signal => revokePerson(person.id, signal),
+            undefined, person.id)),
         }} />)}
     </section>}
   </div>;

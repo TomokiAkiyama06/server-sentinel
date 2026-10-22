@@ -401,7 +401,7 @@ test('credential facts are the recorded ones; no Tailscale identity or credentia
 test('an issued code is shown grouped with its expiry and hand-over guidance', () => {
   for (const locale of ['ja', 'en']) {
     const t = messages[locale];
-    const html = render(createElement(InvitationCode, { t, issued: { name: '生成 閲覧者', code: CODE, expires_at: at },
+    const html = render(createElement(InvitationCode, { t, issued: { name: '生成 閲覧者', principalId: personId, code: CODE, expires_at: at },
       copied: 'idle', onCopy: noop, onDismiss: noop }));
     assert.match(html, new RegExp(`<output class="code" data-invitation-code="true">${CODE}</output>`));
     for (const text of [t.invitationShownOnce, t.invitationHandOver, t.invitationCopy, t.invitationDismiss, '2026-10-22 01:02 UTC']) {

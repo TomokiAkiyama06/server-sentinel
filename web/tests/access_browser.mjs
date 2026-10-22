@@ -43,6 +43,7 @@ const TEXT = {
   done: '変更しました。',
   notPerformed: '本人確認が完了しなかったため、操作は行われていません。',
   confirm: 'パスキーで確認して続ける',
+  unknown: '操作の結果を確認できませんでした。最新の一覧で状態を確認してから、必要ならもう一度操作してください。',
 };
 
 function inventory(extra = []) {
@@ -83,6 +84,7 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true } 
   const unexpected = [];
   const exceptions = [];
   const routeErrors = [];
+  const abandoned = [];
   const cleanup = [
     browser.on('Runtime.exceptionThrown', (_, sessionId) => { if (sessionId === page.sessionId) exceptions.push('unhandled error'); }),
     browser.on('Network.webSocketCreated', (_, sessionId) => { if (sessionId === page.sessionId) unexpected.push('websocket'); }),
@@ -129,7 +131,18 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true } 
       await fulfill(200, ...files.get(url.pathname)); return;
     }
     const handler = handlers[`${request.method} ${url.pathname}`];
-    if (handler && url.search === '') { await fulfill(...handler(body), null); return; }
+    // A handler may answer late (a promise), as a slow Main Server would. A
+    // late answer to a request the page has aborted meanwhile can no longer
+    // be delivered; that is recorded as abandoned, not as a harness error.
+    if (handler && url.search === '') {
+      const pending = handler(body);
+      const answer = await pending;
+      try { await fulfill(...answer, null); } catch (error) {
+        if (!(pending instanceof Promise)) throw error;
+        abandoned.push(`${request.method} ${url.pathname}`);
+      }
+      return;
+    }
     if (url.pathname.startsWith('/api/')) {
       // Anything else is the server's generic refusal (and must not be asked for).
       unexpected.push(`${request.method} ${url.pathname}`);
@@ -163,7 +176,7 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true } 
   try {
     await page.command('Page.navigate', { url: `${origin}/app/` });
     await page.heading('概要');
-    await assertions({ page, ui, requests, posts, state, authenticatorId });
+    await assertions({ page, ui, requests, posts, state, authenticatorId, abandoned });
     await delay(100);
     assert.deepEqual(exceptions, [], 'no unhandled browser errors');
     assert.deepEqual(routeErrors, [], 'request interception must succeed');
@@ -251,7 +264,7 @@ try {
     assert.equal(client.challenge, state.challenges[0]);
     // User verification flag set in the authenticator data (bit 2).
     assert.equal(Buffer.from(assertion.response.authenticatorData, 'base64url')[32] & 0x04, 0x04);
-    assert.equal(await page.evaluate("document.querySelector('[role=alertdialog]')"), null);
+    assert.equal(await page.evaluate("document.querySelector('[role=alertdialog]') === null"), true);
   });
 
   await scenario('a declined step-up sends nothing more and says nothing changed', {
@@ -277,6 +290,60 @@ try {
     await ui.text(TEXT.notPerformed);
     assert.deepEqual(posts().map(item => item.path),
       [`/api/admin/principals/${personId}/revoke`, '/api/auth/step-up/options']);
+  });
+
+  await scenario('an invitation answered after pagehide never shows its code', {
+    handlers: json => ({ 'POST /api/admin/principals': async () => {
+      await delay(800);
+      return json(200, { principal_id: newId, code: CODE, expires_at: at });
+    } }),
+  }, async ({ page, ui, posts, abandoned }) => {
+    await ui.open();
+    await ui.type('.access-invite input[type="text"]', '生成 招待者');
+    await ui.button('招待コードを発行');
+    // Hidden (back-forward cache) while the request is still in flight.
+    for (let attempt = 0; attempt < 100 && posts().length < 1; attempt++) await delay(20);
+    await page.evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }))");
+    // The outcome is unknown, the controls are usable again, and the late answer is dropped.
+    await ui.text(TEXT.unknown);
+    await delay(1200);
+    assert.equal(await page.evaluate("document.querySelector('[data-invitation-code]') === null"), true, 'no code is shown');
+    assert.equal((await page.evaluate('document.body.innerText')).includes(CODE), false);
+    assert.equal(await page.evaluate("document.querySelector('.access-invite button.primary').disabled"), false);
+    // The request itself was aborted: its answer could not even be delivered.
+    assert.deepEqual(abandoned, ['POST /api/admin/principals']);
+  });
+
+  await scenario('a shown code is dropped when that person is re-issued or revoked, whatever the answer', {
+    handlers: json => {
+      let reissues = 0;
+      return {
+        // The second answer is lost; the first and third carry a code.
+        [`POST /api/admin/principals/${personId}/invitation`]: () => (reissues += 1) === 2
+          ? [503, JSON.stringify({ detail: PRIVATE }), 'application/json'] : json(200, { code: CODE, expires_at: at }),
+        [`POST /api/admin/principals/${personId}/revoke`]: () => [503, JSON.stringify({ detail: PRIVATE }), 'application/json'],
+      };
+    },
+  }, async ({ page, ui }) => {
+    await ui.open();
+    const shown = "document.querySelector('[data-invitation-code]')?.textContent === " + JSON.stringify(CODE);
+    // First re-issue: the new code is shown.
+    await ui.button('招待コードを再発行');
+    await ui.button('再発行を確定');
+    await page.wait(shown);
+    // A second re-issue whose answer is lost: the shown code may already be revoked, so it goes.
+    await ui.button('招待コードを再発行');
+    await ui.button('再発行を確定');
+    await ui.text(TEXT.unknown);
+    assert.equal(await page.evaluate("document.querySelector('[data-invitation-code]') === null"), true, 'no code is shown');
+    // Show one again, then revoke the person with the answer lost: dropped as well.
+    await ui.button('招待コードを再発行');
+    await ui.button('再発行を確定');
+    await page.wait(shown);
+    await ui.button('この人のアクセスを失効');
+    await ui.button('失効を確定');
+    await ui.text(TEXT.unknown);
+    assert.equal(await page.evaluate("document.querySelector('[data-invitation-code]') === null"), true, 'no code is shown');
   });
 
   process.stdout.write(`${cases} access screen scenarios passed; a virtual authenticator is not a real passkey provider.\n`);

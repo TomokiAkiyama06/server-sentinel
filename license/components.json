@@ -71,11 +71,11 @@
     },
     {
       "path": "web/tests/access.test.mjs",
-      "sha256": "sha256:362dd46ca5253657237412a88bd506ef39d537b645e48f2472a48cda9ffc1778"
+      "sha256": "sha256:4d555660e21e8993c19a61aabdcb201a65f5ad50145d87fc4ca8bd52cda6e7d4"
     },
     {
       "path": "web/tests/access_browser.mjs",
-      "sha256": "sha256:ef33369d8b0be95ad642687899f4fe33dbe6528c8c066d6923b91f3552698432"
+      "sha256": "sha256:9e58bdf254973322c79346fd7040d27bb7ecda77b5419ace718facd93d0e6049"
     }
   ],
   "inputs": [

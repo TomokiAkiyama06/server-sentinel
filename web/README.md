@@ -431,7 +431,12 @@ built.
   code lives only in component state: never in a URL, storage or history, and
   it is dropped on Close, on leaving the screen and on `pagehide` (so a page
   kept in the back-forward cache holds none; the `pagehide` clear is flushed
-  synchronously). A copied code stays on the clipboard, and the hand-over
+  synchronously). `pagehide` also aborts a change still in flight and drops
+  its late answer, so a code returned after the page was hidden is never
+  shown; that change is reported as unknown and the list reloaded. A shown
+  code is dropped as soon as a re-issue or revocation of the same person
+  starts, whatever its outcome, so a code the server may already have revoked
+  never stays copyable. A copied code stays on the clipboard, and the hand-over
   text says so (copy something else afterwards, re-issue on a suspected
   leak). The Copy button is kept pending the Owner's confirmation (the PR #315
   review recommends keeping it); no automatic clipboard clearing is attempted.
@@ -463,7 +468,9 @@ built dashboard at `http://localhost` in Chrome with every request intercepted
 and a CDP virtual authenticator holding one generated credential: invite and
 code display/close/`pagehide`, a stale Owner confirming and the change sent
 exactly once more with the session's own credential and `webauthn.get` client
-data, a declined step-up, a failed ceremony, exact `Origin` / CSRF / no
+data, a declined step-up, a failed ceremony, an invitation answered after
+`pagehide` (aborted, code never shown), a shown code dropped on re-issue and
+revocation even when the answer is lost, exact `Origin` / CSRF / no
 `Referer` on every POST, no storage or history write, no CSP violation, and no
 proxy identity or credential handle on screen). The stand-in does not verify
 signatures (the server's verifier tests do); neither file proves the real
