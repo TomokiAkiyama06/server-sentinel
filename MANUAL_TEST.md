@@ -1999,7 +1999,7 @@ and a synthetic boot clock (`server/tests/test_human_admin_routes.py`,
 `server/tests/test_access_administration.py`,
 `tests/e2e/test_access_matrix_scenarios.py`); no browser, Tailscale Serve,
 real authenticator or real deployment has exercised them, the production launcher mounts the human routes only from an enabled
-`human_access` deployment section (CP-1), not yet exercised on real hosts, and the Owner's Web screen is S6.
+`human_access` deployment section (CP-1), not yet exercised on real hosts; the Owner's Web screen (S6) has its own steps below.
 Once a deployment enables the routes, with a synthetic `*.invalid` Owner
 and synthetic invitees, each with their own passkey:
 
@@ -2214,6 +2214,79 @@ and then on the Main Server (Owner, synthetic data only):
   under `releases/<older version>/web/` as root and run `rollback`: it is
   refused before any change with the "differs from its release manifest"
   steps; `current`, `previous` and the unit are unchanged.
+
+### Issue #10 phase 2 S6 Owner access screen and Web step-up (pending, not executed)
+
+`web/src/access/screen.tsx`, `web/src/shared/step_up.ts` and the A1-A6 /
+step-up calls in `web/src/shared/services.ts` are verified only with Node
+unit tests against a fake `fetch` (`web/tests/access.test.mjs`) and in
+headless Chrome against intercepted synthetic answers with a CDP virtual
+authenticator (`web/tests/access_browser.mjs`); the stand-in does not verify
+signatures. No real Main Server route, real Owner passkey, passkey provider,
+Safari or phone has used the screen. Once a deployment serves `/app/` at the
+reserved `https` origin, as the Owner with their own passkey and with
+synthetic `*.invalid` invitees, each with their own test passkey (never a
+real person's credential), on **macOS Safari**, **iOS Safari** and a desktop
+Chrome (record the browser and OS versions used):
+
+- [ ] the Access screen lists every principal with role, status, grants,
+  pending-code expiry and each passkey's label, status, sync/backup facts and
+  times; compare with the raw `GET /api/admin/principals` answer, and confirm
+  no Tailscale login or device, credential id or handle is shown anywhere on
+  the page (Owner decision D14); the Owner's own row offers no control;
+- [ ] invite a person with only `recordings:view`: the code is shown once,
+  grouped `XXXX-…` ×8, with its expiry in UTC and the hand-over text; it is
+  absent from the URL bar, history, `localStorage`/`sessionStorage` and the
+  application and audit logs; "閉じる" removes it, and it is not shown again
+  after leaving and reopening the screen, after navigating away and back
+  (back-forward cache), or after a reload;
+- [ ] press "コピー", paste into the invitee's sign-in screen and register:
+  it works; confirm the copied code stays on the clipboard (and in any
+  clipboard history or sync the OS keeps) until something else is copied, as
+  the hand-over text says;
+- [ ] re-issue that person's code while the earlier one is still shown: the
+  shown code disappears at once; the new code is shown, the earlier one is
+  refused at the sign-in screen; repeat with the network cut right after
+  confirming (result unknown): no code is shown and the list is reloaded;
+- [ ] grant `live:view` and withdraw `recordings:view` separately: each click
+  is one change, the invitee's signed-in session ends at its next request,
+  and after signing in again the invitee sees only Live (no recordings or
+  timeline);
+- [ ] revoke one passkey of an invitee whose synced passkey is on two
+  devices: confirm the wording says it stops working on every device that
+  holds it (never "this device"), and both devices are refused afterwards;
+  revoke the person: every session ends, their pending code is refused, and a
+  code still shown for them disappears when the revocation starts;
+- [ ] let the Owner session become stale (more than five minutes after
+  sign-in or the last step-up) and make any change: the step-up question
+  appears and nothing is sent until it is answered; "やめる" reports that
+  nothing changed and sends nothing more; "パスキーで確認して続ける" prompts
+  for the Owner's own passkey with user verification, then the change is sent
+  exactly once more and succeeds (check the request sequence in the browser's
+  network panel: change, step-up options, step-up, change); cancel or fail
+  user verification: nothing changed and the change is not resent;
+- [ ] Safari / iPhone user activation: on iOS Safari and macOS Safari, the
+  click on "パスキーで確認して続ける" first fetches the step-up options and
+  only then calls `navigator.credentials.get`; confirm the passkey prompt
+  appears and does not fail with `NotAllowedError` for missing user
+  activation. If it fails, record it and switch to the fallback design: fetch
+  the options as soon as `step_up_required` arrives and call `get()` directly
+  from the confirm click handler, fetching fresh options when the five-minute
+  challenge lifetime has passed;
+- [ ] start an invitation and leave the page before it answers (navigate
+  to another page and come back with the browser's Back button, so the page
+  may be restored from the back-forward cache; also close the tab and
+  reopen `/app/`): on return no code is shown, a restored page reports the
+  result as unknown and reloads the list; re-issue to obtain a usable code;
+- [ ] with the step-up question open, and again while the passkey prompt is
+  showing (after "パスキーで確認して続ける"), navigate away and come back with
+  Back: the page reports that nothing was changed and the change was not
+  sent again (check the network panel); navigating away only after the
+  retried change was sent reports the result as unknown;
+- [ ] with a code shown, switch to another tab or app (for example the chat
+  app the code is pasted into) and return: the code is still shown. This is
+  intended: only leaving the page (`pagehide`) clears it, not a tab or app
+  switch (`visibilitychange`), so the Owner can paste it elsewhere.
 
 ### Issue #10 S7 interim live (pending)
 
