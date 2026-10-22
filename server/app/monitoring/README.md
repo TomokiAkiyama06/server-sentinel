@@ -74,7 +74,10 @@ a source not online for `camera_offline_notification.after_seconds` (default
 of the last hour on the first running tick. An episode in progress is named
 `uuid5(EVENT_NAMESPACE, "camera-offline:<source>:<last_seen_at>")` from the
 registry, so a restart during the same outage finds the row (any delivery
-state, `pending` included) and does not notify again. See SPECIFICATION §9
+state, `pending` included) and does not notify again, unless that row was
+accepted more than 24 h earlier (Owner decision 2026-10-22): the next name
+`…:repeat:N` of a deterministic chain is then used and the outage is notified
+again under the cap. See SPECIFICATION §9
 for the full rules and the known limits.
 
 Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`

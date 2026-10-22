@@ -43,7 +43,10 @@ Event IDs: an episode still in progress is named after the source and its
 registry ``last_seen_at`` (the last frame time, which stops changing while no
 frame arrives), supplied by the runtime (``durable_id``). A restarted process
 that finds the same camera still offline therefore computes the same ID, finds
-the row (``known``) and does not notify the same outage again. Without
+the row (``known``) and does not notify the same outage again. A row of that
+name accepted more than 24 h earlier no longer counts (Owner decision
+2026-10-22): the runtime then names the outage with the next name of a
+deterministic chain and it is notified again. Without
 storage, or for an episode that already recovered, the ID is per process
 (never a missed notification, at worst one repeat after a restart).
 

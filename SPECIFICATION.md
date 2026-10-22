@@ -1468,12 +1468,22 @@ meanwhile is dropped (`camera_offline_notification_dropped`). An episode in
 progress is named after the source and its registry `last_seen_at` (the last
 frame time), so a restart during the same outage finds the row and does not
 notify again; a `pending` row (an uncertain delivery of the stopped process) is
-not resent. If the last-frame time could not be written during a short online
-period (for example storage refused it), a restarted process cannot tell the
-new outage from the earlier one and does not notify it; within one process
-such a reused ID gets a per-process ID instead. Without storage, or for an
-episode that already recovered, the ID is per process (at worst one repeat
-after a restart). The Slack text is the fixed `ServerSentinel critical alert:
+not resent. A row of that name accepted more than 24 hours earlier no longer
+counts as this outage (Owner decision 2026-10-22, PR #320): the next name of a
+deterministic chain (`…:repeat:1`, `…:repeat:2`, …) is used and the outage is
+notified again, under the hourly cap; a restart within 24 hours of that
+notification still finds it. So when the last-frame time could not be written
+during a short online period (for example storage refused it), a later outage
+that a restarted process maps to the earlier name is notified once the earlier
+notification is more than a day old; within that day it is not (within one
+process such a reused ID gets a per-process ID instead). The same rule notifies
+again an outage that has continued for more than a day when the service
+restarts. Without storage, or for an episode that already recovered, the ID is
+per process (at worst one repeat after a restart). Decided and pending (Owner
+decision 2026-10-22, follow-up PR): a camera that flaps with online periods
+too short to matter (for example four minutes offline, two seconds online) is
+not yet notified; a rule on the total offline time within a window (for
+example five minutes in fifteen) will be added separately. The Slack text is the fixed `ServerSentinel critical alert:
 camera_offline`: no source name, role, UUID, device path, serial, reason or
 image; the Owner identifies the source in the Web UI. `MonitoringStatus`
 reports `camera_offline_degraded` (counted as degraded in the daily summary)

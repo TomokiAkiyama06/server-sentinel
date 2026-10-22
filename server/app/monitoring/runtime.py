@@ -49,6 +49,11 @@ from .store import NotificationEventStore, RecordingHealthStatusStore
 # Fixed namespace for deterministic local event IDs, so an at-least-once
 # redelivery of one fault maps to one notification row and one Slack message.
 EVENT_NAMESPACE = UUID("3b0f6c52-7a1e-5d49-8e2c-0c7d4f1a9b63")
+# Owner decision 2026-10-22 (PR #320): a camera offline row accepted more than
+# this long ago does not suppress a notification for an outage that maps to
+# the same name; the chain bounds the lookups (then a per-process ID is used).
+CAMERA_OFFLINE_RENOTIFY_SECONDS = 24 * 60 * 60.0
+CAMERA_OFFLINE_RENOTIFY_CHAIN = 128
 CRITICAL_KINDS = (
     NotificationKind.HARDWARE_INTEGRITY_FAILURE, NotificationKind.RECORDING_HEALTH_FAILURE,
     NotificationKind.SERVER_MOVEMENT, NotificationKind.CAMERA_TAMPER,
@@ -721,12 +726,39 @@ class MonitoringRuntime:
         frame time, unchanged while no frame arrives), so a restarted process
         that finds the same outage computes the same ID. ``None`` (a
         per-process ID) when the source has no registry row.
+
+        Owner decision 2026-10-22 (PR #320): a row of that name accepted more
+        than ``CAMERA_OFFLINE_RENOTIFY_SECONDS`` (24 h) ago no longer counts
+        as this outage. If the last-frame time could not move during a short
+        online period (a refused write), a later outage would otherwise reuse
+        that name and never be notified. The next name in a deterministic
+        chain (``:repeat:1``, ``:repeat:2`` …) is then used, so a restart
+        within 24 h of that notification still finds it and sends nothing
+        twice, while the outage is notified again (under the hourly cap).
         """
         row = self._connection.execute(
             "SELECT last_seen_at FROM camera_sources WHERE id=?", (str(source_id),)).fetchone()
         if row is None:
             return None
-        return uuid5(EVENT_NAMESPACE, f"camera-offline:{source_id}:{row[0] or 'never'}")
+        base = f"camera-offline:{source_id}:{row[0] or 'never'}"
+        now = self.dependencies.utcnow()
+        for repeat in range(CAMERA_OFFLINE_RENOTIFY_CHAIN):
+            event_id = uuid5(EVENT_NAMESPACE, base if not repeat else f"{base}:repeat:{repeat}")
+            stored = self._connection.execute(
+                "SELECT COALESCE(accepted_at, at) FROM notification_events WHERE event_id=?",
+                (str(event_id),)).fetchone()
+            if stored is None:
+                return event_id
+            try:
+                age = (now - datetime.fromisoformat(stored[0])).total_seconds()
+            except (TypeError, ValueError):
+                # Unreadable: treated as old, so an outage is never hidden.
+                age = math.inf
+            if age < CAMERA_OFFLINE_RENOTIFY_SECONDS:
+                # Notified within 24 h (a clock moved back counts as recent):
+                # the caller finds this row and sends nothing again.
+                return event_id
+        return None
 
     def _notification_known(self, event_id: UUID) -> bool:
         """Whether a `notification_events` row with ``event_id`` exists (any state).

@@ -709,6 +709,61 @@ class LifespanTests(RuntimeFixture):
         self.assertEqual([ALERT], self.slack_texts())
         self.assertEqual([(1, "sent")], self.offline_rows())
 
+    async def first_outage_notified(self):
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.bring_online(application)
+            self.discovery.devices = []
+            self.assertTrue(await self.until(lambda: self.health() is SourceHealthState.OFFLINE))
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+        self.assertEqual([ALERT], self.slack_texts())
+
+    async def restart_offline(self, hours):
+        # A later start with the camera absent and the registry last-frame
+        # time unchanged (as when a short online period could not write it).
+        self.clock.advance(timedelta(hours=hours))
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+
+    async def test_a_row_older_than_a_day_does_not_hide_a_later_outage(self):
+        # Owner decision 2026-10-22 (PR #320 提案 1): a camera_offline row of
+        # the derived name accepted more than 24 h ago no longer suppresses.
+        await self.first_outage_notified()
+        await self.restart_offline(23)
+        self.assertEqual([ALERT], self.slack_texts())
+        await self.restart_offline(25)
+        self.assertEqual([ALERT, ALERT], self.slack_texts())
+        rows = self.offline_rows()
+        self.assertEqual([(1, "sent"), (1, "sent")], rows)
+        # The repeat has a durable name too: a restart within a day of it
+        # sends nothing again.
+        await self.restart_offline(1)
+        self.assertEqual([ALERT, ALERT], self.slack_texts())
+        await self.restart_offline(25)
+        self.assertEqual([ALERT] * 3, self.slack_texts())
+
+    async def test_a_repeat_after_a_day_still_obeys_the_hourly_cap(self):
+        await self.first_outage_notified()
+        self.clock.advance(timedelta(hours=25))
+        # A fresh confirmed alert from another source within the hour.
+        self.stored_row(confirmed=True, delivery="sent", age=60)
+        configuration = self.configuration(camera_offline=CameraOfflineNotification(300, 1))
+        application = self.uvc_application(configuration)
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.clock.advance(timedelta(seconds=301))
+            with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+                await self.tick(runtime)
+            self.assertEqual([ALERT], self.slack_texts())
+            self.clock.advance(timedelta(hours=1))
+            await self.tick(runtime)
+            self.assertEqual([ALERT, ALERT], self.slack_texts())
+
     async def test_the_hourly_cap_continues_across_a_restart(self):
         configuration = self.configuration(
             camera_offline=CameraOfflineNotification(300, 1))
