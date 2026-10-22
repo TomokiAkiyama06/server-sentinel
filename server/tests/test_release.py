@@ -932,14 +932,28 @@ class ReleaseLifecycleTests(unittest.TestCase):
         value["runtime_device"][1] += 16
         self.config.write_text(json.dumps(value))
         self.config.chmod(0o600)
+        # A disposable sysfs models the runtime device as a plain disk.
+        sysfs = self.root / "sys-dev-block"
+        device = self.runtime.stat().st_dev
+        (sysfs / f"{os.major(device)}:{os.minor(device)}").mkdir(parents=True)
         stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr):
+        with contextlib.redirect_stderr(stderr), patch(
+                "app.monitoring.config.SYS_DEV_BLOCK", sysfs):
             self.perform(self.arguments("install", "1.0.0"))
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
         self.assertIn("recorded filesystem device numbers", stderr.getvalue())
         for secret in (self.filesystem_uuid, str(self.root),
                        f"{value['runtime_device'][0]}, {value['runtime_device'][1]}"):
             self.assertNotIn(secret, stderr.getvalue())
+        # A changed major (another kind of device, e.g. a loop image) is
+        # refused by the installer as before.
+        value["runtime_device"] = [7 if os.major(device) != 7 else 8, 0]
+        self.config.write_text(json.dumps(value))
+        self.config.chmod(0o600)
+        with patch("app.monitoring.config.SYS_DEV_BLOCK", sysfs), \
+                self.assertRaisesRegex(ConfigurationError, "filesystem identity mismatch"):
+            self.perform(self.arguments("update", "1.1.0"))
+        self.assertFalse((self.installation / "releases/1.1.0").exists())
 
     def test_approved_filesystem_uuid_lookup_rejects_unsafe_and_missing_entries(self):
         directory = self.root / "by-uuid"

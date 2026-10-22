@@ -29,6 +29,44 @@ MONITORING_KEYS = frozenset({
 })
 STORAGE_SECTIONS = ("storage_limits", "recording_limits", "recording_filesystem")
 SUMMARY_TIME = re.compile(r"([01][0-9]|2[0-3]):([0-5][0-9])")
+# Kernel block-device attributes by `<major>:<minor>` (Issue #321): a loop
+# device has a `loop/` directory (with `backing_file` while attached), a
+# device-mapper device a `dm/` directory.
+SYS_DEV_BLOCK = Path("/sys/dev/block")
+
+
+def renumbered_device_acceptable(recorded: tuple[int, int], device: int) -> bool:
+    """Whether a recorded major/minor pair may differ from ``device`` (Issue #321).
+
+    Called only for a device the approved UUID, the mount point and the
+    runtime root already agree on. An equal pair is always acceptable. A
+    differing pair is acceptable only as a reboot renumbering of the same
+    kind of device: the major (the driver) is unchanged and only the minor
+    differs, and the device is not a loop device, whose backing file may sit
+    on the operating-system root filesystem (a disk image mounted with
+    `-o loop` gets a `/dev/disk/by-uuid` link and a non-root device number).
+    A device-mapper device is accepted only when the recorded device was one
+    too, which the unchanged major already implies (device-mapper has its own
+    major). Missing or unreadable sysfs attributes refuse (fail closed).
+    """
+    major, minor = os.major(device), os.minor(device)
+    if tuple(recorded) == (major, minor):
+        return True
+    if recorded[0] != major:
+        return False
+    node = SYS_DEV_BLOCK / f"{major}:{minor}"
+    try:
+        if not node.is_dir():
+            return False
+        if (node / "loop").exists() or (node / "loop" / "backing_file").exists():
+            return False
+        # A device-mapper device (`dm/`) passes here only because the
+        # recorded major is device-mapper's own: the recorded device was one
+        # too. A disk replaced by a new dm mapping changes the major and was
+        # refused above.
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -44,9 +82,10 @@ class RecordingFilesystem:
     `device` (and the deployment's `runtime_device`, attached by
     `Deployment.load`) are the recorded Linux major/minor numbers. They only
     corroborate the UUID: the kernel may number the same disk differently
-    after a reboot (Issue #321), so a difference while the UUID resolves to
-    the mounted device is a stale recorded value reported to the Owner, never
-    a refusal and never an identity on its own.
+    after a reboot (Issue #321), so a changed minor of the same kind of
+    device while the UUID resolves to the mounted device is a stale recorded
+    value reported to the Owner; a changed major, a loop device or a new
+    device-mapper device is refused (`renumbered_device_acceptable`).
     """
 
     root: Path = field(repr=False)
@@ -62,10 +101,17 @@ class RecordingFilesystem:
         """Whether every recorded major/minor pair names ``device``.
 
         Called only for a device the UUID, the mount point and the root
-        already agree on; the answer never admits or refuses storage.
+        already agree on. False is reported to the Owner; whether storage may
+        be used at all is `recorded_device_numbers_acceptable`.
         """
         actual = (os.major(device), os.minor(device))
         return self.device == actual and self.runtime_device in (None, actual)
+
+    def recorded_device_numbers_acceptable(self, device: int) -> bool:
+        """Whether every recorded pair names ``device`` or is a stale value of
+        the same kind of device (`renumbered_device_acceptable`)."""
+        return all(renumbered_device_acceptable(recorded, device)
+                   for recorded in (self.device, self.runtime_device) if recorded is not None)
 
 
 @dataclass(frozen=True)
@@ -143,15 +189,17 @@ def _recording_filesystem(value: object, recordings_directory: Path, *,
         raise ConfigurationError("recording filesystem is unavailable") from None
     # The UUID is the identity: it must resolve to the device the recordings
     # directory and the mounted mount point are on, and that device must not
-    # be the operating-system root's. The recorded major/minor numbers are
-    # not compared here: they may change across a reboot (Issue #321) and a
-    # difference is reported, not refused (`recorded_device_numbers_match`).
+    # be the operating-system root's. The recorded major/minor numbers may
+    # change across a reboot (Issue #321): a stale minor of the same kind of
+    # device is reported, not refused; a different major, a loop device or a
+    # new device-mapper device is refused (`renumbered_device_acceptable`).
     if (resolved_mount == Path(resolved_mount.anchor)
             or not is_mount(resolved_mount)
             or not directory.is_relative_to(resolved_mount)
             or directory_info.st_dev != mount_info.st_dev
             or directory_info.st_dev != approved
-            or directory_info.st_dev == operating_system_root):
+            or directory_info.st_dev == operating_system_root
+            or not renumbered_device_acceptable((device[0], device[1]), directory_info.st_dev)):
         raise ConfigurationError("recording filesystem identity mismatch")
     return RecordingFilesystem(directory, uuid, (device[0], device[1]), resolved_mount,
                                resolve_device, is_mount)

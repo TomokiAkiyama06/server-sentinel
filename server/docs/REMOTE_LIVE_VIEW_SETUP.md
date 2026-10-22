@@ -667,10 +667,17 @@ it. Check after every host or VM reboot:
    A line `the recorded filesystem device numbers ... differ` (and the Owner
    notice `recording_device_numbers_changed`) means the UUID and the mount were
    verified and the service started, but `runtime_device` /
-   `monitoring.recording_filesystem.device` are from an earlier boot. Update
-   both to the current `MAJ:MIN` from step 1 and restart only when the check
-   passes, as in `DEPLOYMENT.md` "Updating stale device numbers after a
-   reboot" (chain with `&&`, never `;`).
+   `monitoring.recording_filesystem.device` are from an earlier boot (only the
+   minor changed; a changed major is refused, not warned about). Before
+   editing, confirm the device:
+   ```sh
+   lsblk -o NAME,MAJ:MIN,TYPE,SERIAL                 # TYPE disk/part, not loop/dm; known serial
+   blkid -t UUID=<approved uuid> -o device           # exactly one line
+   ```
+   Then update both to the current `MAJ:MIN` from step 1 and restart only
+   when the check passes, as in `DEPLOYMENT.md` "Updating stale device
+   numbers after a reboot" (chain with `&&`, never `;`). The notice is sent
+   once per boot, so restarting does not repeat it.
 3. If the UUID does not resolve, or resolves to a different device than the
    mount, do not edit the values: the disk is missing, not mounted, or not the
    approved one, and the service refuses it on purpose. Check the LXD disk

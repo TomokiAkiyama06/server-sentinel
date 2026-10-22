@@ -4,13 +4,17 @@ A reboot may renumber the same disk (sda/sdb swapped: 8:16 became 8:0). While
 the approved UUID resolves to the device that the runtime root and the mounted
 mount point are on, and that device is not the operating-system root's, a
 stale recorded pair must not stop the service: it is reported (value-free
-launcher warning, monitoring status, one Owner notice per process start).
-Every other identity failure still refuses. Disposable directories, injected
-UUID/mount/root lookups and an intercepted Slack transport only; no real
-block device, mount or Slack endpoint is used.
+launcher warning, monitoring status, one Owner notice per boot and device
+numbers). Only a changed minor of the same kind of device is stale: a changed
+major, a loop device or a new device-mapper device still refuses, as every
+other identity failure does. Disposable directories, a fake sysfs
+`/sys/dev/block`, a fake boot ID, injected UUID/mount/root lookups and an
+intercepted Slack transport only; no real block device, mount or Slack
+endpoint is used.
 """
 
 import contextlib
+from datetime import timedelta
 from dataclasses import replace
 import io
 import json
@@ -23,7 +27,9 @@ from unittest.mock import patch
 from app.deployment import DEVICE_NUMBERS_STALE_WARNING, Deployment, main as deployment_main
 from app.diagnostics.sources import StorageAdapter
 from app.media.recording.model import RecordingError
-from app.monitoring.config import RecordingFilesystem, parse_monitoring
+from app.monitoring.config import (
+    RecordingFilesystem, parse_monitoring, renumbered_device_acceptable,
+)
 from app.monitoring.filesystem import IdentifiedRecordingFilesystem
 from app.monitoring.runtime import MonitoringStatus, RuntimeState
 from app.settings import ConfigurationError
@@ -41,6 +47,34 @@ def other_numbers(device: int) -> list[int]:
     return [os.major(device), os.minor(device) + 16]
 
 
+def other_major(device: int) -> list[int]:
+    """Another driver's numbers, e.g. a loop device `7:0` instead of `8:16`."""
+    return [7, 0] if os.major(device) != 7 else [8, 16]
+
+
+class FakeSysfs:
+    """A disposable `/sys/dev/block` with one entry per device, patched in."""
+
+    def __init__(self, case: unittest.TestCase):
+        temporary = tempfile.TemporaryDirectory(prefix="server-device-numbers-sysfs-")
+        case.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        patcher = patch("app.monitoring.config.SYS_DEV_BLOCK", self.root)
+        patcher.start()
+        case.addCleanup(patcher.stop)
+
+    def node(self, device: int, kind: str = "disk") -> Path:
+        """Model ``device`` as a plain disk, a loop device or a dm device."""
+        node = self.root / f"{os.major(device)}:{os.minor(device)}"
+        node.mkdir(exist_ok=True)
+        if kind == "loop":
+            (node / "loop").mkdir()
+            (node / "loop" / "backing_file").write_text("/synthetic/image\n")
+        elif kind == "dm":
+            (node / "dm").mkdir()
+        return node
+
+
 class DeploymentValidationTests(unittest.TestCase):
     """`Deployment.load` (the launcher's and `--check`'s validation)."""
 
@@ -56,6 +90,8 @@ class DeploymentValidationTests(unittest.TestCase):
         self.device = self.runtime.stat().st_dev
         self.numbers = [os.major(self.device), os.minor(self.device)]
         self.config = self.root / "deployment.json"
+        self.sysfs = FakeSysfs(self)
+        self.sysfs.node(self.device)
         # Defaults model a correctly mounted, separately backed runtime volume.
         self.approved = self.device
         self.mounted = True
@@ -163,6 +199,30 @@ class DeploymentValidationTests(unittest.TestCase):
                 self.assertEqual(1, code)
                 self.assertNotIn("warning", stderr)
 
+    def test_changed_major_loop_and_unknown_devices_are_refused(self):
+        # A changed major is another driver (e.g. a root-filesystem image
+        # mounted with `-o loop`, 7:N): refused as before Issue #321.
+        for value in (self.value(runtime_device=other_major(self.device)),
+                      self.value(recording_device=other_major(self.device))):
+            with self.subTest(value=value["runtime_device"]):
+                with self.assertRaisesRegex(ConfigurationError, "identity mismatch"):
+                    self.load(value)
+                code, _, stderr = self.check(value)
+                self.assertEqual(1, code)
+                self.assertNotIn("warning", stderr)
+        # Same major but a loop device: its image may sit on the root
+        # filesystem, so a renumbered loop device is never accepted.
+        sysfs = FakeSysfs(self)
+        sysfs.node(self.device, "loop")
+        with self.assertRaisesRegex(ConfigurationError, "identity mismatch"):
+            self.load(self.value(runtime_device=other_numbers(self.device)))
+        # An exact match is not re-judged (the deployment approved it).
+        self.assertFalse(self.load(self.value()).filesystem_device_numbers_stale)
+        # Without a sysfs entry nothing proves the kind: refused.
+        FakeSysfs(self)
+        with self.assertRaisesRegex(ConfigurationError, "identity mismatch"):
+            self.load(self.value(recording_device=other_numbers(self.device)))
+
     def test_missing_uuid_is_refused(self):
         value = self.value(runtime_device=other_numbers(self.device))
         value["runtime_filesystem_uuid"] = "99999999-8888-7777-6666-555555555555"
@@ -209,6 +269,8 @@ class RecordingFilesystemTests(unittest.TestCase):
         self.device = self.recordings.stat().st_dev
         self.approved = self.device
         self.mounted = True
+        self.sysfs = FakeSysfs(self)
+        self.sysfs.node(self.device)
 
     def parse(self, numbers, *, root=None):
         return parse_monitoring({
@@ -237,6 +299,31 @@ class RecordingFilesystemTests(unittest.TestCase):
                     root = self.device
                 with self.assertRaisesRegex(ConfigurationError, "mismatch"):
                     self.parse(other_numbers(self.device), root=root)
+        self.approved, self.mounted = self.device, True
+        with self.assertRaisesRegex(ConfigurationError, "mismatch"):
+            self.parse(other_major(self.device))
+
+    def test_renumbering_rule_by_device_kind(self):
+        disk = os.makedev(8, 0)
+        loop = os.makedev(7, 3)
+        mapped = os.makedev(253, 1)
+        self.sysfs.node(disk)
+        self.sysfs.node(loop, "loop")
+        self.sysfs.node(mapped, "dm")
+        cases = (
+            ((8, 0), disk, True),      # unchanged
+            ((8, 16), disk, True),     # sda/sdb swapped (the incident)
+            ((7, 0), disk, False),     # changed major
+            ((8, 16), loop, False),    # disk now a loop device
+            ((7, 0), loop, False),     # renumbered loop device
+            ((7, 3), loop, True),      # an exact match is not re-judged
+            ((8, 16), mapped, False),  # disk now a device-mapper device
+            ((253, 4), mapped, True),  # renumbered device-mapper device
+            ((8, 16), os.makedev(8, 32), False),  # no sysfs entry: fail closed
+        )
+        for recorded, device, expected in cases:
+            with self.subTest(recorded=recorded, device=(os.major(device), os.minor(device))):
+                self.assertIs(expected, renumbered_device_acceptable(recorded, device))
 
     def identity(self, numbers, runtime_device=None):
         return RecordingFilesystem(self.recordings, UUID, tuple(numbers), self.mount,
@@ -265,6 +352,15 @@ class RecordingFilesystemTests(unittest.TestCase):
                 self.approved, self.mounted = self.device, False
                 with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
                     filesystem.check()
+        # A renumbered loop device is refused whenever the root is pinned,
+        # even when the deployment was validated before it appeared.
+        self.approved, self.mounted = self.device, True
+        loop = FakeSysfs(self)
+        loop.node(self.device, "loop")
+        with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+            IdentifiedRecordingFilesystem(self.identity(other_numbers(self.device)), metadata)
+        with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+            IdentifiedRecordingFilesystem(self.identity(other_major(self.device)), metadata)
         # The UUID must already name the pinned device when the root is pinned.
         self.approved, self.mounted = self.device + 7, True
         with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
@@ -272,13 +368,33 @@ class RecordingFilesystemTests(unittest.TestCase):
 
 
 class StaleDeviceNumbersRuntimeTests(RuntimeFixture):
-    """The monitoring runtime starts, reports the stale value and notifies once."""
+    """The monitoring runtime starts, reports the stale value and notifies once
+    per boot and device numbers (Owner decision 2026-10-22)."""
+
+    def setUp(self):
+        super().setUp()
+        FakeSysfs(self).node(self.device)
+        self.boot = Path(self.temporary.name) / "boot_id"
+        self.boot.write_text("6f1c0d7e-3a52-4b8e-9c11-2d4e5f607182\n")
+        patcher = patch("app.monitoring.runtime.BOOT_ID_PATH", self.boot)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def configuration(self, **overrides):
         configuration = super().configuration(**overrides)
         filesystem = replace(configuration.recording_filesystem,
                              runtime_device=tuple(other_numbers(self.device)))
         return replace(configuration, recording_filesystem=filesystem)
+
+    def notices(self):
+        return [text for text in self.slack_texts() if "recording_device" in text]
+
+    async def run_once(self):
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            return runtime.status
 
     async def test_stale_numbers_start_storage_and_notify_the_owner_once(self):
         application = self.application()
@@ -292,20 +408,33 @@ class StaleDeviceNumbersRuntimeTests(RuntimeFixture):
             await runtime.call(runtime.tick)
             await runtime.call(runtime.tick)
             await self.settle(runtime)
-            notices = [text for text in self.slack_texts() if "recording_device" in text]
             self.assertEqual(
-                ["ServerSentinel attention notice: recording_device_numbers_changed"], notices)
+                ["ServerSentinel attention notice: recording_device_numbers_changed"],
+                self.notices())
             self.assertIn(("recording_device_numbers_changed", "sent"), self.events())
             # The daily summary counts the stale value among its errors.
             summary = await runtime.call(runtime._summary, self.clock.utcnow())
             self.assertGreaterEqual(summary.error_count, 1)
-        # A restart (a new process) reminds the Owner again until it is fixed.
-        application = self.application()
-        async with application.router.lifespan_context(application):
-            runtime = application.state.monitoring
-            await self.settle(runtime)
-            notices = [text for text in self.slack_texts() if "recording_device" in text]
-            self.assertEqual(2, len(notices))
+        # A restart within the same boot (e.g. a restart loop) finds the row
+        # and sends nothing; the stale state stays visible.
+        self.clock.advance(timedelta(minutes=5))
+        self.assertTrue((await self.run_once()).recording_device_numbers_stale)
+        self.assertEqual(1, len(self.notices()))
+        # A new boot notifies once more while the value is still stale.
+        self.boot.write_text("0b7e2a91-5c3d-4f60-8e12-9a8b7c6d5e4f\n")
+        self.clock.advance(timedelta(minutes=5))
+        await self.run_once()
+        await self.run_once()
+        self.assertEqual(2, len(self.notices()))
+        self.assertEqual(2, [kind for kind, _ in self.events()].count(
+            "recording_device_numbers_changed"))
+
+    async def test_without_a_boot_id_each_start_notifies(self):
+        self.boot.unlink()
+        await self.run_once()
+        self.clock.advance(timedelta(minutes=5))
+        await self.run_once()
+        self.assertEqual(2, len(self.notices()))
 
     async def test_current_numbers_send_no_notice(self):
         configuration = super().configuration()
@@ -315,6 +444,18 @@ class StaleDeviceNumbersRuntimeTests(RuntimeFixture):
             await self.settle(runtime)
             self.assertFalse(runtime.status.recording_device_numbers_stale)
             self.assertNotIn("recording_device_numbers_changed", dict(self.events()))
+
+    async def test_renumbered_loop_device_fails_closed_at_runtime(self):
+        FakeSysfs(self).node(self.device, "loop")
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            self.assertFalse(application.state.audit_storage_admitted)
+            await self.settle(runtime)
+            self.assertEqual(["ServerSentinel critical alert: recording_health_failure"],
+                             self.slack_texts())
+            self.assertEqual([], list(self.recordings.iterdir()))
 
 
 class DiagnosticsTests(unittest.TestCase):

@@ -2517,7 +2517,10 @@ intercepted Slack transport. On the deployment, additionally check:
       a disposable configuration copy), `--check` passes with the one
       value-free `deployment warning` line, the service starts, one
       `recording_device_numbers_changed` attention notice arrives (Slack when
-      configured, a local row otherwise), diagnostics show
+      configured, a local row otherwise; a second restart in the same boot
+      sends none), a recorded value with another major (e.g. `[7, 0]`) is
+      refused, `lsblk`/`blkid` show the device as `disk`/`part` with one
+      UUID match, diagnostics show
       `recording_filesystem.state` `degraded`, and after both values are
       updated (check `&&` restart) the warning and the degraded state are gone;
       with the UUID pointing to another device than the mount, `--check` still

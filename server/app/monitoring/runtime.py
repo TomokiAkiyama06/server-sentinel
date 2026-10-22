@@ -16,6 +16,7 @@ from enum import StrEnum
 import logging
 import math
 import os
+from pathlib import Path
 import sqlite3
 import stat
 import threading
@@ -57,6 +58,20 @@ CRITICAL_KINDS = (
 # the `recording_device_numbers_stale` flag instead, every day until fixed.
 WARNING_KINDS = (NotificationKind.HARDWARE_INTEGRITY_WARNING,
                  NotificationKind.RECORDING_HEALTH_WARNING)
+# Kernel per-boot random UUID (Issue #321): the stale device-number notice is
+# sent once per boot and device numbers, not on every restart.
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+def _boot_id() -> str | None:
+    """This boot's kernel UUID, or None when unreadable or malformed."""
+    try:
+        with open(BOOT_ID_PATH, encoding="ascii") as stream:
+            return str(UUID(stream.read(64).strip()))
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
 # The audited credential findings (``AccessStore``); their records are the
 # durable evidence a restart recovers an undelivered notification from.
 FINDING_AUDIT_ACTIONS = (AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
@@ -475,15 +490,8 @@ class MonitoringRuntime:
                   recording_filesystem_ok=True, recording_health=None,
                   recording_device_numbers_stale=stale)
         if stale and not self._device_numbers_reported:
-            # Issue #321: the UUID, mount and root were verified, so storage is
-            # admitted; the recorded numbers are only out of date. One
-            # value-free Owner notice per process start, never a refusal.
             self._device_numbers_reported = True
-            at = self.dependencies.utcnow()
-            self.notifications.record(
-                NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED, at=at,
-                event_id=uuid5(EVENT_NAMESPACE, "recording-device-numbers:" + at.isoformat()),
-            )
+            self._report_device_numbers()
         # Startup always compares inventory and runs the recording self-test,
         # regardless of when the previous process last did.
         self._storage_tick()
@@ -535,6 +543,35 @@ class MonitoringRuntime:
             event_id=uuid5(EVENT_NAMESPACE, "recording-startup:" + at.isoformat()),
         )
         self._poll()
+
+    def _report_device_numbers(self) -> None:
+        """Issue #321: one value-free Owner notice per boot and device numbers.
+
+        The UUID, mount and root were verified, so storage is admitted; the
+        recorded numbers are only out of date. The event ID derives from the
+        kernel boot ID and the current numbers (Owner decision 2026-10-22),
+        so a restart within the same boot finds its row and sends nothing,
+        and a new boot or another renumbering notifies once. Without a
+        readable boot ID the notice is sent once per process instead. The
+        numbers only enter the one-way UUIDv5 name together with the random
+        boot ID; nothing is stored or sent but the fixed kind.
+        """
+        at = self.dependencies.utcnow()
+        boot = _boot_id()
+        device = self.filesystem.expected.device
+        if boot is None:
+            event_id = uuid5(EVENT_NAMESPACE, "recording-device-numbers:" + at.isoformat())
+        else:
+            event_id = uuid5(EVENT_NAMESPACE, f"recording-device-numbers:{boot}:"
+                                              f"{os.major(device)}:{os.minor(device)}")
+            try:
+                if self.notification_events.get(event_id) is not None:
+                    return
+            except Exception:
+                # An unreadable store notifies rather than staying silent.
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+        self.notifications.record(NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED,
+                                  at=at, event_id=event_id)
 
     # -- bridges -----------------------------------------------------------
 

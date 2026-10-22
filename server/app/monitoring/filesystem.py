@@ -24,7 +24,9 @@ class IdentifiedRecordingFilesystem:
 
     The recorded major/minor numbers only corroborate the UUID (Issue #321):
     `device_numbers_current` is False when they no longer name the pinned
-    device, which the runtime reports to the Owner; it never admits storage.
+    device, which the runtime reports to the Owner. Only a changed minor of
+    the same kind of device is accepted; a changed major, a loop device or a
+    new device-mapper device is `STORAGE_HARD_STOP` when the root is pinned.
     """
 
     def __init__(self, identity: RecordingFilesystem, metadata: Path):
@@ -37,6 +39,11 @@ class IdentifiedRecordingFilesystem:
             raise RecordingError("STORAGE_HARD_STOP")
         self.expected = RootIdentity(info.st_dev, info.st_ino)
         self._verify_identity()
+        # Issue #321: a stale minor of the same kind of device is reported; a
+        # different major, a loop device or a new device-mapper device is
+        # refused at every (re)open, as at deployment validation.
+        if not identity.recorded_device_numbers_acceptable(info.st_dev):
+            raise RecordingError("STORAGE_HARD_STOP")
         # Fixed for this instance: the pinned device cannot change without
         # every later sample refusing.
         self.device_numbers_current = identity.recorded_device_numbers_match(info.st_dev)

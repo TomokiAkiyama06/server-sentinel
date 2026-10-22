@@ -27,7 +27,8 @@ class NotificationKind(StrEnum):
     # Issue #321: the recorded major/minor numbers of the recording/runtime
     # filesystem no longer name the device its approved UUID and mount agree
     # on (the kernel renumbered the disk at boot). Storage stays admitted;
-    # the Owner is told once per service start to update the stale value.
+    # the Owner is told once per boot and device numbers to update the
+    # stale value (Owner decision 2026-10-22).
     # Value-free: no number, UUID or path.
     RECORDING_DEVICE_NUMBERS_CHANGED = "recording_device_numbers_changed"
     # Visible local warnings (NEW_DEVICE/UNVERIFIABLE hardware, unavailable

@@ -184,9 +184,16 @@ mismatch`, `... unavailable` or `... root filesystem ...`). A missing mount that
 leaves a directory behind on the root filesystem is refused by these checks,
 not by the numbers.
 
-When all of them hold but `runtime_device` (or
-`monitoring.recording_filesystem.device`) differs from the current numbers,
-the recorded value is stale, not a different filesystem. `--check`, the
+When all of them hold and `runtime_device` (or
+`monitoring.recording_filesystem.device`) differs from the current numbers
+**only in the minor**, the recorded value is stale, not a different
+filesystem. A different major is refused as before: the major names the
+driver, and a disk image mounted with `-o loop` (major 7, possibly on the root
+filesystem) or a new device-mapper mapping would otherwise pass the UUID and
+mount checks. A renumbered loop device (`/sys/dev/block/<maj>:<min>/loop`) or
+a device without an entry in `/sys/dev/block` is refused too; a
+device-mapper device is accepted only when the recorded one was
+device-mapper as well (same major). `--check`, the
 launcher and the installer then pass and print one value-free line (no number,
 UUID or path):
 
@@ -197,7 +204,9 @@ ServerSentinel deployment warning: the recorded filesystem device numbers (runti
 The service starts, and the monitoring runtime reports it: the immediate
 Owner notice `recording_device_numbers_changed` (Slack `ServerSentinel
 attention notice: recording_device_numbers_changed`, a local row either way;
-once per service start until the value is updated),
+once per boot and device numbers, so a restart in the same boot does not
+repeat it; without a readable `/proc/sys/kernel/random/boot_id` once per
+service start),
 `MonitoringStatus.recording_device_numbers_stale`, the diagnostics field
 `recording_filesystem.state` `degraded`, and one degraded item in every daily
 summary's error count. Update the recorded value as in "Updating stale device
@@ -271,8 +280,21 @@ stat -c '%d' /srv/ss-data/server-sentinel               # same device as /srv/ss
 journalctl -u server-sentinel.service -b | grep 'deployment warning'
 ```
 
+Before changing anything, also confirm that the device is the approved disk
+and nothing else carries its UUID:
+
+```sh
+lsblk -o NAME,MAJ:MIN,TYPE,SERIAL   # the device: TYPE disk or part (never loop or dm
+                                    # unless it was approved as dm), the known SERIAL
+blkid -t UUID=<runtime_filesystem_uuid> -o device   # exactly one line
+```
+
 Update the numbers only when the UUID is the approved one and resolves to the
-mounted device (the first two lines name the same device). Then write the
+mounted device (the first two lines name the same device), the device is a
+`disk`/`part` with the known serial, the major is the recorded one (only the
+minor changed; otherwise the check refuses anyway), and `blkid` prints exactly
+one device. Two lines mean a second filesystem with the same UUID (a clone):
+stop and find it. Then write the
 current `MAJ:MIN` as `[major, minor]` into both `runtime_device` and
 `monitoring.recording_filesystem.device`, keep the file `root`-owned with mode
 `0640`, and restart only when the check passes: chain the check and the

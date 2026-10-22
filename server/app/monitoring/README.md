@@ -59,7 +59,11 @@ immediate `recording_health_failure` per episode. The recorded major/minor
 numbers only corroborate the UUID (Issue #321): when they no longer name the
 verified device, storage is admitted, `recording_device_numbers_stale` is set
 (degraded in the daily summary and diagnostics) and one immediate
-`recording_device_numbers_changed` attention notice is sent per process start. A failed startup open is
+`recording_device_numbers_changed` attention notice is sent per boot and device
+numbers (event ID from `/proc/sys/kernel/random/boot_id`; per process start
+without it). Only a changed minor of the same kind of device is accepted: a
+changed major, a loop device or a device without a sysfs entry refuses
+(`renumbered_device_acceptable`). A failed startup open is
 retried every `retry_seconds` from the tick against the same declared identity;
 a failed database open (e.g. SQLite I/O error or permission change) takes the
 same alerting startup-failure path. Only the first failure of the episode alerts, and a successful retry runs the

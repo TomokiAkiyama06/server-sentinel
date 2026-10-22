@@ -12,7 +12,9 @@ import sys
 from app.auth.access_config import HumanAccessDeployment, HumanAccessRefused, parse_human_access
 from app.cameras.uvc.config import LocalUvcConfiguration, parse_local_uvc
 from app.detection.foundation.config import DetectionConfiguration, parse_detection
-from app.monitoring.config import MonitoringConfiguration, parse_monitoring
+from app.monitoring.config import (
+    MonitoringConfiguration, parse_monitoring, renumbered_device_acceptable,
+)
 from app.settings import INVITATION_LIFETIME, ConfigurationError, Settings, invitation_lifetime
 
 
@@ -26,7 +28,9 @@ ADMINISTRATOR_UID = 0
 # corroborate this identity, never replace it; and the kernel may number the
 # same disk differently after a reboot (sda/sdb swapped, Issue #321), so a
 # recorded pair that no longer matches while the UUID, the mount and the
-# runtime root agree is reported as stale, not refused.
+# runtime root agree is reported as stale, not refused, but only when the
+# major is unchanged and the device is no loop or new device-mapper device
+# (`renumbered_device_acceptable`).
 FILESYSTEM_UUID_ROOT = Path("/dev/disk/by-uuid")
 DEVICE_NUMBERS_STALE_WARNING = (
     "ServerSentinel deployment warning: the recorded filesystem device numbers "
@@ -415,9 +419,10 @@ class Deployment:
     detection: DetectionConfiguration | None = field(default=None, repr=False)
     # True when a recorded major/minor pair (``runtime_device`` or
     # ``monitoring.recording_filesystem.device``) no longer names the device
-    # the approved UUID, the mount point and the runtime root agree on
-    # (Issue #321). Never a refusal: the launcher prints a value-free warning
-    # and the monitoring runtime notifies the Owner.
+    # the approved UUID, the mount point and the runtime root agree on, and
+    # only its minor differs on the same kind of device (Issue #321): the
+    # launcher prints a value-free warning and the monitoring runtime
+    # notifies the Owner. Any other difference is refused by `load`.
     filesystem_device_numbers_stale: bool = field(default=False, repr=False)
     # The capture-node CA directory. When configured, the launcher refuses to
     # run if the service account can open it (Issue #109).
@@ -526,6 +531,12 @@ class Deployment:
             raise ConfigurationError("runtime filesystem identity mismatch")
         verified_device = (os.major(root_info.st_dev), os.minor(root_info.st_dev))
         device_numbers_stale = tuple(device) != verified_device
+        # Only a reboot renumbering of the same kind of device is stale: the
+        # major must be unchanged, and a loop device (whose image may sit on
+        # the root filesystem) or a new device-mapper device is refused, as
+        # the exact comparison refused it before (Issue #321 review).
+        if not renumbered_device_acceptable((device[0], device[1]), root_info.st_dev):
+            raise ConfigurationError("runtime filesystem identity mismatch")
         directories = tuple(
             _private_directory(runtime_root / name, uid, roots)
             for name in ("state", "recordings", "audit")
