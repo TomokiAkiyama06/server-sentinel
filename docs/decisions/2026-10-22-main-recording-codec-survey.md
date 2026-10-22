@@ -39,7 +39,11 @@ Owner は 2026-10-22 に、§12 の問いについて次のとおり決めまし
   - 認可は server 側で `recordings:view` を確認します（`live:view` だけでは見せません）。download / export の route や button は作りません。
   - 決める必要があるのは、fallback の区間を保存する container（Matroska `V_MJPEG` など）と、再生 UI で H.264 の区間と fallback の区間をどうつなぐか（seek、間引き、帯域）です。
 - **T4: bitrate の上限の強制**。§8.6 の上限は、negotiated bound（`VideoFormat.maximum_bitrate`）が実際に守られることを前提にしています。ただし、`VideoFormat.maximum_bitrate`（`server/app/media/profiles/model.py`）は**宣言されているだけで、今はどこでも強制されていません**（読んでいるのは synthetic の harness の fixture だけです）。
-  - そのため、**H.264 でも MJPEG の fallback でも、segment ごとに byte 数の上限を強制します**。muxer か validator が、segment の byte 数を `B_s` × segment の長さ ÷ 8 × (1 + o) + `V_s` + `H` と比べ、超えた segment は拒否して gap にし、録画を degraded にします。黙って保存することはしません。
+  - そのため、**H.264 でも MJPEG の fallback でも、segment ごとに byte 数の上限を強制します**。上限は `B_s` × segment の長さ ÷ 8 × (1 + o) + `V_s` + `H` です（`max_segment_bytes` 以下）。
+  - **主に強制するのは muxer / segmenter で、segment を組み立てている間に行います**。packet（frame）を加えるたびに、組み立て中の byte 数を数えます。次の packet を加えると上限を超える時点で、その segment を中止して、組み立て中の bytes を捨てます。その区間は gap にし、録画を degraded にします。次の segment は、keyframe（MJPEG ならどの frame でも可）から新しく始めます。こうすると、上限を超えた分を memory に溜めることはありません（§2.1 の「muxer が memory に持つ未完成の segment は `max_segment_ms` / `max_segment_bytes` で上限を持つ」）。
+  - validator は、完成した segment の byte 数を、同じ上限でもう一度確認します（多重の防御）。validator だけで強制すると、`Segment.data` が完成してからでないと拒否できないので、上限を超えた分（§8.6 の例では、上限を強制しない MJPEG で 2 秒 segment あたり約 254 MB / source）を memory に溜めてしまいます。validator を、muxer の検査の代わりにはしません。
+  - capture から muxer までの経路も有界のままにします。1 frame の大きさは、すでに capture 側で上限を持っています（Main の local capture は V4L2 の buffer の上限、Agent は MJPEG frame parser の frame ごとの上限）。muxer への入力は、`SourcePipeline` の packet / byte 数で有界な queue を通ります（`server/app/media/profiles/README.md`）。超過した segment を中止しても、これらの上限はそのまま保ちます。
+  - 拒否は黙って行わず、gap と degraded として見えるようにします。
   - H.264 では、これに加えて NVENC の rate control（最大 bitrate と VBV buffer）で、上限を超えないようにします。rate control だけに頼ることはしません。
   - MJPEG は camera が bitrate を制御しないので、fallback で使う上限を設定で決めます（§8.6）。
 - **T5: GStreamer の導入**。Main の runtime に、operator が導入する GStreamer（core、base、good、bad の nvcodec）を入れることになります。`agent/docs/DEPENDENCIES.md` の前例（絶対 path、root 所有の確認、使う plugin を限る、Landlock）に合わせた閉じ込めと、package の inventory の review が要ります。NVENC は `/dev/nvidia*` への access を必要とします。
@@ -342,7 +346,7 @@ segment の長さを決めるときの trade-off は次のとおりです。
 このことから、次の点が分かります。
 
 - H.264 でも、例の `pre_roll_bytes`（64 MiB）と `max_spool_segments`（64）では、4 source で 30 秒の pre-roll を保証できません。例の値を、上の式で計算した値に更新する必要があります。
-- **MJPEG の fallback は、上限を強制しないと、現実的な値で 30 秒を保証できません。** camera が bitrate を制御しないためです。fallback 用の最大 bitrate を設定し、それを超える segment は拒否して gap にし、degraded にする必要があります（T4）。fallback に切り替わったときは、`pre_roll_bytes` が fallback の bound でも足りるように、最初から大きい方の値で設定します。
+- **MJPEG の fallback は、上限を強制しないと、現実的な値で 30 秒を保証できません。** camera が bitrate を制御しないためです。fallback 用の最大 bitrate を設定し、それを超える segment は、muxer が組み立て中に中止して gap にし、degraded にする必要があります（T4。validator は同じ上限を重ねて確認します）。fallback に切り替わったときは、`pre_roll_bytes` が fallback の bound でも足りるように、最初から大きい方の値で設定します。
 - `max_segments_per_recording`（例では 8,640）は、20 分の録画を 1 秒 segment で記録する場合でも足ります（約 1,200 + R）。
 
 上限値と segment の長さは、実機で同期 I/O（§8.4、HDD）と bitrate を測ってから決め、`server/docs/DEPLOYMENT.md` の例の値も更新します（Q7）。
