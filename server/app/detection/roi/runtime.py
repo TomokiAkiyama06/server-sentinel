@@ -1261,6 +1261,11 @@ class SceneMonitoringRuntime:
                 # Per-source isolation: this source becomes unknown and its
                 # episode ends; other sources keep running.
                 self._fault(context)
+            if context.decoder is not None:
+                # Also polled on every pass, not only around a frame: a child
+                # that refuses its sandbox (or keeps failing) before any frame
+                # arrives is still logged, once per transition (Issue #299).
+                self._decoder_health(context)
         self._kick()
 
     def _refresh_deferred(self, context, now):
@@ -1478,7 +1483,12 @@ class SceneMonitoringRuntime:
 
     def _decoder_health(self, context):
         """Log (value-free, once per transition) a decode child that keeps
-        failing; `status()` lowers the source while it does."""
+        failing; `status()` lowers the source while it does.
+
+        Scene worker only (around each decoded frame and once per pass), so
+        the transition flags are never raced and no frame is needed for a
+        refusal to be logged.
+        """
         failing = context.decoder.failing
         if failing != context.decoder_failing:
             context.decoder_failing = failing
