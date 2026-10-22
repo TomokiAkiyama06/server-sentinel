@@ -1450,10 +1450,14 @@ sink cannot hide an outage; a status older than a received event never
 overrides it), and is drained on the monitoring worker each tick (default
 60 s), also while monitoring is `failed`, so the notification follows the
 threshold within one tick. An episode that reached the threshold and recovered
-before the drain is still notified once, and if it goes offline again before
-that drain the brief recovery is folded into it (notified on that drain, the
-count is not restarted); a recovery is recorded in the episode and is not
-notified. At most `hourly_limit` (default 4, 1 to 60) such
+before the drain is still notified once. If it goes offline again while that
+notification is still owed, a recovery shorter than `after_seconds` is folded
+into the owed episode (notified on the next drain, the count is not
+restarted); after a longer recovery the new outage is its own episode with its
+own time and ID and the owed one keeps its own (at most one owed episode per
+source, an older unsent one is dropped and logged), so a queue that refused
+the first alert for a long time never sends a later outage under the old
+time. A recovery is recorded in the episode and is not notified. At most `hourly_limit` (default 4, 1 to 60) such
 notifications go out per rolling hour for all sources together, re-seeded
 after a restart from the confirmed `camera_offline` rows accepted in the last
 hour (a `pending` one included, since it is never resent; an unconfirmed local

@@ -31,9 +31,11 @@ none. Every configured source starts not online when the monitor is built, so
 a camera that never comes up after a start (missing at boot, capture never
 started) is notified too. An episode notifies once, after it lasted
 ``after_seconds``; an episode that reached the threshold but recovered before
-the next drain is still notified once, and if the source goes offline again
-before that drain the brief recovery is folded into it (still owed, the count
-is not restarted). A recovery is recorded in the episode
+the next drain is still notified once. If the source goes offline again
+before that drain after a recovery shorter than ``after_seconds``, the
+recovery is folded into it (still owed, the count is not restarted); after a
+longer recovery the new outage is its own episode and the old one stays owed
+under its own time and ID (one owed episode per source). A recovery is recorded in the episode
 (``recovered``) and is not notified (no Owner decision for a recovery
 notice).
 
@@ -125,6 +127,10 @@ class _Source:
     # The episode in progress (``recovered is None``) or one that reached the
     # threshold and recovered before it was notified.
     episode: _Episode | None
+    # A recovered episode that reached the threshold, still owed its
+    # notification, set aside when a later outage began after it had stayed
+    # recovered for at least the threshold (a new outage, not a blip).
+    owed: _Episode | None = None
     # Bumped on every signal, so a runtime status read before a newer event
     # cannot overwrite it (``observe_runtime``).
     version: int = 0
@@ -208,14 +214,25 @@ class CameraOfflineMonitor:
                     # to report. The recovery is recorded (``recovered``).
                     source.episode = None
         elif not ongoing and not self._stopped:
-            if episode is not None and not episode.notified:
+            if (episode is not None and not episode.notified
+                    and now - episode.recovered < self.after):
                 # A recovered episode that reached the threshold and is still
-                # owed its notification (the drain has not run since): the
-                # brief recovery is folded into it, so the outage that already
+                # owed its notification: a recovery shorter than the
+                # threshold is folded into it, so the outage that already
                 # lasted the threshold is notified on the next drain instead
                 # of restarting the count (PR #320 review 重要 1).
                 episode.recovered = None
             else:
+                if episode is not None and not episode.notified:
+                    # Recovered for at least the threshold: the new outage is
+                    # its own episode (own time and ID); the old one stays
+                    # owed. Only one is kept per source; an older owed one
+                    # that is still unsent is counted and logged as dropped.
+                    if source.owed is not None:
+                        self.dropped += 1
+                        logging.getLogger(__name__).warning(
+                            Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED)
+                    source.owed = episode
                 source.episode = _Episode(now)
         source.online, source.active = online, active
 
@@ -316,9 +333,10 @@ class CameraOfflineMonitor:
         """
         with self._lock:
             stopped = self._stopped
-            due = sorted(((identity, source.episode) for identity, source in self._sources.items()
-                          if source.episode is not None and not source.episode.notified
-                          and source.episode.qualifies(monotonic, self.after)),
+            due = sorted(((identity, episode) for identity, source in self._sources.items()
+                          for episode in (source.owed, source.episode)
+                          if episode is not None and not episode.notified
+                          and episode.qualifies(monotonic, self.after)),
                          key=lambda item: item[1].since)
         for identity, episode in () if stopped else due:
             ongoing = episode.recovered is None
@@ -369,8 +387,8 @@ class CameraOfflineMonitor:
                           if source.episode is not None and source.episode.recovered is None
                           and source.episode.qualifies(now, self.after))
             held = sum(1 for source in self._sources.values()
-                       if source.episode is not None and source.episode.held
-                       and not source.episode.notified)
+                       for episode in (source.owed, source.episode)
+                       if episode is not None and episode.held and not episode.notified)
         return CameraOfflineStatus(offline_sources=offline, held=held)
 
     def _discard(self, identity: UUID, episode: _Episode) -> None:
@@ -378,6 +396,8 @@ class CameraOfflineMonitor:
         source = self._sources[identity]
         if source.episode is episode:
             source.episode = None
+        if source.owed is episode:
+            source.owed = None
 
     def _durable(self, identity, durable_id) -> UUID | None:
         if durable_id is None:

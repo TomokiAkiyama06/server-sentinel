@@ -248,7 +248,103 @@ class EpisodeTests(MonitorFixture, unittest.TestCase):
         self.assertNotIn(str(self.sources[0]), texts[0])
 
 
+class Refusing:
+    """A `NotificationService` whose capacity check refuses until opened."""
+
+    def __init__(self, service):
+        self.service, self.accept = service, False
+
+    def can_accept(self, event_id):
+        return self.accept and self.service.can_accept(event_id)
+
+    def record(self, *arguments, **fields):
+        return self.service.record(*arguments, **fields)
+
+    def retained(self, event_id):
+        return self.service.retained(event_id)
+
+
+class OwedEpisodeTests(MonitorFixture, unittest.TestCase):
+    def test_a_long_recovery_keeps_the_owed_episode_apart_from_a_new_outage(self):
+        # PR #320 re-review 提案 1: the queue refused the first alert for two
+        # hours; the camera recovered for longer than the threshold and then
+        # went offline again. Each outage is notified under its own time and
+        # ID once the service accepts, never as one merged old alert.
+        monitor = self.monitor()
+        self.online(monitor)
+        refusing = Refusing(self.service)
+        source = self.sources[0]
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(310)
+        monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+        monitor.health_sink(event(source, CameraState.ONLINE))
+        for _ in range(12):
+            self.advance(600)
+            monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(300)
+        later = AT + timedelta(hours=2)
+        monitor.drain(refusing, at=later, monotonic=self.clock.value)
+        self.assertEqual([], self.sent())
+        refusing.accept = True
+        status = monitor.drain(refusing, at=later, monotonic=self.clock.value)
+        self.service.poll()
+        rows = sorted(self.sent(), key=lambda row: row.at)
+        self.assertEqual([AT, later], [row.at for row in rows])
+        self.assertEqual(2, len({row.event_id for row in rows}))
+        self.assertEqual((1, 0), (status.offline_sources, monitor.dropped))
+        self.advance(3600)
+        self.drain(monitor)
+        self.assertEqual(2, len(self.sent()))
+
+    def test_owed_episodes_still_obey_the_cap(self):
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        refusing = Refusing(self.service)
+        source = self.sources[0]
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(310)
+        monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+        monitor.health_sink(event(source, CameraState.ONLINE))
+        self.advance(400)
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(300)
+        refusing.accept = True
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+        self.service.poll()
+        self.assertEqual(1, len(self.sent()))
+        self.advance(3600)
+        monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+        self.service.poll()
+        self.assertEqual(2, len(self.sent()))
+
+
 class CapTests(MonitorFixture, unittest.TestCase):
+    def test_a_held_episode_that_recovers_is_dropped_and_logged(self):
+        # PR #320 re-review 提案 2: held back by the cap, then online for good.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        monitor.health_sink(event(self.sources[0], CameraState.OFFLINE))
+        monitor.health_sink(event(self.sources[1], CameraState.OFFLINE))
+        self.advance(300)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as held:
+            self.assertEqual(1, self.drain(monitor).held)
+        self.assertEqual(1, len(self.sent()))
+        self.assertTrue(any(line.endswith(Event.CAMERA_OFFLINE_NOTIFICATION_RATE_LIMITED.value)
+                            for line in held.output))
+        # Whichever source was held recovers and stays online.
+        self.online(monitor)
+        self.advance(60)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as dropped:
+            status = self.drain(monitor)
+        self.assertEqual([f"WARNING:app.monitoring.cameras:{Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED.value}"],
+                         dropped.output)
+        self.assertEqual((0, 0, 1), (status.offline_sources, status.held, monitor.dropped))
+        self.advance(7200)
+        self.drain(monitor)
+        self.assertEqual(1, len(self.sent()))
+
     def flap(self, monitor, source, seconds=301):
         monitor.health_sink(event(source, CameraState.OFFLINE))
         self.advance(seconds)
