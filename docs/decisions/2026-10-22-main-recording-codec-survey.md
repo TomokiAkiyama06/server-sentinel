@@ -91,7 +91,7 @@ container の「crash-safe append」の比較（§5）は、この前提で評�
     - 「OpenH264 Video Codec provided by Cisco Systems, Inc.」と表示すること
     - EULA 等に条項を再掲すること
     - 対象は「PERSONAL USE OF A CONSUMER OR OTHER USES IN WHICH IT DOES NOT RECEIVE REMUNERATION」に限られ、「NO LICENSE IS GRANTED OR SHALL BE IMPLIED FOR ANY OTHER USE」とされています
-    - この特許 license は Cisco が配布する binary に結び付いています。source から build したもの、distribution の package、同梱したものについては、「you may also obtain your own patent license from MPEG LA or from the individual patent owners, or proceed at your own risk」とされています。
+    - この特許 license の対象は、Cisco が配布する binary だけです。source から build したもの、distribution の package、同梱したものは、この license の対象になりません。同じ文書は、AVC / H.264 の codec 全般について（「As with all AVC/H.264 codecs」）、「you may also obtain your own patent license from MPEG LA or from the individual patent owners, or proceed at your own risk」と一般的に述べています。
 - 特許: H.264 は Via LA の AVC pool の対象です。encoder / decoder product は年 100,000 unit までが $0.00 で、12 分以下の title は content fee が $0.00 です。ただし「The actual License agreement provides the only definitive ... statement」とされています [ViaLA-AVC]。self-hosted で配布もしない研究室の deployment にこれがどう当てはまるかは、**この調査では判断できません**（法務判断が必要です）。
 - CPU: **測っていません**。1080p30 を realtime で encode すると、MJPEG の decode（下の §8.5）に加えて、source ごとに数 core 規模を使う可能性があります。これは仮定であり、根拠はありません。Main host では別の session が GPU benchmark を回しているので、CPU 負荷の測定は CPU を制限した container で行う必要があります（運用上の制約）。
 - 利点: 容量が小さく、H.264 + MP4 は「a broadly-supported combination—by every major browser」です [MDN-codecs]。ただし Firefox の H.264 は、OS 側にある codec に依存します [MDN-codecs]。Linux desktop の Firefox で再生できるかは、実機で確かめる必要があります。
@@ -215,21 +215,27 @@ recording root が SSD / NVMe の場合、MJPEG の pre-roll は耐久性（TBW�
 1. pending 行を入れる SQLite transaction の commit（`synchronous=FULL` 以上）
 2. `.part` の `fsync`
 3. link と unlink のあとの directory `fsync`
-4. ready にして recording に link する SQLite transaction の commit
-5. `_trim()` で spool を追い出すときは、さらに unlink、directory `fsync`、SQLite の commit
+4. ready にして recording に link する SQLite transaction の commit（`_publish()`）
+5. **`_trim()` の transaction の commit。これは append のたびに毎回実行されます**（spool の印を更新する transaction で、追い出すものが無くても commit します）
+6. spool から外れて、どの recording にも link されていない segment ごとに、unlink、directory `fsync`、`DELETE` の transaction の commit
 
-つまり 1 segment あたり、少なくとも **SQLite の commit 2 回と fsync 2 回**が要ります。spool を追い出すときは、さらに増えます。
+event が無い定常状態では、新しい segment が 1 つ入るたびに、pre-roll の窓（`pre_roll_ms`）から古い segment が 1 つ外れ、link されていないので 6 で削除されます。つまり**定常状態では、append のたびに追い出しが起きます**。
 
-| segment の長さ | 4 source での append / 秒 | commit / 秒（下限） | file・dir の fsync / 秒（下限） | 20 分の録画の segment 数（`max_segments_per_recording` の下限の目安） | 30 秒の pre-roll の spool の segment 数（`max_spool_segments` の目安、4 source） |
-| --- | --- | --- | --- | --- | --- |
-| 1 秒 | 4 | 8 | 8 | 約 1,200（境界の分を足す） | 約 120（境界の分を足す） |
-| 2 秒 | 2 | 4 | 4 | 約 600 | 約 60 |
-| 4 秒 | 1 | 2 | 2 | 約 300 | 約 30 |
+| 状態 | 1 append あたりの commit | 1 append あたりの file・dir の fsync |
+| --- | --- | --- |
+| 定常状態（event 無し、追い出し 1 件を含む） | 4（1、4、5、6） | 3（2、3、6） |
+| event の記録中（外れた segment は link されているので削除されない） | 3（1、4、5） | 2（2、3） |
 
-SQLite の commit は、journal mode によっては、内部でさらに fsync を伴います。
+| segment の長さ | 4 source での append / 秒 | 定常状態: commit / 秒 | 定常状態: fsync / 秒 | 定常状態: 同期処理の合計 / 秒 | event 中: commit + fsync / 秒 | 20 分の録画の segment 数（`max_segments_per_recording` の下限の目安） | 30 秒の pre-roll の spool の segment 数（`max_spool_segments` の目安、4 source） |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 秒 | 4 | 16 | 12 | 28 | 20 | 約 1,200（境界の分を足す） | 約 120（境界の分を足す） |
+| 2 秒 | 2 | 8 | 6 | 14 | 10 | 約 600 | 約 60 |
+| 4 秒 | 1 | 4 | 3 | 7 | 5 | 約 300 | 約 30 |
+
+この数え方は、上の file / directory の fsync と、SQLite の commit の回数です。SQLite の commit は、journal mode によっては、内部でさらに fsync を伴います（rollback journal なら journal と database の両方。WAL なら WAL の fsync）。
 
 - SSD / NVMe なら、この回数は問題にならない見込みです（**測っていません**）。
-- HDD では、1 回の fsync に数 ms〜十数 ms かかることがあります。仮に 1 回 10 ms とすると、1 秒の segment × 4 source では、worker の時間の 2〜3 割を同期 I/O が占めます。これは**仮定にもとづく推定**です。
+- HDD では、1 回の fsync に数 ms〜十数 ms かかることがあります。仮に同期処理 1 回を 10 ms とすると、1 秒の segment × 4 source の定常状態（28 回 / 秒）では、worker の時間の**約 3 割以上**を同期 I/O が占めます。SQLite 内部の fsync を足すと、journal mode によってはさらに増えます。これは**仮定にもとづく推定**です。
 
 segment の長さを決めるときの trade-off は次のとおりです。
 
