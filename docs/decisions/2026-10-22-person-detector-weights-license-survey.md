@@ -21,22 +21,29 @@ Q5 と Q6 は未決です。
   （`apache-2.0` は Hugging Face の変換者の metadata で、原著者の表明はなく、upstream の
   [RT-DETR #685](https://github.com/lyuwenyu/RT-DETR/issues/685) は未回答）。
   RT-DETRv2 を置き換えるかどうかは、D-FINE の評価の後に判断します。
-  `server/docs/RTDETR_RUNTIME_AUDIT.md` の「Official model」という記述の訂正は、別の follow-up で行います。
 - **Q2（学習データの残余リスク）**：COCO の画像（Flickr の条件）と、backbone の ImageNet 系
   事前学習（non-commercial research の条件）の残余リスクを、**研究室内での運用に限り、
   重みを再配布しない範囲で受け入れます**。これは Owner の承認として、この文書に記録します。
-  `license/owner-approvals.json` にはまだ入れません。重みの `model_weight` component を追加する
-  PR で、この文書を参照する approval entry として記録します。
 - **Q3（Objects365 系譜）**：Objects365 を事前学習に使った重みは、**当面除外します**。
   RF-DETR は候補から外します（D-FINE の maintainer の見解とも整合します）。
 - **Q4（D-FINE の評価）**：**D-FINE-N / S の COCO-only checkpoint を、評価専用で追加します。**
   artifact は upstream の元の `dfine_{n,s}_coco.pth`（`Peterande/storage` の release `dfinev1.0`）から作ります。
   `torch.load(..., weights_only=True)` を使い、隔離した環境で ONNX に export します。
   HF の `ustc-community/dfine-{nano,small}-coco` の safetensors は、値が一致するかの照合だけに使います。
-  扱いは YOLOX と同じです：重みはリポジトリ外、digest 固定、CI での download なし、
-  deployment schema では拒否。
 - **Q5（export 用の環境）**：未決です。
 - **Q6（YOLOX の評価用 adapter）**：未決です。
+
+### 実施条件（この PR の提案）
+
+次の 3 点は Owner が判断した内容ではなく、上の判断を実施するためにこの PR が提案する条件です。
+
+- Q4 の D-FINE の評価は、YOLOX と同じ扱いにします：重みはリポジトリ外、digest 固定、
+  CI での download なし、deployment schema では拒否。
+- Q1 に関連して、`server/docs/RTDETR_RUNTIME_AUDIT.md` の「Official model」という記述は、
+  別の follow-up で訂正します。
+- Q2 の承認は、`license/owner-approvals.json` にはまだ入れません。重みの `model_weight`
+  component を追加する PR で、この文書を参照する approval entry として記録します。
+- Q4 の export は、Q5（export 用の環境）が決まってから行います。
 
 ### Q1 と D-FINE の関係
 
@@ -226,7 +233,7 @@ GPU：どの候補も upstream は ONNX → TensorRT の手順を示していま
 - **重みのライセンスが不明**：YOLOX、DEIM、RTMDet、PP-YOLOE、NanoDet、EfficientDet、
   MediaPipe、Open Model Zoo。
 - **配布元が許諾を保証しない**：torchvision（docs が利用者の責任と明記）。
-- **Objects365 系譜**：D-FINE obj365/obj2coco、RT-DETR の O365 版、PP-YOLOE+（RF-DETR は上記のとおり条件付き）。
+- **Objects365 系譜**：D-FINE obj365/obj2coco、RT-DETR の O365 版、PP-YOLOE+、RF-DETR（RF-DETR も Q3 により除外）。
 
 ## 提案（Owner 判断の前の推奨。判断の結果は冒頭の「Owner 判断（2026-10-22）」）
 

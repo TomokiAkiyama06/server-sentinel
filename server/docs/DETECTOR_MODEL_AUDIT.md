@@ -16,10 +16,12 @@
 > a known weakness (converter metadata, upstream RT-DETR #685 unanswered); the
 > COCO-image / ImageNet-pretraining residual risk is accepted for lab-internal
 > operation without weight redistribution; Objects365-lineage weights are
-> excluded; D-FINE-N/S COCO-only checkpoints are approved for **evaluation
-> only**, exported from the original `.pth` with `weights_only=True` in an
-> isolated environment. Production adoption of D-FINE is not approved. The
-> export environment and the YOLOX adapter's future are still undecided.
+> excluded for now; D-FINE-N/S COCO-only checkpoints are approved for
+> **evaluation only**, exported from the original `.pth` with
+> `weights_only=True` in an isolated environment. Production adoption of D-FINE
+> is not approved. The export environment (Q5) and the YOLOX adapter's future
+> (Q6) are still undecided; the D-FINE export can only be carried out after Q5
+> is decided.
 
 Decision for this implementation: **evaluation candidate only; no YOLOX package,
 pretrained weights, exported ONNX model, or automatic download is approved or
