@@ -7,6 +7,32 @@
 > closure; see [YOLOX_EVALUATION_AUDIT.md](YOLOX_EVALUATION_AUDIT.md). The
 > weights license remains unresolved, so the statements below about weights
 > still hold: no weight is approved for bundling, redistribution or deployment.
+>
+> **Update 2026-10-22:** a survey of person-detection models whose weights carry
+> an explicit license is in
+> [`2026-10-22-person-detector-weights-license-survey.md`](../../docs/decisions/2026-10-22-person-detector-weights-license-survey.md).
+> Owner decisions recorded there (2026-10-22): newly adopted production weights
+> need an explicit statement by their distributor; RT-DETRv2 stays, recorded as
+> a known weakness (converter metadata, upstream RT-DETR #685 unanswered); the
+> COCO-image / ImageNet-pretraining residual risk is accepted for lab-internal
+> operation without weight redistribution; Objects365-lineage weights are
+> excluded for now; D-FINE-N/S COCO-only checkpoints are approved for
+> **evaluation only**, exported from the original `.pth` with
+> `weights_only=True` in an isolated environment. Production adoption of D-FINE
+> is not approved. Q5: PyTorch may be used for the export in an uncommitted,
+> CPU-limited container (pinned version, explicit `weights_only=True`, tool
+> versions and output SHA-256 recorded). Q6: the YOLOX evaluation adapter stays
+> until the D-FINE evaluation is done.
+> The upstream exporter at the reviewed revision `956d170` calls `torch.load`
+> without `weights_only`, so the export must use our own wrapper that passes
+> `weights_only=True` explicitly with an exact PyTorch version of at least
+> 2.10.0 (advisory GHSA-63cw-57p8-fm3p / CVE-2026-24747: `weights_only=True`
+> loading is exploitable in `<=2.9.1`), inside an isolated, network-less,
+> CPU-limited, non-root container as defence in depth (the >=2.10.0, network-less
+> and non-root conditions are added by the survey on top of Q5). As with YOLOX,
+> the residual-risk approval stays in the decision record: externally kept
+> weights cannot be listed in `license/components.json` /
+> `license/owner-approvals.json`.
 
 Decision for this implementation: **evaluation candidate only; no YOLOX package,
 pretrained weights, exported ONNX model, or automatic download is approved or
