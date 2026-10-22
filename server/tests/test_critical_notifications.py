@@ -5,7 +5,8 @@ transport only. No real Slack endpoint, camera, host or network is used.
 """
 
 import asyncio
-from contextlib import closing, nullcontext
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -27,6 +28,7 @@ from app.presence.delivery import ActionResult, NotificationAdapter
 from app.presence.models import Kind
 from app.presence.runtime import (
     DISPATCH_BATCH, CriticalDispatcher, SceneTimeline, SceneTimelineConfiguration,
+    TimelineNotPinned,
 )
 from app.presence.service import PresenceService
 from app.storage.database import Database
@@ -35,7 +37,7 @@ from app.storage.schema import APPLICATION_MIGRATIONS
 
 from tests.test_detector_roi import HEIGHT, WIDTH, pixels, policy
 from tests.test_monitoring_runtime import RuntimeFixture
-from tests.test_presence import NOW, observation
+from tests.test_presence import NOW, MockAccess, observation
 from tests.test_recording import SyntheticValidator
 from tests.test_scene_runtime import MOVED, OTHER, binding, calibration_for
 from tests.test_storage_notifications import Transport, endpoint
@@ -65,8 +67,11 @@ class Store:
 
     def __init__(self):
         self.rows = {}
+        self.refuse = False
 
     def __call__(self, event):
+        if self.refuse:
+            raise RuntimeError("synthetic STORAGE_HARD_STOP")
         self.rows[event.event_id] = event
 
 
@@ -86,10 +91,11 @@ class Fixture:
         self.addCleanup(service.close)
         return service
 
-    def presence(self, service):
+    def presence(self, service, **changes):
         return PresenceService(
             self.database, reservation=nullcontext,
-            notifications=NotificationAdapter(lambda: service, NotificationKind, provided=True))
+            notifications=NotificationAdapter(lambda: service, NotificationKind, provided=True),
+            **changes)
 
     def deliveries(self):
         with closing(sqlite3.connect(self.database.path)) as db:
@@ -261,6 +267,91 @@ class PresenceNotificationTests(Fixture, unittest.TestCase):
         self.assertEqual("unavailable", status["critical_notifications"])
 
 
+    def test_a_stalled_endpoint_with_a_backlog_costs_one_claim_per_step(self):
+        transport = GatedTransport()
+        service = self.notifications(transport, capacity=16)
+        presence = self.presence(service)
+        for index in range(100):
+            presence.record(observation(Kind.CAMERA_TAMPER, at=NOW + timedelta(seconds=index)))
+        results = [presence.dispatch_pending(limit=DISPATCH_BATCH) for _ in range(10)]
+        # Never a full batch while the port refuses, so the dispatcher waits
+        # its interval instead of rerunning at once.
+        self.assertTrue(all(result < DISPATCH_BATCH for result in results), results)
+        with closing(sqlite3.connect(self.database.path)) as db:
+            attempts = db.execute("SELECT sum(attempts) FROM presence_deliveries "
+                                  "WHERE action='notification'").fetchone()[0]
+            queued = db.execute("SELECT count(*) FROM presence_deliveries "
+                                "WHERE action='notification' AND state='queued'").fetchone()[0]
+        self.assertEqual(16, queued)
+        # 16 accepted submissions plus at most one refused claim per step.
+        self.assertLessEqual(attempts, 16 + len(results))
+        transport.gate.set()
+
+    def test_disabled_slack_with_a_refused_local_write_stays_retryable(self):
+        service = self.notifications(slack=False, capacity=1)
+        presence = self.presence(service)
+        self.store.refuse = True
+        first = presence.record(observation(Kind.SERVER_MOVEMENT))
+        second = presence.record(observation(Kind.SERVER_MOVEMENT, at=NOW + timedelta(seconds=1)))
+        presence.dispatch_pending()
+        # The first is retained for the local retry; nothing was sent, so the
+        # action is retryable, never finalized as failed.
+        self.assertEqual("unavailable", self.state(first.identifier))
+        self.assertTrue(service.retained(first.identifier))
+        # The retry buffer is full: the second is not even submitted.
+        self.assertFalse(service.can_accept(second.identifier))
+        self.assertEqual("pending", self.state(second.identifier))
+        self.store.refuse = False
+        presence.dispatch_pending()
+        presence.dispatch_pending()
+        self.assertEqual("disabled", self.state(first.identifier))
+        self.assertEqual("disabled", self.state(second.identifier))
+        self.assertEqual({first.identifier, second.identifier}, set(self.store.rows))
+
+    def test_an_owner_requeue_of_a_running_delivery_completes_from_its_outcome(self):
+        transport = GatedTransport()
+        service = self.notifications(transport)
+        presence = self.presence(service, access=MockAccess())
+        item = presence.record(observation(Kind.SERVER_MOVEMENT))
+        presence.dispatch_pending()
+        self.assertEqual("queued", self.state(item.identifier))
+        presence.requeue_action("owner", item.identifier, "notification",
+                                now=NOW + timedelta(seconds=1), clock_trusted=True)
+        presence.dispatch_pending()
+        # The resubmission joined the delivery still running (no second POST)
+        # and its new claim generation is completed by that outcome.
+        self.assertEqual("queued", self.state(item.identifier))
+        transport.gate.set()
+        self.drain(service, transport, 1)
+        self.assertEqual("delivered", self.state(item.identifier))
+        self.assertEqual(1, len(transport.requests))
+
+    def test_every_coalesced_callback_is_told_and_a_raising_one_is_retried_alone(self):
+        transport = GatedTransport()
+        service = self.notifications(transport)
+        identifier, calls = uuid4(), []
+
+        def first(result):
+            calls.append(("first", result))
+
+        def flaky(result):
+            calls.append(("flaky", result))
+            if len([call for call in calls if call[0] == "flaky"]) == 1:
+                raise RuntimeError("synthetic presence write refused")
+
+        for callback in (first, flaky):
+            service.record(NotificationKind.CAMERA_TAMPER, at=NOW, confirmed=True,
+                           event_id=identifier, on_complete=callback)
+        transport.gate.set()
+        deadline = time.monotonic() + 10
+        while service.pending_count and time.monotonic() < deadline:
+            service.poll()
+            time.sleep(0.01)
+        self.assertEqual([("first", DeliveryResult.SENT), ("flaky", DeliveryResult.SENT),
+                          ("flaky", DeliveryResult.SENT)], calls)
+        self.assertEqual(1, len(transport.requests))
+
+
 def configuration(**changes):
     values = dict(maximum_source_latency=timedelta(seconds=30),
                   clock=lambda: (datetime.now(timezone.utc), True),
@@ -327,10 +418,13 @@ class ReconciliationTests(Fixture, unittest.TestCase):
         restarted.dispatch(reconcile=reconcile)
         self.assertEqual(2, len(attempts))
 
-    def test_dispatch_never_creates_a_missing_database(self):
-        self.database.path.unlink()
+    def test_dispatch_never_pins_or_creates_the_database(self):
         timeline = SceneTimeline(configuration(), self.database, nullcontext,
                                  notifications=lambda item, complete: ActionResult.QUEUED)
+        with self.assertRaises(TimelineNotPinned):
+            timeline.dispatch()
+        self.assertFalse(timeline._pinned.pinned)
+        self.database.path.unlink()
         with self.assertRaises(Exception):
             timeline.dispatch()
         self.assertFalse(self.database.path.exists())
@@ -338,9 +432,64 @@ class ReconciliationTests(Fixture, unittest.TestCase):
     def test_dispatch_configuration_is_bounded(self):
         for changes in (dict(dispatch_interval_seconds=0), dict(dispatch_backoff_seconds=float("inf")),
                         dict(dispatch_interval_seconds=2.0, dispatch_backoff_seconds=1.0),
-                        dict(dispatch_settle_seconds=-1), dict(dispatch_settle_seconds=31)):
+                        dict(dispatch_settle_seconds=-1), dict(dispatch_settle_seconds=61)):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 configuration(**changes)
+        # The default shutdown wait outlasts the Slack transport timeout.
+        self.assertGreater(SceneTimelineConfiguration(
+            maximum_source_latency=timedelta(seconds=30), clock=lambda: None
+        ).dispatch_settle_seconds, 10)
+
+    def test_dispatch_on_the_worker_never_waits_for_a_pin_held_by_another_thread(self):
+        """Review of PR #316: `open()` holds `_pin_lock` while its admission
+        waits for the single monitoring worker; a dispatch step queued on that
+        worker ahead of the admission must not wait for the lock, or neither
+        ever finishes."""
+        executor = ThreadPoolExecutor(1)
+        self.addCleanup(executor.shutdown, wait=False)
+        owner = executor.submit(threading.get_ident).result()
+
+        @contextmanager
+        def reservation():
+            # The `MonitoringRuntime.reservation()` shape: direct on the
+            # worker; elsewhere the worker parks holding it until the caller ends.
+            if threading.get_ident() == owner:
+                yield
+                return
+            granted, finished = threading.Event(), threading.Event()
+
+            def hold():
+                granted.set()
+                finished.wait(10)
+
+            future = executor.submit(hold)
+            granted.wait(10)
+            try:
+                yield
+            finally:
+                finished.set()
+                future.result()
+
+        timeline = SceneTimeline(configuration(), self.database, reservation,
+                                 notifications=lambda item, complete: ActionResult.QUEUED)
+        busy = threading.Event()
+        executor.submit(busy.wait, 10)                   # a monitoring tick in progress
+        step = executor.submit(timeline.dispatch)        # the dispatcher's step, queued
+        opener = threading.Thread(target=timeline.open, daemon=True)
+        opener.start()
+        deadline = time.monotonic() + 5
+        while not timeline._pin_lock.locked() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(timeline._pin_lock.locked())     # open holds it, waiting
+        busy.set()
+        opener.join(5)
+        self.assertFalse(opener.is_alive())
+        self.assertTrue(timeline.opened)
+        with self.assertRaises(TimelineNotPinned):
+            step.result(5)
+        # Once pinned, the next step on the worker dispatches normally.
+        self.assertEqual(0, executor.submit(timeline.dispatch).result(5))
+        timeline.finish(None)
 
 
 class DispatcherTests(Fixture, unittest.IsolatedAsyncioTestCase):
@@ -446,7 +595,8 @@ class LifespanTests(RuntimeFixture):
             return db.execute(query).fetchall()
 
     def critical_texts(self):
-        return [text for text in self.slack_texts() if text.startswith(ALERT + "server_")]
+        return [text for text in self.slack_texts()
+                if text in (ALERT + "server_movement", ALERT + "camera_tamper")]
 
     async def test_confirmed_server_movement_notifies_the_owner_once_across_restart(self):
         application = self.scene_application()
@@ -478,13 +628,14 @@ class LifespanTests(RuntimeFixture):
             await asyncio.sleep(0.2)
         self.assertEqual([ALERT + "server_movement"], self.critical_texts())
 
-    async def test_work_queued_while_storage_was_refused_is_sent_after_recovery(self):
+    async def test_work_queued_while_dispatch_steps_fail_is_sent_after_recovery(self):
         application = self.scene_application()
         timeline = application.state.scene_timeline
         async with asyncio.timeout(30), application.router.lifespan_context(application):
             monitoring = application.state.monitoring
             dispatcher = application.state.critical_dispatcher
-            # A confirmed observation recorded while dispatch steps fail.
+            # A confirmed observation recorded while dispatch steps fail (a
+            # stubbed step; the real admission refusal is the next test).
             original = monitoring.dispatch_notifications
 
             def refused(step):
@@ -504,6 +655,115 @@ class LifespanTests(RuntimeFixture):
             self.assertTrue(any(Event.CRITICAL_DISPATCH_FAILING.value in line for line in logs.output))
             self.assertTrue(any(Event.CRITICAL_DISPATCH_RECOVERED.value in line for line in logs.output))
         self.assertEqual(1, self.slack_texts().count(ALERT + "camera_tamper"))
+
+    async def test_a_refused_storage_admission_keeps_work_pending_until_it_recovers(self):
+        application = self.scene_application(dispatch_interval_seconds=3600,
+                                              dispatch_backoff_seconds=3600)
+        timeline = application.state.scene_timeline
+        async with asyncio.timeout(30), application.router.lifespan_context(application):
+            dispatcher = application.state.critical_dispatcher
+            item = timeline.presence.record(observation(Kind.CAMERA_TAMPER))
+            # The recording filesystem is replaced: every admission, and so
+            # the dispatch step, is refused by the real storage policy.
+            detached = self.recordings.with_name("detached")
+            self.recordings.rename(detached)
+            self.recordings.mkdir(mode=0o700)
+            with self.assertLogs("app.presence.runtime", level="INFO") as logs:
+                await dispatcher.once()
+                self.assertTrue(dispatcher.failing)
+                self.assertEqual([("pending",), ("pending",)], self.rows(
+                    "SELECT state FROM presence_deliveries"))
+                self.assertEqual([], self.critical_texts())
+                self.recordings.rmdir()
+                detached.rename(self.recordings)
+                await dispatcher.once()
+                self.assertFalse(dispatcher.failing)
+            self.assertTrue(any(Event.CRITICAL_DISPATCH_FAILING.value in line for line in logs.output))
+            self.assertTrue(await self.until(lambda: self.critical_texts() == [ALERT + "camera_tamper"]))
+            self.assertTrue(await self.until(lambda: self.rows(
+                f"SELECT delivery FROM notification_events WHERE event_id='{item.identifier}'")
+                == [("sent",)]))
+
+    async def test_settle_waits_for_a_slow_delivery_and_gives_up_at_its_bound(self):
+        self.transport = GatedTransport()
+        application = self.scene_application(dispatch_interval_seconds=3600,
+                                              dispatch_backoff_seconds=3600,
+                                              dispatch_settle_seconds=0.2)
+        timeline = application.state.scene_timeline
+        try:
+            async with asyncio.timeout(30), application.router.lifespan_context(application):
+                monitoring = application.state.monitoring
+                item = timeline.presence.record(observation(Kind.SERVER_MOVEMENT))
+                await application.state.critical_dispatcher.once()
+                started = time.monotonic()
+                unsettled = await monitoring.call(monitoring.settle_notifications, 0.3)
+                self.assertGreaterEqual(time.monotonic() - started, 0.3)
+                self.assertGreaterEqual(unsettled, 1)
+                self.assertEqual("queued", self.rows(
+                    "SELECT state FROM presence_deliveries WHERE action='notification'")[0][0])
+                self.transport.gate.set()
+                self.assertEqual(0, await monitoring.call(monitoring.settle_notifications, 10))
+                self.assertEqual("delivered", self.rows(
+                    "SELECT state FROM presence_deliveries WHERE action='notification'")[0][0])
+                self.assertEqual([("sent",)], self.rows(
+                    f"SELECT delivery FROM notification_events WHERE event_id='{item.identifier}'"))
+        finally:
+            self.transport.gate.set()
+
+    async def test_shutdown_gives_up_on_a_stalled_delivery_after_the_settle_bound(self):
+        self.transport = GatedTransport()
+        application = self.scene_application(dispatch_interval_seconds=3600,
+                                              dispatch_backoff_seconds=3600,
+                                              dispatch_settle_seconds=0.3)
+        timeline = application.state.scene_timeline
+        lifespan = application.router.lifespan_context(application)
+        try:
+            await lifespan.__aenter__()
+            timeline.presence.record(observation(Kind.SERVER_MOVEMENT))
+            started = time.monotonic()
+            with self.assertLogs("app.main", level="ERROR") as logs:
+                await asyncio.wait_for(lifespan.__aexit__(None, None, None), 30)
+            self.assertGreaterEqual(time.monotonic() - started, 0.3)
+            self.assertTrue(any(Event.CRITICAL_NOTIFICATIONS_UNSETTLED.value in line
+                                for line in logs.output))
+            # Submitted but unconfirmed: unresolved, never reported delivered.
+            self.assertEqual("queued", self.rows(
+                "SELECT state FROM presence_deliveries WHERE action='notification'")[0][0])
+        finally:
+            self.transport.gate.set()
+
+    async def test_restart_reconciles_claims_from_the_stored_notification_rows(self):
+        application = self.scene_application()
+        timeline = application.state.scene_timeline
+        async with asyncio.timeout(30), application.router.lifespan_context(application):
+            # Current times: the restart's retention cleanup must not expire them.
+            now = datetime.now(timezone.utc)
+            sent = timeline.presence.record(observation(Kind.SERVER_MOVEMENT, at=now))
+            uncertain = timeline.presence.record(
+                observation(Kind.CAMERA_TAMPER, at=now + timedelta(milliseconds=1)))
+            self.assertTrue(await self.until(lambda: self.rows(
+                "SELECT count(*) FROM presence_deliveries "
+                "WHERE action='notification' AND state='delivered'") == [(2,)]))
+        self.assertEqual(2, len(self.critical_texts()))
+        # As if the process had stopped after the POSTs: both completions were
+        # lost; one result reached `notification_events`, the other did not.
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            db.execute("UPDATE presence_deliveries SET state='queued' WHERE action='notification'")
+            db.execute("UPDATE notification_events SET delivery='pending' WHERE event_id=?",
+                       (str(uncertain.identifier),))
+            db.commit()
+        restarted = self.scene_application()
+        async with asyncio.timeout(30), restarted.router.lifespan_context(restarted):
+            self.assertTrue(await self.until(lambda: self.rows(
+                "SELECT state FROM presence_deliveries WHERE action='notification' "
+                f"AND observation='{sent.identifier}'") == [("delivered",)]))
+            await asyncio.sleep(0.2)
+        # The uncertain one stays unresolved for an Owner requeue; nothing is
+        # sent again by the restart.
+        self.assertEqual([("queued",)], self.rows(
+            "SELECT state FROM presence_deliveries WHERE action='notification' "
+            f"AND observation='{uncertain.identifier}'"))
+        self.assertEqual(2, len(self.critical_texts()))
 
     async def test_shutdown_submits_queued_work_and_waits_for_its_delivery(self):
         # The loop never runs during this test, so only shutdown dispatches.

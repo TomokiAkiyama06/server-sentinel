@@ -68,4 +68,10 @@ class NotificationAdapter:
             confirmed=True, event_id=observation.identifier,
             on_complete=lambda result: complete(self._result(result)),
         )
-        return self._result(result)
+        outcome = self._result(result)
+        if outcome is ActionResult.FAILED and service.retained(observation.identifier):
+            # Nothing was sent and the event waits in the service's local
+            # retry buffer: keep the action retryable rather than final; the
+            # next submission of this ID retries the local write.
+            return ActionResult.UNAVAILABLE
+        return outcome

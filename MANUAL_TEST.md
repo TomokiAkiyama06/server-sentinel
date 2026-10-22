@@ -1242,7 +1242,9 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   delivery `delivered`; a service restart afterwards sends nothing again;
   with Slack unconfigured the row is `disabled` and Owner status reports
   `critical_notifications` unavailable; while the recording filesystem is
-  refused nothing is lost and the alert is sent after it recovers;
+  refused a confirmation is kept only within the scene runtime's bounded
+  critical staging (beyond it, counted as undelivered loss) and its alert is
+  sent after storage recovers;
   `critical_evidence` stays unavailable (no evidence port yet). Verified so
   far only with synthetic observations and an intercepted Slack transport
   (`server/tests/test_critical_notifications.py`); needs the same deployment

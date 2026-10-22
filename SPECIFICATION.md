@@ -1168,15 +1168,20 @@ message (`ServerSentinel critical alert: server_movement` / `camera_tamper`,
 fixed category only, no image, source, person or cause) as a hardware-integrity
 or recording-health failure, in every presence state. A `CriticalDispatcher`
 runs `dispatch_pending()` on the monitoring worker every second (at once again
-after a full batch; a failing step backs off exponentially up to 60 s and is
-logged value-free); unclaimed work stays `pending`, and a full or closed
-notification queue leaves the row `unavailable` with nothing submitted, retried
-by a later step. A claimed submission is never retried automatically: `failed`
+after a batch in which every row made progress; a failing step backs off
+exponentially up to 60 s and is logged value-free); unclaimed work stays
+`pending`, and a full or closed notification queue (or, without Slack, a full
+local-retry buffer) leaves the row `unavailable` with nothing submitted, retried
+by a later step, and ends that action's batch. A step never pins the database
+(the outbox open does), so it cannot deadlock the monitoring worker. While
+storage is refused a confirmed observation cannot be recorded and waits only
+within the scene runtime's bounded critical staging; no Slack attempt is made
+for it meanwhile. A claimed submission is never retried automatically: `failed`
 or `uncertain` outcomes, and claims an earlier process left `submitting` or
 `queued` whose `notification_events` row is still `pending` (or absent), stay
 unresolved for an audited Owner requeue; a final `sent`/`failed`/`disabled` row
 completes such a claim at the next start. Shutdown runs one last step after
-scene `stop()` and waits up to 5 s for submitted deliveries before the
+scene `stop()` and waits up to 12 s (above the 10 s Slack timeout) for submitted deliveries before the
 notification service closes. With Slack unconfigured the local row is
 `disabled` and `critical_notifications` stays `unavailable`. No
 evidence-preservation port exists yet (a separate recording decision), so

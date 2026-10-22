@@ -159,15 +159,29 @@ class NotificationService:
         An upstream durable outbox asks before it submits, so a full or closed
         queue leaves its work queued for a later attempt instead of turning
         into a final `failed` delivery for an alert that was never sent. A
-        resubmission of an event already pending or retained always fits, and
-        without Slack nothing is queued at all.
+        resubmission of an event already pending or retained always fits.
+        Without Slack nothing is queued, but a refused local write must still
+        fit the bounded retry buffer (`_retain`), or the event would be
+        dropped; while that buffer is full nothing new is accepted.
         """
         self._check()
         if not isinstance(event_id, UUID):
             raise ValueError("invalid notification event")
-        if event_id in self._pending or event_id in self._unpersisted or not self._slack.configured:
+        if event_id in self._pending or event_id in self._unpersisted:
             return True
+        if not self._slack.configured:
+            return len(self._unpersisted) < self._capacity
         return not self.closed and len(self._pending) < self._capacity
+
+    def retained(self, event_id: UUID) -> bool:
+        """Whether ``event_id`` is final but its local write is still being retried.
+
+        Such a `record()` returned `failed` although nothing was sent (Slack
+        disabled, or a closed or full queue) and nothing is lost: resubmitting
+        the same ID retries the local write and returns the stored result.
+        """
+        self._check()
+        return event_id in self._unpersisted
 
     def _check(self):
         if threading.get_ident() != self._owner:
@@ -204,6 +218,11 @@ class NotificationService:
             if (event.kind, event.at, event.confirmed) != (prior.kind, prior.at, prior.confirmed):
                 self.delivery_failed = True
                 return DeliveryResult.FAILED
+            # A coalesced resubmission (for example an Owner requeue, which
+            # starts a new presence claim generation) is told the outcome of
+            # the delivery it joined, as is the original submitter.
+            if on_complete is not None:
+                self._pending[event.event_id][1].append(on_complete)
             return DeliveryResult.PENDING
         if not self._slack.configured:
             result = DeliveryResult.DISABLED
@@ -220,7 +239,7 @@ class NotificationService:
             return self.last_delivery
         self.last_delivery = result
         if result == DeliveryResult.PENDING:
-            self._pending[event.event_id] = [event, on_complete, None]
+            self._pending[event.event_id] = [event, [on_complete] if on_complete else [], None]
             try:
                 self._worker.submit(event.event_id, text)
             except Exception:
@@ -237,7 +256,7 @@ class NotificationService:
         for identifier, result in self._worker.results():
             self._pending[identifier][2] = result
         completed = []
-        for identifier, (event, callback, result) in tuple(self._pending.items()):
+        for identifier, (event, callbacks, result) in tuple(self._pending.items()):
             if result is None:
                 continue
             update = replace(event, delivery=result)
@@ -245,11 +264,17 @@ class NotificationService:
                 self.delivery_failed = True
             if not self._local(update):
                 continue
-            try:
-                if callback:
+            # Every submitter of a coalesced delivery is told; a callback that
+            # raised is retried on the next poll, the others are not repeated.
+            failed = []
+            for callback in callbacks:
+                try:
                     callback(result)
-            except Exception:
+                except Exception:
+                    failed.append(callback)
+            if failed:
                 self.local_delivery_failed = True
+                self._pending[identifier][1] = failed
                 continue
             self.last_delivery = result
             completed.append(update)

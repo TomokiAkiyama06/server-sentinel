@@ -85,7 +85,9 @@ DISPATCH_BATCH = 50
 # busy), and how long shutdown waits for submitted notifications to finish.
 DEFAULT_DISPATCH_INTERVAL_SECONDS = 1.0
 DEFAULT_DISPATCH_BACKOFF_SECONDS = 60.0
-DEFAULT_DISPATCH_SETTLE_SECONDS = 5.0
+# The settle wait exceeds the Slack transport timeout (10 s by default), so a
+# slow POST still completes, and stays well inside the unit's stop timeout.
+DEFAULT_DISPATCH_SETTLE_SECONDS = 12.0
 
 
 class RetentionClockUntrusted(RuntimeError):
@@ -99,6 +101,17 @@ class RetentionClockUntrusted(RuntimeError):
 
     def __init__(self):
         super().__init__("presence retention clock untrusted")
+
+
+class TimelineNotPinned(RuntimeError):
+    """Critical dispatch refused: the timeline database is not pinned yet.
+
+    `SceneTimeline.open()` (or a retention batch) pins it under the storage
+    admission; the dispatcher backs off and retries meanwhile.
+    """
+
+    def __init__(self):
+        super().__init__("presence timeline database not pinned")
 
 
 class _PresenceRetention:
@@ -174,7 +187,7 @@ class SceneTimelineConfiguration:
         if self.dispatch_backoff_seconds < self.dispatch_interval_seconds:
             raise ValueError("invalid timeline interval")
         settle = self.dispatch_settle_seconds
-        if type(settle) not in (int, float) or not math.isfinite(settle) or not 0 <= settle <= 30:
+        if type(settle) not in (int, float) or not math.isfinite(settle) or not 0 <= settle <= 60:
             raise ValueError("invalid timeline interval")
 
 
@@ -237,7 +250,9 @@ class SceneTimeline:
 
     def _pin(self) -> None:
         # Pinned once, under the same admission every write takes; a missing
-        # database file is refused, never created here.
+        # database file is refused, never created here. `_pin_lock` is held
+        # while the admission waits for the monitoring worker, so this must
+        # never run on that worker (see `dispatch()`).
         with self._pin_lock:
             if not self._pinned.pinned:
                 self._pinned.pin(self._reservation)
@@ -305,9 +320,13 @@ class SceneTimeline:
     def dispatch(self, reconcile: Callable[[tuple[UUID, ...]], dict] | None = None) -> int:
         """One critical dispatch step; run it on the notification port's owning thread.
 
-        Returns how many delivery rows were selected (`DISPATCH_BATCH` means
-        more may wait). The database is pinned under the storage admission
-        first, never created here; a refusal raises and nothing is claimed.
+        Returns how many delivery rows the step resolved (`DISPATCH_BATCH`
+        means more may wait). It never pins the database itself: it runs on
+        the monitoring worker, while `open()` and the retention cleanup pin on
+        other threads by holding `_pin_lock` and waiting in the storage
+        admission for that same worker, so blocking on `_pin_lock` here would
+        deadlock the worker. Until one of them pinned it, `TimelineNotPinned`
+        is raised (the dispatcher backs off) and nothing is claimed.
 
         Before the first step of this process, `notification` claims that an
         earlier process left `submitting`/`queued` are reconciled against the
@@ -319,7 +338,10 @@ class SceneTimeline:
         never resent automatically. Raising leaves reconciliation for the
         next step.
         """
-        self._pin()
+        # `PinnedDatabase.pinned` takes only its own short lock, never
+        # `_pin_lock`; an unpinned database also refuses every connection.
+        if not self._pinned.pinned:
+            raise TimelineNotPinned()
         if not self._reconciled:
             if reconcile is not None and self.presence.notifications is not None:
                 claims = self.presence.unconfirmed_actions("notification")

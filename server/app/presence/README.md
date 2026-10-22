@@ -245,20 +245,33 @@ confirmed critical observation.
 `CriticalDispatcher` drives `dispatch_pending()` from the lifespan. Each step
 runs on the monitoring worker (`MonitoringRuntime.dispatch_notifications`),
 which owns the notification service, polls its completions before and after
-the step, and takes the storage admission directly. Steps run every
-`dispatch_interval_seconds` (default 1 s), at once again after a full batch
-(`DISPATCH_BATCH`); a failing step (storage refused, database not openable
-yet) backs off exponentially up to `dispatch_backoff_seconds` (default 60 s),
+the step, and takes the storage admission directly. A step never pins the
+database: `open()` and the retention cleanup pin it on other threads while
+holding `_pin_lock` and waiting in the storage admission for that same worker,
+so a step blocking on that lock would deadlock the worker. Until the database
+is pinned a step raises `TimelineNotPinned` and backs off. Steps run every
+`dispatch_interval_seconds` (default 1 s), at once again only after a batch in
+which every one of `DISPATCH_BATCH` rows made progress; a failing step
+(storage refused, database not pinned yet) backs off exponentially up to `dispatch_backoff_seconds` (default 60 s),
 logging `critical_dispatch_failing` at the first failure of a streak and at
 every doubling and `critical_dispatch_recovered` once. Unclaimed rows stay
 `pending` meanwhile, so nothing is dropped. The adapter asks
 `NotificationService.can_accept()` first: no service yet, a full or closed
 queue, or a call from another thread returns `unavailable` with nothing
 submitted, and that row is retried by a later step instead of becoming a final
-`failed` for an alert that was never sent.
+`failed` for an alert that was never sent. After the first such refusal the
+step leaves the rest of that action's rows untouched, so a stalled Slack
+endpoint with a large backlog costs one claim per step, not a busy loop. With
+Slack unconfigured, `can_accept()` also refuses while the service's bounded
+local-retry buffer is full, and a `failed` result that is only a refused local
+write being retried (`NotificationService.retained()`) is mapped to
+`unavailable` too, so the local row is never dropped while the action is
+finalized.
 
 No notification is sent twice automatically. A claimed row is never
-reclaimed, the service coalesces a resubmitted event ID, and a `failed`
+reclaimed, the service coalesces a resubmitted event ID (and tells every
+submitter, so an Owner requeue of a still-running delivery completes its new
+claim generation from that delivery's outcome), and a `failed`
 (Slack refused or timed out) or `uncertain` outcome stays unresolved until an
 audited Owner `requeue_action()`. After a restart, before its first dispatch,
 the dispatcher reconciles the `notification` claims an earlier process left
@@ -272,7 +285,7 @@ as for any durably disabled delivery.
 Shutdown cancels the loop (a step in flight finishes on the worker first),
 and after scene `stop()` and the outbox finish it runs one more step, so a
 confirmation from the final scene pass is submitted, then waits up to
-`dispatch_settle_seconds` (default 5 s) for submitted deliveries to complete
+`dispatch_settle_seconds` (default 12 s, above the 10 s Slack timeout) for submitted deliveries to complete
 before the monitoring runtime closes the service. A delivery still running then
 stays `pending` / unresolved (`critical_notifications_unsettled` is logged),
 never resent.
@@ -282,6 +295,13 @@ pending. The dispatcher records the `evidence` rows `unavailable` and
 `critical_evidence` stays unavailable in Owner status. Without a monitoring
 runtime (an embedded `create_app()` with only an injected reservation) no
 notification service exists, no dispatcher runs and the path stays unavailable.
+
+While storage is refused (`STORAGE_HARD_STOP`, a lost or replaced recording
+filesystem) a confirmed observation cannot be written to the timeline, so it
+is not dispatched either: it waits only within the scene runtime's bounded
+in-memory critical staging, and confirmations beyond that bound are counted
+as undelivered loss. Unlike recording-health and integrity alerts, no Slack
+attempt is made for it meanwhile (an open Owner question).
 
 ### Entrance gate quality
 

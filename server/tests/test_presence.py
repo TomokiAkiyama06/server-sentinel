@@ -700,6 +700,8 @@ class PresenceTests(unittest.TestCase):
             callback = None
             def can_accept(inner, event_id):
                 return True
+            def retained(inner, event_id):
+                return False
             def record(inner, kind, **fields):
                 inner.identifier = fields["event_id"]
                 inner.callback = fields["on_complete"]
