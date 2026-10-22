@@ -42,6 +42,42 @@ SUMMARY_TIME = re.compile(r"([01][0-9]|2[0-3]):([0-5][0-9])")
 # device has a `loop/` directory (with `backing_file` while attached), a
 # device-mapper device a `dm/` directory.
 SYS_DEV_BLOCK = Path("/sys/dev/block")
+# Bound on the dm/md stacking walked through `slaves/` (each level is one
+# mapping on top of another); deeper stacks are refused, not trusted.
+MAX_BLOCK_STACK_DEPTH = 8
+
+
+def _loop_backed(node: Path, depth: int = 0) -> bool:
+    """Whether the sysfs block device ``node`` is or sits on a loop device.
+
+    A partition (`partition` attribute) is judged by its parent disk, the
+    directory that contains it once the `/sys/dev/block` link is resolved:
+    `losetup -P` partitions get the generic extended major (259, as NVMe)
+    and only the parent `loopN` has the `loop/` attribute. A stacked device
+    (device-mapper, md) is judged by every device under `slaves/`, so LVM or
+    dm-crypt on a loop device is a loop device too. True also when the walk
+    is too deep or anything cannot be read (fail closed).
+    """
+    if depth > MAX_BLOCK_STACK_DEPTH:
+        return True
+    try:
+        path = node.resolve(strict=True)
+        if (path / "partition").exists():
+            if (path / "loop").exists():
+                return True
+            path = path.parent
+            if not path.is_dir():
+                return True
+        if (path / "loop").exists():
+            return True
+        slaves = path / "slaves"
+        if slaves.exists():
+            for slave in sorted(slaves.iterdir()):
+                if _loop_backed(slave, depth + 1):
+                    return True
+    except (OSError, RuntimeError, ValueError):
+        return True
+    return False
 
 
 def renumbered_device_acceptable(recorded: tuple[int, int], device: int) -> bool:
@@ -51,12 +87,15 @@ def renumbered_device_acceptable(recorded: tuple[int, int], device: int) -> bool
     runtime root already agree on. An equal pair is always acceptable. A
     differing pair is acceptable only as a reboot renumbering of the same
     kind of device: the major (the driver) is unchanged and only the minor
-    differs, and the device is not a loop device, whose backing file may sit
-    on the operating-system root filesystem (a disk image mounted with
-    `-o loop` gets a `/dev/disk/by-uuid` link and a non-root device number).
-    A device-mapper device is accepted only when the recorded device was one
-    too, which the unchanged major already implies (device-mapper has its own
-    major). Missing or unreadable sysfs attributes refuse (fail closed).
+    differs, and the device is not and does not sit on a loop device, whose
+    backing file may be on the operating-system root filesystem (a disk image
+    mounted with `-o loop` gets a `/dev/disk/by-uuid` link and a non-root
+    device number). Loop partitions (major 259, shared with NVMe) are found
+    through their parent disk and dm/md stacks through `slaves/`
+    (`_loop_backed`). A device-mapper device is accepted only when the
+    recorded device was one too, which the unchanged major already implies
+    (device-mapper has its own major). Missing or unreadable sysfs entries
+    refuse (fail closed).
     """
     major, minor = os.major(device), os.minor(device)
     if tuple(recorded) == (major, minor):
@@ -65,17 +104,11 @@ def renumbered_device_acceptable(recorded: tuple[int, int], device: int) -> bool
         return False
     node = SYS_DEV_BLOCK / f"{major}:{minor}"
     try:
-        if not node.is_dir():
+        if not node.exists():
             return False
-        if (node / "loop").exists() or (node / "loop" / "backing_file").exists():
-            return False
-        # A device-mapper device (`dm/`) passes here only because the
-        # recorded major is device-mapper's own: the recorded device was one
-        # too. A disk replaced by a new dm mapping changes the major and was
-        # refused above.
     except (OSError, ValueError):
         return False
-    return True
+    return not _loop_backed(node)
 
 
 @dataclass(frozen=True)

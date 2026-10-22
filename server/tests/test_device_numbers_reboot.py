@@ -53,26 +53,46 @@ def other_major(device: int) -> list[int]:
 
 
 class FakeSysfs:
-    """A disposable `/sys/dev/block` with one entry per device, patched in."""
+    """A disposable sysfs patched in as `/sys/dev/block`.
+
+    Laid out like the kernel's: `dev/<maj>:<min>` links to the device
+    directory under `devices/`, a partition is a directory inside its parent
+    disk with a `partition` attribute, a loop disk has `loop/backing_file`, a
+    dm device has `dm/` and links its underlying devices under `slaves/`.
+    """
 
     def __init__(self, case: unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="server-device-numbers-sysfs-")
         case.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        patcher = patch("app.monitoring.config.SYS_DEV_BLOCK", self.root)
+        (self.root / "dev").mkdir()
+        (self.root / "devices").mkdir()
+        patcher = patch("app.monitoring.config.SYS_DEV_BLOCK", self.root / "dev")
         patcher.start()
         case.addCleanup(patcher.stop)
 
+    def device(self, device: int, name: str, *, parent: Path | None = None,
+               loop: bool = False, dm: bool = False, slaves=()) -> Path:
+        directory = (parent if parent is not None else self.root / "devices") / name
+        directory.mkdir()
+        if parent is not None:
+            (directory / "partition").write_text("1\n")
+        if loop:
+            (directory / "loop").mkdir()
+            (directory / "loop" / "backing_file").write_text("/synthetic/image\n")
+        if dm:
+            (directory / "dm").mkdir()
+        if slaves:
+            (directory / "slaves").mkdir()
+            for slave in slaves:
+                (directory / "slaves" / slave.name).symlink_to(slave)
+        (self.root / "dev" / f"{os.major(device)}:{os.minor(device)}").symlink_to(directory)
+        return directory
+
     def node(self, device: int, kind: str = "disk") -> Path:
-        """Model ``device`` as a plain disk, a loop device or a dm device."""
-        node = self.root / f"{os.major(device)}:{os.minor(device)}"
-        node.mkdir(exist_ok=True)
-        if kind == "loop":
-            (node / "loop").mkdir()
-            (node / "loop" / "backing_file").write_text("/synthetic/image\n")
-        elif kind == "dm":
-            (node / "dm").mkdir()
-        return node
+        """Model ``device`` as a plain disk, a loop disk or a dm device."""
+        return self.device(device, f"{kind}-{os.major(device)}-{os.minor(device)}",
+                           loop=kind == "loop", dm=kind == "dm")
 
 
 class DeploymentValidationTests(unittest.TestCase):
@@ -307,9 +327,11 @@ class RecordingFilesystemTests(unittest.TestCase):
         disk = os.makedev(8, 0)
         loop = os.makedev(7, 3)
         mapped = os.makedev(253, 1)
-        self.sysfs.node(disk)
-        self.sysfs.node(loop, "loop")
-        self.sysfs.node(mapped, "dm")
+        # A fresh sysfs, so the synthetic numbers never meet the runner's.
+        sysfs = FakeSysfs(self)
+        sysfs.node(disk)
+        sysfs.node(loop, "loop")
+        sysfs.node(mapped, "dm")
         cases = (
             ((8, 0), disk, True),      # unchanged
             ((8, 16), disk, True),     # sda/sdb swapped (the incident)
@@ -324,6 +346,44 @@ class RecordingFilesystemTests(unittest.TestCase):
         for recorded, device, expected in cases:
             with self.subTest(recorded=recorded, device=(os.major(device), os.minor(device))):
                 self.assertIs(expected, renumbered_device_acceptable(recorded, device))
+
+    def test_loop_found_through_partitions_and_device_mapper_slaves(self):
+        # `losetup -P` partitions get major 259, the same as NVMe; only the
+        # parent loop disk has `loop/`. LVM/dm on a loop device is loop-backed.
+        sysfs = FakeSysfs(self)
+        loop0 = sysfs.device(os.makedev(7, 0), "loop0", loop=True)
+        loop0p1 = sysfs.device(os.makedev(259, 5), "loop0p1", parent=loop0)
+        nvme = sysfs.device(os.makedev(259, 0), "nvme0n1")
+        nvme_part = sysfs.device(os.makedev(259, 2), "nvme0n1p2", parent=nvme)
+        loop1 = sysfs.device(os.makedev(7, 1), "loop1", loop=True)
+        sysfs.device(os.makedev(253, 0), "dm-0", dm=True, slaves=(loop1,))
+        sysfs.device(os.makedev(253, 1), "dm-1", dm=True, slaves=(nvme_part,))
+        inner = sysfs.device(os.makedev(253, 3), "dm-3", dm=True, slaves=(loop0p1,))
+        sysfs.device(os.makedev(253, 2), "dm-2", dm=True, slaves=(inner,))
+        broken = sysfs.root / "devices" / "missing-slave"
+        sysfs.device(os.makedev(253, 5), "dm-5", dm=True, slaves=(broken,))
+        cases = (
+            ((259, 1), os.makedev(259, 5), False),  # loop partition, NVMe numbers recorded
+            ((259, 7), os.makedev(259, 2), True),   # NVMe partition renumbered
+            ((259, 7), os.makedev(259, 0), True),   # NVMe disk renumbered
+            ((253, 4), os.makedev(253, 0), False),  # dm on a loop disk
+            ((253, 4), os.makedev(253, 1), True),   # dm on an NVMe partition
+            ((253, 4), os.makedev(253, 2), False),  # dm on dm on a loop partition
+            ((253, 4), os.makedev(253, 5), False),  # unreadable slave: fail closed
+            ((259, 5), os.makedev(259, 5), True),   # an exact match is not re-judged
+        )
+        for recorded, device, expected in cases:
+            with self.subTest(recorded=recorded, device=(os.major(device), os.minor(device))):
+                self.assertIs(expected, renumbered_device_acceptable(recorded, device))
+
+    def test_stacking_deeper_than_the_bound_is_refused(self):
+        sysfs = FakeSysfs(self)
+        below = sysfs.device(os.makedev(259, 0), "nvme0n1")
+        for level in range(12):
+            below = sysfs.device(os.makedev(253, level), f"dm-{level}", dm=True,
+                                      slaves=(below,))
+        self.assertTrue(renumbered_device_acceptable((253, 20), os.makedev(253, 0)))
+        self.assertFalse(renumbered_device_acceptable((253, 20), os.makedev(253, 11)))
 
     def identity(self, numbers, runtime_device=None):
         return RecordingFilesystem(self.recordings, UUID, tuple(numbers), self.mount,

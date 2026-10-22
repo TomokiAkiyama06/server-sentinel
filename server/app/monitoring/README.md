@@ -62,8 +62,9 @@ verified device, storage is admitted, `recording_device_numbers_stale` is set
 `recording_device_numbers_changed` attention notice is sent per boot and device
 numbers (event ID from `/proc/sys/kernel/random/boot_id`; per process start
 without it). Only a changed minor of the same kind of device is accepted: a
-changed major, a loop device or a device without a sysfs entry refuses
-(`renumbered_device_acceptable`). A failed startup open is
+changed major, a device that is or sits on a loop device (through a
+partition's parent disk or dm/md `slaves/`) or a device without a readable
+sysfs entry refuses (`renumbered_device_acceptable`). A failed startup open is
 retried every `retry_seconds` from the tick against the same declared identity;
 a failed database open (e.g. SQLite I/O error or permission change) takes the
 same alerting startup-failure path. Only the first failure of the episode alerts, and a successful retry runs the

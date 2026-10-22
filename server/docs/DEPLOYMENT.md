@@ -190,8 +190,11 @@ When all of them hold and `runtime_device` (or
 filesystem. A different major is refused as before: the major names the
 driver, and a disk image mounted with `-o loop` (major 7, possibly on the root
 filesystem) or a new device-mapper mapping would otherwise pass the UUID and
-mount checks. A renumbered loop device (`/sys/dev/block/<maj>:<min>/loop`) or
-a device without an entry in `/sys/dev/block` is refused too; a
+mount checks. A renumbered device that is or sits on a loop device is refused
+too: a partition is judged by its parent disk (`losetup -P` loop partitions
+share major 259 with NVMe), and a device-mapper/md device by every device
+under its sysfs `slaves/`, recursively. A device without a readable entry in
+`/sys/dev/block` is refused as well; a
 device-mapper device is accepted only when the recorded one was
 device-mapper as well (same major). `--check`, the
 launcher and the installer then pass and print one value-free line (no number,

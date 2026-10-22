@@ -187,9 +187,14 @@ Runtime-data assumptions:
   root filesystem mounted with `-o loop` gets a `/dev/disk/by-uuid` link and a
   non-root `7:N` device, so the UUID, mount and root-device checks alone would
   pass it and recordings would fill the root filesystem) or from a new
-  device-mapper mapping. A renumbered device that sysfs shows as a loop device
-  (`/sys/dev/block/<maj>:<min>/loop`), or that has no sysfs entry, is refused
-  too; a device-mapper device is accepted only when the recorded one was
+  device-mapper mapping. A renumbered device that is or sits on a loop device
+  is refused too, whatever its major: sysfs is walked from
+  `/sys/dev/block/<maj>:<min>`, a partition is judged by its parent disk
+  (`losetup -P` loop partitions share major 259 with NVMe, and only the
+  parent `loopN` has `loop/`), and a dm/md device by every device under
+  `slaves/`, recursively (at most 8 levels; LVM or dm-crypt on a loop device is
+  a loop device). A missing or unreadable sysfs entry, or a deeper stack, is
+  refused. A device-mapper device is accepted only when the recorded one was
   device-mapper as well (same major). The rule is applied by `--check`, the
   launcher, the installer and every monitoring storage (re)open. Residual
   risk: a disk carrying a cloned UUID in another slot of the same driver
