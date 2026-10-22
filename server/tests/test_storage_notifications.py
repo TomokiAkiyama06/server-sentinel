@@ -119,9 +119,14 @@ class NotificationTests(unittest.TestCase):
         service = NotificationService(local.append, SlackDelivery(endpoint(), opener=transport))
         for _ in range(100):
             for kind in [NotificationKind.PERSON, NotificationKind.MOTION,
-                         NotificationKind.ENTRY, NotificationKind.CAMERA_OFFLINE]:
+                         NotificationKind.ENTRY]:
                 self.assertEqual(DeliveryResult.SUPPRESSED, service.record(
                     kind, at=datetime.now(timezone.utc), confirmed=True))
+            # An ordinary (unconfirmed) camera-offline observation stays
+            # local; only the threshold-confirmed one of the camera offline
+            # monitor, which caps it per hour, is immediate (Issue #301).
+            self.assertEqual(DeliveryResult.SUPPRESSED, service.record(
+                NotificationKind.CAMERA_OFFLINE, at=datetime.now(timezone.utc)))
         self.assertEqual([], transport.requests)
         self.assertEqual(400, len(local))
 
@@ -130,14 +135,15 @@ class NotificationTests(unittest.TestCase):
         local = []
         service = NotificationService(local.append, SlackDelivery(endpoint(), opener=transport))
         self.addCleanup(service.close)
-        for kind in (NotificationKind.SERVER_MOVEMENT, NotificationKind.CAMERA_TAMPER):
+        for kind in (NotificationKind.SERVER_MOVEMENT, NotificationKind.CAMERA_TAMPER,
+                     NotificationKind.CAMERA_OFFLINE):
             self.assertEqual(DeliveryResult.SUPPRESSED, service.record(kind, at=datetime.now(timezone.utc)))
             self.assertEqual(DeliveryResult.PENDING, service.record(kind, at=datetime.now(timezone.utc), confirmed=True))
         for kind in (NotificationKind.HARDWARE_INTEGRITY_FAILURE, NotificationKind.RECORDING_HEALTH_FAILURE):
             self.assertEqual(DeliveryResult.PENDING, service.record(kind, at=datetime.now(timezone.utc)))
         drain(self, service)
-        self.assertEqual(4, len(transport.requests))
-        self.assertEqual(4, sum(event.delivery == DeliveryResult.SENT for event in local))
+        self.assertEqual(5, len(transport.requests))
+        self.assertEqual(5, sum(event.delivery == DeliveryResult.SENT for event in local))
 
     def test_failed_local_sink_still_alerts_and_completion_remains_pending_for_persistence(self):
         transport = Transport()
