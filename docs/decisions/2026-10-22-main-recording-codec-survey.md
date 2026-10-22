@@ -15,13 +15,13 @@ Owner は 2026-10-22 に、§12 の問いについて次のとおり決めまし
 | Q1 保存の codec | **H.264** で保存する。 |
 | Q2（D13）container と再生 | **fragmented MP4** で保存し、**そのまま browser へ配る**（MSE / HLS(fMP4)。§6 の P3）。録画の一覧・再生・playlist・segment は、server 側で `recordings:view` を確認してから返す。download / export は提供しない。 |
 | Q3 encoder | **GStreamer の nvcodec（NVENC）**。 |
-| Q4 NVENC が無い・失敗したとき | **MJPEG の保存に fallback する**。そのとき録画を **degraded** にし、**Owner に通知する**。黙って fallback しない。segment は `codec` / `container` を持つので、形式の混在は manifest で区別できる。 |
+| Q4 NVENC が無い・失敗したとき | **MJPEG の保存に fallback する**。そのとき録画を **degraded** にし、**Owner に通知する**。黙って fallback しない。segment は `codec` / `container` を持つので、形式の混在は manifest で区別できる。fallback の区間にも、認可付きの browser 再生の経路を必ず用意する（T3）。 |
 | Q5 validator | **全 frame の decode による検証を必須**とする。録画の検証専用の子プロセスで行い、ROI 用の子プロセスとは分ける。CPU の割り当ては、実機で測ってから決める。 |
 | Q6 self-test | **実 pipeline の sample** を使う（capture → packet adapter → muxer → validator）。既存の `.selftest` の契約に従って扱う。 |
 | Q7 容量と上限 | recording root は **HDD**。segment の長さは、実機で同期 I/O の負荷を測ってから決める。§8.6 の上限は、H.264 と MJPEG の fallback のそれぞれについて、negotiated bound から計算し直す。 |
 | Q8 AVC の特許 | 研究室内での使用として、**Owner の責任で受け入れる**。 |
 
-**MEDIA-003 / SPEC §6.2 との関係**: MEDIA-003 は「source の codec / profile が suitable なら stream copy を優先し、そうでなければ（Otherwise）encode する」としています。MJPEG は browser の `<video>` で再生できないので（§4 A）、browser で再生するという用途には suitable ではありません。そのため H.264 への transcode は、MEDIA-003 の「Otherwise」に当たります。また、NVENC が無い・失敗したときは MJPEG の保存に fallback するので（Q4）、録画の correctness は GPU に依存しません（SPEC §6.2 の「Do not require a specific GPU vendor for correctness」）。
+**MEDIA-003 / SPEC §6.2 との関係**: MEDIA-003 は「source の codec / profile が suitable なら stream copy を優先し、そうでなければ（Otherwise）encode する」としています。MJPEG は browser の `<video>` で再生できないので（§4 A）、browser で再生するという用途には suitable ではありません。そのため H.264 への transcode は、MEDIA-003 の「Otherwise」に当たります。また、NVENC が無い・失敗したときは MJPEG の保存に fallback するので（Q4）、録画の correctness は GPU に依存しません（SPEC §6.2 の「Do not require a specific GPU vendor for correctness」）。ただしこれが成り立つのは、fallback の MJPEG の区間も、`recordings:view` を持つ人が browser で再生できる場合だけです。P3 は H.264 の fMP4 しか配れないので、fallback の区間には別の再生経路が必須です（T3）。
 
 この判断により、§4 の B（software encode。x264 / OpenH264）、§7 の V3（FFmpeg の CLI）と V4（PyAV）、§6 の P1 / P2 を主な経路とする案は、採用しません。§11 の推奨（MJPEG で保存し、P1 で再生する案）は、判断の前の提案として残しています。
 
@@ -34,7 +34,10 @@ Owner は 2026-10-22 に、§12 の問いについて次のとおり決めまし
   - MJPEG の fallback の segment は、これまでどおり simplejpeg で検証します。
 - **T2: fMP4 の muxer**。Main host には `mp4mux` / `qtmux`（gst-plugins-good。`fragment-duration` を持ちます）があります。`isofmp4mux`（gst-plugins-rs）はありません。GStreamer の muxer を使うか、自前の stdlib の ISO BMFF writer を使うかは、まだ決まっていません。どちらの場合も、segment ごとに init（`ftyp` + `moov`）を持たせて、単独で decode できるようにします。
   - そのような自己完結した segment file を HLS(fMP4) でそのまま配るには、playlist で同じ file の中の範囲を指す必要があります。init 部分は `EXT-X-MAP` の `BYTERANGE` で、media 部分（`moof` + `mdat`）は `EXT-X-BYTERANGE` で指します [RFC8216]。そのため、認可付きの再生 route は **HTTP の byte-range request（`Range` / `206 Partial Content`）に対応する**必要があります。iOS も、media の server に byte-range への対応を求めています [Apple-byterange]。認可は、range ごとの request にも同じように掛けます。
-- **T3: MJPEG の fallback の segment の container と再生**。MJPEG は `<video>` で再生できません（§4 A）。fallback の区間をどの container（Matroska `V_MJPEG` など）で保存し、browser でどう見せるか（frame pull、または「この区間は再生できない」と表示するか）を決める必要があります。
+- **T3: MJPEG の fallback の segment の container と、必須の再生経路**。MJPEG は `<video>` で再生できず（§4 A）、P3 は H.264 の fMP4 しか配れません。non-owner にとって録画を見る手段は browser 再生だけなので（AUTH-007）、fallback の区間にも **認可付きの browser 再生経路を必ず用意します**。「この区間は再生できない」と表示するだけの案は採りません。
+  - 経路の例は、保存した JPEG の frame を認可付きで取りに行く方式（§6 P1。S7 の暫定 live と同じ取り出し方）です。
+  - 認可は server 側で `recordings:view` を確認します（`live:view` だけでは見せません）。download / export の route や button は作りません。
+  - 決める必要があるのは、fallback の区間を保存する container（Matroska `V_MJPEG` など）と、再生 UI で H.264 の区間と fallback の区間をどうつなぐか（seek、間引き、帯域）です。
 - **T4: bitrate の上限の強制**。§8.6 の上限は、negotiated bound（`VideoFormat.maximum_bitrate`）が実際に守られることを前提にしています。ただし、`VideoFormat.maximum_bitrate`（`server/app/media/profiles/model.py`）は**宣言されているだけで、今はどこでも強制されていません**（読んでいるのは synthetic の harness の fixture だけです）。
   - そのため、**H.264 でも MJPEG の fallback でも、segment ごとに byte 数の上限を強制します**。muxer か validator が、segment の byte 数を `B_s` × segment の長さ ÷ 8 × (1 + o) + `V_s` + `H` と比べ、超えた segment は拒否して gap にし、録画を degraded にします。黙って保存することはしません。
   - H.264 では、これに加えて NVENC の rate control（最大 bitrate と VBV buffer）で、上限を超えないようにします。rate control だけに頼ることはしません。
@@ -360,7 +363,7 @@ segment の長さを決めるときの trade-off は次のとおりです。
    - そのため、同じ方式（fork+exec、rlimit、Landlock + seccomp、deadline）を基にして、**検証専用の request を足す**必要があります。
      - 画素を返さず、decode できたかどうかと寸法だけを返します。
      - segment 単位で、複数の frame をまとめて送ります。
-   - 子プロセスの数と優先度も決める必要があります。ROI と共有するか、録画の検証専用にするかです。
+   - 子プロセスは、ROI 用とは別の**録画の検証専用**にします（Q5 の Owner 判断。ROI 用の子プロセスとは共有しません）。まだ決まっていないのは、専用の子プロセスの数と優先度だけです。
    - 検証が録画の速さに追いつかないときは、queue を有界に保ちます。あふれた segment は拒否して gap にし、録画を degraded にします。検証を飛ばして保存することはしません。
 5. byte の integrity（SHA-256、長さ、hard link や symlink の拒否、再検証）は、保存層がすでに行っています。
 
@@ -414,7 +417,7 @@ segment の長さを決めるときの trade-off は次のとおりです。
 - **Q2（D13: container / 再生）**: MJPEG なら Matroska / 自前の形式 / MP4 のどれか、P1 でよいか。H.264 なら fragmented MP4 + HLS(fMP4) / MSE でよいか。→ **fragmented MP4 をそのまま browser へ配る（P3）。server 側で `recordings:view` を確認し、download / export は提供しない**
 - **Q3（依存）**: 自前の stdlib 実装 / GStreamer / FFmpeg の CLI / PyAV のどれを認めるか。x264 と OpenH264 を外してよいか。→ **encoder は GStreamer の nvcodec（NVENC）**。muxer と validator の decoder は、T1 / T2 で決めます。
 - **Q4（hardware と fallback）**: NVENC が無い・失敗したときの動作。→ **MJPEG の保存に fallback し、degraded にして Owner に通知する（黙って fallback しない）**
-- **Q5（validator）**: 全 frame の decode に必要な CPU と、子プロセスを共有するか専用にするか。→ **全 frame の decode は必須。録画の検証専用の子プロセスで行う。CPU は実機で測る**
+- **Q5（validator）**: 全 frame の decode に必要な CPU と、子プロセスを共有するか専用にするか。→ **全 frame の decode は必須。ROI 用とは共有せず、録画の検証専用の子プロセスで行う（未決は数と優先度だけ）。CPU は実機で測る**
 - **Q6（self-test の sample）**: 実 pipeline の sample を `.selftest` の契約で扱うこと。→ **実 pipeline の sample を使い、`.selftest` の契約に従う**
 - **Q7（容量と上限）**: recording root の容量と媒体、pre-roll の置き場所、上限値と segment の長さ。→ **HDD。segment の長さは実機で同期 I/O を測ってから決める。§8.6 の上限は negotiated bound から計算し直す**
 - **Q8（AVC の特許）**: → **研究室内での使用として、Owner の責任で受け入れる**
