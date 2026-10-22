@@ -186,3 +186,15 @@ p { margin: .5rem 0 1rem; }
 .access-credential { border-top: 1px solid #e4ecee; padding-top: .6rem; }
 .access-credential p { margin: 0 0 .3rem; }
 .access-credential-revoked { color: #536771; }
+/* Issue #205: the Owner's scene calibration on the Sources view. */
+.calibration-screen { display: grid; gap: 1rem; min-width: 0; max-width: 60rem; margin-top: 1.5rem; }
+.calibration-screen > h2 { margin: 0; font-size: 1.15rem; }
+.calibration-screen > p { margin: 0; }
+.calibration-source { min-width: 0; background: #fff; border: 1px solid #dce5e8; border-radius: 1rem; padding: 1.25rem; overflow-wrap: anywhere; }
+.calibration-source h3 { margin: 0 0 .3rem; font-size: 1.05rem; }
+.calibration-source dl { font-size: .85rem; display: grid; grid-template-columns: auto 1fr; gap: .2rem .8rem; margin: .4rem 0; }
+.calibration-source dd { margin: 0; }
+.calibration-warning { margin: .4rem 0; padding: .6rem 1rem; border-radius: .6rem; background: #fff4e0; color: #6b4a12; }
+.calibration-action { display: grid; gap: .6rem; justify-items: start; margin-top: .6rem; }
+.calibration-confirm { display: flex; gap: .5rem; align-items: flex-start; }
+.calibration-action button:disabled { opacity: .55; }

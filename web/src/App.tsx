@@ -3,6 +3,7 @@ import { flushSync } from 'react-dom';
 import { canVisit, deniedServices, parseWizard, views, type CameraSourceSummary, type DashboardServices, type RecordingSummary, type Session, type StorageSummary, type View, type WizardSnapshot, type WizardStatus, type WizardStepState } from './domain';
 import { ApiError } from './api';
 import { AccessScreen } from './access/screen';
+import { CalibrationScreen } from './calibration/screen';
 import { LiveScreen } from './dashboard/live';
 import { messages, type Locale } from './i18n';
 import { RecordingsView } from './recordings/view';
@@ -39,6 +40,19 @@ class LocalBoundary extends Component<{ children: ReactNode; message: string }, 
   render() {
     return this.state.failed ? <p role="alert">{this.props.message}</p> : this.props.children;
   }
+}
+
+function SourceCards({ t, items }: { t: typeof messages[Locale]; items: readonly CameraSourceSummary[] }) {
+  return <>
+    <p className="source-count">{t.sourceCount}: {items.length}</p>
+    <div className="source-grid">{items.map(source => <article className="source-card" key={source.id} data-source-id={source.id}>
+      <div className="source-icon" aria-hidden="true">▣</div><h2>{source.name}</h2><p>{t[source.source_type]}</p>
+      <dl><dt>{t.role}</dt><dd>{source.role || t.unassigned}</dd></dl>
+      <span className={`health health-${source.health}`}>{t[source.health]}</span>
+      {!source.enabled && <span className="badge">{t.disabled}</span>}
+    </article>)}</div>
+    {items.length === 0 && <p>{t.noSources}</p>}
+  </>;
 }
 
 export function App({ services = deniedServices }: { services?: DashboardServices }) {
@@ -288,16 +302,13 @@ export function App({ services = deniedServices }: { services?: DashboardService
               : selected === 'timeline' && canVisit(session, 'timeline') ? <TimelineScreen services={services} t={t} />
               : selected === 'presence' && access.role === 'owner' ? <PresenceScreen services={services} t={t} />
               : selected === 'access' && access.role === 'owner' ? <AccessScreen services={services} t={t} />
-                : selected === 'sources' && access.role === 'owner' && sources.state === 'ready' ? <>
-              <p className="source-count">{t.sourceCount}: {sources.items.length}</p>
-              <div className="source-grid">{sources.items.map(source => <article className="source-card" key={source.id} data-source-id={source.id}>
-                <div className="source-icon" aria-hidden="true">▣</div><h2>{source.name}</h2><p>{t[source.source_type]}</p>
-                <dl><dt>{t.role}</dt><dd>{source.role || t.unassigned}</dd></dl>
-                <span className={`health health-${source.health}`}>{t[source.health]}</span>
-                {!source.enabled && <span className="badge">{t.disabled}</span>}
-              </article>)}</div>
-              {sources.items.length === 0 && <p>{t.noSources}</p>}
-            </> : selected === 'sources' && sources.state === 'failed' ? <p role="alert">{t.sourcesUnavailable}</p>
+                : selected === 'sources' && access.role === 'owner' && services.loadSceneCalibration ? <>
+              {/* Issue #205: the Owner's scene calibration lives with the sources. */}
+              {sources.state === 'ready' && <SourceCards t={t} items={sources.items} />}
+              <CalibrationScreen services={services} t={t} />
+            </> : selected === 'sources' && access.role === 'owner' && sources.state === 'ready'
+              ? <SourceCards t={t} items={sources.items} />
+              : selected === 'sources' && sources.state === 'failed' ? <p role="alert">{t.sourcesUnavailable}</p>
               : selected === 'sources' && sources.state === 'loading' ? <p role="status">{t.checking}</p>
               : selected === 'recordings' && recordings.state === 'ready'
                 ? <RecordingsView t={t} recordings={recordings.items} owner={access.role === 'owner'} actions={actions} busy={busy}

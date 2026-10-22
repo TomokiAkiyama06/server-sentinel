@@ -274,4 +274,16 @@ and geometry. Its scene-change measurements are bounded scalars and never
 person identities, and a detector that cannot register a scene reliably reports
 `unknown` rather than a trustworthy "no tamper".
 
+The Issue #205 Owner calibration keeps the reference frame only in the Main
+process's memory (Owner decision 2026-10-22): no reference frame, crop,
+reduced image or other image-derived data is written to disk, and the Owner
+status route returns no pixel, digest, polygon or policy. The history also
+records the luma reader (capture format, resolution and decoder version
+pins; no device path or serial). Because the frame does not survive a
+restart, Main takes the reference again from the camera after every restart
+with the stored settings and notifies the Owner with a fixed, value-free
+message (`scene_reference_reacquired`); a person in view at that moment is
+part of that in-memory reference just as in an Owner calibration, and is
+never identified or stored.
+
 The Issue #20 detector foundation keeps only bounded transient grayscale samples and a previous motion sample per source. It performs no model download, persistence or network I/O; unavailable person inference remains `unknown`. Model/runtime adoption and their separate privacy/license acceptance are documented in `server/docs/DETECTOR_MODEL_AUDIT.md`; synthetic primitive tests are not acceptance of an external model.

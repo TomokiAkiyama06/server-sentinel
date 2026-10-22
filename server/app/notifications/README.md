@@ -22,6 +22,12 @@ person/motion/entry/camera-offline observations stay local until the summary;
 a `camera_offline` recorded `confirmed=True` (the source stayed offline for the
 deployment threshold, Issue #301 item 2, `../monitoring/cameras.py`, which
 caps it per hour) is immediate like a confirmed server movement.
+`scene_reference_reacquired` and `scene_calibration_required` (Issue #205,
+Owner decision 2026-10-22, option A) are immediate as well: after a Main
+restart a stored scene calibration's reference was taken again from the
+camera without the Owner, or could not be; `app.main` submits them on the
+monitoring worker, at most one of each per source and process, with no
+source, image or reason in the text.
 Such a local-only event returns `suppressed` when it was written or retained for
 the `poll()` retry, and `failed` when the write was refused with the retry
 buffer full (the event is dropped), so callers can retry with the same

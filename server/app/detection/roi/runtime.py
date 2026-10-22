@@ -19,14 +19,19 @@ leaves the others running.
 
 The runtime fails closed throughout. Without a durable critical recorder no
 detector runs. Without a stored calibration whose reference frame can be
-re-bound (the Owner calibration route is Issue #10), a source stays inactive
-and `unknown`; no baseline is fabricated from live frames. Poor or unknown
+re-bound, a source stays inactive and `unknown`; no baseline is fabricated
+from live frames on the runtime's own initiative. A reference is taken from
+live frames only on an explicit `acquire_reference()` request: the Owner
+calibration route, or the re-acquisition after a Main restart that the Owner
+chose (Owner decision 2026-10-22, option A) and is notified of; both go
+through `app.detection.roi.calibration_service`. Poor or unknown
 quality, an undecodable frame, a sampling gap, critical backpressure or an
 evaluation failure is `unknown`, never "no movement" or "no tamper". Results
 are neutral scene observations; they never name a person or assert a cause.
 No frame or pixel is retained after evaluation, and nothing is persisted here.
 """
 
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -48,7 +53,7 @@ from .contracts import Calibration, CriticalObservation
 from .delivery import MAXIMUM_BATCH, CriticalRecorder
 from .detector import SceneDetector
 from .mjpg import MAXIMUM_FRAME_BYTES, MjpgFrameRejected, MjpgLumaLayout
-from .mjpg_worker import MjpgDecoderProcess
+from .mjpg_worker import NUMPY_VERSION, SIMPLEJPEG_VERSION, MjpgDecoderProcess
 
 
 MAXIMUM_SOURCES = 4
@@ -104,6 +109,51 @@ class CalibrationUnavailable(Exception):
             reason = "calibration_unavailable"
         super().__init__(reason)
         self.reason = reason
+
+
+class ReferenceUnavailable(Exception):
+    """A reference acquisition's fixed, value-free refusal (Issue #205)."""
+
+    REASONS = frozenset({
+        # Another acquisition of this source is still running.
+        "busy",
+        # The runtime is not running (not started, stopping, stopped, failed).
+        "unavailable",
+        # The requested reference geometry cannot be read from this source
+        # (capture layout, quality pixel budget, decoder not installed).
+        "geometry_unsupported",
+        # No frame of the source could be read before the deadline.
+        "no_frame",
+        # Frames arrived but never passed both detectors' quality gates.
+        "quality_insufficient",
+        # The requester gave up (timeout on its side, shutdown).
+        "cancelled",
+    })
+
+    def __init__(self, reason: str):
+        if reason not in self.REASONS:
+            reason = "unavailable"
+        super().__init__(reason)
+        self.reason = reason
+
+
+def reader_identity(binding: "SceneSourceBinding") -> str:
+    """The fixed, value-free name of the luma reader of `binding`.
+
+    Recorded with every calibration (Issue #205, the follow-up of PR #225):
+    a reference re-acquired after a restart must come through the same
+    reader (same capture layout and decoder pins), otherwise the stored
+    calibration is not re-used. It names no device, path or serial.
+    """
+    layout = binding.layout
+    if isinstance(layout, MjpgLumaLayout):
+        return (f"mjpg:simplejpeg={SIMPLEJPEG_VERSION}:numpy={NUMPY_VERSION}:"
+                f"{layout.width}x{layout.height}")
+    if isinstance(layout, PackedLumaLayout):
+        return f"packed:{layout.pixel_format.lower()}:{layout.width}x{layout.height}"
+    # A producer that offers decoded luma (`offer_luma`); its own decoder is
+    # outside this runtime.
+    return f"decoded:{binding.source_type.value}"
 
 
 class CalibrationProvider(Protocol):
@@ -479,6 +529,34 @@ class _Published:
     undecodable: dict = field(default_factory=dict)
 
 
+class _Acquisition:
+    """One pending reference acquisition (worker-side, under the runtime lock
+    for its creation and cancellation).
+
+    Fresh quality gates of the source's own two detector policies: a frame
+    becomes the reference only once both report `sufficient`, which needs
+    each policy's `recovery_frames` consecutive good samples of one stream.
+    """
+
+    def __init__(self, binding, width, height, requested_ns, deadline_ns):
+        self.width, self.height = width, height
+        self.requested_ns, self.deadline_ns = requested_ns, deadline_ns
+        self.future = Future()
+        self.movement_gate = QualityGate(binding.source_id, binding.movement_quality)
+        self.tamper_gate = QualityGate(binding.source_id, binding.tamper_quality)
+        # Whether any frame of the source could be read at all, so a refusal
+        # says `quality_insufficient` rather than `no_frame`.
+        self.read = False
+
+    def fail(self, reason):
+        if not self.future.done():
+            self.future.set_exception(ReferenceUnavailable(reason))
+
+    def succeed(self, frame):
+        if not self.future.done():
+            self.future.set_result(frame)
+
+
 class _Context:
     """Worker-only detector state for one source."""
 
@@ -518,6 +596,8 @@ class _Context:
         self.unprocessed_loss = None
         # The unprocessed loss `stop()` already counted in `losses_cleared`.
         self.cleared_loss = None
+        # A pending `acquire_reference()` (at most one per source).
+        self.acquisition = None
 
 
 @dataclass(frozen=True)
@@ -761,6 +841,11 @@ class SceneMonitoringRuntime:
         return self.configuration.source_ids
 
     @property
+    def calibrations(self) -> CalibrationProvider | None:
+        """The injected calibration provider (read-only)."""
+        return self._deps.calibrations
+
+    @property
     def refresh_interval_seconds(self) -> float:
         """How often an embedder should re-read `status()` (worker tick)."""
         return self._deps.tick_seconds
@@ -824,6 +909,9 @@ class SceneMonitoringRuntime:
         with self._lock:
             self._accepting = False
             self._stopping = True
+            # A pending reference acquisition ends now; nothing is taken from
+            # the final pass.
+            self._fail_acquisitions_locked("unavailable")
             for context in self._contexts.values():
                 if context.decoder is not None:
                     # No decode child is started any more; a running one
@@ -952,6 +1040,80 @@ class SceneMonitoringRuntime:
             if not self._accepting:
                 return
         self._cycle()
+
+    def binding(self, source_id: UUID) -> SceneSourceBinding | None:
+        slot = self._slots.get(source_id) if isinstance(source_id, UUID) else None
+        return slot.binding if slot is not None else None
+
+    def calibration_refusal(self, calibration: Calibration) -> str | None:
+        """Why `_bind` would refuse `calibration` for its source, or None.
+
+        The same checks the worker applies when it binds (source, type and
+        profile, sampling gap, quality pixel budget, capture layout, decoder,
+        `SceneDetector` support), so a calibration is checked before it is
+        stored rather than stored and then refused.
+        """
+        binding = self.binding(getattr(calibration, "source_id", None))
+        if binding is None:
+            return "calibration_mismatch"
+        return self._refusal(binding, calibration)
+
+    def acquire_reference(self, source_id: UUID, width: int, height: int, *,
+                          timeout_ns: int) -> Future:
+        """Take the next good frame of `source_id` as a calibration reference.
+
+        Only on an explicit request (the Owner calibration route, or the
+        restart re-acquisition the Owner chose, #205): the worker reads the
+        next samples captured after this call at `width` x `height` through
+        the source's own reviewed luma reader, assesses them with fresh
+        quality gates of both detectors and resolves the returned future
+        with the first `GrayFrame` that both report `sufficient`. The frame
+        exists only in memory. The future fails with `ReferenceUnavailable`
+        (`no_frame`, `quality_insufficient`, `unavailable`, `cancelled`)
+        when the deadline passes or the runtime stops; a request that cannot
+        be served at all raises it at once (`busy`, `unavailable`,
+        `geometry_unsupported`).
+        """
+        binding = self.binding(source_id)
+        if binding is None:
+            raise ReferenceUnavailable("unavailable")
+        if (type(width) is not int or type(height) is not int or width <= 0 or height <= 0
+                or width * height > min(binding.movement_quality.maximum_pixels,
+                                        binding.tamper_quality.maximum_pixels)
+                or binding.layout is not None and (not binding.layout.compatible(width, height)
+                                                   or not binding.layout.available())):
+            raise ReferenceUnavailable("geometry_unsupported")
+        if type(timeout_ns) is not int or timeout_ns <= 0:
+            raise ValueError("invalid acquisition timeout")
+        now = self._deps.monotonic_ns()
+        with self._lock:
+            if not self._accepting or self._stopping:
+                raise ReferenceUnavailable("unavailable")
+            context = self._contexts[source_id]
+            if context.acquisition is not None:
+                raise ReferenceUnavailable("busy")
+            acquisition = _Acquisition(binding, width, height, now, now + timeout_ns)
+            context.acquisition = acquisition
+            self._wake.notify_all()
+        if context.decoder is not None:
+            # An inactive source has no decode child yet (it starts at bind).
+            context.decoder.prepare()
+        return acquisition.future
+
+    def cancel_acquisition(self, source_id: UUID, future: Future) -> None:
+        """End the acquisition behind `future` (its requester gave up)."""
+        with self._lock:
+            context = self._contexts.get(source_id) if isinstance(source_id, UUID) else None
+            acquisition = context.acquisition if context is not None else None
+            if acquisition is not None and acquisition.future is future:
+                context.acquisition = None
+                acquisition.fail("cancelled")
+
+    def _fail_acquisitions_locked(self, reason):
+        for context in self._contexts.values():
+            acquisition, context.acquisition = context.acquisition, None
+            if acquisition is not None:
+                acquisition.fail(reason)
 
     def request_calibration_refresh(self, source_id: UUID | None = None) -> None:
         """Re-resolve calibration on the worker (after an Owner save, #10)."""
@@ -1140,6 +1302,7 @@ class SceneMonitoringRuntime:
             # more samples are accepted, so nothing reads as current.
             with self._lock:
                 self._accepting = False
+                self._fail_acquisitions_locked("unavailable")
                 # After stop() the lifecycle is final (STOPPED/STOP_FAILED):
                 # the late failure is logged as a failure, not as a transition.
                 log = not self._unavailable_logged and not self._withdrawn
@@ -1250,6 +1413,12 @@ class SceneMonitoringRuntime:
                 # Once per refresh request; value-free. `status()` lowers the
                 # source for as long as the deferral lasts.
                 logging.getLogger(__name__).error(Event.SCENE_CALIBRATION_REFRESH_DEFERRED)
+            if context.acquisition is not None:
+                # Before detection, which releases the sample's bytes.
+                try:
+                    self._acquire(context, sample, loss, now)
+                except Exception:
+                    self._settle_acquisition(context, context.acquisition, reason="unavailable")
             context.unprocessed_loss = loss
             try:
                 if refresh or context.detector is None and (
@@ -1289,24 +1458,8 @@ class SceneMonitoringRuntime:
             except Exception:
                 reason = "calibration_unavailable"
         if reason is None:
-            reference = getattr(calibration, "reference", None)
-            if (not isinstance(calibration, Calibration) or calibration.source_id != binding.source_id
-                    or calibration.source_type is not binding.source_type
-                    or calibration.profile_id != binding.profile_id):
-                reason = "calibration_mismatch"
-            elif binding.sample_interval_ns >= calibration.policy.maximum_gap_ns:
-                reason = "sampling_exceeds_gap"
-            elif reference.width * reference.height > min(
-                    binding.movement_quality.maximum_pixels, binding.tamper_quality.maximum_pixels):
-                reason = "quality_budget_exceeded"
-            elif binding.layout is not None and not binding.layout.compatible(
-                    reference.width, reference.height):
-                reason = "capture_layout_incompatible"
-            elif binding.layout is not None and not binding.layout.available():
-                # The reviewed MJPG decoder (exact simplejpeg / numpy pins) is
-                # not installed: nothing can be decoded, so nothing is bound.
-                reason = "frame_decoder_unavailable"
-            else:
+            reason = self._refusal(binding, calibration)
+            if reason is None:
                 try:
                     detector = SceneDetector(calibration)
                 except Exception:
@@ -1443,20 +1596,7 @@ class SceneMonitoringRuntime:
             self._end_episode(context, item, "critical_backpressure", "backpressured")
             return
         try:
-            if context.decoder is not None:
-                try:
-                    pixels = context.binding.layout.luma(item.data, reference.width,
-                                                         reference.height, context.decoder)
-                finally:
-                    self._decoder_health(context)
-                width, height = reference.width, reference.height
-            elif context.binding.layout is not None:
-                pixels = context.binding.layout.luma(item.data, reference.width, reference.height)
-                width, height = reference.width, reference.height
-            else:
-                pixels, width, height = item.data, item.width, item.height
-            frame = GrayFrame(context.binding.source_id, item.stream_id, item.sequence,
-                              width, height, pixels)
+            frame = self._read(context, item, reference.width, reference.height)
         except MjpgFrameRejected as rejected:
             with self._lock:
                 counts = self._target_locked(context.binding.source_id).undecodable
@@ -1480,6 +1620,96 @@ class SceneMonitoringRuntime:
                                           movement_quality=movement.quality,
                                           tamper_quality=tamper.quality, roi_occluded=None)
         self._handle(context, result, item.monotonic_ns, reason="evaluated")
+
+    def _read(self, context, item, width, height):
+        """The sample's luma at `width` x `height` through the source's reader.
+
+        Raises `MjpgFrameRejected` for a refused MJPG frame and another
+        exception for any other unreadable sample. Does not release the
+        sample's bytes.
+        """
+        if context.decoder is not None:
+            try:
+                pixels = context.binding.layout.luma(item.data, width, height, context.decoder)
+            finally:
+                self._decoder_health(context)
+        elif context.binding.layout is not None:
+            pixels = context.binding.layout.luma(item.data, width, height)
+        else:
+            pixels, width, height = item.data, item.width, item.height
+        return GrayFrame(context.binding.source_id, item.stream_id, item.sequence,
+                         width, height, pixels)
+
+    def _acquire(self, context, sample, loss, now):
+        """One worker pass of a pending reference acquisition."""
+        acquisition = context.acquisition
+        if acquisition is None:
+            return
+        binding = context.binding
+        if loss is not None:
+            # A camera loss interrupts the consecutive good samples a
+            # reference needs; a sample from before it is not used either.
+            acquisition.movement_gate = QualityGate(binding.source_id, binding.movement_quality)
+            acquisition.tamper_gate = QualityGate(binding.source_id, binding.tamper_quality)
+            if sample is not None and sample.monotonic_ns <= loss.monotonic_ns:
+                sample = None
+        if (sample is not None and sample.data is not None
+                and sample.monotonic_ns > acquisition.requested_ns):
+            try:
+                frame = self._read(context, sample, acquisition.width, acquisition.height)
+                if (frame.width, frame.height) != (acquisition.width, acquisition.height):
+                    frame = None
+            except Exception:
+                # Refused or undecodable: no reference; quality recovery
+                # restarts with the next readable sample.
+                frame = None
+                acquisition.movement_gate = QualityGate(binding.source_id, binding.movement_quality)
+                acquisition.tamper_gate = QualityGate(binding.source_id, binding.tamper_quality)
+            if frame is not None:
+                acquisition.read = True
+                movement = acquisition.movement_gate.assess(frame, execution=Execution.READY)
+                tamper = acquisition.tamper_gate.assess(frame, execution=Execution.READY)
+                if movement.allows_conclusion and tamper.allows_conclusion:
+                    self._settle_acquisition(context, acquisition, frame=frame)
+                    return
+        if now >= acquisition.deadline_ns:
+            self._settle_acquisition(context, acquisition, reason=(
+                "quality_insufficient" if acquisition.read else "no_frame"))
+
+    def _settle_acquisition(self, context, acquisition, *, frame=None, reason=None):
+        with self._lock:
+            if acquisition is None or context.acquisition is not acquisition:
+                return
+            context.acquisition = None
+        if frame is not None:
+            acquisition.succeed(frame)
+        else:
+            acquisition.fail(reason)
+
+    def _refusal(self, binding, calibration):
+        """Why this binding cannot be bound to `calibration` (see `_bind`)."""
+        reference = getattr(calibration, "reference", None)
+        if (not isinstance(calibration, Calibration) or calibration.source_id != binding.source_id
+                or calibration.source_type is not binding.source_type
+                or calibration.profile_id != binding.profile_id):
+            return "calibration_mismatch"
+        if binding.sample_interval_ns >= calibration.policy.maximum_gap_ns:
+            return "sampling_exceeds_gap"
+        if reference.width * reference.height > min(
+                binding.movement_quality.maximum_pixels, binding.tamper_quality.maximum_pixels):
+            return "quality_budget_exceeded"
+        if binding.layout is not None and not binding.layout.compatible(
+                reference.width, reference.height):
+            return "capture_layout_incompatible"
+        if binding.layout is not None and not binding.layout.available():
+            # The reviewed MJPG decoder (exact simplejpeg / numpy pins) is
+            # not installed: nothing can be decoded, so nothing is bound.
+            return "frame_decoder_unavailable"
+        try:
+            SceneDetector(calibration)
+        except Exception:
+            return "calibration_refused"
+        return None
 
     def _decoder_health(self, context):
         """Log (value-free, once per transition) a decode child that keeps

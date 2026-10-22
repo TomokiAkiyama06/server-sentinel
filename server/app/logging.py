@@ -43,6 +43,12 @@ class Event(StrEnum):
     SCENE_CALIBRATION_REFRESH_DEFERRED = "scene_calibration_refresh_deferred"
     SCENE_STREAM_HISTORY_EXHAUSTED = "scene_stream_history_exhausted"
     SCENE_UNDELIVERED_UNRECORDED = "scene_undelivered_unrecorded"
+    # Issue #205 calibration (Owner decision 2026-10-22, option A): a
+    # reference re-acquired after a restart, a source whose stored
+    # calibration could not be re-acquired, and an undelivered notice.
+    SCENE_REFERENCE_REACQUIRED = "scene_reference_reacquired"
+    SCENE_CALIBRATION_REQUIRED = "scene_calibration_required"
+    SCENE_CALIBRATION_NOTICE_UNDELIVERED = "scene_calibration_notice_undelivered"
     HUMAN_LISTENER_ACTIVATION_INVALID = "human_listener_activation_invalid"
     HUMAN_REQUEST_RATE_LIMITED = "human_request_rate_limited"
     INVITATION_REDEMPTION_REFUSED = "invitation_redemption_refused"

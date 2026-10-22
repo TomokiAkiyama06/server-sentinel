@@ -239,6 +239,8 @@ Person/face implementations remain replaceable. Code and model/weight licenses a
 ### DET-004 Server ROI/movement
 One or more sources may have server ROI/polygon/reference geometry. Meaningful displacement/rotation requires temporal/scene confirmation; person presence alone is not proof of movement.
 
+The Owner calibrates a source (with step-up) after confirming the camera and server are in their normal position; the reference frame stays in memory only and no image-derived data is stored on disk. After a Main restart the reference is re-acquired from the camera with the stored settings and the Owner is notified immediately; such a reference is shown as not confirmed by the Owner until the Owner calibrates again (Owner decision 2026-10-22, option A, Issue #205).
+
 ### DET-005 Camera tamper
 Detect probable camera tampering using signals available to the source, including where applicable sudden global scene transform, camera occlusion, stream interruption, abrupt orientation/pose change visible in the scene, and source-health changes correlated with motion.
 

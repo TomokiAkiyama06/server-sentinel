@@ -76,6 +76,14 @@
     {
       "path": "web/tests/access_browser.mjs",
       "sha256": "sha256:7324d34d3a0416e46ec6db42ee032a994a761de105f5e1ffa6caa9d32d967173"
+    },
+    {
+      "path": "web/tests/calibration.test.mjs",
+      "sha256": "sha256:e352af31c13a7f0f802bd314e5c496f713391fe59ff290c265f847455ab7c016"
+    },
+    {
+      "path": "web/tests/calibration_browser.mjs",
+      "sha256": "sha256:e913d20e59fdc0c95db1bcff2065813d9564e8392c3cb25407828a555edcbfdb"
     }
   ],
   "inputs": [

@@ -658,6 +658,8 @@ OpenAPI or error handler is reachable):
 | `POST /api/live/sessions` | `LIVE` + exact `Origin` + `X-CSRF-Token` (live limiter) | `{"session_id", "source_id", "lease_seconds", "frame_interval_ms"}` (S7) |
 | `GET /api/live/sessions/<session>/frame?after=<n>` | `LIVE`, the opening human session only | `200 image/jpeg` + `X-Frame-Sequence`, or `204` (S7) |
 | `POST /api/live/sessions/<session>/close` | `SESSION` + exact `Origin` + `X-CSRF-Token`; only a held id with its opening cookie | `204` (S7) |
+| `GET /api/scene/calibration` | Owner session (`OWNER_READ`); only with an attached `SceneCalibrationService` | `{"sources": [{"source_id", "origin", "version", "calibrated_at", "phase", "failure", "owner_calibration_available", "detection", "detection_reason"}]}` (Issue #205; no pixel, digest, polygon or policy) |
+| `POST /api/scene/sources/<id>/calibration` | fresh Owner session (`OWNER_OP`, step-up) + exact `Origin` + `X-CSRF-Token` (administration limiter); body exactly `{"normal_position_confirmed": true}` | `200 {"outcome": "calibrated", "version", "calibrated_at"}` or `200 {"outcome": "refused", "reason"}`; audited `calibrate_scene_source` (Issue #205, `app.detection.roi.calibration_service`) |
 
 The session route grants nothing and returns only the caller's own role,
 permissions (the Owner holds both) and CSRF token. Apart from sign-out, the

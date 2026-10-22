@@ -370,6 +370,49 @@ class AccessAdministration:
         ))
 
 
+class SceneCalibrationAdministration:
+    """The Owner's scene calibration with its audit record (Issue #205).
+
+    The same contract as ``AccessAdministration``: an
+    ``OwnerOperationContext`` of the request's gated ``OWNER_OP``
+    authorization (``HumanOwnerAuthorizer``), the commit inside
+    ``admit(epoch)`` of that same authorization (lock order: gate -> storage
+    admission -> SQLite), and the Owner session read again inside the
+    transaction (``AccessStore.require_owner_session_on``), so a session
+    that ended or whose verification went stale while the reference was
+    read changes nothing. ``prepare`` (reading the reference from the
+    camera, which may take seconds) runs after the authorization and outside
+    the transaction and the gate; its refusal is a ``failed`` record. The
+    calibration's provenance and the ``calibrate_scene_source`` record
+    commit in one transaction. Only the source's logical UUID reaches the
+    audit log. This class registers no route.
+    """
+
+    def __init__(self, service, access_store, *, session_gate):
+        if getattr(service.store, "database", None) != access_store.database:
+            raise ValueError("calibration audit must share the access database")
+        if not isinstance(session_gate, ServingGate):
+            raise ValueError("session gate is invalid")
+        self.service = service
+        self.access = access_store
+        self.session_gate = session_gate
+
+    def calibrate(self, actor_context, source_id, prepare, persist, *, epoch):
+        def run(connection, prepared):
+            at = self.access.now()
+            if (not isinstance(actor_context, OwnerOperationContext) or isinstance(epoch, bool)
+                    or not isinstance(epoch, int) or actor_context.epoch != epoch):
+                raise AccessValidationError("access is unavailable")
+            self.access.require_owner_session_on(connection, actor_context.session, at)
+            return persist(connection, prepared)
+
+        return self.service.execute_transactional(
+            actor_context, action=AuditAction.CALIBRATE_SCENE_SOURCE,
+            target_kind=TargetKind.SCENE_CALIBRATION, target_logical_id=source_id,
+            operation=run, prepare=prepare, reservation=lambda: self.session_gate.admit(epoch),
+        )
+
+
 class ReservationAdministration:
     """Owner-only change of the hostname-reservation listener exceptions.
 

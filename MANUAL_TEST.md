@@ -1263,7 +1263,7 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   is wired in `create_app()` (`scene_timeline`, Issue #205; synthetic
   verification in `server/tests/test_scene_timeline.py`), but the production
   launcher does not build scene monitoring yet, so this needs the deployment
-  section and the Owner calibration route first (follow-up).
+  section first (follow-up; the Owner calibration route exists since #205).
 - [ ] (#26) a confirmed server movement or camera tamper on the deployment
   sends exactly one `ServerSentinel critical alert: server_movement` /
   `camera_tamper` to the configured Slack within about 5 s (the dispatch interval), in every
@@ -1278,7 +1278,48 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   `critical_evidence` stays unavailable (no evidence port yet). Verified so
   far only with synthetic observations and an intercepted Slack transport
   (`server/tests/test_critical_notifications.py`); needs the same deployment
-  section and calibration route as above.
+  section as above.
+
+### Issue #205 Owner calibration and restart re-acquisition (pending, not executed)
+
+Owner decision 2026-10-22 (option A). Verified only with generated frames, a
+synthetic human surface and an intercepted Slack transport
+(`server/tests/test_scene_calibration.py`,
+`server/tests/test_scene_calibration_routes.py`, `web/tests/calibration*.mjs`).
+Needs the deployment section that builds scene monitoring and its calibration
+templates (a follow-up of #205). On the deployment, with the Owner present:
+
+- [ ] Sources view: each configured source shows `未校正` before any
+  calibration; the calibrate button stays disabled until the normal-position
+  statement is ticked; the screen shows no image, digest or polygon;
+- [ ] with the camera and server in their normal position, an Owner
+  calibration on a fresh session succeeds within about 10 s, a stale session
+  first asks for the passkey and then succeeds once; the source becomes
+  active; `security_admin_audit_records` has one `calibrate_scene_source`
+  (`owner`, `succeeded`) and `roi_calibration_history` one more version whose
+  metadata holds no pixel data (only geometry, polygon, policy, digest and
+  `reader`);
+- [ ] with the lens covered or the room dark, the calibration is refused
+  (`quality_insufficient` or `scene_unsuitable`) with a `failed` audit record
+  and nothing stored; with the camera unplugged it is `no_frame`;
+- [ ] restart the Main service: within about a minute the source is active
+  again with origin `restart_reacquired`, the Owner receives exactly one
+  `ServerSentinel critical alert: scene_reference_reacquired` per source in
+  Slack, `notification_events` has the `sent` row, the audit log has a
+  `reacquire_scene_reference` (`system`, `succeeded`), and no file under the
+  data or recording directories contains image data from the reference;
+- [ ] restart with the camera unplugged: one
+  `scene_calibration_required` alert per source, the source stays inactive and
+  `unknown`; after re-plugging it is re-acquired within the retry interval
+  (60 s) and `scene_reference_reacquired` is sent;
+- [ ] change the camera's negotiated format or resolution (or the MJPG
+  decoder pins) and restart: the stored calibration is not re-used
+  (`reader_changed`, one `scene_calibration_required`); an Owner calibration
+  restores detection;
+- [ ] move the camera slightly while the Main service is stopped, then
+  start it: the re-acquired reference does **not** report the move (expected,
+  documented limit); the Owner sees the `restart_reacquired` warning and
+  recalibrates after checking the live view.
 
 ### Issue #217 MJPG decoder on real C960 frames (pending physical execution)
 

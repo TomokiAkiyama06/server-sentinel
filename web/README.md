@@ -483,6 +483,51 @@ proxy identity or credential handle on screen). The stand-in does not verify
 signatures (the server's verifier tests do); neither file proves the real
 routes, Safari, iOS/Android or a real passkey provider (MANUAL_TEST.md).
 
+## Owner scene calibration for #205
+
+`src/calibration/screen.tsx` is shown to the Owner on the Sources view when the
+provider offers `loadSceneCalibration` (the production provider always does;
+the existing source cards stay above it when a source list exists). Routes
+(server-side `OWNER_READ` / `OWNER_OP`, Owner decision 2026-10-22, option A):
+
+```text
+GET  /api/scene/calibration                           200 {"sources":[{source_id, origin, version, calibrated_at,
+                                                           phase, failure, owner_calibration_available,
+                                                           detection, detection_reason}]}
+POST /api/scene/sources/<id>/calibration  {"normal_position_confirmed":true}
+                                                      200 {"outcome":"calibrated","version","calibrated_at"}
+                                                      200 {"outcome":"refused","reason":<fixed reason>}
+```
+
+- The status parser (`parseSceneCalibration`) fails closed as a whole and
+  copies only the documented fields, so no image, digest, polygon or policy a
+  server might add can be rendered; nothing on the screen draws an image.
+  Camera names come from `GET /api/live/sources` (an id prefix without one).
+- Each source shows where its calibration came from: `owner`, or
+  `restart_reacquired`, taken again from the camera after a Main restart
+  without the Owner. The latter carries a warning that a camera or server
+  moved while Main was down is not detected against it, and asks the Owner to
+  check the live view and calibrate again.
+- The calibrate button is enabled only after the Owner ticks the explicit
+  normal-position statement; the request carries that statement. A
+  `step_up_required` answer runs the same step-up prompt and single retry as
+  the access screen (`shared/step_up.ts`). The request is bounded by
+  `CALIBRATION_REQUEST_MS` (45 s; the server reads the camera for at most
+  30 s), every other request by the usual 10 s. A refusal shows its fixed
+  reason; an unknown outcome reloads the status. `pagehide` abandons a
+  calibration in flight like the access screen. Nothing is written to
+  browser storage.
+
+Tests: `tests/calibration.test.mjs` (fake `fetch`: strict decoding, request
+shape, CSRF, the step-up answer, the longer bound, rendered cards, and ja/en
+key parity) and `tests/calibration_browser.mjs` (part of `npm run
+test:browser`: the built dashboard in Chrome with intercepted requests and a
+CDP virtual authenticator: status, the disabled control before the
+statement, a stale Owner confirming and the calibration sent exactly once
+more, a refusal, a declined step-up, a failed ceremony, CSP, no storage
+write, no digest or image on screen). Neither proves the real routes, a real
+camera or a real passkey provider (MANUAL_TEST.md §E).
+
 ## Sign-in shell and build split for #10 phase 2 S5a
 
 Owner decisions S5-1 .. S5-5 (Issue #10, 2026-10-14). The Web build produces

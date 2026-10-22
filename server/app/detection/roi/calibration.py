@@ -17,7 +17,7 @@ from uuid import UUID
 from app.cameras.registry.models import SourceType, timestamp
 from app.detection.foundation import GrayFrame
 from app.detection.foundation.contracts import positive_integer
-from .contracts import Calibration, Policy
+from .contracts import Calibration, Policy, valid_reader
 from .detector import SceneDetector
 from .geometry import validate_polygon
 
@@ -28,7 +28,9 @@ COLUMNS = ("source_id", "profile_id", "version", "identifier", "metadata")
 
 def calibration_metadata(calibration):
     reference = calibration.reference
+    reader = {} if calibration.reader is None else {"reader": calibration.reader}
     return {
+        **reader,
         "identifier": str(calibration.identifier), "source_id": str(calibration.source_id),
         "source_type": calibration.source_type.value, "profile_id": str(calibration.profile_id),
         "version": calibration.version, "created_at": calibration.created_at.isoformat(),
@@ -62,11 +64,16 @@ class CalibrationRecord:
     reference_height: int
     reference_sha256: str
     policy: Policy
+    # The luma reader of the reference (``contracts.READER``); ``None`` in a
+    # record written before readers were recorded.
+    reader: str | None = None
 
     def __post_init__(self):
         identities = (self.identifier, self.source_id, self.profile_id, self.reference_stream_id)
         if any(not isinstance(value, UUID) for value in identities):
             raise ValueError("calibration identities must be UUIDs")
+        if not valid_reader(self.reader):
+            raise ValueError("invalid calibration reader")
         if not isinstance(self.source_type, SourceType) or not isinstance(self.policy, Policy):
             raise ValueError("invalid source type or calibration policy")
         positive_integer(self.version, "calibration version")
@@ -105,7 +112,7 @@ class CalibrationRecord:
             raise ValueError("reference frame does not match calibration history")
         calibration = Calibration(self.identifier, self.source_id, self.source_type,
                                   self.profile_id, self.version, self.created_at,
-                                  self.polygon, reference, self.policy)
+                                  self.polygon, reference, self.policy, self.reader)
         if calibration.reference_sha256 != self.reference_sha256:
             raise ValueError("calibration reference integrity failed")
         SceneDetector(calibration)
@@ -119,7 +126,8 @@ def _record(calibration: Calibration) -> CalibrationRecord:
                              calibration.version, calibration.created_at,
                              calibration.polygon, reference.stream_id, reference.sequence,
                              reference.width, reference.height,
-                             calibration.reference_sha256, calibration.policy)
+                             calibration.reference_sha256, calibration.policy,
+                             calibration.reader)
 
 
 def _decode(metadata) -> CalibrationRecord:
@@ -134,7 +142,7 @@ def _decode(metadata) -> CalibrationRecord:
                              tuple(tuple(point) for point in value["polygon"]),
                              UUID(reference["stream_id"]), reference["sequence"],
                              reference["width"], reference["height"],
-                             reference["sha256"], Policy(**policy))
+                             reference["sha256"], Policy(**policy), value.get("reader"))
 
 
 def decode_history_row(row) -> CalibrationRecord:
@@ -160,6 +168,45 @@ def decode_history_row(row) -> CalibrationRecord:
             str(record.identifier)) != tuple(row[:4]):
         raise ValueError("calibration history record does not match its key")
     return record
+
+
+def _insert(connection, calibration: Calibration) -> None:
+    latest = connection.execute(
+        "SELECT version, identifier FROM roi_calibration_history WHERE source_id=? AND profile_id=? ORDER BY version DESC LIMIT 1",
+        (str(calibration.source_id), str(calibration.profile_id)),
+    ).fetchone()
+    expected = latest[0] + 1 if latest else 1
+    if calibration.version != expected or latest and latest[1] != str(calibration.identifier):
+        raise ValueError("calibration version or identity conflicts with history")
+    connection.execute("INSERT INTO roi_calibration_history VALUES (?,?,?,?,?)", (
+        str(calibration.source_id), str(calibration.profile_id), calibration.version,
+        str(calibration.identifier), json.dumps(calibration_metadata(calibration), sort_keys=True),
+    ))
+
+
+def append_on(connection: sqlite3.Connection, calibration: Calibration) -> CalibrationRecord:
+    """Append one version inside a caller-owned write transaction.
+
+    For an audited mutation (Issue #205): the calibration's provenance and its
+    audit record commit or roll back together. The caller owns ``BEGIN
+    IMMEDIATE``, the storage admission and the commit; the same version and
+    identity rules as ``CalibrationArchive.append`` apply, and nothing but
+    provenance is written (no pixel, crop or frame).
+    """
+    if not isinstance(connection, sqlite3.Connection) or not connection.in_transaction:
+        raise ValueError("calibration history requires an open transaction")
+    SceneDetector(calibration)
+    try:
+        cursor = connection.execute("SELECT * FROM roi_calibration_history LIMIT 0")
+    except sqlite3.Error:
+        raise RuntimeError("calibration archive unavailable") from None
+    if tuple(column[0] for column in cursor.description) != COLUMNS:
+        raise RuntimeError("calibration archive unavailable")
+    try:
+        _insert(connection, calibration)
+    except sqlite3.Error:
+        raise RuntimeError("calibration archive unavailable") from None
+    return _record(calibration)
 
 
 class CalibrationArchive:
@@ -192,17 +239,7 @@ class CalibrationArchive:
             raise ValueError("archive requires an idle database connection")
         try:
             connection.execute("BEGIN IMMEDIATE")
-            latest = connection.execute(
-                "SELECT version, identifier FROM roi_calibration_history WHERE source_id=? AND profile_id=? ORDER BY version DESC LIMIT 1",
-                (str(calibration.source_id), str(calibration.profile_id)),
-            ).fetchone()
-            expected = latest[0] + 1 if latest else 1
-            if calibration.version != expected or latest and latest[1] != str(calibration.identifier):
-                raise ValueError("calibration version or identity conflicts with history")
-            connection.execute("INSERT INTO roi_calibration_history VALUES (?,?,?,?,?)", (
-                str(calibration.source_id), str(calibration.profile_id), calibration.version,
-                str(calibration.identifier), json.dumps(calibration_metadata(calibration), sort_keys=True),
-            ))
+            _insert(connection, calibration)
             connection.commit()
         except sqlite3.Error:
             connection.rollback()
