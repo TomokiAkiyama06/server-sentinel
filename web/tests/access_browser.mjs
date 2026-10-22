@@ -174,7 +174,7 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true } 
     },
   };
   try {
-    await page.command('Page.navigate', { url: `${origin}/app/` });
+    await page.navigate(`${origin}/app/`);
     await page.heading('概要');
     await assertions({ page, ui, requests, posts, state, authenticatorId, abandoned });
     await delay(100);
