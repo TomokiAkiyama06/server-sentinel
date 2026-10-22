@@ -202,7 +202,11 @@ Runtime-data assumptions:
   (same major) is accepted with the immediate notice instead of refused; the
   exact comparison only refused that by accident (the same clone in the same
   slot passed silently), and the hardware integrity check matches disks by
-  serial/WWID;
+  serial/WWID. File-backed SCSI devices that do have a `device` link (LIO
+  `tcm_loop`/fileio, an iSCSI loopback, `scsi_debug`) are not distinguished
+  from a hardware disk by this rule; creating one requires root, and
+  detection relies on the immediate `recording_device_numbers_changed` notice
+  and the hardware integrity check's serial/WWID matching;
 - the generated unit grants the runtime account write access to the state,
   recording, and audit directories only. The runtime root itself stays
   read-only, so a compromised service cannot replace or remove them;
