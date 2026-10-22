@@ -47,37 +47,38 @@ SYS_DEV_BLOCK = Path("/sys/dev/block")
 MAX_BLOCK_STACK_DEPTH = 8
 
 
-def _loop_backed(node: Path, depth: int = 0) -> bool:
-    """Whether the sysfs block device ``node`` is or sits on a loop device.
+def _hardware_backed(node: Path, depth: int = 0) -> bool:
+    """Whether the sysfs block device ``node`` rests only on hardware disks.
 
-    A partition (`partition` attribute) is judged by its parent disk, the
-    directory that contains it once the `/sys/dev/block` link is resolved:
-    `losetup -P` partitions get the generic extended major (259, as NVMe)
-    and only the parent `loopN` has the `loop/` attribute. A stacked device
-    (device-mapper, md) is judged by every device under `slaves/`, so LVM or
-    dm-crypt on a loop device is a loop device too. True also when the walk
-    is too deep or anything cannot be read (fail closed).
+    An allowlist (Issue #321 review): a partition (`partition` attribute) is
+    judged by its parent disk, the directory that contains it once the
+    `/sys/dev/block` link is resolved; a stacked device (device-mapper, md)
+    by every device under `slaves/`, recursively; and every leaf disk must
+    have a `device` link to its bus device (SCSI, NVMe, virtio). Loop, nbd,
+    ublk, zram and ram disks have none, so an image on the root filesystem,
+    or a dm/LVM mapping on one, is never accepted, whatever its major (a
+    `losetup -P` partition shares major 259 with NVMe). False also when the
+    stack is deeper than `MAX_BLOCK_STACK_DEPTH` or anything cannot be read
+    (fail closed).
     """
     if depth > MAX_BLOCK_STACK_DEPTH:
-        return True
+        return False
     try:
         path = node.resolve(strict=True)
         if (path / "partition").exists():
-            if (path / "loop").exists():
-                return True
             path = path.parent
             if not path.is_dir():
-                return True
+                return False
+        # Defence in depth only: a loop disk also lacks the `device` link.
         if (path / "loop").exists():
-            return True
+            return False
         slaves = path / "slaves"
-        if slaves.exists():
-            for slave in sorted(slaves.iterdir()):
-                if _loop_backed(slave, depth + 1):
-                    return True
+        below = sorted(slaves.iterdir()) if slaves.exists() else []
+        if not below:
+            return (path / "device").exists()
+        return all(_hardware_backed(slave, depth + 1) for slave in below)
     except (OSError, RuntimeError, ValueError):
-        return True
-    return False
+        return False
 
 
 def renumbered_device_acceptable(recorded: tuple[int, int], device: int) -> bool:
@@ -87,12 +88,11 @@ def renumbered_device_acceptable(recorded: tuple[int, int], device: int) -> bool
     runtime root already agree on. An equal pair is always acceptable. A
     differing pair is acceptable only as a reboot renumbering of the same
     kind of device: the major (the driver) is unchanged and only the minor
-    differs, and the device is not and does not sit on a loop device, whose
-    backing file may be on the operating-system root filesystem (a disk image
-    mounted with `-o loop` gets a `/dev/disk/by-uuid` link and a non-root
-    device number). Loop partitions (major 259, shared with NVMe) are found
-    through their parent disk and dm/md stacks through `slaves/`
-    (`_loop_backed`). A device-mapper device is accepted only when the
+    differs, and the device rests only on hardware disks (`_hardware_backed`):
+    a loop device's backing file may be on the operating-system root
+    filesystem (a disk image mounted with `-o loop` gets a
+    `/dev/disk/by-uuid` link and a non-root device number), and loop
+    partitions (major 259) or dm/LVM on a loop device keep a familiar major. A device-mapper device is accepted only when the
     recorded device was one too, which the unchanged major already implies
     (device-mapper has its own major). Missing or unreadable sysfs entries
     refuse (fail closed).
@@ -108,7 +108,7 @@ def renumbered_device_acceptable(recorded: tuple[int, int], device: int) -> bool
             return False
     except (OSError, ValueError):
         return False
-    return not _loop_backed(node)
+    return _hardware_backed(node)
 
 
 @dataclass(frozen=True)

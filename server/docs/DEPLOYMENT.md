@@ -190,10 +190,12 @@ When all of them hold and `runtime_device` (or
 filesystem. A different major is refused as before: the major names the
 driver, and a disk image mounted with `-o loop` (major 7, possibly on the root
 filesystem) or a new device-mapper mapping would otherwise pass the UUID and
-mount checks. A renumbered device that is or sits on a loop device is refused
-too: a partition is judged by its parent disk (`losetup -P` loop partitions
-share major 259 with NVMe), and a device-mapper/md device by every device
-under its sysfs `slaves/`, recursively. A device without a readable entry in
+mount checks. A renumbered device must also rest only on hardware disks: a
+partition is judged by its parent disk (`losetup -P` loop partitions share
+major 259 with NVMe), a device-mapper/md device by every device under its
+sysfs `slaves/`, recursively, and every disk at the bottom must have the
+sysfs `device` link to its bus device (SCSI, NVMe, virtio), which loop, nbd,
+ublk, zram and ram disks lack. A device without a readable entry in
 `/sys/dev/block` is refused as well; a
 device-mapper device is accepted only when the recorded one was
 device-mapper as well (same major). `--check`, the

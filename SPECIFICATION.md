@@ -127,10 +127,11 @@ reformatted disk can reuse them and a reboot can renumber the same disk. While
 the UUID resolves to the device of the runtime root and of the mounted mount
 point (not the root filesystem's), a recorded pair with the same major and
 another minor is reported as stale (value-free launcher warning, Owner notice
-`recording_device_numbers_changed`), not refused; a changed major, a device
-that is or sits on a loop device (a partition judged by its parent disk, a
-dm/md device by its sysfs `slaves/`, recursively) or a device without a
-readable sysfs entry is still refused, and a
+`recording_device_numbers_changed`), not refused, when it rests only on
+hardware disks (a partition judged by its parent disk, a dm/md device by its
+sysfs `slaves/`, recursively, every leaf disk with a sysfs `device` link to
+its bus device); a changed major, a loop/nbd/ublk/zram/ram disk or a mapping
+on one, or a device without a readable sysfs entry is still refused, and a
 device-mapper device only passes when the recorded one was device-mapper too
 (Issue #321). Deployment configuration is administrator-owned
 and runtime-readable but not runtime-writable, and is refused inside the

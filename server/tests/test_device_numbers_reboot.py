@@ -56,9 +56,11 @@ class FakeSysfs:
     """A disposable sysfs patched in as `/sys/dev/block`.
 
     Laid out like the kernel's: `dev/<maj>:<min>` links to the device
-    directory under `devices/`, a partition is a directory inside its parent
-    disk with a `partition` attribute, a loop disk has `loop/backing_file`, a
-    dm device has `dm/` and links its underlying devices under `slaves/`.
+    directory under `devices/`, a hardware disk has a `device` link to its
+    bus device, a partition is a directory inside its parent disk with a
+    `partition` attribute, a loop disk has `loop/backing_file` and no
+    `device`, a virtual disk (nbd, zram) has neither, a dm device has `dm/`
+    and links its underlying devices under `slaves/`.
     """
 
     def __init__(self, case: unittest.TestCase):
@@ -67,14 +69,23 @@ class FakeSysfs:
         self.root = Path(temporary.name)
         (self.root / "dev").mkdir()
         (self.root / "devices").mkdir()
+        (self.root / "bus").mkdir()
         patcher = patch("app.monitoring.config.SYS_DEV_BLOCK", self.root / "dev")
         patcher.start()
         case.addCleanup(patcher.stop)
 
     def device(self, device: int, name: str, *, parent: Path | None = None,
-               loop: bool = False, dm: bool = False, slaves=()) -> Path:
+               loop: bool = False, dm: bool = False, slaves=(),
+               hardware: bool | None = None) -> Path:
         directory = (parent if parent is not None else self.root / "devices") / name
         directory.mkdir()
+        if hardware is None:
+            # Whole disks that are no loop/dm device are hardware by default.
+            hardware = parent is None and not loop and not dm and not slaves
+        if hardware:
+            bus = self.root / "bus" / name
+            bus.mkdir()
+            (directory / "device").symlink_to(bus)
         if parent is not None:
             (directory / "partition").write_text("1\n")
         if loop:
@@ -90,9 +101,15 @@ class FakeSysfs:
         return directory
 
     def node(self, device: int, kind: str = "disk") -> Path:
-        """Model ``device`` as a plain disk, a loop disk or a dm device."""
-        return self.device(device, f"{kind}-{os.major(device)}-{os.minor(device)}",
-                           loop=kind == "loop", dm=kind == "dm")
+        """Model ``device`` as a hardware disk, a loop disk, a virtual disk
+        without a bus device (`nbd`) or a dm device on a hardware disk."""
+        name = f"{kind}-{os.major(device)}-{os.minor(device)}"
+        slaves = ()
+        if kind == "dm":
+            slaves = (self.device(os.makedev(8, 240 + os.minor(device) % 16),
+                                  name + "-disk"),)
+        return self.device(device, name, loop=kind == "loop", dm=kind == "dm",
+                           slaves=slaves, hardware=kind == "disk" or None)
 
 
 class DeploymentValidationTests(unittest.TestCase):
@@ -347,7 +364,7 @@ class RecordingFilesystemTests(unittest.TestCase):
             with self.subTest(recorded=recorded, device=(os.major(device), os.minor(device))):
                 self.assertIs(expected, renumbered_device_acceptable(recorded, device))
 
-    def test_loop_found_through_partitions_and_device_mapper_slaves(self):
+    def test_only_devices_resting_on_hardware_disks_are_renumbered(self):
         # `losetup -P` partitions get major 259, the same as NVMe; only the
         # parent loop disk has `loop/`. LVM/dm on a loop device is loop-backed.
         sysfs = FakeSysfs(self)
@@ -362,6 +379,10 @@ class RecordingFilesystemTests(unittest.TestCase):
         sysfs.device(os.makedev(253, 2), "dm-2", dm=True, slaves=(inner,))
         broken = sysfs.root / "devices" / "missing-slave"
         sysfs.device(os.makedev(253, 5), "dm-5", dm=True, slaves=(broken,))
+        nbd = sysfs.device(os.makedev(43, 1), "nbd1", hardware=False)
+        sysfs.device(os.makedev(253, 6), "dm-6", dm=True, slaves=(nbd,))
+        sysfs.device(os.makedev(253, 7), "dm-7", dm=True)
+        sysfs.device(os.makedev(253, 8), "dm-8", dm=True, slaves=(nvme_part, nbd))
         cases = (
             ((259, 1), os.makedev(259, 5), False),  # loop partition, NVMe numbers recorded
             ((259, 7), os.makedev(259, 2), True),   # NVMe partition renumbered
@@ -370,6 +391,10 @@ class RecordingFilesystemTests(unittest.TestCase):
             ((253, 4), os.makedev(253, 1), True),   # dm on an NVMe partition
             ((253, 4), os.makedev(253, 2), False),  # dm on dm on a loop partition
             ((253, 4), os.makedev(253, 5), False),  # unreadable slave: fail closed
+            ((43, 3), os.makedev(43, 1), False),    # nbd-like disk: no bus device
+            ((253, 4), os.makedev(253, 6), False),  # dm over an nbd-like disk
+            ((253, 4), os.makedev(253, 7), False),  # dm without any slave
+            ((253, 4), os.makedev(253, 8), False),  # dm over hardware and nbd
             ((259, 5), os.makedev(259, 5), True),   # an exact match is not re-judged
         )
         for recorded, device, expected in cases:

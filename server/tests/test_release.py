@@ -935,7 +935,9 @@ class ReleaseLifecycleTests(unittest.TestCase):
         # A disposable sysfs models the runtime device as a plain disk.
         sysfs = self.root / "sys-dev-block"
         device = self.runtime.stat().st_dev
-        (sysfs / f"{os.major(device)}:{os.minor(device)}").mkdir(parents=True)
+        node = sysfs / f"{os.major(device)}:{os.minor(device)}"
+        node.mkdir(parents=True)
+        (node / "device").mkdir()  # the bus device link of a hardware disk
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr), patch(
                 "app.monitoring.config.SYS_DEV_BLOCK", sysfs):
