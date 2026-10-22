@@ -400,24 +400,41 @@ sudo systemctl start server-sentinel.service
   - `none`: no camera was ever approved for the source;
   - `approved`: an Owner approval is stored and no service session holds it
     (the usual state with the service stopped; the approval applies on start);
-  - `approved_in_use`: the approval is stored and the running service has
-    started its session for the source (the active-session marker), so it is
-    *not* a lost approval and needs no re-approval. It says nothing about
-    capture: whether the camera is actually online is the source's health;
+  - `approved_in_use`: the approval is stored, the deployment lists the
+    source, it carries an active-session marker and a process of the service
+    account holds the database: most likely the running service started its
+    session for the source, so it is usually *not* a lost approval. The
+    command cannot prove that the marker belongs to the current run, though
+    (see the limits below), and it says nothing about capture: whether the
+    camera is actually online is the source's health;
   - `approval_required`: the source needs an Owner approval before the
     service binds a camera: it was never approved (only the service's
     candidate is stored), the service latched it
     `manual_intervention_required` (for example an ambiguous reconnect of an
     identical camera without a unique serial), or an active-session marker is
-    left while no process holds the database, i.e. the service did not end
-    its session (a crash); the next start then requires the approval again.
-    Approve it with `approve` (the service stopped).
-  `approved_in_use` and the left-marker case are told apart with the same
-  database-holder check as `service_running`, so another local admin command
-  still holding the database also counts as running: list again once it has
+    left that the running service cannot have armed: no process holds the
+    database, or the source is not in `local_uvc.source_ids` (the service
+    starts sessions only for listed sources). Such a marker is a session the
+    service did not end (a crash); the next start that includes the source
+    requires the approval again. Approve it with `approve` (the service
+    stopped).
+  Limits of `approved_in_use`: it is told apart from a left marker with the
+  same database-holder check as `service_running`, so it only shows that
+  *some* process of the service account holds the database, not that the
+  service started this source's session in its current run. After a crash,
+  a restarted service whose local UVC capture has not started (its storage
+  admission refused, its start failed, or it is waiting to retry the start)
+  still holds the database, and the left marker then shows `approved_in_use`
+  although the source will need approval once capture does start; another
+  local admin command still holding the database also counts. Confirm with
+  the service's runtime state and the source's health (an approval-required
+  source reports `manual_intervention_required` / `owner_approval_required`)
+  rather than with `sources` alone. A listing taken while the service is
+  starting or stopping is not definitive either: list again once it is
+  stable, and when another admin command held the database, once it has
   finished. A same-account process that cannot be inspected refuses the
   listing (`service_state_unavailable`) instead of guessing; the check runs
-  only when a source carries a marker.
+  only when an approved, listed source carries a marker.
 - `approve` rescans and binds exactly that camera. It refuses a camera without
   a serial (`camera_without_serial`) and one whose serial is not unique
   (`camera_serial_not_unique`): stored evidence cannot tell such a camera from

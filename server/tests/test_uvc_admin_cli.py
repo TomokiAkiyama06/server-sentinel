@@ -255,10 +255,32 @@ class AdminCliTests(unittest.TestCase):
         source = self.local_source()
         self.approve_offline(source.id, camera(0))
         ApprovalStore(self.database).start_session(source.id, camera(0))
+        self.configured = (source.id,)
         code, stdout, stderr, _ = self.run_cli("sources")
         self.assertEqual((code, stderr), (0, ""))
         self.assertIn(f"source {source.id} enabled=yes approval=approval_required", stdout)
         self.assertTrue(ApprovalStore(self.database).start_session(source.id, camera(0))
+                        .requires_approval)
+
+    def test_sources_shows_a_left_marker_of_an_unlisted_source_as_approval_required(self):
+        # A crash left the marker, the Owner removed the source from
+        # local_uvc.source_ids and restarted: the database is held, but the
+        # service started no session for this source, and listing it again
+        # later requires approval.
+        listed, unlisted = self.local_source("Listed"), self.local_source("Unlisted")
+        store = ApprovalStore(self.database)
+        for source, device in ((listed, camera(0)), (unlisted, camera(2, "SYNTHSERIAL0002"))):
+            self.approve_offline(source.id, device)
+            store.start_session(source.id, device)
+        self.configured = (listed.id,)
+        self.running = [1]
+        code, stdout, stderr, _ = self.run_cli("sources")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(f"source {listed.id} enabled=yes approval=approved_in_use configured=yes",
+                      stdout)
+        self.assertIn(f"source {unlisted.id} enabled=yes approval=approval_required configured=no",
+                      stdout)
+        self.assertTrue(store.start_session(unlisted.id, camera(2, "SYNTHSERIAL0002"))
                         .requires_approval)
 
     def test_sources_keeps_approval_required_for_a_latched_source_of_the_running_service(self):
@@ -271,6 +293,7 @@ class AdminCliTests(unittest.TestCase):
         store.save(latched.id, camera(0), True, session_token=token, serial_ambiguous=True)
         store.start_session(never.id, camera(4, None, port="1-5"))
         self.approve_offline(approved.id, camera(2, "SYNTHSERIAL0002"))
+        self.configured = (latched.id, never.id, approved.id)
         self.running = [1]
         code, stdout, stderr, _ = self.run_cli("sources")
         self.assertEqual((code, stderr), (0, ""))
@@ -284,6 +307,7 @@ class AdminCliTests(unittest.TestCase):
         source = self.local_source()
         self.approve_offline(source.id, camera(0))
         ApprovalStore(self.database).start_session(source.id, camera(0))
+        self.configured = (source.id,)
 
         def unreadable(identity, name):
             raise CliRefused("service_state_unavailable")
