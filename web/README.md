@@ -442,10 +442,11 @@ built.
   the code into another app. A shown
   code is dropped as soon as a re-issue or revocation of the same person
   starts, whatever its outcome, so a code the server may already have revoked
-  never stays copyable. A copied code stays on the clipboard, and the hand-over
-  text says so (copy something else afterwards, re-issue on a suspected
-  leak). The Copy button is kept pending the Owner's confirmation (the PR #315
-  review recommends keeping it); no automatic clipboard clearing is attempted.
+  never stays copyable. Owner decision 2026-10-22 (PR #315 conversation): keep
+  the Copy button; the clipboard is never cleared automatically; the
+  hand-over text tells the Owner to overwrite the clipboard (copy something
+  else) once the code is handed over and to re-issue it if leakage is
+  suspected.
 - **Step-up** (AUTH-008, D3, S4-1). `src/shared/step_up.ts` runs a change; only
   the exact `403 step_up_required` answer (JSON, at most 256 bytes; any other
   `403` is a refusal) leads to an explicit question, "パスキーで確認して続ける"
