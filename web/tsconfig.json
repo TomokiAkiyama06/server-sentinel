@@ -13,5 +13,5 @@
     "skipLibCheck": false,
     "lib": ["DOM", "DOM.Iterable", "ES2022"]
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/harness.tsx"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "tests/harness.tsx", "tests/access_entry.ts"]
 }

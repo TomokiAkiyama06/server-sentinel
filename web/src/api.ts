@@ -1,4 +1,8 @@
-export type ApiFailure = 'unauthorized' | 'unavailable' | 'invalid_response' | 'invalid_request' | 'cancelled';
+/** `step_up_required`: only the server's fixed `403 {"detail":"step_up_required"}`
+ *  on an Owner operation (Owner decision D3); every other refusal is
+ *  `unauthorized`. */
+export type ApiFailure = 'unauthorized' | 'unavailable' | 'invalid_response' | 'invalid_request' | 'cancelled'
+  | 'step_up_required';
 
 /** Fixed local messages only: no response body, credentials, URL or cause retained. */
 export class ApiError extends Error {
