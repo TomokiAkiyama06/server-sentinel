@@ -570,20 +570,20 @@ class SummarizerTests(unittest.TestCase):
         return {row["scenario"]: row for row in summarize.summarize([self.root])["runs"]}
 
     def test_gap_accuracy_and_duplicates(self):
-        orchestrator, receiver, sender_rows = _base("outage_5s")
+        orchestrator, receiver, sender_rows = _base("outage_8s")
         durable = {"kind": "durable", "t_ns": 9, "source": 0, "epoch": 1, "min_sequence": 0,
                    "max_sequence": 99, "units": 90, "duplicates": 0}
         gap = {"kind": "gap", "t_ns": 5, "source": 0, "epoch": 1, "reason": "sequence_skip",
                "after_sequence": 10, "before_sequence": 21, "missing_units": 10}
-        self.run_dir("outage_5s-a_framed", orchestrator=orchestrator,
+        self.run_dir("outage_8s-a_framed", orchestrator=orchestrator,
                      receiver=receiver + [gap, durable], sender_rows=sender_rows)
-        self.assertEqual("pass", self.report()["outage_5s"]["g2"])
-        self.rewrite("outage_5s-a_framed", "receiver",
+        self.assertEqual("pass", self.report()["outage_8s"]["g2"])
+        self.rewrite("outage_8s-a_framed", "receiver",
                      receiver + [{**gap, "missing_units": 9}, durable])
-        self.assertEqual("fail", self.report()["outage_5s"]["g2"])
-        self.rewrite("outage_5s-a_framed", "receiver",
+        self.assertEqual("fail", self.report()["outage_8s"]["g2"])
+        self.rewrite("outage_8s-a_framed", "receiver",
                      receiver + [gap, {**durable, "duplicates": 1}])
-        self.assertEqual("fail", self.report()["outage_5s"]["g2"])
+        self.assertEqual("fail", self.report()["outage_8s"]["g2"])
 
     def test_capture_restart_requires_unknown_extent(self):
         orchestrator, receiver, sender_rows = _base("capture_restart")
@@ -649,7 +649,7 @@ class SummarizerTests(unittest.TestCase):
         self.assertEqual("fail", self.report()["normal"]["g3"])
 
     def test_reconnect_and_detection_and_protection(self):
-        orchestrator, receiver, sender_rows = _base("outage_5s")
+        orchestrator, receiver, sender_rows = _base("outage_8s")
         second = 10**9
         proxy_rows = [{"kind": "impairment_start", "t_ns": 10 * second, "impairment": "blackhole",
                        "duration_ns": 5 * second, "rate_bytes": 0},
@@ -668,18 +668,18 @@ class SummarizerTests(unittest.TestCase):
              "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0},
             {"kind": "interrupted", "t_ns": 13 * second, "source": 0,
              "since_last_rx_ns": 3 * second}]
-        self.run_dir("outage_5s-a_framed", orchestrator=orchestrator, receiver=receiver + [gap],
+        self.run_dir("outage_8s-a_framed", orchestrator=orchestrator, receiver=receiver + [gap],
                      sender_rows=sender_rows + events, proxy_rows=proxy_rows)
-        row = self.report()["outage_5s"]
+        row = self.report()["outage_8s"]
         self.assertEqual(("pass", "pass"), (row["g4"], row["g5"]))
         self.assertEqual(second, row["reconnect_p95_ns"])
         late = [*events[:3], {**events[3], "t_ns": 26 * second}]
-        self.rewrite("outage_5s-a_framed", "sender", sender_rows + late)
-        self.assertEqual("fail", self.report()["outage_5s"]["g4"])
-        self.rewrite("outage_5s-a_framed", "sender", sender_rows + events)
-        self.rewrite("outage_5s-a_framed", "receiver",
+        self.rewrite("outage_8s-a_framed", "sender", sender_rows + late)
+        self.assertEqual("fail", self.report()["outage_8s"]["g4"])
+        self.rewrite("outage_8s-a_framed", "sender", sender_rows + events)
+        self.rewrite("outage_8s-a_framed", "receiver",
                      receiver + [{**gap, "to_capture_ns": 700 * second}])
-        self.assertEqual("fail", self.report()["outage_5s"]["g5"])
+        self.assertEqual("fail", self.report()["outage_8s"]["g5"])
 
     def test_main_side_outage_requires_agent_detection(self):
         second = 10**9
@@ -954,7 +954,7 @@ class SummarizerTests(unittest.TestCase):
 
     def test_silent_outage_needs_proxy_and_main_detection(self):
         second = 10**9
-        orchestrator, receiver, sender_rows = _base("outage_5s")
+        orchestrator, receiver, sender_rows = _base("outage_8s")
         proxy_rows = [{"kind": "impairment_start", "t_ns": 10 * second, "impairment": "blackhole",
                        "duration_ns": 3 * second, "rate_bytes": 0},
                       {"kind": "impairment_end", "t_ns": 13 * second, "impairment": "blackhole",
@@ -969,17 +969,17 @@ class SummarizerTests(unittest.TestCase):
                    "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0}
         flagged = {"kind": "interrupted", "t_ns": 12 * second, "source": 0,
                    "since_last_rx_ns": 2 * second}
-        name = "outage_5s-a_framed"
+        name = "outage_8s-a_framed"
         self.run_dir(name, orchestrator=orchestrator, receiver=receiver + [durable, flagged],
                      sender_rows=sender_rows + events, proxy_rows=proxy_rows)
-        self.assertEqual("pass", self.report()["outage_5s"]["g5"])
+        self.assertEqual("pass", self.report()["outage_8s"]["g5"])
         # Main never flagged the silent outage itself
         self.rewrite(name, "receiver", receiver + [durable])
-        self.assertEqual("fail", self.report()["outage_5s"]["g5"])
+        self.assertEqual("fail", self.report()["outage_8s"]["g5"])
         # Main flagged it, but later than 15 s after the last received unit
         self.rewrite(name, "receiver",
                      receiver + [durable, {**flagged, "since_last_rx_ns": 16 * second}])
-        self.assertEqual("fail", self.report()["outage_5s"]["g5"])
+        self.assertEqual("fail", self.report()["outage_8s"]["g5"])
         # two hosts: one Main detection per window and source, no clock comparison
         self.rewrite(name, "receiver", receiver + [durable, {**flagged, "t_ns": 1}])
         runs = summarize.summarize([self.root], single_host=False)["runs"]
@@ -987,11 +987,35 @@ class SummarizerTests(unittest.TestCase):
         self.rewrite(name, "receiver", receiver + [durable, flagged])
         # the Agent-side proxy record is missing: incomplete, never pass
         (self.root / name / "proxy.jsonl").unlink()
-        self.assertEqual("unmeasured", self.report()["outage_5s"]["g5"])
+        self.assertEqual("unmeasured", self.report()["outage_8s"]["g5"])
         # fewer blackholes recorded than scheduled
         self.rewrite(name, "proxy", [{"kind": "sample", "t_ns": 1, "max_held": 0,
                                       "buffer_bytes": 65536}])
-        self.assertEqual("fail", self.report()["outage_5s"]["g5"])
+        self.assertEqual("fail", self.report()["outage_8s"]["g5"])
+
+    def test_agent_detection_is_required_only_past_the_loss_timeout_margin(self):
+        # #308: a blackhole equal to the loss timeout is detected only when
+        # inbound had already paused before it, so G5 requires an Agent loss
+        # episode only for the G4 rule (timeout + LOSS_MARGIN_NS).
+        second = 10**9
+        orchestrator, receiver, sender_rows = _base("outage_8s")
+        proxy_rows = [{"kind": "impairment_start", "t_ns": 10 * second, "impairment": "blackhole",
+                       "duration_ns": 3 * second, "rate_bytes": 0},
+                      {"kind": "impairment_end", "t_ns": 13 * second, "impairment": "blackhole",
+                       "duration_ns": 3 * second, "rate_bytes": 0}]
+        durable = {"kind": "durable", "t_ns": 30 * second, "source": 0, "epoch": 1,
+                   "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0}
+        flagged = {"kind": "interrupted", "t_ns": 12 * second, "source": 0,
+                   "since_last_rx_ns": 2 * second}
+        name = "outage_8s-a_framed"
+        for timeout_s, verdict in ((3, "pass"), (2.5, "pass"), (2, "fail")):
+            with self.subTest(loss_timeout_s=timeout_s):
+                start = {"kind": "start", "t_ns": 0, "loss_timeout_ns": int(timeout_s * second)}
+                self.run_dir(name, orchestrator=orchestrator, receiver=receiver + [durable, flagged],
+                             sender_rows=sender_rows + [start], proxy_rows=proxy_rows)
+                self.assertEqual(verdict, self.report()["outage_8s"]["g5"])
+                for path in (self.root / name).iterdir():
+                    path.unlink()
 
     def test_capacity_needs_every_sender_total(self):
         orchestrator, receiver, sender_rows = _base("capacity_4", sources=4)
@@ -1112,8 +1136,8 @@ class SummarizerTests(unittest.TestCase):
         _write(self.root, "holder", _holder([]))
         self.assertEqual("unmeasured", verdict())
         # a second real-input run without a holder record of its own
-        _write(self.root / "outage_5s-a_framed", "orchestrator-both", _complete(
-            [{**orchestrator[0], "inputs": "real", "scenario": "outage_5s"}],
+        _write(self.root / "outage_8s-a_framed", "orchestrator-both", _complete(
+            [{**orchestrator[0], "inputs": "real", "scenario": "outage_8s"}],
             ("receiver", "proxy", "sender")), run_id="r20261010t000000ab")
         _write(self.root, "holder", _holder([sample]))
         self.assertEqual("unmeasured", verdict())
@@ -1258,8 +1282,8 @@ class SummarizerTests(unittest.TestCase):
     def test_gap_ranges_must_equal_the_durable_missing_set(self):
         """Matching gap counts are not enough: the reported ranges must be the
         durable stand-in's missing sequences exactly, each reported once."""
-        orchestrator, receiver, sender_rows = _base("outage_5s")
-        name = "outage_5s-a_framed"
+        orchestrator, receiver, sender_rows = _base("outage_8s")
+        name = "outage_8s-a_framed"
         durable = {"kind": "durable", "t_ns": 9, "source": 0, "epoch": 1, "min_sequence": 0,
                    "max_sequence": 19, "units": 15, "duplicates": 0, "runs": 2}
         runs = [{"kind": "durable_run", "t_ns": 9, "source": 0, "epoch": 1,
@@ -1274,7 +1298,7 @@ class SummarizerTests(unittest.TestCase):
         self.run_dir(name, orchestrator=orchestrator,
                      receiver=receiver + [gap(4, 10)] + runs + [durable],
                      sender_rows=sender_rows)
-        self.assertEqual("pass", self.report()["outage_5s"]["g2"])
+        self.assertEqual("pass", self.report()["outage_8s"]["g2"])
         cases = {
             # the same 5 units, but two overlapping reports (2 + 3 = 5)
             "double-reported": [gap(4, 7), gap(5, 9)],
@@ -1288,7 +1312,7 @@ class SummarizerTests(unittest.TestCase):
         for label, gaps in cases.items():
             with self.subTest(case=label):
                 self.rewrite(name, "receiver", receiver + gaps + runs + [durable])
-                row = self.report()["outage_5s"]
+                row = self.report()["outage_8s"]
                 self.assertEqual("fail", row["g2"])
                 self.assertGreater(row["gap_set_mismatches"], 0)
         # persisted runs that are not the durable row's sequence set
@@ -1298,11 +1322,11 @@ class SummarizerTests(unittest.TestCase):
                 "overlap": [runs[0], {**runs[1], "first_sequence": 3}]}.items():
             with self.subTest(runs=label):
                 self.rewrite(name, "receiver", receiver + [gap(4, 10)] + bad + [durable])
-                self.assertEqual("fail", self.report()["outage_5s"]["g2"])
+                self.assertEqual("fail", self.report()["outage_8s"]["g2"])
         # older records without the persisted runs: the set cannot be checked
         self.rewrite(name, "receiver",
                      receiver + [gap(4, 10), {**durable, "runs": None}])
-        self.assertEqual("unmeasured", self.report()["outage_5s"]["g2"])
+        self.assertEqual("unmeasured", self.report()["outage_8s"]["g2"])
 
     def test_gap_set_after_capture_restart_excludes_the_unknown_extent(self):
         orchestrator, receiver, sender_rows = _base("capture_restart")
@@ -1427,13 +1451,13 @@ class SummarizerTests(unittest.TestCase):
     def test_sender_acks_need_this_runs_receiver(self):
         """Media the Agent saw accepted must have reached this run's receiver
         (a session and accepted units); otherwise it hit another receiver."""
-        orchestrator, receiver, sender_rows = _base("outage_5s")
-        name = "outage_5s-a_framed"
+        orchestrator, receiver, sender_rows = _base("outage_8s")
+        name = "outage_8s-a_framed"
         durable = {"kind": "durable", "t_ns": 9, "source": 0, "epoch": 1, "min_sequence": 0,
                    "max_sequence": 9, "units": 10, "duplicates": 0}
         self.run_dir(name, orchestrator=orchestrator, receiver=receiver + [durable],
                      sender_rows=sender_rows)
-        self.assertEqual("pass", self.report()["outage_5s"]["integrity"])
+        self.assertEqual("pass", self.report()["outage_8s"]["integrity"])
         rows = _finished_receiver(receiver + [durable])
         for label, changed in (
                 ("nothing accepted", [{**r, "accepted": 0} if r["kind"] == "end" else r
@@ -1441,7 +1465,7 @@ class SummarizerTests(unittest.TestCase):
                 ("no session", [r for r in rows if r["kind"] != "session_open"])):
             with self.subTest(case=label):
                 _write(self.root / name, "receiver", changed)
-                row = self.report()["outage_5s"]
+                row = self.report()["outage_8s"]
                 self.assertEqual(("fail", "fail", "fail"),
                                  (row["integrity"], row["g4"], row["g5"]))
 
@@ -1581,24 +1605,24 @@ class SummarizerTests(unittest.TestCase):
 
     def test_reconnect_requirement_follows_only_the_loss_timeout_rule(self):
         second = 10**9
-        orchestrator, receiver, sender_rows = _base("outage_5s")
-        # fast outage_5s: one 3 s blackhole; a 5 s Agent loss timeout requires
-        # no disconnect (3 s < 5 s + 1 s), so no reconnect episode is needed
+        orchestrator, receiver, sender_rows = _base("outage_8s")
+        # fast outage_8s: one 4 s blackhole; a 5 s Agent loss timeout requires
+        # no disconnect (4 s < 5 s + 1 s), so no reconnect episode is needed
         start = {"kind": "start", "t_ns": 0, "n_sources": 1, "loss_timeout_ns": 5 * second}
-        self.run_dir("outage_5s-a_framed", orchestrator=orchestrator,
+        self.run_dir("outage_8s-a_framed", orchestrator=orchestrator,
                      receiver=receiver + self._durable(1), sender_rows=[start] + sender_rows)
-        row = self.report()["outage_5s"]
+        row = self.report()["outage_8s"]
         self.assertEqual(("pass", 0, 0), (row["g4"], row["reconnects"],
                                           row["reconnects_required"]))
         # a 1.5 s loss timeout requires one, and it is missing
-        self.rewrite("outage_5s-a_framed", "sender",
+        self.rewrite("outage_8s-a_framed", "sender",
                      [{**start, "loss_timeout_ns": int(1.5 * second)}] + sender_rows)
-        row = self.report()["outage_5s"]
+        row = self.report()["outage_8s"]
         self.assertEqual(("fail", 1), (row["g4"], row["reconnects_required"]))
 
     def test_post_run_stale_flag_is_not_outage_detection(self):
         second = 10**9
-        orchestrator, receiver, sender_rows = _base("outage_5s")
+        orchestrator, receiver, sender_rows = _base("outage_8s")
         proxy_rows = [{"kind": "impairment_start", "t_ns": 10 * second, "impairment": "blackhole",
                        "duration_ns": 3 * second, "rate_bytes": 0},
                       {"kind": "impairment_end", "t_ns": 13 * second, "impairment": "blackhole",
@@ -1620,17 +1644,17 @@ class SummarizerTests(unittest.TestCase):
         in_window = {"kind": "interrupted", "t_ns": 12 * second, "source": 0,
                      "since_last_rx_ns": 2 * second}
         post_run = {**in_window, "t_ns": 23 * second}
-        name = "outage_5s-a_framed"
+        name = "outage_8s-a_framed"
         for two_host in (False, True):
             with self.subTest(two_host=two_host):
                 self.run_dir(name, orchestrator=orchestrator, two_host=two_host,
                              receiver=receiver + sessions + self._durable(1) + [in_window],
                              sender_rows=sender_rows + events, proxy_rows=proxy_rows)
-                self.assertEqual("pass", self.report()["outage_5s"]["g5"])
+                self.assertEqual("pass", self.report()["outage_8s"]["g5"])
                 # only the flag raised after the sender shut down (main grace)
                 self.rewrite(name, "receiver",
                              receiver + sessions + self._durable(1) + [post_run])
-                row = self.report()["outage_5s"]
+                row = self.report()["outage_8s"]
                 self.assertEqual(("fail", 0), (row["g5"], row["main_detect_matched"]))
                 for path in (self.root / name).iterdir():
                     path.unlink()
@@ -2094,11 +2118,11 @@ class SummarizerTests(unittest.TestCase):
         self.assertEqual([None], match([10], [26], 15))
         self.assertEqual([15], match([10], [25], 15))
         # blackholes: an episode after the next blackhole began is not the earlier one's
-        orchestrator, receiver, sender_rows = _base("outage_5s")
+        orchestrator, receiver, sender_rows = _base("outage_8s")
         start = {**start, "loss_timeout_ns": int(1.5 * second)}
         proxy_rows = reset(10 * second, "blackhole", 3 * second) + reset(
             20 * second, "blackhole", 3 * second)
-        name = "outage_5s-a_framed"
+        name = "outage_8s-a_framed"
         # Main flagged both blackholes itself (only the Agent matching is under test)
         flagged = [{"kind": "interrupted", "t_ns": at * second, "source": 0,
                     "since_last_rx_ns": 2 * second} for at in (12, 22)]
@@ -2106,10 +2130,10 @@ class SummarizerTests(unittest.TestCase):
         self.run_dir(name, orchestrator=orchestrator,
                      receiver=receiver + self._durable(1) + flagged,
                      sender_rows=[start] + sender_rows + late, proxy_rows=proxy_rows)
-        self.assertEqual("fail", self.report()["outage_5s"]["g5"])
+        self.assertEqual("fail", self.report()["outage_8s"]["g5"])
         self.rewrite(name, "sender", [start] + sender_rows + [loss(12 * second, 1),
                                                               loss(22 * second, 2)])
-        row = self.report()["outage_5s"]
+        row = self.report()["outage_8s"]
         self.assertEqual(("pass", 2 * second), (row["g5"], row["agent_detect_max_ns"]))
 
     # -- regressions for the PR #222 review (head 7749efa) ---------------------
@@ -3039,6 +3063,26 @@ class MiscTests(unittest.TestCase):
                         with self.subTest(scenario=name, fast=fast):
                             self.assertGreaterEqual(item[2], loss_timeout + 2.5)
 
+    def test_no_blackhole_is_borderline_to_the_agent_loss_timeout(self):
+        # #308: a 5 s blackhole against the 5 s loss timeout was detected
+        # 3/2/0 of 3 times on a real run. Each scheduled blackhole is either
+        # shorter than the timeout (no detection expected) or outlasts it like
+        # a Main stop; in a disconnect scenario it must also require one (G4).
+        for fast in (True, False):
+            loss_timeout = sender.SenderConfig(candidate="b_segment", host="127.0.0.1",
+                                               port=1, n_sources=1, fast=fast).loss_timeout_s
+            for name, spec in matrix.SCENARIOS.items():
+                for item in spec["fast" if fast else "full"].get("proxy", []):
+                    if item[1] != "blackhole":
+                        continue
+                    with self.subTest(scenario=name, fast=fast, at=item[0]):
+                        if name in summarize.DISCONNECT_SCENARIOS:
+                            self.assertGreaterEqual(item[2], loss_timeout + 2.5)
+                            self.assertTrue(summarize._must_disconnect(
+                                item, int(loss_timeout * 10**9)))
+                        else:
+                            self.assertLess(item[2], loss_timeout)
+
     def test_sigstop_is_confirmed_from_the_process_state(self):
         with tempfile.TemporaryDirectory() as directory:
             stat = Path(directory) / "42" / "stat"
@@ -3142,7 +3186,7 @@ class MiscTests(unittest.TestCase):
             base = ["matrix", "--materials", directory, "--state", directory,
                     "--out", directory, "--run-id", RUN]
             for role in ("main", "agent"):
-                for extra in (["--scenarios", "normal,outage_5s", "--candidates", "a_framed"],
+                for extra in (["--scenarios", "normal,outage_8s", "--candidates", "a_framed"],
                               ["--scenarios", "normal"],  # default: three candidates
                               ["--scenarios", "default", "--candidates", "a_framed"]):
                     with self.subTest(role=role, extra=extra):
@@ -3153,7 +3197,7 @@ class MiscTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 poc15.main(base + ["--role", "main", "--scenarios", "normal",
                                    "--candidates", "a_framed"])
-                poc15.main(base + ["--scenarios", "normal,outage_5s"])  # role both
+                poc15.main(base + ["--scenarios", "normal,outage_8s"])  # role both
             self.assertEqual(2, orchestrator.call_count)
 
     def test_holder_hello_identifies_the_sender(self):
@@ -3313,7 +3357,7 @@ class LoopbackMatrixTests(unittest.TestCase):
             bind="127.0.0.1", upstream_host="127.0.0.1", upstream_port=0,
             proxy_host="127.0.0.1", port_offset=_free_offset(), main_grace=0)
         orchestrator = matrix.Orchestrator(args, RUN)
-        out = orchestrator.run(["normal", "outage_5s", "auth_other_ca", "route_probe"],
+        out = orchestrator.run(["normal", "outage_8s", "auth_other_ca", "route_probe"],
                                ["a_framed"])
         orchestrator.run(["rst", "route_probe"], ["b_chunked"])
         # #237: the fast Main stop is long enough for b_segment's Agent to
@@ -3336,7 +3380,7 @@ class LoopbackMatrixTests(unittest.TestCase):
                                  row["g3"], detail)
                 self.assertIn(row["g4"], ("pass", "not_applicable"), detail)
                 self.assertIn(row["g5"], ("pass", "not_applicable"), detail)
-        self.assertGreater(runs[("outage_5s", "a_framed")]["reported_missing"], 0)
+        self.assertGreater(runs[("outage_8s", "a_framed")]["reported_missing"], 0)
         self.assertEqual(0, runs[("auth_other_ca", "a_framed")]["receiver_accepted"])
         self.assertGreater(runs[("normal", "b_segment")]["receiver_accepted"], 0)
         for candidate in ("a_framed", "b_chunked"):
