@@ -408,6 +408,18 @@ record.
   after `sudo systemctl kill -s KILL server-sentinel.service` (no clean
   session end) `sources` shows `approval=approval_required` until it is
   approved again;
+- [ ] (Issue #317) with the service running and the source `online`,
+  confirm `state/uvc-session-ledger.json` is a `0600` file of the service
+  account, contains no session marker (only 64-hex digests, the boot id,
+  the service's main PID and a start time) and names the PID `systemctl
+  show -p MainPID server-sentinel.service` reports; on a test deployment
+  where local UVC can be kept from starting after an unclean stop (for
+  example a runtime filesystem filled past its hard reserve, so the storage
+  admission refuses the session start), `systemctl kill -s KILL` and
+  confirm that while the restarted service runs `sources` shows the left
+  marker as `approval=approval_required` (never `approved_in_use`); a
+  ledger made unreadable (`chmod 000`, restored afterwards) refuses the
+  listing with `service_state_unavailable`;
 - [ ] approve the camera already held by another enabled source:
   `camera_approved_for_another_source`; an unknown or stale label (after a
   re-plug): `candidate_not_found`; a source whose profile's pixel format the

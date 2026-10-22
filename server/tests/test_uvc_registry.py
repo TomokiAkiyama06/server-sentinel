@@ -2,6 +2,7 @@ from contextlib import closing, contextmanager
 from dataclasses import asdict, replace
 from itertools import count
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -20,6 +21,7 @@ from app.cameras.uvc.capture import VideoProfile as CaptureVideo
 from app.cameras.uvc.identity import DeviceEvidence
 from app.cameras.uvc.persistence import ApprovalConflictError, ApprovalStorageError
 from app.cameras.uvc.registry_adapter import LocalUvcAdapter
+from app.cameras.uvc.session_ledger import ledger_path, marker_digest, read_ledger
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -492,6 +494,10 @@ class UvcRegistryTests(UvcRegistryFixture):
     def test_clean_shutdown_closes_capture_without_reporting_unplug(self):
         self.adapter._approve_live_session(self.source.id, self.camera)
         self.assertTrue(self.adapter.poll_source(self.source.id))
+        # Issue #317: the session's marker is in this process's ledger while held.
+        token = self.adapter.store.load(self.source.id).session_token
+        ledger = read_ledger(ledger_path(self.database.path), account=os.geteuid())
+        self.assertIn(marker_digest(token), ledger.sessions[str(self.source.id)])
         capture = self.adapter.sessions[self.source.id].capture
         self.events.clear()
         self.adapter.close()
@@ -499,6 +505,8 @@ class UvcRegistryTests(UvcRegistryFixture):
         self.assertEqual([event.reason for event in self.events], ["video_capture_closed"])
         self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.OFFLINE)
         self.assertIsNone(self.adapter.store.load(self.source.id).session_token)
+        ledger = read_ledger(ledger_path(self.database.path), account=os.geteuid())
+        self.assertNotIn(str(self.source.id), ledger.sessions)
 
     def test_clean_shutdown_of_disabled_source_does_not_report_unplug(self):
         self.adapter._approve_live_session(self.source.id, self.camera)

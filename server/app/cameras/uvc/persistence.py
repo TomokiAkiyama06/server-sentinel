@@ -7,6 +7,7 @@ import sqlite3
 from uuid import uuid4
 
 from .identity import DeviceEvidence, same_physical_camera
+from .session_ledger import SessionLedgerError
 
 
 # Included by the append-only application migration after the registry schema.
@@ -66,13 +67,21 @@ class ApprovalStore:
     nothing is written; the already durable marker then conservatively
     requires Owner reapproval. The Owner approval itself is written on the
     audited transaction, which holds its own admission.
+
+    ``ledger`` (``SessionLedger``, Issue #317) records which markers this
+    process issued and still holds, so ``admin_cli sources`` can tell them
+    from markers a crashed run left. The service always passes it
+    (``LocalUvcAdapter``); a marker is published to it before it is
+    committed (a ledger that cannot be written refuses the start, like a
+    database fault) and withdrawn before it is released.
     """
 
-    def __init__(self, database, *, reservation=None):
+    def __init__(self, database, *, reservation=None, ledger=None):
         if reservation is not None and not callable(reservation):
             raise ApprovalStorageError("UVC approval storage admission is invalid")
         self.database = database
         self.reservation = reservation
+        self.ledger = ledger
 
     def _admission(self):
         return self.reservation() if self.reservation is not None else nullcontext()
@@ -190,7 +199,16 @@ class ApprovalStore:
         marker makes the next controller require approval. A new session also
         fences old controllers from clearing its state with a stale shutdown.
         """
+        token = str(uuid4())
+        if self.ledger is not None:
+            # Published before the commit: while the database holds this
+            # marker, the ledger lists it (Issue #317).
+            try:
+                self.ledger.issue(source_id, token)
+            except SessionLedgerError:
+                raise ApprovalStorageError("UVC approval session could not start") from None
         connection = None
+        committed = False
         try:
             connection = self.database.connect()
             connection.execute("BEGIN IMMEDIATE")
@@ -206,7 +224,6 @@ class ApprovalStore:
             # successful approve() write may clear its approval-required flag.
             required = True if prior is None else prior.requires_approval or prior.session_token is not None
             ambiguous = False if prior is None else prior.serial_ambiguous
-            token = str(uuid4())
             connection.execute(
                 "INSERT INTO uvc_approvals "
                 "(source_id,evidence,requires_approval,session_token,serial_ambiguous,explicit_binding) "
@@ -217,6 +234,7 @@ class ApprovalStore:
                 (str(source_id), json.dumps(asdict(approved), allow_nan=False), int(required), token, int(ambiguous)),
             )
             connection.commit()
+            committed = True
             return ApprovalState(approved, required, token, ambiguous, False)
         except (sqlite3.Error, ValueError, TypeError, KeyError):
             if connection is not None:
@@ -225,6 +243,8 @@ class ApprovalStore:
         finally:
             if connection is not None:
                 connection.close()
+            if not committed and self.ledger is not None:
+                self.ledger.withdraw(source_id, token)
 
     def save(self, source_id, approved, requires_approval, *, session_token, serial_ambiguous, release=False):
         if session_token is None:
@@ -236,6 +256,11 @@ class ApprovalStore:
     def _save(self, source_id, approved, requires_approval, *, session_token, serial_ambiguous,
               release):
         evidence = json.dumps(asdict(approved), allow_nan=False, separators=(",", ":"))
+        if release and self.ledger is not None:
+            # Withdrawn before the marker is cleared (Issue #317): a release
+            # that then fails leaves a marker the next start requires
+            # approval for, and that is what ``sources`` shows meanwhile.
+            self.ledger.withdraw(source_id, session_token)
         connection = None
         try:
             connection = self.database.connect()

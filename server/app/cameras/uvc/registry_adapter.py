@@ -11,6 +11,7 @@ from .capture import MmapCapture, VideoProfile
 from .discovery import LinuxDiscovery
 from .identity import DeviceEvidence, ReconnectController
 from .persistence import ApprovalStore
+from .session_ledger import SessionLedger
 from .session import CaptureSession
 
 
@@ -263,9 +264,12 @@ class LocalUvcAdapter:
                  frame_stall_reopen_seconds=5.0, presence_scan_seconds=1.0):
         self.registry = registry
         # Session-marker writes share the registry's storage admission, so no
-        # capture-driven write bypasses the Main storage policy.
+        # capture-driven write bypasses the Main storage policy. The ledger
+        # records which markers this process holds (Issue #317), for
+        # ``admin_cli sources``; it is never read back here.
         self.store = ApprovalStore(registry.database,
-                                   reservation=getattr(registry, "reservation", None))
+                                   reservation=getattr(registry, "reservation", None),
+                                   ledger=SessionLedger.for_database(registry.database))
         self.emit_audit = emit_audit
         # Downstream delivery (logging, external health sinks) that may block;
         # the controller calls it only after releasing its transition lock.
