@@ -23,9 +23,9 @@ RECONNECT_P95_NS = 10 * SECOND
 DETECTION_NS = 15 * SECOND
 OUTQ_SLACK = 64 * 1024
 GROWTH_BYTES = 16 * 1024 * 1024
-DISCONNECT_SCENARIOS = {"outage_5s", "outage_120s", "rst", "slow_stop_10s", "slow_stop_60s",
+DISCONNECT_SCENARIOS = {"outage_8s", "outage_120s", "rst", "slow_stop_10s", "slow_stop_60s",
                         "main_restart"}
-COMM_LOSS_SCENARIOS = {"outage_1s", "outage_5s", "outage_120s", "rst", "slow_stop_10s",
+COMM_LOSS_SCENARIOS = {"outage_1s", "outage_8s", "outage_120s", "rst", "slow_stop_10s",
                        "slow_stop_60s", "main_restart"}
 NEGATIVE_SCENARIOS = {"auth_unpaired", "auth_other_ca", "auth_revoked"}
 # Main-side outages (orchestrator sigstop / restart_receiver windows): the Agent
@@ -1449,10 +1449,13 @@ class RunSummary:
         proxy_evidence = self._silent_outage_evidence(single_host)
         ok = True
         detections = []
-        # Each long blackhole takes its own loss episode (one per connection).
+        # Each blackhole that must disconnect (the G4 ``_must_disconnect`` rule:
+        # loss timeout + ``LOSS_MARGIN_NS``) takes its own loss episode (one
+        # per connection). A window equal to the timeout is detected only when
+        # inbound had already paused before it, so it cannot be required (#308).
         blackholes = [item["t_ns"] for item in self.proxy
                       if item["kind"] == "impairment_start" and item["impairment"] == "blackhole"
-                      and item["duration_ns"] >= loss_timeout_ns]
+                      and item["duration_ns"] >= loss_timeout_ns + LOSS_MARGIN_NS]
         # Like resets: an episode only counts before the next impairment starts.
         for delay in _match_episodes(blackholes, _loss_episodes(losses), DETECTION_NS,
                                      self._impairment_starts()):

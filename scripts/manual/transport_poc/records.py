@@ -23,7 +23,7 @@ KEY_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,47}")
 
 CANDIDATES = ("a_framed", "b_chunked", "b_segment")
 SCENARIOS = (
-    "normal", "sources_2", "sources_3", "outage_1s", "outage_5s", "outage_120s", "rst",
+    "normal", "sources_2", "sources_3", "outage_1s", "outage_8s", "outage_120s", "rst",
     "bandwidth_cap",
     "slow_stop_10s", "slow_stop_60s", "slow_drain", "main_restart",
     "capture_restart", "capacity_4", "fifth_refused", "auth_unpaired",
