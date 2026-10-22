@@ -55,6 +55,14 @@ IMMEDIATE_KINDS = frozenset({
     NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.HUMAN_ACCESS_RECOVERED,
     NotificationKind.CREDENTIAL_FINDING, NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED,
 })
+# Immediate only when confirmed: a confirmed server movement / camera tamper
+# (Issue #26), and a camera source offline for the deployment's threshold
+# (Issue #301 item 2, Owner decision 2026-10-22; `../monitoring/cameras.py`).
+# An unconfirmed observation of these kinds stays local until the summary.
+CONFIRMED_IMMEDIATE_KINDS = frozenset({
+    NotificationKind.SERVER_MOVEMENT, NotificationKind.CAMERA_TAMPER,
+    NotificationKind.CAMERA_OFFLINE,
+})
 # Immediate, but the end of a fault rather than an alert.
 RECOVERY_KINDS = frozenset({NotificationKind.HUMAN_ACCESS_RECOVERED})
 # Immediate, but a condition needing Owner attention rather than a failure:
@@ -313,9 +321,7 @@ class NotificationService:
                 return DeliveryResult.FAILED
             del self._unpersisted[event.event_id]
             return prior.delivery
-        immediate = (kind in IMMEDIATE_KINDS
-                     or confirmed and kind in {NotificationKind.SERVER_MOVEMENT,
-                                               NotificationKind.CAMERA_TAMPER})
+        immediate = (kind in IMMEDIATE_KINDS or confirmed and kind in CONFIRMED_IMMEDIATE_KINDS)
         if not immediate:
             # SUPPRESSED: written locally, or retained for the poll retry.
             # FAILED: the write was refused and the retry buffer is full, so

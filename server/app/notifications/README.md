@@ -21,7 +21,10 @@ when they are sent. `recording_device_numbers_changed` (Issue #321) is
 immediate too, worded as an attention notice: the recorded filesystem device
 numbers are stale while the UUID and mount were verified, and recording
 continues. Ordinary
-person/motion/entry/camera-offline observations stay local until the summary.
+person/motion/entry/camera-offline observations stay local until the summary;
+a `camera_offline` recorded `confirmed=True` (the source stayed offline for the
+deployment threshold, Issue #301 item 2, `../monitoring/cameras.py`, which
+caps it per hour) is immediate like a confirmed server movement.
 Such a local-only event returns `suppressed` when it was written or retained for
 the `poll()` retry, and `failed` when the write was refused with the retry
 buffer full (the event is dropped), so callers can retry with the same

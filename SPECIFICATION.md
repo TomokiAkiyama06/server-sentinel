@@ -1398,7 +1398,8 @@ it mounts no human endpoint pending #10.
 delivery using verified HTTPS, no environment proxy/redirect, bounded timeout and
 redacted failures. Unconfigured delivery performs no network operation. The
 current payload is a fixed critical category or validated daily aggregate, with
-no image/media, source identity or arbitrary probe details. Both immediate and
+no image/media, source identity or arbitrary probe details (a camera offline
+notification, Issue #301, names no source either). Both immediate and
 daily notifications enqueue on a bounded delivery worker; the recorder worker
 never waits for network IO. Local pending/result events share an ID and are
 persisted only on the owning worker. Full queues and failed persistence remain
@@ -1436,6 +1437,70 @@ recording pipeline or human route is started. The daily summary marks monitored
 duration, source, agent and observation counts `unavailable` while no capture
 pipeline reports (service uptime is labeled separately), never presenting zero
 observations or process uptime as verified monitoring coverage.
+
+Camera offline notification (Issue #301 item 2, Owner decision 2026-10-22,
+`server/app/monitoring/cameras.py`). A configured camera source that stays
+not online (`offline`, `degraded` or `manual_intervention_required`) for
+`monitoring.camera_offline_notification.after_seconds` (default 300 s, 60 s to
+one day) notifies the Owner once per offline episode as the confirmed
+`camera_offline` kind through the same `NotificationService`, durable
+`notification_events` row and optional Slack delivery as a hardware-integrity
+failure. Only `online` ends an episode; a source the Owner disabled
+(`disabled`) or whose capture is stopping (`capture_service_stopping`) starts
+none, so a service stop never notifies. Every configured source starts not
+online, so a camera that never comes up after a start is notified too. The
+monitor is fed on the local UVC runtime's health-sink delivery thread (never a
+capture worker) and by the application capture watcher's status poll (a worker
+that is no longer running is not online, a running worker's latest camera
+state starts or ends an episode, so a health event that never reached the
+sink cannot hide an outage; a status older than a received event never
+overrides it), and is drained on the monitoring worker each tick (default
+60 s), also while monitoring is `failed`, so the notification follows the
+threshold within one tick. An episode that reached the threshold and recovered
+before the drain is still notified once. If it goes offline again while that
+notification is still owed, a recovery shorter than `after_seconds` is folded
+into the owed episode (notified on the next drain, the count is not
+restarted); after a longer recovery the new outage is its own episode with its
+own time and ID and the owed one keeps its own (at most one owed episode per
+source, an older unsent one is dropped and logged), so a queue that refused
+the first alert for a long time never sends a later outage under the old
+time. A recovery is recorded in the episode and is not notified. At most `hourly_limit` (default 4, 1 to 60) such
+notifications go out per rolling hour for all sources together, re-seeded
+after a restart from the confirmed `camera_offline` rows accepted in the last
+hour (a `pending` one included, since it is never resent; an unconfirmed local
+observation never counts); an episode held back by the
+cap is logged once (`camera_offline_notification_rate_limited`) and notified
+when the hour allows if the source is still not online, and one that recovered
+meanwhile is dropped (`camera_offline_notification_dropped`). An episode in
+progress is named after the source and its registry `last_seen_at` (the last
+frame time), so a restart during the same outage finds the row and does not
+notify again; a `pending` row (an uncertain delivery of the stopped process) is
+not resent. A row of that name accepted more than 24 hours earlier no longer
+counts as this outage (Owner decision 2026-10-22, PR #320): the next name of a
+deterministic chain (`…:repeat:1`, `…:repeat:2`, …) is used and the outage is
+notified again, under the hourly cap; a restart within 24 hours of that
+notification still finds it. So when the last-frame time could not be written
+during a short online period (for example storage refused it), a later outage
+that a restarted process maps to the earlier name is notified once the earlier
+notification is more than a day old; within that day it is not (within one
+process such a reused ID gets a per-process ID instead). The same rule notifies
+again an outage that has continued for more than a day when the service
+restarts. Without storage, or for an episode that already recovered, the ID is
+per process (at worst one repeat after a restart). Decided and pending (Owner
+decision 2026-10-22, follow-up PR): a camera that flaps with online periods
+too short to matter (for example four minutes offline, two seconds online) is
+not yet notified; a rule on the total offline time within a window (for
+example five minutes in fifteen) will be added separately. The Slack text is the fixed `ServerSentinel critical alert:
+camera_offline`: no source name, role, UUID, device path, serial, reason or
+image; the Owner identifies the source in the Web UI. `MonitoringStatus`
+reports `camera_offline_degraded` (counted as degraded in the daily summary)
+and `camera_offline_notifications`, false without a configured Slack endpoint
+(the local row is then `disabled`). Shutdown stops the monitor first and, when
+no scene critical dispatcher settles them, waits at most 12 s for a submitted
+notification before the monitoring runtime stops. Only `local_uvc` sources are
+wired: `remote_agent` sources have no Main runtime yet; `observe()` is the
+source-type-neutral entry point for one. The daily summary still reports
+source and agent counts as unavailable.
 
 ## 10. Host hardware integrity and recording self-check
 
