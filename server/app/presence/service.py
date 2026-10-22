@@ -970,7 +970,34 @@ class PresenceService:
                        (actor, timestamp(now), target))
             return gap
 
+    def unconfirmed_actions(self, action):
+        """``(identifier, generation)`` of claims of ``action`` left unresolved.
+
+        These are `submitting`/`queued` rows: a port was (or may have been)
+        called and no completion was recorded. Only a caller that knows no
+        claim of its own process is still in flight, such as a dispatcher
+        before its first dispatch, may reconcile them against the port's own
+        durable record; the generation scopes that completion to the claim.
+        """
+        if action not in {"evidence", "notification"}:
+            raise ValueError("invalid action identity")
+        with self._read() as db:
+            rows = db.execute("SELECT observation,generation FROM presence_deliveries "
+                              "WHERE action=? AND state IN ('submitting','queued') "
+                              "ORDER BY observation", (action,)).fetchall()
+        return tuple((UUID(row[0]), int(row[1])) for row in rows)
+
     def dispatch_pending(self, *, limit=100):
+        """Submit up to ``limit`` queued critical actions; returns how many made progress.
+
+        Progress is a row submitted to its port (any outcome but
+        `unavailable`) or recorded `unavailable` because no port exists. Once
+        a port answers `unavailable` (nothing submitted, for example a full
+        notification queue), the rest of that action's rows in this batch are
+        left untouched for a later call instead of being claimed and refused
+        one by one. A result equal to ``limit`` therefore means more work may
+        be waiting and can be taken at once; a backpressured port never does.
+        """
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("invalid dispatch limit")
         # Submission is separate from observation ingestion. Claim durably,
@@ -1013,7 +1040,10 @@ class PresenceService:
                 following = "unavailable" if selected_state == "pending" else "pending"
                 db.execute("INSERT INTO presence_delivery_fairness VALUES (1,?) "
                            "ON CONFLICT(singleton) DO UPDATE SET next_state=excluded.next_state", (following,))
+        progressed, refused = 0, set()
         for row in pending:
+            if row["action"] in refused:
+                continue
             with self._transaction() as db:
                 job = db.execute("SELECT * FROM presence_deliveries WHERE observation=? AND action=?",
                                  tuple(row)).fetchone()
@@ -1024,6 +1054,7 @@ class PresenceService:
                 port = self.evidence if row["action"] == "evidence" else self.notifications
                 if port is None:
                     db.execute("UPDATE presence_deliveries SET state='unavailable' WHERE observation=? AND action=?", tuple(row))
+                    progressed += 1
                     continue
                 payload = db.execute("SELECT payload FROM presence_observations WHERE id=?", (row["observation"],)).fetchone()[0]
                 observation = Observation.from_payload(json.loads(payload))
@@ -1046,6 +1077,11 @@ class PresenceService:
                 db.execute("UPDATE presence_deliveries SET state=? WHERE observation=? AND action=? "
                            "AND state='submitting' AND generation=?",
                            (result.value, row["observation"], row["action"], claim))
+            if result is ActionResult.UNAVAILABLE:
+                refused.add(row["action"])
+            else:
+                progressed += 1
+        return progressed
 
     def process_critical(self, detector):
         """Run the supplied critical detector in every presence state."""
@@ -1134,6 +1170,26 @@ class PresenceService:
             return UNKNOWN
         return ARMED if reported else UNAVAILABLE
 
+    @staticmethod
+    def _port_armed(port):
+        """A configured port, unless it reports its external delivery disabled.
+
+        A port may expose ``armed()``: the Main notification adapter records a
+        local `disabled` event when Slack is unconfigured, which is not an
+        armed Owner notification path, so it reports False from the start
+        rather than only after the first event. A raising or non-bool answer
+        is unavailable, never armed.
+        """
+        if port is None:
+            return False
+        armed = getattr(port, "armed", None)
+        if armed is None:
+            return True
+        try:
+            return armed() is True
+        except Exception:
+            return False
+
     def _critical_paths(self, unresolved, denied):
         """Report configured/known critical-path availability, never a fixed armed.
 
@@ -1147,8 +1203,8 @@ class PresenceService:
         paths = {
             "critical_detection": self._detection_path(),
             "critical_persistence": self._persistence_path(denied),
-            "critical_evidence": ARMED if self.evidence is not None and "evidence" not in unresolved else UNAVAILABLE,
-            "critical_notifications": ARMED if self.notifications is not None and "notification" not in unresolved else UNAVAILABLE,
+            "critical_evidence": ARMED if self._port_armed(self.evidence) and "evidence" not in unresolved else UNAVAILABLE,
+            "critical_notifications": ARMED if self._port_armed(self.notifications) and "notification" not in unresolved else UNAVAILABLE,
         }
         return {**paths, "critical_paths_degraded": any(value != ARMED for value in paths.values())}
 

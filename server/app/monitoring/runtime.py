@@ -839,6 +839,64 @@ class MonitoringRuntime:
         self._set(notification_local_failed=self.notifications.local_delivery_failed,
                   notification_delivery_failed=self.notifications.delivery_failed)
 
+    # -- presence critical notifications (Issue #26) -------------------------
+
+    def _require_owner(self) -> None:
+        if threading.get_ident() != self._owner:
+            raise RuntimeError("monitoring owner thread required")
+
+    def dispatch_notifications(self, step: Callable[[], int]) -> int:
+        """Run an upstream outbox's dispatch ``step`` on this worker.
+
+        `NotificationService` is owned by this thread, so the presence
+        dispatcher submits through it here (``self.call(...)``). Completions
+        are polled before the step, freeing queue capacity, and after it, so a
+        synchronous outcome reaches the outbox at once rather than on the next
+        tick. Raises without a notification service (nothing is submitted).
+        """
+        self._require_owner()
+        if self.notifications is None:
+            raise RecordingError("NOTIFICATION_SERVICE_UNAVAILABLE")
+        self._poll()
+        try:
+            return step()
+        finally:
+            self._poll()
+
+    def notification_outcomes(self, event_ids) -> dict[UUID, DeliveryResult]:
+        """Stored delivery results of ``event_ids`` in `notification_events`.
+
+        Used to reconcile an upstream outbox's unconfirmed claims after a
+        restart. An event without a row is absent from the result.
+        """
+        self._require_owner()
+        if self.notification_events is None:
+            raise RecordingError("NOTIFICATION_STORE_UNAVAILABLE")
+        outcomes = {}
+        for event_id in event_ids:
+            row = self.notification_events.get(event_id)
+            if row is not None:
+                outcomes[event_id] = row["delivery"]
+        return outcomes
+
+    def settle_notifications(self, timeout_seconds: float) -> int:
+        """Poll until no immediate delivery is pending or ``timeout_seconds`` pass.
+
+        Shutdown calls it before `stop()`, so a notification submitted just
+        before shutdown still completes and is recorded when the endpoint
+        answers in time. Returns how many deliveries are still pending; those
+        stay `pending` in `notification_events` (uncertain, never resent).
+        """
+        self._require_owner()
+        if self.notifications is None:
+            return 0
+        deadline = time.monotonic() + timeout_seconds
+        self._poll()
+        while self.notifications.pending_count and time.monotonic() < deadline:
+            time.sleep(0.02)
+            self._poll()
+        return self.notifications.pending_count
+
     def tick(self) -> None:
         """One owner-thread pass; call only through `call` or the run loop."""
         if threading.get_ident() != self._owner:

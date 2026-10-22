@@ -52,9 +52,19 @@ is in memory only: after a restart the startup checks re-detect a persisting
 fault. Call `poll()` on each worker timer tick, not just at 23:00.
 Critical `record` also accepts an upstream `event_id: UUID` and an optional
 `on_complete(result)` callback. Repeated submissions of that ID coalesce while
-pending; the callback runs on `poll`'s owning thread. The upstream durable outbox
+pending, and every submitter's callback is told the joined delivery's outcome
+(an Owner requeue starts a new presence claim generation that must complete
+too); callbacks run on `poll`'s owning thread, and one that raises is retried on
+the next poll without repeating the others. The upstream durable outbox
 must reconcile already-persisted IDs after restart and must not treat `pending`
-as confirmed delivery. This in-memory queue does not promise exactly-once Slack
+as confirmed delivery. `can_accept(event_id)` tells such an outbox before it
+submits whether the event fits: the ID is already pending or retained, the
+queue has room, or (Slack disabled) the bounded local-retry buffer has room.
+A full or closed queue or a full retry buffer then leaves its work queued
+instead of becoming a final `failed`. `retained(event_id)` reports a `failed`
+result that is only a refused local write being retried (nothing was sent, and
+resubmitting the ID retries it). The presence critical dispatcher uses both
+(Issue #26, `../presence/README.md`). This in-memory queue does not promise exactly-once Slack
 delivery across a crash; retrying an uncertain external POST may duplicate it.
 `close()` stops new submissions without waiting for a blocked transport/DNS call;
 in-flight/queued events remain durably pending or locally failed as recorded.
