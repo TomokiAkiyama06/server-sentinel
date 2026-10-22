@@ -62,6 +62,24 @@ same alerting startup-failure path. Only the first failure of the episode alerts
 startup steps and binds admission. Slack remains optional and
 never determines local state.
 
+Camera offline (Issue #301 item 2, Owner decision 2026-10-22):
+`create_app` builds one `cameras.CameraOfflineMonitor` for the configured
+local UVC sources and hands it to the runtime as
+`MonitoringDependencies(camera_offline=)` (an embedder may not supply its
+own). It is fed by the capture runtime's health sink and the application
+capture watcher's status poll, and drained every tick, also while `failed`:
+a source not online for `camera_offline_notification.after_seconds` (default
+300 s) is one confirmed `camera_offline` notification per episode, at most
+`hourly_limit` (default 4) per rolling hour, re-seeded from the accepted rows
+of the last hour on the first running tick. An episode in progress is named
+`uuid5(EVENT_NAMESPACE, "camera-offline:<source>:<last_seen_at>")` from the
+registry, so a restart during the same outage finds the row (any delivery
+state, `pending` included) and does not notify again, unless that row was
+accepted more than 24 h earlier (Owner decision 2026-10-22): the next name
+`…:repeat:N` of a deterministic chain is then used and the outage is notified
+again under the cap. See SPECIFICATION §9
+for the full rules and the known limits.
+
 Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
 takes the `AccessFaultMonitor` the composition root also passes to the
 `HostnameReservationCheck` (`sink=`) and `PasskeyCeremonies` (`findings=`).
