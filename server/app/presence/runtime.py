@@ -86,8 +86,11 @@ DISPATCH_BATCH = 50
 DEFAULT_DISPATCH_INTERVAL_SECONDS = 1.0
 DEFAULT_DISPATCH_BACKOFF_SECONDS = 60.0
 # The settle wait exceeds the Slack transport timeout (10 s by default), so a
-# slow POST still completes, and stays well inside the unit's stop timeout.
+# slow POST still completes. It is bounded to 30 s because the whole shutdown
+# (capture and scene stop, outbox finish, this wait, monitoring stop) must end
+# within the unit's `TimeoutStopSec=90` (`install.py`), or systemd kills it.
 DEFAULT_DISPATCH_SETTLE_SECONDS = 12.0
+MAXIMUM_DISPATCH_SETTLE_SECONDS = 30.0
 
 
 class RetentionClockUntrusted(RuntimeError):
@@ -187,7 +190,7 @@ class SceneTimelineConfiguration:
         if self.dispatch_backoff_seconds < self.dispatch_interval_seconds:
             raise ValueError("invalid timeline interval")
         settle = self.dispatch_settle_seconds
-        if type(settle) not in (int, float) or not math.isfinite(settle) or not 0 <= settle <= 60:
+        if type(settle) not in (int, float) or not math.isfinite(settle) or not 0 <= settle <= MAXIMUM_DISPATCH_SETTLE_SECONDS:
             raise ValueError("invalid timeline interval")
 
 

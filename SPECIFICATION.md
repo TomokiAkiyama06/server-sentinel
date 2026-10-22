@@ -1181,7 +1181,7 @@ or `uncertain` outcomes, and claims an earlier process left `submitting` or
 `queued` whose `notification_events` row is still `pending` (or absent), stay
 unresolved for an audited Owner requeue; a final `sent`/`failed`/`disabled` row
 completes such a claim at the next start. Shutdown runs one last step after
-scene `stop()` and waits up to 12 s (above the 10 s Slack timeout) for submitted deliveries before the
+scene `stop()` and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s, so that with the other stop steps shutdown stays within `TimeoutStopSec=90`) for submitted deliveries before the
 notification service closes. With Slack unconfigured the local row is
 `disabled` and `critical_notifications` stays `unavailable`. No
 evidence-preservation port exists yet (a separate recording decision), so

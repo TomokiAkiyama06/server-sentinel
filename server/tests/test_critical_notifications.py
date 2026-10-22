@@ -5,10 +5,11 @@ transport only. No real Slack endpoint, camera, host or network is used.
 """
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 import json
+import queue
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -118,6 +119,7 @@ class Fixture:
 class CanAcceptTests(Fixture, unittest.TestCase):
     def test_capacity_closed_queue_and_owner_thread(self):
         transport = GatedTransport()
+        self.addCleanup(transport.gate.set)
         service = self.notifications(transport, capacity=1)
         first, second = uuid4(), uuid4()
         self.assertTrue(service.can_accept(first))
@@ -224,6 +226,7 @@ class PresenceNotificationTests(Fixture, unittest.TestCase):
 
     def test_a_full_queue_leaves_work_for_a_later_step_instead_of_failing_it(self):
         transport = GatedTransport()
+        self.addCleanup(transport.gate.set)
         service = self.notifications(transport, capacity=1)
         presence = self.presence(service)
         first = presence.record(observation(Kind.SERVER_MOVEMENT))
@@ -269,6 +272,7 @@ class PresenceNotificationTests(Fixture, unittest.TestCase):
 
     def test_a_stalled_endpoint_with_a_backlog_costs_one_claim_per_step(self):
         transport = GatedTransport()
+        self.addCleanup(transport.gate.set)
         service = self.notifications(transport, capacity=16)
         presence = self.presence(service)
         for index in range(100):
@@ -310,6 +314,7 @@ class PresenceNotificationTests(Fixture, unittest.TestCase):
 
     def test_an_owner_requeue_of_a_running_delivery_completes_from_its_outcome(self):
         transport = GatedTransport()
+        self.addCleanup(transport.gate.set)
         service = self.notifications(transport)
         presence = self.presence(service, access=MockAccess())
         item = presence.record(observation(Kind.SERVER_MOVEMENT))
@@ -328,6 +333,7 @@ class PresenceNotificationTests(Fixture, unittest.TestCase):
 
     def test_every_coalesced_callback_is_told_and_a_raising_one_is_retried_alone(self):
         transport = GatedTransport()
+        self.addCleanup(transport.gate.set)
         service = self.notifications(transport)
         identifier, calls = uuid4(), []
 
@@ -432,7 +438,7 @@ class ReconciliationTests(Fixture, unittest.TestCase):
     def test_dispatch_configuration_is_bounded(self):
         for changes in (dict(dispatch_interval_seconds=0), dict(dispatch_backoff_seconds=float("inf")),
                         dict(dispatch_interval_seconds=2.0, dispatch_backoff_seconds=1.0),
-                        dict(dispatch_settle_seconds=-1), dict(dispatch_settle_seconds=61)):
+                        dict(dispatch_settle_seconds=-1), dict(dispatch_settle_seconds=31)):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 configuration(**changes)
         # The default shutdown wait outlasts the Slack transport timeout.
@@ -445,9 +451,11 @@ class ReconciliationTests(Fixture, unittest.TestCase):
         waits for the single monitoring worker; a dispatch step queued on that
         worker ahead of the admission must not wait for the lock, or neither
         ever finishes."""
-        executor = ThreadPoolExecutor(1)
-        self.addCleanup(executor.shutdown, wait=False)
-        owner = executor.submit(threading.get_ident).result()
+        # A daemon fake of the single monitoring worker: a regression blocks
+        # it on `_pin_lock`, and the test then fails on its timeouts and the
+        # process still exits (a ThreadPoolExecutor worker would hang it).
+        executor = DaemonWorker()
+        owner = executor.submit(threading.get_ident).result(5)
 
         @contextmanager
         def reservation():
@@ -463,12 +471,13 @@ class ReconciliationTests(Fixture, unittest.TestCase):
                 finished.wait(10)
 
             future = executor.submit(hold)
-            granted.wait(10)
+            if not granted.wait(10):
+                raise TimeoutError("synthetic admission not granted")
             try:
                 yield
             finally:
                 finished.set()
-                future.result()
+                future.result(10)
 
         timeline = SceneTimeline(configuration(), self.database, reservation,
                                  notifications=lambda item, complete: ActionResult.QUEUED)
@@ -477,6 +486,7 @@ class ReconciliationTests(Fixture, unittest.TestCase):
         step = executor.submit(timeline.dispatch)        # the dispatcher's step, queued
         opener = threading.Thread(target=timeline.open, daemon=True)
         opener.start()
+        self.addCleanup(busy.set)
         deadline = time.monotonic() + 5
         while not timeline._pin_lock.locked() and time.monotonic() < deadline:
             time.sleep(0.005)
@@ -490,6 +500,28 @@ class ReconciliationTests(Fixture, unittest.TestCase):
         # Once pinned, the next step on the worker dispatches normally.
         self.assertEqual(0, executor.submit(timeline.dispatch).result(5))
         timeline.finish(None)
+
+
+class DaemonWorker:
+    """One daemon thread running submitted calls in order, like the monitoring
+    worker's single-thread executor, but never blocking interpreter exit."""
+
+    def __init__(self):
+        self._work = queue.Queue()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            future, function, arguments = self._work.get()
+            try:
+                future.set_result(function(*arguments))
+            except BaseException as error:
+                future.set_exception(error)
+
+    def submit(self, function, *arguments):
+        future = Future()
+        self._work.put((future, function, arguments))
+        return future
 
 
 class DispatcherTests(Fixture, unittest.IsolatedAsyncioTestCase):
@@ -686,6 +718,7 @@ class LifespanTests(RuntimeFixture):
 
     async def test_settle_waits_for_a_slow_delivery_and_gives_up_at_its_bound(self):
         self.transport = GatedTransport()
+        self.addCleanup(self.transport.gate.set)
         application = self.scene_application(dispatch_interval_seconds=3600,
                                               dispatch_backoff_seconds=3600,
                                               dispatch_settle_seconds=0.2)
@@ -712,6 +745,7 @@ class LifespanTests(RuntimeFixture):
 
     async def test_shutdown_gives_up_on_a_stalled_delivery_after_the_settle_bound(self):
         self.transport = GatedTransport()
+        self.addCleanup(self.transport.gate.set)
         application = self.scene_application(dispatch_interval_seconds=3600,
                                               dispatch_backoff_seconds=3600,
                                               dispatch_settle_seconds=0.3)
