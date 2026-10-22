@@ -30,24 +30,38 @@ The lifecycle follows the acceptance conditions on Issue #205 (from PR #250,
    stays, so the next start records an interrupted gap and Owner status
    reports `timeline_gap` until the Owner clears it.
 
+Confirmed critical observations queue an `evidence` and a `notification`
+delivery row in the same write (`PresenceService.record`). `CriticalDispatcher`
+drives `PresenceService.dispatch_pending()` for them (Issue #26): the Main
+lifespan runs each step on the monitoring worker that owns the #21
+`NotificationService`, so a confirmed server movement or camera tamper reaches
+the Owner through the same local event store and optional Slack delivery as a
+hardware-integrity or recording-health failure. No evidence-preservation port
+exists yet (a separate recording decision), so the `evidence` rows are
+recorded `unavailable` and that critical path stays reported unavailable.
+
 Nothing here registers a route, reads pixels, names a person or infers cause.
 Timing policy stays explicit: there is no default source latency bound or
 clock trust (see `adapters.py`).
 """
 
+import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
 import logging
 import math
 import threading
-from typing import Callable, ContextManager
+from typing import Awaitable, Callable, ContextManager
+from uuid import UUID
 
+from app.completion import run_to_completion
 from app.detection.roi.runtime import SceneRuntimeState
 from app.logging import Event
 from app.storage.database import Database, PinnedDatabase
 
 from .adapters import CriticalTimelineRecorder, MainClock, OutboxState, TimelineOutbox
+from .delivery import ActionResult, notification_result
 from .service import PresenceService
 
 
@@ -63,6 +77,15 @@ DEFAULT_OPEN_RETRY_SECONDS = 15.0
 # Rows one scheduled retention batch may delete per presence table; the
 # largest limit `PresenceService.expire_history` / `expire_audit` accept.
 RETENTION_BATCH = 1000
+# Critical delivery rows one dispatch step selects. A full batch is followed
+# by the next step at once, so a backlog drains without waiting an interval.
+DISPATCH_BATCH = 50
+# How soon a confirmed critical observation is submitted to its ports, the
+# ceiling of the backoff after a failed step (storage refused, database
+# busy), and how long shutdown waits for submitted notifications to finish.
+DEFAULT_DISPATCH_INTERVAL_SECONDS = 1.0
+DEFAULT_DISPATCH_BACKOFF_SECONDS = 60.0
+DEFAULT_DISPATCH_SETTLE_SECONDS = 5.0
 
 
 class RetentionClockUntrusted(RuntimeError):
@@ -122,6 +145,9 @@ class SceneTimelineConfiguration:
     source timing is recorded as untrusted (confirmation is never withdrawn).
     `clock` is the main-host receipt clock port: it returns an aware time and
     whether the deployment trusts it (for example, NTP synchronized).
+    The dispatch values bound how soon confirmed critical work is submitted,
+    the exponential backoff after a failed dispatch step, and the bounded
+    wait at shutdown for submitted notifications (0 waits for none).
     """
 
     maximum_source_latency: timedelta
@@ -129,6 +155,9 @@ class SceneTimelineConfiguration:
     outbox_capacity: int = DEFAULT_OUTBOX_CAPACITY
     flush_interval_seconds: float = DEFAULT_FLUSH_INTERVAL_SECONDS
     open_retry_seconds: float = DEFAULT_OPEN_RETRY_SECONDS
+    dispatch_interval_seconds: float = DEFAULT_DISPATCH_INTERVAL_SECONDS
+    dispatch_backoff_seconds: float = DEFAULT_DISPATCH_BACKOFF_SECONDS
+    dispatch_settle_seconds: float = DEFAULT_DISPATCH_SETTLE_SECONDS
 
     def __post_init__(self):
         if (not isinstance(self.maximum_source_latency, timedelta)
@@ -138,9 +167,15 @@ class SceneTimelineConfiguration:
             raise ValueError("explicit main clock required")
         if type(self.outbox_capacity) is not int or not 1 <= self.outbox_capacity <= 10_000:
             raise ValueError("bounded timeline staging required")
-        for value in (self.flush_interval_seconds, self.open_retry_seconds):
+        for value in (self.flush_interval_seconds, self.open_retry_seconds,
+                      self.dispatch_interval_seconds, self.dispatch_backoff_seconds):
             if type(value) not in (int, float) or not math.isfinite(value) or not 0.01 <= value <= 3600:
                 raise ValueError("invalid timeline interval")
+        if self.dispatch_backoff_seconds < self.dispatch_interval_seconds:
+            raise ValueError("invalid timeline interval")
+        settle = self.dispatch_settle_seconds
+        if type(settle) not in (int, float) or not math.isfinite(settle) or not 0 <= settle <= 30:
+            raise ValueError("invalid timeline interval")
 
 
 class TimelineFinish(StrEnum):
@@ -161,7 +196,8 @@ class SceneTimeline:
 
     def __init__(self, configuration: SceneTimelineConfiguration, database: Database,
                  reservation: Callable[[], ContextManager], *,
-                 detection: Callable[[], bool] | None = None):
+                 detection: Callable[[], bool] | None = None,
+                 notifications: Callable | None = None):
         if not isinstance(configuration, SceneTimelineConfiguration):
             raise TypeError("scene timeline configuration is required")
         if not isinstance(database, Database):
@@ -170,14 +206,20 @@ class SceneTimeline:
             raise TypeError("storage admission is required")
         if detection is not None and not callable(detection):
             raise TypeError("invalid detection health probe")
+        if notifications is not None and not callable(notifications):
+            raise TypeError("invalid notification port")
         self.configuration = configuration
         self._reservation = reservation
         self._pinned = PinnedDatabase(database)
-        # No evidence or notification port is configured here yet (#21): the
-        # Owner status reports those critical paths as unavailable, never
-        # armed, and the queued delivery rows stay visibly pending.
+        # The notification port is the #21 `NotificationService` adapter the
+        # Main composition passes when a monitoring runtime owns that service;
+        # without it the path stays reported unavailable, never armed. No
+        # evidence-preservation port exists yet (a separate recording
+        # decision), so `critical_evidence` stays unavailable and its rows are
+        # recorded `unavailable` by the dispatcher rather than left pending.
         self.presence = PresenceService(self._pinned, reservation=reservation,
-                                        detection=detection)
+                                        detection=detection, notifications=notifications)
+        self._reconciled = False
         self.outbox = TimelineOutbox(self.presence, clock=configuration.clock,
                                      capacity=configuration.outbox_capacity)
         self.recorder = CriticalTimelineRecorder(
@@ -260,6 +302,37 @@ class SceneTimeline:
     def state(self) -> OutboxState:
         return self.outbox.state()
 
+    def dispatch(self, reconcile: Callable[[tuple[UUID, ...]], dict] | None = None) -> int:
+        """One critical dispatch step; run it on the notification port's owning thread.
+
+        Returns how many delivery rows were selected (`DISPATCH_BATCH` means
+        more may wait). The database is pinned under the storage admission
+        first, never created here; a refusal raises and nothing is claimed.
+
+        Before the first step of this process, `notification` claims that an
+        earlier process left `submitting`/`queued` are reconciled against the
+        notification service's durable event rows: ``reconcile(ids)`` returns
+        the stored #21 delivery result per event ID. A final `sent`, `failed`
+        or `disabled` row completes that claim (scoped to its generation); a
+        row still `pending`, or none at all, proves nothing about the external
+        POST, so the claim stays unresolved for an audited Owner requeue and is
+        never resent automatically. Raising leaves reconciliation for the
+        next step.
+        """
+        self._pin()
+        if not self._reconciled:
+            if reconcile is not None and self.presence.notifications is not None:
+                claims = self.presence.unconfirmed_actions("notification")
+                outcomes = reconcile(tuple(identifier for identifier, _ in claims)) if claims else {}
+                for identifier, generation in claims:
+                    result = notification_result(outcomes.get(identifier))
+                    if result in (ActionResult.DELIVERED, ActionResult.FAILED,
+                                  ActionResult.DISABLED):
+                        self.presence.complete_action(identifier, "notification", result,
+                                                      generation=generation)
+            self._reconciled = True
+        return self.presence.dispatch_pending(limit=DISPATCH_BATCH)
+
     def finish(self, scene_status) -> TimelineFinish:
         """End the outbox after the scene runtime's `stop()` returned.
 
@@ -290,3 +363,72 @@ class SceneTimeline:
             logging.getLogger(__name__).error(Event.TIMELINE_OUTBOX_CLOSE_FAILED)
             return TimelineFinish.CLOSE_FAILED
         return TimelineFinish.CLOSED
+
+
+class CriticalDispatcher:
+    """Drives `SceneTimeline.dispatch()` from the Main lifespan (Issue #26).
+
+    ``run_step(function)`` executes ``function`` on the thread that owns the
+    notification port (the monitoring worker) and returns its result; the
+    loop itself never touches SQLite or the notification service.
+
+    A step that raises (storage refused, the database not openable yet, a
+    busy database) is retried after an exponential backoff from the
+    dispatch interval up to `dispatch_backoff_seconds`; the failure is
+    logged value-free at the first failure of a streak and at every doubling,
+    and the recovery once. Nothing is dropped meanwhile: unclaimed rows stay
+    `pending` in the database and are submitted by a later step or the next
+    process. A full batch is followed by the next step at once.
+
+    Retries never duplicate a notification: a claimed row is never reclaimed
+    by `dispatch_pending`, the notification service coalesces a resubmitted
+    event ID, the event ID is the observation identity, and only an action the
+    port refused to accept (`unavailable`, nothing submitted) is retried.
+    """
+
+    def __init__(self, timeline: SceneTimeline,
+                 run_step: Callable[[Callable[[], int]], Awaitable[int]],
+                 step: Callable[[], int]):
+        if not isinstance(timeline, SceneTimeline):
+            raise TypeError("scene timeline is required")
+        if not callable(run_step) or not callable(step):
+            raise TypeError("dispatch step is required")
+        self.configuration = timeline.configuration
+        self._run_step, self._step = run_step, step
+        self._failures = 0
+
+    @property
+    def failing(self) -> bool:
+        """Whether the latest step failed; the backlog then waits for a retry."""
+        return self._failures > 0
+
+    async def once(self) -> float:
+        """Run one step; returns the delay before the next one.
+
+        Cancelling the caller never abandons a step in flight: it finishes
+        on its worker first (`run_to_completion`), so shutdown never races a
+        claim or a submission it cannot see.
+        """
+        configuration = self.configuration
+        try:
+            selected = await run_to_completion(self._run_step(self._step))
+        except Exception:
+            self._failures += 1
+            failures = self._failures
+            if failures & (failures - 1) == 0:
+                logging.getLogger(__name__).error(Event.CRITICAL_DISPATCH_FAILING)
+            return min(configuration.dispatch_backoff_seconds,
+                       configuration.dispatch_interval_seconds * 2 ** min(failures, 30))
+        if self._failures:
+            self._failures = 0
+            logging.getLogger(__name__).info(Event.CRITICAL_DISPATCH_RECOVERED)
+        if type(selected) is int and selected >= DISPATCH_BATCH:
+            return 0.0
+        return configuration.dispatch_interval_seconds
+
+    async def run(self) -> None:
+        """Dispatch forever; cancel to stop (an in-flight step completes first)."""
+        delay = self.configuration.dispatch_interval_seconds
+        while True:
+            await asyncio.sleep(delay)
+            delay = await self.once()

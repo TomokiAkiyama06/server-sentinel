@@ -1234,6 +1234,19 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   verification in `server/tests/test_scene_timeline.py`), but the production
   launcher does not build scene monitoring yet, so this needs the deployment
   section and the Owner calibration route first (follow-up).
+- [ ] (#26) a confirmed server movement or camera tamper on the deployment
+  sends exactly one `ServerSentinel critical alert: server_movement` /
+  `camera_tamper` to the configured Slack within a few seconds, in every
+  presence state, with no image, source name, person or cause in it; its
+  `notification_events` row is `sent` and the presence `notification`
+  delivery `delivered`; a service restart afterwards sends nothing again;
+  with Slack unconfigured the row is `disabled` and Owner status reports
+  `critical_notifications` unavailable; while the recording filesystem is
+  refused nothing is lost and the alert is sent after it recovers;
+  `critical_evidence` stays unavailable (no evidence port yet). Verified so
+  far only with synthetic observations and an intercepted Slack transport
+  (`server/tests/test_critical_notifications.py`); needs the same deployment
+  section and calibration route as above.
 
 ### Issue #217 MJPG decoder on real C960 frames (pending physical execution)
 

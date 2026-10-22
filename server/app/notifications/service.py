@@ -153,6 +153,22 @@ class NotificationService:
     def unpersisted_count(self) -> int:
         return len(self._unpersisted)
 
+    def can_accept(self, event_id: UUID) -> bool:
+        """Whether `record(..., event_id=event_id)` would not be refused for capacity.
+
+        An upstream durable outbox asks before it submits, so a full or closed
+        queue leaves its work queued for a later attempt instead of turning
+        into a final `failed` delivery for an alert that was never sent. A
+        resubmission of an event already pending or retained always fits, and
+        without Slack nothing is queued at all.
+        """
+        self._check()
+        if not isinstance(event_id, UUID):
+            raise ValueError("invalid notification event")
+        if event_id in self._pending or event_id in self._unpersisted or not self._slack.configured:
+            return True
+        return not self.closed and len(self._pending) < self._capacity
+
     def _check(self):
         if threading.get_ident() != self._owner:
             raise RuntimeError("notification owner thread required")

@@ -970,7 +970,28 @@ class PresenceService:
                        (actor, timestamp(now), target))
             return gap
 
+    def unconfirmed_actions(self, action):
+        """``(identifier, generation)`` of claims of ``action`` left unresolved.
+
+        These are `submitting`/`queued` rows: a port was (or may have been)
+        called and no completion was recorded. Only a caller that knows no
+        claim of its own process is still in flight, such as a dispatcher
+        before its first dispatch, may reconcile them against the port's own
+        durable record; the generation scopes that completion to the claim.
+        """
+        if action not in {"evidence", "notification"}:
+            raise ValueError("invalid action identity")
+        with self._read() as db:
+            rows = db.execute("SELECT observation,generation FROM presence_deliveries "
+                              "WHERE action=? AND state IN ('submitting','queued') "
+                              "ORDER BY observation", (action,)).fetchall()
+        return tuple((UUID(row[0]), int(row[1])) for row in rows)
+
     def dispatch_pending(self, *, limit=100):
+        """Submit up to ``limit`` queued critical actions; returns how many were selected.
+
+        A result equal to ``limit`` means more work may be waiting.
+        """
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("invalid dispatch limit")
         # Submission is separate from observation ingestion. Claim durably,
@@ -1046,6 +1067,7 @@ class PresenceService:
                 db.execute("UPDATE presence_deliveries SET state=? WHERE observation=? AND action=? "
                            "AND state='submitting' AND generation=?",
                            (result.value, row["observation"], row["action"], claim))
+        return len(pending)
 
     def process_critical(self, detector):
         """Run the supplied critical detector in every presence state."""

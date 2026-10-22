@@ -1160,9 +1160,28 @@ start records an interrupted gap and Owner status reports `timeline_gap` until
 the Owner clears it. A count handed over after the outbox closed or before it
 opened would be refused and only logged; this ordering prevents both. Presence
 reports `critical_detection` armed only while the scene runtime is `running`.
-No evidence-preservation or notification port is wired yet (#21), so those
-critical paths stay `unavailable` in Owner status, and the production launcher
-does not build scene monitoring yet (the calibration route and the deployment
+With the monitoring runtime configured, a confirmed server movement or camera
+tamper notifies the Owner through the monitoring runtime's
+`NotificationService` (Issue #26): the same durable `notification_events` row,
+keyed by the observation identity, and the same optional immediate Slack
+message (`ServerSentinel critical alert: server_movement` / `camera_tamper`,
+fixed category only, no image, source, person or cause) as a hardware-integrity
+or recording-health failure, in every presence state. A `CriticalDispatcher`
+runs `dispatch_pending()` on the monitoring worker every second (at once again
+after a full batch; a failing step backs off exponentially up to 60 s and is
+logged value-free); unclaimed work stays `pending`, and a full or closed
+notification queue leaves the row `unavailable` with nothing submitted, retried
+by a later step. A claimed submission is never retried automatically: `failed`
+or `uncertain` outcomes, and claims an earlier process left `submitting` or
+`queued` whose `notification_events` row is still `pending` (or absent), stay
+unresolved for an audited Owner requeue; a final `sent`/`failed`/`disabled` row
+completes such a claim at the next start. Shutdown runs one last step after
+scene `stop()` and waits up to 5 s for submitted deliveries before the
+notification service closes. With Slack unconfigured the local row is
+`disabled` and `critical_notifications` stays `unavailable`. No
+evidence-preservation port exists yet (a separate recording decision), so
+`critical_evidence` stays `unavailable` in Owner status, and the production
+launcher does not build scene monitoring yet (the calibration route and the deployment
 section are follow-ups of #205). Without `scene_timeline` the count is only
 logged, as before.
 

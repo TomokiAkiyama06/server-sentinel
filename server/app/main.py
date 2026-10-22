@@ -32,7 +32,9 @@ from app.media.live.local_preview import LocalPreviewHub
 from app.monitoring.access import AccessFaultMonitor
 from app.monitoring.config import MonitoringConfiguration
 from app.monitoring.runtime import MonitoringDependencies, MonitoringRuntime, RuntimeState
-from app.presence.runtime import SceneTimeline, SceneTimelineConfiguration
+from app.notifications.service import NotificationKind
+from app.presence.delivery import NotificationAdapter
+from app.presence.runtime import CriticalDispatcher, SceneTimeline, SceneTimelineConfiguration
 from app.settings import Settings
 from app.storage.database import Database, PinnedDatabase
 from app.storage.migrations import migrate
@@ -192,10 +194,18 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # thresholds the admission stays unbound: writes are refused rather than
     # admitted against a reserve this process cannot verify.
     runtime_admission = RuntimeStorageAdmission()
+    # Built before the scene timeline, whose critical notification port
+    # submits through this runtime's `NotificationService` (Issue #26).
+    monitoring_runtime = (
+        MonitoringRuntime(monitoring, store, monitoring_dependencies,
+                          migrations=APPLICATION_MIGRATIONS)
+        if monitoring is not None and monitoring.storage_configured else None
+    )
     # Presence timeline for scene evidence (#205): with `scene_timeline` the
     # application owns the durable critical recorder, the count-only
     # undelivered sink and the outbox session lifecycle (see lifespan).
     timeline = None
+    critical_dispatcher = None
     if scene_timeline is not None:
         if not isinstance(scene_timeline, SceneTimelineConfiguration):
             raise TypeError("scene timeline configuration is invalid")
@@ -215,8 +225,30 @@ def create_app(settings: Settings, *, database: Database | None = None,
             return bool(scene_holder) and (scene_holder[0].status().state
                                            is SceneRuntimeState.RUNNING)
 
+        # Confirmed server movement / camera tamper notify the Owner through
+        # the monitoring runtime's `NotificationService`: the same durable
+        # `notification_events` row and optional Slack delivery as a hardware
+        # integrity or recording-health failure (Issue #26, #21). The port
+        # runs on that runtime's worker (`CriticalDispatcher` below). Without
+        # a monitoring runtime there is no notification service, so the path
+        # stays reported unavailable. No evidence-preservation port exists
+        # yet (a separate recording decision): `critical_evidence` stays
+        # unavailable.
+        notification_port = (
+            NotificationAdapter(lambda: monitoring_runtime.notifications, NotificationKind,
+                                provided=True)
+            if monitoring_runtime is not None else None)
         timeline = SceneTimeline(scene_timeline, store, storage_reservation or runtime_admission,
-                                 detection=scene_detection_armed)
+                                 detection=scene_detection_armed,
+                                 notifications=notification_port)
+        if monitoring_runtime is not None:
+            def critical_dispatch_step() -> int:
+                return timeline.dispatch(reconcile=monitoring_runtime.notification_outcomes)
+
+            critical_dispatcher = CriticalDispatcher(
+                timeline,
+                lambda step: monitoring_runtime.call(monitoring_runtime.dispatch_notifications, step),
+                critical_dispatch_step)
         scene_monitoring_dependencies = replace(
             scene_monitoring_dependencies or SceneMonitoringDependencies(),
             recorder=timeline.recorder, undelivered=timeline.undelivered)
@@ -258,11 +290,6 @@ def create_app(settings: Settings, *, database: Database | None = None,
             discovery=uvc_dependencies.discovery,
             capture_factory=uvc_dependencies.capture_factory,
         ) if local_uvc is not None else None
-    )
-    monitoring_runtime = (
-        MonitoringRuntime(monitoring, store, monitoring_dependencies,
-                          migrations=APPLICATION_MIGRATIONS)
-        if monitoring is not None and monitoring.storage_configured else None
     )
     audit_store = AuditStore(store, reservation=storage_reservation or runtime_admission)
     if human_access is not None:
@@ -318,7 +345,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
         human_task = None
         # The scene watcher may be started late, by the timeline task, once
         # a deferred outbox open succeeds; shutdown reads it from here.
-        scene_lifecycle = {"watch": None, "timeline": None, "stopping": False}
+        scene_lifecycle = {"watch": None, "timeline": None, "dispatch": None, "stopping": False}
 
         uvc_lifecycle = {"deferred": None, "stopping": False}
 
@@ -429,6 +456,26 @@ def create_app(settings: Settings, *, database: Database | None = None,
             with suppress(Exception):
                 application.state.scene_timeline_finish = await run_to_completion(
                     asyncio.to_thread(timeline.finish, scene_status))
+
+        async def settle_critical_dispatch() -> None:
+            # Issue #26: after scene stop() returned (its final pass may have
+            # recorded confirmed critical observations) and while storage is
+            # still admitted, submit what is queued once more, then wait a
+            # bounded time for submitted notifications to complete, so a
+            # shutdown right after a server movement still notifies. What
+            # does not finish stays `pending` / unresolved, never sent twice.
+            if critical_dispatcher is None:
+                return
+            with suppress(Exception):
+                await critical_dispatcher.once()
+            try:
+                unsettled = await run_to_completion(monitoring_runtime.call(
+                    monitoring_runtime.settle_notifications,
+                    timeline.configuration.dispatch_settle_seconds))
+            except Exception:
+                unsettled = None
+            if unsettled != 0:
+                logging.getLogger(__name__).error(Event.CRITICAL_NOTIFICATIONS_UNSETTLED)
 
         async def start_local_uvc() -> None:
             # Never a silent default: every outcome is an explicit state.
@@ -542,10 +589,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 with suppress(asyncio.CancelledError):
                     await human_task
             scene_lifecycle["stopping"] = True
-            for name in ("timeline", "watch"):
+            for name in ("timeline", "watch", "dispatch"):
                 # The timeline task first: a deferred start it is running
                 # finishes (cancellation is deferred) before stop() below,
-                # and it can then create no new watcher.
+                # and it can then create no new watcher. A dispatch step in
+                # flight finishes on the monitoring worker first as well.
                 task = scene_lifecycle[name]
                 if task is not None:
                     task.cancel()
@@ -567,6 +615,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # After scene stop() returned and while storage is still admitted
             # (the monitoring runtime stops below).
             await finish_timeline(scene_status)
+            # Before the monitoring runtime (and its notification service)
+            # stops below.
+            await settle_critical_dispatch()
             if cleanup_task is not None:
                 cleanup_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -625,6 +676,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
                     application.state.scene_monitoring_state = SceneRuntimeState.UNAVAILABLE
                     logging.getLogger(__name__).error(Event.SCENE_MONITORING_UNAVAILABLE)
                 scene_lifecycle["timeline"] = asyncio.create_task(run_timeline())
+                if critical_dispatcher is not None:
+                    # Independent of the outbox open: queued critical work
+                    # from an earlier process is submitted as soon as the
+                    # monitoring runtime admits storage.
+                    scene_lifecycle["dispatch"] = asyncio.create_task(critical_dispatcher.run())
             await start_local_uvc()
             if local_uvc_runtime is not None:
                 uvc_watch_task = asyncio.create_task(watch_local_uvc())
@@ -683,6 +739,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # reads either; Owner status through a reviewed route is a follow-up.
     application.state.scene_timeline = timeline
     application.state.scene_timeline_finish = None
+    # Internal only: drives presence critical notifications (Issue #26).
+    application.state.critical_dispatcher = critical_dispatcher
     application.state.diagnostic_export_endpoint = diagnostic_export_endpoint
     application.state.human_access = human_access
     # No FastAPI human router is ever included: the surface below answers

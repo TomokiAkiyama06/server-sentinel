@@ -698,6 +698,8 @@ class PresenceTests(unittest.TestCase):
     def test_async_notification_stays_pending_until_polled_completion(self):
         class NotificationMock:
             callback = None
+            def can_accept(inner, event_id):
+                return True
             def record(inner, kind, **fields):
                 inner.identifier = fields["event_id"]
                 inner.callback = fields["on_complete"]
