@@ -75,7 +75,7 @@
     },
     {
       "path": "web/tests/access_browser.mjs",
-      "sha256": "sha256:9e58bdf254973322c79346fd7040d27bb7ecda77b5419ace718facd93d0e6049"
+      "sha256": "sha256:9990de41319a061590291827e7924c797270337183e5ee8bda858df7b82a119d"
     }
   ],
   "inputs": [

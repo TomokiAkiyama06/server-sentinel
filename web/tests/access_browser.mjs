@@ -292,6 +292,20 @@ try {
       [`/api/admin/principals/${personId}/revoke`, '/api/auth/step-up/options']);
   });
 
+  await scenario('pagehide while the step-up question is open reports that nothing changed', {
+    handlers: (json, stepUpRequired) => ({ [`POST /api/admin/principals/${personId}/permissions`]: stepUpRequired }),
+  }, async ({ page, ui, posts }) => {
+    await ui.open();
+    await ui.button('付与する');
+    await page.wait("Boolean(document.querySelector('[role=alertdialog]'))");
+    await page.evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }))");
+    await ui.text(TEXT.notPerformed);
+    assert.equal(await page.evaluate("document.querySelector('[role=alertdialog]') === null"), true);
+    await delay(300);
+    // Refused before any commit and never resent; no step-up was started.
+    assert.deepEqual(posts().map(item => item.path), [`/api/admin/principals/${personId}/permissions`]);
+  });
+
   await scenario('an invitation answered after pagehide never shows its code', {
     handlers: json => ({ 'POST /api/admin/principals': async () => {
       await delay(800);

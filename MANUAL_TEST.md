@@ -2232,10 +2232,17 @@ Chrome (record the browser and OS versions used):
   the options as soon as `step_up_required` arrives and call `get()` directly
   from the confirm click handler, fetching fresh options when the five-minute
   challenge lifetime has passed;
-- [ ] start an invitation and hide the page (switch tabs/apps or navigate
-  away) before it answers: on return no code is shown, the result is
-  reported as unknown and the list is reloaded; re-issue to obtain a usable
-  code.
+- [ ] start an invitation and leave the page before it answers (navigate
+  to another page and come back with the browser's Back button, so the page
+  may be restored from the back-forward cache; also close the tab and
+  reopen `/app/`): on return no code is shown, a restored page reports the
+  result as unknown and reloads the list; re-issue to obtain a usable code;
+- [ ] with the step-up question open, navigate away and come back with Back:
+  the page reports that nothing was changed and nothing was sent again;
+- [ ] with a code shown, switch to another tab or app (for example the chat
+  app the code is pasted into) and return: the code is still shown. This is
+  intended: only leaving the page (`pagehide`) clears it, not a tab or app
+  switch (`visibilitychange`), so the Owner can paste it elsewhere.
 
 ### Issue #10 S7 interim live (pending)
 

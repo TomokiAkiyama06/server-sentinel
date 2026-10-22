@@ -433,7 +433,11 @@ built.
   kept in the back-forward cache holds none; the `pagehide` clear is flushed
   synchronously). `pagehide` also aborts a change still in flight and drops
   its late answer, so a code returned after the page was hidden is never
-  shown; that change is reported as unknown and the list reloaded. A shown
+  shown; that change is reported as unknown and the list reloaded, except
+  while the step-up question is open (refused before any commit, never
+  resent), which is reported as not performed. A tab or app switch
+  (`visibilitychange`) deliberately clears nothing, so the Owner can paste
+  the code into another app. A shown
   code is dropped as soon as a re-issue or revocation of the same person
   starts, whatever its outcome, so a code the server may already have revoked
   never stays copyable. A copied code stays on the clipboard, and the hand-over

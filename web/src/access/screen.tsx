@@ -79,8 +79,14 @@ export function AccessScreen({ services, t }: { services: DashboardServices; t: 
     // Synchronous, so the DOM no longer holds the code when the page is frozen.
     // A change still in flight is abandoned too (Codex PR #315): its late
     // answer, a code included, is never applied, and its outcome is unknown.
+    // Only `pagehide` (navigation, back-forward cache, closing the tab), not
+    // `visibilitychange`: switching to another app to paste the code must
+    // keep it shown (PR #315 review).
     const hide = () => {
       const pending = operation.current;
+      // The step-up question is open: the change was refused before any
+      // commit (`step_up_required`) and is not sent again, so nothing changed.
+      const unanswered = answer.current !== null;
       operation.current = null;
       pending?.abort();
       answer.current?.(false);
@@ -91,8 +97,8 @@ export function AccessScreen({ services, t }: { services: DashboardServices; t: 
           setPrompt(null);
           setCeremony(false);
           setBusy(null);
-          setResult('unknown');
-          setReload(value => value + 1);
+          setResult(unanswered ? 'not_performed' : 'unknown');
+          if (!unanswered) setReload(value => value + 1);
         }
       });
     };
