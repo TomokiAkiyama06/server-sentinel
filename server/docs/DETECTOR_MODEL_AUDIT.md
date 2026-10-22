@@ -7,6 +7,10 @@
 > closure; see [YOLOX_EVALUATION_AUDIT.md](YOLOX_EVALUATION_AUDIT.md). The
 > weights license remains unresolved, so the statements below about weights
 > still hold: no weight is approved for bundling, redistribution or deployment.
+>
+> **Update 2026-10-22:** a survey of person-detection models whose weights carry
+> an explicit license (status Proposed, no adoption) is in
+> [`2026-10-22-person-detector-weights-license-survey.md`](../../docs/decisions/2026-10-22-person-detector-weights-license-survey.md).
 
 Decision for this implementation: **evaluation candidate only; no YOLOX package,
 pretrained weights, exported ONNX model, or automatic download is approved or
