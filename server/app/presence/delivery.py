@@ -42,10 +42,24 @@ class NotificationAdapter:
     the service's fixed category text only (`server_movement` or
     `camera_tamper`): no image, source, person or cause.
     """
-    def __init__(self, service, kind_factory, *, provided=False):
+    def __init__(self, service, kind_factory, *, provided=False, configured=None):
         if provided and not callable(service):
             raise ValueError("notification service provider required")
+        if configured is not None and not callable(configured):
+            raise ValueError("invalid delivery capability probe")
         self.service, self.kind_factory, self.provided = service, kind_factory, provided
+        self.configured = configured
+
+    def armed(self) -> bool:
+        """Whether an external Owner notification can be delivered at all.
+
+        ``configured`` reports the deployment's delivery capability (the Main
+        composition: whether Slack is configured). Without Slack the service
+        still records a local `disabled` event for every critical observation,
+        but presence reports `critical_notifications` unavailable from the
+        start, not only once a `disabled` outcome was recorded.
+        """
+        return True if self.configured is None else self.configured() is True
 
     _result = staticmethod(notification_result)
 

@@ -280,7 +280,9 @@ or `disabled` row completes the claim (scoped to its generation); a row still
 `pending`, or no row, proves nothing about the earlier POST, so the claim
 stays unresolved and `critical_notifications` stays unavailable. With Slack
 unconfigured the local row is `disabled` and the path is reported unavailable,
-as for any durably disabled delivery.
+as for any durably disabled delivery, and also from the start, before any
+event: the adapter's `armed()` reports the deployment's Slack capability
+(`configured=`), which `PresenceService` consults besides the delivery rows.
 
 Shutdown cancels the loop (a step in flight finishes on the worker first),
 and after scene `stop()` and the outbox finish it runs one more step, so a

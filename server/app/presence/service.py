@@ -1170,6 +1170,26 @@ class PresenceService:
             return UNKNOWN
         return ARMED if reported else UNAVAILABLE
 
+    @staticmethod
+    def _port_armed(port):
+        """A configured port, unless it reports its external delivery disabled.
+
+        A port may expose ``armed()``: the Main notification adapter records a
+        local `disabled` event when Slack is unconfigured, which is not an
+        armed Owner notification path, so it reports False from the start
+        rather than only after the first event. A raising or non-bool answer
+        is unavailable, never armed.
+        """
+        if port is None:
+            return False
+        armed = getattr(port, "armed", None)
+        if armed is None:
+            return True
+        try:
+            return armed() is True
+        except Exception:
+            return False
+
     def _critical_paths(self, unresolved, denied):
         """Report configured/known critical-path availability, never a fixed armed.
 
@@ -1183,8 +1203,8 @@ class PresenceService:
         paths = {
             "critical_detection": self._detection_path(),
             "critical_persistence": self._persistence_path(denied),
-            "critical_evidence": ARMED if self.evidence is not None and "evidence" not in unresolved else UNAVAILABLE,
-            "critical_notifications": ARMED if self.notifications is not None and "notification" not in unresolved else UNAVAILABLE,
+            "critical_evidence": ARMED if self._port_armed(self.evidence) and "evidence" not in unresolved else UNAVAILABLE,
+            "critical_notifications": ARMED if self._port_armed(self.notifications) and "notification" not in unresolved else UNAVAILABLE,
         }
         return {**paths, "critical_paths_degraded": any(value != ARMED for value in paths.values())}
 

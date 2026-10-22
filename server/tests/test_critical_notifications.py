@@ -259,6 +259,24 @@ class PresenceNotificationTests(Fixture, unittest.TestCase):
         status = presence.snapshot(now=NOW + timedelta(seconds=1), clock_trusted=True)
         self.assertEqual("unavailable", status["critical_notifications"])
 
+    def test_an_unconfigured_delivery_capability_is_unavailable_before_any_event(self):
+        service = self.notifications(slack=False)
+        for configured, expected in ((lambda: False, "unavailable"), (lambda: True, "armed"),
+                                     (lambda: 1, "unavailable"), (self.raising, "unavailable")):
+            presence = PresenceService(
+                self.database, reservation=nullcontext,
+                notifications=NotificationAdapter(lambda: service, NotificationKind,
+                                                  provided=True, configured=configured))
+            with self.subTest(expected=expected, configured=configured):
+                status = presence.snapshot(now=NOW, clock_trusted=True)
+                self.assertEqual(expected, status["critical_notifications"])
+        with self.assertRaises(ValueError):
+            NotificationAdapter(service, NotificationKind, configured=object())
+
+    @staticmethod
+    def raising():
+        raise RuntimeError("synthetic probe failure")
+
     def test_disabled_slack_records_the_local_event_and_reports_the_path_unavailable(self):
         service = self.notifications(slack=False)
         presence = self.presence(service)
@@ -812,6 +830,32 @@ class LifespanTests(RuntimeFixture):
             f"SELECT delivery FROM notification_events WHERE event_id='{item.identifier}'"))
         self.assertEqual("delivered", self.rows(
             "SELECT state FROM presence_deliveries WHERE action='notification'")[0][0])
+
+    async def test_path_health_follows_the_configured_slack_capability_from_the_start(self):
+        for slack, expected in ((False, "unavailable"), (True, "armed")):
+            with self.subTest(slack=slack):
+                self.setUp()
+                self.slack = slack
+                application = self.scene_application()
+                timeline = application.state.scene_timeline
+                async with asyncio.timeout(30), application.router.lifespan_context(application):
+                    # A fresh deployment, before any critical event.
+                    self.assertTrue(await self.until(lambda: timeline.opened))
+                    status = timeline.presence.snapshot(
+                        now=datetime.now(timezone.utc), clock_trusted=True)
+                    self.assertEqual(expected, status["critical_notifications"])
+                    if not slack:
+                        # The local event is still recorded, as `disabled`,
+                        # and the path stays unavailable afterwards too.
+                        item = timeline.presence.record(observation(
+                            Kind.SERVER_MOVEMENT, at=datetime.now(timezone.utc)))
+                        self.assertTrue(await self.until(lambda: self.rows(
+                            "SELECT delivery FROM notification_events "
+                            f"WHERE event_id='{item.identifier}'") == [("disabled",)]))
+                        status = timeline.presence.snapshot(
+                            now=datetime.now(timezone.utc), clock_trusted=True)
+                        self.assertEqual("unavailable", status["critical_notifications"])
+                        self.assertEqual([], self.critical_texts())
 
     async def test_without_monitoring_no_dispatcher_runs_and_the_path_stays_unavailable(self):
         remote = binding(OTHER, SourceType.REMOTE_AGENT)

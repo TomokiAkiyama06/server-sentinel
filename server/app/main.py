@@ -236,7 +236,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # unavailable.
         notification_port = (
             NotificationAdapter(lambda: monitoring_runtime.notifications, NotificationKind,
-                                provided=True)
+                                provided=True,
+                                # Without Slack the local `disabled` event is
+                                # still recorded, but the path is unavailable
+                                # from the start (SPECIFICATION #205 runtime).
+                                configured=lambda: monitoring.slack is not None)
             if monitoring_runtime is not None else None)
         timeline = SceneTimeline(scene_timeline, store, storage_reservation or runtime_admission,
                                  detection=scene_detection_armed,
