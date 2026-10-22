@@ -149,6 +149,35 @@ async function startChrome(executable, options) {
   };
 }
 
+const IDENTIFIER = '[A-Za-z_$][\\w$]{0,63}';
+// V8 messages whose only variable part is an identifier taken from the test's
+// own expression, never page or input text. Anything else is reduced to its
+// error class.
+const STANDARD_MESSAGES = [
+  new RegExp(`^Cannot read properties of (?:null|undefined) \\(reading '${IDENTIFIER}'\\)$`),
+  new RegExp(`^Cannot set properties of (?:null|undefined) \\(setting '${IDENTIFIER}'\\)$`),
+  new RegExp(`^${IDENTIFIER}(?:\\.${IDENTIFIER}){0,7} is not a function$`),
+  new RegExp(`^${IDENTIFIER} is not defined$`),
+];
+
+/**
+ * A value-free description of a CDP `exceptionDetails` (#322): the error
+ * class, plus the engine message only when it has one of the allowlisted V8
+ * shapes above. Every other message (which may quote page text, input or an
+ * invitation code, e.g. JSON.parse or an application error) is dropped, and a
+ * thrown non-Error value is described by its type only.
+ */
+export function describeException(details) {
+  const exception = details?.exception;
+  if (exception?.type !== 'object' || exception.subtype !== 'error') {
+    return `non-Error value thrown (${exception?.type ?? 'unknown'})`;
+  }
+  const className = new RegExp(`^${IDENTIFIER}$`).test(exception.className ?? '') ? exception.className : 'Error';
+  const first = String(exception.description ?? '').split('\n', 1)[0];
+  const message = first.startsWith(`${className}: `) ? first.slice(className.length + 2) : '';
+  return STANDARD_MESSAGES.some(shape => shape.test(message)) ? `${className}: ${message}` : className;
+}
+
 export async function pageFor(browser, viewport) {
   const { browserContextId } = await browser.command('Target.createBrowserContext');
   const { targetId } = await browser.command('Target.createTarget', { url: 'about:blank', browserContextId });
@@ -161,18 +190,69 @@ export async function pageFor(browser, viewport) {
   await command('Emulation.setDeviceMetricsOverride', { ...viewport, deviceScaleFactor: 1, mobile: false });
   async function evaluate(expression) {
     const result = await command('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
-    if (result.exceptionDetails) throw new Error('Browser evaluation failed');
+    if (result.exceptionDetails) throw new Error(`Browser evaluation failed: ${describeException(result.exceptionDetails)}`);
     return result.result.value;
   }
+  // A poll may span a navigation the page makes itself (e.g. a redirect to
+  // /app/): CDP then refuses the evaluation because the document's context is
+  // gone, which is not an answer, so the poll goes on until its deadline. An
+  // exception thrown by the expression itself stays fatal. A timeout names the
+  // last refusal so a poll stuck in navigation is not mistaken for a false DOM.
+  const NAVIGATING = /^(Execution context was destroyed|Cannot find default execution context|Inspected target navigated or closed)\b/;
   async function wait(expression) {
+    let refused;
     for (let i = 0; i < 100; i++) {
-      if (await evaluate(expression)) return;
+      try {
+        if (await evaluate(expression)) return;
+      } catch (error) {
+        const navigating = NAVIGATING.exec(error.message);
+        if (!navigating) throw error;
+        refused = navigating[1];
+      }
       await delay(50);
     }
-    throw new Error('Browser DOM assertion timed out');
+    throw new Error(`Browser DOM assertion timed out${refused ? ` (last CDP refusal while navigating: ${refused})` : ''}`);
+  }
+  /**
+   * Navigates the top frame and resolves once that navigation's document has
+   * committed and parsed (DOMContentLoaded). `Page.navigate` answers before the
+   * new document has been parsed, so an evaluation sent right after it can run
+   * while that document is still loading (#322: `readyState` 'loading', `#m`
+   * not parsed yet, so `getElementById('m')` returns null).
+   */
+  async function navigate(url, timeoutMilliseconds = 10000) {
+    // Events may arrive before the command's answer, so every parsed top-level
+    // document is recorded by loader and matched once the loader is known.
+    let committed;
+    let wanted;
+    let reached;
+    const parsed = new Set();
+    const ready = new Promise(resolve => { reached = resolve; });
+    const cleanup = [
+      browser.on('Page.frameNavigated', ({ frame }, from) => { if (from === sessionId && !frame.parentId) committed = frame.loaderId; }),
+      browser.on('Page.domContentEventFired', (_, from) => {
+        if (from !== sessionId || !committed) return;
+        parsed.add(committed);
+        if (committed === wanted) reached();
+      }),
+    ];
+    let timer;
+    try {
+      const { loaderId, errorText } = await command('Page.navigate', { url });
+      if (errorText) throw new Error(`Navigation failed: ${errorText}`);
+      if (!loaderId) throw new Error('Navigation started no new document');
+      wanted = loaderId;
+      if (parsed.has(loaderId)) return;
+      await Promise.race([ready, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Navigation did not reach DOMContentLoaded within ${timeoutMilliseconds} ms`)), timeoutMilliseconds);
+      })]);
+    } finally {
+      clearTimeout(timer);
+      cleanup.forEach(remove => remove());
+    }
   }
   return {
-    command, evaluate, wait, sessionId,
+    command, evaluate, wait, navigate, sessionId,
     async heading(title) { await wait(`Array.from(document.querySelectorAll('h1')).some(el => el.textContent === ${JSON.stringify(title)})`); },
     async click(title) {
       const selector = `Array.from(document.querySelectorAll('nav button')).find(el => el.textContent === ${JSON.stringify(title)})`;

@@ -150,7 +150,7 @@ async function scenario(name, { origin = secure, overrides = {}, viewport = { wi
     async idle() { await page.wait("!document.getElementById('a').disabled && !document.getElementById('r').disabled"); },
   };
   try {
-    await page.command('Page.navigate', { url: `${origin}/` });
+    await page.navigate(`${origin}/`);
     await assertions({ page, ui, requests, posted, stand, text, authenticatorId });
     await delay(100);
     assert.deepEqual(exceptions, [], 'no unhandled browser errors');
