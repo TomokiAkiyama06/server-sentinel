@@ -2,6 +2,7 @@ import { Component, useEffect, useState, type ReactNode } from 'react';
 import { flushSync } from 'react-dom';
 import { canVisit, deniedServices, parseWizard, views, type CameraSourceSummary, type DashboardServices, type RecordingSummary, type Session, type StorageSummary, type View, type WizardSnapshot, type WizardStatus, type WizardStepState } from './domain';
 import { ApiError } from './api';
+import { AccessScreen } from './access/screen';
 import { LiveScreen } from './dashboard/live';
 import { messages, type Locale } from './i18n';
 import { RecordingsView } from './recordings/view';
@@ -286,6 +287,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
             {selected === 'live' && canVisit(session, 'live') ? <LiveScreen services={services} t={t} />
               : selected === 'timeline' && canVisit(session, 'timeline') ? <TimelineScreen services={services} t={t} />
               : selected === 'presence' && access.role === 'owner' ? <PresenceScreen services={services} t={t} />
+              : selected === 'access' && access.role === 'owner' ? <AccessScreen services={services} t={t} />
                 : selected === 'sources' && access.role === 'owner' && sources.state === 'ready' ? <>
               <p className="source-count">{t.sourceCount}: {sources.items.length}</p>
               <div className="source-grid">{sources.items.map(source => <article className="source-card" key={source.id} data-source-id={source.id}>

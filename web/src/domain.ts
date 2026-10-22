@@ -101,8 +101,64 @@ export interface LiveGrant {
   frameIntervalMs: number | null;
 }
 
+/** One credential in the Owner's access inventory (A1). Credential-scoped: a
+ *  synced passkey is one credential that may live on several of its owner's
+ *  devices, so nothing here names or counts a device. */
+export interface AccessCredential {
+  /** Random server handle (never the WebAuthn credential id); used only to
+   *  address a revocation, never rendered. */
+  handle: string;
+  /** The hint entered at registration, not a device name. */
+  label: string | null;
+  status: 'active' | 'revoked' | 'inconsistent';
+  inconsistency_reason: 'backup_eligibility_changed' | null;
+  backup_eligible: boolean;
+  /** As of the latest sign-in; it can change after registration. */
+  backup_state: boolean;
+  /** ISO 8601 UTC strings, as the server sent them. */
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+}
+
+/** One person in the Owner's access inventory (A1, `GET /api/admin/principals`).
+ *  The server sends no proxy (Tailscale) identity (Owner decision D14), and
+ *  the parser copies only these fields, so none can reach the screen. */
+export interface AccessPrincipal {
+  id: string;
+  display_name: string;
+  role: 'owner' | 'invited_user';
+  status: 'invited' | 'active' | 'revoked';
+  created_at: string;
+  revoked_at: string | null;
+  permissions: readonly Permission[];
+  invitation: { pending: boolean; expires_at: string | null };
+  credentials: readonly AccessCredential[];
+}
+
+/** A freshly issued invitation code (A2 / A3). The response is the only place
+ *  the server ever shows it; the client holds it in memory only. */
+export interface IssuedInvitation {
+  code: string;
+  expires_at: string;
+}
+
 export interface DashboardServices {
   loadSession(signal: AbortSignal): Promise<Session>;
+  /** Owner access administration (Issue #10 phase 2 S4b routes A1-A6). The
+   *  server authorizes every call; a change made with a stale user
+   *  verification rejects with `ApiError('step_up_required')` and changed
+   *  nothing, every other refusal with `ApiError('unauthorized')`. */
+  loadPrincipals?(signal: AbortSignal): Promise<readonly AccessPrincipal[]>;
+  invitePrincipal?(displayName: string, permissions: readonly Permission[],
+    signal: AbortSignal): Promise<IssuedInvitation & { principal_id: string }>;
+  reissueInvitation?(principalId: string, signal: AbortSignal): Promise<IssuedInvitation>;
+  changePermission?(principalId: string, permission: Permission, granted: boolean, signal: AbortSignal): Promise<void>;
+  revokePrincipal?(principalId: string, signal: AbortSignal): Promise<void>;
+  revokeCredential?(principalId: string, handle: string, signal: AbortSignal): Promise<void>;
+  /** The Owner's step-up ceremony (S3): a fresh user-verified assertion of
+   *  this session's own passkey. Resolves only when the server accepted it. */
+  stepUp?(signal: AbortSignal): Promise<void>;
   /** End the caller's own session (`POST /api/auth/sign-out`, CSRF). */
   signOut?(signal: AbortSignal): Promise<void>;
   /** Live view (`live:view`; the server repeats every check). A refusal of

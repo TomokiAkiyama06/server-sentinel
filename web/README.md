@@ -383,6 +383,88 @@ leaving the screen, sign-out, and no live request for a `recordings:view`-only
 viewer). Neither proves the real routes, a real camera or a physical phone/Mac;
 see MANUAL_TEST.md section I.
 
+## Owner access administration and step-up for #10 phase 2 S6
+
+`src/access/screen.tsx` is the Access screen, rendered only for the Owner
+(the server repeats every check). It uses the S4b routes and the S3 step-up
+routes through `src/shared/services.ts`:
+
+```text
+GET  /api/admin/principals                                   200 {"principals":[...]}                   (A1, OWNER_READ)
+POST /api/admin/principals  {"display_name","permissions"}   200 {"principal_id","code","expires_at"}   (A2)
+POST /api/admin/principals/<id>/invitation  {}               200 {"code","expires_at"}                  (A3)
+POST /api/admin/principals/<id>/permissions {"permission","granted"}  204                               (A4, one grant as a delta)
+POST /api/admin/principals/<id>/revoke  {}                   204                                        (A5)
+POST /api/admin/principals/<id>/credentials/<handle>/revoke {}  204                                     (A6)
+POST /api/auth/step-up/options  {}                           200 request options (this session's own credential only)
+POST /api/auth/step-up  <assertion>                          204
+A2-A6 with a stale user verification                         403 {"detail":"step_up_required"}
+every other refusal                                          404 (generic)
+```
+
+Every POST carries `X-CSRF-Token`, a JSON body, `referrer: ''` and
+`referrerPolicy: 'same-origin'` (exact `Origin`, no `Referer`), and is
+bounded to 10 s. Ids and handles are lower-case UUIDs, checked before a URL is
+built.
+
+- **Inventory.** The whole list fails closed on any malformed person or
+  credential (an access list that silently left someone out would misstate who
+  can reach the deployment). Only the documented fields are copied, so a field
+  the server might add — never a Tailscale login or device (Owner decision
+  D14), a WebAuthn credential id, key or counter — cannot be rendered. The
+  credential handle is used only to address A6 and is never shown. Times are
+  shown as `YYYY-MM-DD HH:MM UTC` from the server's ISO 8601 UTC strings.
+- **Controls.** Each invited person gets independent `live:view` /
+  `recordings:view` grant and withdraw buttons (one delta per click, S4-5; the
+  screen says a change ends that person's sessions), a code re-issue (S4-4,
+  confirmed first: it makes earlier unused codes stop working), per-credential
+  revocation and revocation of the person (both confirmed first). The Owner's
+  own row and a revoked person's row carry no control (S4-3: the Owner's
+  credentials change only through the local `recover`). Revocation is worded
+  per passkey: a synced passkey may be on several devices and stops working
+  on all of them; the label is the hint entered at registration, not a device
+  name. The recorded backup eligibility and backup state (as of the latest
+  sign-in) are shown, never inferred.
+- **Invitation codes** (D5) are accepted only in the canonical grouped form
+  and shown once in a monospace block with their expiry, hand-over guidance and
+  a Copy button (the Owner found copy-paste reliable where typing failed). The
+  code lives only in component state: never in a URL, storage or history, and
+  it is dropped on Close, on leaving the screen and on `pagehide` (so a page
+  kept in the back-forward cache holds none). A copied code stays on the
+  clipboard; that is the Owner's choice.
+- **Step-up** (AUTH-008, D3, S4-1). `src/shared/step_up.ts` runs a change; only
+  the exact `403 step_up_required` answer (JSON, at most 256 bytes; any other
+  `403` is a refusal) leads to an explicit question, "パスキーで確認して続ける"
+  / "やめる". Nothing is sent until the Owner answers. On confirm, the
+  ceremony asks the server for options, passes the server's single allowed
+  credential to `navigator.credentials.get` unchanged (no picker, no
+  fallback), posts the assertion (the `webauthn.ts` serialization the sign-in
+  shell uses), and on `204` retries the original change **once**. A declined,
+  cancelled or failed ceremony, or a second `step_up_required`, is reported as
+  "nothing was changed" and nothing is retried; the client never decides
+  freshness itself and never loops.
+- **Results.** A committed change reloads the list. Any other failure
+  (network, timeout, the generic `404`, an unexpected answer) is reported as
+  "the result could not be confirmed" and the list is reloaded, since the
+  change may or may not have been made. While the human access gate is closed
+  every change is the generic refusal (Owner decision D6); an emergency
+  revocation then goes through the local CLI on the Main Server.
+
+Tests: `tests/access.test.mjs` (fake `fetch`: request shapes, CSRF, strict
+decoding and fail-closed inventory, undocumented fields dropped, exact
+step-up answer detection, step-up ceremony requests, retry-once and no-loop
+rules, rendered Owner/revoked/managed rows, credential-scoped wording in both
+locales) and `tests/access_browser.mjs` (part of `npm run test:browser`: the
+built dashboard at `http://localhost` in Chrome with every request intercepted
+and a CDP virtual authenticator holding one generated credential: invite and
+code display/close/`pagehide`, a stale Owner confirming and the change sent
+exactly once more with the session's own credential and `webauthn.get` client
+data, a declined step-up, a failed ceremony, exact `Origin` / CSRF / no
+`Referer` on every POST, no storage or history write, no CSP violation, and no
+proxy identity or credential handle on screen). The stand-in does not verify
+signatures (the server's verifier tests do); neither file proves the real
+routes, Safari, iOS/Android or a real passkey provider (MANUAL_TEST.md).
+
 ## Sign-in shell and build split for #10 phase 2 S5a
 
 Owner decisions S5-1 .. S5-5 (Issue #10, 2026-10-14). The Web build produces
