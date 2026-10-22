@@ -24,7 +24,10 @@
 > is decided.
 > The upstream exporter at the reviewed revision `956d170` calls `torch.load`
 > without `weights_only`, so the export must use our own wrapper that passes
-> `weights_only=True` explicitly with a pinned PyTorch version. As with YOLOX,
+> `weights_only=True` explicitly with an exact PyTorch version of at least
+> 2.10.0 (advisory GHSA-63cw-57p8-fm3p / CVE-2026-24747: `weights_only=True`
+> loading is exploitable in `<=2.9.1`), inside an isolated, network-less,
+> CPU-limited, non-root container as defence in depth. As with YOLOX,
 > the residual-risk approval stays in the decision record: externally kept
 > weights cannot be listed in `license/components.json` /
 > `license/owner-approvals.json`.

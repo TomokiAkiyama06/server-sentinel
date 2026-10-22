@@ -60,6 +60,18 @@ Q5 と Q6 は未決です。
   - checkpoint を読むのは、自前の小さな wrapper（または upstream の呼び出しを patch したもの）で、
     `torch.load(path, map_location="cpu", weights_only=True)` を**明示的に**渡します。既定値には頼りません。
   - PyTorch は exact version で固定し、その版で `weights_only=True` が有効なことを、手順書に記録します。
+    さらに、その版は **2.10.0 以上**でなければなりません。PyTorch の security advisory
+    [GHSA-63cw-57p8-fm3p](https://github.com/pytorch/pytorch/security/advisories/GHSA-63cw-57p8-fm3p)
+    （CVE-2026-24747、2026-01-26 公開、severity high）は、細工した `.pth` を
+    `torch.load(..., weights_only=True)` で読むと、`weights_only` の unpickler の検証漏れにより
+    memory が壊れ、任意のコード実行に至りうる、としています。影響を受ける版は `<=2.9.1`、
+    修正版は `>=2.10.0` です（2026-10-22 に advisory の原文と GitHub Advisory Database の記録を確認）。
+    upstream の下限 `torch>=2.0.1` の版はすべて影響を受けます。実装の時点で、選んだ版に
+    この advisory 以降の同種の advisory がないことも確認し、版と確認日を手順書に記録します。
+  - それでも `weights_only=True` だけには頼りません（多層防御）。export は、固定 revision の
+    checkpoint（size と SHA-256 をローカルで記録したもの）だけを対象に、network なし
+    （`--network none`）、CPU と memory を制限した、non-root の使い捨て container の中で行います。
+    container の外へ持ち出すのは、出力した ONNX とその SHA-256 だけです。
   - `weights_only=True` で読めない checkpoint（独自 class などを含むもの）は、その場で export を中止します。
     `weights_only=False` に戻すことはしません。
   - D-FINE のコードは、下記の固定 revision だけを使います。
