@@ -220,13 +220,95 @@ stays unstarted meanwhile), flushes at `flush_interval_seconds`, and at shutdown
 ends it only after scene `stop()` returned: flush first, then `close()` only for
 a `stopped` result whose undelivered count was recorded. Every other outcome
 leaves the session row for the next start to record as interrupted
-(`timeline_outbox_left_open`). No evidence or notification port is configured
-there yet (#21), so those critical paths stay `unavailable`, and no route reads
-this service (Owner status and timeline routes are follow-ups). Its
+(`timeline_outbox_left_open`). No route reads this service (Owner status and
+timeline routes are follow-ups). Critical notification and evidence ports are
+described in the next section. Its
 `retention_stores` are registered with the application's scheduled cleanup
 (`AuditRetentionRuntime`: at startup, daily, sooner after a failure), so
 `expire_history()` and `expire_audit()` apply the shared `RetentionPeriods`
 (20-day recording, 90-day audit) to this database.
+
+### Critical notifications on Main (#26, #21)
+
+When `create_app()` also runs the monitoring runtime, `SceneTimeline` gets a
+notification port: `NotificationAdapter` over the runtime's
+`NotificationService` (`provided=True`, since that service is created on the
+monitoring worker). A confirmed server movement or camera tamper therefore
+reaches the Owner through the same path as a hardware-integrity or
+recording-health failure: a durable `notification_events` row keyed by the
+observation identity, and, when configured, the immediate fixed-category Slack
+message `ServerSentinel critical alert: server_movement` / `camera_tamper`.
+Nothing else is sent: no image, source, person, place or cause. It is queued in
+every presence state (the row is written with the observation) and only for a
+confirmed critical observation.
+
+`CriticalDispatcher` drives `dispatch_pending()` from the lifespan. Each step
+runs on the monitoring worker (`MonitoringRuntime.dispatch_notifications`),
+which owns the notification service, polls its completions before and after
+the step, and takes the storage admission directly. A step never pins the
+database: `open()` and the retention cleanup pin it on other threads while
+holding `_pin_lock` and waiting in the storage admission for that same worker,
+so a step blocking on that lock would deadlock the worker. Until the database
+is pinned a step raises `TimelineNotPinned` and backs off. Steps run every
+`dispatch_interval_seconds` (default 5 s, Owner decision 2026-10-22), at once again only after a batch in
+which every one of `DISPATCH_BATCH` rows made progress; a failing step
+(storage refused, database not pinned yet) backs off exponentially up to `dispatch_backoff_seconds` (default 60 s),
+logging `critical_dispatch_failing` at the first failure of a streak and at
+every doubling and `critical_dispatch_recovered` once. Unclaimed rows stay
+`pending` meanwhile, so nothing is dropped. The adapter asks
+`NotificationService.can_accept()` first: no service yet, a full or closed
+queue, or a call from another thread returns `unavailable` with nothing
+submitted, and that row is retried by a later step instead of becoming a final
+`failed` for an alert that was never sent. After the first such refusal the
+step leaves the rest of that action's rows untouched, so a stalled Slack
+endpoint with a large backlog costs one claim per step, not a busy loop. With
+Slack unconfigured, `can_accept()` also refuses while the service's bounded
+local-retry buffer is full, and a `failed` result that is only a refused local
+write being retried (`NotificationService.retained()`) is mapped to
+`unavailable` too, so the local row is never dropped while the action is
+finalized.
+
+No notification is sent twice automatically. A claimed row is never
+reclaimed, the service coalesces a resubmitted event ID (and tells every
+submitter, so an Owner requeue of a still-running delivery completes its new
+claim generation from that delivery's outcome), and a `failed`
+(Slack refused or timed out) or `uncertain` outcome stays unresolved until an
+audited Owner `requeue_action()`. After a restart, before its first dispatch,
+the dispatcher reconciles the `notification` claims an earlier process left
+`submitting`/`queued` against `notification_events`: a final `sent`, `failed`
+or `disabled` row completes the claim (scoped to its generation); a row still
+`pending`, or no row, proves nothing about the earlier POST, so the claim
+stays unresolved and `critical_notifications` stays unavailable. With Slack
+unconfigured the local row is `disabled` and the path is reported unavailable,
+as for any durably disabled delivery, and also from the start, before any
+event: the adapter's `armed()` reports the deployment's Slack capability
+(`configured=`), which `PresenceService` consults besides the delivery rows.
+
+Shutdown cancels the loop (a step in flight finishes on the worker first),
+and after scene `stop()` and the outbox finish it runs one more step, so a
+confirmation from the final scene pass is submitted, then waits up to
+`dispatch_settle_seconds` (default 12 s, above the 10 s Slack timeout; at most
+30 s, because this wait plus the other stop steps must stay within the unit's
+`TimeoutStopSec=90`) for submitted deliveries to complete
+before the monitoring runtime closes the service. A delivery still running then
+stays `pending` / unresolved (`critical_notifications_unsettled` is logged),
+never resent.
+
+There is still no evidence-preservation port: a separate recording decision is
+pending. The dispatcher records the `evidence` rows `unavailable` and
+`critical_evidence` stays unavailable in Owner status. Without a monitoring
+runtime (an embedded `create_app()` with only an injected reservation) no
+notification service exists, no dispatcher runs and the path stays unavailable.
+
+While storage is refused (`STORAGE_HARD_STOP`, a lost or replaced recording
+filesystem) a confirmed observation cannot be written to the timeline, so it
+is not dispatched either: it waits only within the scene runtime's bounded
+in-memory critical staging, and confirmations beyond that bound are counted
+as undelivered loss. Unlike recording-health and integrity alerts, no Slack
+attempt is made for it meanwhile yet. The Owner decided on 2026-10-22 that
+scene critical alerts shall attempt Slack during a hard stop like
+recording-health does, accepting the duplicate risk; that is implemented in a
+follow-up issue, not here.
 
 ### Entrance gate quality
 

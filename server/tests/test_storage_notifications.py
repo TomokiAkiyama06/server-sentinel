@@ -255,7 +255,9 @@ class NotificationTests(unittest.TestCase):
                 NotificationKind.CAMERA_TAMPER, at=now, confirmed=True, event_id=identifier,
                 on_complete=lambda result: results.append((threading.get_ident(), result))))
         drain(self, service)
-        self.assertEqual([(threading.get_ident(), DeliveryResult.SENT)], results)
+        # One delivery; each coalesced submitter is told its outcome once
+        # (PR #316: an Owner requeue's new claim must complete too).
+        self.assertEqual([(threading.get_ident(), DeliveryResult.SENT)] * 2, results)
         self.assertEqual(1, len(transport.requests))
         self.assertEqual([identifier, identifier], [event.event_id for event in local])
 
