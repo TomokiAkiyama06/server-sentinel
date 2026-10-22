@@ -35,9 +35,11 @@ Owner は 2026-10-22 に、下の「Owner への質問」の Q1〜Q6 につい�
   使った tool の version と出力した ONNX の SHA-256 を記録します。
 - **Q6（YOLOX の評価用 adapter）**：D-FINE の評価が終わるまで残します。
 
-### 実施条件（この PR の提案）
+### 実施条件
 
-次の 5 点は Owner が判断した内容ではなく、上の判断を実施するためにこの PR が提案する条件です。
+上の判断を実施するための条件です。Owner が判断した条件（「（Q5 の Owner 条件）」）と、
+この PR が加える条件（「（この PR の追加条件）」）を、タグで区別して書きます。
+タグのない項目は、この PR の提案です。
 Q5 の export については、Owner の条件（version 固定、`weights_only=True` の明示、tool の version と
 出力 SHA-256 の記録、commit しない CPU 制限 container）に、この PR が次の条件を加えます：
 PyTorch 2.10.0 以上、network なし・memory 制限・non-root の使い捨て container、固定 revision の
@@ -63,10 +65,12 @@ code と checkpoint だけを使うこと。
   `torch>=2.0.1` を許しており、PyTorch 2.6 より前の版では `torch.load` の既定は制限のない
   pickle の読み込みです（既定が `weights_only=True` に変わったのは 2.6。PyTorch の release notes に
   基づく記述で、この調査では再確認していません）。そのため、export は次の条件で行います。
-  - （Q5 の Owner 条件）checkpoint を読むのは、自前の小さな wrapper（または upstream の呼び出しを patch したもの）で、
-    `torch.load(path, map_location="cpu", weights_only=True)` を**明示的に**渡します。既定値には頼りません。
-  - （Q5 の Owner 条件）PyTorch は exact version で固定し、その版で `weights_only=True` が有効なことを、手順書に記録します。
-    （この PR の追加条件）さらに、その版は **2.10.0 以上**でなければなりません。PyTorch の security advisory
+  - （Q5 の Owner 条件）`torch.load` に `weights_only=True` を**明示的に**渡します。既定値には頼りません。
+  - （この PR の追加条件）そのために、checkpoint は自前の小さな wrapper（または upstream の呼び出しを
+    patch したもの）で `torch.load(path, map_location="cpu", weights_only=True)` として読みます。
+  - （Q5 の Owner 条件）PyTorch は exact version で固定します。
+  - （この PR の追加条件）固定した版で `weights_only=True` が有効なことを、手順書に記録します。
+  - （この PR の追加条件）その版は **2.10.0 以上**でなければなりません。PyTorch の security advisory
     [GHSA-63cw-57p8-fm3p](https://github.com/pytorch/pytorch/security/advisories/GHSA-63cw-57p8-fm3p)
     （CVE-2026-24747、2026-01-26 公開、severity high）は、細工した `.pth` を
     `torch.load(..., weights_only=True)` で読むと、`weights_only` の unpickler の検証漏れにより
