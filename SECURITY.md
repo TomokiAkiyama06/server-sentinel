@@ -174,9 +174,15 @@ Runtime-data assumptions:
   the service;
 - the Owner-approved runtime filesystem is pinned by a stable filesystem UUID.
   Linux major/minor device numbers are reused by a replaced or reformatted disk,
-  so they only corroborate that identity. A runtime mount that is missing,
+  so they only corroborate that identity, and they may change for the same
+  disk across a reboot (Issue #321). A runtime mount that is missing,
   substituted, backed by the root filesystem device, or carrying a different
-  filesystem is refused, and no root-filesystem fallback directory is created;
+  filesystem is refused, and no root-filesystem fallback directory is created.
+  When the UUID resolves to the device the runtime root and the mounted mount
+  point are on, a recorded major/minor pair that differs is a stale value: the
+  service starts and the Owner is notified (value-free) to update it. This
+  accepts nothing the UUID check refuses: a numbers check never distinguished
+  a disk carrying a cloned UUID from the approved one either;
 - the generated unit grants the runtime account write access to the state,
   recording, and audit directories only. The runtime root itself stays
   read-only, so a compromised service cannot replace or remove them;

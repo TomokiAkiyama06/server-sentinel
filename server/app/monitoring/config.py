@@ -40,6 +40,13 @@ class RecordingFilesystem:
     unavailable. `is_mount(path)` reports whether the mount point is mounted.
     Both are re-evaluated on every storage sample, so a detached, reformatted
     or substituted filesystem refuses writes instead of falling back.
+
+    `device` (and the deployment's `runtime_device`, attached by
+    `Deployment.load`) are the recorded Linux major/minor numbers. They only
+    corroborate the UUID: the kernel may number the same disk differently
+    after a reboot (Issue #321), so a difference while the UUID resolves to
+    the mounted device is a stale recorded value reported to the Owner, never
+    a refusal and never an identity on its own.
     """
 
     root: Path = field(repr=False)
@@ -49,6 +56,16 @@ class RecordingFilesystem:
     resolve_device: Callable[[str], int] = field(repr=False, compare=False)
     is_mount: Callable[[Path], bool] = field(default=os.path.ismount, repr=False,
                                              compare=False)
+    runtime_device: tuple[int, int] | None = field(default=None, repr=False)
+
+    def recorded_device_numbers_match(self, device: int) -> bool:
+        """Whether every recorded major/minor pair names ``device``.
+
+        Called only for a device the UUID, the mount point and the root
+        already agree on; the answer never admits or refuses storage.
+        """
+        actual = (os.major(device), os.minor(device))
+        return self.device == actual and self.runtime_device in (None, actual)
 
 
 @dataclass(frozen=True)
@@ -124,12 +141,16 @@ def _recording_filesystem(value: object, recordings_directory: Path, *,
         operating_system_root = root_device()
     except (OSError, RuntimeError, ValueError):
         raise ConfigurationError("recording filesystem is unavailable") from None
+    # The UUID is the identity: it must resolve to the device the recordings
+    # directory and the mounted mount point are on, and that device must not
+    # be the operating-system root's. The recorded major/minor numbers are
+    # not compared here: they may change across a reboot (Issue #321) and a
+    # difference is reported, not refused (`recorded_device_numbers_match`).
     if (resolved_mount == Path(resolved_mount.anchor)
             or not is_mount(resolved_mount)
             or not directory.is_relative_to(resolved_mount)
             or directory_info.st_dev != mount_info.st_dev
             or directory_info.st_dev != approved
-            or [os.major(directory_info.st_dev), os.minor(directory_info.st_dev)] != device
             or directory_info.st_dev == operating_system_root):
         raise ConfigurationError("recording filesystem identity mismatch")
     return RecordingFilesystem(directory, uuid, (device[0], device[1]), resolved_mount,

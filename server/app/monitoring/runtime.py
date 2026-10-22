@@ -53,6 +53,8 @@ CRITICAL_KINDS = (
     NotificationKind.SERVER_MOVEMENT, NotificationKind.CAMERA_TAMPER,
     NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.CREDENTIAL_FINDING,
 )
+# `recording_device_numbers_changed` is not listed: the daily summary counts
+# the `recording_device_numbers_stale` flag instead, every day until fixed.
 WARNING_KINDS = (NotificationKind.HARDWARE_INTEGRITY_WARNING,
                  NotificationKind.RECORDING_HEALTH_WARNING)
 # The audited credential findings (``AccessStore``); their records are the
@@ -133,6 +135,9 @@ class MonitoringStatus:
     # composition, and a credential finding within the hold window.
     human_access_degraded: bool = False
     credential_finding_degraded: bool = False
+    # Issue #321: a recorded major/minor pair is stale while the approved
+    # UUID, mount and root agree; storage stays admitted.
+    recording_device_numbers_stale: bool = False
 
 
 class RefuseUnvalidatedSegments:
@@ -221,6 +226,8 @@ class MonitoringRuntime:
         # committed but not yet notified before a restart is recovered from
         # the audit log on the first running access tick.
         self._findings_recovered = False
+        # Issue #321: the stale device-number notice goes out once per process.
+        self._device_numbers_reported = False
         self.notifications: NotificationService | None = None
         self.notification_events: NotificationEventStore | None = None
         self.recordings: RecordingStore | None = None
@@ -463,8 +470,20 @@ class MonitoringRuntime:
         self._startup_alerted = False
         self._filesystem_ok = True
         self._retry_at.pop("startup", None)
+        stale = not self.filesystem.device_numbers_current
         self._set(state=RuntimeState.RUNNING, storage_state=policy.state,
-                  recording_filesystem_ok=True, recording_health=None)
+                  recording_filesystem_ok=True, recording_health=None,
+                  recording_device_numbers_stale=stale)
+        if stale and not self._device_numbers_reported:
+            # Issue #321: the UUID, mount and root were verified, so storage is
+            # admitted; the recorded numbers are only out of date. One
+            # value-free Owner notice per process start, never a refusal.
+            self._device_numbers_reported = True
+            at = self.dependencies.utcnow()
+            self.notifications.record(
+                NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED, at=at,
+                event_id=uuid5(EVENT_NAMESPACE, "recording-device-numbers:" + at.isoformat()),
+            )
         # Startup always compares inventory and runs the recording self-test,
         # regardless of when the previous process last did.
         self._storage_tick()
@@ -615,7 +634,7 @@ class MonitoringRuntime:
             status.integrity_degraded, status.recording_health_degraded, status.retention_degraded,
             status.storage_audit_failed, status.notification_local_failed,
             status.notification_delivery_failed, status.human_access_degraded,
-            status.credential_finding_degraded,
+            status.credential_finding_degraded, status.recording_device_numbers_stale,
         ))
         elapsed = self.dependencies.monotonic() - self._started_monotonic
         monitored = int(min(86400, max(0, elapsed))) if math.isfinite(elapsed) else 0

@@ -17,7 +17,10 @@ an immediate fixed-category Slack message, independently of presence. So do the
 human-access kinds `human_access_fault`, `credential_finding` and
 `human_access_recovered` (Issue #232 item 4; the last one is worded as a
 recovery notice, not a critical alert); `../monitoring/access.py` decides
-when they are sent. Ordinary
+when they are sent. `recording_device_numbers_changed` (Issue #321) is
+immediate too, worded as an attention notice: the recorded filesystem device
+numbers are stale while the UUID and mount were verified, and recording
+continues. Ordinary
 person/motion/entry/camera-offline observations stay local until the summary.
 Such a local-only event returns `suppressed` when it was written or retained for
 the `poll()` retry, and `failed` when the write was refused with the retry

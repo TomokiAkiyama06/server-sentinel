@@ -55,7 +55,11 @@ results persist in `recording_health_status` before notification;
 still updates the in-memory state and attempts the alert, then marks the step
 degraded for retry; while the write keeps failing the same verdict re-alerts at
 most once per day. A recording filesystem mismatch raises one
-immediate `recording_health_failure` per episode. A failed startup open is
+immediate `recording_health_failure` per episode. The recorded major/minor
+numbers only corroborate the UUID (Issue #321): when they no longer name the
+verified device, storage is admitted, `recording_device_numbers_stale` is set
+(degraded in the daily summary and diagnostics) and one immediate
+`recording_device_numbers_changed` attention notice is sent per process start. A failed startup open is
 retried every `retry_seconds` from the tick against the same declared identity;
 a failed database open (e.g. SQLite I/O error or permission change) takes the
 same alerting startup-failure path. Only the first failure of the episode alerts, and a successful retry runs the

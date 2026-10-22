@@ -14,12 +14,17 @@ from .config import RecordingFilesystem
 class IdentifiedRecordingFilesystem:
     """Pin the recording root and re-check its declared filesystem identity.
 
-    Each sample re-resolves the approved filesystem UUID, checks the Linux
-    device numbers and that the declared mount point is still mounted on that
-    device, then delegates to `ExpectedFilesystem`, which pins the root's
-    device/inode and the private metadata file without following links. Any
-    mismatch is `STORAGE_HARD_STOP`: the caller refuses the write rather than
-    writing into whatever is now at that path.
+    Each sample re-resolves the approved filesystem UUID, checks that it
+    still names the device the root was pinned on and that the declared mount
+    point is still mounted on that device, then delegates to
+    `ExpectedFilesystem`, which pins the root's device/inode and the private
+    metadata file without following links. Any mismatch is
+    `STORAGE_HARD_STOP`: the caller refuses the write rather than writing into
+    whatever is now at that path.
+
+    The recorded major/minor numbers only corroborate the UUID (Issue #321):
+    `device_numbers_current` is False when they no longer name the pinned
+    device, which the runtime reports to the Owner; it never admits storage.
     """
 
     def __init__(self, identity: RecordingFilesystem, metadata: Path):
@@ -32,6 +37,9 @@ class IdentifiedRecordingFilesystem:
             raise RecordingError("STORAGE_HARD_STOP")
         self.expected = RootIdentity(info.st_dev, info.st_ino)
         self._verify_identity()
+        # Fixed for this instance: the pinned device cannot change without
+        # every later sample refusing.
+        self.device_numbers_current = identity.recorded_device_numbers_match(info.st_dev)
         self._checker = ExpectedFilesystem(identity.root, self.expected, metadata)
 
     def _verify_identity(self) -> None:
@@ -44,7 +52,6 @@ class IdentifiedRecordingFilesystem:
             raise RecordingError("STORAGE_HARD_STOP") from None
         device = self.expected.device
         if (type(approved) is not int or approved != device
-                or (os.major(device), os.minor(device)) != identity.device
                 or not mounted or mount.st_dev != device):
             raise RecordingError("STORAGE_HARD_STOP")
 

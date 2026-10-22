@@ -18,7 +18,9 @@ import sys
 import tarfile
 import time
 
-from app.deployment import CaptureCaSettingMissing, Deployment, WebAssetsRefused
+from app.deployment import (
+    DEVICE_NUMBERS_STALE_WARNING, CaptureCaSettingMissing, Deployment, WebAssetsRefused,
+)
 from app.settings import ConfigurationError
 
 
@@ -1348,6 +1350,10 @@ def _execute_locked(args, runner) -> None:
     # refuses it, a later one requires it (see _require_capture_ca_setting).
     deployment = Deployment.load(args.config, code_root=Path(__file__).resolve().parent,
                                  install_root=args.destination, capture_ca_setting="optional")
+    if deployment.filesystem_device_numbers_stale:
+        # Issue #321: the approved UUID and the mount agree, so this is not a
+        # refusal; the recorded major/minor numbers are only out of date.
+        print(DEVICE_NUMBERS_STALE_WARNING, file=sys.stderr)
     _reachable_deployment_path(deployment.runtime_root, "runtime root")
     account = pwd.getpwuid(deployment.service_uid)
     if account.pw_uid == 0:

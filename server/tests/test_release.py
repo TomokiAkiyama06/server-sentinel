@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import hashlib
 import io
 import json
@@ -437,16 +438,13 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertFalse((self.installation / "releases").exists())
 
         (self.runtime / "recordings").mkdir(mode=0o700)
-        value = json.loads(self.config.read_text())
-        value["runtime_device"][1] += 1
-        self.config.write_text(json.dumps(value))
-        self.config.chmod(0o600)
+        # The approved UUID naming another device than the mounted runtime
+        # root is refused (a stale major/minor pair alone is not, Issue #321).
         with self.assertRaisesRegex(ConfigurationError, "filesystem identity"):
-            self.perform(self.arguments("install", "1.0.1"))
+            self.perform(self.arguments("install", "1.0.1"),
+                         approved_device=self.runtime.stat().st_dev + 7)
 
         value = json.loads(self.config.read_text())
-        device = self.runtime.stat().st_dev
-        value["runtime_device"] = [os.major(device), os.minor(device)]
         value["human_host"] = "0.0.0.0"
         self.config.write_text(json.dumps(value))
         self.config.chmod(0o600)
@@ -925,6 +923,23 @@ class ReleaseLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigurationError, "unavailable"):
             self.perform(self.arguments("update", "1.1.1"))
         self.assertFalse((self.installation / "releases/1.1.1").exists())
+
+    def test_renumbered_runtime_disk_installs_with_a_value_free_warning(self):
+        # Issue #321: after a reboot the same disk (same UUID, same mount) may
+        # carry other major/minor numbers. The installer accepts it and only
+        # warns, without printing the numbers, the UUID or a path.
+        value = json.loads(self.config.read_text())
+        value["runtime_device"][1] += 16
+        self.config.write_text(json.dumps(value))
+        self.config.chmod(0o600)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.perform(self.arguments("install", "1.0.0"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+        self.assertIn("recorded filesystem device numbers", stderr.getvalue())
+        for secret in (self.filesystem_uuid, str(self.root),
+                       f"{value['runtime_device'][0]}, {value['runtime_device'][1]}"):
+            self.assertNotIn(secret, stderr.getvalue())
 
     def test_approved_filesystem_uuid_lookup_rejects_unsafe_and_missing_entries(self):
         directory = self.root / "by-uuid"

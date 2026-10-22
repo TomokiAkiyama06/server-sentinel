@@ -814,10 +814,12 @@ class ConfigurationTests(unittest.TestCase):
             self.parse(approved=self.device + 7)
         with self.assertRaisesRegex(ConfigurationError, "mismatch"):
             self.parse(root=self.device)
+        # Issue #321: recorded numbers only corroborate the UUID; a stale
+        # pair with a verified UUID and mount is reported, not refused.
         value = dict(self.value, recording_filesystem=dict(
             self.value["recording_filesystem"], device=[0, 0]))
-        with self.assertRaisesRegex(ConfigurationError, "mismatch"):
-            self.parse(value)
+        self.assertFalse(self.parse(value).recording_filesystem
+                         .recorded_device_numbers_match(self.device))
         value = dict(self.value, recording_filesystem=dict(
             self.value["recording_filesystem"], mount_point="relative"))
         with self.assertRaises(ConfigurationError):
