@@ -696,9 +696,14 @@ class MonitoringRuntime:
             if running and not self._camera_window_restored:
                 # The rolling hour continues across a restart (as Issue #281
                 # item 2 for the access budgets).
+                # Only the confirmed threshold alerts the monitor counted,
+                # an accepted `pending` one included (it is never resent),
+                # never an unconfirmed local `camera_offline` observation
+                # (Codex PR #320).
                 monitor.restore_window(self._notification_window(
                     (NotificationKind.CAMERA_OFFLINE,), monitor.hourly_limit,
-                    self.dependencies.utcnow()), monotonic=self.dependencies.monotonic())
+                    self.dependencies.utcnow(), confirmed_only=True, include_pending=True),
+                    monotonic=self.dependencies.monotonic())
                 self._camera_window_restored = True
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
                                    monotonic=self.dependencies.monotonic(),
@@ -860,7 +865,9 @@ class MonitoringRuntime:
                 (NotificationKind.CREDENTIAL_FINDING,), monitor.finding_budget, now),
             monotonic=self.dependencies.monotonic())
 
-    def _notification_window(self, kinds, limit: int, now: datetime) -> list[tuple[UUID, float]]:
+    def _notification_window(self, kinds, limit: int, now: datetime, *,
+                             confirmed_only: bool = False,
+                             include_pending: bool = False) -> list[tuple[UUID, float]]:
         """``(event ID, age)`` of the newest ``limit`` rows of ``kinds`` accepted
         in the hour before ``now`` (Issue #287).
 
@@ -872,13 +879,19 @@ class MonitoringRuntime:
         late nor a row stamped in the future (the clock moved back) displaces
         a recent one. The text comparison is the time order for the UTC text
         ``NotificationEventStore`` writes, and every row is parsed again here.
+        ``confirmed_only`` keeps confirmed rows only; ``include_pending``
+        also counts `pending` rows, for a budget whose accepted but uncertain
+        deliveries are not sent again (the camera offline monitor).
         """
         marks = ",".join("?" for _ in kinds)
+        excluded = () if include_pending else (DeliveryResult.PENDING.value,)
+        filters = "".join((" AND delivery != ?" if excluded else "",
+                           " AND confirmed = 1" if confirmed_only else ""))
         rows = self._connection.execute(
             "SELECT event_id, COALESCE(accepted_at, at) AS accepted FROM notification_events "
-            f"WHERE kind IN ({marks}) AND delivery != ? AND accepted > ? AND accepted <= ? "
+            f"WHERE kind IN ({marks}){filters} AND accepted > ? AND accepted <= ? "
             "ORDER BY accepted DESC",
-            (*(kind.value for kind in kinds), DeliveryResult.PENDING.value,
+            (*(kind.value for kind in kinds), *excluded,
              (now - timedelta(seconds=HOUR_SECONDS)).astimezone(timezone.utc).isoformat(),
              now.astimezone(timezone.utc).isoformat()),
         )

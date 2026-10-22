@@ -362,7 +362,7 @@ Raw hardware serials/UUIDs and detailed inventory are deployment-local operation
 Slack is optional and disabled until configured.
 
 ### NOTIFY-002 Sparse immediate alerts
-Immediate alerts cover confirmed server movement/camera tamper and hardware-integrity/recording-health failures defined by INTEGRITY-006. Ordinary person/motion/entry and ordinary camera unplug events are summarized unless the owner configures otherwise. Slack remains optional; disabling Slack does not suppress immediate local/UI fault reporting.
+Immediate alerts cover confirmed server movement/camera tamper and hardware-integrity/recording-health failures defined by INTEGRITY-006. Ordinary person/motion/entry events, and camera unplug/offline events shorter than the camera-offline threshold below, are summarized unless the owner configures otherwise. Slack remains optional; disabling Slack does not suppress immediate local/UI fault reporting.
 
 A camera source that stays offline notifies the Owner (Owner decision, 2026-10-22, Issue #301): once per offline episode after it lasted five minutes, a time the deployment configuration may change, with at most a configured number of such notifications per rolling hour so a flapping camera cannot flood the channel. The notification carries only the fixed category `camera_offline`, never a source name, device path, serial or image. Recovery is not notified.
 

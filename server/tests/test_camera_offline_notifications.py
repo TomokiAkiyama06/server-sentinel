@@ -166,6 +166,27 @@ class EpisodeTests(MonitorFixture, unittest.TestCase):
         self.assertEqual(1, self.drain(monitor).offline_sources)
         self.assertEqual(1, len(self.sent()))
 
+    def test_a_brief_recovery_after_the_threshold_does_not_reset_the_outage(self):
+        # PR #320 review 重要 1: offline past the threshold, a brief online and
+        # offline again, all before the next drain: the outage that already
+        # lasted the threshold is notified on that drain, exactly once.
+        monitor = self.monitor()
+        self.online(monitor)
+        source = self.sources[0]
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(310)
+        monitor.health_sink(event(source, CameraState.ONLINE))
+        self.advance(3)
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(1)
+        self.assertEqual(1, self.drain(monitor).offline_sources)
+        self.assertEqual(1, len(self.sent()))
+        self.assertEqual(0, monitor.dropped)
+        for _ in range(3):
+            self.advance(600)
+            self.drain(monitor)
+        self.assertEqual(1, len(self.sent()))
+
     def test_episode_that_recovered_after_the_threshold_before_the_drain_is_notified(self):
         monitor = self.monitor()
         self.online(monitor)
@@ -248,7 +269,9 @@ class CapTests(MonitorFixture, unittest.TestCase):
                             for line in logs.output), logs.output)
         self.assertTrue(any(str(Event.CAMERA_OFFLINE_NOTIFICATION_RATE_LIMITED) in line
                             for line in logs.output))
-        self.assertGreater(monitor.dropped, 0)
+        # A recovery of a few seconds is folded into the held outage, which
+        # stays owed rather than being dropped.
+        self.assertEqual(0, monitor.dropped)
 
     def test_a_held_episode_is_notified_once_the_hour_allows(self):
         monitor = self.monitor(hourly_limit=1)
@@ -418,6 +441,20 @@ class RuntimeSignalTests(MonitorFixture, unittest.TestCase):
         self.advance(300)
         self.drain(monitor)
         self.assertEqual(1, len(self.sent()))
+
+    def test_a_running_worker_reported_not_online_starts_an_episode(self):
+        # PR #320 review 提案 3: a health event that never reached the sink
+        # cannot hide an outage the polled status shows.
+        for state in (CameraState.OFFLINE, CameraState.DEGRADED, CameraState.MANUAL):
+            with self.subTest(state=state):
+                self.sink.rows.clear()
+                monitor = self.monitor()
+                self.online(monitor)
+                monitor.observe_runtime([self.status(self.sources[0], True, state)],
+                                        monitor.version())
+                self.advance(300)
+                self.drain(monitor)
+                self.assertEqual(1, len(self.sent()))
 
     def test_an_inactive_source_stays_inactive(self):
         monitor = self.monitor()
@@ -631,6 +668,45 @@ class LifespanTests(RuntimeFixture):
             await self.tick(runtime)
             self.assertEqual([ALERT], self.slack_texts())
             uvc.status = real_status
+
+    def stored_row(self, *, confirmed, delivery, age):
+        at = (self.clock.now - timedelta(seconds=age)).isoformat()
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            db.execute(
+                "INSERT INTO notification_events(event_id,kind,at,confirmed,delivery,accepted_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (str(uuid4()), NotificationKind.CAMERA_OFFLINE.value, at, int(confirmed),
+                 delivery, at))
+            db.commit()
+
+    async def test_restored_window_counts_confirmed_alerts_including_pending(self):
+        # Codex PR #320 P2: an unconfirmed local observation never used the
+        # budget; an accepted `pending` alert did (it is never resent).
+        configuration = self.configuration(camera_offline=CameraOfflineNotification(300, 1))
+        self.stored_row(confirmed=False, delivery="suppressed", age=60)
+        application = self.uvc_application(configuration)
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.discovery.devices = []
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+            self.assertEqual([ALERT], self.slack_texts())
+        self.transport.requests.clear()
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            db.execute("DELETE FROM notification_events WHERE kind=?",
+                       (NotificationKind.CAMERA_OFFLINE.value,))
+            db.commit()
+        self.stored_row(confirmed=True, delivery="pending", age=60)
+        application = self.uvc_application(configuration)
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.clock.advance(timedelta(seconds=301))
+            with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+                await self.tick(runtime)
+            self.assertEqual([], self.slack_texts())
+            self.clock.advance(timedelta(hours=1))
+            await self.tick(runtime)
+            self.assertEqual([ALERT], self.slack_texts())
 
     async def test_without_slack_the_row_is_disabled_and_the_path_unavailable(self):
         self.slack = False

@@ -1444,14 +1444,20 @@ none, so a service stop never notifies. Every configured source starts not
 online, so a camera that never comes up after a start is notified too. The
 monitor is fed on the local UVC runtime's health-sink delivery thread (never a
 capture worker) and by the application capture watcher's status poll (a worker
-that is no longer running is not online; a status older than a received event
-never overrides it), and is drained on the monitoring worker each tick (default
+that is no longer running is not online, a running worker's latest camera
+state starts or ends an episode, so a health event that never reached the
+sink cannot hide an outage; a status older than a received event never
+overrides it), and is drained on the monitoring worker each tick (default
 60 s), also while monitoring is `failed`, so the notification follows the
 threshold within one tick. An episode that reached the threshold and recovered
-before the drain is still notified once; a recovery is recorded in the episode
-and is not notified. At most `hourly_limit` (default 4, 1 to 60) such
-notifications go out per rolling hour for all sources together, re-seeded from
-the accepted rows of the last hour after a restart; an episode held back by the
+before the drain is still notified once, and if it goes offline again before
+that drain the brief recovery is folded into it (notified on that drain, the
+count is not restarted); a recovery is recorded in the episode and is not
+notified. At most `hourly_limit` (default 4, 1 to 60) such
+notifications go out per rolling hour for all sources together, re-seeded
+after a restart from the confirmed `camera_offline` rows accepted in the last
+hour (a `pending` one included, since it is never resent; an unconfirmed local
+observation never counts); an episode held back by the
 cap is logged once (`camera_offline_notification_rate_limited`) and notified
 when the hour allows if the source is still not online, and one that recovered
 meanwhile is dropped (`camera_offline_notification_dropped`). An episode in

@@ -15,7 +15,8 @@ Slack delivery as a hardware-integrity or recording-health failure.
 Signals: ``health_sink`` takes the local UVC runtime's ``HealthEvent`` (it is
 installed as that runtime's optional health sink, whose delivery thread calls
 it); ``observe_runtime`` takes the runtime status the application watcher
-already polls, so a worker that is no longer running is not kept ``online``.
+already polls, so a worker that is no longer running is not kept ``online``
+and a health event that never reached the sink cannot hide an outage.
 ``observe`` is the source-type-neutral entry point: a later ``remote_agent``
 runtime on Main reports its sources' camera health through it. Only the
 deployment-configured source IDs are tracked.
@@ -30,7 +31,9 @@ none. Every configured source starts not online when the monitor is built, so
 a camera that never comes up after a start (missing at boot, capture never
 started) is notified too. An episode notifies once, after it lasted
 ``after_seconds``; an episode that reached the threshold but recovered before
-the next drain is still notified once. A recovery is recorded in the episode
+the next drain is still notified once, and if the source goes offline again
+before that drain the brief recovery is folded into it (still owed, the count
+is not restarted). A recovery is recorded in the episode
 (``recovered``) and is not notified (no Owner decision for a recovery
 notice).
 
@@ -43,8 +46,8 @@ storage, or for an episode that already recovered, the ID is per process
 (never a missed notification, at worst one repeat after a restart).
 
 Cap: at most ``hourly_limit`` notifications per rolling hour for all sources
-together, continued across a restart from the accepted rows of the last hour
-(``restore_window``). An episode held back by the cap is logged once
+together, continued across a restart from the confirmed ``camera_offline``
+rows accepted in the last hour, ``pending`` included (``restore_window``). An episode held back by the cap is logged once
 (value-free) and notified as soon as the hour allows if the source is still
 not online; one that recovered meanwhile is dropped and logged.
 
@@ -206,11 +209,14 @@ class CameraOfflineMonitor:
                     source.episode = None
         elif not ongoing and not self._stopped:
             if episode is not None and not episode.notified:
-                # A recovered, qualifying episode not yet drained is
-                # superseded by the new one; its loss is counted and logged.
-                self.dropped += 1
-                logging.getLogger(__name__).warning(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED)
-            source.episode = _Episode(now)
+                # A recovered episode that reached the threshold and is still
+                # owed its notification (the drain has not run since): the
+                # brief recovery is folded into it, so the outage that already
+                # lasted the threshold is notified on the next drain instead
+                # of restarting the count (PR #320 review 重要 1).
+                episode.recovered = None
+            else:
+                source.episode = _Episode(now)
         source.online, source.active = online, active
 
     def health_sink(self, event) -> None:
@@ -229,10 +235,12 @@ class CameraOfflineMonitor:
         """Apply a polled ``LocalUvcRuntimeStatus.sources`` snapshot.
 
         A source whose worker is not running is not online. A running
-        worker's latest in-memory camera state ``online`` ends an episode
-        (for example after a worker restart that raised no new transition).
-        A source that received an event after ``versions`` was read keeps
-        that newer event; an inactive source stays inactive.
+        worker's latest in-memory camera state decides otherwise: ``online``
+        ends an episode (for example after a worker restart that raised no
+        new transition), and any other known state starts one, so a health
+        event that never reached the sink cannot hide an outage. A source
+        that received an event after ``versions`` was read keeps that newer
+        event; an inactive source (disabled, stopping) stays inactive.
         """
         now = self._monotonic()
         with self._lock:
@@ -249,6 +257,9 @@ class CameraOfflineMonitor:
                 elif camera == _ONLINE and not source.online:
                     source.version += 1
                     self._apply(source, True, True, now)
+                elif camera in _NOT_ONLINE and source.online:
+                    source.version += 1
+                    self._apply(source, False, True, now)
 
     def stop(self) -> None:
         """Shutdown: no new episode and no further notification."""
