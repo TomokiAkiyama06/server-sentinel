@@ -1456,10 +1456,11 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         self.assertEqual(4, source.decoder_failures)
         status = harness.runtime.status()
         self.assertIs(SceneRuntimeState.DEGRADED, status.state)
-        # One successful exchange clears it, logged once.
+        # A healthy child clears it, logged once (the stand-in decoder starts
+        # without failures, so the worker pass already sees the recovery).
         harness.use(SOURCE)
-        harness.warm(SOURCE)
         with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            harness.warm(SOURCE)
             harness.frame()
             recovered = harness.frame()
         self.assertEqual(1, sum("scene_frame_decoder_recovered" in line for line in logs.output))
@@ -1483,6 +1484,50 @@ class SceneRuntimeMjpgTests(unittest.TestCase):
         self.assertEqual(0, source.evaluated)
         self.assertIs(SceneRuntimeState.DEGRADED, harness.runtime.status().state)
         self.assertEqual([], harness.recorder.items)
+
+    def test_sandbox_refusal_before_any_frame_is_logged_once(self):
+        # Issue #299: a camera that never delivers a frame still gets the
+        # refusal logged, from the worker pass rather than the frame path.
+        harness = self.harness(binding(layout=FAST_LAYOUT))
+        harness.use(SOURCE, "sandbox_refused_2")
+        harness.runtime.start()
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            harness.warm(SOURCE)  # binds, asks for the child, which refuses
+            harness.runtime.step()
+        self.assertEqual(1, sum("scene_frame_decoder_sandbox_unavailable" in line
+                                for line in logs.output))
+        self.assertEqual(1, sum("scene_frame_decoder_failing" in line for line in logs.output))
+        self.assertTrue(all("scene_frame_decoder" in line for line in logs.output))
+        source = harness.source()
+        self.assertEqual((SceneSourceState.DEGRADED, "frame_decoder_sandbox_unavailable",
+                          Observation.UNKNOWN, 0),
+                         (source.state, source.reason, source.movement, source.evaluated))
+        # Later passes (past restart backoffs that refuse again) and frames
+        # never repeat it.
+        with self.assertNoLogs("app.detection.roi.runtime", level="ERROR"):
+            for _ in range(3):
+                harness.warm(SOURCE)
+                harness.runtime.step()
+            source = harness.frame(MOVED)
+        self.assertEqual(("frame_decoder_sandbox_unavailable", Observation.UNKNOWN, 0),
+                         (source.reason, source.movement, source.evaluated))
+        self.assertEqual([], harness.recorder.items)
+
+    def test_threaded_worker_logs_a_sandbox_refusal_without_frames(self):
+        harness = self.harness(binding(layout=FAST_LAYOUT), threaded=True)
+        harness.use(SOURCE, "sandbox_refused_3")
+        with self.assertLogs("app.detection.roi.runtime", level="ERROR") as logs:
+            harness.runtime.start()
+            self.assertTrue(wait_for(
+                lambda: any("scene_frame_decoder_sandbox_unavailable" in line
+                            for line in logs.output), timeout=20))
+            # Further idle passes keep it at one event.
+            time.sleep(0.1)
+        self.assertEqual(1, sum("scene_frame_decoder_sandbox_unavailable" in line
+                                for line in logs.output))
+        self.assertEqual("frame_decoder_sandbox_unavailable", harness.source().reason)
+        self.assertEqual("seccomp_unavailable",
+                         harness.runtime._contexts[SOURCE].decoder.sandbox_refusal)
 
     def test_decoder_unavailable_keeps_source_inactive(self):
         with mock.patch.object(mjpg, "decoder_available", return_value=False):

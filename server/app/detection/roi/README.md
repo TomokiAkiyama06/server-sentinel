@@ -186,7 +186,9 @@ process:
   `sandbox_refusal` (`landlock_unavailable`, `seccomp_unavailable`,
   `unsupported_architecture`, `sandbox_not_applied`); the source is `degraded`
   with `frame_decoder_sandbox_unavailable` and
-  `scene_frame_decoder_sandbox_unavailable` is logged once (value-free). No
+  `scene_frame_decoder_sandbox_unavailable` is logged once (value-free; the
+  scene worker polls the decoder on every pass, so the event appears even
+  when the camera never delivers a frame, Issue #299). No
   setting decodes unconfined (keeping seccomp only on a kernel without
   Landlock is an open Owner decision). The child still runs as the same
   unprivileged service account inside the same systemd unit (same network

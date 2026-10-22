@@ -178,7 +178,7 @@ class CommandTests(unittest.TestCase):
     def test_input_plan_is_real_only_for_one_source_media_scenarios(self):
         real = {name for name in schedule.DEFAULT_SCENARIOS
                 if schedule.uses_real_camera(name, True)}
-        self.assertEqual({"normal", "outage_1s", "outage_5s", "outage_120s", "rst",
+        self.assertEqual({"normal", "outage_1s", "outage_8s", "outage_120s", "rst",
                           "bandwidth_cap", "slow_stop_10s", "slow_stop_60s", "slow_drain",
                           "main_restart", "capture_restart"}, real)
         self.assertTrue(schedule.uses_real_camera("soak", True))
@@ -298,7 +298,7 @@ class SchedulerTests(unittest.TestCase):
         self.assertIn("exit=2", self.output.getvalue())
 
     def test_missed_slot_stops_the_whole_schedule(self):
-        slots = schedule.timetable(START, ["a_framed"], ["rst", "normal", "outage_5s"], False)
+        slots = schedule.timetable(START, ["a_framed"], ["rst", "normal", "outage_8s"], False)
         overrun = slots[0].duration + schedule.SLOT_MARGIN_S + schedule.START_TOLERANCE_S + 1
         scheduler = self._scheduler(slots, _args("main", self.directory.name),
                                     lambda kind, n: overrun)
