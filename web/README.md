@@ -430,15 +430,19 @@ built.
   a Copy button (the Owner found copy-paste reliable where typing failed). The
   code lives only in component state: never in a URL, storage or history, and
   it is dropped on Close, on leaving the screen and on `pagehide` (so a page
-  kept in the back-forward cache holds none). A copied code stays on the
-  clipboard; that is the Owner's choice.
+  kept in the back-forward cache holds none; the `pagehide` clear is flushed
+  synchronously). A copied code stays on the clipboard, and the hand-over
+  text says so (copy something else afterwards, re-issue on a suspected
+  leak). The Copy button is kept pending the Owner's confirmation (the PR #315
+  review recommends keeping it); no automatic clipboard clearing is attempted.
 - **Step-up** (AUTH-008, D3, S4-1). `src/shared/step_up.ts` runs a change; only
   the exact `403 step_up_required` answer (JSON, at most 256 bytes; any other
   `403` is a refusal) leads to an explicit question, "パスキーで確認して続ける"
   / "やめる". Nothing is sent until the Owner answers. On confirm, the
   ceremony asks the server for options, passes the server's single allowed
   credential to `navigator.credentials.get` unchanged (no picker, no
-  fallback), posts the assertion (the `webauthn.ts` serialization the sign-in
+  fallback; options naming none or several credentials are refused as an
+  invalid answer before any ceremony), posts the assertion (the `webauthn.ts` serialization the sign-in
   shell uses), and on `204` retries the original change **once**. A declined,
   cancelled or failed ceremony, or a second `step_up_required`, is reported as
   "nothing was changed" and nothing is retried; the client never decides

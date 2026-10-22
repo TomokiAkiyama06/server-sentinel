@@ -494,6 +494,9 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
       });
       let publicKey: PublicKeyCredentialRequestOptions;
       try { publicKey = decodeRequestOptions(options); } catch { throw new ApiError('invalid_response'); }
+      // Exactly the session's own credential: an empty list would let the
+      // browser offer an account picker, more than one a choice of keys.
+      if (publicKey.allowCredentials?.length !== 1) throw new ApiError('invalid_response');
       // The server names this session's own credential as the only one
       // allowed; it is passed through unchanged (no picker, no fallback).
       let assertion: AssertionJSON;

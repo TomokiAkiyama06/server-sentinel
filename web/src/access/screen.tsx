@@ -18,6 +18,7 @@
  * component's memory and cleared on dismissal, unmount and `pagehide`.
  */
 import { useEffect, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 import type { AccessCredential, AccessPrincipal, DashboardServices, IssuedInvitation, Permission } from '../domain';
 import type { Catalog } from '../i18n';
 import { displayNameAcceptable } from '../shared/services';
@@ -74,7 +75,8 @@ export function AccessScreen({ services, t }: { services: DashboardServices; t: 
   // prompt declines) and drops a code still shown. A page kept in the
   // back-forward cache must not hold the code either.
   useEffect(() => {
-    const hide = () => { setIssued(null); setCopied('idle'); };
+    // Synchronous, so the DOM no longer holds the code when the page is frozen.
+    const hide = () => flushSync(() => { setIssued(null); setCopied('idle'); });
     addEventListener('pagehide', hide);
     return () => {
       removeEventListener('pagehide', hide);

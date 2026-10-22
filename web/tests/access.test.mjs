@@ -225,9 +225,18 @@ test('step-up: CSRF options, the session credential passed through unchanged, th
 });
 
 test('step-up failures stop before the next request and leak nothing', async () => {
-  const goodOptions = json({ challenge: 'AAEC', rpId: 'server-sentinel.test', userVerification: 'required', allowCredentials: [] });
+  const goodOptions = json({ challenge: 'AAEC', rpId: 'server-sentinel.test', userVerification: 'required',
+    allowCredentials: [{ type: 'public-key', id: 'AQID' }] });
   let asked = 0;
   const assertWith = async () => { asked += 1; throw new Error('synthetic private NotAllowedError'); };
+  // Not exactly one allowed credential (none would open a picker): refused before the ceremony.
+  for (const allowCredentials of [undefined, [], [{ type: 'public-key', id: 'AQID' }, { type: 'public-key', id: 'BAU' }]]) {
+    const picker = await signedIn({ 'POST /api/auth/step-up/options': json({ challenge: 'AAEC', rpId: 'server-sentinel.test',
+      userVerification: 'required', ...(allowCredentials ? { allowCredentials } : {}) }) }, { assertWith });
+    await assert.rejects(picker.services.stepUp(signal()), { code: 'invalid_response' });
+    assert.ok(!picker.calls.some(call => call.key === 'POST /api/auth/step-up'));
+  }
+  assert.equal(asked, 0);
   // Options refused: no ceremony.
   const refused = await signedIn({}, { assertWith });
   await assert.rejects(refused.services.stepUp(signal()), { code: 'unauthorized' });
