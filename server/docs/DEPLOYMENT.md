@@ -196,6 +196,7 @@ of roughly 1 TB, not defaults; size them for the actual deployment:
   "time_zone": "Asia/Tokyo",
   "daily_summary_time": "23:00",
   "slack_webhook_url": "<private incoming webhook, optional>",
+  "camera_offline_notification": {"after_seconds": 300, "hourly_limit": 4},
   "storage_limits": {
     "recording_limit_bytes": 500000000000, "critical_allowance_bytes": 10000000000,
     "hard_reserve_bytes": 20000000000, "pressure_free_bytes": 40000000000,
@@ -218,7 +219,14 @@ of roughly 1 TB, not defaults; size them for the actual deployment:
 
 `time_zone` is an IANA name and is required when the object is present;
 `daily_summary_time` defaults to 23:00. Slack stays disabled without
-`slack_webhook_url`; keep that value only in this private file. Every storage
+`slack_webhook_url`; keep that value only in this private file.
+`camera_offline_notification` is optional (Issue #301): a configured
+`local_uvc` source that stays offline for `after_seconds` (integer, 60 to
+86400, default 300) notifies the Owner once per offline episode, at most
+`hourly_limit` (integer, 1 to 60, default 4) times per rolling hour for all
+sources together. The notification is the fixed text `ServerSentinel critical
+alert: camera_offline` without the source name; check the Web UI for which
+camera is offline. Without Slack it is recorded locally only. Every storage
 and recording limit must be sized for the deployment (all positive integers,
 `hard_reserve_bytes < pressure_free_bytes < recovery_free_bytes`,
 `recovery_allocation_bytes < recording_limit_bytes`, `cleanup_batch_size` at

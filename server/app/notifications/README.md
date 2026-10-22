@@ -18,7 +18,10 @@ human-access kinds `human_access_fault`, `credential_finding` and
 `human_access_recovered` (Issue #232 item 4; the last one is worded as a
 recovery notice, not a critical alert); `../monitoring/access.py` decides
 when they are sent. Ordinary
-person/motion/entry/camera-offline observations stay local until the summary.
+person/motion/entry/camera-offline observations stay local until the summary;
+a `camera_offline` recorded `confirmed=True` (the source stayed offline for the
+deployment threshold, Issue #301 item 2, `../monitoring/cameras.py`, which
+caps it per hour) is immediate like a confirmed server movement.
 Such a local-only event returns `suppressed` when it was written or retained for
 the `poll()` retry, and `failed` when the write was refused with the retry
 buffer full (the event is dropped), so callers can retry with the same
