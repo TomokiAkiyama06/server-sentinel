@@ -393,9 +393,31 @@ sudo systemctl start server-sentinel.service
   then refuses the old label (`candidate_not_found`), which is the safe
   direction: list again. A `chmod`, `setfacl` or udev permission change of
   the `/dev/videoN` node does not change the label.
-  `sources` prints each `local_uvc` source's UUID, enabled state, approval
-  state (`approved`, `approval_required`, `none`), whether the deployment
-  lists it, its profile and its name.
+  `sources` (read-only, allowed while the service runs) prints each
+  `local_uvc` source's UUID, enabled state, approval state, whether the
+  deployment lists it, its profile and its name. The approval states (Issue
+  #300):
+  - `none`: no camera was ever approved for the source;
+  - `approved`: an Owner approval is stored and no service session holds it
+    (the usual state with the service stopped; the approval applies on start);
+  - `approved_in_use`: the approval is stored and the running service has
+    started its session for the source (the active-session marker), so it is
+    *not* a lost approval and needs no re-approval. It says nothing about
+    capture: whether the camera is actually online is the source's health;
+  - `approval_required`: the source needs an Owner approval before the
+    service binds a camera: it was never approved (only the service's
+    candidate is stored), the service latched it
+    `manual_intervention_required` (for example an ambiguous reconnect of an
+    identical camera without a unique serial), or an active-session marker is
+    left while no process holds the database, i.e. the service did not end
+    its session (a crash); the next start then requires the approval again.
+    Approve it with `approve` (the service stopped).
+  `approved_in_use` and the left-marker case are told apart with the same
+  database-holder check as `service_running`, so another local admin command
+  still holding the database also counts as running: list again once it has
+  finished. A same-account process that cannot be inspected refuses the
+  listing (`service_state_unavailable`) instead of guessing; the check runs
+  only when a source carries a marker.
 - `approve` rescans and binds exactly that camera. It refuses a camera without
   a serial (`camera_without_serial`) and one whose serial is not unique
   (`camera_serial_not_unique`): stored evidence cannot tell such a camera from

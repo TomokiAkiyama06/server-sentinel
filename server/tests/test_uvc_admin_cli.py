@@ -223,6 +223,75 @@ class AdminCliTests(unittest.TestCase):
         self.assertIn(f"source {pending.id} enabled=no approval=none configured=no", stdout)
         self.assertPrivateAbsent(stdout)
 
+    def approve_offline(self, source_id, device, *, serial_ambiguous=False):
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            ApprovalStore.approve_on(connection, source_id, device, serial_ambiguous=serial_ambiguous)
+            connection.execute("COMMIT")
+
+    def test_sources_shows_an_approved_source_of_the_running_service_as_in_use(self):
+        # Issue #300: the running service's ReconnectController keeps an
+        # active-session marker on every approved source it reconciles.
+        first, second = self.local_source("First"), self.local_source("Second")
+        store = ApprovalStore(self.database)
+        for source, device in ((first, camera(0)), (second, camera(2, "SYNTHSERIAL0002"))):
+            self.approve_offline(source.id, device)
+            started = store.start_session(source.id, device)
+            self.assertFalse(started.requires_approval)
+        self.configured = (first.id, second.id)
+        self.running = [1]  # a single /proc scan answers for the whole listing
+        code, stdout, stderr, _ = self.run_cli("sources")
+        self.assertEqual((code, stderr), (0, ""))
+        for source in (first, second):
+            self.assertIn(f"source {source.id} enabled=yes approval=approved_in_use configured=yes",
+                          stdout)
+        self.assertNotIn("approval_required", stdout)
+        self.assertEqual([], self.running)
+        self.assertPrivateAbsent(stdout)
+
+    def test_sources_shows_a_marker_left_by_a_stopped_service_as_approval_required(self):
+        # No process holds the database: the session was not ended (a crash),
+        # and the next start_session turns the marker into approval required.
+        source = self.local_source()
+        self.approve_offline(source.id, camera(0))
+        ApprovalStore(self.database).start_session(source.id, camera(0))
+        code, stdout, stderr, _ = self.run_cli("sources")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(f"source {source.id} enabled=yes approval=approval_required", stdout)
+        self.assertTrue(ApprovalStore(self.database).start_session(source.id, camera(0))
+                        .requires_approval)
+
+    def test_sources_keeps_approval_required_for_a_latched_source_of_the_running_service(self):
+        # A latched manual_intervention_required (e.g. an identical camera
+        # without a serial or a shared serial) is never shown as in use.
+        latched, never, approved = (self.local_source(name) for name in ("Latched", "Never", "Ok"))
+        store = ApprovalStore(self.database)
+        self.approve_offline(latched.id, camera(0))
+        token = store.start_session(latched.id, camera(0)).session_token
+        store.save(latched.id, camera(0), True, session_token=token, serial_ambiguous=True)
+        store.start_session(never.id, camera(4, None, port="1-5"))
+        self.approve_offline(approved.id, camera(2, "SYNTHSERIAL0002"))
+        self.running = [1]
+        code, stdout, stderr, _ = self.run_cli("sources")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(f"source {latched.id} enabled=yes approval=approval_required", stdout)
+        self.assertIn(f"source {never.id} enabled=yes approval=approval_required", stdout)
+        self.assertIn(f"source {approved.id} enabled=yes approval=approved ", stdout)
+        self.assertNotIn("approved_in_use", stdout)
+        self.assertEqual([1], self.running)  # no marker on an approved row: /proc not scanned
+
+    def test_sources_refuses_when_the_service_state_cannot_be_read(self):
+        source = self.local_source()
+        self.approve_offline(source.id, camera(0))
+        ApprovalStore(self.database).start_session(source.id, camera(0))
+
+        def unreadable(identity, name):
+            raise CliRefused("service_state_unavailable")
+        self.holders = unreadable
+        code, stdout, stderr, _ = self.run_cli("sources")
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("refused: service_state_unavailable", stderr)
+
     # -- create-source --------------------------------------------------
 
     def test_create_source_confirms_on_the_terminal_and_is_audited(self):
