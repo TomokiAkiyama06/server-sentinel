@@ -1,6 +1,7 @@
 # 2026-10-22: 重みのライセンスが明確な人物検出モデルの調査（Issue #20）
 
-- Status: **Proposed**（調査のみ。Owner の採用判断は未了）
+- Status: **Accepted（Q1〜Q4、Owner 判断 2026-10-22）／ Q5・Q6 は未決**。
+  下の「Owner 判断（2026-10-22）」の節を見てください。D-FINE の評価は承認済みですが、本番採用はまだ承認されていません。
 - Date: 2026-10-22
 - Related: Issue #20、`docs/THIRD_PARTY_POLICY.md`、
   [`2026-09-30-yolox-person-evaluation.md`](2026-09-30-yolox-person-evaluation.md)、
@@ -9,6 +10,45 @@
 - Scope: 文書だけです。この文書は依存、lock、`license/components.json` /
   `license/owner-approvals.json` の記録、コード、重みファイルのどれも追加しません。
   どの重みも採用・同梱・再配布・自動 download を承認しません。
+
+## Owner 判断（2026-10-22）
+
+Owner は 2026-10-22 に、下の「Owner への質問」の Q1〜Q4 について次のとおり判断しました。
+Q5 と Q6 は未決です。
+
+- **Q1（重みのライセンスの基準）**：**新しく本番採用する重みには、配布元による明示を必須とします。**
+  RT-DETRv2-S は維持します。ただし、根拠が弱いことを既知の弱点として記録します
+  （`apache-2.0` は Hugging Face の変換者の metadata で、原著者の表明はなく、upstream の
+  [RT-DETR #685](https://github.com/lyuwenyu/RT-DETR/issues/685) は未回答）。
+  RT-DETRv2 を置き換えるかどうかは、D-FINE の評価の後に判断します。
+  `server/docs/RTDETR_RUNTIME_AUDIT.md` の「Official model」という記述の訂正は、別の follow-up で行います。
+- **Q2（学習データの残余リスク）**：COCO の画像（Flickr の条件）と、backbone の ImageNet 系
+  事前学習（non-commercial research の条件）の残余リスクを、**研究室内での運用に限り、
+  重みを再配布しない範囲で受け入れます**。これは Owner の承認として、この文書に記録します。
+  `license/owner-approvals.json` にはまだ入れません。重みの `model_weight` component を追加する
+  PR で、この文書を参照する approval entry として記録します。
+- **Q3（Objects365 系譜）**：Objects365 を事前学習に使った重みは、**当面除外します**。
+  RF-DETR は候補から外します（D-FINE の maintainer の見解とも整合します）。
+- **Q4（D-FINE の評価）**：**D-FINE-N / S の COCO-only checkpoint を、評価専用で追加します。**
+  artifact は upstream の元の `dfine_{n,s}_coco.pth`（`Peterande/storage` の release `dfinev1.0`）から作ります。
+  `torch.load(..., weights_only=True)` を使い、隔離した環境で ONNX に export します。
+  HF の `ustc-community/dfine-{nano,small}-coco` の safetensors は、値が一致するかの照合だけに使います。
+  扱いは YOLOX と同じです：重みはリポジトリ外、digest 固定、CI での download なし、
+  deployment schema では拒否。
+- **Q5（export 用の環境）**：未決です。
+- **Q6（YOLOX の評価用 adapter）**：未決です。
+
+### Q1 と D-FINE の関係
+
+今ある D-FINE の根拠は、書き込み権限を持つ maintainer の Issue コメントです。論文の著者や、
+重みを upload した `Peterande` の表明ではありません。Q1 の「配布元による明示」が原著者や
+upload した人を指すなら、この根拠だけでは**本番採用の条件を満たしません**。
+
+- **評価は進めてかまいません**（Q4）。
+- **本番採用の前に**、次のどちらかが必要です。
+  1. upstream（`Peterande` または論文の著者）が、README か release notes で、COCO-only の重みが
+     Apache-2.0 であると明示する。
+  2. この maintainer の表明で足りると、Owner が別に判断する。
 
 ## 背景
 
@@ -82,7 +122,7 @@ AP<sup>val</sup> です。**この調査では測定していません。** pers
 | D-FINE（`*_obj365` / `*_obj2coco`） | 同上 | 同じコメントで「should not be considered commercially cleared」。README にも同趣旨の [License note](https://github.com/Peterande/D-FINE/blob/956d1709314c2c6a4df6f34de232054578a7449f/README.md)（commit `956d170`） | Objects365 → COCO | 除外（Objects365 は academic only） |
 | **RT-DETRv2-S（r18vd、COCO）** | Apache-2.0（[lyuwenyu/RT-DETR](https://github.com/lyuwenyu/RT-DETR)。maintainer が [#433](https://github.com/lyuwenyu/RT-DETR/issues/433) で「entire codebase is licensed under Apache 2.0」と回答） | **HF metadata で `apache-2.0`**（[PekingU/rtdetr_v2_r18vd](https://huggingface.co/PekingU/rtdetr_v2_r18vd/blob/5650961749fa93567c0d46fc7f43ea4f9e914107/README.md)。card には「contributed by @jadechoghari」とあり、Hugging Face 側の変換）。採用済み adapter が使う [onnx-community 変換](https://huggingface.co/onnx-community/rtdetr_v2_r18vd-ONNX/blob/936f90b6a476c6da4dfe053fc521af55285976ba/README.md)も `apache-2.0`。**原著者による重みの表明はない**：元の `.pth` を置く [lyuwenyu/storage](https://github.com/lyuwenyu/storage) には LICENSE がなく、重みについて尋ねる [Issue #685](https://github.com/lyuwenyu/RT-DETR/issues/685)（2026-08-19）は回答 0 件で open | COCO train2017。backbone は ImageNet 系事前学習（未検証） | **候補（既存の比較基準）** |
 | RT-DETR / RT-DETRv2 の Objects365 版 | 同上 | 明示なし | Objects365 → COCO | 除外 |
-| RF-DETR Nano / Small / Medium / Large | Apache-2.0（[roboflow/rf-detr](https://github.com/roboflow/rf-detr)） | **Apache-2.0（配布元が明示）**。README の License 節：「Apache-designated model weights are licensed under Apache License 2.0」。model 表で N/S/M/L が Apache 2.0。Atto/Femto/Pico/XL/2XL は **PML 1.0**（別ライセンス、対象外） | 公式 docs は「trained on the Microsoft COCO dataset」。ただし [論文](https://arxiv.org/html/2511.09554v2)の Table 6 注に「All models are pretrained with 60 epochs of Objects-365」。Table 11 の caption も Objects365 事前学習を前提にしている。配布 checkpoint についての明示はなく未確定。backbone は DINOv2（LVD-142M で学習、系譜は未検証） | **条件付き**（Objects365 系譜を Owner が受け入れる場合だけ） |
+| RF-DETR Nano / Small / Medium / Large | Apache-2.0（[roboflow/rf-detr](https://github.com/roboflow/rf-detr)） | **Apache-2.0（配布元が明示）**。README の License 節：「Apache-designated model weights are licensed under Apache License 2.0」。model 表で N/S/M/L が Apache 2.0。Atto/Femto/Pico/XL/2XL は **PML 1.0**（別ライセンス、対象外） | 公式 docs は「trained on the Microsoft COCO dataset」。ただし [論文](https://arxiv.org/html/2511.09554v2)の Table 6 注に「All models are pretrained with 60 epochs of Objects-365」。Table 11 の caption も Objects365 事前学習を前提にしている。配布 checkpoint についての明示はなく未確定。backbone は DINOv2（LVD-142M で学習、系譜は未検証） | 条件付きとして調査 → **Q3（2026-10-22）で除外** |
 | YOLOX | Apache-2.0 | **不明**（上記 #1865） | COCO | 保留中（既存判断のまま） |
 | DEIM / DEIMv2 | DEIM：LICENSE は Apache-2.0 の本文（GitHub の判定は `NOASSERTION`） | 重みは Google Drive。明示なし。DEIMv2 は DINOv3（Meta の独自ライセンス）由来の variant があり、[DEIMv2 #167](https://github.com/Intellindust-AI-Lab/DEIMv2/issues/167) が未回答 | COCO / Objects365 | 除外（不明） |
 | Ultralytics YOLOv8 / YOLO11 など | AGPL-3.0 | AGPL-3.0（重みも同じ条件で配布）。商用の Enterprise License は有償の個別契約 | COCO ほか | 除外（ポリシーで既定ブロック） |
@@ -188,7 +228,7 @@ GPU：どの候補も upstream は ONNX → TensorRT の手順を示していま
 - **配布元が許諾を保証しない**：torchvision（docs が利用者の責任と明記）。
 - **Objects365 系譜**：D-FINE obj365/obj2coco、RT-DETR の O365 版、PP-YOLOE+（RF-DETR は上記のとおり条件付き）。
 
-## 提案（Owner 判断の前の推奨）
+## 提案（Owner 判断の前の推奨。判断の結果は冒頭の「Owner 判断（2026-10-22）」）
 
 1. **D-FINE-N と D-FINE-S の COCO-only checkpoint を「評価専用」で追加すること**を提案します。
    YOLOX と同じ扱いにします：重みはリポジトリ外、digest 固定、CI での download なし、
@@ -224,6 +264,8 @@ Owner の同意のもとで Main host のローカルだけで使い、結果の
 6. （評価専用）GPU：`onnxruntime-gpu` の scratch 環境で、2026-09-30 の測定と同じ方法。
 
 ## Owner への質問
+
+Q1〜Q4 は 2026-10-22 に判断済みです（冒頭の節）。Q5・Q6 は未決です。記録のため、質問は元の文のまま残します。
 
 1. **重みのライセンスの基準**：本番採用には「配布元（原著者・公式組織）の明示」を必須に
    しますか。それとも、RT-DETRv2 のような Hugging Face 変換者の metadata でも十分としますか。
