@@ -224,13 +224,17 @@ event が無い定常状態では、新しい segment が 1 つ入るたびに�
 | 状態 | 1 append あたりの commit | 1 append あたりの file・dir の fsync |
 | --- | --- | --- |
 | 定常状態（event 無し、追い出し 1 件を含む） | 4（1、4、5、6） | 3（2、3、6） |
-| event の記録中（外れた segment は link されているので削除されない） | 3（1、4、5） | 2（2、3） |
+| その source が event で録画されている間（外れた segment は link されているので削除されない） | 3（1、4、5） | 2（2、3） |
 
-| segment の長さ | 4 source での append / 秒 | 定常状態: commit / 秒 | 定常状態: fsync / 秒 | 定常状態: 同期処理の合計 / 秒 | event 中: commit + fsync / 秒 | 20 分の録画の segment 数（`max_segments_per_recording` の下限の目安） | 30 秒の pre-roll の spool の segment 数（`max_spool_segments` の目安、4 source） |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 秒 | 4 | 16 | 12 | 28 | 20 | 約 1,200（境界の分を足す） | 約 120（境界の分を足す） |
-| 2 秒 | 2 | 8 | 6 | 14 | 10 | 約 600 | 約 60 |
-| 4 秒 | 1 | 4 | 3 | 7 | 5 | 約 300 | 約 30 |
+event は 1〜4 source の任意の部分集合に掛かります。spool の追い出しは source ごとに起きるので、active な source が N 台、そのうち録画中の source が k 台のとき、同期処理（commit + fsync）の回数は 1 秒あたり **(k × 5 + (N − k) × 7) ÷ segment の秒数** です。録画していない source は、event 中でも定常状態と同じく追い出しを続けます。最も多くなるのは、event が無い（k = 0）ときです。
+
+| segment の長さ | 4 source での append / 秒 | 定常状態: commit / 秒 | 定常状態: fsync / 秒 | 同期処理の合計 / 秒（N = 4、録画中 k = 0 / 1 / 2 / 3 / 4） | 20 分の録画の segment 数（`max_segments_per_recording` の下限の目安） |
+| --- | --- | --- | --- | --- | --- |
+| 1 秒 | 4 | 16 | 12 | 28 / 26 / 24 / 22 / 20 | 約 1,200（境界の分を足す） |
+| 2 秒 | 2 | 8 | 6 | 14 / 13 / 12 / 11 / 10 | 約 600 |
+| 4 秒 | 1 | 4 | 3 | 7 / 6.5 / 6 / 5.5 / 5 | 約 300 |
+
+pre-roll に関わる上限（`pre_roll_bytes`、`max_spool_segments`、`max_segment_bytes`）は §8.6 にまとめました。
 
 この数え方は、上の file / directory の fsync と、SQLite の commit の回数です。SQLite の commit は、journal mode によっては、内部でさらに fsync を伴います（rollback journal なら journal と database の両方。WAL なら WAL の fsync）。
 
@@ -250,9 +254,38 @@ segment の長さを決めるときの trade-off は次のとおりです。
 | --- | --- | --- |
 | A（MJPEG copy） | mux | 無視できる程度（frame の copy と header を書くだけ） |
 | A の validator | 全 frame を decode する | 合成 frame の 1080p 4:2:2 で full decode が 3.4〜4.1 ms / frame（decoder 調査の値で、合成の noise を含む上限）。30 fps なら約 0.12 core / source、4 source で約 0.5 core。実 frame（約 166 KiB）は合成（約 425 KB）より小さいので、実際はこれより軽いと考えられる（**確認していません**） |
-| A の validator | 構造は全 frame、decode は一部（例: 各 segment の先頭と末尾の frame） | 上記の数 % |
+| （不採用）A の validator で、構造は全 frame、decode は一部の frame だけ | 上記の数 % | 不採用。§9 の 4 を参照 |
 | B（x264 / OpenH264） | decode + 色変換 + encode | **測っていません**。1080p30 では source ごとに数 core 規模の可能性がある（仮定） |
 | C（NVENC） | decode（CPU か `nvjpegdec`）+ upload + encode | CPU は decode の分（約 0.12 core / source）+ α。NVENC は 4 基あり、session の上限はありません [NVIDIA-matrix]。throughput と VRAM は**測っていません** |
+
+### 8.6 30 秒の pre-roll に必要な運用上限
+
+`Limits` の `pre_roll_bytes`、`max_spool_segments`、`max_segment_bytes` は、**source ごとではなく、store 全体で共有される上限**です（`store.py` の `_trim()` は、全 source の spool の合計 byte 数と合計 segment 数を比べます）。`_trim()` は、各 source の最新の `end_ms` から `pre_roll_ms` より前に終わった segment を spool から外します。このため、spool には source ごとに 30 秒分と、境界の 1 segment が残ります。
+
+`server/docs/DEPLOYMENT.md` の例の値は、`pre_roll_bytes` = 67,108,864（64 MiB）、`max_spool_segments` = 64、`max_segment_bytes` = 8,388,608（8 MiB）、`max_segment_ms` = 10,000 です。また、`max_segment_bytes` は storage の `max_request_bytes`（例では 16 MiB）以下でなければ、設定が拒否されます（`server/app/monitoring/config.py`）。
+
+MJPEG で 30 秒の pre-roll を保つのに必要な値は、次の式で計算できます（推定。§3 の bitrate を使います）。
+
+- `pre_roll_bytes` ≥ N × (30 秒 + segment の秒数) × bitrate ÷ 8
+- `max_spool_segments` ≥ N × (30 ÷ segment の秒数 + 1)
+- `max_segment_bytes` ≥ segment の秒数 × 最大 bitrate ÷ 8 に、frame の大きさの揺れ分の余裕を足した値
+
+| 条件（4 source、MJPEG 1080p30） | `pre_roll_bytes` | `max_spool_segments` | `max_segment_bytes` |
+| --- | --- | --- | --- |
+| 1 秒 segment、40.7 Mbps | 約 0.63 GB | 124 以上 | 約 5.1 MB + 余裕 |
+| 1 秒 segment、60 Mbps | 約 0.93 GB | 124 以上 | 約 7.5 MB + 余裕 |
+| 2 秒 segment、40.7 Mbps | 約 0.65 GB | 64 以上（余裕なし） | 約 10.2 MB + 余裕 |
+| 2 秒 segment、60 Mbps | 約 0.96 GB | 64 以上（余裕なし） | 約 15 MB + 余裕 |
+| DEPLOYMENT.md の例 | 64 MiB（約 0.067 GB） | 64 | 8 MiB |
+
+このことから、次の点が分かります。
+
+- **例の `pre_roll_bytes`（64 MiB）では、4 source の MJPEG 1080p は、各 source で約 2〜3 秒分（40.7〜60 Mbps）しか残りません。** 30 秒の pre-roll（MEDIA-009）を満たせません。
+- **例の `max_segment_bytes`（8 MiB）では、60 Mbps の 2 秒 segment（約 15 MB）は、append の前に `Segment.validate()` で拒否されます。** 2 秒 segment にするなら、`max_segment_bytes` を約 16 MiB 以上にし、`max_request_bytes` もそれ以上に上げる必要があります。1 秒 segment なら 8 MiB に収まりますが、余裕は小さくなります。
+- `max_spool_segments` は、1 秒 segment なら 124 以上、2 秒 segment なら 64 ちょうどで余裕がありません。
+- `max_segments_per_recording`（例では 8,640）は、20 分の録画を 1 秒 segment で記録する場合でも足ります（約 1,200）。
+
+MJPEG を採用する場合は、Q7 で容量と媒体を決めるのと同時に、これらの上限値を決め、`server/docs/DEPLOYMENT.md` の例の値も更新する必要があります。例の値のまま運用すると、30 秒の pre-roll が欠けるか、segment が拒否されて録画が止まります。H.264（6 Mbps の仮定）であれば、4 source・2 秒 segment で `pre_roll_bytes` は約 0.1 GB、`max_segment_bytes` は約 1.5 MB です。
 
 ## 9. segment の integrity 検証
 
@@ -263,7 +296,9 @@ segment の長さを決めるときの trade-off は次のとおりです。
    - MJPEG: frame ごとに SOI / EOI と SOF の寸法を確認し、SOF0 / SOF1 の 8-bit baseline 以外を拒否します（decoder 調査の規則 2 と、#233 の lossless SOF 拒否を流用します）。
    - H.264: SPS の寸法と profile の allowlist を確認し、segment の先頭が IDR であることを確認します。
 3. **timestamp**: segment の中で単調に増えること。`Segment.start_ms` / `end_ms` と container の duration が一致すること。frame 数が fps × duration の許容範囲内に収まること。
-4. **decode**: 分離子プロセスで decode します。全 frame を decode するか一部にするかは Owner の判断です（§12 Q5）。失敗はすべて拒否にして、録画の health を degraded にします。黙って保存することはしません。
+4. **decode**: 分離子プロセスで、**segment の全 frame を decode します（必須）**。失敗はすべて拒否にして、録画の health を degraded にします。黙って保存することはしません。
+   - 一部の frame だけを decode する案は採りません。SOI / EOI / SOF などの構造検査を通っても、Huffman 表、量子化表、entropy-coded data が壊れていて decode できない frame があり得ます。decode しなかった frame にそれがあると、そのまま保存されます。`RecordingStore` は validator が成功した segment を `integrity='verified'` として記録するので、壊れた frame は再生するまで見つからず、録画の health も正常のままになります。これは、保存の前に「independent decodability」を確かめるという保存層の契約（`SegmentValidator`）に反します。
+   - CPU は 4 source で約 0.5 core と推定しています（§8.5。合成 frame による上限）。実機で測って、資源の上限を決めます。
    - 既存の ROI 用の子プロセス（`server/app/detection/roi/mjpg_worker.py` / `mjpg_child.py`）は、ROI 用に作られています。1 source に 1 つ、低い優先度（nice 10）、1 frame あたり 500 ms の deadline で動き、luma の画素を返します。そのまま録画の検証に使うことはできません。
    - そのため、同じ方式（fork+exec、rlimit、Landlock + seccomp、deadline）を基にして、**検証専用の request を足す**必要があります。
      - 画素を返さず、decode できたかどうかと寸法だけを返します。
@@ -272,12 +307,15 @@ segment の長さを決めるときの trade-off は次のとおりです。
    - 検証が録画の速さに追いつかないときは、queue を有界に保ちます。あふれた segment は拒否して gap にし、録画を degraded にします。検証を飛ばして保存することはしません。
 5. byte の integrity（SHA-256、長さ、hard link や symlink の拒否、再検証）は、保存層がすでに行っています。
 
-**Recording Health の self-test（#23、SPEC §10.3）**: 同じ muxer と validator を通した短い一時 segment を、recording root に write → fsync → reopen → 構造 / duration / size の検証 → decode の順で確認します。一時 segment の中身は 2 通り考えられます。
+**Recording Health の self-test（#23、SPEC §10.3）**: 既存の self-test の契約は、**実際の pipeline から取った、上限のある sample** を使うことを求めています（`server/app/media/health/README.md`「obtains a bounded sample from the actual pipeline」、`RecordingStore.self_test_probe()` の docstring「bounded actual-pipeline sample provider」）。そのため self-test の segment は、**直近の実 pipeline の出力（capture → packet adapter → muxer）**を取り、それを recording root に write → fsync → reopen → 構造 / duration / size の検証 → validator による全 frame の decode、の順で確認します。
 
-- 合成の frame（simplejpeg は JPEG の encode もできます。採用するときに API を確認します）
-- 直近の実 frame（camera の freshness も同時に確かめられます。ただし、実際の部屋の映像を一時的に書くことになります）
-
-どちらにするかは Owner の判断です（§12 Q6）。H.264 を選んだ場合、self-test は encoder（GPU）の health も確かめる必要があります。
+- 合成の frame を self-test に使うことはしません。合成の入力を mux して検証するだけでは、実際の capture → packet adapter → muxer の経路が壊れていても self-test が成功してしまうからです。合成の media は、validator や muxer の単体テストにだけ使います（README「Generated test bytes do not constitute a production codec」）。
+- **privacy**: self-test の segment には、実際の部屋の映像が入ります。既存の契約どおりに扱います。
+  - file は journal に記録した `.selftest` の 1 つだけで、名前は生成した UUID です。
+  - 成功・失敗・中断のどの場合も、検証のあとに削除し、削除も fsync します。強制終了などで残ったものは、次の起動時に、新しい test segment を書く前に回収します。cleanup に失敗した場合は、次の self-test media を書きません。
+  - 結果には media、path、例外の文字列を含めません（health README）。
+  - self-test の segment は録画として登録しないので、一覧・再生・retention の対象にはなりません。
+- H.264 を選んだ場合、self-test は encoder（GPU）の health も確かめる必要があります。
 
 ## 10. Agent の MJPEG 入力との関係
 
@@ -298,7 +336,8 @@ segment の長さを決めるときの trade-off は次のとおりです。
      - MEDIA-003 / SPEC §6.2 の優先順位 1 位（stream copy）に当たります。
      - Agent から届く入力（MJPEG）を transcode せずに保存できます。Agent の ring の形式も `V_MJPEG` にそろえる余地があります（§10。Agent 側はまだ決まっていません）。
      - validator には、Owner が承認済みの decoder を、既存と同じ閉じ込めの方式で使えます（検証用の protocol を足します。§9）。
-     - これで #23 の self-test を実際の recording path で実装でき、`RefuseUnvalidatedSegments` を外せます。
+     - これで #23 の self-test を、実際の pipeline の sample（capture → packet adapter → muxer → validator）で実装でき、`RefuseUnvalidatedSegments` を外せます。
+   - 前提: validator は全 frame を decode します（§9）。`pre_roll_bytes`、`max_spool_segments`、`max_segment_bytes`、`max_request_bytes` を §8.6 の値に合わせて決め、`server/docs/DEPLOYMENT.md` の例も更新します。
    - 代償:
      - 容量が H.264 の約 7 倍です（推定。§8）。retention は保持日数より容量で決まりやすくなります。
      - pre-roll spool の書き込み量が大きくなります（SSD の場合）。
@@ -329,9 +368,9 @@ segment の長さを決めるときの trade-off は次のとおりです。
   - (a) software encode に fallback する（B の依存が要る）
   - (b) MJPEG の保存に fallback する（形式が混在する）
   - (c) `adapter_unavailable` で録画を止めて、Owner に通知する
-- **Q5（validator の強さ）**: 保存の前の decode 確認を、全 frame にしますか（4 source で約 0.5 core の推定）。それとも、構造の検査は全 frame、decode は一部の frame にしますか。
-- **Q6（self-test の中身）**: 日次の self-test segment に、合成 frame と直近の実 frame のどちらを使いますか。
-- **Q7（容量）**: MJPEG を選ぶ場合、§8 の推定（4 source × 50 event / 日 × 20 日で約 3〜4.5 TB）を前提に、recording root の容量と媒体（HDD / SSD）、pre-roll を disk に置くか memory に置くかを決めていただけますか。
+- **Q5（validator の資源）**: 保存の前に全 frame を decode することは必須とします（§9。一部の frame だけの decode は不採用）。そのための CPU（4 source で約 0.5 core の推定）を割り当ててよいでしょうか。また、検証用の子プロセスを ROI 用と共有しますか、それとも専用にしますか。
+- **Q6（self-test の sample）**: 既存の契約により、日次の self-test は直近の実 pipeline の出力を使います（合成 frame は使いません。§9）。実際の部屋の映像を含む一時 segment を、既存の `.selftest` の契約（journal、検証後の削除、起動時の回収、結果に media を含めない）で扱うことを確認していただけますか。sample の長さと byte の上限も決めていただく必要があります。
+- **Q7（容量と上限）**: MJPEG を選ぶ場合、§8 の推定（4 source × 50 event / 日 × 20 日で約 3〜4.5 TB）を前提に、recording root の容量と媒体（HDD / SSD）、pre-roll を disk に置くか memory に置くかを決めていただけますか。あわせて、30 秒の pre-roll を保つための `pre_roll_bytes`（4 source で約 0.65〜0.96 GB）、`max_spool_segments`、`max_segment_bytes` / `max_request_bytes`、segment の長さ（§8.4、§8.6）も決める必要があります。
 - **Q8（AVC の特許）**: H.264 を使う場合、Via LA の AVC license の当てはまり方（self-hosted で、配布しない研究室の deployment）を Owner 側で判断していただけますか。この調査では判断できません。
 
 ## 13. 未検証のこと
