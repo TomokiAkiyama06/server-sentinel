@@ -19,6 +19,7 @@ import unittest
 from uuid import uuid4
 
 from app.cameras.registry.models import SourceType
+from app.detection.roi.contracts import CriticalKind
 from app.detection.roi.runtime import SceneMonitoringConfiguration, SceneMonitoringDependencies
 from app.logging import Event
 from app.main import create_app
@@ -39,6 +40,7 @@ from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.test_detector_roi import HEIGHT, WIDTH, pixels, policy
 from tests.test_monitoring_runtime import RuntimeFixture
 from tests.test_presence import NOW, MockAccess, observation
+from tests.test_presence_adapters import critical
 from tests.test_recording import SyntheticValidator
 from tests.test_scene_runtime import MOVED, OTHER, binding, calibration_for
 from tests.test_storage_notifications import Transport, endpoint
@@ -782,6 +784,38 @@ class LifespanTests(RuntimeFixture):
                 f"WHERE event_id='{identifier}'"))
             self.assertEqual(1, timeline.unrecorded.submitted)
         self.assertEqual([ALERT + "server_movement"], self.critical_texts())
+
+    async def test_a_record_just_before_the_hard_stop_alerts_once_and_reconciles(self):
+        application = self.scene_application(dispatch_interval_seconds=3600,
+                                              dispatch_backoff_seconds=3600)
+        timeline = application.state.scene_timeline
+        async with asyncio.timeout(30), application.router.lifespan_context(application):
+            self.assertTrue(await self.until(lambda: timeline.opened))
+            dispatcher = application.state.critical_dispatcher
+            monitoring = application.state.monitoring
+            item = critical(CriticalKind.CAMERA_TAMPER, at=datetime.now(timezone.utc))
+            await asyncio.to_thread(timeline.recorder, item)
+            # The disk is removed before any dispatch step claimed the row.
+            detached = self.recordings.with_name("detached")
+            self.recordings.rename(detached)
+            self.recordings.mkdir(mode=0o700)
+            await dispatcher.once()
+            self.assertTrue(dispatcher.failing)
+            await dispatcher.alert_once()
+            self.assertTrue(await self.until(
+                lambda: self.critical_texts() == [ALERT + "camera_tamper"]))
+            self.assertEqual([("pending",)], self.rows(
+                "SELECT state FROM presence_deliveries WHERE action='notification'"))
+            self.recordings.rmdir()
+            detached.rename(self.recordings)
+            await monitoring.call(monitoring.settle_notifications, 10)
+            await dispatcher.once()
+            self.assertFalse(dispatcher.failing)
+            self.assertEqual([("delivered",)], self.rows(
+                "SELECT state FROM presence_deliveries WHERE action='notification'"))
+            self.assertEqual([("sent",)], self.rows(
+                f"SELECT delivery FROM notification_events WHERE event_id='{item.identifier}'"))
+        self.assertEqual([ALERT + "camera_tamper"], self.critical_texts())
 
     async def test_settle_waits_for_a_slow_delivery_and_gives_up_at_its_bound(self):
         self.transport = GatedTransport()

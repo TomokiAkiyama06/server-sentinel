@@ -1178,11 +1178,17 @@ storage is refused a confirmed observation cannot be recorded and waits only
 within the scene runtime's bounded critical staging, but its Slack alert is
 still attempted like a recording-health alert (Owner decision 2026-10-22,
 Issue #318, accepting the duplicate risk): the recorder hands the event ID
-and fixed kind to a bounded in-memory queue (64, overflow counted and logged
-value-free) without blocking, and the dispatcher submits it on the monitoring
-worker at every 5 s interval, independently of the failing dispatch step's
-backoff, through the same `NotificationService` under the observation
-identity, taking at most half of its queue. After recovery the recorded
+and fixed kind to a bounded in-memory queue without blocking (64, overflow
+counted and logged value-free; in practice bounded by the 32-observation
+critical staging), and also watches every recorded one (at most 64) until a
+dispatch step claims it, escalating it when a dispatch step fails (a record
+just before the disk is removed, or a row left `unavailable` for queue
+space). The dispatcher submits these on the monitoring worker at every 5 s
+interval, independently of the failing dispatch step's backoff, through the
+same `NotificationService` under the observation identity, holding at most
+half of its queue (at least one slot; at most 8 attempts per hard stop with
+the default 16) so they cannot monopolise it. Owner status reports
+value-free `unrecorded_critical_alerts` counts. After recovery the recorded
 observation's notification claim joins that delivery or takes its stored
 outcome instead of sending again (only an Owner requeue resends); a process
 that ends between the attempt and its outcome row may notify a recovered

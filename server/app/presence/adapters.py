@@ -697,17 +697,22 @@ class CriticalTimelineRecorder:
     the failure is raised to the scene runtime's retry: the Main composition
     passes `UnrecordedCriticalAlerts.refused`, which only queues the event ID
     and fixed kind for a Slack attempt and never blocks or raises here.
+    ``recorded(identifier, kind)`` is told about every one recorded, so one
+    whose notification row storage keeps from being claimed (a refusal right
+    after the record) is attempted too (`UnrecordedCriticalAlerts.recorded`).
     """
 
     def __init__(self, outbox: TimelineOutbox, *, maximum_source_latency: timedelta,
-                 refused: Callable[[UUID, CriticalKind], None] | None = None):
+                 refused: Callable[[UUID, CriticalKind], None] | None = None,
+                 recorded: Callable[[UUID, CriticalKind], None] | None = None):
         if not isinstance(outbox, TimelineOutbox):
             raise ValueError("shared timeline receipt clock required")
-        if refused is not None and not callable(refused):
-            raise ValueError("invalid refused critical hand-over")
+        if (refused is not None and not callable(refused)
+                or recorded is not None and not callable(recorded)):
+            raise ValueError("invalid critical hand-over")
         self.outbox = outbox
         self.maximum_source_latency = _positive(maximum_source_latency, "source latency bound")
-        self.refused = refused
+        self.refused, self.recorded = refused, recorded
 
     @staticmethod
     def _quality(item):
@@ -743,6 +748,12 @@ class CriticalTimelineRecorder:
                     # The hand-over must never change the recorder's failure.
                     pass
             raise
+        if self.recorded is not None:
+            try:
+                self.recorded(item.identifier, item.kind)
+            except Exception:
+                # Nor its success.
+                pass
 
     def record_undelivered(self, count: int) -> None:
         """Scene runtime `undelivered` sink: a count-only durable gap record.

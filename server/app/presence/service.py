@@ -190,9 +190,15 @@ class TimelineSession:
 class PresenceService:
     def __init__(self, database, *, access=None, evidence=None, notifications=None,
                  reservation=None, detection=None, storage_status=None,
-                 periods: RetentionPeriods = RetentionPeriods()):
+                 periods: RetentionPeriods = RetentionPeriods(), unrecorded_alerts=None):
         if not isinstance(periods, RetentionPeriods):
             raise ValueError("retention periods required")
+        if unrecorded_alerts is not None and not callable(unrecorded_alerts):
+            raise ValueError("invalid unrecorded alert counts")
+        # Issue #318: value-free counts of the Slack alerts attempted for
+        # confirmed criticals storage kept from the timeline or the claim
+        # (`UnrecordedCriticalAlerts.counts`), shown in Owner status.
+        self.unrecorded_alerts = unrecorded_alerts
         self.database = database
         self.periods = periods
         self.access = access or DenyAccess()
@@ -987,6 +993,26 @@ class PresenceService:
                               "ORDER BY observation", (action,)).fetchall()
         return tuple((UUID(row[0]), int(row[1])) for row in rows)
 
+    def awaiting_notification(self, identifiers):
+        """Those of ``identifiers`` whose `notification` row is `pending` or `unavailable`.
+
+        That is confirmed critical work no dispatch step has submitted yet
+        (Issue #318 watches it while storage may refuse the claim).
+        """
+        identifiers = tuple(identifiers)
+        if not all(isinstance(identifier, UUID) for identifier in identifiers):
+            raise ValueError("invalid action identity")
+        found = set()
+        with self._read() as db:
+            for start in range(0, len(identifiers), 500):
+                chunk = identifiers[start:start + 500]
+                found.update(UUID(row[0]) for row in db.execute(
+                    "SELECT observation FROM presence_deliveries WHERE action='notification' "
+                    "AND state IN ('pending','unavailable') AND observation IN ("
+                    + ",".join("?" * len(chunk)) + ")",
+                    tuple(str(identifier) for identifier in chunk)))
+        return found
+
     def dispatch_pending(self, *, limit=100):
         """Submit up to ``limit`` queued critical actions; returns how many made progress.
 
@@ -1297,9 +1323,25 @@ class PresenceService:
                 # Consecutive flushes a transient failure stopped; a growing
                 # count is a stuck outbox rather than a passing refusal.
                 "timeline_flush_failures": failures,
+                # Issue #318: Slack alerts this process attempted (or could
+                # not) for confirmed criticals storage kept from the timeline
+                # or the claim; counts only, None without the hand-over.
+                "unrecorded_critical_alerts": self._unrecorded_counts(),
                 # False when the owning outbox lives in another process and
                 # its in-memory backlog is reported as unknown rather than empty.
                 "timeline_backlog_visible": not foreign}
+
+    def _unrecorded_counts(self):
+        if self.unrecorded_alerts is None:
+            return None
+        try:
+            counts = self.unrecorded_alerts()
+        except Exception:
+            return None
+        if (not isinstance(counts, dict)
+                or not all(type(value) is int and value >= 0 for value in counts.values())):
+            return None
+        return dict(counts)
 
     def owner_status(self, context, *, now, clock_trusted):
         self._owner(context)

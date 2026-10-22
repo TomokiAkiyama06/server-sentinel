@@ -1286,11 +1286,16 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   identifier, source or kind; no `notification_events` row exists yet. After
   the volume is remounted, the staged observation is recorded, its
   `notification_events` row becomes `sent` and the presence `notification`
-  delivery `delivered`, with no second Slack message. Record the number of
-  messages when more than 8 confirmations occur during one hard stop (with
-  the default queue of 16 at most 8 are sent before recovery; the rest follow
-  after it, and beyond 64 queued hand-overs `unrecorded_critical_alert_dropped`
-  is logged). Restarting the service during the hard stop sends nothing by
+  delivery `delivered`, with no second Slack message. Repeat with the volume
+  removed a few seconds after a confirmation was recorded but before the next
+  dispatch step (about 5 s): the alert must still reach Slack during the hard
+  stop, once. Record the number of messages when more than 8 confirmations
+  occur during one hard stop (with the default queue of 16 at most 8 are sent
+  before recovery and the rest after it; confirmations beyond the scene
+  runtime's 32-observation critical staging are counted as undelivered loss
+  and not attempted; `unrecorded_critical_alert_dropped` is not expected with
+  the default staging), and the Owner status `unrecorded_critical_alerts`
+  counts. Restarting the service during the hard stop sends nothing by
   itself; record any duplicate after recovery (accepted risk, at most one per
   observation whose record reached the database just before the restart).
   Verified so far only with synthetic observations, a replaced recording

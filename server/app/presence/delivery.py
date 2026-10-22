@@ -144,27 +144,43 @@ class NotificationAdapter:
 
 # Alerts handed over while their observation could not be recorded and not
 # yet submitted (any thread adds, the monitoring worker drains). Beyond it a
-# hand-over is counted and logged, never queued.
+# hand-over is counted and logged, never queued. In practice the scene
+# runtime's critical staging (32 observations by default) and the watched
+# records below bound the hand-overs; the cap is a safety bound.
 UNRECORDED_ALERT_CAPACITY = 64
+# Confirmed observations recorded but whose notification row was not yet
+# claimed (or was left `unavailable`): escalated when a dispatch step fails,
+# for example storage refused right after the record. The oldest beyond it is
+# no longer watched (counted as `untracked`).
+RECORDED_WATCH_CAPACITY = 64
 # Event IDs already attempted in this process, so the scene runtime's retries
 # of the same refused observation do not attempt it again.
 UNRECORDED_ALERT_REMEMBERED = 1024
 
 
 class UnrecordedCriticalAlerts:
-    """Slack attempt for a confirmed critical the timeline refused (Issue #318).
+    """Slack attempt for a confirmed critical storage keeps from its claim (Issue #318).
 
     While storage is refused (`STORAGE_HARD_STOP`, a lost or replaced
-    recording filesystem) a confirmed server movement or camera tamper cannot
-    be written to the timeline, so no delivery row exists for the dispatcher.
-    Owner decision 2026-10-22: like a recording-health failure it still
-    attempts the immediate Slack alert, accepting the risk of a duplicate.
+    recording filesystem) a confirmed server movement or camera tamper either
+    cannot be written to the timeline at all, or was written just before the
+    refusal and its notification row cannot be claimed: either way the
+    dispatcher cannot submit it. Owner decision 2026-10-22: like a
+    recording-health failure it still attempts the immediate Slack alert,
+    accepting the risk of a duplicate.
 
-    `refused()` is the timeline recorder's hand-over and may be called on any
-    thread (the scene delivery thread): it only takes a short lock and adds
-    the event ID and fixed kind to a bounded queue; it never blocks on I/O or
-    on the monitoring worker. A full queue counts the hand-over in `dropped`
-    and logs `unrecorded_critical_alert_dropped` value-free (first and every
+    Two hand-overs feed it, both callable from any thread and never blocking
+    (a short lock, no I/O, no wait for the monitoring worker):
+
+    - `refused()`: the timeline recorder could not record the observation;
+    - `recorded()` / `escalate()`: the recorder wrote it, and it stays watched
+      until a successful dispatch step finds its notification row neither
+      `pending` nor `unavailable` (`prune()`); a dispatch step that fails
+      escalates every watched one to `refused()`. A row left `unavailable`
+      because the notification queue was full stays watched as well.
+
+    A full queue counts the hand-over in `dropped` and logs
+    `unrecorded_critical_alert_dropped` value-free (first and every
     doubling). Nothing else is kept: no image, source, time, person or cause.
 
     `drain()` runs on the monitoring worker that owns the notification
@@ -172,9 +188,11 @@ class UnrecordedCriticalAlerts:
     the dispatcher, under the same event ID (the observation identity), with
     the fixed category text only. The service keeps the delivery in memory
     while its local event row is refused and writes it once storage admits
-    it. At most half of the service's queue is taken by such alerts at a time,
-    because an outcome that cannot be persisted keeps its slot until storage
-    returns and recording-health or integrity alerts still need room.
+    it, so its queue slot stays taken until then. These alerts may hold at
+    most half of the service queue (at least one slot), so scene alerts
+    cannot monopolise it: with the default queue of 16 at most 8 are attempted
+    during one hard stop and the rest wait for recovery. Other immediate
+    alerts may still fill the remaining slots.
 
     After recovery the scene runtime records the staged observation and the
     dispatcher reaches it through `NotificationAdapter`: a delivery still in
@@ -188,21 +206,23 @@ class UnrecordedCriticalAlerts:
 
     def __init__(self, adapter: NotificationAdapter, *,
                  capacity: int = UNRECORDED_ALERT_CAPACITY,
+                 watched: int = RECORDED_WATCH_CAPACITY,
                  remembered: int = UNRECORDED_ALERT_REMEMBERED):
         if not isinstance(adapter, NotificationAdapter):
             raise TypeError("notification adapter required")
         if (type(capacity) is not int or not 1 <= capacity <= 1024
+                or type(watched) is not int or not 1 <= watched <= 1024
                 or type(remembered) is not int or not capacity <= remembered <= 65536):
             raise ValueError("bounded unrecorded alert queue required")
         self._adapter = adapter
-        self._capacity, self._remembered = capacity, remembered
+        self._capacity, self._watched, self._remembered = capacity, watched, remembered
         self._lock = threading.Lock()
         self._queued: OrderedDict[UUID, Kind] = OrderedDict()
+        self._recorded: OrderedDict[UUID, Kind] = OrderedDict()
         self._attempted: OrderedDict[UUID, None] = OrderedDict()
         # Worker only: this process's attempts whose outcome is not persisted.
         self._in_flight: set[UUID] = set()
-        self._dropped = 0
-        self._submitted = 0
+        self._dropped = self._submitted = self._untracked = 0
 
     @property
     def queued(self) -> int:
@@ -219,13 +239,24 @@ class UnrecordedCriticalAlerts:
         with self._lock:
             return self._submitted
 
-    def refused(self, identifier: UUID, kind) -> None:
-        """Hand over a confirmed critical whose record was refused; never blocks."""
-        if not isinstance(identifier, UUID):
-            raise ValueError("invalid critical identity")
+    def counts(self) -> dict:
+        """Value-free counts for Owner status (this process only)."""
+        with self._lock:
+            return {"attempted": self._submitted, "waiting": len(self._queued),
+                    "dropped": self._dropped, "untracked": self._untracked}
+
+    @staticmethod
+    def _kind(kind) -> Kind:
         kind = Kind(getattr(kind, "value", kind))
         if kind not in CRITICAL:
             raise ValueError("critical kind required")
+        return kind
+
+    def refused(self, identifier: UUID, kind) -> None:
+        """Hand over a confirmed critical that cannot be submitted now; never blocks."""
+        if not isinstance(identifier, UUID):
+            raise ValueError("invalid critical identity")
+        kind = self._kind(kind)
         if not self._adapter.armed():
             # Without Slack there is nothing to attempt; the local event is
             # written by the dispatcher once the observation is recorded.
@@ -241,6 +272,40 @@ class UnrecordedCriticalAlerts:
         if dropped & (dropped - 1) == 0:
             logging.getLogger(__name__).warning(Event.UNRECORDED_CRITICAL_ALERT_DROPPED)
 
+    def recorded(self, identifier: UUID, kind) -> None:
+        """Watch a confirmed critical the recorder wrote until it is claimed; never blocks."""
+        if not isinstance(identifier, UUID):
+            raise ValueError("invalid critical identity")
+        kind = self._kind(kind)
+        if not self._adapter.armed():
+            return
+        with self._lock:
+            self._recorded[identifier] = kind
+            self._recorded.move_to_end(identifier)
+            while len(self._recorded) > self._watched:
+                self._recorded.popitem(last=False)
+                self._untracked += 1
+
+    def awaiting(self) -> tuple[UUID, ...]:
+        """The watched identities, checked by a successful dispatch step."""
+        with self._lock:
+            return tuple(self._recorded)
+
+    def prune(self, checked, keep) -> None:
+        """Stop watching ``checked`` identities not in ``keep`` (claimed or resolved)."""
+        keep = set(keep)
+        with self._lock:
+            for identifier in checked:
+                if identifier not in keep:
+                    self._recorded.pop(identifier, None)
+
+    def escalate(self) -> None:
+        """A dispatch step failed: attempt every watched, unclaimed one."""
+        with self._lock:
+            watched = tuple(self._recorded.items())
+        for identifier, kind in watched:
+            self.refused(identifier, kind)
+
     def _attempt(self, identifier: UUID) -> None:
         # Called with the lock held.
         self._queued.pop(identifier, None)
@@ -252,8 +317,8 @@ class UnrecordedCriticalAlerts:
         """Submit queued alerts on the service's owning thread; returns how many wait.
 
         Stops at the first one the service cannot take now (queue full or
-        closed, or half of it already held by these alerts); it is retried by
-        the next drain. Raises nothing for a single alert's failure.
+        closed, or these alerts already hold their share of it); it is
+        retried by the next drain. Raises nothing for a single alert's failure.
         """
         service = self._adapter.current()
         if service is None:
@@ -263,7 +328,8 @@ class UnrecordedCriticalAlerts:
                 self._queued.clear()
             return 0
         self._in_flight = {item for item in self._in_flight if service.in_flight(item)}
-        limit = service.capacity // 2
+        # Half of the queue, and at least one slot (a queue of one).
+        limit = max(1, service.capacity // 2)
         with self._lock:
             waiting = tuple(self._queued.items())
         for identifier, kind in waiting:

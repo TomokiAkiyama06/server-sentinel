@@ -237,19 +237,23 @@ class SceneTimeline:
         # evidence-preservation port exists yet (a separate recording
         # decision), so `critical_evidence` stays unavailable and its rows are
         # recorded `unavailable` by the dispatcher rather than left pending.
-        self.presence = PresenceService(self._pinned, reservation=reservation,
-                                        detection=detection, notifications=notifications)
+        # Issue #318: a confirmed critical whose record, or whose claim, storage
+        # refuses (hard stop) still attempts Slack through the same
+        # notification service; the dispatcher drains these on the monitoring
+        # worker.
+        self.unrecorded = (UnrecordedCriticalAlerts(notifications)
+                           if isinstance(notifications, NotificationAdapter) else None)
+        self.presence = PresenceService(
+            self._pinned, reservation=reservation, detection=detection,
+            notifications=notifications,
+            unrecorded_alerts=self.unrecorded.counts if self.unrecorded is not None else None)
         self._reconciled = False
         self.outbox = TimelineOutbox(self.presence, clock=configuration.clock,
                                      capacity=configuration.outbox_capacity)
-        # Issue #318: a confirmed critical whose record is refused (storage
-        # hard stop) still attempts Slack through the same notification
-        # service; the dispatcher drains these on the monitoring worker.
-        self.unrecorded = (UnrecordedCriticalAlerts(notifications)
-                           if isinstance(notifications, NotificationAdapter) else None)
         self.recorder = CriticalTimelineRecorder(
             self.outbox, maximum_source_latency=configuration.maximum_source_latency,
-            refused=self.unrecorded.refused if self.unrecorded is not None else None)
+            refused=self.unrecorded.refused if self.unrecorded is not None else None,
+            recorded=self.unrecorded.recorded if self.unrecorded is not None else None)
         self._lock = threading.Lock()
         self._pin_lock = threading.Lock()
         self._opened = False
@@ -350,11 +354,37 @@ class SceneTimeline:
         POST, so the claim stays unresolved for an audited Owner requeue and is
         never resent automatically. Raising leaves reconciliation for the
         next step.
+
+        A failing step (for example storage refused) escalates every
+        confirmed critical the recorder wrote but no step has claimed yet to
+        `UnrecordedCriticalAlerts` (Issue #318); a successful one stops
+        watching those whose notification row is no longer `pending` or
+        `unavailable`.
         """
         # `PinnedDatabase.pinned` takes only its own short lock, never
         # `_pin_lock`; an unpinned database also refuses every connection.
         if not self._pinned.pinned:
             raise TimelineNotPinned()
+        try:
+            progressed = self._dispatch(reconcile)
+        except Exception:
+            # Issue #318: a confirmed critical recorded just before storage
+            # was refused cannot be claimed now; attempt its Slack alert.
+            if self.unrecorded is not None:
+                self.unrecorded.escalate()
+            raise
+        if self.unrecorded is not None:
+            checked = self.unrecorded.awaiting()
+            if checked:
+                try:
+                    keep = self.presence.awaiting_notification(checked)
+                except Exception:
+                    self.unrecorded.escalate()
+                else:
+                    self.unrecorded.prune(checked, keep)
+        return progressed
+
+    def _dispatch(self, reconcile) -> int:
         if not self._reconciled:
             if reconcile is not None and self.presence.notifications is not None:
                 claims = self.presence.unconfirmed_actions("notification")

@@ -32,7 +32,7 @@ class Unrecorded(Fixture):
 
     def adapter(self, service, *, configured=None):
         def outcomes(identifiers):
-            if self.store.refuse:
+            if self.store.refuse or getattr(self, "lookup_fails", False):
                 raise RuntimeError("synthetic STORAGE_HARD_STOP read")
             return {identifier: self.store.rows[identifier].delivery
                     for identifier in identifiers if identifier in self.store.rows}
@@ -178,15 +178,150 @@ class HandOverTests(Unrecorded, unittest.TestCase):
         # A transient record failure handed it over although the dispatcher
         # submitted it meanwhile: joined by identity, nothing sent twice.
         alerts.refused(item.identifier, CriticalKind.CAMERA_TAMPER)
-        self.assertEqual(0, alerts.drain(at=NOW))
+        # Another time than the dispatched delivery's and an unreadable row:
+        # only the in-flight check keeps it from a refused second submission.
+        self.lookup_fails = True
+        self.assertEqual(0, alerts.drain(at=NOW + timedelta(minutes=1)))
+        self.lookup_fails = False
+        self.assertFalse(service.delivery_failed)
         transport.gate.set()
         self.drain(service, transport, 1)
+        self.assertEqual("delivered", self.state(item.identifier))
         other = uuid4()
         self.store.rows[other] = type("Row", (), {"delivery": DeliveryResult.SENT})()
         alerts.refused(other, CriticalKind.CAMERA_TAMPER)
         self.assertEqual(0, alerts.drain(at=NOW))
         self.assertEqual(1, len(transport.requests))
         self.assertEqual(0, alerts.submitted)
+
+
+    def test_an_attempted_alert_is_not_attempted_again_while_its_row_is_unreadable(self):
+        transport = Transport()
+        service = self.notifications(transport)
+        alerts = UnrecordedCriticalAlerts(self.adapter(service))
+        identifier = uuid4()
+        alerts.refused(identifier, CriticalKind.SERVER_MOVEMENT)
+        alerts.drain(at=NOW)
+        self.drain(service, transport, 1)
+        self.assertFalse(service.in_flight(identifier))
+        # Neither in flight nor readable: only the remembered attempt keeps a
+        # later hand-over of the same observation from a second message.
+        self.lookup_fails = True
+        alerts.refused(identifier, CriticalKind.SERVER_MOVEMENT)
+        alerts.escalate()
+        self.assertEqual(0, alerts.drain(at=NOW + timedelta(minutes=1)))
+        # Waits until nothing is pending, so a second POST would be counted.
+        self.drain(service, transport, 1)
+        self.assertEqual(1, len(transport.requests))
+        self.assertEqual(1, alerts.submitted)
+
+    def test_a_queue_of_one_still_attempts_one_alert(self):
+        transport = Transport()
+        service = self.notifications(transport, capacity=1)
+        alerts = UnrecordedCriticalAlerts(self.adapter(service))
+        self.store.refuse = True
+        alerts.refused(uuid4(), CriticalKind.CAMERA_TAMPER)
+        alerts.refused(uuid4(), CriticalKind.CAMERA_TAMPER)
+        self.assertEqual(1, alerts.drain(at=NOW))
+        self.settle(service, transport, 1)
+        self.assertEqual({"attempted": 1, "waiting": 1, "dropped": 0, "untracked": 0},
+                         alerts.counts())
+
+
+class ClaimRefusedTests(Unrecorded, unittest.TestCase):
+    """Recorded just before the hard stop, but the claim is refused (Issue #318)."""
+
+    def setUp(self):
+        super().setUp()
+        self.refusing = False
+
+    def reservation(self):
+        @contextmanager
+        def admission():
+            if self.refusing:
+                raise RuntimeError("synthetic STORAGE_HARD_STOP")
+            yield
+
+        return admission()
+
+    def timeline(self, service):
+        timeline = SceneTimeline(configuration(), self.database, self.reservation,
+                                 notifications=self.adapter(service))
+        timeline._pin()
+        return timeline
+
+    def refuse(self, refusing):
+        # The timeline and the notification event rows share the storage.
+        self.refusing = self.store.refuse = refusing
+
+    def test_a_record_just_before_the_hard_stop_alerts_once_and_reconciles(self):
+        transport = Transport()
+        service = self.notifications(transport)
+        timeline = self.timeline(service)
+        item = critical(CriticalKind.SERVER_MOVEMENT, at=datetime.now(timezone.utc))
+        timeline.recorder(item)
+        self.assertEqual((item.identifier,), timeline.unrecorded.awaiting())
+        # The disk is removed before the next dispatch step claims the row.
+        self.refuse(True)
+        with self.assertRaises(Exception):
+            timeline.dispatch()
+        self.assertEqual("pending", self.state(item.identifier))
+        timeline.unrecorded.drain(at=NOW)
+        self.settle(service, transport, 1)
+        self.assertEqual([ALERT + "server_movement"], texts(transport))
+        # Later failing steps attempt nothing again.
+        with self.assertRaises(Exception):
+            timeline.dispatch()
+        self.assertEqual(0, timeline.unrecorded.drain(at=NOW))
+        self.refuse(False)
+        service.poll()
+        timeline.dispatch()
+        self.assertEqual("delivered", self.state(item.identifier))
+        self.assertEqual((), timeline.unrecorded.awaiting())
+        self.assertEqual([ALERT + "server_movement"], texts(transport))
+        status = timeline.presence.snapshot(now=datetime.now(timezone.utc), clock_trusted=True)
+        self.assertEqual({"attempted": 1, "waiting": 0, "dropped": 0, "untracked": 0},
+                         status["unrecorded_critical_alerts"])
+
+    def test_a_row_left_unavailable_for_queue_space_is_covered_too(self):
+        transport = GatedTransport()
+        self.addCleanup(transport.gate.set)
+        service = self.notifications(transport, capacity=2)
+        timeline = self.timeline(service)
+        # Two other immediate alerts fill the notification queue.
+        for _ in range(2):
+            service.record(NotificationKind.RECORDING_HEALTH_FAILURE, at=NOW)
+        item = critical(CriticalKind.CAMERA_TAMPER, at=datetime.now(timezone.utc))
+        timeline.recorder(item)
+        timeline.dispatch()
+        self.assertEqual("unavailable", self.state(item.identifier))
+        self.assertEqual((item.identifier,), timeline.unrecorded.awaiting())
+        transport.gate.set()
+        self.settle(service, transport, 2)
+        service.poll()
+        self.refuse(True)
+        with self.assertRaises(Exception):
+            timeline.dispatch()
+        timeline.unrecorded.drain(at=NOW)
+        self.settle(service, transport, 3)
+        self.assertEqual(1, texts(transport).count(ALERT + "camera_tamper"))
+        self.refuse(False)
+        service.poll()
+        timeline.dispatch()
+        self.assertEqual("delivered", self.state(item.identifier))
+        self.assertEqual(1, texts(transport).count(ALERT + "camera_tamper"))
+
+    def test_a_successful_step_stops_watching_and_overflow_is_counted(self):
+        service = self.notifications(Transport())
+        adapter = self.adapter(service)
+        alerts = UnrecordedCriticalAlerts(adapter, watched=2)
+        for _ in range(3):
+            alerts.recorded(uuid4(), CriticalKind.CAMERA_TAMPER)
+        self.assertEqual(2, len(alerts.awaiting()))
+        self.assertEqual(1, alerts.counts()["untracked"])
+        checked = alerts.awaiting()
+        alerts.prune(checked, {checked[1]})
+        self.assertEqual((checked[1],), alerts.awaiting())
 
 
 class RecoveryTests(Unrecorded, unittest.TestCase):

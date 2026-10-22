@@ -310,12 +310,23 @@ like a recording-health or integrity alert (Owner decision 2026-10-22, Issue
 
 - `CriticalTimelineRecorder` hands every confirmed observation whose record
   failed (anything but a contract error) to `UnrecordedCriticalAlerts`
-  (`delivery.py`) before raising to the scene runtime's retry. The hand-over
-  only queues the event ID and fixed kind under a short lock: no I/O, no wait
-  for the monitoring worker, never a raise into the recorder. The queue holds
-  at most 64 alerts; a hand-over beyond that is counted (`dropped`) and logged
-  value-free as `unrecorded_critical_alert_dropped` (first and every
-  doubling). Without Slack nothing is queued.
+  (`delivery.py`) before raising to the scene runtime's retry. A recorded one
+  is also handed over, as watched: until a successful dispatch step finds its
+  `notification` row neither `pending` nor `unavailable` (claimed, or
+  resolved), a failing dispatch step escalates it to an attempt. That covers
+  an observation recorded just before the disk is removed (the claim is then
+  refused) and a row left `unavailable` while the notification queue was
+  full. Each hand-over only touches memory under a short lock: no I/O, no
+  wait for the monitoring worker, never a raise into the recorder. Without
+  Slack nothing is handed over.
+- Bounds: refused hand-overs are in practice bounded by the scene runtime's
+  critical staging (32 observations by default, `DEFAULT_CRITICAL_CAPACITY`;
+  beyond it the scene runtime counts undelivered loss and no attempt is made)
+  plus at most 64 watched records (the oldest beyond that is no longer
+  watched, counted as `untracked`). The attempt queue itself holds at most 64;
+  beyond it a hand-over is counted (`dropped`) and logged value-free as
+  `unrecorded_critical_alert_dropped` (first and every doubling), which the
+  default staging does not reach.
 - `CriticalDispatcher` drains it on the monitoring worker at every dispatch
   interval (5 s), independently of the dispatch step's backoff, which keeps
   failing while storage is refused. Each alert goes through the same
@@ -323,10 +334,15 @@ like a recording-health or integrity alert (Owner decision 2026-10-22, Issue
   with the same fixed text (`ServerSentinel critical alert: server_movement` /
   `camera_tamper`) and nothing else; `unrecorded_critical_alert_attempted` is
   logged value-free. The service keeps the delivery in memory until its
-  `notification_events` row can be written. Such alerts take at most half of
-  the service queue at a time, because a slot whose outcome cannot be written
-  stays taken until storage returns and recording-health or integrity alerts
-  still need room; the rest wait in the bounded queue.
+  `notification_events` row can be written, so its queue slot stays taken
+  until storage returns. Such alerts hold at most half of the service queue
+  (at least one slot), so scene alerts cannot monopolise it: with the default
+  queue of 16, at most 8 are attempted during one hard stop and the rest are
+  sent after recovery. Other immediate alerts (recording health, integrity,
+  camera offline, access faults) may still fill the remaining slots.
+- Owner status (`PresenceService.snapshot`) reports value-free counts for
+  this process as `unrecorded_critical_alerts`: `attempted`, `waiting`,
+  `dropped` and `untracked` (None without the hand-over).
 - After recovery the scene runtime records the staged observation and the
   dispatcher claims its `notification` row. `NotificationAdapter` then joins a
   delivery of that event ID still in flight (`NotificationService.join()`) or
