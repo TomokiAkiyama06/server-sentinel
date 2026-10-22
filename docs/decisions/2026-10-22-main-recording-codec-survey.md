@@ -6,12 +6,12 @@
 - Scope: 文書だけです。runtime の依存、lock、`license/components.json` / `license/owner-approvals.json` の記録、code は追加しません。
 - 実測について: **この文書のために新しく測った値はありません**。数値は、既存の記録（`MANUAL_TEST.md`、`docs/decisions/2026-10-11-mjpg-decoder-survey.md`）から引用するか、明記した仮定から計算した **推定** です。Main host と capture host は本番環境なので、この調査ではカメラにも稼働中のサービスにも触れていません。Main host で行ったのは、読み取りだけの `gst-inspect-1.0` と `dpkg -l` による package の確認だけです。
 
-## 1. 問題（main `81a6b00` 時点）
+## 1. 問題（main `833c492` 時点）
 
 Main の durable recording には、保存層（`server/app/media/recording/`、#18）しかありません。
 
 - production code から `RecordingStore.append()` を呼ぶ箇所がありません。#17 の `PacketAdapter`（`server/app/media/profiles/pipeline.py`）を `Segment` に変える muxer もありません。
-- segment validator が注入されないとき、`MonitoringRuntime` は `RefuseUnvalidatedSegments` を使い、すべての segment を `SEGMENT_VALIDATOR_UNAVAILABLE` で拒否します（`server/app/monitoring/runtime.py`）。`recorder_probe_factory` も無いので、日次の recording-health self-test は `UNAVAILABLE` を返します（SPEC §9 Storage/admission の記述どおり）。
+- segment validator が注入されないとき、`MonitoringRuntime` は `RefuseUnvalidatedSegments` を使い、すべての segment を `SEGMENT_VALIDATOR_UNAVAILABLE` で拒否します（`server/app/monitoring/runtime.py`）。`recorder_probe_factory` も無いので、日次の recording-health self-test は `UNAVAILABLE` を返します（`server/app/monitoring/runtime.py` の `MonitoringDependencies` の docstring、`server/app/monitoring/README.md` の `UNAVAILABLE` → `recording_health_warning`）。
 - codec / container / muxer / validator は、まだ何も選ばれていません。#10 Phase 2 の Owner 判断 **D13（再生の container）** は「#19 / #17 で決めます」として未決です。
 - #18 は primitive だけで close されています。recording README にも「No production validator is shipped here」とあります。
 
@@ -62,17 +62,17 @@ container の「crash-safe append」の比較（§5）は、この前提で評�
 | 同上 | C960 MJPG 1280x720@30 | 100–103 KiB | 24.5–25.3 Mbps |
 | 同上 | C960 MJPG 640x480@30 | 50–53 KiB | 12.3–13.0 Mbps |
 | `MANUAL_TEST.md`「LAN baseline」2026-09-30 | 観測した camera の MJPEG | — | 約 60 Mbps（1080p30）、約 30 Mbps（720p30） |
-| `MANUAL_TEST.md` 低照度の観測（lens を覆う） | C960 1080p | 約 150 → 220 KiB に増加 | （計算すると約 54 Mbps） |
+| `MANUAL_TEST.md` 低照度の観測（lens を覆う） | C960 1080p、実配信 16〜17 fps | 約 150 → 220 KiB に増加 | 実測の条件（16〜17 fps × 約 220 KiB）では約 29〜31 Mbps |
 | 2026-10-22 の capture host 計測（#305） | CS-800 MJPG 1280x720@30 | 約 125 KB | （計算すると約 30 Mbps） |
 
-暗い場面や noise の多い場面では、MJPEG の frame は大きくなります。1080p30 の MJPEG は **40〜60 Mbps / source** と見積もるのが妥当です。
+暗い場面や noise の多い場面では、MJPEG の frame は大きくなります。ただし C960 の低照度の観測では fps も 16〜17 に下がったので、帯域は実測の条件では約 30 Mbps でした。**仮定**として、220 KiB の frame のまま 30 fps を保つ camera があれば約 54 Mbps になります（この組み合わせは観測していません）。以下の見積もりでは、1080p30 の MJPEG を代表値 40.7 Mbps（Main の local capture の実測）、上振れ値 60 Mbps としました。60 Mbps の根拠は、LAN baseline の「約 60 Mbps（1080p30）」という観測だけです。
 
 ## 4. codec の選択肢
 
 ### A. MJPEG をそのまま stream copy する（transcode しない）
 
 - 処理: camera の JPEG frame を、そのまま container に入れます。MJPEG では frame がそれぞれ独立に decode できるので、segment の境界はどの frame にも置けます。keyframe を待つ必要もありません。
-- 新しい codec の依存: **ありません**。integrity の検証には、Owner が採用を承認した simplejpeg（libjpeg-turbo）を、既存の分離子プロセス（Landlock + seccomp、#269）で使い回せます（§7）。
+- 新しい codec の依存: **ありません**。integrity の検証には、Owner が採用を承認した simplejpeg（libjpeg-turbo）を使えます。既存の ROI 用の分離子プロセス（Landlock + seccomp、#269）と同じ方式を基に、検証用の protocol を足す形になります（§7、§9）。
 - 特許: AVC の pool（Via LA）の対象外です。
 - GPU: 要りません。SPEC §6.2 の「特定の GPU vendor を correctness の条件にしない」に、そのまま合います。
 - **欠点**:
@@ -84,16 +84,16 @@ container の「crash-safe append」の比較（§5）は、この前提で評�
 
 - 処理: MJPEG を decode し、YUV に直して H.264 に encode します。decode した frame は encoder に渡すまでの短い間だけ持つので、MEDIA-009 の「decoded frame history を持たない」に反しません。
 - 候補の encoder:
-  - **x264**: GPL です（商用 license も別にあります）[x264]。FFmpeg も、libx264 を使うと「the GPL applies to all of FFmpeg」になります [FFmpeg-legal]。GStreamer の `x264enc` は gst-plugins-ugly にあります。ugly は「the license ... might not be how we'd like / might be widely known to present patent problems」と説明される module です [GStreamer-modules]。**THIRD_PARTY_POLICY の「GPL where obligations may affect the combined distributed work」に当たり、Owner の承認が要ります**。
+  - **x264**: GPL です（商用 license も別にあります）[x264]。FFmpeg も、libx264 を使うと「the GPL applies to all of FFmpeg」になります [FFmpeg-legal]。GStreamer の `x264enc` は gst-plugins-ugly にあります。ugly は、plug-in や支えとなる library の license、あるいは広く知られた特許の問題のために、配布に問題が生じうる module だと説明されています [GStreamer-modules]。**THIRD_PARTY_POLICY の「GPL where obligations may affect the combined distributed work」に当たり、Owner の承認が要ります**。
   - **OpenH264**: source は BSD-2-Clause です。ただし AVC の特許 license が及ぶのは、**Cisco が配布した binary** で、次の条件をすべて満たす場合だけです [OpenH264-binary]。
     - 第三者のソフトウェアと統合・結合する前の状態で、end user の端末へ別に download されること
     - user が有効・無効を切り替えられること
     - 「OpenH264 Video Codec provided by Cisco Systems, Inc.」と表示すること
     - EULA 等に条項を再掲すること
-    - 対象は「personal use by a consumer or other uses that receive no remuneration」に限られ、「NO LICENSE IS GRANTED OR SHALL BE IMPLIED FOR ANY OTHER USE」とされています
-    - source から build したもの、distribution の package、同梱したものは、この特許 license の対象外です。それらは「obtain your own patent license ... or proceed at your own risk」とされています。
+    - 対象は「PERSONAL USE OF A CONSUMER OR OTHER USES IN WHICH IT DOES NOT RECEIVE REMUNERATION」に限られ、「NO LICENSE IS GRANTED OR SHALL BE IMPLIED FOR ANY OTHER USE」とされています
+    - この特許 license は Cisco が配布する binary に結び付いています。source から build したもの、distribution の package、同梱したものについては、「you may also obtain your own patent license from MPEG LA or from the individual patent owners, or proceed at your own risk」とされています。
 - 特許: H.264 は Via LA の AVC pool の対象です。encoder / decoder product は年 100,000 unit までが $0.00 で、12 分以下の title は content fee が $0.00 です。ただし「The actual License agreement provides the only definitive ... statement」とされています [ViaLA-AVC]。self-hosted で配布もしない研究室の deployment にこれがどう当てはまるかは、**この調査では判断できません**（法務判断が必要です）。
-- CPU: **測っていません**。1080p30 を realtime で encode すると、MJPEG の decode（下の §8.4）に加えて、source ごとに数 core 規模を使う可能性があります。これは仮定であり、根拠はありません。Main host では別の session が GPU benchmark を回しているので、CPU 負荷の測定は CPU を制限した container で行う必要があります（運用上の制約）。
+- CPU: **測っていません**。1080p30 を realtime で encode すると、MJPEG の decode（下の §8.5）に加えて、source ごとに数 core 規模を使う可能性があります。これは仮定であり、根拠はありません。Main host では別の session が GPU benchmark を回しているので、CPU 負荷の測定は CPU を制限した container で行う必要があります（運用上の制約）。
 - 利点: 容量が小さく、H.264 + MP4 は「a broadly-supported combination—by every major browser」です [MDN-codecs]。ただし Firefox の H.264 は、OS 側にある codec に依存します [MDN-codecs]。Linux desktop の Firefox で再生できるかは、実機で確かめる必要があります。
 
 ### C. H.264 に NVENC（NVIDIA hardware）で encode する
@@ -128,13 +128,13 @@ A で保存し、再生の要求が来たときだけ H.264 に変換します�
 
 | container | MJPEG を入れられるか | H.264 を入れられるか | browser 再生 | segment の自己完結性 | Main host の muxer | 備考 |
 | --- | --- | --- | --- | --- | --- | --- |
-| **fragmented MP4（ISO BMFF、init + `moof`/`mdat`）** | ISO BMFF に MJPEG を入れる一般的な方法は QuickTime の `jpeg` sample entry で、browser では再生できない | ○ | H.264 なら MSE / HLS（EXT-X-MAP）にそのまま使える。init segment は `ftyp`+`moov`（sample なし）、media segment は `moof`+`mdat` [W3C-MSE-ISOBMFF][RFC8216] | segment ごとに init を持たせれば完結する | `mp4mux` / `qtmux`（good）あり。`isofmp4mux`（gst-plugins-rs の fmp4）は無い | iPhone は native HLS か ManagedMediaSource（Safari 17.1 で iPhone に対応）[WebKit-17.1][MDN-MMS] |
+| **fragmented MP4（ISO BMFF、init + `moof`/`mdat`）** | ISO BMFF に MJPEG を入れる一般的な方法は QuickTime の `jpeg` sample entry で、browser では再生できない | ○ | H.264 なら MSE / HLS（EXT-X-MAP）にそのまま使える。init segment は `ftyp`+`moov`（sample なし）、media segment は `moof`+`mdat` [W3C-MSE-ISOBMFF][RFC8216] | segment ごとに init を持たせれば完結する | `mp4mux` / `qtmux`（good）あり。`isofmp4mux`（gst-plugins-rs の fmp4）は無い | iPhone は native HLS か ManagedMediaSource（Safari 17.1 で iPhone に対応）[WebKit-17.1][MDN-MMS]。Safari の ManagedMediaSource は、AirPlay の代替 source（例: HLS の `<source>`）があるか、`disableRemotePlayback` を `true` にした場合にだけ有効になる [MDN-MMS] |
 | 非 fragment の MP4 | 同上 | ○ | `<video src>` で progressive 再生（iOS は byte-range が必須 [Apple-byterange]） | `moov` が末尾に来るので、file を閉じるまで読めない。短い segment なら §2.1 で吸収できる | `mp4mux`。robust muxing（`reserved-moov-update-period`）で crash 後も読めるが、seekable な出力が必要 [GStreamer-qtmux] | 長い 1 file の追記には向かない |
 | **Matroska（MKV）** | ○（`V_MJPEG`、初期化データなし）[Matroska-codecs] | ○（`V_MPEG4/ISO/AVC`） | MDN の web 向け container 一覧には WebM（Matroska の subset）しかなく、MKV は載っていない [MDN-containers]。browser 再生の前提にはできない | Cluster 単位で完結する。MJPEG なら header と frame だけで済む | `matroskamux` / `matroskademux`（good）あり | Owner が VLC / mpv などで local に確認するのに向く |
 | MPEG-TS | 実質的に不可 | ○ | MDN の一覧に無い [MDN-containers]。Safari の HLS 以外では transmux（hls.js 等）が要る | packet 単位で頑丈 | `mpegtsmux`（bad）は無い | 188 byte の packet と PES の parser が増え、検証の面が大きくなる |
 | 自前の frame index 形式（JPEG の連結 + timestamp 表） | ○ | — | 不可（再生は §6 P1 を使う） | 完結する | 不要（stdlib で書ける） | 外部の tool では読めない。形式の文書化と versioning が自前の責任になる |
 
-**整理**: H.264 で保存するなら fragmented MP4 一択です（D13 = fMP4、再生は HLS(fMP4) または MSE）。MJPEG で保存するなら、browser が読める container はありません。Matroska（`V_MJPEG`）か自前の形式になり、D13 は「保存の container」と「再生の packaging」に分かれます。
+**整理**: H.264 で保存し、**保存した segment をそのまま配る（§6 P3）場合は**、fragmented MP4 がほぼ唯一の選択肢です（D13 = fMP4、再生は HLS(fMP4) または MSE）。再生のときに packaging し直す前提なら、H.264 を Matroska 等で保存する余地もあります。ただしその場合は、再生のたびに remux が要ります。MJPEG で保存するなら、browser が読める container はありません。Matroska（`V_MJPEG`）か自前の形式になり、D13 は「保存の container」と「再生の packaging」に分かれます。
 
 ## 6. 再生の方式（S9、non-owner は browser 再生だけ）
 
@@ -151,14 +151,17 @@ A で保存し、再生の要求が来たときだけ H.264 に変換します�
   - 変換はいりません。認可付きの playlist / segment route と、iOS 向けの byte-range 対応が必要です [Apple-byterange]。
   - 認可済みの URL が漏れても再生できないこと（SECURITY）は、cookie による session 認可で守ります。native HLS player がすべての request に cookie を付けるかどうかは、**実機の Safari で確かめる必要があります**。
 
-どの方式でも、manifest の clip 区間（README「Whole compressed segments may overlap window boundaries」）を守るのは再生側の責任です。
+どの方式でも、次の 2 点は共通です。
+
+- 録画の一覧、再生（P1 の frame、P2 / P3 の playlist と segment を含む）、録画に結び付いた historical timeline / event は、**server 側で `recordings:view` を確認して**から返します。`live:view` だけの principal には返しません（REQUIREMENTS の `recordings:view` の定義、AGENTS §9）。P1 は S7 の live と同じ取り出し方をしますが、認可は live の validator ではなく、録画の permission で行います。
+- manifest の clip 区間（README「Whole compressed segments may overlap window boundaries」）を守るのは再生側の責任です。
 
 ## 7. muxer / demuxer / validator の実装と依存
 
 | 案 | 内容 | license | sandbox / 分離 | 所見 |
 | --- | --- | --- | --- | --- |
-| **V1: 自前の stdlib muxer / parser + 既存の simplejpeg 分離子プロセス**（A 向け） | Matroska（`V_MJPEG`）の EBML writer と、**自分が書く subset だけ**を受け付ける parser を Python stdlib で書きます。JPEG の構造の pre-check は、既存の `server/app/detection/roi/mjpg.py`（SOF の寸法検査など）を使い回します。decode の確認は、既存の simplejpeg 子プロセスで行います。 | 自前のコードは Apache-2.0。simplejpeg は Owner 承認済み（`pypi:simplejpeg@1.9.0`、IJG を個別承認） | decode は Landlock + seccomp で閉じ込めた子プロセスで行います（#269）。parser は Main 内の pure Python です。 | 新しい依存がありません。parser の範囲を狭くできます。ただし、EBML の writer / parser を保守する必要があります。 |
-| V2: operator が導入する GStreamer の subprocess（`matroskamux` / `mp4mux` / `qtdemux` / `jpegdec`、C なら `nvh264enc`） | Agent の capture と同じく、絶対 path、root 所有の確認、使う plugin を限る、Landlock で閉じ込める、という形で実行します。 | core / base / good は LGPL-2.1-or-later（agent/docs/DEPENDENCIES.md）。bad も LGPL（要再確認）。ugly の `x264enc` は x264 の GPL が掛かる | Agent の `uvc_sandbox.py` と同じ手法を、Main にも適用する必要があります。GPU を使うなら `/dev/nvidia*` への access が要るので、閉じ込めの範囲が広がります。 | Main の capture は今は GStreamer を使っていないので、Main への新しい runtime の導入になります。Owner の承認が要ります（DEPENDENCIES.md の「Adopting GStreamer as the production capture runtime ... requires the Owner decision」に準じます）。 |
+| **V1: 自前の stdlib muxer / parser + 既存の simplejpeg 分離子プロセス**（A 向け） | Matroska（`V_MJPEG`）の EBML writer と、**自分が書く subset だけ**を受け付ける parser を Python stdlib で書きます。JPEG の構造の pre-check は、既存の `server/app/detection/roi/mjpg.py`（SOF の寸法検査など）の規則を基にします。decode の確認は、ROI 用の simplejpeg 子プロセスと同じ方式で行います。ただし、検証用の protocol を足す必要があります（§9）。 | 自前のコードは Apache-2.0。simplejpeg は Owner 承認済み（`pypi:simplejpeg@1.9.0`、IJG を個別承認） | decode は Landlock + seccomp で閉じ込めた子プロセスで行います（#269 と同じ方式）。parser は Main 内の pure Python です。 | 新しい依存がありません。parser の範囲を狭くできます。ただし、EBML の writer / parser を保守する必要があります。 |
+| V2: operator が導入する GStreamer の subprocess（`matroskamux` / `mp4mux` / `qtdemux` / `jpegdec`、C なら `nvh264enc`） | Agent の capture と同じく、絶対 path、root 所有の確認、使う plugin を限る、Landlock で閉じ込める、という形で実行します。 | `agent/docs/DEPENDENCIES.md` が LGPL-2.1-or-later と記録しているのは core と good だけ。base と bad も upstream では LGPL のはずだが、採用のときに COPYING で確認する。ugly の `x264enc` は x264 の GPL が掛かる | Agent の `uvc_sandbox.py` と同じ手法を、Main にも適用する必要があります。GPU を使うなら `/dev/nvidia*` への access が要るので、閉じ込めの範囲が広がります。 | Main の capture は今は GStreamer を使っていないので、Main への新しい runtime の導入になります。Owner の承認が要ります（DEPENDENCIES.md の「Adopting GStreamer as the production capture runtime ... requires the Owner decision」に準じます）。 |
 | V3: FFmpeg の CLI を subprocess で使う | `ffmpeg` / `ffprobe` を operator が導入します。 | 既定の build は LGPL-2.1-or-later。`--enable-gpl` や libx264 を使うと全体が GPL になります [FFmpeg-legal]。distribution の package がどう configure されているか、監査が要ります | subprocess + Landlock で閉じ込めます。demuxer と decoder の攻撃面が非常に広くなります。 | Main host には入っていません。 |
 | V4: PyAV（in-process） | FFmpeg の Python binding です。wheel に FFmpeg が同梱されています。 | PyAV 自体は BSD-3-Clause です。PyPI の page には、同梱した FFmpeg の build 構成（GPL か LGPL か、libx264 を含むか）が**書かれていません** [PyPI-av]。旧版の文書では、wheel に libx264 / libx265 が入っていると書かれていました [PyAV-install-old] | native の decoder が Main の process 内で動くので、simplejpeg のときに Owner が決めた「native decode は分離子プロセスで行う」方針と合いません。採用するなら、分離子プロセスの中で動かす必要があります。 | wheel の監査（native library と license file の一覧）が重くなります。 |
 
@@ -205,7 +208,37 @@ event が続いて 20 分の上限まで伸びる場合や、手動録画が多�
 
 recording root が SSD / NVMe の場合、MJPEG の pre-roll は耐久性（TBW）にかなり効きます。HDD なら、帯域は問題にならない見込みです。代わりの方法として、pre-roll を memory 上の compressed ring に置く方法があります（4 × 225 MB ≈ 0.9 GB。decoded frame ではないので MEDIA-009 に反しません）。ただしこれは保存層の設計変更になり、crash のときに pre-roll を失います。
 
-### 8.4 CPU / GPU
+### 8.4 segment の長さと、同期 I/O・行数への影響
+
+`RecordingStore.append()` は、1 segment ごとに次の同期処理を、1 つの owning worker thread の上で順番に行います（`store.py`）。
+
+1. pending 行を入れる SQLite transaction の commit（`synchronous=FULL` 以上）
+2. `.part` の `fsync`
+3. link と unlink のあとの directory `fsync`
+4. ready にして recording に link する SQLite transaction の commit
+5. `_trim()` で spool を追い出すときは、さらに unlink、directory `fsync`、SQLite の commit
+
+つまり 1 segment あたり、少なくとも **SQLite の commit 2 回と fsync 2 回**が要ります。spool を追い出すときは、さらに増えます。
+
+| segment の長さ | 4 source での append / 秒 | commit / 秒（下限） | file・dir の fsync / 秒（下限） | 20 分の録画の segment 数（`max_segments_per_recording` の下限の目安） | 30 秒の pre-roll の spool の segment 数（`max_spool_segments` の目安、4 source） |
+| --- | --- | --- | --- | --- | --- |
+| 1 秒 | 4 | 8 | 8 | 約 1,200（境界の分を足す） | 約 120（境界の分を足す） |
+| 2 秒 | 2 | 4 | 4 | 約 600 | 約 60 |
+| 4 秒 | 1 | 2 | 2 | 約 300 | 約 30 |
+
+SQLite の commit は、journal mode によっては、内部でさらに fsync を伴います。
+
+- SSD / NVMe なら、この回数は問題にならない見込みです（**測っていません**）。
+- HDD では、1 回の fsync に数 ms〜十数 ms かかることがあります。仮に 1 回 10 ms とすると、1 秒の segment × 4 source では、worker の時間の 2〜3 割を同期 I/O が占めます。これは**仮定にもとづく推定**です。
+
+segment の長さを決めるときの trade-off は次のとおりです。
+
+- **短くする利点**: crash で失う量（最大 1 segment）、gap の粒度、再生の seek の粒度、muxer が memory に持つ量（`max_segment_bytes`。MJPEG 1080p の 2 秒で約 10〜15 MB）が小さくなります。
+- **長くする利点**: 同期 I/O の回数と、SQLite の行数（`recording_segments` / `recording_links`）が減ります。
+
+推奨案（§11）の「1〜2 秒」は、MJPEG では segment の境界をどの frame にも置けることと、上の同期 I/O の回数とのあいだの仮の値です。recording root の媒体（Q7）に対して、実機で append の遅延と fsync の回数を測ってから決めます（§13）。`Limits` の値は caller が与えるもので、この調査は既定値を決めません。
+
+### 8.5 CPU / GPU
 
 | 形式 | 処理 | 見積もり |
 | --- | --- | --- |
@@ -225,6 +258,12 @@ recording root が SSD / NVMe の場合、MJPEG の pre-roll は耐久性（TBW�
    - H.264: SPS の寸法と profile の allowlist を確認し、segment の先頭が IDR であることを確認します。
 3. **timestamp**: segment の中で単調に増えること。`Segment.start_ms` / `end_ms` と container の duration が一致すること。frame 数が fps × duration の許容範囲内に収まること。
 4. **decode**: 分離子プロセスで decode します。全 frame を decode するか一部にするかは Owner の判断です（§12 Q5）。失敗はすべて拒否にして、録画の health を degraded にします。黙って保存することはしません。
+   - 既存の ROI 用の子プロセス（`server/app/detection/roi/mjpg_worker.py` / `mjpg_child.py`）は、ROI 用に作られています。1 source に 1 つ、低い優先度（nice 10）、1 frame あたり 500 ms の deadline で動き、luma の画素を返します。そのまま録画の検証に使うことはできません。
+   - そのため、同じ方式（fork+exec、rlimit、Landlock + seccomp、deadline）を基にして、**検証専用の request を足す**必要があります。
+     - 画素を返さず、decode できたかどうかと寸法だけを返します。
+     - segment 単位で、複数の frame をまとめて送ります。
+   - 子プロセスの数と優先度も決める必要があります。ROI と共有するか、録画の検証専用にするかです。
+   - 検証が録画の速さに追いつかないときは、queue を有界に保ちます。あふれた segment は拒否して gap にし、録画を degraded にします。検証を飛ばして保存することはしません。
 5. byte の integrity（SHA-256、長さ、hard link や symlink の拒否、再検証）は、保存層がすでに行っています。
 
 **Recording Health の self-test（#23、SPEC §10.3）**: 同じ muxer と validator を通した短い一時 segment を、recording root に write → fsync → reopen → 構造 / duration / size の検証 → decode の順で確認します。一時 segment の中身は 2 通り考えられます。
@@ -237,7 +276,10 @@ recording root が SSD / NVMe の場合、MJPEG の pre-roll は耐久性（TBW�
 ## 10. Agent の MJPEG 入力との関係
 
 - capture host には H.264 encoder がありません（base / good だけ）。Agent が H.264 を作るには、capture host にも codec の依存と CPU / GPU が要ります。そうすると、`media-capture-agent` の「最小の plugin（`coreelements` + `video4linux2`）」という sandbox の前提が崩れます。**MJPEG のまま転送し、Main で処理する**のが、現在の Agent の設計に合います。
-- Agent の ring buffer（#16）が保護する incident は、Main の録画とは別の二次証拠です。Main が MJPEG（A）で保存すれば、Agent の incident 証拠と Main の録画は同じ形式になり、validator と再生（P1）も共通にできます。Main が H.264 で保存すれば、形式が 2 つになります。
+- Agent の ring buffer（#16）が保護する incident は、Main の録画とは別の二次証拠です。ring に入れる segment の codec と container は、まだ決まっていません。capture adapter の責任とされています（`agent/docs/RING_BUFFER.md`「Inputs and control boundary」）。また、Agent の runtime は stdlib だけを使う方針です（`agent/docs/DEPENDENCIES.md`。`node_tls` の cryptography を除く）。
+  - **Agent の segmenter も Matroska `V_MJPEG` を選べば**、Agent の incident 証拠と Main の録画の形式をそろえられます。その場合、stdlib の EBML writer / parser は共有できる余地があります。
+  - simplejpeg による decode の検証は、Main 側だけで行います。Agent には simplejpeg を入れないので、Agent 側の検証は構造の検査までです。
+  - Main が H.264 で保存する場合は、Agent の証拠（MJPEG を前提とする）と形式が分かれます。
 - LAN の帯域は、MJPEG 1080p × 4 source で約 160〜240 Mbps です。これに対し、TCP の実測は 940 Mbps です（`MANUAL_TEST.md` の LAN baseline）。
 
 ## 11. 推奨（Proposed）
@@ -248,8 +290,8 @@ recording root が SSD / NVMe の場合、MJPEG の pre-roll は耐久性（TBW�
    - 理由:
      - 新しい codec の依存、GPL、AVC の特許、GPU が要りません。
      - MEDIA-003 / SPEC §6.2 の優先順位 1 位（stream copy）に当たります。
-     - Agent の入力と形式が同じです。
-     - validator には、Owner が承認済みで閉じ込め済みの decoder を使えます。
+     - Agent から届く入力（MJPEG）を transcode せずに保存できます。Agent の ring の形式も `V_MJPEG` にそろえる余地があります（§10。Agent 側はまだ決まっていません）。
+     - validator には、Owner が承認済みの decoder を、既存と同じ閉じ込めの方式で使えます（検証用の protocol を足します。§9）。
      - これで #23 の self-test を実際の recording path で実装でき、`RefuseUnvalidatedSegments` を外せます。
    - 代償:
      - 容量が H.264 の約 7 倍です（推定。§8）。retention は保持日数より容量で決まりやすくなります。
@@ -292,6 +334,9 @@ recording root が SSD / NVMe の場合、MJPEG の pre-roll は耐久性（TBW�
 - H.264 の bitrate、software encode の CPU、NVENC の throughput は仮定です。
 - distribution package の GStreamer bad / FFmpeg の build 構成と license、gst-plugins-rs の fmp4 の正確な license（distribution の metadata には MPL-2.0 とある）、PyAV の wheel に同梱された FFmpeg の構成は、pinning のときに一次資料で確認する必要があります。
 - 法務の判断（AVC の特許、OpenH264 の binary license の適用範囲）は、この調査の範囲外です。
+- recording root の実際の媒体（HDD / SSD）での append の遅延、fsync と SQLite の commit の回数・時間（§8.4）は測っていません。segment の長さ（1〜2 秒）は、この実機の測定を経てから決めます。
+- iPhone Safari の ManagedMediaSource が、AirPlay の代替 source を置いたとき、または `disableRemotePlayback` を `true` にしたときにだけ開くこと（[MDN-MMS] の条件）を、実機で確かめていません。
+- 検証用の decode の子プロセスが、ROI 用と並んで動いたときの CPU と遅延（§9）は測っていません。
 
 ## 14. 出典（2026-10-22 に参照）
 
