@@ -690,13 +690,24 @@ class CriticalTimelineRecorder:
     Clock distrust or excessive source latency marks the timing untrusted but
     never withdraws confirmation: critical evidence and notification work is
     queued in every presence and clock state.
+
+    ``refused(identifier, kind)`` (Issue #318) is told about every confirmed
+    observation whose record failed for any reason but a contract error
+    (storage refused, an unwritable database, an unavailable clock), before
+    the failure is raised to the scene runtime's retry: the Main composition
+    passes `UnrecordedCriticalAlerts.refused`, which only queues the event ID
+    and fixed kind for a Slack attempt and never blocks or raises here.
     """
 
-    def __init__(self, outbox: TimelineOutbox, *, maximum_source_latency: timedelta):
+    def __init__(self, outbox: TimelineOutbox, *, maximum_source_latency: timedelta,
+                 refused: Callable[[UUID, CriticalKind], None] | None = None):
         if not isinstance(outbox, TimelineOutbox):
             raise ValueError("shared timeline receipt clock required")
+        if refused is not None and not callable(refused):
+            raise ValueError("invalid refused critical hand-over")
         self.outbox = outbox
         self.maximum_source_latency = _positive(maximum_source_latency, "source latency bound")
+        self.refused = refused
 
     @staticmethod
     def _quality(item):
@@ -716,8 +727,22 @@ class CriticalTimelineRecorder:
 
     def __call__(self, item: CriticalObservation) -> None:
         self._quality(item)
-        with self.outbox.receipt() as (received, trusted):
-            self.outbox.service.record(self.observation(item, received, trusted), restamped=True)
+        try:
+            with self.outbox.receipt() as (received, trusted):
+                self.outbox.service.record(self.observation(item, received, trusted), restamped=True)
+        except InvalidObservation:
+            # A contract error or an identity conflict: not an alert waiting
+            # for storage. (An unavailable database location is a plain
+            # `ValueError` and is handed over below.)
+            raise
+        except Exception:
+            if self.refused is not None:
+                try:
+                    self.refused(item.identifier, item.kind)
+                except Exception:
+                    # The hand-over must never change the recorder's failure.
+                    pass
+            raise
 
     def record_undelivered(self, count: int) -> None:
         """Scene runtime `undelivered` sink: a count-only durable gap record.

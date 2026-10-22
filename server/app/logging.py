@@ -62,6 +62,12 @@ class Event(StrEnum):
     CRITICAL_DISPATCH_FAILING = "critical_dispatch_failing"
     CRITICAL_DISPATCH_RECOVERED = "critical_dispatch_recovered"
     CRITICAL_NOTIFICATIONS_UNSETTLED = "critical_notifications_unsettled"
+    # Issue #318: a confirmed critical whose timeline record was refused
+    # (storage hard stop) attempted Slack, or did not fit the bounded queue.
+    UNRECORDED_CRITICAL_ALERT_ATTEMPTED = "unrecorded_critical_alert_attempted"
+    UNRECORDED_CRITICAL_ALERT_DROPPED = "unrecorded_critical_alert_dropped"
+    UNRECORDED_CRITICAL_ALERTS_FAILING = "unrecorded_critical_alerts_failing"
+    UNRECORDED_CRITICAL_ALERTS_UNSENT = "unrecorded_critical_alerts_unsent"
     CAMERA_OFFLINE_NOTIFICATION_RATE_LIMITED = "camera_offline_notification_rate_limited"
     CAMERA_OFFLINE_NOTIFICATION_DROPPED = "camera_offline_notification_dropped"
     CAMERA_OFFLINE_NOTIFICATIONS_UNSETTLED = "camera_offline_notifications_unsettled"

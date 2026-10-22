@@ -1061,12 +1061,18 @@ class PresenceService:
                 # Each claim gets its own generation, so a callback can only
                 # complete the attempt it belongs to.
                 claim = job["generation"] + 1
+                # A requeue-aware port (the #21 notification adapter) takes an
+                # outcome stored for this identity before the claim, such as
+                # an alert attempted while the record was refused (Issue
+                # #318), instead of sending again; an Owner requeue resends.
+                requeue = ({"requeued": bool(job["requeued"])}
+                           if getattr(port, "requeue_aware", False) is True else {})
                 db.execute("UPDATE presence_deliveries SET state='submitting',attempts=attempts+1,"
                            "generation=? WHERE observation=? AND action=?", (claim, *row))
             def complete(result, identifier=observation.identifier, action=row["action"], claim=claim):
                 self.complete_action(identifier, action, result, generation=claim)
             try:
-                result = port(observation, complete)
+                result = port(observation, complete, **requeue)
                 if not isinstance(result, ActionResult):
                     result = ActionResult.UNCERTAIN
             except Exception:
