@@ -1462,6 +1462,13 @@ clock / process でのみ試験済み）でもよく、どちらで実行した�
   14 slot は時刻表どおり実行。real camera の 24 slot は未実行（holder が起動直後に終了: archive 由来の
   mode で sandbox helper が group 書込可能）。real slot は再実行が必要（以後 `schedule` は slot 0 の前に
   holder の信頼検査で拒否する。README Step 0）。
+- 2026-10-21 `schedule`（real camera）: `capture_restart` / `b_segment` が、再起動後の sender の
+  `producer_failed`（`exception`）で `fail`。原因は harness の holder（前の sender の切断を次の frame
+  送信まで検知せず、camera frame が止まっていた間に再起動後の sender を拒否した。Issue #307）で、
+  transport 候補の問題ではない。修正後の 3 候補の `capture_restart` は実機では**未確認**:
+- [ ] Issue #307 の修正を含む HEAD で 3 候補の `capture_restart`（real camera）を再実行し、holder 記録に
+  再起動前後の 2 つの nonce の `session_open` / `session_close` があり、`refused` が無く、sender に
+  `producer_failed` が無いことを生記録で確かめた（未実施）。
 
 TCP の packet loss / jitter は root の `netem` を使わないため `unmeasured` のまま残し、
 QUIC / WebRTC はこのハーネスの対象外です。

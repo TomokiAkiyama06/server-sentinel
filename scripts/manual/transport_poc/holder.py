@@ -15,6 +15,15 @@ forwarded at least, and at most ``HOLDER_INFLIGHT_SLACK`` more than, the
 units the sender generated: a concurrently running holder of another sender
 cannot vouch for it.
 
+One session at a time: a sender sends nothing after its ``HELLO``, so the
+holder watches the session socket and closes the session as soon as it reads
+EOF (or anything else), without waiting for a frame whose ``sendall`` fails.
+A connection that arrives while a session is open is served only if that
+session's sender has already gone; otherwise it is closed and recorded as
+``refused`` (``connection_limit``). Before this, a sender restarted while the
+camera delivered no frame was refused by its predecessor's stale session
+(#307).
+
 Frames on the socket: ``uint8 source_index, uint64 capture_ns, uint32 length``
 then ``length`` JPEG bytes. ``capture_ns`` is this host's CLOCK_MONOTONIC when
 the frame left the capture queue, the same clock the sender and the local
@@ -29,6 +38,7 @@ numeric JSONL only (counts, fps, drops, CPU, RSS): no serial, path or port.
 import hashlib
 import os
 from pathlib import Path
+import select
 import selectors
 import signal
 import socket
@@ -89,6 +99,12 @@ def read_hello(connection):
         data += chunk
     nonce = HELLO.unpack(data)[0]
     return nonce if 0 < nonce < 1 << 63 else None
+
+
+def peer_gone(connection):
+    """Holder side: True if the sender closed (EOF / error) or sent anything
+    after its ``HELLO`` (it never does): its socket is readable. Never blocks."""
+    return bool(select.select([connection], [], [], 0)[0])
 
 
 def encode_frame(index, capture_ns, payload):
@@ -204,12 +220,12 @@ class Holder:
         self.client_frames = [0] * len(source_ids)
         self.frames = [0] * len(source_ids)
         self.forward_drops = 0
+        self.selector = selectors.DefaultSelector()
 
     def run(self, seconds):
         deadline = time.monotonic() + seconds
         self.listener.setblocking(False)
-        selector = selectors.DefaultSelector()
-        selector.register(self.listener, selectors.EVENT_READ)
+        self.selector.register(self.listener, selectors.EVENT_READ)
         next_poll = next_sample = 0.0
         cpu0 = records.process_cpu_seconds()
         self.writer.write("start", sources=len(self.source_ids), fps=self.fps)
@@ -219,20 +235,11 @@ class Holder:
                 if now >= next_poll:
                     self.capture.poll()
                     next_poll = now + 0.5
-                for _key, _ in selector.select(timeout=0):
-                    connection, _ = self.listener.accept()
-                    if self.client is not None:
-                        connection.close()  # exactly one local sender
-                    else:
-                        connection.setblocking(True)
-                        connection.settimeout(1.0)
-                        nonce = read_hello(connection)
-                        if nonce is None:
-                            connection.close()  # no session identity: not served
-                            continue
-                        self.client, self.client_nonce = connection, nonce
-                        self.client_frames = [0] * len(self.source_ids)
-                        self.writer.write("session_open", nonce=nonce)
+                for key, _ in self.selector.select(timeout=0):
+                    if key.fileobj is self.listener:
+                        self._accept()
+                    elif key.fileobj is self.client:
+                        self._close_client()  # the sender closed (or broke protocol)
                 for index, source in enumerate(self.source_ids):
                     frame = self.capture.frames(source).get(0.005)
                     if frame is None:
@@ -260,10 +267,30 @@ class Holder:
         finally:
             self.close()
 
+    def _accept(self):
+        connection, _ = self.listener.accept()
+        if self.client is not None and peer_gone(self.client):
+            self._close_client()  # the previous sender has gone; its EOF is not yet handled
+        if self.client is not None:
+            connection.close()  # exactly one local sender
+            self.writer.write("refused", reason="connection_limit")
+            return
+        connection.setblocking(True)
+        connection.settimeout(1.0)
+        nonce = read_hello(connection)
+        if nonce is None:
+            connection.close()  # no session identity: not served
+            return
+        self.client, self.client_nonce = connection, nonce
+        self.client_frames = [0] * len(self.source_ids)
+        self.selector.register(connection, selectors.EVENT_READ)
+        self.writer.write("session_open", nonce=nonce)
+
     def _close_client(self):
         """End the current sender session: its per-source forwarded counts."""
         if self.client is None:
             return
+        self.selector.unregister(self.client)
         self.client.close()
         for index, frames in enumerate(self.client_frames):
             self.writer.write("forwarded", nonce=self.client_nonce, source=index,
@@ -273,6 +300,7 @@ class Holder:
 
     def close(self):
         self._close_client()
+        self.selector.close()
         self.listener.close()
         try:
             self.path.unlink()
