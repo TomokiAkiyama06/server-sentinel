@@ -149,23 +149,33 @@ async function startChrome(executable, options) {
   };
 }
 
+const IDENTIFIER = '[A-Za-z_$][\\w$]{0,63}';
+// V8 messages whose only variable part is an identifier taken from the test's
+// own expression, never page or input text. Anything else is reduced to its
+// error class.
+const STANDARD_MESSAGES = [
+  new RegExp(`^Cannot read properties of (?:null|undefined) \\(reading '${IDENTIFIER}'\\)$`),
+  new RegExp(`^Cannot set properties of (?:null|undefined) \\(setting '${IDENTIFIER}'\\)$`),
+  new RegExp(`^${IDENTIFIER}(?:\\.${IDENTIFIER}){0,7} is not a function$`),
+  new RegExp(`^${IDENTIFIER} is not defined$`),
+];
+
 /**
- * A value-free description of a CDP `exceptionDetails` (#322): the error class
- * and the first line of its engine message, with every quoted literal that is
- * not a plain identifier (an engine message may quote page or input text, e.g.
- * JSON.parse) and every invitation-code-shaped token replaced. A thrown
- * non-Error value is described by its type only.
+ * A value-free description of a CDP `exceptionDetails` (#322): the error
+ * class, plus the engine message only when it has one of the allowlisted V8
+ * shapes above. Every other message (which may quote page text, input or an
+ * invitation code, e.g. JSON.parse or an application error) is dropped, and a
+ * thrown non-Error value is described by its type only.
  */
 export function describeException(details) {
   const exception = details?.exception;
   if (exception?.type !== 'object' || exception.subtype !== 'error') {
     return `non-Error value thrown (${exception?.type ?? 'unknown'})`;
   }
-  const line = String(exception.description ?? '').split('\n', 1)[0]
-    .replace(/(["'`])(.*?)\1/g, (quoted, mark, inner) => (/^[A-Za-z_$][\w$]{0,63}$/.test(inner) ? quoted : `${mark}…${mark}`))
-    .replace(/\b[0-9A-Z]{4}(?:[-\s\u3000\u30fc][0-9A-Z]{4}){2,}\b|\b[0-9A-Z]{20,}\b/gi, '<code>')
-    .slice(0, 200);
-  return line || String(exception.className ?? 'Error');
+  const className = new RegExp(`^${IDENTIFIER}$`).test(exception.className ?? '') ? exception.className : 'Error';
+  const first = String(exception.description ?? '').split('\n', 1)[0];
+  const message = first.startsWith(`${className}: `) ? first.slice(className.length + 2) : '';
+  return STANDARD_MESSAGES.some(shape => shape.test(message)) ? `${className}: ${message}` : className;
 }
 
 export async function pageFor(browser, viewport) {
@@ -186,24 +196,29 @@ export async function pageFor(browser, viewport) {
   // A poll may span a navigation the page makes itself (e.g. a redirect to
   // /app/): CDP then refuses the evaluation because the document's context is
   // gone, which is not an answer, so the poll goes on until its deadline. An
-  // exception thrown by the expression itself stays fatal.
+  // exception thrown by the expression itself stays fatal. A timeout names the
+  // last refusal so a poll stuck in navigation is not mistaken for a false DOM.
   const NAVIGATING = /^(Execution context was destroyed|Cannot find default execution context|Inspected target navigated or closed)\b/;
   async function wait(expression) {
+    let refused;
     for (let i = 0; i < 100; i++) {
       try {
         if (await evaluate(expression)) return;
       } catch (error) {
-        if (!NAVIGATING.test(error.message)) throw error;
+        const navigating = NAVIGATING.exec(error.message);
+        if (!navigating) throw error;
+        refused = navigating[1];
       }
       await delay(50);
     }
-    throw new Error('Browser DOM assertion timed out');
+    throw new Error(`Browser DOM assertion timed out${refused ? ` (last CDP refusal while navigating: ${refused})` : ''}`);
   }
   /**
    * Navigates the top frame and resolves once that navigation's document has
    * committed and parsed (DOMContentLoaded). `Page.navigate` answers before the
-   * commit, so an evaluation sent right after it can still run in the previous
-   * document (#322: `about:blank`, where `getElementById` returns null).
+   * new document has been parsed, so an evaluation sent right after it can run
+   * while that document is still loading (#322: `readyState` 'loading', `#m`
+   * not parsed yet, so `getElementById('m')` returns null).
    */
   async function navigate(url, timeoutMilliseconds = 10000) {
     // Events may arrive before the command's answer, so every parsed top-level
