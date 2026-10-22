@@ -39,7 +39,7 @@ Owner は 2026-10-22 に、§12 の問いについて次のとおり決めまし
   - 認可は server 側で `recordings:view` を確認します（`live:view` だけでは見せません）。download / export の route や button は作りません。
   - 決める必要があるのは、fallback の区間を保存する container（Matroska `V_MJPEG` など）と、再生 UI で H.264 の区間と fallback の区間をどうつなぐか（seek、間引き、帯域）です。
 - **T4: bitrate の上限の強制**。§8.6 の上限は、negotiated bound（`VideoFormat.maximum_bitrate`）が実際に守られることを前提にしています。ただし、`VideoFormat.maximum_bitrate`（`server/app/media/profiles/model.py`）は**宣言されているだけで、今はどこでも強制されていません**（読んでいるのは synthetic の harness の fixture だけです）。
-  - そのため、**H.264 でも MJPEG の fallback でも、segment ごとに byte 数の上限を強制します**。上限は `B_s` × segment の長さ ÷ 8 × (1 + o) + `V_s` + `H` です（`max_segment_bytes` 以下）。
+  - そのため、**H.264 でも MJPEG の fallback でも、segment ごとに byte 数の上限を強制します**。上限は `B_s` × segment の長さ（秒）÷ 8 × (1 + o) + `V_s` + `H`（byte）です（`max_segment_bytes` 以下）。
   - **主に強制するのは muxer / segmenter で、segment を組み立てている間に行います**。packet（frame）を加えるたびに、組み立て中の byte 数を数えます。次の packet を加えると上限を超える時点で、その segment を中止して、組み立て中の bytes を捨てます。その区間は gap にし、録画を degraded にします。次の segment は、keyframe（MJPEG ならどの frame でも可）から新しく始めます。こうすると、上限を超えた分を memory に溜めることはありません（§2.1 の「muxer が memory に持つ未完成の segment は `max_segment_ms` / `max_segment_bytes` で上限を持つ」）。
   - validator は、完成した segment の byte 数を、同じ上限でもう一度確認します（多重の防御）。validator だけで強制すると、`Segment.data` が完成してからでないと拒否できないので、上限を超えた分（§8.6 の例では、上限を強制しない MJPEG で 2 秒 segment あたり約 254 MB / source）を memory に溜めてしまいます。validator を、muxer の検査の代わりにはしません。
   - capture から muxer までの経路も有界のままにします。1 frame の大きさは、すでに capture 側で上限を持っています（Main の local capture は V4L2 の buffer の上限、Agent は MJPEG frame parser の frame ごとの上限）。muxer への入力は、`SourcePipeline` の packet / byte 数で有界な queue を通ります（`server/app/media/profiles/README.md`）。超過した segment を中止しても、これらの上限はそのまま保ちます。
@@ -318,15 +318,16 @@ segment の長さを決めるときの trade-off は次のとおりです。
 
 観測した平均の bitrate（§3）では、30 秒を保証できません。上限は、**source ごとの negotiated bound** から計算します。
 
-- 記号:
-  - `P` = `pre_roll_ms`（30 秒）
+- 記号と単位（**時間はすべて秒、大きさはすべて byte、bitrate は bit/s** で統一します。設定ファイルの `*_ms` の値は、1000 で割って秒にしてから式に入れます）:
+  - `P` = pre-roll の長さ（秒）= 設定の `pre_roll_ms` ÷ 1000。既定の 30,000 ms なら `P` = 30
   - `B_s` = source s の `VideoFormat.maximum_bitrate`（bit/s）。H.264 では NVENC の rate control で守らせる最大 bitrate です。
   - `V_s` = encoder の VBV buffer の大きさ（byte）。rate control が許す一時的な超過の上限です。MJPEG では 0 とし、`B_s` を超える segment は拒否します（T4）。
-  - `o` = mux の overhead の割合（`moof` / sample table など）
-  - `H` = segment ごとの固定の overhead（自己完結させるための init segment など）
-  - `D_s` = 通常の segment の長さ。`Dmax_s` = その最大値（`max_segment_ms` 以下）
-  - `R_s` = 1 つの pre-roll の窓の中で許す、reset / discontinuity による早い区切りの回数。区切りが起きると、短い segment ができます。
-- 式:
+  - `o` = mux の overhead の割合（単位なし。例: 2 % なら 0.02）
+  - `H` = segment ごとの固定の overhead（byte。自己完結させるための init segment など）
+  - `D_s` = 通常の segment の長さ（秒）。`Dmax_s` = その最大値（秒）で、設定の `max_segment_ms` ÷ 1000 以下
+  - `R_s` = 1 つの pre-roll の窓の中で許す、reset / discontinuity による早い区切りの回数（回）。区切りが起きると、短い segment ができます。
+  - `n_s` = source s が spool に持つ segment の数の上限（個）
+- 式（左辺は設定の値。`pre_roll_bytes` / `max_segment_bytes` は byte、`max_spool_segments` は個）:
   - `pre_roll_bytes` ≥ Σ_s [ (P + Dmax_s) × B_s ÷ 8 × (1 + o) + V_s + n_s × H ]
   - `max_spool_segments` ≥ Σ_s n_s。ここで n_s = ⌈P ÷ D_s⌉ + 1 + R_s
   - `max_segment_bytes` ≥ max_s [ Dmax_s × B_s ÷ 8 × (1 + o) + V_s + H ]。また、`max_request_bytes` ≥ `max_segment_bytes`
@@ -334,11 +335,13 @@ segment の長さを決めるときの trade-off は次のとおりです。
 
 #### 例（値はすべて仮定。実機で決め直します）
 
-`P` = 30 秒、4 source、`D_s` = `Dmax_s` = 2 秒、`R_s` = 2、`o` = 2 %、`H` = 2 KB としました。
+`P` = 30（秒。`pre_roll_ms` = 30,000）、4 source、`D_s` = `Dmax_s` = 2（秒。`max_segment_ms` = 2,000）、`R_s` = 2、`o` = 0.02、`H` = 2,000 byte としました。1 KB = 10^3 byte、1 MB = 10^6 byte、1 GB = 10^9 byte です。
+
+計算例（H.264 の行、1 source あたり）: (30 + 2) 秒 × 8,000,000 bit/s ÷ 8 × 1.02 + 1,000,000 + 18 × 2,000 ≈ 33.7 MB。4 source で約 135 MB です。
 
 | 条件 | `B_s` | `V_s` | `pre_roll_bytes` | `max_spool_segments` | `max_segment_bytes` |
 | --- | --- | --- | --- | --- | --- |
-| H.264（NVENC、決定済みの形式） | 8 Mbps（仮定） | 1 MB（仮定） | 約 0.14 GB | 72 以上 | 約 3.0 MB |
+| H.264（NVENC、決定済みの形式） | 8 Mbps（仮定） | 1 MB（仮定） | 約 0.135 GB | 72 以上 | 約 3.0 MB |
 | MJPEG の fallback（上限を設定で強制） | 60 Mbps（仮定） | 0 | 約 0.98 GB | 72 以上 | 約 15.3 MB（16 MiB 以上を推奨） |
 | MJPEG の fallback（上限を強制しない場合） | 約 995 Mbps（1 frame の上限を V4L2 の MJPG buffer の大きさ 1920×1080×2 byte とし、30 fps とした場合） | 0 | 約 16 GB | 72 以上 | 約 254 MB（`max_request_bytes` を大きく超える） |
 | DEPLOYMENT.md の例 | — | — | 64 MiB（約 0.067 GB） | 64 | 8 MiB |
