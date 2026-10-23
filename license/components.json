@@ -83,7 +83,7 @@
     },
     {
       "path": "web/tests/calibration_browser.mjs",
-      "sha256": "sha256:da3c7ed7b90147a1061dfbc634136d1b4a660bc95382a712261e2d41545062de"
+      "sha256": "sha256:3d89a01d397087e24be8ebfef992730117e9648048c92faf5f6d47e46dea1fd4"
     }
   ],
   "inputs": [

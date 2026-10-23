@@ -246,8 +246,9 @@ try {
     assert.equal(assertion.id, b64(credentialId));
     const client = JSON.parse(Buffer.from(assertion.response.clientDataJSON, 'base64url'));
     assert.equal(client.challenge, state.challenges[0]);
-    // The status is loaded again and shows the Owner's calibration.
-    await page.wait(`document.querySelector('[data-calibration-source="${sourceId}"]').dataset.calibrationOrigin === 'owner'`);
+    // The status is loaded again and shows the Owner's calibration. The row
+    // may be absent while the status reloads, which is waited for, not a TypeError.
+    await page.wait(`document.querySelector('[data-calibration-source="${sourceId}"]')?.dataset.calibrationOrigin === 'owner'`);
     assert.ok(state.statusLoads >= 2);
   });
 
