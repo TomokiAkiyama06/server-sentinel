@@ -1314,7 +1314,10 @@ continues during an acquisition.
   notified as not confirmed). A failed attempt leaves the
   source inactive and `unknown`, is retried every `reacquire_retry_seconds`
   (default 60 s), and notifies `scene_calibration_required` once per process
-  (not for a runtime that is not running yet); an acquisition refusal of the
+  (not for a runtime that has not started yet, nor at shutdown, when the
+  service is closed first; a runtime that started and then stopped or failed,
+  so that every retry is refused `unavailable`, is notified); an acquisition
+  refusal of the
   system path is not an audited change. An Owner calibration ends a pending
   re-acquisition without a notice. A source never calibrated is left alone.
   An unexpected failure of one source's attempt is logged value-free

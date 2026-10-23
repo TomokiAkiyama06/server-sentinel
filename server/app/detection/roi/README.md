@@ -496,8 +496,10 @@ its reference.
   re-acquired with the stored size, polygon and policy, through the same
   reader only (`reader_changed` otherwise), and committed by Main's system
   commit (`reacquire_scene_reference`, actor `system`). Success queues a
-  `scene_reference_reacquired` notice; a failure other than a not-yet-running
-  runtime queues `scene_calibration_required` once per process and is
+  `scene_reference_reacquired` notice; a failure queues
+  `scene_calibration_required` once per process and source (not for a runtime
+  that has not started yet, nor once `close()` began the shutdown; a runtime
+  that started and then stopped or failed is notified) and is
   retried by the application at `reacquire_retry_seconds`. `take_notices()` /
   `return_notices()` hand the fixed notices to Main, which submits them
   through the monitoring runtime's `NotificationService` (immediate kinds)

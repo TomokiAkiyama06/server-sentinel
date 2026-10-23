@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -34,7 +35,7 @@ from app.detection.roi.calibration_service import (
 from app.detection.roi.mjpg import MjpgLumaLayout
 from app.detection.roi.runtime import (
     ArchiveCalibrationProvider, PackedLumaLayout, ReferenceUnavailable, SceneMonitoringConfiguration,
-    SceneMonitoringDependencies, SceneMonitoringRuntime, SceneSourceState, reader_identity,
+    SceneMonitoringDependencies, SceneMonitoringRuntime, SceneRuntimeState, SceneSourceState, reader_identity,
 )
 from app.detection.roi.mjpg_worker import NUMPY_VERSION, SIMPLEJPEG_VERSION
 from app.logging import Event
@@ -174,7 +175,7 @@ class Service:
     """A threaded runtime with one decoded-sample source and its service."""
 
     def __init__(self, test, database, *, templates=None, quality_policy=None, timeout=5.0,
-                 reacquire_timeout=5.0):
+                 reacquire_timeout=5.0, start=True):
         self.references = TransientReferences()
         movement = quality_policy or quality("server_roi")
         tamper = (quality_policy and replace(quality_policy, detector="camera_tamper")
@@ -193,7 +194,8 @@ class Service:
             acquisition_timeout_seconds=timeout, reacquire_timeout_seconds=reacquire_timeout)
         self.service = SceneCalibrationService(configuration, self.runtime, database.connect_read_only,
                                                references=self.references)
-        self.runtime.start()
+        if start:
+            self.runtime.start()
         test.addCleanup(self.close)
 
     def close(self):
@@ -707,6 +709,44 @@ class RestartReacquisitionTests(unittest.TestCase):
         with Feed(harness.runtime):
             self.assertIsNotNone(harness.service.reacquire(OTHER, commit_with(self.database.database)))
         self.assertEqual([REACQUIRED], [item.kind for item in harness.service.take_notices()])
+
+    def test_an_unavailable_runtime_is_notified_only_after_it_ran_and_not_at_shutdown(self):
+        # Codex P1 (#330): "unavailable" has three causes. A runtime that has
+        # not started yet may still start: no notice. One that started and
+        # then stopped or failed leaves detection off with every retry refused
+        # the same way: one `scene_calibration_required`. A shutdown of this
+        # service is not a failure: no notice.
+        self.database.store(stored())
+        pending = Service(self, self.database.database, start=False)
+        pending.service.start()
+        self.assertIsNone(pending.service.reacquire(OTHER, commit_with(self.database.database)))
+        self.assertEqual("unavailable", pending.status().failure)
+        self.assertEqual((), pending.service.take_notices())
+
+        ended = Service(self, self.database.database)
+        ended.service.start()
+        ended.runtime.stop()
+        for _ in range(2):
+            self.assertIsNone(ended.service.reacquire(OTHER, commit_with(self.database.database)))
+        self.assertEqual([REQUIRED], [notice.kind for notice in ended.service.take_notices()])
+
+        failed = Service(self, self.database.database)
+        failed.service.start()
+        with mock.patch.object(failed.runtime, "acquire_reference",
+                               side_effect=ReferenceUnavailable("unavailable")), \
+                mock.patch.object(failed.runtime, "status", return_value=SimpleNamespace(
+                    state=SceneRuntimeState.UNAVAILABLE)):
+            # The worker failed: the runtime reports itself unavailable.
+            self.assertIsNone(failed.service.reacquire(OTHER, commit_with(self.database.database)))
+        self.assertEqual([REQUIRED], [notice.kind for notice in failed.service.take_notices()])
+
+        closing_down = Service(self, self.database.database)
+        closing_down.service.start()
+        closing_down.service.close()
+        closing_down.runtime.stop()
+        self.assertIsNone(closing_down.service.reacquire(OTHER, commit_with(self.database.database)))
+        self.assertEqual((), closing_down.service.take_notices())
+        self.assertEqual([1], [item.version for item in self.database.history()])
 
     def test_without_a_stored_calibration_nothing_is_reacquired_or_notified(self):
         harness = Service(self, self.database.database)

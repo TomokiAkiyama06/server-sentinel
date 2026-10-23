@@ -52,7 +52,7 @@ from .contracts import Calibration, Policy
 from .geometry import validate_polygon
 from .runtime import (
     MAXIMUM_SOURCES, ArchiveCalibrationProvider, ReferenceUnavailable, SceneMonitoringRuntime,
-    reader_identity,
+    SceneRuntimeState, reader_identity,
 )
 
 
@@ -419,12 +419,33 @@ class SceneCalibrationService:
             if refused.reason == "calibration_missing":
                 with self._lock:
                     self._sources[source_id].reacquire = False
-            elif refused.reason not in ("unavailable", "busy", "cancelled"):
+            elif refused.reason == "unavailable":
+                # Not notified while the runtime has not started yet (it may
+                # still start) or when this service was closed (shutdown);
+                # a runtime that started and then stopped or failed leaves
+                # detection off with every retry refused the same way, so
+                # the Owner is told (Codex P1 on PR #330).
+                if self._runtime_ended():
+                    self._required(source_id)
+            elif refused.reason not in ("busy", "cancelled"):
                 self._required(source_id)
             return None
         except Exception:
             self._required(source_id)
             return None
+
+    def _runtime_ended(self) -> bool:
+        """Whether the scene runtime ran and is no longer running, outside a
+        shutdown of this service (an unreadable status counts as ended)."""
+        with self._lock:
+            if self._closed:
+                return False
+        try:
+            state = self.runtime.status().state
+        except Exception:
+            return True
+        return state not in (SceneRuntimeState.CONFIGURED, SceneRuntimeState.RUNNING,
+                             SceneRuntimeState.DEGRADED)
 
     def _required(self, source_id):
         with self._lock:
