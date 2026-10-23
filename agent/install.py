@@ -13,10 +13,11 @@ import pwd
 import re
 import subprocess
 import stat
+import sys
 import zipfile
 
 from media_capture_agent.config import ConfigurationError, Settings, read_protected_configuration
-from media_capture_agent.storage import StorageRefused, open_directory
+from media_capture_agent.storage import DEVICE_NUMBERS_STALE, StorageRefused, open_directory
 
 
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -294,6 +295,20 @@ def release_lock(destination):
         os.close(descriptor)
 
 
+# `--check` warning lines the installer shows the Owner (Issue #324). Only
+# these exact, value-free lines are forwarded; any other check output stays
+# discarded, as before.
+FORWARDED_CHECK_WARNINGS = frozenset({
+    "media-capture-agent: local deployment validation warning: " + DEVICE_NUMBERS_STALE,
+})
+
+
+def _forward_check_warnings(stderr, stream):
+    for line in stderr.decode("utf-8", "replace").splitlines():
+        if line in FORWARDED_CHECK_WARNINGS:
+            print(line, file=stream)
+
+
 def _stage(args, artifact, settings, account, config):
     version_root = args.destination / args.version
     version_root.mkdir(mode=0o755)
@@ -305,11 +320,12 @@ def _stage(args, artifact, settings, account, config):
             stream.flush()
             os.fchmod(stream.fileno(), 0o555)
             os.fsync(stream.fileno())
-        subprocess.run([str(executable), "--config", str(config), "--check"],
-                       check=True, timeout=30, user=account.pw_uid, group=account.pw_gid,
-                       extra_groups=[], env={"PATH": "/usr/bin:/bin",
-                                             "PYTHONDONTWRITEBYTECODE": "1"},
-                       cwd="/", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        checked = subprocess.run(
+            [str(executable), "--config", str(config), "--check"],
+            check=True, timeout=30, user=account.pw_uid, group=account.pw_gid,
+            extra_groups=[], env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+            cwd="/", stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _forward_check_warnings(checked.stderr, sys.stderr)
         _sync_directory(version_root)
         _sync_directory(args.destination)
         return executable
