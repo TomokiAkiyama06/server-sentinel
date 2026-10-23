@@ -289,7 +289,14 @@ operating-system root. `device` records its major/minor numbers; like
 `runtime_device` it only corroborates the UUID, and a stale value is reported,
 not refused (see `runtime_device` above). The runtime re-checks the UUID, the
 mount and the pinned root device/inode on every storage sample and refuses
-writes, without a fallback, when they no longer hold.
+writes, without a fallback, when they no longer hold. While a recorded value
+is stale it also re-checks, on every sample, that the device still rests only
+on hardware disks (Issue #340): a dm table reload or md member replacement
+onto a loop or virtual device while the service runs keeps the device number
+and the mount, yet storage stops (`STORAGE_HARD_STOP`, one immediate
+`recording_health_failure`) until the backing is hardware-only again, when
+writes resume without a restart. Updating the recorded numbers ends this
+extra check along with the warning.
 
 #### Updating stale device numbers after a reboot
 

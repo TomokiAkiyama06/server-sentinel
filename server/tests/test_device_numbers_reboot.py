@@ -48,6 +48,13 @@ def other_numbers(device: int) -> list[int]:
     return [os.major(device), os.minor(device) + 16]
 
 
+def spare_device(taken: int, major: int, minor: int) -> int:
+    """Synthetic numbers for a fake sysfs entry that never meet ``taken``."""
+    while os.makedev(major, minor) == taken:
+        minor += 1
+    return os.makedev(major, minor)
+
+
 def other_major(device: int) -> list[int]:
     """Another driver's numbers, e.g. a loop device `7:0` instead of `8:16`."""
     return [7, 0] if os.major(device) != 7 else [8, 16]
@@ -452,6 +459,77 @@ class RecordingFilesystemTests(unittest.TestCase):
         with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
             IdentifiedRecordingFilesystem(self.identity(other_numbers(self.device)), metadata)
 
+    def metadata(self) -> Path:
+        metadata = self.recordings / "metadata.sqlite3"
+        metadata.write_bytes(b"")
+        metadata.chmod(0o600)
+        return metadata
+
+    def test_backing_topology_is_revalidated_at_every_sample(self):
+        # Issue #340: a stale dm device first rests on a hardware disk; a live
+        # table reload then moves it onto a loop device (or an md member swap
+        # onto an nbd-like virtual disk) without changing its own number, the
+        # mount or `st_dev`. The next sample must refuse, and a return to
+        # hardware-only backing must admit again (not latched).
+        sysfs = FakeSysfs(self)
+        disk = sysfs.device(spare_device(self.device, 8, 240), "sdz")
+        loop = sysfs.device(spare_device(self.device, 7, 9), "loop9", loop=True)
+        nbd = sysfs.device(spare_device(self.device, 43, 7), "nbd7", hardware=False)
+        mapped = sysfs.device(self.device, "dm-stale", dm=True, slaves=(disk,))
+        filesystem = IdentifiedRecordingFilesystem(
+            self.identity(other_numbers(self.device)), self.metadata())
+        self.assertFalse(filesystem.device_numbers_current)
+        filesystem.check()
+        filesystem.snapshot()
+        for replacement in (loop, nbd):
+            with self.subTest(backing=replacement.name):
+                (mapped / "slaves" / disk.name).unlink()
+                (mapped / "slaves" / replacement.name).symlink_to(replacement)
+                for sample in (filesystem.check, filesystem.snapshot, filesystem.check):
+                    with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                        sample()
+                # Restored: the very next sample admits again.
+                (mapped / "slaves" / replacement.name).unlink()
+                (mapped / "slaves" / disk.name).symlink_to(disk)
+                filesystem.check()
+                filesystem.snapshot()
+        # An added loop member beside the hardware disk refuses as well.
+        (mapped / "slaves" / loop.name).symlink_to(loop)
+        with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+            filesystem.check()
+        (mapped / "slaves" / loop.name).unlink()
+        # A vanished or unreadable sysfs entry fails closed at the sample.
+        (sysfs.root / "dev" / f"{os.major(self.device)}:{os.minor(self.device)}").unlink()
+        with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+            filesystem.check()
+
+    def test_a_raising_topology_judgement_fails_closed(self):
+        filesystem = IdentifiedRecordingFilesystem(
+            self.identity(other_numbers(self.device)), self.metadata())
+        with patch("app.monitoring.config._hardware_backed", side_effect=RuntimeError):
+            with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                filesystem.check()
+        filesystem.check()
+
+    def test_current_numbers_never_read_sysfs(self):
+        current = (os.major(self.device), os.minor(self.device))
+        metadata = self.metadata()
+        # Even a loop device in sysfs is not re-judged when nothing is stale.
+        FakeSysfs(self).node(self.device, "loop")
+        with patch("app.monitoring.config._hardware_backed",
+                   side_effect=AssertionError("sysfs read")) as walked, \
+                patch("app.monitoring.config.SYS_DEV_BLOCK",
+                      Path("/nonexistent-sysfs-must-not-be-read")), \
+                patch.object(RecordingFilesystem, "recorded_device_numbers_acceptable",
+                             side_effect=AssertionError("topology judged")):
+            for runtime_device in (None, current):
+                filesystem = IdentifiedRecordingFilesystem(
+                    self.identity(current, runtime_device), metadata)
+                self.assertTrue(filesystem.device_numbers_current)
+                filesystem.check()
+                filesystem.snapshot()
+            walked.assert_not_called()
+
 
 class StaleDeviceNumbersRuntimeTests(RuntimeFixture):
     """The monitoring runtime starts, reports the stale value and notifies once
@@ -584,6 +662,62 @@ class StaleDeviceNumbersRuntimeTests(RuntimeFixture):
             await self.settle(runtime)
             self.assertFalse(runtime.status.recording_device_numbers_stale)
             self.assertNotIn("recording_device_numbers_changed", dict(self.events()))
+
+    async def test_backing_moved_onto_loop_at_runtime_hard_stops_until_restored(self):
+        # Issue #340: accepted at open on a hardware-backed dm device, then a
+        # live table reload moves it onto a loop device while the number, the
+        # mount and `st_dev` stay. The next tick and every admission refuse
+        # (STORAGE_HARD_STOP, one immediate alert); restoring resumes them.
+        sysfs = FakeSysfs(self)
+        disk = sysfs.device(spare_device(self.device, 8, 240), "sdz")
+        loop = sysfs.device(spare_device(self.device, 7, 9), "loop9", loop=True)
+        mapped = sysfs.device(self.device, "dm-stale", dm=True, slaves=(disk,))
+
+        def recording():
+            # Hardware integrity (no approved baseline here) alerts on its own.
+            return [text for text in self.slack_texts() if "recording_" in text]
+
+        def admit():
+            with runtime._policy.control():
+                pass
+
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
+            self.assertTrue(runtime.status.recording_filesystem_ok)
+            self.assertTrue(runtime.status.recording_device_numbers_stale)
+            await runtime.call(admit)
+            self.assertEqual(["ServerSentinel attention notice: recording_device_numbers_changed"],
+                             recording())
+            (mapped / "slaves" / disk.name).unlink()
+            (mapped / "slaves" / loop.name).symlink_to(loop)
+            with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                await runtime.call(admit)
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            self.assertFalse(runtime.status.recording_filesystem_ok)
+            self.assertEqual(StorageState.HARD_STOP, runtime.status.storage_state)
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertEqual(["ServerSentinel attention notice: recording_device_numbers_changed",
+                              "ServerSentinel critical alert: recording_health_failure"],
+                             recording())
+            # Restored to hardware-only backing: not latched.
+            (mapped / "slaves" / loop.name).unlink()
+            (mapped / "slaves" / disk.name).symlink_to(disk)
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            self.assertTrue(runtime.status.recording_filesystem_ok)
+            self.assertNotEqual(StorageState.HARD_STOP, runtime.status.storage_state)
+            self.assertTrue(runtime.status.recording_device_numbers_stale)
+            await runtime.call(admit)
+            await self.settle(runtime)
+            # The stale-numbers notice stays one per boot and numbers.
+            self.assertEqual(1, len(self.notices()))
+            self.assertEqual(2, len(recording()))
 
     async def test_renumbered_loop_device_fails_closed_at_runtime(self):
         FakeSysfs(self).node(self.device, "loop")

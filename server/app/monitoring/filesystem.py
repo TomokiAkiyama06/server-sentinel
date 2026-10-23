@@ -27,6 +27,14 @@ class IdentifiedRecordingFilesystem:
     device, which the runtime reports to the Owner. Only a changed minor of
     the same kind of device is accepted; a changed major, a loop device or a
     new device-mapper device is `STORAGE_HARD_STOP` when the root is pinned.
+
+    While the numbers are stale that judgement is repeated on every sample
+    (Issue #340): a live dm table reload or md member replacement can move the
+    pinned device onto loop/virtual backing without changing its own number,
+    the mount or `st_dev`, so the sysfs topology is walked again each time and
+    a refusal is `STORAGE_HARD_STOP` for that sample only (not latched: the
+    next sample on hardware-only backing admits again). Current numbers never
+    read sysfs.
     """
 
     def __init__(self, identity: RecordingFilesystem, metadata: Path):
@@ -38,15 +46,11 @@ class IdentifiedRecordingFilesystem:
         if not stat.S_ISDIR(info.st_mode):
             raise RecordingError("STORAGE_HARD_STOP")
         self.expected = RootIdentity(info.st_dev, info.st_ino)
-        self._verify_identity()
-        # Issue #321: a stale minor of the same kind of device is reported; a
-        # different major, a loop device or a new device-mapper device is
-        # refused at every (re)open, as at deployment validation.
-        if not identity.recorded_device_numbers_acceptable(info.st_dev):
-            raise RecordingError("STORAGE_HARD_STOP")
-        # Fixed for this instance: the pinned device cannot change without
-        # every later sample refusing.
+        # Fixed for this instance: the pinned device number cannot change
+        # without every later sample refusing. What lies beneath it can, so
+        # `_verify_identity` re-judges the topology while this is False.
         self.device_numbers_current = identity.recorded_device_numbers_match(info.st_dev)
+        self._verify_identity()
         self._checker = ExpectedFilesystem(identity.root, self.expected, metadata)
 
     def _verify_identity(self) -> None:
@@ -60,6 +64,19 @@ class IdentifiedRecordingFilesystem:
         device = self.expected.device
         if (type(approved) is not int or approved != device
                 or not mounted or mount.st_dev != device):
+            raise RecordingError("STORAGE_HARD_STOP")
+        # Issue #321/#340: a stale minor of the same kind of device on
+        # hardware-only backing is reported; a different major, a loop device,
+        # a new device-mapper device or backing that moved onto loop/virtual
+        # disks is refused, judged again at every sample (a handful of sysfs
+        # lookups, never cached), as at deployment validation.
+        if self.device_numbers_current:
+            return
+        try:
+            acceptable = identity.recorded_device_numbers_acceptable(device)
+        except Exception:
+            acceptable = False
+        if acceptable is not True:
             raise RecordingError("STORAGE_HARD_STOP")
 
     def check(self) -> None:
