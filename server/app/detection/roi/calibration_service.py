@@ -365,8 +365,12 @@ class SceneCalibrationService:
                 record, unreadable = None, True
             with self._lock:
                 state = self._sources[source_id]
-                if state.origin is not CalibrationOrigin.NONE or state.acquiring:
+                if state.origin is not CalibrationOrigin.NONE:
                     continue
+                # Also while an Owner calibration is in flight (Codex P2 on
+                # PR #345): if it fails, the stored calibration is still
+                # re-acquired; if it succeeds, `_attempt` clears the mark
+                # and the failure. The phase shows `acquiring` meanwhile.
                 if unreadable:
                     # Whether a calibration is stored is unknown, not
                     # "stored": the status says why (Issue #341), and the

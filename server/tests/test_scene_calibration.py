@@ -842,6 +842,63 @@ class RestartReacquisitionTests(unittest.TestCase):
         self.assertEqual((), harness.service.pending_reacquisitions())
         self.assertEqual((), harness.service.take_notices())
 
+    def test_a_failed_owner_calibration_overlapping_the_marks_keeps_the_reacquisition(self):
+        # Codex P2 on PR #345: an Owner calibration in flight across both the
+        # early `mark_stored()` and the `start()` scan, which then fails, must
+        # not leave the stored calibration without its re-acquisition.
+        self.database.store(stored())
+        harness = Service(self, self.database.database, start=False)
+        harness.runtime.start()
+        order, read = [], harness.service._read
+
+        def overlapping_read(source_id, width, height, timeout):
+            # The Owner attempt is `acquiring` here: both scans run now.
+            order.append(harness.status().phase)
+            harness.service.mark_stored()
+            harness.service.start()
+            order.append("marked")
+            raise CalibrationRefused("no_frame")
+
+        harness.service._read = overlapping_read
+        with self.assertRaises(CalibrationRefused):
+            harness.service.calibrate(OTHER, commit_with(self.database.database))
+        self.assertEqual([CalibrationPhase.ACQUIRING, "marked"], order)
+        harness.service._read = read
+        status = harness.status()
+        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, "no_frame"),
+                         (status.origin, status.phase, status.failure))
+        # The next pass of the restart loop re-acquires the stored calibration
+        # and detection starts on it.
+        self.assertEqual((OTHER,), harness.service.pending_reacquisitions())
+        with Feed(harness.runtime):
+            record = harness.service.reacquire(OTHER, commit_with(self.database.database))
+            harness.runtime.request_calibration_refresh(OTHER)
+            self.assertTrue(wait_for(lambda: harness.source().state is SceneSourceState.ACTIVE))
+        self.assertEqual((2, UUID(int=700)), (record.version, record.identifier))
+        self.assertIs(CalibrationOrigin.RESTART_REACQUIRED, harness.status().origin)
+        self.assertEqual([REACQUIRED], [item.kind for item in harness.service.take_notices()])
+
+    def test_a_successful_owner_calibration_overlapping_the_marks_clears_them(self):
+        self.database.store(stored())
+        harness = Service(self, self.database.database, start=False)
+        harness.runtime.start()
+        read = harness.service._read
+
+        def overlapping_read(*arguments):
+            harness.service.mark_stored()
+            harness.service.start()
+            return read(*arguments)
+
+        harness.service._read = overlapping_read
+        with Feed(harness.runtime):
+            record = harness.service.calibrate(OTHER, commit_with(self.database.database))
+        self.assertEqual(2, record.version)
+        status = harness.status()
+        self.assertEqual((CalibrationOrigin.OWNER, CalibrationPhase.IDLE, None),
+                         (status.origin, status.phase, status.failure))
+        self.assertEqual((), harness.service.pending_reacquisitions())
+        self.assertEqual((), harness.service.take_notices())
+
     def test_without_a_stored_calibration_nothing_is_reacquired_or_notified(self):
         harness = Service(self, self.database.database)
         harness.service.start()
