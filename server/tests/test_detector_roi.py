@@ -1,7 +1,7 @@
 """Generated grayscale scenes for calibrated ROI movement and camera tamper."""
 
 import base64
-from dataclasses import replace
+from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import inspect
@@ -13,8 +13,8 @@ from app.cameras.registry.models import SourceType
 from app.detection.foundation import GrayFrame, Observation, Quality
 from app.detection.roi import (
     MAXIMUM_BATCH, RETIRED_STREAM_LIMIT, Calibration, CalibrationArchive,
-    CalibrationRecord, CriticalDelivery, CriticalKind,
-    OwnerCalibrationOperations, Policy, SceneDetector, Transform,
+    CalibrationRecord, CriticalDelivery, CriticalKind, CriticalObservation,
+    OwnerCalibrationOperations, Policy, SceneDetector, SceneObservation, Transform,
 )
 from app.detection.roi.geometry import coverage
 from app.storage.migrations import migrate
@@ -61,6 +61,27 @@ def frame_digests(media: bytes) -> tuple[bytes, ...]:
         traces += [digest, digest.hex().encode(), base64.b64encode(digest),
                    base64.urlsafe_b64encode(digest).rstrip(b"=")]
     return tuple(traces)
+
+
+def frame_traces(*media) -> tuple[str, ...]:
+    """Text forms of `media` and of its digests (`frame_digests`)."""
+    traces = []
+    for luma in media:
+        traces += [luma.hex(), base64.b64encode(luma).decode(), luma.decode("latin-1")]
+        traces += [trace.decode("latin-1") for trace in frame_digests(luma)]
+    return tuple(traces)
+
+
+def leaves(value):
+    """Every scalar inside an observation (dataclass fields, tuples)."""
+    if is_dataclass(value) and not isinstance(value, type):
+        for item in fields(value):
+            yield from leaves(getattr(value, item.name))
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from leaves(item)
+    else:
+        yield value
 
 
 def frame(index, data=None, *, source=SOURCE, stream=STREAM):
@@ -537,6 +558,44 @@ class SceneDetectorTests(unittest.TestCase):
         parameters = inspect.signature(SceneDetector.inspect).parameters
         self.assertNotIn("person", parameters)
         self.assertNotIn("presence", parameters)
+
+
+class FrameDerivedValueTests(unittest.TestCase):
+    """Issue #332: no observation carries a value derived from a frame.
+
+    The timeline, audit and notification writers persist observation facts,
+    so an observation must not hold a reference digest or any other value
+    computed from the pixels (Owner decision 2026-10-22, DET-004).
+    """
+
+    FORBIDDEN = ("sha", "digest", "hash", "pixel", "histogram", "thumbnail", "reference")
+
+    def test_calibration_and_observation_contracts_have_no_frame_derived_field(self):
+        self.assertFalse(hasattr(calibration(), "reference_sha256"))
+        self.assertFalse([name for name in dir(Calibration) if not name.startswith("__")
+                          and any(word in name for word in self.FORBIDDEN[:3])])
+        for contract in (SceneObservation, CriticalObservation):
+            with self.subTest(contract=contract.__name__):
+                self.assertFalse([item.name for item in fields(contract)
+                                  if any(word in item.name for word in self.FORBIDDEN)])
+
+    def test_scene_and_critical_observations_hold_no_frame_derived_value(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        shifted = transformed(pixels(), (1, 0))
+        traces = frame_traces(pixels(), moved, shifted)
+        observations = []
+        for media in (moved, shifted):
+            instance = detector()
+            for index, (luma, at) in enumerate(((pixels(), 0), (media, 10), (media, 20))):
+                observations.append(inspect_scene(instance, frame(index, luma), at))
+        critical = [item for observation in observations for item in observation.critical]
+        self.assertEqual({CriticalKind.SERVER_MOVEMENT, CriticalKind.CAMERA_TAMPER},
+                         {item.kind for item in critical})
+        for observation in (*observations, *critical):
+            for value in leaves(observation):
+                self.assertNotIsInstance(value, (bytes, bytearray, memoryview, GrayFrame))
+                text = str(value)
+                self.assertFalse([trace for trace in traces if trace in text], text)
 
 
 class CalibrationAndDeliveryTests(unittest.TestCase):

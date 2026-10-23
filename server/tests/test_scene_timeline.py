@@ -97,6 +97,21 @@ class Fixture:
             "SELECT kind FROM presence_observations ORDER BY sequence")]
 
 
+def refuse_outbox_open(timeline):
+    """Refuse the outbox open (storage refused) until `refusing` is cleared."""
+    refusing = threading.Event()
+    refusing.set()
+    open_outbox = timeline.outbox.open
+
+    def refused():
+        if refusing.is_set():
+            raise RuntimeError("synthetic STORAGE_HARD_STOP")
+        return open_outbox()
+
+    timeline.outbox.open = refused
+    return refusing
+
+
 def scene_status(state, undelivered_recorded=None):
     return type("Status", (), {"state": state, "undelivered_recorded": undelivered_recorded})()
 
@@ -486,18 +501,7 @@ class SceneTimelineApplicationTests(Fixture, unittest.IsolatedAsyncioTestCase):
                 timeline.outbox._handle.release()
 
     def refuse_outbox_open(self, timeline):
-        """Refuse the outbox open (storage refused) until `refusing` is cleared."""
-        refusing = threading.Event()
-        refusing.set()
-        open_outbox = timeline.outbox.open
-
-        def refused():
-            if refusing.is_set():
-                raise RuntimeError("synthetic STORAGE_HARD_STOP")
-            return open_outbox()
-
-        timeline.outbox.open = refused
-        return refusing
+        return refuse_outbox_open(timeline)
 
     async def test_scene_monitoring_waits_for_a_deferred_outbox_open(self):
         application = self.application()

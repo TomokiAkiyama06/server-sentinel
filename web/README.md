@@ -510,7 +510,13 @@ POST /api/scene/sources/<id>/calibration  {"normal_position_confirmed":true}
   `restart_reacquired`, taken again from the camera after a Main restart
   without the Owner. The latter carries a warning that a camera or server
   moved while Main was down is not detected against it, and asks the Owner to
-  check the live view and calibrate again.
+  check the live view and calibrate again. A source with a stored
+  calibration whose restart re-acquisition is still pending (`origin: none`,
+  `phase: reacquire_pending`, also while scene detection waits for a deferred
+  start) is shown as a stored calibration waiting for its reference, never as
+  "not calibrated" (Issue #341). With `failure: history_unavailable` the
+  history could not be read, so the badge and text say only that the state
+  is unknown and ask the Owner to check the storage.
 - The calibrate button is enabled only after the Owner ticks the explicit
   normal-position statement; the request carries that statement. A
   `step_up_required` answer runs the same step-up prompt and single retry as

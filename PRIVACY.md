@@ -296,5 +296,9 @@ with the stored settings and notifies the Owner with a fixed, value-free
 message (`scene_reference_reacquired`); a person in view at that moment is
 part of that in-memory reference just as in an Owner calibration, and is
 never identified or stored.
+A scene or critical observation identifies its calibration by identifier,
+version and creation time only and carries no value derived from the
+reference frame (Issue #332), so the presence timeline, audit records and
+notifications that persist observation facts receive none either.
 
 The Issue #20 detector foundation keeps only bounded transient grayscale samples and a previous motion sample per source. It performs no model download, persistence or network I/O; unavailable person inference remains `unknown`. Model/runtime adoption and their separate privacy/license acceptance are documented in `server/docs/DETECTOR_MODEL_AUDIT.md`; synthetic primitive tests are not acceptance of an external model.

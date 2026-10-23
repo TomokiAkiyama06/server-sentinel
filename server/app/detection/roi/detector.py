@@ -106,7 +106,6 @@ class SceneDetector:
         if not self._reachable(self.roi_points, self.roi_candidates, self.roi_center,
                                self.policy.movement_pixels, reference):
             raise ValueError("no usable ROI transform reaches the movement threshold")
-        self.reference_digest = calibration.reference_sha256
         # Start from the reference sample itself. A frame the source produced
         # before the Owner calibrated is pre-calibration imagery, and accepting
         # it would let two increasing stale samples confirm under a calibration
@@ -164,7 +163,7 @@ class SceneDetector:
                                    self.stream_id or c.reference.stream_id,
                                    frame.sequence if frame is not None else None,
                                    observed_at, now, c.identifier, c.version, c.created_at,
-                                   self.reference_digest, confidence, Quality.SUFFICIENT, reason)
+                                   confidence, Quality.SUFFICIENT, reason)
 
     def _observation(self, frame, now, observed_at, *, stream=None, movement=Observation.UNKNOWN,
                      movement_quality=Quality.UNKNOWN, tamper=Observation.UNKNOWN,
@@ -176,7 +175,7 @@ class SceneDetector:
         return SceneObservation(c.source_id, stream or self.stream_id or c.reference.stream_id,
                                 frame.sequence if frame is not None else None,
                                 observed_at, now, c.identifier, c.version, c.created_at,
-                                self.reference_digest, movement, movement_quality,
+                                movement, movement_quality,
                                 tamper, tamper_quality, movement_reason, tamper_reason,
                                 movement_confidence, tamper_confidence, global_transform,
                                 relative_transform, critical)
