@@ -774,7 +774,11 @@ hostile opt-in configuration.
 Every page request is intercepted and fulfilled locally or rejected. CSP
 violations and WebSocket attempts fail tests. A dedicated external `.invalid`
 positive-control request proves interception detects/aborts attempted egress;
-no actual external probe is delivered.
+no actual external probe is delivered. A request the page abandons before its
+answer fails the scenario unless the scenario names it (a mutation only by its
+exact method and path), and interception errors raised after the last check are
+still caught at page teardown, which first takes the page offline and disables
+interception (#334); harness self-checks prove both failures are detected.
 
 Container smoke starts the local preview and checks normal assets/invalid
 requests with network disabled, non-root, read-only root, no host mounts, and no

@@ -170,6 +170,7 @@ const COMMAND_MESSAGES = [
   /^Session with given id not found\.?$/,
   /^Target closed\.?$/,
   /^Inspected target navigated or closed$/,
+  /^Fetch domain is not enabled\.?$/,
 ];
 const METHOD = /^[A-Z][A-Za-z]{0,31}\.[a-z][A-Za-z]{0,63}$/;
 // Errors this adapter raises itself, whose only variable parts are a CDP
@@ -199,6 +200,20 @@ export function describeCommandError(error) {
   return `${name} raised by the interceptor`;
 }
 
+// Interception errors a scenario's own teardown causes (#334): an answer
+// sent after `finish` disabled the Fetch domain, or after the page's target
+// went away. Matched against `describeCommandError` output, so they stay
+// value-free; every other error found by `finish` fails the scenario.
+const TEARDOWN_ERRORS = [
+  /^Fetch\.(?:fulfillRequest|failRequest|continueRequest) refused \(CDP -32000\): Fetch domain is not enabled\.?$/,
+  /^[A-Z][A-Za-z]{0,31}\.[a-z][A-Za-z]{0,63} refused \(CDP -?\d+\): (?:Session with given id not found|Target closed|Inspected target navigated or closed)\.?$/,
+];
+
+/** True for a described interception error that only a scenario's teardown causes (#334). */
+export function isTeardownError(description) {
+  return TEARDOWN_ERRORS.some(shape => shape.test(description));
+}
+
 /**
  * Tracks the detached handlers a scenario starts for `Fetch.requestPaused`
  * (Codex PR #331). A handler may finish long after the page has moved on:
@@ -208,10 +223,34 @@ export function describeCommandError(error) {
  * scenario asserts and closes the page instead of landing after it. The
  * errors are kept value-free (`describeCommandError`). A handler still
  * running after `timeoutMilliseconds` fails the settle.
+ *
+ * `finish` closes the gap after the scenario's last `settle` (#334): the page
+ * may still start requests while the scenario finishes its checks. It takes
+ * the page offline (so a request still paused is released to no network),
+ * disables the Fetch domain (so no further handler starts), waits for every
+ * handler again and returns the errors not yet reported by an earlier
+ * `settle`, minus the ones the teardown itself causes (`isTeardownError`).
+ * It never throws: a refused or failed teardown command is returned as an
+ * error unless it, too, is teardown-induced.
  */
 export function routeTracker() {
   const running = new Set();
   const errors = [];
+  let reported = 0;
+  async function settle(timeoutMilliseconds = 15000) {
+    const deadline = Date.now() + timeoutMilliseconds;
+    let timer;
+    try {
+      while (running.size) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error(`Interception handlers did not settle within ${timeoutMilliseconds} ms`);
+        await Promise.race([Promise.all(running), new Promise(resolve => { timer = setTimeout(resolve, remaining); })]);
+        clearTimeout(timer);
+      }
+    } finally { clearTimeout(timer); }
+    reported = errors.length;
+    return errors;
+  }
   return {
     errors,
     track(handler) {
@@ -220,20 +259,46 @@ export function routeTracker() {
         .finally(() => running.delete(settled));
       running.add(settled);
     },
-    async settle(timeoutMilliseconds = 15000) {
-      const deadline = Date.now() + timeoutMilliseconds;
-      let timer;
-      try {
-        while (running.size) {
-          const remaining = deadline - Date.now();
-          if (remaining <= 0) throw new Error(`Interception handlers did not settle within ${timeoutMilliseconds} ms`);
-          await Promise.race([Promise.all(running), new Promise(resolve => { timer = setTimeout(resolve, remaining); })]);
-          clearTimeout(timer);
-        }
-      } finally { clearTimeout(timer); }
-      return errors;
+    settle,
+    async finish(command, timeoutMilliseconds = 15000) {
+      const from = reported;
+      const late = [];
+      for (const [method, params] of [
+        ['Network.emulateNetworkConditions', { offline: true, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }],
+        ['Fetch.disable', {}],
+      ]) {
+        try { await command(method, params); } catch (error) { late.push(describeCommandError(error)); }
+      }
+      try { await settle(timeoutMilliseconds); } catch (error) { late.push(error.message); }
+      return [...errors.slice(from), ...late].filter(description => !isTeardownError(description));
     },
   };
+}
+
+const ABANDONABLE_METHOD = /^[A-Z]{3,7}$/;
+const READ_METHODS = new Set(['GET', 'HEAD']);
+
+/**
+ * The requests a scenario saw abandoned by the page that it did not expect
+ * (#334). By default no request may be abandoned: a page that cancels a
+ * request mid-flight (a view change, a reload, pagehide) must be named by the
+ * scenario in `expected`, as `{ method, path }` with an exact HTTP method and
+ * either an exact pathname or a RegExp over it. A RegExp may only cover reads
+ * (GET/HEAD); a mutation (POST and the rest) may be abandoned only where the
+ * scenario names its exact path, so a regression that aborts a change on
+ * unmount is not hidden by a broad pattern. `abandoned` holds
+ * `{ method, path }` records; the result is `METHOD path` strings.
+ */
+export function unexpectedAbandoned(abandoned, expected = []) {
+  for (const entry of expected) {
+    if (!ABANDONABLE_METHOD.test(entry?.method ?? '')) throw new TypeError('expectAbandoned needs an exact HTTP method');
+    const exact = typeof entry.path === 'string' && entry.path.startsWith('/');
+    if (!exact && !(entry.path instanceof RegExp)) throw new TypeError('expectAbandoned needs a path or a RegExp');
+    if (!exact && !READ_METHODS.has(entry.method)) throw new TypeError('expectAbandoned names a mutation by its exact path only');
+  }
+  const allowed = ({ method, path }) => expected.some(entry => entry.method === method
+    && (entry.path instanceof RegExp ? new RegExp(entry.path.source, entry.path.flags.replace(/[gy]/g, '')).test(path) : entry.path === path));
+  return abandoned.filter(item => !allowed(item)).map(({ method, path }) => `${method} ${path}`);
 }
 
 // V8 messages whose only variable part is an identifier taken from the test's

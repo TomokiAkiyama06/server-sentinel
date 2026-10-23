@@ -4,7 +4,8 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { clickWhenEnabled, CommandError, describeCommandError, describeException, launchChrome, pageFor, routeTracker } from './chrome.mjs';
+import { clickWhenEnabled, CommandError, describeCommandError, describeException, isTeardownError, launchChrome, pageFor, routeTracker,
+  unexpectedAbandoned } from './chrome.mjs';
 
 // Synthetic stand-ins for Chrome's --remote-debugging-pipe transport (#197).
 // Each launch appends its pid to a ledger so the tests can prove that hung
@@ -295,6 +296,90 @@ test('a late genuine interception error still fails the scenario (Codex PR #331)
   const stuck = routeTracker();
   stuck.track(new Promise(() => {}));
   await assert.rejects(stuck.settle(50), { message: 'Interception handlers did not settle within 50 ms' });
+});
+
+const refusal = (method, code, message) => new CommandError(method, { code, message });
+
+test('finish disables interception, then reports errors started after the last settle (#334)', async () => {
+  const sent = [];
+  const command = async method => { sent.push(method); return {}; };
+  const routes = routeTracker();
+  routes.track(Promise.reject(new TypeError('/api/early 0123')));
+  assert.deepEqual(await routes.settle(), ['TypeError raised by the interceptor']);
+  // A genuine error from a handler started after that settle: the scenario
+  // used to have asserted already, so it landed unseen before the page closed.
+  routes.track(delay(30).then(() => { throw new TypeError('/api/late 0123'); }));
+  // Answers the teardown itself refuses are not errors.
+  routes.track(Promise.reject(refusal('Fetch.fulfillRequest', -32000, 'Fetch domain is not enabled')));
+  routes.track(Promise.reject(refusal('Fetch.failRequest', -32001, 'Session with given id not found.')));
+  assert.deepEqual(await routes.finish(command), ['TypeError raised by the interceptor'], 'only the late genuine error, once');
+  // Offline first, so a request still paused is released to no network; then no handler starts.
+  assert.deepEqual(sent, ['Network.emulateNetworkConditions', 'Fetch.disable']);
+  // Nothing new since: nothing reported, even though the earlier errors are kept.
+  assert.deepEqual(await routes.finish(command), []);
+  assert.equal(routes.errors.length, 4);
+});
+
+test('finish never throws and keeps its own failures value-free (#334)', async () => {
+  // A page already gone refuses the teardown commands: teardown-induced, not an error.
+  const gone = async method => { throw refusal(method, -32001, 'Session with given id not found.'); };
+  assert.deepEqual(await routeTracker().finish(gone), []);
+  // Any other refusal of the teardown is reported, without its message.
+  const refused = async method => { if (method === 'Fetch.disable') throw refusal(method, -32602, 'Invalid parameters 0123'); };
+  assert.deepEqual(await routeTracker().finish(refused), ['Fetch.disable refused (CDP -32602)']);
+  // A handler that never finishes fails the finish instead of hanging it.
+  const stuck = routeTracker();
+  stuck.track(new Promise(() => {}));
+  assert.deepEqual(await stuck.finish(async () => ({}), 50), ['Interception handlers did not settle within 50 ms']);
+  // A finish with no settle before it reports every error.
+  const fresh = routeTracker();
+  fresh.track(Promise.reject(new Error('Chrome was closed.')));
+  assert.deepEqual(await fresh.finish(async () => ({})), ['Chrome was closed.']);
+});
+
+test('only the teardown\'s own refusals are allow-listed (#334)', () => {
+  const described = (method, code, message) => describeCommandError(refusal(method, code, message));
+  for (const allowed of [
+    described('Fetch.fulfillRequest', -32000, 'Fetch domain is not enabled'),
+    described('Fetch.failRequest', -32000, 'Fetch domain is not enabled'),
+    described('Fetch.fulfillRequest', -32001, 'Session with given id not found.'),
+    described('Fetch.disable', -32001, 'Session with given id not found.'),
+    described('Network.emulateNetworkConditions', -32000, 'Target closed.'),
+    described('Fetch.failRequest', -32000, 'Inspected target navigated or closed'),
+  ]) assert.equal(isTeardownError(allowed), true, allowed);
+  for (const genuine of [
+    // A request the page did not cancel: Chrome dropped it for another reason.
+    described('Fetch.fulfillRequest', -32602, 'Invalid InterceptionId.'),
+    described('Fetch.fulfillRequest', -32602, 'Invalid header'),
+    described('Fetch.fulfillRequest', -32602, 'Fetch domain is not enabled'),
+    described('Fetch.disable', -32000, 'Fetch domain is not enabled'),
+    'TypeError raised by the interceptor',
+    'Chrome was closed.',
+    'Chrome command timeout: Fetch.fulfillRequest (10000 ms)',
+    'Interception handlers did not settle within 15000 ms',
+  ]) assert.equal(isTeardownError(genuine), false, genuine);
+});
+
+test('an abandoned request fails unless the scenario names it; a mutation only by its exact path (#334)', () => {
+  const invite = { method: 'POST', path: '/api/admin/principals' };
+  const reload = { method: 'GET', path: '/api/admin/principals' };
+  // By default nothing may be abandoned, a read included.
+  assert.deepEqual(unexpectedAbandoned([]), []);
+  assert.deepEqual(unexpectedAbandoned([invite, reload]), ['POST /api/admin/principals', 'GET /api/admin/principals']);
+  // A named request may be abandoned; the method is part of the name.
+  assert.deepEqual(unexpectedAbandoned([invite, reload], [invite]), ['GET /api/admin/principals']);
+  assert.deepEqual(unexpectedAbandoned([invite], [reload]), ['POST /api/admin/principals']);
+  assert.deepEqual(unexpectedAbandoned([invite], [{ method: 'POST', path: '/api/admin/principals/' }]), ['POST /api/admin/principals']);
+  // A read may be named by a pattern (a global or sticky flag keeps no state between requests).
+  const views = { method: 'GET', path: /^\/api\/mock\/(?:timeline|presence)$/g };
+  assert.deepEqual(unexpectedAbandoned([{ method: 'GET', path: '/api/mock/timeline' }, { method: 'GET', path: '/api/mock/timeline' },
+    { method: 'GET', path: '/api/mock/presence' }, { method: 'POST', path: '/api/mock/timeline' }], [views]), ['POST /api/mock/timeline']);
+  // A mutation may not be covered by a pattern, nor any method by a wildcard.
+  assert.throws(() => unexpectedAbandoned([invite], [{ method: 'POST', path: /^\/api\// }]), /mutation by its exact path only/);
+  for (const entry of [{ method: '*', path: '/api/x' }, { method: 'post', path: '/api/x' }, { path: '/api/x' }, null]) {
+    assert.throws(() => unexpectedAbandoned([], [entry]), /exact HTTP method/);
+  }
+  for (const path of ['api/x', undefined, 3]) assert.throws(() => unexpectedAbandoned([], [{ method: 'GET', path }]), /a path or a RegExp/);
 });
 
 test('click finds and clicks the element in one evaluation', () => {
