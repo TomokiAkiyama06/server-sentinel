@@ -53,7 +53,8 @@ limit and reject metadata changes during the read.
 On failure `--check` exits with status 1 and prints exactly one line,
 `media-capture-agent: local deployment validation failed: <reason>`, to stderr.
 With `--check --json` it instead prints only `{"ok": false, "reason": "<reason>"}`
-to stdout (success: `{"ok": true}`); `--json` without `--check` is a usage error.
+to stdout (success: `{"ok": true}`, or `{"ok": true, "warnings": [...]}` with fixed
+warning codes, see below); `--json` without `--check` is a usage error.
 The success line without `--json` is unchanged. The reason is a fixed word from
 the table below: filesystem UUIDs, device numbers, paths, mount sources, sizes,
 usernames and exception text are never printed. The Owner compares the code with
@@ -73,11 +74,11 @@ is reported; fix it and rerun to reveal any later failure.
 | `mount_inventory_unavailable` | `/proc/self/mountinfo` or fdinfo could not be read or parsed |
 | `media_root_on_root_filesystem` | The approved mount is not `/`, but the media root currently resolves to the root filesystem |
 | `mount_point_is_root` | `expected_mount.mount_point` is `/`, but the media root lives on a separate mount |
-| `mount_source_mismatch` | The mount `source` differs from the approved value |
-| `mount_device_mismatch` | The mount's device `major`/`minor` differs from the approved values |
+| `mount_source_mismatch` | The mount `source` differs from the approved value and is not an accepted kernel-name rename (see below) |
+| `mount_device_mismatch` | The mount's device `major`/`minor` differs from the approved values and is not an acceptable reboot renumbering (see below): the major differs, only the minor differs but the device is not hardware-backed in sysfs (loop, nbd, zram, a dm/md mapping on one), its sysfs entry is missing or unreadable, it is the operating-system root filesystem's device, or the approved `mount_point` is `/` |
 | `mount_identity_mismatch` | Any other approved-mount difference: filesystem type, `filesystem_root`, a different mount point, or a bind of another backing directory |
 | `mount_readonly` | The approved mount or filesystem is read-only |
-| `filesystem_uuid_mismatch` | `filesystem_uuid` does not resolve through `/dev/disk/by-uuid/` to the approved block-device major/minor |
+| `filesystem_uuid_mismatch` | `filesystem_uuid` does not resolve through `/dev/disk/by-uuid/` to the block device the approved mount is currently on |
 | `insufficient_free_space` | Free space is below `safety_reserve_bytes` (including a reserve larger than the filesystem) |
 | `storage_unavailable` | A filesystem query on the pinned media directory failed |
 | `service_account_mismatch` | Running as root, or not as `service_uid` |
@@ -87,6 +88,17 @@ is reported; fix it and rerun to reveal any later failure.
 | `node_identity_mismatch` | An installed node credential names a different node than the configuration's `node_id` (for example after `enroll pair --repair revoked` before `node_id` was updated); the Agent starts no capture or session |
 | `node_credential_unavailable` | The installed node credential under the runtime root is damaged or unreadable (never treated as unpaired) |
 | `check_failed` | Any other internal error; exception text is suppressed |
+
+`--check` can also pass with a warning (Issue #324). The exit status is 0 and
+the unchanged success line is printed; one extra stderr line
+`media-capture-agent: local deployment validation warning: device_numbers_stale`
+follows (`--check --json`: `{"ok": true, "warnings": ["device_numbers_stale"]}`;
+without a warning the JSON stays exactly `{"ok": true}`). It means the approved
+filesystem (UUID, mount and pinned media directory agree) is mounted under
+renumbered device numbers (and possibly a renamed kernel source) that the rule
+below accepts. Neither the recorded nor the current numbers or sources are
+printed. The installer forwards exactly this fixed line to its stderr and
+discards all other `--check` output, as before.
 
 The deployment-local JSON configuration requires every field below. No private
 path, device identity, disk reserve, segment limit or clock threshold is a public
@@ -109,15 +121,61 @@ all runtime/media data outside the Git checkout and the application install:
 
 The Owner provisions paths and approves mount identity locally. Runtime never
 creates roots, follows path symlinks, repairs an unexpected mount, or substitutes
-a root-filesystem directory. Device numbers can change after reboot; revalidate
-and explicitly re-approve configuration instead of relaxing checks. Mount IDs are
+a root-filesystem directory.
+
+The filesystem UUID and the actual mount are the identity; the recorded
+`major`/`minor` only corroborate it, and a reboot can renumber the same disk
+(Issue #324, the Agent counterpart of Main's Issue #321). At every admission the
+UUID must resolve through `/dev/disk/by-uuid/` to the device the matching mount
+inventory entry and the pinned media directory are on. If the recorded numbers
+still differ, they are accepted only as a renumbering of the same kind of
+hardware device: the major (the driver) is unchanged and only the minor differs,
+the device is not the operating-system root filesystem's, the approved
+`mount_point` is not `/`, and sysfs shows it rests only on hardware disks.
+`/sys/dev/block/<maj>:<min>` is resolved; a partition is judged by its parent
+disk, a dm/md device by every device under `slaves/`, recursively (at most 8
+levels), and every leaf disk must have the `device` link to its bus device
+(SCSI, NVMe, virtio, USB storage). Loop, nbd, ublk, zram and ram disks have none,
+so they and any mapping on them are refused, as are a changed major, a missing
+or unreadable sysfs entry and a deeper stack (`mount_device_mismatch`).
+
+The mount `source` is corroboration too. The sd driver derives a disk's name and
+minor from the same index, so renumbering `8:16` to `8:0` also renames
+`/dev/sdb1` to `/dev/sda1`, and mountinfo reports that kernel name even when
+fstab uses `UUID=` or `/dev/disk/by-uuid/`. A differing source is accepted only
+when the recorded and the current source are both a single kernel block-device
+name under `/dev` (`/dev/` plus lowercase letters and digits, such as `sda1` or
+`nvme0n1p1`), the current source is a block device node whose `st_rdev` is the
+mounted device (which the pinned directory's `st_dev` must also be), and the
+recorded numbers are an accepted renumbering as above. Any other source change,
+including a rename with unchanged numbers, refuses with `mount_source_mismatch`.
+
+Owner decision (2026-10-23): like Main (#323), the Agent keeps recording when
+only the minor changes, as degraded `device_numbers_stale`. The sysfs topology
+of a renumbered device is walked again at every admission, not cached: a live
+dm table reload or md member replacement can move it onto loop or virtual
+backing without changing its own number or the mount ID, and then the next
+write refuses with `mount_device_mismatch` (refused, not degraded). The refusal
+is not latched: once the topology rests only on hardware again, the next check
+admits writes again (still degraded while the numbers are stale). A reload in
+the middle of writing one segment is not prevented inside that segment; the
+store's next internal check (after `posix_fallocate`, then after the write and
+fsync) refuses, and the partial segment is removed. An accepted
+renumbering keeps writing but is degraded and value-free: `--check`
+prints the `device_numbers_stale` warning, and every heartbeat reports
+`storage.state = "degraded"`, `storage.reason = "device_numbers_stale"` and node
+reason `storage_device_numbers_stale` (node `degraded`) until the Owner verifies
+the device and updates `major`/`minor` (and `source`) in the private configuration. The service
+heartbeat line on stdout (journal) carries the same reason. Mount IDs are
 read from pinned-directory fdinfo and compared with mountinfo, including stacked
 bind mounts; a mount ID change during execution refuses writes. A systemd
 `ReadWritePaths` bind at exactly `media_root` is accepted only while the approved
-parent mount remains present and source/filesystem/device plus backing filesystem
-root match the approved parent and relative media path. At every admission, the
-configured UUID must still resolve through `/dev/disk/by-uuid/` to the approved
-block-device major/minor; unavailable or replaced identity refuses writes. A
+parent mount remains present on the same device as the bind and
+source/filesystem plus backing filesystem root match the approved parent and
+relative media path. At every admission, the configured UUID must still resolve
+through `/dev/disk/by-uuid/` to the mounted block device, and the recorded
+numbers are judged by the rule above; unavailable or replaced identity refuses
+writes. A
 same-device bind of another backing directory fails. This preserves the narrow write allowlist and
 `ProtectSystem=strict`; it does not approve arbitrary bind mounts.
 

@@ -7,7 +7,7 @@ from typing import Protocol
 
 from .health import ClockExchange, SourceHealth, assess_clock
 from .pairing import NodeCredentialStore, PairingRefused
-from .storage import StorageRefused, open_directory
+from .storage import DEVICE_NUMBERS_STALE, StorageRefused, open_directory
 
 
 class Capture(Protocol):
@@ -92,6 +92,12 @@ class Agent:
             free = self.store.check()
             storage = {"state": "online", "available_bytes": free,
                        "safety_reserve_bytes": self.settings.safety_reserve_bytes}
+            if self.store.device_numbers_stale:
+                # Issue #324: the approved filesystem (UUID + mount) is mounted
+                # under renumbered device numbers. Writes continue; the node is
+                # degraded until the Owner re-approves the configuration.
+                storage.update(state="degraded", reason=DEVICE_NUMBERS_STALE)
+                reasons.append("storage_" + DEVICE_NUMBERS_STALE)
         except StorageRefused as exc:
             reasons.append("storage_unavailable")
             storage = {"state": "failed", "reason": str(exc)}
