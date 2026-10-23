@@ -160,8 +160,11 @@ def scrub_legacy_reference_digests(connection: sqlite3.Connection) -> int:
     one, so its frame-free provenance, and the lifecycle inventory's keyed
     digest of it (``app.lifecycle_inventory.sources``), stay identical.
     A row that is not a JSON object with a ``reference`` object is left for
-    the history and inventory checks to report. Returns the number of rows
-    scrubbed; idempotent.
+    the history and inventory checks to report; only a row that carried the
+    key is counted and re-serialized, every other row is inserted back
+    byte-for-byte. The rebuild does not keep SQLite rowids (nothing reads
+    them for this table: it is keyed by source, profile and version).
+    Returns the number of rows scrubbed; idempotent.
     """
     if not isinstance(connection, sqlite3.Connection) or not connection.in_transaction:
         raise ValueError("calibration history requires an open transaction")
@@ -171,8 +174,11 @@ def scrub_legacy_reference_digests(connection: sqlite3.Connection) -> int:
     rows = connection.execute(
         "SELECT source_id, profile_id, version, identifier, metadata FROM roi_calibration_history "
         "ORDER BY source_id, profile_id, version").fetchall()
-    rewritten = [(*row[:4], without_reference_digest(row[4]) or row[4]) for row in rows]
-    scrubbed = sum(1 for old, new in zip(rows, rewritten) if old[4] != new[4])
+    scrubbed, rewritten = 0, []
+    for row in rows:
+        metadata = without_reference_digest(row[4])
+        scrubbed += metadata is not None
+        rewritten.append((*row[:4], row[4] if metadata is None else metadata))
     if not scrubbed:
         return 0
     # Rebuild the whole table, not only the scrubbed rows: a legacy build
@@ -189,17 +195,19 @@ def scrub_legacy_reference_digests(connection: sqlite3.Connection) -> int:
 def without_reference_digest(metadata) -> str | None:
     """`metadata` re-serialized without ``reference.sha256``, or None.
 
-    None when it is not a JSON object whose ``reference`` is an object (a
-    corrupt row the history checks report as such). A row without the key
-    comes back as ``calibration_metadata()`` would serialize it.
+    Only a JSON object whose ``reference`` object actually carries the key is
+    rewritten (as ``calibration_metadata()`` serializes a new version);
+    anything else, a corrupt row the history checks report included, is
+    None and stays exactly as stored.
     """
     try:
         value = json.loads(metadata)
     except (TypeError, ValueError):
         return None
-    if not isinstance(value, dict) or not isinstance(value.get("reference"), dict):
+    if (not isinstance(value, dict) or not isinstance(value.get("reference"), dict)
+            or "sha256" not in value["reference"]):
         return None
-    value["reference"].pop("sha256", None)
+    del value["reference"]["sha256"]
     return json.dumps(value, sort_keys=True)
 
 

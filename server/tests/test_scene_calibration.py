@@ -452,6 +452,10 @@ class LegacyDigestScrubTests(unittest.TestCase):
         database = Database_(self)
         with closing(database.database.connect()) as connection:
             self.assertEqual("delete", connection.execute("PRAGMA journal_mode").fetchone()[0].lower())
+            # The legacy build's writes, with secure_delete off as well, and a
+            # later in-place rewrite, so stale digest copies sit in the free
+            # space (Claude re-review on b528106: the update-only mutant fails).
+            connection.execute("PRAGMA secure_delete = OFF")
             connection.execute("BEGIN IMMEDIATE")
             digest = hashlib.sha256(pixels()).hexdigest()
             for version in range(1, 1001):
@@ -461,6 +465,7 @@ class LegacyDigestScrubTests(unittest.TestCase):
                 value["reference"]["sha256"] = digest
                 connection.execute("UPDATE roi_calibration_history SET metadata=? WHERE version=?",
                                    (json.dumps(value, sort_keys=True), version))
+            connection.execute("UPDATE roi_calibration_history SET metadata=metadata")
             connection.execute("COMMIT")
         with self.assertRaises(AssertionError):
             assert_no_frame_trace(self, database.raw())
@@ -471,6 +476,25 @@ class LegacyDigestScrubTests(unittest.TestCase):
             connection.execute("COMMIT")
         assert_no_frame_trace(self, database.raw())
         self.assertEqual(list(range(1, 1001)), [item.version for item in database.history()])
+
+    def test_only_rows_that_carried_the_digest_are_counted_and_rewritten(self):
+        # Claude re-review on b528106: a row without the key, even one not in
+        # the archive's own serialization, is inserted back byte-for-byte.
+        database = Database_(self)
+        store_legacy(database.database.path, stored())
+        database.store(stored(source=SOURCE, source_type=SourceType.LOCAL_UVC))
+        compact = json.dumps(calibration_metadata(stored(source=SOURCE, source_type=SourceType.LOCAL_UVC)),
+                             sort_keys=True, separators=(",", ":"))
+        with closing(database.database.connect()) as connection:
+            connection.execute("UPDATE roi_calibration_history SET metadata=? WHERE source_id=?",
+                               (compact, str(SOURCE)))
+            connection.execute("BEGIN IMMEDIATE")
+            self.assertEqual(1, scrub_legacy_reference_digests(connection))
+            connection.execute("COMMIT")
+            (kept,) = connection.execute("SELECT metadata FROM roi_calibration_history WHERE source_id=?",
+                                         (str(SOURCE),)).fetchone()
+        self.assertEqual(compact, kept)
+        assert_no_frame_trace(self, database.raw())
 
     def test_without_the_table_or_a_digest_nothing_is_written(self):
         with closing(sqlite3.connect(":memory:")) as connection:
