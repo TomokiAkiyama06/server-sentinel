@@ -104,10 +104,15 @@ before resends. Pending rows beyond `hourly_limit` are left out
 (`unrestored`, logged once as `camera_offline_notification_unrestored`) and
 resent only when an outage in progress maps to one by name. A restored name
 covers only the outage in progress since the start (and a ratio alert); a
-later outage reusing it gets a per-process ID. A row of that name accepted more than
-24 h earlier no longer counts (Owner decision 2026-10-22): the next name
-`…:repeat:N` of a deterministic chain is then used and the outage is notified
-again under the cap. Intermittent outages (Refs #301): a source not online for
+later outage reusing it gets a per-process ID. That initial outage is named
+once on the first running tick (`name_initial`, Issue #342), so it is still
+matched after it recovered before being named, and a restored row of the
+outage it already notified while monitoring was not running is not resent
+(it stays `pending`). Pending rows whose event time cannot be read are
+skipped. A row of that name accepted more than
+24 h earlier no longer counts (Owner decision 2026-10-22; a `pending` row by
+its event time, Issue #342): the next name `…:repeat:N` of a deterministic
+chain is then used and the outage is notified again under the cap. Intermittent outages (Refs #301): a source not online for
 `flapping_offline_seconds` (default 300 s) in total within the last
 `flapping_window_seconds` (default 900 s), over at least two not-online
 periods, is one more `camera_offline` under the same cap, once per flapping
@@ -119,7 +124,10 @@ stays offline for `after_seconds` after a short online is notified once more
 an online of at least `after_seconds` is an ordinary episode. A ratio alert is named
 `uuid5(EVENT_NAMESPACE, "camera-offline-flapping:<source>:<window>:<bucket>")`
 after the wall-clock window bucket, so a restart within a window of it sends
-nothing again. See SPECIFICATION §9 for the full rules and the known limits.
+nothing again; a continuous episode due after a restart looks that alert up
+once and restores its period (Issue #338). A ratio alert held back by the cap
+whose period closed is dropped before the cap; one the queue refused is sent
+once the queue takes it, like a refused continuous episode. See SPECIFICATION §9 for the full rules and the known limits.
 
 Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
 takes the `AccessFaultMonitor` the composition root also passes to the
