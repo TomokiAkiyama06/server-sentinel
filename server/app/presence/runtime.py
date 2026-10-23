@@ -253,7 +253,8 @@ class SceneTimeline:
         self.recorder = CriticalTimelineRecorder(
             self.outbox, maximum_source_latency=configuration.maximum_source_latency,
             refused=self.unrecorded.refused if self.unrecorded is not None else None,
-            recorded=self.unrecorded.recorded if self.unrecorded is not None else None)
+            recorded=self.unrecorded.recorded if self.unrecorded is not None else None,
+            settled=self.unrecorded.settled if self.unrecorded is not None else None)
         self._lock = threading.Lock()
         self._pin_lock = threading.Lock()
         self._opened = False
