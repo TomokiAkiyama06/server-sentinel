@@ -24,6 +24,13 @@ class NotificationKind(StrEnum):
     HUMAN_ACCESS_FAULT = "human_access_fault"
     HUMAN_ACCESS_RECOVERED = "human_access_recovered"
     CREDENTIAL_FINDING = "credential_finding"
+    # Issue #321: the recorded major/minor numbers of the recording/runtime
+    # filesystem no longer name the device its approved UUID and mount agree
+    # on (the kernel renumbered the disk at boot). Storage stays admitted;
+    # the Owner is told once per boot and device numbers to update the
+    # stale value (Owner decision 2026-10-22).
+    # Value-free: no number, UUID or path.
+    RECORDING_DEVICE_NUMBERS_CHANGED = "recording_device_numbers_changed"
     # Visible local warnings (NEW_DEVICE/UNVERIFIABLE hardware, unavailable
     # recording-health verdict). They are never an immediate Slack message.
     HARDWARE_INTEGRITY_WARNING = "hardware_integrity_warning"
@@ -46,7 +53,7 @@ class NotificationKind(StrEnum):
 IMMEDIATE_KINDS = frozenset({
     NotificationKind.HARDWARE_INTEGRITY_FAILURE, NotificationKind.RECORDING_HEALTH_FAILURE,
     NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.HUMAN_ACCESS_RECOVERED,
-    NotificationKind.CREDENTIAL_FINDING,
+    NotificationKind.CREDENTIAL_FINDING, NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED,
 })
 # Immediate only when confirmed: a confirmed server movement / camera tamper
 # (Issue #26), and a camera source offline for the deployment's threshold
@@ -58,6 +65,9 @@ CONFIRMED_IMMEDIATE_KINDS = frozenset({
 })
 # Immediate, but the end of a fault rather than an alert.
 RECOVERY_KINDS = frozenset({NotificationKind.HUMAN_ACCESS_RECOVERED})
+# Immediate, but a condition needing Owner attention rather than a failure:
+# monitoring and recording continue (Issue #321).
+ATTENTION_KINDS = frozenset({NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED})
 
 
 def aware(value: datetime) -> None:
@@ -354,6 +364,7 @@ class NotificationService:
                 return DeliveryResult.FAILED
             return DeliveryResult.SUPPRESSED
         prefix = ("ServerSentinel recovery notice" if kind in RECOVERY_KINDS
+                  else "ServerSentinel attention notice" if kind in ATTENTION_KINDS
                   else "ServerSentinel critical alert")
         return self._enqueue(event, f"{prefix}: {kind.value}", on_complete, retain=True)
 
