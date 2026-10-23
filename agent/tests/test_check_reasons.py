@@ -35,6 +35,13 @@ class CheckReasonTests(unittest.TestCase):
             # Restore traversal so the temporary tree can always be removed.
             self.addCleanup(lambda path=directory: path.exists() and path.chmod(0o700))
         self.store_options = {"stable_device": lambda _expected: True}
+        # No sysfs evidence (Issue #324): a changed recorded number is refused
+        # deterministically, whatever block device backs the temporary tree.
+        sysfs = tempfile.TemporaryDirectory(prefix="agent-check-sysfs-")
+        self.addCleanup(sysfs.cleanup)
+        patcher = patch.object(storage, "SYS_DEV_BLOCK", Path(sysfs.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def write(self, **changes):
         value = json.loads(json.dumps(self.value))
