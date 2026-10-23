@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 from uuid import uuid4
@@ -3221,6 +3222,8 @@ class MiscTests(unittest.TestCase):
         queue.drop_stats.return_value = (0, None)
         capture = mock.Mock()
         capture.frames.return_value = queue
+        capture.counters.return_value = SimpleNamespace(launches=1, stream_invalid=0,
+                                                        padding_tolerated=2)
         with tempfile.TemporaryDirectory() as directory:
             writer = records.JsonlWriter(Path(directory) / "h.jsonl", run_id=RUN, role="holder")
             instance = holder.Holder(capture, [uuid4()], Path(directory) / "sock", writer)
@@ -3248,6 +3251,11 @@ class MiscTests(unittest.TestCase):
             self.assertEqual([(4242, 0)], [(row["nonce"], row["source"]) for row in forwarded])
             self.assertGreaterEqual(forwarded[0]["frames"], 1)
             self.assertEqual(1, sum(1 for row in rows if row["kind"] == "session_close"))
+            samples = [row for row in rows if row["kind"] == "sample"]
+            self.assertTrue(samples)
+            self.assertEqual((1, 0, 2), (samples[-1]["capture_launches"],
+                                         samples[-1]["stream_invalid"],
+                                         samples[-1]["padding_tolerated"]))
 
     def _idle_holder(self, directory):
         """A holder whose camera delivers no frame (as during a capture stall)."""
@@ -3256,6 +3264,8 @@ class MiscTests(unittest.TestCase):
         queue.drop_stats.return_value = (0, None)
         capture = mock.Mock()
         capture.frames.return_value = queue
+        capture.counters.return_value = SimpleNamespace(launches=1, stream_invalid=0,
+                                                        padding_tolerated=2)
         out = Path(directory) / "h.jsonl"
         writer = records.JsonlWriter(out, run_id=RUN, role="holder")
         return holder.Holder(capture, [uuid4()], Path(directory) / "sock", writer), writer, out

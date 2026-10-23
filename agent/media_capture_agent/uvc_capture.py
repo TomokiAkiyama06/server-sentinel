@@ -90,6 +90,23 @@ class CaptureLimits:
 
 
 @dataclass(frozen=True)
+class CaptureCounters:
+    """Value-free cumulative per-source capture counters (Issue #305).
+
+    Counts only: no sizes, offsets, timestamps, device details or bytes.
+    ``launches`` is the number of pipelines started for the source (a value
+    above 1 means the GStreamer child was restarted); ``stream_invalid`` the
+    pipelines torn down because the byte stream lost JPEG framing or was
+    malformed; ``padding_tolerated`` the inter-frame gaps above the 4 KiB
+    default that the profile bound skipped before a valid frame.
+    """
+
+    launches: int
+    stream_invalid: int
+    padding_tolerated: int
+
+
+@dataclass(frozen=True)
 class UvcSourceConfig:
     source_id: UUID
     profile: MjpegProfile
@@ -306,6 +323,9 @@ class _Source:
         self.closing = False
         # Queue drops already surfaced in a degraded snapshot.
         self.reported_drops = 0
+        # Value-free counters (``CaptureCounters``) of pipelines already torn down.
+        self.stream_invalid = 0
+        self.retired_padding = 0
         # Last capture failure while no pipeline runs; cleared by real frames.
         self.failure = None
         # The exact device evidence found not to offer this source's profile.
@@ -442,6 +462,7 @@ class UvcCapture:
         active, source.active = source.active, None
         if active is None:
             return
+        source.retired_padding += active.parser.large_gaps
         if not self._reap(active):
             source.stuck.append(active)
 
@@ -509,6 +530,8 @@ class UvcCapture:
                   or first is None and now - active.started > self.limits.startup_timeout
                   or last is not None and now - last > self.limits.stall_timeout)
         if failed:
+            if active.error == "stream_invalid":
+                source.stream_invalid += 1
             self._teardown(source)
             controller.capture_failed()
             source.failure = "capture_failed"
@@ -677,6 +700,14 @@ class UvcCapture:
                 self._device_deadline = self._teardown_deadline = None
             now = self.clock()
             return tuple(self._health(source, now) for source in self._sources.values())
+
+    def counters(self, source_id):
+        """Value-free ``CaptureCounters`` for one source, cumulative since start."""
+        with self._lock:
+            source = self._sources[source_id]
+            active = source.active
+            padding = source.retired_padding + (active.parser.large_gaps if active else 0)
+            return CaptureCounters(source.generation, source.stream_invalid, padding)
 
     def frames(self, source_id):
         """Bounded compressed-frame queue for a later ring/transport consumer."""

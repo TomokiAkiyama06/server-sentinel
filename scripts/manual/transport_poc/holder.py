@@ -258,7 +258,15 @@ class Holder:
                     rss, hwm = records.process_memory()
                     drops = sum(self.capture.frames(source).drop_stats()[0]
                                 for source in self.source_ids)
+                    # Value-free product counters (Issue #305): pipeline
+                    # launches (> sources means a GStreamer child restart),
+                    # framing teardowns and tolerated oversized padding.
+                    counters = [self.capture.counters(source) for source in self.source_ids]
                     self.writer.write("sample", frames=sum(self.frames), queue_drops=drops,
+                                      capture_launches=sum(c.launches for c in counters),
+                                      stream_invalid=sum(c.stream_invalid for c in counters),
+                                      padding_tolerated=sum(c.padding_tolerated
+                                                            for c in counters),
                                       forward_drops=self.forward_drops,
                                       cpu_seconds=records.process_cpu_seconds() - cpu0,
                                       child_cpu_seconds=records.descendant_cpu_seconds(),

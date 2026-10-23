@@ -28,8 +28,8 @@ from media_capture_agent.runtime import Agent
 from media_capture_agent.storage import MediaStore
 from media_capture_agent.uvc_approvals import FILENAME, ApprovalStorageError, ApprovalStore
 from media_capture_agent import uvc_capture
-from media_capture_agent.uvc_capture import (CaptureCleanupError, CaptureLimits, CaptureRefused,
-                                             UvcCapture, UvcSourceConfig)
+from media_capture_agent.uvc_capture import (CaptureCleanupError, CaptureCounters, CaptureLimits,
+                                             CaptureRefused, UvcCapture, UvcSourceConfig)
 from media_capture_agent import uvc_discovery
 from media_capture_agent.uvc_discovery import (DiscoveryResult, LinuxDiscovery, ProbeError,
                                                VideoCapabilities, match_mjpeg_profile)
@@ -334,6 +334,83 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(output, frames)
         # Skipped padding is discarded per feed; only a partial frame is kept.
         self.assertLessEqual(retained, max(len(frame) for frame in frames))
+
+    def test_marker_like_padding_resynchronises_on_the_next_soi(self):
+        # Padding made of stale JPEG tails: everything after an old frame's
+        # SOI (APPn with FF D9 inside, SOF, SOS, stuffed FF 00, RSTn and the
+        # old EOI), runs of FF fill bytes and lone segment-like FF Ex pairs.
+        # It holds every marker shape except SOI, so it is skipped whole and
+        # the frame after it is emitted byte for byte.
+        bound = MjpegProfile(64, 48, 30).max_padding_bytes
+        stale = b"".join(synthetic_jpeg(index)[2:] for index in range(40))
+        noise = (stale + b"\xff" * 300 + b"\xff\xe1\x00\x10" + b"\xff\xd9" * 50) * 20
+        self.assertNotIn(b"\xff\xd8", noise)
+        self.assertGreater(len(noise), bound)
+        frames = [synthetic_jpeg(index) for index in range(100, 104)]
+        stream = (frames[0] + noise[:bound] + frames[1] + noise[:bound - 1] + b"\xff"
+                  + frames[2] + noise[:DEFAULT_MAX_GAP_BYTES + 1] + frames[3])
+        for size in (1, 3, 7, 64, 4096, len(stream)):
+            parser = MjpegFrameParser(4096, max_gap_bytes=bound)
+            with self.subTest(size=size):
+                self.assertEqual(chunked(parser, stream, size), frames)
+                self.assertFalse(parser.partial)
+                self.assertEqual(parser.large_gaps, 3)
+
+    def test_stale_jpeg_tail_after_bound_still_fails_closed(self):
+        bound = MjpegProfile(64, 48, 30).max_padding_bytes
+        stale = b"".join(synthetic_jpeg(index)[2:] for index in range(200))[:bound + 1]
+        self.assertNotIn(b"\xff\xd8", stale)
+        stream = synthetic_jpeg(0) + stale + synthetic_jpeg(1)
+        for size in (1, 7, 4096, len(stream)):
+            parser, output = MjpegFrameParser(4096, max_gap_bytes=bound), []
+            with self.subTest(size=size), self.assertRaises(FrameError) as caught:
+                for offset in range(0, len(stream), size):
+                    output.extend(parser.feed(stream[offset:offset + size]))
+            self.assertEqual(str(caught.exception), "video stream lost JPEG framing")
+            self.assertIn(output, ([], [synthetic_jpeg(0)]))
+
+    def test_soi_split_across_chunks_at_the_exact_bound(self):
+        # The gap ends with FF and the next chunk starts with D8: the FF kept
+        # back from the gap is the SOI's first byte, so exactly ``bound``
+        # skipped bytes is accepted and one more is not.
+        bound = MjpegProfile(64, 48, 30).max_padding_bytes
+        first, second = synthetic_jpeg(0), synthetic_jpeg(1)
+        for extra, accepted in ((0, True), (1, False)):
+            gap = padding(bound + extra)
+            stream = first + gap + second
+            split = len(first) + len(gap) + 1  # chunk ends right after the SOI's FF
+            parser = MjpegFrameParser(4096, max_gap_bytes=bound)
+            with self.subTest(extra=extra):
+                if accepted:
+                    self.assertEqual(parser.feed(stream[:split]) + parser.feed(stream[split:]),
+                                     [first, second])
+                    self.assertEqual(parser.large_gaps, 1)
+                else:
+                    with self.assertRaises(FrameError):
+                        parser.feed(stream[:split])
+                        parser.feed(stream[split:])
+
+    def test_large_gaps_count_only_tolerated_oversized_padding(self):
+        bound = MjpegProfile(64, 48, 30).max_padding_bytes
+        frames = [synthetic_jpeg(index) for index in range(5)]
+        stream = (padding(DEFAULT_MAX_GAP_BYTES + 1) + frames[0]       # leading: counted
+                  + padding(DEFAULT_MAX_GAP_BYTES) + frames[1]          # at default: not
+                  + frames[2] + padding(1) + frames[3]                  # small: not
+                  + padding(bound) + frames[4])                         # at bound: counted
+        for size in (1, 7, 4096, len(stream)):
+            parser = MjpegFrameParser(4096, max_gap_bytes=bound)
+            with self.subTest(size=size):
+                self.assertEqual(chunked(parser, stream, size), frames)
+                self.assertEqual(parser.large_gaps, 2)
+        # A large gap whose SOI is malformed raises and is never counted.
+        parser = MjpegFrameParser(4096, max_gap_bytes=bound)
+        with self.assertRaises(FrameError):
+            parser.feed(frames[0] + padding(DEFAULT_MAX_GAP_BYTES + 1) + b"\xff\xd8\x12\x34")
+        self.assertEqual(parser.large_gaps, 0)
+        # Trailing padding still being skipped is not counted yet.
+        parser = MjpegFrameParser(4096, max_gap_bytes=bound)
+        parser.feed(frames[0] + padding(bound))
+        self.assertEqual(parser.large_gaps, 0)
 
     def test_trailing_padding_counts_as_partial(self):
         parser = MjpegFrameParser(4096)
@@ -927,10 +1004,31 @@ class CaptureTests(CaptureCase):
         self.assertEqual(self.state(capture), ("online", "video_ready"))
         self.assertIsNone(active.error)
         self.assertEqual(len(self.launcher.pipelines), 1)
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(1, 0, 1))
         pipeline.feed(padding(PROFILE.max_padding_bytes + 1))
         self.assertTrue(wait_for(lambda: active.error))
         self.assertEqual(active.error, "stream_invalid")
         self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        # Counts survive the teardown and stay cumulative across a relaunch.
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(1, 1, 1))
+        self.clock.now += 1
+        capture.poll()
+        self.assertEqual(len(self.launcher.pipelines), 2)
+        relaunched = self.launcher.pipelines[-1]
+        relaunched.feed(synthetic_jpeg(0) + padding(DEFAULT_MAX_GAP_BYTES + 1) + synthetic_jpeg(1))
+        self.assertTrue(wait_for(lambda: capture._sources[SOURCES[0]].active.frames >= 2))
+        self.assertEqual(self.state(capture), ("online", "video_ready"))
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(2, 1, 2))
+
+    def test_counters_are_value_free_and_per_source(self):
+        device = evidence()
+        capture, _pipeline = self.approved_online(FakeDiscovery(device), device, count=2)
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(1, 0, 0))
+        self.assertEqual(capture.counters(SOURCES[1]), CaptureCounters(0, 0, 0))
+        self.assertTrue(all(type(value) is int
+                            for value in vars(capture.counters(SOURCES[0])).values()))
+        with self.assertRaises(KeyError):
+            capture.counters(SOURCES[4])
 
     def test_retry_backoff_starts_after_slow_failed_open(self):
         device = evidence()

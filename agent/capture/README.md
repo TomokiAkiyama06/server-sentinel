@@ -121,13 +121,25 @@ cameras (Issue #305) deliver a full-size buffer holding one JPEG and non-JPEG
 padding, and `fdsink` loses buffer boundaries. Skipped padding is discarded as it
 is read; a longer gap without an SOI, or an SOI in the padding followed by an
 invalid structure, is a malformed stream (`capture_failed`, backoff relaunch).
-Memory is bounded by `(queue_frames + 1) * max_frame_bytes` plus one read chunk
+No framing element (`jpegparse`, `multipartmux`, `gdppay`) is added to the
+child: each would load another plugin and more parsing code into it, and would
+still scan the same padded buffers (SECURITY.md, "Agent UVC capture child
+framing"). Memory is bounded by `(queue_frames + 1) * max_frame_bytes` plus one read chunk
 per source.
 
 ## Health
 
 Per-source health never affects node health; `poll()` does not raise for camera
 or pipeline failures.
+
+`UvcCapture.counters(source_id)` returns value-free cumulative counts for one
+source (`CaptureCounters`): `launches` (pipelines started; above 1 means the
+GStreamer child was restarted), `stream_invalid` (pipelines torn down because
+the stream lost JPEG framing or was malformed) and `padding_tolerated`
+(inter-frame gaps above the 4 KiB default that the profile bound skipped before
+a valid frame, Issue #305). They hold no sizes, offsets, timestamps, device
+details or bytes, are not logged per frame and are not part of the Main
+heartbeat contract; the transport PoC holder records them in its samples.
 
 | State | Reasons |
 | --- | --- |

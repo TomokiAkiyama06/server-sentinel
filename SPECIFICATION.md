@@ -472,7 +472,9 @@ Skipped bytes are discarded as they are read, so the bound does not grow the
 parser's memory. A gap beyond the bound without an SOI, and any structural
 error after an SOI (including an SOI found inside padding), is a malformed stream:
 the pipeline is torn down and relaunched with backoff, and no guessed frame is
-emitted.
+emitted. Tolerated oversized gaps, framing teardowns and pipeline launches are
+kept as value-free per-source counters (`UvcCapture.counters`, counts only; not
+logged per frame and not part of the heartbeat contract).
 Before starting a pipeline the Agent checks the explicit profile against the MJPEG
 frame sizes and intervals the opened approved node advertises (read-only
 `VIDIOC_ENUM_FMT`/`ENUM_FRAMESIZES`/`ENUM_FRAMEINTERVALS` on that descriptor only,

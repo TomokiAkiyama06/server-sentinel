@@ -727,6 +727,39 @@ instead keep decoding with seccomp only, with an Owner-visible warning, is an
 open Owner decision (Issue #269); until it is made, such a kernel cannot use
 MJPG scene detection.
 
+### Agent UVC capture child framing (Issue #305)
+
+The `media-capture-agent` GStreamer child stays limited to `v4l2src` and
+`fdsink` (plugins `coreelements` and `video4linux2` only, Landlock confined to
+the approved device). No framing element (`jpegparse`, `multipartmux`, `gdppay`)
+is added: each would load a further plugin (`gst-plugins-bad` or
+`gst-plugins-good`) and more parsing code into the child, and a parser there
+would still have to scan the same padded buffers. Because `fdsink` drops V4L2
+buffer boundaries, the Agent's pure-Python `MjpegFrameParser` re-frames the
+stream structurally:
+
+- bytes between an EOI and the next SOI are skipped only up to the negotiated
+  profile's raw buffer size (`width * height * 2`, clamped to 4 KiB–32 MiB),
+  the largest padding a full-size V4L2 MJPG buffer can carry after its JPEG;
+  skipped bytes are discarded as they are read (C-level `find`, linear in the
+  bytes received), so the bound adds neither memory nor quadratic work;
+- a gap beyond that bound, an SOI followed by an invalid structure, and a frame
+  above `max_frame_bytes` are malformed streams: the child is torn down and
+  relaunched with backoff and no guessed frame is emitted (fail closed);
+- the stale tail of an older JPEG left in a reused buffer cannot start a frame:
+  its SOI was overwritten by the new frame's start, and entropy-coded data
+  cannot contain `FF D8`. Residual risk: padding that happens to contain a
+  complete, structurally valid JPEG would be emitted as a frame; the real
+  CS-800 measurement (Issue #305) found no SOI in the padding at all;
+- tolerated oversized gaps, framing teardowns and pipeline launches are
+  value-free counters (`UvcCapture.counters`): counts only, never sizes,
+  offsets, timestamps or bytes, and nothing is logged per frame.
+
+Main's own local UVC capture dequeues V4L2 MMAP buffers directly and keeps
+their boundaries; there a padded buffer reaches the scene pre-check, which
+refuses it (`trailing_bytes_exceeded`, so that sample is `unknown`) rather than
+decoding it.
+
 ## Web/API
 
 - typed validation;
