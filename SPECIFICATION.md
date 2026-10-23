@@ -1769,7 +1769,10 @@ recorded numbers differ, on every storage sample: the sysfs topology
 or md member replacement onto loop/virtual backing that keeps the device
 number and mount refuses the next admission and raises the per-episode
 `recording_health_failure`; the refusal is not latched and a return to
-hardware-only backing admits again (Issue #340). Current numbers read no
+hardware-only backing admits again (Issue #340). A refusal seen only by an
+admission is kept as one value-free flag that the next tick consumes, so the
+episode alerts once even when restored before that tick; `recording_health`
+stays `failed` until the next daily self-test. Current numbers read no
 sysfs. A mismatch at startup leaves
 the runtime `failed`, refuses writes and still attempts the immediate Slack
 alert; the open is retried every 15 minutes against the same declared identity

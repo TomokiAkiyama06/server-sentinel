@@ -295,7 +295,11 @@ on hardware disks (Issue #340): a dm table reload or md member replacement
 onto a loop or virtual device while the service runs keeps the device number
 and the mount, yet storage stops (`STORAGE_HARD_STOP`, one immediate
 `recording_health_failure`) until the backing is hardware-only again, when
-writes resume without a restart. Updating the recorded numbers ends this
+writes resume without a restart. A refusal seen only by a write in between
+two monitoring ticks still raises the alert at the next tick, even if the
+backing was already restored. After such an episode `recording_health` stays
+`failed` until the next daily recording self-test, even though writes have
+resumed. Updating the recorded numbers ends this
 extra check along with the warning.
 
 #### Updating stale device numbers after a reboot

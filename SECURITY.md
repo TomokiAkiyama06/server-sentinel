@@ -206,7 +206,12 @@ Runtime-data assumptions:
   development host) and a refusal is `STORAGE_HARD_STOP` for that sample:
   writes are refused, one immediate `recording_health_failure` is raised per
   episode, and the next sample on hardware-only backing admits again (not
-  latched). A change in the middle of one admitted write is not prevented
+  latched). A refusal seen only by a write admission is kept as one
+  value-free flag, so the next monitoring tick (every 60 s by default) still
+  raises that episode's alert even when the backing was restored before it
+  (Codex P1 on PR #344); repeated refusals within one episode alert once.
+  `recording_health` then stays `failed` until the next daily recording
+  self-test, although writes have resumed. A change in the middle of one admitted write is not prevented
   inside that write; the next sample refuses. Current numbers never read
   sysfs. Residual
   risk: a disk carrying a cloned UUID in another slot of the same driver

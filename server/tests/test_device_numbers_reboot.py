@@ -27,6 +27,7 @@ from unittest.mock import patch
 
 from app.deployment import DEVICE_NUMBERS_STALE_WARNING, Deployment, main as deployment_main
 from app.diagnostics.sources import StorageAdapter
+from app.media.health.service import HealthState
 from app.media.recording.model import RecordingError
 from app.monitoring.config import (
     RecordingFilesystem, parse_monitoring, renumbered_device_acceptable,
@@ -503,6 +504,33 @@ class RecordingFilesystemTests(unittest.TestCase):
         with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
             filesystem.check()
 
+    def test_a_topology_refusal_is_kept_as_one_value_free_flag(self):
+        # Codex P1 on PR #344: an admission's refusal must reach the next tick
+        # even when the topology is restored before it; repeated refusals are
+        # one flag (bounded), and a UUID/mount refusal does not set it.
+        sysfs = FakeSysfs(self)
+        disk = sysfs.device(spare_device(self.device, 8, 240), "sdz")
+        loop = sysfs.device(spare_device(self.device, 7, 9), "loop9", loop=True)
+        mapped = sysfs.device(self.device, "dm-stale", dm=True, slaves=(disk,))
+        filesystem = IdentifiedRecordingFilesystem(
+            self.identity(other_numbers(self.device)), self.metadata())
+        filesystem.check()
+        self.assertFalse(filesystem.take_topology_refusal())
+        (mapped / "slaves" / disk.name).unlink()
+        (mapped / "slaves" / loop.name).symlink_to(loop)
+        for _ in range(3):
+            with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                filesystem.snapshot()
+        (mapped / "slaves" / loop.name).unlink()
+        (mapped / "slaves" / disk.name).symlink_to(disk)
+        filesystem.check()
+        self.assertIs(True, filesystem.take_topology_refusal())
+        self.assertIs(False, filesystem.take_topology_refusal())
+        self.approved = self.device + 7
+        with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+            filesystem.check()
+        self.assertFalse(filesystem.take_topology_refusal())
+
     def test_a_raising_topology_judgement_fails_closed(self):
         filesystem = IdentifiedRecordingFilesystem(
             self.identity(other_numbers(self.device)), self.metadata())
@@ -718,6 +746,64 @@ class StaleDeviceNumbersRuntimeTests(RuntimeFixture):
             # The stale-numbers notice stays one per boot and numbers.
             self.assertEqual(1, len(self.notices()))
             self.assertEqual(2, len(recording()))
+
+    async def test_an_admission_only_refusal_alerts_once_at_the_next_tick(self):
+        # Codex P1 on PR #344: the backing moves onto a loop device only while
+        # admissions run and is restored before the periodic tick. The tick
+        # must still raise the one immediate alert for that episode.
+        sysfs = FakeSysfs(self)
+        disk = sysfs.device(spare_device(self.device, 8, 240), "sdz")
+        loop = sysfs.device(spare_device(self.device, 7, 9), "loop9", loop=True)
+        mapped = sysfs.device(self.device, "dm-stale", dm=True, slaves=(disk,))
+
+        def alerts():
+            return [text for text in self.slack_texts() if "recording_health_failure" in text]
+
+        def admit():
+            with runtime._policy.control():
+                pass
+
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            await runtime.call(admit)
+            self.assertEqual([], alerts())
+            (mapped / "slaves" / disk.name).unlink()
+            (mapped / "slaves" / loop.name).symlink_to(loop)
+            for _ in range(3):
+                with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                    await runtime.call(admit)
+            (mapped / "slaves" / loop.name).unlink()
+            (mapped / "slaves" / disk.name).symlink_to(disk)
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertEqual(["ServerSentinel critical alert: recording_health_failure"], alerts())
+            self.assertEqual(HealthState.FAILED, runtime.status.recording_health)
+            self.assertFalse(runtime.status.recording_filesystem_ok)
+            # Restored: the next tick recovers without another alert; the
+            # health verdict stays FAILED until the next daily self-test.
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertTrue(runtime.status.recording_filesystem_ok)
+            self.assertNotEqual(StorageState.HARD_STOP, runtime.status.storage_state)
+            await runtime.call(admit)
+            self.assertEqual(1, len(alerts()))
+            self.assertEqual(HealthState.FAILED, runtime.status.recording_health)
+            # A later admission-only episode alerts once more.
+            (mapped / "slaves" / disk.name).unlink()
+            (mapped / "slaves" / loop.name).symlink_to(loop)
+            with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                await runtime.call(admit)
+            (mapped / "slaves" / loop.name).unlink()
+            (mapped / "slaves" / disk.name).symlink_to(disk)
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertEqual(2, len(alerts()))
+            self.assertEqual(1, len(self.notices()))
 
     async def test_renumbered_loop_device_fails_closed_at_runtime(self):
         FakeSysfs(self).node(self.device, "loop")

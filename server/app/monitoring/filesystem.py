@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import stat
+import threading
 
 from app.media.recording.model import RecordingError
 from app.media.recording.store import RootIdentity
@@ -34,11 +35,18 @@ class IdentifiedRecordingFilesystem:
     the mount or `st_dev`, so the sysfs topology is walked again each time and
     a refusal is `STORAGE_HARD_STOP` for that sample only (not latched: the
     next sample on hardware-only backing admits again). Current numbers never
-    read sysfs.
+    read sysfs. Because a refusal raised inside a storage admission is only
+    seen by that admission, it is also kept as one value-free flag
+    (`take_topology_refusal`), so the next monitoring tick alerts the Owner
+    even when the topology was restored before it (Codex P1 on PR #344).
     """
 
     def __init__(self, identity: RecordingFilesystem, metadata: Path):
         self.identity = identity
+        # One bool under a lock: admissions may run on another thread than
+        # the tick that consumes it. It carries no cause, device or count.
+        self._refusal_lock = threading.Lock()
+        self._topology_refused = False
         try:
             info = os.stat(identity.root, follow_symlinks=False)
         except OSError:
@@ -77,7 +85,15 @@ class IdentifiedRecordingFilesystem:
         except Exception:
             acceptable = False
         if acceptable is not True:
+            with self._refusal_lock:
+                self._topology_refused = True
             raise RecordingError("STORAGE_HARD_STOP")
+
+    def take_topology_refusal(self) -> bool:
+        """Whether a sample refused the topology since the last call; clears it."""
+        with self._refusal_lock:
+            refused, self._topology_refused = self._topology_refused, False
+        return refused
 
     def check(self) -> None:
         """Raise `STORAGE_HARD_STOP` unless the expected filesystem is intact."""
