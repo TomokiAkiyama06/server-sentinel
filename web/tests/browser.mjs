@@ -295,10 +295,11 @@ try {
         await page.heading('接続を確認できません');
       });
     }
-    // Walking the screens moves on once each heading shows, so leaving the
-    // recordings screen may abort its read before the answer: the only read
-    // observed abandoned (1 in 40 runs, #334). Any other abandon still fails.
-    const viewReads = [{ method: 'GET', path: '/api/mock/recordings' }];
+    // Walking the screens moves on once each heading shows, so leaving a
+    // screen may abort its read before the answer. Only the reads observed
+    // abandoned in the flake runs are expected (#334): recordings (1 in 40
+    // runs) and storage (1 in 40 runs). Any other abandon still fails.
+    const viewReads = [{ method: 'GET', path: '/api/mock/recordings' }, { method: 'GET', path: '/api/mock/storage' }];
     for (const count of [0, 1, 2, 3, 4]) {
       await scenario(viewport, { count, expectAbandoned: viewReads }, async page => {
         await page.click('カメラソース');

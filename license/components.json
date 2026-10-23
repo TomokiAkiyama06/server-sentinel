@@ -19,7 +19,7 @@
     },
     {
       "path": "web/tests/browser.mjs",
-      "sha256": "sha256:9918e2502908202716f3826df8e29fff7fb33c03388f14db3c17815f50767995"
+      "sha256": "sha256:6ac5d2329ed3a45cdb10e0a5f494ecf657867152f5d5234b0a6f8b47281cd2bc"
     },
     {
       "path": "web/tests/chrome.mjs",
