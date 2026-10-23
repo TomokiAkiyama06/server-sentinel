@@ -154,7 +154,8 @@ UNRECORDED_ALERT_CAPACITY = 64
 # no longer watched (counted as `untracked`).
 RECORDED_WATCH_CAPACITY = 64
 # Event IDs already attempted in this process, so the scene runtime's retries
-# of the same refused observation do not attempt it again.
+# of the same refused observation do not attempt it again. The same bound
+# applies to the IDs whose record committed in this process (`settled()`).
 UNRECORDED_ALERT_REMEMBERED = 1024
 
 
@@ -181,6 +182,14 @@ class UnrecordedCriticalAlerts:
       step that fails escalates every watched one to `refused()`. A row left
       `unavailable` because the notification queue was full stays watched as
       well.
+
+    - `settled()`: the record of a recorded one committed (Issue #333). A
+      later `refused()` of that ID, the scene runtime's retry of an item
+      whose commit succeeded but whose storage release raised, is ignored:
+      its notification is the dispatcher's, or the watch's while unclaimed,
+      and `escalate()` bypasses this check. The last `remembered` such IDs
+      are kept; an older one forgotten is attempted again if refused, a
+      possible duplicate rather than a missed alert.
 
     A full queue counts the hand-over in `dropped` and logs
     `unrecorded_critical_alert_dropped` value-free (first and every
@@ -223,6 +232,7 @@ class UnrecordedCriticalAlerts:
         self._queued: OrderedDict[UUID, Kind] = OrderedDict()
         self._recorded: OrderedDict[UUID, Kind] = OrderedDict()
         self._attempted: OrderedDict[UUID, None] = OrderedDict()
+        self._settled: OrderedDict[UUID, None] = OrderedDict()
         # Worker only: this process's attempts whose outcome is not persisted.
         self._in_flight: set[UUID] = set()
         self._dropped = self._submitted = self._untracked = 0
@@ -256,7 +266,14 @@ class UnrecordedCriticalAlerts:
         return kind
 
     def refused(self, identifier: UUID, kind) -> None:
-        """Hand over a confirmed critical that cannot be submitted now; never blocks."""
+        """Hand over a confirmed critical that cannot be submitted now; never blocks.
+
+        One whose record already committed in this process (`settled()`) is
+        ignored: only the watch (`escalate()`) can bring it back.
+        """
+        self._refuse(identifier, kind, watched=False)
+
+    def _refuse(self, identifier: UUID, kind, *, watched: bool) -> None:
         if not isinstance(identifier, UUID):
             raise ValueError("invalid critical identity")
         kind = self._kind(kind)
@@ -266,6 +283,16 @@ class UnrecordedCriticalAlerts:
             return
         with self._lock:
             if identifier in self._queued or identifier in self._attempted:
+                return
+            if watched:
+                # Issue #333 (Codex P2 on 13712d3e): `escalate()` works on a
+                # snapshot of the watch. A replay may have stopped watching
+                # this one since (claimed or resolved), so the bypass of the
+                # settled check holds only while it is still watched,
+                # checked under the same lock as the queue insert.
+                if identifier not in self._recorded:
+                    return
+            elif identifier in self._settled:
                 return
             if len(self._queued) < self._capacity:
                 self._queued[identifier] = kind
@@ -303,6 +330,21 @@ class UnrecordedCriticalAlerts:
                 self._recorded.popitem(last=False)
                 self._untracked += 1
 
+    def settled(self, identifier: UUID) -> None:
+        """The record of a recorded one committed; never blocks (Issue #333).
+
+        Told by the recorder after the commit returned (never for a commit
+        that failed), so a later `refused()` of the same ID cannot send its
+        alert a second time.
+        """
+        if not isinstance(identifier, UUID):
+            raise ValueError("invalid critical identity")
+        with self._lock:
+            self._settled[identifier] = None
+            self._settled.move_to_end(identifier)
+            while len(self._settled) > self._remembered:
+                self._settled.popitem(last=False)
+
     def awaiting(self) -> tuple[UUID, ...]:
         """The watched identities, checked by a successful dispatch step."""
         with self._lock:
@@ -317,11 +359,15 @@ class UnrecordedCriticalAlerts:
                     self._recorded.pop(identifier, None)
 
     def escalate(self) -> None:
-        """A dispatch step failed: attempt every watched, unclaimed one."""
+        """A dispatch step failed: attempt every watched, unclaimed one.
+
+        Each one is queued only if it is still watched when it is queued, so
+        a replay that stopped watching it meanwhile is never undone.
+        """
         with self._lock:
             watched = tuple(self._recorded.items())
         for identifier, kind in watched:
-            self.refused(identifier, kind)
+            self._refuse(identifier, kind, watched=True)
 
     def _attempt(self, identifier: UUID) -> None:
         # Called with the lock held.
