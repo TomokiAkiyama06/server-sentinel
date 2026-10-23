@@ -56,6 +56,36 @@ rows accepted in the last hour, ``pending`` included (``restore_window``). An ep
 (value-free) and notified as soon as the hour allows if the source is still
 not online; one that recovered meanwhile is dropped and logged.
 
+Intermittent outages (Owner decision 2026-10-22, Refs #301): short outages
+that repeat notify too. A source that was not online for
+``flapping_offline_seconds`` (default 300 s) in total within the last
+``flapping_window_seconds`` (default 900 s), over at least two separate
+not-online periods (a single outage is the continuous rule's), is notified
+once as the same ``camera_offline`` kind under the same cap. Every
+notification of a source that was sent (either rule), or that an earlier
+process already sent, opens that source's *alerted period*, which closes only
+after the source stayed online (or inactive) for a whole window; one dropped
+under the cap opens none. While it is open the ratio rule does not notify
+that source again. In a period a ratio alert opened (Owner decision
+2026-10-23, PR #335) the flapping continues to belong to that alert: the
+outage in progress at the alert and every outage that begins after an online
+shorter than ``after_seconds`` are *flapping episodes*; the first of them
+that stays offline for ``after_seconds`` (the one in progress counting from
+the alert) is notified once by the continuous rule and later ones are not,
+so one flapping period yields at most two notifications. An outage that
+begins after an online of at least ``after_seconds`` is an ordinary episode
+(one notification per episode, as before). A period opened by a continuous
+notification leaves the continuous rule as it was. Not-online time is kept
+per source in at most ``DOWN_BINS`` + 2 time bins of window/``DOWN_BINS``
+holding the actual not-online seconds; the oldest bin may straddle the window
+start and is counted whole, so the total can exceed the true one by at most
+that bin's not-online seconds, never fall short of it. A ratio alert is named
+after the source and the wall-clock window bucket of its trigger
+(``flapping_id``), so a restarted process that triggers again within a window
+of a stored alert of that source sends nothing twice. A ratio alert held back
+by the cap is sent when the hour allows while its period is still open and
+dropped (logged) once the period closed.
+
 Value-free: the notification is the fixed category ``camera_offline`` with no
 source name, role, UUID, device path, serial, reason or image (SPECIFICATION
 §9 Slack payload); the Owner sees which source is offline in the Web UI.
@@ -77,8 +107,9 @@ from app.notifications.service import NotificationKind, NotificationService
 from app.notifications.slack import DeliveryResult
 
 from .config import (
+    CAMERA_FLAPPING_OFFLINE_SECONDS, CAMERA_FLAPPING_WINDOW_SECONDS,
     CAMERA_OFFLINE_HOURLY_LIMIT, CAMERA_OFFLINE_HOURLY_LIMIT_BOUNDS, CAMERA_OFFLINE_SECONDS,
-    CAMERA_OFFLINE_SECONDS_BOUNDS,
+    CAMERA_OFFLINE_SECONDS_BOUNDS, valid_flapping,
 )
 
 
@@ -95,6 +126,13 @@ INACTIVE_REASONS = frozenset({"disabled", "capture_service_stopping"})
 _ONLINE = "online"
 _NOT_ONLINE = frozenset({"offline", "degraded", "manual_intervention_required"})
 MAX_SOURCES = 64
+# Time bins per window holding a source's not-online seconds (ratio rule).
+DOWN_BINS = 128
+DEFAULT_FLAPPING_WINDOW = CAMERA_FLAPPING_WINDOW_SECONDS
+DEFAULT_FLAPPING_OFFLINE = CAMERA_FLAPPING_OFFLINE_SECONDS
+# Who opened a source's alerted period.
+_BY_CONTINUOUS = "continuous"
+_BY_RATIO = "ratio"
 
 
 def valid_offline_seconds(value) -> bool:
@@ -117,10 +155,122 @@ class _Episode:
     # (at, event ID) of a submission the service could not take yet; the
     # retry reuses both, so it upserts one row.
     attempt: tuple[datetime, UUID] | None = None
+    # Set when a ratio alert covered this episode while it was in progress:
+    # the continuous threshold then counts again from that alert (Owner
+    # decision 2026-10-23, PR #335).
+    counted_from: float | None = None
+    # Part of a ratio-opened flapping period: in progress at its alert, or
+    # begun after an online shorter than ``after_seconds`` inside it.
+    flapping: bool = False
 
     def qualifies(self, now: float, after: float) -> bool:
         end = self.recovered if self.recovered is not None else now
-        return not math.isfinite(end) or end - self.since >= after
+        start = self.since if self.counted_from is None else self.counted_from
+        return not math.isfinite(end) or end - start >= after
+
+
+@dataclass
+class _Flap:
+    """A ratio alert of one flapping period, until it is notified."""
+
+    since: float
+    notified: bool = False
+    held: bool = False
+    attempt: tuple[datetime, UUID] | None = None
+    # The period closed before the alert was notified.
+    ended: bool = False
+
+
+class _DownTime:
+    """Bounded not-online seconds of one source within the ratio window.
+
+    ``bins`` holds ``[index, seconds]`` for time bins of ``width`` (window /
+    ``DOWN_BINS``) in increasing index, at most ``DOWN_BINS`` + 2 of them;
+    ``ends`` the end times of the last two closed not-online periods and
+    ``since`` the start of the one in progress. Called with the lock held.
+    """
+
+    __slots__ = ("width", "window", "bins", "ends", "since", "last")
+
+    def __init__(self, window: float, start: float | None = None):
+        self.window = window
+        self.width = window / DOWN_BINS
+        self.bins: deque[list] = deque()
+        self.ends: deque[float] = deque(maxlen=2)
+        self.since = start
+        self.last = start
+
+    def clear(self) -> None:
+        self.bins.clear()
+        self.ends.clear()
+
+    def _clock(self, now: float) -> float | None:
+        """``now`` as this record uses it; ``None`` when it is not finite.
+
+        The runtime reads the monotonic clock before it drains, outside the
+        lock, so a health event observed meanwhile can carry a slightly later
+        time (PR #335 re-review 提案 1). A step back of at most one bin width
+        is such a race: the later time already seen is used. Only a larger
+        step back is a backwards clock: the kept time cannot be placed
+        against it, so the count starts again (the continuous rule is
+        unaffected; a ratio alert is at most one window later).
+        """
+        if not math.isfinite(now):
+            return None
+        if self.last is not None and now < self.last:
+            if self.last - now <= self.width:
+                return self.last
+            self.clear()
+            if self.since is not None:
+                self.since = now
+        self.last = now
+        return now
+
+    def start(self, now: float) -> None:
+        self.since = self._clock(now)
+
+    def stop(self, now: float) -> None:
+        since, self.since = self.since, None
+        now = self._clock(now)
+        if since is None or now is None or now <= since:
+            # Unknown or zero length: no not-online time to count.
+            return
+        self.ends.append(now)
+        self._add(max(since, now - self.window - self.width), now)
+        self.trim(now)
+
+    def _add(self, begin: float, end: float) -> None:
+        width = self.width
+        index = math.floor(begin / width)
+        while begin < end:
+            stop = min(end, (index + 1) * width)
+            if stop > begin:
+                if self.bins and self.bins[-1][0] == index:
+                    self.bins[-1][1] += stop - begin
+                else:
+                    self.bins.append([index, stop - begin])
+            begin, index = stop, index + 1
+
+    def trim(self, now: float) -> None:
+        if not math.isfinite(now):
+            return
+        first = math.floor((now - self.window) / self.width)
+        while self.bins and self.bins[0][0] < first:
+            self.bins.popleft()
+
+    def flapping(self, now: float, offline: float) -> bool:
+        """``offline`` seconds or more, over two or more periods, in the window."""
+        now = self._clock(now)
+        if now is None:
+            return False
+        self.trim(now)
+        start = now - self.window
+        total = sum(seconds for _index, seconds in self.bins)
+        periods = sum(1 for end in self.ends if end > start)
+        if self.since is not None:
+            total += now - max(self.since, start)
+            periods += 1
+        return periods >= 2 and total >= offline
 
 
 @dataclass
@@ -137,6 +287,16 @@ class _Source:
     # Bumped on every signal, so a runtime status read before a newer event
     # cannot overwrite it (``observe_runtime``).
     version: int = 0
+    # Not-online time of the ratio rule.
+    down: _DownTime | None = None
+    # Since when the source has been online or inactive; None while not.
+    quiet_since: float | None = None
+    # Who opened the alerted period (``_BY_CONTINUOUS`` / ``_BY_RATIO``).
+    period: str | None = None
+    # The ratio alert of the current period, while it is not notified.
+    flap: _Flap | None = None
+    # A ratio-opened period already sent its one continuous notification.
+    continuous_sent: bool = False
 
 
 @dataclass(frozen=True)
@@ -147,6 +307,8 @@ class CameraOfflineStatus:
     offline_sources: int
     # Episodes past the threshold that the hourly cap is holding back.
     held: int
+    # Sources in an alerted period opened by the ratio rule.
+    flapping_sources: int = 0
 
 
 class CameraOfflineMonitor:
@@ -155,14 +317,21 @@ class CameraOfflineMonitor:
     def __init__(self, source_ids: Iterable[UUID], *,
                  after_seconds: float = DEFAULT_OFFLINE_SECONDS,
                  hourly_limit: int = DEFAULT_HOURLY_LIMIT,
+                 flapping_window_seconds: float = DEFAULT_FLAPPING_WINDOW,
+                 flapping_offline_seconds: float = DEFAULT_FLAPPING_OFFLINE,
                  monotonic: Callable[[], float]):
         ids = tuple(source_ids)
         if (not 1 <= len(ids) <= MAX_SOURCES or len(set(ids)) != len(ids)
                 or any(not isinstance(value, UUID) for value in ids)
                 or not valid_offline_seconds(after_seconds)
-                or not valid_hourly_limit(hourly_limit) or not callable(monotonic)):
+                or not valid_hourly_limit(hourly_limit) or not callable(monotonic)
+                or not valid_flapping(flapping_window_seconds, flapping_offline_seconds)
+                or not all(map(math.isfinite, (flapping_window_seconds,
+                                               flapping_offline_seconds)))):
             raise ValueError("invalid camera offline monitor setting")
         self.after = float(after_seconds)
+        self.window = float(flapping_window_seconds)
+        self.flapping_offline = float(flapping_offline_seconds)
         self.hourly_limit = hourly_limit
         self._monotonic = monotonic
         self._lock = threading.Lock()
@@ -170,7 +339,10 @@ class CameraOfflineMonitor:
         self._sequence = 0
         self._stopped = False
         start = monotonic()
-        self._sources = {identity: _Source(True, False, _Episode(start)) for identity in ids}
+        self._sources = {
+            identity: _Source(True, False, _Episode(start),
+                              down=_DownTime(self.window, start if math.isfinite(start) else None))
+            for identity in ids}
         # (monotonic time, event ID) of the notifications in the rolling hour.
         self._sent: deque[tuple[float, UUID]] = deque()
         # Durable IDs this process already notified: an episode whose
@@ -206,6 +378,21 @@ class CameraOfflineMonitor:
 
     def _apply(self, source: _Source, online: bool, active: bool, now: float) -> None:
         # Called with the lock held.
+        self._close_period(source, now)
+        was_down = source.active and not source.online
+        down = active and not online
+        # How long the source was online (or inactive) before this outage,
+        # taken before the quiet start is cleared (PR #335 review 重大 1).
+        quiet = source.quiet_since
+        short_online = (quiet is not None and math.isfinite(now) and math.isfinite(quiet)
+                        and now - quiet < self.after)
+        if down and not was_down:
+            source.quiet_since = None
+            source.down.start(now)
+        elif was_down and not down:
+            source.down.stop(now)
+            # An unknown time counts as long ago: the period may close.
+            source.quiet_since = now if math.isfinite(now) else -math.inf
         episode = source.episode
         ongoing = episode is not None and episode.recovered is None
         if online or not active:
@@ -236,8 +423,28 @@ class CameraOfflineMonitor:
                         logging.getLogger(__name__).warning(
                             Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED)
                     source.owed = episode
-                source.episode = _Episode(now)
+                # Inside a ratio-opened period, an outage after a short
+                # online continues the flapping; after a longer one it is an
+                # ordinary episode.
+                source.episode = _Episode(
+                    now, flapping=source.period == _BY_RATIO and short_online)
         source.online, source.active = online, active
+
+    def _close_period(self, source: _Source, now: float) -> None:
+        """Close the alerted period once the source stayed quiet a window."""
+        if source.period is None or source.quiet_since is None or not math.isfinite(now):
+            return
+        if now < source.quiet_since:
+            # A backwards clock: count the quiet time again from now.
+            source.quiet_since = now
+        if now - source.quiet_since < self.window:
+            return
+        source.period, source.continuous_sent = None, False
+        # Every not-online period ended before the quiet window began.
+        source.down.clear()
+        if source.flap is not None:
+            # Still unsent (a notified one is removed at once).
+            source.flap.ended = True
 
     def health_sink(self, event) -> None:
         """Local UVC ``health_sink``: one ``HealthEvent``; never raises."""
@@ -326,81 +533,152 @@ class CameraOfflineMonitor:
 
     def drain(self, notifications: NotificationService, *, at: datetime, monotonic: float,
               durable_id: Callable[[UUID], UUID | None] | None = None,
-              known: Callable[[UUID], bool] | None = None) -> CameraOfflineStatus:
-        """Notify every episode that reached the threshold, within the cap.
+              known: Callable[[UUID], bool] | None = None,
+              flapping_id: Callable[[UUID], tuple[UUID, bool] | None] | None = None,
+              ) -> CameraOfflineStatus:
+        """Notify every episode or flapping period that qualified, within the cap.
 
         ``durable_id(source_id)`` names an episode in progress after the
         source's durable last-frame time; ``known(event_id)`` tells whether
         that row already exists (an earlier process notified this outage).
-        Either may be absent or fail; the episode then gets a per-process ID.
+        ``flapping_id(source_id)`` names a ratio alert: ``(event ID,
+        notified)``, ``notified`` when an earlier process stored a ratio
+        alert of that source within the window. Any of them may be absent or
+        fail; the alert then gets a per-process ID.
         """
+        now = monotonic
         with self._lock:
             stopped = self._stopped
-            due = sorted(((identity, episode) for identity, source in self._sources.items()
-                          for episode in (source.owed, source.episode)
-                          if episode is not None and not episode.notified
-                          and episode.qualifies(monotonic, self.after)),
-                         key=lambda item: item[1].since)
-        for identity, episode in () if stopped else due:
-            ongoing = episode.recovered is None
-            if not self._window_open(monotonic):
+            if not stopped:
+                for source in self._sources.values():
+                    self._close_period(source, now)
+                    source.down.trim(now)
+                    if (source.period is None and source.flap is None
+                            and not self._continuous_due(source, now)
+                            and source.down.flapping(now, self.flapping_offline)):
+                        # One alert for this flapping period. The outage in
+                        # progress belongs to it; it is notified by the
+                        # continuous rule only if it lasts `after_seconds`
+                        # more (Owner decision 2026-10-23, PR #335).
+                        source.period, source.flap = _BY_RATIO, _Flap(now)
+                        source.continuous_sent = False
+                        episode = source.episode
+                        if episode is not None and episode.recovered is None:
+                            episode.counted_from, episode.flapping = now, True
+            due = sorted(((identity, item) for identity, source in self._sources.items()
+                          for item in (source.owed, source.episode, source.flap)
+                          if item is not None and not item.notified
+                          and (isinstance(item, _Flap) or item.qualifies(now, self.after))),
+                         key=lambda entry: entry[1].since)
+        for identity, item in () if stopped else due:
+            flap = isinstance(item, _Flap)
+            ongoing = not item.ended if flap else item.recovered is None
+            with self._lock:
+                source = self._sources[identity]
+                if (not flap and item.flapping and source.period == _BY_RATIO
+                        and source.continuous_sent):
+                    # A ratio-opened period yields at most one continuous
+                    # notification after its ratio alert (at most two).
+                    self._finish(identity, item)
+                    continue
+            if not self._window_open(now):
                 with self._lock:
                     if not ongoing:
-                        # Recovered while held back: nothing left to report.
-                        self._discard(identity, episode)
+                        # Recovered (or the flapping period closed) while
+                        # held back: nothing left to report. Not sent, so it
+                        # opens no alerted period (PR #335 review 重要 2).
+                        self._finish(identity, item, sent=False)
                         self.dropped += 1
                         logging.getLogger(__name__).warning(
                             Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED)
-                    elif not episode.held:
-                        episode.held = True
+                    elif not item.held:
+                        item.held = True
                         logging.getLogger(__name__).warning(
                             Event.CAMERA_OFFLINE_NOTIFICATION_RATE_LIMITED)
                 continue
-            attempt = episode.attempt
+            attempt = item.attempt
             if attempt is None:
-                event_id = self._durable(identity, durable_id) if ongoing else None
-                if event_id is not None and self._known(event_id, known):
+                if flap:
+                    event_id, earlier = self._flapping_name(identity, flapping_id)
+                else:
+                    event_id = self._durable(identity, durable_id) if ongoing else None
+                    earlier = event_id is not None and self._known(event_id, known)
+                if earlier:
                     # An earlier process already notified this outage.
                     self._used.add(event_id)
                     with self._lock:
-                        episode.notified = True
-                        if episode.recovered is not None:
-                            self._discard(identity, episode)
+                        self._finish(identity, item)
                     continue
                 attempt = (at, event_id or self._local_id(identity))
             if not notifications.can_accept(attempt[1]):
                 # Queue full or closed: retried on the next drain.
-                episode.attempt = attempt
+                item.attempt = attempt
                 continue
             result = notifications.record(NotificationKind.CAMERA_OFFLINE, at=attempt[0],
                                           confirmed=True, event_id=attempt[1])
             if result == DeliveryResult.FAILED and not notifications.retained(attempt[1]):
-                episode.attempt = attempt
+                item.attempt = attempt
                 continue
             self._used.add(attempt[1])
-            if math.isfinite(monotonic):
-                self._sent.append((monotonic, attempt[1]))
+            if math.isfinite(now):
+                self._sent.append((now, attempt[1]))
             with self._lock:
-                episode.notified, episode.attempt = True, None
-                if episode.recovered is not None:
-                    self._discard(identity, episode)
-        now = monotonic
+                item.attempt = None
+                self._finish(identity, item)
         with self._lock:
             offline = sum(1 for source in self._sources.values()
                           if source.episode is not None and source.episode.recovered is None
                           and source.episode.qualifies(now, self.after))
             held = sum(1 for source in self._sources.values()
-                       for episode in (source.owed, source.episode)
-                       if episode is not None and episode.held and not episode.notified)
-        return CameraOfflineStatus(offline_sources=offline, held=held)
+                       for item in (source.owed, source.episode, source.flap)
+                       if item is not None and item.held and not item.notified)
+            flapping = sum(1 for source in self._sources.values()
+                           if source.period == _BY_RATIO)
+        return CameraOfflineStatus(offline_sources=offline, held=held,
+                                   flapping_sources=flapping)
 
-    def _discard(self, identity: UUID, episode: _Episode) -> None:
-        # Called with the lock held; a newer episode is never removed.
+    def _continuous_due(self, source: _Source, now: float) -> bool:
+        # A qualifying continuous episode is the continuous rule's to report.
+        return any(item is not None and not item.notified and item.qualifies(now, self.after)
+                   for item in (source.owed, source.episode))
+
+    def _finish(self, identity: UUID, item, *, sent: bool = True) -> None:
+        """Notified, found notified, covered, or dropped: settled for good.
+
+        Called with the lock held; a newer episode is never removed. A
+        continuous episode that was sent (or an earlier process sent) opens
+        the alerted period when none is open, so the ratio rule does not
+        report the same outage again; a dropped one (``sent=False``) opens
+        none, since the Owner was never told.
+        """
         source = self._sources[identity]
-        if source.episode is episode:
-            source.episode = None
-        if source.owed is episode:
-            source.owed = None
+        item.notified = True
+        if isinstance(item, _Flap):
+            if source.flap is item:
+                source.flap = None
+            return
+        if sent:
+            if source.period is None:
+                source.period = _BY_CONTINUOUS
+            elif source.period == _BY_RATIO and item.flapping:
+                source.continuous_sent = True
+        if item.recovered is not None:
+            if source.episode is item:
+                source.episode = None
+            if source.owed is item:
+                source.owed = None
+
+    def _flapping_name(self, identity, flapping_id) -> tuple[UUID | None, bool]:
+        if flapping_id is None:
+            return None, False
+        try:
+            value = flapping_id(identity)
+        except Exception:
+            return None, False
+        if (type(value) is not tuple or len(value) != 2 or not isinstance(value[0], UUID)
+                or type(value[1]) is not bool or value[0] in self._used):
+            return None, False
+        return value
 
     def _durable(self, identity, durable_id) -> UUID | None:
         if durable_id is None:

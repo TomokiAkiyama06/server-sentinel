@@ -87,8 +87,19 @@ registry, so a restart during the same outage finds the row (any delivery
 state, `pending` included) and does not notify again, unless that row was
 accepted more than 24 h earlier (Owner decision 2026-10-22): the next name
 `…:repeat:N` of a deterministic chain is then used and the outage is notified
-again under the cap. See SPECIFICATION §9
-for the full rules and the known limits.
+again under the cap. Intermittent outages (Refs #301): a source not online for
+`flapping_offline_seconds` (default 300 s) in total within the last
+`flapping_window_seconds` (default 900 s), over at least two not-online
+periods, is one more `camera_offline` under the same cap, once per flapping
+period: a sent notification of a source opens its alerted period, which
+closes after a whole window online; while it is open the ratio rule stays
+silent, and in a period a ratio alert opened only the first outage that
+stays offline for `after_seconds` after a short online is notified once more
+(at most two per flapping period, Owner decision 2026-10-23); an outage after
+an online of at least `after_seconds` is an ordinary episode. A ratio alert is named
+`uuid5(EVENT_NAMESPACE, "camera-offline-flapping:<source>:<window>:<bucket>")`
+after the wall-clock window bucket, so a restart within a window of it sends
+nothing again. See SPECIFICATION §9 for the full rules and the known limits.
 
 Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
 takes the `AccessFaultMonitor` the composition root also passes to the
