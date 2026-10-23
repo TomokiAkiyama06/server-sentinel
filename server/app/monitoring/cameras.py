@@ -50,9 +50,24 @@ deterministic chain and it is notified again. Without
 storage, or for an episode that already recovered, the ID is per process
 (never a missed notification, at worst one repeat after a restart).
 
+Uncertain deliveries (Issue #336): only a final ``sent`` / ``failed`` /
+``disabled`` row counts as notified. A row still ``pending`` is a delivery an
+earlier process never finished (it exited before the Slack outcome was
+stored), which the notifications README forbids treating as confirmed. The
+runtime hands the newest such rows of the last 24 h to ``restore_pending``
+at the first running tick; each is submitted again under its stored event ID
+and time whether or not the outage is still in progress (an episode that
+reached the threshold is notified once even if it recovered before the
+drain; the row does not name its source). An episode or ratio alert whose
+durable name is such a row is covered by it; a pending row found only by
+``known`` / ``flapping_id`` is submitted again the same way. If the earlier
+POST did reach Slack the Owner sees the alert twice, never not at all.
+
 Cap: at most ``hourly_limit`` notifications per rolling hour for all sources
 together, continued across a restart from the confirmed ``camera_offline``
-rows accepted in the last hour, ``pending`` included (``restore_window``). An episode held back by the cap is logged once
+rows accepted in the last hour, ``pending`` included (``restore_window``); a
+pending row sent again keeps its one slot (an older one takes a new slot).
+An episode held back by the cap is logged once
 (value-free) and notified as soon as the hour allows if the source is still
 not online; one that recovered meanwhile is dropped and logged.
 
@@ -179,6 +194,22 @@ class _Flap:
     attempt: tuple[datetime, UUID] | None = None
     # The period closed before the alert was notified.
     ended: bool = False
+
+
+@dataclass
+class _Resend:
+    """A ``pending`` row an earlier process left (Issue #336).
+
+    Its Slack outcome was never stored, so it is not confirmed delivery
+    (notifications README): it is submitted again under its stored event ID
+    and time. The row does not name its source, so it is never dropped as
+    recovered and opens no alerted period.
+    """
+
+    attempt: tuple[datetime, UUID]
+    since: float = -math.inf
+    notified: bool = False
+    held: bool = False
 
 
 class _DownTime:
@@ -349,6 +380,10 @@ class CameraOfflineMonitor:
         # ``last_seen_at`` did not move (a refused frame-time write) gets a
         # per-process ID instead of being taken for the earlier one.
         self._used: set[UUID] = set()
+        # Restored ``pending`` rows still to be sent again (``restore_pending``)
+        # and the restored IDs no episode or ratio alert has claimed yet.
+        self._resend: list[_Resend] = []
+        self._restored: set[UUID] = set()
         self.recovered = 0
         self.dropped = 0
 
@@ -518,6 +553,44 @@ class CameraOfflineMonitor:
         self._sent.clear()
         self._sent.extend(merged[-self.hourly_limit:])
 
+    def restore_pending(self, rows, *, dropped: int = 0) -> None:
+        """Send again the ``pending`` rows an earlier process left (Issue #336).
+
+        ``rows`` are ``(event ID, stored time)`` of confirmed
+        ``camera_offline`` rows still ``pending``, newest first, at most
+        ``hourly_limit``; ``dropped`` counts the older ones left out (logged
+        once). A process exit before the Slack outcome was stored leaves such
+        a row, and ``pending`` is not confirmed delivery (notifications
+        README). Each is submitted again under its own ID and stored time,
+        whether or not the outage is still in progress: an episode that
+        reached the threshold is notified once even if it recovered before
+        the drain, and the row does not name its source. A row already in the
+        restored rolling hour is not counted again; an older one takes a slot
+        like any notification and waits for the hour (it is never dropped).
+        An episode or ratio alert of this process whose durable name is such
+        a row is covered by it and sends nothing twice. If the earlier POST
+        did reach Slack, the Owner sees the alert twice, never not at all.
+        """
+        rows = tuple(rows)
+        if (len(rows) > self.hourly_limit or type(dropped) is not int or dropped < 0 or any(
+                type(row) is not tuple or len(row) != 2 or not isinstance(row[0], UUID)
+                or not _aware(row[1]) for row in rows)):
+            raise ValueError("invalid restored pending rows")
+        with self._lock:
+            for event_id, at in rows:
+                # This process's own rows are its deliveries, not a restart's.
+                if event_id in self._used or event_id in self._restored:
+                    continue
+                self._restored.add(event_id)
+                self._resend.append(_Resend((at, event_id)))
+        if dropped:
+            self.dropped += dropped
+            logging.getLogger(__name__).warning(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED)
+
+    def _counted(self, event_id: UUID) -> bool:
+        """Whether ``event_id`` already holds a slot of the rolling hour."""
+        return any(entry == event_id for _time, entry in self._sent)
+
     def _window_open(self, now: float) -> bool:
         if not math.isfinite(now):
             return True
@@ -544,7 +617,11 @@ class CameraOfflineMonitor:
         ``flapping_id(source_id)`` names a ratio alert: ``(event ID,
         notified)``, ``notified`` when an earlier process stored a ratio
         alert of that source within the window. Any of them may be absent or
-        fail; the alert then gets a per-process ID.
+        fail; the alert then gets a per-process ID. A stored row still
+        ``pending`` is not confirmed (Issue #336): ``known`` (or ``notified``)
+        then gives its stored time instead of ``True``, and the alert is
+        submitted again under that ID and time; only ``True`` (a final
+        ``sent`` / ``failed`` / ``disabled`` row) settles it as notified.
         """
         now = monotonic
         with self._lock:
@@ -565,23 +642,29 @@ class CameraOfflineMonitor:
                         episode = source.episode
                         if episode is not None and episode.recovered is None:
                             episode.counted_from, episode.flapping = now, True
-            due = sorted(((identity, item) for identity, source in self._sources.items()
-                          for item in (source.owed, source.episode, source.flap)
-                          if item is not None and not item.notified
-                          and (isinstance(item, _Flap) or item.qualifies(now, self.after))),
+            due = sorted([*((None, item) for item in self._resend),
+                          *((identity, item) for identity, source in self._sources.items()
+                            for item in (source.owed, source.episode, source.flap)
+                            if item is not None and not item.notified
+                            and (isinstance(item, _Flap) or item.qualifies(now, self.after)))],
                          key=lambda entry: entry[1].since)
         for identity, item in () if stopped else due:
             flap = isinstance(item, _Flap)
-            ongoing = not item.ended if flap else item.recovered is None
+            resend = isinstance(item, _Resend)
+            # A restored row is never dropped: its source is not known.
+            ongoing = True if resend else not item.ended if flap else item.recovered is None
             with self._lock:
-                source = self._sources[identity]
-                if (not flap and item.flapping and source.period == _BY_RATIO
+                source = None if resend else self._sources[identity]
+                if (not flap and not resend and item.flapping and source.period == _BY_RATIO
                         and source.continuous_sent):
                     # A ratio-opened period yields at most one continuous
                     # notification after its ratio alert (at most two).
                     self._finish(identity, item)
                     continue
-            if not self._window_open(now):
+            # A restored row already counted in the rolling hour is sent
+            # again without taking a second slot.
+            if not self._window_open(now) and not (
+                    item.attempt is not None and self._counted(item.attempt[1])):
                 with self._lock:
                     if not ongoing:
                         # Recovered (or the flapping period closed) while
@@ -602,14 +685,26 @@ class CameraOfflineMonitor:
                     event_id, earlier = self._flapping_name(identity, flapping_id)
                 else:
                     event_id = self._durable(identity, durable_id) if ongoing else None
-                    earlier = event_id is not None and self._known(event_id, known)
+                    earlier = (event_id is not None and event_id not in self._restored
+                               and self._known(event_id, known))
+                if event_id is not None and event_id in self._restored:
+                    # The earlier process's pending row of this name is sent
+                    # again by ``restore_pending``: that covers this alert.
+                    # Claimed once, so a later episode reusing the name gets
+                    # a per-process ID (as for any used name).
+                    self._restored.discard(event_id)
+                    earlier = True
+                if isinstance(earlier, datetime):
+                    # A pending row: submitted again under its ID and time.
+                    attempt, earlier = (earlier, event_id), False
                 if earlier:
                     # An earlier process already notified this outage.
                     self._used.add(event_id)
                     with self._lock:
                         self._finish(identity, item)
                     continue
-                attempt = (at, event_id or self._local_id(identity))
+                if attempt is None:
+                    attempt = (at, event_id or self._local_id(identity))
             if not notifications.can_accept(attempt[1]):
                 # Queue full or closed: retried on the next drain.
                 item.attempt = attempt
@@ -620,7 +715,7 @@ class CameraOfflineMonitor:
                 item.attempt = attempt
                 continue
             self._used.add(attempt[1])
-            if math.isfinite(now):
+            if math.isfinite(now) and not self._counted(attempt[1]):
                 self._sent.append((now, attempt[1]))
             with self._lock:
                 item.attempt = None
@@ -631,7 +726,8 @@ class CameraOfflineMonitor:
                           and source.episode.qualifies(now, self.after))
             held = sum(1 for source in self._sources.values()
                        for item in (source.owed, source.episode, source.flap)
-                       if item is not None and item.held and not item.notified)
+                       if item is not None and item.held and not item.notified) + sum(
+                           1 for item in self._resend if item.held)
             flapping = sum(1 for source in self._sources.values()
                            if source.period == _BY_RATIO)
         return CameraOfflineStatus(offline_sources=offline, held=held,
@@ -651,8 +747,12 @@ class CameraOfflineMonitor:
         report the same outage again; a dropped one (``sent=False``) opens
         none, since the Owner was never told.
         """
-        source = self._sources[identity]
         item.notified = True
+        if isinstance(item, _Resend):
+            if item in self._resend:
+                self._resend.remove(item)
+            return
+        source = self._sources[identity]
         if isinstance(item, _Flap):
             if source.flap is item:
                 source.flap = None
@@ -676,7 +776,8 @@ class CameraOfflineMonitor:
         except Exception:
             return None, False
         if (type(value) is not tuple or len(value) != 2 or not isinstance(value[0], UUID)
-                or type(value[1]) is not bool or value[0] in self._used):
+                or not (type(value[1]) is bool or _aware(value[1]))
+                or (value[0] in self._used and value[0] not in self._restored)):
             return None, False
         return value
 
@@ -687,16 +788,22 @@ class CameraOfflineMonitor:
             value = durable_id(identity)
         except Exception:
             return None
-        if not isinstance(value, UUID) or value in self._used:
+        if not isinstance(value, UUID) or (value in self._used and value not in self._restored):
             return None
         return value
 
     @staticmethod
-    def _known(event_id, known) -> bool:
+    def _known(event_id, known) -> bool | datetime:
+        """``True`` (final row), a pending row's stored time, or ``False``."""
         if known is None:
             return False
         try:
-            return known(event_id) is True
+            value = known(event_id)
         except Exception:
             # Unknown: notify rather than risk hiding an outage.
             return False
+        return value if value is True or _aware(value) else False
+
+
+def _aware(value) -> bool:
+    return isinstance(value, datetime) and value.tzinfo is not None

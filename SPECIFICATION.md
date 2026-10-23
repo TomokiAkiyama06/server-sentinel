@@ -1488,15 +1488,30 @@ the first alert for a long time never sends a later outage under the old
 time. A recovery is recorded in the episode and is not notified. At most `hourly_limit` (default 4, 1 to 60) such
 notifications go out per rolling hour for all sources together, re-seeded
 after a restart from the confirmed `camera_offline` rows accepted in the last
-hour (a `pending` one included, since it is never resent; an unconfirmed local
-observation never counts); an episode held back by the
+hour (a `pending` one included: it is sent again and keeps that one slot; an
+unconfirmed local observation never counts); an episode held back by the
 cap is logged once (`camera_offline_notification_rate_limited`) and notified
 when the hour allows if the source is still not online, and one that recovered
 meanwhile is dropped (`camera_offline_notification_dropped`). An episode in
 progress is named after the source and its registry `last_seen_at` (the last
 frame time), so a restart during the same outage finds the row and does not
-notify again; a `pending` row (an uncertain delivery of the stopped process) is
-not resent. A row of that name accepted more than 24 hours earlier no longer
+notify again. Only a final row (`sent`, `failed` or `disabled`) counts as
+notified (Issue #336): a `pending` row is a delivery whose Slack outcome the
+stopped process never stored, which is not confirmed delivery. On the first
+running tick the newest such confirmed `camera_offline` rows accepted in the
+last 24 hours (at most `hourly_limit`; older ones beyond that are dropped and
+logged as `camera_offline_notification_dropped`) are submitted again under
+their stored event ID and time, whether or not the outage is still in
+progress, as an episode that reached the threshold is notified once even if it
+recovered before the drain (the row does not name its source, so it opens no
+alerted period and is never dropped as recovered). One already in the restored
+hour keeps its slot and is not counted twice; an older one takes a slot like
+any notification and waits for the hour. An episode or ratio alert whose
+durable name is such a row is covered by it and sends nothing twice; a
+`pending` row found only by name is submitted again under that name and time.
+If the earlier POST did reach Slack the Owner receives the alert twice, never
+not at all. A pending row older than 24 hours is not sent again (the outage is
+named anew after a day). A row of that name accepted more than 24 hours earlier no longer
 counts as this outage (Owner decision 2026-10-22, PR #320): the next name of a
 deterministic chain (`…:repeat:1`, `…:repeat:2`, …) is used and the outage is
 notified again, under the hourly cap; a restart within 24 hours of that

@@ -774,13 +774,16 @@ class MonitoringRuntime:
                 # The rolling hour continues across a restart (as Issue #281
                 # item 2 for the access budgets).
                 # Only the confirmed threshold alerts the monitor counted,
-                # an accepted `pending` one included (it is never resent),
-                # never an unconfirmed local `camera_offline` observation
-                # (Codex PR #320).
+                # an accepted `pending` one included (it is sent again below
+                # and keeps that one slot), never an unconfirmed local
+                # `camera_offline` observation (Codex PR #320).
+                now = self.dependencies.utcnow()
                 monitor.restore_window(self._notification_window(
                     (NotificationKind.CAMERA_OFFLINE,), monitor.hourly_limit,
-                    self.dependencies.utcnow(), confirmed_only=True, include_pending=True),
+                    now, confirmed_only=True, include_pending=True),
                     monotonic=self.dependencies.monotonic())
+                rows, dropped = self._camera_pending_rows(monitor.hourly_limit, now)
+                monitor.restore_pending(rows, dropped=dropped)
                 self._camera_window_restored = True
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
                                    monotonic=self.dependencies.monotonic(),
@@ -793,8 +796,12 @@ class MonitoringRuntime:
         self._set(camera_offline_degraded=status.offline_sources > 0
                   or status.flapping_sources > 0)
 
-    def _camera_flapping_event(self, source_id: UUID) -> tuple[UUID, bool] | None:
+    def _camera_flapping_event(self, source_id: UUID) -> tuple[UUID, bool | datetime] | None:
         """``(event ID, already notified)`` of a ratio (flapping) alert.
+
+        "Already notified" is ``True`` only for a final row; for a row still
+        ``pending`` it is that row's stored time, and the alert is submitted
+        again under the same ID and time (Issue #336).
 
         Refs #301 (Owner decision 2026-10-22): named after the source, the
         window length and the wall-clock window bucket of the trigger, so a
@@ -818,16 +825,19 @@ class MonitoringRuntime:
         taken = False
         for position, event_id in enumerate(names):
             stored = self._connection.execute(
-                "SELECT at FROM notification_events WHERE event_id=?",
+                "SELECT at, delivery FROM notification_events WHERE event_id=?",
                 (str(event_id),)).fetchone()
             if stored is None:
                 continue
             try:
-                age = (now - datetime.fromisoformat(stored[0])).total_seconds()
+                at = datetime.fromisoformat(stored[0])
+                age = (now - at).total_seconds()
             except (TypeError, ValueError):
                 age = math.inf
             if age < window:
-                return event_id, True
+                # A `pending` row is not confirmed (Issue #336): its stored
+                # time is given and the alert is sent again under that ID.
+                return event_id, (at if stored[1] == DeliveryResult.PENDING.value else True)
             taken = taken or position == 0
         return None if taken else (names[0], False)
 
@@ -872,13 +882,61 @@ class MonitoringRuntime:
                 return event_id
         return None
 
-    def _notification_known(self, event_id: UUID) -> bool:
-        """Whether a `notification_events` row with ``event_id`` exists (any state).
+    def _notification_known(self, event_id: UUID) -> bool | datetime:
+        """``True`` for a final `notification_events` row of ``event_id``.
 
-        A `pending` row is an earlier process's uncertain delivery: it is not
-        sent again (no duplicate), as for the presence critical claims.
+        Only a stored final outcome (`sent`, `failed`, `disabled`) is
+        "already notified". A `pending` row is an earlier process's delivery
+        whose outcome was never stored: it is not confirmed (notifications
+        README, Issue #336), so its stored time is returned and the monitor
+        submits it again under the same ID and time, the outcome landing in
+        that row. ``False`` without a row.
         """
-        return self.notification_events.get(event_id) is not None
+        stored = self.notification_events.get(event_id)
+        if stored is None:
+            return False
+        if stored["delivery"] == DeliveryResult.PENDING:
+            return stored["at"]
+        return True
+
+    def _camera_pending_rows(self, limit: int,
+                             now: datetime) -> tuple[list[tuple[UUID, datetime]], int]:
+        """``(rows, dropped)``: confirmed `camera_offline` rows still `pending`.
+
+        Issue #336: an earlier process that exited before the Slack outcome
+        was stored left these; the monitor sends them again
+        (``restore_pending``). Rows accepted in the last
+        ``CAMERA_OFFLINE_RENOTIFY_SECONDS`` (24 h, as the durable name chain;
+        a time in the future counts as recent) are taken newest first, at
+        most ``limit``; ``dropped`` counts the older ones left out. An older
+        row is not resent: the outage it reported is named anew after a day.
+        A row whose ID cannot be read is skipped; one whose time cannot be
+        read is sent with ``now`` (the stored row keeps its own time).
+        """
+        since = (now - timedelta(seconds=CAMERA_OFFLINE_RENOTIFY_SECONDS)
+                 ).astimezone(timezone.utc).isoformat()
+        cursor = self._connection.execute(
+            "SELECT event_id, at, COALESCE(accepted_at, at) AS accepted FROM notification_events "
+            "WHERE kind=? AND confirmed=1 AND delivery=? AND accepted > ? ORDER BY accepted DESC",
+            (NotificationKind.CAMERA_OFFLINE.value, DeliveryResult.PENDING.value, since))
+        rows, dropped = [], 0
+        try:
+            for event_id, at, _accepted in cursor:
+                try:
+                    event = UUID(event_id)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if len(rows) == limit:
+                    dropped += 1
+                    continue
+                try:
+                    stamp = datetime.fromisoformat(at)
+                except (TypeError, ValueError):
+                    stamp = now
+                rows.append((event, stamp if stamp.tzinfo is not None else now))
+        finally:
+            cursor.close()
+        return rows, dropped
 
     def _latest_finding(self, *, since: datetime | None = None) -> tuple[str, int] | None:
         """``(id, occurred_at_us)`` of the newest finding audit record.
@@ -1025,7 +1083,8 @@ class MonitoringRuntime:
         ``NotificationEventStore`` writes, and every row is parsed again here.
         ``confirmed_only`` keeps confirmed rows only; ``include_pending``
         also counts `pending` rows, for a budget whose accepted but uncertain
-        deliveries are not sent again (the camera offline monitor).
+        deliveries are sent again under their own ID and keep that one slot
+        (the camera offline monitor, Issue #336).
         """
         marks = ",".join("?" for _ in kinds)
         excluded = () if include_pending else (DeliveryResult.PENDING.value,)
@@ -1113,7 +1172,8 @@ class MonitoringRuntime:
         Shutdown calls it before `stop()`, so a notification submitted just
         before shutdown still completes and is recorded when the endpoint
         answers in time. Returns how many deliveries are still pending; those
-        stay `pending` in `notification_events` (uncertain, never resent).
+        stay `pending` in `notification_events` (uncertain, not confirmed); a
+        restarted process's reconciliation decides whether one is sent again.
         """
         self._require_owner()
         if self.notifications is None:

@@ -423,6 +423,108 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
         self.drain(monitor, durable_id=lambda source: durable, known=lambda value: value == durable)
         self.assertEqual([], self.sent())
 
+    def test_a_pending_durable_id_is_sent_again_under_its_id_and_time(self):
+        # Issue #336: a `pending` row (the earlier process exited before the
+        # Slack outcome was stored) is not confirmed: `known` gives its
+        # stored time and the alert is submitted again under that ID.
+        durable, stored = uuid4(), AT - timedelta(hours=2)
+        # Counted once: the row already holds one of the two slots.
+        monitor = self.monitor(hourly_limit=2)
+        self.online(monitor)
+        monitor.restore_window([(durable, 600.0)], monotonic=self.clock.value)
+        monitor.health_sink(event(self.sources[0], CameraState.OFFLINE))
+        self.advance(300)
+        known = {durable: stored}
+        self.drain(monitor, durable_id=lambda source: durable,
+                   known=lambda value: known.get(value, False))
+        rows = self.sent()
+        self.assertEqual([(durable, stored, "sent")],
+                         [(row.event_id, row.at, row.delivery.value) for row in rows])
+        self.assertEqual(1, len(monitor._sent))
+        # Another source takes the second slot, and nothing is left.
+        monitor.health_sink(event(self.sources[1], CameraState.OFFLINE))
+        self.advance(300)
+        self.assertEqual(0, self.drain(monitor).held)
+        self.assertEqual(2, len(self.sent()))
+        self.assertEqual(2, len(monitor._sent))
+
+    def test_restored_pending_rows_are_sent_again_once(self):
+        # Issue #336: rows the runtime found still `pending` at start, sent
+        # whether or not the outage is still in progress (the row does not
+        # name its source), and never twice when an episode maps to them.
+        monitor = self.monitor(hourly_limit=2)
+        self.online(monitor)
+        counted, older = uuid4(), uuid4()
+        monitor.restore_window([(counted, 60.0), (uuid4(), 120.0)],
+                               monotonic=self.clock.value)
+        stored = AT - timedelta(minutes=1)
+        monitor.restore_pending([(counted, stored), (older, stored)])
+        status = self.drain(monitor)
+        # The counted row keeps its slot; the older one waits for a slot.
+        self.assertEqual([counted], [row.event_id for row in self.sent()])
+        self.assertEqual(stored, self.sent()[0].at)
+        self.assertEqual(1, status.held)
+        self.advance(3600 - 120)
+        self.assertEqual(0, self.drain(monitor).held)
+        self.assertEqual({counted, older}, {row.event_id for row in self.sent()})
+        # A restored ID that an outage's durable name maps to is covered:
+        # one alert. A later episode reusing that name gets its own ID.
+        monitor = self.monitor()
+        self.sink.rows.clear()
+        self.online(monitor)
+        durable = uuid4()
+        monitor.restore_pending([(durable, stored)])
+        source = self.sources[0]
+        for _ in range(2):
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+            self.advance(300)
+            self.drain(monitor, durable_id=lambda value: durable,
+                       known=lambda value: stored if value == durable else False)
+            monitor.health_sink(event(source, CameraState.ONLINE))
+        rows = self.sent()
+        self.assertEqual(2, len(rows))
+        self.assertIn(durable, {row.event_id for row in rows})
+        # The flapping name is covered the same way.
+        monitor = self.monitor()
+        self.sink.rows.clear()
+        self.online(monitor)
+        durable = uuid4()
+        monitor.restore_pending([(durable, stored)])
+        self.drain(monitor)
+        for _ in range(2):
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+            self.advance(240)
+            self.drain(monitor, flapping_id=lambda value: (durable, stored))
+            monitor.health_sink(event(source, CameraState.ONLINE))
+            self.advance(2)
+        self.assertEqual([durable], [row.event_id for row in self.sent()])
+        self.assertEqual(1, self.drain(monitor).flapping_sources)
+        for rows in ([(uuid4(), stored)] * 5, [(uuid4(), AT.replace(tzinfo=None))],
+                     [("x", stored)]):
+            with self.assertRaises(ValueError):
+                monitor.restore_pending(rows)
+        with self.assertRaises(ValueError):
+            monitor.restore_pending([], dropped=-1)
+
+    def test_a_restored_pending_row_waits_for_the_queue(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        pending, stored = uuid4(), AT - timedelta(minutes=1)
+        monitor.restore_pending([(pending, stored)])
+        self.service.close()
+        self.drain(monitor)
+        self.assertEqual([], self.sent())
+        self.service = NotificationService(
+            self.sink, SlackDelivery(endpoint(), opener=self.transport))
+        self.addCleanup(self.service.close)
+        self.drain(monitor)
+        self.assertEqual([(pending, stored)], [(row.event_id, row.at) for row in self.sent()])
+        # Stopped: nothing further.
+        monitor.restore_pending([(uuid4(), stored)])
+        monitor.stop()
+        self.drain(monitor)
+        self.assertEqual(1, len(self.sent()))
+
     def test_the_durable_id_names_the_row_and_a_reused_one_is_not_trusted(self):
         monitor = self.monitor()
         self.online(monitor)
@@ -969,6 +1071,26 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
             self.advance(2)
         self.assertEqual([name], [row.event_id for row in self.sent()])
 
+    def test_a_pending_flapping_row_is_sent_again_under_its_id_and_time(self):
+        # Issue #336: `pending` is not confirmed delivery.
+        stored = AT - timedelta(minutes=5)
+        for notified, expected in ((stored, [(stored, True)]), (True, [])):
+            with self.subTest(notified=notified):
+                self.sink.rows.clear()
+                monitor = self.monitor()
+                self.online(monitor)
+                name = uuid4()
+                for _ in range(2):
+                    self.off(monitor)
+                    self.advance(240)
+                    self.drain(monitor, flapping_id=lambda source: (name, notified))
+                    self.on(monitor)
+                    self.advance(2)
+                self.assertEqual(expected,
+                                 [(row.at, row.event_id == name) for row in self.sent()])
+                # Either way the period is open: no second ratio alert.
+                self.assertEqual(1, self.drain(monitor).flapping_sources)
+
     def test_failing_or_reused_flapping_ids_fall_back_to_a_process_id(self):
         def broken(source):
             raise RuntimeError("synthetic database error")
@@ -1384,19 +1506,121 @@ class LifespanTests(RuntimeFixture):
             self.assertEqual([ALERT], self.slack_texts())
             uvc.status = real_status
 
-    def stored_row(self, *, confirmed, delivery, age):
+    def stored_row(self, *, confirmed, delivery, age, event_id=None):
+        event_id = event_id or uuid4()
         at = (self.clock.now - timedelta(seconds=age)).isoformat()
         with closing(sqlite3.connect(self.settings.database_path)) as db:
             db.execute(
                 "INSERT INTO notification_events(event_id,kind,at,confirmed,delivery,accepted_at) "
                 "VALUES (?,?,?,?,?,?)",
-                (str(uuid4()), NotificationKind.CAMERA_OFFLINE.value, at, int(confirmed),
+                (str(event_id), NotificationKind.CAMERA_OFFLINE.value, at, int(confirmed),
                  delivery, at))
             db.commit()
+        return event_id
+
+    def delivery(self, event_id):
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            row = db.execute("SELECT delivery, at FROM notification_events WHERE event_id=?",
+                             (str(event_id),)).fetchone()
+        return None if row is None else row[0]
+
+    def stored_at(self, event_id):
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            return db.execute("SELECT at FROM notification_events WHERE event_id=?",
+                              (str(event_id),)).fetchone()[0]
+
+    async def test_a_pending_alert_of_the_same_outage_is_sent_again(self):
+        # Issue #336: the earlier process exited before the Slack outcome of
+        # this outage's alert was stored. The restarted process finds the
+        # same durable name and sends it again under that ID and time.
+        pending = self.stored_row(confirmed=True, delivery="pending", age=600,
+                                  event_id=self.chain_name())
+        at = self.stored_at(pending)
+        self.discovery.devices = []
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(datetime.fromisoformat(at),
+                             await runtime.call(runtime._notification_known, pending))
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+            self.assertEqual([ALERT], self.slack_texts())
+            self.assertTrue(await runtime.call(runtime._notification_known, pending))
+            # The same outage is not notified a third time.
+            self.clock.advance(timedelta(hours=2))
+            await self.tick(runtime)
+        self.assertEqual([ALERT], self.slack_texts())
+        self.assertEqual([(1, "sent")], self.offline_rows())
+        self.assertEqual(at, self.stored_at(pending))
+
+    async def test_a_final_row_of_the_same_outage_is_not_sent_again(self):
+        for delivery in ("sent", "failed", "disabled"):
+            with self.subTest(delivery=delivery):
+                self.delete_rows()
+                self.stored_row(confirmed=True, delivery=delivery, age=600,
+                                event_id=self.chain_name())
+                self.discovery.devices = []
+                application = self.uvc_application()
+                async with asyncio.timeout(60), application.router.lifespan_context(application):
+                    runtime = application.state.monitoring
+                    self.assertIs(True, await runtime.call(
+                        runtime._notification_known, self.chain_name()))
+                    self.clock.advance(timedelta(seconds=301))
+                    await self.tick(runtime)
+                self.assertEqual([], self.slack_texts())
+                self.assertEqual([(1, delivery)], self.offline_rows())
+
+    async def test_a_pending_alert_of_a_recovered_outage_is_sent_again(self):
+        # The outage ended while the service was down; the alert reached the
+        # threshold, so it is sent once, as one that recovered before the
+        # drain (Issue #336).
+        pending = self.stored_row(confirmed=True, delivery="pending", age=1800)
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.bring_online(application)
+            await self.tick(runtime)
+            self.assertEqual([ALERT], self.slack_texts())
+            self.assertEqual("sent", self.delivery(pending))
+            self.clock.advance(timedelta(hours=2))
+            await self.tick(runtime)
+        self.assertEqual([ALERT], self.slack_texts())
+        # Older than a day: superseded, not sent again; final rows never.
+        self.delete_rows()
+        self.transport.requests.clear()
+        old = self.stored_row(confirmed=True, delivery="pending", age=25 * 3600)
+        self.stored_row(confirmed=True, delivery="sent", age=60)
+        self.stored_row(confirmed=False, delivery="pending", age=60)
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.bring_online(application)
+            await self.tick(runtime)
+        self.assertEqual([], self.slack_texts())
+        self.assertEqual("pending", self.delivery(old))
+
+    async def test_more_pending_alerts_than_an_hour_allows(self):
+        # At most `hourly_limit` are taken (newest first), each counted once;
+        # the older ones are dropped and logged.
+        configuration = self.configuration(camera_offline=CameraOfflineNotification(300, 2))
+        rows = [self.stored_row(confirmed=True, delivery="pending", age=age)
+                for age in (60, 120, 180)]
+        application = self.uvc_application(configuration)
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.bring_online(application)
+            with self.assertLogs("app.monitoring.cameras", level="WARNING") as logs:
+                await self.tick(runtime)
+            self.assertIn(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED, "".join(logs.output))
+            self.assertEqual([ALERT, ALERT], self.slack_texts())
+            self.assertEqual(["sent", "sent", "pending"], [self.delivery(row) for row in rows])
+            monitor = application.state.camera_offline
+            self.assertEqual(2, len(monitor._sent))
 
     async def test_restored_window_counts_confirmed_alerts_including_pending(self):
         # Codex PR #320 P2: an unconfirmed local observation never used the
-        # budget; an accepted `pending` alert did (it is never resent).
+        # budget; an accepted `pending` alert did. Issue #336: that alert is
+        # sent again at once under its own slot, never counted twice.
         configuration = self.configuration(camera_offline=CameraOfflineNotification(300, 1))
         self.stored_row(confirmed=False, delivery="suppressed", age=60)
         application = self.uvc_application(configuration)
@@ -1411,17 +1635,20 @@ class LifespanTests(RuntimeFixture):
             db.execute("DELETE FROM notification_events WHERE kind=?",
                        (NotificationKind.CAMERA_OFFLINE.value,))
             db.commit()
-        self.stored_row(confirmed=True, delivery="pending", age=60)
+        pending = self.stored_row(confirmed=True, delivery="pending", age=60)
         application = self.uvc_application(configuration)
         async with asyncio.timeout(60), application.router.lifespan_context(application):
             runtime = application.state.monitoring
             self.clock.advance(timedelta(seconds=301))
             with self.assertLogs("app.monitoring.cameras", level="WARNING"):
                 await self.tick(runtime)
-            self.assertEqual([], self.slack_texts())
+            # The pending alert went out again; the new outage is held.
+            self.assertEqual([ALERT], self.slack_texts())
+            self.assertEqual("sent", self.delivery(pending))
+            self.assertEqual(1, len(application.state.camera_offline._sent))
             self.clock.advance(timedelta(hours=1))
             await self.tick(runtime)
-            self.assertEqual([ALERT], self.slack_texts())
+            self.assertEqual([ALERT, ALERT], self.slack_texts())
 
     async def test_without_slack_the_row_is_disabled_and_the_path_unavailable(self):
         self.slack = False
@@ -1532,6 +1759,12 @@ class LifespanTests(RuntimeFixture):
             recent = (self.clock.now - timedelta(seconds=100)).isoformat()
             self.insert_row(self.flapping_name(bucket - 1), recent, recent)
             self.assertEqual((self.flapping_name(bucket - 1), True), await name())
+            # A `pending` row is not confirmed: its stored time (Issue #336).
+            self.delete_rows()
+            pending = self.stored_row(confirmed=True, delivery="pending", age=100,
+                                      event_id=self.flapping_name(bucket - 1))
+            self.assertEqual((pending, datetime.fromisoformat(self.stored_at(pending))),
+                             await name())
             # More than a window ago by its event time (which a retry keeps),
             # even when accepted later.
             self.delete_rows()
