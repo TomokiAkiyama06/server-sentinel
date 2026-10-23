@@ -6,8 +6,9 @@ transport only. No real Slack endpoint, camera, host or network is used.
 
 import asyncio
 from dataclasses import replace
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
+import sqlite3
 import threading
 import time
 import unittest
@@ -345,12 +346,86 @@ class ClaimRefusedTests(Unrecorded, unittest.TestCase):
         timeline.recorder(item)
         self.assertEqual((item.identifier,), timeline.unrecorded.awaiting())
 
+    def test_a_queued_alert_the_dispatcher_sent_is_not_resent_by_a_later_refusal(self):
+        # Claude review on e0028ca8 (重要 1): b waits in the refused queue for
+        # a drain slot; after recovery it is recorded and the dispatcher sends
+        # it itself; a second refusal before the next drain must not resend it.
+        transport = Transport()
+        service = self.notifications(transport, capacity=2)   # one drain slot
+        timeline = self.timeline(service)
+        a = critical(CriticalKind.SERVER_MOVEMENT, at=datetime.now(timezone.utc))
+        b = critical(CriticalKind.CAMERA_TAMPER, at=datetime.now(timezone.utc))
+        self.refuse(True)
+        for item in (a, b):
+            with self.assertRaises(Exception):
+                timeline.recorder(item)
+        self.assertEqual(1, timeline.unrecorded.drain(at=NOW))
+        self.settle(service, transport, 1)
+        self.refuse(False)
+        service.poll()
+        timeline.recorder(a)
+        timeline.recorder(b)
+        self.assertEqual(0, timeline.unrecorded.queued)
+        timeline.dispatch()
+        self.settle(service, transport, 2)
+        service.poll()
+        self.assertEqual("delivered", self.state(b.identifier))
+        self.refuse(True)
+        self.assertEqual(0, timeline.unrecorded.drain(at=NOW))
+        time.sleep(0.2)
+        service.poll()
+        self.assertEqual(1, texts(transport).count(ALERT + "camera_tamper"))
+        self.assertEqual(1, texts(transport).count(ALERT + "server_movement"))
+
+    def test_the_watch_is_registered_before_the_record_commits(self):
+        # Claude review on e0028ca8 (提案 2): a dispatch step needs the write
+        # lock to claim, so a watch registered before the commit can never be
+        # left behind by a claim and prune made right after it.
+        service = self.notifications(Transport())
+        timeline = self.timeline(service)
+        item = critical(CriticalKind.SERVER_MOVEMENT, at=datetime.now(timezone.utc))
+        seen = []
+        register = timeline.recorder.recorded
+
+        def recorded(identifier, kind, awaiting):
+            with closing(sqlite3.connect(self.database.path)) as db:
+                seen.append(db.execute("SELECT COUNT(*) FROM presence_observations WHERE id=?",
+                                       (str(identifier),)).fetchone()[0])
+            register(identifier, kind, awaiting)
+            raise RuntimeError("synthetic hand-over fault")
+
+        timeline.recorder.recorded = recorded
+        timeline.recorder(item)
+        self.assertEqual([0], seen)
+        self.assertEqual("pending", self.state(item.identifier))
+        self.assertEqual((item.identifier,), timeline.unrecorded.awaiting())
+
+    def test_an_unreadable_watch_after_a_successful_step_escalates(self):
+        # Claude review on e0028ca8 (提案 1): the step itself succeeds but the
+        # watched rows cannot be read, so the unclaimed one is attempted.
+        transport = Transport()
+        service = self.notifications(transport)
+        timeline = self.timeline(service)
+        item = critical(CriticalKind.CAMERA_TAMPER, at=datetime.now(timezone.utc))
+        timeline.recorder(item)
+
+        def unreadable(identifiers):
+            raise RuntimeError("synthetic read failure")
+
+        timeline.presence.dispatch_pending = lambda limit: 0   # nothing claimed
+        timeline.presence.awaiting_notification = unreadable
+        self.assertEqual(0, timeline.dispatch())
+        self.assertEqual(1, timeline.unrecorded.queued)
+        self.assertEqual(0, timeline.unrecorded.drain(at=NOW))
+        self.settle(service, transport, 1)
+        self.assertEqual([ALERT + "camera_tamper"], texts(transport))
+
     def test_a_successful_step_stops_watching_and_overflow_is_counted(self):
         service = self.notifications(Transport())
         adapter = self.adapter(service)
         alerts = UnrecordedCriticalAlerts(adapter, watched=2)
         for _ in range(3):
-            alerts.recorded(uuid4(), CriticalKind.CAMERA_TAMPER)
+            alerts.recorded(uuid4(), CriticalKind.CAMERA_TAMPER, True)
         self.assertEqual(2, len(alerts.awaiting()))
         self.assertEqual(1, alerts.counts()["untracked"])
         checked = alerts.awaiting()

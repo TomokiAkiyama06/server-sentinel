@@ -310,12 +310,16 @@ like a recording-health or integrity alert (Owner decision 2026-10-22, Issue
 
 - `CriticalTimelineRecorder` hands every confirmed observation whose record
   failed (anything but a contract error) to `UnrecordedCriticalAlerts`
-  (`delivery.py`) before raising to the scene runtime's retry. A recorded one
-  whose `notification` row is still `pending` / `unavailable` at the commit
-  of the same transaction (`PresenceService.record_critical()`) is also
-  handed over, as watched; an idempotent replay of an observation already
-  claimed or resolved is not, so a later refusal cannot resend an alert
-  already delivered. Until a successful dispatch step finds its
+  (`delivery.py`) before raising to the scene runtime's retry. Every
+  successful record is reported too, inside the record transaction before
+  its commit (`PresenceService.record_critical()`), so no dispatch step can
+  claim the row in between. It then leaves the refused queue, whatever its
+  state: from now on its notification belongs to the dispatcher, so one that
+  waited there for a drain slot and was sent by the dispatcher after recovery
+  is not resent by a drain during a later refusal. One whose `notification`
+  row is still `pending` / `unavailable` is watched; an idempotent replay of
+  an observation already claimed or resolved is not, so a later refusal
+  cannot resend an alert already delivered. Until a successful dispatch step finds its
   `notification` row neither `pending` nor `unavailable` (claimed, or
   resolved), a failing dispatch step escalates it to an attempt. That covers
   an observation recorded just before the disk is removed (the claim is then

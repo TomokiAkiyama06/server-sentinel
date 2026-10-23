@@ -541,7 +541,7 @@ class PresenceService:
         with self._transaction() as db:
             return self._record(db, observation, presence_valid_until, restamped, source_fact)
 
-    def record_critical(self, observation, *, restamped=False):
+    def record_critical(self, observation, *, restamped=False, recorded=None):
         """`record()` for a confirmed critical, also telling whether its notification waits.
 
         Returns ``(observation, awaiting)``: ``awaiting`` is whether, at the
@@ -550,15 +550,29 @@ class PresenceService:
         submitted it). An idempotent replay of an observation whose
         notification was already claimed or resolved is therefore not
         awaiting (Issue #318 watches only unclaimed work).
+
+        ``recorded(awaiting)``, when given, is called inside the transaction,
+        before its commit, while the write lock is held: no dispatch step can
+        claim the row between that call and the commit, so a watch it
+        registers cannot outlive a claim made right after the commit. It must
+        only touch memory; its exceptions are ignored, and if the commit then
+        fails the record fails as usual.
         """
         if not isinstance(observation, Observation):
             raise InvalidObservation("typed observation required")
+        if recorded is not None and not callable(recorded):
+            raise InvalidObservation("invalid record hand-over")
         with self._transaction() as db:
-            recorded = self._record(db, observation, None, restamped, None)
-            row = db.execute("SELECT 1 FROM presence_deliveries WHERE observation=? "
-                             "AND action='notification' AND state IN ('pending','unavailable')",
-                             (str(observation.identifier),)).fetchone()
-        return recorded, row is not None
+            stored = self._record(db, observation, None, restamped, None)
+            awaiting = db.execute("SELECT 1 FROM presence_deliveries WHERE observation=? "
+                                  "AND action='notification' AND state IN ('pending','unavailable')",
+                                  (str(observation.identifier),)).fetchone() is not None
+            if recorded is not None:
+                try:
+                    recorded(awaiting)
+                except Exception:
+                    pass
+        return stored, awaiting
 
     def _record(self, db, observation, presence_valid_until, restamped, source_fact):
         # The body of `record()` inside its admitted transaction.

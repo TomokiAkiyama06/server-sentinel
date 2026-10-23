@@ -858,6 +858,24 @@ class LifespanTests(RuntimeFixture):
             await asyncio.sleep(0.3)
         self.assertEqual([ALERT + "server_movement"] * 2, self.critical_texts())
 
+    async def test_alerts_still_waiting_at_shutdown_are_logged_unsent(self):
+        # Claude review on e0028ca8 (提案 1): more refused alerts than the
+        # drain may hold while earlier ones are still in flight.
+        self.transport = GatedTransport()
+        self.addCleanup(self.transport.gate.set)
+        application = self.scene_application(dispatch_interval_seconds=3600,
+                                              dispatch_backoff_seconds=3600,
+                                              dispatch_settle_seconds=0.2)
+        timeline = application.state.scene_timeline
+        with self.assertLogs("app", level="INFO") as logs:
+            async with asyncio.timeout(30), application.router.lifespan_context(application):
+                self.assertTrue(await self.until(lambda: timeline.opened))
+                for _ in range(9):
+                    timeline.unrecorded.refused(uuid4(), CriticalKind.CAMERA_TAMPER)
+        self.assertEqual(8, timeline.unrecorded.submitted)
+        self.assertEqual(1, timeline.unrecorded.queued)
+        self.assertIn(f"ERROR:app.main:{Event.UNRECORDED_CRITICAL_ALERTS_UNSENT.value}", logs.output)
+
     async def test_settle_waits_for_a_slow_delivery_and_gives_up_at_its_bound(self):
         self.transport = GatedTransport()
         self.addCleanup(self.transport.gate.set)

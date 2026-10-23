@@ -1180,9 +1180,11 @@ still attempted like a recording-health alert (Owner decision 2026-10-22,
 Issue #318, accepting the duplicate risk): the recorder hands the event ID
 and fixed kind to a bounded in-memory queue without blocking (64, overflow
 counted and logged value-free; in practice bounded by the 32-observation
-critical staging), and also watches every recorded one whose notification
-row is still unclaimed at its commit (at most 64; an idempotent replay of one
-already claimed or resolved is not watched) until a dispatch step claims it,
+critical staging). Once recorded, an observation leaves that queue (its
+notification belongs to the dispatcher), and one whose notification row is
+still unclaimed is watched, registered inside the record transaction before
+its commit (at most 64; an idempotent replay of one already claimed or
+resolved is not watched), until a dispatch step claims it,
 escalating it when a dispatch step fails (a record just before the disk is
 removed, or a row left `unavailable` for queue space). The dispatcher submits these on the monitoring worker at every 5 s
 interval, independently of the failing dispatch step's backoff, through the

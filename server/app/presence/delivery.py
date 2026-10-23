@@ -173,11 +173,14 @@ class UnrecordedCriticalAlerts:
     (a short lock, no I/O, no wait for the monitoring worker):
 
     - `refused()`: the timeline recorder could not record the observation;
-    - `recorded()` / `escalate()`: the recorder wrote it, and it stays watched
-      until a successful dispatch step finds its notification row neither
-      `pending` nor `unavailable` (`prune()`); a dispatch step that fails
-      escalates every watched one to `refused()`. A row left `unavailable`
-      because the notification queue was full stays watched as well.
+    - `recorded()` / `escalate()`: the recorder wrote it (told inside the
+      record transaction, before the commit, so no claim can slip in
+      between). It leaves the refused queue, and while its notification row
+      is unclaimed it stays watched until a successful dispatch step finds
+      that row neither `pending` nor `unavailable` (`prune()`); a dispatch
+      step that fails escalates every watched one to `refused()`. A row left
+      `unavailable` because the notification queue was full stays watched as
+      well.
 
     A full queue counts the hand-over in `dropped` and logs
     `unrecorded_critical_alert_dropped` value-free (first and every
@@ -272,14 +275,28 @@ class UnrecordedCriticalAlerts:
         if dropped & (dropped - 1) == 0:
             logging.getLogger(__name__).warning(Event.UNRECORDED_CRITICAL_ALERT_DROPPED)
 
-    def recorded(self, identifier: UUID, kind) -> None:
-        """Watch a confirmed critical the recorder wrote until it is claimed; never blocks."""
+    def recorded(self, identifier: UUID, kind, awaiting: bool = True) -> None:
+        """The recorder wrote a confirmed critical; never blocks.
+
+        It leaves the refused queue whatever ``awaiting`` says: once recorded,
+        its notification belongs to the dispatcher, and only the watch below
+        can bring it back here. Without that, one left queued for want of a
+        drain slot and sent by the dispatcher after recovery would be resent
+        by a drain during a later refusal, a second message in one process.
+
+        ``awaiting`` (its `notification` row still `pending` / `unavailable`)
+        watches it until a successful dispatch step finds it claimed; a
+        replay of one already claimed or resolved stops watching it.
+        """
         if not isinstance(identifier, UUID):
             raise ValueError("invalid critical identity")
         kind = self._kind(kind)
-        if not self._adapter.armed():
-            return
+        watch = awaiting is True and self._adapter.armed()
         with self._lock:
+            self._queued.pop(identifier, None)
+            if not watch:
+                self._recorded.pop(identifier, None)
+                return
             self._recorded[identifier] = kind
             self._recorded.move_to_end(identifier)
             while len(self._recorded) > self._watched:
