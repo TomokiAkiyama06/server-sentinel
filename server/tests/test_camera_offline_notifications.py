@@ -1724,7 +1724,8 @@ class LifespanTests(RuntimeFixture):
             await self.bring_online(application)
             with self.assertLogs("app.monitoring.cameras", level="WARNING") as logs:
                 await self.tick(runtime)
-            self.assertIn(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED, "".join(logs.output))
+            self.assertIn(Event.CAMERA_OFFLINE_NOTIFICATION_UNRESTORED, "".join(logs.output))
+            self.assertNotIn(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED, "".join(logs.output))
             self.assertEqual([ALERT, ALERT], self.slack_texts())
             self.assertEqual(["sent", "sent", "pending"], [self.delivery(row) for row in rows])
             monitor = application.state.camera_offline

@@ -61,8 +61,11 @@ its stored event ID and time whether or not the outage is still in progress
 before the drain; the row does not name its source). An episode or ratio
 alert whose durable name is such a row is covered by it, settled when it is
 named, before the cap is consulted; a pending row found only by ``known`` /
-``flapping_id`` is submitted again the same way. If the earlier POST did
-reach Slack the Owner sees the alert twice, never not at all.
+``flapping_id`` is submitted again the same way. For such a restored row or
+one found by name, if the earlier POST did reach Slack the Owner sees the
+alert twice, never not at all. A pending row beyond ``hourly_limit`` that is
+left out of the restore (``unrestored``) and that no outage in progress maps
+to by name (its outage recovered) is not sent again.
 
 Cap: at most ``hourly_limit`` notifications per rolling hour for all sources
 together, continued across a restart from the confirmed ``camera_offline``
@@ -576,14 +579,17 @@ class CameraOfflineMonitor:
         so it can be up to about an hour late. Live alerts go first; restored
         rows follow by their stored time. A resend is never dropped. An
         episode or ratio alert of this process whose durable name is such a
-        row is covered by it and sends nothing twice. If the earlier POST did
-        reach Slack, the Owner sees the alert twice, never not at all.
+        row is covered by it and sends nothing twice. For such a restored row,
+        if the earlier POST did reach Slack, the Owner sees the alert twice,
+        never not at all.
 
         ``unrestored`` counts the older pending rows left out (more than
         ``hourly_limit``): they are not resent on their own, only when an
         outage still in progress or a ratio alert maps to one by name (then
-        as above under its ID and time). They are counted in
-        ``unrestored`` (not ``dropped``) and logged once.
+        as above under its ID and time); one whose outage already recovered
+        is not sent again. They are counted in ``unrestored`` (not
+        ``dropped``) and logged once as
+        ``camera_offline_notification_unrestored``.
         """
         rows = tuple(rows)
         if (len(rows) > self.hourly_limit or type(unrestored) is not int or unrestored < 0
@@ -599,7 +605,7 @@ class CameraOfflineMonitor:
                 self._resend.append(_Resend((at, event_id)))
         if unrestored:
             self.unrestored += unrestored
-            logging.getLogger(__name__).warning(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED)
+            logging.getLogger(__name__).warning(Event.CAMERA_OFFLINE_NOTIFICATION_UNRESTORED)
 
     def _counted(self, event_id: UUID) -> bool:
         """Whether ``event_id`` already holds a slot of the rolling hour."""

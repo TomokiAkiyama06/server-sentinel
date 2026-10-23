@@ -1630,10 +1630,15 @@ before resends, which follow in stored-time order. An episode or ratio alert
 whose durable name is such a row is covered by it as soon as it is named,
 before the cap is consulted, and sends nothing twice; a `pending` row found
 only by name is submitted again under that name and time, under the same cap.
-Pending rows beyond `hourly_limit` are not restored (logged once as
-`camera_offline_notification_dropped`); one of them is resent only when an
-outage in progress or a ratio alert maps to it by name. If the earlier POST
-did reach Slack the Owner receives the alert twice, never not at all. A pending
+So when a pending row of the hour still holds its slot and the same outage is
+still in progress, the notification of that outage itself waits for the slot
+too and can be up to about an hour late, even when the hour has room for
+other alerts. Pending rows beyond `hourly_limit` are not restored (counted as
+`unrestored` and logged once as `camera_offline_notification_unrestored`);
+one of them is resent only when an outage in progress or a ratio alert maps to
+it by name, and one whose outage has already recovered is not sent again. For
+a restored row, or one found by name, if the earlier POST did reach Slack the
+Owner receives the alert twice, never not at all. A pending
 row whose event is more than 24 hours old is not sent again (the outage is
 named anew after a day). A row of that name accepted more than 24 hours earlier no longer
 counts as this outage (Owner decision 2026-10-22, PR #320): the next name of a
