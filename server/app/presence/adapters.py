@@ -707,20 +707,26 @@ class CriticalTimelineRecorder:
     close or the reservation release, Issue #333) is not handed to
     ``refused`` once ``recorded`` completed: the record is durable and the
     watch covers it. Without a completed ``recorded`` hand-over it is handed
-    to ``refused`` as before, so it is never left unattempted.
+    to ``refused`` as before, so it is never left unattempted. With a
+    completed one, ``settled(identifier)`` is told once the commit returned,
+    so a refusal of the scene runtime's later retry of the same item is not
+    attempted either (`UnrecordedCriticalAlerts.settled`). Its exceptions
+    never change the record.
     """
 
     def __init__(self, outbox: TimelineOutbox, *, maximum_source_latency: timedelta,
                  refused: Callable[[UUID, CriticalKind], None] | None = None,
-                 recorded: Callable[[UUID, CriticalKind], None] | None = None):
+                 recorded: Callable[[UUID, CriticalKind], None] | None = None,
+                 settled: Callable[[UUID], None] | None = None):
         if not isinstance(outbox, TimelineOutbox):
             raise ValueError("shared timeline receipt clock required")
         if (refused is not None and not callable(refused)
-                or recorded is not None and not callable(recorded)):
+                or recorded is not None and not callable(recorded)
+                or settled is not None and not callable(settled)):
             raise ValueError("invalid critical hand-over")
         self.outbox = outbox
         self.maximum_source_latency = _positive(maximum_source_latency, "source latency bound")
-        self.refused, self.recorded = refused, recorded
+        self.refused, self.recorded, self.settled = refused, recorded, settled
 
     @staticmethod
     def _quality(item):
@@ -753,6 +759,10 @@ class CriticalTimelineRecorder:
 
         def committed():
             settled["committed"] = True
+            if settled["handed"] and self.settled is not None:
+                # Issue #333: a later retry of this item refused before its
+                # transaction must not send the alert a second time.
+                self.settled(item.identifier)
 
         try:
             with self.outbox.receipt() as (received, trusted):

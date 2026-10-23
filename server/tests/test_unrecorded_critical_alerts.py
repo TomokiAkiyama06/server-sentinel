@@ -458,6 +458,54 @@ class ClaimRefusedTests(Unrecorded, unittest.TestCase):
         timeline.recorder(item)
         self.assertEqual((), timeline.unrecorded.awaiting())
 
+    def test_a_refused_retry_after_a_failure_after_the_commit_is_not_resent(self):
+        # Claude review on fc153c61 (提案 1): the scene runtime retries the
+        # item whose release raised; the dispatcher sent it meanwhile, and
+        # storage refuses the retry before its transaction. The retry's
+        # refusal must not queue a second message.
+        transport = Transport()
+        service = self.notifications(transport)
+        timeline = self.timeline(service)
+        item = critical(CriticalKind.CAMERA_TAMPER, at=datetime.now(timezone.utc))
+        self.record_then_release_fails(timeline, item)
+        timeline.dispatch()
+        self.settle(service, transport, 1)
+        service.poll()
+        self.assertEqual("delivered", self.state(item.identifier))
+        self.refuse(True)
+        with self.assertRaises(Exception):
+            timeline.recorder(item)
+        self.assertEqual(0, timeline.unrecorded.queued)
+        self.assertEqual(0, timeline.unrecorded.drain(at=NOW))
+        time.sleep(0.2)
+        service.poll()
+        self.assertEqual([ALERT + "camera_tamper"], texts(transport))
+        self.assertEqual(0, timeline.unrecorded.submitted)
+
+    def test_a_refused_retry_of_an_unclaimed_committed_record_is_escalated_once(self):
+        # The same retry before any dispatch step claimed the row: the watch
+        # still escalates it, so it is never left unattempted.
+        transport = Transport()
+        service = self.notifications(transport)
+        timeline = self.timeline(service)
+        item = critical(CriticalKind.SERVER_MOVEMENT, at=datetime.now(timezone.utc))
+        self.record_then_release_fails(timeline, item)
+        self.refuse(True)
+        with self.assertRaises(Exception):
+            timeline.recorder(item)
+        self.assertEqual(0, timeline.unrecorded.queued)
+        with self.assertRaises(Exception):
+            timeline.dispatch()
+        self.assertEqual(0, timeline.unrecorded.drain(at=NOW))
+        self.settle(service, transport, 1)
+        self.refuse(False)
+        service.poll()
+        timeline.recorder(item)
+        timeline.dispatch()
+        self.assertEqual("delivered", self.state(item.identifier))
+        self.assertEqual([ALERT + "server_movement"], texts(transport))
+        self.assertEqual(1, timeline.unrecorded.submitted)
+
     def test_a_failure_after_the_commit_before_a_hard_stop_still_alerts_once(self):
         # Issue #333 (2): committed but unclaimed, and the disk goes away:
         # the watch escalates it, so it is never left unattempted.
@@ -521,6 +569,57 @@ class ClaimRefusedTests(Unrecorded, unittest.TestCase):
             timeline.presence.database.connect = connect
         self.assertEqual(1, timeline.unrecorded.queued)
         self.assertEqual((item.identifier,), timeline.unrecorded.awaiting())
+
+    def test_a_settled_identity_ignores_refusals_but_not_the_watch(self):
+        # Issue #333: a refusal of an ID whose record committed is ignored;
+        # the watch still escalates it, and an ID forgotten beyond the bound
+        # is attempted again (a possible duplicate, never a missed alert).
+        service = self.notifications(Transport())
+        alerts = UnrecordedCriticalAlerts(self.adapter(service), capacity=2, remembered=2)
+        first, second, third = uuid4(), uuid4(), uuid4()
+        alerts.recorded(first, CriticalKind.SERVER_MOVEMENT, True)
+        alerts.settled(first)
+        alerts.refused(first, CriticalKind.SERVER_MOVEMENT)
+        self.assertEqual(0, alerts.queued)
+        alerts.escalate()
+        self.assertEqual(1, alerts.queued)
+        alerts.recorded(first, CriticalKind.SERVER_MOVEMENT, False)
+        self.assertEqual(0, alerts.queued)
+        for identifier in (second, third):
+            alerts.settled(identifier)
+        alerts.refused(first, CriticalKind.SERVER_MOVEMENT)
+        alerts.refused(third, CriticalKind.CAMERA_TAMPER)
+        self.assertEqual(1, alerts.queued)
+
+    def test_the_recorder_tells_a_commit_only_after_a_completed_hand_over(self):
+        service = self.notifications(Transport())
+        timeline = self.timeline(service)
+        told = []
+        timeline.recorder.settled = told.append
+        item = critical(CriticalKind.SERVER_MOVEMENT, at=datetime.now(timezone.utc))
+        timeline.recorder(item)
+        self.assertEqual([item.identifier], told)
+
+        def recorded(identifier, kind, awaiting):
+            raise RuntimeError("synthetic hand-over fault")
+
+        timeline.recorder.recorded = recorded
+        other = critical(CriticalKind.CAMERA_TAMPER, at=datetime.now(timezone.utc))
+        timeline.recorder(other)
+        self.assertEqual([item.identifier], told)
+
+    def test_a_raising_commit_callback_leaves_the_record_committed(self):
+        # Claude review on fc153c61 (提案 2).
+        presence = self.presence_for(self.adapter(self.notifications(Transport())))
+        item = observation(Kind.CAMERA_TAMPER)
+
+        def committed():
+            raise RuntimeError("synthetic commit callback fault")
+
+        stored, awaiting = presence.record_critical(item, committed=committed)
+        self.assertEqual(item.identifier, stored.identifier)
+        self.assertTrue(awaiting)
+        self.assertEqual("pending", self.state(item.identifier))
 
     def test_an_unreadable_watch_after_a_successful_step_escalates(self):
         # Claude review on e0028ca8 (提案 1): the step itself succeeds but the
