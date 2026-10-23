@@ -740,6 +740,20 @@ class RestartReacquisitionTests(unittest.TestCase):
             self.assertIsNone(failed.service.reacquire(OTHER, commit_with(self.database.database)))
         self.assertEqual([REQUIRED], [notice.kind for notice in failed.service.take_notices()])
 
+        for state, notified in ((SceneRuntimeState.DEGRADED, False), (None, True)):
+            # Claude re-review: a degraded runtime still runs (no notice); a
+            # status that cannot be read counts as ended (notice).
+            other = Service(self, self.database.database)
+            other.service.start()
+            status = (mock.patch.object(other.runtime, "status", side_effect=RuntimeError("unreadable"))
+                      if state is None else
+                      mock.patch.object(other.runtime, "status", return_value=SimpleNamespace(state=state)))
+            with mock.patch.object(other.runtime, "acquire_reference",
+                                   side_effect=ReferenceUnavailable("unavailable")), status:
+                self.assertIsNone(other.service.reacquire(OTHER, commit_with(self.database.database)))
+            self.assertEqual([REQUIRED] if notified else [],
+                             [notice.kind for notice in other.service.take_notices()])
+
         closing_down = Service(self, self.database.database)
         closing_down.service.start()
         closing_down.service.close()
@@ -777,7 +791,7 @@ def Database_History(test, source):
 class LifespanTests(RuntimeFixture):
     """Main lifespan: restart -> re-acquisition -> audited commit -> Owner alert."""
 
-    def scene_application(self, sources=(OTHER,), **calibration):
+    def scene_application(self, sources=(OTHER,), recorder=True, **calibration):
         remotes = tuple(binding(source, SourceType.REMOTE_AGENT, sample_interval_ns=1_000_000)
                         for source in sources)
         values = dict(reacquire_timeout_seconds=5, reacquire_retry_seconds=1)
@@ -790,8 +804,8 @@ class LifespanTests(RuntimeFixture):
                 slack_opener=self.transport, utcnow=self.clock.utcnow,
                 monotonic=lambda: self.clock.monotonic, tick_seconds=3600.0),
             scene_monitoring=SceneMonitoringConfiguration(remotes),
-            scene_monitoring_dependencies=SceneMonitoringDependencies(tick_seconds=0.01,
-                                                                      recorder=Recorder()),
+            scene_monitoring_dependencies=SceneMonitoringDependencies(
+                tick_seconds=0.01, recorder=Recorder() if recorder else None),
             scene_calibration=SceneCalibrationConfiguration(
                 tuple(template(source) for source in sources), **values),
         )
@@ -1106,7 +1120,35 @@ class LifespanTests(RuntimeFixture):
         remote = binding(OTHER, SourceType.REMOTE_AGENT)
         with self.assertRaises(TypeError):
             create_app(self.settings, scene_monitoring=SceneMonitoringConfiguration((remote,)),
+                       scene_monitoring_dependencies=SceneMonitoringDependencies(recorder=Recorder()),
                        scene_calibration=SceneCalibrationConfiguration((template(),)))
+
+    def test_scene_calibration_requires_a_durable_critical_recorder(self):
+        # Codex P1 (#330): without `scene_timeline` or an injected recorder
+        # the scene runtime never starts and nothing could be re-acquired.
+        with self.assertRaisesRegex(TypeError, "critical recorder"):
+            self.scene_application(recorder=False)
+
+    async def test_a_scene_runtime_that_cannot_start_is_notified_once_per_source(self):
+        # Codex P1 (#330): a start that ends `unavailable` cannot be retried;
+        # each source with a stored calibration is notified once instead of
+        # the loop waiting forever.
+        silent = uuid4()
+        sources = (OTHER, silent)
+        self.store(stored())
+        application = self.scene_application(sources)
+        runtime = application.state.scene_monitoring
+        service = application.state.scene_calibration
+        with mock.patch.object(runtime._pump, "start", side_effect=RuntimeError("synthetic start failure")):
+            async with asyncio.timeout(60), application.router.lifespan_context(application):
+                self.assertIs(SceneRuntimeState.UNAVAILABLE, runtime.status().state)
+                self.assertTrue(await self.until(lambda: len(self.scene_texts()) == 1))
+                # Retried every second; still one notice per stored source.
+                await asyncio.sleep(2.5)
+                (status,) = [item for item in service.status() if item.source_id == OTHER]
+                self.assertEqual("unavailable", status.failure)
+        self.assertEqual(["ServerSentinel critical alert: scene_calibration_required"], self.scene_texts())
+        self.assertEqual([1], self.versions())
 
     def test_the_application_owns_the_calibration_provider(self):
         remote = binding(OTHER, SourceType.REMOTE_AGENT)

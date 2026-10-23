@@ -318,6 +318,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
         if (scene_monitoring_dependencies is not None
                 and scene_monitoring_dependencies.calibrations is not None):
             raise TypeError("scene calibration owns the calibration provider")
+        if (scene_monitoring_dependencies is None
+                or scene_monitoring_dependencies.recorder is None):
+            # Without a durable critical recorder (`scene_timeline`, or an
+            # injected one) the scene runtime never starts, so no stored
+            # calibration could ever be re-acquired (Codex P1 on PR #330).
+            raise TypeError("scene calibration requires a durable critical recorder")
         if monitoring_runtime is None:
             # A re-acquired reference must reach the Owner at once (DET-004)
             # through the monitoring runtime's `NotificationService`; without
@@ -614,6 +620,17 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 if undelivered:
                     scene_calibration_service.return_notices(undelivered)
 
+        def scene_runtime_ended() -> bool:
+            # Started (or its start was attempted) and no longer running; an
+            # unreadable status counts as ended. A runtime still waiting for
+            # its deferred start (`configured`) is not.
+            try:
+                state = scene_runtime.status().state
+            except Exception:
+                return True
+            return state not in (SceneRuntimeState.CONFIGURED, SceneRuntimeState.RUNNING,
+                                 SceneRuntimeState.DEGRADED)
+
         async def reacquire_source(source_id) -> None:
             await run_to_completion(asyncio.to_thread(
                 scene_calibration_service.reacquire, source_id, system_commit))
@@ -634,7 +651,14 @@ def create_app(settings: Settings, *, database: Database | None = None,
             while True:
                 if scene_lifecycle["stopping"]:
                     return
-                if not started and application.state.scene_monitoring_state in live:
+                if not started and (application.state.scene_monitoring_state in live
+                                    or await asyncio.to_thread(scene_runtime_ended)):
+                    # Also after a start that failed (`unavailable`, Codex P1
+                    # on PR #330): the runtime cannot be restarted, so each
+                    # stored calibration's re-acquisition is refused
+                    # `unavailable` and notified once
+                    # (`SceneCalibrationService._runtime_ended`), instead of
+                    # this loop waiting forever without a notice.
                     if not scene_lifecycle["scrubbed"]:
                         scene_lifecycle["scrubbed"] = await run_to_completion(
                             asyncio.to_thread(scrub_reference_digests))

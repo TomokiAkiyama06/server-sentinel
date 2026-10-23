@@ -1242,7 +1242,9 @@ follow-up of #205; the Owner calibration route below exists). Without
 
 **Owner calibration and restart re-acquisition (Issue #205, Owner decision
 2026-10-22, option A).** With `create_app(scene_calibration=...)`
-(`SceneCalibrationConfiguration`; it requires scene monitoring and the
+(`SceneCalibrationConfiguration`; it requires scene monitoring with a durable
+critical recorder (`scene_timeline` or an injected one; without it the scene
+runtime never starts and nothing could be re-acquired) and the
 storage-configured monitoring runtime whose `NotificationService` delivers the
 Owner notices, otherwise `create_app` refuses the composition, since a notice
 could only be logged and dropped) the application owns the scene runtime's
@@ -1316,7 +1318,8 @@ continues during an acquisition.
   (default 60 s), and notifies `scene_calibration_required` once per process
   (not for a runtime that has not started yet, nor at shutdown, when the
   service is closed first; a runtime that started and then stopped or failed,
-  so that every retry is refused `unavailable`, is notified); an acquisition
+  or whose start itself ended `unavailable` (it cannot be restarted), so
+  that every retry is refused `unavailable`, is notified); an acquisition
   refusal of the
   system path is not an audited change. An Owner calibration ends a pending
   re-acquisition without a notice. A source never calibrated is left alone.
