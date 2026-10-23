@@ -13,6 +13,7 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -24,6 +25,7 @@ from media_capture_agent.config import ExpectedMount
 from media_capture_agent.runtime import Agent
 from media_capture_agent.storage import (DEVICE_NUMBERS_STALE, MAX_BLOCK_STACK_DEPTH,
                                          MediaStore, Mount, StorageRefused,
+                                         block_device_number,
                                          renumbered_device_acceptable)
 from tests.support import MockSession, SyntheticCapture, configuration, settings
 
@@ -302,6 +304,23 @@ class MediaStoreRenumberingTests(RenumberingCase):
         with self.assertRaisesRegex(StorageRefused, "mount_identity_mismatch"):
             store.check()
 
+    def test_bind_with_another_source_than_its_parent_is_refused(self):
+        self.hardware()
+        self.renumbered()
+        expected = self.settings.expected_mount
+        relative = self.settings.media_root.relative_to(expected.mount_point)
+        parent = dataclasses.replace(expected, filesystem_uuid=None,
+                                     major=self.numbers[0], minor=self.numbers[1])
+        bind = dataclasses.replace(parent, mount_point=self.settings.media_root,
+                                   source="synthetic-other-source",
+                                   filesystem_root=expected.filesystem_root / relative)
+        mounts = [Mount(parent, 10, True), Mount(bind, 11, False)]
+        with self.assertRaises(StorageRefused) as raised:
+            self.store(mounts=lambda: mounts, mount_id=lambda _fd: 11)
+        self.assertEqual((str(raised.exception), raised.exception.diagnostic),
+                         ("mount_identity_mismatch", "mount_source_mismatch"))
+        self.assertEqual(list(self.settings.media_root.iterdir()), [])
+
     def test_runtime_mount_replacement_still_refuses_when_stale(self):
         self.hardware()
         self.renumbered()
@@ -551,6 +570,77 @@ class InstallerWarningTests(unittest.TestCase):
         stream = io.StringIO()
         _forward_check_warnings(b"\xff\xfe", stream)
         self.assertEqual(stream.getvalue(), "")
+
+    def test_stage_forwards_only_fixed_warning_lines_from_check(self):
+        import install
+        warning = "media-capture-agent: local deployment validation warning: device_numbers_stale"
+        temporary = tempfile.TemporaryDirectory(prefix="agent-installer-stage-")
+        self.addCleanup(temporary.cleanup)
+        destination = Path(temporary.name)
+        args = type("Args", (), {"destination": destination, "version": "synthetic-1"})()
+        account = type("Account", (), {"pw_uid": os.geteuid(), "pw_gid": os.getegid()})()
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs))
+            stderr = "\n".join(["synthetic diagnostic /synthetic/path 8:16", warning,
+                                warning + " /synthetic/path", ""]).encode()
+            return type("Completed", (), {"returncode": 0, "stderr": stderr})()
+
+        stderr = io.StringIO()
+        with patch.object(install.subprocess, "run", run), \
+                contextlib.redirect_stderr(stderr):
+            executable = install._stage(args, b"synthetic artifact", None, account,
+                                        destination / "synthetic-config.json")
+        self.assertEqual(stderr.getvalue(), warning + "\n")
+        self.assertEqual(executable, destination / "synthetic-1" / "media-capture-agent")
+        self.assertEqual(len(calls), 1)
+        command, kwargs = calls[0]
+        self.assertEqual(command[-1], "--check")
+        self.assertIs(kwargs["stderr"], install.subprocess.PIPE)
+        self.assertIs(kwargs["stdout"], install.subprocess.DEVNULL)
+
+
+class BlockDeviceNumberTests(unittest.TestCase):
+    """The default `block_device_number` accepts only block device nodes."""
+
+    def test_character_device_and_missing_path_are_refused(self):
+        self.assertIsNone(block_device_number("/dev/null"))
+        temporary = tempfile.TemporaryDirectory(prefix="agent-block-device-")
+        self.addCleanup(temporary.cleanup)
+        self.assertIsNone(block_device_number(str(Path(temporary.name) / "absent")))
+        self.assertIsNone(block_device_number(temporary.name))  # a directory
+
+    def test_real_block_device_node_returns_its_rdev_when_present(self):
+        try:
+            entries = sorted(Path("/dev").iterdir())
+        except OSError:
+            entries = []
+        for entry in entries:
+            try:
+                info = os.stat(entry, follow_symlinks=False)
+            except OSError:
+                continue
+            if stat.S_ISBLK(info.st_mode):
+                self.assertEqual(block_device_number(str(entry)), info.st_rdev)
+                return
+        self.skipTest("no block device node is visible in this environment")
+
+    def test_block_device_returns_its_rdev_and_other_kinds_none(self):
+        device = os.makedev(8, 1)
+        for mode, expected in ((stat.S_IFBLK | 0o660, device),
+                               (stat.S_IFCHR | 0o660, None),
+                               (stat.S_IFREG | 0o600, None)):
+            info = type("Info", (), {"st_mode": mode, "st_rdev": device})()
+            with self.subTest(mode=oct(mode)), \
+                    patch("media_capture_agent.storage.os.stat", return_value=info):
+                self.assertEqual(block_device_number("/dev/synthetic"), expected)
+
+    def test_stat_errors_are_refused(self):
+        for error in (PermissionError(13, "synthetic"), ValueError("synthetic")):
+            with self.subTest(error=type(error).__name__), \
+                    patch("media_capture_agent.storage.os.stat", side_effect=error):
+                self.assertIsNone(block_device_number("/dev/synthetic"))
 
 
 if __name__ == "__main__":
