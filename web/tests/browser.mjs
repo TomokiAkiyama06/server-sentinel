@@ -271,7 +271,8 @@ try {
     for (const count of [0, 1, 2, 3, 4]) {
       await scenario(viewport, { count }, async page => {
         await page.click('カメラソース');
-        await page.wait(`document.querySelectorAll('[data-source-id]').length === ${count} && Boolean(document.querySelector('.source-count'))`);
+        await page.wait(`document.querySelectorAll('[data-source-id]').length === ${count} && Boolean(document.querySelector('.source-count'))
+          && Boolean(document.querySelector('.calibration-screen'))`);
         assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'source collection fits viewport');
         for (const title of ['概要', '初期設定', 'キャプチャノード', 'ライブ', '録画', 'ストレージと通知', 'アクセス']) {
           await page.click(title); await page.heading(title);
@@ -591,8 +592,10 @@ try {
     });
     await scenario(viewport, { sourceStatus: 503 }, async page => {
       await page.click('カメラソース');
-      await page.wait("Boolean(document.querySelector('[role=alert]'))");
+      // The inventory failure stays visible beside the calibration section.
+      await page.wait("Array.from(document.querySelectorAll('#main [role=alert]')).some(el => el.textContent === 'カメラソースの状態を取得できません。')");
       assert.equal(await page.evaluate("document.querySelectorAll('[data-source-id]').length"), 0);
+      assert.equal(await page.evaluate("Boolean(document.querySelector('#main .source-count'))"), false);
     });
     await scenario(viewport, { initialViewFailures: true }, async (page, requests) => {
       await page.click('タイムライン');

@@ -49,6 +49,7 @@ class Event(StrEnum):
     SCENE_REFERENCE_REACQUIRED = "scene_reference_reacquired"
     SCENE_CALIBRATION_REQUIRED = "scene_calibration_required"
     SCENE_CALIBRATION_NOTICE_UNDELIVERED = "scene_calibration_notice_undelivered"
+    SCENE_REACQUISITION_FAILED = "scene_reacquisition_failed"
     HUMAN_LISTENER_ACTIVATION_INVALID = "human_listener_activation_invalid"
     HUMAN_REQUEST_RATE_LIMITED = "human_request_rate_limited"
     INVITATION_REDEMPTION_REFUSED = "invitation_redemption_refused"

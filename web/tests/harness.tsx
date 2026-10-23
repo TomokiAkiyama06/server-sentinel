@@ -100,6 +100,10 @@ const services = {
     }, signal);
   },
   loadPresence: (signal: AbortSignal) => api.read('/api/mock/presence', presence, signal),
+  // Synthetic and route-free: with it the Owner Sources view takes the same
+  // combined branch as the production provider (source inventory beside the
+  // calibration section, PR #330), so the inventory scenarios below cover it.
+  loadSceneCalibration: async () => [],
   cancelPresenceOverride: (signal: AbortSignal) => api.read('/api/mock/presence-cancelled', presence, signal),
   loadWizard: async () => wizard,
   transitionWizard,

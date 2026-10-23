@@ -1652,6 +1652,8 @@ class SceneMonitoringRuntime:
         if loss is not None:
             # A camera loss interrupts the consecutive good samples a
             # reference needs; a sample from before it is not used either.
+            # (Redundant with the stream the slot mints after every loss,
+            # which restarts the gates as well; kept as a second guard.)
             acquisition.movement_gate = QualityGate(binding.source_id, binding.movement_quality)
             acquisition.tamper_gate = QualityGate(binding.source_id, binding.tamper_quality)
             if sample is not None and sample.monotonic_ns <= loss.monotonic_ns:

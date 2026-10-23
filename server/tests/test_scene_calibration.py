@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -25,7 +26,7 @@ from app.cameras.uvc.capture import VideoFrame
 from app.detection.roi import CalibrationArchive
 from app.detection.roi.calibration import append_on, decode_history_row, provenance
 from app.detection.roi.calibration_service import (
-    REACQUIRED, REQUIRED, CalibrationOrigin, CalibrationPhase, CalibrationRefused,
+    REACQUIRED, REQUIRED, CalibrationOrigin, Notice, CalibrationPhase, CalibrationRefused,
     CalibrationTemplate, SceneCalibrationConfiguration, SceneCalibrationService, TransientReferences,
 )
 from app.detection.roi.mjpg import MjpgLumaLayout
@@ -36,6 +37,7 @@ from app.detection.roi.runtime import (
 from app.detection.roi.mjpg_worker import NUMPY_VERSION, SIMPLEJPEG_VERSION
 from app.main import create_app
 from app.monitoring.runtime import MonitoringDependencies
+from app.notifications.service import NotificationService
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -259,8 +261,13 @@ class RuntimeAcquisitionTests(unittest.TestCase):
         self.assertEqual(2, future.result(0).sequence)
 
     def test_a_sample_captured_before_a_loss_is_never_used(self):
-        # A decoded producer may keep its stream across a loss, so the
-        # stream change alone does not exclude the sample held in the slot.
+        # Behaviour only, not a guard of one line: the runtime mints a new
+        # stream for the first sample after every loss (even when the
+        # producer keeps its stream id), and the quality gate restarts on a
+        # stream change, so the pre-loss sample can never be followed by a
+        # consecutive one. `_acquire`'s own pre-loss exclusion is therefore
+        # a redundant second guard that no observable case distinguishes
+        # (Claude re-review 1 on PR #330).
         harness = Harness(binding(OTHER, SourceType.REMOTE_AGENT), calibrations=None)
         harness.runtime.start()
         stream = uuid4()
@@ -758,6 +765,98 @@ class LifespanTests(RuntimeFixture):
                 await asyncio.sleep(1.5)
         self.assertEqual([], self.scene_texts())
         self.assertEqual([], self.versions())
+
+    async def test_an_unexpected_failure_of_one_source_ends_neither_others_nor_the_retries(self):
+        # Claude re-review 3: `gather(return_exceptions=True)`.
+        bad = uuid4()
+        sources = (bad, OTHER)
+        for source in sources:
+            self.store(stored(source))
+        application = self.scene_application(sources)
+        service = application.state.scene_calibration
+        runtime = application.state.scene_monitoring
+        original, calls = service.reacquire, []
+
+        def reacquire(source_id, commit):
+            calls.append(source_id)
+            if source_id == bad and calls.count(bad) == 1:
+                raise RuntimeError("synthetic unexpected failure")
+            return original(source_id, commit)
+
+        service.reacquire = reacquire
+        with self.assertLogs("app.main", "ERROR") as logs:
+            async with asyncio.timeout(60), application.router.lifespan_context(application):
+                with Feed(runtime, bad), Feed(runtime, OTHER):
+                    # The failed source is retried on the next pass.
+                    self.assertTrue(await self.until(lambda: all(
+                        item.state is SceneSourceState.ACTIVE for item in runtime.status().sources)))
+                    self.assertTrue(await self.until(lambda: len(self.scene_texts()) == 2))
+        self.assertGreaterEqual(calls.count(bad), 2)
+        self.assertIn("scene_reacquisition_failed", "\n".join(logs.output))
+        self.assertNotIn("synthetic unexpected failure", "\n".join(logs.output))
+
+    async def test_a_notice_queued_just_before_shutdown_is_still_submitted(self):
+        # Claude re-review 2: shutdown submits what an attempt queued right
+        # before close(), while the monitoring runtime still runs.
+        application = self.scene_application()
+        service = application.state.scene_calibration
+        original = service.close
+
+        def close():
+            service._notices.append(Notice(REACQUIRED, self.clock.utcnow(), uuid4()))
+            original()
+
+        service.close = close
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            await asyncio.sleep(0.2)
+        self.assertEqual([("scene_reference_reacquired", 1, "sent")], self.notified())
+        self.assertEqual(["ServerSentinel critical alert: scene_reference_reacquired"], self.scene_texts())
+
+    async def test_a_delivery_cancelled_by_shutdown_keeps_its_unsubmitted_notice(self):
+        # Claude re-review 3: `return_notices` in `finally`. The submission
+        # fails while shutdown cancels the pass that runs it; the notice is
+        # put back (and, still undeliverable, reported) instead of vanishing.
+        self.store(stored())
+        application = self.scene_application()
+        service = application.state.scene_calibration
+        runtime = application.state.scene_monitoring
+        entered = threading.Event()
+        returned = []
+        original_return = service.return_notices
+
+        def return_notices(notices):
+            returned.extend(notices)
+            original_return(notices)
+
+        service.return_notices = return_notices
+
+        real_record = NotificationService.record
+
+        def refuse(notifications, kind, **options):
+            if kind.value != REACQUIRED:
+                return real_record(notifications, kind, **options)
+            entered.set()
+            time.sleep(3.0)
+            raise RuntimeError("synthetic submission failure")
+
+        with self.assertLogs("app.main", "ERROR") as logs, \
+                mock.patch.object(NotificationService, "record", autospec=True, side_effect=refuse):
+            async with asyncio.timeout(60), application.router.lifespan_context(application):
+                with Feed(runtime):
+                    # Shutdown starts while the first submission is running.
+                    self.assertTrue(await self.until(entered.is_set))
+        self.assertTrue(returned)
+        self.assertEqual([REACQUIRED], [item.kind for item in returned][:1])
+        self.assertIn("scene_calibration_notice_undelivered", "\n".join(logs.output))
+        self.assertEqual([], self.notified())
+
+    def test_scene_calibration_requires_the_monitoring_notifications(self):
+        # Codex P2 (#330): without them a re-acquisition notice could only
+        # be logged and dropped.
+        remote = binding(OTHER, SourceType.REMOTE_AGENT)
+        with self.assertRaises(TypeError):
+            create_app(self.settings, scene_monitoring=SceneMonitoringConfiguration((remote,)),
+                       scene_calibration=SceneCalibrationConfiguration((template(),)))
 
     def test_the_application_owns_the_calibration_provider(self):
         remote = binding(OTHER, SourceType.REMOTE_AGENT)

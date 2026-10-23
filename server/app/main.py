@@ -304,6 +304,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
         if (scene_monitoring_dependencies is not None
                 and scene_monitoring_dependencies.calibrations is not None):
             raise TypeError("scene calibration owns the calibration provider")
+        if monitoring_runtime is None:
+            # A re-acquired reference must reach the Owner at once (DET-004)
+            # through the monitoring runtime's `NotificationService`; without
+            # it a notice could only be logged and dropped (Codex P2, #330).
+            raise TypeError("scene calibration requires the monitoring notification runtime")
         calibration_references = TransientReferences()
         scene_monitoring_dependencies = replace(
             scene_monitoring_dependencies or SceneMonitoringDependencies(),
@@ -543,10 +548,6 @@ def create_app(settings: Settings, *, database: Database | None = None,
             notices = scene_calibration_service.take_notices()
             if not notices:
                 return
-            if monitoring_runtime is None:
-                logging.getLogger(__name__).error(Event.SCENE_CALIBRATION_NOTICE_UNDELIVERED)
-                return
-
             submitted = []
 
             def step():
@@ -566,9 +567,13 @@ def create_app(settings: Settings, *, database: Database | None = None,
                     monitoring_runtime.dispatch_notifications, step))
             except Exception:
                 pass
-            undelivered = [notice for notice in notices if notice not in submitted]
-            if undelivered:
-                scene_calibration_service.return_notices(undelivered)
+            finally:
+                # Also when this pass is cancelled (run_to_completion re-raises
+                # the cancellation after the step finished): an unsubmitted
+                # notice is never lost here.
+                undelivered = [notice for notice in notices if notice not in submitted]
+                if undelivered:
+                    scene_calibration_service.return_notices(undelivered)
 
         async def reacquire_source(source_id) -> None:
             await run_to_completion(asyncio.to_thread(
@@ -599,7 +604,13 @@ def create_app(settings: Settings, *, database: Database | None = None,
                         # A cancelled gather still waits for every attempt
                         # (each defers its cancellation until its thread
                         # returns; `close()` ends the acquisitions first).
-                        await asyncio.gather(*(reacquire_source(source_id) for source_id in pending))
+                        outcomes = await asyncio.gather(
+                            *(reacquire_source(source_id) for source_id in pending),
+                            return_exceptions=True)
+                        if any(isinstance(item, Exception) for item in outcomes):
+                            # One source's unexpected failure ends neither
+                            # the others nor the retry loop; value-free.
+                            logging.getLogger(__name__).error(Event.SCENE_REACQUISITION_FAILED)
                 await deliver_calibration_notices()
                 await asyncio.sleep(scene_calibration.reacquire_retry_seconds if started
                                     else scene_runtime.refresh_interval_seconds)

@@ -1200,7 +1200,10 @@ follow-up of #205; the Owner calibration route below exists). Without
 
 **Owner calibration and restart re-acquisition (Issue #205, Owner decision
 2026-10-22, option A).** With `create_app(scene_calibration=...)`
-(`SceneCalibrationConfiguration`) the application owns the scene runtime's
+(`SceneCalibrationConfiguration`; it requires scene monitoring and the
+storage-configured monitoring runtime whose `NotificationService` delivers the
+Owner notices, otherwise `create_app` refuses the composition, since a notice
+could only be logged and dropped) the application owns the scene runtime's
 calibration provider: the stored provenance (`roi_calibration_history`, read
 only) plus the reference frames this process holds in memory
 (`TransientReferences`). Nothing derived from an image is written to disk;
@@ -1272,6 +1275,10 @@ continues during an acquisition.
   (not for a runtime that is not running yet); an acquisition refusal of the
   system path is not an audited change. An Owner calibration ends a pending
   re-acquisition without a notice. A source never calibrated is left alone.
+  An unexpected failure of one source's attempt is logged value-free
+  (`scene_reacquisition_failed`) and ends neither the other sources' attempts
+  nor the retries; a notice whose submission was cancelled or failed is put
+  back for the next pass.
   Shutdown cancels an acquisition in flight, then submits a notice an attempt
   queued just before (while the monitoring runtime still runs) and waits up
   to 12 s for a submitted notice; a notice that could not be submitted is in
