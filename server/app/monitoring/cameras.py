@@ -118,8 +118,11 @@ of a stored alert of that source sends nothing twice. A ratio alert held back
 by the cap is sent when the hour allows while its period is still open. Once
 its period closed it is dropped (logged) before the cap is consulted, also
 when the hour has room again by the next drain (Issue #338 item 2): a ratio
-alert exists only from the drain that triggers it, so an ended one was held
-or refused for a whole quiet window. After a restart the in-memory period is
+alert exists only from the drain that triggers it, so an ended one without a
+pending attempt was held for a whole quiet window. One the cap allowed but
+the queue refused is retried under its time and ID like a refused continuous
+episode, also after its period closed (dropped only if the cap is closed
+then, as a recovered episode). After a restart the in-memory period is
 gone; a continuous episode that is due while its source has no period looks
 up the source's recent ratio alert once (``flapping_id``) and, when an
 earlier process stored one within the window, restores the period as
@@ -825,9 +828,8 @@ class CameraOfflineMonitor:
         for identity, item in () if stopped else due:
             flap = isinstance(item, _Flap)
             resend = isinstance(item, _Resend)
-            # A restored row is never dropped: its source is not known. An
-            # ended ratio alert is dropped below, before the cap.
-            ongoing = True if resend or flap else item.recovered is None
+            # A restored row is never dropped: its source is not known.
+            ongoing = True if resend else not item.ended if flap else item.recovered is None
             with self._lock:
                 source = None if resend else self._sources[identity]
                 if (not flap and not resend and item.flapping and source.period == _BY_RATIO
@@ -836,14 +838,18 @@ class CameraOfflineMonitor:
                     # notification after its ratio alert (at most two).
                     self._finish(identity, item)
                     continue
-                if flap and item.ended:
+                if flap and item.ended and item.attempt is None:
                     # Issue #338 item 2 (Codex PR #335 P2): the period
                     # closed before its alert went out. A ratio alert exists
-                    # only from the drain that triggers it, so it ended only
-                    # after it was held by the cap or refused by the queue
-                    # for a whole quiet window: dropped whether or not the
-                    # hour has room by now (never a stale alert after a
-                    # delayed drain). Not sent: no alerted period.
+                    # only from the drain that triggers it, so one without a
+                    # pending attempt ended while held by the cap for a
+                    # whole quiet window: dropped whether or not the hour
+                    # has room by now (never a stale alert after a delayed
+                    # drain). Not sent: no alerted period. One the cap
+                    # allowed but the queue refused keeps its attempt and is
+                    # sent once the queue takes it, as a refused continuous
+                    # episode is (PR #348 review 提案 1); like a recovered
+                    # episode, it is dropped if the cap is closed by then.
                     self._finish(identity, item, sent=False)
                     self.dropped += 1
                     logging.getLogger(__name__).warning(

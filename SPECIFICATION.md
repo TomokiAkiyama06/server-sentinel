@@ -1717,13 +1717,18 @@ continuous notification):
   rule does not evaluate that source; the continuous notification reports it.
 - A ratio alert held back by the cap is sent when the hour allows if its
   period is still open; one refused by the queue is retried with the same
-  time and ID. Once its period has closed an unsent ratio alert is dropped
-  (`camera_offline_notification_dropped`) before the cap is consulted, also
-  when the hour has room again by the next drain (Issue #338 item 2). A
-  ratio alert exists only from the drain that triggers it, so one that ended
-  was held or refused for a whole quiet window; unlike a continuous episode
+  time and ID. Once its period has closed, a ratio alert held back by the
+  cap is dropped (`camera_offline_notification_dropped`) before the cap is
+  consulted, also when the hour has room again by the next drain (Issue #338
+  item 2). A ratio alert exists only from the drain that triggers it, so one
+  that ended was held for a whole quiet window; unlike a continuous episode
   that reached the threshold between two drains, it has no "recovered
-  before its first drain" case to send once.
+  before its first drain" case to send once. One the cap allowed but the
+  queue refused (delivery backpressure) is, like a refused continuous
+  episode, still sent under its time and ID once the queue takes it, also
+  after its period closed, and dropped only if the cap is closed by then
+  (PR #348 review), so a backpressure lasting a window never leaves the
+  period unnotified.
 
 `MonitoringStatus.camera_offline_degraded` is also set while a ratio-opened
 period is open. Per source the not-online seconds are kept in at most 130
