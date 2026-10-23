@@ -171,11 +171,51 @@ the administrator running the installer and the service resolving it from the
 release tree, so it is refused.
 
 `runtime_device` records the decimal Linux major/minor numbers of the same
-filesystem. It corroborates the UUID and catches a missing mount that leaves a
-directory behind, but it can never replace the UUID because a replacement disk
-can reuse the same numbers. The mount point must contain the runtime root and
-resolve to that same device, and the runtime filesystem must not be the
-operating-system root filesystem or backed by its device.
+filesystem. It only corroborates the UUID: it can never replace the UUID,
+because a replacement disk can reuse the same numbers, and it is not a stable
+identity either, because the kernel may number the same disk differently after
+a reboot (for example `sda`/`sdb` swapped, `8:16` becoming `8:0`; Issue #321).
+The decision rests on the UUID: it must resolve to a block device, that device
+must be the device of both the runtime root and the mount point, the mount
+point must be an actual mount containing the runtime root, and the runtime
+filesystem must not be the operating-system root filesystem or backed by its
+device. Any of these failing is refused (`runtime filesystem identity
+mismatch`, `... unavailable` or `... root filesystem ...`). A missing mount that
+leaves a directory behind on the root filesystem is refused by these checks,
+not by the numbers.
+
+When all of them hold and `runtime_device` (or
+`monitoring.recording_filesystem.device`) differs from the current numbers
+**only in the minor**, the recorded value is stale, not a different
+filesystem. A different major is refused as before: the major names the
+driver, and a disk image mounted with `-o loop` (major 7, possibly on the root
+filesystem) or a new device-mapper mapping would otherwise pass the UUID and
+mount checks. A renumbered device must also rest only on hardware disks: a
+partition is judged by its parent disk (`losetup -P` loop partitions share
+major 259 with NVMe), a device-mapper/md device by every device under its
+sysfs `slaves/`, recursively, and every disk at the bottom must have the
+sysfs `device` link to its bus device (SCSI, NVMe, virtio), which loop, nbd,
+ublk, zram and ram disks lack. A device without a readable entry in
+`/sys/dev/block` is refused as well; a
+device-mapper device is accepted only when the recorded one was
+device-mapper as well (same major). `--check`, the
+launcher and the installer then pass and print one value-free line (no number,
+UUID or path):
+
+```text
+ServerSentinel deployment warning: the recorded filesystem device numbers (runtime_device / monitoring.recording_filesystem.device) differ from the current ones; the approved filesystem UUID and mount were verified, so the service starts. Update the recorded numbers (see DEPLOYMENT.md)
+```
+
+The service starts, and the monitoring runtime reports it: the immediate
+Owner notice `recording_device_numbers_changed` (Slack `ServerSentinel
+attention notice: recording_device_numbers_changed`, a local row either way;
+once per boot and device numbers, so a restart in the same boot does not
+repeat it; without a readable `/proc/sys/kernel/random/boot_id` once per
+service start),
+`MonitoringStatus.recording_device_numbers_stale`, the diagnostics field
+`recording_filesystem.state` `degraded`, and one degraded item in every daily
+summary's error count. Update the recorded value as in "Updating stale device
+numbers after a reboot" below.
 
 Keep actual paths, filesystem identity and UID private. A loopback literal is
 mandatory for the human listener; expose it through the separately configured
@@ -232,11 +272,59 @@ and recording limit must be sized for the deployment (all positive integers,
 `recovery_allocation_bytes < recording_limit_bytes`, `cleanup_batch_size` at
 most 1000, `max_segment_bytes` at most `max_request_bytes`); ServerSentinel does
 not guess them. `recording_filesystem` must describe the filesystem that holds
-`<runtime_root>/recordings`: the UUID must resolve to its device, `device` must
-equal its major/minor numbers, and `mount_point` must be a mounted ancestor on
-the same device other than the operating-system root. The runtime re-checks this
-identity on every storage sample and refuses writes, without a fallback, when
-it no longer holds.
+`<runtime_root>/recordings`: the UUID must resolve to its device, and
+`mount_point` must be a mounted ancestor on the same device other than the
+operating-system root. `device` records its major/minor numbers; like
+`runtime_device` it only corroborates the UUID, and a stale value is reported,
+not refused (see `runtime_device` above). The runtime re-checks the UUID, the
+mount and the pinned root device/inode on every storage sample and refuses
+writes, without a fallback, when they no longer hold.
+
+#### Updating stale device numbers after a reboot
+
+After a reboot of the host or VM (Issue #321), check the recorded numbers
+before or right after the service starts. With the example paths of the VM
+procedure (`server/docs/REMOTE_LIVE_VIEW_SETUP.md`):
+
+```sh
+findmnt -no MAJ:MIN,UUID,SOURCE /srv/ss-data            # current major:minor, UUID, device
+readlink -f /dev/disk/by-uuid/<runtime_filesystem_uuid> # must be the SOURCE above
+stat -c '%d' /srv/ss-data/server-sentinel               # same device as /srv/ss-data
+journalctl -u server-sentinel.service -b | grep 'deployment warning'
+```
+
+Before changing anything, also confirm that the device is the approved disk
+and nothing else carries its UUID:
+
+```sh
+lsblk -o NAME,MAJ:MIN,TYPE,SERIAL   # the device: TYPE disk or part (never loop or dm
+                                    # unless it was approved as dm), the known SERIAL
+blkid -t UUID=<runtime_filesystem_uuid> -o device   # exactly one line
+```
+
+Update the numbers only when the UUID is the approved one and resolves to the
+mounted device (the first two lines name the same device), the device is a
+`disk`/`part` with the known serial, the major is the recorded one (only the
+minor changed; otherwise the check refuses anyway), and `blkid` prints exactly
+one device. Two lines mean a second filesystem with the same UUID (a clone):
+stop and find it. Then write the
+current `MAJ:MIN` as `[major, minor]` into both `runtime_device` and
+`monitoring.recording_filesystem.device`, keep the file `root`-owned with mode
+`0640`, and restart only when the check passes: chain the check and the
+restart with `&&`, never `;`, so a failing check does not restart the service:
+
+```sh
+cd /opt/server-sentinel-main/current \
+  && sudo -u server-sentinel ./venv/bin/python -m app.deployment \
+       --config /etc/server-sentinel/deployment.json --check \
+  && systemctl restart server-sentinel.service
+```
+
+(`systemctl cat server-sentinel.service` shows the unit's exact
+`ExecStartPre` check command.) The warning line is gone once both values match. If the UUID does not resolve, or
+resolves to another device than the mount, do not edit the values: the
+filesystem is missing, not mounted or not the approved one, and the service
+refuses it on purpose.
 
 The service must run the startup/daily hardware integrity check and the daily
 recording self-test, which need all three of `storage_limits`,

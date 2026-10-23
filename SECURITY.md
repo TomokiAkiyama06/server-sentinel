@@ -174,9 +174,39 @@ Runtime-data assumptions:
   the service;
 - the Owner-approved runtime filesystem is pinned by a stable filesystem UUID.
   Linux major/minor device numbers are reused by a replaced or reformatted disk,
-  so they only corroborate that identity. A runtime mount that is missing,
+  so they only corroborate that identity, and they may change for the same
+  disk across a reboot (Issue #321). A runtime mount that is missing,
   substituted, backed by the root filesystem device, or carrying a different
-  filesystem is refused, and no root-filesystem fallback directory is created;
+  filesystem is refused, and no root-filesystem fallback directory is created.
+  When the UUID resolves to the device the runtime root and the mounted mount
+  point are on, a recorded major/minor pair whose **major** is unchanged and
+  whose minor differs is a stale value (the kernel renumbered the same kind of
+  device at boot): the service starts and the Owner is notified (value-free)
+  to update it. A changed major is refused as before: the major names the
+  driver, so it is what tells a disk from a loop device (a disk image on the
+  root filesystem mounted with `-o loop` gets a `/dev/disk/by-uuid` link and a
+  non-root `7:N` device, so the UUID, mount and root-device checks alone would
+  pass it and recordings would fill the root filesystem) or from a new
+  device-mapper mapping. A renumbered device must also rest only on hardware
+  disks, whatever its major (an allowlist, not a loop denylist): sysfs is
+  walked from `/sys/dev/block/<maj>:<min>`, a partition is judged by its
+  parent disk (`losetup -P` loop partitions share major 259 with NVMe), a
+  dm/md device by every device under `slaves/`, recursively (at most 8
+  levels), and every leaf disk must have the `device` link to its bus device
+  (SCSI, NVMe, virtio). Loop, nbd, ublk, zram and ram disks have none, so they
+  and any LVM/dm-crypt mapping on them are refused. A missing or unreadable
+  sysfs entry, or a deeper stack, is refused. A device-mapper device is accepted only when the recorded one was
+  device-mapper as well (same major). The rule is applied by `--check`, the
+  launcher, the installer and every monitoring storage (re)open. Residual
+  risk: a disk carrying a cloned UUID in another slot of the same driver
+  (same major) is accepted with the immediate notice instead of refused; the
+  exact comparison only refused that by accident (the same clone in the same
+  slot passed silently), and the hardware integrity check matches disks by
+  serial/WWID. File-backed SCSI devices that do have a `device` link (LIO
+  `tcm_loop`/fileio, an iSCSI loopback, `scsi_debug`) are not distinguished
+  from a hardware disk by this rule; creating one requires root, and
+  detection relies on the immediate `recording_device_numbers_changed` notice
+  and the hardware integrity check's serial/WWID matching;
 - the generated unit grants the runtime account write access to the state,
   recording, and audit directories only. The runtime root itself stays
   read-only, so a compromised service cannot replace or remove them;

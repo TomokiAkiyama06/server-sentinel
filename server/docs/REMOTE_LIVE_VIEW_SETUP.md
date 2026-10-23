@@ -263,8 +263,10 @@ sudo lxc config device add <vm> eth0 nic nictype=macvlan parent=<lan nic>
 ## Step 3. Recording filesystem on a dedicated disk
 
 ServerSentinel refuses a runtime root on the operating system's root
-filesystem and identifies its recording filesystem by UUID and device
-numbers. In the VM, give it a separate block device:
+filesystem and identifies its recording filesystem by its filesystem UUID
+(the recorded device numbers only corroborate it and may change across a
+reboot; see "After a host or VM reboot"). In the VM, give it a separate block
+device:
 
 - **Recommended**: a whole host disk or partition that the host does not
   mount, passed as a block device by its stable `/dev/disk/by-id/` path.
@@ -453,6 +455,9 @@ Follow `server/docs/DEPLOYMENT.md` inside the guest. VM-specific points:
    ```
    `runtime_device` and `monitoring.recording_filesystem.device` take the
    major and minor numbers as two decimal integers, for example `[8, 16]`.
+   These numbers can change when the VM reboots (Issue #321); the service
+   still starts while the UUID and the mount agree, and reports the stale
+   value (see "After a host or VM reboot").
 3. [guest, root] Write `/etc/server-sentinel/deployment.json` (owner `root`,
    group `server-sentinel`, mode `0640`) with the shape in "One-time
    deployment preparation": `runtime_root` `/srv/ss-data/server-sentinel`,
@@ -639,6 +644,46 @@ VM's LAN IP literal (not a MagicDNS name; no Tailscale on the capture host is
 needed). A capture node paired with a previous host deployment trusts that
 deployment's CA, not the VM's, and must be re-paired with the VM.
 
+## After a host or VM reboot
+
+The kernel may number the passed disk differently after a reboot (on
+2026-10-22 the data disk moved from `8:16` to `8:0` when `sda` and `sdb`
+swapped). The filesystem UUID decides; the recorded numbers only corroborate
+it. Check after every host or VM reboot:
+
+1. [guest, root] The service is running and the data disk is mounted:
+   ```sh
+   systemctl is-active server-sentinel.service    # active
+   findmnt -no MAJ:MIN,UUID,SOURCE /srv/ss-data    # the approved UUID
+   readlink -f /dev/disk/by-uuid/<approved uuid>  # the SOURCE above
+   ```
+   If the service is not active, read `journalctl -u server-sentinel.service
+   -b`; ServerSentinel cannot notify about its own failed start (Issue #321
+   item 2 is open), so this check is the only signal.
+2. [guest, root] Stale device numbers:
+   ```sh
+   journalctl -u server-sentinel.service -b | grep 'deployment warning'
+   ```
+   A line `the recorded filesystem device numbers ... differ` (and the Owner
+   notice `recording_device_numbers_changed`) means the UUID and the mount were
+   verified and the service started, but `runtime_device` /
+   `monitoring.recording_filesystem.device` are from an earlier boot (only the
+   minor changed; a changed major is refused, not warned about). Before
+   editing, confirm the device:
+   ```sh
+   lsblk -o NAME,MAJ:MIN,TYPE,SERIAL                 # TYPE disk/part, not loop/dm; known serial
+   blkid -t UUID=<approved uuid> -o device           # exactly one line
+   ```
+   Then update both to the current `MAJ:MIN` from step 1 and restart only
+   when the check passes, as in `DEPLOYMENT.md` "Updating stale device
+   numbers after a reboot" (chain with `&&`, never `;`). The notice is sent
+   once per boot, so restarting does not repeat it.
+3. If the UUID does not resolve, or resolves to a different device than the
+   mount, do not edit the values: the disk is missing, not mounted, or not the
+   approved one, and the service refuses it on purpose. Check the LXD disk
+   device (`sudo lxc config device show <vm>` on the host) and the guest's
+   mount first.
+
 ## Verification checklist
 
 Record each item in `MANUAL_TEST.md` (section J, "Issue #205 remote live view
@@ -653,6 +698,10 @@ in the dedicated environment"), without private values:
 - [ ] the runtime filesystem is the passed disk (not the guest root), and
   with the disk detached the service refuses to start instead of writing to
   `/srv/ss-data` on the root filesystem;
+- [ ] after a VM reboot, "After a host or VM reboot" was followed; when the
+  disk was renumbered the service started with the value-free deployment
+  warning and one `recording_device_numbers_changed` notice, and after
+  updating both recorded values the warning is gone;
 - [ ] `ss -ltn --cgroup 'sport = :880'` in the guest shows
   `cgroup:/system.slice/server-sentinel-upstream.socket`;
 - [ ] the Tailscale node name was neutral before the first certificate

@@ -2691,8 +2691,22 @@ intercepted Slack transport. On the deployment, additionally check:
       `--check` fails and the unit does not start, so it never runs without the
       startup/daily hardware integrity check and recording self-test;
 - [ ] with configured thresholds and `recording_filesystem`, `--check` passes and
-      the service reports `monitoring_started`; a wrong UUID/device/mount point is
-      refused by `--check`;
+      the service reports `monitoring_started`; a wrong UUID or mount point, an
+      unmounted data disk and a runtime root on the root filesystem are refused
+      by `--check`;
+- [ ] (Issue #321) after a reboot that renumbers the data disk (or with
+      `runtime_device` / `recording_filesystem.device` set to another minor on
+      a disposable configuration copy), `--check` passes with the one
+      value-free `deployment warning` line, the service starts, one
+      `recording_device_numbers_changed` attention notice arrives (Slack when
+      configured, a local row otherwise; a second restart in the same boot
+      sends none), a recorded value with another major (e.g. `[7, 0]`) is
+      refused, `lsblk`/`blkid` show the device as `disk`/`part` with one
+      UUID match, diagnostics show
+      `recording_filesystem.state` `degraded`, and after both values are
+      updated (check `&&` restart) the warning and the degraded state are gone;
+      with the UUID pointing to another device than the mount, `--check` still
+      refuses;
 - [ ] storage state transitions appear in `storage_state_audit`, and expired
       unstarred recordings/state-audit rows are removed by the running service;
 - [ ] detaching or substituting the recording mount while running yields one
