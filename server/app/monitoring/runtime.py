@@ -581,6 +581,14 @@ class MonitoringRuntime:
         readable boot ID the notice is sent once per process instead. The
         numbers only enter the one-way UUIDv5 name together with the random
         boot ID; nothing is stored or sent but the fixed kind.
+
+        Only a stored final outcome (`sent`, `failed`, `disabled`) ends the
+        notice for this boot. A `pending` row is an earlier process's
+        delivery whose outcome was never stored (it exited before the Slack
+        worker finished): it is not confirmed (notifications README), so it is
+        submitted again under the same event ID and its stored time, and the
+        outcome lands in that row. If the earlier POST did reach Slack, the
+        Owner sees the notice twice, never not at all (Codex PR #323).
         """
         at = self.dependencies.utcnow()
         boot = _boot_id()
@@ -591,11 +599,17 @@ class MonitoringRuntime:
             event_id = uuid5(EVENT_NAMESPACE, f"recording-device-numbers:{boot}:"
                                               f"{os.major(device)}:{os.minor(device)}")
             try:
-                if self.notification_events.get(event_id) is not None:
-                    return
+                stored = self.notification_events.get(event_id)
             except Exception:
                 # An unreadable store notifies rather than staying silent.
                 logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+                stored = None
+            if stored is not None:
+                if stored["delivery"] != DeliveryResult.PENDING:
+                    return
+                # The row keeps its kind and time on upsert; resubmitting
+                # with that time keeps the in-memory event identical to it.
+                at = stored["at"]
         self.notifications.record(NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED,
                                   at=at, event_id=event_id)
 

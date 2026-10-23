@@ -19,6 +19,7 @@ from dataclasses import replace
 import io
 import json
 import os
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
@@ -513,6 +514,60 @@ class StaleDeviceNumbersRuntimeTests(RuntimeFixture):
         self.assertEqual(2, len(self.notices()))
         self.assertEqual(2, [kind for kind, _ in self.events()].count(
             "recording_device_numbers_changed"))
+
+    def stored_notice(self):
+        with contextlib.closing(sqlite3.connect(self.settings.database_path)) as db:
+            return db.execute(
+                "SELECT event_id, at, delivery FROM notification_events "
+                "WHERE kind='recording_device_numbers_changed'").fetchall()
+
+    def set_delivery(self, delivery):
+        with contextlib.closing(sqlite3.connect(self.settings.database_path)) as db, db:
+            db.execute("UPDATE notification_events SET delivery=? "
+                       "WHERE kind='recording_device_numbers_changed'", (delivery,))
+
+    async def test_a_pending_notice_left_by_a_crash_is_resent_once_with_its_id(self):
+        # Codex PR #323: the process exited after the `pending` row was
+        # written but before the Slack outcome was stored. The restart in the
+        # same boot must not treat that uncertain delivery as done
+        # (notifications README: `pending` is never confirmed delivery).
+        await self.run_once()
+        [(event_id, at, _delivery)] = self.stored_notice()
+        self.set_delivery("pending")
+        self.clock.advance(timedelta(minutes=5))
+        await self.run_once()
+        self.assertEqual(2, len(self.notices()))
+        # The same row (ID and original time) now holds the outcome.
+        self.assertEqual([(event_id, at, "sent")], self.stored_notice())
+        # Once the outcome is stored, a further restart sends nothing.
+        self.clock.advance(timedelta(minutes=5))
+        await self.run_once()
+        self.assertEqual(2, len(self.notices()))
+        self.assertEqual([(event_id, at, "sent")], self.stored_notice())
+
+    async def test_a_pending_notice_is_resent_once_within_the_restarted_process(self):
+        await self.run_once()
+        self.set_delivery("pending")
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await runtime.call(runtime.tick)
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+        self.assertEqual(2, len(self.notices()))
+
+    async def test_a_final_stored_outcome_is_not_resent(self):
+        for delivery in ("sent", "failed", "disabled"):
+            with self.subTest(delivery=delivery):
+                before = len(self.notices())
+                if not before:
+                    await self.run_once()
+                    before = len(self.notices())
+                self.set_delivery(delivery)
+                self.clock.advance(timedelta(minutes=5))
+                await self.run_once()
+                self.assertEqual(before, len(self.notices()))
+                self.assertEqual(delivery, self.stored_notice()[0][2])
 
     async def test_without_a_boot_id_each_start_notifies(self):
         self.boot.unlink()
