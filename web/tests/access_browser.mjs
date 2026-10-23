@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { launchChrome, pageFor } from './chrome.mjs';
+import { clickWhenEnabled, launchChrome, pageFor, routeTracker } from './chrome.mjs';
 import { APP_CSP } from '../scripts/policy.mjs';
 
 const origin = 'http://localhost';
@@ -83,7 +83,7 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true } 
   const requests = [];
   const unexpected = [];
   const exceptions = [];
-  const routeErrors = [];
+  const routes = routeTracker();
   const abandoned = [];
   const cleanup = [
     browser.on('Runtime.exceptionThrown', (_, sessionId) => { if (sessionId === page.sessionId) exceptions.push('unhandled error'); }),
@@ -111,37 +111,36 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true } 
       History.prototype[name] = function (...args) { window.__writes.push('history ' + name); return original.apply(this, args); };
     }
   ` });
-  async function route({ requestId, request }) {
+  async function route({ requestId, networkId, request }) {
     const url = new URL(request.url);
     let body = request.postData ?? '';
     if (!body && request.postDataEntries) body = request.postDataEntries.map(entry => Buffer.from(entry.bytes ?? '', 'base64').toString()).join('');
     requests.push({ method: request.method, url: request.url, path: url.pathname, body, headers: request.headers });
+    // A request the page aborted while it was paused here (a late answer
+    // after pagehide, a reload replacing a load) can no longer be answered:
+    // `page.answer` reports it only once Chrome confirmed the page cancelled
+    // it, and it is recorded as abandoned. Any other refusal is a harness error.
+    async function send(method, params) {
+      if (!await page.answer(networkId, method, { requestId, ...params })) abandoned.push(`${request.method} ${url.pathname}`);
+    }
     async function fulfill(responseCode, content, contentType, csp) {
       const responseHeaders = [{ name: 'Cache-Control', value: 'no-store' }];
       if (contentType) responseHeaders.push({ name: 'Content-Type', value: contentType });
       if (csp) responseHeaders.push({ name: 'Content-Security-Policy', value: csp });
-      await page.command('Fetch.fulfillRequest', { requestId, responseCode, responseHeaders,
-        body: Buffer.from(content).toString('base64') });
+      await send('Fetch.fulfillRequest', { responseCode, responseHeaders, body: Buffer.from(content).toString('base64') });
     }
+    const block = () => send('Fetch.failRequest', { errorReason: 'BlockedByClient' });
     if (url.origin !== origin) {
       unexpected.push(`origin ${url.origin}`);
-      await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }); return;
+      await block(); return;
     }
     if (request.method === 'GET' && files.has(url.pathname) && url.search === '') {
       await fulfill(200, ...files.get(url.pathname)); return;
     }
     const handler = handlers[`${request.method} ${url.pathname}`];
-    // A handler may answer late (a promise), as a slow Main Server would. A
-    // late answer to a request the page has aborted meanwhile can no longer
-    // be delivered; that is recorded as abandoned, not as a harness error.
+    // A handler may answer late (a promise), as a slow Main Server would.
     if (handler && url.search === '') {
-      const pending = handler(body);
-      const answer = await pending;
-      try { await fulfill(...answer, null); } catch (error) {
-        if (!(pending instanceof Promise)) throw error;
-        abandoned.push(`${request.method} ${url.pathname}`);
-      }
-      return;
+      await fulfill(...await handler(body), null); return;
     }
     if (url.pathname.startsWith('/api/')) {
       // Anything else is the server's generic refusal (and must not be asked for).
@@ -149,18 +148,18 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true } 
       await fulfill(404, JSON.stringify({ detail: PRIVATE }), 'application/json', null); return;
     }
     unexpected.push(`${request.method} ${url.pathname}`);
-    await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' });
+    await block();
   }
   cleanup.push(browser.on('Fetch.requestPaused', (params, sessionId) => {
-    if (sessionId === page.sessionId) void route(params).catch(() => routeErrors.push('interception failed'));
+    if (sessionId === page.sessionId) routes.track(route(params));
   }));
   await page.command('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
   const posts = () => requests.filter(item => item.method === 'POST');
   const ui = {
     async button(label) {
-      const find = `Array.from(document.querySelectorAll('#main button')).find(el => el.textContent === ${JSON.stringify(label)})`;
-      await page.wait(`Boolean(${find}) && !(${find}).disabled`);
-      await page.evaluate(`(${find}).click()`);
+      // Found and clicked in one evaluation: the list unmounts while it
+      // reloads after a change, so a separate lookup could find nothing.
+      await page.wait(clickWhenEnabled(`Array.from(document.querySelectorAll('#main button')).find(el => el.textContent === ${JSON.stringify(label)})`));
     },
     async text(value) { await page.wait(`document.body.innerText.includes(${JSON.stringify(value)})`); },
     async type(selector, value) {
@@ -179,7 +178,10 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true } 
     await assertions({ page, ui, requests, posts, state, authenticatorId, abandoned });
     await delay(100);
     assert.deepEqual(exceptions, [], 'no unhandled browser errors');
-    assert.deepEqual(routeErrors, [], 'request interception must succeed');
+    // Every handler has finished, a late answer included (Codex PR #331).
+    assert.deepEqual(await routes.settle(), [], 'request interception must succeed');
+    // Only API requests are ever abandoned; the document and its assets are always delivered.
+    assert.deepEqual(abandoned.filter(item => !item.split(' ')[1].startsWith('/api/')), [], 'only API requests may be abandoned by the page');
     assert.deepEqual(unexpected, [], 'every request is expected');
     assert.deepEqual(await page.evaluate('window.__policyViolations'), [], 'no CSP violation');
     assert.deepEqual(await page.evaluate('window.__writes'), [], 'no storage or history writes');

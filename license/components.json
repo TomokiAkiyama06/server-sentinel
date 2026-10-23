@@ -19,15 +19,15 @@
     },
     {
       "path": "web/tests/browser.mjs",
-      "sha256": "sha256:9a6771a6fc273aa1b34c6c7275b0de43c26b201cfe6a7bda9b4da253d7395c35"
+      "sha256": "sha256:1826d64774c0d7a2d4f942fb347a0bb9d43e29ae7e936697e8c42bf8fbea43a4"
     },
     {
       "path": "web/tests/chrome.mjs",
-      "sha256": "sha256:947d81ff9547d168ef5741d6ee82e8e2be1852e3740a9407f99fe23caed19d99"
+      "sha256": "sha256:ecd927c9e687f912f69876e3da7e75498d313eac628c16d7c514a64ed73c9055"
     },
     {
       "path": "web/tests/chrome.test.mjs",
-      "sha256": "sha256:db29672ed673399866b24d7c0f15c5f2a8c1cae198d6f5770e2213eb3b4bcd60"
+      "sha256": "sha256:fcd2ee3980442f8cbeb36f1cf0009395f7aed9aef706bd558c4577388ab96f6a"
     },
     {
       "path": "web/tests/compile.mjs",
@@ -75,7 +75,7 @@
     },
     {
       "path": "web/tests/access_browser.mjs",
-      "sha256": "sha256:7324d34d3a0416e46ec6db42ee032a994a761de105f5e1ffa6caa9d32d967173"
+      "sha256": "sha256:0e88b733d12a5f31071967838e9dc51b1481686aa666613bb3de0b76d1ee969c"
     }
   ],
   "inputs": [
