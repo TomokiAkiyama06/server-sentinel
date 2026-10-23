@@ -90,6 +90,26 @@ class CaptureLimits:
 
 
 @dataclass(frozen=True)
+class CaptureCounters:
+    """Value-free cumulative per-source capture counters (Issue #305).
+
+    Counts only: no sizes, offsets, timestamps, device details or bytes.
+    ``launches`` is the number of pipelines started for the source (a value
+    above 1 means the GStreamer child was restarted); ``stream_invalid`` the
+    pipelines whose reader saw the byte stream lose JPEG framing or turn
+    malformed (whatever path then tore the pipeline down; a stall, EOF,
+    startup timeout or reader failure is not counted here, only in
+    ``launches``); ``padding_tolerated`` the inter-frame gaps above the 4 KiB
+    default that the profile bound skipped before a valid frame. Counts of a
+    pipeline still running or not yet reaped are included as they stand.
+    """
+
+    launches: int
+    stream_invalid: int
+    padding_tolerated: int
+
+
+@dataclass(frozen=True)
 class UvcSourceConfig:
     source_id: UUID
     profile: MjpegProfile
@@ -306,6 +326,9 @@ class _Source:
         self.closing = False
         # Queue drops already surfaced in a degraded snapshot.
         self.reported_drops = 0
+        # Value-free counters (``CaptureCounters``) of pipelines already reaped.
+        self.stream_invalid = 0
+        self.retired_padding = 0
         # Last capture failure while no pipeline runs; cleared by real frames.
         self.failure = None
         # The exact device evidence found not to offer this source's profile.
@@ -442,8 +465,24 @@ class UvcCapture:
         active, source.active = source.active, None
         if active is None:
             return
-        if not self._reap(active):
+        if self._reap(active):
+            self._retire(source, active)
+        else:
             source.stuck.append(active)
+
+    @staticmethod
+    def _retire(source, active):
+        """Fold a reaped pipeline's counts into the source's counters.
+
+        Called only after the process stopped and the reader thread was
+        joined, so bytes the reader still handled during teardown are counted,
+        and whatever path tore it down (supervision, reconcile, conflict,
+        discovery failure, approval or close), a framing loss the reader saw
+        counts as ``stream_invalid``.
+        """
+        source.retired_padding += active.parser.large_gaps
+        if active.error == "stream_invalid":
+            source.stream_invalid += 1
 
     def _stop_bound(self):
         if self._teardown_deadline is None:
@@ -470,8 +509,13 @@ class UvcCapture:
         # heartbeat); later attempts re-signal and only check without waiting.
         # The check itself (a process-table scan) stays within the shared
         # per-poll stop bound.
-        source.stuck = [active for active in source.stuck
-                        if not self._reap(active, self._stop_bound(), wait=False)]
+        stuck = []
+        for active in source.stuck:
+            if self._reap(active, self._stop_bound(), wait=False):
+                self._retire(source, active)
+            else:
+                stuck.append(active)
+        source.stuck = stuck
 
     def _storage_failure(self, source):
         self._teardown(source)
@@ -678,6 +722,17 @@ class UvcCapture:
             now = self.clock()
             return tuple(self._health(source, now) for source in self._sources.values())
 
+    def counters(self, source_id):
+        """Value-free ``CaptureCounters`` for one source, cumulative since start."""
+        with self._lock:
+            source = self._sources[source_id]
+            # Pipelines not yet reaped (running or stuck) count with their
+            # current values; they move to the retired totals once reaped.
+            live = ([source.active] if source.active is not None else []) + source.stuck
+            padding = source.retired_padding + sum(a.parser.large_gaps for a in live)
+            invalid = source.stream_invalid + sum(a.error == "stream_invalid" for a in live)
+            return CaptureCounters(source.generation, invalid, padding)
+
     def frames(self, source_id):
         """Bounded compressed-frame queue for a later ring/transport consumer."""
         return self._sources[source_id].queue
@@ -736,7 +791,13 @@ class UvcCapture:
             for source in self._sources.values():
                 self._teardown(source)
                 # Shutdown grants every stuck pipeline one more full bound.
-                source.stuck = [active for active in source.stuck if not self._reap(active)]
+                stuck = []
+                for active in source.stuck:
+                    if self._reap(active):
+                        self._retire(source, active)
+                    else:
+                        stuck.append(active)
+                source.stuck = stuck
                 # A still-blocked open or close (its late descriptor is released
                 # in the worker) gets one more full bound; if it is still
                 # running, shutdown is not clean.
