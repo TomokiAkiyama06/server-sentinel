@@ -557,9 +557,9 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
         monitor = self.monitor(hourly_limit=1)
         self.online(monitor, self.sources[1])
         old, older = uuid4(), uuid4()
-        # Newest first, as the runtime hands them over.
-        monitor.restore_pending([(old, AT - timedelta(hours=5)),
-                                 (older, AT - timedelta(hours=10))])
+        # The newer handed over first: the order is by stored time.
+        monitor.restore_pending([(old, AT - timedelta(hours=5))])
+        monitor.restore_pending([(older, AT - timedelta(hours=10))])
         self.advance(300)
         with self.assertLogs("app.monitoring.cameras", level="WARNING"):
             self.assertEqual(2, self.drain(monitor).held)
