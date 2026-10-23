@@ -509,7 +509,14 @@ its reference.
   frame delays no other source; detection starts at once on the re-acquired
   reference (Owner decision 2026-10-23). The re-acquired reference is reported `restart_reacquired` (not confirmed by
   the Owner): a camera or server moved while Main was down is not detected
-  against it.
+  against it. Before the runtime runs (for example a deferred timeline
+  outbox open waiting for storage) Main calls `mark_stored()`, which only
+  reads the history so that such a source reports `reacquire_pending`
+  instead of `none`/`idle` (Issue #341); `pending_reacquisitions()` stays
+  empty and `reacquire()` does nothing until `start()`. An unreadable
+  history marks the source with `failure="history_unavailable"` (unknown,
+  not "stored"); `start()` reads the history again, clearing that failure or
+  withdrawing the mark when nothing is stored.
 - `status()` is value-free: origin, version, time, phase, last refusal,
   whether a template exists, and the runtime's own source state and reason.
 

@@ -31,6 +31,7 @@ const b64 = bytes => Buffer.from(bytes).toString('base64url');
 const csrf = `${'A'.repeat(42)}b`;
 const sourceId = '00000000-0000-4000-8000-00000000e001';
 const otherId = '00000000-0000-4000-8000-00000000e002';
+const unknownId = '00000000-0000-4000-8000-00000000e003';
 const at = '2026-10-22T01:02:03.123456+00:00';
 const DIGEST = 'f'.repeat(64);
 const credentialId = randomBytes(16);
@@ -43,6 +44,10 @@ const TEXT = {
   done: '校正しました',
   noFrame: '時間内にカメラの映像を取得できませんでした。カメラの接続を確認してください。',
   restart: '再起動後に自動で取り直した基準（未確認）',
+  pending: '保存済みの校正あり（基準の取り直し待ち）',
+  pendingPhase: '（検知が始まるまでの間も含みます）',
+  none: '未校正',
+  unknown: '校正の状態を確認できません',
 };
 const CALIBRATE = `/api/scene/sources/${sourceId}/calibration`;
 
@@ -54,6 +59,9 @@ function status(calibrated) {
     { source_id: otherId, origin: 'none', version: null, calibrated_at: null, phase: 'reacquire_pending',
       failure: 'reader_changed', owner_calibration_available: false, detection: 'inactive',
       detection_reason: 'calibration_reference_unavailable' },
+    { source_id: unknownId, origin: 'none', version: null, calibrated_at: null, phase: 'reacquire_pending',
+      failure: 'history_unavailable', owner_calibration_available: false, detection: 'inactive',
+      detection_reason: 'unavailable' },
   ] };
 }
 
@@ -159,7 +167,7 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true, e
     async text(value) { await page.wait(`document.body.innerText.includes(${JSON.stringify(value)})`); },
     async open() {
       await page.click('カメラソース');
-      await page.wait("document.querySelectorAll('[data-calibration-source]').length === 2");
+      await page.wait("document.querySelectorAll('[data-calibration-source]').length === 3");
     },
     async confirmPosition() {
       await page.evaluate(`document.querySelector('[data-calibration-source="${sourceId}"] input[type=checkbox]').click()`);
@@ -216,6 +224,16 @@ try {
     await ui.text(TEXT.restart);
     // A source without a template carries no control.
     assert.equal(await page.evaluate(`document.querySelectorAll('[data-calibration-source="${otherId}"] button').length`), 0);
+    // Issue #341: its stored calibration waits for the re-acquisition, so it
+    // is shown as stored and pending, never as "not calibrated".
+    await ui.text(TEXT.pending);
+    const other = await page.evaluate(`document.querySelector('[data-calibration-source="${otherId}"]').textContent`);
+    assert.ok(other.includes(TEXT.pendingPhase), other);
+    assert.ok(!other.includes(TEXT.none), other);
+    // An unreadable history is shown as unknown, neither stored nor "not calibrated".
+    await ui.text(TEXT.unknown);
+    const unknown = await page.evaluate(`document.querySelector('[data-calibration-source="${unknownId}"]').textContent`);
+    assert.ok(!unknown.includes(TEXT.pending) && !unknown.includes(TEXT.none), unknown);
     // The control needs the explicit normal-position statement first.
     assert.equal(await page.evaluate(`document.querySelector('[data-calibration-source="${sourceId}"] button').disabled`), true);
     assert.deepEqual(posts(), []);

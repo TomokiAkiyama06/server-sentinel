@@ -131,7 +131,7 @@ def crossing(kind, *, received=NOW, occurred=None, confidence=None, trusted=True
 def critical(kind=CriticalKind.SERVER_MOVEMENT, *, at=NOW, quality=DetectionQuality.SUFFICIENT,
              confirmed=True, source=SOURCE):
     return CriticalObservation(uuid4(), kind, source, SourceType.LOCAL_UVC, uuid4(), 1, at, 1, uuid4(), 1,
-                               NOW - timedelta(days=1), "0" * 64, .9, quality, "synthetic", confirmed)
+                               NOW - timedelta(days=1), .9, quality, "synthetic", confirmed)
 
 
 class EntranceAdapterTests(PresenceFixture, TestCase):

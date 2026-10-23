@@ -648,6 +648,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # delays neither another source's detection nor its notice.
             live = (SceneRuntimeState.RUNNING, SceneRuntimeState.DEGRADED)
             started = False
+            # Issue #341: a source with a stored calibration reports
+            # `reacquire_pending` (not "never calibrated") while the runtime
+            # still waits for a deferred start; this only reads the history.
+            # The re-acquisition itself waits for `start()` below.
+            await run_to_completion(asyncio.to_thread(scene_calibration_service.mark_stored))
             while True:
                 if scene_lifecycle["stopping"]:
                     return

@@ -5,9 +5,11 @@ transport only. No real Slack endpoint, camera, host or network is used.
 """
 
 import asyncio
+import base64
 from concurrent.futures import Future
 from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import queue
 from pathlib import Path
@@ -37,7 +39,7 @@ from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
-from tests.test_detector_roi import HEIGHT, WIDTH, pixels, policy
+from tests.test_detector_roi import HEIGHT, WIDTH, frame_digests, frame_traces, pixels, policy
 from tests.test_monitoring_runtime import RuntimeFixture
 from tests.test_presence import NOW, MockAccess, observation
 from tests.test_presence_adapters import critical
@@ -59,6 +61,27 @@ class GatedTransport(Transport):
     def open(self, request, *, timeout):
         self.gate.wait(10)
         return super().open(request, timeout=timeout)
+
+
+def frame_trace_findings(media, *, texts, database, directory):
+    """Where `media` or a digest of it appears (Issue #332): in `texts`
+    (payloads, request bodies), in any value of any table of `database`, or
+    in any file under `directory`. Each location is reported once."""
+    traces = frame_traces(*media)
+    raw = [trace for luma in media for trace in (luma, *frame_digests(luma))]
+    found = []
+    with closing(sqlite3.connect(database)) as db:
+        for (table,) in db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"):
+            values = [value for row in db.execute(f'SELECT * FROM "{table}"') for value in row]
+            if any(isinstance(value, (bytes, bytearray)) or any(trace in str(value) for trace in traces)
+                   for value in values):
+                found.append(f"table {table}")
+    if any(trace in text for text in texts for trace in traces):
+        found.append("text")
+    for path in sorted(Path(directory).rglob("*")):
+        if path.is_file() and any(trace in path.read_bytes() for trace in raw):
+            found.append(f"file {path.name}")
+    return found
 
 
 def texts(transport):
@@ -685,6 +708,62 @@ class LifespanTests(RuntimeFixture):
         async with asyncio.timeout(30), restarted.router.lifespan_context(restarted):
             await asyncio.sleep(0.2)
         self.assertEqual([ALERT + "server_movement"], self.critical_texts())
+
+    async def test_no_frame_derived_value_reaches_the_timeline_audit_or_notifications(self):
+        # Issue #332: a confirmed critical observation crosses the presence
+        # adapter (`CriticalTimelineRecorder`), the timeline writer
+        # (`PresenceService.record_critical`), the audit records and the
+        # notification row and Slack delivery. None of them receives the
+        # reference or sample pixels, or any digest of them.
+        application = self.scene_application()
+        timeline = application.state.scene_timeline
+        runtime = application.state.scene_monitoring
+        written, writer = [], timeline.outbox.service.record_critical
+
+        def record_critical(observation, **options):
+            written.append(observation)
+            return writer(observation, **options)
+
+        timeline.outbox.service.record_critical = record_critical
+        async with asyncio.timeout(30), application.router.lifespan_context(application):
+            stream = uuid4()
+            for luma in (pixels(), pixels(), MOVED, MOVED):
+                await self.offer(runtime, stream, luma)
+            self.assertTrue(await self.until(
+                lambda: self.critical_texts() == [ALERT + "server_movement"]))
+            self.assertTrue(await self.until(lambda: self.rows(
+                "SELECT delivery FROM notification_events WHERE kind='server_movement'")
+                == [("sent",)]))
+        self.assertEqual(["server_movement"], [item.kind.value for item in written])
+        payloads = [json.dumps(item.payload(), sort_keys=True) for item in written]
+        requests = [request.data.decode("latin-1") for request, _ in self.transport.requests]
+        self.assertTrue(requests)
+        database = Path(self.settings.database_path)
+        with closing(sqlite3.connect(database)) as db:
+            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertLessEqual({"presence_observations", "notification_events",
+                              "security_admin_audit_records"}, tables)
+
+        def findings():
+            return frame_trace_findings((pixels(), MOVED), texts=(*payloads, *requests),
+                                        database=database, directory=database.parent)
+
+        self.assertEqual([], findings())
+        # Positive controls (Claude review of PR #345, proposal 1): the same
+        # scan reports a digest hex written into a notification row, a
+        # payload or request carrying pixels, and a file holding pixels.
+        with closing(sqlite3.connect(database)) as db:
+            db.execute("UPDATE notification_events SET kind=? WHERE kind='server_movement'",
+                       (hashlib.sha256(MOVED).hexdigest(),))
+            db.commit()
+        found = findings()
+        self.assertIn("table notification_events", found)
+        self.assertNotIn("text", found)
+        requests.append(base64.b64encode(pixels()).decode())
+        self.assertIn("text", findings())
+        self.assertNotIn("file synthetic-trace.bin", findings())
+        (database.parent / "synthetic-trace.bin").write_bytes(b"prefix" + pixels())
+        self.assertIn("file synthetic-trace.bin", findings())
 
     async def test_work_queued_while_dispatch_steps_fail_is_sent_after_recovery(self):
         application = self.scene_application()

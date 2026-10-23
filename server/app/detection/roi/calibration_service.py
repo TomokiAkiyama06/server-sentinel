@@ -293,6 +293,7 @@ class SceneCalibrationService:
         self._pending: dict[UUID, object] = {}
         self._closed = False
         self._started = False
+        self._marked = False
 
     # -- status ----------------------------------------------------------
     def status(self) -> tuple[SourceCalibrationStatus, ...]:
@@ -325,31 +326,69 @@ class SceneCalibrationService:
             self._notices[:0] = list(notices)
 
     # -- lifecycle ---------------------------------------------------------
+    def mark_stored(self) -> None:
+        """Mark the sources with a stored calibration before the runtime runs.
+
+        Issue #341: a deferred scene runtime start (a timeline outbox open
+        still waiting for storage) would otherwise report such a source as
+        never calibrated (`origin=none`, `phase=idle`). This only reads the
+        history and sets the value-free `reacquire_pending` phase; nothing is
+        re-acquired, refused or notified before `start()`. Repeated calls,
+        and calls after `start()` or `close()`, do nothing.
+        """
+        with self._lock:
+            if self._marked or self._started or self._closed:
+                return
+            self._marked = True
+        self._mark()
+
     def start(self) -> None:
         """Mark every source with a stored calibration for re-acquisition.
 
         Called once after the scene runtime started. A history that cannot
         be read marks the source as well (the attempt reports why), so a
-        failure is never silent.
+        failure is never silent. The history is read again even after
+        `mark_stored()`, so the marks are those of the history at start.
         """
         with self._lock:
             if self._started or self._closed:
                 return
             self._started = True
+        self._mark()
+
+    def _mark(self) -> None:
         for source_id in self.runtime.source_ids:
             binding = self.runtime.binding(source_id)
             try:
-                record = self._latest(binding)
+                record, unreadable = self._latest(binding), False
             except CalibrationRefused:
-                record = True
-            if record is not None:
-                with self._lock:
-                    state = self._sources[source_id]
-                    if state.origin is CalibrationOrigin.NONE:
-                        state.reacquire = True
+                record, unreadable = None, True
+            with self._lock:
+                state = self._sources[source_id]
+                if state.origin is not CalibrationOrigin.NONE:
+                    continue
+                # Also while an Owner calibration is in flight (Codex P2 on
+                # PR #345): if it fails, the stored calibration is still
+                # re-acquired; if it succeeds, `_attempt` clears the mark
+                # and the failure. The phase shows `acquiring` meanwhile.
+                if unreadable:
+                    # Whether a calibration is stored is unknown, not
+                    # "stored": the status says why (Issue #341), and the
+                    # attempt after `start()` reports it again.
+                    state.reacquire, state.failure = True, "history_unavailable"
+                    continue
+                if state.failure == "history_unavailable":
+                    # An earlier unreadable read is superseded by this one.
+                    state.failure = None
+                # A read that finds no stored calibration withdraws an
+                # earlier mark made only because the history was unreadable.
+                state.reacquire = record is not None
 
     def pending_reacquisitions(self) -> tuple[UUID, ...]:
+        """The sources to re-acquire; none before `start()` (Issue #341)."""
         with self._lock:
+            if not self._started:
+                return ()
             return tuple(source_id for source_id, state in self._sources.items()
                          if state.reacquire and not state.acquiring)
 
@@ -400,7 +439,9 @@ class SceneCalibrationService:
         binding = self.runtime.binding(source_id) if isinstance(source_id, UUID) else None
         with self._lock:
             state = self._sources.get(source_id)
-            if binding is None or state is None or not state.reacquire:
+            if binding is None or state is None or not state.reacquire or not self._started:
+                # Before `start()` a source is only marked (`mark_stored`);
+                # the re-acquisition waits for the runtime (Issue #341).
                 return None
 
         def plan():

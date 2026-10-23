@@ -185,6 +185,23 @@ export function CalibrationScreen({ services, t }: { services: DashboardServices
   </section>;
 }
 
+/**
+ * The origin badge. A source still waiting for its restart re-acquisition has
+ * no reference in use yet (`origin: none`) but does have a stored calibration
+ * (Issue #341), so it is not called "not calibrated". When the history could
+ * not be read (`history_unavailable`) whether one is stored is unknown, and
+ * the badge says only that.
+ */
+export function originText(t: Catalog, item: SceneCalibrationSource): string {
+  if (item.origin !== 'none' || item.phase !== 'reacquire_pending') return t[`calibrationOrigin_${item.origin}`];
+  return historyUnknown(item) ? t.calibrationOriginUnknown : t.calibrationOriginPending;
+}
+
+/** A pending source whose calibration history could not be read. */
+function historyUnknown(item: SceneCalibrationSource): boolean {
+  return item.origin === 'none' && item.phase === 'reacquire_pending' && item.failure === 'history_unavailable';
+}
+
 /** One source's calibration state and, when a template exists, its control. */
 export function CalibrationCard({ t, item, name, disabled, busy = false, confirmed, onConfirm, onCalibrate }: {
   t: Catalog; item: SceneCalibrationSource; name: string | null; disabled: boolean; busy?: boolean; confirmed: boolean;
@@ -195,7 +212,7 @@ export function CalibrationCard({ t, item, name, disabled, busy = false, confirm
     data-calibration-origin={item.origin} aria-busy={busy || undefined}>
     <h3>{name ?? `${t.calibrationSourceId} ${item.source_id.slice(0, 8)}`}</h3>
     <p>
-      <span className={`badge calibration-origin-${item.origin}`}>{t[`calibrationOrigin_${item.origin}`]}</span>{' '}
+      <span className={`badge calibration-origin-${item.origin}`}>{originText(t, item)}</span>{' '}
       <span className={`badge calibration-detection-${item.detection}`}>
         {t.calibrationDetection}: {t[`calibrationDetection_${item.detection}`]}</span>
     </p>
@@ -208,8 +225,9 @@ export function CalibrationCard({ t, item, name, disabled, busy = false, confirm
     {item.origin === 'restart_reacquired' && <p role="note" className="calibration-warning">
       {t.calibrationRestartWarning}</p>}
     {item.phase === 'acquiring' && <p role="status">{t.calibrationPhase_acquiring}</p>}
-    {item.phase === 'reacquire_pending' && <p role="status">{t.calibrationPhase_reacquire_pending}</p>}
-    {item.failure !== null && <p className="notice-inline" data-calibration-failure={item.failure}>
+    {item.phase === 'reacquire_pending' && <p role="status">
+      {historyUnknown(item) ? t.calibrationHistoryUnknown : t.calibrationPhase_reacquire_pending}</p>}
+    {item.failure !== null && !historyUnknown(item) && <p className="notice-inline" data-calibration-failure={item.failure}>
       {t.calibrationLastFailure}: {refusalText(t, item.failure)}</p>}
     {!item.owner_calibration_available && <p className="muted">{t.calibrationNoTemplate}</p>}
     {onCalibrate && <div className="calibration-action">

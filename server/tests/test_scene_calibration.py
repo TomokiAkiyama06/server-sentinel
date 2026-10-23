@@ -52,6 +52,7 @@ from tests.test_scene_runtime import (
     INTERVAL, OTHER, SOURCE, Harness, Recorder, binding, calibration_for, quality, unattainable, yuyv,
 )
 from tests.test_monitoring_runtime import RuntimeFixture
+from tests.test_scene_timeline import refuse_outbox_open, timeline_configuration
 from tests.test_recording import SyntheticValidator
 from tests.test_uvc_runtime import wait_for
 
@@ -762,6 +763,142 @@ class RestartReacquisitionTests(unittest.TestCase):
         self.assertEqual((), closing_down.service.take_notices())
         self.assertEqual([1], [item.version for item in self.database.history()])
 
+    def test_marking_before_start_only_shows_the_pending_reacquisition(self):
+        # Issue #341: `mark_stored()` reads the history before the runtime
+        # runs; the status reports `reacquire_pending`, but nothing is
+        # re-acquired, refused or notified until `start()`.
+        self.database.store(stored())
+        harness = Service(self, self.database.database, start=False)
+        harness.service.mark_stored()
+        status = harness.status()
+        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, None),
+                         (status.origin, status.phase, status.failure))
+        self.assertEqual((), harness.service.pending_reacquisitions())
+        log = []
+        self.assertIsNone(harness.service.reacquire(OTHER, commit_with(self.database.database, log)))
+        self.assertEqual(([], None, ()), (log, harness.status().failure, harness.service.take_notices()))
+        harness.runtime.start()
+        harness.service.start()
+        self.assertEqual((OTHER,), harness.service.pending_reacquisitions())
+        with Feed(harness.runtime):
+            self.assertIsNotNone(harness.service.reacquire(OTHER, commit_with(self.database.database, log)))
+        self.assertEqual([OTHER], log)
+        self.assertEqual([REACQUIRED], [item.kind for item in harness.service.take_notices()])
+        # Without a stored calibration, or after close(), nothing is marked.
+        empty = Service(self, Database_(self).database, start=False)
+        empty.service.mark_stored()
+        self.assertIs(CalibrationPhase.IDLE, empty.status().phase)
+        closed = Service(self, self.database.database, start=False)
+        closed.service.close()
+        closed.service.mark_stored()
+        self.assertIs(CalibrationPhase.IDLE, closed.status().phase)
+
+    def unreadable_at_mark(self, harness):
+        """Make the history unreadable for `mark_stored()` only."""
+        real, calls = harness.service._latest, []
+
+        def latest(binding):
+            calls.append(binding.source_id)
+            if len(calls) == 1:
+                raise CalibrationRefused("history_unavailable")
+            return real(binding)
+
+        harness.service._latest = latest
+        return calls
+
+    def test_an_unreadable_history_at_mark_is_unknown_and_start_reads_it_again(self):
+        # Claude review of PR #345, proposals 2 and 3: an unreadable history
+        # is reported as such (never as a stored calibration), and `start()`
+        # reads the history again instead of keeping the earlier mark.
+        self.database.store(stored())
+        harness = Service(self, self.database.database, start=False)
+        calls = self.unreadable_at_mark(harness)
+        harness.service.mark_stored()
+        status = harness.status()
+        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, "history_unavailable"),
+                         (status.origin, status.phase, status.failure))
+        self.assertEqual((), harness.service.take_notices())
+        harness.runtime.start()
+        harness.service.start()
+        self.assertEqual([OTHER, OTHER], calls)
+        status = harness.status()
+        self.assertEqual((CalibrationPhase.REACQUIRE_PENDING, None), (status.phase, status.failure))
+        self.assertEqual((OTHER,), harness.service.pending_reacquisitions())
+        with Feed(harness.runtime):
+            record = harness.service.reacquire(OTHER, commit_with(self.database.database))
+        self.assertEqual((2, UUID(int=700)), (record.version, record.identifier))
+        self.assertEqual([REACQUIRED], [item.kind for item in harness.service.take_notices()])
+
+    def test_a_mark_made_only_for_an_unreadable_history_is_withdrawn_at_start(self):
+        harness = Service(self, self.database.database, start=False)
+        self.unreadable_at_mark(harness)
+        harness.service.mark_stored()
+        self.assertEqual("history_unavailable", harness.status().failure)
+        harness.runtime.start()
+        harness.service.start()
+        status = harness.status()
+        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.IDLE, None),
+                         (status.origin, status.phase, status.failure))
+        self.assertEqual((), harness.service.pending_reacquisitions())
+        self.assertEqual((), harness.service.take_notices())
+
+    def test_a_failed_owner_calibration_overlapping_the_marks_keeps_the_reacquisition(self):
+        # Codex P2 on PR #345: an Owner calibration in flight across both the
+        # early `mark_stored()` and the `start()` scan, which then fails, must
+        # not leave the stored calibration without its re-acquisition.
+        self.database.store(stored())
+        harness = Service(self, self.database.database, start=False)
+        harness.runtime.start()
+        order, read = [], harness.service._read
+
+        def overlapping_read(source_id, width, height, timeout):
+            # The Owner attempt is `acquiring` here: both scans run now.
+            order.append(harness.status().phase)
+            harness.service.mark_stored()
+            harness.service.start()
+            order.append("marked")
+            raise CalibrationRefused("no_frame")
+
+        harness.service._read = overlapping_read
+        with self.assertRaises(CalibrationRefused):
+            harness.service.calibrate(OTHER, commit_with(self.database.database))
+        self.assertEqual([CalibrationPhase.ACQUIRING, "marked"], order)
+        harness.service._read = read
+        status = harness.status()
+        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, "no_frame"),
+                         (status.origin, status.phase, status.failure))
+        # The next pass of the restart loop re-acquires the stored calibration
+        # and detection starts on it.
+        self.assertEqual((OTHER,), harness.service.pending_reacquisitions())
+        with Feed(harness.runtime):
+            record = harness.service.reacquire(OTHER, commit_with(self.database.database))
+            harness.runtime.request_calibration_refresh(OTHER)
+            self.assertTrue(wait_for(lambda: harness.source().state is SceneSourceState.ACTIVE))
+        self.assertEqual((2, UUID(int=700)), (record.version, record.identifier))
+        self.assertIs(CalibrationOrigin.RESTART_REACQUIRED, harness.status().origin)
+        self.assertEqual([REACQUIRED], [item.kind for item in harness.service.take_notices()])
+
+    def test_a_successful_owner_calibration_overlapping_the_marks_clears_them(self):
+        self.database.store(stored())
+        harness = Service(self, self.database.database, start=False)
+        harness.runtime.start()
+        read = harness.service._read
+
+        def overlapping_read(*arguments):
+            harness.service.mark_stored()
+            harness.service.start()
+            return read(*arguments)
+
+        harness.service._read = overlapping_read
+        with Feed(harness.runtime):
+            record = harness.service.calibrate(OTHER, commit_with(self.database.database))
+        self.assertEqual(2, record.version)
+        status = harness.status()
+        self.assertEqual((CalibrationOrigin.OWNER, CalibrationPhase.IDLE, None),
+                         (status.origin, status.phase, status.failure))
+        self.assertEqual((), harness.service.pending_reacquisitions())
+        self.assertEqual((), harness.service.take_notices())
+
     def test_without_a_stored_calibration_nothing_is_reacquired_or_notified(self):
         harness = Service(self, self.database.database)
         harness.service.start()
@@ -791,7 +928,7 @@ def Database_History(test, source):
 class LifespanTests(RuntimeFixture):
     """Main lifespan: restart -> re-acquisition -> audited commit -> Owner alert."""
 
-    def scene_application(self, sources=(OTHER,), recorder=True, **calibration):
+    def scene_application(self, sources=(OTHER,), recorder=True, timeline=None, **calibration):
         remotes = tuple(binding(source, SourceType.REMOTE_AGENT, sample_interval_ns=1_000_000)
                         for source in sources)
         values = dict(reacquire_timeout_seconds=5, reacquire_retry_seconds=1)
@@ -808,7 +945,15 @@ class LifespanTests(RuntimeFixture):
                 tick_seconds=0.01, recorder=Recorder() if recorder else None),
             scene_calibration=SceneCalibrationConfiguration(
                 tuple(template(source) for source in sources), **values),
+            scene_timeline=timeline,
         )
+
+    def deferred_application(self):
+        """`scene_application` whose timeline outbox open is refused
+        (storage not admitted) until the returned event is cleared; the
+        scene runtime meanwhile stays `configured` (deferred start)."""
+        application = self.scene_application(recorder=False, timeline=timeline_configuration())
+        return application, refuse_outbox_open(application.state.scene_timeline)
 
     def store(self, calibration):
         database = Database(self.settings.database_path)
@@ -973,6 +1118,77 @@ class LifespanTests(RuntimeFixture):
         self.assertEqual(["ServerSentinel critical alert: scene_calibration_required"], self.scene_texts())
         self.assertEqual([1], self.versions())
         self.assertEqual([], self.reacquire_records())
+
+    async def test_a_deferred_start_shows_the_pending_reacquisition_and_attempts_nothing(self):
+        # Issue #341 (Claude re-review of PR #330): while the timeline outbox
+        # open is deferred, the runtime is `configured`. It is not treated as
+        # ended (`scene_runtime_ended`): no scrub, start or re-acquisition
+        # runs and nothing is notified. The stored calibration is still shown
+        # as waiting for its re-acquisition, not as never calibrated.
+        self.store(stored())
+        application, refusing = self.deferred_application()
+        service = application.state.scene_calibration
+        runtime = application.state.scene_monitoring
+        calls, original = [], service.reacquire
+
+        def reacquire(source_id, commit):
+            calls.append(source_id)
+            return original(source_id, commit)
+
+        service.reacquire = reacquire
+        with self.assertLogs("app", "ERROR"):
+            async with asyncio.timeout(60), application.router.lifespan_context(application):
+                with Feed(runtime):
+                    self.assertTrue(await self.until(
+                        lambda: service.status()[0].phase is CalibrationPhase.REACQUIRE_PENDING))
+                    # Many passes of the calibration loop (it polls at the
+                    # runtime's 10 ms tick until the runtime runs).
+                    await asyncio.sleep(1.0)
+                    self.assertIs(SceneRuntimeState.CONFIGURED, runtime.status().state)
+                    self.assertIs(SceneRuntimeState.UNAVAILABLE,
+                                  application.state.scene_monitoring_state)
+                    status = service.status()[0]
+                    self.assertEqual(
+                        (CalibrationOrigin.NONE, None, None, CalibrationPhase.REACQUIRE_PENDING, None),
+                        (status.origin, status.version, status.calibrated_at, status.phase,
+                         status.failure))
+                    self.assertEqual((), service.pending_reacquisitions())
+                    self.assertEqual([], calls)
+                    self.assertEqual([], self.scene_texts())
+                    self.assertEqual([], self.reacquire_records())
+                    self.assertEqual([1], self.versions())
+                    # Once the open succeeds the runtime runs and the stored
+                    # calibration is re-acquired and notified as before.
+                    refusing.clear()
+                    self.assertTrue(await self.until(
+                        lambda: service.status()[0].origin is CalibrationOrigin.RESTART_REACQUIRED))
+                    self.assertTrue(await self.until(lambda: len(self.scene_texts()) == 1))
+        self.assertEqual([OTHER], calls)
+        self.assertEqual(["ServerSentinel critical alert: scene_reference_reacquired"], self.scene_texts())
+        self.assertEqual([1, 2], self.versions())
+
+    async def test_an_unreadable_runtime_status_during_a_deferred_start_is_notified_once(self):
+        # Issue #341: `scene_runtime_ended` counts a status it cannot read as
+        # ended, so the stored calibration's re-acquisition is attempted,
+        # refused `unavailable` and notified once, instead of waiting forever.
+        self.store(stored())
+        application, _ = self.deferred_application()
+        runtime = application.state.scene_monitoring
+        required = ["ServerSentinel critical alert: scene_calibration_required"]
+        with self.assertLogs("app", "ERROR"):
+            async with asyncio.timeout(60), application.router.lifespan_context(application):
+                self.assertTrue(await self.until(
+                    lambda: application.state.scene_calibration.status()[0].phase
+                    is CalibrationPhase.REACQUIRE_PENDING))
+                with mock.patch.object(runtime, "status", side_effect=RuntimeError("unreadable")):
+                    self.assertTrue(await self.until(lambda: self.scene_texts() == required))
+                    # Retried every second; notified only once per process.
+                    await asyncio.sleep(2.5)
+                status = application.state.scene_calibration.status()[0]
+                self.assertEqual((CalibrationPhase.REACQUIRE_PENDING, "unavailable"),
+                                 (status.phase, status.failure))
+        self.assertEqual(required, self.scene_texts())
+        self.assertEqual([1], self.versions())
 
     async def test_never_calibrated_sources_are_left_alone(self):
         application = self.scene_application()
