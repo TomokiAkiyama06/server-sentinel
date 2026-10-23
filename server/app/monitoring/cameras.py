@@ -204,28 +204,35 @@ class _DownTime:
         self.bins.clear()
         self.ends.clear()
 
-    def _clock(self, now: float) -> bool:
+    def _clock(self, now: float) -> float | None:
+        """``now`` as this record uses it; ``None`` when it is not finite.
+
+        The runtime reads the monotonic clock before it drains, outside the
+        lock, so a health event observed meanwhile can carry a slightly later
+        time (PR #335 re-review 提案 1). A step back of at most one bin width
+        is such a race: the later time already seen is used. Only a larger
+        step back is a backwards clock: the kept time cannot be placed
+        against it, so the count starts again (the continuous rule is
+        unaffected; a ratio alert is at most one window later).
+        """
         if not math.isfinite(now):
-            return False
+            return None
         if self.last is not None and now < self.last:
-            # A backwards clock: the kept time cannot be placed against it,
-            # so the count starts again (the continuous rule is unaffected;
-            # a ratio alert is at most one window later).
+            if self.last - now <= self.width:
+                return self.last
             self.clear()
             if self.since is not None:
                 self.since = now
         self.last = now
-        return True
+        return now
 
     def start(self, now: float) -> None:
-        if self._clock(now):
-            self.since = now
-        else:
-            self.since = None
+        self.since = self._clock(now)
 
     def stop(self, now: float) -> None:
         since, self.since = self.since, None
-        if since is None or not self._clock(now) or now <= since:
+        now = self._clock(now)
+        if since is None or now is None or now <= since:
             # Unknown or zero length: no not-online time to count.
             return
         self.ends.append(now)
@@ -253,7 +260,8 @@ class _DownTime:
 
     def flapping(self, now: float, offline: float) -> bool:
         """``offline`` seconds or more, over two or more periods, in the window."""
-        if not self._clock(now):
+        now = self._clock(now)
+        if now is None:
             return False
         self.trim(now)
         start = now - self.window

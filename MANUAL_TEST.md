@@ -364,8 +364,9 @@ least 60):
 - [ ] intermittent outage (Refs #301 ratio rule, mock-verified only): unplug
   for about four minutes, replug for a few seconds, unplug again: exactly one
   `camera_offline` arrives once about five minutes of not-online time have
-  accumulated within fifteen minutes; keep flapping (or leave it unplugged)
-  for an hour: no further message; leave it plugged in for at least fifteen
+  accumulated within fifteen minutes; keep flapping (online periods of a few
+  seconds, never five minutes unplugged on end) for an hour: no further
+  message; leave it plugged in for at least fifteen
   minutes and flap again: one new message;
 - [ ] after that message, leave the camera unplugged for five minutes on end:
   exactly one more `camera_offline` (Owner decision 2026-10-23, at most two

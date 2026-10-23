@@ -1573,8 +1573,10 @@ alert, may get one more ratio alert; and after a restart that follows a
 ratio alert, a flapping episode that stays offline for `after_seconds` is
 notified by the continuous rule even when the stopped process already sent
 that period's continuous notification (its name follows the last-frame
-time, not the flapping alert). Each is at most one extra notification per
-restart, under the hourly cap. The Slack text is the fixed `ServerSentinel critical alert:
+time, not the flapping alert). One restart can therefore add up to two
+notifications: a restart more than a window after the last ratio alert of a
+source that is still flapping can send a new ratio alert and then that new
+period's continuous notification. All of them stay under the hourly cap. The Slack text is the fixed `ServerSentinel critical alert:
 camera_offline`: no source name, role, UUID, device path, serial, reason or
 image; the Owner identifies the source in the Web UI. `MonitoringStatus`
 reports `camera_offline_degraded` (counted as degraded in the daily summary)

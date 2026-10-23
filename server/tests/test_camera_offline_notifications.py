@@ -1043,6 +1043,37 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         self.drain(monitor)
         self.assertEqual(1, len(self.sent()))
 
+    def stale_drain(self, back):
+        # PR #335 re-review 提案 1: the runtime reads the clock before it
+        # drains, outside the lock; a health event observed meanwhile carries
+        # a later time than the drain.
+        monitor = self.monitor()
+        self.online(monitor)
+        self.off(monitor)
+        self.advance(240)
+        self.on(monitor)
+        self.advance(2)
+        self.off(monitor)
+        monitor.drain(self.service, at=AT, monotonic=self.clock.value - back)
+        return monitor
+
+    def test_a_drain_slightly_behind_an_event_keeps_the_count(self):
+        monitor = self.stale_drain(0.01)
+        self.run_for(monitor, 60)
+        self.assertEqual(1, len(self.sent()))
+
+    def test_a_clock_far_behind_restarts_the_count(self):
+        monitor = self.stale_drain(10)
+        self.run_for(monitor, 60)
+        self.assertEqual([], self.sent())
+        self.on(monitor)
+        self.advance(2)
+        self.off(monitor)
+        self.run_for(monitor, 210)
+        self.assertEqual([], self.sent())
+        self.run_for(monitor, 30)
+        self.assertEqual(1, len(self.sent()))
+
     def test_odd_clocks_never_raise(self):
         monitor = self.monitor()
         self.online(monitor)
