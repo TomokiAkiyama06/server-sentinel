@@ -38,9 +38,23 @@ as ``approved_in_use`` because of it (a missing or stale ledger shows
 ``approval_required``). Writes are made under the same storage admission as
 the marker itself (``ApprovalStore``).
 
+Best effort (Owner decision 2026-10-23). The ledger only serves a display,
+so a publication that fails never stops a session: ``issue`` keeps the
+digest in this process's entries (and still raises, for the caller to log)
+and the next successful publication includes it. Until then the file lacks
+it and ``sources`` shows the marker as ``approval_required``, never a false
+``approved_in_use``.
+
+Bounds. The writer keeps at most ``MAX_SOURCES`` sources of
+``MAX_DIGESTS_PER_SOURCE`` digests each, the bounds the reader enforces, and
+``MAX_LEDGER_BYTES`` is derived from them (the largest file they allow), so
+the writer never produces a file the reader refuses.
+
 Ordering. A marker's digest is published *before* the marker is committed to
-the database, and withdrawn *before* the marker is cleared, so whenever the
-database holds a marker of the current run the ledger lists it. A digest of
+the database, and withdrawn *before* the marker is cleared (or the file is
+removed if that withdrawal cannot be published), so a listed digest matches
+a database marker only while the current run holds it, and every marker it
+holds is listed once a publication succeeds (best effort, above). A digest of
 a marker that never committed, or one that was later superseded, matches no
 row and is harmless. The command reads the database first and the ledger
 after it.
@@ -63,7 +77,6 @@ from uuid import UUID
 
 LEDGER_NAME = "uvc-session-ledger.json"
 FORMAT = "serversentinel-uvc-session-ledger-v1"
-MAX_LEDGER_BYTES = 16 * 1024
 # Supervisors start at most one session per source at a time, and every start
 # supersedes the previous marker; keeping the last few covers an overlap.
 MAX_DIGESTS_PER_SOURCE = 4
@@ -136,6 +149,22 @@ def current_process_identity(proc_root: Path = Path("/proc")) -> ProcessIdentity
     if start is None:
         raise SessionLedgerError("process state is unavailable")
     return ProcessIdentity(boot_id(proc_root), pid, start)
+
+
+def _encode(identity: ProcessIdentity, sessions: Mapping[str, list[str]]) -> bytes:
+    return json.dumps({
+        "format": FORMAT, "boot_id": identity.boot_id, "pid": identity.pid,
+        "start_time": identity.start_time,
+        "sessions": {source: sorted(digests) for source, digests in sorted(sessions.items())},
+    }, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+
+# The largest file the writer's bounds allow: the widest identity (a 64-bit
+# PID and start time; the kernel's are smaller) and every source holding the
+# most digests.
+MAX_LEDGER_BYTES = len(_encode(
+    ProcessIdentity("0" * 36, 2 ** 64 - 1, 2 ** 64 - 1),
+    {str(UUID(int=number)): ["0" * 64] * MAX_DIGESTS_PER_SOURCE for number in range(MAX_SOURCES)}))
 
 
 @dataclass(frozen=True)
@@ -238,27 +267,33 @@ class SessionLedger:
             return ledger
 
     def issue(self, source_id, session_token: str) -> None:
-        """Publish a marker before it is committed; raises if it cannot be published."""
+        """Publish a marker before it is committed.
+
+        Raises ``SessionLedgerError`` when it cannot be published, for the
+        caller to log; the session goes on (best effort). The digest is kept
+        in this process's entries all the same, so the next successful
+        publication includes it; until then ``sources`` shows the marker as
+        ``approval_required``. A new source beyond ``MAX_SOURCES`` is not
+        recorded at all (the same display), so the file stays readable.
+        """
         source, digest = str(source_id), marker_digest(session_token)
         with self._lock:
-            previous = list(self._sessions.get(source, ()))
-            digests = [item for item in previous if item != digest] + [digest]
+            previous = self._sessions.get(source)
+            if previous is None and len(self._sessions) >= MAX_SOURCES:
+                raise SessionLedgerError("UVC session ledger is full")
+            digests = [item for item in previous or () if item != digest] + [digest]
             self._sessions[source] = digests[-MAX_DIGESTS_PER_SOURCE:]
-            try:
-                self._publish()
-            except BaseException:
-                if previous:
-                    self._sessions[source] = previous
-                else:
-                    self._sessions.pop(source, None)
-                raise
+            self._publish()
 
     def withdraw(self, source_id, session_token: str) -> None:
         """Drop a marker before it is cleared (or after it failed to commit).
 
         Best effort: a digest that stays published matches no marker once
-        the marker is cleared or superseded, so a failed publication only
-        delays its removal until the next successful one.
+        the marker is cleared or superseded. If the publication fails, the
+        ledger file is removed instead where that still works, because the
+        marker's release may fail too and leave the marker in the database:
+        until the next successful publication every marker then shows as
+        ``approval_required``, never a false ``approved_in_use``.
         """
         source, digest = str(source_id), marker_digest(session_token)
         with self._lock:
@@ -270,7 +305,20 @@ class SessionLedger:
             try:
                 self._publish()
             except SessionLedgerError:
-                pass
+                self._discard()
+
+    def _discard(self) -> None:
+        try:
+            directory = os.open(self.path.parent,
+                                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            return
+        try:
+            os.unlink(LEDGER_NAME, dir_fd=directory)
+        except OSError:
+            pass
+        finally:
+            os.close(directory)
 
     def _publish(self) -> None:
         """Atomically replace the ledger with this process's current entries."""
@@ -278,16 +326,15 @@ class SessionLedger:
             if self._identity is None:
                 self._identity = self._identity_source()
             identity = self._identity
-            content = json.dumps({
-                "format": FORMAT, "boot_id": identity.boot_id, "pid": identity.pid,
-                "start_time": identity.start_time,
-                "sessions": {source: sorted(digests)
-                             for source, digests in sorted(self._sessions.items())},
-            }, sort_keys=True, separators=(",", ":")).encode("ascii")
+            content = _encode(identity, self._sessions)
         except SessionLedgerError:
             raise
         except Exception:
             raise SessionLedgerError("UVC session ledger could not be written") from None
+        if len(self._sessions) > MAX_SOURCES or len(content) > MAX_LEDGER_BYTES:
+            # Unreachable within the bounds ``issue`` keeps; never write a
+            # file the reader would refuse.
+            raise SessionLedgerError("UVC session ledger could not be written")
         try:
             directory = os.open(self.path.parent,
                                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)

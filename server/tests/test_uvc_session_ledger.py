@@ -27,6 +27,7 @@ from app.cameras.uvc.session_ledger import (
     ledger_path, marker_digest, process_start_time, read_ledger,
 )
 from app.local_admin import CliRefused
+from app.logging import Event
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -86,16 +87,48 @@ class SessionLedgerTests(Fixture):
         self.assertFalse(left.exists())
         self.assertTrue(unrelated.exists())
 
-    def test_a_failed_publication_refuses_the_issue_and_keeps_the_previous_entries(self):
+    def test_a_failed_publication_keeps_the_file_and_retains_the_digest_for_the_next(self):
         ledger = SessionLedger(self.ledger_file)
-        first = str(uuid4())
+        first, second = str(uuid4()), str(uuid4())
         ledger.issue(SOURCE, first)
         with patch.object(session_ledger.os, "replace", side_effect=OSError(28, "synthetic")):
-            with self.assertRaises(SessionLedgerError):
-                ledger.issue(SOURCE, str(uuid4()))
-            ledger.withdraw(SOURCE, first)  # best effort: does not raise
-        self.assertEqual({str(SOURCE): frozenset({marker_digest(first)})}, self.contents().sessions)
-        self.assertEqual(["state.sqlite3", LEDGER_NAME], sorted(os.listdir(self.root)))
+            with self.assertRaises(SessionLedgerError):  # reported, for the caller to log
+                ledger.issue(SOURCE, second)
+            # The file is the last complete publication; no staging file is left.
+            self.assertEqual({str(SOURCE): frozenset({marker_digest(first)})},
+                             self.contents().sessions)
+            self.assertEqual(["state.sqlite3", LEDGER_NAME], sorted(os.listdir(self.root)))
+            # A withdrawal that cannot publish removes the file instead (its
+            # release may fail too): it vouches for nothing until the next
+            # publication. Best effort: it does not raise.
+            ledger.withdraw(SOURCE, first)
+        self.assertIsNone(self.contents())
+        self.assertEqual(["state.sqlite3"], sorted(os.listdir(self.root)))
+        # The next successful publication (here another source's issue)
+        # includes the retained digest, and not the withdrawn one.
+        ledger.issue(OTHER, str(uuid4()))
+        self.assertEqual(frozenset({marker_digest(second)}), self.contents().sessions[str(SOURCE)])
+
+    def test_the_writer_keeps_the_bounds_the_reader_enforces(self):
+        ledger = SessionLedger(self.ledger_file, identity=lambda: ProcessIdentity(
+            current_process_identity().boot_id, 2 ** 64 - 1, 2 ** 64 - 1))
+        sources = [UUID(int=number) for number in range(1, session_ledger.MAX_SOURCES + 1)]
+        for source in sources:
+            for _ in range(session_ledger.MAX_DIGESTS_PER_SOURCE + 1):
+                ledger.issue(source, str(uuid4()))
+        self.assertLessEqual(self.ledger_file.stat().st_size, session_ledger.MAX_LEDGER_BYTES)
+        self.assertEqual(session_ledger.MAX_SOURCES, len(self.contents().sessions))
+        # One source more is not recorded at all; the file stays readable.
+        extra = UUID(int=session_ledger.MAX_SOURCES + 1)
+        with self.assertRaises(SessionLedgerError):
+            ledger.issue(extra, str(uuid4()))
+        ledger.withdraw(sources[0], str(uuid4()))  # publishes again
+        contents = self.contents()
+        self.assertNotIn(str(extra), contents.sessions)
+        self.assertEqual(session_ledger.MAX_SOURCES, len(contents.sessions))
+        # The size bound is derived from the source and digest bounds.
+        self.assertGreater(session_ledger.MAX_LEDGER_BYTES,
+                           session_ledger.MAX_SOURCES * session_ledger.MAX_DIGESTS_PER_SOURCE * 64)
 
     def test_a_shared_directory_is_refused(self):
         os.chmod(self.root, 0o777)
@@ -156,6 +189,20 @@ class CurrentRunMarkerTests(Fixture):
         token = str(uuid4())
         self.write(current_process_identity(), token)
         self.assertEqual({str(SOURCE): frozenset({marker_digest(token)})}, self.markers())
+
+    def test_a_writer_whose_start_time_changes_during_the_check_is_stale(self):
+        # The PID was reused while its descriptors were read: the first
+        # check saw the writer, the re-check another process.
+        own = current_process_identity()
+        self.write(own, str(uuid4()))
+        with patch.object(admin_cli, "process_start_time",
+                          side_effect=[own.start_time, own.start_time + 1]) as start:
+            self.assertEqual({}, self.markers())
+        self.assertEqual(2, start.call_count)
+        with patch.object(admin_cli, "process_start_time",
+                          side_effect=[own.start_time, SessionLedgerError("synthetic")]), \
+                self.assertRaises(CliRefused):
+            self.markers()
 
     def test_a_missing_ledger_vouches_for_nothing(self):
         self.assertEqual({}, self.markers())
@@ -242,11 +289,71 @@ class ServiceStoreTests(Fixture):
         self.store.start_session(self.source.id, self.camera)
         self.assertEqual([True], seen)
 
-    def test_a_ledger_that_cannot_be_written_refuses_the_start(self):
+    def approved_start_without_ledger(self):
+        """An approved source whose session starts while the ledger cannot be written."""
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            ApprovalStore.approve_on(connection, self.source.id, self.camera, serial_ambiguous=False)
+            connection.execute("COMMIT")
         with patch.object(session_ledger.os, "replace", side_effect=OSError(28, "synthetic")), \
+                self.assertLogs("app.cameras.uvc.persistence", "WARNING") as logs:
+            started = self.store.start_session(self.source.id, self.camera)
+        self.assertEqual([Event.LOCAL_UVC_SESSION_LEDGER_UNPUBLISHED.value],
+                         [record.getMessage() for record in logs.records])
+        # A fixed event: no path, marker or digest.
+        self.assertNotIn(str(self.root), logs.output[0])
+        self.assertNotIn(started.session_token, logs.output[0])
+        return started
+
+    def listing(self):
+        lines = admin_cli.source_lines(
+            CameraRegistry(self.database, unaudited_writes=True), ApprovalStore(self.database),
+            {self.source.id}, lambda: admin_cli._current_run_markers(self.identity, self.path))
+        return "\n".join(lines)
+
+    def test_a_ledger_that_cannot_be_written_never_stops_the_session(self):
+        # Owner decision 2026-10-23: the ledger only serves a display.
+        started = self.approved_start_without_ledger()
+        self.assertFalse(started.requires_approval)
+        self.assertEqual(started.session_token, self.store.load(self.source.id).session_token)
+        self.assertNotIn(marker_digest(started.session_token), self.listed())
+        # The display falls toward approval_required, never a false in-use.
+        self.assertIn("approval=approval_required configured=yes", self.listing())
+        self.assertNotIn("approved_in_use", self.listing())
+
+    def test_a_later_successful_publication_includes_the_retained_digest(self):
+        started = self.approved_start_without_ledger()
+        other = CameraRegistry(self.database, unaudited_writes=True).create_source(
+            source_type=SourceType.LOCAL_UVC, name="Other source", enabled=True,
+            desired_capture_profile=CaptureProfile(640, 480, 10, "MJPG"))
+        self.store.start_session(other.id, DeviceEvidence("/dev/video2", "synthetic", "model", "s2"))
+        self.assertEqual({marker_digest(started.session_token)}, self.listed())
+        self.assertIn("approval=approved_in_use configured=yes", self.listing())
+        # Released as usual: withdrawn before the marker is cleared.
+        self.store.save(self.source.id, self.camera, False, session_token=started.session_token,
+                        serial_ambiguous=False, release=True)
+        self.assertEqual(set(), self.listed())
+
+    def test_a_release_that_fails_with_its_withdrawal_never_shows_in_use(self):
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            ApprovalStore.approve_on(connection, self.source.id, self.camera, serial_ambiguous=False)
+            connection.execute("COMMIT")
+        started = self.store.start_session(self.source.id, self.camera)
+        self.assertIn("approval=approved_in_use", self.listing())
+
+        class Failing:
+            path = self.path
+
+            def connect(self):
+                raise __import__("sqlite3").OperationalError("synthetic")
+        with patch.object(session_ledger.os, "replace", side_effect=OSError(28, "synthetic")), \
+                patch.object(self.store, "database", Failing()), \
                 self.assertRaises(ApprovalStorageError):
-            self.store.start_session(self.source.id, self.camera)
-        self.assertIsNone(self.store.load(self.source.id))
+            self.store.save(self.source.id, self.camera, False, session_token=started.session_token,
+                            serial_ambiguous=False, release=True)
+        self.assertEqual(started.session_token, self.store.load(self.source.id).session_token)
+        self.assertIn("approval=approval_required configured=yes", self.listing())
 
     def test_a_start_that_fails_to_commit_withdraws_its_marker(self):
         class Failing:

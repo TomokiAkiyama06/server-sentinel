@@ -28,6 +28,7 @@ class Event(StrEnum):
     LOCAL_UVC_HEALTH_FENCE_INCOMPLETE = "local_uvc_health_fence_incomplete"
     LOCAL_UVC_HEALTH_FENCE_PIN_RELEASED = "local_uvc_health_fence_pin_released"
     LOCAL_UVC_SOURCE_HEALTH_CHANGED = "local_uvc_source_health_changed"
+    LOCAL_UVC_SESSION_LEDGER_UNPUBLISHED = "local_uvc_session_ledger_unpublished"
     SCENE_MONITORING_UNCONFIGURED = "scene_monitoring_unconfigured"
     SCENE_MONITORING_STARTED = "scene_monitoring_started"
     SCENE_MONITORING_UNAVAILABLE = "scene_monitoring_unavailable"

@@ -3,8 +3,11 @@
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 import json
+import logging
 import sqlite3
 from uuid import uuid4
+
+from app.logging import Event
 
 from .identity import DeviceEvidence, same_physical_camera
 from .session_ledger import SessionLedgerError
@@ -72,8 +75,11 @@ class ApprovalStore:
     process issued and still holds, so ``admin_cli sources`` can tell them
     from markers a crashed run left. The service always passes it
     (``LocalUvcAdapter``); a marker is published to it before it is
-    committed (a ledger that cannot be written refuses the start, like a
-    database fault) and withdrawn before it is released.
+    committed and withdrawn before it is released. The ledger is best effort
+    (Owner decision 2026-10-23): a marker it cannot publish never stops the
+    session; it is logged (``local_uvc_session_ledger_unpublished``), kept
+    for the ledger's next publication, and meanwhile ``sources`` shows the
+    source as ``approval_required``, never a false ``approved_in_use``.
     """
 
     def __init__(self, database, *, reservation=None, ledger=None):
@@ -202,11 +208,13 @@ class ApprovalStore:
         token = str(uuid4())
         if self.ledger is not None:
             # Published before the commit: while the database holds this
-            # marker, the ledger lists it (Issue #317).
+            # marker, the ledger lists it (Issue #317). Best effort: a
+            # ledger that cannot be written only makes ``sources`` show
+            # ``approval_required`` until its next publication.
             try:
                 self.ledger.issue(source_id, token)
             except SessionLedgerError:
-                raise ApprovalStorageError("UVC approval session could not start") from None
+                logging.getLogger(__name__).warning(Event.LOCAL_UVC_SESSION_LEDGER_UNPUBLISHED)
         connection = None
         committed = False
         try:

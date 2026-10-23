@@ -38,7 +38,10 @@ current run in a session ledger (`session_ledger.py`, Issue #317:
 `uvc-session-ledger.json` next to the database, mode `0600`, SHA-256 digests
 of the markers plus the writing process's boot id, PID and start time),
 published before a marker is committed and withdrawn before it is released;
-a ledger that cannot be written refuses the session start. Only
+the ledger is best effort (Owner decision 2026-10-23): one that cannot be
+written never stops the session (`local_uvc_session_ledger_unpublished` is
+logged and the digest is kept for the next successful publication), and
+meanwhile `sources` may show the source as `approval_required`. Only
 `admin_cli sources` reads it, to tell a marker of the running service from
 one a crash left; the service never reads it back. This means an unclean restart conservatively requires reapproval even
 for serial-backed devices. Known duplicated serials are persisted as ambiguous.

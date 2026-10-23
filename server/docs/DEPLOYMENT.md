@@ -446,10 +446,21 @@ sudo systemctl start server-sentinel.service
   regular `0600` file of the service account with one link, or that is
   malformed, and a boot id or process state that cannot be read, refuse
   the listing (`service_state_unavailable`) instead of guessing; the check
-  runs only when an approved, listed source carries a marker. The service
-  refuses to start a session whose marker it cannot publish to the ledger
-  (like a database fault: the start is retried), so a running session is
-  never shown as `approval_required` because of a missing ledger entry.
+  runs only when an approved, listed source carries a marker. The ledger
+  is best effort (Owner decision 2026-10-23): a marker the service cannot
+  publish to it (for example inodes exhausted, or `/proc` unreadable) never
+  stops the session or its recording; the service logs
+  `local_uvc_session_ledger_unpublished` (no path or marker), keeps the
+  digest and includes it in the ledger's next successful publication.
+  Until then the display may show that running source as
+  `approval_required`; it never shows a false `approved_in_use` (a
+  withdrawal that cannot be published removes the ledger file instead,
+  where that still works, so a release that fails as well leaves no entry
+  vouching for its marker). When
+  `sources` shows `approval_required` for a source whose health is
+  `online`, check the service log for that event before stopping the
+  service to reapprove: the running session itself is unaffected. The
+  ledger holds at most 64 sources (the reader's bound).
   The same `/proc` limits as `service_running` apply (run the command in
   the environment the service runs in).
 - `approve` rescans and binds exactly that camera. It refuses a camera without
@@ -931,6 +942,7 @@ database-owning process may load the CA private key.
 | CA directory, for example `/var/lib/serversentinel-ca` | `serversentinel-ca` | `0700` | `ca-key.pem` (the only copy of the CA private key), `ca-certificate.pem`, `issuance-log.jsonl`, each `0600` |
 | Main listener directory | service account | `0700` | `main-server-key.pem`, `main-server-certificate.pem`, `deployment-ca-certificate.pem` (public CA copy), each `0600` |
 | `<runtime_root>/state/state.sqlite3` | service account | `0600` in `0700` | application database, including the pairing ledger |
+| `<runtime_root>/state/uvc-session-ledger.json` | service account | `0600` in `0700`, one link | UVC session ledger (Issue #317): SHA-256 digests of the session markers the running service holds, plus its boot id, PID and start time; written by the service, read only by `admin_cli sources` |
 
 Create the CA account once as a static system account with no login shell and
 no home (not a systemd `DynamicUser`, whose UID would change), and the two
