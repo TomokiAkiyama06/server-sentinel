@@ -5,11 +5,24 @@ from datetime import datetime
 from enum import StrEnum
 import hashlib
 import math
+import re
 from uuid import UUID
 
 from app.cameras.registry.models import SourceType, timestamp
 from app.detection.foundation import GrayFrame, Observation, Quality
 from app.detection.foundation.contracts import positive_integer
+
+
+# The luma reader that produced a calibration reference (Issue #205; the
+# follow-up of PR #225): a fixed, value-free spelling of the capture layout
+# and decoder, such as ``packed:YUYV:1920x1080`` or
+# ``mjpg:simplejpeg=1.9.0:numpy=2.3.5:1920x1080``. It carries no device path,
+# serial or pixel value.
+READER = re.compile(r"[a-z0-9][a-z0-9:=._x+-]{0,127}")
+
+
+def valid_reader(value) -> bool:
+    return value is None or type(value) is str and READER.fullmatch(value) is not None
 
 
 class CriticalKind(StrEnum):
@@ -92,10 +105,16 @@ class Calibration:
     polygon: tuple[tuple[int, int], ...]
     reference: GrayFrame = field(repr=False)
     policy: Policy
+    # The luma reader of the reference (``READER``); ``None`` for a
+    # calibration recorded before readers were recorded. A stored calibration
+    # is re-acquired after a restart only through the same reader.
+    reader: str | None = None
 
     def __post_init__(self):
         if any(not isinstance(v, UUID) for v in (self.identifier, self.source_id, self.profile_id)):
             raise ValueError("calibration identities must be UUIDs")
+        if not valid_reader(self.reader):
+            raise ValueError("invalid calibration reader")
         if not isinstance(self.source_type, SourceType) or not isinstance(self.policy, Policy):
             raise ValueError("invalid source type or calibration policy")
         positive_integer(self.version, "calibration version")
@@ -116,6 +135,8 @@ class Calibration:
 
     @property
     def reference_sha256(self):
+        # In memory only (observations carry it for in-process correlation);
+        # never persisted with the calibration history (#205).
         return hashlib.sha256(self.reference.pixels).hexdigest()
 
 

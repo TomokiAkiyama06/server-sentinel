@@ -1,41 +1,43 @@
 """Private calibration history and a default-denied Owner operation facade.
 
-The history stores no decoded monitoring media. A calibration reference frame
-stays transient: only its irreversible digest, geometry and policy are
-persisted, and an Owner-supplied frame must be re-bound through
-``CalibrationRecord.rehydrate`` before detection can resume.
+The history stores no decoded monitoring media and nothing derived from it
+(Owner decision 2026-10-22, Issue #205): a calibration reference frame stays in
+process memory only, and the history keeps non-frame provenance (identities,
+version, time, polygon, policy, reference geometry and the luma reader). No
+digest, histogram, thumbnail or statistic of the frame is persisted. Detection
+resumes only by binding the in-memory ``Calibration`` that produced a stored
+record (``CalibrationRecord.bind``); a stored record alone cannot reproduce or
+re-admit a reference.
 """
 
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
-import re
 import sqlite3
 from typing import Callable
 from uuid import UUID
 
 from app.cameras.registry.models import SourceType, timestamp
-from app.detection.foundation import GrayFrame
 from app.detection.foundation.contracts import positive_integer
-from .contracts import Calibration, Policy
+from .contracts import Calibration, Policy, valid_reader
 from .detector import SceneDetector
 from .geometry import validate_polygon
 
 
-DIGEST = re.compile(r"[0-9a-f]{64}")
 COLUMNS = ("source_id", "profile_id", "version", "identifier", "metadata")
 
 
 def calibration_metadata(calibration):
     reference = calibration.reference
+    reader = {} if calibration.reader is None else {"reader": calibration.reader}
     return {
+        **reader,
         "identifier": str(calibration.identifier), "source_id": str(calibration.source_id),
         "source_type": calibration.source_type.value, "profile_id": str(calibration.profile_id),
         "version": calibration.version, "created_at": calibration.created_at.isoformat(),
         "polygon": calibration.polygon, "policy": asdict(calibration.policy),
         "reference": {"stream_id": str(reference.stream_id), "sequence": reference.sequence,
-                      "width": reference.width, "height": reference.height,
-                      "sha256": calibration.reference_sha256},
+                      "width": reference.width, "height": reference.height},
     }
 
 
@@ -43,10 +45,13 @@ def calibration_metadata(calibration):
 class CalibrationRecord:
     """Persistable calibration provenance that cannot reconstruct a scene.
 
-    It intentionally has no pixel field: the archive keeps the reference
-    digest, not the reference image, so restored history never becomes a
+    It intentionally has no pixel field and no value computed from pixels
+    (no digest, histogram or statistic): restored history never becomes a
     retention-free still-image store of a monitored room or of whoever was
-    visible while the Owner calibrated it.
+    visible while the Owner calibrated it, nor a fingerprint of that scene.
+    A record written before #205 may carry a ``reference.sha256``; it is
+    ignored when read and removed by ``scrub_legacy_reference_digests`` at
+    the next start.
     """
 
     identifier: UUID
@@ -60,13 +65,17 @@ class CalibrationRecord:
     reference_sequence: int
     reference_width: int
     reference_height: int
-    reference_sha256: str
     policy: Policy
+    # The luma reader of the reference (``contracts.READER``); ``None`` in a
+    # record written before readers were recorded.
+    reader: str | None = None
 
     def __post_init__(self):
         identities = (self.identifier, self.source_id, self.profile_id, self.reference_stream_id)
         if any(not isinstance(value, UUID) for value in identities):
             raise ValueError("calibration identities must be UUIDs")
+        if not valid_reader(self.reader):
+            raise ValueError("invalid calibration reader")
         if not isinstance(self.source_type, SourceType) or not isinstance(self.policy, Policy):
             raise ValueError("invalid source type or calibration policy")
         positive_integer(self.version, "calibration version")
@@ -75,8 +84,6 @@ class CalibrationRecord:
         if type(self.reference_sequence) is not int or self.reference_sequence < 0:
             raise ValueError("reference sequence must be a nonnegative integer")
         timestamp(self.created_at)
-        if type(self.reference_sha256) is not str or not DIGEST.fullmatch(self.reference_sha256):
-            raise ValueError("calibration reference digest is malformed")
         if self.reference_width * self.reference_height > self.policy.maximum_pixels:
             raise ValueError("calibration exceeds pixel budget")
         if type(self.polygon) is not tuple or not 3 <= len(self.polygon) <= 32:
@@ -88,38 +95,36 @@ class CalibrationRecord:
                 raise ValueError("polygon lies outside reference")
         validate_polygon(self.polygon)
 
-    def rehydrate(self, reference: GrayFrame) -> Calibration:
-        """Bind a transient Owner-supplied frame to this stored provenance.
+    def bind(self, calibration: Calibration) -> Calibration:
+        """Bind the in-memory calibration that produced this stored record.
 
-        The archive cannot return a reference image, so the caller supplies the
-        frame again from the deployment's own Owner-controlled media boundary.
-        A frame from another source, stream, sample or geometry, or one whose
-        digest differs, is refused instead of silently recalibrating.
+        The archive cannot return a reference image and keeps nothing derived
+        from one, so the integrity binding between the stored version and its
+        reference lives in process memory: only a ``Calibration`` object whose
+        whole non-frame provenance (identity, source, profile, version, time,
+        polygon, policy, reader, reference stream, sample and geometry) is this
+        record is accepted. A bare frame, or a calibration of another version
+        or identity, is refused instead of silently recalibrating; a frame
+        read from the camera becomes a reference only through a new, audited
+        calibration version.
         """
-        if not isinstance(reference, GrayFrame) or reference.channels != 1:
-            raise ValueError("calibration requires a grayscale reference")
-        if (reference.source_id != self.source_id
-                or reference.stream_id != self.reference_stream_id
-                or reference.sequence != self.reference_sequence
-                or (reference.width, reference.height) != (self.reference_width, self.reference_height)):
-            raise ValueError("reference frame does not match calibration history")
-        calibration = Calibration(self.identifier, self.source_id, self.source_type,
-                                  self.profile_id, self.version, self.created_at,
-                                  self.polygon, reference, self.policy)
-        if calibration.reference_sha256 != self.reference_sha256:
+        if not isinstance(calibration, Calibration):
+            raise ValueError("calibration reference must be an in-memory calibration")
+        if provenance(calibration) != self:
             raise ValueError("calibration reference integrity failed")
         SceneDetector(calibration)
         return calibration
 
 
-def _record(calibration: Calibration) -> CalibrationRecord:
+def provenance(calibration: Calibration) -> CalibrationRecord:
+    """The persistable, frame-free provenance of an in-memory calibration."""
     reference = calibration.reference
     return CalibrationRecord(calibration.identifier, calibration.source_id,
                              calibration.source_type, calibration.profile_id,
                              calibration.version, calibration.created_at,
                              calibration.polygon, reference.stream_id, reference.sequence,
-                             reference.width, reference.height,
-                             calibration.reference_sha256, calibration.policy)
+                             reference.width, reference.height, calibration.policy,
+                             calibration.reader)
 
 
 def _decode(metadata) -> CalibrationRecord:
@@ -127,6 +132,7 @@ def _decode(metadata) -> CalibrationRecord:
     policy = dict(value["policy"])
     policy["global_quarter_turns"] = tuple(policy["global_quarter_turns"])
     policy["roi_quarter_turns"] = tuple(policy["roi_quarter_turns"])
+    # A pre-#205 record's ``reference.sha256`` is ignored, never re-used.
     reference = value["reference"]
     return CalibrationRecord(UUID(value["identifier"]), UUID(value["source_id"]),
                              SourceType(value["source_type"]), UUID(value["profile_id"]),
@@ -134,7 +140,75 @@ def _decode(metadata) -> CalibrationRecord:
                              tuple(tuple(point) for point in value["polygon"]),
                              UUID(reference["stream_id"]), reference["sequence"],
                              reference["width"], reference["height"],
-                             reference["sha256"], Policy(**policy))
+                             Policy(**policy), value.get("reader"))
+
+
+def scrub_legacy_reference_digests(connection: sqlite3.Connection) -> int:
+    """Remove ``reference.sha256`` from every stored version (#205, Codex P1).
+
+    A version written before the Owner decision 2026-10-22 may carry the
+    SHA-256 of its reference frame, image-derived data that must not stay on
+    disk. Runs inside the caller's write transaction (storage admission and
+    commit are the caller's). When a row carries the key, the whole table is
+    rebuilt with ``secure_delete`` on, so the old cells, the freed pages and
+    any stale copy a legacy write left in this table's free space are
+    zeroed inside the database file. This is not a forensic erasure: copies
+    outside the file (rollback-journal blocks the filesystem freed, SSD
+    remapping, snapshots, backups) and a page of this table an earlier build
+    freed to another table are beyond it. Each scrubbed
+    row is re-serialized exactly as ``calibration_metadata()`` writes a new
+    one, so its frame-free provenance, and the lifecycle inventory's keyed
+    digest of it (``app.lifecycle_inventory.sources``), stay identical.
+    A row that is not a JSON object with a ``reference`` object is left for
+    the history and inventory checks to report; only a row that carried the
+    key is counted and re-serialized, every other row is inserted back
+    byte-for-byte. The rebuild does not keep SQLite rowids (nothing reads
+    them for this table: it is keyed by source, profile and version).
+    Returns the number of rows scrubbed; idempotent.
+    """
+    if not isinstance(connection, sqlite3.Connection) or not connection.in_transaction:
+        raise ValueError("calibration history requires an open transaction")
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                          "AND name='roi_calibration_history'").fetchone() is None:
+        return 0
+    rows = connection.execute(
+        "SELECT source_id, profile_id, version, identifier, metadata FROM roi_calibration_history "
+        "ORDER BY source_id, profile_id, version").fetchall()
+    scrubbed, rewritten = 0, []
+    for row in rows:
+        metadata = without_reference_digest(row[4])
+        scrubbed += metadata is not None
+        rewritten.append((*row[:4], row[4] if metadata is None else metadata))
+    if not scrubbed:
+        return 0
+    # Rebuild the whole table, not only the scrubbed rows: a legacy build
+    # may have written with `secure_delete` off, leaving stale copies of a
+    # digest in the free space of this table's pages, which rewriting a row
+    # does not reach. With `secure_delete` on, deleting every row zeroes
+    # the cells and the freed pages before the rows are inserted again.
+    connection.execute("PRAGMA secure_delete = ON")
+    connection.execute("DELETE FROM roi_calibration_history")
+    connection.executemany("INSERT INTO roi_calibration_history VALUES (?,?,?,?,?)", rewritten)
+    return scrubbed
+
+
+def without_reference_digest(metadata) -> str | None:
+    """`metadata` re-serialized without ``reference.sha256``, or None.
+
+    Only a JSON object whose ``reference`` object actually carries the key is
+    rewritten (as ``calibration_metadata()`` serializes a new version);
+    anything else, a corrupt row the history checks report included, is
+    None and stays exactly as stored.
+    """
+    try:
+        value = json.loads(metadata)
+    except (TypeError, ValueError):
+        return None
+    if (not isinstance(value, dict) or not isinstance(value.get("reference"), dict)
+            or "sha256" not in value["reference"]):
+        return None
+    del value["reference"]["sha256"]
+    return json.dumps(value, sort_keys=True)
 
 
 def decode_history_row(row) -> CalibrationRecord:
@@ -162,13 +236,53 @@ def decode_history_row(row) -> CalibrationRecord:
     return record
 
 
+def _insert(connection, calibration: Calibration) -> None:
+    latest = connection.execute(
+        "SELECT version, identifier FROM roi_calibration_history WHERE source_id=? AND profile_id=? ORDER BY version DESC LIMIT 1",
+        (str(calibration.source_id), str(calibration.profile_id)),
+    ).fetchone()
+    expected = latest[0] + 1 if latest else 1
+    if calibration.version != expected or latest and latest[1] != str(calibration.identifier):
+        raise ValueError("calibration version or identity conflicts with history")
+    connection.execute("INSERT INTO roi_calibration_history VALUES (?,?,?,?,?)", (
+        str(calibration.source_id), str(calibration.profile_id), calibration.version,
+        str(calibration.identifier), json.dumps(calibration_metadata(calibration), sort_keys=True),
+    ))
+
+
+def append_on(connection: sqlite3.Connection, calibration: Calibration) -> CalibrationRecord:
+    """Append one version inside a caller-owned write transaction.
+
+    For an audited mutation (Issue #205): the calibration's provenance and its
+    audit record commit or roll back together. The caller owns ``BEGIN
+    IMMEDIATE``, the storage admission and the commit; the same version and
+    identity rules as ``CalibrationArchive.append`` apply, and nothing but
+    provenance is written (no pixel, crop, frame or value derived from one).
+    """
+    if not isinstance(connection, sqlite3.Connection) or not connection.in_transaction:
+        raise ValueError("calibration history requires an open transaction")
+    SceneDetector(calibration)
+    try:
+        cursor = connection.execute("SELECT * FROM roi_calibration_history LIMIT 0")
+    except sqlite3.Error:
+        raise RuntimeError("calibration archive unavailable") from None
+    if tuple(column[0] for column in cursor.description) != COLUMNS:
+        raise RuntimeError("calibration archive unavailable")
+    try:
+        _insert(connection, calibration)
+    except sqlite3.Error:
+        raise RuntimeError("calibration archive unavailable") from None
+    return provenance(calibration)
+
+
 class CalibrationArchive:
     """Append-only versions in a caller-owned private deployment SQLite database.
 
     The caller supplies an already-open connection from the deployment's private
     database boundary. This does not choose paths, create directories or expose
     references through any API. It persists calibration provenance only: no
-    frame bytes, crop or other decoded media enters this table, so the history
+    frame bytes, crop, other decoded media or value computed from a frame
+    (digest, histogram, statistic) enters this table, so the history
     cannot outlive recording retention as hidden image storage. Schema is local
     to this independently testable archive; Main runtime onboarding must
     register its migration explicitly.
@@ -192,17 +306,7 @@ class CalibrationArchive:
             raise ValueError("archive requires an idle database connection")
         try:
             connection.execute("BEGIN IMMEDIATE")
-            latest = connection.execute(
-                "SELECT version, identifier FROM roi_calibration_history WHERE source_id=? AND profile_id=? ORDER BY version DESC LIMIT 1",
-                (str(calibration.source_id), str(calibration.profile_id)),
-            ).fetchone()
-            expected = latest[0] + 1 if latest else 1
-            if calibration.version != expected or latest and latest[1] != str(calibration.identifier):
-                raise ValueError("calibration version or identity conflicts with history")
-            connection.execute("INSERT INTO roi_calibration_history VALUES (?,?,?,?,?)", (
-                str(calibration.source_id), str(calibration.profile_id), calibration.version,
-                str(calibration.identifier), json.dumps(calibration_metadata(calibration), sort_keys=True),
-            ))
+            _insert(connection, calibration)
             connection.commit()
         except sqlite3.Error:
             connection.rollback()
@@ -210,7 +314,7 @@ class CalibrationArchive:
         except Exception:
             connection.rollback()
             raise
-        return _record(calibration)
+        return provenance(calibration)
 
     def load(self, source_id: UUID, profile_id: UUID, version: int | None = None):
         """Return stored provenance only; a reference image is never returned."""

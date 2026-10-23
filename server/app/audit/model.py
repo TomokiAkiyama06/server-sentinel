@@ -35,6 +35,9 @@ class TargetKind(StrEnum):
     PRINCIPAL = "principal"
     RECORDING = "recording"
     SETUP_WIZARD_STEP = "setup_wizard_step"
+    # A source's scene calibration (Issue #205), named by the source's
+    # logical UUID; no polygon, digest or image reaches the record.
+    SCENE_CALIBRATION = "scene_calibration"
 
 
 class AuditAction(StrEnum):
@@ -75,6 +78,11 @@ class AuditAction(StrEnum):
     DELETE_RECORDING_CLEANUP = "delete_recording_cleanup"
     UPDATE_RECORDING = "update_recording"
     TRANSITION_SETUP_WIZARD_STEP = "transition_setup_wizard_step"
+    # Issue #205: an Owner calibration, and the system's re-acquisition of a
+    # stored calibration's reference after a restart (Owner decision
+    # 2026-10-22, option A).
+    CALIBRATE_SCENE_SOURCE = "calibrate_scene_source"
+    REACQUIRE_SCENE_REFERENCE = "reacquire_scene_reference"
 
 
 ACTION_TARGETS = {
@@ -115,6 +123,8 @@ ACTION_TARGETS = {
     AuditAction.DELETE_RECORDING_CLEANUP: TargetKind.RECORDING,
     AuditAction.UPDATE_RECORDING: TargetKind.RECORDING,
     AuditAction.TRANSITION_SETUP_WIZARD_STEP: TargetKind.SETUP_WIZARD_STEP,
+    AuditAction.CALIBRATE_SCENE_SOURCE: TargetKind.SCENE_CALIBRATION,
+    AuditAction.REACQUIRE_SCENE_REFERENCE: TargetKind.SCENE_CALIBRATION,
 }
 
 

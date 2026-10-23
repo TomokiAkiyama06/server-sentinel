@@ -223,20 +223,24 @@ class SceneRuntimeFailClosedTests(unittest.TestCase):
         with self.assertRaises(CalibrationUnavailable) as unreferenced:
             provider(item)
         self.assertEqual("calibration_reference_unavailable", unreferenced.exception.reason)
-        # A live frame offered as the reference does not match the digest.
-        live = ArchiveCalibrationProvider(connect, references=lambda record: replace(
-            stored.reference, pixels=MOVED))
-        with self.assertRaises(CalibrationUnavailable) as forged:
-            live(item)
-        self.assertEqual("calibration_integrity_failed", forged.exception.reason)
+        # A live frame offered as the reference, or an in-memory calibration
+        # that is not the stored version, is not bound: the history keeps no
+        # digest, so the binding is the in-memory calibration itself.
+        for offered in (replace(stored.reference, pixels=MOVED),
+                        replace(stored, reference=replace(stored.reference, sequence=9)),
+                        replace(stored, version=2)):
+            live = ArchiveCalibrationProvider(connect, references=lambda record, offered=offered: offered)
+            with self.assertRaises(CalibrationUnavailable) as forged:
+                live(item)
+            self.assertEqual("calibration_integrity_failed", forged.exception.reason)
         harness = Harness(item, calibrations=provider)
         harness.runtime.start()
         for luma in (None, MOVED, MOVED, MOVED):
             source = harness.frame(luma)
         self.assertEqual("calibration_reference_unavailable", source.reason)
         self.assertEqual(Observation.UNKNOWN, source.movement)
-        trusted = ArchiveCalibrationProvider(connect, references=lambda record: stored.reference)
-        self.assertEqual(stored.reference_sha256, trusted(item).reference_sha256)
+        trusted = ArchiveCalibrationProvider(connect, references=lambda record: stored)
+        self.assertIs(stored, trusted(item))
 
     def test_calibration_and_binding_mismatch_is_refused(self):
         cases = (

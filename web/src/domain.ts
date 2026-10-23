@@ -143,6 +143,40 @@ export interface IssuedInvitation {
   expires_at: string;
 }
 
+/** Where the scene calibration in use came from (Issue #205). `restart_reacquired`:
+ *  taken again from the camera after a Main restart without the Owner (Owner
+ *  decision 2026-10-22, option A), so not confirmed by the Owner. */
+export type CalibrationOrigin = 'none' | 'owner' | 'restart_reacquired';
+export type CalibrationPhase = 'idle' | 'acquiring' | 'reacquire_pending';
+/** The server's fixed refusals (`CalibrationRefused.REASONS`). */
+export const calibrationReasons = ['busy', 'unavailable', 'geometry_unsupported', 'no_frame', 'quality_insufficient',
+  'cancelled', 'scene_unsuitable', 'template_unconfigured', 'history_unavailable', 'reader_changed',
+  'calibration_missing'] as const;
+export type CalibrationReason = typeof calibrationReasons[number];
+export type SceneDetectionState = 'active' | 'inactive' | 'degraded';
+
+/** One source in the Owner's scene calibration status (`GET /api/scene/calibration`).
+ *  Value-free: no image, digest, polygon or policy reaches the browser. */
+export interface SceneCalibrationSource {
+  source_id: string;
+  origin: CalibrationOrigin;
+  version: number | null;
+  /** ISO 8601 UTC, as the server sent it. */
+  calibrated_at: string | null;
+  phase: CalibrationPhase;
+  failure: CalibrationReason | null;
+  /** The deployment configures a calibration template for this source. */
+  owner_calibration_available: boolean;
+  detection: SceneDetectionState;
+  /** The scene runtime's fixed reason code, shown as a diagnostic only. */
+  detection_reason: string;
+}
+
+/** The answer to one Owner calibration (`POST /api/scene/sources/<id>/calibration`). */
+export type CalibrationResult =
+  | { outcome: 'calibrated'; version: number; calibrated_at: string }
+  | { outcome: 'refused'; reason: CalibrationReason };
+
 export interface DashboardServices {
   loadSession(signal: AbortSignal): Promise<Session>;
   /** Owner access administration (Issue #10 phase 2 S4b routes A1-A6). The
@@ -156,6 +190,11 @@ export interface DashboardServices {
   changePermission?(principalId: string, permission: Permission, granted: boolean, signal: AbortSignal): Promise<void>;
   revokePrincipal?(principalId: string, signal: AbortSignal): Promise<void>;
   revokeCredential?(principalId: string, handle: string, signal: AbortSignal): Promise<void>;
+  /** The Owner's scene calibration (Issue #205), shown on the Sources view.
+   *  A calibration made with a stale user verification rejects with
+   *  `ApiError('step_up_required')` and changed nothing. */
+  loadSceneCalibration?(signal: AbortSignal): Promise<readonly SceneCalibrationSource[]>;
+  calibrateSource?(sourceId: string, signal: AbortSignal): Promise<CalibrationResult>;
   /** The Owner's step-up ceremony (S3): a fresh user-verified assertion of
    *  this session's own passkey. Resolves only when the server accepted it. */
   stepUp?(signal: AbortSignal): Promise<void>;

@@ -8,6 +8,7 @@ source limit and the append-only ROI calibration history.
 from __future__ import annotations
 
 from app.cameras.uvc.persistence import ApprovalStore
+from app.detection.roi.calibration import without_reference_digest
 
 from ._common import _compare_keyed, _digest, _keyed
 
@@ -96,12 +97,21 @@ def _roi_history(connection, tables, salt: str) -> dict | None:
     """Every ROI calibration version as a keyed digest (#132).
 
     CalibrationArchive is append-only: a version is never rewritten or
-    removed. The identifier and metadata (reference digest, geometry and
-    policy of an Owner calibration) are kept only as keyed digests.
+    removed. The identifier and metadata (geometry, polygon, policy and
+    reader of a calibration) are kept only as keyed digests.
+
+    The one approved rewrite is the #205 scrub of a legacy
+    ``reference.sha256`` (``scrub_legacy_reference_digests``, Codex P1 on
+    PR #330): the metadata is digested without that key, in the exact
+    serialization the archive writes, so a scrubbed version stays preserved
+    against a baseline recorded with this rule, and a version that never had
+    the key keeps the digest earlier releases recorded. Metadata that is not
+    such a JSON object is digested as stored.
     """
     if "roi_calibration_history" not in tables:
         return None
-    return {f"{row[0]}/{row[1]}/{row[2]}": _keyed(salt, ["roi-calibration-v1", row[3], row[4]])
+    return {f"{row[0]}/{row[1]}/{row[2]}": _keyed(salt, ["roi-calibration-v1", row[3],
+                                                        without_reference_digest(row[4]) or row[4]])
             for row in connection.execute(
                 "SELECT source_id, profile_id, version, identifier, metadata "
                 "FROM roi_calibration_history")}

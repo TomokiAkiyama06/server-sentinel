@@ -46,6 +46,12 @@ class NotificationKind(StrEnum):
     MOTION = "motion"
     ENTRY = "entry"
     CAMERA_OFFLINE = "camera_offline"
+    # Issue #205 (Owner decision 2026-10-22, option A): after a Main restart
+    # a scene reference was re-acquired from the camera without the Owner,
+    # or a stored calibration could not be re-acquired. Immediate and
+    # value-free: no source, image or reason.
+    SCENE_REFERENCE_REACQUIRED = "scene_reference_reacquired"
+    SCENE_CALIBRATION_REQUIRED = "scene_calibration_required"
     DAILY_SUMMARY = "daily_summary"
 
 
@@ -54,6 +60,7 @@ IMMEDIATE_KINDS = frozenset({
     NotificationKind.HARDWARE_INTEGRITY_FAILURE, NotificationKind.RECORDING_HEALTH_FAILURE,
     NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.HUMAN_ACCESS_RECOVERED,
     NotificationKind.CREDENTIAL_FINDING, NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED,
+    NotificationKind.SCENE_REFERENCE_REACQUIRED, NotificationKind.SCENE_CALIBRATION_REQUIRED,
 })
 # Immediate only when confirmed: a confirmed server movement / camera tamper
 # (Issue #26), and a camera source offline for the deployment's threshold
