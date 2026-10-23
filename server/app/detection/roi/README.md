@@ -493,8 +493,11 @@ its reference.
   runtime queues `scene_calibration_required` once per process and is
   retried by the application at `reacquire_retry_seconds`. `take_notices()` /
   `return_notices()` hand the fixed notices to Main, which submits them
-  through the monitoring runtime's `NotificationService` (immediate kinds).
-  The re-acquired reference is reported `restart_reacquired` (not confirmed by
+  through the monitoring runtime's `NotificationService` (immediate kinds)
+  right after each source's attempt. Main re-acquires the sources
+  independently and concurrently (at most four), so a camera that gives no
+  frame delays no other source; detection starts at once on the re-acquired
+  reference (Owner decision 2026-10-23). The re-acquired reference is reported `restart_reacquired` (not confirmed by
   the Owner): a camera or server moved while Main was down is not detected
   against it.
 - `status()` is value-free: origin, version, time, phase, last refusal,

@@ -4,3 +4,4 @@ export { ApiError } from '../src/api';
 export { calibrationReasons } from '../src/domain';
 export { createDashboardServices, parseCalibrationResult, parseSceneCalibration } from '../src/shared/services';
 export { CalibrationCard, CalibrationScreen, refusalText } from '../src/calibration/screen';
+export { SourceInventory } from '../src/App';

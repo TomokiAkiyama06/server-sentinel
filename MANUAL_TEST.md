@@ -1282,7 +1282,9 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
 
 ### Issue #205 Owner calibration and restart re-acquisition (pending, not executed)
 
-Owner decision 2026-10-22 (option A). Verified only with generated frames, a
+Owner decision 2026-10-22 (option A) and 2026-10-23 (detection starts at
+once on a re-acquired reference, shown and notified as not confirmed by the
+Owner). Verified only with generated frames, a
 synthetic human surface and an intercepted Slack transport
 (`server/tests/test_scene_calibration.py`,
 `server/tests/test_scene_calibration_routes.py`, `web/tests/calibration*.mjs`).
@@ -1297,15 +1299,17 @@ templates (a follow-up of #205). On the deployment, with the Owner present:
   first asks for the passkey and then succeeds once; the source becomes
   active; `security_admin_audit_records` has one `calibrate_scene_source`
   (`owner`, `succeeded`) and `roi_calibration_history` one more version whose
-  metadata holds no pixel data (only geometry, polygon, policy, digest and
-  `reader`);
+  metadata holds no pixel data and no digest of it (only identities,
+  geometry, polygon, policy, version, time and `reader`);
 - [ ] with the lens covered or the room dark, the calibration is refused
   (`quality_insufficient` or `scene_unsuitable`) with a `failed` audit record
   and nothing stored; with the camera unplugged it is `no_frame`;
 - [ ] restart the Main service: within about a minute the source is active
   again with origin `restart_reacquired`, the Owner receives exactly one
   `ServerSentinel critical alert: scene_reference_reacquired` per source in
-  Slack, `notification_events` has the `sent` row, the audit log has a
+  Slack, `notification_events` has the `sent` row (with one camera unplugged,
+  the others still become active and notify within about a minute, without
+  waiting for the unplugged camera's timeout), the audit log has a
   `reacquire_scene_reference` (`system`, `succeeded`), and no file under the
   data or recording directories contains image data from the reference;
 - [ ] restart with the camera unplugged: one

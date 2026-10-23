@@ -14,7 +14,7 @@ import { PresenceScreen } from './views/presence';
 import { TimelineScreen } from './views/timeline';
 
 type Access = { state: 'loading' | 'failed' } | Session;
-type Sources = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly CameraSourceSummary[] };
+export type Sources = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly CameraSourceSummary[] };
 type Recordings = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly RecordingSummary[] };
 /** One write whose server-side result is unknown.
  *
@@ -53,6 +53,14 @@ function SourceCards({ t, items }: { t: typeof messages[Locale]; items: readonly
     </article>)}</div>
     {items.length === 0 && <p>{t.noSources}</p>}
   </>;
+}
+
+/** The Owner's source inventory beside the calibration section: never
+ *  silently absent while it loads or after it failed (PR #330 review). */
+export function SourceInventory({ t, sources }: { t: typeof messages[Locale]; sources: Sources }) {
+  return sources.state === 'ready' ? <SourceCards t={t} items={sources.items} />
+    : sources.state === 'failed' ? <p role="alert">{t.sourcesUnavailable}</p>
+    : <p role="status">{t.checking}</p>;
 }
 
 export function App({ services = deniedServices }: { services?: DashboardServices }) {
@@ -304,7 +312,8 @@ export function App({ services = deniedServices }: { services?: DashboardService
               : selected === 'access' && access.role === 'owner' ? <AccessScreen services={services} t={t} />
                 : selected === 'sources' && access.role === 'owner' && services.loadSceneCalibration ? <>
               {/* Issue #205: the Owner's scene calibration lives with the sources. */}
-              {sources.state === 'ready' && <SourceCards t={t} items={sources.items} />}
+              {/* The inventory keeps its own loading and failure states (Codex P2). */}
+              {services.loadSources && <SourceInventory t={t} sources={sources} />}
               <CalibrationScreen services={services} t={t} />
             </> : selected === 'sources' && access.role === 'owner' && sources.state === 'ready'
               ? <SourceCards t={t} items={sources.items} />

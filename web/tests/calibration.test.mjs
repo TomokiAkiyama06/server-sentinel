@@ -9,7 +9,7 @@ await compile('tests/calibration_entry.ts', 'build/calibration.mjs');
 const { messages } = await import('../build/i18n.mjs');
 const {
   ApiError, calibrationReasons, createDashboardServices, parseCalibrationResult, parseSceneCalibration,
-  CalibrationCard, CalibrationScreen, refusalText,
+  CalibrationCard, CalibrationScreen, refusalText, SourceInventory,
 } = await import('../build/calibration.mjs');
 
 // Synthetic only: generated identifiers, no deployment, camera or person value.
@@ -50,6 +50,24 @@ async function signedIn(routes = {}, options = {}) {
   await services.loadSession(signal());
   return { services, calls: transport.calls };
 }
+
+test('the source inventory beside the calibration keeps its loading and failure states', () => {
+  // Codex P2 / Claude review 2 (PR #330): never silently absent.
+  for (const locale of ['ja', 'en']) {
+    const t = messages[locale];
+    for (const state of ['pending', 'loading']) {
+      const html = render(createElement(SourceInventory, { t, sources: { state } }));
+      assert.equal(html, `<p role="status">${t.checking}</p>`);
+    }
+    assert.equal(render(createElement(SourceInventory, { t, sources: { state: 'failed' } })),
+      `<p role="alert">${t.sourcesUnavailable}</p>`);
+    const ready = render(createElement(SourceInventory, { t, sources: { state: 'ready', items: [
+      { id: sourceId, name: 'generated', source_type: 'local_uvc', role: '', health: 'online', enabled: true },
+    ] } }));
+    assert.match(ready, new RegExp(`data-source-id="${sourceId}"`));
+    assert.doesNotMatch(ready, /role="alert"|role="status"/);
+  }
+});
 
 test('status decodes strictly and copies only the documented fields', async () => {
   const body = { sources: [

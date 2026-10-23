@@ -377,7 +377,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
         human_access.attach_live(LiveFrameService(local_preview, human_access.store))
         if scene_calibration_service is not None:
             # The Owner's calibration routes (#205); without the service
-            # they stay the generic denial.
+            # they stay the generic denial. The routes write the history
+            # through the access store's database while the provider and the
+            # service read it from `store`; `bind_storage_admission` above
+            # already refused an access store on any other database, so the
+            # history cannot split (Claude review proposal 7).
             human_access.attach_scene_calibration(scene_calibration_service)
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
@@ -566,11 +570,21 @@ def create_app(settings: Settings, *, database: Database | None = None,
             if undelivered:
                 scene_calibration_service.return_notices(undelivered)
 
+        async def reacquire_source(source_id) -> None:
+            await run_to_completion(asyncio.to_thread(
+                scene_calibration_service.reacquire, source_id, system_commit))
+            # Its own outcome is notified at once, not after the other
+            # sources' attempts (Codex P1 on PR #330, DET-004 "immediately").
+            await deliver_calibration_notices()
+
         async def run_scene_calibration() -> None:
             # Once scene monitoring runs, every source with a stored
             # calibration has its reference re-acquired (Owner decision
             # 2026-10-22, option A), and a failed attempt is retried at the
             # configured interval; the Owner is notified of both outcomes.
+            # The sources (at most MAXIMUM_SOURCES) are re-acquired
+            # independently and concurrently: a camera that gives no frame
+            # delays neither another source's detection nor its notice.
             live = (SceneRuntimeState.RUNNING, SceneRuntimeState.DEGRADED)
             started = False
             while True:
@@ -580,11 +594,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
                     await run_to_completion(asyncio.to_thread(scene_calibration_service.start))
                     started = True
                 if started:
-                    for source_id in scene_calibration_service.pending_reacquisitions():
-                        if scene_lifecycle["stopping"]:
-                            return
-                        await run_to_completion(asyncio.to_thread(
-                            scene_calibration_service.reacquire, source_id, system_commit))
+                    pending = scene_calibration_service.pending_reacquisitions()
+                    if pending and not scene_lifecycle["stopping"]:
+                        # A cancelled gather still waits for every attempt
+                        # (each defers its cancellation until its thread
+                        # returns; `close()` ends the acquisitions first).
+                        await asyncio.gather(*(reacquire_source(source_id) for source_id in pending))
                 await deliver_calibration_notices()
                 await asyncio.sleep(scene_calibration.reacquire_retry_seconds if started
                                     else scene_runtime.refresh_interval_seconds)
@@ -807,9 +822,14 @@ def create_app(settings: Settings, *, database: Database | None = None,
                     calibration_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await calibration_task
+                # A notice queued by an attempt that finished just before
+                # the close is submitted now, while the monitoring runtime
+                # still runs; the calibration settle below waits for it like
+                # any other (Claude review proposal 8).
+                await deliver_calibration_notices()
                 if scene_calibration_service.take_notices():
-                    # In memory only; the next start re-acquires again and
-                    # notifies again.
+                    # Not submitted (storage not admitted): in memory only;
+                    # the next start re-acquires again and notifies again.
                     logging.getLogger(__name__).error(Event.SCENE_CALIBRATION_NOTICE_UNDELIVERED)
             for name in ("timeline", "watch", "dispatch"):
                 # The timeline task first: a deferred start it is running

@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 from contextlib import closing
 from dataclasses import replace
+from datetime import timedelta
 import json
 import sqlite3
 import tempfile
@@ -20,8 +21,9 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from app.cameras.registry.models import SourceType
+from app.cameras.uvc.capture import VideoFrame
 from app.detection.roi import CalibrationArchive
-from app.detection.roi.calibration import append_on, decode_history_row
+from app.detection.roi.calibration import append_on, decode_history_row, provenance
 from app.detection.roi.calibration_service import (
     REACQUIRED, REQUIRED, CalibrationOrigin, CalibrationPhase, CalibrationRefused,
     CalibrationTemplate, SceneCalibrationConfiguration, SceneCalibrationService, TransientReferences,
@@ -40,7 +42,7 @@ from app.storage.schema import APPLICATION_MIGRATIONS
 
 from tests.test_detector_roi import HEIGHT, POLYGON, WIDTH, frame_digests, near_dark, pixels, policy
 from tests.test_scene_runtime import (
-    INTERVAL, OTHER, SOURCE, Harness, Recorder, binding, calibration_for, quality, unattainable,
+    INTERVAL, OTHER, SOURCE, Harness, Recorder, binding, calibration_for, quality, unattainable, yuyv,
 )
 from tests.test_monitoring_runtime import RuntimeFixture
 from tests.test_recording import SyntheticValidator
@@ -235,6 +237,53 @@ class RuntimeAcquisitionTests(unittest.TestCase):
         harness.frame()
         self.assertTrue(future.done())
 
+    def held_sample(self, harness):
+        """A sample offered to the slot but not yet handled by the worker."""
+        harness.clock.value += INTERVAL
+        number = harness.sequence.get(SOURCE, 0) + 1
+        harness.sequence[SOURCE] = number
+        harness.runtime.on_uvc_frame(SOURCE, VideoFrame(yuyv(pixels()), number, 0.0))
+        harness.clock.value += 1
+
+    def test_a_sample_captured_before_the_request_is_never_used(self):
+        # Claude review 5: still unprocessed in its slot when the request
+        # arrives, so only the capture time can exclude it.
+        harness = Harness(calibrations=None)
+        harness.runtime.start()
+        self.held_sample(harness)
+        future = harness.runtime.acquire_reference(SOURCE, WIDTH, HEIGHT, timeout_ns=100 * INTERVAL)
+        harness.runtime.step()
+        harness.frame()
+        self.assertFalse(future.done())
+        harness.frame()
+        self.assertEqual(2, future.result(0).sequence)
+
+    def test_a_sample_captured_before_a_loss_is_never_used(self):
+        # A decoded producer may keep its stream across a loss, so the
+        # stream change alone does not exclude the sample held in the slot.
+        harness = Harness(binding(OTHER, SourceType.REMOTE_AGENT), calibrations=None)
+        harness.runtime.start()
+        stream = uuid4()
+
+        def offer(step=True):
+            harness.clock.value += INTERVAL
+            harness.runtime.offer_luma(OTHER, stream_id=stream, width=WIDTH, height=HEIGHT, pixels=pixels())
+            if step:
+                harness.runtime.step()
+
+        future = harness.runtime.acquire_reference(OTHER, WIDTH, HEIGHT, timeout_ns=100 * INTERVAL)
+        offer()
+        # Captured after the request but before the camera loss handled in
+        # the same pass: it starts no new count after the loss.
+        offer(step=False)
+        harness.clock.value += 1
+        harness.runtime.source_unavailable(OTHER, trusted=True)
+        harness.runtime.step()
+        offer()
+        self.assertFalse(future.done())
+        offer()
+        self.assertTrue(future.done())
+
     def test_refusals_busy_geometry_unavailable_cancel_and_stop(self):
         harness = Harness(calibrations=None)
         with self.assertRaises(ReferenceUnavailable) as raised:
@@ -338,6 +387,23 @@ class HistoryTests(unittest.TestCase):
         (record,) = database.history()
         self.assertNotIn("reference_sha256", vars(record))
         self.assertEqual(stored(), record.bind(stored()))
+
+
+class TransientReferenceTests(unittest.TestCase):
+    def test_a_record_is_served_only_its_own_in_memory_calibration(self):
+        # Claude review 4: the in-memory binding itself, apart from bind().
+        references = TransientReferences()
+        calibration = stored()
+        references.stage(calibration)
+        self.assertIs(calibration, references(provenance(calibration)))
+        later = calibration.created_at + timedelta(seconds=1)
+        for other in (replace(calibration, created_at=later), replace(calibration, identifier=uuid4()),
+                      replace(calibration, reader="packed:yuyv:24x24"),
+                      replace(calibration, version=2)):
+            with self.subTest(other=other.version):
+                self.assertIsNone(references(provenance(other)))
+        references.drop(calibration)
+        self.assertIsNone(references(provenance(calibration)))
 
 
 class TemplateTests(unittest.TestCase):
@@ -538,11 +604,19 @@ class RestartReacquisitionTests(unittest.TestCase):
         self.assertEqual(notices, harness.service.take_notices())
 
 
+def Database_History(test, source):
+    with closing(Database(test.settings.database_path).connect()) as connection:
+        return [decode_history_row(row) for row in connection.execute(
+            "SELECT source_id, profile_id, version, identifier, metadata FROM roi_calibration_history "
+            "WHERE source_id=? ORDER BY version", (str(source),))]
+
+
 class LifespanTests(RuntimeFixture):
     """Main lifespan: restart -> re-acquisition -> audited commit -> Owner alert."""
 
-    def scene_application(self, **calibration):
-        remote = binding(OTHER, SourceType.REMOTE_AGENT, sample_interval_ns=1_000_000)
+    def scene_application(self, sources=(OTHER,), **calibration):
+        remotes = tuple(binding(source, SourceType.REMOTE_AGENT, sample_interval_ns=1_000_000)
+                        for source in sources)
         values = dict(reacquire_timeout_seconds=5, reacquire_retry_seconds=1)
         values.update(calibration)
         return create_app(
@@ -552,10 +626,11 @@ class LifespanTests(RuntimeFixture):
                 integrity_probe=self.probe, segment_validator=SyntheticValidator(),
                 slack_opener=self.transport, utcnow=self.clock.utcnow,
                 monotonic=lambda: self.clock.monotonic, tick_seconds=3600.0),
-            scene_monitoring=SceneMonitoringConfiguration((remote,)),
+            scene_monitoring=SceneMonitoringConfiguration(remotes),
             scene_monitoring_dependencies=SceneMonitoringDependencies(tick_seconds=0.01,
                                                                       recorder=Recorder()),
-            scene_calibration=SceneCalibrationConfiguration((template(),), **values),
+            scene_calibration=SceneCalibrationConfiguration(
+                tuple(template(source) for source in sources), **values),
         )
 
     def store(self, calibration):
@@ -612,6 +687,53 @@ class LifespanTests(RuntimeFixture):
                 self.assertEqual([("scene_reference_reacquired", 1, "sent")] * restart, self.notified())
         # The reference never reached the disk.
         assert_no_frame_trace(self, database_bytes(self.settings.database_path))
+
+    async def test_a_silent_camera_delays_neither_other_sources_nor_their_notices(self):
+        # Claude review 1 / Codex P1 (PR #330): the sources are re-acquired
+        # independently. The silent camera is first, so a serial pass would
+        # hold the others for its whole timeout; four sources, the maximum.
+        silent, healthy = uuid4(), (OTHER, uuid4(), uuid4())
+        sources = (silent, *healthy)
+        for source in sources:
+            self.store(stored(source))
+        application = self.scene_application(sources, reacquire_timeout_seconds=30)
+        service = application.state.scene_calibration
+        runtime = application.state.scene_monitoring
+
+        def state(source):
+            return next(item for item in runtime.status().sources if item.source_id == source).state
+
+        def phase(source):
+            return next(item for item in service.status() if item.source_id == source).phase
+
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            feeds = [Feed(runtime, source) for source in healthy]
+            for feed in feeds:
+                feed.__enter__()
+            try:
+                started = time.monotonic()
+                self.assertTrue(await self.until(
+                    lambda: all(state(source) is SceneSourceState.ACTIVE for source in healthy)))
+                # One immediate notice per re-acquired source, each well
+                # before the silent camera's 30 s deadline.
+                self.assertTrue(await self.until(lambda: len(self.scene_texts()) == len(healthy)))
+                self.assertLess(time.monotonic() - started, 20)
+                self.assertIs(CalibrationPhase.ACQUIRING, phase(silent))
+                self.assertIs(SceneSourceState.INACTIVE, state(silent))
+            finally:
+                for feed in feeds:
+                    feed.__exit__()
+            closing_at = time.monotonic()
+        # Shutdown ends the silent camera's acquisition at once (close())
+        # instead of waiting for its deadline.
+        self.assertLess(time.monotonic() - closing_at, 15)
+        self.assertEqual(["ServerSentinel critical alert: scene_reference_reacquired"] * len(healthy),
+                         self.scene_texts())
+        self.assertEqual(sorted(str(source) for source in healthy),
+                         sorted(row[2] for row in self.reacquire_records()))
+        for source in healthy:
+            self.assertEqual([1, 2], [item.version for item in Database_History(self, source)])
+        self.assertEqual([1], [item.version for item in Database_History(self, silent)])
 
     async def test_a_stored_calibration_that_cannot_be_reacquired_notifies_once(self):
         self.store(stored(reader="packed:yuyv:24x24"))

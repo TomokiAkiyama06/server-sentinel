@@ -487,7 +487,10 @@ routes, Safari, iOS/Android or a real passkey provider (MANUAL_TEST.md).
 
 `src/calibration/screen.tsx` is shown to the Owner on the Sources view when the
 provider offers `loadSceneCalibration` (the production provider always does;
-the existing source cards stay above it when a source list exists). Routes
+when the provider has a source list (`loadSources`), the source cards, or
+while it loads `checking` and after a failure `sourcesUnavailable`
+(`SourceInventory`), stay above it; the production provider has none yet, so
+only the calibration section is shown there). Routes
 (server-side `OWNER_READ` / `OWNER_OP`, Owner decision 2026-10-22, option A):
 
 ```text

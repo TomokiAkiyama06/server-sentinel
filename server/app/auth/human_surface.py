@@ -1797,11 +1797,17 @@ class HumanSurface:
         SQLite lock) and commits the new version with its audit record
         inside ``admit`` of the authorization's epoch, re-checking the Owner
         session and its freshness in that transaction. A refused attempt
-        (``CalibrationRefused``: no frame, insufficient quality, an
-        unsuitable scene, another attempt running, ...) is ``200
-        {"outcome":"refused","reason"}`` with its ``failed`` record; any
-        other failure (an unknown source, a gate change, a session that no
-        longer holds) is the generic denial and nothing is stored.
+        (``CalibrationRefused``) is ``200 {"outcome":"refused","reason"}``.
+        Only a refusal of the audited attempt itself (the camera read and
+        the checks after it: no frame, insufficient quality, an unsuitable
+        scene, an unsupported geometry, an unavailable history) leaves a
+        ``failed`` record; one refused before that attempt starts (another
+        attempt running, ``busy``; no template, ``template_unconfigured``; a
+        closed service, ``unavailable``) changes and reads nothing and is
+        not audited. Any other failure (an unknown source, a gate change, a
+        session that no longer holds) is the generic denial with a
+        ``failed`` record when the attempt had started, and nothing is
+        stored.
         """
         service = self._scene_service()
         body = _json_object(await self._body(request, json_required=True))

@@ -11,6 +11,9 @@ import json
 from uuid import uuid4
 
 from app.audit.model import AuditAction
+from app.auth.bootstrap_cli import recover_owner
+from app.auth.invitation_code import new_invitation_code
+from app.auth.rate_limit import SourceRateLimiter
 from app.auth.human_surface import (
     SCENE_CALIBRATION_PATH, SCENE_SOURCES_PATH, HumanAccessUnavailable, match_route,
 )
@@ -181,6 +184,80 @@ class SceneRouteTests(SceneRouteFixture):
         self.assertEqual([], self.history())
         self.assertEqual([("owner", "failed", OTHER)], self.calibration_records())
         self.assertEqual({}, self.references._frames)
+
+    def sql(self, statement, parameters=()):
+        with closing(self.database.connect()) as connection:
+            connection.execute(statement, parameters)
+
+    def us(self):
+        return int(self.ceremony_clock().timestamp() * 1_000_000)
+
+    async def calibrate_after_read(self, interrupt):
+        """Calibrate with `interrupt()` run after the frame was read, before
+        the commit: the gate epoch does not move, so only the Owner session
+        re-check inside the commit transaction can refuse it."""
+        original = self.service._read
+        epochs = []
+
+        def read_then_interrupt(*args):
+            frame = original(*args)
+            before = self.access.epoch()
+            interrupt()
+            epochs.append((before, self.access.epoch()))
+            return frame
+
+        self.service._read = read_then_interrupt
+        with Feed(self.runtime):
+            result = await self.calibrate()
+        self.assertEqual(1, len(epochs))
+        self.assertEqual(epochs[0][0], epochs[0][1])
+        self.assertEqual([], self.history())
+        self.assertEqual([("owner", "failed", OTHER)], self.calibration_records())
+        self.assertEqual({}, self.references._frames)
+        self.assertIs(SceneSourceState.INACTIVE, self.runtime.status().sources[0].state)
+        return result
+
+    async def test_a_session_ended_while_the_frame_was_read_commits_nothing(self):
+        # Claude review 3: the local recover / revocation commit outside the
+        # gate (D6); the transaction's own session re-check refuses.
+        self.assertEqual(GENERIC, await self.calibrate_after_read(lambda: self.sql(
+            "UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL "
+            "WHERE principal_id=?", (self.us(), str(self.owner.id)))))
+
+    async def test_an_owner_recovered_while_the_frame_was_read_commits_nothing(self):
+        def recover():
+            secret, _ = new_invitation_code()
+            recover_owner(self.store, secret, at=self.ceremony_clock())
+
+        self.assertEqual(GENERIC, await self.calibrate_after_read(recover))
+
+    async def test_a_credential_revoked_while_the_frame_was_read_commits_nothing(self):
+        self.assertEqual(GENERIC, await self.calibrate_after_read(lambda: self.sql(
+            "UPDATE access_credentials SET revoked_at_us=? WHERE principal_id=?",
+            (self.us(), str(self.owner.id)))))
+
+    async def test_a_verification_gone_stale_while_the_frame_was_read_commits_nothing(self):
+        # Fresh at the authorization, stale by the commit: the generic
+        # denial like the other Owner operations (the next attempt is the
+        # ordinary 403 step_up_required before any frame is read).
+        self.assertEqual(GENERIC, await self.calibrate_after_read(lambda: self.elapse(minutes=6)))
+        self.assertEqual(STEP_UP, await self.calibrate())
+
+    async def test_the_calibration_is_charged_to_the_administration_limiter(self):
+        self.access.admin_limiter = SourceRateLimiter(
+            per_source_capacity=1, per_source_refill_seconds=3600.0, global_capacity=None,
+            monotonic=self.limit_clock)
+        reads = []
+        original = self.service._read
+        self.service._read = lambda *args: reads.append(args) or original(*args)
+        with Feed(self.runtime):
+            self.assertEqual("calibrated", payload(await self.calibrate())["outcome"])
+            # Over the limit: the generic denial before any frame is read.
+            self.assertEqual(GENERIC, await self.calibrate())
+        self.assertEqual(1, len(reads))
+        self.assertEqual([1], self.history())
+        self.assertEqual([("owner", "succeeded", OTHER)], self.calibration_records())
+        self.assertEqual(1, self.access.admin_limiter.limited)
 
 
 class UnattachedTests(AdminRouteFixture):

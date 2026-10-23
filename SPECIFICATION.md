@@ -1233,7 +1233,13 @@ continues during an acquisition.
   inside `admit` of the authorization's epoch, re-checking the Owner session
   and its freshness there. The acquisition runs after the authorization,
   outside the gate and the transaction; its refusal is a `failed` record and
-  `200 {"outcome":"refused","reason"}`. Success is `200
+  `200 {"outcome":"refused","reason"}`. A refusal before the attempt starts
+  (`busy`, `template_unconfigured`, a closed service's `unavailable`) reads no
+  frame, changes nothing and is the same `200` refusal without an audit
+  record. A session that ended, or whose verification went stale, while the
+  frame was read commits nothing: the generic denial with a `failed` record
+  (the next request of a stale session is the ordinary `403
+  step_up_required` before any frame is read). Success is `200
   {"outcome":"calibrated","version","calibrated_at"}`, after which the worker
   re-binds the source. `GET /api/scene/calibration` (`OWNER_READ`) returns per
   configured source `source_id`, `origin` (`none` / `owner` /
@@ -1242,26 +1248,34 @@ continues during an acquisition.
   and the scene runtime's `detection` state and `detection_reason`; never a
   pixel, frame, digest, polygon or policy value.
 - *Restart re-acquisition.* After every Main start, once scene monitoring
-  runs, each source with a stored calibration has its reference taken again
+  runs, each source with a stored calibration has its reference taken again,
+  every source independently and concurrently (at most four), so a camera
+  that gives no frame delays neither another source's detection nor its
+  notice,
   with the stored geometry, polygon and policy, but only through the same luma
   reader (otherwise `reader_changed`, also for a record written before readers
   were recorded), within `reacquire_timeout_seconds` (default 60 s), committed
   as the next version with a `reacquire_scene_reference` record of actor
   `system` (a failed commit leaves a `failed` record), and the Owner is
-  notified at once through the monitoring runtime's `NotificationService`
+  notified at once, right after that source's attempt, through the
+  monitoring runtime's `NotificationService`
   (`scene_reference_reacquired`, an immediate kind: the same durable
   `notification_events` row and optional Slack text `ServerSentinel critical
   alert: scene_reference_reacquired`; no source, image or reason). Such a
   reference was not confirmed by the Owner: a camera or server moved while
   Main was down is not detected against it, so the status keeps
-  `restart_reacquired` until the Owner calibrates. A failed attempt leaves the
+  `restart_reacquired` until the Owner calibrates. Detection nevertheless
+  starts at once on that reference (Owner decision 2026-10-23: shown and
+  notified as not confirmed). A failed attempt leaves the
   source inactive and `unknown`, is retried every `reacquire_retry_seconds`
   (default 60 s), and notifies `scene_calibration_required` once per process
   (not for a runtime that is not running yet); an acquisition refusal of the
   system path is not an audited change. An Owner calibration ends a pending
   re-acquisition without a notice. A source never calibrated is left alone.
-  Shutdown cancels an acquisition in flight and waits up to 12 s for a
-  submitted notice; a notice that could not be submitted is in memory only
+  Shutdown cancels an acquisition in flight, then submits a notice an attempt
+  queued just before (while the monitoring runtime still runs) and waits up
+  to 12 s for a submitted notice; a notice that could not be submitted is in
+  memory only
   and logged (`scene_calibration_notice_undelivered`), and the next start
   re-acquires and notifies again.
 
