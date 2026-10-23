@@ -220,6 +220,8 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true, e
       assert.deepEqual(late, [], 'request interception must succeed until the page closes');
       // A request the page abandoned after the last check counts as well.
       assert.deepEqual(unexpectedAbandoned(abandoned, expectAbandoned), [], 'no request is abandoned unless the scenario expects it');
+      // So does a request nobody expected (Codex PR #352).
+      assert.deepEqual(unexpected, [], 'every request is expected until the page closes');
     }
   }
   cases++;
@@ -470,7 +472,20 @@ try {
     assert.deepEqual(error.actual, [`POST ${lateAbandon}`]);
     return true;
   });
-  process.stdout.write('access screen harness: an unexpected abandoned POST, a late interception error and a late abandon all fail\n');
+  // A request nobody expected, started after the last check, before the page closes.
+  const lateUnexpected = '/api/self-check/unexpected';
+  await assert.rejects(scenario('self-check: an unexpected request after the last check', {
+    async afterChecks({ page, requests }) {
+      await page.evaluate(`void fetch(${JSON.stringify(lateUnexpected)}, { method: 'POST', body: '{}' }).catch(() => undefined)`);
+      for (let attempt = 0; attempt < 100 && !requests.some(item => item.path === lateUnexpected); attempt++) await delay(20);
+      assert.ok(requests.some(item => item.path === lateUnexpected), 'the late request reached the interceptor');
+    },
+  }, async ({ ui }) => { await ui.open(); }), error => {
+    assert.match(error.message, /^every request is expected until the page closes\n/);
+    assert.deepEqual(error.actual, [`POST ${lateUnexpected}`]);
+    return true;
+  });
+  process.stdout.write('access screen harness: an unexpected abandoned POST, a late interception error, a late abandon and a late unexpected request all fail\n');
 
   process.stdout.write(`${cases} access screen scenarios passed; a virtual authenticator is not a real passkey provider.\n`);
 } finally { await browser.close(); }

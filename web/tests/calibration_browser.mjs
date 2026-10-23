@@ -209,6 +209,8 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true, e
       assert.deepEqual(late, [], 'request interception must succeed until the page closes');
       // A request the page abandoned after the last check counts as well.
       assert.deepEqual(unexpectedAbandoned(abandoned, expectAbandoned), [], 'no request is abandoned unless the scenario expects it');
+      // So does a request nobody expected (Codex PR #352).
+      assert.deepEqual(unexpected, [], 'every request is expected until the page closes');
     }
   }
   cases++;
