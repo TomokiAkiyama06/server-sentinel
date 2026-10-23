@@ -291,8 +291,11 @@ try {
         await page.heading('接続を確認できません');
       });
     }
+    // Walking the screens moves on once each heading shows, so leaving a
+    // screen may abort its read before the answer (seen 1 in 40 runs, #334).
+    const viewReads = [{ method: 'GET', path: /^\/api\/mock\/(?:sources|timeline|presence|recordings|storage)$/ }];
     for (const count of [0, 1, 2, 3, 4]) {
-      await scenario(viewport, { count }, async page => {
+      await scenario(viewport, { count, expectAbandoned: viewReads }, async page => {
         await page.click('カメラソース');
         await page.wait(`document.querySelectorAll('[data-source-id]').length === ${count} && Boolean(document.querySelector('.source-count'))
           && Boolean(document.querySelector('.calibration-screen'))`);
