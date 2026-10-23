@@ -28,8 +28,13 @@ nor any value computed from a frame (no digest, histogram or statistic; Owner
 decision 2026-10-22, #205), and the history cannot become retention-free image
 storage or a scene fingerprint. A `reference.sha256` in a pre-#205 record is
 ignored when read and removed at the next Main start
-(`scrub_legacy_reference_digests`, `secure_delete`, count-only log; the
-lifecycle inventory treats it as preserved). `load()` therefore
+(`scrub_legacy_reference_digests` rebuilds the table with `secure_delete` on;
+count-only log). This removes the value inside the database file only and is
+not a claim of forensic erasure: copies outside the file (rollback-journal
+blocks the filesystem freed, SSDs, snapshots or backups) may remain. The
+lifecycle inventory treats a scrubbed version as preserved against a baseline
+recorded by this release's tool; against an earlier release's baseline it is
+`changed`. `load()` therefore
 returns a `CalibrationRecord` without pixels, separates a record it cannot
 decode from an unavailable database so corrupt history is not hidden behind a
 transient-looking failure, and refuses a record whose decoded provenance is not

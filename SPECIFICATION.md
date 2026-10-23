@@ -1009,13 +1009,19 @@ the record. A bare frame is never bound to a stored version; a frame read from
 the camera becomes a reference only through a new calibration version. A
 `reference.sha256` in a record written before #205 is ignored when read and
 removed at every Main start once the migrations ran and the audit storage
-admission is bound (`scrub_legacy_reference_digests`, in a write transaction
-with `secure_delete` on, re-serialized exactly as a new version; retried
-before the restart re-acquisition and at the next start when refused; the
-event `scene_reference_digests_scrubbed` carries only the row count). The
-lifecycle inventory digests the ROI metadata without that key, so the scrub
-is the one approved rewrite of this append-only history and a scrubbed
-version verifies as preserved. The core does not supply production thresholds, start capture, expose an
+admission is bound (`scrub_legacy_reference_digests`: in one write
+transaction with `secure_delete` on, the table is rebuilt (every row deleted
+and inserted again, re-serialized exactly as a new version), so stale copies
+a legacy write left in its pages' free space are zeroed too; retried before
+the restart re-acquisition and at the next start when refused; the event
+`scene_reference_digests_scrubbed` carries only the row count). This removes
+the value inside the database file only and is not a claim of forensic
+erasure: copies outside the file (rollback-journal blocks the filesystem
+freed, SSDs, snapshots or backups) may remain. The lifecycle inventory
+digests the ROI metadata without that key, so the scrub is the one approved
+rewrite of this append-only history and a scrubbed version verifies as
+preserved against a baseline recorded by this release's tool; against a
+baseline an earlier release's tool recorded it is reported `changed`. The core does not supply production thresholds, start capture, expose an
 API, retain decoded media, make a presence decision, or issue a notification.
 
 A calibration policy whose bounded search window cannot reach its own movement

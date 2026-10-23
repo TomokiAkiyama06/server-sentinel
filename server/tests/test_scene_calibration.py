@@ -443,6 +443,35 @@ class LegacyDigestScrubTests(unittest.TestCase):
         (record,) = database.history()
         self.assertEqual(stored(), record.bind(stored()))
 
+    def test_the_scrub_itself_turns_secure_delete_on(self):
+        # Claude re-review proposal 1: with `secure_delete` explicitly off on
+        # the connection (some SQLite builds default it on) and a thousand
+        # versions in a DELETE-journal database, the rebuilt table's freed
+        # pages would keep stale digests; the scrub's own pragma is what
+        # zeroes them (the pragma-less mutant leaves copies here).
+        database = Database_(self)
+        with closing(database.database.connect()) as connection:
+            self.assertEqual("delete", connection.execute("PRAGMA journal_mode").fetchone()[0].lower())
+            connection.execute("BEGIN IMMEDIATE")
+            digest = hashlib.sha256(pixels()).hexdigest()
+            for version in range(1, 1001):
+                calibration = stored(version=version)
+                append_on(connection, calibration)
+                value = calibration_metadata(calibration)
+                value["reference"]["sha256"] = digest
+                connection.execute("UPDATE roi_calibration_history SET metadata=? WHERE version=?",
+                                   (json.dumps(value, sort_keys=True), version))
+            connection.execute("COMMIT")
+        with self.assertRaises(AssertionError):
+            assert_no_frame_trace(self, database.raw())
+        with closing(database.database.connect()) as connection:
+            connection.execute("PRAGMA secure_delete = OFF")
+            connection.execute("BEGIN IMMEDIATE")
+            self.assertEqual(1000, scrub_legacy_reference_digests(connection))
+            connection.execute("COMMIT")
+        assert_no_frame_trace(self, database.raw())
+        self.assertEqual(list(range(1, 1001)), [item.version for item in database.history()])
+
     def test_without_the_table_or_a_digest_nothing_is_written(self):
         with closing(sqlite3.connect(":memory:")) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -770,6 +799,38 @@ class LifespanTests(RuntimeFixture):
                     if record.msg == Event.SCENE_REFERENCE_DIGESTS_SCRUBBED]
         self.assertEqual([1], [record.count for record in scrubbed])
         self.assertNotIn(hashlib.sha256(pixels()).hexdigest(), "\n".join(logs.output))
+        assert_no_frame_trace(self, database_bytes(self.settings.database_path))
+
+    async def test_a_refused_startup_scrub_is_retried_before_the_reacquisition(self):
+        # Claude re-review proposal 2: the scrub refused at startup (storage
+        # not yet admitted, for example) runs again before the restart
+        # re-acquisition, so no re-acquired version sits beside the digest.
+        store_legacy(self.settings.database_path, stored())
+        application = self.scene_application()
+        service = application.state.scene_calibration
+        runtime = application.state.scene_monitoring
+        from app import main as main_module
+        real, calls = main_module.scrub_legacy_reference_digests, []
+
+        def scrub(connection):
+            calls.append(service.status()[0].origin)
+            if len(calls) == 1:
+                raise RuntimeError("synthetic refusal")
+            return real(connection)
+
+        with self.assertLogs("app.main", "WARNING") as logs, \
+                mock.patch.object(main_module, "scrub_legacy_reference_digests", side_effect=scrub):
+            async with asyncio.timeout(60), application.router.lifespan_context(application):
+                with Feed(runtime):
+                    self.assertTrue(await self.until(
+                        lambda: service.status()[0].origin is CalibrationOrigin.RESTART_REACQUIRED))
+        events = [record.msg for record in logs.records]
+        self.assertEqual(1, events.count(Event.SCENE_REFERENCE_DIGEST_SCRUB_FAILED))
+        self.assertLess(events.index(Event.SCENE_REFERENCE_DIGEST_SCRUB_FAILED),
+                        events.index(Event.SCENE_REFERENCE_DIGESTS_SCRUBBED))
+        # Both attempts ran before the re-acquisition.
+        self.assertEqual([CalibrationOrigin.NONE, CalibrationOrigin.NONE], calls)
+        self.assertEqual([1, 2], self.versions())
         assert_no_frame_trace(self, database_bytes(self.settings.database_path))
 
     async def test_a_silent_camera_delays_neither_other_sources_nor_their_notices(self):

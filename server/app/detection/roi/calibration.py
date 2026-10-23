@@ -149,8 +149,13 @@ def scrub_legacy_reference_digests(connection: sqlite3.Connection) -> int:
     A version written before the Owner decision 2026-10-22 may carry the
     SHA-256 of its reference frame, image-derived data that must not stay on
     disk. Runs inside the caller's write transaction (storage admission and
-    commit are the caller's) with ``secure_delete`` on, so the old cell bytes
-    are overwritten rather than left in the page's free space. Each scrubbed
+    commit are the caller's). When a row carries the key, the whole table is
+    rebuilt with ``secure_delete`` on, so the old cells, the freed pages and
+    any stale copy a legacy write left in this table's free space are
+    zeroed inside the database file. This is not a forensic erasure: copies
+    outside the file (rollback-journal blocks the filesystem freed, SSD
+    remapping, snapshots, backups) and a page of this table an earlier build
+    freed to another table are beyond it. Each scrubbed
     row is re-serialized exactly as ``calibration_metadata()`` writes a new
     one, so its frame-free provenance, and the lifecycle inventory's keyed
     digest of it (``app.lifecycle_inventory.sources``), stay identical.
@@ -163,18 +168,21 @@ def scrub_legacy_reference_digests(connection: sqlite3.Connection) -> int:
     if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                           "AND name='roi_calibration_history'").fetchone() is None:
         return 0
+    rows = connection.execute(
+        "SELECT source_id, profile_id, version, identifier, metadata FROM roi_calibration_history "
+        "ORDER BY source_id, profile_id, version").fetchall()
+    rewritten = [(*row[:4], without_reference_digest(row[4]) or row[4]) for row in rows]
+    scrubbed = sum(1 for old, new in zip(rows, rewritten) if old[4] != new[4])
+    if not scrubbed:
+        return 0
+    # Rebuild the whole table, not only the scrubbed rows: a legacy build
+    # may have written with `secure_delete` off, leaving stale copies of a
+    # digest in the free space of this table's pages, which rewriting a row
+    # does not reach. With `secure_delete` on, deleting every row zeroes
+    # the cells and the freed pages before the rows are inserted again.
     connection.execute("PRAGMA secure_delete = ON")
-    scrubbed = 0
-    for key in connection.execute(
-            "SELECT source_id, profile_id, version, metadata FROM roi_calibration_history "
-            "WHERE metadata LIKE '%sha256%'").fetchall():
-        rewritten = without_reference_digest(key[3])
-        if rewritten is None or rewritten == key[3]:
-            continue
-        connection.execute("UPDATE roi_calibration_history SET metadata=? "
-                           "WHERE source_id=? AND profile_id=? AND version=?",
-                           (rewritten, key[0], key[1], key[2]))
-        scrubbed += 1
+    connection.execute("DELETE FROM roi_calibration_history")
+    connection.executemany("INSERT INTO roi_calibration_history VALUES (?,?,?,?,?)", rewritten)
     return scrubbed
 
 
