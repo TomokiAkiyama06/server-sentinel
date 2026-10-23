@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describeException, launchChrome, pageFor } from './chrome.mjs';
+import { setTimeout as delay } from 'node:timers/promises';
+import { clickWhenEnabled, CommandError, describeCommandError, describeException, launchChrome, pageFor, routeTracker } from './chrome.mjs';
 
 // Synthetic stand-ins for Chrome's --remote-debugging-pipe transport (#197).
 // Each launch appends its pid to a ledger so the tests can prove that hung
@@ -113,7 +114,7 @@ function fakeBrowser(answer) {
       listeners.get(method).add(listener);
       return () => listeners.get(method).delete(listener);
     },
-    emit(method, params) { for (const listener of listeners.get(method) ?? []) listener(params, 'session-1'); },
+    emit(method, params, session = 'session-1') { for (const listener of listeners.get(method) ?? []) listener(params, session); },
   };
   return browser;
 }
@@ -214,4 +215,94 @@ test('navigate resolves only once the new document has parsed', async () => {
   await assert.rejects((await pageFor(refused, viewport)).navigate('http://localhost/'), /Navigation failed: net::ERR_BLOCKED_BY_CLIENT/);
   const silent = fakeBrowser(method => (method === 'Page.navigate' ? { frameId: 'frame-1', loaderId: 'l' } : setup(method)));
   await assert.rejects((await pageFor(silent, viewport)).navigate('http://localhost/', 50), /did not reach DOMContentLoaded within 50 ms/);
+});
+
+test('interception failures are described without request values', () => {
+  const refused = (method, message, code = -32602) => describeCommandError(new CommandError(method, { code, message }));
+  assert.equal(refused('Fetch.fulfillRequest', 'Invalid InterceptionId.'),
+    'Fetch.fulfillRequest refused (CDP -32602): Invalid InterceptionId.');
+  assert.equal(refused('Fetch.failRequest', 'Session with given id not found.', -32001),
+    'Fetch.failRequest refused (CDP -32001): Session with given id not found.');
+  // A protocol message outside the fixed set, a malformed method or code keep no value.
+  assert.equal(refused('Fetch.fulfillRequest', 'Invalid header: 0123-4567-89AB'), 'Fetch.fulfillRequest refused (CDP -32602)');
+  assert.equal(refused('person-a@example.invalid', 'Invalid InterceptionId.', 'x'), 'unknown method refused (CDP unknown): Invalid InterceptionId.');
+  // This adapter's own errors carry only a method, a number or a process status.
+  for (const message of ['Chrome command timeout: Fetch.fulfillRequest (10000 ms)', 'Chrome was closed.',
+    'Chrome exited before the command completed (code null, signal SIGTERM).']) {
+    assert.equal(describeCommandError(new Error(message)), message);
+  }
+  // Anything else (e.g. a handler bug quoting request data) is reduced to its class.
+  assert.equal(describeCommandError(new TypeError('/api/mock/0123-4567 is not valid JSON')), 'TypeError raised by the interceptor');
+  assert.equal(describeCommandError(new Error('Chrome command timeout: Fetch.fulfillRequest (10 ms) 0123')), 'Error raised by the interceptor');
+  assert.equal(describeCommandError('a private value'), 'non-Error value raised by the interceptor');
+});
+
+test('answer tells a request the page cancelled apart from a genuine interception error', async () => {
+  const invalid = new CommandError('Fetch.fulfillRequest', { code: -32602, message: 'Invalid InterceptionId.' });
+  let refusal = invalid;
+  const browser = fakeBrowser(method => {
+    if (method !== 'Fetch.fulfillRequest') return setup(method);
+    if (refusal) throw refusal;
+    return {};
+  });
+  const page = await pageFor(browser, viewport);
+  // Cancelled by the page (reported before the refusal, as Chrome does): abandoned.
+  browser.emit('Network.loadingFailed', { requestId: 'network-1', canceled: true, errorText: 'net::ERR_ABORTED' });
+  assert.equal(await page.answer('network-1', 'Fetch.fulfillRequest', { requestId: 'job-1' }), false);
+  // The cancellation may also arrive shortly after the refusal.
+  setTimeout(() => browser.emit('Network.loadingFailed', { requestId: 'network-2', canceled: true }), 30);
+  assert.equal(await page.answer('network-2', 'Fetch.fulfillRequest', { requestId: 'job-2' }), false);
+  // The same refusal without a page cancellation is a harness error.
+  browser.emit('Network.loadingFailed', { requestId: 'network-3', canceled: false, errorText: 'net::ERR_FAILED' });
+  await assert.rejects(page.answer('network-3', 'Fetch.fulfillRequest', { requestId: 'job-3' }, 100), error => error === invalid);
+  await assert.rejects(page.answer(undefined, 'Fetch.fulfillRequest', { requestId: 'job-0' }, 100), error => error === invalid);
+  // A cancellation on another page's session does not count.
+  browser.emit('Network.loadingFailed', { requestId: 'network-4', canceled: true }, 'session-2');
+  await assert.rejects(page.answer('network-4', 'Fetch.fulfillRequest', { requestId: 'job-4' }, 100), error => error === invalid);
+  // Any other refusal or adapter failure is rethrown at once, cancelled or not.
+  refusal = new CommandError('Fetch.fulfillRequest', { code: -32602, message: 'Invalid header' });
+  await assert.rejects(page.answer('network-1', 'Fetch.fulfillRequest', { requestId: 'job-1' }), error => error === refusal);
+  refusal = new Error('Chrome command timeout: Fetch.fulfillRequest (10000 ms)');
+  await assert.rejects(page.answer('network-1', 'Fetch.fulfillRequest', { requestId: 'job-1' }), error => error === refusal);
+  refusal = null;
+  assert.equal(await page.answer('network-5', 'Fetch.fulfillRequest', { requestId: 'job-5' }), true);
+  // Closing the page stops recording cancellations.
+  await page.close();
+  browser.emit('Network.loadingFailed', { requestId: 'network-6', canceled: true });
+  refusal = invalid;
+  await assert.rejects(page.answer('network-6', 'Fetch.fulfillRequest', { requestId: 'job-6' }, 50), error => error === invalid);
+});
+
+test('a late genuine interception error still fails the scenario (Codex PR #331)', async () => {
+  const invalid = new CommandError('Fetch.fulfillRequest', { code: -32602, message: 'Invalid InterceptionId.' });
+  const browser = fakeBrowser(method => { if (method === 'Fetch.fulfillRequest') throw invalid; return setup(method); });
+  const page = await pageFor(browser, viewport);
+  const routes = routeTracker();
+  // A refusal with no page cancellation: `answer` waits out its grace period
+  // before it rethrows, longer than the 100 ms a scenario used to allow.
+  routes.track(page.answer('network-1', 'Fetch.fulfillRequest', { requestId: 'job-1' }, 300));
+  await delay(100);
+  assert.deepEqual(routes.errors, [], 'not reported yet when the scenario used to assert');
+  assert.deepEqual(await routes.settle(), ['Fetch.fulfillRequest refused (CDP -32602): Invalid InterceptionId.']);
+  // A handler started while the scenario settles is waited for as well.
+  const late = routeTracker();
+  late.track(delay(50).then(() => late.track(delay(50).then(() => { throw new TypeError('/api/private 0123'); }))));
+  assert.deepEqual(await late.settle(), ['TypeError raised by the interceptor']);
+  // Handlers that finish cleanly report nothing; one that never finishes fails the settle.
+  const clean = routeTracker();
+  clean.track(delay(20));
+  assert.deepEqual(await clean.settle(), []);
+  const stuck = routeTracker();
+  stuck.track(new Promise(() => {}));
+  await assert.rejects(stuck.settle(50), { message: 'Interception handlers did not settle within 50 ms' });
+});
+
+test('click finds and clicks the element in one evaluation', () => {
+  const run = element => new Function('element', `return ${clickWhenEnabled('element')}`)(element);
+  let clicks = 0;
+  assert.equal(run(undefined), false, 'a missing element (a list re-rendering) is waited for, not a TypeError');
+  assert.equal(run({ disabled: true, click() { clicks++; } }), false);
+  assert.equal(clicks, 0);
+  assert.equal(run({ disabled: false, click() { clicks++; } }), true);
+  assert.equal(clicks, 1);
 });

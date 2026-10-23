@@ -98,7 +98,7 @@ async function startChrome(executable, options) {
       if (message.id) {
         const promise = pending.get(message.id);
         pending.delete(message.id);
-        if (promise) message.error ? promise.reject(new Error(message.error.message)) : promise.resolve(message.result);
+        if (promise) message.error ? promise.reject(new CommandError(promise.method, message.error)) : promise.resolve(message.result);
       } else for (const listener of listeners.get(message.method) || []) listener(message.params, message.sessionId);
     }
   });
@@ -110,6 +110,7 @@ async function startChrome(executable, options) {
       reject(new Error(`Chrome command timeout: ${method} (${timeoutMilliseconds} ms)`));
     }, timeoutMilliseconds);
     pending.set(commandId, {
+      method,
       resolve(value) { clearTimeout(timeout); resolve(value); },
       reject(error) { clearTimeout(timeout); reject(error); },
     });
@@ -150,6 +151,91 @@ async function startChrome(executable, options) {
 }
 
 const IDENTIFIER = '[A-Za-z_$][\\w$]{0,63}';
+
+/** A command Chrome answered with a protocol error (as opposed to a timeout or a closed pipe). */
+export class CommandError extends Error {
+  constructor(method, { code, message }) {
+    super(String(message ?? ''));
+    this.name = 'CommandError';
+    this.method = method;
+    this.code = code;
+  }
+}
+
+// Protocol error messages that are fixed strings in Chrome's DevTools handlers
+// and carry no request, page or input value.
+const COMMAND_MESSAGES = [
+  /^Invalid InterceptionId\.?$/,
+  /^Invalid state for continueInterceptedRequest\.?$/,
+  /^Session with given id not found\.?$/,
+  /^Target closed\.?$/,
+  /^Inspected target navigated or closed$/,
+];
+const METHOD = /^[A-Z][A-Za-z]{0,31}\.[a-z][A-Za-z]{0,63}$/;
+// Errors this adapter raises itself, whose only variable parts are a CDP
+// method name, a configured number or a process status.
+const ADAPTER_MESSAGES = [
+  /^Chrome command timeout: [A-Z][A-Za-z]{0,31}\.[a-z][A-Za-z]{0,63} \(\d+ ms\)$/,
+  /^Chrome was closed\.$/,
+  /^Chrome exited before the command completed \(code (?:-?\d+|null), signal (?:[A-Z0-9]+|null)\)\.$/,
+];
+
+/**
+ * A value-free description of an error raised while answering an intercepted
+ * request (#326): for a protocol error the CDP method and numeric code, plus
+ * the message only when it is one of the fixed strings above; for this
+ * adapter's own timeout/closed errors the message; anything else (a handler
+ * bug, which may quote request data) is reduced to its error class.
+ */
+export function describeCommandError(error) {
+  if (error instanceof CommandError) {
+    const method = METHOD.test(error.method ?? '') ? error.method : 'unknown method';
+    const code = Number.isInteger(error.code) ? error.code : 'unknown';
+    const message = COMMAND_MESSAGES.some(shape => shape.test(error.message)) ? `: ${error.message}` : '';
+    return `${method} refused (CDP ${code})${message}`;
+  }
+  if (error instanceof Error && ADAPTER_MESSAGES.some(shape => shape.test(error.message))) return error.message;
+  const name = error instanceof Error && new RegExp(`^${IDENTIFIER}$`).test(error.name) ? error.name : 'non-Error value';
+  return `${name} raised by the interceptor`;
+}
+
+/**
+ * Tracks the detached handlers a scenario starts for `Fetch.requestPaused`
+ * (Codex PR #331). A handler may finish long after the page has moved on:
+ * a slow synthetic answer, or `answer` waiting up to its grace period before
+ * it rethrows a genuine refusal. `settle` waits for every handler, including
+ * one started while it waits, so such an error is reported before the
+ * scenario asserts and closes the page instead of landing after it. The
+ * errors are kept value-free (`describeCommandError`). A handler still
+ * running after `timeoutMilliseconds` fails the settle.
+ */
+export function routeTracker() {
+  const running = new Set();
+  const errors = [];
+  return {
+    errors,
+    track(handler) {
+      const settled = Promise.resolve(handler)
+        .catch(error => { errors.push(describeCommandError(error)); })
+        .finally(() => running.delete(settled));
+      running.add(settled);
+    },
+    async settle(timeoutMilliseconds = 15000) {
+      const deadline = Date.now() + timeoutMilliseconds;
+      let timer;
+      try {
+        while (running.size) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw new Error(`Interception handlers did not settle within ${timeoutMilliseconds} ms`);
+          await Promise.race([Promise.all(running), new Promise(resolve => { timer = setTimeout(resolve, remaining); })]);
+          clearTimeout(timer);
+        }
+      } finally { clearTimeout(timer); }
+      return errors;
+    },
+  };
+}
+
 // V8 messages whose only variable part is an identifier taken from the test's
 // own expression, never page or input text. Anything else is reduced to its
 // error class.
@@ -178,6 +264,17 @@ export function describeException(details) {
   return STANDARD_MESSAGES.some(shape => shape.test(message)) ? `${className}: ${message}` : className;
 }
 
+/**
+ * An expression for `wait` that finds the element, and clicks it only when it
+ * is present and enabled, in the same evaluation. Finding it in one
+ * evaluation and clicking it in the next raced a re-render in between (PR #331
+ * CI: the access screen unmounts its list while it reloads after a change, so
+ * the second lookup found nothing).
+ */
+export function clickWhenEnabled(find) {
+  return `(() => { const el = ${find}; if (!el || el.disabled) return false; el.click(); return true; })()`;
+}
+
 export async function pageFor(browser, viewport) {
   const { browserContextId } = await browser.command('Target.createBrowserContext');
   const { targetId } = await browser.command('Target.createTarget', { url: 'about:blank', browserContextId });
@@ -188,6 +285,33 @@ export async function pageFor(browser, viewport) {
   await command('Network.enable');
   await command('Network.setBypassServiceWorker', { bypass: true });
   await command('Emulation.setDeviceMetricsOverride', { ...viewport, deviceScaleFactor: 1, mobile: false });
+  // Requests the page itself cancelled (an AbortController on a view change,
+  // or a navigation), by network id, for `answer` below.
+  const cancelled = new Set();
+  const stopCancelled = browser.on('Network.loadingFailed', ({ requestId, canceled }, from) => {
+    if (from === sessionId && canceled) cancelled.add(requestId);
+  });
+  /**
+   * Answers an intercepted request (`Fetch.fulfillRequest` / `Fetch.failRequest`)
+   * and resolves true once Chrome accepted the answer. When the page cancelled
+   * the request while it was paused, Chrome has already dropped the
+   * interception and refuses the answer with `Invalid InterceptionId` (#326);
+   * that resolves false, but only once Chrome has also reported the request as
+   * cancelled (`Network.loadingFailed` with `canceled`, normally sent before the
+   * refusal; up to `graceMilliseconds` are allowed for it). Every other failure,
+   * and an `Invalid InterceptionId` without a page cancellation, is rethrown.
+   */
+  async function answer(networkId, method, params, graceMilliseconds = 1000) {
+    try {
+      await command(method, params);
+      return true;
+    } catch (error) {
+      if (!(error instanceof CommandError) || !/^Invalid InterceptionId\.?$/.test(error.message) || !networkId) throw error;
+      for (let waited = 0; !cancelled.has(networkId) && waited < graceMilliseconds; waited += 25) await delay(25);
+      if (!cancelled.has(networkId)) throw error;
+      return false;
+    }
+  }
   async function evaluate(expression) {
     const result = await command('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
     if (result.exceptionDetails) throw new Error(`Browser evaluation failed: ${describeException(result.exceptionDetails)}`);
@@ -252,16 +376,17 @@ export async function pageFor(browser, viewport) {
     }
   }
   return {
-    command, evaluate, wait, navigate, sessionId,
+    command, evaluate, wait, navigate, answer, sessionId,
     async heading(title) { await wait(`Array.from(document.querySelectorAll('h1')).some(el => el.textContent === ${JSON.stringify(title)})`); },
     async click(title) {
-      const selector = `Array.from(document.querySelectorAll('nav button')).find(el => el.textContent === ${JSON.stringify(title)})`;
-      await wait(`Boolean((${selector}) && !(${selector}).disabled)`);
-      await evaluate(`(${selector}).click()`);
+      await wait(clickWhenEnabled(`Array.from(document.querySelectorAll('nav button')).find(el => el.textContent === ${JSON.stringify(title)})`));
     },
     async enabled(title) {
       return evaluate(`!Array.from(document.querySelectorAll('nav button')).find(el => el.textContent === ${JSON.stringify(title)}).disabled`);
     },
-    async close() { await browser.command('Target.disposeBrowserContext', { browserContextId }); },
+    async close() {
+      stopCancelled();
+      await browser.command('Target.disposeBrowserContext', { browserContextId });
+    },
   };
 }
