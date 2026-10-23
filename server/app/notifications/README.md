@@ -67,7 +67,12 @@ A full or closed queue or a full retry buffer then leaves its work queued
 instead of becoming a final `failed`. `retained(event_id)` reports a `failed`
 result that is only a refused local write being retried (nothing was sent, and
 resubmitting the ID retries it). The presence critical dispatcher uses both
-(Issue #26, `../presence/README.md`). This in-memory queue does not promise exactly-once Slack
+(Issue #26, `../presence/README.md`). `in_flight(event_id)` reports a submitted
+delivery whose outcome is not yet persisted (still running, or finished while
+its local write is refused), `join(event_id, kind, on_complete)` attaches a
+callback to such a delivery without comparing its time, and `capacity` is the
+queue bound: a scene critical alert attempted while its timeline record was
+refused (Issue #318) is joined, not resent, once that record exists. This in-memory queue does not promise exactly-once Slack
 delivery across a crash; retrying an uncertain external POST may duplicate it.
 `close()` stops new submissions without waiting for a blocked transport/DNS call;
 in-flight/queued events remain durably pending or locally failed as recorded.

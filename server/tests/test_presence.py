@@ -702,6 +702,8 @@ class PresenceTests(unittest.TestCase):
                 return True
             def retained(inner, event_id):
                 return False
+            def join(inner, event_id, kind, on_complete):
+                return False
             def record(inner, kind, **fields):
                 inner.identifier = fields["event_id"]
                 inner.callback = fields["on_complete"]

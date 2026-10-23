@@ -161,6 +161,40 @@ class NotificationService:
     def unpersisted_count(self) -> int:
         return len(self._unpersisted)
 
+    @property
+    def capacity(self) -> int:
+        """The bound of the Slack queue (and of the local retry buffer)."""
+        return self._capacity
+
+    def in_flight(self, event_id: UUID) -> bool:
+        """Whether ``event_id`` was submitted and its outcome is not yet persisted.
+
+        That is a delivery still running, or one that finished while its
+        local write is refused (`STORAGE_HARD_STOP`): it stays here, and so
+        in `pending_count`, until the outcome row is written.
+        """
+        self._check()
+        return event_id in self._pending
+
+    def join(self, event_id: UUID, kind: NotificationKind, on_complete) -> bool:
+        """Attach ``on_complete`` to the delivery of ``event_id`` already in flight.
+
+        Returns False (nothing attached) when no such delivery is in flight or
+        it is of another kind. Unlike a coalesced `record()`, the time of the
+        joined delivery is not compared: an upstream outbox that learns about
+        an alert submitted earlier under the same identity (Issue #318, an
+        alert attempted while its durable record was refused) is told that
+        delivery's outcome instead of sending a second message.
+        """
+        self._check()
+        if not isinstance(event_id, UUID) or not callable(on_complete):
+            raise ValueError("invalid notification event")
+        entry = self._pending.get(event_id)
+        if entry is None or entry[0].kind != kind or not entry[0].confirmed:
+            return False
+        entry[1].append(on_complete)
+        return True
+
     def can_accept(self, event_id: UUID) -> bool:
         """Whether `record(..., event_id=event_id)` would not be refused for capacity.
 
