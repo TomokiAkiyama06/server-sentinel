@@ -302,13 +302,71 @@ notification service exists, no dispatcher runs and the path stays unavailable.
 
 While storage is refused (`STORAGE_HARD_STOP`, a lost or replaced recording
 filesystem) a confirmed observation cannot be written to the timeline, so it
-is not dispatched either: it waits only within the scene runtime's bounded
-in-memory critical staging, and confirmations beyond that bound are counted
-as undelivered loss. Unlike recording-health and integrity alerts, no Slack
-attempt is made for it meanwhile yet. The Owner decided on 2026-10-22 that
-scene critical alerts shall attempt Slack during a hard stop like
-recording-health does, accepting the duplicate risk; that is implemented in a
-follow-up issue, not here.
+is not dispatched either: the observation itself waits only within the scene
+runtime's bounded in-memory critical staging, and confirmations beyond that
+bound are counted as undelivered loss. Its Slack alert is still attempted,
+like a recording-health or integrity alert (Owner decision 2026-10-22, Issue
+#318, accepting the duplicate risk):
+
+- `CriticalTimelineRecorder` hands every confirmed observation whose record
+  failed (anything but a contract error) to `UnrecordedCriticalAlerts`
+  (`delivery.py`) before raising to the scene runtime's retry. Every
+  successful record is reported too, inside the record transaction before
+  its commit (`PresenceService.record_critical()`), so no dispatch step can
+  claim the row in between. It then leaves the refused queue, whatever its
+  state: from now on its notification belongs to the dispatcher, so one that
+  waited there for a drain slot and was sent by the dispatcher after recovery
+  is not resent by a drain during a later refusal. One whose `notification`
+  row is still `pending` / `unavailable` is watched; an idempotent replay of
+  an observation already claimed or resolved is not, so a later refusal
+  cannot resend an alert already delivered. Until a successful dispatch step finds its
+  `notification` row neither `pending` nor `unavailable` (claimed, or
+  resolved), a failing dispatch step escalates it to an attempt. That covers
+  an observation recorded just before the disk is removed (the claim is then
+  refused) and a row left `unavailable` while the notification queue was
+  full. Each hand-over only touches memory under a short lock: no I/O, no
+  wait for the monitoring worker, never a raise into the recorder. Without
+  Slack nothing is handed over.
+- Bounds: refused hand-overs are in practice bounded by the scene runtime's
+  critical staging (32 observations by default, `DEFAULT_CRITICAL_CAPACITY`;
+  beyond it the scene runtime counts undelivered loss and no attempt is made)
+  plus at most 64 watched records (the oldest beyond that is no longer
+  watched, counted as `untracked`). The attempt queue itself holds at most 64;
+  beyond it a hand-over is counted (`dropped`) and logged value-free as
+  `unrecorded_critical_alert_dropped` (first and every doubling), which the
+  default staging does not reach.
+- `CriticalDispatcher` drains it on the monitoring worker at every dispatch
+  interval (5 s), independently of the dispatch step's backoff, which keeps
+  failing while storage is refused. Each alert goes through the same
+  `NotificationService.record()` under the observation identity as event ID,
+  with the same fixed text (`ServerSentinel critical alert: server_movement` /
+  `camera_tamper`) and nothing else; `unrecorded_critical_alert_attempted` is
+  logged value-free. The service keeps the delivery in memory until its
+  `notification_events` row can be written, so its queue slot stays taken
+  until storage returns. Such alerts hold at most half of the service queue
+  (at least one slot), so scene alerts cannot monopolise it: with the default
+  queue of 16, at most 8 are attempted during one hard stop and the rest are
+  sent after recovery. Other immediate alerts (recording health, integrity,
+  camera offline, access faults) may still fill the remaining slots.
+- Owner status (`PresenceService.snapshot`) reports value-free counts for
+  this process as `unrecorded_critical_alerts`: `attempted`, `waiting`,
+  `dropped` and `untracked` (None without the hand-over).
+- After recovery the scene runtime records the staged observation and the
+  dispatcher claims its `notification` row. `NotificationAdapter` then joins a
+  delivery of that event ID still in flight (`NotificationService.join()`) or
+  takes the stored outcome (`sent` delivered, `failed` / `disabled` as they
+  are, a `pending` row of an earlier process uncertain) instead of sending
+  again; only an audited Owner requeue sends again. One process therefore
+  sends one message per observation.
+- If the process ends after the attempt and before its outcome row was
+  written, the next process cannot know about the attempt, and a recovered
+  observation (one whose record reached the database just before the end) is
+  notified once more: that single duplicate is the accepted risk. The
+  shutdown settle drains the alerts both before and after its last dispatch
+  step, so watched records that step escalates (storage refused at exit) are
+  still attempted within the same settle bound. Alerts still queued and never
+  submitted at shutdown are logged as
+  `unrecorded_critical_alerts_unsent` and are not kept across a restart.
 
 ### Entrance gate quality
 

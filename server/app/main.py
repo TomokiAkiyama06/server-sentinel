@@ -268,7 +268,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
                                 # Without Slack the local `disabled` event is
                                 # still recorded, but the path is unavailable
                                 # from the start (SPECIFICATION #205 runtime).
-                                configured=lambda: monitoring.slack is not None)
+                                configured=lambda: monitoring.slack is not None,
+                                # Issue #318: an outcome already stored for the
+                                # observation (an alert attempted while its
+                                # record was refused) is taken, not resent.
+                                outcomes=lambda ids: monitoring_runtime.notification_outcomes(ids))
             if monitoring_runtime is not None else None)
         timeline = SceneTimeline(scene_timeline, store, storage_reservation or runtime_admission,
                                  detection=scene_detection_armed,
@@ -277,10 +281,16 @@ def create_app(settings: Settings, *, database: Database | None = None,
             def critical_dispatch_step() -> int:
                 return timeline.dispatch(reconcile=monitoring_runtime.notification_outcomes)
 
+            def unrecorded_alert_step() -> int:
+                # Issue #318: confirmed criticals whose record storage refused
+                # still attempt Slack (Owner decision 2026-10-22).
+                return timeline.unrecorded.drain(at=monitoring_runtime.dependencies.utcnow())
+
             critical_dispatcher = CriticalDispatcher(
                 timeline,
                 lambda step: monitoring_runtime.call(monitoring_runtime.dispatch_notifications, step),
-                critical_dispatch_step)
+                critical_dispatch_step,
+                alerts=unrecorded_alert_step if timeline.unrecorded is not None else None)
         scene_monitoring_dependencies = replace(
             scene_monitoring_dependencies or SceneMonitoringDependencies(),
             recorder=timeline.recorder, undelivered=timeline.undelivered)
@@ -511,7 +521,15 @@ def create_app(settings: Settings, *, database: Database | None = None,
             if critical_dispatcher is None:
                 return
             with suppress(Exception):
+                await critical_dispatcher.alert_once()
+            with suppress(Exception):
                 await critical_dispatcher.once()
+            # Issue #318: a final step refused by storage escalates the
+            # recorded but unclaimed criticals it watched; drain once more so
+            # they are still attempted (no network wait: the settle below
+            # bounds the time spent on their delivery).
+            with suppress(Exception):
+                await critical_dispatcher.alert_once()
             try:
                 unsettled = await run_to_completion(monitoring_runtime.call(
                     monitoring_runtime.settle_notifications,
@@ -520,6 +538,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 unsettled = None
             if unsettled != 0:
                 logging.getLogger(__name__).error(Event.CRITICAL_NOTIFICATIONS_UNSETTLED)
+            if timeline.unrecorded is not None and timeline.unrecorded.queued:
+                # Handed over during a hard stop but never submitted (the
+                # service had no room): nothing remembers them after exit.
+                logging.getLogger(__name__).error(Event.UNRECORDED_CRITICAL_ALERTS_UNSENT)
 
         async def settle_camera_offline() -> None:
             # Issue #301 item 2: a camera offline notification submitted by
