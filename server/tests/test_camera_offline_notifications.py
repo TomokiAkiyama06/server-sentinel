@@ -476,11 +476,12 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
         self.assertEqual({counted: stored, older: earlier},
                          {row.event_id: row.at for row in self.sent()})
         self.assertEqual(2, len(monitor._sent))
-        # A restored ID that an outage's durable name maps to is covered:
-        # one alert. A later episode reusing that name gets its own ID.
+        # A restored ID that the outage in progress since the start maps to
+        # is covered: one alert. A later episode reusing that name gets its
+        # own ID.
         monitor = self.monitor()
         self.sink.rows.clear()
-        self.online(monitor)
+        self.online(monitor, self.sources[1])
         durable = uuid4()
         monitor.restore_pending([(durable, stored)])
         source = self.sources[0]
@@ -536,7 +537,7 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
         # Only P's resend waits for the hour; the episode is settled.
         self.assertEqual(1, status.held)
         self.assertEqual(1, len(logs.output))
-        self.assertNotIn(pending, monitor._restored)
+        self.assertIn(pending, monitor._restored)
         self.assertEqual([], self.sent())
         monitor.health_sink(event(self.sources[0], CameraState.ONLINE))
         self.advance(60)
@@ -545,11 +546,62 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
         self.advance(3600)
         self.drain(monitor, durable_id=lambda source: pending, known=known)
         self.assertEqual([(pending, stored)], [(row.event_id, row.at) for row in self.sent()])
+        self.assertNotIn(pending, monitor._restored)
         # A new outage with the same last-frame time (a refused write).
         monitor.health_sink(event(self.sources[0], CameraState.OFFLINE))
         self.advance(300)
         self.drain(monitor, durable_id=lambda source: pending, known=lambda value: True)
         self.assertEqual(2, len(self.sent()))
+
+    def test_a_sent_resend_still_covers_the_outage_in_progress(self):
+        # The resend goes out before the outage in progress since the start
+        # reaches the threshold: that outage is still covered, not resent.
+        monitor = self.monitor()
+        self.online(monitor, self.sources[1])
+        pending, stored = uuid4(), AT - timedelta(hours=2)
+        monitor.restore_pending([(pending, stored)])
+        self.drain(monitor)
+        self.assertEqual([pending], [row.event_id for row in self.sent()])
+        self.assertNotIn(pending, monitor._restored)
+        self.advance(300)
+        self.drain(monitor, durable_id=lambda source: pending, known=lambda value: True)
+        self.assertEqual(1, len(self.sent()))
+        self.assertEqual(1, self.drain(monitor).offline_sources)
+
+    def later_outage_reusing_a_restored_name(self, *, sent_first):
+        # Codex PR #339 P2: the restored row's outage recovered before the
+        # restart, so no episode claims its resend. A later, distinct outage
+        # that reuses the durable name (its online last-frame write was
+        # refused) must still be notified, under a per-process ID, whether
+        # the resend was already sent or is still waiting for the hour.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        pending, stored = uuid4(), AT - timedelta(hours=2)
+        monitor.restore_pending([(pending, stored)])
+        if sent_first:
+            self.drain(monitor)
+            self.assertEqual([pending], [row.event_id for row in self.sent()])
+            self.advance(3600)
+        else:
+            monitor.restore_window([(uuid4(), 60.0)], monotonic=self.clock.value)
+        monitor.health_sink(event(self.sources[0], CameraState.OFFLINE))
+        self.advance(300)
+        for _ in range(3):
+            # The row is final once sent, pending while it waits.
+            self.drain(monitor, durable_id=lambda source: pending,
+                       known=lambda value: True if sent_first else stored)
+            self.advance(3600)
+        ids = [row.event_id for row in self.sent()]
+        self.assertEqual(2, len(ids))
+        self.assertIn(pending, ids)
+        self.assertEqual(2, len(set(ids)))
+
+    def test_a_sent_restored_name_does_not_cover_a_later_outage(self):
+        self.later_outage_reusing_a_restored_name(sent_first=True)
+
+    def test_an_unsent_restored_name_does_not_cover_a_later_outage(self):
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.later_outage_reusing_a_restored_name(sent_first=False)
 
     def test_live_alerts_go_before_restored_rows(self):
         # PR #339 重要 3: an outage in progress is not held back behind an

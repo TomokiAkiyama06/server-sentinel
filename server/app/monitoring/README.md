@@ -94,7 +94,9 @@ restored hour waits for that slot to expire (up to about an hour, which also
 delays the alert of the same outage still in progress), and live alerts go
 before resends. Pending rows beyond `hourly_limit` are left out
 (`unrestored`, logged once as `camera_offline_notification_unrestored`) and
-resent only when an outage in progress maps to one by name. A row of that name accepted more than
+resent only when an outage in progress maps to one by name. A restored name
+covers only the outage in progress since the start (and a ratio alert); a
+later outage reusing it gets a per-process ID. A row of that name accepted more than
 24 h earlier no longer counts (Owner decision 2026-10-22): the next name
 `…:repeat:N` of a deterministic chain is then used and the outage is notified
 again under the cap. Intermittent outages (Refs #301): a source not online for

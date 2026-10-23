@@ -60,7 +60,9 @@ its stored event ID and time whether or not the outage is still in progress
 (an episode that reached the threshold is notified once even if it recovered
 before the drain; the row does not name its source). An episode or ratio
 alert whose durable name is such a row is covered by it, settled when it is
-named, before the cap is consulted; a pending row found only by ``known`` /
+named, before the cap is consulted. Only each source's initial episode (in
+progress since this process started) and a ratio alert can be covered; a
+later outage that reuses a restored name gets a per-process ID; a pending row found only by ``known`` /
 ``flapping_id`` is submitted again the same way. For such a restored row or
 one found by name, if the earlier POST did reach Slack the Owner sees the
 alert twice, never not at all. A pending row beyond ``hourly_limit`` that is
@@ -183,6 +185,10 @@ class _Episode:
     # Part of a ratio-opened flapping period: in progress at its alert, or
     # begun after an online shorter than ``after_seconds`` inside it.
     flapping: bool = False
+    # The episode every source starts with: in progress since this process
+    # started, so the only one that can be an earlier process's outage that
+    # a restored pending row reported (PR #339, Codex P2).
+    initial: bool = False
 
     def qualifies(self, now: float, after: float) -> bool:
         end = self.recovered if self.recovered is not None else now
@@ -212,9 +218,14 @@ class _Resend:
     recovered and opens no alerted period.
     """
 
-    attempt: tuple[datetime, UUID]
+    attempt: tuple[datetime, UUID] | None
     notified: bool = False
     held: bool = False
+    # The stored row's ID (``attempt`` is cleared once it is sent).
+    event_id: UUID | None = None
+
+    def __post_init__(self):
+        self.event_id = self.attempt[1]
 
 
 class _DownTime:
@@ -376,7 +387,7 @@ class CameraOfflineMonitor:
         self._stopped = False
         start = monotonic()
         self._sources = {
-            identity: _Source(True, False, _Episode(start),
+            identity: _Source(True, False, _Episode(start, initial=True),
                               down=_DownTime(self.window, start if math.isfinite(start) else None))
             for identity in ids}
         # (monotonic time, event ID) of the notifications in the rolling hour.
@@ -386,9 +397,11 @@ class CameraOfflineMonitor:
         # per-process ID instead of being taken for the earlier one.
         self._used: set[UUID] = set()
         # Restored ``pending`` rows still to be sent again (``restore_pending``)
-        # and the restored IDs no episode or ratio alert has claimed yet.
+        # and their IDs while unsent.
         self._resend: list[_Resend] = []
         self._restored: set[UUID] = set()
+        # Restored IDs whose resend was sent (moved out of ``_restored``).
+        self._resent: set[UUID] = set()
         self.recovered = 0
         self.dropped = 0
         # Pending rows left out of ``restore_pending`` (beyond the cap).
@@ -579,7 +592,15 @@ class CameraOfflineMonitor:
         so it can be up to about an hour late. Live alerts go first; restored
         rows follow by their stored time. A resend is never dropped. An
         episode or ratio alert of this process whose durable name is such a
-        row is covered by it and sends nothing twice. For such a restored row,
+        row is covered by it and sends nothing twice. Only the outage in
+        progress since this process started (each source's initial episode)
+        and a ratio alert, whose name already holds only within its window,
+        can be the earlier process's outage. Any later episode of this
+        process that maps to a restored name (its online last-frame write was
+        refused), before or after the resend was sent, is a new outage and
+        gets a per-process ID (Codex PR #339 P2). The ID leaves the set of
+        unsent resends as soon as its resend is sent; a resend is never
+        dropped, and a refused submission keeps waiting. For such a restored row,
         if the earlier POST did reach Slack, the Owner sees the alert twice,
         never not at all.
 
@@ -599,13 +620,17 @@ class CameraOfflineMonitor:
         with self._lock:
             for event_id, at in rows:
                 # This process's own rows are its deliveries, not a restart's.
-                if event_id in self._used or event_id in self._restored:
+                if event_id in self._used or self._is_restored(event_id):
                     continue
                 self._restored.add(event_id)
                 self._resend.append(_Resend((at, event_id)))
         if unrestored:
             self.unrestored += unrestored
             logging.getLogger(__name__).warning(Event.CAMERA_OFFLINE_NOTIFICATION_UNRESTORED)
+
+    def _is_restored(self, event_id: UUID) -> bool:
+        """Whether ``event_id`` is a restored row's ID, sent again or not."""
+        return event_id in self._restored or event_id in self._resent
 
     def _counted(self, event_id: UUID) -> bool:
         """Whether ``event_id`` already holds a slot of the rolling hour."""
@@ -694,15 +719,21 @@ class CameraOfflineMonitor:
                     event_id, earlier = self._flapping_name(identity, flapping_id)
                 else:
                     event_id = self._durable(identity, durable_id) if ongoing else None
-                    earlier = (event_id is not None and event_id not in self._restored
-                               and self._known(event_id, known))
-                if event_id is not None and event_id in self._restored:
-                    # The earlier process's pending row of this name is sent
-                    # again by ``restore_pending``: that covers this alert.
-                    # Claimed once, so a later episode reusing the name gets
-                    # a per-process ID (as for any used name).
-                    self._restored.discard(event_id)
-                    earlier = True
+                    earlier = False
+                if event_id is not None and self._is_restored(event_id):
+                    if flap or item.initial:
+                        # The earlier process's pending row of this name is
+                        # (or was) sent again by ``restore_pending``: that
+                        # covers the outage in progress since this process
+                        # started, or a ratio alert within its window.
+                        earlier = True
+                    else:
+                        # A later outage of this process that reuses the name
+                        # (its online last-frame write was refused) is a new
+                        # outage: its own per-process ID (Codex PR #339 P2).
+                        event_id, earlier = None, False
+                elif not flap and event_id is not None:
+                    earlier = self._known(event_id, known)
                 if isinstance(earlier, datetime):
                     # A pending row: submitted again under its ID and time.
                     attempt, earlier = (earlier, event_id), False
@@ -781,6 +812,10 @@ class CameraOfflineMonitor:
         if isinstance(item, _Resend):
             if item in self._resend:
                 self._resend.remove(item)
+            # Sent: the ID no longer waits (Codex PR #339 P2); it still covers
+            # the source's initial episode and a ratio alert (``drain``).
+            self._restored.discard(item.event_id)
+            self._resent.add(item.event_id)
             return
         source = self._sources[identity]
         if isinstance(item, _Flap):
@@ -807,7 +842,7 @@ class CameraOfflineMonitor:
             return None, False
         if (type(value) is not tuple or len(value) != 2 or not isinstance(value[0], UUID)
                 or not (type(value[1]) is bool or _aware(value[1]))
-                or (value[0] in self._used and value[0] not in self._restored)):
+                or (value[0] in self._used and not self._is_restored(value[0]))):
             return None, False
         return value
 
@@ -818,7 +853,7 @@ class CameraOfflineMonitor:
             value = durable_id(identity)
         except Exception:
             return None
-        if not isinstance(value, UUID) or (value in self._used and value not in self._restored):
+        if not isinstance(value, UUID) or (value in self._used and not self._is_restored(value)):
             return None
         return value
 

@@ -1629,7 +1629,12 @@ hour waits until that slot has expired, so a resend can be up to about an hour
 late, and live alerts (outages and ratio alerts of this process) are sent
 before resends, which follow in stored-time order. An episode or ratio alert
 whose durable name is such a row is covered by it as soon as it is named,
-before the cap is consulted, and sends nothing twice; a `pending` row found
+before the cap is consulted, and sends nothing twice. Only the outage in
+progress since the service started (each source's first episode) and a ratio
+alert (whose name holds only within its window) can be covered: a later
+outage of the same process that reuses a restored name (its online
+last-frame write was refused), before or after the resend went out, is a new
+outage and is notified under a per-process ID (Codex PR #339). A `pending` row found
 only by name is submitted again under that name and time, under the same cap.
 So when a pending row of the hour still holds its slot and the same outage is
 still in progress, the notification of that outage itself waits for the slot
