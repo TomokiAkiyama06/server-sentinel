@@ -591,6 +591,38 @@ class ClaimRefusedTests(Unrecorded, unittest.TestCase):
         alerts.refused(third, CriticalKind.CAMERA_TAMPER)
         self.assertEqual(1, alerts.queued)
 
+    def test_an_escalation_rechecks_the_watch_before_bypassing_a_settled_id(self):
+        # Codex P2 on 13712d3e: `escalate()` takes a snapshot of the watch;
+        # a replay on the scene thread that finds the row claimed stops
+        # watching the settled ID before the worker queues it. The stale
+        # snapshot must not queue it (a drain with an unreadable outcome
+        # would send it a second time).
+        transport = Transport()
+        service = self.notifications(transport)
+        alerts = UnrecordedCriticalAlerts(self.adapter(service))
+        replayed, watched = uuid4(), uuid4()
+        alerts.recorded(replayed, CriticalKind.SERVER_MOVEMENT, True)
+        alerts.settled(replayed)
+        alerts.recorded(watched, CriticalKind.CAMERA_TAMPER, True)
+        alerts.settled(watched)
+        refuse = alerts._refuse
+
+        def interleaved(identifier, kind, *, watched):
+            if identifier == replayed:
+                # The scene thread's replay runs between the snapshot and
+                # the queue insert.
+                alerts.recorded(replayed, CriticalKind.SERVER_MOVEMENT, False)
+            refuse(identifier, kind, watched=watched)
+
+        alerts._refuse = interleaved
+        alerts.escalate()
+        self.assertEqual((watched,), alerts.awaiting())
+        self.assertEqual(1, alerts.queued)
+        self.store.refuse = True
+        self.assertEqual(0, alerts.drain(at=NOW))
+        self.settle(service, transport, 1)
+        self.assertEqual([ALERT + "camera_tamper"], texts(transport))
+
     def test_the_recorder_tells_a_commit_only_after_a_completed_hand_over(self):
         service = self.notifications(Transport())
         timeline = self.timeline(service)

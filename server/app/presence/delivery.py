@@ -284,7 +284,15 @@ class UnrecordedCriticalAlerts:
         with self._lock:
             if identifier in self._queued or identifier in self._attempted:
                 return
-            if not watched and identifier in self._settled:
+            if watched:
+                # Issue #333 (Codex P2 on 13712d3e): `escalate()` works on a
+                # snapshot of the watch. A replay may have stopped watching
+                # this one since (claimed or resolved), so the bypass of the
+                # settled check holds only while it is still watched,
+                # checked under the same lock as the queue insert.
+                if identifier not in self._recorded:
+                    return
+            elif identifier in self._settled:
                 return
             if len(self._queued) < self._capacity:
                 self._queued[identifier] = kind
@@ -351,7 +359,11 @@ class UnrecordedCriticalAlerts:
                     self._recorded.pop(identifier, None)
 
     def escalate(self) -> None:
-        """A dispatch step failed: attempt every watched, unclaimed one."""
+        """A dispatch step failed: attempt every watched, unclaimed one.
+
+        Each one is queued only if it is still watched when it is queued, so
+        a replay that stopped watching it meanwhile is never undone.
+        """
         with self._lock:
             watched = tuple(self._recorded.items())
         for identifier, kind in watched:

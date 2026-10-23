@@ -334,7 +334,9 @@ like a recording-health or integrity alert (Owner decision 2026-10-22, Issue
   completed hand-over, and `refused()` ignores such an ID from then on, so
   the refused queue cannot send a second message for it. Only the watch's
   escalation (an unclaimed row and a failing dispatch step) bypasses that
-  check. The last 1024 such IDs are kept; an older one forgotten would be
+  check, and only for an ID still watched when it is queued (checked under
+  the same lock), so a replay that stopped watching it meanwhile is never
+  undone by the escalation's earlier snapshot. The last 1024 such IDs are kept; an older one forgotten would be
   attempted again if refused, a possible duplicate rather than a missed
   alert (the scene runtime's 32-observation staging keeps retries far below
   that). If the hand-over itself did not complete, the failure is handed
