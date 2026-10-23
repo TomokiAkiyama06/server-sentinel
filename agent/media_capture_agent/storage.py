@@ -237,8 +237,6 @@ class MediaStore:
         self.block_device = block_device
         self._lock = threading.Lock()
         self._mount_id = None
-        # (device, stale) of the last accepted device-number judgement.
-        self._device_judgement = None
         # True while the approved filesystem is mounted under device numbers
         # other than the recorded ones (Issue #324): accepted, but degraded.
         self.device_numbers_stale = False
@@ -350,11 +348,14 @@ class MediaStore:
         UUID, mount and pinned directory already agree on ``device``. Equal
         numbers: not stale. Otherwise only a same-major, hardware-backed
         renumbering of a non-root filesystem is accepted, as stale (Issue
-        #324); anything else refuses with ``mount_device_mismatch``. The
-        accepted judgement is cached per device: the pinned mount cannot change
-        device without a mount ID change, which already refuses. A renamed
-        source (`_source_renamed`) is accepted only together with such a
-        renumbering, never with unchanged numbers.
+        #324); anything else refuses with ``mount_device_mismatch``. Nothing
+        is cached: the sysfs topology is walked again at every check, because
+        a live dm table reload or an md member replacement can move a stale
+        device onto loop/virtual backing without changing its own number or
+        the mount ID (Codex P1 on Issue #324). The walk is a handful of sysfs
+        lookups per admission. A renamed source (`_source_renamed`) is
+        accepted only together with such a renumbering, never with unchanged
+        numbers.
         """
         expected = self.settings.expected_mount
         recorded = (expected.major, expected.minor)
@@ -363,12 +364,9 @@ class MediaStore:
                 raise StorageRefused("mount_identity_mismatch",
                                      diagnostic="mount_source_mismatch")
             return False
-        if self._device_judgement == (device, True):
-            return True
         if (expected.mount_point == Path("/") or device == self.root_device()
                 or not self.renumbered(recorded, device)):
             raise StorageRefused("mount_identity_mismatch", diagnostic="mount_device_mismatch")
-        self._device_judgement = (device, True)
         return True
 
     def _unavailable_root_diagnostic(self):

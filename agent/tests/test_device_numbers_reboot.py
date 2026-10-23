@@ -304,6 +304,29 @@ class MediaStoreRenumberingTests(RenumberingCase):
         with self.assertRaisesRegex(StorageRefused, "mount_identity_mismatch"):
             store.check()
 
+    def test_backing_topology_is_revalidated_at_every_check(self):
+        # A stale dm device first rests on a hardware disk; a live table
+        # reload then moves it onto a loop device without changing its own
+        # number or the mount ID (Codex P1). The next admission must refuse.
+        disk = self.sysfs.device(os.makedev(8, 240), "sdz")
+        loop = self.sysfs.device(os.makedev(7, 9), "loop9", loop=True)
+        dm = self.sysfs.device(self.device, "dm-stale", dm=True, slaves=(disk,))
+        self.renumbered()
+        store = self.store()
+        self.assertTrue(store.device_numbers_stale)
+        first = uuid4()
+        store.write_segment(first, b"synthetic hardware-backed capture")
+        (dm / "slaves" / disk.name).unlink()
+        (dm / "slaves" / loop.name).symlink_to(loop)
+        with self.assertRaises(StorageRefused) as raised:
+            store.write_segment(uuid4(), b"synthetic loop-backed capture")
+        self.assertEqual((str(raised.exception), raised.exception.diagnostic),
+                         ("mount_identity_mismatch", "mount_device_mismatch"))
+        with self.assertRaises(StorageRefused):
+            store.check()
+        self.assertEqual(sorted(path.name for path in self.settings.media_root.iterdir()),
+                         [f"{first}.segment"])
+
     def test_bind_with_another_source_than_its_parent_is_refused(self):
         self.hardware()
         self.renumbered()

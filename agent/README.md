@@ -151,7 +151,11 @@ recorded numbers are an accepted renumbering as above. Any other source change,
 including a rename with unchanged numbers, refuses with `mount_source_mismatch`.
 
 Owner decision (2026-10-23): like Main (#323), the Agent keeps recording when
-only the minor changes, as degraded `device_numbers_stale`. An accepted
+only the minor changes, as degraded `device_numbers_stale`. The sysfs topology
+of a renumbered device is walked again at every admission, not cached: a live
+dm table reload or md member replacement can move it onto loop or virtual
+backing without changing its own number or the mount ID, and then the next
+write refuses with `mount_device_mismatch` (refused, not degraded). An accepted
 renumbering keeps writing but is degraded and value-free: `--check`
 prints the `device_numbers_stale` warning, and every heartbeat reports
 `storage.state = "degraded"`, `storage.reason = "device_numbers_stale"` and node
