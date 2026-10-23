@@ -1142,6 +1142,30 @@ class SummarizerTests(unittest.TestCase):
         legacy = {key: value for key, value in sample.items()
                   if key not in summarize.CAPTURE_COUNTER_KEYS}
         self.assertEqual("pass", holder(legacy)["holder_verdict"])
+
+        # The end record's final counters win over the last sample: a
+        # framing loss or restart after the last sample still fails.
+        def with_end(row, **final):
+            rows = _holder([row])
+            rows[-1] = {**rows[-1], **final}
+            _write(self.root, "holder", rows)
+            return summarize.summarize([self.root], holder_files=[path])["holder"]
+
+        counters = {key: sample[key] for key in summarize.CAPTURE_COUNTER_KEYS}
+        self.assertEqual("pass", with_end(sample, **counters)["holder_verdict"])
+        result = with_end(sample, **{**counters, "stream_invalid": 1})
+        self.assertEqual(("fail", 1), (result["holder_verdict"],
+                                       result["holder_stream_invalid"]))
+        result = with_end(sample, **{**counters, "capture_launches": 2, "capture_restarts": 1})
+        self.assertEqual(("fail", 1), (result["holder_verdict"],
+                                       result["holder_capture_restarts"]))
+        self.assertEqual("fail", with_end(legacy, stream_invalid=1)["holder_verdict"])
+        self.assertEqual("fail", with_end(legacy, padding_tolerated=1)["holder_verdict"])
+        self.assertEqual(70, with_end(sample, **{**counters, "padding_tolerated": 70})[
+            "holder_padding_tolerated"])
+        # An end record without counters (older holder) falls back to the sample.
+        self.assertEqual("fail", with_end({**sample, "stream_invalid": 1})["holder_verdict"])
+        self.assertEqual("pass", with_end(sample)["holder_verdict"])
         # Any single counter key makes it a counter sample: the rest must be there.
         for key in summarize.CAPTURE_COUNTER_KEYS:
             with self.subTest(only=key):
@@ -3336,6 +3360,38 @@ class MiscTests(unittest.TestCase):
             samples = [row for row in records.read_jsonl(out) if row["kind"] == "sample"]
         self.assertTrue(samples)
         self.assertEqual((3, 1, 1, 1, 2), tuple(samples[-1][key] for key in (
+            "capture_launches", "capture_restarts", "sources_never_launched",
+            "stream_invalid", "padding_tolerated")))
+
+    def test_holder_end_carries_counters_taken_after_capture_close(self):
+        # A framing loss classified while close() reaps the readers (after
+        # the last one-second sample) must reach the end record.
+        source = uuid4()
+        state = {"closed": False}
+
+        def counters(_source):
+            invalid = 1 if state["closed"] else 0
+            return SimpleNamespace(launches=1, stream_invalid=invalid, padding_tolerated=0)
+
+        queue = mock.Mock()
+        queue.get.side_effect = lambda timeout: None
+        queue.drop_stats.return_value = (0, None)
+        capture = mock.Mock()
+        capture.frames.return_value = queue
+        capture.counters.side_effect = counters
+        capture.close.side_effect = lambda: state.update(closed=True)
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "h.jsonl"
+            writer = records.JsonlWriter(out, run_id=RUN, role="holder")
+            holder.Holder(capture, [source], Path(directory) / "sock", writer).run(0.2)
+            writer.close()
+            rows = records.read_jsonl(out)
+        samples = [row for row in rows if row["kind"] == "sample"]
+        end = [row for row in rows if row["kind"] == "end"]
+        self.assertTrue(samples)
+        self.assertEqual(0, samples[-1]["stream_invalid"])
+        self.assertEqual(1, len(end))
+        self.assertEqual((1, 0, 0, 1, 0), tuple(end[0][key] for key in (
             "capture_launches", "capture_restarts", "sources_never_launched",
             "stream_invalid", "padding_tolerated")))
 

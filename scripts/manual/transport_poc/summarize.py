@@ -1783,7 +1783,11 @@ def load_holders(paths, summaries):
     ``stream_invalid`` as integers, each computed per source by the holder,
     and fails when any is above 0 (a GStreamer child was restarted, a camera
     never started, or a pipeline lost JPEG framing). A file written before
-    the counters existed (none of their keys) is judged without them.
+    the counters existed (none of their keys) is judged without them. The
+    holder's ``end`` record carries the final counters, taken after the
+    capture was closed and every pipeline reaped; when it has any counter key
+    it is what is judged (an event after the last sample still counts),
+    otherwise the last sample is.
     ``unmeasured``: a file whose ``run_id`` matches no real-input run (stale
     or from another run), a file without samples or without the profile
     rate, or a real-input run without a holder file.
@@ -1843,8 +1847,9 @@ def load_holders(paths, summaries):
         forward_drops += last.get("forward_drops") or 0
         allowed += run_allowed
         capture_ok = True
-        if any(key in last for key in CAPTURE_COUNTER_KEYS):
-            judged = [last.get(key) for key in
+        counted = ends[0] if any(key in ends[0] for key in CAPTURE_COUNTER_KEYS) else last
+        if any(key in counted for key in CAPTURE_COUNTER_KEYS):
+            judged = [counted.get(key) for key in
                       ("capture_restarts", "sources_never_launched", "stream_invalid")]
             capture_ok = all(_is_int(value) and value == 0 for value in judged)
             run_restarts, run_never, run_invalid = (
@@ -1852,8 +1857,8 @@ def load_holders(paths, summaries):
             restarts += run_restarts
             never_launched += run_never
             stream_invalid += run_invalid
-            padding += last.get("padding_tolerated") if _is_int(
-                last.get("padding_tolerated")) else 0
+            padding += counted.get("padding_tolerated") if _is_int(
+                counted.get("padding_tolerated")) else 0
         verdicts.append(_verdict((last.get("frames") or 0) > 0
                                  and (last.get("queue_drops") or 0) == 0
                                  and (last.get("forward_drops") or 0) <= run_allowed
