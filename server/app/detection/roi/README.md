@@ -5,8 +5,8 @@ immutable source/profile calibration. It stores no media, starts no capture,
 opens no HTTP route, and makes no presence, identity, guilt, or notification
 decision.
 
-A calibration contains an Owner-selected polygon, reference frame digest,
-source type, profile ID, explicit search/quality thresholds, version, and
+A calibration contains an Owner-selected polygon, an in-memory reference
+frame, source type, profile ID, explicit search/quality thresholds, version, and
 timestamp. A policy is refused when a bounded search window cannot reach its
 own displacement threshold, because such a configuration cannot express the
 movement or camera shift it asks for and would report a matching geometry
@@ -22,21 +22,34 @@ refused too: every unchanged sample would look obscured and confirm a tamper
 that never happened. `CalibrationArchive` is a small append-only SQLite port: the Main
 runtime must supply its already-open private database after application
 migration (`roi_calibration_history`) has run. The table holds provenance
-only — identities, polygon, policy, reference geometry and the reference
-SHA-256 — so no decoded frame, crop, or other monitoring media is persisted
-and the history cannot become retention-free image storage. `load()` therefore
+only — identities, polygon, policy, reference geometry, luma reader, version
+and time — so no decoded frame, crop, or other monitoring media is persisted,
+nor any value computed from a frame (no digest, histogram or statistic; Owner
+decision 2026-10-22, #205), and the history cannot become retention-free image
+storage or a scene fingerprint. A `reference.sha256` in a pre-#205 record is
+ignored when read and removed at the next Main start
+(`scrub_legacy_reference_digests` rebuilds the table with `secure_delete` on;
+count-only log). This removes the value inside the database file only and is
+not a claim of forensic erasure: copies outside the file (rollback-journal
+blocks the filesystem freed, SSDs, snapshots or backups) may remain. The
+lifecycle inventory treats a scrubbed version as preserved against a baseline
+recorded by this release's tool; against an earlier release's baseline it is
+`changed`. `load()` therefore
 returns a `CalibrationRecord` without pixels, separates a record it cannot
 decode from an unavailable database so corrupt history is not hidden behind a
 transient-looking failure, and refuses a record whose decoded provenance is not
 the row that was looked up, so swapped history cannot bind a detector to
 another source or profile; resuming detection needs
-`CalibrationRecord.rehydrate(frame)`, which re-binds an Owner-supplied
-transient frame and refuses any frame whose source, stream, sample, geometry
-or digest differs. A history table carrying a media column is rejected at
-construction. Where a deployment obtains that frame again is outside this core:
-it comes from Owner-authorized media under ordinary recording authorization and
-retention, or from a fresh Owner recalibration, never from a private image
-store owned by this module. `OwnerCalibrationOperations` defaults to refusal;
+`CalibrationRecord.bind(calibration)`, which accepts only the in-memory
+`Calibration` whose whole non-frame provenance (identity, version, time,
+polygon, policy, reader, reference stream, sample and geometry) is that record
+and refuses a bare frame or any other calibration. The integrity binding
+between a stored version and its reference is therefore that in-memory object
+(`TransientReferences` in `calibration_service.py`), never a stored digest. A
+history table carrying a media column is rejected at construction. After a
+restart the in-memory reference is gone; a new reference comes only from a new
+calibration version (an Owner calibration or the restart re-acquisition of
+#205), never from a private image store owned by this module. `OwnerCalibrationOperations` defaults to refusal;
 authentication and API policy remain outside this core.
 
 `SceneDetector` compares the background first to estimate bounded global
@@ -116,8 +129,9 @@ It fails closed:
   `CriticalTimelineRecorder`) the runtime is `unavailable` and no detector runs;
 - without a calibration provider, a stored record, or a re-bindable reference
   frame (`ArchiveCalibrationProvider` never re-bases a stored calibration on a
-  live frame; the Owner calibration route is #10), the source stays inactive
-  and `unknown`;
+  live frame by itself; a new reference comes only from an explicit
+  acquisition, see "Owner calibration and restart re-acquisition" below), the
+  source stays inactive and `unknown`;
 - a calibration whose source, type or profile differ, whose `maximum_gap_ns`
   does not exceed the sample interval, whose reference exceeds a quality pixel
   budget, or that the capture layout cannot decimate to, is refused;
@@ -259,9 +273,9 @@ trailing MCUs are exactly 128 (a uniform mid-grey area at the bottom right)
 is refused as `undecoded_band` (fail-closed `unknown`).
 
 A calibration reference for an `MJPG` source must be produced through the same
-reader (same decoder, scale and decimation); the Owner calibration route (#10)
-does not exist yet, and recording the reader identity in the calibration
-metadata is a follow-up for it. Real EMEET C960 frames (DHT presence, bytes
+reader (same decoder, scale and decimation): `acquire_reference()` reads it on
+the scene worker through the source's own reader, and the calibration records
+the reader identity (`reader_identity()`, below). Real EMEET C960 frames (DHT presence, bytes
 after `EOI`, decode time, refusal rates, the decode child inside the systemd
 sandbox) are still to be checked (`MANUAL_TEST.md`).
 
@@ -429,8 +443,81 @@ left staged stays counted in `critical_pending` and
 `scene_critical_undelivered` is logged. The Main
 application's `scene_monitoring_state` follows the
 runtime status while it runs (those conditions are `degraded`; a failed or dead
-worker or delivery thread, or an unreadable status, is `unavailable`). No route
-reads the runtime status before #10.
+worker or delivery thread, or an unreadable status, is `unavailable`). Only the
+Owner's scene calibration status route reads it (below).
+
+## Owner calibration and restart re-acquisition (Issue #205)
+
+`calibration_service.py` (Owner decision 2026-10-22, option A) produces the
+reference frames the provider binds; `app.main.create_app(scene_calibration=
+SceneCalibrationConfiguration(...))` builds it, owns the runtime's provider
+(`ArchiveCalibrationProvider` over a read-only connection with the in-memory
+`TransientReferences`) and refuses an embedder-supplied provider. Nothing
+derived from an image is written to disk (no digest either): the history
+keeps frame-free provenance only, and the frame lives in `TransientReferences`
+(and the bound `Calibration`) for the process's lifetime. `TransientReferences`
+serves a stored record only the in-memory calibration whose whole provenance
+equals it, so this in-memory object, not a stored digest, binds a version to
+its reference.
+
+- `SceneMonitoringRuntime.acquire_reference(source, width, height,
+  timeout_ns)` is the only way a reference is taken from live frames. The
+  worker reads the next samples captured after the request through the
+  source's own luma reader at that size (packed decimation, the MJPG decode
+  child, or a decoded producer's exact size) and assesses them with fresh
+  quality gates of the source's two detector policies; the first frame both
+  report `sufficient` (each policy's `recovery_frames` consecutive good
+  samples of one stream) resolves the future. A camera loss or an unreadable
+  sample restarts the count; the deadline is `no_frame` (nothing readable) or
+  `quality_insufficient`; at most one acquisition per source (`busy`); a size
+  the layout cannot decimate to, beyond a quality pixel budget, or without the
+  reviewed decoder is `geometry_unsupported`; stop and `cancel_acquisition()`
+  end it (`unavailable`, `cancelled`). Normal evaluation of the same sample
+  continues. `calibration_refusal()` applies the same checks as binding
+  (`_bind`), so a calibration is checked before it is stored.
+- `reader_identity(binding)` names the reader without a device value:
+  `packed:<format>:<w>x<h>`, `mjpg:simplejpeg=<pin>:numpy=<pin>:<w>x<h>` or
+  `decoded:<source type>`. `Calibration.reader` / `CalibrationRecord.reader`
+  carry it (`None` in a record written before #205).
+- **Owner calibration** (`SceneCalibrationService.calibrate`): the
+  deployment's `CalibrationTemplate` of the source (reference size,
+  Owner-selected polygon, policy) plus the acquired frame make the next
+  version (the identifier of the first version is kept). `commit(source,
+  prepare, persist)` is the caller's audited transaction: the human surface
+  passes `SceneCalibrationAdministration.calibrate` (an `OWNER_OP` request
+  only), which runs `prepare` (the acquisition) after the authorization and
+  `persist` (`calibration.append_on`, inside the caller's transaction) with
+  the `calibrate_scene_source` record. The frame is staged in
+  `TransientReferences` before the commit and dropped if it fails; on success
+  older frames of the source are forgotten and a calibration refresh is
+  requested. Refusals are `CalibrationRefused` with a fixed reason.
+- **Restart re-acquisition** (`start()`, `pending_reacquisitions()`,
+  `reacquire()`): after every start each source with a stored calibration is
+  re-acquired with the stored size, polygon and policy, through the same
+  reader only (`reader_changed` otherwise), and committed by Main's system
+  commit (`reacquire_scene_reference`, actor `system`). Success queues a
+  `scene_reference_reacquired` notice; a failure queues
+  `scene_calibration_required` once per process and source (not for a runtime
+  that has not started yet, nor once `close()` began the shutdown; a runtime
+  that started and then stopped or failed, or whose start ended
+  `unavailable`, is notified) and is
+  retried by the application at `reacquire_retry_seconds`. `take_notices()` /
+  `return_notices()` hand the fixed notices to Main, which submits them
+  through the monitoring runtime's `NotificationService` (immediate kinds)
+  right after each source's attempt. Main re-acquires the sources
+  independently and concurrently (at most four), so a camera that gives no
+  frame delays no other source; detection starts at once on the re-acquired
+  reference (Owner decision 2026-10-23). The re-acquired reference is reported `restart_reacquired` (not confirmed by
+  the Owner): a camera or server moved while Main was down is not detected
+  against it.
+- `status()` is value-free: origin, version, time, phase, last refusal,
+  whether a template exists, and the runtime's own source state and reason.
+
+Synthetic verification: `server/tests/test_scene_calibration.py` (runtime
+acquisition, history, service, and the application lifespan with an
+intercepted Slack transport) and `server/tests/test_scene_calibration_routes.py`
+(the Owner routes). The production launcher does not build scene monitoring
+yet (the deployment section, including the templates, is a follow-up).
 
 `server/tests/test_detector_roi.py` generates all pixel inputs in memory for
 local and remote-agent calibration, relative movement, global camera motion,

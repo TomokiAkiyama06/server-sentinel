@@ -1488,6 +1488,18 @@ class AccessStore:
         if self._verification_stale(row, utc_time(at), freshness):
             raise StepUpRequired()
 
+    def require_owner_read_session(self, view: "SessionView") -> None:
+        """``require_owner_read_session_on`` in its own read transaction.
+
+        For an ``OWNER_READ`` route that reads nothing from this database
+        (the scene calibration status, Issue #205): the local ``recover`` or
+        revocation commands commit outside the serving gate (D6), so the
+        session is read again before anything is returned. Nothing is
+        written.
+        """
+        with self._transaction() as connection:
+            self.require_owner_read_session_on(connection, view, self.now())
+
     def require_owner_read_session_on(self, connection, view: "SessionView", at: datetime) -> None:
         """The ``OWNER_READ`` re-check (the A1 inventory, PR #242 review).
 

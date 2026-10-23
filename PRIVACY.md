@@ -265,13 +265,36 @@ The deployment owner is responsible for camera placement and compliance with app
 Any feature that sends monitoring/biometric data to infrastructure operated by the ServerSentinel developer is a fundamental privacy-model change and requires explicit owner approval plus updated requirements/security/privacy documentation before implementation.
 
 The Issue #24 ROI/tamper core keeps its calibration history as metadata only:
-identities, Owner polygon, policy, reference geometry, version, timestamp and
-the reference SHA-256. No reference frame, crop or other decoded monitoring
-media is written to that history, so it cannot become a persistent still-image
-store outside recording authorization and retention. Restoring a calibration
-re-binds an Owner-supplied transient frame that must match the stored digest
-and geometry. Its scene-change measurements are bounded scalars and never
+identities, Owner polygon, policy, reference geometry, version and timestamp
+(and, since #205, the luma reader). No reference frame, crop or other decoded
+monitoring media is written to that history, nor any value computed from the
+frame such as a digest, histogram or statistic (Owner decision 2026-10-22,
+Issue #205), so it can become neither a persistent still-image store outside
+recording authorization and retention nor a fingerprint of the scene. A
+calibration is used only while the process holds its in-memory reference;
+the binding between a stored version and that reference is the in-memory
+calibration itself, not a stored digest. A record written before #205 may
+carry a reference SHA-256: it is ignored when read and removed from the
+database at the next Main start (an idempotent scrub that rebuilds the
+calibration history table with SQLite `secure_delete` on; only the number of
+scrubbed rows is logged, `scene_reference_digests_scrubbed`). This removes the
+value inside the database file only and is not a claim of forensic erasure:
+copies outside the file (rollback-journal blocks the filesystem freed, SSDs,
+snapshots or backups) may remain. Its scene-change measurements are bounded scalars and never
 person identities, and a detector that cannot register a scene reliably reports
 `unknown` rather than a trustworthy "no tamper".
+
+The Issue #205 Owner calibration keeps the reference frame only in the Main
+process's memory (Owner decision 2026-10-22): no reference frame, crop,
+reduced image or other image-derived data (no digest, histogram or
+statistic of the frame) is written to disk, and the Owner
+status route returns no pixel, digest, polygon or policy. The history also
+records the luma reader (capture format, resolution and decoder version
+pins; no device path or serial). Because the frame does not survive a
+restart, Main takes the reference again from the camera after every restart
+with the stored settings and notifies the Owner with a fixed, value-free
+message (`scene_reference_reacquired`); a person in view at that moment is
+part of that in-memory reference just as in an Owner calibration, and is
+never identified or stored.
 
 The Issue #20 detector foundation keeps only bounded transient grayscale samples and a previous motion sample per source. It performs no model download, persistence or network I/O; unavailable person inference remains `unknown`. Model/runtime adoption and their separate privacy/license acceptance are documented in `server/docs/DETECTOR_MODEL_AUDIT.md`; synthetic primitive tests are not acceptance of an external model.

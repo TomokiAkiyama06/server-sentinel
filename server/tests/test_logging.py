@@ -24,7 +24,7 @@ class LoggingTests(unittest.TestCase):
                 "headers": {"authorization": marker}, "cookie": marker,
                 "pairing": marker, "embedding": [marker], "media": marker,
                 "path": marker, "query": marker, "arbitrary": marker,
-                "status": marker, "duration_ms": marker,
+                "status": marker, "duration_ms": marker, "count": marker,
             })
         result = json.loads(self.output.getvalue())
         self.assertNotIn(marker, self.output.getvalue())
@@ -38,9 +38,15 @@ class LoggingTests(unittest.TestCase):
         self.assertEqual(result["status"], 404)
         self.assertEqual(result["duration_ms"], 1.25)
 
+    def test_a_bounded_row_count_is_kept(self):
+        self.logger.info(Event.SCENE_REFERENCE_DIGESTS_SCRUBBED, extra={"count": 3})
+        self.assertEqual(3, json.loads(self.output.getvalue())["count"])
+
     def test_nan_bool_and_out_of_range_values_are_discarded(self):
-        for status, duration in ((True, float("nan")), (99, -1), (600, float("inf"))):
-            self.logger.info(Event.REQUEST_DENIED, extra={"status": status, "duration_ms": duration})
+        for status, duration, count in ((True, float("nan"), True), (99, -1, -1),
+                                        (600, float("inf"), 1_000_001)):
+            self.logger.info(Event.REQUEST_DENIED, extra={"status": status, "duration_ms": duration,
+                                                         "count": count})
         for line in self.output.getvalue().splitlines():
             self.assertEqual(set(json.loads(line)), {"timestamp", "level", "event"})
 

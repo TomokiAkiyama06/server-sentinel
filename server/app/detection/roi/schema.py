@@ -1,7 +1,10 @@
 """ROI calibration DDL; the application aggregator assigns its final slot.
 
 The history is metadata only. Decoded monitoring frames are never persisted
-here: only the reference digest, geometry and policy of an Owner calibration.
+here, nor any value computed from them (since #205 no reference digest
+either): only identities, reference geometry, polygon, policy and reader of a
+calibration. A pre-#205 row may still carry a reference digest: it is ignored
+and removed at the next start (``calibration.scrub_legacy_reference_digests``).
 """
 
 from app.storage.migrations import Migration
