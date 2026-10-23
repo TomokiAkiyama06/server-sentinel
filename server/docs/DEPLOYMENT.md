@@ -451,12 +451,18 @@ sudo systemctl start server-sentinel.service
   publish to it (for example inodes exhausted, or `/proc` unreadable) never
   stops the session or its recording; the service logs
   `local_uvc_session_ledger_unpublished` (no path or marker), keeps the
-  digest and includes it in the ledger's next successful publication.
-  Until then the display may show that running source as
-  `approval_required`; it never shows a false `approved_in_use` (a
-  withdrawal that cannot be published removes the ledger file instead,
-  where that still works, so a release that fails as well leaves no entry
-  vouching for its marker). When
+  digest and retries the publication from the source polls (at most every
+  30 s, under the storage admission; `local_uvc_session_ledger_republished`
+  once it succeeds). Until then the display may show that running source as
+  `approval_required`. The ledger is made to never show a false
+  `approved_in_use`: an ended session's digest is dropped from the
+  service's entries before the release's storage admission, a withdrawal
+  that cannot be published or is not admitted (a storage hard stop)
+  removes the ledger file instead (no space needed), and a session that
+  could not be built after its marker was committed is withdrawn the same
+  way. What remains is a release whose withdrawal can neither be published
+  nor the file removed (for example a read-only state filesystem) while
+  the service keeps running. When
   `sources` shows `approval_required` for a source whose health is
   `online`, check the service log for that event before stopping the
   service to reapprove: the running session itself is unaffected. The

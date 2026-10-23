@@ -467,11 +467,15 @@ class LocalUvcAdapter:
                 last_seen["at"], last_seen["state"] = now, state
             self.on_frame(source.id, frame)
 
-        session = CaptureSession(
-            controller, self.discovery, capture_profile(source.desired_capture_profile),
-            on_frame=frame_sink, on_profile=profile_sink, capture_factory=self.capture_factory,
-            clock=lambda: self.monotonic(), **self.session_timing,
-        )
+        try:
+            session = CaptureSession(
+                controller, self.discovery, capture_profile(source.desired_capture_profile),
+                on_frame=frame_sink, on_profile=profile_sink, capture_factory=self.capture_factory,
+                clock=lambda: self.monotonic(), **self.session_timing,
+            )
+        except BaseException:
+            controller.abandon()  # its marker stays; never shown as in use (Issue #317)
+            raise
         self.sessions[source.id] = session
         return session
 
@@ -572,6 +576,9 @@ class LocalUvcAdapter:
             session.controller.capture_failed()
 
     def poll_source(self, source_id, *, timeout=1.0):
+        # A session ledger publication that failed earlier is retried here
+        # (Issue #317); a no-op unless one is pending, and it never raises.
+        self.store.retry_ledger(self.monotonic)
         try:
             source = self._source(source_id)
         except BaseException:

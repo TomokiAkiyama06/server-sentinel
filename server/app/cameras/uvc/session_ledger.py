@@ -41,9 +41,13 @@ the marker itself (``ApprovalStore``).
 Best effort (Owner decision 2026-10-23). The ledger only serves a display,
 so a publication that fails never stops a session: ``issue`` keeps the
 digest in this process's entries (and still raises, for the caller to log)
-and the next successful publication includes it. Until then the file lacks
-it and ``sources`` shows the marker as ``approval_required``, never a false
-``approved_in_use``.
+and the next successful publication includes it; ``pending`` stays set
+until then, and the source polls retry it (``ApprovalStore.retry_ledger``,
+at most every ``RETRY_SECONDS``). Until then the file lacks it and
+``sources`` shows the marker as ``approval_required``, never a false
+``approved_in_use``. A release drops its digest from the entries before
+its storage admission (``forget``) and removes the file (``discard``) when
+the admission is refused.
 
 Bounds. The writer keeps at most ``MAX_SOURCES`` sources of
 ``MAX_DIGESTS_PER_SOURCE`` digests each, the bounds the reader enforces, and
@@ -81,6 +85,9 @@ FORMAT = "serversentinel-uvc-session-ledger-v1"
 # supersedes the previous marker; keeping the last few covers an overlap.
 MAX_DIGESTS_PER_SOURCE = 4
 MAX_SOURCES = 64
+# A failed publication is retried by the source workers' polls, at most this
+# often (``SessionLedger.retry_due``).
+RETRY_SECONDS = 30.0
 _DOMAIN = b"serversentinel-uvc-session-marker-v1\0"
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _BOOT_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -256,6 +263,10 @@ class SessionLedger:
         self._sessions: dict[str, list[str]] = {}
         self._lock = threading.Lock()
         self._swept = False
+        # Set when the file may lack (or still list) an entry, cleared by a
+        # successful publication; ``retry`` republishes it.
+        self._pending = False
+        self._retried_at: float | None = None
 
     @classmethod
     def for_database(cls, database) -> "SessionLedger":
@@ -283,6 +294,7 @@ class SessionLedger:
                 raise SessionLedgerError("UVC session ledger is full")
             digests = [item for item in previous or () if item != digest] + [digest]
             self._sessions[source] = digests[-MAX_DIGESTS_PER_SOURCE:]
+            self._pending = True
             self._publish()
 
     def withdraw(self, source_id, session_token: str) -> None:
@@ -295,19 +307,65 @@ class SessionLedger:
         until the next successful publication every marker then shows as
         ``approval_required``, never a false ``approved_in_use``.
         """
-        source, digest = str(source_id), marker_digest(session_token)
         with self._lock:
-            digests = [item for item in self._sessions.get(source, ()) if item != digest]
-            if digests:
-                self._sessions[source] = digests
-            else:
-                self._sessions.pop(source, None)
+            self._forget(source_id, session_token)
             try:
                 self._publish()
             except SessionLedgerError:
                 self._discard()
 
+    def forget(self, source_id, session_token: str) -> None:
+        """Drop a marker from this process's entries only, without writing.
+
+        For a caller that cannot write yet (``ApprovalStore.save`` before its
+        storage admission): the digest can then never be published again,
+        and the next publication (or ``discard``) removes it from the file.
+        """
+        with self._lock:
+            self._forget(source_id, session_token)
+
+    def discard(self) -> None:
+        """Remove the ledger file (no space needed); it vouches for nothing until republished."""
+        with self._lock:
+            self._discard()
+
+    @property
+    def pending(self) -> bool:
+        """Whether the file may differ from this process's entries."""
+        return self._pending
+
+    def retry_due(self, now: float) -> bool:
+        """Whether a pending publication should be retried now (at most every ``RETRY_SECONDS``)."""
+        with self._lock:
+            if not self._pending:
+                return False
+            if self._retried_at is not None and now - self._retried_at < RETRY_SECONDS:
+                return False
+            self._retried_at = now
+            return True
+
+    def retry(self) -> bool:
+        """Publish a pending state again; whether the file is now up to date. Never raises."""
+        with self._lock:
+            if not self._pending:
+                return True
+            try:
+                self._publish()
+            except SessionLedgerError:
+                return False
+            return True
+
+    def _forget(self, source_id, session_token: str) -> None:
+        source, digest = str(source_id), marker_digest(session_token)
+        digests = [item for item in self._sessions.get(source, ()) if item != digest]
+        if digests:
+            self._sessions[source] = digests
+        else:
+            self._sessions.pop(source, None)
+        self._pending = True
+
     def _discard(self) -> None:
+        self._pending = True
         try:
             directory = os.open(self.path.parent,
                                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -363,6 +421,7 @@ class SessionLedger:
                 finally:
                     os.close(descriptor)
                 os.replace(staging, LEDGER_NAME, src_dir_fd=directory, dst_dir_fd=directory)
+                self._pending = False
             except BaseException:
                 try:
                     os.unlink(staging, dir_fd=directory)

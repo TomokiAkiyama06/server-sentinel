@@ -508,6 +508,38 @@ class UvcRegistryTests(UvcRegistryFixture):
         ledger = read_ledger(ledger_path(self.database.path), account=os.geteuid())
         self.assertNotIn(str(self.source.id), ledger.sessions)
 
+    def approve_offline(self):
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self.adapter.store.approve_on(connection, self.source.id, self.camera,
+                                          serial_ambiguous=False)
+            connection.execute("COMMIT")
+
+    def ledger_sessions(self):
+        ledger = read_ledger(ledger_path(self.database.path), account=os.geteuid())
+        return {} if ledger is None else ledger.sessions
+
+    def test_a_capture_session_that_cannot_be_built_withdraws_its_marker(self):
+        # Issue #317 (review of bfac895): the marker is committed, then the
+        # capture session cannot be built; no session runs, so the ledger
+        # must not vouch for the marker (it stays durable, as after a crash).
+        self.approve_offline()
+        with patch("app.cameras.uvc.registry_adapter.CaptureSession",
+                   side_effect=ValueError("synthetic")), self.assertRaises(ValueError):
+            self.adapter.poll_source(self.source.id)
+        self.assertIsNotNone(self.adapter.store.load(self.source.id).session_token)
+        self.assertNotIn(str(self.source.id), self.ledger_sessions())
+
+    def test_a_poll_republishes_a_ledger_that_could_not_be_written(self):
+        self.approve_offline()
+        with patch("app.cameras.uvc.session_ledger.os.replace", side_effect=OSError(28, "synthetic")), \
+                self.assertLogs("app.cameras.uvc.persistence", "WARNING"):
+            self.adapter.poll_source(self.source.id)
+        token = self.adapter.store.load(self.source.id).session_token
+        self.assertEqual({}, self.ledger_sessions())
+        self.adapter.poll_source(self.source.id)
+        self.assertIn(marker_digest(token), self.ledger_sessions()[str(self.source.id)])
+
     def test_clean_shutdown_of_disabled_source_does_not_report_unplug(self):
         self.adapter._approve_live_session(self.source.id, self.camera)
         self.registry.update_source(self.source.id, enabled=False)

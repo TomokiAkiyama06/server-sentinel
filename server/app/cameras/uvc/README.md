@@ -40,8 +40,11 @@ of the markers plus the writing process's boot id, PID and start time),
 published before a marker is committed and withdrawn before it is released;
 the ledger is best effort (Owner decision 2026-10-23): one that cannot be
 written never stops the session (`local_uvc_session_ledger_unpublished` is
-logged and the digest is kept for the next successful publication), and
-meanwhile `sources` may show the source as `approval_required`. Only
+logged, the digest is kept and the source polls retry the publication at
+most every 30 s), and meanwhile `sources` may show the source as
+`approval_required`. An ended session's digest is dropped before the
+release's storage admission, and a withdrawal that cannot be written
+(including a refused admission) removes the ledger file instead. Only
 `admin_cli sources` reads it, to tell a marker of the running service from
 one a crash left; the service never reads it back. This means an unclean restart conservatively requires reapproval even
 for serial-backed devices. Known duplicated serials are persisted as ambiguous.

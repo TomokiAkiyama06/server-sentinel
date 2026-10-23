@@ -6,7 +6,7 @@ fencing reads the real ``/proc`` of this test process and of a short-lived
 child, or a fake ``/proc`` tree. No camera or service is used; mock only.
 """
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 import json
 import os
 from pathlib import Path
@@ -20,7 +20,7 @@ from uuid import UUID, uuid4
 from app.cameras.registry import CameraRegistry, CaptureProfile, SourceType
 from app.cameras.uvc import admin_cli
 from app.cameras.uvc import session_ledger
-from app.cameras.uvc.identity import DeviceEvidence
+from app.cameras.uvc.identity import DeviceEvidence, ReconnectController
 from app.cameras.uvc.persistence import ApprovalStorageError, ApprovalStore
 from app.cameras.uvc.session_ledger import (
     LEDGER_NAME, ProcessIdentity, SessionLedger, SessionLedgerError, current_process_identity,
@@ -28,6 +28,7 @@ from app.cameras.uvc.session_ledger import (
 )
 from app.local_admin import CliRefused
 from app.logging import Event
+from app.media.recording.model import RecordingError
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -365,6 +366,92 @@ class ServiceStoreTests(Fixture):
         with self.assertRaises(ApprovalStorageError):
             store.start_session(self.source.id, self.camera)
         self.assertEqual(set(), self.listed())
+
+    def approve(self):
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            ApprovalStore.approve_on(connection, self.source.id, self.camera, serial_ambiguous=False)
+            connection.execute("COMMIT")
+
+    def gated_store(self):
+        """A store whose storage admission can be refused (a storage hard stop)."""
+        gate = {"refused": False}
+
+        @contextmanager
+        def reservation():
+            if gate["refused"]:
+                raise RecordingError("STORAGE_HARD_STOP")
+            yield
+        return ApprovalStore(self.database, reservation=reservation, ledger=self.ledger), gate
+
+    def test_a_release_the_storage_admission_refuses_never_shows_in_use(self):
+        # Review of bfac895: the release never reached its withdrawal, so a
+        # marker of an ended session kept showing as approved_in_use.
+        self.approve()
+        store, gate = self.gated_store()
+        started = store.start_session(self.source.id, self.camera)
+        self.assertIn("approval=approved_in_use", self.listing())
+        gate["refused"] = True
+        with self.assertRaises(RecordingError):
+            store.save(self.source.id, self.camera, False, session_token=started.session_token,
+                       serial_ambiguous=False, release=True)
+        self.assertEqual(started.session_token, self.store.load(self.source.id).session_token)
+        self.assertNotIn(marker_digest(started.session_token), self.listed())
+        self.assertIn("approval=approval_required configured=yes", self.listing())
+        # Once the storage recovers, the republished ledger still lacks it.
+        gate["refused"] = False
+        store.retry_ledger(lambda: 0.0)
+        self.assertIsNotNone(self.contents())
+        self.assertNotIn(marker_digest(started.session_token), self.listed())
+        self.assertIn("approval=approval_required configured=yes", self.listing())
+
+    def test_a_failed_publication_is_retried_by_the_polls(self):
+        self.approve()
+        with patch.object(session_ledger.os, "replace", side_effect=OSError(28, "synthetic")), \
+                self.assertLogs("app.cameras.uvc.persistence", "WARNING"):
+            started = self.store.start_session(self.source.id, self.camera)
+        self.assertTrue(self.ledger.pending)
+        self.assertIn("approval=approval_required", self.listing())
+        now = [100.0]
+        with patch.object(session_ledger.os, "replace", side_effect=OSError(28, "synthetic")):
+            self.store.retry_ledger(lambda: now[0])  # still failing: no raise, still pending
+        self.assertTrue(self.ledger.pending)
+        now[0] += session_ledger.RETRY_SECONDS - 1
+        with patch.object(session_ledger.os, "replace") as replace:
+            self.store.retry_ledger(lambda: now[0])  # throttled: no write
+        replace.assert_not_called()
+        now[0] += 1
+        with self.assertLogs("app.cameras.uvc.persistence", "INFO") as logs:
+            self.store.retry_ledger(lambda: now[0])
+        self.assertEqual([Event.LOCAL_UVC_SESSION_LEDGER_REPUBLISHED.value],
+                         [record.getMessage() for record in logs.records])
+        self.assertFalse(self.ledger.pending)
+        self.assertEqual({marker_digest(started.session_token)}, self.listed())
+        self.assertIn("approval=approved_in_use", self.listing())
+        # Nothing pending: the poll neither reads the clock nor writes.
+        self.store.retry_ledger(lambda: self.fail("clock read without a pending publication"))
+
+    def test_a_controller_that_cannot_be_built_withdraws_its_marker(self):
+        # Review of bfac895, proposal 2: start_session committed the marker,
+        # then the controller refused; no session runs.
+        self.approve()
+        other = DeviceEvidence("/dev/video1", "synthetic", "model", "other")
+        with self.assertRaises(ValueError):
+            ReconnectController(self.source.id, self.camera, lambda event: None,
+                                store=self.store, explicit_candidate=other)
+        self.assertIsNotNone(self.store.load(self.source.id).session_token)
+        self.assertEqual(set(), self.listed())
+        self.assertIn("approval=approval_required configured=yes", self.listing())
+
+    def test_withdrawing_a_session_that_never_ran_under_a_refused_admission(self):
+        self.approve()
+        store, gate = self.gated_store()
+        started = store.start_session(self.source.id, self.camera)
+        gate["refused"] = True
+        store.withdraw_session(self.source.id, started.session_token)  # never raises
+        self.assertIsNone(self.contents())
+        self.assertTrue(self.ledger.pending)
+        self.assertIn("approval=approval_required configured=yes", self.listing())
 
 
 if __name__ == "__main__":
