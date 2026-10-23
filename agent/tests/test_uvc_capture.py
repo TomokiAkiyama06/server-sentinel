@@ -1060,6 +1060,54 @@ class CaptureTests(CaptureCase):
         self.assertEqual(self.state(capture), ("offline", "capture_failed"))
         self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(5, 1, 0))
 
+    def test_truncated_stream_is_not_stream_invalid_before_the_next_poll(self):
+        # A holder may read counters() between the reader's error and the
+        # poll that tears the pipeline down: only a framing loss counts.
+        device = evidence()
+        capture, pipeline = self.approved_online(FakeDiscovery(device), device)
+        active = capture._sources[SOURCES[0]].active
+        pipeline.feed(b"\xff\xd8")
+        pipeline.end()
+        self.assertTrue(wait_for(lambda: active.eof))
+        self.assertEqual(active.error, "stream_truncated")
+        self.assertIs(capture._sources[SOURCES[0]].active, active)  # not polled yet
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(1, 0, 0))
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(1, 0, 0))
+
+    def test_close_retires_active_and_stuck_pipelines(self):
+        devices = [evidence(index, serial=f"SYN-{index}") for index in range(2)]
+        discovery = FakeDiscovery(*devices)
+        capture = self.capture(discovery, count=2)
+        for index, device in enumerate(devices):
+            capture.approve(SOURCES[index], device)
+        capture.poll()
+        for index in range(2):
+            self.stream(capture, self.launcher.pipelines[index], index=index)
+        stuck, running = self.launcher.pipelines
+        stuck_active = capture._sources[SOURCES[0]].active
+        stuck.feed(padding(DEFAULT_MAX_GAP_BYTES + 1) + synthetic_jpeg(1) + b"\xff\xd8\x12\x34")
+        self.assertTrue(wait_for(lambda: stuck_active.error))
+        stuck.stop_result = False
+        discovery.devices = [devices[1]]
+        capture.poll()
+        self.assertEqual(capture._sources[SOURCES[0]].stuck, [stuck_active])
+        running_active = capture._sources[SOURCES[1]].active
+        original_stop = running.stop
+
+        def stop(timeout, *, wait=True):
+            # Bytes still in the pipe at shutdown are read before EOF.
+            running.feed(padding(DEFAULT_MAX_GAP_BYTES + 1) + synthetic_jpeg(2))
+            return original_stop(timeout, wait=wait)
+
+        running.stop = stop
+        stuck.stop_result = True  # Shutdown's full bound finally reaps it.
+        capture.close()
+        self.assertEqual(capture._sources[SOURCES[0]].stuck, [])
+        self.assertIsNone(running_active.error)
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(1, 1, 1))
+        self.assertEqual(capture.counters(SOURCES[1]), CaptureCounters(1, 0, 1))
+
     def test_framing_loss_counts_when_another_path_tears_down(self):
         # The reader saw the framing loss, but the same poll's reconcile
         # (camera gone) tears the pipeline down before supervision does.

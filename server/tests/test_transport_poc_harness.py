@@ -1104,7 +1104,8 @@ class SummarizerTests(unittest.TestCase):
                      receiver=receiver, sender_rows=sender_rows)
         sample = {"kind": "sample", "t_ns": 1, "frames": 100, "queue_drops": 0,
                   "forward_drops": 0, "cpu_seconds": 0.1, "child_cpu_seconds": 0.0,
-                  "capture_launches": 1, "stream_invalid": 0, "padding_tolerated": 50}
+                  "capture_launches": 1, "capture_restarts": 0, "sources_never_launched": 0,
+                  "stream_invalid": 0, "padding_tolerated": 50}
         path = self.root / "holder.jsonl"
 
         def holder(row):
@@ -1116,16 +1117,35 @@ class SummarizerTests(unittest.TestCase):
                                               result["holder_capture_restarts"],
                                               result["holder_stream_invalid"],
                                               result["holder_padding_tolerated"]))
-        result = holder({**sample, "capture_launches": 3})
-        self.assertEqual(("fail", 2), (result["holder_verdict"],
+        # Exactly one restart already fails (no off-by-one slack).
+        result = holder({**sample, "capture_launches": 2, "capture_restarts": 1})
+        self.assertEqual(("fail", 1), (result["holder_verdict"],
                                        result["holder_capture_restarts"]))
+        # Per-source judgement: two sources, A restarted once and B never
+        # started; the launch total (2) equals the sources, still a fail.
+        result = holder({**sample, "capture_launches": 2, "capture_restarts": 1,
+                         "sources_never_launched": 1})
+        self.assertEqual(("fail", 1, 1), (result["holder_verdict"],
+                                          result["holder_capture_restarts"],
+                                          result["holder_sources_never_launched"]))
+        result = holder({**sample, "sources_never_launched": 1})
+        self.assertEqual(("fail", 1), (result["holder_verdict"],
+                                       result["holder_sources_never_launched"]))
         result = holder({**sample, "stream_invalid": 1})
         self.assertEqual(("fail", 1), (result["holder_verdict"],
                                        result["holder_stream_invalid"]))
-        self.assertEqual("fail", holder({**sample, "capture_launches": None})["holder_verdict"])
+        for key in ("capture_restarts", "sources_never_launched", "stream_invalid"):
+            with self.subTest(key):
+                self.assertEqual("fail", holder({**sample, key: None})["holder_verdict"])
+                missing = {k: v for k, v in sample.items() if k != key}
+                self.assertEqual("fail", holder(missing)["holder_verdict"])
         legacy = {key: value for key, value in sample.items()
-                  if key not in ("capture_launches", "stream_invalid", "padding_tolerated")}
+                  if key not in summarize.CAPTURE_COUNTER_KEYS}
         self.assertEqual("pass", holder(legacy)["holder_verdict"])
+        # Any single counter key makes it a counter sample: the rest must be there.
+        for key in summarize.CAPTURE_COUNTER_KEYS:
+            with self.subTest(only=key):
+                self.assertEqual("fail", holder({**legacy, key: 0})["holder_verdict"])
         _write(self.root, "holder", _holder([{**sample, "stream_invalid": 1}]))
         report = summarize.summarize([self.root], holder_files=[path])
         self.assertIn("stream_invalid 1", summarize.render(report))
@@ -3288,9 +3308,36 @@ class MiscTests(unittest.TestCase):
             self.assertEqual(1, sum(1 for row in rows if row["kind"] == "session_close"))
             samples = [row for row in rows if row["kind"] == "sample"]
             self.assertTrue(samples)
-            self.assertEqual((1, 0, 2), (samples[-1]["capture_launches"],
-                                         samples[-1]["stream_invalid"],
-                                         samples[-1]["padding_tolerated"]))
+            self.assertEqual((1, 0, 0, 0, 2), tuple(samples[-1][key] for key in (
+                "capture_launches", "capture_restarts", "sources_never_launched",
+                "stream_invalid", "padding_tolerated")))
+
+    def test_holder_samples_judge_restarts_per_source(self):
+        # A total of 3 launches equals the 3 sources, yet source 0 restarted
+        # once and source 1 never started: the holder counts per source.
+        sources = [uuid4(), uuid4(), uuid4()]
+        per_source = {sources[0]: SimpleNamespace(launches=2, stream_invalid=1,
+                                                  padding_tolerated=2),
+                      sources[1]: SimpleNamespace(launches=0, stream_invalid=0,
+                                                  padding_tolerated=0),
+                      sources[2]: SimpleNamespace(launches=1, stream_invalid=0,
+                                                  padding_tolerated=0)}
+        queue = mock.Mock()
+        queue.get.side_effect = lambda timeout: None
+        queue.drop_stats.return_value = (0, None)
+        capture = mock.Mock()
+        capture.frames.return_value = queue
+        capture.counters.side_effect = per_source.__getitem__
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "h.jsonl"
+            writer = records.JsonlWriter(out, run_id=RUN, role="holder")
+            holder.Holder(capture, sources, Path(directory) / "sock", writer).run(0.2)
+            writer.close()
+            samples = [row for row in records.read_jsonl(out) if row["kind"] == "sample"]
+        self.assertTrue(samples)
+        self.assertEqual((3, 1, 1, 1, 2), tuple(samples[-1][key] for key in (
+            "capture_launches", "capture_restarts", "sources_never_launched",
+            "stream_invalid", "padding_tolerated")))
 
     def _idle_holder(self, directory):
         """A holder whose camera delivers no frame (as during a capture stall)."""

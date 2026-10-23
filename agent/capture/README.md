@@ -144,7 +144,10 @@ are folded in after its process is stopped and its reader joined, so bytes
 read during teardown are included; a running or not-yet-reaped (stuck)
 pipeline is included with its current counts. They hold no sizes, offsets, timestamps, device
 details or bytes, are not logged per frame and are not part of the Main
-heartbeat contract; the transport PoC holder records them in its samples.
+heartbeat contract; the transport PoC holder records them in its samples,
+judging restarts per source (`capture_restarts`, the sum of each source's
+`launches - 1`, and `sources_never_launched`) so one camera's restart cannot
+hide behind another that never started.
 
 | State | Reasons |
 | --- | --- |
