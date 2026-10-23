@@ -16,6 +16,7 @@ from enum import StrEnum
 import logging
 import math
 import os
+from pathlib import Path
 import sqlite3
 import stat
 import threading
@@ -59,8 +60,24 @@ CRITICAL_KINDS = (
     NotificationKind.SERVER_MOVEMENT, NotificationKind.CAMERA_TAMPER,
     NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.CREDENTIAL_FINDING,
 )
+# `recording_device_numbers_changed` is not listed: the daily summary counts
+# the `recording_device_numbers_stale` flag instead, every day until fixed.
 WARNING_KINDS = (NotificationKind.HARDWARE_INTEGRITY_WARNING,
                  NotificationKind.RECORDING_HEALTH_WARNING)
+# Kernel per-boot random UUID (Issue #321): the stale device-number notice is
+# sent once per boot and device numbers, not on every restart.
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+def _boot_id() -> str | None:
+    """This boot's kernel UUID, or None when unreadable or malformed."""
+    try:
+        with open(BOOT_ID_PATH, encoding="ascii") as stream:
+            return str(UUID(stream.read(64).strip()))
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
 # The audited credential findings (``AccessStore``); their records are the
 # durable evidence a restart recovers an undelivered notification from.
 FINDING_AUDIT_ACTIONS = (AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
@@ -146,6 +163,9 @@ class MonitoringStatus:
     # store: False without a configured Slack endpoint (the local row is then
     # `disabled`) or without a camera offline monitor.
     camera_offline_notifications: bool = False
+    # Issue #321: a recorded major/minor pair is stale while the approved
+    # UUID, mount and root agree; storage stays admitted.
+    recording_device_numbers_stale: bool = False
 
 
 class RefuseUnvalidatedSegments:
@@ -246,6 +266,9 @@ class MonitoringRuntime:
         # Issue #301 item 2: the camera offline hourly cap is re-seeded from
         # the stored rows once, on the first running tick.
         self._camera_window_restored = False
+        # Issue #321: the stale device-number check runs once per process;
+        # the notice itself is deduplicated per boot (`_report_device_numbers`).
+        self._device_numbers_reported = False
         self.notifications: NotificationService | None = None
         self.notification_events: NotificationEventStore | None = None
         self.recordings: RecordingStore | None = None
@@ -488,8 +511,13 @@ class MonitoringRuntime:
         self._startup_alerted = False
         self._filesystem_ok = True
         self._retry_at.pop("startup", None)
+        stale = not self.filesystem.device_numbers_current
         self._set(state=RuntimeState.RUNNING, storage_state=policy.state,
-                  recording_filesystem_ok=True, recording_health=None)
+                  recording_filesystem_ok=True, recording_health=None,
+                  recording_device_numbers_stale=stale)
+        if stale and not self._device_numbers_reported:
+            self._device_numbers_reported = True
+            self._report_device_numbers()
         # Startup always compares inventory and runs the recording self-test,
         # regardless of when the previous process last did.
         self._storage_tick()
@@ -541,6 +569,49 @@ class MonitoringRuntime:
             event_id=uuid5(EVENT_NAMESPACE, "recording-startup:" + at.isoformat()),
         )
         self._poll()
+
+    def _report_device_numbers(self) -> None:
+        """Issue #321: one value-free Owner notice per boot and device numbers.
+
+        The UUID, mount and root were verified, so storage is admitted; the
+        recorded numbers are only out of date. The event ID derives from the
+        kernel boot ID and the current numbers (Owner decision 2026-10-22),
+        so a restart within the same boot finds its row and sends nothing,
+        and a new boot or another renumbering notifies once. Without a
+        readable boot ID the notice is sent once per process instead. The
+        numbers only enter the one-way UUIDv5 name together with the random
+        boot ID; nothing is stored or sent but the fixed kind.
+
+        Only a stored final outcome (`sent`, `failed`, `disabled`) ends the
+        notice for this boot. A `pending` row is an earlier process's
+        delivery whose outcome was never stored (it exited before the Slack
+        worker finished): it is not confirmed (notifications README), so it is
+        submitted again under the same event ID and its stored time, and the
+        outcome lands in that row. If the earlier POST did reach Slack, the
+        Owner sees the notice twice, never not at all (Codex PR #323).
+        """
+        at = self.dependencies.utcnow()
+        boot = _boot_id()
+        device = self.filesystem.expected.device
+        if boot is None:
+            event_id = uuid5(EVENT_NAMESPACE, "recording-device-numbers:" + at.isoformat())
+        else:
+            event_id = uuid5(EVENT_NAMESPACE, f"recording-device-numbers:{boot}:"
+                                              f"{os.major(device)}:{os.minor(device)}")
+            try:
+                stored = self.notification_events.get(event_id)
+            except Exception:
+                # An unreadable store notifies rather than staying silent.
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+                stored = None
+            if stored is not None:
+                if stored["delivery"] != DeliveryResult.PENDING:
+                    return
+                # The row keeps its kind and time on upsert; resubmitting
+                # with that time keeps the in-memory event identical to it.
+                at = stored["at"]
+        self.notifications.record(NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED,
+                                  at=at, event_id=event_id)
 
     # -- bridges -----------------------------------------------------------
 
@@ -641,6 +712,7 @@ class MonitoringRuntime:
             status.storage_audit_failed, status.notification_local_failed,
             status.notification_delivery_failed, status.human_access_degraded,
             status.credential_finding_degraded, status.camera_offline_degraded,
+            status.recording_device_numbers_stale,
         ))
         elapsed = self.dependencies.monotonic() - self._started_monotonic
         monitored = int(min(86400, max(0, elapsed))) if math.isfinite(elapsed) else 0

@@ -230,7 +230,12 @@ class StorageAdapter(_Adapter):
         if filesystem is False:
             filesystem_state = Health.FAILED
         elif filesystem is True and running:
-            filesystem_state = Health.OK
+            # Issue #321: verified by UUID and mount, but a recorded
+            # major/minor pair is stale (Owner attention, writes admitted).
+            stale = status.recording_device_numbers_stale
+            if type(stale) is not bool:
+                raise DiagnosticSourceUnavailable
+            filesystem_state = Health.DEGRADED if stale else Health.OK
         else:
             filesystem_state = Health.UNKNOWN if running else Health.UNAVAILABLE
         if not running:
