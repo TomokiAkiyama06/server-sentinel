@@ -24,6 +24,9 @@ from app.cameras.uvc import admin_cli
 from app.cameras.uvc.discovery import DiscoveryResult
 from app.cameras.uvc.identity import DeviceEvidence
 from app.cameras.uvc.persistence import ApprovalStore
+from app.cameras.uvc.session_ledger import (
+    ProcessIdentity, SessionLedger, current_process_identity, ledger_path, marker_digest,
+)
 from app.local_admin import CliRefused
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -86,16 +89,30 @@ class AdminCliTests(unittest.TestCase):
         self.assertEqual(self.path.name, name)
         return self.running.pop(0) if self.running else 0
 
-    def run_cli(self, *argv, lines=(), console=None, terminal_factory=None):
+    def run_cli(self, *argv, lines=(), console=None, terminal_factory=None, markers=None):
         console = console or Console(self)
         console.type(*lines)
         stdout, stderr = io.StringIO(), io.StringIO()
+        # By default the real ``/proc`` and ledger check: this test process
+        # holds the database and stands in for the running service.
+        extra = {} if markers is None else {"markers": markers}
         with redirect_stdout(stdout), redirect_stderr(stderr), \
                 patch.object(admin_cli, "_load_deployment", self.deployment):
             code = admin_cli.main([argv[0], "--config", str(self.config), *argv[1:]],
                                   terminal_factory=terminal_factory or console.factory,
-                                  discovery_factory=lambda: self.discovery, holders=self.holders)
+                                  discovery_factory=lambda: self.discovery, holders=self.holders,
+                                  **extra)
         return code, stdout.getvalue(), stderr.getvalue(), console.output()
+
+    def service_store(self, identity=None):
+        """The store of a service process with its own session ledger (Issue #317).
+
+        ``identity`` stands for another (earlier) process; by default the
+        ledger names this test process.
+        """
+        ledger = SessionLedger(ledger_path(self.path),
+                               **({} if identity is None else {"identity": lambda: identity}))
+        return ApprovalStore(self.database, ledger=ledger)
 
     def rows(self, sql):
         with closing(self.database.connect()) as connection:
@@ -231,23 +248,37 @@ class AdminCliTests(unittest.TestCase):
 
     def test_sources_shows_an_approved_source_of_the_running_service_as_in_use(self):
         # Issue #300: the running service's ReconnectController keeps an
-        # active-session marker on every approved source it reconciles.
+        # active-session marker on every approved source it reconciles;
+        # Issue #317: its session ledger lists the markers of this run.
         first, second = self.local_source("First"), self.local_source("Second")
-        store = ApprovalStore(self.database)
+        store = self.service_store()
+        tokens = []
         for source, device in ((first, camera(0)), (second, camera(2, "SYNTHSERIAL0002"))):
             self.approve_offline(source.id, device)
             started = store.start_session(source.id, device)
             self.assertFalse(started.requires_approval)
+            tokens.append(started.session_token)
         self.configured = (first.id, second.id)
-        self.running = [1]  # a single /proc scan answers for the whole listing
-        code, stdout, stderr, _ = self.run_cli("sources")
+        calls = []
+
+        def markers(identity, path):
+            calls.append(path)
+            return admin_cli._current_run_markers(identity, path)
+        code, stdout, stderr, _ = self.run_cli("sources", markers=markers)
         self.assertEqual((code, stderr), (0, ""))
         for source in (first, second):
             self.assertIn(f"source {source.id} enabled=yes approval=approved_in_use configured=yes",
                           stdout)
         self.assertNotIn("approval_required", stdout)
-        self.assertEqual([], self.running)
+        self.assertEqual([self.path], calls)  # one ledger check answers for the whole listing
         self.assertPrivateAbsent(stdout)
+        # The ledger is private and holds digests only, never a marker.
+        ledger = ledger_path(self.path)
+        self.assertEqual(0o600, ledger.stat().st_mode & 0o777)
+        content = ledger.read_text()
+        for token in tokens:
+            self.assertNotIn(token, content)
+            self.assertIn(marker_digest(token), content)
 
     def test_sources_shows_a_marker_left_by_a_stopped_service_as_approval_required(self):
         # No process holds the database: the session was not ended (a crash),
@@ -262,18 +293,60 @@ class AdminCliTests(unittest.TestCase):
         self.assertTrue(ApprovalStore(self.database).start_session(source.id, camera(0))
                         .requires_approval)
 
+    def crashed_run(self, *sources):
+        """Markers and a ledger left by a service process that no longer exists."""
+        own = current_process_identity()
+        crashed = ProcessIdentity(own.boot_id, own.pid, own.start_time + 1)
+        store = self.service_store(crashed)
+        for source, device in sources:
+            self.approve_offline(source.id, device)
+            self.assertFalse(store.start_session(source.id, device).requires_approval)
+
+    def test_sources_shows_a_crash_left_marker_as_approval_required_before_capture_starts(self):
+        # Issue #317: the restarted service holds the database but has not
+        # started this source's session (storage admission refused, start
+        # failed, waiting to retry). Its ledger is still the crashed run's.
+        source = self.local_source()
+        self.crashed_run((source, camera(0)))
+        self.configured = (source.id,)
+        self.running = [1]
+        code, stdout, stderr, _ = self.run_cli("sources")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(f"source {source.id} enabled=yes approval=approval_required configured=yes",
+                      stdout)
+        self.assertNotIn("approved_in_use", stdout)
+        self.assertTrue(ApprovalStore(self.database).start_session(source.id, camera(0))
+                        .requires_approval)
+
+    def test_sources_tells_a_crash_left_marker_from_a_current_one_of_the_running_service(self):
+        # The restarted service already started another source's session, so
+        # its own ledger replaced the crashed run's; the left marker of the
+        # source it has not started yet is still not in it.
+        started, waiting = self.local_source("Started"), self.local_source("Waiting")
+        self.crashed_run((started, camera(0)), (waiting, camera(2, "SYNTHSERIAL0002")))
+        self.approve_offline(started.id, camera(0))  # the Owner re-approved it
+        self.assertFalse(self.service_store().start_session(started.id, camera(0))
+                         .requires_approval)
+        self.configured = (started.id, waiting.id)
+        self.running = [1]
+        code, stdout, stderr, _ = self.run_cli("sources")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(f"source {started.id} enabled=yes approval=approved_in_use configured=yes",
+                      stdout)
+        self.assertIn(f"source {waiting.id} enabled=yes approval=approval_required configured=yes",
+                      stdout)
+
     def test_sources_shows_a_left_marker_of_an_unlisted_source_as_approval_required(self):
         # A crash left the marker, the Owner removed the source from
         # local_uvc.source_ids and restarted: the database is held, but the
         # service started no session for this source, and listing it again
         # later requires approval.
         listed, unlisted = self.local_source("Listed"), self.local_source("Unlisted")
-        store = ApprovalStore(self.database)
+        store = self.service_store()
         for source, device in ((listed, camera(0)), (unlisted, camera(2, "SYNTHSERIAL0002"))):
             self.approve_offline(source.id, device)
             store.start_session(source.id, device)
         self.configured = (listed.id,)
-        self.running = [1]
         code, stdout, stderr, _ = self.run_cli("sources")
         self.assertEqual((code, stderr), (0, ""))
         self.assertIn(f"source {listed.id} enabled=yes approval=approved_in_use configured=yes",
@@ -287,34 +360,74 @@ class AdminCliTests(unittest.TestCase):
         # A latched manual_intervention_required (e.g. an identical camera
         # without a serial or a shared serial) is never shown as in use.
         latched, never, approved = (self.local_source(name) for name in ("Latched", "Never", "Ok"))
-        store = ApprovalStore(self.database)
+        store = self.service_store()
         self.approve_offline(latched.id, camera(0))
         token = store.start_session(latched.id, camera(0)).session_token
         store.save(latched.id, camera(0), True, session_token=token, serial_ambiguous=True)
         store.start_session(never.id, camera(4, None, port="1-5"))
         self.approve_offline(approved.id, camera(2, "SYNTHSERIAL0002"))
         self.configured = (latched.id, never.id, approved.id)
-        self.running = [1]
-        code, stdout, stderr, _ = self.run_cli("sources")
+
+        def markers(identity, path):
+            raise AssertionError("no marker on an approved row: the ledger is not read")
+        code, stdout, stderr, _ = self.run_cli("sources", markers=markers)
         self.assertEqual((code, stderr), (0, ""))
         self.assertIn(f"source {latched.id} enabled=yes approval=approval_required", stdout)
         self.assertIn(f"source {never.id} enabled=yes approval=approval_required", stdout)
         self.assertIn(f"source {approved.id} enabled=yes approval=approved ", stdout)
         self.assertNotIn("approved_in_use", stdout)
-        self.assertEqual([1], self.running)  # no marker on an approved row: /proc not scanned
 
     def test_sources_refuses_when_the_service_state_cannot_be_read(self):
         source = self.local_source()
         self.approve_offline(source.id, camera(0))
-        ApprovalStore(self.database).start_session(source.id, camera(0))
+        self.service_store().start_session(source.id, camera(0))
         self.configured = (source.id,)
 
-        def unreadable(identity, name):
+        def unreadable(identity, path):
             raise CliRefused("service_state_unavailable")
-        self.holders = unreadable
-        code, stdout, stderr, _ = self.run_cli("sources")
+        code, stdout, stderr, _ = self.run_cli("sources", markers=unreadable)
         self.assertEqual((code, stdout), (2, ""))
         self.assertIn("refused: service_state_unavailable", stderr)
+
+    def test_sources_refuses_a_ledger_it_cannot_trust(self):
+        # Issue #317: a ledger that cannot be read, or that is not a private
+        # regular file of the service account, refuses instead of guessing.
+        source = self.local_source()
+        self.approve_offline(source.id, camera(0))
+        self.service_store().start_session(source.id, camera(0))
+        self.configured = (source.id,)
+        ledger = ledger_path(self.path)
+        content = ledger.read_bytes()
+
+        def refused():
+            code, stdout, stderr, _ = self.run_cli("sources")
+            self.assertEqual((code, stdout), (2, ""))
+            self.assertIn("refused: service_state_unavailable", stderr)
+
+        os.chmod(ledger, 0)
+        if not os.access(ledger, os.R_OK):  # not with permission overrides
+            refused()
+        os.chmod(ledger, 0o640)
+        refused()
+        os.chmod(ledger, 0o600)
+        ledger.write_bytes(b"{")
+        refused()
+        ledger.unlink()
+        (self.root / "elsewhere").write_bytes(content)
+        os.chmod(self.root / "elsewhere", 0o600)
+        ledger.symlink_to(self.root / "elsewhere")
+        refused()
+        ledger.unlink()
+        os.link(self.root / "elsewhere", ledger)
+        refused()
+        ledger.unlink()
+        ledger.write_bytes(content)
+        os.chmod(ledger, 0o600)
+        code, stdout, stderr, _ = self.run_cli("sources")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("approval=approved_in_use", stdout)
+        with self.assertRaises(CliRefused):
+            admin_cli._current_run_markers((0, 0), self.path, account=os.geteuid() + 1)
 
     # -- create-source --------------------------------------------------
 
