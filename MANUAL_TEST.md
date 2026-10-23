@@ -2727,6 +2727,15 @@ intercepted Slack transport. On the deployment, additionally check:
       updated (check `&&` restart) the warning and the degraded state are gone;
       with the UUID pointing to another device than the mount, `--check` still
       refuses;
+- [ ] (Issue #340, disposable VM and disposable disks only, never a
+      production host) with a stale recorded value on a dm (e.g. LVM)
+      recording filesystem over a hardware/virtio disk, reload its table live
+      onto a loop device (`dmsetup reload` + `resume`, same dm number and
+      mount): the next tick shows `recording_filesystem_ok` false and
+      `STORAGE_HARD_STOP`, one immediate `recording_health_failure` arrives
+      and no recording is written; reloading it back onto the disk resumes
+      writes without a restart. Until done, only the mock regression
+      (`server/tests/test_device_numbers_reboot.py`) covers this;
 - [ ] storage state transitions appear in `storage_state_audit`, and expired
       unstarred recordings/state-audit rows are removed by the running service;
 - [ ] detaching or substituting the recording mount while running yields one

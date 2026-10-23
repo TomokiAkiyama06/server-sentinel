@@ -197,7 +197,23 @@ Runtime-data assumptions:
   and any LVM/dm-crypt mapping on them are refused. A missing or unreadable
   sysfs entry, or a deeper stack, is refused. A device-mapper device is accepted only when the recorded one was
   device-mapper as well (same major). The rule is applied by `--check`, the
-  launcher, the installer and every monitoring storage (re)open. Residual
+  launcher, the installer and every monitoring storage (re)open, and, while
+  the recorded numbers differ, again on every monitoring storage sample
+  (Issue #340): a live dm table reload or md member replacement can move the
+  device onto loop or virtual backing without changing its own number, the
+  mount or the root's `st_dev`, so the sysfs topology is walked again at each
+  sample (never cached; about 30 µs for an NVMe partition, measured on a
+  development host) and a refusal is `STORAGE_HARD_STOP` for that sample:
+  writes are refused, one immediate `recording_health_failure` is raised per
+  episode, and the next sample on hardware-only backing admits again (not
+  latched). A refusal seen only by a write admission is kept as one
+  value-free flag, so the next monitoring tick (every 60 s by default) still
+  raises that episode's alert even when the backing was restored before it
+  (Codex P1 on PR #344); repeated refusals within one episode alert once.
+  `recording_health` then stays `failed` until the next daily recording
+  self-test, although writes have resumed. A change in the middle of one admitted write is not prevented
+  inside that write; the next sample refuses. Current numbers never read
+  sysfs. Residual
   risk: a disk carrying a cloned UUID in another slot of the same driver
   (same major) is accepted with the immediate notice instead of refused; the
   exact comparison only refused that by accident (the same clone in the same
