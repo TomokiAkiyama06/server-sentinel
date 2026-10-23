@@ -134,10 +134,15 @@ or pipeline failures.
 
 `UvcCapture.counters(source_id)` returns value-free cumulative counts for one
 source (`CaptureCounters`): `launches` (pipelines started; above 1 means the
-GStreamer child was restarted), `stream_invalid` (pipelines torn down because
-the stream lost JPEG framing or was malformed) and `padding_tolerated`
-(inter-frame gaps above the 4 KiB default that the profile bound skipped before
-a valid frame, Issue #305). They hold no sizes, offsets, timestamps, device
+GStreamer child was restarted), `stream_invalid` (pipelines whose reader saw
+the stream lose JPEG framing or turn malformed, whichever path then tore them
+down: supervision, reconcile, a device conflict, discovery failure, approval or
+close; a stall, EOF, startup timeout or reader failure raises only `launches`)
+and `padding_tolerated` (inter-frame gaps above the 4 KiB default that the
+profile bound skipped before a valid frame, Issue #305). A pipeline's counts
+are folded in after its process is stopped and its reader joined, so bytes
+read during teardown are included; a running or not-yet-reaped (stuck)
+pipeline is included with its current counts. They hold no sizes, offsets, timestamps, device
 details or bytes, are not logged per frame and are not part of the Main
 heartbeat contract; the transport PoC holder records them in its samples.
 

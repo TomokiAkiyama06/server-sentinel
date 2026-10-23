@@ -756,9 +756,17 @@ stream structurally:
   offsets, timestamps or bytes, and nothing is logged per frame.
 
 Main's own local UVC capture dequeues V4L2 MMAP buffers directly and keeps
-their boundaries; there a padded buffer reaches the scene pre-check, which
-refuses it (`trailing_bytes_exceeded`, so that sample is `unknown`) rather than
-decoding it.
+their boundaries, so its framing is not lost; a padded buffer is handed on as
+one payload to both local sinks (`on_local_frame`). The scene pre-check refuses
+it before decoding: with padding of this size (about 1.7 MB, above the trailing
+limit of 8 KiB by default and 1 MiB at most) as `trailing_bytes_exceeded`;
+`trailing_marker` applies only to padding within that limit that contains
+`FF D8` / `FF D9`. That sample is `unknown`. The local live preview
+(`LocalPreviewHub`) keeps and serves the payload as received, padding included
+(about 1.8 MB, within its 32 MiB frame bound), to `live:view` viewers of that
+camera: the same camera's bytes under the same permission, but more than the
+JPEG itself. Cutting the payload at EOI on Main is left to a separate Issue
+(Owner decision); this change does not modify Main.
 
 ## Web/API
 

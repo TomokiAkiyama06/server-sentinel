@@ -1095,6 +1095,41 @@ class SummarizerTests(unittest.TestCase):
         self.assertEqual("fail", report["holder"]["holder_verdict"])
         self.assertIn("holder: fail", summarize.render(report))
 
+    def test_holder_capture_counters_are_checked(self):
+        # Issue #305: a restarted GStreamer child or a framing loss fails the
+        # holder; tolerated padding alone does not. Files without the
+        # counters (written before them) are judged as before.
+        orchestrator, receiver, sender_rows = _base("normal")
+        self.run_dir("normal-a_framed", orchestrator=[{**orchestrator[0], "inputs": "real"}],
+                     receiver=receiver, sender_rows=sender_rows)
+        sample = {"kind": "sample", "t_ns": 1, "frames": 100, "queue_drops": 0,
+                  "forward_drops": 0, "cpu_seconds": 0.1, "child_cpu_seconds": 0.0,
+                  "capture_launches": 1, "stream_invalid": 0, "padding_tolerated": 50}
+        path = self.root / "holder.jsonl"
+
+        def holder(row):
+            _write(self.root, "holder", _holder([row]))
+            return summarize.summarize([self.root], holder_files=[path])["holder"]
+
+        result = holder(sample)
+        self.assertEqual(("pass", 0, 0, 50), (result["holder_verdict"],
+                                              result["holder_capture_restarts"],
+                                              result["holder_stream_invalid"],
+                                              result["holder_padding_tolerated"]))
+        result = holder({**sample, "capture_launches": 3})
+        self.assertEqual(("fail", 2), (result["holder_verdict"],
+                                       result["holder_capture_restarts"]))
+        result = holder({**sample, "stream_invalid": 1})
+        self.assertEqual(("fail", 1), (result["holder_verdict"],
+                                       result["holder_stream_invalid"]))
+        self.assertEqual("fail", holder({**sample, "capture_launches": None})["holder_verdict"])
+        legacy = {key: value for key, value in sample.items()
+                  if key not in ("capture_launches", "stream_invalid", "padding_tolerated")}
+        self.assertEqual("pass", holder(legacy)["holder_verdict"])
+        _write(self.root, "holder", _holder([{**sample, "stream_invalid": 1}]))
+        report = summarize.summarize([self.root], holder_files=[path])
+        self.assertIn("stream_invalid 1", summarize.render(report))
+
     def test_holder_file_must_be_one_complete_execution_of_the_run(self):
         orchestrator, receiver, sender_rows = _base("normal")
         self.run_dir("normal-a_framed", orchestrator=[{**orchestrator[0], "inputs": "real"}],

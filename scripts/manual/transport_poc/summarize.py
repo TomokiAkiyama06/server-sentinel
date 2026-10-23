@@ -1772,6 +1772,11 @@ def load_holders(paths, summaries):
     ``end`` (a crashed or still-running holder), a second file for the same
     run, a holder that did not cover its run, or a camera profile rate
     (holder ``start`` ``fps``) that differs from the sender's declared fps.
+    A holder whose last sample carries the product capture counters (Issue
+    #305) also fails when a GStreamer child was restarted
+    (``capture_launches`` above the holder ``start`` ``sources``) or a pipeline
+    lost JPEG framing (``stream_invalid`` above 0); a file written before those
+    counters existed is judged without them.
     ``unmeasured``: a file whose ``run_id`` matches no real-input run (stale
     or from another run), a file without samples or without the profile
     rate, or a real-input run without a holder file.
@@ -1790,6 +1795,7 @@ def load_holders(paths, summaries):
     verdicts, rates, seen = [], {}, set()
     sessions = {}  # run id -> nonce -> (opens, closes, {source: forwarded})
     frames = queue_drops = forward_drops = allowed = 0
+    restarts = stream_invalid = padding = 0
     for path in paths:
         rows = records.read_jsonl(path)
         ids = {row.get("run_id") for row in rows}
@@ -1829,9 +1835,21 @@ def load_holders(paths, summaries):
         queue_drops += last.get("queue_drops") or 0
         forward_drops += last.get("forward_drops") or 0
         allowed += run_allowed
+        capture_ok = True
+        if "capture_launches" in last or "stream_invalid" in last:
+            sources = starts[0].get("sources")
+            launches, invalid = last.get("capture_launches"), last.get("stream_invalid")
+            capture_ok = (_is_int(sources) and _is_int(launches) and _is_int(invalid)
+                          and launches <= sources and invalid == 0)
+            if _is_int(sources) and _is_int(launches):
+                restarts += max(0, launches - sources)
+            stream_invalid += invalid if _is_int(invalid) else 0
+            padding += last.get("padding_tolerated") if _is_int(
+                last.get("padding_tolerated")) else 0
         verdicts.append(_verdict((last.get("frames") or 0) > 0
                                  and (last.get("queue_drops") or 0) == 0
-                                 and (last.get("forward_drops") or 0) <= run_allowed))
+                                 and (last.get("forward_drops") or 0) <= run_allowed
+                                 and capture_ok))
         rate = _holder_rate(samples)
         if rate is not None:
             rates[run_id] = rate
@@ -1851,6 +1869,9 @@ def load_holders(paths, summaries):
                    "holder_frames": frames, "holder_queue_drops": queue_drops,
                    "holder_forward_drops": forward_drops,
                    "holder_forward_drops_allowed": allowed,
+                   "holder_capture_restarts": restarts,
+                   "holder_stream_invalid": stream_invalid,
+                   "holder_padding_tolerated": padding,
                    "holder_verdict": _combine(verdicts)}
 
 
@@ -1988,7 +2009,10 @@ def render(report):
         lines.append(f"holder: {holder['holder_verdict']} (queue_drops "
                      f"{holder.get('holder_queue_drops')}, forward_drops "
                      f"{holder.get('holder_forward_drops')}/"
-                     f"{holder.get('holder_forward_drops_allowed')})")
+                     f"{holder.get('holder_forward_drops_allowed')}, capture_restarts "
+                     f"{holder.get('holder_capture_restarts')}, stream_invalid "
+                     f"{holder.get('holder_stream_invalid')}, padding_tolerated "
+                     f"{holder.get('holder_padding_tolerated')})")
     lines.append("")
     lines.append("scenario            candidate   G1   G2   G3   G4   G5   G6  missing(rep/act)"
                  "  integrity   drop_acct   production  fast")

@@ -1020,6 +1020,96 @@ class CaptureTests(CaptureCase):
         self.assertEqual(self.state(capture), ("online", "video_ready"))
         self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(2, 1, 2))
 
+    def _relaunch(self, capture):
+        count = len(self.launcher.pipelines)
+        for _ in range(8):
+            self.clock.now += 5  # Past any backoff (backoff_max is 4).
+            capture.poll()
+            if len(self.launcher.pipelines) > count:
+                return self.launcher.pipelines[-1]
+        self.fail("capture was not relaunched")
+
+    def test_restarts_without_framing_loss_count_only_launches(self):
+        # MANUAL_TEST #305 reads stream_invalid == 0 as "no framing loss": a
+        # stall, startup timeout, clean EOF or truncated EOF restarts the
+        # child (launches grows) but is never counted as stream_invalid.
+        device = evidence()
+        capture, pipeline = self.approved_online(FakeDiscovery(device), device)
+        self.clock.now += 3  # Stall beyond stall_timeout.
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(1, 0, 0))
+        self._relaunch(capture)
+        self.clock.now += 6  # No first frame within startup_timeout.
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(2, 0, 0))
+        for fed, error in ((b"", None), (b"\xff\xd8", "stream_truncated")):
+            pipeline = self._relaunch(capture)
+            active = capture._sources[SOURCES[0]].active
+            if fed:
+                pipeline.feed(fed)
+            pipeline.end()
+            self.assertTrue(wait_for(lambda: active.eof))
+            self.assertEqual(active.error, error)
+            self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(4, 0, 0))
+        # Only a framing loss is stream_invalid.
+        pipeline = self._relaunch(capture)
+        active = capture._sources[SOURCES[0]].active
+        pipeline.feed(b"\xff\xd8\x12\x34")
+        self.assertTrue(wait_for(lambda: active.error))
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(5, 1, 0))
+
+    def test_framing_loss_counts_when_another_path_tears_down(self):
+        # The reader saw the framing loss, but the same poll's reconcile
+        # (camera gone) tears the pipeline down before supervision does.
+        device = evidence()
+        discovery = FakeDiscovery(device)
+        capture, pipeline = self.approved_online(discovery, device)
+        active = capture._sources[SOURCES[0]].active
+        pipeline.feed(b"\xff\xd8\x12\x34")
+        self.assertTrue(wait_for(lambda: active.error))
+        discovery.devices = []
+        self.assertEqual(self.state(capture), ("offline", "camera_missing"))
+        self.assertIsNone(capture._sources[SOURCES[0]].active)
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(1, 1, 0))
+
+    def test_padding_read_during_teardown_is_counted(self):
+        # Chunks still in the pipe when the camera disappears are handled by
+        # the reader before it sees EOF; counts are taken after the join.
+        device = evidence()
+        discovery = FakeDiscovery(device)
+        capture, pipeline = self.approved_online(discovery, device)
+        original_stop = pipeline.stop
+
+        def stop(timeout, *, wait=True):
+            # The last bytes reach the reader only once teardown has begun.
+            pipeline.feed(padding(PROFILE.max_padding_bytes) + synthetic_jpeg(1))
+            return original_stop(timeout, wait=wait)
+
+        pipeline.stop = stop
+        discovery.devices = []
+        self.assertEqual(self.state(capture), ("offline", "camera_missing"))
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(1, 0, 1))
+
+    def test_stuck_pipeline_counts_once_before_and_after_reaping(self):
+        device = evidence()
+        discovery = FakeDiscovery(device)
+        capture, pipeline = self.approved_online(discovery, device)
+        active = capture._sources[SOURCES[0]].active
+        pipeline.feed(synthetic_jpeg(1) + padding(DEFAULT_MAX_GAP_BYTES + 1) + synthetic_jpeg(2)
+                      + b"\xff\xd8\x12\x34")
+        self.assertTrue(wait_for(lambda: active.error))
+        pipeline.stop_result = False
+        discovery.devices = []
+        self.assertEqual(self.state(capture), ("offline", "capture_cleanup_failed"))
+        self.assertEqual(capture._sources[SOURCES[0]].stuck, [active])
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(1, 1, 1))
+        pipeline.stop_result = True
+        self.assertEqual(self.state(capture), ("offline", "camera_missing"))
+        self.assertEqual(capture._sources[SOURCES[0]].stuck, [])
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(1, 1, 1))
+
     def test_counters_are_value_free_and_per_source(self):
         device = evidence()
         capture, _pipeline = self.approved_online(FakeDiscovery(device), device, count=2)

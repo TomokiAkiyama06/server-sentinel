@@ -1145,7 +1145,7 @@ Installation/service checkboxes above remain open.
 unit test（synthetic な JPEG 形の byte 列と非 0 の padding）でのみ確認済み。以下の実機確認はまだ実施していない。
 カメラは無人の壁またはテストチャートに向け、映像は保存・表示しない。serial・by-id 名・IP・hostname は記録しない。
 
-- [ ] 未実施: Yamaha CS-800、MJPG 1280x720@30 で、製品の `UvcCapture` + `GStreamerLauncher` を 5 分以上連続実行し、GStreamer child の再起動が 0 回（`stream_invalid` / `capture_failed` が出ない）。`UvcCapture.counters()`（transport PoC holder の `sample` 行の `capture_launches` / `stream_invalid` / `padding_tolerated`）で、`launches` が source 数のまま、`stream_invalid` が 0 であることを記録する。
+- [ ] 未実施: Yamaha CS-800、MJPG 1280x720@30 で、製品の `UvcCapture` + `GStreamerLauncher` を 5 分以上連続実行し、GStreamer child の再起動が 0 回（`stream_invalid` / `capture_failed` が出ない）。`UvcCapture.counters()`（transport PoC holder の `sample` 行の `capture_launches` / `stream_invalid` / `padding_tolerated`）で、`launches` が source 数のまま、`stream_invalid` が 0 であることを記録する。`stream_invalid` は framing の喪失・構造エラーだけを数える（stall・EOF・startup timeout による再起動は `launches` だけが増える）。PoC の `summarize.py --holder` は、`capture_launches` が source 数を超えるか `stream_invalid` が 0 より大きければ holder を `fail` にし、`capture_restarts` / `stream_invalid` / `padding_tolerated` を report に出す。
 - [ ] 未実施: 同じ実行で `padding_tolerated` が 0 より大きい（padding 付き buffer が実際に来て、再起動せずに読み飛ばされた証拠）。値の目安は Issue #305 の測定（1,800 buffer 中 約 11 個 = 約 0.6 %、5 分で約 50 回前後）。0 のままなら、その実行では padding 付き buffer が出ておらず、本修正の確認にならない（照明・解像度を Issue と揃えて再実行）。
 - [ ] 未実施: 同じ実行で実効 frame rate が約 30 fps（frame 数 / 経過時間を記録）。
 - [ ] 未実施: 照明あり、およびレンズを覆った暗い状態の両方で上の 2 点を確認。
