@@ -1,28 +1,29 @@
 """Private calibration history and a default-denied Owner operation facade.
 
-The history stores no decoded monitoring media. A calibration reference frame
-stays transient: only its irreversible digest, geometry and policy are
-persisted, and an Owner-supplied frame must be re-bound through
-``CalibrationRecord.rehydrate`` before detection can resume.
+The history stores no decoded monitoring media and nothing derived from it
+(Owner decision 2026-10-22, Issue #205): a calibration reference frame stays in
+process memory only, and the history keeps non-frame provenance (identities,
+version, time, polygon, policy, reference geometry and the luma reader). No
+digest, histogram, thumbnail or statistic of the frame is persisted. Detection
+resumes only by binding the in-memory ``Calibration`` that produced a stored
+record (``CalibrationRecord.bind``); a stored record alone cannot reproduce or
+re-admit a reference.
 """
 
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import json
-import re
 import sqlite3
 from typing import Callable
 from uuid import UUID
 
 from app.cameras.registry.models import SourceType, timestamp
-from app.detection.foundation import GrayFrame
 from app.detection.foundation.contracts import positive_integer
 from .contracts import Calibration, Policy, valid_reader
 from .detector import SceneDetector
 from .geometry import validate_polygon
 
 
-DIGEST = re.compile(r"[0-9a-f]{64}")
 COLUMNS = ("source_id", "profile_id", "version", "identifier", "metadata")
 
 
@@ -36,8 +37,7 @@ def calibration_metadata(calibration):
         "version": calibration.version, "created_at": calibration.created_at.isoformat(),
         "polygon": calibration.polygon, "policy": asdict(calibration.policy),
         "reference": {"stream_id": str(reference.stream_id), "sequence": reference.sequence,
-                      "width": reference.width, "height": reference.height,
-                      "sha256": calibration.reference_sha256},
+                      "width": reference.width, "height": reference.height},
     }
 
 
@@ -45,10 +45,12 @@ def calibration_metadata(calibration):
 class CalibrationRecord:
     """Persistable calibration provenance that cannot reconstruct a scene.
 
-    It intentionally has no pixel field: the archive keeps the reference
-    digest, not the reference image, so restored history never becomes a
+    It intentionally has no pixel field and no value computed from pixels
+    (no digest, histogram or statistic): restored history never becomes a
     retention-free still-image store of a monitored room or of whoever was
-    visible while the Owner calibrated it.
+    visible while the Owner calibrated it, nor a fingerprint of that scene.
+    A record written before #205 may carry a ``reference.sha256``; it is
+    ignored when read.
     """
 
     identifier: UUID
@@ -62,7 +64,6 @@ class CalibrationRecord:
     reference_sequence: int
     reference_width: int
     reference_height: int
-    reference_sha256: str
     policy: Policy
     # The luma reader of the reference (``contracts.READER``); ``None`` in a
     # record written before readers were recorded.
@@ -82,8 +83,6 @@ class CalibrationRecord:
         if type(self.reference_sequence) is not int or self.reference_sequence < 0:
             raise ValueError("reference sequence must be a nonnegative integer")
         timestamp(self.created_at)
-        if type(self.reference_sha256) is not str or not DIGEST.fullmatch(self.reference_sha256):
-            raise ValueError("calibration reference digest is malformed")
         if self.reference_width * self.reference_height > self.policy.maximum_pixels:
             raise ValueError("calibration exceeds pixel budget")
         if type(self.polygon) is not tuple or not 3 <= len(self.polygon) <= 32:
@@ -95,38 +94,35 @@ class CalibrationRecord:
                 raise ValueError("polygon lies outside reference")
         validate_polygon(self.polygon)
 
-    def rehydrate(self, reference: GrayFrame) -> Calibration:
-        """Bind a transient Owner-supplied frame to this stored provenance.
+    def bind(self, calibration: Calibration) -> Calibration:
+        """Bind the in-memory calibration that produced this stored record.
 
-        The archive cannot return a reference image, so the caller supplies the
-        frame again from the deployment's own Owner-controlled media boundary.
-        A frame from another source, stream, sample or geometry, or one whose
-        digest differs, is refused instead of silently recalibrating.
+        The archive cannot return a reference image and keeps nothing derived
+        from one, so the integrity binding between the stored version and its
+        reference lives in process memory: only a ``Calibration`` object whose
+        whole non-frame provenance (identity, source, profile, version, time,
+        polygon, policy, reader, reference stream, sample and geometry) is this
+        record is accepted. A bare frame, or a calibration of another version
+        or identity, is refused instead of silently recalibrating; a frame
+        read from the camera becomes a reference only through a new, audited
+        calibration version.
         """
-        if not isinstance(reference, GrayFrame) or reference.channels != 1:
-            raise ValueError("calibration requires a grayscale reference")
-        if (reference.source_id != self.source_id
-                or reference.stream_id != self.reference_stream_id
-                or reference.sequence != self.reference_sequence
-                or (reference.width, reference.height) != (self.reference_width, self.reference_height)):
-            raise ValueError("reference frame does not match calibration history")
-        calibration = Calibration(self.identifier, self.source_id, self.source_type,
-                                  self.profile_id, self.version, self.created_at,
-                                  self.polygon, reference, self.policy, self.reader)
-        if calibration.reference_sha256 != self.reference_sha256:
+        if not isinstance(calibration, Calibration):
+            raise ValueError("calibration reference must be an in-memory calibration")
+        if provenance(calibration) != self:
             raise ValueError("calibration reference integrity failed")
         SceneDetector(calibration)
         return calibration
 
 
-def _record(calibration: Calibration) -> CalibrationRecord:
+def provenance(calibration: Calibration) -> CalibrationRecord:
+    """The persistable, frame-free provenance of an in-memory calibration."""
     reference = calibration.reference
     return CalibrationRecord(calibration.identifier, calibration.source_id,
                              calibration.source_type, calibration.profile_id,
                              calibration.version, calibration.created_at,
                              calibration.polygon, reference.stream_id, reference.sequence,
-                             reference.width, reference.height,
-                             calibration.reference_sha256, calibration.policy,
+                             reference.width, reference.height, calibration.policy,
                              calibration.reader)
 
 
@@ -135,6 +131,7 @@ def _decode(metadata) -> CalibrationRecord:
     policy = dict(value["policy"])
     policy["global_quarter_turns"] = tuple(policy["global_quarter_turns"])
     policy["roi_quarter_turns"] = tuple(policy["roi_quarter_turns"])
+    # A pre-#205 record's ``reference.sha256`` is ignored, never re-used.
     reference = value["reference"]
     return CalibrationRecord(UUID(value["identifier"]), UUID(value["source_id"]),
                              SourceType(value["source_type"]), UUID(value["profile_id"]),
@@ -142,7 +139,7 @@ def _decode(metadata) -> CalibrationRecord:
                              tuple(tuple(point) for point in value["polygon"]),
                              UUID(reference["stream_id"]), reference["sequence"],
                              reference["width"], reference["height"],
-                             reference["sha256"], Policy(**policy), value.get("reader"))
+                             Policy(**policy), value.get("reader"))
 
 
 def decode_history_row(row) -> CalibrationRecord:
@@ -191,7 +188,7 @@ def append_on(connection: sqlite3.Connection, calibration: Calibration) -> Calib
     audit record commit or roll back together. The caller owns ``BEGIN
     IMMEDIATE``, the storage admission and the commit; the same version and
     identity rules as ``CalibrationArchive.append`` apply, and nothing but
-    provenance is written (no pixel, crop or frame).
+    provenance is written (no pixel, crop, frame or value derived from one).
     """
     if not isinstance(connection, sqlite3.Connection) or not connection.in_transaction:
         raise ValueError("calibration history requires an open transaction")
@@ -206,7 +203,7 @@ def append_on(connection: sqlite3.Connection, calibration: Calibration) -> Calib
         _insert(connection, calibration)
     except sqlite3.Error:
         raise RuntimeError("calibration archive unavailable") from None
-    return _record(calibration)
+    return provenance(calibration)
 
 
 class CalibrationArchive:
@@ -215,7 +212,8 @@ class CalibrationArchive:
     The caller supplies an already-open connection from the deployment's private
     database boundary. This does not choose paths, create directories or expose
     references through any API. It persists calibration provenance only: no
-    frame bytes, crop or other decoded media enters this table, so the history
+    frame bytes, crop, other decoded media or value computed from a frame
+    (digest, histogram, statistic) enters this table, so the history
     cannot outlive recording retention as hidden image storage. Schema is local
     to this independently testable archive; Main runtime onboarding must
     register its migration explicitly.
@@ -247,7 +245,7 @@ class CalibrationArchive:
         except Exception:
             connection.rollback()
             raise
-        return _record(calibration)
+        return provenance(calibration)
 
     def load(self, source_id: UUID, profile_id: UUID, version: int | None = None):
         """Return stored provenance only; a reference image is never returned."""

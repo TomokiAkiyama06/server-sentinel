@@ -135,6 +135,8 @@ class Calibration:
 
     @property
     def reference_sha256(self):
+        # In memory only (observations carry it for in-process correlation);
+        # never persisted with the calibration history (#205).
         return hashlib.sha256(self.reference.pixels).hexdigest()
 
 

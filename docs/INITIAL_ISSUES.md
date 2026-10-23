@@ -698,7 +698,7 @@ Acceptance:
 
 Implementation: `server/app/detection/roi/` provides a bounded local grayscale
 core with immutable source/profile calibration, append-only private calibration
-history that stores provenance and the reference digest but never decoded media,
+history that stores frame-free provenance (since #205 no reference digest) but never decoded media,
 global transform compensation, relative ROI comparison, explicit
 occlusion/quality fail-unknown handling, temporal confirmation, persistent
 dark/unmatched-scene tamper, and trusted source-loss correlation. A refused or

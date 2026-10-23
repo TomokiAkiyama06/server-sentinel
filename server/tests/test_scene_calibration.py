@@ -7,6 +7,7 @@ database is a disposable SQLite file. No camera, real scene or person is used.
 """
 
 import asyncio
+import hashlib
 from contextlib import closing
 from dataclasses import replace
 import json
@@ -37,7 +38,7 @@ from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
-from tests.test_detector_roi import HEIGHT, POLYGON, WIDTH, near_dark, pixels, policy
+from tests.test_detector_roi import HEIGHT, POLYGON, WIDTH, frame_digests, near_dark, pixels, policy
 from tests.test_scene_runtime import (
     INTERVAL, OTHER, SOURCE, Harness, Recorder, binding, calibration_for, quality, unattainable,
 )
@@ -109,7 +110,23 @@ class Database_:
                 "WHERE source_id=? ORDER BY version", (str(source),))]
 
     def raw(self):
-        return Path(self.database.path).read_bytes()
+        return database_bytes(self.database.path)
+
+
+def database_bytes(path):
+    """The database file with any WAL or rollback journal beside it."""
+    path = Path(path)
+    return b"".join(candidate.read_bytes() for candidate in
+                    (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-journal"))
+                    if candidate.exists())
+
+
+def assert_no_frame_trace(test, raw, luma=None):
+    """Neither the reference pixels nor any digest of them reached the disk."""
+    luma = pixels() if luma is None else luma
+    test.assertNotIn(luma, raw)
+    for trace in frame_digests(luma):
+        test.assertNotIn(trace, raw)
 
 
 def commit_with(database, log=None):
@@ -297,9 +314,30 @@ class HistoryTests(unittest.TestCase):
             (metadata,) = connection.execute("SELECT metadata FROM roi_calibration_history").fetchone()
         self.assertEqual({"identifier", "source_id", "source_type", "profile_id", "version", "created_at",
                           "polygon", "policy", "reference", "reader"}, set(json.loads(metadata)))
-        self.assertEqual({"stream_id", "sequence", "width", "height", "sha256"},
+        # Only geometry of the reference: no digest or other value computed
+        # from its pixels (Owner decision 2026-10-22, option A).
+        self.assertEqual({"stream_id", "sequence", "width", "height"},
                          set(json.loads(metadata)["reference"]))
-        self.assertNotIn(pixels(), database.raw())
+        assert_no_frame_trace(self, database.raw())
+        # The check itself sees a stored digest (the pre-#205 layout).
+        legacy = database.raw() + hashlib.sha256(pixels()).hexdigest().encode()
+        with self.assertRaises(AssertionError):
+            assert_no_frame_trace(self, legacy)
+
+    def test_a_pre_205_record_with_a_reference_digest_is_read_and_the_digest_ignored(self):
+        database = Database_(self)
+        with closing(database.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            append_on(connection, stored())
+            (metadata,) = connection.execute("SELECT metadata FROM roi_calibration_history").fetchone()
+            value = json.loads(metadata)
+            value["reference"]["sha256"] = "0" * 64
+            connection.execute("UPDATE roi_calibration_history SET metadata=?",
+                               (json.dumps(value, sort_keys=True),))
+            connection.commit()
+        (record,) = database.history()
+        self.assertNotIn("reference_sha256", vars(record))
+        self.assertEqual(stored(), record.bind(stored()))
 
 
 class TemplateTests(unittest.TestCase):
@@ -353,7 +391,7 @@ class OwnerCalibrationTests(unittest.TestCase):
             self.assertTrue(wait_for(lambda: self.harness.source().calibration_version == 2))
         self.assertEqual((2, record.identifier), (second.version, second.identifier))
         self.assertEqual([1, 2], [item.version for item in self.database.history()])
-        self.assertNotIn(pixels(), self.database.raw())
+        assert_no_frame_trace(self, self.database.raw())
         # The Owner path produces no Owner notice: only the restart path does.
         self.assertEqual((), self.harness.service.take_notices())
 
@@ -442,7 +480,7 @@ class RestartReacquisitionTests(unittest.TestCase):
         # Nothing more to do, and nothing notified twice.
         self.assertIsNone(harness.service.reacquire(OTHER, commit_with(self.database.database)))
         self.assertEqual((), harness.service.take_notices())
-        self.assertNotIn(pixels(), self.database.raw())
+        assert_no_frame_trace(self, self.database.raw())
 
     def test_owner_calibration_replaces_a_pending_reacquisition_without_notice(self):
         self.database.store(stored())
@@ -573,7 +611,7 @@ class LifespanTests(RuntimeFixture):
                                  self.scene_texts())
                 self.assertEqual([("scene_reference_reacquired", 1, "sent")] * restart, self.notified())
         # The reference never reached the disk.
-        self.assertNotIn(pixels(), Path(self.settings.database_path).read_bytes())
+        assert_no_frame_trace(self, database_bytes(self.settings.database_path))
 
     async def test_a_stored_calibration_that_cannot_be_reacquired_notifies_once(self):
         self.store(stored(reader="packed:yuyv:24x24"))

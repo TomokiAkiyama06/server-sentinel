@@ -6852,10 +6852,13 @@ class LifecycleInventoryTests(unittest.TestCase):
         for version in (1, 2):
             archive.append(calibration(version))
         with closing(sqlite3.connect(self.runtime.database)) as db:
-            digest = db.execute("SELECT metadata FROM roi_calibration_history "
-                                "WHERE version=1").fetchone()[0]
+            metadata = db.execute("SELECT metadata FROM roi_calibration_history "
+                                  "WHERE version=1").fetchone()[0]
+        # The history keeps no value computed from the reference frame (#205),
+        # and the baseline copies none of the stored provenance either.
+        self.assertNotIn("sha256", json.loads(metadata)["reference"])
         _, baseline = self.record()
-        self.assertNotIn(json.loads(digest)["reference"]["sha256"], baseline.read_text())
+        self.assertNotIn(metadata, baseline.read_text())
         self.assertNotIn(identifier, baseline.read_text())
         # A next version is appended, never counted as preserved.
         archive.append(calibration(3))

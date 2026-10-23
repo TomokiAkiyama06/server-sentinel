@@ -24,11 +24,10 @@ from app.detection.roi.runtime import (
 )
 from app.cameras.registry.models import SourceType
 
-from tests.test_detector_roi import pixels
 from tests.test_human_admin_routes import AdminRouteFixture
 from tests.test_human_gated_authorization import GENERIC, STEP_UP
 from tests.test_human_surface import payload, status
-from tests.test_scene_calibration import Feed, template
+from tests.test_scene_calibration import Feed, assert_no_frame_trace, database_bytes, template
 from tests.test_scene_runtime import OTHER, Recorder, binding
 from tests.test_uvc_runtime import wait_for
 
@@ -120,7 +119,7 @@ class SceneRouteTests(SceneRouteFixture):
         text = json.dumps(payload(await self.read_status()))
         for forbidden in ("sha256", "polygon", "policy", "pixels", "reference", "stream"):
             self.assertNotIn(forbidden, text)
-        self.assertNotIn(pixels(), self.database.path.read_bytes())
+        assert_no_frame_trace(self, database_bytes(self.database.path))
 
     async def test_non_owner_sessions_are_refused_on_both_routes(self):
         before = self.history(), self.calibration_records()

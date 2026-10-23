@@ -995,14 +995,19 @@ Candidate signals include global optical transform, persistent occlusion/near-bl
 
 The internal `server/app/detection/roi/` core operates only on transient,
 bounded grayscale frames for one immutable source/profile calibration. It stores
-source type, profile, polygon, reference digest, reference geometry, policy,
-version, and timestamp in a private append-only calibration history after
-the application's ROI calibration migration. That history is metadata only: no frame pixels, crop,
-thumbnail or other decoded monitoring media is persisted, so it cannot become
-still-image storage outside recording authorization and retention. A stored
-record therefore cannot reproduce a reference image; resuming detection re-binds
-an Owner-supplied transient frame whose digest and geometry must match the
-record. The core does not supply production thresholds, start capture, expose an
+source type, profile, polygon, reference geometry (stream, sample, width,
+height), policy, luma reader, version, and timestamp in a private append-only
+calibration history after the application's ROI calibration migration. That
+history is metadata only: no frame pixels, crop, thumbnail or other decoded
+monitoring media is persisted, and no value computed from the frame (digest,
+histogram, statistic) either (Owner decision 2026-10-22, Issue #205), so it
+cannot become still-image storage outside recording authorization and
+retention. A stored record therefore cannot reproduce or re-admit a reference
+image; resuming detection binds the in-memory `Calibration` that produced the
+record (`CalibrationRecord.bind`), whose whole non-frame provenance must equal
+the record. A bare frame is never bound to a stored version; a frame read from
+the camera becomes a reference only through a new calibration version. A
+`reference.sha256` in a record written before #205 is ignored when read. The core does not supply production thresholds, start capture, expose an
 API, retain decoded media, make a presence decision, or issue a notification.
 
 A calibration policy whose bounded search window cannot reach its own movement
@@ -1199,8 +1204,8 @@ follow-up of #205; the Owner calibration route below exists). Without
 calibration provider: the stored provenance (`roi_calibration_history`, read
 only) plus the reference frames this process holds in memory
 (`TransientReferences`). Nothing derived from an image is written to disk;
-the history keeps the reference digest, geometry, polygon, policy and, since
-#205, the luma reader (`reader`: the capture layout and decoder pins, such as
+no digest, histogram or statistic of the frame either. The history keeps the
+reference geometry, polygon, policy and, since #205, the luma reader (`reader`: the capture layout and decoder pins, such as
 `packed:yuyv:1920x1080` or `mjpg:simplejpeg=1.9.0:numpy=2.3.5:1920x1080`;
 `decoded:remote_agent` for a decoded-sample producer). A reference is taken
 from live frames only by `SceneMonitoringRuntime.acquire_reference()`: the

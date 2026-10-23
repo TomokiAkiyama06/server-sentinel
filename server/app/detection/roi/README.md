@@ -5,8 +5,8 @@ immutable source/profile calibration. It stores no media, starts no capture,
 opens no HTTP route, and makes no presence, identity, guilt, or notification
 decision.
 
-A calibration contains an Owner-selected polygon, reference frame digest,
-source type, profile ID, explicit search/quality thresholds, version, and
+A calibration contains an Owner-selected polygon, an in-memory reference
+frame, source type, profile ID, explicit search/quality thresholds, version, and
 timestamp. A policy is refused when a bounded search window cannot reach its
 own displacement threshold, because such a configuration cannot express the
 movement or camera shift it asks for and would report a matching geometry
@@ -22,21 +22,27 @@ refused too: every unchanged sample would look obscured and confirm a tamper
 that never happened. `CalibrationArchive` is a small append-only SQLite port: the Main
 runtime must supply its already-open private database after application
 migration (`roi_calibration_history`) has run. The table holds provenance
-only — identities, polygon, policy, reference geometry and the reference
-SHA-256 — so no decoded frame, crop, or other monitoring media is persisted
-and the history cannot become retention-free image storage. `load()` therefore
+only — identities, polygon, policy, reference geometry, luma reader, version
+and time — so no decoded frame, crop, or other monitoring media is persisted,
+nor any value computed from a frame (no digest, histogram or statistic; Owner
+decision 2026-10-22, #205), and the history cannot become retention-free image
+storage or a scene fingerprint. A `reference.sha256` in a pre-#205 record is
+ignored when read. `load()` therefore
 returns a `CalibrationRecord` without pixels, separates a record it cannot
 decode from an unavailable database so corrupt history is not hidden behind a
 transient-looking failure, and refuses a record whose decoded provenance is not
 the row that was looked up, so swapped history cannot bind a detector to
 another source or profile; resuming detection needs
-`CalibrationRecord.rehydrate(frame)`, which re-binds an Owner-supplied
-transient frame and refuses any frame whose source, stream, sample, geometry
-or digest differs. A history table carrying a media column is rejected at
-construction. Where a deployment obtains that frame again is outside this core:
-it comes from Owner-authorized media under ordinary recording authorization and
-retention, or from a fresh Owner recalibration, never from a private image
-store owned by this module. `OwnerCalibrationOperations` defaults to refusal;
+`CalibrationRecord.bind(calibration)`, which accepts only the in-memory
+`Calibration` whose whole non-frame provenance (identity, version, time,
+polygon, policy, reader, reference stream, sample and geometry) is that record
+and refuses a bare frame or any other calibration. The integrity binding
+between a stored version and its reference is therefore that in-memory object
+(`TransientReferences` in `calibration_service.py`), never a stored digest. A
+history table carrying a media column is rejected at construction. After a
+restart the in-memory reference is gone; a new reference comes only from a new
+calibration version (an Owner calibration or the restart re-acquisition of
+#205), never from a private image store owned by this module. `OwnerCalibrationOperations` defaults to refusal;
 authentication and API policy remain outside this core.
 
 `SceneDetector` compares the background first to estimate bounded global
@@ -436,13 +442,16 @@ Owner's scene calibration status route reads it (below).
 ## Owner calibration and restart re-acquisition (Issue #205)
 
 `calibration_service.py` (Owner decision 2026-10-22, option A) produces the
-reference frames the provider re-binds; `app.main.create_app(scene_calibration=
+reference frames the provider binds; `app.main.create_app(scene_calibration=
 SceneCalibrationConfiguration(...))` builds it, owns the runtime's provider
 (`ArchiveCalibrationProvider` over a read-only connection with the in-memory
 `TransientReferences`) and refuses an embedder-supplied provider. Nothing
-derived from an image is written to disk: the history keeps provenance only,
-and the frame lives in `TransientReferences` (and the bound `Calibration`)
-for the process's lifetime.
+derived from an image is written to disk (no digest either): the history
+keeps frame-free provenance only, and the frame lives in `TransientReferences`
+(and the bound `Calibration`) for the process's lifetime. `TransientReferences`
+serves a stored record only the in-memory calibration whose whole provenance
+equals it, so this in-memory object, not a stored digest, binds a version to
+its reference.
 
 - `SceneMonitoringRuntime.acquire_reference(source, width, height,
   timeout_ns)` is the only way a reference is taken from live frames. The

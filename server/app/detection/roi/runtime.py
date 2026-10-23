@@ -163,17 +163,20 @@ class CalibrationProvider(Protocol):
 
 
 class ArchiveCalibrationProvider:
-    """Resolve the latest archived calibration and re-bind its reference.
+    """Resolve the latest archived calibration and bind its in-memory reference.
 
-    The archive keeps provenance only, never a reference image. `references`
-    is the deployment's Owner-controlled port that supplies the transient
-    reference frame again (Issue #10); without it, or when it has none, a
+    The archive keeps frame-free provenance only, never a reference image or
+    a value derived from one (Owner decision 2026-10-22, Issue #205).
+    `references` is the process-memory port (`TransientReferences`) that
+    returns the in-memory `Calibration` that produced the stored record; it is
+    bound only when its whole provenance is that record
+    (`CalibrationRecord.bind`). Without the port, or when it has none, a
     stored calibration stays unusable rather than being re-based on a live
     frame. `connect` opens a fresh connection on the calling (worker) thread.
     """
 
     def __init__(self, connect: Callable[[], sqlite3.Connection], *,
-                 references: Callable[[CalibrationRecord], GrayFrame | None] | None = None):
+                 references: Callable[[CalibrationRecord], Calibration | None] | None = None):
         if not callable(connect) or references is not None and not callable(references):
             raise ValueError("invalid calibration provider")
         self.connect, self.references = connect, references
@@ -191,13 +194,13 @@ class ArchiveCalibrationProvider:
         if self.references is None:
             raise CalibrationUnavailable("calibration_reference_unavailable")
         try:
-            reference = self.references(record)
+            calibration = self.references(record)
         except Exception:
-            reference = None
-        if reference is None:
+            calibration = None
+        if calibration is None:
             raise CalibrationUnavailable("calibration_reference_unavailable")
         try:
-            return record.rehydrate(reference)
+            return record.bind(calibration)
         except Exception:
             raise CalibrationUnavailable("calibration_integrity_failed") from None
 

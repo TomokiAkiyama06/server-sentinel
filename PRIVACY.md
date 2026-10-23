@@ -265,18 +265,23 @@ The deployment owner is responsible for camera placement and compliance with app
 Any feature that sends monitoring/biometric data to infrastructure operated by the ServerSentinel developer is a fundamental privacy-model change and requires explicit owner approval plus updated requirements/security/privacy documentation before implementation.
 
 The Issue #24 ROI/tamper core keeps its calibration history as metadata only:
-identities, Owner polygon, policy, reference geometry, version, timestamp and
-the reference SHA-256. No reference frame, crop or other decoded monitoring
-media is written to that history, so it cannot become a persistent still-image
-store outside recording authorization and retention. Restoring a calibration
-re-binds an Owner-supplied transient frame that must match the stored digest
-and geometry. Its scene-change measurements are bounded scalars and never
+identities, Owner polygon, policy, reference geometry, version and timestamp
+(and, since #205, the luma reader). No reference frame, crop or other decoded
+monitoring media is written to that history, nor any value computed from the
+frame such as a digest, histogram or statistic (Owner decision 2026-10-22,
+Issue #205), so it can become neither a persistent still-image store outside
+recording authorization and retention nor a fingerprint of the scene. A
+calibration is used only while the process holds its in-memory reference;
+the binding between a stored version and that reference is the in-memory
+calibration itself, not a stored digest. A record written before #205 may
+carry a reference SHA-256; it is ignored when read. Its scene-change measurements are bounded scalars and never
 person identities, and a detector that cannot register a scene reliably reports
 `unknown` rather than a trustworthy "no tamper".
 
 The Issue #205 Owner calibration keeps the reference frame only in the Main
 process's memory (Owner decision 2026-10-22): no reference frame, crop,
-reduced image or other image-derived data is written to disk, and the Owner
+reduced image or other image-derived data (no digest, histogram or
+statistic of the frame) is written to disk, and the Owner
 status route returns no pixel, digest, polygon or policy. The history also
 records the luma reader (capture format, resolution and decoder version
 pins; no device path or serial). Because the frame does not survive a

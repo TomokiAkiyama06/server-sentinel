@@ -1,10 +1,11 @@
 """Owner calibration and the restart re-acquisition of scene references (#205).
 
-The scene detector needs a calibration whose reference frame it can re-bind
-(`CalibrationRecord.rehydrate`), and the private history keeps provenance
-only, never pixels. A reference therefore exists only in this process's
-memory (`TransientReferences`); nothing derived from an image is written to
-disk (Owner decision 2026-10-22). Two paths produce one:
+The scene detector needs a calibration whose reference frame it can bind
+(`CalibrationRecord.bind`), and the private history keeps frame-free
+provenance only: never pixels, nor a digest or other value derived from
+them. A reference therefore exists only in this process's memory
+(`TransientReferences`); nothing derived from an image is written to disk
+(Owner decision 2026-10-22). Two paths produce one:
 
 - **Owner calibration.** The Owner states that the camera and the monitored
   server are in their normal position and asks for a calibration (the
@@ -46,7 +47,7 @@ from uuid import UUID, uuid4
 
 from app.detection.foundation import GrayFrame
 from app.logging import Event
-from .calibration import CalibrationArchive, CalibrationRecord, append_on
+from .calibration import CalibrationArchive, CalibrationRecord, append_on, provenance
 from .contracts import Calibration, Policy
 from .geometry import validate_polygon
 from .runtime import (
@@ -155,9 +156,12 @@ class TransientReferences:
 
     Holds the reference frame of the calibration in use (and of one being
     committed) per source; never written anywhere. A stored record is served
-    its frame only when source, profile, version and digest all match, so a
-    frame staged for a commit that then failed is never bound to the record
-    that is actually stored.
+    its in-memory calibration only when that calibration's whole frame-free
+    provenance is the record (identity, version, time, polygon, policy,
+    reader, reference stream, sample and geometry), so a frame staged for a
+    commit that then failed is never bound to the record that is actually
+    stored. This in-memory object identity is the integrity binding; no
+    digest of the frame is kept on disk.
     """
 
     def __init__(self):
@@ -188,12 +192,12 @@ class TransientReferences:
         with self._lock:
             self._frames.clear()
 
-    def __call__(self, record: CalibrationRecord) -> GrayFrame | None:
+    def __call__(self, record: CalibrationRecord) -> Calibration | None:
         with self._lock:
             calibration = self._frames.get(self._key(record))
-        if calibration is None or calibration.reference_sha256 != record.reference_sha256:
+        if calibration is None or provenance(calibration) != record:
             return None
-        return calibration.reference
+        return calibration
 
 
 class CalibrationOrigin(StrEnum):
