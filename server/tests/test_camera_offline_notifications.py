@@ -102,6 +102,16 @@ class MonitorFixture:
         return [event for event in self.sink.rows.values()
                 if event.kind is NotificationKind.CAMERA_OFFLINE]
 
+    def clear_sent(self):
+        # Wait for the delivery thread first: an outcome stored after the
+        # clear would bring an earlier row back.
+        for _ in range(1000):
+            self.service.poll()
+            if not self.service.pending_count:
+                break
+            time.sleep(0.01)
+        self.sink.rows.clear()
+
     def advance(self, seconds):
         self.clock.value += seconds
 
@@ -480,7 +490,7 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
         # is covered: one alert. A later episode reusing that name gets its
         # own ID.
         monitor = self.monitor()
-        self.sink.rows.clear()
+        self.clear_sent()
         self.online(monitor, self.sources[1])
         durable = uuid4()
         monitor.restore_pending([(durable, stored)])
@@ -496,7 +506,7 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
         self.assertIn(durable, {row.event_id for row in rows})
         # The flapping name is covered the same way.
         monitor = self.monitor()
-        self.sink.rows.clear()
+        self.clear_sent()
         self.online(monitor)
         durable = uuid4()
         monitor.restore_pending([(durable, stored)])
@@ -602,6 +612,110 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
     def test_an_unsent_restored_name_does_not_cover_a_later_outage(self):
         with self.assertLogs("app.monitoring.cameras", level="WARNING"):
             self.later_outage_reusing_a_restored_name(sent_first=False)
+
+    def test_an_initial_episode_recovered_before_the_drain_keeps_its_name(self):
+        # Issue #342 D: named on the first running tick (`name_initial`),
+        # it reached the threshold and recovered before the drain; the live
+        # name has moved with the new frame. It is matched by the name kept.
+        pending, stored, moved = uuid4(), AT - timedelta(minutes=10), uuid4()
+        rows = {pending: stored}
+
+        def run(rows, restore):
+            self.clear_sent()
+            monitor = self.monitor()
+            self.online(monitor, self.sources[1])
+            monitor.restore_window([], monotonic=self.clock.value)
+            if restore:
+                monitor.restore_pending([(pending, stored)])
+            monitor.name_initial(lambda source: pending)
+            self.assertEqual(pending, monitor._sources[self.sources[0]].episode.name)
+            self.assertIsNone(monitor._sources[self.sources[1]].episode)
+            self.advance(310)
+            monitor.health_sink(event(self.sources[0], CameraState.ONLINE))
+            for _ in range(2):
+                self.drain(monitor, durable_id=lambda source: moved,
+                           known=lambda value: rows.get(value, False))
+                self.advance(3600)
+            return [(row.event_id, row.at) for row in self.sent()]
+
+        # A restored row: covered by its resend, one notification.
+        self.assertEqual([(pending, stored)], run(rows, restore=True))
+        # Left out of the restore (beyond the cap): sent again by name.
+        self.assertEqual([(pending, stored)], run(rows, restore=False))
+        # A final row: the earlier process notified this outage.
+        self.assertEqual([], run({pending: True}, restore=False))
+        # No row: a per-process ID as before (never the kept name).
+        sent = run({}, restore=False)
+        self.assertEqual(1, len(sent))
+        self.assertNotIn(sent[0][0], {pending, moved})
+
+    def test_name_initial_names_only_an_initial_outage_in_progress(self):
+        monitor = self.monitor()
+        self.online(monitor, self.sources[1])
+        calls = []
+
+        def durable(source):
+            calls.append(source)
+            if source == self.sources[0]:
+                raise RuntimeError("synthetic database error")
+            return uuid4()
+
+        monitor.name_initial(durable)
+        monitor.name_initial(None)
+        self.assertEqual([self.sources[0]], calls)
+        self.assertIsNone(monitor._sources[self.sources[0]].episode.name)
+
+    def initial_sent_before_running(self, *, refused):
+        # Issue #342 E: the runtime was not RUNNING for the threshold (no
+        # names without storage), so the initial outage was notified under a
+        # per-process ID (or its submission was refused). The first running
+        # tick restores the pending row P of the same outage and names the
+        # episode P: P's resend is not sent (the Owner already has this
+        # process's notification), or the refused one is named and covered.
+        monitor = self.monitor()
+        self.online(monitor, self.sources[1])
+        self.advance(300)
+        if refused:
+            self.service.close()
+        self.drain(monitor)
+        pending, stored = uuid4(), AT - timedelta(minutes=10)
+        if refused:
+            self.assertEqual([], self.sent())
+            self.service = NotificationService(
+                self.sink, SlackDelivery(endpoint(), opener=self.transport))
+            self.addCleanup(self.service.close)
+        else:
+            self.assertEqual(1, len(self.sent()))
+        monitor.restore_window([], monotonic=self.clock.value)
+        monitor.restore_pending([(pending, stored)])
+        monitor.name_initial(lambda source: pending)
+        for _ in range(3):
+            self.drain(monitor, durable_id=lambda source: pending,
+                       known=lambda value: stored if value == pending else False)
+            self.advance(3600)
+        return monitor, pending
+
+    def test_an_initial_outage_sent_before_running_covers_its_restored_row(self):
+        monitor, pending = self.initial_sent_before_running(refused=False)
+        rows = self.sent()
+        self.assertEqual(1, len(rows))
+        self.assertNotEqual(pending, rows[0].event_id)
+        self.assertEqual((1, [], set()), (monitor.covered, monitor._resend, monitor._restored))
+        # A later outage that reuses the name (a refused last-frame write)
+        # is still notified, under a per-process ID.
+        source = self.sources[0]
+        monitor.health_sink(event(source, CameraState.ONLINE))
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(300)
+        self.drain(monitor, durable_id=lambda value: pending, known=lambda value: False)
+        ids = [row.event_id for row in self.sent()]
+        self.assertEqual(2, len(set(ids)))
+        self.assertNotIn(pending, ids)
+
+    def test_a_refused_initial_submission_is_covered_by_its_restored_row(self):
+        monitor, pending = self.initial_sent_before_running(refused=True)
+        self.assertEqual([pending], [row.event_id for row in self.sent()])
+        self.assertEqual(0, monitor.covered)
 
     def test_live_alerts_go_before_restored_rows(self):
         # PR #339 重要 3: an outage in progress is not held back behind an
@@ -783,7 +897,7 @@ class RuntimeSignalTests(MonitorFixture, unittest.TestCase):
         # cannot hide an outage the polled status shows.
         for state in (CameraState.OFFLINE, CameraState.DEGRADED, CameraState.MANUAL):
             with self.subTest(state=state):
-                self.sink.rows.clear()
+                self.clear_sent()
                 monitor = self.monitor()
                 self.online(monitor)
                 monitor.observe_runtime([self.status(self.sources[0], True, state)],
@@ -1159,6 +1273,129 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         self.run_for(monitor, 3600, step=600)
         self.assertEqual(1, len(self.sent()))
 
+    def test_an_ended_ratio_alert_is_dropped_when_the_hour_has_room_again(self):
+        # Issue #338 item 2 (Codex PR #335 P2): drains were delayed until
+        # both the quiet window and the hour had passed. The ended alert is
+        # dropped before the cap, as when the cap is still closed.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        second = self.sources[1]
+        self.off(monitor, second)
+        self.run_for(monitor, 300)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            for _ in range(2):
+                self.cycle(monitor)
+        self.assertIsNotNone(monitor._sources[self.sources[0]].flap)
+        self.advance(3700)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as dropped:
+            status = self.drain(monitor)
+        self.assertEqual(
+            [f"WARNING:app.monitoring.cameras:{Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED.value}"],
+            dropped.output)
+        self.assertEqual((1, 0), (monitor.dropped, status.flapping_sources))
+        self.assertIsNone(monitor._sources[self.sources[0]].flap)
+        self.assertEqual(1, len(self.sent()))
+        # Not sent: it opened no period, so later flapping is a new alert.
+        for _ in range(2):
+            self.cycle(monitor)
+        self.assertEqual(2, len(self.sent()))
+
+    def test_an_ended_refused_ratio_alert_is_dropped(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        self.service.close()
+        for _ in range(2):
+            self.cycle(monitor)
+        self.assertIsNotNone(monitor._sources[self.sources[0]].flap.attempt)
+        self.service = NotificationService(
+            self.sink, SlackDelivery(endpoint(), opener=self.transport))
+        self.addCleanup(self.service.close)
+        self.advance(900)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.drain(monitor)
+        self.assertEqual(([], 1), (self.sent(), monitor.dropped))
+
+    def restart_in_a_ratio_period(self, found, *, restore=False):
+        # Issue #338 item 1 (Codex PR #335 P2): an earlier process sent a
+        # ratio alert; the camera is still offline at the restart, so the
+        # initial episode reaches the threshold and the ratio rule is never
+        # evaluated. The continuous path finds the recent ratio alert once
+        # and restores the period, so the period still yields one
+        # continuous notification and later flapping episodes none.
+        monitor = self.monitor()
+        self.online(monitor, self.sources[1])
+        ratio, stored = uuid4(), AT - timedelta(minutes=8)
+        if restore:
+            monitor.restore_pending([(ratio, stored)])
+        calls = []
+
+        def flapping_id(source):
+            calls.append(source)
+            return ratio, {"final": True, "pending": stored, "none": False}[found]
+
+        self.advance(300)
+        self.drain(monitor, flapping_id=flapping_id)
+        for _ in range(2):
+            self.on(monitor)
+            self.advance(2)
+            self.off(monitor)
+            self.advance(300)
+            self.drain(monitor, flapping_id=flapping_id)
+        return monitor, ratio, stored, calls
+
+    def test_a_restart_in_a_ratio_period_keeps_the_period(self):
+        monitor, ratio, _stored, calls = self.restart_in_a_ratio_period("final")
+        rows = self.sent()
+        self.assertEqual(1, len(rows))
+        self.assertNotEqual(ratio, rows[0].event_id)
+        self.assertEqual([self.sources[0]], calls)
+        self.assertEqual(1, self.drain(monitor).flapping_sources)
+
+    def test_a_pending_ratio_row_found_from_the_continuous_path(self):
+        # Sent again under its ID and time (found only by name), or covered
+        # by its restored resend; the episode is the period's continuous one.
+        for restore in (False, True):
+            with self.subTest(restore=restore):
+                self.clear_sent()
+                _monitor, ratio, stored, _calls = self.restart_in_a_ratio_period(
+                    "pending", restore=restore)
+                rows = self.sent()
+                self.assertEqual(2, len(rows))
+                self.assertEqual([(ratio, stored)],
+                                 [(row.event_id, row.at) for row in rows if row.event_id == ratio])
+
+    def test_without_a_recent_ratio_row_the_continuous_rule_is_unchanged(self):
+        monitor, _ratio, _stored, calls = self.restart_in_a_ratio_period("none")
+        # A period opened by the continuous notification: each outage after
+        # a short online that lasts the threshold is its own episode.
+        self.assertEqual(3, len(self.sent()))
+        self.assertEqual(0, self.drain(monitor).flapping_sources)
+        # Looked up once: the period it opened is known from then on.
+        self.assertEqual([self.sources[0]], calls)
+
+    def test_the_recent_ratio_row_is_looked_up_once_per_episode(self):
+        # Held by the cap, the episode stays due without a period: the
+        # lookup is not repeated on every drain.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor, self.sources[1])
+        monitor.restore_window([(uuid4(), 60.0)], monotonic=self.clock.value)
+        calls = []
+
+        def flapping_id(source):
+            calls.append(source)
+            return uuid4(), False
+
+        self.advance(300)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            for _ in range(3):
+                self.drain(monitor, flapping_id=flapping_id)
+                self.advance(60)
+        self.assertEqual([self.sources[0]], calls)
+        self.advance(3600)
+        self.drain(monitor, flapping_id=flapping_id)
+        self.assertEqual(1, len(self.sent()))
+        self.assertEqual([self.sources[0]], calls)
+
     def test_a_ratio_alert_an_earlier_process_sent_is_not_sent_again(self):
         monitor = self.monitor()
         self.online(monitor)
@@ -1211,7 +1448,7 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         stored = AT - timedelta(minutes=5)
         for notified, expected in ((stored, [(stored, True)]), (True, [])):
             with self.subTest(notified=notified):
-                self.sink.rows.clear()
+                self.clear_sent()
                 monitor = self.monitor()
                 self.online(monitor)
                 name = uuid4()
@@ -1232,7 +1469,7 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
 
         for flapping_id in (broken, lambda source: "x", lambda source: (uuid4(), 1)):
             with self.subTest(flapping_id=flapping_id):
-                self.sink.rows.clear()
+                self.clear_sent()
                 monitor = self.monitor()
                 self.online(monitor)
                 for _ in range(2):
@@ -1749,20 +1986,100 @@ class LifespanTests(RuntimeFixture):
         self.assertEqual(["pending", "pending"], [self.delivery(old), self.delivery(refreshed)])
 
     async def test_a_pending_row_with_an_unreadable_time(self):
-        # Sent with the current time when accepted within a day; the stored
-        # row keeps its own text. Not when accepted earlier.
+        # Issue #342: skipped like a row whose ID cannot be read, however
+        # recently it was accepted (`accepted_at` moves with every resend,
+        # so it cannot bound the row to a day). A naive time is unreadable.
         recent = self.stored_row(confirmed=True, delivery="pending", age=0, at="not a time",
                                  accepted_age=7200)
         stale = self.stored_row(confirmed=True, delivery="pending", age=0, at="not a time",
                                 accepted_age=25 * 3600)
+        naive = self.stored_row(confirmed=True, delivery="pending", age=0,
+                                at=(self.clock.now - timedelta(hours=1)).replace(
+                                    tzinfo=None).isoformat())
         application = self.uvc_application()
         async with asyncio.timeout(60), application.router.lifespan_context(application):
             runtime = application.state.monitoring
             await self.bring_online(application)
             await self.tick(runtime)
-        self.assertEqual([ALERT], self.slack_texts())
-        self.assertEqual(["sent", "pending"], [self.delivery(recent), self.delivery(stale)])
+            self.assertEqual([], application.state.camera_offline._resend)
+        self.assertEqual([], self.slack_texts())
+        self.assertEqual(["pending"] * 3,
+                         [self.delivery(row) for row in (recent, stale, naive)])
         self.assertEqual("not a time", self.stored_at(recent))
+
+    async def test_a_pending_chain_row_is_aged_by_its_event_time(self):
+        # Issue #342: on the name path a `pending` row counts as old once its
+        # event is 24 h old, although a resend just wrote `accepted_at`
+        # again; the chain moves to the next name, so a restart loop during
+        # one long outage does not resend that row for ever. A final row is
+        # still aged by its acceptance, an unreadable pending time is old.
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+
+            def name():
+                return runtime.call(runtime._camera_offline_event, self.source.id)
+
+            self.stored_row(confirmed=True, delivery="pending", age=25 * 3600,
+                            accepted_age=600, event_id=self.chain_name())
+            self.assertEqual(self.chain_name(1), await name())
+            self.stored_row(confirmed=True, delivery="pending", age=23 * 3600,
+                            accepted_age=600, event_id=self.chain_name(1))
+            self.assertEqual(self.chain_name(1), await name())
+            self.delete_rows()
+            self.stored_row(confirmed=True, delivery="pending", age=0, at="not a time",
+                            accepted_age=600, event_id=self.chain_name())
+            self.assertEqual(self.chain_name(1), await name())
+            self.delete_rows()
+            self.stored_row(confirmed=True, delivery="sent", age=25 * 3600,
+                            accepted_age=600, event_id=self.chain_name())
+            self.assertEqual(self.chain_name(), await name())
+        # The whole path: the camera is still offline at a restart and the
+        # outage's pending alert is more than a day old by its event time.
+        self.delete_rows()
+        old = self.stored_row(confirmed=True, delivery="pending", age=25 * 3600,
+                              accepted_age=7200, event_id=self.chain_name())
+        self.discovery.devices = []
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.tick(runtime)
+            self.assertEqual([], self.slack_texts())
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+            self.clock.advance(timedelta(hours=2))
+            await self.tick(runtime)
+        self.assertEqual([ALERT], self.slack_texts())
+        self.assertEqual("pending", self.delivery(old))
+        self.assertEqual("sent", self.delivery(self.chain_name(1)))
+
+    async def test_an_initial_outage_that_recovers_before_it_is_named_is_sent_once(self):
+        # Issue #342 D: the camera is still offline at the restart and the
+        # outage's alert is still `pending`. The first running tick resends
+        # it and names the initial episode; the episode reaches the
+        # threshold and the camera is back (a new last-frame time) before
+        # the next tick. It is covered by the resend, not sent again.
+        pending = self.stored_row(confirmed=True, delivery="pending", age=7200,
+                                  event_id=self.chain_name())
+        self.discovery.devices = []
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.tick(runtime)
+            self.assertEqual([ALERT], self.slack_texts())
+            monitor = application.state.camera_offline
+            self.assertEqual(pending, monitor._sources[self.source.id].episode.name)
+            self.clock.advance(timedelta(seconds=301))
+            self.discovery.devices = [self.camera]
+            await self.bring_online(application)
+            self.assertTrue(await self.until(lambda: self.last_seen() is not None))
+            self.assertNotEqual(pending, await runtime.call(runtime._camera_offline_event,
+                                                            self.source.id))
+            await self.tick(runtime)
+            self.clock.advance(timedelta(hours=2))
+            await self.tick(runtime)
+        self.assertEqual([ALERT], self.slack_texts())
+        self.assertEqual([(1, "sent")], self.offline_rows())
 
     async def test_more_pending_alerts_than_an_hour_allows(self):
         # At most `hourly_limit` are taken (newest event first); the older

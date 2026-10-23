@@ -785,6 +785,10 @@ class MonitoringRuntime:
                     monotonic=self.dependencies.monotonic())
                 rows, unrestored = self._camera_pending_rows(monitor.hourly_limit, now)
                 monitor.restore_pending(rows, unrestored=unrestored)
+                # Issue #342 D/E: each source's initial episode is named once
+                # now, so it still matches a restored row of its outage after
+                # it recovered, or after it was sent while not running.
+                monitor.name_initial(self._camera_offline_event)
                 self._camera_window_restored = True
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
                                    monotonic=self.dependencies.monotonic(),
@@ -858,6 +862,13 @@ class MonitoringRuntime:
         chain (``:repeat:1``, ``:repeat:2`` …) is then used, so a restart
         within 24 h of that notification still finds it and sends nothing
         twice, while the outage is notified again (under the hourly cap).
+
+        Issue #342: a ``pending`` row is aged by its event time ``at``, as
+        ``_camera_pending_rows`` does. A resend under the same ID writes
+        ``accepted_at`` again, so a restart loop during one long outage
+        would otherwise keep resending that row past the day; with ``at``
+        it is superseded by the next name once its event is 24 h old. An
+        unreadable time counts as old.
         """
         row = self._connection.execute(
             "SELECT last_seen_at FROM camera_sources WHERE id=?", (str(source_id),)).fetchone()
@@ -868,12 +879,13 @@ class MonitoringRuntime:
         for repeat in range(CAMERA_OFFLINE_RENOTIFY_CHAIN):
             event_id = uuid5(EVENT_NAMESPACE, base if not repeat else f"{base}:repeat:{repeat}")
             stored = self._connection.execute(
-                "SELECT COALESCE(accepted_at, at) FROM notification_events WHERE event_id=?",
-                (str(event_id),)).fetchone()
+                "SELECT COALESCE(accepted_at, at), at, delivery FROM notification_events "
+                "WHERE event_id=?", (str(event_id),)).fetchone()
             if stored is None:
                 return event_id
+            stamp = stored[1] if stored[2] == DeliveryResult.PENDING.value else stored[0]
             try:
-                age = (now - datetime.fromisoformat(stored[0])).total_seconds()
+                age = (now - datetime.fromisoformat(stamp)).total_seconds()
             except (TypeError, ValueError):
                 # Unreadable: treated as old, so an outage is never hidden.
                 age = math.inf
@@ -914,34 +926,26 @@ class MonitoringRuntime:
         Rows are taken newest first by that time, at most ``limit``;
         ``unrestored`` counts the older ones left out. An older row is not
         resent: the outage it reported is named anew after a day. A row whose
-        ID cannot be read is skipped; one whose time cannot be read counts as
-        recent only when it was accepted within 24 h and is sent with ``now``
-        (the stored row keeps its own time).
+        ID or event time cannot be read is skipped (Issue #342: its age
+        cannot be bounded by the event time, and ``accepted_at`` moves with
+        every resend).
         """
         horizon = timedelta(seconds=CAMERA_OFFLINE_RENOTIFY_SECONDS)
         cursor = self._connection.execute(
-            "SELECT event_id, at, COALESCE(accepted_at, at) FROM notification_events "
+            "SELECT event_id, at FROM notification_events "
             "WHERE kind=? AND confirmed=1 AND delivery=?",
             (NotificationKind.CAMERA_OFFLINE.value, DeliveryResult.PENDING.value))
         found = []
         try:
-            for event_id, at, accepted in cursor:
+            for event_id, at in cursor:
                 try:
                     event = UUID(event_id)
-                except (TypeError, ValueError, AttributeError):
-                    continue
-                try:
                     stamp = datetime.fromisoformat(at)
                     if stamp.tzinfo is None:
                         raise ValueError
-                    recent = now - stamp < horizon
-                except (TypeError, ValueError):
-                    try:
-                        recent = now - datetime.fromisoformat(accepted) < horizon
-                    except (TypeError, ValueError):
-                        recent = False
-                    stamp = now
-                if recent:
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if now - stamp < horizon:
                     found.append((event, stamp))
         finally:
             cursor.close()

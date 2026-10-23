@@ -46,9 +46,13 @@ that finds the same camera still offline therefore computes the same ID, finds
 the row (``known``) and does not notify the same outage again. A row of that
 name accepted more than 24 h earlier no longer counts (Owner decision
 2026-10-22): the runtime then names the outage with the next name of a
-deterministic chain and it is notified again. Without
-storage, or for an episode that already recovered, the ID is per process
-(never a missed notification, at worst one repeat after a restart).
+deterministic chain and it is notified again; a ``pending`` row is aged by
+its event time instead (a resend writes its acceptance again, Issue #342).
+Without storage, or for an episode that already recovered, the ID is per
+process (never a missed notification, at worst one repeat after a restart),
+except each source's initial episode: its name is resolved once on the first
+running tick while it is in progress (``name_initial``) and kept, so it still
+matches its row after it recovered (Issue #342 D).
 
 Uncertain deliveries (Issue #336): only a final ``sent`` / ``failed`` /
 ``disabled`` row counts as notified. A row still ``pending`` is a delivery an
@@ -67,7 +71,12 @@ later outage that reuses a restored name gets a per-process ID; a pending row fo
 one found by name, if the earlier POST did reach Slack the Owner sees the
 alert twice, never not at all. A pending row beyond ``hourly_limit`` that is
 left out of the restore (``unrestored``) and that no outage in progress maps
-to by name (its outage recovered) is not sent again.
+to by name (its outage recovered) is not sent again. An initial episode this
+process already notified under a per-process ID while the runtime was not
+running (no names without storage) is matched by the name resolved on the
+first running tick: the restored row of that name is not sent again
+(``covered``), it stays ``pending`` and keeps its slot (Issue #342 E; see
+``name_initial`` for the one later resend it may still get).
 
 Cap: at most ``hourly_limit`` notifications per rolling hour for all sources
 together, continued across a restart from the confirmed ``camera_offline``
@@ -106,8 +115,18 @@ that bin's not-online seconds, never fall short of it. A ratio alert is named
 after the source and the wall-clock window bucket of its trigger
 (``flapping_id``), so a restarted process that triggers again within a window
 of a stored alert of that source sends nothing twice. A ratio alert held back
-by the cap is sent when the hour allows while its period is still open and
-dropped (logged) once the period closed.
+by the cap is sent when the hour allows while its period is still open. Once
+its period closed it is dropped (logged) before the cap is consulted, also
+when the hour has room again by the next drain (Issue #338 item 2): a ratio
+alert exists only from the drain that triggers it, so an ended one was held
+or refused for a whole quiet window. After a restart the in-memory period is
+gone; a continuous episode that is due while its source has no period looks
+up the source's recent ratio alert once (``flapping_id``) and, when an
+earlier process stored one within the window, restores the period as
+ratio-opened with this episode as its flapping episode (Issue #338 item 1):
+the episode is still notified once (whether the stopped process already sent
+the period's continuous notification is not stored) and later flapping
+episodes of the period are not.
 
 Value-free: the notification is the fixed category ``camera_offline`` with no
 source name, role, UUID, device path, serial, reason or image (SPECIFICATION
@@ -189,6 +208,12 @@ class _Episode:
     # started, so the only one that can be an earlier process's outage that
     # a restored pending row reported (PR #339, Codex P2).
     initial: bool = False
+    # The initial episode's durable name, resolved once on the first running
+    # tick while it was still in progress (``name_initial``, Issue #342 D/E).
+    name: UUID | None = None
+    # The recent ratio alert of the source was looked up once for this
+    # episode from the continuous path (Issue #338 item 1).
+    ratio_checked: bool = False
 
     def qualifies(self, now: float, after: float) -> bool:
         end = self.recovered if self.recovered is not None else now
@@ -206,6 +231,9 @@ class _Flap:
     attempt: tuple[datetime, UUID] | None = None
     # The period closed before the alert was notified.
     ended: bool = False
+    # ``(event ID, notified)`` of an earlier process's ratio alert found from
+    # the continuous path (Issue #338 item 1): the name is not looked up again.
+    name: tuple[UUID, bool | datetime] | None = None
 
 
 @dataclass
@@ -406,6 +434,9 @@ class CameraOfflineMonitor:
         self.dropped = 0
         # Pending rows left out of ``restore_pending`` (beyond the cap).
         self.unrestored = 0
+        # Restored rows not sent again because this process had already
+        # notified the same outage (``name_initial``, Issue #342 E).
+        self.covered = 0
 
     @property
     def source_ids(self) -> tuple[UUID, ...]:
@@ -611,6 +642,10 @@ class CameraOfflineMonitor:
         is not sent again. They are counted in ``unrestored`` (not
         ``dropped``) and logged once as
         ``camera_offline_notification_unrestored``.
+
+        The runtime calls ``name_initial`` right after this, so each
+        source's initial episode is matched to these rows by name even once
+        it recovered or after it was sent while not running (Issue #342).
         """
         rows = tuple(rows)
         if (len(rows) > self.hourly_limit or type(unrestored) is not int or unrestored < 0
@@ -627,6 +662,61 @@ class CameraOfflineMonitor:
         if unrestored:
             self.unrestored += unrestored
             logging.getLogger(__name__).warning(Event.CAMERA_OFFLINE_NOTIFICATION_UNRESTORED)
+
+    def name_initial(self, durable_id: Callable[[UUID], UUID | None] | None) -> None:
+        """Resolve each source's initial-episode durable name once (Issue #342 D/E).
+
+        The runtime calls this on the first running tick, right after
+        ``restore_pending``. A source whose initial episode (in progress
+        since this process started) is still in progress then gets its
+        durable name remembered, so the episode is matched to a restored
+        ``pending`` row of that name even when it is no longer named live:
+
+        - D: it reached the threshold and recovered before the drain that
+          would have named it. It is covered by the restored row's resend
+          (or, for a row found only by ``known``, settled or resent under
+          that name) instead of being sent again under a per-process ID.
+        - E: it was already sent under a per-process ID while the runtime
+          was not running (no names without storage). The restored row of
+          that name reported the same outage, so its resend is not sent:
+          the Owner already received this process's notification of it.
+          The row stays ``pending`` (there is no truthful final state to
+          write for a POST whose outcome is unknown); it keeps its slot of
+          the restored hour and a later restart within 24 h of its event
+          time may send it once more (SPECIFICATION §9). A per-process
+          submission of the episode the queue has not taken yet is
+          discarded and the episode is named, so the resend covers it.
+
+        A name that cannot be resolved (no registry row, a failing lookup)
+        leaves the episode as before. An episode that already recovered is
+        not named here: its last-frame time may have moved.
+        """
+        if durable_id is None:
+            return
+        with self._lock:
+            candidates = [(identity, source.episode) for identity, source in self._sources.items()
+                          if source.episode is not None and source.episode.initial
+                          and source.episode.recovered is None and source.episode.name is None]
+        names = [(identity, episode, self._durable(identity, durable_id))
+                 for identity, episode in candidates]
+        with self._lock:
+            for identity, episode, name in names:
+                if (name is None or self._sources[identity].episode is not episode
+                        or episode.recovered is not None):
+                    continue
+                episode.name = name
+                if name not in self._restored:
+                    continue
+                if episode.notified:
+                    # E: this process's own notification covered the outage.
+                    self._resend = [item for item in self._resend if item.event_id != name]
+                    self._restored.discard(name)
+                    self._used.add(name)
+                    self.covered += 1
+                elif episode.attempt is not None:
+                    # Never accepted (queue full or the write refused): it is
+                    # named on the next drain and covered by the resend.
+                    episode.attempt = None
 
     def _is_restored(self, event_id: UUID) -> bool:
         """Whether ``event_id`` is a restored row's ID, sent again or not."""
@@ -667,12 +757,16 @@ class CameraOfflineMonitor:
         then gives its stored time instead of ``True``, and the alert is
         submitted again under that ID and time; only ``True`` (a final
         ``sent`` / ``failed`` / ``disabled`` row) settles it as notified.
+        ``flapping_id`` is also asked once for a continuous episode that is
+        due while its source has no alerted period (Issue #338 item 1): a
+        stored ratio alert then restores that period.
         """
         now = monotonic
+        check = []
         with self._lock:
             stopped = self._stopped
             if not stopped:
-                for source in self._sources.values():
+                for identity, source in self._sources.items():
                     self._close_period(source, now)
                     source.down.trim(now)
                     if (source.period is None and source.flap is None
@@ -687,6 +781,38 @@ class CameraOfflineMonitor:
                         episode = source.episode
                         if episode is not None and episode.recovered is None:
                             episode.counted_from, episode.flapping = now, True
+                    episode = source.episode
+                    if (flapping_id is not None and source.period is None
+                            and source.flap is None and episode is not None
+                            and episode.recovered is None and not episode.notified
+                            and not episode.ratio_checked and episode.attempt is None
+                            and episode.qualifies(now, self.after)):
+                        episode.ratio_checked = True
+                        check.append((identity, episode))
+        # Issue #338 item 1 (Codex PR #335 P2): a continuous episode that is
+        # due keeps the ratio rule from evaluating its source, so a restart
+        # during a flapping period an earlier process's ratio alert opened
+        # would otherwise lose that period. Its recent ratio alert of the
+        # source is looked up once per episode, before the episode is named.
+        found = [(identity, episode, self._flapping_name(identity, flapping_id))
+                 for identity, episode in check]
+        with self._lock:
+            for identity, episode, (event_id, earlier) in found:
+                source = self._sources[identity]
+                if (stopped or event_id is None or earlier is False
+                        or source.period is not None or source.flap is not None
+                        or source.episode is not episode or episode.recovered is not None):
+                    continue
+                # Found: the period is restored as ratio-opened and this
+                # episode is its flapping episode. Its one continuous
+                # notification is still sent (whether the stopped process
+                # sent it is not stored); later flapping episodes are not.
+                # The found alert is settled through the loop below (final:
+                # nothing; pending: covered by a restored resend or sent
+                # again under its ID and time).
+                source.period, source.continuous_sent = _BY_RATIO, False
+                source.flap = _Flap(now, name=(event_id, earlier))
+                episode.flapping = True
             # Live items first, by their start; restored rows after them, by
             # their stored time, so an outage in progress is never held back
             # behind an earlier process's uncertain delivery (PR #339 重要 3).
@@ -699,8 +825,9 @@ class CameraOfflineMonitor:
         for identity, item in () if stopped else due:
             flap = isinstance(item, _Flap)
             resend = isinstance(item, _Resend)
-            # A restored row is never dropped: its source is not known.
-            ongoing = True if resend else not item.ended if flap else item.recovered is None
+            # A restored row is never dropped: its source is not known. An
+            # ended ratio alert is dropped below, before the cap.
+            ongoing = True if resend or flap else item.recovered is None
             with self._lock:
                 source = None if resend else self._sources[identity]
                 if (not flap and not resend and item.flapping and source.period == _BY_RATIO
@@ -709,6 +836,19 @@ class CameraOfflineMonitor:
                     # notification after its ratio alert (at most two).
                     self._finish(identity, item)
                     continue
+                if flap and item.ended:
+                    # Issue #338 item 2 (Codex PR #335 P2): the period
+                    # closed before its alert went out. A ratio alert exists
+                    # only from the drain that triggers it, so it ended only
+                    # after it was held by the cap or refused by the queue
+                    # for a whole quiet window: dropped whether or not the
+                    # hour has room by now (never a stale alert after a
+                    # delayed drain). Not sent: no alerted period.
+                    self._finish(identity, item, sent=False)
+                    self.dropped += 1
+                    logging.getLogger(__name__).warning(
+                        Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED)
+                    continue
             attempt, event_id = item.attempt, None
             if attempt is None:
                 # Named before the cap (PR #339 重要 1): an alert an earlier
@@ -716,10 +856,19 @@ class CameraOfflineMonitor:
                 # covers, is settled now whatever the hour allows, so it is
                 # never held, dropped or left claiming that row.
                 if flap:
-                    event_id, earlier = self._flapping_name(identity, flapping_id)
+                    event_id, earlier = item.name or self._flapping_name(identity, flapping_id)
                 else:
                     event_id = self._durable(identity, durable_id) if ongoing else None
                     earlier = False
+                    name = item.name
+                    if (name is not None and name != event_id and self._usable(name)
+                            and (self._is_restored(name)
+                                 or (event_id is None and self._known(name, known) is not False))):
+                        # Issue #342 D: the initial episode's name resolved on
+                        # the first running tick, used when the episode is no
+                        # longer named live (it recovered before this drain)
+                        # and its row exists, or when it is a restored row.
+                        event_id = name
                 if event_id is not None and self._is_restored(event_id):
                     if flap or item.initial:
                         # The earlier process's pending row of this name is
@@ -842,7 +991,7 @@ class CameraOfflineMonitor:
             return None, False
         if (type(value) is not tuple or len(value) != 2 or not isinstance(value[0], UUID)
                 or not (type(value[1]) is bool or _aware(value[1]))
-                or (value[0] in self._used and not self._is_restored(value[0]))):
+                or not self._usable(value[0])):
             return None, False
         return value
 
@@ -853,9 +1002,13 @@ class CameraOfflineMonitor:
             value = durable_id(identity)
         except Exception:
             return None
-        if not isinstance(value, UUID) or (value in self._used and not self._is_restored(value)):
+        if not isinstance(value, UUID) or not self._usable(value):
             return None
         return value
+
+    def _usable(self, event_id: UUID) -> bool:
+        """A durable name this process has not used, or a restored row's."""
+        return event_id not in self._used or self._is_restored(event_id)
 
     @staticmethod
     def _known(event_id, known) -> bool | datetime:
