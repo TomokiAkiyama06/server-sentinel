@@ -409,40 +409,66 @@ sudo systemctl start server-sentinel.service
   - `approved`: an Owner approval is stored and no service session holds it
     (the usual state with the service stopped; the approval applies on start);
   - `approved_in_use`: the approval is stored, the deployment lists the
-    source, it carries an active-session marker and a process of the service
-    account holds the database: most likely the running service started its
-    session for the source, so it is usually *not* a lost approval. The
-    command cannot prove that the marker belongs to the current run, though
-    (see the limits below), and it says nothing about capture: whether the
-    camera is actually online is the source's health;
+    source, and its active-session marker is one the running service issued
+    in its current run and still holds (Issue #317): the service's session
+    ledger `state/uvc-session-ledger.json` lists it, and the process that
+    wrote that ledger is still alive in this boot (same boot id, PID and
+    process start time), runs as the service account and holds the
+    database. It is *not* a lost approval. It says nothing about capture:
+    whether the camera is actually online is the source's health;
   - `approval_required`: the source needs an Owner approval before the
     service binds a camera: it was never approved (only the service's
     candidate is stored), the service latched it
     `manual_intervention_required` (for example an ambiguous reconnect of an
     identical camera without a unique serial), or an active-session marker is
-    left that the running service cannot have armed: no process holds the
-    database, or the source is not in `local_uvc.source_ids` (the service
-    starts sessions only for listed sources). Such a marker is a session the
-    service did not end (a crash); the next start that includes the source
-    requires the approval again. Approve it with `approve` (the service
-    stopped).
-  Limits of `approved_in_use`: it is told apart from a left marker with the
-  same database-holder check as `service_running`, so it only shows that
-  *some* process of the service account holds the database, not that the
-  service started this source's session in its current run. After a crash,
-  a restarted service whose local UVC capture has not started (its storage
-  admission refused, its start failed, or it is waiting to retry the start)
-  still holds the database, and the left marker then shows `approved_in_use`
-  although the source will need approval once capture does start; another
-  local admin command still holding the database also counts. Confirm with
-  the service's runtime state and the source's health (an approval-required
-  source reports `manual_intervention_required` / `owner_approval_required`)
-  rather than with `sources` alone. A listing taken while the service is
-  starting or stopping is not definitive either: list again once it is
-  stable, and when another admin command held the database, once it has
-  finished. A same-account process that cannot be inspected refuses the
-  listing (`service_state_unavailable`) instead of guessing; the check runs
-  only when an approved, listed source carries a marker.
+    left that the running service did not issue in its current run: the
+    session ledger does not list it (no service process, a ledger left by an
+    earlier process or boot, or a restarted service that has not started
+    this source's session yet: its storage admission refused, its start
+    failed, or it is waiting to retry the start), or the source is not in
+    `local_uvc.source_ids` (the service starts sessions only for listed
+    sources). Such a marker is a session the service did not end (a crash);
+    the next start that includes the source requires the approval again.
+    Approve it with `approve` (the service stopped).
+  How `approved_in_use` is decided (Issue #317): the service publishes the
+  SHA-256 digest of each marker to the ledger before committing the marker,
+  and withdraws it before releasing the marker; the ledger holds digests
+  only, never a marker, plus the writing process's boot id, PID and start
+  time. A ledger left by a crashed or stopped process is ignored, because
+  its writer no longer exists (a PID is not reused with the same start time
+  within one boot, and a reboot changes the boot id), so neither another
+  local admin command holding the database nor a restarted service that has
+  not started capture yet makes a left marker look in use. Limits: the
+  listing is a snapshot (the approvals are read first, the ledger after
+  them), so one taken while the service is starting or stopping, or while
+  a session is being started or ended, may already be out of date: list
+  again once it is stable. A ledger that cannot be read, or that is not a
+  regular `0600` file of the service account with one link, or that is
+  malformed, and a boot id or process state that cannot be read, refuse
+  the listing (`service_state_unavailable`) instead of guessing; the check
+  runs only when an approved, listed source carries a marker. The ledger
+  is best effort (Owner decision 2026-10-23): a marker the service cannot
+  publish to it (for example inodes exhausted, or `/proc` unreadable) never
+  stops the session or its recording; the service logs
+  `local_uvc_session_ledger_unpublished` (no path or marker), keeps the
+  digest and retries the publication from the source polls (at most every
+  30 s, under the storage admission; `local_uvc_session_ledger_republished`
+  once it succeeds). Until then the display may show that running source as
+  `approval_required`. The ledger is made to never show a false
+  `approved_in_use`: an ended session's digest is dropped from the
+  service's entries before the release's storage admission, a withdrawal
+  that cannot be published or is not admitted (a storage hard stop)
+  removes the ledger file instead (no space needed), and a session that
+  could not be built after its marker was committed is withdrawn the same
+  way. What remains is a release whose withdrawal can neither be published
+  nor the file removed (for example a read-only state filesystem) while
+  the service keeps running. When
+  `sources` shows `approval_required` for a source whose health is
+  `online`, check the service log for that event before stopping the
+  service to reapprove: the running session itself is unaffected. The
+  ledger holds at most 64 sources (the reader's bound).
+  The same `/proc` limits as `service_running` apply (run the command in
+  the environment the service runs in).
 - `approve` rescans and binds exactly that camera. It refuses a camera without
   a serial (`camera_without_serial`) and one whose serial is not unique
   (`camera_serial_not_unique`): stored evidence cannot tell such a camera from
@@ -922,6 +948,7 @@ database-owning process may load the CA private key.
 | CA directory, for example `/var/lib/serversentinel-ca` | `serversentinel-ca` | `0700` | `ca-key.pem` (the only copy of the CA private key), `ca-certificate.pem`, `issuance-log.jsonl`, each `0600` |
 | Main listener directory | service account | `0700` | `main-server-key.pem`, `main-server-certificate.pem`, `deployment-ca-certificate.pem` (public CA copy), each `0600` |
 | `<runtime_root>/state/state.sqlite3` | service account | `0600` in `0700` | application database, including the pairing ledger |
+| `<runtime_root>/state/uvc-session-ledger.json` | service account | `0600` in `0700`, one link | UVC session ledger (Issue #317): SHA-256 digests of the session markers the running service holds, plus its boot id, PID and start time; written by the service, read only by `admin_cli sources` |
 
 Create the CA account once as a static system account with no login shell and
 no home (not a systemd `DynamicUser`, whose UID would change), and the two

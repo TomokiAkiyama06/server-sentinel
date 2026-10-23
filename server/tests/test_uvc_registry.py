@@ -2,6 +2,7 @@ from contextlib import closing, contextmanager
 from dataclasses import asdict, replace
 from itertools import count
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -20,6 +21,8 @@ from app.cameras.uvc.capture import VideoProfile as CaptureVideo
 from app.cameras.uvc.identity import DeviceEvidence
 from app.cameras.uvc.persistence import ApprovalConflictError, ApprovalStorageError
 from app.cameras.uvc.registry_adapter import LocalUvcAdapter
+from app.cameras.uvc.session_ledger import ledger_path, marker_digest, read_ledger
+from app.media.recording.model import RecordingError
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -492,6 +495,10 @@ class UvcRegistryTests(UvcRegistryFixture):
     def test_clean_shutdown_closes_capture_without_reporting_unplug(self):
         self.adapter._approve_live_session(self.source.id, self.camera)
         self.assertTrue(self.adapter.poll_source(self.source.id))
+        # Issue #317: the session's marker is in this process's ledger while held.
+        token = self.adapter.store.load(self.source.id).session_token
+        ledger = read_ledger(ledger_path(self.database.path), account=os.geteuid())
+        self.assertIn(marker_digest(token), ledger.sessions[str(self.source.id)])
         capture = self.adapter.sessions[self.source.id].capture
         self.events.clear()
         self.adapter.close()
@@ -499,6 +506,65 @@ class UvcRegistryTests(UvcRegistryFixture):
         self.assertEqual([event.reason for event in self.events], ["video_capture_closed"])
         self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.OFFLINE)
         self.assertIsNone(self.adapter.store.load(self.source.id).session_token)
+        ledger = read_ledger(ledger_path(self.database.path), account=os.geteuid())
+        self.assertNotIn(str(self.source.id), ledger.sessions)
+
+    def approve_offline(self):
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self.adapter.store.approve_on(connection, self.source.id, self.camera,
+                                          serial_ambiguous=False)
+            connection.execute("COMMIT")
+
+    def ledger_sessions(self):
+        ledger = read_ledger(ledger_path(self.database.path), account=os.geteuid())
+        return {} if ledger is None else ledger.sessions
+
+    def test_a_capture_session_that_cannot_be_built_withdraws_its_marker(self):
+        # Issue #317 (review of bfac895): the marker is committed, then the
+        # capture session cannot be built; no session runs, so the ledger
+        # must not vouch for the marker (it stays durable, as after a crash).
+        self.approve_offline()
+        with patch("app.cameras.uvc.registry_adapter.CaptureSession",
+                   side_effect=ValueError("synthetic")), self.assertRaises(ValueError):
+            self.adapter.poll_source(self.source.id)
+        self.assertIsNotNone(self.adapter.store.load(self.source.id).session_token)
+        self.assertNotIn(str(self.source.id), self.ledger_sessions())
+
+    def test_a_poll_republishes_a_ledger_that_could_not_be_written(self):
+        self.approve_offline()
+        with patch("app.cameras.uvc.session_ledger.os.replace", side_effect=OSError(28, "synthetic")), \
+                self.assertLogs("app.cameras.uvc.persistence", "WARNING"):
+            self.adapter.poll_source(self.source.id)
+        token = self.adapter.store.load(self.source.id).session_token
+        self.assertEqual({}, self.ledger_sessions())
+        self.adapter.poll_source(self.source.id)
+        self.assertIn(marker_digest(token), self.ledger_sessions()[str(self.source.id)])
+
+    def test_a_ledger_retry_the_storage_admission_refuses_never_stops_the_poll(self):
+        refused = {"on": False}
+
+        @contextmanager
+        def reservation():
+            if refused["on"]:
+                raise RecordingError("STORAGE_HARD_STOP")
+            yield
+        self.adapter.store.reservation = reservation
+        # Reopened before the fixture's clean close releases the marker.
+        self.addCleanup(refused.__setitem__, "on", False)
+        self.approve_offline()
+        with patch("app.cameras.uvc.session_ledger.os.replace", side_effect=OSError(28, "synthetic")), \
+                self.assertLogs("app.cameras.uvc.persistence", "WARNING"):
+            self.adapter.poll_source(self.source.id)
+        self.assertTrue(self.adapter.store.ledger.pending)
+        refused["on"] = True
+        session = self.adapter.sessions[self.source.id]
+        with patch.object(session, "step", wraps=session.step) as step, \
+                patch("app.cameras.uvc.session_ledger.os.replace") as replace:
+            self.adapter.poll_source(self.source.id)  # the refused retry does not escape
+        step.assert_called_once()
+        replace.assert_not_called()
+        self.assertTrue(self.adapter.store.ledger.pending)
 
     def test_clean_shutdown_of_disabled_source_does_not_report_unplug(self):
         self.adapter._approve_live_session(self.source.id, self.camera)

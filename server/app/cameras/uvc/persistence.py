@@ -3,10 +3,14 @@
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 import json
+import logging
 import sqlite3
 from uuid import uuid4
 
+from app.logging import Event
+
 from .identity import DeviceEvidence, same_physical_camera
+from .session_ledger import SessionLedgerError
 
 
 # Included by the append-only application migration after the registry schema.
@@ -66,13 +70,24 @@ class ApprovalStore:
     nothing is written; the already durable marker then conservatively
     requires Owner reapproval. The Owner approval itself is written on the
     audited transaction, which holds its own admission.
+
+    ``ledger`` (``SessionLedger``, Issue #317) records which markers this
+    process issued and still holds, so ``admin_cli sources`` can tell them
+    from markers a crashed run left. The service always passes it
+    (``LocalUvcAdapter``); a marker is published to it before it is
+    committed and withdrawn before it is released. The ledger is best effort
+    (Owner decision 2026-10-23): a marker it cannot publish never stops the
+    session; it is logged (``local_uvc_session_ledger_unpublished``), kept
+    for the ledger's next publication, and meanwhile ``sources`` shows the
+    source as ``approval_required``, never a false ``approved_in_use``.
     """
 
-    def __init__(self, database, *, reservation=None):
+    def __init__(self, database, *, reservation=None, ledger=None):
         if reservation is not None and not callable(reservation):
             raise ApprovalStorageError("UVC approval storage admission is invalid")
         self.database = database
         self.reservation = reservation
+        self.ledger = ledger
 
     def _admission(self):
         return self.reservation() if self.reservation is not None else nullcontext()
@@ -190,7 +205,18 @@ class ApprovalStore:
         marker makes the next controller require approval. A new session also
         fences old controllers from clearing its state with a stale shutdown.
         """
+        token = str(uuid4())
+        if self.ledger is not None:
+            # Published before the commit: while the database holds this
+            # marker, the ledger lists it (Issue #317). Best effort: a
+            # ledger that cannot be written only makes ``sources`` show
+            # ``approval_required`` until its next publication.
+            try:
+                self.ledger.issue(source_id, token)
+            except SessionLedgerError:
+                logging.getLogger(__name__).warning(Event.LOCAL_UVC_SESSION_LEDGER_UNPUBLISHED)
         connection = None
+        committed = False
         try:
             connection = self.database.connect()
             connection.execute("BEGIN IMMEDIATE")
@@ -206,7 +232,6 @@ class ApprovalStore:
             # successful approve() write may clear its approval-required flag.
             required = True if prior is None else prior.requires_approval or prior.session_token is not None
             ambiguous = False if prior is None else prior.serial_ambiguous
-            token = str(uuid4())
             connection.execute(
                 "INSERT INTO uvc_approvals "
                 "(source_id,evidence,requires_approval,session_token,serial_ambiguous,explicit_binding) "
@@ -217,6 +242,7 @@ class ApprovalStore:
                 (str(source_id), json.dumps(asdict(approved), allow_nan=False), int(required), token, int(ambiguous)),
             )
             connection.commit()
+            committed = True
             return ApprovalState(approved, required, token, ambiguous, False)
         except (sqlite3.Error, ValueError, TypeError, KeyError):
             if connection is not None:
@@ -225,13 +251,73 @@ class ApprovalStore:
         finally:
             if connection is not None:
                 connection.close()
+            if not committed and self.ledger is not None:
+                self.ledger.withdraw(source_id, token)
 
     def save(self, source_id, approved, requires_approval, *, session_token, serial_ambiguous, release=False):
         if session_token is None:
             raise ApprovalStorageError("UVC approval session is not active")
-        with self._admission():
-            self._save(source_id, approved, requires_approval, session_token=session_token,
-                       serial_ambiguous=serial_ambiguous, release=release)
+        withdrawing = release and self.ledger is not None
+        if withdrawing:
+            # Withdrawn before the marker is cleared (Issue #317), and from
+            # this process's entries even before the storage admission: a
+            # release that then fails, or that the admission refuses (a
+            # storage hard stop), leaves a marker the next start requires
+            # approval for, and that is what ``sources`` shows meanwhile.
+            self.ledger.forget(source_id, session_token)
+        admitted = False
+        try:
+            with self._admission():
+                admitted = True
+                if withdrawing:
+                    self.ledger.withdraw(source_id, session_token)
+                self._save(source_id, approved, requires_approval, session_token=session_token,
+                           serial_ambiguous=serial_ambiguous, release=release)
+        except BaseException:
+            if withdrawing and not admitted:
+                # No write is admitted; removing the file needs no space.
+                self.ledger.discard()
+            raise
+
+    def withdraw_session(self, source_id, session_token):
+        """Withdraw a marker from the ledger whose session never ran (Issue #317).
+
+        For a controller or capture session that could not be built after
+        ``start_session``: the marker stays in the database (the next start
+        requires approval), so ``sources`` must not show it as in use.
+        Best effort; never raises.
+        """
+        if self.ledger is None or session_token is None:
+            return
+        try:
+            self.ledger.forget(source_id, session_token)
+            try:
+                with self._admission():
+                    self.ledger.withdraw(source_id, session_token)
+            except Exception:
+                self.ledger.discard()
+        except Exception:
+            pass
+
+    def retry_ledger(self, monotonic):
+        """Republish a ledger whose earlier publication failed (Issue #317).
+
+        Called on every source poll; it reads ``monotonic`` and writes only
+        while a publication is pending, at most every ``RETRY_SECONDS``,
+        under the storage admission. Never raises: the ledger only serves a
+        display.
+        """
+        ledger = self.ledger
+        if ledger is None or not ledger.pending:
+            return
+        try:
+            if not ledger.retry_due(monotonic()):
+                return
+            with self._admission():
+                if ledger.retry():
+                    logging.getLogger(__name__).info(Event.LOCAL_UVC_SESSION_LEDGER_REPUBLISHED)
+        except Exception:
+            pass
 
     def _save(self, source_id, approved, requires_approval, *, session_token, serial_ambiguous,
               release):
