@@ -228,6 +228,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
         camera_offline = CameraOfflineMonitor(
             local_uvc.source_ids, after_seconds=monitoring.camera_offline.after_seconds,
             hourly_limit=monitoring.camera_offline.hourly_limit,
+            flapping_window_seconds=monitoring.camera_offline.flapping_window_seconds,
+            flapping_offline_seconds=monitoring.camera_offline.flapping_offline_seconds,
             monotonic=dependencies.monotonic)
         monitoring_dependencies = replace(dependencies, camera_offline=camera_offline)
     # Built before the scene timeline, whose critical notification port
