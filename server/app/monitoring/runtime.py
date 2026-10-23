@@ -670,6 +670,17 @@ class MonitoringRuntime:
             healthy = True
         except RecordingError:
             healthy = False
+        # Issue #340 / Codex P1 on PR #344: a topology refusal seen only by an
+        # admission since the last healthy tick starts an episode too, even
+        # when the backing was restored before this check, and alerts once
+        # like any other mismatch. Consumed after `check` (which may set it
+        # again); refusals during an episode already alerted belong to it, so
+        # a healthy check then ends the episode as before. `take` must run
+        # first, on every tick: a flag raised during the episode is discarded
+        # here, never left for the tick after recovery to re-alert the ended
+        # episode (PR #344 review).
+        if self.filesystem.take_topology_refusal() and self._filesystem_ok:
+            healthy = False
         if not healthy and self._filesystem_ok:
             # One immediate alert per mismatch episode; recovery re-arms it.
             at = self.dependencies.utcnow()

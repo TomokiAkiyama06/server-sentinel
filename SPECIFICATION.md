@@ -1800,7 +1800,17 @@ attention notice is sent once per boot and device numbers (event ID from the
 kernel boot ID and the numbers; a restart in the same boot finds the row and
 sends nothing; without a readable boot ID once per process start). A changed
 major, a loop device or a device without a sysfs entry is
-`STORAGE_HARD_STOP` at every storage (re)open (Issue #321). A mismatch at startup leaves
+`STORAGE_HARD_STOP` at every storage (re)open (Issue #321) and, while the
+recorded numbers differ, on every storage sample: the sysfs topology
+(hardware-only backing) is walked again each time, so a live dm table reload
+or md member replacement onto loop/virtual backing that keeps the device
+number and mount refuses the next admission and raises the per-episode
+`recording_health_failure`; the refusal is not latched and a return to
+hardware-only backing admits again (Issue #340). A refusal seen only by an
+admission is kept as one value-free flag that the next tick consumes, so the
+episode alerts once even when restored before that tick; `recording_health`
+stays `failed` until the next daily self-test. Current numbers read no
+sysfs. A mismatch at startup leaves
 the runtime `failed`, refuses writes and still attempts the immediate Slack
 alert; the open is retried every 15 minutes against the same declared identity
 (never another directory), without repeating the alert, and a successful retry
