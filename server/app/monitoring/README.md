@@ -65,7 +65,15 @@ without it). Only a changed minor of the same kind of device is accepted: a
 changed major, a device that does not rest only on hardware disks (every
 leaf disk, through a partition's parent disk or dm/md `slaves/`, needs a
 sysfs `device` bus link; loop/nbd/zram lack it) or a device without a
-readable sysfs entry refuses (`renumbered_device_acceptable`). A failed startup open is
+readable sysfs entry refuses (`renumbered_device_acceptable`). While the
+numbers are stale this is judged on every storage sample, not only at open
+(Issue #340): a dm table reload or md member swap onto loop/virtual backing
+that keeps the number and mount is `STORAGE_HARD_STOP` (the per-episode
+filesystem alert) until the backing is hardware-only again; it is not
+latched. An admission-only refusal is kept as one flag
+(`take_topology_refusal`) that the next tick consumes, so that episode alerts
+once even when restored before the tick; `recording_health` stays failed
+until the next daily self-test. Current numbers read no sysfs. A failed startup open is
 retried every `retry_seconds` from the tick against the same declared identity;
 a failed database open (e.g. SQLite I/O error or permission change) takes the
 same alerting startup-failure path. Only the first failure of the episode alerts, and a successful retry runs the
