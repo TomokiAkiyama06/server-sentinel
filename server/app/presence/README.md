@@ -311,7 +311,11 @@ like a recording-health or integrity alert (Owner decision 2026-10-22, Issue
 - `CriticalTimelineRecorder` hands every confirmed observation whose record
   failed (anything but a contract error) to `UnrecordedCriticalAlerts`
   (`delivery.py`) before raising to the scene runtime's retry. A recorded one
-  is also handed over, as watched: until a successful dispatch step finds its
+  whose `notification` row is still `pending` / `unavailable` at the commit
+  of the same transaction (`PresenceService.record_critical()`) is also
+  handed over, as watched; an idempotent replay of an observation already
+  claimed or resolved is not, so a later refusal cannot resend an alert
+  already delivered. Until a successful dispatch step finds its
   `notification` row neither `pending` nor `unavailable` (claimed, or
   resolved), a failing dispatch step escalates it to an attempt. That covers
   an observation recorded just before the disk is removed (the claim is then
@@ -353,8 +357,11 @@ like a recording-health or integrity alert (Owner decision 2026-10-22, Issue
 - If the process ends after the attempt and before its outcome row was
   written, the next process cannot know about the attempt, and a recovered
   observation (one whose record reached the database just before the end) is
-  notified once more: that single duplicate is the accepted risk. Alerts still
-  queued and never submitted at shutdown are logged as
+  notified once more: that single duplicate is the accepted risk. The
+  shutdown settle drains the alerts both before and after its last dispatch
+  step, so watched records that step escalates (storage refused at exit) are
+  still attempted within the same settle bound. Alerts still queued and never
+  submitted at shutdown are logged as
   `unrecorded_critical_alerts_unsent` and are not kept across a restart.
 
 ### Entrance gate quality

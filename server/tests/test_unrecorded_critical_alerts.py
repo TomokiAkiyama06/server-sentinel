@@ -311,6 +311,40 @@ class ClaimRefusedTests(Unrecorded, unittest.TestCase):
         self.assertEqual("delivered", self.state(item.identifier))
         self.assertEqual(1, texts(transport).count(ALERT + "camera_tamper"))
 
+    def test_a_replay_of_an_already_delivered_record_is_not_watched(self):
+        # Codex P2 on dae0154d: an idempotent replay of an observation whose
+        # notification was already delivered has no unclaimed work, so a
+        # later hard stop with unreadable outcomes must not resend it.
+        transport = Transport()
+        service = self.notifications(transport)
+        timeline = self.timeline(service)
+        item = critical(CriticalKind.SERVER_MOVEMENT, at=datetime.now(timezone.utc))
+        timeline.recorder(item)
+        timeline.dispatch()
+        self.settle(service, transport, 1)
+        service.poll()
+        timeline.dispatch()
+        self.assertEqual("delivered", self.state(item.identifier))
+        self.assertEqual((), timeline.unrecorded.awaiting())
+        # The scene runtime hands the same observation over again.
+        timeline.recorder(item)
+        self.assertEqual((), timeline.unrecorded.awaiting())
+        self.refuse(True)
+        with self.assertRaises(Exception):
+            timeline.dispatch()
+        self.assertEqual(0, timeline.unrecorded.drain(at=NOW))
+        self.assertEqual(0, timeline.unrecorded.submitted)
+        self.assertEqual([ALERT + "server_movement"], texts(transport))
+
+    def test_a_replay_whose_notification_is_still_unclaimed_stays_watched(self):
+        service = self.notifications(Transport())
+        timeline = self.timeline(service)
+        item = critical(CriticalKind.CAMERA_TAMPER, at=datetime.now(timezone.utc))
+        timeline.recorder(item)
+        timeline.unrecorded.prune(timeline.unrecorded.awaiting(), ())
+        timeline.recorder(item)
+        self.assertEqual((item.identifier,), timeline.unrecorded.awaiting())
+
     def test_a_successful_step_stops_watching_and_overflow_is_counted(self):
         service = self.notifications(Transport())
         adapter = self.adapter(service)

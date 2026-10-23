@@ -697,9 +697,11 @@ class CriticalTimelineRecorder:
     the failure is raised to the scene runtime's retry: the Main composition
     passes `UnrecordedCriticalAlerts.refused`, which only queues the event ID
     and fixed kind for a Slack attempt and never blocks or raises here.
-    ``recorded(identifier, kind)`` is told about every one recorded, so one
-    whose notification row storage keeps from being claimed (a refusal right
-    after the record) is attempted too (`UnrecordedCriticalAlerts.recorded`).
+    ``recorded(identifier, kind)`` is told about every one recorded whose
+    notification row is still unclaimed (`pending` / `unavailable`) at the
+    commit, so one storage keeps from being claimed (a refusal right after the
+    record) is attempted too (`UnrecordedCriticalAlerts.recorded`). An
+    idempotent replay of one already claimed or resolved is not handed over.
     """
 
     def __init__(self, outbox: TimelineOutbox, *, maximum_source_latency: timedelta,
@@ -734,7 +736,8 @@ class CriticalTimelineRecorder:
         self._quality(item)
         try:
             with self.outbox.receipt() as (received, trusted):
-                self.outbox.service.record(self.observation(item, received, trusted), restamped=True)
+                _, awaiting = self.outbox.service.record_critical(
+                    self.observation(item, received, trusted), restamped=True)
         except InvalidObservation:
             # A contract error or an identity conflict: not an alert waiting
             # for storage. (An unavailable database location is a plain
@@ -748,7 +751,11 @@ class CriticalTimelineRecorder:
                     # The hand-over must never change the recorder's failure.
                     pass
             raise
-        if self.recorded is not None:
+        if self.recorded is not None and awaiting:
+            # Only work no dispatch step has claimed yet: an idempotent replay
+            # of an observation whose notification was already submitted or
+            # resolved must not be watched, or a later refusal could resend
+            # an alert already delivered.
             try:
                 self.recorded(item.identifier, item.kind)
             except Exception:

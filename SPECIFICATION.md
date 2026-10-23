@@ -1180,10 +1180,11 @@ still attempted like a recording-health alert (Owner decision 2026-10-22,
 Issue #318, accepting the duplicate risk): the recorder hands the event ID
 and fixed kind to a bounded in-memory queue without blocking (64, overflow
 counted and logged value-free; in practice bounded by the 32-observation
-critical staging), and also watches every recorded one (at most 64) until a
-dispatch step claims it, escalating it when a dispatch step fails (a record
-just before the disk is removed, or a row left `unavailable` for queue
-space). The dispatcher submits these on the monitoring worker at every 5 s
+critical staging), and also watches every recorded one whose notification
+row is still unclaimed at its commit (at most 64; an idempotent replay of one
+already claimed or resolved is not watched) until a dispatch step claims it,
+escalating it when a dispatch step fails (a record just before the disk is
+removed, or a row left `unavailable` for queue space). The dispatcher submits these on the monitoring worker at every 5 s
 interval, independently of the failing dispatch step's backoff, through the
 same `NotificationService` under the observation identity, holding at most
 half of its queue (at least one slot; at most 8 attempts per hard stop with
@@ -1197,7 +1198,8 @@ or `uncertain` outcomes, and claims an earlier process left `submitting` or
 `queued` whose `notification_events` row is still `pending` (or absent), stay
 unresolved for an audited Owner requeue; a final `sent`/`failed`/`disabled` row
 completes such a claim at the next start. Shutdown runs one last step after
-scene `stop()` and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s, so that with the other stop steps shutdown stays within `TimeoutStopSec=90`) for submitted deliveries before the
+scene `stop()`, then drains these alerts once more (a last step refused by
+storage escalates the watched records to it), and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s, so that with the other stop steps shutdown stays within `TimeoutStopSec=90`) for submitted deliveries before the
 notification service closes. With Slack unconfigured the local row is
 `disabled` and `critical_notifications` stays `unavailable`. No
 evidence-preservation port exists yet (a separate recording decision), so

@@ -524,6 +524,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 await critical_dispatcher.alert_once()
             with suppress(Exception):
                 await critical_dispatcher.once()
+            # Issue #318: a final step refused by storage escalates the
+            # recorded but unclaimed criticals it watched; drain once more so
+            # they are still attempted (no network wait: the settle below
+            # bounds the time spent on their delivery).
+            with suppress(Exception):
+                await critical_dispatcher.alert_once()
             try:
                 unsettled = await run_to_completion(monitoring_runtime.call(
                     monitoring_runtime.settle_notifications,

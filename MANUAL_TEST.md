@@ -1289,7 +1289,9 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   delivery `delivered`, with no second Slack message. Repeat with the volume
   removed a few seconds after a confirmation was recorded but before the next
   dispatch step (about 5 s): the alert must still reach Slack during the hard
-  stop, once. Record the number of messages when more than 8 confirmations
+  stop, once; and once more stopping the service right after the removal
+  (before the next dispatch step): the alert is still sent during shutdown and
+  `unrecorded_critical_alerts_unsent` is not logged. Record the number of messages when more than 8 confirmations
   occur during one hard stop (with the default queue of 16 at most 8 are sent
   before recovery and the rest after it; confirmations beyond the scene
   runtime's 32-observation critical staging are counted as undelivered loss

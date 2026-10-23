@@ -817,6 +817,47 @@ class LifespanTests(RuntimeFixture):
                 f"SELECT delivery FROM notification_events WHERE event_id='{item.identifier}'"))
         self.assertEqual([ALERT + "camera_tamper"], self.critical_texts())
 
+    async def test_a_shutdown_whose_final_dispatch_is_refused_still_alerts(self):
+        # Codex P1 on dae0154d: the final settle dispatch fails after the disk
+        # is removed and escalates the watched record; the settle drains the
+        # alerts again instead of only logging them unsent.
+        application = self.scene_application(dispatch_interval_seconds=3600,
+                                              dispatch_backoff_seconds=3600)
+        timeline = application.state.scene_timeline
+        with self.assertLogs("app", level="INFO") as logs:
+            async with asyncio.timeout(30), application.router.lifespan_context(application):
+                self.assertTrue(await self.until(lambda: timeline.opened))
+                item = critical(CriticalKind.SERVER_MOVEMENT, at=datetime.now(timezone.utc))
+                await asyncio.to_thread(timeline.recorder, item)
+                self.assertEqual((item.identifier,), timeline.unrecorded.awaiting())
+                # The disk is removed before any dispatch step claimed the row;
+                # the lifespan then ends without a periodic step in between.
+                detached = self.recordings.with_name("detached")
+                self.recordings.rename(detached)
+                self.recordings.mkdir(mode=0o700)
+            self.assertTrue(await self.until(
+                lambda: self.critical_texts() == [ALERT + "server_movement"]))
+        self.assertEqual(1, timeline.unrecorded.submitted)
+        self.assertEqual(0, timeline.unrecorded.queued)
+        self.assertFalse(any(Event.UNRECORDED_CRITICAL_ALERTS_UNSENT.value in line
+                             for line in logs.output))
+        self.recordings.rmdir()
+        detached.rename(self.recordings)
+        # The outcome row could not be written before exit, so the next
+        # process cannot know about the attempt and notifies the recorded
+        # observation once more: the one documented, Owner-accepted duplicate
+        # (and never a third time).
+        restarted = self.scene_application(dispatch_interval_seconds=0.05)
+        async with asyncio.timeout(30), restarted.router.lifespan_context(restarted):
+            self.assertTrue(await self.until(lambda: self.rows(
+                "SELECT state FROM presence_deliveries WHERE action='notification'")
+                == [("delivered",)]))
+        self.assertEqual([ALERT + "server_movement"] * 2, self.critical_texts())
+        again = self.scene_application(dispatch_interval_seconds=0.05)
+        async with asyncio.timeout(30), again.router.lifespan_context(again):
+            await asyncio.sleep(0.3)
+        self.assertEqual([ALERT + "server_movement"] * 2, self.critical_texts())
+
     async def test_settle_waits_for_a_slow_delivery_and_gives_up_at_its_bound(self):
         self.transport = GatedTransport()
         self.addCleanup(self.transport.gate.set)
