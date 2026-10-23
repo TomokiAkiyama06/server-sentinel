@@ -782,6 +782,13 @@ class StaleDeviceNumbersRuntimeTests(RuntimeFixture):
             self.assertEqual(["ServerSentinel critical alert: recording_health_failure"], alerts())
             self.assertEqual(HealthState.FAILED, runtime.status.recording_health)
             self.assertFalse(runtime.status.recording_filesystem_ok)
+            # Another admission-only refusal within the alerted episode.
+            (mapped / "slaves" / disk.name).unlink()
+            (mapped / "slaves" / loop.name).symlink_to(loop)
+            with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                await runtime.call(admit)
+            (mapped / "slaves" / loop.name).unlink()
+            (mapped / "slaves" / disk.name).symlink_to(disk)
             # Restored: the next tick recovers without another alert; the
             # health verdict stays FAILED until the next daily self-test.
             self.clock.advance(timedelta(minutes=1))
@@ -792,6 +799,13 @@ class StaleDeviceNumbersRuntimeTests(RuntimeFixture):
             await runtime.call(admit)
             self.assertEqual(1, len(alerts()))
             self.assertEqual(HealthState.FAILED, runtime.status.recording_health)
+            # The refusal within the ended episode was discarded: a further
+            # tick neither re-alerts nor reports the filesystem unhealthy.
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertTrue(runtime.status.recording_filesystem_ok)
+            self.assertEqual(1, len(alerts()))
             # A later admission-only episode alerts once more.
             (mapped / "slaves" / disk.name).unlink()
             (mapped / "slaves" / loop.name).symlink_to(loop)
