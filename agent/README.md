@@ -155,7 +155,12 @@ only the minor changes, as degraded `device_numbers_stale`. The sysfs topology
 of a renumbered device is walked again at every admission, not cached: a live
 dm table reload or md member replacement can move it onto loop or virtual
 backing without changing its own number or the mount ID, and then the next
-write refuses with `mount_device_mismatch` (refused, not degraded). An accepted
+write refuses with `mount_device_mismatch` (refused, not degraded). The refusal
+is not latched: once the topology rests only on hardware again, the next check
+admits writes again (still degraded while the numbers are stale). A reload in
+the middle of writing one segment is not prevented inside that segment; the
+store's next internal check (after `posix_fallocate`, then after the write and
+fsync) refuses, and the partial segment is removed. An accepted
 renumbering keeps writing but is degraded and value-free: `--check`
 prints the `device_numbers_stale` warning, and every heartbeat reports
 `storage.state = "degraded"`, `storage.reason = "device_numbers_stale"` and node
