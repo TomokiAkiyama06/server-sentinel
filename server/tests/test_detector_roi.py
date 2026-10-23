@@ -2,7 +2,8 @@
 
 import base64
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import hashlib
 import inspect
 import sqlite3
 import unittest
@@ -50,6 +51,16 @@ def reference_frame(data=None):
     """The calibrated sample itself, which every later sample follows."""
     return GrayFrame(SOURCE, STREAM, REFERENCE_SEQUENCE, WIDTH, HEIGHT,
                      pixels() if data is None else data)
+
+
+def frame_digests(media: bytes) -> tuple[bytes, ...]:
+    """Common encodings of digests of `media`, none of which may be stored."""
+    traces = []
+    for name in ("sha256", "sha1", "md5", "blake2b", "sha512"):
+        digest = hashlib.new(name, media).digest()
+        traces += [digest, digest.hex().encode(), base64.b64encode(digest),
+                   base64.urlsafe_b64encode(digest).rstrip(b"=")]
+    return tuple(traces)
 
 
 def frame(index, data=None, *, source=SOURCE, stream=STREAM):
@@ -545,7 +556,7 @@ class CalibrationAndDeliveryTests(unittest.TestCase):
         owner.save(second)
         self.assertEqual(2, archive.load(SOURCE, PROFILE).version)
         self.assertEqual(record, archive.load(SOURCE, PROFILE, 1))
-        self.assertEqual(first, record.rehydrate(first.reference))
+        self.assertEqual(first, record.bind(first))
         with self.assertRaises(ValueError):
             owner.save(replace(second, identifier=UUID(int=499), version=3))
 
@@ -568,15 +579,26 @@ class CalibrationAndDeliveryTests(unittest.TestCase):
                     self.assertNotIn(media.hex(), text)
                     self.assertNotIn(base64.b64encode(media).decode(), text)
                     self.assertNotIn(media.decode("latin-1"), text)
+        # Nothing computed from the frame is stored either (Owner decision
+        # 2026-10-22, #205): no digest of the reference in any encoding.
+        for trace in frame_digests(media):
+            for (table,) in connection.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+                for row in connection.execute(f'SELECT * FROM "{table}"'):
+                    self.assertFalse([value for value in row if trace in str(value).encode()])
         record = archive.load(SOURCE, PROFILE)
         self.assertIsInstance(record, CalibrationRecord)
-        self.assertEqual(stored.reference_sha256, record.reference_sha256)
+        self.assertNotIn("reference_sha256", vars(record))
         self.assertFalse([name for name, value in vars(record).items()
                           if isinstance(value, (bytes, bytearray, GrayFrame))])
-        self.assertEqual(stored, record.rehydrate(stored.reference))
-        for rejected in (frame(0, covered()), frame(1), frame(0, source=UUID(int=399))):
+        self.assertEqual(stored, record.bind(stored))
+        # Only the in-memory calibration of exactly this record is bound: a
+        # bare frame, or a calibration of another sample, identity, version
+        # or time, is refused.
+        for rejected in (stored.reference, replace(stored, reference=frame(1)),
+                         replace(stored, identifier=UUID(int=398)), replace(stored, version=2),
+                         replace(stored, created_at=stored.created_at + timedelta(seconds=1))):
             with self.assertRaises(ValueError):
-                record.rehydrate(rejected)
+                record.bind(rejected)
 
     def test_corrupt_history_is_reported_apart_from_an_unavailable_archive(self):
         connection = sqlite3.connect(":memory:", isolation_level=None)

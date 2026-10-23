@@ -15,15 +15,20 @@ from app.audit import (
     AuditStore, DenyAllOwners, OwnerAuditService, OwnerAuthorizer,
     UnboundStorageAdmission,
 )
+from app.audit.model import ActorCategory, AuditAction, AuditOutcome, TargetKind
 from app.audit.integration import OwnerAdministration
 from app.audit.runtime import AuditRetentionRuntime
 from app.cameras.registry import CameraRegistry
 from app.cameras.uvc.config import LocalUvcConfiguration
 from app.cameras.uvc.runtime import LocalUvcDependencies, LocalUvcRuntime, LocalUvcRuntimeState
 from app.completion import run_to_completion
+from app.detection.roi.calibration import scrub_legacy_reference_digests
+from app.detection.roi.calibration_service import (
+    SceneCalibrationConfiguration, SceneCalibrationService, TransientReferences,
+)
 from app.detection.roi.runtime import (
-    SceneMonitoringConfiguration, SceneMonitoringDependencies, SceneMonitoringRuntime,
-    SceneRuntimeState,
+    ArchiveCalibrationProvider, SceneMonitoringConfiguration, SceneMonitoringDependencies,
+    SceneMonitoringRuntime, SceneRuntimeState,
 )
 from app.diagnostics import DiagnosticExportEndpoint
 from app.logging import Event
@@ -34,6 +39,7 @@ from app.monitoring.cameras import CameraOfflineMonitor
 from app.monitoring.config import MonitoringConfiguration
 from app.monitoring.runtime import MonitoringDependencies, MonitoringRuntime, RuntimeState
 from app.notifications.service import NotificationKind
+from app.notifications.slack import DeliveryResult
 from app.presence.delivery import NotificationAdapter
 from app.presence.runtime import CriticalDispatcher, SceneTimeline, SceneTimelineConfiguration
 from app.settings import Settings
@@ -46,6 +52,7 @@ from app.storage.schema import APPLICATION_MIGRATIONS
 # settle already waits for every pending notification), shutdown waits at
 # most this long for a camera offline notification still being delivered,
 # longer than the 10 s Slack timeout, before the monitoring runtime stops.
+# The scene calibration notices (#205) use the same bound.
 CAMERA_OFFLINE_SETTLE_SECONDS = 12.0
 
 
@@ -134,6 +141,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
                scene_monitoring: SceneMonitoringConfiguration | None = None,
                scene_monitoring_dependencies: SceneMonitoringDependencies | None = None,
                scene_timeline: SceneTimelineConfiguration | None = None,
+               scene_calibration: SceneCalibrationConfiguration | None = None,
                human_access: HumanAccess | None = None) -> FastAPI:
     # Closed unless the embedder passes a validated composition: it exists
     # only when the deployment explicitly enabled human access and the
@@ -296,10 +304,44 @@ def create_app(settings: Settings, *, database: Database | None = None,
         scene_monitoring_dependencies = replace(
             scene_monitoring_dependencies or SceneMonitoringDependencies(),
             recorder=timeline.recorder, undelivered=timeline.undelivered)
+    # The Owner calibration and the restart re-acquisition of scene
+    # references (#205, Owner decision 2026-10-22, option A). With
+    # `scene_calibration` the application owns the runtime's calibration
+    # provider: stored provenance (read-only) plus the reference frames this
+    # process holds in memory. Nothing derived from an image is persisted.
+    calibration_references = None
+    if scene_calibration is not None:
+        if not isinstance(scene_calibration, SceneCalibrationConfiguration):
+            raise TypeError("scene calibration configuration is invalid")
+        if scene_monitoring is None:
+            raise TypeError("scene calibration requires scene monitoring")
+        if (scene_monitoring_dependencies is not None
+                and scene_monitoring_dependencies.calibrations is not None):
+            raise TypeError("scene calibration owns the calibration provider")
+        if (scene_monitoring_dependencies is None
+                or scene_monitoring_dependencies.recorder is None):
+            # Without a durable critical recorder (`scene_timeline`, or an
+            # injected one) the scene runtime never starts, so no stored
+            # calibration could ever be re-acquired (Codex P1 on PR #330).
+            raise TypeError("scene calibration requires a durable critical recorder")
+        if monitoring_runtime is None:
+            # A re-acquired reference must reach the Owner at once (DET-004)
+            # through the monitoring runtime's `NotificationService`; without
+            # it a notice could only be logged and dropped (Codex P2, #330).
+            raise TypeError("scene calibration requires the monitoring notification runtime")
+        calibration_references = TransientReferences()
+        scene_monitoring_dependencies = replace(
+            scene_monitoring_dependencies or SceneMonitoringDependencies(),
+            calibrations=ArchiveCalibrationProvider(store.connect_read_only,
+                                                    references=calibration_references))
     scene_runtime = (SceneMonitoringRuntime(scene_monitoring, scene_monitoring_dependencies)
                      if scene_monitoring is not None else None)
     if timeline is not None:
         scene_holder.append(scene_runtime)
+    scene_calibration_service = (
+        SceneCalibrationService(scene_calibration, scene_runtime, store.connect_read_only,
+                                references=calibration_references)
+        if scene_calibration is not None else None)
 
     def on_local_frame(source_id, frame) -> None:
         # Both sinks are non-blocking and never raise into the capture worker.
@@ -358,6 +400,14 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # pull is the only reader of the preview hub; it retains nothing
         # without polling live:view viewers and starts/stops with run().
         human_access.attach_live(LiveFrameService(local_preview, human_access.store))
+        if scene_calibration_service is not None:
+            # The Owner's calibration routes (#205); without the service
+            # they stay the generic denial. The routes write the history
+            # through the access store's database while the provider and the
+            # service read it from `store`; `bind_storage_admission` above
+            # already refused an access store on any other database, so the
+            # history cannot split (Claude review proposal 7).
+            human_access.attach_scene_calibration(scene_calibration_service)
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(
@@ -368,6 +418,22 @@ def create_app(settings: Settings, *, database: Database | None = None,
         *(timeline.retention_stores if timeline is not None else ()),
         interval_seconds=audit_cleanup_interval_seconds,
     )
+
+    def scrub_reference_digests() -> bool:
+        """Remove the frame digest a pre-#205 calibration version still
+        carries (Owner decision 2026-10-22; Codex P1 on PR #330), under the
+        audit storage admission. Idempotent; False when it could not run."""
+        try:
+            with audit_store.transaction(write=True) as connection:
+                scrubbed = scrub_legacy_reference_digests(connection)
+        except Exception:
+            logging.getLogger(__name__).error(Event.SCENE_REFERENCE_DIGEST_SCRUB_FAILED)
+            return False
+        if scrubbed:
+            # The number of rows only; no source, version or value.
+            logging.getLogger(__name__).warning(Event.SCENE_REFERENCE_DIGESTS_SCRUBBED,
+                                                extra={"count": scrubbed})
+        return True
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -401,7 +467,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
         human_task = None
         # The scene watcher may be started late, by the timeline task, once
         # a deferred outbox open succeeds; shutdown reads it from here.
-        scene_lifecycle = {"watch": None, "timeline": None, "dispatch": None, "stopping": False}
+        scene_lifecycle = {"watch": None, "timeline": None, "dispatch": None, "calibration": None,
+                           "notified": False, "stopping": False, "scrubbed": False}
 
         uvc_lifecycle = {"deferred": None, "stopping": False}
 
@@ -479,6 +546,140 @@ def create_app(settings: Settings, *, database: Database | None = None,
             await start_scene_monitoring()
             if scene_runtime is not None and not scene_lifecycle["stopping"]:
                 scene_lifecycle["watch"] = asyncio.create_task(watch_scene_monitoring())
+
+        def system_commit(source_id, prepare, persist):
+            """The restart re-acquisition's commit (#205, Owner decision A).
+
+            The new version's provenance and a `system` audit record commit
+            in one transaction under the storage admission; a commit that
+            fails leaves a `failed` record (best effort) and nothing stored.
+            A refused acquisition (`prepare`) is not a change and is not
+            audited: the status and the Owner notification report it.
+            """
+            calibration = prepare()
+            try:
+                with audit_store.transaction(write=True) as connection:
+                    record = persist(connection, calibration)
+                    audit_store.append_on(
+                        connection, actor_category=ActorCategory.SYSTEM,
+                        action=AuditAction.REACQUIRE_SCENE_REFERENCE,
+                        target_kind=TargetKind.SCENE_CALIBRATION, target_logical_id=source_id,
+                        outcome=AuditOutcome.SUCCEEDED)
+                return record
+            except BaseException:
+                with suppress(Exception):
+                    audit_store.append(
+                        actor_category=ActorCategory.SYSTEM,
+                        action=AuditAction.REACQUIRE_SCENE_REFERENCE,
+                        target_kind=TargetKind.SCENE_CALIBRATION, target_logical_id=source_id,
+                        outcome=AuditOutcome.FAILED)
+                raise
+
+        async def deliver_calibration_notices() -> None:
+            # The Owner is told at once through the monitoring runtime's
+            # `NotificationService` (the same durable row and optional Slack
+            # delivery as a hardware-integrity failure). Fixed kinds only: no
+            # source, image or reason. A notice the service cannot take yet
+            # (storage not admitted) is kept, in memory, for the next pass.
+            notices = scene_calibration_service.take_notices()
+            if not notices:
+                return
+            submitted = []
+
+            def step():
+                # Accepted notices only (the camera offline monitor's rule):
+                # a full or closed queue (`can_accept`), or a `failed` result
+                # whose event the service does not retain, kept nothing, so
+                # the notice is put back and retried later under the same
+                # event id, which upserts one row and is never sent twice
+                # (Codex P1 on PR #330). An accepted one has its
+                # `notification_events` row and is not submitted again.
+                notifications = monitoring_runtime.notifications
+                for notice in notices:
+                    if not notifications.can_accept(notice.event_id):
+                        continue
+                    result = notifications.record(
+                        NotificationKind(notice.kind), at=notice.at, confirmed=True,
+                        event_id=notice.event_id)
+                    if result == DeliveryResult.FAILED and not notifications.retained(notice.event_id):
+                        continue
+                    submitted.append(notice)
+                    scene_lifecycle["notified"] = True
+                return len(submitted)
+
+            try:
+                await run_to_completion(monitoring_runtime.call(
+                    monitoring_runtime.dispatch_notifications, step))
+            except Exception:
+                pass
+            finally:
+                # Also when this pass is cancelled (run_to_completion re-raises
+                # the cancellation after the step finished): an unsubmitted
+                # notice is never lost here.
+                undelivered = [notice for notice in notices if notice not in submitted]
+                if undelivered:
+                    scene_calibration_service.return_notices(undelivered)
+
+        def scene_runtime_ended() -> bool:
+            # Started (or its start was attempted) and no longer running; an
+            # unreadable status counts as ended. A runtime still waiting for
+            # its deferred start (`configured`) is not.
+            try:
+                state = scene_runtime.status().state
+            except Exception:
+                return True
+            return state not in (SceneRuntimeState.CONFIGURED, SceneRuntimeState.RUNNING,
+                                 SceneRuntimeState.DEGRADED)
+
+        async def reacquire_source(source_id) -> None:
+            await run_to_completion(asyncio.to_thread(
+                scene_calibration_service.reacquire, source_id, system_commit))
+            # Its own outcome is notified at once, not after the other
+            # sources' attempts (Codex P1 on PR #330, DET-004 "immediately").
+            await deliver_calibration_notices()
+
+        async def run_scene_calibration() -> None:
+            # Once scene monitoring runs, every source with a stored
+            # calibration has its reference re-acquired (Owner decision
+            # 2026-10-22, option A), and a failed attempt is retried at the
+            # configured interval; the Owner is notified of both outcomes.
+            # The sources (at most MAXIMUM_SOURCES) are re-acquired
+            # independently and concurrently: a camera that gives no frame
+            # delays neither another source's detection nor its notice.
+            live = (SceneRuntimeState.RUNNING, SceneRuntimeState.DEGRADED)
+            started = False
+            while True:
+                if scene_lifecycle["stopping"]:
+                    return
+                if not started and (application.state.scene_monitoring_state in live
+                                    or await asyncio.to_thread(scene_runtime_ended)):
+                    # Also after a start that failed (`unavailable`, Codex P1
+                    # on PR #330): the runtime cannot be restarted, so each
+                    # stored calibration's re-acquisition is refused
+                    # `unavailable` and notified once
+                    # (`SceneCalibrationService._runtime_ended`), instead of
+                    # this loop waiting forever without a notice.
+                    if not scene_lifecycle["scrubbed"]:
+                        scene_lifecycle["scrubbed"] = await run_to_completion(
+                            asyncio.to_thread(scrub_reference_digests))
+                    await run_to_completion(asyncio.to_thread(scene_calibration_service.start))
+                    started = True
+                if started:
+                    pending = scene_calibration_service.pending_reacquisitions()
+                    if pending and not scene_lifecycle["stopping"]:
+                        # A cancelled gather still waits for every attempt
+                        # (each defers its cancellation until its thread
+                        # returns; `close()` ends the acquisitions first).
+                        outcomes = await asyncio.gather(
+                            *(reacquire_source(source_id) for source_id in pending),
+                            return_exceptions=True)
+                        if any(isinstance(item, Exception) for item in outcomes):
+                            # One source's unexpected failure ends neither
+                            # the others nor the retry loop; value-free.
+                            logging.getLogger(__name__).error(Event.SCENE_REACQUISITION_FAILED)
+                await deliver_calibration_notices()
+                await asyncio.sleep(scene_calibration.reacquire_retry_seconds if started
+                                    else scene_runtime.refresh_interval_seconds)
 
         async def open_timeline() -> bool:
             # Issue #205 condition 5: scene monitoring starts only after the
@@ -559,6 +760,22 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 unsettled = None
             if unsettled != 0:
                 logging.getLogger(__name__).error(Event.CAMERA_OFFLINE_NOTIFICATIONS_UNSETTLED)
+
+        async def settle_calibration_notices() -> None:
+            # Like the camera offline settle: a calibration notice submitted
+            # just before shutdown still completes and is recorded when the
+            # endpoint answers in time. The critical and camera offline
+            # settles already wait for every pending notification.
+            if (not scene_lifecycle["notified"] or monitoring_runtime is None
+                    or critical_dispatcher is not None or camera_offline is not None):
+                return
+            try:
+                unsettled = await run_to_completion(monitoring_runtime.call(
+                    monitoring_runtime.settle_notifications, CAMERA_OFFLINE_SETTLE_SECONDS))
+            except Exception:
+                unsettled = None
+            if unsettled != 0:
+                logging.getLogger(__name__).error(Event.SCENE_CALIBRATION_NOTICE_UNDELIVERED)
 
         async def start_local_uvc() -> None:
             # Never a silent default: every outcome is an explicit state.
@@ -684,6 +901,25 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 with suppress(asyncio.CancelledError):
                     await human_task
             scene_lifecycle["stopping"] = True
+            if scene_calibration_service is not None:
+                # Ends an acquisition in flight at once, so the calibration
+                # task (and an Owner request) returns without waiting for its
+                # deadline; nothing is committed after this.
+                scene_calibration_service.close()
+                calibration_task = scene_lifecycle["calibration"]
+                if calibration_task is not None:
+                    calibration_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await calibration_task
+                # A notice queued by an attempt that finished just before
+                # the close is submitted now, while the monitoring runtime
+                # still runs; the calibration settle below waits for it like
+                # any other (Claude review proposal 8).
+                await deliver_calibration_notices()
+                if scene_calibration_service.take_notices():
+                    # Not submitted (storage not admitted): in memory only;
+                    # the next start re-acquires again and notifies again.
+                    logging.getLogger(__name__).error(Event.SCENE_CALIBRATION_NOTICE_UNDELIVERED)
             for name in ("timeline", "watch", "dispatch"):
                 # The timeline task first: a deferred start it is running
                 # finishes (cancellation is deferred) before stop() below,
@@ -714,6 +950,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # stops below.
             await settle_critical_dispatch()
             await settle_camera_offline()
+            await settle_calibration_notices()
             if cleanup_task is not None:
                 cleanup_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -760,6 +997,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 # take physical-security monitoring offline. The bounded degraded
                 # retention state stays visible and the scheduled run retries it.
                 logging.getLogger(__name__).error(Event.AUDIT_RETENTION_DEGRADED)
+            # Once the migrations ran and the audit admission is bound. A
+            # refused attempt is repeated before the restart re-acquisition
+            # (below) and at the next start.
+            scene_lifecycle["scrubbed"] = (
+                (storage_reservation is not None or runtime_admission.bound)
+                and await asyncio.to_thread(scrub_reference_digests))
             # Before capture, so the first frames already reach the detector.
             if timeline is None:
                 await launch_scene_monitoring()
@@ -777,6 +1020,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
                     # from an earlier process is submitted as soon as the
                     # monitoring runtime admits storage.
                     scene_lifecycle["dispatch"] = asyncio.create_task(critical_dispatcher.run())
+            if scene_calibration_service is not None:
+                # It waits for scene monitoring to run (a deferred timeline
+                # open starts it later); capture starts right below, so the
+                # re-acquisition reads the first frames.
+                scene_lifecycle["calibration"] = asyncio.create_task(run_scene_calibration())
             await start_local_uvc()
             if local_uvc_runtime is not None:
                 uvc_watch_task = asyncio.create_task(watch_local_uvc())
@@ -824,7 +1072,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
         else LocalUvcRuntimeState.UNCONFIGURED
     )
     application.state.local_preview = local_preview
-    # Internal only: no route exposes scene observations before #10.
+    # Internal only: no route exposes scene observations; the Owner calibration
+    # status route (#205) reads only each source's state and reason code.
     application.state.scene_monitoring = scene_runtime
     application.state.scene_monitoring_state = (
         SceneRuntimeState.CONFIGURED if scene_runtime is not None
@@ -835,6 +1084,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # reads either; Owner status through a reviewed route is a follow-up.
     application.state.scene_timeline = timeline
     application.state.scene_timeline_finish = None
+    # The Owner calibration and restart re-acquisition (#205); its status is
+    # served only through the Owner routes of the human surface.
+    application.state.scene_calibration = scene_calibration_service
     # Internal only: camera offline episodes (Issue #301 item 2).
     application.state.camera_offline = camera_offline
     # Internal only: drives presence critical notifications (Issue #26).

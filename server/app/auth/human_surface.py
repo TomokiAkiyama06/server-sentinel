@@ -92,7 +92,23 @@ WebSocket and error path gets the same generic denial):
   at most once per 60 s per live session; capacity (4 in total, 2 per
   source, 2 per person) and a full request backlog (32 jobs, at most 8 of
   them per human session; Issue #279 item 1) are the generic denial. See
-  ``app.media.live.frame_pull``.
+  ``app.media.live.frame_pull``;
+- the Owner's scene calibration (Issue #205, Owner decision 2026-10-22),
+  mounted only when the embedder attached a ``SceneCalibrationService``
+  (``HumanAccess.attach_scene_calibration``; otherwise the generic denial):
+  ``GET /api/scene/calibration`` (``OWNER_READ``: per configured source its
+  calibration origin, version and time, phase, last fixed refusal and the
+  scene runtime's own state and reason; never a pixel, frame, digest,
+  polygon or policy value) and ``POST /api/scene/sources/<source>/calibration``
+  (``OWNER_OP``, CSRF, body ``{"normal_position_confirmed": true}``: the
+  Owner states the camera and server are in their normal position; the next
+  good frames become the reference, held in memory only, and its provenance
+  commits with a ``calibrate_scene_source`` audit record through
+  ``HumanAccess.scene_administration`` inside ``admit`` of the
+  authorization's epoch). ``200 {"outcome": "calibrated", "version",
+  "calibrated_at"}`` or ``200 {"outcome": "refused", "reason"}`` with a
+  fixed reason (no frame, insufficient quality, an unsuitable scene, ...);
+  every other refusal is the generic denial.
 
 The four ceremony routes run before a credential exists (AUTH-013). Each is
 rate-limited per verified proxy identity before the request body is parsed
@@ -135,7 +151,8 @@ Owner or a ``live:view`` holder (a close
 reaches SQLite only for a live session held for that token, so closes are
 bounded by opens); frame polls to the
 service's own in-memory budget per live session, charged only to its holder. No recording,
-timeline, event, health or version route is mounted here. The step-up routes require ``OWNER_READ`` (an Owner
+timeline, event, health or version route is mounted here; the scene
+calibration routes (Issue #205) report calibration state, not events. The step-up routes require ``OWNER_READ`` (an Owner
 session, fresh or stale),
 so a non-Owner gets the generic denial inside the authorization transaction.
 Neither step-up route commits an idle touch: only a successful step-up
@@ -176,9 +193,10 @@ from uuid import UUID
 
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from app.audit.integration import AccessAdministration
+from app.audit.integration import AccessAdministration, SceneCalibrationAdministration
 from app.audit.service import OwnerAuditService
 from app.completion import run_to_completion
+from app.detection.roi.calibration_service import CalibrationRefused, SceneCalibrationService
 from app.logging import Event
 from app.media.live.frame_pull import LiveFrameService
 from app.storage.database import Database, PinnedDatabase
@@ -222,6 +240,10 @@ APP_PATH = "/app/"
 # S7, the interim live frame pull (Owner decision D10, Issue #10/#19).
 LIVE_SOURCES_PATH = "/api/live/sources"
 LIVE_SESSIONS_PATH = "/api/live/sessions"
+# The Owner's scene calibration (Issue #205).
+SCENE_CALIBRATION_PATH = "/api/scene/calibration"
+SCENE_SOURCES_PATH = "/api/scene/sources"
+MAX_CALIBRATE_BODY = 128
 MAX_LIVE_OPEN_BODY = 128
 MAX_OPTIONS_BODY = 1024
 MAX_ASSERTION_BODY = 64 * 1024
@@ -444,6 +466,12 @@ ROUTES: tuple[Route, ...] = (
           "_live_frame", mutating=False, csrf=False, body_limit=0, query=(("after", _SEQUENCE),)),
     Route("POST", _with_ids(LIVE_SESSIONS_PATH, "/", ("session",), "/close"), Requirement.SESSION,
           "_live_close", mutating=True, csrf=True, body_limit=MAX_EMPTY_BODY),
+    # Issue #205, the Owner's scene calibration: the status read is
+    # OWNER_READ, a calibration OWNER_OP (step-up, D3/D6).
+    Route("GET", _exact(SCENE_CALIBRATION_PATH), Requirement.OWNER_READ, "_scene_status",
+          mutating=False, csrf=False, body_limit=0),
+    Route("POST", _with_ids(SCENE_SOURCES_PATH, "/", ("source",), "/calibration"), Requirement.OWNER_OP,
+          "_scene_calibrate", mutating=True, csrf=True, body_limit=MAX_CALIBRATE_BODY),
 )
 
 
@@ -770,6 +798,13 @@ class HumanAccess:
         # records share the access store's database and storage admission.
         self.administration = AccessAdministration(
             OwnerAuditService(store.audit, HumanOwnerAuthorizer()), store, session_gate=self.gate)
+        # The Owner's scene calibration (Issue #205): the same authorizer,
+        # audit store and gate as the access administration.
+        self.scene_administration = SceneCalibrationAdministration(
+            OwnerAuditService(store.audit, HumanOwnerAuthorizer()), store, session_gate=self.gate)
+        # Optional component (``attach_scene_calibration``): without it both
+        # scene calibration routes are the generic denial.
+        self.scene_calibration: SceneCalibrationService | None = None
         # S7 interim live (optional component, ``attach_live``): without it
         # every live route is the generic denial.
         self.live: LiveFrameService | None = None
@@ -806,6 +841,20 @@ class HumanAccess:
             raise HumanAccessUnavailable()
         with self._live_lock:
             self._attach_live(live)
+
+    def attach_scene_calibration(self, service: SceneCalibrationService) -> None:
+        """Mount the Owner's scene calibration routes over ``service`` (#205).
+
+        The service reads and writes the calibration history in this
+        composition's access database (the application database), so its
+        audit records and the Owner session they are checked against are the
+        same database's. Attached once; a different service is refused.
+        """
+        if not isinstance(service, SceneCalibrationService):
+            raise HumanAccessUnavailable()
+        if self.scene_calibration is not None and self.scene_calibration is not service:
+            raise HumanAccessUnavailable()
+        self.scene_calibration = service
 
     def _attach_live(self, live: LiveFrameService) -> None:
         previous = self.live
@@ -1692,6 +1741,98 @@ class HumanSurface:
         except Exception:
             raise _Denied() from None
         await self._no_content(request.send)
+
+    # -- the Owner's scene calibration (Issue #205) ---------------------
+
+    def _scene_service(self) -> SceneCalibrationService:
+        service = self.access.scene_calibration
+        if service is None:
+            raise _Denied()
+        return service
+
+    async def _scene_status(self, request: _Request) -> None:
+        """``GET /api/scene/calibration`` (``OWNER_READ``): value-free status.
+
+        Read inside ``admit`` of the authorization's epoch after the Owner
+        session was read again (``require_owner_read_session``), like the A1
+        inventory. Per configured source: ``source_id``, ``origin``
+        (``none`` / ``owner`` / ``restart_reacquired``), ``version``,
+        ``calibrated_at``, ``phase`` (``idle`` / ``acquiring`` /
+        ``reacquire_pending``), ``failure`` (a fixed reason or null),
+        ``owner_calibration_available`` and the scene runtime's
+        ``detection`` state and ``detection_reason``. No pixel, frame,
+        digest, polygon, policy, device or camera name.
+        """
+        service = self._scene_service()
+        authorized = await self._authorize(request, Requirement.OWNER_READ)
+        access = self.access
+
+        def read():
+            with access.admit(authorized.epoch):
+                access.store.require_owner_read_session(authorized.session)
+                return service.status()
+
+        try:
+            sources = await asyncio.to_thread(read)
+        except Exception:
+            raise _Denied() from None
+        await self._json(request.send, 200, {"sources": [{
+            "source_id": str(item.source_id), "origin": item.origin.value, "version": item.version,
+            "calibrated_at": _utc_iso(item.calibrated_at) if item.calibrated_at is not None else None,
+            "phase": item.phase.value, "failure": item.failure,
+            "owner_calibration_available": item.owner_calibration_available,
+            "detection": item.detection, "detection_reason": item.detection_reason,
+        } for item in sources]})
+
+    async def _scene_calibrate(self, request: _Request) -> None:
+        """``POST /api/scene/sources/<source>/calibration`` (``OWNER_OP``, CSRF).
+
+        Body exactly ``{"normal_position_confirmed": true}``: the Owner's
+        statement that the camera and the monitored server are in their
+        normal position now. Order: the strict body; the gated ``OWNER_OP``
+        authorization (a stale Owner gets ``403 step_up_required`` and
+        nothing happens), charged to the session's administration bucket;
+        then the service reads the next good frames of that source (at most
+        its acquisition timeout, off the event loop, holding no gate or
+        SQLite lock) and commits the new version with its audit record
+        inside ``admit`` of the authorization's epoch, re-checking the Owner
+        session and its freshness in that transaction. A refused attempt
+        (``CalibrationRefused``) is ``200 {"outcome":"refused","reason"}``.
+        Only a refusal of the audited attempt itself (the camera read and
+        the checks after it: no frame, insufficient quality, an unsuitable
+        scene, an unsupported geometry, an unavailable history) leaves a
+        ``failed`` record; one refused before that attempt starts (another
+        attempt running, ``busy``; no template, ``template_unconfigured``; a
+        closed service, ``unavailable``) changes and reads nothing and is
+        not audited. Any other failure (an unknown source, a gate change, a
+        session that no longer holds) is the generic denial with a
+        ``failed`` record when the attempt had started, and nothing is
+        stored.
+        """
+        service = self._scene_service()
+        body = _json_object(await self._body(request, json_required=True))
+        if body != {"normal_position_confirmed": True} or body["normal_position_confirmed"] is not True:
+            raise _Denied()
+        source_id = UUID(request.params["source"])
+        if source_id not in service.runtime.source_ids:
+            raise _Denied()
+        context = await self._owner_operation(request, charge=self._limit_admin)
+        administration = self.access.scene_administration
+
+        def commit(target, prepare, persist):
+            return administration.calibrate(context, target, prepare, persist, epoch=context.epoch)
+
+        try:
+            record = await asyncio.to_thread(service.calibrate, source_id, commit)
+        except CalibrationRefused as refused:
+            await self._json(request.send, 200, {"outcome": "refused", "reason": refused.reason})
+            return
+        except Exception:
+            raise _Denied() from None
+        await self._json(request.send, 200, {
+            "outcome": "calibrated", "version": record.version,
+            "calibrated_at": _utc_iso(record.created_at),
+        })
 
     # -- Owner access administration (S4b, A1-A6) ----------------------
 

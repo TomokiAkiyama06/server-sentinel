@@ -6852,10 +6852,13 @@ class LifecycleInventoryTests(unittest.TestCase):
         for version in (1, 2):
             archive.append(calibration(version))
         with closing(sqlite3.connect(self.runtime.database)) as db:
-            digest = db.execute("SELECT metadata FROM roi_calibration_history "
-                                "WHERE version=1").fetchone()[0]
+            metadata = db.execute("SELECT metadata FROM roi_calibration_history "
+                                  "WHERE version=1").fetchone()[0]
+        # The history keeps no value computed from the reference frame (#205),
+        # and the baseline copies none of the stored provenance either.
+        self.assertNotIn("sha256", json.loads(metadata)["reference"])
         _, baseline = self.record()
-        self.assertNotIn(json.loads(digest)["reference"]["sha256"], baseline.read_text())
+        self.assertNotIn(metadata, baseline.read_text())
         self.assertNotIn(identifier, baseline.read_text())
         # A next version is appended, never counted as preserved.
         archive.append(calibration(3))
@@ -7223,6 +7226,39 @@ class LifecycleInventoryTests(unittest.TestCase):
                 self.assertEqual(getattr(limits, field), ceiling)
                 with self.assertRaisesRegex(ValueError, "exceeds maximum"):
                     model.Limits(**dict(smallest, **{field: ceiling + 1}))
+
+    def test_the_legacy_reference_digest_scrub_is_preserved_not_a_loss(self):
+        # Codex P1 on PR #330: the one approved rewrite of the append-only
+        # history removes a pre-#205 `reference.sha256`; a baseline recorded
+        # before it still verifies the version as preserved, while any other
+        # rewrite stays a loss.
+        from app.detection.roi.calibration import (
+            calibration_metadata, scrub_legacy_reference_digests)
+        self.runtime.seed()
+        source, profile, identifier = str(uuid4()), str(uuid4()), str(uuid4())
+        archive, calibration = self._roi_archive(source, profile, identifier)
+        archive.append(calibration(1))
+        legacy = calibration_metadata(calibration(1))
+        legacy["reference"]["sha256"] = "a" * 64
+        self.runtime.execute("UPDATE roi_calibration_history SET metadata=? WHERE version=1",
+                             (json.dumps(legacy, sort_keys=True),))
+        _, baseline = self.record()
+        self.assertNotIn("a" * 64, baseline.read_text())
+        with closing(sqlite3.connect(self.runtime.database, isolation_level=None)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.assertEqual(1, scrub_legacy_reference_digests(db))
+            db.execute("COMMIT")
+        code, report, _ = self.verify(baseline)
+        section = report["sections"]["roi_calibration_history"]
+        self.assertEqual(code, inventory.EXIT_PRESERVED, section)
+        self.assertEqual(section["preserved"], [f"{source}/{profile}/1"])
+        # Removing anything else is still detected.
+        changed = calibration_metadata(calibration(1))
+        changed["reference"].pop("sequence")
+        self.runtime.execute("UPDATE roi_calibration_history SET metadata=? WHERE version=1",
+                             (json.dumps(changed, sort_keys=True),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
 
     def test_roi_rows_must_read_back_through_the_archive(self):
         # Codex P1: an appended version with the right number and identifier

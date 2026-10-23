@@ -1005,14 +1005,33 @@ Candidate signals include global optical transform, persistent occlusion/near-bl
 
 The internal `server/app/detection/roi/` core operates only on transient,
 bounded grayscale frames for one immutable source/profile calibration. It stores
-source type, profile, polygon, reference digest, reference geometry, policy,
-version, and timestamp in a private append-only calibration history after
-the application's ROI calibration migration. That history is metadata only: no frame pixels, crop,
-thumbnail or other decoded monitoring media is persisted, so it cannot become
-still-image storage outside recording authorization and retention. A stored
-record therefore cannot reproduce a reference image; resuming detection re-binds
-an Owner-supplied transient frame whose digest and geometry must match the
-record. The core does not supply production thresholds, start capture, expose an
+source type, profile, polygon, reference geometry (stream, sample, width,
+height), policy, luma reader, version, and timestamp in a private append-only
+calibration history after the application's ROI calibration migration. That
+history is metadata only: no frame pixels, crop, thumbnail or other decoded
+monitoring media is persisted, and no value computed from the frame (digest,
+histogram, statistic) either (Owner decision 2026-10-22, Issue #205), so it
+cannot become still-image storage outside recording authorization and
+retention. A stored record therefore cannot reproduce or re-admit a reference
+image; resuming detection binds the in-memory `Calibration` that produced the
+record (`CalibrationRecord.bind`), whose whole non-frame provenance must equal
+the record. A bare frame is never bound to a stored version; a frame read from
+the camera becomes a reference only through a new calibration version. A
+`reference.sha256` in a record written before #205 is ignored when read and
+removed at every Main start once the migrations ran and the audit storage
+admission is bound (`scrub_legacy_reference_digests`: in one write
+transaction with `secure_delete` on, the table is rebuilt (every row deleted
+and inserted again, re-serialized exactly as a new version), so stale copies
+a legacy write left in its pages' free space are zeroed too; retried before
+the restart re-acquisition and at the next start when refused; the event
+`scene_reference_digests_scrubbed` carries only the row count). This removes
+the value inside the database file only and is not a claim of forensic
+erasure: copies outside the file (rollback-journal blocks the filesystem
+freed, SSDs, snapshots or backups) may remain. The lifecycle inventory
+digests the ROI metadata without that key, so the scrub is the one approved
+rewrite of this append-only history and a scrubbed version verifies as
+preserved against a baseline recorded by this release's tool; against a
+baseline an earlier release's tool recorded it is reported `changed`. The core does not supply production thresholds, start capture, expose an
 API, retain decoded media, make a presence decision, or issue a notification.
 
 A calibration policy whose bounded search window cannot reach its own movement
@@ -1079,7 +1098,8 @@ sampling or detection: staging fills and further confirmations become explicit
 `critical_backpressure`, and a recorder call in flight longer than the stall
 bound reports the runtime `degraded` (`recorder_stalled`). Without a stored
 calibration whose reference frame can be re-bound, a source stays inactive and
-`unknown`; no baseline is taken from live frames.
+`unknown`; no baseline is taken from live frames except on an explicit Owner
+calibration or the restart re-acquisition below.
 
 Local capture is read as uncompressed `GREY`/`YUYV` or, since Issue #217 (Owner
 decision 2026-10-11), as `MJPG` through the reviewed simplejpeg decoder: a
@@ -1216,9 +1236,103 @@ notification service closes. With Slack unconfigured the local row is
 `disabled` and `critical_notifications` stays `unavailable`. No
 evidence-preservation port exists yet (a separate recording decision), so
 `critical_evidence` stays `unavailable` in Owner status, and the production
-launcher does not build scene monitoring yet (the calibration route and the deployment
-section are follow-ups of #205). Without `scene_timeline` the count is only
-logged, as before.
+launcher does not build scene monitoring yet (the deployment section is a
+follow-up of #205; the Owner calibration route below exists). Without
+`scene_timeline` the count is only logged, as before.
+
+**Owner calibration and restart re-acquisition (Issue #205, Owner decision
+2026-10-22, option A).** With `create_app(scene_calibration=...)`
+(`SceneCalibrationConfiguration`; it requires scene monitoring with a durable
+critical recorder (`scene_timeline` or an injected one; without it the scene
+runtime never starts and nothing could be re-acquired) and the
+storage-configured monitoring runtime whose `NotificationService` delivers the
+Owner notices, otherwise `create_app` refuses the composition, since a notice
+could only be logged and dropped) the application owns the scene runtime's
+calibration provider: the stored provenance (`roi_calibration_history`, read
+only) plus the reference frames this process holds in memory
+(`TransientReferences`). Nothing derived from an image is written to disk;
+no digest, histogram or statistic of the frame either. The history keeps the
+reference geometry, polygon, policy and, since #205, the luma reader (`reader`: the capture layout and decoder pins, such as
+`packed:yuyv:1920x1080` or `mjpg:simplejpeg=1.9.0:numpy=2.3.5:1920x1080`;
+`decoded:remote_agent` for a decoded-sample producer). A reference is taken
+from live frames only by `SceneMonitoringRuntime.acquire_reference()`: the
+worker reads the next samples captured after the request through the source's
+own luma reader at the reference size, assesses them with fresh `server_roi`
+and `camera_tamper` quality gates and takes the first frame both report
+`sufficient` (their `recovery_frames` consecutive good samples of one stream);
+a camera loss or an unreadable sample restarts that count. The acquisition
+fails with a fixed reason (`no_frame`, `quality_insufficient`, `busy`,
+`geometry_unsupported`, `unavailable`, `cancelled`) at its deadline, at stop or
+when cancelled. A reference the detector refuses (an already obscured scene,
+too little support) is `scene_unsuitable`. Normal detection of the source
+continues during an acquisition.
+
+- *Owner calibration.* `POST /api/scene/sources/<id>/calibration`
+  (`OWNER_OP`, CSRF, step-up; body exactly `{"normal_position_confirmed":
+  true}`, the Owner's statement that the camera and the server are in their
+  normal position) acquires a reference with the deployment's
+  `CalibrationTemplate` of that source (reference size, Owner-selected ROI
+  polygon and policy; the template is part of the deployment configuration,
+  so a source without one is `template_unconfigured`) within
+  `acquisition_timeout_seconds` (default 10 s, at most 30 s) and commits the
+  next version's provenance with a `calibrate_scene_source` audit record
+  (target `scene_calibration`, the source's logical UUID) in one transaction
+  inside `admit` of the authorization's epoch, re-checking the Owner session
+  and its freshness there. The acquisition runs after the authorization,
+  outside the gate and the transaction; its refusal is a `failed` record and
+  `200 {"outcome":"refused","reason"}`. A refusal before the attempt starts
+  (`busy`, `template_unconfigured`, a closed service's `unavailable`) reads no
+  frame, changes nothing and is the same `200` refusal without an audit
+  record. A session that ended, or whose verification went stale, while the
+  frame was read commits nothing: the generic denial with a `failed` record
+  (the next request of a stale session is the ordinary `403
+  step_up_required` before any frame is read). Success is `200
+  {"outcome":"calibrated","version","calibrated_at"}`, after which the worker
+  re-binds the source. `GET /api/scene/calibration` (`OWNER_READ`) returns per
+  configured source `source_id`, `origin` (`none` / `owner` /
+  `restart_reacquired`), `version`, `calibrated_at`, `phase` (`idle` /
+  `acquiring` / `reacquire_pending`), `failure`, `owner_calibration_available`,
+  and the scene runtime's `detection` state and `detection_reason`; never a
+  pixel, frame, digest, polygon or policy value.
+- *Restart re-acquisition.* After every Main start, once scene monitoring
+  runs, each source with a stored calibration has its reference taken again,
+  every source independently and concurrently (at most four), so a camera
+  that gives no frame delays neither another source's detection nor its
+  notice,
+  with the stored geometry, polygon and policy, but only through the same luma
+  reader (otherwise `reader_changed`, also for a record written before readers
+  were recorded), within `reacquire_timeout_seconds` (default 60 s), committed
+  as the next version with a `reacquire_scene_reference` record of actor
+  `system` (a failed commit leaves a `failed` record), and the Owner is
+  notified at once, right after that source's attempt, through the
+  monitoring runtime's `NotificationService`
+  (`scene_reference_reacquired`, an immediate kind: the same durable
+  `notification_events` row and optional Slack text `ServerSentinel critical
+  alert: scene_reference_reacquired`; no source, image or reason). Such a
+  reference was not confirmed by the Owner: a camera or server moved while
+  Main was down is not detected against it, so the status keeps
+  `restart_reacquired` until the Owner calibrates. Detection nevertheless
+  starts at once on that reference (Owner decision 2026-10-23: shown and
+  notified as not confirmed). A failed attempt leaves the
+  source inactive and `unknown`, is retried every `reacquire_retry_seconds`
+  (default 60 s), and notifies `scene_calibration_required` once per process
+  (not for a runtime that has not started yet, nor at shutdown, when the
+  service is closed first; a runtime that started and then stopped or failed,
+  or whose start itself ended `unavailable` (it cannot be restarted), so
+  that every retry is refused `unavailable`, is notified); an acquisition
+  refusal of the
+  system path is not an audited change. An Owner calibration ends a pending
+  re-acquisition without a notice. A source never calibrated is left alone.
+  An unexpected failure of one source's attempt is logged value-free
+  (`scene_reacquisition_failed`) and ends neither the other sources' attempts
+  nor the retries; a notice whose submission was cancelled or failed is put
+  back for the next pass.
+  Shutdown cancels an acquisition in flight, then submits a notice an attempt
+  queued just before (while the monitoring runtime still runs) and waits up
+  to 12 s for a submitted notice; a notice that could not be submitted is in
+  memory only
+  and logged (`scene_calibration_notice_undelivered`), and the next start
+  re-acquires and notifies again.
 
 A camera loss (`offline`, `manual_intervention_required` or `degraded`, that is
 every non-`online` state) lowers the source to `degraded` until a new evaluated

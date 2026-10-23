@@ -12,7 +12,8 @@
  * The server answers every refusal with the same generic `404` (ADR-0003);
  * this module maps it, and `401`/`403`, to `ApiError('unauthorized')` and
  * never reads a refusal's body. The one exception is an Owner change (Issue
- * #10 phase 2 S6, routes A2-A6): there a `403` whose small JSON body is
+ * #10 phase 2 S6, routes A2-A6, and the scene calibration of #205): there a
+ * `403` whose small JSON body is
  * exactly `{"detail":"step_up_required"}` (Owner decision D3) becomes
  * `ApiError('step_up_required')`, so the screen can run the step-up ceremony
  * (`stepUp`) and retry once (`step_up.ts`). Authorization is the server's:
@@ -20,8 +21,9 @@
  */
 import { ApiError } from '../api';
 import {
-  type AccessCredential, type AccessPrincipal, type CameraHealth, type DashboardServices, type IssuedInvitation,
-  type LiveFrame, type LiveGrant, type LiveSource, type Permission, type Session,
+  calibrationReasons, type AccessCredential, type AccessPrincipal, type CalibrationReason, type CalibrationResult,
+  type CameraHealth, type DashboardServices, type IssuedInvitation, type LiveFrame, type LiveGrant, type LiveSource,
+  type Permission, type SceneCalibrationSource, type Session,
 } from '../domain';
 import { decodeRequestOptions, serializeAssertion, type AssertionJSON } from './webauthn';
 
@@ -35,6 +37,12 @@ export const FRAME_SEQUENCE_HEADER = 'X-Frame-Sequence';
 export const ADMIN_PRINCIPALS_PATH = '/api/admin/principals';
 export const STEP_UP_OPTIONS_PATH = '/api/auth/step-up/options';
 export const STEP_UP_PATH = '/api/auth/step-up';
+/** The Owner's scene calibration (Issue #205). */
+export const SCENE_CALIBRATION_PATH = '/api/scene/calibration';
+export const SCENE_SOURCES_PATH = '/api/scene/sources';
+/** A calibration reads the next good camera frames before it answers (the
+ *  server bounds that at 30 s at most), so its request gets a longer bound. */
+export const CALIBRATION_REQUEST_MS = 45000;
 /** The server's fixed step-up body `{"detail":"step_up_required"}` (Owner
  *  decision D3). A body larger than this is not that answer and is not read. */
 const STEP_UP_DETAIL = 'step_up_required';
@@ -207,6 +215,65 @@ export function parseIssuedInvitation(value: unknown): IssuedInvitation {
   return { code: value.code, expires_at: utc(value.expires_at) };
 }
 
+const ORIGINS = ['none', 'owner', 'restart_reacquired'] as const;
+const PHASES = ['idle', 'acquiring', 'reacquire_pending'] as const;
+const DETECTION = ['active', 'inactive', 'degraded'] as const;
+/** A scene runtime reason code: fixed lower-case words only. */
+const REASON_CODE = /^[a-z][a-z_]{0,63}$/;
+
+function member<T extends string>(values: readonly T[], value: unknown): T {
+  if (typeof value !== 'string' || !values.includes(value as T)) throw new ApiError('invalid_response');
+  return value as T;
+}
+
+function version(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) throw new ApiError('invalid_response');
+  return value;
+}
+
+/** `GET /api/scene/calibration` body `{"sources":[...]}` (Issue #205).
+ *
+ * Fails closed as a whole on any malformed entry, like the access inventory:
+ * a status that silently left a source out would misstate which cameras are
+ * watched. Only the documented fields are copied, so nothing else a server
+ * might add (never an image, digest, polygon or policy) can be rendered. */
+export function parseSceneCalibration(value: unknown): SceneCalibrationSource[] {
+  if (!record(value) || !Array.isArray(value.sources)) throw new ApiError('invalid_response');
+  const seen = new Set<string>();
+  return (value.sources as unknown[]).map(item => {
+    if (!record(item)) throw new ApiError('invalid_response');
+    const { source_id: id, detection_reason: reason } = item;
+    if (typeof id !== 'string' || !UUID.test(id) || seen.has(id)) throw new ApiError('invalid_response');
+    seen.add(id);
+    const origin = member(ORIGINS, item.origin);
+    const current = item.version === null ? null : version(item.version);
+    const at = optionalUtc(item.calibrated_at);
+    // A calibration in use has a version and a time; none has neither.
+    if ((origin === 'none') !== (current === null) || (current === null) !== (at === null)) {
+      throw new ApiError('invalid_response');
+    }
+    const failure = item.failure === null ? null : member<CalibrationReason>(calibrationReasons, item.failure);
+    if (typeof reason !== 'string' || !REASON_CODE.test(reason)) throw new ApiError('invalid_response');
+    return {
+      source_id: id, origin, version: current, calibrated_at: at, phase: member(PHASES, item.phase), failure,
+      owner_calibration_available: bool(item.owner_calibration_available),
+      detection: member(DETECTION, item.detection), detection_reason: reason,
+    };
+  });
+}
+
+/** One calibration's answer: calibrated with its version and time, or a fixed refusal. */
+export function parseCalibrationResult(value: unknown): CalibrationResult {
+  if (!record(value)) throw new ApiError('invalid_response');
+  if (value.outcome === 'calibrated') {
+    return { outcome: 'calibrated', version: version(value.version), calibrated_at: utc(value.calibrated_at) };
+  }
+  if (value.outcome === 'refused') {
+    return { outcome: 'refused', reason: member<CalibrationReason>(calibrationReasons, value.reason) };
+  }
+  throw new ApiError('invalid_response');
+}
+
 /** Read at most `limit` bytes of `response`'s body, whatever its headers say. */
 async function cappedBody(response: Response, limit: number, signal: AbortSignal): Promise<Uint8Array[]> {
   if (!response.body) throw new ApiError('invalid_response');
@@ -271,8 +338,9 @@ const browserAssertion: AssertWith = async (publicKey, signal) => {
 };
 
 export function createDashboardServices(origin: string, request: typeof fetch = (...args) => fetch(...args),
-  { cleanupMs = SIGN_OUT_CLEANUP_MS, requestMs = REQUEST_TIMEOUT_MS, assertWith = browserAssertion }:
-    { cleanupMs?: number; requestMs?: number; assertWith?: AssertWith } = {}): DashboardServices {
+  { cleanupMs = SIGN_OUT_CLEANUP_MS, requestMs = REQUEST_TIMEOUT_MS, calibrateMs = CALIBRATION_REQUEST_MS,
+    assertWith = browserAssertion }:
+    { cleanupMs?: number; requestMs?: number; calibrateMs?: number; assertWith?: AssertWith } = {}): DashboardServices {
   const deployment = new URL(origin);
   if (!['http:', 'https:'].includes(deployment.protocol)) throw new ApiError('invalid_request');
   let csrf: string | null = null;
@@ -341,16 +409,17 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
     return `${LIVE_SESSIONS_PATH}/${sessionId}/${action}`;
   }
 
-  /** Run `work` with a signal that also aborts after `requestMs`; the result
-   *  is bounded whether or not fetch honours the abort. */
-  async function bounded<T>(signal: AbortSignal, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  /** Run `work` with a signal that also aborts after `limit` (`requestMs` by
+   *  default); the result is bounded whether or not fetch honours the abort. */
+  async function bounded<T>(signal: AbortSignal, work: (signal: AbortSignal) => Promise<T>,
+    limit: number = requestMs): Promise<T> {
     const deadline = new AbortController();
     const forward = () => deadline.abort();
     if (signal.aborted) deadline.abort();
     signal.addEventListener('abort', forward);
     let expiry: ReturnType<typeof setTimeout> | undefined;
     const expired = new Promise<never>((_, reject) => {
-      expiry = setTimeout(() => { deadline.abort(); reject(new ApiError('unavailable')); }, requestMs);
+      expiry = setTimeout(() => { deadline.abort(); reject(new ApiError('unavailable')); }, limit);
     });
     try {
       return await Promise.race([work(deadline.signal), expired]);
@@ -368,7 +437,8 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
   /** One Owner change (A2-A6): CSRF, a JSON body, bounded in time, and the
    *  step-up answer reported as `step_up_required`. Any status other than
    *  `expected` is a failure whose outcome the caller must not guess. */
-  async function change(path: string, body: unknown, expected: 200 | 204, signal: AbortSignal): Promise<unknown> {
+  async function change(path: string, body: unknown, expected: 200 | 204, signal: AbortSignal,
+    limit: number = requestMs): Promise<unknown> {
     const header = token();
     return bounded(signal, async bound => {
       const response = await send({ method: 'POST', path, accept: 'application/json', signal: bound, csrf: header,
@@ -379,7 +449,7 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
         return undefined;
       }
       return json(response, bound);
-    });
+    }, limit);
   }
 
   async function open(sourceId: string, header: string, signal: AbortSignal): Promise<LiveGrant> {
@@ -480,6 +550,23 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
     async revokeCredential(principalId, handle, signal) {
       if (!UUID.test(handle)) throw new ApiError('invalid_request');
       await change(principalPath(principalId, `/credentials/${handle}/revoke`), {}, 204, signal);
+    },
+
+    async loadSceneCalibration(signal) {
+      return bounded(signal, async bound => {
+        const response = await send({ method: 'GET', path: SCENE_CALIBRATION_PATH, accept: 'application/json',
+          signal: bound });
+        if (response.status !== 200) throw new ApiError('unavailable');
+        return parseSceneCalibration(await json(response, bound));
+      });
+    },
+
+    async calibrateSource(sourceId, signal) {
+      if (!UUID.test(sourceId)) throw new ApiError('invalid_request');
+      // The body is the Owner's statement that the camera and the server are
+      // in their normal position; the server requires exactly this.
+      return parseCalibrationResult(await change(`${SCENE_SOURCES_PATH}/${sourceId}/calibration`,
+        { normal_position_confirmed: true }, 200, signal, calibrateMs));
     },
 
     async stepUp(signal) {

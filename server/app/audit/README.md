@@ -96,6 +96,14 @@ application UUID; external identity, display name, invitation secret,
 credential identifier, public key, challenges, client data and signatures never
 reach the log.
 
+A scene calibration (Issue #205) is recorded under target kind
+`scene_calibration` with the source's logical UUID: an Owner calibration as
+`calibrate_scene_source` through `SceneCalibrationAdministration` (the new
+version's provenance commits in the same transaction; a refused camera read is
+a `failed` record), and the re-acquisition after a restart as
+`reacquire_scene_reference` with actor `system` (Owner decision 2026-10-22,
+option A). No polygon, policy, digest, reader or image reaches the record.
+
 First-run wizard progress (Issue #48) changes only through
 `SetupWizardService` in `app/setup_wizard/service.py`, which wraps
 `OwnerAuditService.execute_transactional()` around
