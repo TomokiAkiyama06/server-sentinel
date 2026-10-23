@@ -452,6 +452,33 @@ class ServiceStoreTests(Fixture):
         self.assertIsNone(self.contents())
         self.assertTrue(self.ledger.pending)
         self.assertIn("approval=approval_required configured=yes", self.listing())
+        # Once the storage recovers, the republished ledger still lacks it
+        # (the digest was dropped from the entries before the admission).
+        gate["refused"] = False
+        store.retry_ledger(lambda: 0.0)
+        self.assertIsNotNone(self.contents())
+        self.assertFalse(self.ledger.pending)
+        self.assertNotIn(marker_digest(started.session_token), self.listed())
+        self.assertIn("approval=approval_required configured=yes", self.listing())
+
+    def test_a_retry_the_storage_admission_refuses_writes_nothing_and_never_raises(self):
+        self.approve()
+        store, gate = self.gated_store()
+        with patch.object(session_ledger.os, "replace", side_effect=OSError(28, "synthetic")), \
+                self.assertLogs("app.cameras.uvc.persistence", "WARNING"):
+            started = store.start_session(self.source.id, self.camera)
+        self.assertTrue(self.ledger.pending)
+        gate["refused"] = True
+        with patch.object(session_ledger.os, "replace") as replace:
+            store.retry_ledger(lambda: 0.0)  # the refused admission does not escape
+        replace.assert_not_called()
+        self.assertTrue(self.ledger.pending)
+        self.assertNotIn(marker_digest(started.session_token), self.listed())
+        # Admitted again (after the retry interval): published.
+        gate["refused"] = False
+        store.retry_ledger(lambda: session_ledger.RETRY_SECONDS)
+        self.assertFalse(self.ledger.pending)
+        self.assertEqual({marker_digest(started.session_token)}, self.listed())
 
 
 if __name__ == "__main__":

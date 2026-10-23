@@ -22,6 +22,7 @@ from app.cameras.uvc.identity import DeviceEvidence
 from app.cameras.uvc.persistence import ApprovalConflictError, ApprovalStorageError
 from app.cameras.uvc.registry_adapter import LocalUvcAdapter
 from app.cameras.uvc.session_ledger import ledger_path, marker_digest, read_ledger
+from app.media.recording.model import RecordingError
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -539,6 +540,31 @@ class UvcRegistryTests(UvcRegistryFixture):
         self.assertEqual({}, self.ledger_sessions())
         self.adapter.poll_source(self.source.id)
         self.assertIn(marker_digest(token), self.ledger_sessions()[str(self.source.id)])
+
+    def test_a_ledger_retry_the_storage_admission_refuses_never_stops_the_poll(self):
+        refused = {"on": False}
+
+        @contextmanager
+        def reservation():
+            if refused["on"]:
+                raise RecordingError("STORAGE_HARD_STOP")
+            yield
+        self.adapter.store.reservation = reservation
+        # Reopened before the fixture's clean close releases the marker.
+        self.addCleanup(refused.__setitem__, "on", False)
+        self.approve_offline()
+        with patch("app.cameras.uvc.session_ledger.os.replace", side_effect=OSError(28, "synthetic")), \
+                self.assertLogs("app.cameras.uvc.persistence", "WARNING"):
+            self.adapter.poll_source(self.source.id)
+        self.assertTrue(self.adapter.store.ledger.pending)
+        refused["on"] = True
+        session = self.adapter.sessions[self.source.id]
+        with patch.object(session, "step", wraps=session.step) as step, \
+                patch("app.cameras.uvc.session_ledger.os.replace") as replace:
+            self.adapter.poll_source(self.source.id)  # the refused retry does not escape
+        step.assert_called_once()
+        replace.assert_not_called()
+        self.assertTrue(self.adapter.store.ledger.pending)
 
     def test_clean_shutdown_of_disabled_source_does_not_report_unplug(self):
         self.adapter._approve_live_session(self.source.id, self.camera)
