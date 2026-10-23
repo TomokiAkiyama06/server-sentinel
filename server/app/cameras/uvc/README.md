@@ -33,7 +33,20 @@ process dies or a later latch write fails, the next session requires Owner
 approval instead of trusting the earlier approval value. A clean shutdown closes
 capture before releasing this marker, preserving any existing ambiguity latch.
 Session-token checks prevent an old controller's shutdown from clearing a newer
-session. This means an unclean restart conservatively requires reapproval even
+session. The service also lists the markers it issued and still holds in its
+current run in a session ledger (`session_ledger.py`, Issue #317:
+`uvc-session-ledger.json` next to the database, mode `0600`, SHA-256 digests
+of the markers plus the writing process's boot id, PID and start time),
+published before a marker is committed and withdrawn before it is released;
+the ledger is best effort (Owner decision 2026-10-23): one that cannot be
+written never stops the session (`local_uvc_session_ledger_unpublished` is
+logged, the digest is kept and the source polls retry the publication at
+most every 30 s), and meanwhile `sources` may show the source as
+`approval_required`. An ended session's digest is dropped before the
+release's storage admission, and a withdrawal that cannot be written
+(including a refused admission) removes the ledger file instead. Only
+`admin_cli sources` reads it, to tell a marker of the running service from
+one a crash left; the service never reads it back. This means an unclean restart conservatively requires reapproval even
 for serial-backed devices. Known duplicated serials are persisted as ambiguous.
 Owner selection permits that exact current binding; it does not make the same
 serial trustworthy for a later reconnect. A different uniquely observed serial

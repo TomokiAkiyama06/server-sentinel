@@ -78,11 +78,15 @@ by-id name or USB port. Names are printed quoted, escaped and bounded.
 ``sources`` prints each ``local_uvc`` source's approval state (``none``,
 ``approved``, ``approved_in_use`` or ``approval_required``; ``approval_state``)
 and is allowed while the service runs: ``approved_in_use`` is an approved,
-configured source with an active-session marker while a process of the
-service account holds the database (most likely the running service's
-session; not proof of it), and a marker of a source the deployment does not
-list or left while no process holds the database (a crash) is
-``approval_required`` because the next start requires the approval again.
+configured source whose active-session marker the running service issued in
+its current run and still holds (``session_ledger``, Issue #317: the
+service's ledger lists the marker, and the process that wrote the ledger is
+alive in this boot and holds the database). Any other marker (left by a
+crash, also while a restarted service has not started local UVC capture yet,
+or of a source the deployment does not list) is ``approval_required``
+because the next start requires the approval again. A ledger that cannot be
+read or fails its ownership checks refuses the listing
+(``service_state_unavailable``).
 
 Ambiguity (AGENTS.md section 7). ``approve`` refuses a camera without a serial
 (``camera_without_serial``) and one whose serial is not unique
@@ -132,6 +136,9 @@ from .discovery import LinuxDiscovery
 from .identity import DeviceEvidence
 from .persistence import ApprovalConflictError, ApprovalStore
 from .registry_adapter import LocalUvcAdapter, capture_profile
+from .session_ledger import (
+    SessionLedgerError, boot_id, ledger_path, marker_digest, process_start_time, read_ledger,
+)
 
 
 PROG = "python -m app.cameras.uvc.admin_cli"
@@ -236,43 +243,96 @@ def _database_holders(identity: tuple[int, int], name: str, *, proc_root: Path =
     for entry in entries:
         if not entry.isdecimal() or int(entry) == own_pid:
             continue
-        uids = _process_uids(proc_root / entry / "status")
-        if uids is None or account not in uids:
-            continue
-        descriptors = proc_root / entry / "fd"
-        try:
-            names = os.listdir(descriptors)
-        except (FileNotFoundError, ProcessLookupError):
-            continue  # exited meanwhile
-        except OSError:
-            raise CliRefused("service_state_unavailable") from None
-        for number in names:
-            try:
-                # The link text comes from the kernel's own record of the
-                # open file; reading it never reaches the file's file system.
-                if not _may_name_database(os.readlink(descriptors / number), name):
-                    continue
-                info = os.stat(descriptors / number)
-            except (FileNotFoundError, ProcessLookupError):
-                continue  # closed meanwhile, or the process exited
-            except OSError:
-                # Never counted as "not the database": fail closed.
-                raise CliRefused("service_state_unavailable") from None
-            if (info.st_dev, info.st_ino) == identity:
-                holders += 1
-                break
+        if _holds_database(proc_root / entry, identity, name, account):
+            holders += 1
     return holders
 
 
+def _holds_database(process: Path, identity: tuple[int, int], name: str, account: int) -> bool:
+    """Whether the process at ``process`` (``/proc/<pid>``) of ``account`` holds the database.
+
+    False for a process that is gone or runs as another account; refuses
+    (``service_state_unavailable``) instead of answering for one it cannot
+    inspect.
+    """
+    uids = _process_uids(process / "status")
+    if uids is None or account not in uids:
+        return False
+    descriptors = process / "fd"
+    try:
+        names = os.listdir(descriptors)
+    except (FileNotFoundError, ProcessLookupError):
+        return False  # exited meanwhile
+    except OSError:
+        raise CliRefused("service_state_unavailable") from None
+    for number in names:
+        try:
+            # The link text comes from the kernel's own record of the
+            # open file; reading it never reaches the file's file system.
+            if not _may_name_database(os.readlink(descriptors / number), name):
+                continue
+            info = os.stat(descriptors / number)
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # closed meanwhile, or the process exited
+        except OSError:
+            # Never counted as "not the database": fail closed.
+            raise CliRefused("service_state_unavailable") from None
+        if (info.st_dev, info.st_ino) == identity:
+            return True
+    return False
+
+
+def _current_run_markers(identity: tuple[int, int], database_path: Path, *,
+                         proc_root: Path = Path("/proc"),
+                         account: int | None = None) -> dict[str, frozenset[str]]:
+    """Marker digests per source the running service issued in its current run (Issue #317).
+
+    The service's ``session_ledger`` counts only while the process that
+    wrote it is alive in this boot (same boot id, PID and start time), runs
+    as this account and holds the database. A missing ledger, or one of an
+    earlier process or boot, vouches for no marker: an empty mapping. A
+    ledger or process state that cannot be read or checked refuses
+    (``service_state_unavailable``) instead of guessing either way.
+    """
+    account = os.geteuid() if account is None else account
+    try:
+        ledger = read_ledger(ledger_path(database_path), account=account)
+        if ledger is None:
+            return {}
+        writer = ledger.writer
+        if writer.boot_id != boot_id(proc_root):
+            return {}
+        if process_start_time(writer.pid, proc_root) != writer.start_time:
+            return {}  # gone, or the PID now names another process
+    except SessionLedgerError:
+        raise CliRefused("service_state_unavailable") from None
+    if not _holds_database(proc_root / str(writer.pid), identity, database_path.name, account):
+        return {}
+    # Checked again: the PID may have been reused while its descriptors were read.
+    try:
+        if process_start_time(writer.pid, proc_root) != writer.start_time:
+            return {}
+    except SessionLedgerError:
+        raise CliRefused("service_state_unavailable") from None
+    return dict(ledger.sessions)
+
+
 class _ServiceCheck:
-    def __init__(self, database, holders: Callable[[tuple[int, int], str], int]):
+    def __init__(self, database, holders: Callable[[tuple[int, int], str], int],
+                 markers: Callable[[tuple[int, int], Path], dict[str, frozenset[str]]]):
         self._identity = database._identity
+        self._path = database.path
         self._name = database.path.name
         self._holders = holders
+        self._markers = markers
 
     def running(self) -> bool:
         """Whether another process of the service account holds the database."""
         return bool(self._holders(self._identity, self._name))
+
+    def current_run_markers(self) -> dict[str, frozenset[str]]:
+        """The running service's current-run marker digests per source (``session_ledger``)."""
+        return self._markers(self._identity, self._path)
 
     def require_stopped(self) -> None:
         if self.running():
@@ -303,6 +363,12 @@ class _OfflineApprovalAdapter(LocalUvcAdapter):
     serial-ambiguous approval that the restarted service can only latch to
     ``manual_intervention_required``.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # This command never starts a session; it must never write the
+        # service's session ledger either.
+        self.store.ledger = None
 
     def prepare_approval(self, source_id, candidate):
         prepared = super().prepare_approval(source_id, candidate)
@@ -399,25 +465,25 @@ def candidate_lines(devices, failures: int, held) -> list[str]:
     return lines
 
 
-def approval_state(approval, configured: bool, service_running: Callable[[], bool]) -> str:
-    """The ``sources`` approval state of one stored approval (Issue #300).
+def approval_state(source_id: UUID, approval, configured: bool,
+                   current_run_markers: Callable[[], dict[str, frozenset[str]]]) -> str:
+    """The ``sources`` approval state of one stored approval (Issues #300, #317).
 
     ``approval_required`` when the source needs an Owner approval now or on
     the next start: the row requires approval (never approved, or the service
     latched ``manual_intervention_required``), or it still carries an
-    active-session marker the service may not have armed in its current run:
-    no process holds the database, or the deployment does not list the
-    source (the service starts sessions only for ``local_uvc.source_ids``),
-    i.e. a session that was not ended (a crash), which
-    ``ApprovalStore.start_session`` turns into "approval required" on the
-    next start. ``approved_in_use`` is an approved row with a marker, of a
-    listed source, while a process of the service account holds the
-    database: most likely the running service armed it in ``start_session``
-    for its session. It is not proof: the command cannot tell a marker of the
-    current run from one a crash left when the restarted service has not
-    (yet) started local UVC capture, and it does not mean the camera is
-    capturing (see the source's health). ``service_running`` is asked only
-    for such a row; a process state it cannot read refuses
+    active-session marker the running service did not issue in its current
+    run: the deployment does not list the source (the service starts
+    sessions only for ``local_uvc.source_ids``), or the service's session
+    ledger does not list the marker (no service process, a ledger of an
+    earlier process or boot, or a restarted service that has not started
+    this source's session yet), i.e. a session that was not ended (a crash),
+    which ``ApprovalStore.start_session`` turns into "approval required" on
+    the next start. ``approved_in_use`` is an approved row of a listed
+    source whose marker the running service issued in its current run and
+    still holds. It does not mean the camera is capturing (see the source's
+    health). ``current_run_markers`` is asked only for a row with a marker;
+    a ledger or process state it cannot read refuses
     (``service_state_unavailable``) instead of guessing either way.
     """
     if approval is None:
@@ -428,23 +494,27 @@ def approval_state(approval, configured: bool, service_running: Callable[[], boo
         return "approved"
     if not configured:
         return "approval_required"
-    return "approved_in_use" if service_running() else "approval_required"
+    digests = current_run_markers().get(str(source_id), frozenset())
+    return "approved_in_use" if marker_digest(approval.session_token) in digests else "approval_required"
 
 
 def source_lines(registry: CameraRegistry, store: ApprovalStore, configured,
-                 service_running: Callable[[], bool]) -> list[str]:
+                 current_run_markers: Callable[[], dict[str, frozenset[str]]]) -> list[str]:
     lines = []
-    running = []
+    ledger = []
 
-    def holds() -> bool:
-        if not running:  # one /proc scan per listing
-            running.append(service_running())
-        return running[0]
+    def markers() -> dict[str, frozenset[str]]:
+        if not ledger:  # one ledger and /proc check per listing
+            ledger.append(current_run_markers())
+        return ledger[0]
 
-    for source in registry.list_sources():
-        if source.source_type is not SourceType.LOCAL_UVC:
-            continue
-        state = approval_state(store.load(source.id), source.id in configured, holds)
+    # Every approval is read before the ledger: the service publishes a
+    # marker before committing it, so a marker of the current run read
+    # here is already in the ledger read afterwards.
+    sources = [(source, store.load(source.id)) for source in registry.list_sources()
+               if source.source_type is SourceType.LOCAL_UVC]
+    for source, approval in sources:
+        state = approval_state(source.id, approval, source.id in configured, markers)
         profile = source.desired_capture_profile
         wanted = ("-" if profile is None else
                   f"{profile.width}x{profile.height}@{profile.fps:g}/{profile.pixel_format}"
@@ -532,7 +602,7 @@ def _scan(context: _Context):
 def _sources(context: _Context) -> list[str]:
     try:
         lines = source_lines(context.registry, ApprovalStore(context.database), context.configured,
-                             context.check.running)
+                             context.check.current_run_markers)
     except CliRefused:
         raise  # service_state_unavailable
     except Exception:
@@ -660,7 +730,8 @@ def _approve(context: _Context, source_id: UUID, label: str) -> list[str]:
 
 def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
          discovery_factory: Callable[[], object],
-         holders: Callable[..., int]) -> int:
+         holders: Callable[..., int],
+         markers: Callable[..., dict[str, frozenset[str]]]) -> int:
     if os.geteuid() == 0:
         raise CliRefused("run_as_service_account")
     source_id = profile = None
@@ -691,7 +762,7 @@ def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
                 raise
             except Exception:
                 raise _storage_refusal(database) from None
-            check = _ServiceCheck(database, holders)
+            check = _ServiceCheck(database, holders, markers)
             registry = _StoppedServiceRegistry(database, check)
             owner = LocalConsoleOwner()
             admin = OwnerAdministration(OwnerAuditService(AuditStore(database), owner), registry)
@@ -741,11 +812,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None, *,
          terminal_factory: Callable[[], ControllingTerminal] = ControllingTerminal,
          discovery_factory: Callable[[], object] = LinuxDiscovery,
-         holders: Callable[..., int] = _database_holders) -> int:
+         holders: Callable[..., int] = _database_holders,
+         markers: Callable[..., dict[str, frozenset[str]]] = _current_run_markers) -> int:
     args = _parser().parse_args(argv)
     try:
         return _run(args, terminal_factory=terminal_factory, discovery_factory=discovery_factory,
-                    holders=holders)
+                    holders=holders, markers=markers)
     except CliRefused as error:
         print(f"{PROG}: refused: {error.reason}", file=sys.stderr)
         if error.reason in _HINTS:
