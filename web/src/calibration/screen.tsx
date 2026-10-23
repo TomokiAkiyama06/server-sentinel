@@ -188,11 +188,18 @@ export function CalibrationScreen({ services, t }: { services: DashboardServices
 /**
  * The origin badge. A source still waiting for its restart re-acquisition has
  * no reference in use yet (`origin: none`) but does have a stored calibration
- * (Issue #341), so it is not called "not calibrated".
+ * (Issue #341), so it is not called "not calibrated". When the history could
+ * not be read (`history_unavailable`) whether one is stored is unknown, and
+ * the badge says only that.
  */
 export function originText(t: Catalog, item: SceneCalibrationSource): string {
-  return item.origin === 'none' && item.phase === 'reacquire_pending'
-    ? t.calibrationOriginPending : t[`calibrationOrigin_${item.origin}`];
+  if (item.origin !== 'none' || item.phase !== 'reacquire_pending') return t[`calibrationOrigin_${item.origin}`];
+  return historyUnknown(item) ? t.calibrationOriginUnknown : t.calibrationOriginPending;
+}
+
+/** A pending source whose calibration history could not be read. */
+function historyUnknown(item: SceneCalibrationSource): boolean {
+  return item.origin === 'none' && item.phase === 'reacquire_pending' && item.failure === 'history_unavailable';
 }
 
 /** One source's calibration state and, when a template exists, its control. */
@@ -218,8 +225,9 @@ export function CalibrationCard({ t, item, name, disabled, busy = false, confirm
     {item.origin === 'restart_reacquired' && <p role="note" className="calibration-warning">
       {t.calibrationRestartWarning}</p>}
     {item.phase === 'acquiring' && <p role="status">{t.calibrationPhase_acquiring}</p>}
-    {item.phase === 'reacquire_pending' && <p role="status">{t.calibrationPhase_reacquire_pending}</p>}
-    {item.failure !== null && <p className="notice-inline" data-calibration-failure={item.failure}>
+    {item.phase === 'reacquire_pending' && <p role="status">
+      {historyUnknown(item) ? t.calibrationHistoryUnknown : t.calibrationPhase_reacquire_pending}</p>}
+    {item.failure !== null && !historyUnknown(item) && <p className="notice-inline" data-calibration-failure={item.failure}>
       {t.calibrationLastFailure}: {refusalText(t, item.failure)}</p>}
     {!item.owner_calibration_available && <p className="muted">{t.calibrationNoTemplate}</p>}
     {onCalibrate && <div className="calibration-action">

@@ -513,7 +513,10 @@ its reference.
   outbox open waiting for storage) Main calls `mark_stored()`, which only
   reads the history so that such a source reports `reacquire_pending`
   instead of `none`/`idle` (Issue #341); `pending_reacquisitions()` stays
-  empty and `reacquire()` does nothing until `start()`.
+  empty and `reacquire()` does nothing until `start()`. An unreadable
+  history marks the source with `failure="history_unavailable"` (unknown,
+  not "stored"); `start()` reads the history again, clearing that failure or
+  withdrawing the mark when nothing is stored.
 - `status()` is value-free: origin, version, time, phase, last refusal,
   whether a template exists, and the runtime's own source state and reason.
 

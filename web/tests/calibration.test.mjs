@@ -199,8 +199,25 @@ test('a restart re-acquired reference warns that it was not confirmed by the Own
   }
   assert.match(messages.ja.calibrationOriginPending, /保存済みの校正/);
   assert.doesNotMatch(messages.ja.calibrationOriginPending, /未校正/);
-  assert.match(messages.ja.calibrationPhase_reacquire_pending, /検知の開始を待っている間/);
+  assert.match(messages.ja.calibrationPhase_reacquire_pending, /検知が始まるまでの間も含みます/);
   assert.match(messages.en.calibrationPhase_reacquire_pending, /while detection has not started/);
+  // An unreadable history (`history_unavailable`) is unknown, never "stored"
+  // nor "not calibrated" (Claude review of PR #345, proposal 3).
+  for (const locale of ['ja', 'en']) {
+    const m = messages[locale];
+    const unknown = render(createElement(CalibrationCard, { t: m, item: source({ origin: 'none', version: null,
+      calibrated_at: null, phase: 'reacquire_pending', failure: 'history_unavailable', detection: 'inactive',
+      detection_reason: 'unavailable' }), name: null, disabled: false, confirmed: false, onConfirm: noop }));
+    for (const text of [m.calibrationOriginUnknown, m.calibrationHistoryUnknown]) assert.ok(unknown.includes(text), `${locale} ${text}`);
+    for (const text of [m.calibrationOriginPending, m.calibrationOrigin_none, m.calibrationPhase_reacquire_pending,
+      m.calibrationRefused_history_unavailable]) assert.ok(!unknown.includes(text), `${locale} ${text}`);
+    // After the source ran, an attempt's own `history_unavailable` is still the refusal line.
+    const refused = render(createElement(CalibrationCard, { t: m, item: source({ failure: 'history_unavailable' }),
+      name: null, disabled: false, confirmed: false, onConfirm: noop }));
+    assert.ok(refused.includes(m.calibrationRefused_history_unavailable), locale);
+    assert.ok(!refused.includes(m.calibrationOriginUnknown), locale);
+  }
+  assert.doesNotMatch(messages.ja.calibrationOriginUnknown, /保存済み|未校正/);
 });
 
 test('every refusal and calibration text exists in both locales', () => {

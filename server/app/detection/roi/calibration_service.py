@@ -360,14 +360,25 @@ class SceneCalibrationService:
         for source_id in self.runtime.source_ids:
             binding = self.runtime.binding(source_id)
             try:
-                record = self._latest(binding)
+                record, unreadable = self._latest(binding), False
             except CalibrationRefused:
-                record = True
-            if record is not None:
-                with self._lock:
-                    state = self._sources[source_id]
-                    if state.origin is CalibrationOrigin.NONE:
-                        state.reacquire = True
+                record, unreadable = None, True
+            with self._lock:
+                state = self._sources[source_id]
+                if state.origin is not CalibrationOrigin.NONE or state.acquiring:
+                    continue
+                if unreadable:
+                    # Whether a calibration is stored is unknown, not
+                    # "stored": the status says why (Issue #341), and the
+                    # attempt after `start()` reports it again.
+                    state.reacquire, state.failure = True, "history_unavailable"
+                    continue
+                if state.failure == "history_unavailable":
+                    # An earlier unreadable read is superseded by this one.
+                    state.failure = None
+                # A read that finds no stored calibration withdraws an
+                # earlier mark made only because the history was unreadable.
+                state.reacquire = record is not None
 
     def pending_reacquisitions(self) -> tuple[UUID, ...]:
         """The sources to re-acquire; none before `start()` (Issue #341)."""

@@ -793,6 +793,55 @@ class RestartReacquisitionTests(unittest.TestCase):
         closed.service.mark_stored()
         self.assertIs(CalibrationPhase.IDLE, closed.status().phase)
 
+    def unreadable_at_mark(self, harness):
+        """Make the history unreadable for `mark_stored()` only."""
+        real, calls = harness.service._latest, []
+
+        def latest(binding):
+            calls.append(binding.source_id)
+            if len(calls) == 1:
+                raise CalibrationRefused("history_unavailable")
+            return real(binding)
+
+        harness.service._latest = latest
+        return calls
+
+    def test_an_unreadable_history_at_mark_is_unknown_and_start_reads_it_again(self):
+        # Claude review of PR #345, proposals 2 and 3: an unreadable history
+        # is reported as such (never as a stored calibration), and `start()`
+        # reads the history again instead of keeping the earlier mark.
+        self.database.store(stored())
+        harness = Service(self, self.database.database, start=False)
+        calls = self.unreadable_at_mark(harness)
+        harness.service.mark_stored()
+        status = harness.status()
+        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, "history_unavailable"),
+                         (status.origin, status.phase, status.failure))
+        self.assertEqual((), harness.service.take_notices())
+        harness.runtime.start()
+        harness.service.start()
+        self.assertEqual([OTHER, OTHER], calls)
+        status = harness.status()
+        self.assertEqual((CalibrationPhase.REACQUIRE_PENDING, None), (status.phase, status.failure))
+        self.assertEqual((OTHER,), harness.service.pending_reacquisitions())
+        with Feed(harness.runtime):
+            record = harness.service.reacquire(OTHER, commit_with(self.database.database))
+        self.assertEqual((2, UUID(int=700)), (record.version, record.identifier))
+        self.assertEqual([REACQUIRED], [item.kind for item in harness.service.take_notices()])
+
+    def test_a_mark_made_only_for_an_unreadable_history_is_withdrawn_at_start(self):
+        harness = Service(self, self.database.database, start=False)
+        self.unreadable_at_mark(harness)
+        harness.service.mark_stored()
+        self.assertEqual("history_unavailable", harness.status().failure)
+        harness.runtime.start()
+        harness.service.start()
+        status = harness.status()
+        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.IDLE, None),
+                         (status.origin, status.phase, status.failure))
+        self.assertEqual((), harness.service.pending_reacquisitions())
+        self.assertEqual((), harness.service.take_notices())
+
     def test_without_a_stored_calibration_nothing_is_reacquired_or_notified(self):
         harness = Service(self, self.database.database)
         harness.service.start()
