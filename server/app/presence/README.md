@@ -324,7 +324,14 @@ like a recording-health or integrity alert (Owner decision 2026-10-22, Issue
   resolved), a failing dispatch step escalates it to an attempt. That covers
   an observation recorded just before the disk is removed (the claim is then
   refused) and a row left `unavailable` while the notification queue was
-  full. Each hand-over only touches memory under a short lock: no I/O, no
+  full. A record whose commit succeeded but whose connection close or
+  storage reservation release raised afterwards (Issue #333) is not handed
+  to the refused queue: the record is durable and the hand-over above already
+  passed it to the dispatcher or the watch, so a drain cannot send a second
+  message for it. The scene runtime still retries it as an idempotent replay.
+  If that hand-over itself did not complete, the failure is handed over as a
+  refusal as before, so the alert is never left unattempted. Each hand-over
+  only touches memory under a short lock: no I/O, no
   wait for the monitoring worker, never a raise into the recorder. Without
   Slack nothing is handed over.
 - Bounds: refused hand-overs are in practice bounded by the scene runtime's

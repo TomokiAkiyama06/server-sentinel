@@ -388,13 +388,18 @@ class PresenceService:
         return held
 
     @contextmanager
-    def _transaction(self, *, required=True):
+    def _transaction(self, *, required=True, committed=None):
         """Admitted durable write. ``required=False`` yields ``None`` when storage refuses.
 
         Only read-only status reporting uses the optional form, so a refused or
         exhausted volume degrades visibly instead of hiding presence state.
         The reservation stays entered until after the SQLite commit and the
         connection close, and is released even when the write fails.
+
+        ``committed()``, when given, is called right after the SQLite commit
+        returned, before the connection close and the reservation release, so
+        a caller can tell a failure of those (raised after a durable commit)
+        from a write that did not commit. Its exceptions are ignored.
         """
         with ExitStack() as reserved:
             try:
@@ -410,6 +415,11 @@ class PresenceService:
             try:
                 yield db
                 db.commit()
+                if committed is not None:
+                    try:
+                        committed()
+                    except Exception:
+                        pass
             except BaseException:
                 db.rollback()
                 raise
@@ -541,7 +551,7 @@ class PresenceService:
         with self._transaction() as db:
             return self._record(db, observation, presence_valid_until, restamped, source_fact)
 
-    def record_critical(self, observation, *, restamped=False, recorded=None):
+    def record_critical(self, observation, *, restamped=False, recorded=None, committed=None):
         """`record()` for a confirmed critical, also telling whether its notification waits.
 
         Returns ``(observation, awaiting)``: ``awaiting`` is whether, at the
@@ -557,12 +567,18 @@ class PresenceService:
         registers cannot outlive a claim made right after the commit. It must
         only touch memory; its exceptions are ignored, and if the commit then
         fails the record fails as usual.
+
+        ``committed()``, when given, is called once the commit returned and
+        before the connection close and the reservation release (see
+        `_transaction`): a failure raised after it leaves the record durable
+        (Issue #333). It must only touch memory; its exceptions are ignored.
         """
         if not isinstance(observation, Observation):
             raise InvalidObservation("typed observation required")
-        if recorded is not None and not callable(recorded):
+        if (recorded is not None and not callable(recorded)
+                or committed is not None and not callable(committed)):
             raise InvalidObservation("invalid record hand-over")
-        with self._transaction() as db:
+        with self._transaction(committed=committed) as db:
             stored = self._record(db, observation, None, restamped, None)
             awaiting = db.execute("SELECT 1 FROM presence_deliveries WHERE observation=? "
                                   "AND action='notification' AND state IN ('pending','unavailable')",

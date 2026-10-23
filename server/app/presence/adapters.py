@@ -703,7 +703,11 @@ class CriticalTimelineRecorder:
     one storage keeps from being claimed (a refusal right after the record) is
     attempted too, while a recorded one is never attempted again from the
     refused queue (`UnrecordedCriticalAlerts.recorded`). Its exceptions never
-    change the record.
+    change the record. A failure raised after the commit (the connection
+    close or the reservation release, Issue #333) is not handed to
+    ``refused`` once ``recorded`` completed: the record is durable and the
+    watch covers it. Without a completed ``recorded`` hand-over it is handed
+    to ``refused`` as before, so it is never left unattempted.
     """
 
     def __init__(self, outbox: TimelineOutbox, *, maximum_source_latency: timedelta,
@@ -736,23 +740,40 @@ class CriticalTimelineRecorder:
 
     def __call__(self, item: CriticalObservation) -> None:
         self._quality(item)
+        # Whether the watch hand-over completed and the record committed.
+        settled = {"handed": False, "committed": False}
         if self.recorded is not None:
             def hand_over(awaiting):
                 # Inside the record transaction, before its commit (see
                 # `PresenceService.record_critical`).
                 self.recorded(item.identifier, item.kind, awaiting)
+                settled["handed"] = True
         else:
             hand_over = None
+
+        def committed():
+            settled["committed"] = True
+
         try:
             with self.outbox.receipt() as (received, trusted):
                 self.outbox.service.record_critical(
-                    self.observation(item, received, trusted), restamped=True, recorded=hand_over)
+                    self.observation(item, received, trusted), restamped=True,
+                    recorded=hand_over, committed=committed)
         except InvalidObservation:
             # A contract error or an identity conflict: not an alert waiting
             # for storage. (An unavailable database location is a plain
             # `ValueError` and is handed over below.)
             raise
         except Exception:
+            if settled["handed"] and settled["committed"]:
+                # Issue #333: the record committed and only the connection
+                # close or the reservation release raised afterwards. The
+                # hand-over already gave its notification to the dispatcher
+                # (unclaimed work stays watched and is escalated by a failing
+                # dispatch step; claimed work is the dispatcher's), so the
+                # refused queue must not attempt it a second time. The scene
+                # runtime still retries it as an idempotent replay.
+                raise
             if self.refused is not None:
                 try:
                     self.refused(item.identifier, item.kind)

@@ -234,7 +234,7 @@ class ClaimRefusedTests(Unrecorded, unittest.TestCase):
 
     def setUp(self):
         super().setUp()
-        self.refusing = False
+        self.refusing = self.release_fails = False
 
     def reservation(self):
         @contextmanager
@@ -242,8 +242,19 @@ class ClaimRefusedTests(Unrecorded, unittest.TestCase):
             if self.refusing:
                 raise RuntimeError("synthetic STORAGE_HARD_STOP")
             yield
+            if self.release_fails:
+                # Raised after the commit and the connection close.
+                raise RuntimeError("synthetic reservation release failure")
 
         return admission()
+
+    def record_then_release_fails(self, timeline, item):
+        self.release_fails = True
+        try:
+            with self.assertRaises(RuntimeError):
+                timeline.recorder(item)
+        finally:
+            self.release_fails = False
 
     def timeline(self, service):
         timeline = SceneTimeline(configuration(), self.database, self.reservation,
@@ -398,6 +409,117 @@ class ClaimRefusedTests(Unrecorded, unittest.TestCase):
         timeline.recorder(item)
         self.assertEqual([0], seen)
         self.assertEqual("pending", self.state(item.identifier))
+        self.assertEqual((item.identifier,), timeline.unrecorded.awaiting())
+
+    def test_a_claimed_replay_stops_watching(self):
+        # Issue #333 (1): a watched ID claimed by a dispatch step and replayed
+        # before the prune leaves the watch, so a failing step does not
+        # escalate an alert the dispatcher already owns.
+        service = self.notifications(Transport())
+        alerts = UnrecordedCriticalAlerts(self.adapter(service))
+        identifier, other = uuid4(), uuid4()
+        alerts.recorded(identifier, CriticalKind.SERVER_MOVEMENT, True)
+        alerts.recorded(other, CriticalKind.CAMERA_TAMPER, True)
+        self.assertEqual((identifier, other), alerts.awaiting())
+        alerts.recorded(identifier, CriticalKind.SERVER_MOVEMENT, False)
+        self.assertEqual((other,), alerts.awaiting())
+        alerts.escalate()
+        self.assertEqual(1, alerts.queued)
+        alerts.refused(other, CriticalKind.CAMERA_TAMPER)
+        self.assertEqual(1, alerts.queued)
+
+    def test_a_failure_after_the_commit_is_not_resent_by_a_later_refusal(self):
+        # Issue #333 (2): the record committed, then the reservation release
+        # raised. The recorded ID must not go back to the refused queue, or a
+        # drain whose stored outcome is unreadable would send it again.
+        transport = Transport()
+        service = self.notifications(transport)
+        timeline = self.timeline(service)
+        item = critical(CriticalKind.CAMERA_TAMPER, at=datetime.now(timezone.utc))
+        self.record_then_release_fails(timeline, item)
+        self.assertEqual("pending", self.state(item.identifier))
+        self.assertEqual(0, timeline.unrecorded.queued)
+        self.assertEqual((item.identifier,), timeline.unrecorded.awaiting())
+        timeline.dispatch()
+        self.settle(service, transport, 1)
+        service.poll()
+        timeline.dispatch()
+        self.assertEqual("delivered", self.state(item.identifier))
+        self.refuse(True)
+        with self.assertRaises(Exception):
+            timeline.dispatch()
+        self.assertEqual(0, timeline.unrecorded.drain(at=NOW))
+        time.sleep(0.2)
+        service.poll()
+        self.assertEqual([ALERT + "camera_tamper"], texts(transport))
+        self.assertEqual(0, timeline.unrecorded.submitted)
+        # The scene runtime's retry is an idempotent replay.
+        self.refuse(False)
+        timeline.recorder(item)
+        self.assertEqual((), timeline.unrecorded.awaiting())
+
+    def test_a_failure_after_the_commit_before_a_hard_stop_still_alerts_once(self):
+        # Issue #333 (2): committed but unclaimed, and the disk goes away:
+        # the watch escalates it, so it is never left unattempted.
+        transport = Transport()
+        service = self.notifications(transport)
+        timeline = self.timeline(service)
+        item = critical(CriticalKind.SERVER_MOVEMENT, at=datetime.now(timezone.utc))
+        self.record_then_release_fails(timeline, item)
+        self.assertEqual(0, timeline.unrecorded.queued)
+        self.refuse(True)
+        with self.assertRaises(Exception):
+            timeline.dispatch()
+        self.assertEqual(0, timeline.unrecorded.drain(at=NOW))
+        self.settle(service, transport, 1)
+        self.assertEqual(1, timeline.unrecorded.submitted)
+        self.refuse(False)
+        service.poll()
+        timeline.dispatch()
+        self.assertEqual("delivered", self.state(item.identifier))
+        self.assertEqual([ALERT + "server_movement"], texts(transport))
+
+    def test_a_failure_after_the_commit_without_a_completed_hand_over_is_refused(self):
+        # Issue #333 (2): when the watch hand-over itself failed, nothing
+        # watches the committed record, so the failure is handed over as a
+        # refusal as before rather than left unattempted.
+        service = self.notifications(Transport())
+        timeline = self.timeline(service)
+        item = critical(CriticalKind.CAMERA_TAMPER, at=datetime.now(timezone.utc))
+
+        def recorded(identifier, kind, awaiting):
+            raise RuntimeError("synthetic hand-over fault")
+
+        timeline.recorder.recorded = recorded
+        self.record_then_release_fails(timeline, item)
+        self.assertEqual("pending", self.state(item.identifier))
+        self.assertEqual(1, timeline.unrecorded.queued)
+
+    def test_a_failed_commit_is_still_refused(self):
+        # The hand-over runs before the commit; a commit that then fails
+        # leaves nothing recorded, so the alert goes to the refused queue.
+        service = self.notifications(Transport())
+        timeline = self.timeline(service)
+        item = critical(CriticalKind.SERVER_MOVEMENT, at=datetime.now(timezone.utc))
+        connect = timeline.presence.database.connect
+
+        class FailingCommit:
+            def __init__(self, db):
+                self.db = db
+
+            def commit(self):
+                raise sqlite3.OperationalError("synthetic commit failure")
+
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+
+        timeline.presence.database.connect = lambda: FailingCommit(connect())
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                timeline.recorder(item)
+        finally:
+            timeline.presence.database.connect = connect
+        self.assertEqual(1, timeline.unrecorded.queued)
         self.assertEqual((item.identifier,), timeline.unrecorded.awaiting())
 
     def test_an_unreadable_watch_after_a_successful_step_escalates(self):
