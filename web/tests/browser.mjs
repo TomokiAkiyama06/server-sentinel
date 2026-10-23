@@ -269,7 +269,11 @@ async function scenario(viewport, { production = false, status = 200, session = 
     // own refusals are not errors.
     let late = [];
     try { late = await routes.finish(page.command); } finally { cleanup.forEach(remove => remove()); await page.close(); }
-    if (checked) assert.deepEqual(late, [], 'request interception must succeed until the page closes');
+    if (checked) {
+      assert.deepEqual(late, [], 'request interception must succeed until the page closes');
+      // A request the page abandoned after the last check counts as well.
+      assert.deepEqual(unexpectedAbandoned(abandoned, expectAbandoned), [], 'no request is abandoned unless the scenario expects it');
+    }
   }
   cases++;
 }
@@ -291,9 +295,10 @@ try {
         await page.heading('接続を確認できません');
       });
     }
-    // Walking the screens moves on once each heading shows, so leaving a
-    // screen may abort its read before the answer (seen 1 in 40 runs, #334).
-    const viewReads = [{ method: 'GET', path: /^\/api\/mock\/(?:sources|timeline|presence|recordings|storage)$/ }];
+    // Walking the screens moves on once each heading shows, so leaving the
+    // recordings screen may abort its read before the answer: the only read
+    // observed abandoned (1 in 40 runs, #334). Any other abandon still fails.
+    const viewReads = [{ method: 'GET', path: '/api/mock/recordings' }];
     for (const count of [0, 1, 2, 3, 4]) {
       await scenario(viewport, { count, expectAbandoned: viewReads }, async page => {
         await page.click('カメラソース');

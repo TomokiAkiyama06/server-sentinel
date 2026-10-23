@@ -311,13 +311,17 @@ test('finish disables interception, then reports errors started after the last s
   routes.track(delay(30).then(() => { throw new TypeError('/api/late 0123'); }));
   // Answers the teardown itself refuses are not errors.
   routes.track(Promise.reject(refusal('Fetch.fulfillRequest', -32000, 'Fetch domain is not enabled')));
+  routes.track(Promise.reject(refusal('Fetch.failRequest', -32000, 'Fetch domain is not enabled')));
+  // A handler's answer refused because the target went away is not excused:
+  // finish runs before the page closes, so that is a genuine failure.
   routes.track(Promise.reject(refusal('Fetch.failRequest', -32001, 'Session with given id not found.')));
-  assert.deepEqual(await routes.finish(command), ['TypeError raised by the interceptor'], 'only the late genuine error, once');
+  assert.deepEqual(await routes.finish(command), ['Fetch.failRequest refused (CDP -32001): Session with given id not found.',
+    'TypeError raised by the interceptor'], 'only the late genuine errors, once');
   // Offline first, so a request still paused is released to no network; then no handler starts.
   assert.deepEqual(sent, ['Network.emulateNetworkConditions', 'Fetch.disable']);
   // Nothing new since: nothing reported, even though the earlier errors are kept.
   assert.deepEqual(await routes.finish(command), []);
-  assert.equal(routes.errors.length, 4);
+  assert.equal(routes.errors.length, 5);
 });
 
 test('finish never throws and keeps its own failures value-free (#334)', async () => {
@@ -342,10 +346,11 @@ test('only the teardown\'s own refusals are allow-listed (#334)', () => {
   for (const allowed of [
     described('Fetch.fulfillRequest', -32000, 'Fetch domain is not enabled'),
     described('Fetch.failRequest', -32000, 'Fetch domain is not enabled'),
-    described('Fetch.fulfillRequest', -32001, 'Session with given id not found.'),
+    // A target already gone is excused only for finish's own commands.
     described('Fetch.disable', -32001, 'Session with given id not found.'),
+    described('Network.emulateNetworkConditions', -32001, 'Session with given id not found.'),
     described('Network.emulateNetworkConditions', -32000, 'Target closed.'),
-    described('Fetch.failRequest', -32000, 'Inspected target navigated or closed'),
+    described('Fetch.disable', -32000, 'Inspected target navigated or closed'),
   ]) assert.equal(isTeardownError(allowed), true, allowed);
   for (const genuine of [
     // A request the page did not cancel: Chrome dropped it for another reason.
@@ -353,6 +358,11 @@ test('only the teardown\'s own refusals are allow-listed (#334)', () => {
     described('Fetch.fulfillRequest', -32602, 'Invalid header'),
     described('Fetch.fulfillRequest', -32602, 'Fetch domain is not enabled'),
     described('Fetch.disable', -32000, 'Fetch domain is not enabled'),
+    // A handler's answer refused because its target went away (#334 review).
+    described('Fetch.fulfillRequest', -32001, 'Session with given id not found.'),
+    described('Fetch.failRequest', -32000, 'Target closed.'),
+    described('Fetch.continueRequest', -32000, 'Inspected target navigated or closed'),
+    described('Runtime.evaluate', -32001, 'Session with given id not found.'),
     'TypeError raised by the interceptor',
     'Chrome was closed.',
     'Chrome command timeout: Fetch.fulfillRequest (10000 ms)',

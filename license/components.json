@@ -19,15 +19,15 @@
     },
     {
       "path": "web/tests/browser.mjs",
-      "sha256": "sha256:793fba1853c503d4c5df80cde856a86f000ff17dc3b0947939b48fce5a57d0a4"
+      "sha256": "sha256:9918e2502908202716f3826df8e29fff7fb33c03388f14db3c17815f50767995"
     },
     {
       "path": "web/tests/chrome.mjs",
-      "sha256": "sha256:809b25ab6cd90ebdfa72172e0ed9fbc331bf9d0cdfbe2141e4963b6d5f480cfc"
+      "sha256": "sha256:ee704787d076dfcb1d4cab5d6124951de926b355d676ec72861e0d860f37a792"
     },
     {
       "path": "web/tests/chrome.test.mjs",
-      "sha256": "sha256:da3466270fe89745a3f4039d6fdc9fad820e7257a1f7563887312b71621708a7"
+      "sha256": "sha256:df7ed85c89457705e17d7509f3a2a8dc0db6e8c9dd84fe06576edc505a420048"
     },
     {
       "path": "web/tests/compile.mjs",
@@ -51,7 +51,7 @@
     },
     {
       "path": "web/tests/signin_browser.mjs",
-      "sha256": "sha256:42143cc417808f3c20f4722f861405458c0be397c810b6914bdfb79a229b8d4f"
+      "sha256": "sha256:4775fe3df18c6fb5a4a8616e9b4d48ceb9cb853392c4143a72899db770ba55dc"
     },
     {
       "path": "web/tests/views.test.mjs",
@@ -75,7 +75,7 @@
     },
     {
       "path": "web/tests/access_browser.mjs",
-      "sha256": "sha256:b2ad76ba8466e8b00806263180e6c8c225b64aaa01b2cb88954c51c663774c3b"
+      "sha256": "sha256:4ef6814215cc72bee5d65965f5bd700ac040fb6cb48d322fc4dca86acf7cd3e9"
     },
     {
       "path": "web/tests/calibration.test.mjs",
@@ -83,7 +83,7 @@
     },
     {
       "path": "web/tests/calibration_browser.mjs",
-      "sha256": "sha256:2a78b6f680cb05213c78356c13f2bee49de098c56a3c042c4c8b1c573dbcc307"
+      "sha256": "sha256:da3c7ed7b90147a1061dfbc634136d1b4a660bc95382a712261e2d41545062de"
     }
   ],
   "inputs": [

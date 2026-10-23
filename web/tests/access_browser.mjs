@@ -209,14 +209,18 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true, e
       assert.equal(request.headers.Origin ?? request.headers.origin, origin, `Origin on POST ${request.path}`);
       assert.equal(request.headers.Referer ?? request.headers.referer, undefined);
     }
-    if (afterChecks) await afterChecks({ page, requests });
+    if (afterChecks) await afterChecks({ page, requests, abandoned });
     checked = true;
   } finally {
     // A handler the page started after the last settle is still checked
     // before the page closes (#334); the teardown's own refusals are not errors.
     let late = [];
     try { late = await routes.finish(page.command); } finally { cleanup.forEach(remove => remove()); await page.close(); }
-    if (checked) assert.deepEqual(late, [], 'request interception must succeed until the page closes');
+    if (checked) {
+      assert.deepEqual(late, [], 'request interception must succeed until the page closes');
+      // A request the page abandoned after the last check counts as well.
+      assert.deepEqual(unexpectedAbandoned(abandoned, expectAbandoned), [], 'no request is abandoned unless the scenario expects it');
+    }
   }
   cases++;
   process.stdout.write(`access screen: ${name}\n`);
@@ -446,7 +450,27 @@ try {
     assert.deepEqual(error.actual, ['TypeError raised by the interceptor']);
     return true;
   });
-  process.stdout.write('access screen harness: an unexpected abandoned POST and a late interception error both fail\n');
+  // A request the page abandons after the last check, before the page closes.
+  const lateAbandon = '/api/self-check/abandoned';
+  await assert.rejects(scenario('self-check: a request abandoned after the last check', {
+    handlers: () => ({ [`POST ${lateAbandon}`]: async () => { await delay(300); return [204, '', null]; } }),
+    async afterChecks({ page, requests, abandoned }) {
+      await page.evaluate(`(() => { const controller = new AbortController();
+        fetch(${JSON.stringify(lateAbandon)}, { method: 'POST', body: '{}', signal: controller.signal }).catch(() => undefined);
+        window.__abortLate = () => controller.abort(); })()`);
+      for (let attempt = 0; attempt < 100 && !requests.some(item => item.path === lateAbandon); attempt++) await delay(20);
+      assert.ok(requests.some(item => item.path === lateAbandon), 'the late request reached the interceptor');
+      await page.evaluate('window.__abortLate()');
+      // Recorded once its late answer is refused as cancelled by the page.
+      for (let attempt = 0; attempt < 100 && !abandoned.length; attempt++) await delay(20);
+      assert.equal(abandoned.length, 1, 'the late request was abandoned');
+    },
+  }, async ({ ui }) => { await ui.open(); }), error => {
+    assert.match(error.message, /^no request is abandoned unless the scenario expects it\n/);
+    assert.deepEqual(error.actual, [`POST ${lateAbandon}`]);
+    return true;
+  });
+  process.stdout.write('access screen harness: an unexpected abandoned POST, a late interception error and a late abandon all fail\n');
 
   process.stdout.write(`${cases} access screen scenarios passed; a virtual authenticator is not a real passkey provider.\n`);
 } finally { await browser.close(); }

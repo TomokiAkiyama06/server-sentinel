@@ -197,7 +197,11 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true, e
     // before the page closes (#334); the teardown's own refusals are not errors.
     let late = [];
     try { late = await routes.finish(page.command); } finally { cleanup.forEach(remove => remove()); await page.close(); }
-    if (checked) assert.deepEqual(late, [], 'request interception must succeed until the page closes');
+    if (checked) {
+      assert.deepEqual(late, [], 'request interception must succeed until the page closes');
+      // A request the page abandoned after the last check counts as well.
+      assert.deepEqual(unexpectedAbandoned(abandoned, expectAbandoned), [], 'no request is abandoned unless the scenario expects it');
+    }
   }
   cases++;
   process.stdout.write(`calibration screen: ${name}\n`);

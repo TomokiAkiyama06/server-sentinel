@@ -200,13 +200,14 @@ export function describeCommandError(error) {
   return `${name} raised by the interceptor`;
 }
 
-// Interception errors a scenario's own teardown causes (#334): an answer
-// sent after `finish` disabled the Fetch domain, or after the page's target
-// went away. Matched against `describeCommandError` output, so they stay
-// value-free; every other error found by `finish` fails the scenario.
+// Interception errors a scenario's own teardown causes (#334). A handler's
+// answer may only be refused because `finish` disabled the Fetch domain; a
+// target that went away is excused only for `finish`'s own commands, never
+// for a handler's answer. Matched against `describeCommandError` output, so
+// they stay value-free; every other error found by `finish` fails the scenario.
 const TEARDOWN_ERRORS = [
   /^Fetch\.(?:fulfillRequest|failRequest|continueRequest) refused \(CDP -32000\): Fetch domain is not enabled\.?$/,
-  /^[A-Z][A-Za-z]{0,31}\.[a-z][A-Za-z]{0,63} refused \(CDP -?\d+\): (?:Session with given id not found|Target closed|Inspected target navigated or closed)\.?$/,
+  /^(?:Network\.emulateNetworkConditions|Fetch\.disable) refused \(CDP -?\d+\): (?:Session with given id not found|Target closed|Inspected target navigated or closed)\.?$/,
 ];
 
 /** True for a described interception error that only a scenario's teardown causes (#334). */
