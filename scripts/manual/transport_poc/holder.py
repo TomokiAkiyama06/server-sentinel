@@ -259,6 +259,7 @@ class Holder:
                     drops = sum(self.capture.frames(source).drop_stats()[0]
                                 for source in self.source_ids)
                     self.writer.write("sample", frames=sum(self.frames), queue_drops=drops,
+                                      **self._counter_fields(),
                                       forward_drops=self.forward_drops,
                                       cpu_seconds=records.process_cpu_seconds() - cpu0,
                                       child_cpu_seconds=records.descendant_cpu_seconds(),
@@ -307,7 +308,25 @@ class Holder:
         except OSError:
             pass
         self.capture.close()
-        self.writer.write("end", frames=sum(self.frames))
+        # The authoritative final counters: taken after capture.close() has
+        # reaped every pipeline, so a framing loss, relaunch or padding seen
+        # after the last one-second sample (or while the readers drained at
+        # shutdown) is still judged (summarize prefers these over samples).
+        self.writer.write("end", frames=sum(self.frames), **self._counter_fields())
+
+    def _counter_fields(self):
+        """Value-free product counters (Issue #305), judged per source.
+
+        Restarts are launches beyond each source's first, so a restart of one
+        camera cannot hide behind another that never started; plus sources
+        never launched, framing teardowns and tolerated oversized padding.
+        """
+        counters = [self.capture.counters(source) for source in self.source_ids]
+        return {"capture_launches": sum(c.launches for c in counters),
+                "capture_restarts": sum(max(0, c.launches - 1) for c in counters),
+                "sources_never_launched": sum(1 for c in counters if c.launches == 0),
+                "stream_invalid": sum(c.stream_invalid for c in counters),
+                "padding_tolerated": sum(c.padding_tolerated for c in counters)}
 
 
 def run(args, writer):

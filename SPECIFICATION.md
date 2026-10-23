@@ -472,7 +472,9 @@ Skipped bytes are discarded as they are read, so the bound does not grow the
 parser's memory. A gap beyond the bound without an SOI, and any structural
 error after an SOI (including an SOI found inside padding), is a malformed stream:
 the pipeline is torn down and relaunched with backoff, and no guessed frame is
-emitted.
+emitted. Tolerated oversized gaps, framing teardowns and pipeline launches are
+kept as value-free per-source counters (`UvcCapture.counters`, counts only; not
+logged per frame and not part of the heartbeat contract).
 Before starting a pipeline the Agent checks the explicit profile against the MJPEG
 frame sizes and intervals the opened approved node advertises (read-only
 `VIDIOC_ENUM_FMT`/`ENUM_FRAMESIZES`/`ENUM_FRAMEINTERVALS` on that descriptor only,
@@ -1618,8 +1620,8 @@ stopped process never stored, which is not confirmed delivery. On the first
 running tick the confirmed `camera_offline` rows still `pending` whose event
 time is less than 24 hours old are taken, newest event first, at most
 `hourly_limit` (the event time never moves when a row is written again, so a
-restart loop cannot keep a row eligible; a row whose time cannot be read
-counts when it was accepted within 24 hours). Each is submitted again under its
+restart loop cannot keep a row eligible; a row whose ID or event time cannot
+be read is skipped, Issue #342). Each is submitted again under its
 stored event ID and time, whether or not the outage is still in progress, as
 an episode that reached the threshold is notified once even if it recovered
 before the drain (the row does not name its source, so it opens no alerted
@@ -1634,7 +1636,23 @@ progress since the service started (each source's first episode) and a ratio
 alert (whose name holds only within its window) can be covered: a later
 outage of the same process that reuses a restored name (its online
 last-frame write was refused), before or after the resend went out, is a new
-outage and is notified under a per-process ID (Codex PR #339). A `pending` row found
+outage and is notified under a per-process ID (Codex PR #339). Each source's
+first episode is named once on that first running tick while it is still in
+progress, and the name is kept (Issue #342): an episode that reached the
+threshold and recovered before the drain that would have named it is still
+matched to its row by that name (covered by the resend, settled by a final
+row, or resent under it), not sent again under a per-process ID; and when
+that episode was already notified under a per-process ID because monitoring
+was not yet running (no names without storage, e.g. the recording
+filesystem was not yet visible), the restored row of that name is not sent
+again, since the Owner already has that notification. That row stays
+`pending` (there is no truthful final state for a POST whose outcome is
+unknown) and keeps its slot of the restored hour; a later restart within 24
+hours of its event time restores it once more and sends it once (one
+further notice of that outage, under the cap). An outage that had already
+recovered with a new last-frame time before monitoring reached `running`
+cannot be matched by name: its restored row is then sent again too (one
+duplicate). A `pending` row found
 only by name is submitted again under that name and time, under the same cap.
 So when a pending row of the hour still holds its slot and the same outage is
 still in progress, the notification of that outage itself waits for the slot
@@ -1650,14 +1668,18 @@ named anew after a day). A row of that name accepted more than 24 hours earlier 
 counts as this outage (Owner decision 2026-10-22, PR #320): the next name of a
 deterministic chain (`…:repeat:1`, `…:repeat:2`, …) is used and the outage is
 notified again, under the hourly cap; a restart within 24 hours of that
-notification still finds it. So when the last-frame time could not be written
+notification still finds it. A `pending` row of the chain is aged by its event
+time instead (an unreadable one counts as old, Issue #342): its resend writes
+its acceptance time again, so a restart loop during one long outage would
+otherwise resend the same row hourly past the day. So when the last-frame time could not be written
 during a short online period (for example storage refused it), a later outage
 that a restarted process maps to the earlier name is notified once the earlier
 notification is more than a day old; within that day it is not (within one
 process such a reused ID gets a per-process ID instead). The same rule notifies
 again an outage that has continued for more than a day when the service
 restarts. Without storage, or for an episode that already recovered, the ID is
-per process (at worst one repeat after a restart).
+per process (at worst one repeat after a restart), except a first episode
+named on the first running tick (above).
 
 Intermittent outages (Owner decision 2026-10-22, Refs #301: short outages that
 repeat must notify too). A source that was not online for
@@ -1696,9 +1718,19 @@ continuous notification):
   not yet notified (owed, held by the cap or refused by the queue), the ratio
   rule does not evaluate that source; the continuous notification reports it.
 - A ratio alert held back by the cap is sent when the hour allows if its
-  period is still open, and dropped (`camera_offline_notification_dropped`)
-  once the period has closed; one refused by the queue is retried with the
-  same time and ID.
+  period is still open; one refused by the queue is retried with the same
+  time and ID. Once its period has closed, a ratio alert held back by the
+  cap is dropped (`camera_offline_notification_dropped`) before the cap is
+  consulted, also when the hour has room again by the next drain (Issue #338
+  item 2). A ratio alert exists only from the drain that triggers it, so one
+  that ended was held for a whole quiet window; unlike a continuous episode
+  that reached the threshold between two drains, it has no "recovered
+  before its first drain" case to send once. One the cap allowed but the
+  queue refused (delivery backpressure) is, like a refused continuous
+  episode, still sent under its time and ID once the queue takes it, also
+  after its period closed, and dropped only if the cap is closed by then
+  (PR #348 review), so a backpressure lasting a window never leaves the
+  period unnotified.
 
 `MonitoringStatus.camera_offline_degraded` is also set while a ratio-opened
 period is open. Per source the not-online seconds are kept in at most 130
@@ -1716,17 +1748,28 @@ bucket whose event time is less than one window old (a future time counts as
 recent, an unreadable one as old) and sends nothing, opening the period as if
 it had. A new flapping period can only trigger more than a window after the
 previous alert of the source (its period first has to close after a whole
-quiet window), so this lookup never hides a new period. Known limits after a
-restart (the in-memory period does not survive it): a source that keeps
-flapping more than a window after its last ratio alert, or after a continuous
-alert, may get one more ratio alert; and after a restart that follows a
-ratio alert, a flapping episode that stays offline for `after_seconds` is
-notified by the continuous rule even when the stopped process already sent
-that period's continuous notification (its name follows the last-frame
-time, not the flapping alert). One restart can therefore add up to two
-notifications: a restart more than a window after the last ratio alert of a
-source that is still flapping can send a new ratio alert and then that new
-period's continuous notification. All of them stay under the hourly cap. The Slack text is the fixed `ServerSentinel critical alert:
+quiet window), so this lookup never hides a new period. After a restart the
+in-memory period is gone, and a continuous episode that reaches
+`after_seconds` keeps the ratio rule from evaluating its source. Such an
+episode, while its source has no alerted period, looks up the same stored
+ratio alert once (Issue #338 item 1); when one of the source is found, the
+period is restored as ratio-opened with this episode as its flapping
+episode (a `pending` alert found this way is resent under its ID and time,
+or covered by its restored resend). The episode is still notified once, as
+the period's continuous notification, and later flapping episodes of the
+period are not. Known limits after a restart (whether the stopped process
+already sent the period's continuous notification is not stored, and the
+lookup only reaches a ratio alert less than one window old): when the
+stopped process had already sent that continuous notification for an
+earlier flapping episode, the restarted process sends one more; a restart
+whose first due episode comes a window or more after the last ratio alert
+restores no period (the continuous rule then runs as for a period it
+opened); and a source that keeps flapping more than a window after its last
+ratio alert, or after a continuous alert, may get one more ratio alert. One
+restart can therefore add up to two notifications: a restart more than a
+window after the last ratio alert of a source that is still flapping can
+send a new ratio alert and then that new period's continuous notification.
+All of them stay under the hourly cap. The Slack text is the fixed `ServerSentinel critical alert:
 camera_offline`: no source name, role, UUID, device path, serial, reason or
 image; the Owner identifies the source in the Web UI. `MonitoringStatus`
 reports `camera_offline_degraded` (counted as degraded in the daily summary)
