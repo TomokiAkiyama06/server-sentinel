@@ -670,6 +670,17 @@ class MonitoringRuntime:
             healthy = True
         except RecordingError:
             healthy = False
+        # Issue #340 / Codex P1 on PR #344: a topology refusal seen only by an
+        # admission since the last healthy tick starts an episode too, even
+        # when the backing was restored before this check, and alerts once
+        # like any other mismatch. Consumed after `check` (which may set it
+        # again); refusals during an episode already alerted belong to it, so
+        # a healthy check then ends the episode as before. `take` must run
+        # first, on every tick: a flag raised during the episode is discarded
+        # here, never left for the tick after recovery to re-alert the ended
+        # episode (PR #344 review).
+        if self.filesystem.take_topology_refusal() and self._filesystem_ok:
+            healthy = False
         if not healthy and self._filesystem_ok:
             # One immediate alert per mismatch episode; recovery re-arms it.
             at = self.dependencies.utcnow()
@@ -774,13 +785,17 @@ class MonitoringRuntime:
                 # The rolling hour continues across a restart (as Issue #281
                 # item 2 for the access budgets).
                 # Only the confirmed threshold alerts the monitor counted,
-                # an accepted `pending` one included (it is never resent),
-                # never an unconfirmed local `camera_offline` observation
-                # (Codex PR #320).
+                # an accepted `pending` one included (its uncertain delivery
+                # holds a slot; it is sent again below once that slot
+                # expires), never an unconfirmed local
+                # `camera_offline` observation (Codex PR #320).
+                now = self.dependencies.utcnow()
                 monitor.restore_window(self._notification_window(
                     (NotificationKind.CAMERA_OFFLINE,), monitor.hourly_limit,
-                    self.dependencies.utcnow(), confirmed_only=True, include_pending=True),
+                    now, confirmed_only=True, include_pending=True),
                     monotonic=self.dependencies.monotonic())
+                rows, unrestored = self._camera_pending_rows(monitor.hourly_limit, now)
+                monitor.restore_pending(rows, unrestored=unrestored)
                 self._camera_window_restored = True
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
                                    monotonic=self.dependencies.monotonic(),
@@ -793,8 +808,12 @@ class MonitoringRuntime:
         self._set(camera_offline_degraded=status.offline_sources > 0
                   or status.flapping_sources > 0)
 
-    def _camera_flapping_event(self, source_id: UUID) -> tuple[UUID, bool] | None:
+    def _camera_flapping_event(self, source_id: UUID) -> tuple[UUID, bool | datetime] | None:
         """``(event ID, already notified)`` of a ratio (flapping) alert.
+
+        "Already notified" is ``True`` only for a final row; for a row still
+        ``pending`` it is that row's stored time, and the alert is submitted
+        again under the same ID and time (Issue #336).
 
         Refs #301 (Owner decision 2026-10-22): named after the source, the
         window length and the wall-clock window bucket of the trigger, so a
@@ -818,16 +837,19 @@ class MonitoringRuntime:
         taken = False
         for position, event_id in enumerate(names):
             stored = self._connection.execute(
-                "SELECT at FROM notification_events WHERE event_id=?",
+                "SELECT at, delivery FROM notification_events WHERE event_id=?",
                 (str(event_id),)).fetchone()
             if stored is None:
                 continue
             try:
-                age = (now - datetime.fromisoformat(stored[0])).total_seconds()
+                at = datetime.fromisoformat(stored[0])
+                age = (now - at).total_seconds()
             except (TypeError, ValueError):
                 age = math.inf
             if age < window:
-                return event_id, True
+                # A `pending` row is not confirmed (Issue #336): its stored
+                # time is given and the alert is sent again under that ID.
+                return event_id, (at if stored[1] == DeliveryResult.PENDING.value else True)
             taken = taken or position == 0
         return None if taken else (names[0], False)
 
@@ -872,13 +894,70 @@ class MonitoringRuntime:
                 return event_id
         return None
 
-    def _notification_known(self, event_id: UUID) -> bool:
-        """Whether a `notification_events` row with ``event_id`` exists (any state).
+    def _notification_known(self, event_id: UUID) -> bool | datetime:
+        """``True`` for a final `notification_events` row of ``event_id``.
 
-        A `pending` row is an earlier process's uncertain delivery: it is not
-        sent again (no duplicate), as for the presence critical claims.
+        Only a stored final outcome (`sent`, `failed`, `disabled`) is
+        "already notified". A `pending` row is an earlier process's delivery
+        whose outcome was never stored: it is not confirmed (notifications
+        README, Issue #336), so its stored time is returned and the monitor
+        submits it again under the same ID and time, the outcome landing in
+        that row. ``False`` without a row.
         """
-        return self.notification_events.get(event_id) is not None
+        stored = self.notification_events.get(event_id)
+        if stored is None:
+            return False
+        if stored["delivery"] == DeliveryResult.PENDING:
+            return stored["at"]
+        return True
+
+    def _camera_pending_rows(self, limit: int,
+                             now: datetime) -> tuple[list[tuple[UUID, datetime]], int]:
+        """``(rows, unrestored)``: confirmed `camera_offline` rows still `pending`.
+
+        Issue #336: an earlier process that exited before the Slack outcome
+        was stored left these; the monitor sends them again
+        (``restore_pending``). A row whose event time ``at`` is less than
+        ``CAMERA_OFFLINE_RENOTIFY_SECONDS`` (24 h) old is taken (a time in the
+        future counts as recent). The event time, unlike ``accepted_at``,
+        never moves when the row is written again, so a restart loop that
+        resends a row cannot keep it eligible beyond a day (PR #339 重要 2).
+        Rows are taken newest first by that time, at most ``limit``;
+        ``unrestored`` counts the older ones left out. An older row is not
+        resent: the outage it reported is named anew after a day. A row whose
+        ID cannot be read is skipped; one whose time cannot be read counts as
+        recent only when it was accepted within 24 h and is sent with ``now``
+        (the stored row keeps its own time).
+        """
+        horizon = timedelta(seconds=CAMERA_OFFLINE_RENOTIFY_SECONDS)
+        cursor = self._connection.execute(
+            "SELECT event_id, at, COALESCE(accepted_at, at) FROM notification_events "
+            "WHERE kind=? AND confirmed=1 AND delivery=?",
+            (NotificationKind.CAMERA_OFFLINE.value, DeliveryResult.PENDING.value))
+        found = []
+        try:
+            for event_id, at, accepted in cursor:
+                try:
+                    event = UUID(event_id)
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                try:
+                    stamp = datetime.fromisoformat(at)
+                    if stamp.tzinfo is None:
+                        raise ValueError
+                    recent = now - stamp < horizon
+                except (TypeError, ValueError):
+                    try:
+                        recent = now - datetime.fromisoformat(accepted) < horizon
+                    except (TypeError, ValueError):
+                        recent = False
+                    stamp = now
+                if recent:
+                    found.append((event, stamp))
+        finally:
+            cursor.close()
+        found.sort(key=lambda row: row[1], reverse=True)
+        return found[:limit], max(0, len(found) - limit)
 
     def _latest_finding(self, *, since: datetime | None = None) -> tuple[str, int] | None:
         """``(id, occurred_at_us)`` of the newest finding audit record.
@@ -1025,7 +1104,8 @@ class MonitoringRuntime:
         ``NotificationEventStore`` writes, and every row is parsed again here.
         ``confirmed_only`` keeps confirmed rows only; ``include_pending``
         also counts `pending` rows, for a budget whose accepted but uncertain
-        deliveries are not sent again (the camera offline monitor).
+        deliveries hold a slot until it expires and are only then sent again
+        under their own ID (the camera offline monitor, Issue #336, PR #339).
         """
         marks = ",".join("?" for _ in kinds)
         excluded = () if include_pending else (DeliveryResult.PENDING.value,)
@@ -1113,7 +1193,8 @@ class MonitoringRuntime:
         Shutdown calls it before `stop()`, so a notification submitted just
         before shutdown still completes and is recorded when the endpoint
         answers in time. Returns how many deliveries are still pending; those
-        stay `pending` in `notification_events` (uncertain, never resent).
+        stay `pending` in `notification_events` (uncertain, not confirmed); a
+        restarted process's reconciliation decides whether one is sent again.
         """
         self._require_owner()
         if self.notifications is None:

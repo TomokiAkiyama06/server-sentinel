@@ -712,6 +712,7 @@ The Agent media root is a deployment-configured path outside the source tree tha
 At install/startup/runtime admission, the Agent shall verify:
 - the configured media root exists or can be created only by the intended installer/owner workflow;
 - it resolves to the expected filesystem/mount/device and backing-filesystem-root identity; a narrow systemd namespace bind must map to the approved parent root plus the configured relative media path;
+- the approved filesystem UUID resolves to the device the mount and pinned media directory are on. Recorded major/minor only corroborate it (Issue #324, as Main's Issue #321): a difference is accepted only for an unchanged major on a hardware-backed device in sysfs that is not the root filesystem's (approved mount point not `/`), and then as degraded with the value-free `device_numbers_stale` (`--check` warning; heartbeat `storage.state = degraded`, `storage.reason = device_numbers_stale`, node reason `storage_device_numbers_stale`). A changed major, loop/nbd/zram/ram or a mapping on one, or missing sysfs evidence refuses with `mount_device_mismatch`. A differing mount `source` is accepted only together with such a renumbering, when both sources are single kernel block-device names under `/dev` and the current one's `st_rdev` is the mounted device (sd renames `/dev/sdb1` to `/dev/sda1` with `8:16` to `8:0`); otherwise `mount_source_mismatch`. Owner decision 2026-10-23: keep recording as degraded, as on Main (#323);
 - sufficient free space and safety reserve remain;
 - it is writable by the dedicated Agent service account;
 - loss/unmount/substitution of the expected media filesystem does **not** silently redirect ring-buffer or incident writes into a directory on the root filesystem.
@@ -1602,15 +1603,50 @@ the first alert for a long time never sends a later outage under the old
 time. A recovery is recorded in the episode and is not notified. At most `hourly_limit` (default 4, 1 to 60) such
 notifications go out per rolling hour for all sources together, re-seeded
 after a restart from the confirmed `camera_offline` rows accepted in the last
-hour (a `pending` one included, since it is never resent; an unconfirmed local
-observation never counts); an episode held back by the
+hour (a `pending` one included: its uncertain delivery holds that slot; an
+unconfirmed local observation never counts). The cap is absolute (Owner
+decision, PR #339): a restart never sends more than `hourly_limit` in a
+rolling hour, also when it resends uncertain deliveries. An episode held back by the
 cap is logged once (`camera_offline_notification_rate_limited`) and notified
 when the hour allows if the source is still not online, and one that recovered
 meanwhile is dropped (`camera_offline_notification_dropped`). An episode in
 progress is named after the source and its registry `last_seen_at` (the last
 frame time), so a restart during the same outage finds the row and does not
-notify again; a `pending` row (an uncertain delivery of the stopped process) is
-not resent. A row of that name accepted more than 24 hours earlier no longer
+notify again. Only a final row (`sent`, `failed` or `disabled`) counts as
+notified (Issue #336): a `pending` row is a delivery whose Slack outcome the
+stopped process never stored, which is not confirmed delivery. On the first
+running tick the confirmed `camera_offline` rows still `pending` whose event
+time is less than 24 hours old are taken, newest event first, at most
+`hourly_limit` (the event time never moves when a row is written again, so a
+restart loop cannot keep a row eligible; a row whose time cannot be read
+counts when it was accepted within 24 hours). Each is submitted again under its
+stored event ID and time, whether or not the outage is still in progress, as
+an episode that reached the threshold is notified once even if it recovered
+before the drain (the row does not name its source, so it opens no alerted
+period and is never dropped as recovered). A resend takes a slot like any
+notification: one whose uncertain delivery still holds a slot of the restored
+hour waits until that slot has expired, so a resend can be up to about an hour
+late, and live alerts (outages and ratio alerts of this process) are sent
+before resends, which follow in stored-time order. An episode or ratio alert
+whose durable name is such a row is covered by it as soon as it is named,
+before the cap is consulted, and sends nothing twice. Only the outage in
+progress since the service started (each source's first episode) and a ratio
+alert (whose name holds only within its window) can be covered: a later
+outage of the same process that reuses a restored name (its online
+last-frame write was refused), before or after the resend went out, is a new
+outage and is notified under a per-process ID (Codex PR #339). A `pending` row found
+only by name is submitted again under that name and time, under the same cap.
+So when a pending row of the hour still holds its slot and the same outage is
+still in progress, the notification of that outage itself waits for the slot
+too and can be up to about an hour late, even when the hour has room for
+other alerts. Pending rows beyond `hourly_limit` are not restored (counted as
+`unrestored` and logged once as `camera_offline_notification_unrestored`);
+one of them is resent only when an outage in progress or a ratio alert maps to
+it by name, and one whose outage has already recovered is not sent again. For
+a restored row, or one found by name, if the earlier POST did reach Slack the
+Owner receives the alert twice, never not at all. A pending
+row whose event is more than 24 hours old is not sent again (the outage is
+named anew after a day). A row of that name accepted more than 24 hours earlier no longer
 counts as this outage (Owner decision 2026-10-22, PR #320): the next name of a
 deterministic chain (`…:repeat:1`, `…:repeat:2`, …) is used and the outage is
 notified again, under the hourly cap; a restart within 24 hours of that
@@ -1762,7 +1798,17 @@ attention notice is sent once per boot and device numbers (event ID from the
 kernel boot ID and the numbers; a restart in the same boot finds the row and
 sends nothing; without a readable boot ID once per process start). A changed
 major, a loop device or a device without a sysfs entry is
-`STORAGE_HARD_STOP` at every storage (re)open (Issue #321). A mismatch at startup leaves
+`STORAGE_HARD_STOP` at every storage (re)open (Issue #321) and, while the
+recorded numbers differ, on every storage sample: the sysfs topology
+(hardware-only backing) is walked again each time, so a live dm table reload
+or md member replacement onto loop/virtual backing that keeps the device
+number and mount refuses the next admission and raises the per-episode
+`recording_health_failure`; the refusal is not latched and a return to
+hardware-only backing admits again (Issue #340). A refusal seen only by an
+admission is kept as one value-free flag that the next tick consumes, so the
+episode alerts once even when restored before that tick; `recording_health`
+stays `failed` until the next daily self-test. Current numbers read no
+sysfs. A mismatch at startup leaves
 the runtime `failed`, refuses writes and still attempts the immediate Slack
 alert; the open is retried every 15 minutes against the same declared identity
 (never another directory), without repeating the alert, and a successful retry

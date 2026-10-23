@@ -65,7 +65,15 @@ without it). Only a changed minor of the same kind of device is accepted: a
 changed major, a device that does not rest only on hardware disks (every
 leaf disk, through a partition's parent disk or dm/md `slaves/`, needs a
 sysfs `device` bus link; loop/nbd/zram lack it) or a device without a
-readable sysfs entry refuses (`renumbered_device_acceptable`). A failed startup open is
+readable sysfs entry refuses (`renumbered_device_acceptable`). While the
+numbers are stale this is judged on every storage sample, not only at open
+(Issue #340): a dm table reload or md member swap onto loop/virtual backing
+that keeps the number and mount is `STORAGE_HARD_STOP` (the per-episode
+filesystem alert) until the backing is hardware-only again; it is not
+latched. An admission-only refusal is kept as one flag
+(`take_topology_refusal`) that the next tick consumes, so that episode alerts
+once even when restored before the tick; `recording_health` stays failed
+until the next daily self-test. Current numbers read no sysfs. A failed startup open is
 retried every `retry_seconds` from the tick against the same declared identity;
 a failed database open (e.g. SQLite I/O error or permission change) takes the
 same alerting startup-failure path. Only the first failure of the episode alerts, and a successful retry runs the
@@ -83,9 +91,21 @@ a source not online for `camera_offline_notification.after_seconds` (default
 `hourly_limit` (default 4) per rolling hour, re-seeded from the accepted rows
 of the last hour on the first running tick. An episode in progress is named
 `uuid5(EVENT_NAMESPACE, "camera-offline:<source>:<last_seen_at>")` from the
-registry, so a restart during the same outage finds the row (any delivery
-state, `pending` included) and does not notify again, unless that row was
-accepted more than 24 h earlier (Owner decision 2026-10-22): the next name
+registry, so a restart during the same outage finds the row and does not
+notify again when its delivery is final (`sent`, `failed`, `disabled`). A
+`pending` row (the stopped process never stored the Slack outcome) is not
+confirmed: the first running tick submits the newest confirmed pending rows
+whose event time is less than 24 h old (at most `hourly_limit`) again under
+their stored ID and time, also when the outage has recovered (Issue #336).
+The cap stays absolute (PR #339): a resend whose row still holds a slot of the
+restored hour waits for that slot to expire (up to about an hour, which also
+delays the alert of the same outage still in progress), and live alerts go
+before resends. Pending rows beyond `hourly_limit` are left out
+(`unrestored`, logged once as `camera_offline_notification_unrestored`) and
+resent only when an outage in progress maps to one by name. A restored name
+covers only the outage in progress since the start (and a ratio alert); a
+later outage reusing it gets a per-process ID. A row of that name accepted more than
+24 h earlier no longer counts (Owner decision 2026-10-22): the next name
 `…:repeat:N` of a deterministic chain is then used and the outage is notified
 again under the cap. Intermittent outages (Refs #301): a source not online for
 `flapping_offline_seconds` (default 300 s) in total within the last
