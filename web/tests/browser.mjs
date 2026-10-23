@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { describeCommandError, launchChrome, pageFor } from './chrome.mjs';
+import { launchChrome, pageFor, routeTracker } from './chrome.mjs';
 import { compile } from './compile.mjs';
 import { APP_CSP } from '../scripts/policy.mjs';
 
@@ -148,7 +148,7 @@ async function scenario(viewport, { production = false, status = 200, session = 
   const requests = [];
   const unexpected = [];
   const exceptions = [];
-  const routeErrors = [];
+  const routes = routeTracker();
   const abandoned = [];
   let timelineLoads = 0;
   let presenceLoads = 0;
@@ -236,7 +236,7 @@ async function scenario(viewport, { production = false, status = 200, session = 
     await block();
   }
   cleanup.push(browser.on('Fetch.requestPaused', (params, sessionId) => {
-    if (sessionId === page.sessionId) void route(params).catch(error => routeErrors.push(describeCommandError(error)));
+    if (sessionId === page.sessionId) routes.track(route(params));
   }));
   await page.command('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
   try {
@@ -247,7 +247,9 @@ async function scenario(viewport, { production = false, status = 200, session = 
     await delay(100);
     assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'no horizontal document overflow');
     assert.deepEqual(exceptions, [], 'no unhandled browser errors');
-    assert.deepEqual(routeErrors, [], 'request interception must succeed');
+    // Every interception handler has finished, including one still waiting to
+    // tell a page cancellation from a genuine refusal (Codex PR #331).
+    assert.deepEqual(await routes.settle(), [], 'request interception must succeed');
     // Only API reads are ever abandoned; the document and its assets are always delivered.
     assert.deepEqual(abandoned.filter(path => !path.startsWith('/api/')), [], 'only API requests may be abandoned by the page');
     abandonedTotal += abandoned.length;
@@ -259,6 +261,7 @@ async function scenario(viewport, { production = false, status = 200, session = 
       await page.evaluate("fetch('https://egress-probe.invalid/probe').catch(() => undefined)");
       assert.deepEqual(unexpected, ['unexpected origin or method']);
     } else assert.deepEqual(unexpected, [], 'all browser requests must be explicitly expected');
+    assert.deepEqual(await routes.settle(), [], 'request interception must succeed');
     cases++;
   } finally { cleanup.forEach(remove => remove()); await page.close(); }
 }

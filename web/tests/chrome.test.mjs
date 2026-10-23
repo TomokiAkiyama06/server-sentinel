@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CommandError, describeCommandError, describeException, launchChrome, pageFor } from './chrome.mjs';
+import { setTimeout as delay } from 'node:timers/promises';
+import { clickWhenEnabled, CommandError, describeCommandError, describeException, launchChrome, pageFor, routeTracker } from './chrome.mjs';
 
 // Synthetic stand-ins for Chrome's --remote-debugging-pipe transport (#197).
 // Each launch appends its pid to a ledger so the tests can prove that hung
@@ -270,4 +271,38 @@ test('answer tells a request the page cancelled apart from a genuine interceptio
   browser.emit('Network.loadingFailed', { requestId: 'network-6', canceled: true });
   refusal = invalid;
   await assert.rejects(page.answer('network-6', 'Fetch.fulfillRequest', { requestId: 'job-6' }, 50), error => error === invalid);
+});
+
+test('a late genuine interception error still fails the scenario (Codex PR #331)', async () => {
+  const invalid = new CommandError('Fetch.fulfillRequest', { code: -32602, message: 'Invalid InterceptionId.' });
+  const browser = fakeBrowser(method => { if (method === 'Fetch.fulfillRequest') throw invalid; return setup(method); });
+  const page = await pageFor(browser, viewport);
+  const routes = routeTracker();
+  // A refusal with no page cancellation: `answer` waits out its grace period
+  // before it rethrows, longer than the 100 ms a scenario used to allow.
+  routes.track(page.answer('network-1', 'Fetch.fulfillRequest', { requestId: 'job-1' }, 300));
+  await delay(100);
+  assert.deepEqual(routes.errors, [], 'not reported yet when the scenario used to assert');
+  assert.deepEqual(await routes.settle(), ['Fetch.fulfillRequest refused (CDP -32602): Invalid InterceptionId.']);
+  // A handler started while the scenario settles is waited for as well.
+  const late = routeTracker();
+  late.track(delay(50).then(() => late.track(delay(50).then(() => { throw new TypeError('/api/private 0123'); }))));
+  assert.deepEqual(await late.settle(), ['TypeError raised by the interceptor']);
+  // Handlers that finish cleanly report nothing; one that never finishes fails the settle.
+  const clean = routeTracker();
+  clean.track(delay(20));
+  assert.deepEqual(await clean.settle(), []);
+  const stuck = routeTracker();
+  stuck.track(new Promise(() => {}));
+  await assert.rejects(stuck.settle(50), { message: 'Interception handlers did not settle within 50 ms' });
+});
+
+test('click finds and clicks the element in one evaluation', () => {
+  const run = element => new Function('element', `return ${clickWhenEnabled('element')}`)(element);
+  let clicks = 0;
+  assert.equal(run(undefined), false, 'a missing element (a list re-rendering) is waited for, not a TypeError');
+  assert.equal(run({ disabled: true, click() { clicks++; } }), false);
+  assert.equal(clicks, 0);
+  assert.equal(run({ disabled: false, click() { clicks++; } }), true);
+  assert.equal(clicks, 1);
 });

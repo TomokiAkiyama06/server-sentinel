@@ -199,6 +199,43 @@ export function describeCommandError(error) {
   return `${name} raised by the interceptor`;
 }
 
+/**
+ * Tracks the detached handlers a scenario starts for `Fetch.requestPaused`
+ * (Codex PR #331). A handler may finish long after the page has moved on:
+ * a slow synthetic answer, or `answer` waiting up to its grace period before
+ * it rethrows a genuine refusal. `settle` waits for every handler, including
+ * one started while it waits, so such an error is reported before the
+ * scenario asserts and closes the page instead of landing after it. The
+ * errors are kept value-free (`describeCommandError`). A handler still
+ * running after `timeoutMilliseconds` fails the settle.
+ */
+export function routeTracker() {
+  const running = new Set();
+  const errors = [];
+  return {
+    errors,
+    track(handler) {
+      const settled = Promise.resolve(handler)
+        .catch(error => { errors.push(describeCommandError(error)); })
+        .finally(() => running.delete(settled));
+      running.add(settled);
+    },
+    async settle(timeoutMilliseconds = 15000) {
+      const deadline = Date.now() + timeoutMilliseconds;
+      let timer;
+      try {
+        while (running.size) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) throw new Error(`Interception handlers did not settle within ${timeoutMilliseconds} ms`);
+          await Promise.race([Promise.all(running), new Promise(resolve => { timer = setTimeout(resolve, remaining); })]);
+          clearTimeout(timer);
+        }
+      } finally { clearTimeout(timer); }
+      return errors;
+    },
+  };
+}
+
 // V8 messages whose only variable part is an identifier taken from the test's
 // own expression, never page or input text. Anything else is reduced to its
 // error class.
@@ -225,6 +262,17 @@ export function describeException(details) {
   const first = String(exception.description ?? '').split('\n', 1)[0];
   const message = first.startsWith(`${className}: `) ? first.slice(className.length + 2) : '';
   return STANDARD_MESSAGES.some(shape => shape.test(message)) ? `${className}: ${message}` : className;
+}
+
+/**
+ * An expression for `wait` that finds the element, and clicks it only when it
+ * is present and enabled, in the same evaluation. Finding it in one
+ * evaluation and clicking it in the next raced a re-render in between (PR #331
+ * CI: the access screen unmounts its list while it reloads after a change, so
+ * the second lookup found nothing).
+ */
+export function clickWhenEnabled(find) {
+  return `(() => { const el = ${find}; if (!el || el.disabled) return false; el.click(); return true; })()`;
 }
 
 export async function pageFor(browser, viewport) {
@@ -331,9 +379,7 @@ export async function pageFor(browser, viewport) {
     command, evaluate, wait, navigate, answer, sessionId,
     async heading(title) { await wait(`Array.from(document.querySelectorAll('h1')).some(el => el.textContent === ${JSON.stringify(title)})`); },
     async click(title) {
-      const selector = `Array.from(document.querySelectorAll('nav button')).find(el => el.textContent === ${JSON.stringify(title)})`;
-      await wait(`Boolean((${selector}) && !(${selector}).disabled)`);
-      await evaluate(`(${selector}).click()`);
+      await wait(clickWhenEnabled(`Array.from(document.querySelectorAll('nav button')).find(el => el.textContent === ${JSON.stringify(title)})`));
     },
     async enabled(title) {
       return evaluate(`!Array.from(document.querySelectorAll('nav button')).find(el => el.textContent === ${JSON.stringify(title)}).disabled`);
