@@ -774,16 +774,17 @@ class MonitoringRuntime:
                 # The rolling hour continues across a restart (as Issue #281
                 # item 2 for the access budgets).
                 # Only the confirmed threshold alerts the monitor counted,
-                # an accepted `pending` one included (it is sent again below
-                # and keeps that one slot), never an unconfirmed local
+                # an accepted `pending` one included (its uncertain delivery
+                # holds a slot; it is sent again below once that slot
+                # expires), never an unconfirmed local
                 # `camera_offline` observation (Codex PR #320).
                 now = self.dependencies.utcnow()
                 monitor.restore_window(self._notification_window(
                     (NotificationKind.CAMERA_OFFLINE,), monitor.hourly_limit,
                     now, confirmed_only=True, include_pending=True),
                     monotonic=self.dependencies.monotonic())
-                rows, dropped = self._camera_pending_rows(monitor.hourly_limit, now)
-                monitor.restore_pending(rows, dropped=dropped)
+                rows, unrestored = self._camera_pending_rows(monitor.hourly_limit, now)
+                monitor.restore_pending(rows, unrestored=unrestored)
                 self._camera_window_restored = True
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
                                    monotonic=self.dependencies.monotonic(),
@@ -901,42 +902,51 @@ class MonitoringRuntime:
 
     def _camera_pending_rows(self, limit: int,
                              now: datetime) -> tuple[list[tuple[UUID, datetime]], int]:
-        """``(rows, dropped)``: confirmed `camera_offline` rows still `pending`.
+        """``(rows, unrestored)``: confirmed `camera_offline` rows still `pending`.
 
         Issue #336: an earlier process that exited before the Slack outcome
         was stored left these; the monitor sends them again
-        (``restore_pending``). Rows accepted in the last
-        ``CAMERA_OFFLINE_RENOTIFY_SECONDS`` (24 h, as the durable name chain;
-        a time in the future counts as recent) are taken newest first, at
-        most ``limit``; ``dropped`` counts the older ones left out. An older
-        row is not resent: the outage it reported is named anew after a day.
-        A row whose ID cannot be read is skipped; one whose time cannot be
-        read is sent with ``now`` (the stored row keeps its own time).
+        (``restore_pending``). A row whose event time ``at`` is less than
+        ``CAMERA_OFFLINE_RENOTIFY_SECONDS`` (24 h) old is taken (a time in the
+        future counts as recent). The event time, unlike ``accepted_at``,
+        never moves when the row is written again, so a restart loop that
+        resends a row cannot keep it eligible beyond a day (PR #339 重要 2).
+        Rows are taken newest first by that time, at most ``limit``;
+        ``unrestored`` counts the older ones left out. An older row is not
+        resent: the outage it reported is named anew after a day. A row whose
+        ID cannot be read is skipped; one whose time cannot be read counts as
+        recent only when it was accepted within 24 h and is sent with ``now``
+        (the stored row keeps its own time).
         """
-        since = (now - timedelta(seconds=CAMERA_OFFLINE_RENOTIFY_SECONDS)
-                 ).astimezone(timezone.utc).isoformat()
+        horizon = timedelta(seconds=CAMERA_OFFLINE_RENOTIFY_SECONDS)
         cursor = self._connection.execute(
-            "SELECT event_id, at, COALESCE(accepted_at, at) AS accepted FROM notification_events "
-            "WHERE kind=? AND confirmed=1 AND delivery=? AND accepted > ? ORDER BY accepted DESC",
-            (NotificationKind.CAMERA_OFFLINE.value, DeliveryResult.PENDING.value, since))
-        rows, dropped = [], 0
+            "SELECT event_id, at, COALESCE(accepted_at, at) FROM notification_events "
+            "WHERE kind=? AND confirmed=1 AND delivery=?",
+            (NotificationKind.CAMERA_OFFLINE.value, DeliveryResult.PENDING.value))
+        found = []
         try:
-            for event_id, at, _accepted in cursor:
+            for event_id, at, accepted in cursor:
                 try:
                     event = UUID(event_id)
                 except (TypeError, ValueError, AttributeError):
                     continue
-                if len(rows) == limit:
-                    dropped += 1
-                    continue
                 try:
                     stamp = datetime.fromisoformat(at)
+                    if stamp.tzinfo is None:
+                        raise ValueError
+                    recent = now - stamp < horizon
                 except (TypeError, ValueError):
+                    try:
+                        recent = now - datetime.fromisoformat(accepted) < horizon
+                    except (TypeError, ValueError):
+                        recent = False
                     stamp = now
-                rows.append((event, stamp if stamp.tzinfo is not None else now))
+                if recent:
+                    found.append((event, stamp))
         finally:
             cursor.close()
-        return rows, dropped
+        found.sort(key=lambda row: row[1], reverse=True)
+        return found[:limit], max(0, len(found) - limit)
 
     def _latest_finding(self, *, since: datetime | None = None) -> tuple[str, int] | None:
         """``(id, occurred_at_us)`` of the newest finding audit record.
@@ -1083,8 +1093,8 @@ class MonitoringRuntime:
         ``NotificationEventStore`` writes, and every row is parsed again here.
         ``confirmed_only`` keeps confirmed rows only; ``include_pending``
         also counts `pending` rows, for a budget whose accepted but uncertain
-        deliveries are sent again under their own ID and keep that one slot
-        (the camera offline monitor, Issue #336).
+        deliveries hold a slot until it expires and are only then sent again
+        under their own ID (the camera offline monitor, Issue #336, PR #339).
         """
         marks = ",".join("?" for _ in kinds)
         excluded = () if include_pending else (DeliveryResult.PENDING.value,)

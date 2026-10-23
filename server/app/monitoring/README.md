@@ -87,9 +87,11 @@ registry, so a restart during the same outage finds the row and does not
 notify again when its delivery is final (`sent`, `failed`, `disabled`). A
 `pending` row (the stopped process never stored the Slack outcome) is not
 confirmed: the first running tick submits the newest confirmed pending rows
-of the last 24 h (at most `hourly_limit`) again under their stored ID and
-time, also when the outage has recovered, without counting a row already in
-the restored hour twice (Issue #336). A row of that name accepted more than
+whose event time is less than 24 h old (at most `hourly_limit`) again under
+their stored ID and time, also when the outage has recovered (Issue #336).
+The cap stays absolute (PR #339): a resend whose row still holds a slot of the
+restored hour waits for that slot to expire (up to about an hour), and live
+alerts go before resends. A row of that name accepted more than
 24 h earlier no longer counts (Owner decision 2026-10-22): the next name
 `…:repeat:N` of a deterministic chain is then used and the outage is notified
 again under the cap. Intermittent outages (Refs #301): a source not online for

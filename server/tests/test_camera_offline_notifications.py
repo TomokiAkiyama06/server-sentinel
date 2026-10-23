@@ -426,27 +426,31 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
     def test_a_pending_durable_id_is_sent_again_under_its_id_and_time(self):
         # Issue #336: a `pending` row (the earlier process exited before the
         # Slack outcome was stored) is not confirmed: `known` gives its
-        # stored time and the alert is submitted again under that ID.
+        # stored time and the alert is submitted again under that ID. The
+        # cap is absolute (PR #339): while the row's uncertain delivery still
+        # holds a slot of the hour, the resend waits for that slot.
         durable, stored = uuid4(), AT - timedelta(hours=2)
-        # Counted once: the row already holds one of the two slots.
         monitor = self.monitor(hourly_limit=2)
         self.online(monitor)
         monitor.restore_window([(durable, 600.0)], monotonic=self.clock.value)
         monitor.health_sink(event(self.sources[0], CameraState.OFFLINE))
         self.advance(300)
         known = {durable: stored}
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.assertEqual(1, self.drain(monitor, durable_id=lambda source: durable,
+                                           known=lambda value: known.get(value, False)).held)
+        self.assertEqual([], self.sent())
+        self.advance(2699)
+        self.drain(monitor, durable_id=lambda source: durable,
+                   known=lambda value: known.get(value, False))
+        self.assertEqual([], self.sent())
+        self.advance(1)
         self.drain(monitor, durable_id=lambda source: durable,
                    known=lambda value: known.get(value, False))
         rows = self.sent()
         self.assertEqual([(durable, stored, "sent")],
                          [(row.event_id, row.at, row.delivery.value) for row in rows])
         self.assertEqual(1, len(monitor._sent))
-        # Another source takes the second slot, and nothing is left.
-        monitor.health_sink(event(self.sources[1], CameraState.OFFLINE))
-        self.advance(300)
-        self.assertEqual(0, self.drain(monitor).held)
-        self.assertEqual(2, len(self.sent()))
-        self.assertEqual(2, len(monitor._sent))
 
     def test_restored_pending_rows_are_sent_again_once(self):
         # Issue #336: rows the runtime found still `pending` at start, sent
@@ -457,16 +461,21 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
         counted, older = uuid4(), uuid4()
         monitor.restore_window([(counted, 60.0), (uuid4(), 120.0)],
                                monotonic=self.clock.value)
-        stored = AT - timedelta(minutes=1)
-        monitor.restore_pending([(counted, stored), (older, stored)])
-        status = self.drain(monitor)
-        # The counted row keeps its slot; the older one waits for a slot.
-        self.assertEqual([counted], [row.event_id for row in self.sent()])
-        self.assertEqual(stored, self.sent()[0].at)
-        self.assertEqual(1, status.held)
+        stored, earlier = AT - timedelta(minutes=1), AT - timedelta(hours=3)
+        monitor.restore_pending([(counted, stored), (older, earlier)])
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.assertEqual(2, self.drain(monitor).held)
+        self.assertEqual([], self.sent())
+        # One slot frees: the restored rows go by their stored time, but the
+        # counted one still holds its own slot and waits for it.
         self.advance(3600 - 120)
+        self.assertEqual(1, self.drain(monitor).held)
+        self.assertEqual([(older, earlier)], [(row.event_id, row.at) for row in self.sent()])
+        self.advance(60)
         self.assertEqual(0, self.drain(monitor).held)
-        self.assertEqual({counted, older}, {row.event_id for row in self.sent()})
+        self.assertEqual({counted: stored, older: earlier},
+                         {row.event_id: row.at for row in self.sent()})
+        self.assertEqual(2, len(monitor._sent))
         # A restored ID that an outage's durable name maps to is covered:
         # one alert. A later episode reusing that name gets its own ID.
         monitor = self.monitor()
@@ -504,7 +513,81 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
             with self.assertRaises(ValueError):
                 monitor.restore_pending(rows)
         with self.assertRaises(ValueError):
-            monitor.restore_pending([], dropped=-1)
+            monitor.restore_pending([], unrestored=-1)
+
+    def test_a_covered_episode_is_settled_before_the_cap(self):
+        # PR #339 重要 1: the hour is full and one of its rows is the pending
+        # alert P of the outage still in progress. The episode is covered by
+        # P's resend at once (never held, then dropped on recovery, leaving P
+        # claimed), so a later outage reusing the name is still notified.
+        monitor = self.monitor()
+        self.online(monitor, self.sources[1])
+        pending, stored = uuid4(), AT - timedelta(minutes=2)
+        monitor.restore_window([(pending, 120.0)] + [(uuid4(), 600.0) for _ in range(3)],
+                               monotonic=self.clock.value)
+        monitor.restore_pending([(pending, stored)])
+
+        def known(value):
+            return stored if value == pending else False
+
+        self.advance(300)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as logs:
+            status = self.drain(monitor, durable_id=lambda source: pending, known=known)
+        # Only P's resend waits for the hour; the episode is settled.
+        self.assertEqual(1, status.held)
+        self.assertEqual(1, len(logs.output))
+        self.assertNotIn(pending, monitor._restored)
+        self.assertEqual([], self.sent())
+        monitor.health_sink(event(self.sources[0], CameraState.ONLINE))
+        self.advance(60)
+        self.drain(monitor, durable_id=lambda source: pending, known=known)
+        self.assertEqual(0, monitor.dropped)
+        self.advance(3600)
+        self.drain(monitor, durable_id=lambda source: pending, known=known)
+        self.assertEqual([(pending, stored)], [(row.event_id, row.at) for row in self.sent()])
+        # A new outage with the same last-frame time (a refused write).
+        monitor.health_sink(event(self.sources[0], CameraState.OFFLINE))
+        self.advance(300)
+        self.drain(monitor, durable_id=lambda source: pending, known=lambda value: True)
+        self.assertEqual(2, len(self.sent()))
+
+    def test_live_alerts_go_before_restored_rows(self):
+        # PR #339 重要 3: an outage in progress is not held back behind an
+        # earlier process's uncertain delivery of an older outage.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor, self.sources[1])
+        old, older = uuid4(), uuid4()
+        # Newest first, as the runtime hands them over.
+        monitor.restore_pending([(old, AT - timedelta(hours=5)),
+                                 (older, AT - timedelta(hours=10))])
+        self.advance(300)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.assertEqual(2, self.drain(monitor).held)
+        rows = self.sent()
+        self.assertEqual(1, len(rows))
+        self.assertNotIn(rows[0].event_id, {old, older})
+        # Then the restored rows, by their stored time.
+        self.advance(3600)
+        self.assertEqual(1, self.drain(monitor).held)
+        self.assertEqual(older, self.sent()[-1].event_id)
+        self.advance(3600)
+        self.assertEqual(0, self.drain(monitor).held)
+        self.assertEqual(old, self.sent()[-1].event_id)
+
+    def test_this_process_rows_are_not_restored(self):
+        # A row this process wrote itself (it notified while monitoring was
+        # still `failed`) is its own delivery, not a restart's.
+        monitor = self.monitor()
+        self.online(monitor, self.sources[1])
+        self.advance(300)
+        self.drain(monitor)
+        own = self.sent()[0].event_id
+        monitor.restore_pending([(own, AT)])
+        self.assertNotIn(own, monitor._restored)
+        self.assertEqual([], monitor._resend)
+        self.advance(3600)
+        self.drain(monitor)
+        self.assertEqual(1, len(self.sent()))
 
     def test_a_restored_pending_row_waits_for_the_queue(self):
         monitor = self.monitor()
@@ -1506,15 +1589,18 @@ class LifespanTests(RuntimeFixture):
             self.assertEqual([ALERT], self.slack_texts())
             uvc.status = real_status
 
-    def stored_row(self, *, confirmed, delivery, age, event_id=None):
+    def stored_row(self, *, confirmed, delivery, age, event_id=None, accepted_age=None,
+                   at=None):
         event_id = event_id or uuid4()
-        at = (self.clock.now - timedelta(seconds=age)).isoformat()
+        at = at or (self.clock.now - timedelta(seconds=age)).isoformat()
+        accepted = (self.clock.now - timedelta(
+            seconds=age if accepted_age is None else accepted_age)).isoformat()
         with closing(sqlite3.connect(self.settings.database_path)) as db:
             db.execute(
                 "INSERT INTO notification_events(event_id,kind,at,confirmed,delivery,accepted_at) "
                 "VALUES (?,?,?,?,?,?)",
                 (str(event_id), NotificationKind.CAMERA_OFFLINE.value, at, int(confirmed),
-                 delivery, at))
+                 delivery, accepted))
             db.commit()
         return event_id
 
@@ -1529,11 +1615,18 @@ class LifespanTests(RuntimeFixture):
             return db.execute("SELECT at FROM notification_events WHERE event_id=?",
                               (str(event_id),)).fetchone()[0]
 
+    def all_pending_again(self):
+        # A process that died before the Slack outcome was stored.
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            db.execute("UPDATE notification_events SET delivery=? WHERE kind=?",
+                       (DeliveryResult.PENDING.value, NotificationKind.CAMERA_OFFLINE.value))
+            db.commit()
+
     async def test_a_pending_alert_of_the_same_outage_is_sent_again(self):
         # Issue #336: the earlier process exited before the Slack outcome of
         # this outage's alert was stored. The restarted process finds the
         # same durable name and sends it again under that ID and time.
-        pending = self.stored_row(confirmed=True, delivery="pending", age=600,
+        pending = self.stored_row(confirmed=True, delivery="pending", age=7200,
                                   event_id=self.chain_name())
         at = self.stored_at(pending)
         self.discovery.devices = []
@@ -1574,7 +1667,7 @@ class LifespanTests(RuntimeFixture):
         # The outage ended while the service was down; the alert reached the
         # threshold, so it is sent once, as one that recovered before the
         # drain (Issue #336).
-        pending = self.stored_row(confirmed=True, delivery="pending", age=1800)
+        pending = self.stored_row(confirmed=True, delivery="pending", age=7200)
         application = self.uvc_application()
         async with asyncio.timeout(60), application.router.lifespan_context(application):
             runtime = application.state.monitoring
@@ -1585,26 +1678,46 @@ class LifespanTests(RuntimeFixture):
             self.clock.advance(timedelta(hours=2))
             await self.tick(runtime)
         self.assertEqual([ALERT], self.slack_texts())
-        # Older than a day: superseded, not sent again; final rows never.
+        # An event older than a day is superseded and not sent again, also
+        # when a restart loop moved its acceptance time (PR #339 重要 2);
+        # final and unconfirmed rows never are.
         self.delete_rows()
         self.transport.requests.clear()
         old = self.stored_row(confirmed=True, delivery="pending", age=25 * 3600)
-        self.stored_row(confirmed=True, delivery="sent", age=60)
-        self.stored_row(confirmed=False, delivery="pending", age=60)
+        refreshed = self.stored_row(confirmed=True, delivery="pending", age=25 * 3600,
+                                    accepted_age=7200)
+        self.stored_row(confirmed=True, delivery="sent", age=7200)
+        self.stored_row(confirmed=False, delivery="pending", age=7200)
         application = self.uvc_application()
         async with asyncio.timeout(60), application.router.lifespan_context(application):
             runtime = application.state.monitoring
             await self.bring_online(application)
             await self.tick(runtime)
         self.assertEqual([], self.slack_texts())
-        self.assertEqual("pending", self.delivery(old))
+        self.assertEqual(["pending", "pending"], [self.delivery(old), self.delivery(refreshed)])
+
+    async def test_a_pending_row_with_an_unreadable_time(self):
+        # Sent with the current time when accepted within a day; the stored
+        # row keeps its own text. Not when accepted earlier.
+        recent = self.stored_row(confirmed=True, delivery="pending", age=0, at="not a time",
+                                 accepted_age=7200)
+        stale = self.stored_row(confirmed=True, delivery="pending", age=0, at="not a time",
+                                accepted_age=25 * 3600)
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.bring_online(application)
+            await self.tick(runtime)
+        self.assertEqual([ALERT], self.slack_texts())
+        self.assertEqual(["sent", "pending"], [self.delivery(recent), self.delivery(stale)])
+        self.assertEqual("not a time", self.stored_at(recent))
 
     async def test_more_pending_alerts_than_an_hour_allows(self):
-        # At most `hourly_limit` are taken (newest first), each counted once;
-        # the older ones are dropped and logged.
+        # At most `hourly_limit` are taken (newest event first); the older
+        # ones are left out, counted in `unrestored` and logged.
         configuration = self.configuration(camera_offline=CameraOfflineNotification(300, 2))
         rows = [self.stored_row(confirmed=True, delivery="pending", age=age)
-                for age in (60, 120, 180)]
+                for age in (7200, 7260, 7320)]
         application = self.uvc_application(configuration)
         async with asyncio.timeout(60), application.router.lifespan_context(application):
             runtime = application.state.monitoring
@@ -1615,12 +1728,48 @@ class LifespanTests(RuntimeFixture):
             self.assertEqual([ALERT, ALERT], self.slack_texts())
             self.assertEqual(["sent", "sent", "pending"], [self.delivery(row) for row in rows])
             monitor = application.state.camera_offline
-            self.assertEqual(2, len(monitor._sent))
+            self.assertEqual((2, 1, 0), (len(monitor._sent), monitor.unrestored, monitor.dropped))
+
+    async def test_a_restart_loop_never_exceeds_the_hourly_cap(self):
+        # PR #339 重要 2 (Owner decision: the cap is absolute). Five starts
+        # within one hour, each dying before the Slack outcome is stored: a
+        # resend holds its slot, so at most `hourly_limit` (4) POSTs go out.
+        for age in (7200, 7260, 7320, 7380):
+            self.stored_row(confirmed=True, delivery="pending", age=age)
+        for _ in range(5):
+            application = self.uvc_application()
+            async with asyncio.timeout(60), application.router.lifespan_context(application):
+                runtime = application.state.monitoring
+                await self.tick(runtime)
+            self.all_pending_again()
+            self.clock.advance(timedelta(minutes=11))
+        self.assertEqual([ALERT] * 4, self.slack_texts())
+
+    async def test_a_pending_row_just_inside_a_day(self):
+        # PR #339 提案 3: the outage's own pending alert, 23 h 59 min old at
+        # the restart, is sent again once; its resend renews the chain name,
+        # so the outage gets no `:repeat:1` alert as well.
+        pending = self.stored_row(confirmed=True, delivery="pending", age=23 * 3600 + 59 * 60,
+                                  event_id=self.chain_name())
+        self.discovery.devices = []
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.tick(runtime)
+            self.assertEqual([ALERT], self.slack_texts())
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+            self.clock.advance(timedelta(hours=2))
+            await self.tick(runtime)
+        self.assertEqual([ALERT], self.slack_texts())
+        self.assertEqual([(1, "sent")], self.offline_rows())
+        self.assertEqual("sent", self.delivery(pending))
 
     async def test_restored_window_counts_confirmed_alerts_including_pending(self):
         # Codex PR #320 P2: an unconfirmed local observation never used the
-        # budget; an accepted `pending` alert did. Issue #336: that alert is
-        # sent again at once under its own slot, never counted twice.
+        # budget; an accepted `pending` alert did. Issue #336 / PR #339: that
+        # alert is sent again only once its own slot expired (the cap is
+        # absolute), after the live outage.
         configuration = self.configuration(camera_offline=CameraOfflineNotification(300, 1))
         self.stored_row(confirmed=False, delivery="suppressed", age=60)
         application = self.uvc_application(configuration)
@@ -1642,13 +1791,16 @@ class LifespanTests(RuntimeFixture):
             self.clock.advance(timedelta(seconds=301))
             with self.assertLogs("app.monitoring.cameras", level="WARNING"):
                 await self.tick(runtime)
-            # The pending alert went out again; the new outage is held.
+            self.assertEqual([], self.slack_texts())
+            # The hour frees one slot: the live outage takes it first.
+            self.clock.advance(timedelta(hours=1))
+            await self.tick(runtime)
             self.assertEqual([ALERT], self.slack_texts())
-            self.assertEqual("sent", self.delivery(pending))
-            self.assertEqual(1, len(application.state.camera_offline._sent))
+            self.assertEqual("pending", self.delivery(pending))
             self.clock.advance(timedelta(hours=1))
             await self.tick(runtime)
             self.assertEqual([ALERT, ALERT], self.slack_texts())
+            self.assertEqual("sent", self.delivery(pending))
 
     async def test_without_slack_the_row_is_disabled_and_the_path_unavailable(self):
         self.slack = False
