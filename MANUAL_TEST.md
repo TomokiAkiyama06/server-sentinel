@@ -2966,7 +2966,10 @@ Owner schedules it; the read-only steps below change nothing.
   (`ls -l <parent>/device`), for dm/md every entry of
   `ls /sys/dev/block/<maj:min>/slaves/` leads to such a disk, and there is no
   `loop/` directory; `lsblk -o NAME,MAJ:MIN,TYPE` shows `disk`/`part` (or
-  `lvm`/`crypt` on them). This predicts whether a renumbering would be accepted.
+  `lvm`/`crypt` on them). Note whether `findmnt -no SOURCE` is a kernel name
+  such as `/dev/sdX1` (it then changes with an sd renumbering and must equal
+  the configured `source` today) and `stat -L -c '%t:%T' <source>` equals
+  `MAJ:MIN` (hexadecimal). This predicts whether a renumbering would be accepted.
 - [ ] Inside the generated unit's sandbox (`ProtectKernelTunables=true`,
   `ProtectSystem=strict`), the dedicated account can read the same sysfs
   entries, e.g. `systemd-run --uid=<agent account> -p ProtectKernelTunables=yes
@@ -2975,12 +2978,15 @@ Owner schedules it; the read-only steps below change nothing.
   below; an unreadable sysfs must make a renumbering refuse, not pass.
 - [ ] On an isolated test node or a disposable configuration copy (never the
   production config): set `expected_mount.minor` to another value with the same
-  `major`; `--check` exits 0, prints the unchanged success line and exactly one
+  `major` (and, for an sd disk, `source` to another `/dev/sdX1` name); `--check`
+  exits 0, prints the unchanged success line and exactly one
   `media-capture-agent: local deployment validation warning: device_numbers_stale`
   stderr line (`--check --json`: `{"ok": true, "warnings": ["device_numbers_stale"]}`),
   with no number, path, UUID or source printed. A service run with that copy
   prints heartbeat lines with reason `storage_device_numbers_stale` and keeps
-  writing segments.
+  writing segments. The installer, run against such a copy on an isolated
+  node, prints the same single warning line and nothing else from `--check`.
+  A changed `source` with the original numbers → `mount_source_mismatch`.
 - [ ] Same copy with another `major` (e.g. `7`) → `mount_device_mismatch`; a
   disposable loop-backed filesystem (`losetup` image on the root filesystem)
   recorded as `7:N` and reattached as another loop minor → `mount_device_mismatch`,

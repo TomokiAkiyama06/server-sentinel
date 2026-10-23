@@ -53,7 +53,8 @@ limit and reject metadata changes during the read.
 On failure `--check` exits with status 1 and prints exactly one line,
 `media-capture-agent: local deployment validation failed: <reason>`, to stderr.
 With `--check --json` it instead prints only `{"ok": false, "reason": "<reason>"}`
-to stdout (success: `{"ok": true}`); `--json` without `--check` is a usage error.
+to stdout (success: `{"ok": true}`, or `{"ok": true, "warnings": [...]}` with fixed
+warning codes, see below); `--json` without `--check` is a usage error.
 The success line without `--json` is unchanged. The reason is a fixed word from
 the table below: filesystem UUIDs, device numbers, paths, mount sources, sizes,
 usernames and exception text are never printed. The Owner compares the code with
@@ -73,7 +74,7 @@ is reported; fix it and rerun to reveal any later failure.
 | `mount_inventory_unavailable` | `/proc/self/mountinfo` or fdinfo could not be read or parsed |
 | `media_root_on_root_filesystem` | The approved mount is not `/`, but the media root currently resolves to the root filesystem |
 | `mount_point_is_root` | `expected_mount.mount_point` is `/`, but the media root lives on a separate mount |
-| `mount_source_mismatch` | The mount `source` differs from the approved value |
+| `mount_source_mismatch` | The mount `source` differs from the approved value and is not an accepted kernel-name rename (see below) |
 | `mount_device_mismatch` | The mount's device `major`/`minor` differs from the approved values and is not an acceptable reboot renumbering (see below): the major differs, only the minor differs but the device is not hardware-backed in sysfs (loop, nbd, zram, a dm/md mapping on one), its sysfs entry is missing or unreadable, it is the operating-system root filesystem's device, or the approved `mount_point` is `/` |
 | `mount_identity_mismatch` | Any other approved-mount difference: filesystem type, `filesystem_root`, a different mount point, or a bind of another backing directory |
 | `mount_readonly` | The approved mount or filesystem is read-only |
@@ -94,8 +95,10 @@ the unchanged success line is printed; one extra stderr line
 follows (`--check --json`: `{"ok": true, "warnings": ["device_numbers_stale"]}`;
 without a warning the JSON stays exactly `{"ok": true}`). It means the approved
 filesystem (UUID, mount and pinned media directory agree) is mounted under
-renumbered device numbers that the rule below accepts. Neither the recorded nor
-the current numbers are printed.
+renumbered device numbers (and possibly a renamed kernel source) that the rule
+below accepts. Neither the recorded nor the current numbers or sources are
+printed. The installer forwards exactly this fixed line to its stderr and
+discards all other `--check` output, as before.
 
 The deployment-local JSON configuration requires every field below. No private
 path, device identity, disk reserve, segment limit or clock threshold is a public
@@ -134,12 +137,26 @@ disk, a dm/md device by every device under `slaves/`, recursively (at most 8
 levels), and every leaf disk must have the `device` link to its bus device
 (SCSI, NVMe, virtio, USB storage). Loop, nbd, ublk, zram and ram disks have none,
 so they and any mapping on them are refused, as are a changed major, a missing
-or unreadable sysfs entry and a deeper stack (`mount_device_mismatch`). An
-accepted renumbering keeps writing but is degraded and value-free: `--check`
+or unreadable sysfs entry and a deeper stack (`mount_device_mismatch`).
+
+The mount `source` is corroboration too. The sd driver derives a disk's name and
+minor from the same index, so renumbering `8:16` to `8:0` also renames
+`/dev/sdb1` to `/dev/sda1`, and mountinfo reports that kernel name even when
+fstab uses `UUID=` or `/dev/disk/by-uuid/`. A differing source is accepted only
+when the recorded and the current source are both a single kernel block-device
+name under `/dev` (`/dev/` plus lowercase letters and digits, such as `sda1` or
+`nvme0n1p1`), the current source is a block device node whose `st_rdev` is the
+mounted device (which the pinned directory's `st_dev` must also be), and the
+recorded numbers are an accepted renumbering as above. Any other source change,
+including a rename with unchanged numbers, refuses with `mount_source_mismatch`.
+
+Owner decision (2026-10-23): like Main (#323), the Agent keeps recording when
+only the minor changes, as degraded `device_numbers_stale`. An accepted
+renumbering keeps writing but is degraded and value-free: `--check`
 prints the `device_numbers_stale` warning, and every heartbeat reports
 `storage.state = "degraded"`, `storage.reason = "device_numbers_stale"` and node
 reason `storage_device_numbers_stale` (node `degraded`) until the Owner verifies
-the device and updates `major`/`minor` in the private configuration. The service
+the device and updates `major`/`minor` (and `source`) in the private configuration. The service
 heartbeat line on stdout (journal) carries the same reason. Mount IDs are
 read from pinned-directory fdinfo and compared with mountinfo, including stacked
 bind mounts; a mount ID change during execution refuses writes. A systemd

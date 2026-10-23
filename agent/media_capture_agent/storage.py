@@ -157,6 +157,23 @@ def renumbered_device_acceptable(recorded, device):
     return _hardware_backed(node)
 
 
+# A kernel block-device name as mountinfo reports a mounted source: one
+# component under /dev (`sda1`, `nvme0n1p1`, `vda1`, `mmcblk0p1`). The sd driver
+# derives both the name and the minor from the disk index, so a reboot that
+# renumbers `8:16` to `8:0` also renames `/dev/sdb1` to `/dev/sda1` (Issue #324
+# review): mountinfo normalizes `UUID=` / by-uuid fstab sources to that name.
+KERNEL_DEVICE_SOURCE = re.compile(r"/dev/[a-z][a-z0-9]{0,31}")
+
+
+def block_device_number(path):
+    """``st_rdev`` of the block device node at ``path``, or None (fail closed)."""
+    try:
+        info = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return info.st_rdev if stat.S_ISBLK(info.st_mode) else None
+
+
 def os_root_device():
     """Device of the operating-system root filesystem (never a renumbering target)."""
     return os.stat("/").st_dev
@@ -208,7 +225,8 @@ class MediaStore:
 
     def __init__(self, settings, *, mounts=read_mounts, space=os.fstatvfs,
                  mount_id=descriptor_mount_id, stable_device=stable_device_matches,
-                 root_device=os_root_device, renumbered=renumbered_device_acceptable):
+                 root_device=os_root_device, renumbered=renumbered_device_acceptable,
+                 block_device=block_device_number):
         self.settings = settings
         self.mounts = mounts
         self.space = space
@@ -216,6 +234,7 @@ class MediaStore:
         self.stable_device = stable_device
         self.root_device = root_device
         self.renumbered = renumbered
+        self.block_device = block_device
         self._lock = threading.Lock()
         self._mount_id = None
         # (device, stale) of the last accepted device-number judgement.
@@ -277,11 +296,13 @@ class MediaStore:
             if not applicable:
                 raise StorageRefused("mount_missing")
             mount = max(applicable, key=lambda entry: len(entry.identity.mount_point.parts))
-            approved = self._approved_mount(mount.identity, mounts)
+            renamed = self._source_renamed(mount.identity)
+            source = mount.identity.source if renamed else self.settings.expected_mount.source
+            approved = self._approved_mount(mount.identity, mounts, source)
             if not approved or mount.readonly:
                 raise StorageRefused("mount_identity_mismatch", diagnostic=(
                     "mount_readonly" if approved
-                    else self._mismatch_diagnostic(mount.identity, mounts)))
+                    else self._mismatch_diagnostic(mount.identity, mounts, source)))
             # The approved UUID must resolve to the device actually mounted.
             if not self.stable_device(replace(self.settings.expected_mount,
                                               major=mount.identity.major,
@@ -293,7 +314,7 @@ class MediaStore:
                 # The pinned directory is not on the device mountinfo reports:
                 # a stacked/replaced mount, not an Owner configuration error.
                 raise StorageRefused("mount_device_mismatch", diagnostic="mount_replaced")
-            self.device_numbers_stale = self._judge_device_numbers(info.st_dev)
+            self.device_numbers_stale = self._judge_device_numbers(info.st_dev, renamed)
             if self._mount_id is not None and self._mount_id != mount.mount_id:
                 raise StorageRefused("mount_replaced")
             self._mount_id = mount.mount_id
@@ -308,7 +329,22 @@ class MediaStore:
         except OSError as exc:
             raise StorageRefused("storage_unavailable") from exc
 
-    def _judge_device_numbers(self, device):
+    def _source_renamed(self, actual):
+        """Whether a differing mount ``source`` may be a reboot rename (Issue #324).
+
+        Only a candidate: both the recorded and the current source must be
+        kernel block-device names and the current one must be the block device
+        node of the mounted device. `_judge_device_numbers` then requires the
+        recorded numbers to be an acceptable renumbering as well; anything else
+        keeps refusing with ``mount_source_mismatch``.
+        """
+        expected = self.settings.expected_mount
+        return (actual.source != expected.source
+                and KERNEL_DEVICE_SOURCE.fullmatch(expected.source) is not None
+                and KERNEL_DEVICE_SOURCE.fullmatch(actual.source) is not None
+                and self.block_device(actual.source) == os.makedev(actual.major, actual.minor))
+
+    def _judge_device_numbers(self, device, source_renamed=False):
         """Compare the recorded major/minor with the verified mounted ``device``.
 
         UUID, mount and pinned directory already agree on ``device``. Equal
@@ -316,11 +352,16 @@ class MediaStore:
         renumbering of a non-root filesystem is accepted, as stale (Issue
         #324); anything else refuses with ``mount_device_mismatch``. The
         accepted judgement is cached per device: the pinned mount cannot change
-        device without a mount ID change, which already refuses.
+        device without a mount ID change, which already refuses. A renamed
+        source (`_source_renamed`) is accepted only together with such a
+        renumbering, never with unchanged numbers.
         """
         expected = self.settings.expected_mount
         recorded = (expected.major, expected.minor)
         if recorded == (os.major(device), os.minor(device)):
+            if source_renamed:
+                raise StorageRefused("mount_identity_mismatch",
+                                     diagnostic="mount_source_mismatch")
             return False
         if self._device_judgement == (device, True):
             return True
@@ -342,7 +383,7 @@ class MediaStore:
             return "mount_missing"
         return "media_root_unavailable"
 
-    def _mismatch_diagnostic(self, actual, mounts):
+    def _mismatch_diagnostic(self, actual, mounts, source):
         """Name the first differing approved-mount property as one fixed code.
 
         Diagnostic only: admission already refused. Precedence is fixed so each
@@ -361,7 +402,7 @@ class MediaStore:
             # Narrow service bind at media_root: compare with the approved parent.
             reference_root = expected.filesystem_root / self.settings.media_root.relative_to(
                 expected.mount_point)
-        if actual.source != expected.source:
+        if actual.source != source:
             return "mount_source_mismatch"
         # Device numbers are not part of approval (Issue #324); they are judged
         # after the UUID check by `_judge_device_numbers`.
@@ -370,7 +411,7 @@ class MediaStore:
         # Every field matches a bind, but the approved parent mount is not visible.
         return "mount_missing"
 
-    def _approved_mount(self, actual, mounts):
+    def _approved_mount(self, actual, mounts, source):
         """Allow only the exact approved filesystem or its narrow service bind.
 
         systemd ReadWritePaths creates a namespace bind at media_root. Its root
@@ -379,10 +420,12 @@ class MediaStore:
         The approved parent mount must remain visible in the namespace inventory.
         Device numbers are taken from ``actual`` (Issue #324): they can change
         across a reboot, so the UUID check and `_judge_device_numbers` decide
-        them, and the parent must be on the same device as the bind.
+        them, and the parent must be on the same device as the bind. ``source``
+        is the recorded source, or the current one when `_source_renamed`
+        accepted it as a candidate rename.
         """
         expected = self.settings.expected_mount
-        mountinfo_expected = replace(expected, filesystem_uuid=None,
+        mountinfo_expected = replace(expected, filesystem_uuid=None, source=source,
                                      major=actual.major, minor=actual.minor)
         if actual == mountinfo_expected:
             return True
@@ -392,7 +435,7 @@ class MediaStore:
             return False
         relative = self.settings.media_root.relative_to(expected.mount_point)
         return (
-            actual.filesystem == expected.filesystem and actual.source == expected.source
+            actual.filesystem == expected.filesystem and actual.source == source
             and actual.filesystem_root == expected.filesystem_root / relative
         )
 

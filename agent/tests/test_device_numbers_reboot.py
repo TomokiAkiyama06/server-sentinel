@@ -324,6 +324,110 @@ class MediaStoreRenumberingTests(RenumberingCase):
             store.write_segment(uuid4(), b"synthetic")
         self.assertFalse(self.settings.media_root.exists())
 
+    def test_pinned_directory_must_be_on_the_device_mountinfo_reports(self):
+        # mountinfo claims the recorded numbers while the pinned directory is
+        # on another device: a stacked/replaced mount, never a renumbering.
+        self.hardware()
+        self.renumbered()
+        expected = self.settings.expected_mount
+        claimed = dataclasses.replace(expected, filesystem_uuid=None)
+        self.sysfs.device(os.makedev(expected.major, expected.minor), "claimed")
+        for mount in (claimed, dataclasses.replace(claimed, minor=self.numbers[1] + 5)):
+            with self.subTest(minor=mount.minor - self.numbers[1]):
+                with self.assertRaises(StorageRefused) as raised:
+                    self.store(mounts=lambda mount=mount: [Mount(mount, 1, False)])
+                self.assertEqual((str(raised.exception), raised.exception.diagnostic),
+                                 ("mount_device_mismatch", "mount_replaced"))
+        self.assertEqual(list(self.settings.media_root.iterdir()), [])
+
+
+@unittest.skipIf(os.geteuid() == 0, "the Agent refuses root by design")
+class SourceRenameTests(RenumberingCase):
+    """sd derives name and minor from one index: `8:16` -> `8:0` renames
+    `/dev/sdb1` to `/dev/sda1` (Issue #324 review, important 1)."""
+
+    RECORDED, CURRENT = "/dev/sdb1", "/dev/sda1"
+
+    def setUp(self):
+        super().setUp()
+        self.hardware()
+        self.renumbered()
+        self.settings = dataclasses.replace(self.settings, expected_mount=dataclasses.replace(
+            self.settings.expected_mount, source=self.RECORDED))
+        self.rename(self.CURRENT)
+        self.nodes = {self.CURRENT: self.device}
+
+    def rename(self, source, **numbers):
+        self.mounts = [Mount(dataclasses.replace(self.mounts[0].identity, source=source,
+                                                 **numbers), 1, False)]
+
+    def store(self, **kwargs):
+        kwargs.setdefault("block_device", self.nodes.get)
+        return super().store(**kwargs)
+
+    def assert_refused(self, diagnostic, **kwargs):
+        with self.assertRaises(StorageRefused) as raised:
+            self.store(**kwargs)
+        self.assertEqual(raised.exception.diagnostic, diagnostic)
+        self.assertEqual(list(self.settings.media_root.iterdir()), [])
+
+    def test_sd_rename_with_minor_renumbering_is_accepted_as_stale(self):
+        store = self.store()
+        self.assertTrue(store.device_numbers_stale)
+        identity = uuid4()
+        store.write_segment(identity, b"synthetic renamed capture")
+        self.assertIn(identity, store.list_segments())
+
+    def test_rename_through_narrow_service_bind_is_accepted(self):
+        expected = self.settings.expected_mount
+        parent = self.mounts[0].identity
+        bind = dataclasses.replace(
+            parent, mount_point=self.settings.media_root,
+            filesystem_root=expected.filesystem_root
+            / self.settings.media_root.relative_to(expected.mount_point))
+        mounts = [Mount(parent, 10, True), Mount(bind, 11, False)]
+        store = self.store(mounts=lambda: mounts, mount_id=lambda _fd: 11)
+        self.assertTrue(store.device_numbers_stale)
+
+    def test_non_kernel_name_shapes_are_refused(self):
+        for recorded, current in (("UUID=synthetic", self.CURRENT),
+                                  ("/dev/disk/by-uuid/synthetic", self.CURRENT),
+                                  (self.RECORDED, "/dev/mapper/synthetic-volume"),
+                                  (self.RECORDED, "/dev/../dev/sda1"),
+                                  (self.RECORDED, "synthetic-source")):
+            with self.subTest(recorded=recorded, current=current):
+                self.settings = dataclasses.replace(
+                    self.settings, expected_mount=dataclasses.replace(
+                        self.settings.expected_mount, source=recorded))
+                self.rename(current)
+                self.nodes[current] = self.device
+                self.assert_refused("mount_source_mismatch")
+
+    def test_current_source_node_must_be_the_mounted_device(self):
+        for node in (None, self.device + 1):
+            with self.subTest(node=node):
+                self.assert_refused("mount_source_mismatch",
+                                    block_device=lambda _path, node=node: node)
+
+    def test_rename_with_major_change_is_refused(self):
+        self.settings = dataclasses.replace(self.settings, expected_mount=dataclasses.replace(
+            self.settings.expected_mount, major=self.numbers[0] + 1, minor=self.numbers[1]))
+        self.assert_refused("mount_device_mismatch")
+
+    def test_rename_without_renumbering_is_refused(self):
+        self.settings = dataclasses.replace(self.settings, expected_mount=dataclasses.replace(
+            self.settings.expected_mount, minor=self.numbers[1]))
+        self.assert_refused("mount_source_mismatch")
+
+    def test_rename_without_hardware_evidence_is_refused(self):
+        for entry in (self.sysfs.root / "dev").iterdir():
+            entry.unlink()
+        self.assert_refused("mount_device_mismatch")
+
+    def test_uuid_mismatch_still_refuses_a_renamed_device(self):
+        with self.assertRaisesRegex(StorageRefused, "stable_device_mismatch"):
+            self.store(stable_device=lambda _expected: False)
+
 
 @unittest.skipIf(os.geteuid() == 0, "the Agent refuses root by design")
 class HeartbeatRenumberingTests(RenumberingCase):
@@ -429,6 +533,24 @@ class CheckRenumberingTests(unittest.TestCase):
         code, stdout, _stderr = self.run_check(config, json_output=True)
         self.assertEqual((code, json.loads(stdout)),
                          (1, {"ok": False, "reason": "mount_device_mismatch"}))
+
+
+
+class InstallerWarningTests(unittest.TestCase):
+    """The installer forwards only the fixed, value-free `--check` warning lines."""
+
+    def test_only_fixed_warning_lines_are_forwarded(self):
+        from install import _forward_check_warnings
+        warning = "media-capture-agent: local deployment validation warning: device_numbers_stale"
+        stderr = "\n".join(["synthetic diagnostic /synthetic/path 8:16", warning,
+                            warning + " /synthetic/path", "Traceback (most recent call last):",
+                            ""]).encode()
+        stream = io.StringIO()
+        _forward_check_warnings(stderr, stream)
+        self.assertEqual(stream.getvalue(), warning + "\n")
+        stream = io.StringIO()
+        _forward_check_warnings(b"\xff\xfe", stream)
+        self.assertEqual(stream.getvalue(), "")
 
 
 if __name__ == "__main__":
