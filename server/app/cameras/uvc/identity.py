@@ -171,6 +171,10 @@ class ReconnectController:
         if (explicit_candidate is not None
                 and (not isinstance(explicit_candidate, DeviceEvidence)
                      or explicit_candidate != self.approved)):
+            # The session never runs: its marker must not show as in use
+            # (Issue #317); it stays durable, so the next start requires
+            # approval.
+            self.abandon()
             raise ValueError("explicit candidate does not match approval")
         self.emit = emit
         self.enabled = enabled
@@ -726,6 +730,17 @@ class ReconnectController:
             self._session_token = None
         with self.lock:
             self._finished = True
+
+    def abandon(self):
+        """Withdraw this controller's marker from the session ledger when its
+        session can never run (it could not be built); best effort.
+
+        The marker itself stays durable, as after a crash, so the next start
+        requires approval; ``sources`` shows that instead of a session in use.
+        """
+        withdraw = getattr(self.store, "withdraw_session", None)
+        if withdraw is not None and self._session_token is not None:
+            withdraw(self.source_id, self._session_token)
 
     def supersede_stopped_session(self):
         """Discard only in-memory state after an audited approval supersedes it."""

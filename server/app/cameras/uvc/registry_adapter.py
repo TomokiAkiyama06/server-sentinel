@@ -11,6 +11,7 @@ from .capture import MmapCapture, VideoProfile
 from .discovery import LinuxDiscovery
 from .identity import DeviceEvidence, ReconnectController
 from .persistence import ApprovalStore
+from .session_ledger import SessionLedger
 from .session import CaptureSession
 
 
@@ -263,9 +264,12 @@ class LocalUvcAdapter:
                  frame_stall_reopen_seconds=5.0, presence_scan_seconds=1.0):
         self.registry = registry
         # Session-marker writes share the registry's storage admission, so no
-        # capture-driven write bypasses the Main storage policy.
+        # capture-driven write bypasses the Main storage policy. The ledger
+        # records which markers this process holds (Issue #317), for
+        # ``admin_cli sources``; it is never read back here.
         self.store = ApprovalStore(registry.database,
-                                   reservation=getattr(registry, "reservation", None))
+                                   reservation=getattr(registry, "reservation", None),
+                                   ledger=SessionLedger.for_database(registry.database))
         self.emit_audit = emit_audit
         # Downstream delivery (logging, external health sinks) that may block;
         # the controller calls it only after releasing its transition lock.
@@ -463,11 +467,15 @@ class LocalUvcAdapter:
                 last_seen["at"], last_seen["state"] = now, state
             self.on_frame(source.id, frame)
 
-        session = CaptureSession(
-            controller, self.discovery, capture_profile(source.desired_capture_profile),
-            on_frame=frame_sink, on_profile=profile_sink, capture_factory=self.capture_factory,
-            clock=lambda: self.monotonic(), **self.session_timing,
-        )
+        try:
+            session = CaptureSession(
+                controller, self.discovery, capture_profile(source.desired_capture_profile),
+                on_frame=frame_sink, on_profile=profile_sink, capture_factory=self.capture_factory,
+                clock=lambda: self.monotonic(), **self.session_timing,
+            )
+        except BaseException:
+            controller.abandon()  # its marker stays; never shown as in use (Issue #317)
+            raise
         self.sessions[source.id] = session
         return session
 
@@ -568,6 +576,9 @@ class LocalUvcAdapter:
             session.controller.capture_failed()
 
     def poll_source(self, source_id, *, timeout=1.0):
+        # A session ledger publication that failed earlier is retried here
+        # (Issue #317); a no-op unless one is pending, and it never raises.
+        self.store.retry_ledger(self.monotonic)
         try:
             source = self._source(source_id)
         except BaseException:
