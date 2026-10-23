@@ -50,6 +50,77 @@ CAMERA_FLAPPING_OFFLINE_SECONDS = 300.0
 CAMERA_FLAPPING_OFFLINE_MIN = 60.0
 STORAGE_SECTIONS = ("storage_limits", "recording_limits", "recording_filesystem")
 SUMMARY_TIME = re.compile(r"([01][0-9]|2[0-3]):([0-5][0-9])")
+# Kernel block-device attributes by `<major>:<minor>` (Issue #321): a loop
+# device has a `loop/` directory (with `backing_file` while attached), a
+# device-mapper device a `dm/` directory.
+SYS_DEV_BLOCK = Path("/sys/dev/block")
+# Bound on the dm/md stacking walked through `slaves/` (each level is one
+# mapping on top of another); deeper stacks are refused, not trusted.
+MAX_BLOCK_STACK_DEPTH = 8
+
+
+def _hardware_backed(node: Path, depth: int = 0) -> bool:
+    """Whether the sysfs block device ``node`` rests only on hardware disks.
+
+    An allowlist (Issue #321 review): a partition (`partition` attribute) is
+    judged by its parent disk, the directory that contains it once the
+    `/sys/dev/block` link is resolved; a stacked device (device-mapper, md)
+    by every device under `slaves/`, recursively; and every leaf disk must
+    have a `device` link to its bus device (SCSI, NVMe, virtio). Loop, nbd,
+    ublk, zram and ram disks have none, so an image on the root filesystem,
+    or a dm/LVM mapping on one, is never accepted, whatever its major (a
+    `losetup -P` partition shares major 259 with NVMe). False also when the
+    stack is deeper than `MAX_BLOCK_STACK_DEPTH` or anything cannot be read
+    (fail closed).
+    """
+    if depth > MAX_BLOCK_STACK_DEPTH:
+        return False
+    try:
+        path = node.resolve(strict=True)
+        if (path / "partition").exists():
+            path = path.parent
+            if not path.is_dir():
+                return False
+        # Defence in depth only: a loop disk also lacks the `device` link.
+        if (path / "loop").exists():
+            return False
+        slaves = path / "slaves"
+        below = sorted(slaves.iterdir()) if slaves.exists() else []
+        if not below:
+            return (path / "device").exists()
+        return all(_hardware_backed(slave, depth + 1) for slave in below)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def renumbered_device_acceptable(recorded: tuple[int, int], device: int) -> bool:
+    """Whether a recorded major/minor pair may differ from ``device`` (Issue #321).
+
+    Called only for a device the approved UUID, the mount point and the
+    runtime root already agree on. An equal pair is always acceptable. A
+    differing pair is acceptable only as a reboot renumbering of the same
+    kind of device: the major (the driver) is unchanged and only the minor
+    differs, and the device rests only on hardware disks (`_hardware_backed`):
+    a loop device's backing file may be on the operating-system root
+    filesystem (a disk image mounted with `-o loop` gets a
+    `/dev/disk/by-uuid` link and a non-root device number), and loop
+    partitions (major 259) or dm/LVM on a loop device keep a familiar major. A device-mapper device is accepted only when the
+    recorded device was one too, which the unchanged major already implies
+    (device-mapper has its own major). Missing or unreadable sysfs entries
+    refuse (fail closed).
+    """
+    major, minor = os.major(device), os.minor(device)
+    if tuple(recorded) == (major, minor):
+        return True
+    if recorded[0] != major:
+        return False
+    node = SYS_DEV_BLOCK / f"{major}:{minor}"
+    try:
+        if not node.exists():
+            return False
+    except (OSError, ValueError):
+        return False
+    return _hardware_backed(node)
 
 
 @dataclass(frozen=True)
@@ -61,6 +132,14 @@ class RecordingFilesystem:
     unavailable. `is_mount(path)` reports whether the mount point is mounted.
     Both are re-evaluated on every storage sample, so a detached, reformatted
     or substituted filesystem refuses writes instead of falling back.
+
+    `device` (and the deployment's `runtime_device`, attached by
+    `Deployment.load`) are the recorded Linux major/minor numbers. They only
+    corroborate the UUID: the kernel may number the same disk differently
+    after a reboot (Issue #321), so a changed minor of the same kind of
+    device while the UUID resolves to the mounted device is a stale recorded
+    value reported to the Owner; a changed major, a loop device or a new
+    device-mapper device is refused (`renumbered_device_acceptable`).
     """
 
     root: Path = field(repr=False)
@@ -70,6 +149,23 @@ class RecordingFilesystem:
     resolve_device: Callable[[str], int] = field(repr=False, compare=False)
     is_mount: Callable[[Path], bool] = field(default=os.path.ismount, repr=False,
                                              compare=False)
+    runtime_device: tuple[int, int] | None = field(default=None, repr=False)
+
+    def recorded_device_numbers_match(self, device: int) -> bool:
+        """Whether every recorded major/minor pair names ``device``.
+
+        Called only for a device the UUID, the mount point and the root
+        already agree on. False is reported to the Owner; whether storage may
+        be used at all is `recorded_device_numbers_acceptable`.
+        """
+        actual = (os.major(device), os.minor(device))
+        return self.device == actual and self.runtime_device in (None, actual)
+
+    def recorded_device_numbers_acceptable(self, device: int) -> bool:
+        """Whether every recorded pair names ``device`` or is a stale value of
+        the same kind of device (`renumbered_device_acceptable`)."""
+        return all(renumbered_device_acceptable(recorded, device)
+                   for recorded in (self.device, self.runtime_device) if recorded is not None)
 
 
 @dataclass(frozen=True)
@@ -200,13 +296,19 @@ def _recording_filesystem(value: object, recordings_directory: Path, *,
         operating_system_root = root_device()
     except (OSError, RuntimeError, ValueError):
         raise ConfigurationError("recording filesystem is unavailable") from None
+    # The UUID is the identity: it must resolve to the device the recordings
+    # directory and the mounted mount point are on, and that device must not
+    # be the operating-system root's. The recorded major/minor numbers may
+    # change across a reboot (Issue #321): a stale minor of the same kind of
+    # device is reported, not refused; a different major, a loop device or a
+    # new device-mapper device is refused (`renumbered_device_acceptable`).
     if (resolved_mount == Path(resolved_mount.anchor)
             or not is_mount(resolved_mount)
             or not directory.is_relative_to(resolved_mount)
             or directory_info.st_dev != mount_info.st_dev
             or directory_info.st_dev != approved
-            or [os.major(directory_info.st_dev), os.minor(directory_info.st_dev)] != device
-            or directory_info.st_dev == operating_system_root):
+            or directory_info.st_dev == operating_system_root
+            or not renumbered_device_acceptable((device[0], device[1]), directory_info.st_dev)):
         raise ConfigurationError("recording filesystem identity mismatch")
     return RecordingFilesystem(directory, uuid, (device[0], device[1]), resolved_mount,
                                resolve_device, is_mount)

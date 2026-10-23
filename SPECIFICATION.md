@@ -123,7 +123,17 @@ application lifespan startup, and listener creation succeed. Runtime
 subdirectories are resolved and must remain contained on the approved runtime
 filesystem, which is pinned by its Owner-approved filesystem UUID; Linux
 major/minor device numbers only corroborate that identity because a replaced or
-reformatted disk can reuse them. Deployment configuration is administrator-owned
+reformatted disk can reuse them and a reboot can renumber the same disk. While
+the UUID resolves to the device of the runtime root and of the mounted mount
+point (not the root filesystem's), a recorded pair with the same major and
+another minor is reported as stale (value-free launcher warning, Owner notice
+`recording_device_numbers_changed`), not refused, when it rests only on
+hardware disks (a partition judged by its parent disk, a dm/md device by its
+sysfs `slaves/`, recursively, every leaf disk with a sysfs `device` link to
+its bus device); a changed major, a loop/nbd/ublk/zram/ram disk or a mapping
+on one, or a device without a readable sysfs entry is still refused, and a
+device-mapper device only passes when the recorded one was device-mapper too
+(Issue #321). Deployment configuration is administrator-owned
 and runtime-readable but not runtime-writable, and is refused inside the
 installation tree, inside the runtime-writable data tree, or under any
 directory path component the administrator does not control. Both release pointers and the service unit move
@@ -1623,10 +1633,20 @@ episode whose newest access notification row is `human_access_fault` continues
 after a restart, so its recovery is still announced. Without an actual
 capture-pipeline adapter the self-test is an explicit `UNAVAILABLE`, not
 healthy. Independently of that adapter, the runtime re-verifies the declared
-recording filesystem (UUID → device, major/minor, mounted mount point, pinned
+recording filesystem (UUID → device, mounted mount point, pinned
 root device/inode, private metadata file) on every storage sample; a mismatch
 is `STORAGE_HARD_STOP`, refuses writes without creating a fallback and raises one
-immediate `recording_health_failure` per episode. A mismatch at startup leaves
+immediate `recording_health_failure` per episode. The recorded major/minor
+numbers (`recording_filesystem.device`, `runtime_device`) only corroborate the
+UUID: when they no longer name the verified device, storage is admitted,
+`recording_device_numbers_stale` is set (diagnostics
+`recording_filesystem.state` `degraded`, one degraded item in the daily
+summary) and the immediate value-free `recording_device_numbers_changed`
+attention notice is sent once per boot and device numbers (event ID from the
+kernel boot ID and the numbers; a restart in the same boot finds the row and
+sends nothing; without a readable boot ID once per process start). A changed
+major, a loop device or a device without a sysfs entry is
+`STORAGE_HARD_STOP` at every storage (re)open (Issue #321). A mismatch at startup leaves
 the runtime `failed`, refuses writes and still attempts the immediate Slack
 alert; the open is retried every 15 minutes against the same declared identity
 (never another directory), without repeating the alert, and a successful retry

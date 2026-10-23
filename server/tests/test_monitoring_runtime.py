@@ -814,8 +814,12 @@ class ConfigurationTests(unittest.TestCase):
             self.parse(approved=self.device + 7)
         with self.assertRaisesRegex(ConfigurationError, "mismatch"):
             self.parse(root=self.device)
+        # Issue #321: recorded numbers only corroborate the UUID. A changed
+        # major is another kind of device and refused; a changed minor of
+        # the same kind is covered by tests/test_device_numbers_reboot.py.
+        major = os.major(self.device)
         value = dict(self.value, recording_filesystem=dict(
-            self.value["recording_filesystem"], device=[0, 0]))
+            self.value["recording_filesystem"], device=[7 if major != 7 else 8, 0]))
         with self.assertRaisesRegex(ConfigurationError, "mismatch"):
             self.parse(value)
         value = dict(self.value, recording_filesystem=dict(
