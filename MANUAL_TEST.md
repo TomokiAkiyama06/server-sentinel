@@ -2931,8 +2931,10 @@ The synthetic CI tests do not complete these checks. On an isolated Capture Node
   stderr line ending in the fixed reason code listed in `agent/README.md`
   (`--check --json`: only `{"ok": false, "reason": ...}` on stdout), and that no
   UUID, device number, path, mount source, size or username is printed. Expected
-  codes: wrong `filesystem_uuid` → `filesystem_uuid_mismatch`; wrong `major` or
-  `minor` → `mount_device_mismatch`; wrong `source` → `mount_source_mismatch`;
+  codes: wrong `filesystem_uuid` → `filesystem_uuid_mismatch`; wrong `major`, or
+  a wrong `minor` on a device that is not hardware-backed in sysfs →
+  `mount_device_mismatch` (a wrong `minor` on a hardware disk passes with the
+  `device_numbers_stale` warning, Issue #324 below); wrong `source` → `mount_source_mismatch`;
   approved mount unmounted → `mount_missing` (media root absent) or
   `media_root_on_root_filesystem` (media root path exists on `/`);
   `mount_point` set to `/` while the media root is on a separate mount →
@@ -2947,6 +2949,53 @@ The synthetic CI tests do not complete these checks. On an isolated Capture Node
 
 Publish only pass/fail summaries; keep configs, mount identity, host identifiers,
 credentials and captured media private.
+
+### Issue #324 Agent media-root device renumbering (pending physical execution)
+
+CI covers the rule only with a fake sysfs, an injected root device and
+synthetic mount inventories (`agent/tests/test_device_numbers_reboot.py`). None
+of the following is verified. The capture host is production: do not reboot it,
+change its mounts or edit its live configuration for these checks unless the
+Owner schedules it; the read-only steps below change nothing.
+
+- [ ] Read-only evidence on the capture host (run as any user; publish only
+  pass/fail, never the numbers, names or serials): `findmnt -no MAJ:MIN,SOURCE
+  <mount_point>` and `blkid -t UUID=<uuid> -o device` (exactly one line) agree;
+  `ls -l /sys/dev/block/<maj:min>/` resolves; for a partition its parent disk
+  directory (`readlink -f /sys/dev/block/<maj:min>/..`) has a `device` link
+  (`ls -l <parent>/device`), for dm/md every entry of
+  `ls /sys/dev/block/<maj:min>/slaves/` leads to such a disk, and there is no
+  `loop/` directory; `lsblk -o NAME,MAJ:MIN,TYPE` shows `disk`/`part` (or
+  `lvm`/`crypt` on them). This predicts whether a renumbering would be accepted.
+- [ ] Inside the generated unit's sandbox (`ProtectKernelTunables=true`,
+  `ProtectSystem=strict`), the dedicated account can read the same sysfs
+  entries, e.g. `systemd-run --uid=<agent account> -p ProtectKernelTunables=yes
+  -p ProtectSystem=strict --pty ls -l /sys/dev/block/<maj:min>/` on an isolated
+  test node, or confirm through a `--check` on a disposable configuration copy
+  below; an unreadable sysfs must make a renumbering refuse, not pass.
+- [ ] On an isolated test node or a disposable configuration copy (never the
+  production config): set `expected_mount.minor` to another value with the same
+  `major`; `--check` exits 0, prints the unchanged success line and exactly one
+  `media-capture-agent: local deployment validation warning: device_numbers_stale`
+  stderr line (`--check --json`: `{"ok": true, "warnings": ["device_numbers_stale"]}`),
+  with no number, path, UUID or source printed. A service run with that copy
+  prints heartbeat lines with reason `storage_device_numbers_stale` and keeps
+  writing segments.
+- [ ] Same copy with another `major` (e.g. `7`) → `mount_device_mismatch`; a
+  disposable loop-backed filesystem (`losetup` image on the root filesystem)
+  recorded as `7:N` and reattached as another loop minor → `mount_device_mismatch`,
+  and no segment is written to the root filesystem; a UUID pointing to another
+  device than the mount → `filesystem_uuid_mismatch`; the data mount unmounted
+  → `mount_missing` / `media_root_on_root_filesystem` as before.
+- [ ] After a real reboot that renumbers the media disk (only when the Owner
+  schedules one): the unit starts, `journalctl -u media-capture-agent` shows the
+  stale reason, and after verifying the device as in the first item and
+  updating `major`/`minor` in the private configuration (`--check &&
+  systemctl restart media-capture-agent`), the warning and degraded reason are
+  gone.
+- [ ] After the authenticated Agent session is integrated (#14/#15): Main shows the
+  node as degraded with the storage reason and the Owner receives the
+  notification chosen for it (not implemented yet; see the PR for Issue #324).
 
 ### Issue #12 Agent UVC capture adapter (pending physical execution)
 

@@ -712,6 +712,7 @@ The Agent media root is a deployment-configured path outside the source tree tha
 At install/startup/runtime admission, the Agent shall verify:
 - the configured media root exists or can be created only by the intended installer/owner workflow;
 - it resolves to the expected filesystem/mount/device and backing-filesystem-root identity; a narrow systemd namespace bind must map to the approved parent root plus the configured relative media path;
+- the approved filesystem UUID resolves to the device the mount and pinned media directory are on. Recorded major/minor only corroborate it (Issue #324, as Main's Issue #321): a difference is accepted only for an unchanged major on a hardware-backed device in sysfs that is not the root filesystem's (approved mount point not `/`), and then as degraded with the value-free `device_numbers_stale` (`--check` warning; heartbeat `storage.state = degraded`, `storage.reason = device_numbers_stale`, node reason `storage_device_numbers_stale`). A changed major, loop/nbd/zram/ram or a mapping on one, or missing sysfs evidence refuses with `mount_device_mismatch`;
 - sufficient free space and safety reserve remain;
 - it is writable by the dedicated Agent service account;
 - loss/unmount/substitution of the expected media filesystem does **not** silently redirect ring-buffer or incident writes into a directory on the root filesystem.

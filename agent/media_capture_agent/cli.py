@@ -10,7 +10,7 @@ import zipimport
 
 from .config import ConfigurationError, Settings
 from .runtime import Agent
-from .storage import MediaStore, StorageRefused
+from .storage import DEVICE_NUMBERS_STALE, MediaStore, StorageRefused
 
 
 # Stable, identifier-free validation failure codes. Exactly one is reported per
@@ -28,6 +28,10 @@ CHECK_REASONS = frozenset({
     "runtime_root_not_writable", "node_identity_mismatch", "node_credential_unavailable",
     "check_failed",
 })
+
+# Accepted-but-degraded findings `--check` reports without failing (Issue #324).
+CHECK_WARNINGS = frozenset({DEVICE_NUMBERS_STALE})
+CHECK_WARNING = "media-capture-agent: local deployment validation warning: "
 
 # MediaStore refusals (StorageRefused.diagnostic) -> public reason code.
 _STORAGE_REASONS = {
@@ -102,10 +106,16 @@ def main(argv=None):
         runtime_phase = False
         if args.check:
             store.check()
+            # Issue #324: an accepted renumbering passes with one fixed,
+            # value-free warning; device numbers are never printed.
+            warnings = [DEVICE_NUMBERS_STALE] if store.device_numbers_stale else []
             if args.json:
-                print(json.dumps({"ok": True}))
+                print(json.dumps({"ok": True, "warnings": warnings} if warnings
+                                 else {"ok": True}))
             else:
                 print("media-capture-agent: local deployment validation passed")
+                for warning in warnings:
+                    print(CHECK_WARNING + warning, file=sys.stderr)
             return 0
         for signum in (signal.SIGTERM, signal.SIGINT):
             previous[signum] = signal.signal(signum, lambda *_: stopped.set())

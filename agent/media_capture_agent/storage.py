@@ -68,7 +68,12 @@ def descriptor_mount_id(descriptor):
 
 
 def stable_device_matches(expected):
-    """Match the Owner-approved filesystem UUID to its current block device."""
+    """Match the Owner-approved filesystem UUID to the block device ``expected`` names.
+
+    ``MediaStore`` passes the approved identity with the major/minor the mount
+    inventory currently reports (Issue #324), so this proves the UUID resolves
+    to the mounted device; the recorded numbers are judged separately.
+    """
     try:
         if expected.filesystem_uuid is None:
             return False
@@ -77,6 +82,84 @@ def stable_device_matches(expected):
                 and os.minor(info.st_rdev) == expected.minor)
     except OSError:
         return False
+
+
+# Fixed, value-free code for an accepted renumbering (Issue #324): heartbeat
+# storage reason, node reason `storage_device_numbers_stale` and `--check`
+# warning. It never carries the recorded or current numbers.
+DEVICE_NUMBERS_STALE = "device_numbers_stale"
+
+# Kernel block-device attributes by `<major>:<minor>` (Issue #324, the Agent
+# counterpart of Main's Issue #321 rule in `server/app/monitoring/config.py`;
+# the Agent is a separate artifact and shares no code with Main).
+SYS_DEV_BLOCK = Path("/sys/dev/block")
+# Bound on the dm/md stacking walked through `slaves/`; deeper stacks are
+# refused, not trusted.
+MAX_BLOCK_STACK_DEPTH = 8
+
+
+def _hardware_backed(node, depth=0):
+    """Whether the sysfs block device ``node`` rests only on hardware disks.
+
+    An allowlist: a partition (`partition` attribute) is judged by its parent
+    disk, the directory containing it once the `/sys/dev/block` link is
+    resolved; a stacked device (device-mapper, md) by every device under
+    `slaves/`, recursively; every leaf disk must have a `device` link to its
+    bus device (SCSI, NVMe, virtio, USB storage). Loop, nbd, ublk, zram and ram
+    disks have none, so an image on the root filesystem, or a dm/LVM mapping on
+    one, is never accepted whatever its major (a `losetup -P` partition shares
+    major 259 with NVMe). False also beyond ``MAX_BLOCK_STACK_DEPTH`` or when
+    anything cannot be read (fail closed).
+    """
+    if depth > MAX_BLOCK_STACK_DEPTH:
+        return False
+    try:
+        path = node.resolve(strict=True)
+        if (path / "partition").exists():
+            path = path.parent
+            if not path.is_dir():
+                return False
+        # Defence in depth only: a loop disk also lacks the `device` link.
+        if (path / "loop").exists():
+            return False
+        slaves = path / "slaves"
+        below = sorted(slaves.iterdir()) if slaves.exists() else []
+        if not below:
+            return (path / "device").exists()
+        return all(_hardware_backed(slave, depth + 1) for slave in below)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def renumbered_device_acceptable(recorded, device):
+    """Whether recorded ``(major, minor)`` may differ from ``device`` (Issue #324).
+
+    Called only for the device the approved UUID, the mount inventory and the
+    pinned media directory already agree on. Equal numbers are acceptable. A
+    difference is acceptable only as a reboot renumbering of the same kind of
+    device: the major (the driver) is unchanged, only the minor differs, and
+    the device rests only on hardware disks (`_hardware_backed`). A different
+    major (for example a loop image `7:N` replacing a disk) or a missing or
+    unreadable sysfs entry refuses (fail closed). Device-mapper has its own
+    major, so a dm device is accepted only when the recorded one was dm too.
+    """
+    major, minor = os.major(device), os.minor(device)
+    if tuple(recorded) == (major, minor):
+        return True
+    if recorded[0] != major:
+        return False
+    node = SYS_DEV_BLOCK / f"{major}:{minor}"
+    try:
+        if not node.exists():
+            return False
+    except (OSError, ValueError):
+        return False
+    return _hardware_backed(node)
+
+
+def os_root_device():
+    """Device of the operating-system root filesystem (never a renumbering target)."""
+    return os.stat("/").st_dev
 
 
 def parse_mounts(text):
@@ -124,14 +207,22 @@ class MediaStore:
     """
 
     def __init__(self, settings, *, mounts=read_mounts, space=os.fstatvfs,
-                 mount_id=descriptor_mount_id, stable_device=stable_device_matches):
+                 mount_id=descriptor_mount_id, stable_device=stable_device_matches,
+                 root_device=os_root_device, renumbered=renumbered_device_acceptable):
         self.settings = settings
         self.mounts = mounts
         self.space = space
         self.mount_id = mount_id
         self.stable_device = stable_device
+        self.root_device = root_device
+        self.renumbered = renumbered
         self._lock = threading.Lock()
         self._mount_id = None
+        # (device, stale) of the last accepted device-number judgement.
+        self._device_judgement = None
+        # True while the approved filesystem is mounted under device numbers
+        # other than the recorded ones (Issue #324): accepted, but degraded.
+        self.device_numbers_stale = False
         try:
             self._fd = open_directory(settings.media_root)
         except StorageRefused as exc:
@@ -191,7 +282,10 @@ class MediaStore:
                 raise StorageRefused("mount_identity_mismatch", diagnostic=(
                     "mount_readonly" if approved
                     else self._mismatch_diagnostic(mount.identity, mounts)))
-            if not self.stable_device(self.settings.expected_mount):
+            # The approved UUID must resolve to the device actually mounted.
+            if not self.stable_device(replace(self.settings.expected_mount,
+                                              major=mount.identity.major,
+                                              minor=mount.identity.minor)):
                 raise StorageRefused("stable_device_mismatch")
             if (os.major(info.st_dev), os.minor(info.st_dev)) != (
                 mount.identity.major, mount.identity.minor
@@ -199,6 +293,7 @@ class MediaStore:
                 # The pinned directory is not on the device mountinfo reports:
                 # a stacked/replaced mount, not an Owner configuration error.
                 raise StorageRefused("mount_device_mismatch", diagnostic="mount_replaced")
+            self.device_numbers_stale = self._judge_device_numbers(info.st_dev)
             if self._mount_id is not None and self._mount_id != mount.mount_id:
                 raise StorageRefused("mount_replaced")
             self._mount_id = mount.mount_id
@@ -212,6 +307,28 @@ class MediaStore:
             return available
         except OSError as exc:
             raise StorageRefused("storage_unavailable") from exc
+
+    def _judge_device_numbers(self, device):
+        """Compare the recorded major/minor with the verified mounted ``device``.
+
+        UUID, mount and pinned directory already agree on ``device``. Equal
+        numbers: not stale. Otherwise only a same-major, hardware-backed
+        renumbering of a non-root filesystem is accepted, as stale (Issue
+        #324); anything else refuses with ``mount_device_mismatch``. The
+        accepted judgement is cached per device: the pinned mount cannot change
+        device without a mount ID change, which already refuses.
+        """
+        expected = self.settings.expected_mount
+        recorded = (expected.major, expected.minor)
+        if recorded == (os.major(device), os.minor(device)):
+            return False
+        if self._device_judgement == (device, True):
+            return True
+        if (expected.mount_point == Path("/") or device == self.root_device()
+                or not self.renumbered(recorded, device)):
+            raise StorageRefused("mount_identity_mismatch", diagnostic="mount_device_mismatch")
+        self._device_judgement = (device, True)
+        return True
 
     def _unavailable_root_diagnostic(self):
         """Fixed code when the media root cannot be opened at startup."""
@@ -246,8 +363,8 @@ class MediaStore:
                 expected.mount_point)
         if actual.source != expected.source:
             return "mount_source_mismatch"
-        if (actual.major, actual.minor) != (expected.major, expected.minor):
-            return "mount_device_mismatch"
+        # Device numbers are not part of approval (Issue #324); they are judged
+        # after the UUID check by `_judge_device_numbers`.
         if actual.filesystem != expected.filesystem or actual.filesystem_root != reference_root:
             return "mount_identity_mismatch"
         # Every field matches a bind, but the approved parent mount is not visible.
@@ -260,9 +377,13 @@ class MediaStore:
         in the backing filesystem must equal the approved parent root plus the
         configured relative path; a same-device bind of another directory fails.
         The approved parent mount must remain visible in the namespace inventory.
+        Device numbers are taken from ``actual`` (Issue #324): they can change
+        across a reboot, so the UUID check and `_judge_device_numbers` decide
+        them, and the parent must be on the same device as the bind.
         """
         expected = self.settings.expected_mount
-        mountinfo_expected = replace(expected, filesystem_uuid=None)
+        mountinfo_expected = replace(expected, filesystem_uuid=None,
+                                     major=actual.major, minor=actual.minor)
         if actual == mountinfo_expected:
             return True
         if actual.mount_point != self.settings.media_root:
@@ -272,7 +393,6 @@ class MediaStore:
         relative = self.settings.media_root.relative_to(expected.mount_point)
         return (
             actual.filesystem == expected.filesystem and actual.source == expected.source
-            and actual.major == expected.major and actual.minor == expected.minor
             and actual.filesystem_root == expected.filesystem_root / relative
         )
 
