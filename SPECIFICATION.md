@@ -1497,11 +1497,55 @@ notification is more than a day old; within that day it is not (within one
 process such a reused ID gets a per-process ID instead). The same rule notifies
 again an outage that has continued for more than a day when the service
 restarts. Without storage, or for an episode that already recovered, the ID is
-per process (at worst one repeat after a restart). Decided and pending (Owner
-decision 2026-10-22, follow-up PR): a camera that flaps with online periods
-too short to matter (for example four minutes offline, two seconds online) is
-not yet notified; a rule on the total offline time within a window (for
-example five minutes in fifteen) will be added separately. The Slack text is the fixed `ServerSentinel critical alert:
+per process (at worst one repeat after a restart).
+
+Intermittent outages (Owner decision 2026-10-22, Refs #301: short outages that
+repeat must notify too). A source that was not online for
+`flapping_offline_seconds` (default 300 s) in total within the last
+`flapping_window_seconds` (default 900 s), over at least two separate
+not-online periods, is notified as the same confirmed `camera_offline` kind,
+fixed text and hourly cap. Only the part of a not-online period inside the
+window counts; inactive time (`disabled`, `capture_service_stopping`) never
+counts; a single outage is left to the continuous rule, so a total below
+`after_seconds` never shortens it. Durations use the monotonic clock. The
+interaction rule, so that one flapping period yields one notification:
+
+- Every `camera_offline` of a source (either rule, one an earlier process
+  already stored, or one dropped under the cap) opens that source's *alerted
+  period*. It closes only once the source has stayed online (or inactive) for
+  a whole `flapping_window_seconds`; a shorter online keeps it open.
+- While the period is open the ratio rule does not notify that source.
+- When a ratio alert opened the period, the continuous episode in progress
+  and every episode that begins before the period closes belong to that alert
+  and are not notified (a camera that flaps and then stays offline is one
+  notification). When a continuous notification opened it, the continuous
+  rule is unchanged (one notification per episode, including a new episode
+  after a short recovery); only the ratio rule waits for the period to close.
+- While a continuous episode of the source has reached `after_seconds` and is
+  not yet notified (owed, held by the cap or refused by the queue), the ratio
+  rule does not evaluate that source; the continuous notification reports it.
+- A ratio alert held back by the cap is sent when the hour allows if its
+  period is still open, and dropped (`camera_offline_notification_dropped`)
+  once the period has closed; one refused by the queue is retried with the
+  same time and ID.
+
+`MonitoringStatus.camera_offline_degraded` is also set while a ratio-opened
+period is open. Per source at most 128 not-online periods are kept; beyond
+that the two oldest are merged, which only counts more not-online time, and
+periods that ended before the window are discarded, so memory is bounded for
+any number of configured sources. A backwards monotonic clock restarts the
+count for that source (the continuous rule is unaffected). A ratio alert is
+named `uuid5(EVENT_NAMESPACE, "camera-offline-flapping:<source>:<window>:<bucket>")`
+with `bucket = floor(trigger wall time / window)`; a restarted process that
+triggers again for the source finds a stored alert in the current or previous
+bucket whose event time is less than one window old (a future time counts as
+recent, an unreadable one as old) and sends nothing, opening the period as if
+it had. A new flapping period can only trigger more than a window after the
+previous alert of the source (its period first has to close after a whole
+quiet window), so this lookup never hides a new period. A restart more than a
+window after the last ratio alert, or one that follows a continuous alert,
+may notify a still-flapping source once more (the in-memory period does not
+survive a restart), under the hourly cap. The Slack text is the fixed `ServerSentinel critical alert:
 camera_offline`: no source name, role, UUID, device path, serial, reason or
 image; the Owner identifies the source in the Web UI. `MonitoringStatus`
 reports `camera_offline_degraded` (counted as degraded in the daily summary)

@@ -16,7 +16,8 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from uuid import uuid4
+import math
+from uuid import uuid4, uuid5
 
 from app.audit import AuditStore, OwnerAuditService
 from app.audit.integration import OwnerAdministration
@@ -26,9 +27,11 @@ from app.cameras.uvc.identity import CameraState, DeviceEvidence, HealthEvent
 from app.cameras.uvc.runtime import LocalUvcDependencies
 from app.logging import Event
 from app.main import create_app
-from app.monitoring.cameras import CameraOfflineMonitor
+from app.monitoring.cameras import MAX_SPANS, CameraOfflineMonitor
 from app.monitoring.config import CameraOfflineNotification, parse_monitoring
-from app.monitoring.runtime import MonitoringDependencies
+from app.monitoring.runtime import (
+    CAMERA_OFFLINE_RENOTIFY_CHAIN, EVENT_NAMESPACE, MonitoringDependencies,
+)
 from app.notifications.service import NotificationKind, NotificationService
 from app.notifications.slack import DeliveryResult, SlackDelivery
 from app.settings import ConfigurationError
@@ -562,13 +565,362 @@ class RuntimeSignalTests(MonitorFixture, unittest.TestCase):
         self.assertEqual([], self.sent())
 
 
+class FlappingTests(MonitorFixture, unittest.TestCase):
+    """Refs #301 (Owner decision 2026-10-22): short outages that repeat."""
+
+    def off(self, monitor, source=None, reason="device_disconnected"):
+        monitor.health_sink(event(source or self.sources[0], CameraState.OFFLINE, reason))
+
+    def on(self, monitor, source=None):
+        monitor.health_sink(event(source or self.sources[0], CameraState.ONLINE))
+
+    def run_for(self, monitor, seconds, step=30):
+        while seconds > 0:
+            self.advance(min(step, seconds))
+            seconds -= step
+            self.drain(monitor)
+
+    def cycle(self, monitor, offline=240, online=2):
+        self.off(monitor)
+        self.run_for(monitor, offline)
+        self.on(monitor)
+        self.run_for(monitor, online)
+
+    def test_owner_example_four_minutes_offline_two_seconds_online(self):
+        # PR #320 review 提案 2: 4 min offline / 2 s online notified nothing.
+        monitor = self.monitor()
+        self.online(monitor)
+        self.cycle(monitor)
+        self.assertEqual([], self.sent())
+        self.off(monitor)
+        self.run_for(monitor, 30)
+        self.assertEqual([], self.sent())
+        # 240 s + 60 s: five minutes in total within fifteen.
+        self.run_for(monitor, 30)
+        self.assertEqual(1, len(self.sent()))
+        self.assertTrue(self.sent()[0].confirmed)
+        self.assertEqual(1, self.drain(monitor).flapping_sources)
+        # The same flapping period for two hours: still one notification.
+        self.run_for(monitor, 180)
+        for _ in range(30):
+            self.cycle(monitor)
+        self.assertEqual(1, len(self.sent()))
+        self.assertEqual(0, monitor.dropped)
+
+    def test_less_than_the_total_within_the_window_is_not_notified(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        for _ in range(2):
+            self.cycle(monitor, offline=149, online=2)
+        self.run_for(monitor, 3600)
+        self.assertEqual([], self.sent())
+        # Only the part of an outage inside the window counts: 200 s
+        # outages 750 s apart never add up to 300 s within 900 s.
+        for _ in range(4):
+            self.cycle(monitor, offline=200, online=750)
+        self.assertEqual([], self.sent())
+
+    def test_window_and_total_are_configurable(self):
+        monitor = self.monitor(flapping_window_seconds=600, flapping_offline_seconds=120)
+        self.online(monitor)
+        for _ in range(2):
+            self.cycle(monitor, offline=61, online=60)
+        self.assertEqual(1, len(self.sent()))
+
+    def test_a_single_outage_is_left_to_the_continuous_rule(self):
+        # A total shorter than `after_seconds` does not shorten it: one
+        # outage is one not-online period.
+        monitor = self.monitor(flapping_offline_seconds=120)
+        self.online(monitor)
+        self.off(monitor)
+        self.run_for(monitor, 270)
+        self.assertEqual([], self.sent())
+        self.run_for(monitor, 30)
+        self.assertEqual(1, len(self.sent()))
+        self.run_for(monitor, 3600)
+        self.assertEqual(1, len(self.sent()))
+
+    def test_a_continuous_outage_after_a_ratio_alert_is_not_notified_again(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        for _ in range(2):
+            self.cycle(monitor)
+        self.assertEqual(1, len(self.sent()))
+        # Gone for good within the same flapping period.
+        self.off(monitor)
+        self.run_for(monitor, 3 * 3600, step=60)
+        self.assertEqual(1, len(self.sent()))
+        self.assertEqual(1, self.drain(monitor).offline_sources)
+        # Back for a whole window: the period closes and a later flapping
+        # period is notified again.
+        self.on(monitor)
+        self.run_for(monitor, 900, step=60)
+        self.assertEqual(0, self.drain(monitor).flapping_sources)
+        for _ in range(2):
+            self.cycle(monitor)
+        self.assertEqual(2, len(self.sent()))
+
+    def test_an_online_shorter_than_the_window_keeps_the_period_open(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        for _ in range(2):
+            self.cycle(monitor)
+        # Online 2 s + 897 s: one second short of the window.
+        self.run_for(monitor, 897, step=60)
+        for _ in range(2):
+            self.cycle(monitor)
+        self.assertEqual(1, len(self.sent()))
+
+    def test_a_blip_then_an_outage_is_one_notification(self):
+        # The ratio reaches the total before the continuous threshold: the
+        # outage in progress belongs to that alert.
+        monitor = self.monitor()
+        self.online(monitor)
+        self.cycle(monitor, offline=120, online=60)
+        self.off(monitor)
+        self.run_for(monitor, 180)
+        self.assertEqual(1, len(self.sent()))
+        self.run_for(monitor, 3600, step=60)
+        self.assertEqual(1, len(self.sent()))
+
+    def test_flapping_after_a_continuous_alert_is_the_same_period(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        self.off(monitor)
+        self.run_for(monitor, 360)
+        self.assertEqual(1, len(self.sent()))
+        self.on(monitor)
+        self.run_for(monitor, 2)
+        for _ in range(10):
+            self.cycle(monitor)
+        self.assertEqual(1, len(self.sent()))
+        # Unchanged continuous rule: a new outage of five minutes is its own
+        # episode even inside that period.
+        self.off(monitor)
+        self.run_for(monitor, 300)
+        self.assertEqual(2, len(self.sent()))
+        self.on(monitor)
+        self.run_for(monitor, 900, step=60)
+        for _ in range(2):
+            self.cycle(monitor)
+        self.assertEqual(3, len(self.sent()))
+
+    def test_inactive_time_never_counts(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        for reason in ("disabled", "capture_service_stopping"):
+            for _ in range(4):
+                self.off(monitor, reason=reason)
+                self.run_for(monitor, 240)
+                self.on(monitor)
+                self.run_for(monitor, 2)
+        self.assertEqual([], self.sent())
+
+    def test_each_source_is_counted_on_its_own(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        first, second = self.sources
+        self.off(monitor, first)
+        self.run_for(monitor, 150)
+        self.on(monitor, first)
+        self.off(monitor, second)
+        self.run_for(monitor, 149)
+        self.on(monitor, second)
+        self.off(monitor, first)
+        self.run_for(monitor, 149)
+        self.on(monitor, first)
+        self.run_for(monitor, 900)
+        # The first source: 150 s + 149 s; the second: 149 s.
+        self.assertEqual([], self.sent())
+
+    def test_ratio_alerts_share_the_hourly_cap(self):
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        second = self.sources[1]
+        self.off(monitor, second)
+        self.run_for(monitor, 300)
+        self.assertEqual(1, len(self.sent()))
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as logs:
+            for _ in range(2):
+                self.cycle(monitor)
+        self.assertEqual(1, len(self.sent()))
+        self.assertEqual(1, self.drain(monitor).held)
+        self.assertTrue(all(line.endswith(Event.CAMERA_OFFLINE_NOTIFICATION_RATE_LIMITED.value)
+                            for line in logs.output), logs.output)
+        # Still flapping when the hour allows: sent.
+        for _ in range(14):
+            self.cycle(monitor)
+        self.assertEqual(2, len(self.sent()))
+
+    def test_an_owed_continuous_episode_is_not_also_a_ratio_alert(self):
+        # The queue refused an outage past the threshold; after a recovery
+        # longer than the threshold a shorter outage follows. Together they
+        # pass the ratio, but the owed outage is the continuous rule's to
+        # report and it opens the alerted period: one notification.
+        monitor = self.monitor()
+        self.online(monitor)
+        refusing = Refusing(self.service)
+
+        def drain_for(seconds):
+            for _ in range(seconds // 30):
+                self.advance(30)
+                monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+
+        self.off(monitor)
+        drain_for(330)
+        self.on(monitor)
+        drain_for(390)
+        self.off(monitor)
+        drain_for(240)
+        self.on(monitor)
+        drain_for(30)
+        refusing.accept = True
+        self.run_for(monitor, 600)
+        self.service.poll()
+        self.assertEqual(1, len(self.sent()))
+
+    def test_a_held_ratio_alert_whose_period_closed_is_dropped(self):
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        second = self.sources[1]
+        self.off(monitor, second)
+        self.run_for(monitor, 300)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            for _ in range(2):
+                self.cycle(monitor)
+        # The period closes while the hour is still closed.
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as dropped:
+            self.run_for(monitor, 900, step=60)
+        self.assertEqual(
+            [f"WARNING:app.monitoring.cameras:{Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED.value}"],
+            dropped.output)
+        self.assertEqual(1, monitor.dropped)
+        self.run_for(monitor, 3600, step=600)
+        self.assertEqual(1, len(self.sent()))
+
+    def test_a_ratio_alert_an_earlier_process_sent_is_not_sent_again(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        earlier = uuid4()
+        calls = []
+
+        def flapping_id(source):
+            calls.append(source)
+            return earlier, True
+
+        for _ in range(2):
+            self.off(monitor)
+            self.advance(240)
+            self.drain(monitor, flapping_id=flapping_id)
+            self.on(monitor)
+            self.advance(2)
+            self.drain(monitor, flapping_id=flapping_id)
+        self.advance(60)
+        self.off(monitor)
+        self.advance(60)
+        self.drain(monitor, flapping_id=flapping_id)
+        self.assertEqual([self.sources[0]], calls)
+        self.assertEqual([], self.sent())
+        # The period is open: an outage that follows is covered too.
+        self.advance(3600)
+        self.drain(monitor, flapping_id=flapping_id)
+        self.assertEqual([], self.sent())
+
+    def test_the_flapping_id_names_the_row(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        name = uuid4()
+        for _ in range(2):
+            self.off(monitor)
+            self.advance(240)
+            self.drain(monitor, flapping_id=lambda source: (name, False))
+            self.on(monitor)
+            self.advance(2)
+        self.assertEqual([name], [row.event_id for row in self.sent()])
+
+    def test_failing_or_reused_flapping_ids_fall_back_to_a_process_id(self):
+        def broken(source):
+            raise RuntimeError("synthetic database error")
+
+        for flapping_id in (broken, lambda source: "x", lambda source: (uuid4(), 1)):
+            with self.subTest(flapping_id=flapping_id):
+                self.sink.rows.clear()
+                monitor = self.monitor()
+                self.online(monitor)
+                for _ in range(2):
+                    self.off(monitor)
+                    self.advance(240)
+                    self.drain(monitor, flapping_id=flapping_id)
+                    self.on(monitor)
+                    self.advance(2)
+                self.assertEqual(1, len(self.sent()))
+
+    def test_memory_is_bounded_and_merging_never_hides_an_outage(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        for _ in range(MAX_SPANS * 20):
+            self.off(monitor)
+            self.advance(0.2)
+            self.on(monitor)
+            self.advance(0.2)
+        source = monitor._sources[self.sources[0]]
+        self.assertLessEqual(len(source.spans), MAX_SPANS)
+        # Half of the last 1024 s was not online, 512 s in total.
+        self.drain(monitor)
+        self.assertEqual(1, len(self.sent()))
+        # Quiet sources keep nothing beyond the window.
+        self.advance(901)
+        self.drain(monitor)
+        self.assertEqual(0, len(source.spans))
+        self.assertEqual(0, len(monitor._sources[self.sources[1]].spans))
+
+    def test_odd_clocks_never_raise(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        self.cycle(monitor)
+        self.clock.value -= 10_000
+        self.cycle(monitor)
+        self.clock.value = float("nan")
+        self.off(monitor)
+        self.drain(monitor)
+        # An unknown time notifies the outage rather than hiding it (#320).
+        self.assertEqual(1, len(self.sent()))
+        self.clock.value = 50_000.0
+        self.on(monitor)
+        for _ in range(2):
+            self.cycle(monitor)
+        self.assertEqual(1, len(self.sent()))
+        # Once the clock is sane, a later flapping period is detected.
+        self.run_for(monitor, 900, step=60)
+        for _ in range(2):
+            self.cycle(monitor)
+        self.assertEqual(2, len(self.sent()))
+
+    def test_flapping_settings_are_validated(self):
+        for values in (dict(flapping_window_seconds=119), dict(flapping_window_seconds=86401),
+                       dict(flapping_offline_seconds=59),
+                       dict(flapping_window_seconds=600, flapping_offline_seconds=601),
+                       dict(flapping_window_seconds=float("nan")),
+                       dict(flapping_offline_seconds=float("inf")),
+                       dict(flapping_window_seconds=True)):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.monitor(**values)
+        monitor = self.monitor(flapping_window_seconds=300, flapping_offline_seconds=300)
+        self.assertEqual((300.0, 300.0), (monitor.window, monitor.flapping_offline))
+
+
 class ConfigurationTests(unittest.TestCase):
     def parse(self, value):
         return parse_monitoring({"time_zone": "UTC", **value}, recordings_directory=Path("/"),
                                 resolve_device=lambda uuid: 0, root_device=lambda: 0)
 
     def test_defaults_and_values(self):
-        self.assertEqual(CameraOfflineNotification(300.0, 4), self.parse({}).camera_offline)
+        self.assertEqual(CameraOfflineNotification(300.0, 4, 900.0, 300.0),
+                         self.parse({}).camera_offline)
+        flapping = self.parse({"camera_offline_notification": {
+            "flapping_window_seconds": 1200, "flapping_offline_seconds": 600}}).camera_offline
+        self.assertEqual((1200.0, 600.0), (flapping.flapping_window_seconds,
+                                           flapping.flapping_offline_seconds))
         configured = self.parse({"camera_offline_notification": {
             "after_seconds": 600, "hourly_limit": 2}}).camera_offline
         self.assertEqual((600.0, 2), (configured.after_seconds, configured.hourly_limit))
@@ -579,6 +931,10 @@ class ConfigurationTests(unittest.TestCase):
         for value in ([], {"after_seconds": 59}, {"after_seconds": 86401},
                       {"after_seconds": 300.5}, {"after_seconds": True},
                       {"after_seconds": "300"}, {"hourly_limit": 0}, {"hourly_limit": 61},
+                      {"flapping_window_seconds": 119}, {"flapping_window_seconds": 86401},
+                      {"flapping_offline_seconds": 59}, {"flapping_offline_seconds": 901},
+                      {"flapping_window_seconds": 600, "flapping_offline_seconds": 601},
+                      {"flapping_window_seconds": 900.5}, {"flapping_offline_seconds": False},
                       {"source": "camera-1"}):
             with self.subTest(value=value):
                 with self.assertRaises(ConfigurationError) as raised:
@@ -882,6 +1238,155 @@ class LifespanTests(RuntimeFixture):
         # Stopping capture lowered the source; nothing was notified.
         self.assertEqual([], self.slack_texts())
         self.assertEqual([], self.offline_rows())
+
+    def insert_row(self, event_id, at, accepted_at):
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            db.execute(
+                "INSERT INTO notification_events(event_id,kind,at,confirmed,delivery,accepted_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (str(event_id), NotificationKind.CAMERA_OFFLINE.value, at, 1, "sent",
+                 accepted_at))
+            db.commit()
+
+    def delete_rows(self):
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            db.execute("DELETE FROM notification_events WHERE kind=?",
+                       (NotificationKind.CAMERA_OFFLINE.value,))
+            db.commit()
+
+    def chain_name(self, repeat=0):
+        base = f"camera-offline:{self.source.id}:never"
+        return uuid5(EVENT_NAMESPACE, base if not repeat else f"{base}:repeat:{repeat}")
+
+    async def test_the_24_hour_chain_boundaries(self):
+        # PR #320 re-review 3 提案: chain exhausted, a future time and an
+        # unreadable time.
+        old = (self.clock.now - timedelta(days=2)).isoformat()
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            def name():
+                return runtime.call(runtime._camera_offline_event, self.source.id)
+
+            self.assertEqual(self.chain_name(), await name())
+            # Unreadable: treated as old, so the next name is used.
+            self.insert_row(self.chain_name(), old, "not a time")
+            self.assertEqual(self.chain_name(1), await name())
+            # A time in the future (a clock moved back) counts as recent.
+            future = (self.clock.now + timedelta(hours=1)).isoformat()
+            self.insert_row(self.chain_name(1), future, future)
+            self.assertEqual(self.chain_name(1), await name())
+        self.delete_rows()
+        # Every name of the chain was used more than a day ago: no durable
+        # name, and the outage is still notified under a process-local ID.
+        names = [self.chain_name(repeat) for repeat in range(CAMERA_OFFLINE_RENOTIFY_CHAIN)]
+        for event_id in names:
+            self.insert_row(event_id, old, old)
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertIsNone(await runtime.call(runtime._camera_offline_event, self.source.id))
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+        self.assertEqual([ALERT], self.slack_texts())
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            sent = {row[0] for row in db.execute(
+                "SELECT event_id FROM notification_events WHERE kind=? AND accepted_at!=?",
+                (NotificationKind.CAMERA_OFFLINE.value, old))}
+        self.assertEqual(1, len(sent))
+        self.assertNotIn(sent.pop(), {str(event_id) for event_id in names})
+
+    async def test_a_chain_row_stamped_in_the_future_is_not_resent(self):
+        # The future row counts as this outage's notification: not resent.
+        future = (self.clock.now + timedelta(hours=1)).isoformat()
+        self.insert_row(self.chain_name(), future, future)
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+        self.assertEqual([], self.slack_texts())
+
+    def flapping_name(self, index):
+        return uuid5(EVENT_NAMESPACE,
+                     f"camera-offline-flapping:{self.source.id}:900:{index}")
+
+    async def test_the_flapping_name(self):
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            def name():
+                return runtime.call(runtime._camera_flapping_event, self.source.id)
+
+            bucket = math.floor(self.clock.now.timestamp() / 900)
+            self.assertEqual((self.flapping_name(bucket), False), await name())
+            # The previous bucket, triggered less than a window ago.
+            recent = (self.clock.now - timedelta(seconds=100)).isoformat()
+            self.insert_row(self.flapping_name(bucket - 1), recent, recent)
+            self.assertEqual((self.flapping_name(bucket - 1), True), await name())
+            # More than a window ago by its event time (which a retry keeps),
+            # even when accepted later.
+            self.delete_rows()
+            self.insert_row(self.flapping_name(bucket - 1),
+                            (self.clock.now - timedelta(seconds=1000)).isoformat(),
+                            self.clock.now.isoformat())
+            self.assertEqual((self.flapping_name(bucket), False), await name())
+            # A future time counts as recent; an unreadable one as old.
+            future = (self.clock.now + timedelta(hours=1)).isoformat()
+            self.insert_row(self.flapping_name(bucket), future, future)
+            self.assertEqual((self.flapping_name(bucket), True), await name())
+            self.delete_rows()
+            self.insert_row(self.flapping_name(bucket), "not a time", "not a time")
+            self.assertIsNone(await name())
+
+    async def flap(self, application, offline):
+        monitor = application.state.camera_offline
+        self.discovery.devices = []
+        self.assertTrue(await self.until(lambda: not monitor._sources[self.source.id].online))
+        self.clock.advance(timedelta(seconds=offline))
+        self.discovery.devices = [self.camera]
+        self.assertTrue(await self.until(lambda: monitor._sources[self.source.id].online))
+        self.clock.advance(timedelta(seconds=2))
+
+    async def test_a_flapping_camera_notifies_once_across_a_restart(self):
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.bring_online(application)
+            await self.flap(application, 240)
+            await self.tick(runtime)
+            self.assertEqual([], self.slack_texts())
+            monitor = application.state.camera_offline
+            self.discovery.devices = []
+            self.assertTrue(await self.until(lambda: not monitor._sources[self.source.id].online))
+            self.clock.advance(timedelta(seconds=61))
+            await self.tick(runtime)
+            self.assertEqual([ALERT], self.slack_texts())
+            self.assertEqual([(1, "sent")], self.offline_rows())
+            self.assertTrue(runtime.status.camera_offline_degraded)
+            self.discovery.devices = [self.camera]
+            self.assertTrue(await self.until(lambda: monitor._sources[self.source.id].online))
+        # Still flapping when the service starts again: the earlier process's
+        # alert is found and nothing is sent twice.
+        self.discovery.devices = []
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.clock.advance(timedelta(seconds=200))
+            monitor = application.state.camera_offline
+            self.discovery.devices = [self.camera]
+            self.assertTrue(await self.until(lambda: monitor._sources[self.source.id].online))
+            self.clock.advance(timedelta(seconds=2))
+            self.discovery.devices = []
+            self.assertTrue(await self.until(lambda: not monitor._sources[self.source.id].online))
+            self.clock.advance(timedelta(seconds=120))
+            await self.tick(runtime)
+            self.assertTrue(runtime.status.camera_offline_degraded)
+            # The outage that follows belongs to the same period.
+            self.clock.advance(timedelta(hours=1))
+            await self.tick(runtime)
+        self.assertEqual([ALERT], self.slack_texts())
+        self.assertEqual([(1, "sent")], self.offline_rows())
 
     def test_the_application_owns_the_monitor(self):
         monitor = CameraOfflineMonitor((self.source.id,), monotonic=lambda: 0.0)

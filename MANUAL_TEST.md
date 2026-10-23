@@ -361,6 +361,14 @@ least 60):
 - [ ] unplug and replug repeatedly (each time past `after_seconds`): at most
   `hourly_limit` notifications per hour, and the journal shows only the fixed
   `camera_offline_notification_rate_limited` / `_dropped` events;
+- [ ] intermittent outage (Refs #301 ratio rule, mock-verified only): unplug
+  for about four minutes, replug for a few seconds, unplug again: exactly one
+  `camera_offline` arrives once about five minutes of not-online time have
+  accumulated within fifteen minutes; keep flapping (or leave it unplugged)
+  for an hour: no further message; leave it plugged in for at least fifteen
+  minutes and flap again: one new message;
+- [ ] restart the service while the camera keeps flapping, within fifteen
+  minutes of that message: no second message;
 - [ ] `systemctl stop` / restart with every camera connected sends nothing;
 - [ ] with Slack unconfigured the row is `disabled`;
 - [ ] LXD VM configuration (D2): reproduce the host USB re-enumeration of

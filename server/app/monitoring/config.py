@@ -28,7 +28,9 @@ MONITORING_KEYS = frozenset({
     "storage_limits", "recording_limits", "recording_filesystem",
     "camera_offline_notification",
 })
-CAMERA_OFFLINE_KEYS = frozenset({"after_seconds", "hourly_limit"})
+CAMERA_OFFLINE_KEYS = frozenset({
+    "after_seconds", "hourly_limit", "flapping_window_seconds", "flapping_offline_seconds",
+})
 # Issue #301 item 2 (Owner decision 2026-10-22): five minutes, at most four
 # notifications per rolling hour. Kept here (standard library only) because
 # the installer validates the deployment with this module.
@@ -36,6 +38,14 @@ CAMERA_OFFLINE_SECONDS = 300.0
 CAMERA_OFFLINE_SECONDS_BOUNDS = (60.0, 86400.0)
 CAMERA_OFFLINE_HOURLY_LIMIT = 4
 CAMERA_OFFLINE_HOURLY_LIMIT_BOUNDS = (1, 60)
+# Intermittent outages (Owner decision 2026-10-22, Refs #301): not online for
+# five minutes in total within the last fifteen minutes. The window is at
+# least two monitoring ticks and at most a day; the total is at least one
+# tick and at most the window.
+CAMERA_FLAPPING_WINDOW_SECONDS = 900.0
+CAMERA_FLAPPING_WINDOW_BOUNDS = (120.0, 86400.0)
+CAMERA_FLAPPING_OFFLINE_SECONDS = 300.0
+CAMERA_FLAPPING_OFFLINE_MIN = 60.0
 STORAGE_SECTIONS = ("storage_limits", "recording_limits", "recording_filesystem")
 SUMMARY_TIME = re.compile(r"([01][0-9]|2[0-3]):([0-5][0-9])")
 
@@ -68,10 +78,16 @@ class CameraOfflineNotification:
     60 s to one day; the monitoring tick, 60 s by default, drains it).
     ``hourly_limit``: notifications per rolling hour for all sources together
     (default 4, 1 to 60).
+    ``flapping_window_seconds`` / ``flapping_offline_seconds``: intermittent
+    outages notify once the source was not online for the second value in
+    total within the last first value (default 300 s in 900 s; window 120 s
+    to one day, total 60 s up to the window).
     """
 
     after_seconds: float = CAMERA_OFFLINE_SECONDS
     hourly_limit: int = CAMERA_OFFLINE_HOURLY_LIMIT
+    flapping_window_seconds: float = CAMERA_FLAPPING_WINDOW_SECONDS
+    flapping_offline_seconds: float = CAMERA_FLAPPING_OFFLINE_SECONDS
 
     def __post_init__(self):
         low, high = CAMERA_OFFLINE_SECONDS_BOUNDS
@@ -79,9 +95,19 @@ class CameraOfflineNotification:
         if (type(self.after_seconds) not in (int, float)
                 or not low <= self.after_seconds <= high
                 or type(self.hourly_limit) is not int
-                or not first <= self.hourly_limit <= last):
+                or not first <= self.hourly_limit <= last
+                or not valid_flapping(self.flapping_window_seconds,
+                                      self.flapping_offline_seconds)):
             raise ConfigurationError("invalid camera offline notification")
-        object.__setattr__(self, "after_seconds", float(self.after_seconds))
+        for name in ("after_seconds", "flapping_window_seconds", "flapping_offline_seconds"):
+            object.__setattr__(self, name, float(getattr(self, name)))
+
+
+def valid_flapping(window: object, offline: object) -> bool:
+    """Window within its bounds, total from one tick up to the window."""
+    low, high = CAMERA_FLAPPING_WINDOW_BOUNDS
+    return (type(window) in (int, float) and type(offline) in (int, float)
+            and low <= window <= high and CAMERA_FLAPPING_OFFLINE_MIN <= offline <= window)
 
 
 @dataclass(frozen=True)

@@ -713,11 +713,51 @@ class MonitoringRuntime:
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
                                    monotonic=self.dependencies.monotonic(),
                                    durable_id=self._camera_offline_event if running else None,
-                                   known=self._notification_known if running else None)
+                                   known=self._notification_known if running else None,
+                                   flapping_id=self._camera_flapping_event if running else None)
         except Exception:
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
             return
-        self._set(camera_offline_degraded=status.offline_sources > 0)
+        self._set(camera_offline_degraded=status.offline_sources > 0
+                  or status.flapping_sources > 0)
+
+    def _camera_flapping_event(self, source_id: UUID) -> tuple[UUID, bool] | None:
+        """``(event ID, already notified)`` of a ratio (flapping) alert.
+
+        Refs #301 (Owner decision 2026-10-22): named after the source, the
+        window length and the wall-clock window bucket of the trigger, so a
+        restarted process that triggers again for the same flapping period
+        finds the earlier alert. A stored alert of this source in the current
+        or the previous bucket triggered (its event time, which a retry
+        keeps) less than one window ago counts as already notified (a clock
+        moved back counts as recent). A new
+        flapping period of the same process can only trigger more than a
+        window after its previous alert (its period closes after a whole
+        quiet window), so this never hides a new period. An unreadable time
+        counts as old; ``None`` (a per-process ID) when the current bucket's
+        name is taken by such an old row.
+        """
+        monitor = self.dependencies.camera_offline
+        window = monitor.window
+        now = self.dependencies.utcnow()
+        bucket = math.floor(now.timestamp() / window)
+        names = [uuid5(EVENT_NAMESPACE, f"camera-offline-flapping:{source_id}:{window:g}:{index}")
+                 for index in (bucket, bucket - 1)]
+        taken = False
+        for position, event_id in enumerate(names):
+            stored = self._connection.execute(
+                "SELECT at FROM notification_events WHERE event_id=?",
+                (str(event_id),)).fetchone()
+            if stored is None:
+                continue
+            try:
+                age = (now - datetime.fromisoformat(stored[0])).total_seconds()
+            except (TypeError, ValueError):
+                age = math.inf
+            if age < window:
+                return event_id, True
+            taken = taken or position == 0
+        return None if taken else (names[0], False)
 
     def _camera_offline_event(self, source_id: UUID) -> UUID | None:
         """The event ID of ``source_id``'s offline episode in progress.
