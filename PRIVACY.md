@@ -274,7 +274,10 @@ recording authorization and retention nor a fingerprint of the scene. A
 calibration is used only while the process holds its in-memory reference;
 the binding between a stored version and that reference is the in-memory
 calibration itself, not a stored digest. A record written before #205 may
-carry a reference SHA-256; it is ignored when read. Its scene-change measurements are bounded scalars and never
+carry a reference SHA-256: it is ignored when read and removed from the
+database at the next Main start (an idempotent scrub with SQLite
+`secure_delete`; only the number of scrubbed rows is logged,
+`scene_reference_digests_scrubbed`). Its scene-change measurements are bounded scalars and never
 person identities, and a detector that cannot register a scene reliably reports
 `unknown` rather than a trustworthy "no tamper".
 

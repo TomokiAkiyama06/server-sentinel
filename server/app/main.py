@@ -22,6 +22,7 @@ from app.cameras.registry import CameraRegistry
 from app.cameras.uvc.config import LocalUvcConfiguration
 from app.cameras.uvc.runtime import LocalUvcDependencies, LocalUvcRuntime, LocalUvcRuntimeState
 from app.completion import run_to_completion
+from app.detection.roi.calibration import scrub_legacy_reference_digests
 from app.detection.roi.calibration_service import (
     SceneCalibrationConfiguration, SceneCalibrationService, TransientReferences,
 )
@@ -38,6 +39,7 @@ from app.monitoring.cameras import CameraOfflineMonitor
 from app.monitoring.config import MonitoringConfiguration
 from app.monitoring.runtime import MonitoringDependencies, MonitoringRuntime, RuntimeState
 from app.notifications.service import NotificationKind
+from app.notifications.slack import DeliveryResult
 from app.presence.delivery import NotificationAdapter
 from app.presence.runtime import CriticalDispatcher, SceneTimeline, SceneTimelineConfiguration
 from app.settings import Settings
@@ -409,6 +411,22 @@ def create_app(settings: Settings, *, database: Database | None = None,
         interval_seconds=audit_cleanup_interval_seconds,
     )
 
+    def scrub_reference_digests() -> bool:
+        """Remove the frame digest a pre-#205 calibration version still
+        carries (Owner decision 2026-10-22; Codex P1 on PR #330), under the
+        audit storage admission. Idempotent; False when it could not run."""
+        try:
+            with audit_store.transaction(write=True) as connection:
+                scrubbed = scrub_legacy_reference_digests(connection)
+        except Exception:
+            logging.getLogger(__name__).error(Event.SCENE_REFERENCE_DIGEST_SCRUB_FAILED)
+            return False
+        if scrubbed:
+            # The number of rows only; no source, version or value.
+            logging.getLogger(__name__).warning(Event.SCENE_REFERENCE_DIGESTS_SCRUBBED,
+                                                extra={"count": scrubbed})
+        return True
+
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         application.state.ready = False
@@ -442,7 +460,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # The scene watcher may be started late, by the timeline task, once
         # a deferred outbox open succeeds; shutdown reads it from here.
         scene_lifecycle = {"watch": None, "timeline": None, "dispatch": None, "calibration": None,
-                           "notified": False, "stopping": False}
+                           "notified": False, "stopping": False, "scrubbed": False}
 
         uvc_lifecycle = {"deferred": None, "stopping": False}
 
@@ -561,13 +579,22 @@ def create_app(settings: Settings, *, database: Database | None = None,
             submitted = []
 
             def step():
-                # A submitted notice has its `notification_events` row (its
-                # outcome, `failed` included, is recorded there) and is not
-                # submitted again under the same event id.
+                # Accepted notices only (the camera offline monitor's rule):
+                # a full or closed queue (`can_accept`), or a `failed` result
+                # whose event the service does not retain, kept nothing, so
+                # the notice is put back and retried later under the same
+                # event id, which upserts one row and is never sent twice
+                # (Codex P1 on PR #330). An accepted one has its
+                # `notification_events` row and is not submitted again.
+                notifications = monitoring_runtime.notifications
                 for notice in notices:
-                    monitoring_runtime.notifications.record(
+                    if not notifications.can_accept(notice.event_id):
+                        continue
+                    result = notifications.record(
                         NotificationKind(notice.kind), at=notice.at, confirmed=True,
                         event_id=notice.event_id)
+                    if result == DeliveryResult.FAILED and not notifications.retained(notice.event_id):
+                        continue
                     submitted.append(notice)
                     scene_lifecycle["notified"] = True
                 return len(submitted)
@@ -606,6 +633,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 if scene_lifecycle["stopping"]:
                     return
                 if not started and application.state.scene_monitoring_state in live:
+                    if not scene_lifecycle["scrubbed"]:
+                        scene_lifecycle["scrubbed"] = await run_to_completion(
+                            asyncio.to_thread(scrub_reference_digests))
                     await run_to_completion(asyncio.to_thread(scene_calibration_service.start))
                     started = True
                 if started:
@@ -941,6 +971,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 # take physical-security monitoring offline. The bounded degraded
                 # retention state stays visible and the scheduled run retries it.
                 logging.getLogger(__name__).error(Event.AUDIT_RETENTION_DEGRADED)
+            # Once the migrations ran and the audit admission is bound. A
+            # refused attempt is repeated before the restart re-acquisition
+            # (below) and at the next start.
+            scene_lifecycle["scrubbed"] = (
+                (storage_reservation is not None or runtime_admission.bound)
+                and await asyncio.to_thread(scrub_reference_digests))
             # Before capture, so the first frames already reach the detector.
             if timeline is None:
                 await launch_scene_monitoring()

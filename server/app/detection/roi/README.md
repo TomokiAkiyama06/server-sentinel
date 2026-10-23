@@ -27,7 +27,9 @@ and time — so no decoded frame, crop, or other monitoring media is persisted,
 nor any value computed from a frame (no digest, histogram or statistic; Owner
 decision 2026-10-22, #205), and the history cannot become retention-free image
 storage or a scene fingerprint. A `reference.sha256` in a pre-#205 record is
-ignored when read. `load()` therefore
+ignored when read and removed at the next Main start
+(`scrub_legacy_reference_digests`, `secure_delete`, count-only log; the
+lifecycle inventory treats it as preserved). `load()` therefore
 returns a `CalibrationRecord` without pixels, separates a record it cannot
 decode from an unavailable database so corrupt history is not hidden behind a
 transient-looking failure, and refuses a record whose decoded provenance is not

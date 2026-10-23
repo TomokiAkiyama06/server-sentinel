@@ -1007,7 +1007,15 @@ image; resuming detection binds the in-memory `Calibration` that produced the
 record (`CalibrationRecord.bind`), whose whole non-frame provenance must equal
 the record. A bare frame is never bound to a stored version; a frame read from
 the camera becomes a reference only through a new calibration version. A
-`reference.sha256` in a record written before #205 is ignored when read. The core does not supply production thresholds, start capture, expose an
+`reference.sha256` in a record written before #205 is ignored when read and
+removed at every Main start once the migrations ran and the audit storage
+admission is bound (`scrub_legacy_reference_digests`, in a write transaction
+with `secure_delete` on, re-serialized exactly as a new version; retried
+before the restart re-acquisition and at the next start when refused; the
+event `scene_reference_digests_scrubbed` carries only the row count). The
+lifecycle inventory digests the ROI metadata without that key, so the scrub
+is the one approved rewrite of this append-only history and a scrubbed
+version verifies as preserved. The core does not supply production thresholds, start capture, expose an
 API, retain decoded media, make a presence decision, or issue a notification.
 
 A calibration policy whose bounded search window cannot reach its own movement

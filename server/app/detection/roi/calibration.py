@@ -50,7 +50,8 @@ class CalibrationRecord:
     retention-free still-image store of a monitored room or of whoever was
     visible while the Owner calibrated it, nor a fingerprint of that scene.
     A record written before #205 may carry a ``reference.sha256``; it is
-    ignored when read.
+    ignored when read and removed by ``scrub_legacy_reference_digests`` at
+    the next start.
     """
 
     identifier: UUID
@@ -140,6 +141,58 @@ def _decode(metadata) -> CalibrationRecord:
                              UUID(reference["stream_id"]), reference["sequence"],
                              reference["width"], reference["height"],
                              Policy(**policy), value.get("reader"))
+
+
+def scrub_legacy_reference_digests(connection: sqlite3.Connection) -> int:
+    """Remove ``reference.sha256`` from every stored version (#205, Codex P1).
+
+    A version written before the Owner decision 2026-10-22 may carry the
+    SHA-256 of its reference frame, image-derived data that must not stay on
+    disk. Runs inside the caller's write transaction (storage admission and
+    commit are the caller's) with ``secure_delete`` on, so the old cell bytes
+    are overwritten rather than left in the page's free space. Each scrubbed
+    row is re-serialized exactly as ``calibration_metadata()`` writes a new
+    one, so its frame-free provenance, and the lifecycle inventory's keyed
+    digest of it (``app.lifecycle_inventory.sources``), stay identical.
+    A row that is not a JSON object with a ``reference`` object is left for
+    the history and inventory checks to report. Returns the number of rows
+    scrubbed; idempotent.
+    """
+    if not isinstance(connection, sqlite3.Connection) or not connection.in_transaction:
+        raise ValueError("calibration history requires an open transaction")
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                          "AND name='roi_calibration_history'").fetchone() is None:
+        return 0
+    connection.execute("PRAGMA secure_delete = ON")
+    scrubbed = 0
+    for key in connection.execute(
+            "SELECT source_id, profile_id, version, metadata FROM roi_calibration_history "
+            "WHERE metadata LIKE '%sha256%'").fetchall():
+        rewritten = without_reference_digest(key[3])
+        if rewritten is None or rewritten == key[3]:
+            continue
+        connection.execute("UPDATE roi_calibration_history SET metadata=? "
+                           "WHERE source_id=? AND profile_id=? AND version=?",
+                           (rewritten, key[0], key[1], key[2]))
+        scrubbed += 1
+    return scrubbed
+
+
+def without_reference_digest(metadata) -> str | None:
+    """`metadata` re-serialized without ``reference.sha256``, or None.
+
+    None when it is not a JSON object whose ``reference`` is an object (a
+    corrupt row the history checks report as such). A row without the key
+    comes back as ``calibration_metadata()`` would serialize it.
+    """
+    try:
+        value = json.loads(metadata)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(value, dict) or not isinstance(value.get("reference"), dict):
+        return None
+    value["reference"].pop("sha256", None)
+    return json.dumps(value, sort_keys=True)
 
 
 def decode_history_row(row) -> CalibrationRecord:

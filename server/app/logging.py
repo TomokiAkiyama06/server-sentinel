@@ -50,6 +50,8 @@ class Event(StrEnum):
     SCENE_CALIBRATION_REQUIRED = "scene_calibration_required"
     SCENE_CALIBRATION_NOTICE_UNDELIVERED = "scene_calibration_notice_undelivered"
     SCENE_REACQUISITION_FAILED = "scene_reacquisition_failed"
+    SCENE_REFERENCE_DIGESTS_SCRUBBED = "scene_reference_digests_scrubbed"
+    SCENE_REFERENCE_DIGEST_SCRUB_FAILED = "scene_reference_digest_scrub_failed"
     HUMAN_LISTENER_ACTIVATION_INVALID = "human_listener_activation_invalid"
     HUMAN_REQUEST_RATE_LIMITED = "human_request_rate_limited"
     INVITATION_REDEMPTION_REFUSED = "invitation_redemption_refused"
@@ -91,7 +93,9 @@ class SafeJsonFormatter(logging.Formatter):
     """Never format arbitrary messages, exception text, extras or request data.
 
     All free-form data is discarded, including known and unknown secret formats.
-    Numeric status/duration values are the only optional metadata accepted.
+    Numeric status/duration values and a bounded non-negative ``count`` (a
+    number of rows, never an identifier) are the only optional metadata
+    accepted.
     """
 
     def format(self, record: logging.LogRecord) -> str:
@@ -109,6 +113,9 @@ class SafeJsonFormatter(logging.Formatter):
         if (type(duration) in {float, int} and 0 <= duration <= 86400000
                 and math.isfinite(duration)):
             output["duration_ms"] = duration
+        count = getattr(record, "count", None)
+        if type(count) is int and 0 <= count <= 1_000_000:
+            output["count"] = count
         return json.dumps(output, separators=(",", ":"), ensure_ascii=True)
 
 

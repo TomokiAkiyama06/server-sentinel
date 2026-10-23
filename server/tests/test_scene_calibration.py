@@ -24,7 +24,9 @@ from uuid import UUID, uuid4
 from app.cameras.registry.models import SourceType
 from app.cameras.uvc.capture import VideoFrame
 from app.detection.roi import CalibrationArchive
-from app.detection.roi.calibration import append_on, decode_history_row, provenance
+from app.detection.roi.calibration import (
+    append_on, calibration_metadata, decode_history_row, provenance, scrub_legacy_reference_digests,
+)
 from app.detection.roi.calibration_service import (
     REACQUIRED, REQUIRED, CalibrationOrigin, Notice, CalibrationPhase, CalibrationRefused,
     CalibrationTemplate, SceneCalibrationConfiguration, SceneCalibrationService, TransientReferences,
@@ -35,9 +37,11 @@ from app.detection.roi.runtime import (
     SceneMonitoringDependencies, SceneMonitoringRuntime, SceneSourceState, reader_identity,
 )
 from app.detection.roi.mjpg_worker import NUMPY_VERSION, SIMPLEJPEG_VERSION
+from app.logging import Event
 from app.main import create_app
 from app.monitoring.runtime import MonitoringDependencies
 from app.notifications.service import NotificationService
+from app.notifications.slack import DeliveryResult
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -123,6 +127,21 @@ def database_bytes(path):
     return b"".join(candidate.read_bytes() for candidate in
                     (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-journal"))
                     if candidate.exists())
+
+
+def store_legacy(path, calibration):
+    """Store `calibration` as a pre-#205 build did: with its frame digest."""
+    database = Database(Path(path))
+    with closing(database.connect()) as connection:
+        migrate(connection, APPLICATION_MIGRATIONS)
+        connection.execute("BEGIN IMMEDIATE")
+        append_on(connection, calibration)
+        value = calibration_metadata(calibration)
+        value["reference"]["sha256"] = hashlib.sha256(calibration.reference.pixels).hexdigest()
+        connection.execute("UPDATE roi_calibration_history SET metadata=? WHERE source_id=? AND version=?",
+                           (json.dumps(value, sort_keys=True), str(calibration.source_id),
+                            calibration.version))
+        connection.execute("COMMIT")
 
 
 def assert_no_frame_trace(test, raw, luma=None):
@@ -394,6 +413,50 @@ class HistoryTests(unittest.TestCase):
         (record,) = database.history()
         self.assertNotIn("reference_sha256", vars(record))
         self.assertEqual(stored(), record.bind(stored()))
+
+
+class LegacyDigestScrubTests(unittest.TestCase):
+    def test_the_scrub_removes_the_digest_from_the_file_and_keeps_the_provenance(self):
+        # Codex P1 (#330): a version a pre-#205 build stored still carries
+        # its frame's SHA-256; the scrub removes it from the database file.
+        database = Database_(self)
+        store_legacy(database.database.path, stored())
+        store_legacy(database.database.path, stored(source=SOURCE, source_type=SourceType.LOCAL_UVC))
+        # Positive control: the digest is on disk before the scrub.
+        with self.assertRaises(AssertionError):
+            assert_no_frame_trace(self, database.raw())
+        with closing(database.database.connect()) as connection:
+            with self.assertRaises(ValueError):
+                scrub_legacy_reference_digests(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            self.assertEqual(2, scrub_legacy_reference_digests(connection))
+            connection.execute("COMMIT")
+            connection.execute("BEGIN IMMEDIATE")
+            self.assertEqual(0, scrub_legacy_reference_digests(connection))
+            connection.execute("COMMIT")
+            rows = connection.execute("SELECT metadata FROM roi_calibration_history "
+                                      "WHERE source_id=?", (str(OTHER),)).fetchall()
+        assert_no_frame_trace(self, database.raw())
+        # Exactly what the archive writes for such a version today.
+        self.assertEqual([json.dumps(calibration_metadata(stored()), sort_keys=True)],
+                         [row[0] for row in rows])
+        (record,) = database.history()
+        self.assertEqual(stored(), record.bind(stored()))
+
+    def test_without_the_table_or_a_digest_nothing_is_written(self):
+        with closing(sqlite3.connect(":memory:")) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self.assertEqual(0, scrub_legacy_reference_digests(connection))
+            connection.execute("ROLLBACK")
+        database = Database_(self)
+        database.store(stored())
+        before = database.raw()
+        with closing(database.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self.assertEqual(0, scrub_legacy_reference_digests(connection))
+            connection.execute("COMMIT")
+        self.assertEqual([1], [item.version for item in database.history()])
+        self.assertEqual(len(before), len(database.raw()))
 
 
 class TransientReferenceTests(unittest.TestCase):
@@ -695,6 +758,20 @@ class LifespanTests(RuntimeFixture):
         # The reference never reached the disk.
         assert_no_frame_trace(self, database_bytes(self.settings.database_path))
 
+    async def test_startup_scrubs_a_legacy_reference_digest_and_logs_only_the_count(self):
+        # Codex P1 (#330): an upgraded database loses the frame digest of a
+        # pre-#205 version at the first start, before any re-acquisition.
+        store_legacy(self.settings.database_path, stored())
+        application = self.scene_application()
+        with self.assertLogs("app.main", "WARNING") as logs:
+            async with asyncio.timeout(60), application.router.lifespan_context(application):
+                assert_no_frame_trace(self, database_bytes(self.settings.database_path))
+        scrubbed = [record for record in logs.records
+                    if record.msg == Event.SCENE_REFERENCE_DIGESTS_SCRUBBED]
+        self.assertEqual([1], [record.count for record in scrubbed])
+        self.assertNotIn(hashlib.sha256(pixels()).hexdigest(), "\n".join(logs.output))
+        assert_no_frame_trace(self, database_bytes(self.settings.database_path))
+
     async def test_a_silent_camera_delays_neither_other_sources_nor_their_notices(self):
         # Claude review 1 / Codex P1 (PR #330): the sources are re-acquired
         # independently. The silent camera is first, so a serial pass would
@@ -849,6 +926,54 @@ class LifespanTests(RuntimeFixture):
         self.assertEqual([REACQUIRED], [item.kind for item in returned][:1])
         self.assertIn("scene_calibration_notice_undelivered", "\n".join(logs.output))
         self.assertEqual([], self.notified())
+
+    async def test_a_notice_the_service_refuses_is_retried_and_sent_once(self):
+        # Codex P1 (#330): a full or closed queue (`can_accept` false) and a
+        # `failed` result the service does not retain kept nothing; the
+        # notice is put back and later sent once under its event id.
+        self.store(stored())
+        application = self.scene_application()
+        service = application.state.scene_calibration
+        runtime = application.state.scene_monitoring
+        real_accept, real_record = NotificationService.can_accept, NotificationService.record
+        real_take = service.take_notices
+        ours, full, log = set(), set(), []
+
+        def take_notices():
+            notices = real_take()
+            ours.update(notice.event_id for notice in notices)
+            return notices
+
+        def can_accept(notifications, event_id):
+            if event_id in ours and "refused" not in log:
+                # The first ask for the notice finds the queue full.
+                log.append("refused")
+                full.add(event_id)
+                return False
+            full.discard(event_id)
+            return real_accept(notifications, event_id)
+
+        def record(notifications, kind, **options):
+            event_id = options.get("event_id")
+            if event_id not in ours:
+                return real_record(notifications, kind, **options)
+            if event_id in full:
+                log.append("recorded while full")
+            log.append("record")
+            if log.count("record") == 1:
+                return DeliveryResult.FAILED   # closed queue: nothing kept
+            return real_record(notifications, kind, **options)
+
+        service.take_notices = take_notices
+        with mock.patch.object(NotificationService, "can_accept", autospec=True, side_effect=can_accept), \
+                mock.patch.object(NotificationService, "record", autospec=True, side_effect=record):
+            async with asyncio.timeout(60), application.router.lifespan_context(application):
+                with Feed(runtime):
+                    self.assertTrue(await self.until(lambda: len(self.scene_texts()) == 1, timeout=30))
+                    await asyncio.sleep(1.5)
+        self.assertEqual(["refused", "record", "record"], log)
+        self.assertEqual([("scene_reference_reacquired", 1, "sent")], self.notified())
+        self.assertEqual(["ServerSentinel critical alert: scene_reference_reacquired"], self.scene_texts())
 
     def test_scene_calibration_requires_the_monitoring_notifications(self):
         # Codex P2 (#330): without them a re-acquisition notice could only

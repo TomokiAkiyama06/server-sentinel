@@ -1277,7 +1277,7 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   `critical_evidence` stays unavailable (no evidence port yet). Verified so
   far only with synthetic observations and an intercepted Slack transport
   (`server/tests/test_critical_notifications.py`); needs the same deployment
-  section and calibration route as above.
+  section as above.
 - [ ] (#318) with the recording filesystem refused (`STORAGE_HARD_STOP`, for
   example the approved volume lazily unmounted on a disposable Main), a
   confirmed server movement or camera tamper still sends exactly one fixed
@@ -1304,7 +1304,7 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   directory and an intercepted Slack transport
   (`server/tests/test_unrecorded_critical_alerts.py`,
   `server/tests/test_critical_notifications.py`); needs the same deployment
-  section and calibration route as above.
+  section as above.
 
 ### Issue #205 Owner calibration and restart re-acquisition (pending, not executed)
 
