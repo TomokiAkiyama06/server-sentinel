@@ -81,10 +81,12 @@ again under the cap. Intermittent outages (Refs #301): a source not online for
 `flapping_offline_seconds` (default 300 s) in total within the last
 `flapping_window_seconds` (default 900 s), over at least two not-online
 periods, is one more `camera_offline` under the same cap, once per flapping
-period: any notification of a source opens its alerted period, which closes
-after a whole window online; while it is open the ratio rule stays silent,
-and a period a ratio alert opened also covers the continuous episodes inside
-it. A ratio alert is named
+period: a sent notification of a source opens its alerted period, which
+closes after a whole window online; while it is open the ratio rule stays
+silent, and in a period a ratio alert opened only the first outage that
+stays offline for `after_seconds` after a short online is notified once more
+(at most two per flapping period, Owner decision 2026-10-23); an outage after
+an online of at least `after_seconds` is an ordinary episode. A ratio alert is named
 `uuid5(EVENT_NAMESPACE, "camera-offline-flapping:<source>:<window>:<bucket>")`
 after the wall-clock window bucket, so a restart within a window of it sends
 nothing again. See SPECIFICATION §9 for the full rules and the known limits.

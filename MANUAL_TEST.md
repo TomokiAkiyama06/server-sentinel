@@ -367,8 +367,19 @@ least 60):
   accumulated within fifteen minutes; keep flapping (or leave it unplugged)
   for an hour: no further message; leave it plugged in for at least fifteen
   minutes and flap again: one new message;
+- [ ] after that message, leave the camera unplugged for five minutes on end:
+  exactly one more `camera_offline` (Owner decision 2026-10-23, at most two
+  per flapping period); keep it flapping afterwards with short online
+  periods: nothing more; plug it in for ten minutes and unplug it for five:
+  one more (an ordinary outage);
 - [ ] restart the service while the camera keeps flapping, within fifteen
-  minutes of that message: no second message;
+  minutes of that message: no second ratio message;
+- [ ] CS-800 (memory 2026-10-22: about 0.6 % of MJPG buffers are padded and
+  the parser restarts capture): watch whether those restarts change the
+  source's camera health (`local_uvc_source_health_changed` in the journal)
+  during an hour of normal capture; if they do, confirm no `camera_offline`
+  is sent from them (their not-online total stays far below five minutes in
+  fifteen) and record the observed rate;
 - [ ] `systemctl stop` / restart with every camera connected sends nothing;
 - [ ] with Slack unconfigured the row is `disabled`;
 - [ ] LXD VM configuration (D2): reproduce the host USB re-enumeration of

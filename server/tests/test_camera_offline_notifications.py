@@ -27,7 +27,7 @@ from app.cameras.uvc.identity import CameraState, DeviceEvidence, HealthEvent
 from app.cameras.uvc.runtime import LocalUvcDependencies
 from app.logging import Event
 from app.main import create_app
-from app.monitoring.cameras import MAX_SPANS, CameraOfflineMonitor
+from app.monitoring.cameras import DOWN_BINS, CameraOfflineMonitor
 from app.monitoring.config import CameraOfflineNotification, parse_monitoring
 from app.monitoring.runtime import (
     CAMERA_OFFLINE_RENOTIFY_CHAIN, EVENT_NAMESPACE, MonitoringDependencies,
@@ -600,8 +600,11 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         self.assertEqual(1, len(self.sent()))
         self.assertTrue(self.sent()[0].confirmed)
         self.assertEqual(1, self.drain(monitor).flapping_sources)
-        # The same flapping period for two hours: still one notification.
+        # The same flapping period for two hours, never offline for five
+        # minutes on end: still one notification.
         self.run_for(monitor, 180)
+        self.on(monitor)
+        self.run_for(monitor, 2)
         for _ in range(30):
             self.cycle(monitor)
         self.assertEqual(1, len(self.sent()))
@@ -640,24 +643,126 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         self.run_for(monitor, 3600)
         self.assertEqual(1, len(self.sent()))
 
-    def test_a_continuous_outage_after_a_ratio_alert_is_not_notified_again(self):
+    def test_a_period_that_ended_before_the_window_is_not_the_second(self):
+        # An outage that ended before the window plus one in progress is a
+        # single period within the window: left to the continuous rule.
+        monitor = self.monitor(flapping_offline_seconds=120)
+        self.online(monitor)
+        self.cycle(monitor, offline=60, online=1000)
+        self.off(monitor)
+        self.run_for(monitor, 270)
+        self.assertEqual([], self.sent())
+        self.run_for(monitor, 30)
+        self.assertEqual(1, len(self.sent()))
+
+    def test_a_continuous_outage_after_a_ratio_alert_is_notified_once_more(self):
+        # Owner decision 2026-10-23 (PR #335): flapping, the ratio alert,
+        # then offline for `after_seconds` on end: a second notification by
+        # the continuous rule, and never a third in that flapping period.
         monitor = self.monitor()
         self.online(monitor)
         for _ in range(2):
             self.cycle(monitor)
         self.assertEqual(1, len(self.sent()))
-        # Gone for good within the same flapping period.
         self.off(monitor)
-        self.run_for(monitor, 3 * 3600, step=60)
+        self.run_for(monitor, 270)
         self.assertEqual(1, len(self.sent()))
+        self.run_for(monitor, 30)
+        self.assertEqual(2, len(self.sent()))
+        self.assertEqual(2, len({row.event_id for row in self.sent()}))
+        self.run_for(monitor, 3 * 3600, step=60)
+        self.assertEqual(2, len(self.sent()))
         self.assertEqual(1, self.drain(monitor).offline_sources)
-        # Back for a whole window: the period closes and a later flapping
-        # period is notified again.
+        # Flapping and further five-minute outages inside the same period
+        # (online shorter than the window) add nothing.
         self.on(monitor)
+        self.run_for(monitor, 2)
+        for _ in range(3):
+            self.cycle(monitor)
+        self.off(monitor)
+        self.run_for(monitor, 600, step=60)
+        self.on(monitor)
+        self.run_for(monitor, 2)
+        self.assertEqual(2, len(self.sent()))
+        # Back for a whole window: the period closes and a later flapping
+        # period is notified again, with its own second notification.
         self.run_for(monitor, 900, step=60)
         self.assertEqual(0, self.drain(monitor).flapping_sources)
         for _ in range(2):
             self.cycle(monitor)
+        self.assertEqual(3, len(self.sent()))
+        self.off(monitor)
+        self.run_for(monitor, 300)
+        self.assertEqual(4, len(self.sent()))
+        self.run_for(monitor, 3600, step=60)
+        self.assertEqual(4, len(self.sent()))
+
+    def test_the_second_notification_obeys_the_hourly_cap(self):
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        for _ in range(2):
+            self.cycle(monitor)
+        self.assertEqual(1, len(self.sent()))
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as logs:
+            self.off(monitor)
+            self.run_for(monitor, 600)
+        self.assertEqual(1, len(self.sent()))
+        self.assertTrue(all(line.endswith(Event.CAMERA_OFFLINE_NOTIFICATION_RATE_LIMITED.value)
+                            for line in logs.output), logs.output)
+        self.run_for(monitor, 3600, step=60)
+        self.assertEqual(2, len(self.sent()))
+
+    def test_an_outage_after_a_long_online_is_an_ordinary_episode(self):
+        # PR #335 review 重大 1: after the ratio alert the camera was back for
+        # ten minutes (longer than `after_seconds`, shorter than the window);
+        # each later outage of five minutes is its own episode.
+        monitor = self.monitor()
+        self.online(monitor)
+        for _ in range(2):
+            self.cycle(monitor)
+        self.assertEqual(1, len(self.sent()))
+        for count in range(2, 5):
+            self.run_for(monitor, 600)
+            self.off(monitor)
+            self.run_for(monitor, 300)
+            self.assertEqual(count, len(self.sent()))
+            self.run_for(monitor, 3 * 3600 - 300, step=600)
+            self.on(monitor)
+        self.assertEqual(4, len(self.sent()))
+
+    def test_a_long_window_does_not_silence_later_outages(self):
+        monitor = self.monitor(flapping_window_seconds=86400, flapping_offline_seconds=60)
+        self.online(monitor)
+        for _ in range(2):
+            self.cycle(monitor, offline=40, online=2)
+        self.assertEqual(1, len(self.sent()))
+        for count in range(2, 5):
+            self.run_for(monitor, 6 * 3600, step=600)
+            self.off(monitor)
+            self.run_for(monitor, 3600, step=60)
+            self.on(monitor)
+            self.assertEqual(count, len(self.sent()))
+
+    def test_a_dropped_episode_does_not_silence_the_source(self):
+        # PR #335 review 重要 2: an outage held back by the cap and dropped
+        # (online at a drain) was never notified; the flapping that follows
+        # is, once the hour allows.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        second = self.sources[1]
+        self.off(monitor, second)
+        self.run_for(monitor, 300)
+        self.on(monitor, second)
+        self.assertEqual(1, len(self.sent()))
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as logs:
+            self.off(monitor)
+            self.run_for(monitor, 360)
+            self.on(monitor)
+            self.run_for(monitor, 30)
+        self.assertIn(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED.value, logs.output[-1])
+        self.assertEqual(1, monitor.dropped)
+        for _ in range(60):
+            self.cycle(monitor, offline=180, online=60)
         self.assertEqual(2, len(self.sent()))
 
     def test_an_online_shorter_than_the_window_keeps_the_period_open(self):
@@ -671,15 +776,34 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
             self.cycle(monitor)
         self.assertEqual(1, len(self.sent()))
 
-    def test_a_blip_then_an_outage_is_one_notification(self):
-        # The ratio reaches the total before the continuous threshold: the
-        # outage in progress belongs to that alert.
+    def test_the_outage_in_progress_counts_again_from_the_ratio_alert(self):
+        # The ratio reaches the total before the continuous threshold. The
+        # outage in progress belongs to that alert and is notified once more
+        # only after `after_seconds` past the alert, not past its own start.
         monitor = self.monitor()
         self.online(monitor)
         self.cycle(monitor, offline=120, online=60)
         self.off(monitor)
         self.run_for(monitor, 180)
         self.assertEqual(1, len(self.sent()))
+        # 300 s after its start, 120 s after the alert: nothing more.
+        self.run_for(monitor, 120)
+        self.assertEqual(1, len(self.sent()))
+        self.run_for(monitor, 150)
+        self.assertEqual(1, len(self.sent()))
+        self.run_for(monitor, 30)
+        self.assertEqual(2, len(self.sent()))
+        self.run_for(monitor, 3600, step=60)
+        self.assertEqual(2, len(self.sent()))
+
+    def test_an_outage_that_ends_before_the_threshold_from_the_alert_adds_nothing(self):
+        monitor = self.monitor()
+        self.online(monitor)
+        self.cycle(monitor, offline=120, online=60)
+        self.off(monitor)
+        self.run_for(monitor, 180)
+        self.run_for(monitor, 290)
+        self.on(monitor)
         self.run_for(monitor, 3600, step=60)
         self.assertEqual(1, len(self.sent()))
 
@@ -821,10 +945,17 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         self.drain(monitor, flapping_id=flapping_id)
         self.assertEqual([self.sources[0]], calls)
         self.assertEqual([], self.sent())
-        # The period is open: an outage that follows is covered too.
+        # The period is open: the ratio rule stays silent; an outage that
+        # lasts `after_seconds` from the alert is the one continuous
+        # notification of the period (Owner decision 2026-10-23).
         self.advance(3600)
         self.drain(monitor, flapping_id=flapping_id)
-        self.assertEqual([], self.sent())
+        self.assertEqual(1, len(self.sent()))
+        self.assertNotEqual(earlier, self.sent()[0].event_id)
+        self.advance(3600)
+        self.drain(monitor, flapping_id=flapping_id)
+        self.assertEqual([self.sources[0]], calls)
+        self.assertEqual(1, len(self.sent()))
 
     def test_the_flapping_id_names_the_row(self):
         monitor = self.monitor()
@@ -855,24 +986,62 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
                     self.advance(2)
                 self.assertEqual(1, len(self.sent()))
 
-    def test_memory_is_bounded_and_merging_never_hides_an_outage(self):
+    def test_memory_is_bounded_and_the_total_is_kept(self):
         monitor = self.monitor()
         self.online(monitor)
-        for _ in range(MAX_SPANS * 20):
+        for _ in range(DOWN_BINS * 20):
             self.off(monitor)
             self.advance(0.2)
             self.on(monitor)
             self.advance(0.2)
-        source = monitor._sources[self.sources[0]]
-        self.assertLessEqual(len(source.spans), MAX_SPANS)
-        # Half of the last 1024 s was not online, 512 s in total.
+        down = monitor._sources[self.sources[0]].down
+        self.assertLessEqual(len(down.bins), DOWN_BINS + 2)
+        # Half of the last 900 s was not online, about 450 s in total.
+        total = sum(seconds for _index, seconds in down.bins)
+        self.assertGreaterEqual(total, 450 - 0.2)
+        self.assertLessEqual(total, 450 + 900 / DOWN_BINS)
         self.drain(monitor)
         self.assertEqual(1, len(self.sent()))
         # Quiet sources keep nothing beyond the window.
         self.advance(901)
         self.drain(monitor)
-        self.assertEqual(0, len(source.spans))
-        self.assertEqual(0, len(monitor._sources[self.sources[1]].spans))
+        self.assertEqual(0, len(down.bins))
+        self.assertEqual(0, len(monitor._sources[self.sources[1]].down.bins))
+
+    def test_frequent_short_dropouts_are_counted_as_they_are(self):
+        # PR #335 review 提案 3: 0.1 s not online every 2 s (5 %) for an hour
+        # is about 45 s within fifteen minutes, never five minutes.
+        monitor = self.monitor()
+        self.online(monitor)
+        for step in range(1800):
+            self.off(monitor)
+            self.advance(0.1)
+            self.on(monitor)
+            self.advance(1.9)
+            if step % 30 == 0:
+                self.drain(monitor)
+        self.drain(monitor)
+        self.assertEqual([], self.sent())
+        down = monitor._sources[self.sources[0]].down
+        self.assertLessEqual(sum(seconds for _index, seconds in down.bins), 45 + 0.1 * 4)
+        # A long window: the same dropouts reach a one-minute total only once
+        # the window holds at least a minute of them.
+        monitor = self.monitor(flapping_window_seconds=86400, flapping_offline_seconds=60)
+        self.online(monitor)
+        for _ in range(590):
+            self.off(monitor)
+            self.advance(0.1)
+            self.on(monitor)
+            self.advance(1.9)
+        self.drain(monitor)
+        self.assertEqual([], self.sent())
+        for _ in range(20):
+            self.off(monitor)
+            self.advance(0.1)
+            self.on(monitor)
+            self.advance(1.9)
+        self.drain(monitor)
+        self.assertEqual(1, len(self.sent()))
 
     def test_odd_clocks_never_raise(self):
         monitor = self.monitor()
@@ -905,8 +1074,14 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
                        dict(flapping_window_seconds=True)):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 self.monitor(**values)
-        monitor = self.monitor(flapping_window_seconds=300, flapping_offline_seconds=300)
-        self.assertEqual((300.0, 300.0), (monitor.window, monitor.flapping_offline))
+        # PR #335 review 提案 5: a total equal to the window can never be
+        # reached over two periods; one tick below it is the most allowed.
+        with self.assertRaises(ValueError):
+            self.monitor(flapping_window_seconds=300, flapping_offline_seconds=300)
+        with self.assertRaises(ValueError):
+            self.monitor(flapping_window_seconds=300, flapping_offline_seconds=241)
+        monitor = self.monitor(flapping_window_seconds=300, flapping_offline_seconds=240)
+        self.assertEqual((300.0, 240.0), (monitor.window, monitor.flapping_offline))
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -933,6 +1108,8 @@ class ConfigurationTests(unittest.TestCase):
                       {"after_seconds": "300"}, {"hourly_limit": 0}, {"hourly_limit": 61},
                       {"flapping_window_seconds": 119}, {"flapping_window_seconds": 86401},
                       {"flapping_offline_seconds": 59}, {"flapping_offline_seconds": 901},
+                      {"flapping_offline_seconds": 841},
+                      {"flapping_window_seconds": 600, "flapping_offline_seconds": 600},
                       {"flapping_window_seconds": 600, "flapping_offline_seconds": 601},
                       {"flapping_window_seconds": 900.5}, {"flapping_offline_seconds": False},
                       {"source": "camera-1"}):
@@ -1348,7 +1525,7 @@ class LifespanTests(RuntimeFixture):
         self.assertTrue(await self.until(lambda: monitor._sources[self.source.id].online))
         self.clock.advance(timedelta(seconds=2))
 
-    async def test_a_flapping_camera_notifies_once_across_a_restart(self):
+    async def test_a_flapping_camera_is_not_notified_twice_across_a_restart(self):
         application = self.uvc_application()
         async with asyncio.timeout(60), application.router.lifespan_context(application):
             runtime = application.state.monitoring
@@ -1382,11 +1559,16 @@ class LifespanTests(RuntimeFixture):
             self.clock.advance(timedelta(seconds=120))
             await self.tick(runtime)
             self.assertTrue(runtime.status.camera_offline_degraded)
-            # The outage that follows belongs to the same period.
+            self.assertEqual([ALERT], self.slack_texts())
+            # Offline on end from then on: the period's one continuous
+            # notification (Owner decision 2026-10-23), and no third.
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+            self.assertEqual([ALERT, ALERT], self.slack_texts())
             self.clock.advance(timedelta(hours=1))
             await self.tick(runtime)
-        self.assertEqual([ALERT], self.slack_texts())
-        self.assertEqual([(1, "sent")], self.offline_rows())
+        self.assertEqual([ALERT, ALERT], self.slack_texts())
+        self.assertEqual([(1, "sent"), (1, "sent")], self.offline_rows())
 
     def test_the_application_owns_the_monitor(self):
         monitor = CameraOfflineMonitor((self.source.id,), monotonic=lambda: 0.0)

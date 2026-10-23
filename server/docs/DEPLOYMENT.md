@@ -228,10 +228,13 @@ of roughly 1 TB, not defaults; size them for the actual deployment:
 `hourly_limit` (integer, 1 to 60, default 4) times per rolling hour for all
 sources together. A camera that keeps dropping out for shorter times is
 notified too, once per flapping period, when it was not online for
-`flapping_offline_seconds` (integer, 60 up to `flapping_window_seconds`,
-default 300) in total within the last `flapping_window_seconds` (integer, 120
-to 86400, default 900); it is not notified again while it keeps flapping or
-stays offline, until it has stayed online for a whole window. The
+`flapping_offline_seconds` (integer, from 60 to 60 below
+`flapping_window_seconds`, default 300) in total within the last
+`flapping_window_seconds` (integer, 120 to 86400, default 900). After that
+message one more is sent if it then stays offline for `after_seconds` on end,
+and nothing more while it keeps flapping, until it has stayed online for a
+whole window; an outage after it was back for at least `after_seconds` is
+notified as usual. The
 notification is the fixed text `ServerSentinel critical
 alert: camera_offline` without the source name; check the Web UI for which
 camera is offline. Without Slack it is recorded locally only. Every storage

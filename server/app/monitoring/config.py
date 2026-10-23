@@ -41,7 +41,9 @@ CAMERA_OFFLINE_HOURLY_LIMIT_BOUNDS = (1, 60)
 # Intermittent outages (Owner decision 2026-10-22, Refs #301): not online for
 # five minutes in total within the last fifteen minutes. The window is at
 # least two monitoring ticks and at most a day; the total is at least one
-# tick and at most the window.
+# tick and at least one tick shorter than the window (two not-online periods
+# always have online time between them, so a total equal to the window could
+# never be reached; PR #335 review 提案 5).
 CAMERA_FLAPPING_WINDOW_SECONDS = 900.0
 CAMERA_FLAPPING_WINDOW_BOUNDS = (120.0, 86400.0)
 CAMERA_FLAPPING_OFFLINE_SECONDS = 300.0
@@ -81,7 +83,7 @@ class CameraOfflineNotification:
     ``flapping_window_seconds`` / ``flapping_offline_seconds``: intermittent
     outages notify once the source was not online for the second value in
     total within the last first value (default 300 s in 900 s; window 120 s
-    to one day, total 60 s up to the window).
+    to one day, total from 60 s to 60 s below the window).
     """
 
     after_seconds: float = CAMERA_OFFLINE_SECONDS
@@ -104,10 +106,11 @@ class CameraOfflineNotification:
 
 
 def valid_flapping(window: object, offline: object) -> bool:
-    """Window within its bounds, total from one tick up to the window."""
+    """Window within its bounds, total from one tick to one tick below the window."""
     low, high = CAMERA_FLAPPING_WINDOW_BOUNDS
     return (type(window) in (int, float) and type(offline) in (int, float)
-            and low <= window <= high and CAMERA_FLAPPING_OFFLINE_MIN <= offline <= window)
+            and low <= window <= high
+            and CAMERA_FLAPPING_OFFLINE_MIN <= offline <= window - CAMERA_FLAPPING_OFFLINE_MIN)
 
 
 @dataclass(frozen=True)
