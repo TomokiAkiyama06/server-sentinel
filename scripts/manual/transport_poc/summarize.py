@@ -1760,6 +1760,12 @@ def _holder_sessions(rows):
     return sessions
 
 
+# Product capture counters in a holder sample (Issue #305); a sample with
+# none of them is from a holder written before they existed.
+CAPTURE_COUNTER_KEYS = ("capture_launches", "capture_restarts", "sources_never_launched",
+                        "stream_invalid", "padding_tolerated")
+
+
 def load_holders(paths, summaries):
     """Validate ``--holder`` files against the real-input runs they served.
 
@@ -1772,6 +1778,16 @@ def load_holders(paths, summaries):
     ``end`` (a crashed or still-running holder), a second file for the same
     run, a holder that did not cover its run, or a camera profile rate
     (holder ``start`` ``fps``) that differs from the sender's declared fps.
+    A holder whose last sample carries any product capture counter (Issue
+    #305) must carry ``capture_restarts``, ``sources_never_launched`` and
+    ``stream_invalid`` as integers, each computed per source by the holder,
+    and fails when any is above 0 (a GStreamer child was restarted, a camera
+    never started, or a pipeline lost JPEG framing). A file written before
+    the counters existed (none of their keys) is judged without them. The
+    holder's ``end`` record carries the final counters, taken after the
+    capture was closed and every pipeline reaped; when it has any counter key
+    it is what is judged (an event after the last sample still counts),
+    otherwise the last sample is.
     ``unmeasured``: a file whose ``run_id`` matches no real-input run (stale
     or from another run), a file without samples or without the profile
     rate, or a real-input run without a holder file.
@@ -1790,6 +1806,7 @@ def load_holders(paths, summaries):
     verdicts, rates, seen = [], {}, set()
     sessions = {}  # run id -> nonce -> (opens, closes, {source: forwarded})
     frames = queue_drops = forward_drops = allowed = 0
+    restarts = never_launched = stream_invalid = padding = 0
     for path in paths:
         rows = records.read_jsonl(path)
         ids = {row.get("run_id") for row in rows}
@@ -1829,9 +1846,23 @@ def load_holders(paths, summaries):
         queue_drops += last.get("queue_drops") or 0
         forward_drops += last.get("forward_drops") or 0
         allowed += run_allowed
+        capture_ok = True
+        counted = ends[0] if any(key in ends[0] for key in CAPTURE_COUNTER_KEYS) else last
+        if any(key in counted for key in CAPTURE_COUNTER_KEYS):
+            judged = [counted.get(key) for key in
+                      ("capture_restarts", "sources_never_launched", "stream_invalid")]
+            capture_ok = all(_is_int(value) and value == 0 for value in judged)
+            run_restarts, run_never, run_invalid = (
+                value if _is_int(value) else 0 for value in judged)
+            restarts += run_restarts
+            never_launched += run_never
+            stream_invalid += run_invalid
+            padding += counted.get("padding_tolerated") if _is_int(
+                counted.get("padding_tolerated")) else 0
         verdicts.append(_verdict((last.get("frames") or 0) > 0
                                  and (last.get("queue_drops") or 0) == 0
-                                 and (last.get("forward_drops") or 0) <= run_allowed))
+                                 and (last.get("forward_drops") or 0) <= run_allowed
+                                 and capture_ok))
         rate = _holder_rate(samples)
         if rate is not None:
             rates[run_id] = rate
@@ -1851,6 +1882,10 @@ def load_holders(paths, summaries):
                    "holder_frames": frames, "holder_queue_drops": queue_drops,
                    "holder_forward_drops": forward_drops,
                    "holder_forward_drops_allowed": allowed,
+                   "holder_capture_restarts": restarts,
+                   "holder_sources_never_launched": never_launched,
+                   "holder_stream_invalid": stream_invalid,
+                   "holder_padding_tolerated": padding,
                    "holder_verdict": _combine(verdicts)}
 
 
@@ -1988,7 +2023,11 @@ def render(report):
         lines.append(f"holder: {holder['holder_verdict']} (queue_drops "
                      f"{holder.get('holder_queue_drops')}, forward_drops "
                      f"{holder.get('holder_forward_drops')}/"
-                     f"{holder.get('holder_forward_drops_allowed')})")
+                     f"{holder.get('holder_forward_drops_allowed')}, capture_restarts "
+                     f"{holder.get('holder_capture_restarts')}, never_launched "
+                     f"{holder.get('holder_sources_never_launched')}, stream_invalid "
+                     f"{holder.get('holder_stream_invalid')}, padding_tolerated "
+                     f"{holder.get('holder_padding_tolerated')})")
     lines.append("")
     lines.append("scenario            candidate   G1   G2   G3   G4   G5   G6  missing(rep/act)"
                  "  integrity   drop_acct   production  fast")

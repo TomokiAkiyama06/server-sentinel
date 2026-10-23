@@ -90,6 +90,13 @@ class MjpegFrameParser:
     other than byte stuffing/RSTn ends the scan, so an ``FFD9`` byte pair can
     never be mistaken for the end of an image. Anything malformed is an error:
     the caller restarts capture rather than emitting a guessed frame.
+
+    ``large_gaps`` counts inter-frame gaps longer than ``DEFAULT_MAX_GAP_BYTES``
+    that were skipped and followed by a complete, structurally valid frame
+    (Issue #305 padding the profile bound tolerated). It is a value-free count
+    for health reporting: no sizes, offsets or bytes are kept, and nothing is
+    logged per frame. A gap whose following SOI turns out to be malformed is
+    not counted, because it raises instead.
     """
 
     def __init__(self, max_frame_bytes, *, max_gap_bytes=DEFAULT_MAX_GAP_BYTES):
@@ -105,6 +112,8 @@ class MjpegFrameParser:
         self._scans = 0
         self._position = 0
         self._gap = 0  # bytes already discarded since the last EOI (or start)
+        self._large_gap = False  # the current frame followed a gap > default
+        self.large_gaps = 0
 
     @property
     def partial(self):
@@ -131,6 +140,7 @@ class MjpegFrameParser:
                     return frames
                 if self._gap + start > self.max_gap_bytes:
                     raise FrameError("video stream lost JPEG framing")
+                self._large_gap = self._gap + start > DEFAULT_MAX_GAP_BYTES
                 del self._buffer[:start]
                 self._gap = 0
                 self._in_frame, self._entropy, self._scans, self._position = True, False, 0, 2
@@ -144,6 +154,9 @@ class MjpegFrameParser:
             frames.append(bytes(self._buffer[:end]))
             del self._buffer[:end]
             self._in_frame = False
+            if self._large_gap:
+                self.large_gaps += 1
+                self._large_gap = False
 
     def _scan(self):
         data, position = self._buffer, self._position
