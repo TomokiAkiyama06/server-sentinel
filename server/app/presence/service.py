@@ -190,9 +190,15 @@ class TimelineSession:
 class PresenceService:
     def __init__(self, database, *, access=None, evidence=None, notifications=None,
                  reservation=None, detection=None, storage_status=None,
-                 periods: RetentionPeriods = RetentionPeriods()):
+                 periods: RetentionPeriods = RetentionPeriods(), unrecorded_alerts=None):
         if not isinstance(periods, RetentionPeriods):
             raise ValueError("retention periods required")
+        if unrecorded_alerts is not None and not callable(unrecorded_alerts):
+            raise ValueError("invalid unrecorded alert counts")
+        # Issue #318: value-free counts of the Slack alerts attempted for
+        # confirmed criticals storage kept from the timeline or the claim
+        # (`UnrecordedCriticalAlerts.counts`), shown in Owner status.
+        self.unrecorded_alerts = unrecorded_alerts
         self.database = database
         self.periods = periods
         self.access = access or DenyAccess()
@@ -533,76 +539,113 @@ class PresenceService:
                                         or any(c not in "0123456789abcdef" for c in source_fact)):
             raise InvalidObservation("restamped source fact digest required")
         with self._transaction() as db:
-            existing = db.execute("SELECT payload FROM presence_observations WHERE id=?",
-                                  (str(observation.identifier),)).fetchone()
-            if existing:
-                stored = Observation.from_payload(json.loads(existing[0]))
-                digest = db.execute("SELECT digest FROM presence_source_facts WHERE id=?",
-                                    (str(observation.identifier),)).fetchone()
-                if restamped and (digest[0] if digest else None) != source_fact:
-                    # The receipt-independent source fact differs under the
-                    # same UUID; ignoring receipt fields must not hide it.
+            return self._record(db, observation, presence_valid_until, restamped, source_fact)
+
+    def record_critical(self, observation, *, restamped=False, recorded=None):
+        """`record()` for a confirmed critical, also telling whether its notification waits.
+
+        Returns ``(observation, awaiting)``: ``awaiting`` is whether, at the
+        commit of this same transaction, the `notification` row of the
+        observation is still `pending` or `unavailable` (no dispatch step has
+        submitted it). An idempotent replay of an observation whose
+        notification was already claimed or resolved is therefore not
+        awaiting (Issue #318 watches only unclaimed work).
+
+        ``recorded(awaiting)``, when given, is called inside the transaction,
+        before its commit, while the write lock is held: no dispatch step can
+        claim the row between that call and the commit, so a watch it
+        registers cannot outlive a claim made right after the commit. It must
+        only touch memory; its exceptions are ignored, and if the commit then
+        fails the record fails as usual.
+        """
+        if not isinstance(observation, Observation):
+            raise InvalidObservation("typed observation required")
+        if recorded is not None and not callable(recorded):
+            raise InvalidObservation("invalid record hand-over")
+        with self._transaction() as db:
+            stored = self._record(db, observation, None, restamped, None)
+            awaiting = db.execute("SELECT 1 FROM presence_deliveries WHERE observation=? "
+                                  "AND action='notification' AND state IN ('pending','unavailable')",
+                                  (str(observation.identifier),)).fetchone() is not None
+            if recorded is not None:
+                try:
+                    recorded(awaiting)
+                except Exception:
+                    pass
+        return stored, awaiting
+
+    def _record(self, db, observation, presence_valid_until, restamped, source_fact):
+        # The body of `record()` inside its admitted transaction.
+        existing = db.execute("SELECT payload FROM presence_observations WHERE id=?",
+                              (str(observation.identifier),)).fetchone()
+        if existing:
+            stored = Observation.from_payload(json.loads(existing[0]))
+            digest = db.execute("SELECT digest FROM presence_source_facts WHERE id=?",
+                                (str(observation.identifier),)).fetchone()
+            if restamped and (digest[0] if digest else None) != source_fact:
+                # The receipt-independent source fact differs under the
+                # same UUID; ignoring receipt fields must not hide it.
+                raise InvalidObservation("observation identity conflict")
+            if self._confirms_critical(stored, observation, restamped=restamped):
+                return self._confirm_critical(db, stored)
+            if stored.payload() != observation.payload() and stored.payload() != observation.uncertain().payload():
+                fact = {key: value for key, value in stored.payload().items() if key not in RECEIPT_FIELDS}
+                replay = {key: value for key, value in observation.payload().items()
+                          if key not in RECEIPT_FIELDS}
+                if not restamped or fact != replay:
                     raise InvalidObservation("observation identity conflict")
-                if self._confirms_critical(stored, observation, restamped=restamped):
-                    return self._confirm_critical(db, stored)
-                if stored.payload() != observation.payload() and stored.payload() != observation.uncertain().payload():
-                    fact = {key: value for key, value in stored.payload().items() if key not in RECEIPT_FIELDS}
-                    replay = {key: value for key, value in observation.payload().items()
-                              if key not in RECEIPT_FIELDS}
-                    if not restamped or fact != replay:
-                        raise InvalidObservation("observation identity conflict")
-                return stored
-            completed = db.execute("SELECT 1 FROM presence_completed_events WHERE id=?",
-                                   (str(observation.identifier),)).fetchone()
-            if completed:
-                # The timeline payload passed its retention horizon after this
-                # event's critical actions completed. Recording the identity
-                # again would preserve evidence and notify a second time, so a
-                # delayed replay stays a duplicate and its payload stays expired.
-                return observation
-            trusted = self._clock(db, observation.received_at, observation.clock_trusted)
-            clock = SOURCE_CLOCK_TABLES.get(observation.kind) if observation.source_id else None
-            if clock:
-                source = str(observation.source_id)
-                high_water = db.execute(f"SELECT latest_occurred FROM {clock} WHERE source=?",
-                                        (source,)).fetchone()
-                if high_water and timestamp(observation.occurred_at) < high_water["latest_occurred"]:
-                    trusted = False
-            if not trusted:
-                observation = observation.uncertain()
-            elif clock:
-                db.execute(f"INSERT INTO {clock}(source,latest_occurred) VALUES (?,?) "
-                           "ON CONFLICT(source) DO UPDATE SET latest_occurred="
-                           "MAX(latest_occurred,excluded.latest_occurred)",
-                           (str(observation.source_id), timestamp(observation.occurred_at)))
-            payload = json.dumps(observation.payload(), sort_keys=True, separators=(",", ":"))
-            db.execute("INSERT INTO presence_observations(id,kind,source,received,payload) VALUES (?,?,?,?,?)",
-                       (str(observation.identifier), observation.kind.value,
-                        str(observation.source_id) if observation.source_id else None,
-                        timestamp(observation.received_at), payload))
-            if source_fact is not None:
-                db.execute("INSERT OR REPLACE INTO presence_source_facts(id,digest) VALUES (?,?)",
-                           (str(observation.identifier), source_fact))
-            if observation.kind in {Kind.OWNER_ENTRY, Kind.OWNER_EXIT} and presence_valid_until is not None:
-                # Confirmation/high confidence is supplied by the separately
-                # reviewed owner-observation pipeline, never guessed numerically.
-                usable = (observation.confirmed and trusted and observation.quality == Quality.SUFFICIENT
-                          and observation.value == Value.OBSERVED)
-                state = (PresenceState.PRESENT if observation.kind == Kind.OWNER_ENTRY else PresenceState.ABSENT)
-                if not usable:
-                    # The slot still records that the newest owner evidence was
-                    # unusable, so an earlier inference stops applying. It is not
-                    # a high-confidence observation, so `_effective()` falls
-                    # through to any configured hint instead of reporting it.
-                    state = PresenceState.UNKNOWN
-                db.execute("INSERT OR REPLACE INTO presence_inputs VALUES ('owner_observation',?,?,?,?)",
-                           (state.value, timestamp(observation.received_at), timestamp(presence_valid_until),
-                            str(observation.identifier)))
-            if observation.kind in CRITICAL and observation.confirmed:
-                for action in ("evidence", "notification"):
-                    db.execute("INSERT INTO presence_deliveries(observation,action,state,attempts) "
-                               "VALUES (?,?,'pending',0)",
-                               (str(observation.identifier), action))
+            return stored
+        completed = db.execute("SELECT 1 FROM presence_completed_events WHERE id=?",
+                               (str(observation.identifier),)).fetchone()
+        if completed:
+            # The timeline payload passed its retention horizon after this
+            # event's critical actions completed. Recording the identity
+            # again would preserve evidence and notify a second time, so a
+            # delayed replay stays a duplicate and its payload stays expired.
+            return observation
+        trusted = self._clock(db, observation.received_at, observation.clock_trusted)
+        clock = SOURCE_CLOCK_TABLES.get(observation.kind) if observation.source_id else None
+        if clock:
+            source = str(observation.source_id)
+            high_water = db.execute(f"SELECT latest_occurred FROM {clock} WHERE source=?",
+                                    (source,)).fetchone()
+            if high_water and timestamp(observation.occurred_at) < high_water["latest_occurred"]:
+                trusted = False
+        if not trusted:
+            observation = observation.uncertain()
+        elif clock:
+            db.execute(f"INSERT INTO {clock}(source,latest_occurred) VALUES (?,?) "
+                       "ON CONFLICT(source) DO UPDATE SET latest_occurred="
+                       "MAX(latest_occurred,excluded.latest_occurred)",
+                       (str(observation.source_id), timestamp(observation.occurred_at)))
+        payload = json.dumps(observation.payload(), sort_keys=True, separators=(",", ":"))
+        db.execute("INSERT INTO presence_observations(id,kind,source,received,payload) VALUES (?,?,?,?,?)",
+                   (str(observation.identifier), observation.kind.value,
+                    str(observation.source_id) if observation.source_id else None,
+                    timestamp(observation.received_at), payload))
+        if source_fact is not None:
+            db.execute("INSERT OR REPLACE INTO presence_source_facts(id,digest) VALUES (?,?)",
+                       (str(observation.identifier), source_fact))
+        if observation.kind in {Kind.OWNER_ENTRY, Kind.OWNER_EXIT} and presence_valid_until is not None:
+            # Confirmation/high confidence is supplied by the separately
+            # reviewed owner-observation pipeline, never guessed numerically.
+            usable = (observation.confirmed and trusted and observation.quality == Quality.SUFFICIENT
+                      and observation.value == Value.OBSERVED)
+            state = (PresenceState.PRESENT if observation.kind == Kind.OWNER_ENTRY else PresenceState.ABSENT)
+            if not usable:
+                # The slot still records that the newest owner evidence was
+                # unusable, so an earlier inference stops applying. It is not
+                # a high-confidence observation, so `_effective()` falls
+                # through to any configured hint instead of reporting it.
+                state = PresenceState.UNKNOWN
+            db.execute("INSERT OR REPLACE INTO presence_inputs VALUES ('owner_observation',?,?,?,?)",
+                       (state.value, timestamp(observation.received_at), timestamp(presence_valid_until),
+                        str(observation.identifier)))
+        if observation.kind in CRITICAL and observation.confirmed:
+            for action in ("evidence", "notification"):
+                db.execute("INSERT INTO presence_deliveries(observation,action,state,attempts) "
+                           "VALUES (?,?,'pending',0)",
+                           (str(observation.identifier), action))
         return observation
 
     @staticmethod
@@ -987,6 +1030,26 @@ class PresenceService:
                               "ORDER BY observation", (action,)).fetchall()
         return tuple((UUID(row[0]), int(row[1])) for row in rows)
 
+    def awaiting_notification(self, identifiers):
+        """Those of ``identifiers`` whose `notification` row is `pending` or `unavailable`.
+
+        That is confirmed critical work no dispatch step has submitted yet
+        (Issue #318 watches it while storage may refuse the claim).
+        """
+        identifiers = tuple(identifiers)
+        if not all(isinstance(identifier, UUID) for identifier in identifiers):
+            raise ValueError("invalid action identity")
+        found = set()
+        with self._read() as db:
+            for start in range(0, len(identifiers), 500):
+                chunk = identifiers[start:start + 500]
+                found.update(UUID(row[0]) for row in db.execute(
+                    "SELECT observation FROM presence_deliveries WHERE action='notification' "
+                    "AND state IN ('pending','unavailable') AND observation IN ("
+                    + ",".join("?" * len(chunk)) + ")",
+                    tuple(str(identifier) for identifier in chunk)))
+        return found
+
     def dispatch_pending(self, *, limit=100):
         """Submit up to ``limit`` queued critical actions; returns how many made progress.
 
@@ -1061,12 +1124,18 @@ class PresenceService:
                 # Each claim gets its own generation, so a callback can only
                 # complete the attempt it belongs to.
                 claim = job["generation"] + 1
+                # A requeue-aware port (the #21 notification adapter) takes an
+                # outcome stored for this identity before the claim, such as
+                # an alert attempted while the record was refused (Issue
+                # #318), instead of sending again; an Owner requeue resends.
+                requeue = ({"requeued": bool(job["requeued"])}
+                           if getattr(port, "requeue_aware", False) is True else {})
                 db.execute("UPDATE presence_deliveries SET state='submitting',attempts=attempts+1,"
                            "generation=? WHERE observation=? AND action=?", (claim, *row))
             def complete(result, identifier=observation.identifier, action=row["action"], claim=claim):
                 self.complete_action(identifier, action, result, generation=claim)
             try:
-                result = port(observation, complete)
+                result = port(observation, complete, **requeue)
                 if not isinstance(result, ActionResult):
                     result = ActionResult.UNCERTAIN
             except Exception:
@@ -1291,9 +1360,25 @@ class PresenceService:
                 # Consecutive flushes a transient failure stopped; a growing
                 # count is a stuck outbox rather than a passing refusal.
                 "timeline_flush_failures": failures,
+                # Issue #318: Slack alerts this process attempted (or could
+                # not) for confirmed criticals storage kept from the timeline
+                # or the claim; counts only, None without the hand-over.
+                "unrecorded_critical_alerts": self._unrecorded_counts(),
                 # False when the owning outbox lives in another process and
                 # its in-memory backlog is reported as unknown rather than empty.
                 "timeline_backlog_visible": not foreign}
+
+    def _unrecorded_counts(self):
+        if self.unrecorded_alerts is None:
+            return None
+        try:
+            counts = self.unrecorded_alerts()
+        except Exception:
+            return None
+        if (not isinstance(counts, dict)
+                or not all(type(value) is int and value >= 0 for value in counts.values())):
+            return None
+        return dict(counts)
 
     def owner_status(self, context, *, now, clock_trusted):
         self._owner(context)
