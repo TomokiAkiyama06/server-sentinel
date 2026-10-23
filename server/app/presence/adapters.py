@@ -690,13 +690,33 @@ class CriticalTimelineRecorder:
     Clock distrust or excessive source latency marks the timing untrusted but
     never withdraws confirmation: critical evidence and notification work is
     queued in every presence and clock state.
+
+    ``refused(identifier, kind)`` (Issue #318) is told about every confirmed
+    observation whose record failed for any reason but a contract error
+    (storage refused, an unwritable database, an unavailable clock), before
+    the failure is raised to the scene runtime's retry: the Main composition
+    passes `UnrecordedCriticalAlerts.refused`, which only queues the event ID
+    and fixed kind for a Slack attempt and never blocks or raises here.
+    ``recorded(identifier, kind, awaiting)`` is told about every one recorded,
+    inside the record transaction before its commit, with whether its
+    notification row is still unclaimed (`pending` / `unavailable`): a waiting
+    one storage keeps from being claimed (a refusal right after the record) is
+    attempted too, while a recorded one is never attempted again from the
+    refused queue (`UnrecordedCriticalAlerts.recorded`). Its exceptions never
+    change the record.
     """
 
-    def __init__(self, outbox: TimelineOutbox, *, maximum_source_latency: timedelta):
+    def __init__(self, outbox: TimelineOutbox, *, maximum_source_latency: timedelta,
+                 refused: Callable[[UUID, CriticalKind], None] | None = None,
+                 recorded: Callable[[UUID, CriticalKind], None] | None = None):
         if not isinstance(outbox, TimelineOutbox):
             raise ValueError("shared timeline receipt clock required")
+        if (refused is not None and not callable(refused)
+                or recorded is not None and not callable(recorded)):
+            raise ValueError("invalid critical hand-over")
         self.outbox = outbox
         self.maximum_source_latency = _positive(maximum_source_latency, "source latency bound")
+        self.refused, self.recorded = refused, recorded
 
     @staticmethod
     def _quality(item):
@@ -716,8 +736,30 @@ class CriticalTimelineRecorder:
 
     def __call__(self, item: CriticalObservation) -> None:
         self._quality(item)
-        with self.outbox.receipt() as (received, trusted):
-            self.outbox.service.record(self.observation(item, received, trusted), restamped=True)
+        if self.recorded is not None:
+            def hand_over(awaiting):
+                # Inside the record transaction, before its commit (see
+                # `PresenceService.record_critical`).
+                self.recorded(item.identifier, item.kind, awaiting)
+        else:
+            hand_over = None
+        try:
+            with self.outbox.receipt() as (received, trusted):
+                self.outbox.service.record_critical(
+                    self.observation(item, received, trusted), restamped=True, recorded=hand_over)
+        except InvalidObservation:
+            # A contract error or an identity conflict: not an alert waiting
+            # for storage. (An unavailable database location is a plain
+            # `ValueError` and is handed over below.)
+            raise
+        except Exception:
+            if self.refused is not None:
+                try:
+                    self.refused(item.identifier, item.kind)
+                except Exception:
+                    # The hand-over must never change the recorder's failure.
+                    pass
+            raise
 
     def record_undelivered(self, count: int) -> None:
         """Scene runtime `undelivered` sink: a count-only durable gap record.

@@ -1273,11 +1273,37 @@ frames (`server/tests/test_scene_runtime.py`). On real hardware, still to do:
   with Slack unconfigured the row is `disabled` and Owner status reports
   `critical_notifications` unavailable; while the recording filesystem is
   refused a confirmation is kept only within the scene runtime's bounded
-  critical staging (beyond it, counted as undelivered loss) and its alert is
-  sent after storage recovers;
+  critical staging (beyond it, counted as undelivered loss);
   `critical_evidence` stays unavailable (no evidence port yet). Verified so
   far only with synthetic observations and an intercepted Slack transport
   (`server/tests/test_critical_notifications.py`); needs the same deployment
+  section and calibration route as above.
+- [ ] (#318) with the recording filesystem refused (`STORAGE_HARD_STOP`, for
+  example the approved volume lazily unmounted on a disposable Main), a
+  confirmed server movement or camera tamper still sends exactly one fixed
+  `ServerSentinel critical alert: server_movement` / `camera_tamper` to Slack
+  within about 5 s, and `unrecorded_critical_alert_attempted` is logged with no
+  identifier, source or kind; no `notification_events` row exists yet. After
+  the volume is remounted, the staged observation is recorded, its
+  `notification_events` row becomes `sent` and the presence `notification`
+  delivery `delivered`, with no second Slack message. Repeat with the volume
+  removed a few seconds after a confirmation was recorded but before the next
+  dispatch step (about 5 s): the alert must still reach Slack during the hard
+  stop, once; and once more stopping the service right after the removal
+  (before the next dispatch step): the alert is still sent during shutdown and
+  `unrecorded_critical_alerts_unsent` is not logged. Record the number of messages when more than 8 confirmations
+  occur during one hard stop (with the default queue of 16 at most 8 are sent
+  before recovery and the rest after it; confirmations beyond the scene
+  runtime's 32-observation critical staging are counted as undelivered loss
+  and not attempted; `unrecorded_critical_alert_dropped` is not expected with
+  the default staging), and the Owner status `unrecorded_critical_alerts`
+  counts. Restarting the service during the hard stop sends nothing by
+  itself; record any duplicate after recovery (accepted risk, at most one per
+  observation whose record reached the database just before the restart).
+  Verified so far only with synthetic observations, a replaced recording
+  directory and an intercepted Slack transport
+  (`server/tests/test_unrecorded_critical_alerts.py`,
+  `server/tests/test_critical_notifications.py`); needs the same deployment
   section and calibration route as above.
 
 ### Issue #217 MJPG decoder on real C960 frames (pending physical execution)

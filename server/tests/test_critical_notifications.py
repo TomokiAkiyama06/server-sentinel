@@ -19,6 +19,7 @@ import unittest
 from uuid import uuid4
 
 from app.cameras.registry.models import SourceType
+from app.detection.roi.contracts import CriticalKind
 from app.detection.roi.runtime import SceneMonitoringConfiguration, SceneMonitoringDependencies
 from app.logging import Event
 from app.main import create_app
@@ -39,6 +40,7 @@ from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.test_detector_roi import HEIGHT, WIDTH, pixels, policy
 from tests.test_monitoring_runtime import RuntimeFixture
 from tests.test_presence import NOW, MockAccess, observation
+from tests.test_presence_adapters import critical
 from tests.test_recording import SyntheticValidator
 from tests.test_scene_runtime import MOVED, OTHER, binding, calibration_for
 from tests.test_storage_notifications import Transport, endpoint
@@ -163,6 +165,9 @@ class AdapterTests(Fixture, unittest.TestCase):
                 if isinstance(self.answer, Exception):
                     raise self.answer
                 return self.answer
+
+            def join(self, event_id, kind, on_complete):
+                return False
 
             def record(self, *arguments, **fields):
                 self.recorded.append(fields)
@@ -742,6 +747,134 @@ class LifespanTests(RuntimeFixture):
                 f"SELECT delivery FROM notification_events WHERE event_id='{item.identifier}'"))
             self.assertEqual([("delivered",)], self.rows(
                 "SELECT state FROM presence_deliveries WHERE action='notification'"))
+
+    async def test_a_confirmation_during_hard_stop_alerts_once_and_reconciles(self):
+        application = self.scene_application(dispatch_interval_seconds=0.05,
+                                              dispatch_backoff_seconds=0.2)
+        timeline = application.state.scene_timeline
+        runtime = application.state.scene_monitoring
+        async with asyncio.timeout(30), application.router.lifespan_context(application):
+            self.assertTrue(await self.until(lambda: timeline.opened))
+            stream = uuid4()
+            await self.offer(runtime, stream, pixels())
+            # The recording filesystem is replaced: every admission (the
+            # timeline record, the dispatch step and the event row) is refused.
+            detached = self.recordings.with_name("detached")
+            self.recordings.rename(detached)
+            self.recordings.mkdir(mode=0o700)
+            for luma in (pixels(), MOVED, MOVED):
+                await self.offer(runtime, stream, luma)
+            self.assertTrue(await self.until(
+                lambda: self.critical_texts() == [ALERT + "server_movement"]))
+            self.assertEqual([], self.rows("SELECT id FROM presence_observations "
+                                           "WHERE kind='server_movement'"))
+            await asyncio.sleep(0.3)
+            self.assertEqual([ALERT + "server_movement"], self.critical_texts())
+            # Storage returns: the staged observation is recorded and its
+            # delivery row takes the outcome of the alert already sent.
+            self.recordings.rmdir()
+            detached.rename(self.recordings)
+            self.assertTrue(await self.until(lambda: self.rows(
+                "SELECT state FROM presence_deliveries WHERE action='notification'")
+                == [("delivered",)]))
+            identifier = self.rows("SELECT id FROM presence_observations "
+                                   "WHERE kind='server_movement'")[0][0]
+            self.assertEqual([("server_movement", 1, "sent")], self.rows(
+                "SELECT kind, confirmed, delivery FROM notification_events "
+                f"WHERE event_id='{identifier}'"))
+            self.assertEqual(1, timeline.unrecorded.submitted)
+        self.assertEqual([ALERT + "server_movement"], self.critical_texts())
+
+    async def test_a_record_just_before_the_hard_stop_alerts_once_and_reconciles(self):
+        application = self.scene_application(dispatch_interval_seconds=3600,
+                                              dispatch_backoff_seconds=3600)
+        timeline = application.state.scene_timeline
+        async with asyncio.timeout(30), application.router.lifespan_context(application):
+            self.assertTrue(await self.until(lambda: timeline.opened))
+            dispatcher = application.state.critical_dispatcher
+            monitoring = application.state.monitoring
+            item = critical(CriticalKind.CAMERA_TAMPER, at=datetime.now(timezone.utc))
+            await asyncio.to_thread(timeline.recorder, item)
+            # The disk is removed before any dispatch step claimed the row.
+            detached = self.recordings.with_name("detached")
+            self.recordings.rename(detached)
+            self.recordings.mkdir(mode=0o700)
+            await dispatcher.once()
+            self.assertTrue(dispatcher.failing)
+            await dispatcher.alert_once()
+            self.assertTrue(await self.until(
+                lambda: self.critical_texts() == [ALERT + "camera_tamper"]))
+            self.assertEqual([("pending",)], self.rows(
+                "SELECT state FROM presence_deliveries WHERE action='notification'"))
+            self.recordings.rmdir()
+            detached.rename(self.recordings)
+            await monitoring.call(monitoring.settle_notifications, 10)
+            await dispatcher.once()
+            self.assertFalse(dispatcher.failing)
+            self.assertEqual([("delivered",)], self.rows(
+                "SELECT state FROM presence_deliveries WHERE action='notification'"))
+            self.assertEqual([("sent",)], self.rows(
+                f"SELECT delivery FROM notification_events WHERE event_id='{item.identifier}'"))
+        self.assertEqual([ALERT + "camera_tamper"], self.critical_texts())
+
+    async def test_a_shutdown_whose_final_dispatch_is_refused_still_alerts(self):
+        # Codex P1 on dae0154d: the final settle dispatch fails after the disk
+        # is removed and escalates the watched record; the settle drains the
+        # alerts again instead of only logging them unsent.
+        application = self.scene_application(dispatch_interval_seconds=3600,
+                                              dispatch_backoff_seconds=3600)
+        timeline = application.state.scene_timeline
+        with self.assertLogs("app", level="INFO") as logs:
+            async with asyncio.timeout(30), application.router.lifespan_context(application):
+                self.assertTrue(await self.until(lambda: timeline.opened))
+                item = critical(CriticalKind.SERVER_MOVEMENT, at=datetime.now(timezone.utc))
+                await asyncio.to_thread(timeline.recorder, item)
+                self.assertEqual((item.identifier,), timeline.unrecorded.awaiting())
+                # The disk is removed before any dispatch step claimed the row;
+                # the lifespan then ends without a periodic step in between.
+                detached = self.recordings.with_name("detached")
+                self.recordings.rename(detached)
+                self.recordings.mkdir(mode=0o700)
+            self.assertTrue(await self.until(
+                lambda: self.critical_texts() == [ALERT + "server_movement"]))
+        self.assertEqual(1, timeline.unrecorded.submitted)
+        self.assertEqual(0, timeline.unrecorded.queued)
+        self.assertFalse(any(Event.UNRECORDED_CRITICAL_ALERTS_UNSENT.value in line
+                             for line in logs.output))
+        self.recordings.rmdir()
+        detached.rename(self.recordings)
+        # The outcome row could not be written before exit, so the next
+        # process cannot know about the attempt and notifies the recorded
+        # observation once more: the one documented, Owner-accepted duplicate
+        # (and never a third time).
+        restarted = self.scene_application(dispatch_interval_seconds=0.05)
+        async with asyncio.timeout(30), restarted.router.lifespan_context(restarted):
+            self.assertTrue(await self.until(lambda: self.rows(
+                "SELECT state FROM presence_deliveries WHERE action='notification'")
+                == [("delivered",)]))
+        self.assertEqual([ALERT + "server_movement"] * 2, self.critical_texts())
+        again = self.scene_application(dispatch_interval_seconds=0.05)
+        async with asyncio.timeout(30), again.router.lifespan_context(again):
+            await asyncio.sleep(0.3)
+        self.assertEqual([ALERT + "server_movement"] * 2, self.critical_texts())
+
+    async def test_alerts_still_waiting_at_shutdown_are_logged_unsent(self):
+        # Claude review on e0028ca8 (提案 1): more refused alerts than the
+        # drain may hold while earlier ones are still in flight.
+        self.transport = GatedTransport()
+        self.addCleanup(self.transport.gate.set)
+        application = self.scene_application(dispatch_interval_seconds=3600,
+                                              dispatch_backoff_seconds=3600,
+                                              dispatch_settle_seconds=0.2)
+        timeline = application.state.scene_timeline
+        with self.assertLogs("app", level="INFO") as logs:
+            async with asyncio.timeout(30), application.router.lifespan_context(application):
+                self.assertTrue(await self.until(lambda: timeline.opened))
+                for _ in range(9):
+                    timeline.unrecorded.refused(uuid4(), CriticalKind.CAMERA_TAMPER)
+        self.assertEqual(8, timeline.unrecorded.submitted)
+        self.assertEqual(1, timeline.unrecorded.queued)
+        self.assertIn(f"ERROR:app.main:{Event.UNRECORDED_CRITICAL_ALERTS_UNSENT.value}", logs.output)
 
     async def test_settle_waits_for_a_slow_delivery_and_gives_up_at_its_bound(self):
         self.transport = GatedTransport()

@@ -39,6 +39,9 @@ the Owner through the same local event store and optional Slack delivery as a
 hardware-integrity or recording-health failure. No evidence-preservation port
 exists yet (a separate recording decision), so the `evidence` rows are
 recorded `unavailable` and that critical path stays reported unavailable.
+A confirmed observation whose record storage refuses (`STORAGE_HARD_STOP`)
+still attempts its Slack alert (Issue #318): the recorder hands it to
+`UnrecordedCriticalAlerts`, which the dispatcher drains on the same worker.
 
 Nothing here registers a route, reads pixels, names a person or infers cause.
 Timing policy stays explicit: there is no default source latency bound or
@@ -61,7 +64,7 @@ from app.logging import Event
 from app.storage.database import Database, PinnedDatabase
 
 from .adapters import CriticalTimelineRecorder, MainClock, OutboxState, TimelineOutbox
-from .delivery import ActionResult, notification_result
+from .delivery import ActionResult, NotificationAdapter, UnrecordedCriticalAlerts, notification_result
 from .service import PresenceService
 
 
@@ -234,13 +237,23 @@ class SceneTimeline:
         # evidence-preservation port exists yet (a separate recording
         # decision), so `critical_evidence` stays unavailable and its rows are
         # recorded `unavailable` by the dispatcher rather than left pending.
-        self.presence = PresenceService(self._pinned, reservation=reservation,
-                                        detection=detection, notifications=notifications)
+        # Issue #318: a confirmed critical whose record, or whose claim, storage
+        # refuses (hard stop) still attempts Slack through the same
+        # notification service; the dispatcher drains these on the monitoring
+        # worker.
+        self.unrecorded = (UnrecordedCriticalAlerts(notifications)
+                           if isinstance(notifications, NotificationAdapter) else None)
+        self.presence = PresenceService(
+            self._pinned, reservation=reservation, detection=detection,
+            notifications=notifications,
+            unrecorded_alerts=self.unrecorded.counts if self.unrecorded is not None else None)
         self._reconciled = False
         self.outbox = TimelineOutbox(self.presence, clock=configuration.clock,
                                      capacity=configuration.outbox_capacity)
         self.recorder = CriticalTimelineRecorder(
-            self.outbox, maximum_source_latency=configuration.maximum_source_latency)
+            self.outbox, maximum_source_latency=configuration.maximum_source_latency,
+            refused=self.unrecorded.refused if self.unrecorded is not None else None,
+            recorded=self.unrecorded.recorded if self.unrecorded is not None else None)
         self._lock = threading.Lock()
         self._pin_lock = threading.Lock()
         self._opened = False
@@ -341,11 +354,37 @@ class SceneTimeline:
         POST, so the claim stays unresolved for an audited Owner requeue and is
         never resent automatically. Raising leaves reconciliation for the
         next step.
+
+        A failing step (for example storage refused) escalates every
+        confirmed critical the recorder wrote but no step has claimed yet to
+        `UnrecordedCriticalAlerts` (Issue #318); a successful one stops
+        watching those whose notification row is no longer `pending` or
+        `unavailable`.
         """
         # `PinnedDatabase.pinned` takes only its own short lock, never
         # `_pin_lock`; an unpinned database also refuses every connection.
         if not self._pinned.pinned:
             raise TimelineNotPinned()
+        try:
+            progressed = self._dispatch(reconcile)
+        except Exception:
+            # Issue #318: a confirmed critical recorded just before storage
+            # was refused cannot be claimed now; attempt its Slack alert.
+            if self.unrecorded is not None:
+                self.unrecorded.escalate()
+            raise
+        if self.unrecorded is not None:
+            checked = self.unrecorded.awaiting()
+            if checked:
+                try:
+                    keep = self.presence.awaiting_notification(checked)
+                except Exception:
+                    self.unrecorded.escalate()
+                else:
+                    self.unrecorded.prune(checked, keep)
+        return progressed
+
+    def _dispatch(self, reconcile) -> int:
         if not self._reconciled:
             if reconcile is not None and self.presence.notifications is not None:
                 claims = self.presence.unconfirmed_actions("notification")
@@ -414,14 +453,40 @@ class CriticalDispatcher:
 
     def __init__(self, timeline: SceneTimeline,
                  run_step: Callable[[Callable[[], int]], Awaitable[int]],
-                 step: Callable[[], int]):
+                 step: Callable[[], int], *, alerts: Callable[[], int] | None = None):
         if not isinstance(timeline, SceneTimeline):
             raise TypeError("scene timeline is required")
         if not callable(run_step) or not callable(step):
             raise TypeError("dispatch step is required")
+        if alerts is not None and not callable(alerts):
+            raise TypeError("invalid unrecorded alert step")
         self.configuration = timeline.configuration
         self._run_step, self._step = run_step, step
+        self._alerts = alerts
         self._failures = 0
+        self._alert_failures = 0
+
+    async def alert_once(self) -> None:
+        """Attempt the alerts of refused critical records (Issue #318).
+
+        Runs ``alerts`` (`UnrecordedCriticalAlerts.drain`) through the same
+        ``run_step`` on the monitoring worker, independently of the dispatch
+        step and its backoff: while storage is refused every dispatch step
+        fails, and these alerts exist for exactly that time. A failure is
+        logged value-free (first of a streak and every doubling) and retried
+        at the next interval.
+        """
+        if self._alerts is None:
+            return
+        try:
+            await run_to_completion(self._run_step(self._alerts))
+        except Exception:
+            self._alert_failures += 1
+            failures = self._alert_failures
+            if failures & (failures - 1) == 0:
+                logging.getLogger(__name__).error(Event.UNRECORDED_CRITICAL_ALERTS_FAILING)
+            return
+        self._alert_failures = 0
 
     @property
     def failing(self) -> bool:
@@ -453,8 +518,17 @@ class CriticalDispatcher:
         return configuration.dispatch_interval_seconds
 
     async def run(self) -> None:
-        """Dispatch forever; cancel to stop (an in-flight step completes first)."""
-        delay = self.configuration.dispatch_interval_seconds
+        """Dispatch forever; cancel to stop (an in-flight step completes first).
+
+        The unrecorded alerts are attempted at every dispatch interval even
+        while the dispatch step itself is backing off.
+        """
+        interval = self.configuration.dispatch_interval_seconds
+        delay = interval
         while True:
-            await asyncio.sleep(delay)
-            delay = await self.once()
+            wait = min(delay, interval) if self._alerts is not None else delay
+            await asyncio.sleep(wait)
+            delay -= wait
+            await self.alert_once()
+            if delay <= 0:
+                delay = await self.once()
