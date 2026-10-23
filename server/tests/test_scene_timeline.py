@@ -446,7 +446,8 @@ class SceneTimelineApplicationTests(Fixture, unittest.IsolatedAsyncioTestCase):
 
         stream = uuid4()
         async with asyncio.timeout(20), application.router.lifespan_context(application):
-            timeline.presence.record = refused
+            # The critical recorder writes through `record_critical`.
+            timeline.presence.record = timeline.presence.record_critical = refused
             for luma in (pixels(), pixels(), MOVED, MOVED):
                 await self.offer(runtime, stream, luma)
             self.assertTrue(await self._until(lambda: runtime.status().critical_pending == 1))

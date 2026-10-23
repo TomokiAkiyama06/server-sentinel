@@ -1181,15 +1181,33 @@ local-retry buffer) leaves the row `unavailable` with nothing submitted, retried
 by a later step, and ends that action's batch. A step never pins the database
 (the outbox open does), so it cannot deadlock the monitoring worker. While
 storage is refused a confirmed observation cannot be recorded and waits only
-within the scene runtime's bounded critical staging; no Slack attempt is made
-for it meanwhile yet (Owner decision 2026-10-22: it shall attempt Slack during
-a hard stop like recording-health, accepting the duplicate risk; implemented
-in a follow-up issue). A claimed submission is never retried automatically: `failed`
+within the scene runtime's bounded critical staging, but its Slack alert is
+still attempted like a recording-health alert (Owner decision 2026-10-22,
+Issue #318, accepting the duplicate risk): the recorder hands the event ID
+and fixed kind to a bounded in-memory queue without blocking (64, overflow
+counted and logged value-free; in practice bounded by the 32-observation
+critical staging). Once recorded, an observation leaves that queue (its
+notification belongs to the dispatcher), and one whose notification row is
+still unclaimed is watched, registered inside the record transaction before
+its commit (at most 64; an idempotent replay of one already claimed or
+resolved is not watched), until a dispatch step claims it,
+escalating it when a dispatch step fails (a record just before the disk is
+removed, or a row left `unavailable` for queue space). The dispatcher submits these on the monitoring worker at every 5 s
+interval, independently of the failing dispatch step's backoff, through the
+same `NotificationService` under the observation identity, holding at most
+half of its queue (at least one slot; at most 8 attempts per hard stop with
+the default 16) so they cannot monopolise it. Owner status reports
+value-free `unrecorded_critical_alerts` counts. After recovery the recorded
+observation's notification claim joins that delivery or takes its stored
+outcome instead of sending again (only an Owner requeue resends); a process
+that ends between the attempt and its outcome row may notify a recovered
+observation once more, the accepted duplicate. A claimed submission is never retried automatically: `failed`
 or `uncertain` outcomes, and claims an earlier process left `submitting` or
 `queued` whose `notification_events` row is still `pending` (or absent), stay
 unresolved for an audited Owner requeue; a final `sent`/`failed`/`disabled` row
 completes such a claim at the next start. Shutdown runs one last step after
-scene `stop()` and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s, so that with the other stop steps shutdown stays within `TimeoutStopSec=90`) for submitted deliveries before the
+scene `stop()`, then drains these alerts once more (a last step refused by
+storage escalates the watched records to it), and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s, so that with the other stop steps shutdown stays within `TimeoutStopSec=90`) for submitted deliveries before the
 notification service closes. With Slack unconfigured the local row is
 `disabled` and `critical_notifications` stays `unavailable`. No
 evidence-preservation port exists yet (a separate recording decision), so
