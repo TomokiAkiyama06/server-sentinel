@@ -1293,7 +1293,13 @@ continues during an acquisition.
   `restart_reacquired`), `version`, `calibrated_at`, `phase` (`idle` /
   `acquiring` / `reacquire_pending`), `failure`, `owner_calibration_available`,
   and the scene runtime's `detection` state and `detection_reason`; never a
-  pixel, frame, digest, polygon or policy value.
+  pixel, frame, digest, polygon or policy value. A source with a stored
+  calibration reports `reacquire_pending` from the start of Main, also while
+  scene monitoring still waits for a deferred start (a timeline outbox open
+  that storage has not admitted yet): Main reads the history early to mark
+  it, but nothing is re-acquired, refused or notified before the runtime
+  runs or has ended (a status that cannot be read counts as ended) (Issue
+  #341).
 - *Restart re-acquisition.* After every Main start, once scene monitoring
   runs, each source with a stored calibration has its reference taken again,
   every source independently and concurrently (at most four), so a camera

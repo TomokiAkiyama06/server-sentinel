@@ -43,6 +43,9 @@ const TEXT = {
   done: '校正しました',
   noFrame: '時間内にカメラの映像を取得できませんでした。カメラの接続を確認してください。',
   restart: '再起動後に自動で取り直した基準（未確認）',
+  pending: '保存済みの校正あり（基準の取り直し待ち）',
+  pendingPhase: '検知の開始を待っている間も、この表示です。',
+  none: '未校正',
 };
 const CALIBRATE = `/api/scene/sources/${sourceId}/calibration`;
 
@@ -195,6 +198,12 @@ try {
     await ui.text(TEXT.restart);
     // A source without a template carries no control.
     assert.equal(await page.evaluate(`document.querySelectorAll('[data-calibration-source="${otherId}"] button').length`), 0);
+    // Issue #341: its stored calibration waits for the re-acquisition, so it
+    // is shown as stored and pending, never as "not calibrated".
+    await ui.text(TEXT.pending);
+    const other = await page.evaluate(`document.querySelector('[data-calibration-source="${otherId}"]').textContent`);
+    assert.ok(other.includes(TEXT.pendingPhase), other);
+    assert.ok(!other.includes(TEXT.none), other);
     // The control needs the explicit normal-position statement first.
     assert.equal(await page.evaluate(`document.querySelector('[data-calibration-source="${sourceId}"] button').disabled`), true);
     assert.deepEqual(posts(), []);

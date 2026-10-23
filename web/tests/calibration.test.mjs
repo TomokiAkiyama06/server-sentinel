@@ -179,9 +179,28 @@ test('a restart re-acquired reference warns that it was not confirmed by the Own
     calibrated_at: null, phase: 'reacquire_pending', failure: 'no_frame', owner_calibration_available: false,
     detection: 'inactive', detection_reason: 'calibration_reference_unavailable' }), name: null, disabled: false,
     confirmed: false, onConfirm: noop }));
-  for (const text of [t.calibrationPhase_reacquire_pending, t.calibrationRefused_no_frame, t.calibrationNoTemplate,
-    'calibration_reference_unavailable']) assert.ok(pending.includes(text), text);
+  for (const text of [t.calibrationOriginPending, t.calibrationPhase_reacquire_pending, t.calibrationRefused_no_frame,
+    t.calibrationNoTemplate, 'calibration_reference_unavailable']) assert.ok(pending.includes(text), text);
   assert.doesNotMatch(pending, /type="checkbox"|<button/);
+  // Issue #341: a stored calibration waiting for its re-acquisition (also
+  // while detection waits for a deferred start) is never "not calibrated".
+  assert.ok(!pending.includes(t.calibrationOrigin_none));
+  assert.match(pending, /data-calibration-origin="none"/);
+  for (const locale of ['ja', 'en']) {
+    const deferred = render(createElement(CalibrationCard, { t: messages[locale], item: source({ origin: 'none',
+      version: null, calibrated_at: null, phase: 'reacquire_pending', detection: 'inactive',
+      detection_reason: 'unavailable' }), name: null, disabled: false, confirmed: false, onConfirm: noop }));
+    assert.ok(deferred.includes(messages[locale].calibrationOriginPending), locale);
+    assert.ok(!deferred.includes(messages[locale].calibrationOrigin_none), locale);
+    const never = render(createElement(CalibrationCard, { t: messages[locale], item: source({ origin: 'none',
+      version: null, calibrated_at: null }), name: null, disabled: false, confirmed: false, onConfirm: noop }));
+    assert.ok(never.includes(messages[locale].calibrationOrigin_none), locale);
+    assert.ok(!never.includes(messages[locale].calibrationOriginPending), locale);
+  }
+  assert.match(messages.ja.calibrationOriginPending, /保存済みの校正/);
+  assert.doesNotMatch(messages.ja.calibrationOriginPending, /未校正/);
+  assert.match(messages.ja.calibrationPhase_reacquire_pending, /検知の開始を待っている間/);
+  assert.match(messages.en.calibrationPhase_reacquire_pending, /while detection has not started/);
 });
 
 test('every refusal and calibration text exists in both locales', () => {

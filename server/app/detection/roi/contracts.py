@@ -1,9 +1,15 @@
-"""Neutral calibrated scene observations, independent of presence decisions."""
+"""Neutral calibrated scene observations, independent of presence decisions.
+
+An observation identifies its calibration by identifier, version and creation
+time only. It carries no value derived from the reference frame (no digest,
+histogram or statistic), so no observation, timeline, audit or notification
+path that persists one can write image-derived data to disk (Owner decision
+2026-10-22, Issue #332).
+"""
 
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-import hashlib
 import math
 import re
 from uuid import UUID
@@ -133,12 +139,6 @@ class Calibration:
                 raise ValueError("polygon lies outside reference")
         # Geometry validation, support and budget checks are done by SceneDetector.
 
-    @property
-    def reference_sha256(self):
-        # In memory only (observations carry it for in-process correlation);
-        # never persisted with the calibration history (#205).
-        return hashlib.sha256(self.reference.pixels).hexdigest()
-
 
 @dataclass(frozen=True)
 class CriticalObservation:
@@ -153,7 +153,6 @@ class CriticalObservation:
     calibration_id: UUID
     calibration_version: int
     calibration_created_at: datetime
-    reference_sha256: str
     confidence: float
     quality: Quality
     reason: str
@@ -170,7 +169,6 @@ class SceneObservation:
     calibration_id: UUID
     calibration_version: int
     calibration_created_at: datetime
-    reference_sha256: str
     movement: Observation
     movement_quality: Quality
     tamper: Observation

@@ -37,7 +37,7 @@ from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
-from tests.test_detector_roi import HEIGHT, WIDTH, pixels, policy
+from tests.test_detector_roi import HEIGHT, WIDTH, frame_digests, frame_traces, pixels, policy
 from tests.test_monitoring_runtime import RuntimeFixture
 from tests.test_presence import NOW, MockAccess, observation
 from tests.test_presence_adapters import critical
@@ -685,6 +685,60 @@ class LifespanTests(RuntimeFixture):
         async with asyncio.timeout(30), restarted.router.lifespan_context(restarted):
             await asyncio.sleep(0.2)
         self.assertEqual([ALERT + "server_movement"], self.critical_texts())
+
+    async def test_no_frame_derived_value_reaches_the_timeline_audit_or_notifications(self):
+        # Issue #332: a confirmed critical observation crosses the presence
+        # adapter (`CriticalTimelineRecorder`), the timeline writer
+        # (`PresenceService.record_critical`), the audit records and the
+        # notification row and Slack delivery. None of them receives the
+        # reference or sample pixels, or any digest of them.
+        application = self.scene_application()
+        timeline = application.state.scene_timeline
+        runtime = application.state.scene_monitoring
+        traces = frame_traces(pixels(), MOVED)
+        written, writer = [], timeline.outbox.service.record_critical
+
+        def record_critical(observation, **options):
+            written.append(observation)
+            return writer(observation, **options)
+
+        timeline.outbox.service.record_critical = record_critical
+        async with asyncio.timeout(30), application.router.lifespan_context(application):
+            stream = uuid4()
+            for luma in (pixels(), pixels(), MOVED, MOVED):
+                await self.offer(runtime, stream, luma)
+            self.assertTrue(await self.until(
+                lambda: self.critical_texts() == [ALERT + "server_movement"]))
+            self.assertTrue(await self.until(lambda: self.rows(
+                "SELECT delivery FROM notification_events WHERE kind='server_movement'")
+                == [("sent",)]))
+        self.assertEqual(["server_movement"], [item.kind.value for item in written])
+        for item in written:
+            payload = json.dumps(item.payload(), sort_keys=True)
+            self.assertFalse([trace for trace in traces if trace in payload], payload)
+        requests = [request.data.decode("latin-1") for request, _ in self.transport.requests]
+        self.assertTrue(requests)
+        for body in requests:
+            self.assertFalse([trace for trace in traces if trace in body], body)
+        # Every row of every table (timeline, deliveries, notification
+        # events, audit records) and every file left in the state directory.
+        with closing(sqlite3.connect(self.settings.database_path)) as db:
+            tables = [row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+            self.assertIn("presence_observations", tables)
+            self.assertIn("notification_events", tables)
+            self.assertIn("security_admin_audit_records", tables)
+            for table in tables:
+                for row in db.execute(f'SELECT * FROM "{table}"'):
+                    for value in row:
+                        self.assertNotIsInstance(value, (bytes, bytearray), table)
+                        text = str(value)
+                        self.assertFalse([trace for trace in traces if trace in text], table)
+        stored = b"".join(path.read_bytes() for path in Path(self.settings.database_path).parent.rglob("*")
+                          if path.is_file())
+        for luma in (pixels(), MOVED):
+            self.assertNotIn(luma, stored)
+            for trace in frame_digests(luma):
+                self.assertNotIn(trace, stored)
 
     async def test_work_queued_while_dispatch_steps_fail_is_sent_after_recovery(self):
         application = self.scene_application()

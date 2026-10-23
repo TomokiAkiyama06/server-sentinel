@@ -79,11 +79,11 @@
     },
     {
       "path": "web/tests/calibration.test.mjs",
-      "sha256": "sha256:18cf841a49a72d68c61fb2d2d2d1885a669851cc1ec0ddcd2431e2b61c652c28"
+      "sha256": "sha256:8b87b233c87aecf6f79f6fe936462c3175f42b79cbd0785812672c756af5dbfe"
     },
     {
       "path": "web/tests/calibration_browser.mjs",
-      "sha256": "sha256:e913d20e59fdc0c95db1bcff2065813d9564e8392c3cb25407828a555edcbfdb"
+      "sha256": "sha256:b15d64f8208c874f09734bd780b2dfb100c5d800d9e38d87549c4917815fb617"
     }
   ],
   "inputs": [

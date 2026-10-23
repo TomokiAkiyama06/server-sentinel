@@ -185,6 +185,16 @@ export function CalibrationScreen({ services, t }: { services: DashboardServices
   </section>;
 }
 
+/**
+ * The origin badge. A source still waiting for its restart re-acquisition has
+ * no reference in use yet (`origin: none`) but does have a stored calibration
+ * (Issue #341), so it is not called "not calibrated".
+ */
+export function originText(t: Catalog, item: SceneCalibrationSource): string {
+  return item.origin === 'none' && item.phase === 'reacquire_pending'
+    ? t.calibrationOriginPending : t[`calibrationOrigin_${item.origin}`];
+}
+
 /** One source's calibration state and, when a template exists, its control. */
 export function CalibrationCard({ t, item, name, disabled, busy = false, confirmed, onConfirm, onCalibrate }: {
   t: Catalog; item: SceneCalibrationSource; name: string | null; disabled: boolean; busy?: boolean; confirmed: boolean;
@@ -195,7 +205,7 @@ export function CalibrationCard({ t, item, name, disabled, busy = false, confirm
     data-calibration-origin={item.origin} aria-busy={busy || undefined}>
     <h3>{name ?? `${t.calibrationSourceId} ${item.source_id.slice(0, 8)}`}</h3>
     <p>
-      <span className={`badge calibration-origin-${item.origin}`}>{t[`calibrationOrigin_${item.origin}`]}</span>{' '}
+      <span className={`badge calibration-origin-${item.origin}`}>{originText(t, item)}</span>{' '}
       <span className={`badge calibration-detection-${item.detection}`}>
         {t.calibrationDetection}: {t[`calibrationDetection_${item.detection}`]}</span>
     </p>
