@@ -1748,6 +1748,16 @@ continuous notification):
   continuous notification (or is not sent once the period sent one), even
   when it recovered a window and one bin or longer before; so a period
   still yields at most two notifications (Claude re-review PR #359 重要 1).
+  This also holds after the period closed: when one flapping episode of a
+  period is sent (or found sent), any other unsent flapping episode of the
+  same period (at most one more, owed or held by the cap) is settled
+  without a notice, so two flapping episodes held by the cap across the
+  period's close do not both go out. Inside a flapping period the Owner
+  decision of PR #335 (at most two) takes precedence over Issue #349 (an
+  outage that lasted the threshold is sent once); outside one, every
+  held episode is still sent once. Each episode settled this way (also a
+  later one skipped while the period is open) is counted (`suppressed`)
+  and logged value-free at INFO as `camera_offline_notification_suppressed`.
   A flapping episode of an earlier, closed period is never counted as, or
   skipped by, a later period's continuous notification. An outage that begins after an online of at least
   `after_seconds` is an ordinary episode, notified once it lasts

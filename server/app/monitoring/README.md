@@ -120,7 +120,10 @@ period: a sent notification of a source opens its alerted period, which
 closes after a whole window online; while it is open the ratio rule stays
 silent, and in a period a ratio alert opened only the first outage that
 stays offline for `after_seconds` after a short online is notified once more
-(at most two per flapping period, Owner decision 2026-10-23); an outage after
+(at most two per flapping period, Owner decision 2026-10-23; a flapping
+episode belongs to its period by generation, and once one is sent any other
+unsent one of that period is settled without a notice, counted in
+`suppressed`, also after the period closed); an outage after
 an online of at least `after_seconds` is an ordinary episode. A ratio alert is named
 `uuid5(EVENT_NAMESPACE, "camera-offline-flapping:<source>:<window>:<bucket>")`
 after the wall-clock window bucket, so a restart within a window of it sends

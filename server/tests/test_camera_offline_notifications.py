@@ -1662,6 +1662,60 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         self.assertEqual((_BY_RATIO, generation), (source.period, source.period_seq))
         self.assertIsNone(source.owed)
 
+    def test_two_held_flapping_episodes_of_a_closed_period_send_one(self):
+        # Claude re-review PR #359 重要 1 (after 0b9e994): two flapping
+        # episodes of one ratio period are both held by the cap and the
+        # period closes before a slot frees. Only one is sent: with the
+        # ratio alert, two notifications for the period (Owner decision PR
+        # #335 over Issue #349 inside a flapping period); the other is
+        # settled, counted and logged value-free.
+        monitor = self.monitor()
+        with self.assertLogs("app.monitoring.cameras", level="INFO") as logs:
+            source, start, generation = self.ratio_period_with_a_late_flapping_episode(monitor)
+            # An ordinary outage (after 400 s online) makes E1 owed; E2
+            # follows a 2 s online, so it is a flapping episode of the
+            # same period, and it lasts the threshold under the cap too.
+            self.off(monitor)
+            self.run_for(monitor, 100)
+            self.on(monitor)
+            self.run_for(monitor, 2)
+            self.off(monitor)
+            self.run_for(monitor, 320)
+            self.on(monitor)
+            self.assertEqual(2, self.drain(monitor).held)
+            self.assertEqual((generation, generation),
+                             (source.owed.period_seq, source.episode.period_seq))
+            self.run_for(monitor, 1000, step=60)
+            self.assertIsNone(source.period)
+            self.assertEqual([ALERT], self.texts())
+            while self.clock.value < start + 2460:
+                self.run_for(monitor, 60, step=60)
+            self.run_for(monitor, 3600, step=300)
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        self.assertEqual((None, None), (source.owed, source.episode))
+        self.assertEqual((1, 0), (monitor.suppressed, monitor.dropped))
+        self.assertIn(
+            f"INFO:app.monitoring.cameras:{Event.CAMERA_OFFLINE_NOTIFICATION_SUPPRESSED.value}",
+            logs.output)
+
+    def test_held_episodes_outside_a_ratio_period_are_each_sent(self):
+        # Issue #349 still holds outside a flapping period: two outages that
+        # each lasted the threshold, held by the cap, are each sent once.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        source = monitor._sources[self.sources[0]]
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            for _ in range(2):
+                self.off(monitor)
+                self.run_for(monitor, 330)
+                self.on(monitor)
+                self.run_for(monitor, 330)
+            self.assertIsNone(source.period)
+            self.run_for(monitor, 3 * 3600, step=300)
+        self.assertEqual([RECOVERED, RECOVERED], self.texts())
+        self.assertEqual((0, 0), (monitor.suppressed, monitor.dropped))
+
     def refused_closed_ratio_periods(self, monitor, count):
         # `count` flapping periods, each closed by a whole quiet window,
         # while the queue refuses every alert (Codex PR #359 P2).

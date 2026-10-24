@@ -117,7 +117,12 @@ so one flapping period yields at most two notifications. Which period a
 flapping episode belongs to is its generation (``period_seq``), not how long
 ago it recovered: a late notice of a flapping episode of the period still
 open is that period's continuous notification, or is skipped after it
-(Claude re-review PR #359 重要 1). An outage that
+(Claude re-review PR #359 重要 1). Sending one flapping episode settles any
+other unsent one of the same generation without a notice, also after the
+period closed (PR #335 takes precedence over Issue #349 inside a flapping
+period); every skipped or settled flapping episode is counted
+(``suppressed``) and logged value-free at INFO
+(``camera_offline_notification_suppressed``). An outage that
 begins after an online of at least ``after_seconds`` is an ordinary episode
 (one notification per episode, as before). A period opened by a continuous
 notification leaves the continuous rule as it was. Not-online time is kept
@@ -469,6 +474,9 @@ class CameraOfflineMonitor:
         self._resent: set[UUID] = set()
         self.recovered = 0
         self.dropped = 0
+        # Flapping episodes settled without a notice because their ratio
+        # period already had its continuous notification (PR #335).
+        self.suppressed = 0
         # Pending rows left out of ``restore_pending`` (beyond the cap).
         self.unrestored = 0
         # Restored rows not sent again because this process had already
@@ -891,6 +899,10 @@ class CameraOfflineMonitor:
             flap = isinstance(item, _Flap)
             resend = isinstance(item, _Resend)
             with self._lock:
+                if item.notified:
+                    # Settled earlier in this drain (a flapping episode of a
+                    # period whose continuous notification just went out).
+                    continue
                 # A restored row is never dropped: its source is not known.
                 ongoing = _ongoing(item)
                 source = None if resend else self._sources[identity]
@@ -903,6 +915,7 @@ class CameraOfflineMonitor:
                     # however long ago it recovered; one of an earlier
                     # period is still sent (Claude re-review PR #359 重要 1).
                     self._finish(identity, item)
+                    self._suppressed()
                     continue
                 if flap and item.ended and item.attempt is None:
                     # Issue #338 item 2 (Codex PR #335 P2): the period
@@ -1081,11 +1094,34 @@ class CameraOfflineMonitor:
                     source.period = _BY_CONTINUOUS
             elif _of_period(source, item):
                 source.continuous_sent = True
+            if item.flapping and item.period_seq is not None:
+                # Its period's one continuous notification: any other
+                # unsent flapping episode of the same generation (the other
+                # of owed / episode) is settled without a notice, also once
+                # the period has closed meanwhile (Owner decision PR #335
+                # over Issue #349 inside one flapping period; Claude
+                # re-review PR #359 重要 1). Later episodes of a period still
+                # open are covered by ``continuous_sent``.
+                for other in (source.owed, source.episode):
+                    if (other is not None and other is not item and not other.notified
+                            and other.flapping and other.period_seq == item.period_seq):
+                        other.notified = True
+                        self._drop_recovered(source, other)
+                        self._suppressed()
+        self._drop_recovered(source, item)
+
+    @staticmethod
+    def _drop_recovered(source: _Source, item: _Episode) -> None:
         if item.recovered is not None:
             if source.episode is item:
                 source.episode = None
             if source.owed is item:
                 source.owed = None
+
+    def _suppressed(self) -> None:
+        """One flapping episode settled without a notice (value-free log)."""
+        self.suppressed += 1
+        logging.getLogger(__name__).info(Event.CAMERA_OFFLINE_NOTIFICATION_SUPPRESSED)
 
     def _flapping_name(self, identity, flapping_id) -> tuple[UUID | None, bool]:
         if flapping_id is None:
