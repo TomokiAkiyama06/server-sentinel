@@ -1142,12 +1142,12 @@ Installation/service checkboxes above remain open.
 
 ### Issue #305 padding 付き MJPG buffer での連続 capture（一部実施）
 
-unit test（synthetic な JPEG 形の byte 列と非 0 の padding）で確認済み。実機では、PR #306 の修正（commit `190582c`、PR #346 の counter より前）で、frame rate と再起動の有無を確かめた。counter による確認は、まだ実施していない。
+unit test（synthetic な JPEG 形の byte 列と非 0 の padding）で確認済み。実機では、PR #306 の修正（commit `190582c`、PR #346 の counter より前）で、frame rate と、再起動の代わりの指標（CPU 秒の減少）を確かめた。counter による確認は、まだ実施していない。
 カメラは無人の壁またはテストチャートに向け、映像は保存・表示しない。serial・by-id 名・IP・hostname は記録しない。
 
 - [x] **実機記録（PR #306 の修正、commit `190582c`）**：capture host、Yamaha CS-800、MJPG 1280x720@30、1 source。transport PoC の holder（`poc15.py holder --sources 1 --profile 1280x720@30 --seconds 300`、`systemd-run --user --scope -p CPUQuota=100% -p MemoryMax=512M`）で、製品の `UvcCapture` を 5 分ずつ実行した。映像は保存も表示もせず、memory 上で frame 数を数えただけ。
-  - 再起動の回数は、`sample` 行の `child_cpu_seconds`（今生きている子孫 process の CPU 秒の合計）が減った回数で数えた。GStreamer child が作り直されると、この合計が減るため。1 source なので、この数え方が使える。ただし、1 秒ごとの sample の間に child が作り直され、新しい child が前の値以上の CPU を使った場合は、減らないので見逃す。そのため、下の「再起動 0 回」は「CPU 秒の減少が観測されなかった」という意味で、再起動が無かったことの確定ではない（frame が 0 だった秒も 0 なので、約 1 秒の途切れを伴う再起動は無かったと見られる）。これは代わりの指標で、PR #346 以降の `capture_restarts` counter による確認の代わりにはならない。この commit には `UvcCapture.counters()` がまだ無いので、`stream_invalid` / `padding_tolerated` は記録していない。
-  - 修正前（2026-10-21、暗い時間）：約 16 fps、5 分で CPU 秒の減少 51 回（約 6 秒に 1 回の再起動）、frame が 0 だった秒 55。
+  - 再起動の回数は、`sample` 行の `child_cpu_seconds`（今生きている子孫 process の CPU 秒の合計）が減った回数で数えた。GStreamer child が作り直されると、この合計が減るため。1 source なので、この数え方が使える。ただし、1 秒ごとの sample の間に child が作り直され、新しい child が前の値以上の CPU を使った場合は、減らないので見逃す。そのため、下の「CPU 秒の減少 0 回」は「減少が観測されなかった」という意味で、再起動が無かったことの確定ではない（frame が 0 だった秒も 0 なので、約 1 秒の途切れを伴う再起動は無かったと見られる）。これは代わりの指標で、PR #346 以降の `capture_restarts` counter による確認の代わりにはならない。この commit には `UvcCapture.counters()` がまだ無いので、`stream_invalid` / `padding_tolerated` は記録していない。
+  - 修正前（2026-10-21、暗い時間）：約 16 fps、5 分で CPU 秒の減少 51 回（見逃しがありうるので、再起動は少なくとも 51 回。約 6 秒に 1 回）、frame が 0 だった秒 55。
   - 修正後・照明あり（2026-10-22、2 回）：どちらも 28.8 fps、CPU 秒の減少（再起動の代わりの指標）0 回、frame が 0 だった秒 0、queue で捨てた frame 0。
   - 修正後・レンズを覆った暗い状態（2026-10-23、1 回）：28.8 fps（299 秒で 8,600 frame）、CPU 秒の減少 0 回、frame が 0 だった秒 0、queue で捨てた frame 0。
   - 28.8 fps は宣言値 30 fps の 96 % で、PoC の下限（80 % = 24 fps）を超えている。30 fps にわずかに届かない理由は、まだ調べていない。照明ありと暗い状態で値が同じなので、露出の自動調整だけでは説明しにくい。`queue_drops` が数えるのは `FrameQueue` が捨てた frame だけで、parser が捨てた buffer は含まない。
