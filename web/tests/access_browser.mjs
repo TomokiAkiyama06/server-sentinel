@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { clickWhenEnabled, launchChrome, pageFor, routeTracker } from './chrome.mjs';
+import { clickWhenEnabled, launchChrome, pageFor, routeTracker, unexpectedAbandoned } from './chrome.mjs';
 import { APP_CSP } from '../scripts/policy.mjs';
 
 const origin = 'http://localhost';
@@ -63,7 +63,13 @@ function inventory(extra = []) {
 const browser = await launchChrome();
 let cases = 0;
 
-async function scenario(name, { handlers: extra = () => ({}), verified = true } = {}, assertions) {
+/**
+ * One access-screen scenario. `expectAbandoned` names the requests the page
+ * may abandon before their answer (`unexpectedAbandoned`, #334); any other
+ * abandoned request fails the scenario. `afterChecks` runs after the last
+ * check, before the page closes: only the harness self-checks use it.
+ */
+async function scenario(name, { handlers: extra = () => ({}), verified = true, expectAbandoned = [], afterChecks } = {}, assertions) {
   const page = await pageFor(browser, { width: 390, height: 844 });
   const state = { challenges: [], inventoryLoads: 0 };
   const json = (status, value) => [status, JSON.stringify(value), 'application/json'];
@@ -119,9 +125,10 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true } 
     // A request the page aborted while it was paused here (a late answer
     // after pagehide, a reload replacing a load) can no longer be answered:
     // `page.answer` reports it only once Chrome confirmed the page cancelled
-    // it, and it is recorded as abandoned. Any other refusal is a harness error.
+    // it, and it is recorded as abandoned (failing the scenario unless it
+    // expects it). Any other refusal is a harness error.
     async function send(method, params) {
-      if (!await page.answer(networkId, method, { requestId, ...params })) abandoned.push(`${request.method} ${url.pathname}`);
+      if (!await page.answer(networkId, method, { requestId, ...params })) abandoned.push({ method: request.method, path: url.pathname });
     }
     async function fulfill(responseCode, content, contentType, csp) {
       const responseHeaders = [{ name: 'Cache-Control', value: 'no-store' }];
@@ -172,6 +179,7 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true } 
       await page.wait("document.querySelectorAll('[data-principal-id]').length === 2");
     },
   };
+  let checked = false;
   try {
     await page.navigate(`${origin}/app/`);
     await page.heading('概要');
@@ -180,8 +188,8 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true } 
     assert.deepEqual(exceptions, [], 'no unhandled browser errors');
     // Every handler has finished, a late answer included (Codex PR #331).
     assert.deepEqual(await routes.settle(), [], 'request interception must succeed');
-    // Only API requests are ever abandoned; the document and its assets are always delivered.
-    assert.deepEqual(abandoned.filter(item => !item.split(' ')[1].startsWith('/api/')), [], 'only API requests may be abandoned by the page');
+    // Nothing is abandoned unless the scenario names it (#334).
+    assert.deepEqual(unexpectedAbandoned(abandoned, expectAbandoned), [], 'no request is abandoned unless the scenario expects it');
     assert.deepEqual(unexpected, [], 'every request is expected');
     assert.deepEqual(await page.evaluate('window.__policyViolations'), [], 'no CSP violation');
     assert.deepEqual(await page.evaluate('window.__writes'), [], 'no storage or history writes');
@@ -201,9 +209,23 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true } 
       assert.equal(request.headers.Origin ?? request.headers.origin, origin, `Origin on POST ${request.path}`);
       assert.equal(request.headers.Referer ?? request.headers.referer, undefined);
     }
-    cases++;
-    process.stdout.write(`access screen: ${name}\n`);
-  } finally { cleanup.forEach(remove => remove()); await page.close(); }
+    if (afterChecks) await afterChecks({ page, requests, abandoned });
+    checked = true;
+  } finally {
+    // A handler the page started after the last settle is still checked
+    // before the page closes (#334); the teardown's own refusals are not errors.
+    let late = [];
+    try { late = await routes.finish(page.command); } finally { cleanup.forEach(remove => remove()); await page.close(); }
+    if (checked) {
+      assert.deepEqual(late, [], 'request interception must succeed until the page closes');
+      // A request the page abandoned after the last check counts as well.
+      assert.deepEqual(unexpectedAbandoned(abandoned, expectAbandoned), [], 'no request is abandoned unless the scenario expects it');
+      // So does a request nobody expected (Codex PR #352).
+      assert.deepEqual(unexpected, [], 'every request is expected until the page closes');
+    }
+  }
+  cases++;
+  process.stdout.write(`access screen: ${name}\n`);
 }
 
 try {
@@ -313,7 +335,9 @@ try {
       [`POST /api/admin/principals/${personId}/permissions`]: stepUpRequired,
       'POST /api/auth/step-up': async () => { await delay(800); return [204, '', null]; },
     }),
-  }, async ({ page, ui, posts }) => {
+    // The page aborts the pending assertion on pagehide.
+    expectAbandoned: [{ method: 'POST', path: '/api/auth/step-up' }],
+  }, async ({ page, ui, posts, abandoned }) => {
     await ui.open();
     await ui.button('付与する');
     await ui.button(TEXT.confirm);
@@ -325,6 +349,7 @@ try {
     // The change itself was never resent.
     assert.deepEqual(posts().map(item => item.path), [`/api/admin/principals/${personId}/permissions`,
       '/api/auth/step-up/options', '/api/auth/step-up']);
+    assert.deepEqual(abandoned, [{ method: 'POST', path: '/api/auth/step-up' }]);
   });
 
   await scenario('pagehide after the retry was sent reports an unknown result', {
@@ -333,6 +358,8 @@ try {
       return { [`POST /api/admin/principals/${personId}/permissions`]: () => (grants += 1) === 1
         ? stepUpRequired() : delay(800).then(() => [204, '', null]) };
     },
+    // The page aborts the retried change on pagehide; its outcome is unknown.
+    expectAbandoned: [{ method: 'POST', path: `/api/admin/principals/${personId}/permissions` }],
   }, async ({ page, ui, posts }) => {
     await ui.open();
     await ui.button('付与する');
@@ -344,12 +371,14 @@ try {
     assert.deepEqual(posts().map(item => item.path), [path, '/api/auth/step-up/options', '/api/auth/step-up', path]);
   });
 
-  await scenario('an invitation answered after pagehide never shows its code', {
+  // The page aborts the invitation request on pagehide.
+  const lateInvitation = {
     handlers: json => ({ 'POST /api/admin/principals': async () => {
       await delay(800);
       return json(200, { principal_id: newId, code: CODE, expires_at: at });
     } }),
-  }, async ({ page, ui, posts, abandoned }) => {
+  };
+  async function lateInvitationChecks({ page, ui, posts, abandoned }) {
     await ui.open();
     await ui.type('.access-invite input[type="text"]', '生成 招待者');
     await ui.button('招待コードを発行');
@@ -363,8 +392,11 @@ try {
     assert.equal((await page.evaluate('document.body.innerText')).includes(CODE), false);
     assert.equal(await page.evaluate("document.querySelector('.access-invite button.primary').disabled"), false);
     // The request itself was aborted: its answer could not even be delivered.
-    assert.deepEqual(abandoned, ['POST /api/admin/principals']);
-  });
+    assert.deepEqual(abandoned, [{ method: 'POST', path: '/api/admin/principals' }]);
+  }
+  await scenario('an invitation answered after pagehide never shows its code', {
+    ...lateInvitation, expectAbandoned: [{ method: 'POST', path: '/api/admin/principals' }],
+  }, lateInvitationChecks);
 
   await scenario('a shown code is dropped when that person is re-issued or revoked, whatever the answer', {
     handlers: json => {
@@ -397,6 +429,63 @@ try {
     await ui.text(TEXT.unknown);
     assert.equal(await page.evaluate("document.querySelector('[data-invitation-code]') === null"), true, 'no code is shown');
   });
+
+  // Harness self-checks (#334): each must fail the scenario.
+  // A POST the page abandons without the scenario naming it.
+  await assert.rejects(scenario('self-check: an unexpected abandoned POST', lateInvitation, lateInvitationChecks), error => {
+    assert.match(error.message, /^no request is abandoned unless the scenario expects it\n/);
+    assert.deepEqual(error.actual, ['POST /api/admin/principals']);
+    return true;
+  });
+  // A genuine handler error started after the last settle, before the page closes.
+  const lateFailure = '/api/self-check/late';
+  await assert.rejects(scenario('self-check: a late genuine interception error', {
+    handlers: () => ({ [`POST ${lateFailure}`]: () => { throw new TypeError(`synthetic late failure ${CODE}`); } }),
+    async afterChecks({ page, requests }) {
+      await page.evaluate(`void fetch(${JSON.stringify(lateFailure)}, { method: 'POST', body: '{}' }).catch(() => undefined)`);
+      for (let attempt = 0; attempt < 100 && !requests.some(item => item.path === lateFailure); attempt++) await delay(20);
+      assert.ok(requests.some(item => item.path === lateFailure), 'the late request reached the interceptor');
+    },
+  }, async ({ ui }) => { await ui.open(); }), error => {
+    assert.match(error.message, /^request interception must succeed until the page closes\n/);
+    // Value-free: the handler's message (which quotes the code) is dropped.
+    assert.deepEqual(error.actual, ['TypeError raised by the interceptor']);
+    return true;
+  });
+  // A request the page abandons after the last check, before the page closes.
+  const lateAbandon = '/api/self-check/abandoned';
+  await assert.rejects(scenario('self-check: a request abandoned after the last check', {
+    handlers: () => ({ [`POST ${lateAbandon}`]: async () => { await delay(300); return [204, '', null]; } }),
+    async afterChecks({ page, requests, abandoned }) {
+      await page.evaluate(`(() => { const controller = new AbortController();
+        fetch(${JSON.stringify(lateAbandon)}, { method: 'POST', body: '{}', signal: controller.signal }).catch(() => undefined);
+        window.__abortLate = () => controller.abort(); })()`);
+      for (let attempt = 0; attempt < 100 && !requests.some(item => item.path === lateAbandon); attempt++) await delay(20);
+      assert.ok(requests.some(item => item.path === lateAbandon), 'the late request reached the interceptor');
+      await page.evaluate('window.__abortLate()');
+      // Recorded once its late answer is refused as cancelled by the page.
+      for (let attempt = 0; attempt < 100 && !abandoned.length; attempt++) await delay(20);
+      assert.equal(abandoned.length, 1, 'the late request was abandoned');
+    },
+  }, async ({ ui }) => { await ui.open(); }), error => {
+    assert.match(error.message, /^no request is abandoned unless the scenario expects it\n/);
+    assert.deepEqual(error.actual, [`POST ${lateAbandon}`]);
+    return true;
+  });
+  // A request nobody expected, started after the last check, before the page closes.
+  const lateUnexpected = '/api/self-check/unexpected';
+  await assert.rejects(scenario('self-check: an unexpected request after the last check', {
+    async afterChecks({ page, requests }) {
+      await page.evaluate(`void fetch(${JSON.stringify(lateUnexpected)}, { method: 'POST', body: '{}' }).catch(() => undefined)`);
+      for (let attempt = 0; attempt < 100 && !requests.some(item => item.path === lateUnexpected); attempt++) await delay(20);
+      assert.ok(requests.some(item => item.path === lateUnexpected), 'the late request reached the interceptor');
+    },
+  }, async ({ ui }) => { await ui.open(); }), error => {
+    assert.match(error.message, /^every request is expected until the page closes\n/);
+    assert.deepEqual(error.actual, [`POST ${lateUnexpected}`]);
+    return true;
+  });
+  process.stdout.write('access screen harness: an unexpected abandoned POST, a late interception error, a late abandon and a late unexpected request all fail\n');
 
   process.stdout.write(`${cases} access screen scenarios passed; a virtual authenticator is not a real passkey provider.\n`);
 } finally { await browser.close(); }
