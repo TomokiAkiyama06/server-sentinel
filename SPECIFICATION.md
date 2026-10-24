@@ -1742,7 +1742,14 @@ continuous notification):
   episode that stays offline for `after_seconds` is notified once by the
   continuous rule; the episode in progress at the alert counts that time from
   the alert, not from its own start. Later flapping episodes of the period
-  are not notified. An outage that begins after an online of at least
+  are not notified. An episode belongs to the period by the period's
+  generation, not by how long ago it recovered: a flapping episode held by
+  the cap and sent late, while its period is still open, is that period's
+  continuous notification (or is not sent once the period sent one), even
+  when it recovered a window and one bin or longer before; so a period
+  still yields at most two notifications (Claude re-review PR #359 重要 1).
+  A flapping episode of an earlier, closed period is never counted as, or
+  skipped by, a later period's continuous notification. An outage that begins after an online of at least
   `after_seconds` is an ordinary episode, notified once it lasts
   `after_seconds` as before, however long the period stays open.
 - In a period a continuous notification opened, the continuous rule is

@@ -1607,6 +1607,61 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         self.assertEqual(0, len(source.late_flaps))
         self.assertEqual(0, monitor.dropped)
 
+    def ratio_period_with_a_late_flapping_episode(self, monitor):
+        # A ratio period opens and its alert takes one slot; the other three
+        # are full for 2400 s. Its flapping episode E1 lasts the threshold
+        # under the cap and recovers; 400 s online (at least the threshold,
+        # less than a window) makes E1 owed while the period stays open.
+        source = monitor._sources[self.sources[0]]
+        self.online(monitor)
+        self.cycle(monitor)
+        self.off(monitor)
+        while source.period != _BY_RATIO:
+            self.run_for(monitor, 30)
+        self.assertEqual([ALERT], self.texts())
+        start, generation = self.clock.value, source.period_seq
+        monitor.restore_window([(uuid4(), 1200.0) for _ in range(3)], monotonic=start)
+        self.run_for(monitor, 330)
+        self.on(monitor)
+        self.run_for(monitor, 400)
+        return source, start, generation
+
+    def test_a_late_flapping_episode_of_the_open_period_is_its_continuous_notice(self):
+        # Claude re-review PR #359 重要 1 (Owner decision PR #335): E1 is
+        # sent after it recovered more than a window and one bin ago, while
+        # its period is still open. It is still that period's continuous
+        # notification, so the later flapping episode E3 is not notified:
+        # two notifications in the period.
+        monitor = self.monitor()
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            source, start, generation = self.ratio_period_with_a_late_flapping_episode(monitor)
+            while self.clock.value < start + 2460:
+                self.cycle(monitor, offline=200)
+            self.assertEqual([ALERT, RECOVERED], self.texts())
+            self.assertTrue(source.continuous_sent)
+            self.cycle(monitor, offline=330)
+            self.run_for(monitor, 600, step=60)
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        self.assertEqual((_BY_RATIO, generation), (source.period, source.period_seq))
+        self.assertEqual(0, monitor.dropped)
+
+    def test_a_late_flapping_episode_is_not_sent_after_the_period_notified(self):
+        # The reverse order: the flapping episode E2 in progress takes a
+        # freed slot first as the period's continuous notification; the late
+        # E1 of the same period is then settled without a third notice.
+        monitor = self.monitor()
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            source, start, generation = self.ratio_period_with_a_late_flapping_episode(monitor)
+            while self.clock.value + 202 < start + 2070:
+                self.cycle(monitor, offline=200)
+            self.off(monitor)
+            self.run_for(monitor, start + 2430 - self.clock.value)
+            self.on(monitor)
+            self.run_for(monitor, 600, step=60)
+        self.assertEqual([ALERT, ALERT], self.texts())
+        self.assertEqual((_BY_RATIO, generation), (source.period, source.period_seq))
+        self.assertIsNone(source.owed)
+
     def refused_closed_ratio_periods(self, monitor, count):
         # `count` flapping periods, each closed by a whole quiet window,
         # while the queue refuses every alert (Codex PR #359 P2).

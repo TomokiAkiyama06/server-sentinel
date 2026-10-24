@@ -113,7 +113,11 @@ outage in progress at the alert and every outage that begins after an online
 shorter than ``after_seconds`` are *flapping episodes*; the first of them
 that stays offline for ``after_seconds`` (the one in progress counting from
 the alert) is notified once by the continuous rule and later ones are not,
-so one flapping period yields at most two notifications. An outage that
+so one flapping period yields at most two notifications. Which period a
+flapping episode belongs to is its generation (``period_seq``), not how long
+ago it recovered: a late notice of a flapping episode of the period still
+open is that period's continuous notification, or is skipped after it
+(Claude re-review PR #359 重要 1). An outage that
 begins after an online of at least ``after_seconds`` is an ordinary episode
 (one notification per episode, as before). A period opened by a continuous
 notification leaves the continuous rule as it was. Not-online time is kept
@@ -226,6 +230,10 @@ class _Episode:
     # Part of a ratio-opened flapping period: in progress at its alert, or
     # begun after an online shorter than ``after_seconds`` inside it.
     flapping: bool = False
+    # The source's ``period_seq`` of that ratio-opened period: a flapping
+    # episode belongs to the period of this generation only, however long
+    # ago it recovered (Claude re-review PR #359 重要 1).
+    period_seq: int | None = None
     # The episode every source starts with: in progress since this process
     # started, so the only one that can be an earlier process's outage that
     # a restored pending row reported (PR #339, Codex P2).
@@ -396,9 +404,11 @@ class _Source:
     # attempt), oldest first: set aside so none of them blocks a new ratio
     # period of the source (Issue #349 review 提案 3, Codex PR #359 P2). At
     # most ``LATE_FLAPS_PER_SOURCE``.
-    late_flaps: deque = field(default_factory=deque)
+    late_flaps: deque[_Flap] = field(default_factory=deque)
     # A ratio-opened period already sent its one continuous notification.
     continuous_sent: bool = False
+    # Generation of the ratio-opened periods, bumped each time one opens.
+    period_seq: int = 0
 
 
 @dataclass(frozen=True)
@@ -539,8 +549,10 @@ class CameraOfflineMonitor:
                 # Inside a ratio-opened period, an outage after a short
                 # online continues the flapping; after a longer one it is an
                 # ordinary episode.
+                flapping = source.period == _BY_RATIO and short_online
                 source.episode = _Episode(
-                    now, flapping=source.period == _BY_RATIO and short_online)
+                    now, flapping=flapping,
+                    period_seq=source.period_seq if flapping else None)
         source.online, source.active = online, active
 
     def _close_period(self, source: _Source, now: float) -> None:
@@ -819,9 +831,11 @@ class CameraOfflineMonitor:
                         # more (Owner decision 2026-10-23, PR #335).
                         source.period, source.flap = _BY_RATIO, _Flap(now)
                         source.continuous_sent = False
+                        source.period_seq += 1
                         episode = source.episode
                         if episode is not None and episode.recovered is None:
                             episode.counted_from, episode.flapping = now, True
+                            episode.period_seq = source.period_seq
                     episode = source.episode
                     if (flapping_id is not None and source.period is None
                             and source.flap is None and episode is not None
@@ -857,8 +871,9 @@ class CameraOfflineMonitor:
                 # nothing; pending: covered by a restored resend or sent
                 # again under its ID and time).
                 source.period, source.continuous_sent = _BY_RATIO, False
+                source.period_seq += 1
                 source.flap = _Flap(now, name=(event_id, earlier))
-                episode.flapping = True
+                episode.flapping, episode.period_seq = True, source.period_seq
             # Outages and ratio periods in progress first, by their start;
             # then recovered episodes and ended ratio alerts, by their start;
             # restored rows last, by their stored time. An outage in progress
@@ -879,11 +894,14 @@ class CameraOfflineMonitor:
                 # A restored row is never dropped: its source is not known.
                 ongoing = _ongoing(item)
                 source = None if resend else self._sources[identity]
-                if (not flap and not resend and item.flapping and source.period == _BY_RATIO
-                        and source.continuous_sent and not self._stale(item, now)):
+                if (not flap and not resend and _of_period(source, item)
+                        and source.continuous_sent):
                     # A ratio-opened period yields at most one continuous
-                    # notification after its ratio alert (at most two). A
-                    # stale episode belongs to an earlier period: still sent.
+                    # notification after its ratio alert (at most two). The
+                    # period is told by its generation, not by time: a
+                    # flapping episode of the period still open is skipped
+                    # however long ago it recovered; one of an earlier
+                    # period is still sent (Claude re-review PR #359 重要 1).
                     self._finish(identity, item)
                     continue
                 if flap and item.ended and item.attempt is None:
@@ -1034,9 +1052,11 @@ class CameraOfflineMonitor:
         outage that recovered a window and one bin or longer before it was
         sent (``now``, ``_stale``, Issue #349 review 提案 2): none of its
         not-online time is left in the ratio window, so a camera flapping by
-        then still gets its ratio alert. A stale episode is never the
-        continuous notification of a ratio-opened period either: it belongs
-        to an earlier one.
+        then still gets its ratio alert. Whether a sent episode is the one
+        continuous notification of a ratio-opened period is decided by the
+        period's generation (``_of_period``), not by time: a flapping
+        episode of the period still open counts however long ago it
+        recovered, and one of an earlier period (or none) never does.
         """
         item.notified = True
         if isinstance(item, _Resend):
@@ -1055,11 +1075,11 @@ class CameraOfflineMonitor:
             source.late_flaps = deque(flap for flap in source.late_flaps
                                       if flap is not item)
             return
-        stale = self._stale(item, now)
-        if sent and not stale:
+        if sent:
             if source.period is None:
-                source.period = _BY_CONTINUOUS
-            elif source.period == _BY_RATIO and item.flapping:
+                if not self._stale(item, now):
+                    source.period = _BY_CONTINUOUS
+            elif _of_period(source, item):
                 source.continuous_sent = True
         if item.recovered is not None:
             if source.episode is item:
@@ -1115,6 +1135,12 @@ def _ongoing(item) -> bool:
     if isinstance(item, _Flap):
         return not item.ended
     return item.recovered is None
+
+
+def _of_period(source: _Source, item: _Episode) -> bool:
+    """A flapping episode of the source's ratio-opened period still open."""
+    return (source.period == _BY_RATIO and item.flapping
+            and item.period_seq == source.period_seq)
 
 
 def _due_order(entry):
