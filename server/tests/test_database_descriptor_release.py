@@ -54,8 +54,14 @@ def posix_locks_of_this_process(identity: tuple[int, int]) -> list[PosixLock]:
         fields = line.split()
         if len(fields) != 8 or fields[1] != "POSIX":
             continue
-        major, minor, number = fields[5].split(":")
-        if (int(major, 16), int(minor, 16), int(number)) != target or int(fields[4]) != pid:
+        # Another process's lock on a file without an inode prints
+        # ``<none>:0``; it is not ours, so it is skipped, not an error.
+        try:
+            major, minor, number = fields[5].split(":")
+            entry = (int(major, 16), int(minor, 16), int(number))
+        except ValueError:
+            continue
+        if entry != target or int(fields[4]) != pid:
             continue
         locks.append((fields[2], fields[3], int(fields[4]), fields[6], fields[7]))
     return sorted(locks)
