@@ -27,7 +27,7 @@ from app.cameras.uvc.identity import CameraState, DeviceEvidence, HealthEvent
 from app.cameras.uvc.runtime import LocalUvcDependencies
 from app.logging import Event
 from app.main import create_app
-from app.monitoring.cameras import _BY_CONTINUOUS, DOWN_BINS, CameraOfflineMonitor
+from app.monitoring.cameras import _BY_CONTINUOUS, _BY_RATIO, DOWN_BINS, CameraOfflineMonitor
 from app.monitoring.config import CameraOfflineNotification, parse_monitoring
 from app.monitoring.runtime import (
     CAMERA_OFFLINE_RENOTIFY_CHAIN, EVENT_NAMESPACE, MonitoringDependencies,
@@ -428,6 +428,33 @@ class CapTests(MonitorFixture, unittest.TestCase):
             self.advance(3600)
             self.drain(monitor)
         self.assertEqual(2, len(self.sent()))
+
+    def test_an_outage_in_progress_goes_before_a_recovered_one(self):
+        # Issue #349 review 重要 1: A was held and recovered, B went offline
+        # later and is still offline. When the slot frees, B (in progress)
+        # is sent first; A's late "already recovered" notice waits.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        first, second = self.sources
+        monitor.health_sink(event(first, CameraState.OFFLINE))
+        self.advance(310)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.drain(monitor)
+        monitor.health_sink(event(first, CameraState.ONLINE))
+        self.advance(10)
+        monitor.health_sink(event(second, CameraState.OFFLINE))
+        self.advance(310)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.assertEqual(2, self.drain(monitor).held)
+        self.advance(3600 - 630)
+        status = self.drain(monitor)
+        self.assertEqual((1, 1), (status.offline_sources, status.held))
+        self.assertEqual([ALERT], self.texts())
+        self.advance(3600)
+        self.drain(monitor)
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        self.assertEqual(0, monitor.dropped)
 
     def test_held_recovered_episodes_never_exceed_the_cap(self):
         # Issue #349: every source held and recovered; each is sent once,
@@ -1473,6 +1500,69 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         self.advance(3600)
         self.drain(monitor)
         self.assertEqual((1, 0), (len(self.sent()), monitor.dropped))
+
+    def test_a_late_notice_of_a_long_recovered_outage_opens_no_period(self):
+        # Issue #349 review 提案 2: the late "already recovered" notice of an
+        # outage that ended more than a window earlier opens no alerted
+        # period, so the flapping by then still gets its ratio alert.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.off(monitor)
+            self.run_for(monitor, 330)
+            self.on(monitor)
+            self.run_for(monitor, 2400, step=60)
+            for _ in range(5):
+                self.cycle(monitor)
+        source = monitor._sources[self.sources[0]]
+        self.assertEqual([RECOVERED], self.texts())
+        self.assertEqual(_BY_RATIO, source.period)
+        self.assertIsNotNone(source.flap)
+        for _ in range(16):
+            self.cycle(monitor)
+        self.assertEqual([RECOVERED, ALERT], self.texts())
+
+    def test_a_late_notice_of_a_recent_outage_still_opens_the_period(self):
+        # PR #320: one that recovered within the window before it was sent
+        # opens the period, so the ratio rule does not report it again.
+        monitor = self.monitor()
+        self.online(monitor)
+        self.off(monitor)
+        self.advance(310)
+        self.on(monitor)
+        self.advance(50)
+        self.drain(monitor)
+        self.assertEqual([RECOVERED], self.texts())
+        self.assertEqual(_BY_CONTINUOUS, monitor._sources[self.sources[0]].period)
+
+    def test_a_waiting_ended_ratio_alert_never_blocks_a_new_period(self):
+        # Issue #349 review 提案 3: a refused ratio alert whose period closed
+        # waits for the cap apart from the source's current ratio alert, so
+        # new flapping is still evaluated and alerted.
+        monitor = self.monitor(hourly_limit=1)
+        attempt = self.refused_ratio_alert_whose_period_closed(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        source = monitor._sources[self.sources[0]]
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.drain(monitor)
+            self.assertIsNone(source.flap)
+            self.assertIsNotNone(source.late_flap)
+            for _ in range(2):
+                self.cycle(monitor)
+        self.assertEqual(_BY_RATIO, source.period)
+        self.assertIsNotNone(source.flap)
+        self.assertIsNot(source.flap, source.late_flap)
+        self.assertEqual([], self.sent())
+        for _ in range(32):
+            self.cycle(monitor)
+        rows = sorted(self.sent(), key=lambda row: row.at)
+        self.assertEqual(2, len(rows))
+        self.assertIn((attempt[1], attempt[0]), [(row.event_id, row.at) for row in rows])
+        # The new period's alert (in progress) goes first.
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        self.assertIsNone(source.late_flap)
+        self.assertEqual(0, monitor.dropped)
 
     def test_a_refused_continuous_episode_is_sent_after_it_recovered(self):
         # The continuous rule the refused ratio alert now matches.

@@ -1624,10 +1624,16 @@ once when the hour allows, also when the source recovered meanwhile (Owner
 decision 2026-10-24, Issue #349, consistent with PR #320: an episode that
 reached the threshold is notified once even if it recovered before the
 drain). The cap stays absolute, so such a notice can be up to about an hour
-late. A source keeps at most one recovered episode owed besides the one in
-progress (above), so a source that recovers for longer than `after_seconds`
-and fails again twice while the cap holds drops the oldest
-(`camera_offline_notification_dropped`). An episode in
+late. A source keeps at most two unsent episodes: its latest one (in progress,
+or itself recovered and held) and one owed earlier episode (above). So a
+source that, while the cap holds, has three outages of at least
+`after_seconds` each separated by an online of at least `after_seconds`
+drops the oldest (`camera_offline_notification_dropped`, counted); this
+bound on memory is the one exception to "notified once" (pending Owner
+confirmation, PR #359). A late notice is sent after every outage or ratio
+period still in progress (below), so it never delays one; and one whose
+outage recovered more than a window (`flapping_window_seconds`, plus one
+bin) before it was sent opens no alerted period (below). An episode in
 progress is named after the source and its registry `last_seen_at` (the last
 frame time), so a restart during the same outage finds the row and does not
 notify again. Only a final row (`sent`, `failed` or `disabled`) counts as
@@ -1644,8 +1650,11 @@ before the drain (the row does not name its source, so it opens no alerted
 period and is never dropped as recovered). A resend takes a slot like any
 notification: one whose uncertain delivery still holds a slot of the restored
 hour waits until that slot has expired, so a resend can be up to about an hour
-late, and live alerts (outages and ratio alerts of this process) are sent
-before resends, which follow in stored-time order. An episode or ratio alert
+late. The send order is: outages and ratio periods of this process still in
+progress, by their start; then its episodes that already recovered and its
+ratio alerts whose period closed, by their start; then resends, in
+stored-time order (Issue #349 review: a late "already recovered" notice
+never takes the freed slot ahead of a camera that is still offline). An episode or ratio alert
 whose durable name is such a row is covered by it as soon as it is named,
 before the cap is consulted, and sends nothing twice. Only the outage in
 progress since the service started (each source's first episode) and a ratio
@@ -1713,7 +1722,12 @@ continuous notification):
 
 - Every `camera_offline` of a source that was sent (either rule), or that an
   earlier process already stored, opens that source's *alerted period*. One
-  dropped under the cap opens none (the Owner was never told). The period
+  dropped under the cap opens none (the Owner was never told), and nor does
+  a late notice of an outage that recovered more than a window and one bin
+  before it was sent: none of its not-online time is left in the ratio
+  window, so a camera flapping by then still gets its ratio alert. One that
+  recovered more recently opens it as before, so the ratio rule never
+  reports that outage again. The period
   closes only once the source has stayed online (or inactive) for a whole
   `flapping_window_seconds`; a shorter online keeps it open.
 - While the period is open the ratio rule does not notify that source.
@@ -1753,7 +1767,11 @@ continuous notification):
   after its period closed, and when the cap has closed by then it waits for
   the hour like a held continuous episode (Issue #349) instead of being
   dropped, so a backpressure lasting a window never leaves the period
-  unnotified.
+  unnotified. While it waits it is set aside from the source's current
+  ratio alert, so the ratio rule and the restart lookup (below) keep
+  evaluating that source and a new flapping period gets its own alert
+  (sent first, as it is in progress); the late one says `(already
+  recovered)` about its own closed period.
 
 `MonitoringStatus.camera_offline_degraded` is also set while a ratio-opened
 period is open. Per source the not-online seconds are kept in at most 130
