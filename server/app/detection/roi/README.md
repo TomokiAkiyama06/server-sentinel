@@ -516,7 +516,11 @@ its reference.
   empty and `reacquire()` does nothing until `start()`. An unreadable
   history marks the source with `failure="history_unavailable"` (unknown,
   not "stored"); `start()` reads the history again, clearing that failure or
-  withdrawing the mark when nothing is stored.
+  withdrawing the mark when nothing is stored. "History unknown" is its own
+  state, not the last failure (Issue #355): `status()` keeps
+  `history_unavailable` while it lasts, and an attempt that read the
+  history (an Owner calibration that then fails, for example) settles the
+  mark the same way.
 - `status()` is value-free: origin, version, time, phase, last refusal,
   whether a template exists, and the runtime's own source state and reason.
 
