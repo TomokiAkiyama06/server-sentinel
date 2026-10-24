@@ -1060,6 +1060,29 @@ class CaptureTests(CaptureCase):
         self.assertEqual(self.state(capture), ("offline", "capture_failed"))
         self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(5, 1, 0))
 
+    def test_failed_relaunch_after_stall_counts_launch_failures(self):
+        # Issue #354: after a stall, a relaunch that keeps failing (e.g. a
+        # USB error on open/launch) never raises ``launches``; only
+        # ``launch_failures`` shows it, once per failed attempt, and only
+        # for that source.
+        device = evidence()
+        capture, _pipeline = self.approved_online(FakeDiscovery(device), device, count=2)
+        self.clock.now += 3  # Stall beyond stall_timeout.
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.launcher.fail = True
+        for attempt in range(1, 4):
+            self.clock.now += 5  # Past any backoff (backoff_max is 4).
+            self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+            self.assertEqual(capture.counters(SOURCES[0]),
+                             CaptureCounters(1, 0, 0, attempt))
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))  # Backoff.
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(1, 0, 0, 3))
+        self.assertEqual(capture.counters(SOURCES[1]), CaptureCounters(0, 0, 0, 0))
+        self.launcher.fail = False
+        self.clock.now += 5
+        capture.poll()
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(2, 0, 0, 3))
+
     def test_truncated_stream_is_not_stream_invalid_before_the_next_poll(self):
         # A holder may read counters() between the reader's error and the
         # poll that tears the pipeline down: only a framing loss counts.
@@ -1256,6 +1279,7 @@ class CaptureTests(CaptureCase):
         capture.approve(SOURCES[0], device)
         self.assertEqual(self.state(capture), ("offline", "capture_failed"))
         self.assertEqual(self.state(capture), ("offline", "capture_failed"))  # Backoff.
+        self.assertEqual(capture.counters(SOURCES[0]), CaptureCounters(0, 0, 0, 1))
         capture.close()
         other = evidence(1, serial="SYN-0002", formats=("YUYV",))
         unsupported = self.capture(FakeDiscovery(other))
@@ -1264,6 +1288,8 @@ class CaptureTests(CaptureCase):
         self.clock.now += 10
         self.assertEqual(self.state(unsupported), ("offline", "capture_unsupported"))
         self.assertEqual(len(self.launcher.pipelines), 0)
+        # A stable unsupported verdict is not a failed launch attempt.
+        self.assertEqual(unsupported.counters(SOURCES[0]), CaptureCounters(0, 0, 0, 0))
 
     def unsupported_capture(self, supported, **kwargs):
         """A capture whose mode check offers only ``supported`` profiles."""

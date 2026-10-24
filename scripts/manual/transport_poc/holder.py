@@ -54,6 +54,9 @@ FRAME_HEADER = struct.Struct(">BQI")
 HELLO = struct.Struct(">Q")
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 DEFAULT_GST = "/usr/bin/gst-launch-1.0"
+# Source health (state, reason) of a pipeline delivering frames; any other
+# health means that source's camera is not running (Issue #354).
+RUNNING_HEALTH = frozenset({("online", "video_ready"), ("degraded", "capture_overloaded")})
 
 
 def read_frames(connection, deliver, stop):
@@ -220,6 +223,8 @@ class Holder:
         self.client_frames = [0] * len(source_ids)
         self.frames = [0] * len(source_ids)
         self.forward_drops = 0
+        # Per-source health of the latest ``capture.poll()``; None before it.
+        self.health = None
         self.selector = selectors.DefaultSelector()
 
     def run(self, seconds):
@@ -233,7 +238,7 @@ class Holder:
             while not self.stop.is_set() and time.monotonic() < deadline:
                 now = time.monotonic()
                 if now >= next_poll:
-                    self.capture.poll()
+                    self.health = tuple(self.capture.poll())
                     next_poll = now + 0.5
                 for key, _ in self.selector.select(timeout=0):
                     if key.fileobj is self.listener:
@@ -320,13 +325,22 @@ class Holder:
         Restarts are launches beyond each source's first, so a restart of one
         camera cannot hide behind another that never started; plus sources
         never launched, framing teardowns and tolerated oversized padding.
+        Issue #354: failed launch attempts (a relaunch that keeps failing
+        after a stall / EOF / timeout never raises ``launches``) and the
+        sources whose latest poll reported no pipeline delivering frames (a
+        run ending in backoff), from the health polled before the capture is
+        closed (every source, before the first poll). Counts only.
         """
         counters = [self.capture.counters(source) for source in self.source_ids]
+        running = sum(1 for item in self.health or ()
+                      if (item.state, item.reason) in RUNNING_HEALTH)
         return {"capture_launches": sum(c.launches for c in counters),
                 "capture_restarts": sum(max(0, c.launches - 1) for c in counters),
                 "sources_never_launched": sum(1 for c in counters if c.launches == 0),
                 "stream_invalid": sum(c.stream_invalid for c in counters),
-                "padding_tolerated": sum(c.padding_tolerated for c in counters)}
+                "padding_tolerated": sum(c.padding_tolerated for c in counters),
+                "launch_failures": sum(c.launch_failures for c in counters),
+                "sources_not_running": max(0, len(self.source_ids) - running)}
 
 
 def run(args, writer):
