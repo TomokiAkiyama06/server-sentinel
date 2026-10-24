@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { launchChrome, pageFor, routeTracker } from './chrome.mjs';
+import { launchChrome, pageFor, routeTracker, unexpectedAbandoned } from './chrome.mjs';
 import { compile } from './compile.mjs';
 import { APP_CSP } from '../scripts/policy.mjs';
 
@@ -85,7 +85,6 @@ const storageFixture = (state, available_bytes = 21_474_836_480, faults = false)
   notification_delivery_failed: faults, notification_log_failed: faults,
 });
 let cases = 0;
-let abandonedTotal = 0;
 // Live view (#205 CP-5) against synthetic answers shaped like the CP-4 routes.
 const liveSources = ['00000000-0000-4000-8000-00000000a001', '00000000-0000-4000-8000-00000000a002'];
 const liveSession = '00000000-0000-4000-8000-00000000b001';
@@ -140,7 +139,7 @@ async function until(check) {
 async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false,
   sourceStatus = 200, initialViewFailures = false, positiveControl = false, recordings = 3, recordingStatus = 200,
   storageState = 'STORAGE_PRESSURE', storageAvailable, storageFaults = false, storageStatus = 200,
-  storageDelay = 0, mutationStatus = 200, api = null } = {}, assertions) {
+  storageDelay = 0, mutationStatus = 200, api = null, expectAbandoned = [] } = {}, assertions) {
   const page = await pageFor(browser, viewport);
   // Chrome applies bypass when parsing a document's policy. Set it before
   // navigation, only for the dedicated interception positive control.
@@ -166,9 +165,10 @@ async function scenario(viewport, { production = false, status = 200, session = 
     requests.push(url.pathname);
     // The page may cancel a request while it is paused here (#326): leaving a
     // view aborts its load. Such a request can no longer be answered; it is
-    // recorded as abandoned, while any other refusal stays a harness error.
+    // recorded as abandoned and fails the scenario unless the scenario expects
+    // it (#334), while any other refusal stays a harness error.
     async function send(method, params) {
-      if (!await page.answer(networkId, method, { requestId, ...params })) abandoned.push(url.pathname);
+      if (!await page.answer(networkId, method, { requestId, ...params })) abandoned.push({ method: request.method, path: url.pathname });
     }
     async function fulfill(body, contentType, responseCode = 200, headers = []) {
       await send('Fetch.fulfillRequest', { responseCode,
@@ -239,6 +239,7 @@ async function scenario(viewport, { production = false, status = 200, session = 
     if (sessionId === page.sessionId) routes.track(route(params));
   }));
   await page.command('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+  let checked = false;
   try {
     const url = new URL('/app/', origin);
     if (optIn) for (const key of ['telemetryOptIn', 'analyticsEnabled', 'crashUpload', 'trackingOptIn']) url.searchParams.set(key, 'true');
@@ -250,9 +251,8 @@ async function scenario(viewport, { production = false, status = 200, session = 
     // Every interception handler has finished, including one still waiting to
     // tell a page cancellation from a genuine refusal (Codex PR #331).
     assert.deepEqual(await routes.settle(), [], 'request interception must succeed');
-    // Only API reads are ever abandoned; the document and its assets are always delivered.
-    assert.deepEqual(abandoned.filter(path => !path.startsWith('/api/')), [], 'only API requests may be abandoned by the page');
-    abandonedTotal += abandoned.length;
+    // Nothing is abandoned unless the scenario names it (#334).
+    assert.deepEqual(unexpectedAbandoned(abandoned, expectAbandoned), [], 'no request is abandoned unless the scenario expects it');
     assert.deepEqual(await page.evaluate('window.__policyViolations'), [], 'no CSP-blocked reporting attempts');
     assert.doesNotMatch(await page.evaluate('document.body.innerText'), /synthetic private error/);
     if (positiveControl) {
@@ -262,8 +262,23 @@ async function scenario(viewport, { production = false, status = 200, session = 
       assert.deepEqual(unexpected, ['unexpected origin or method']);
     } else assert.deepEqual(unexpected, [], 'all browser requests must be explicitly expected');
     assert.deepEqual(await routes.settle(), [], 'request interception must succeed');
-    cases++;
-  } finally { cleanup.forEach(remove => remove()); await page.close(); }
+    checked = true;
+  } finally {
+    // A handler the page started after the last settle (a poll, a late
+    // reload) is still checked before the page closes (#334); the teardown's
+    // own refusals are not errors.
+    let late = [];
+    try { late = await routes.finish(page.command); } finally { cleanup.forEach(remove => remove()); await page.close(); }
+    if (checked) {
+      assert.deepEqual(late, [], 'request interception must succeed until the page closes');
+      // A request the page abandoned after the last check counts as well.
+      assert.deepEqual(unexpectedAbandoned(abandoned, expectAbandoned), [], 'no request is abandoned unless the scenario expects it');
+      // So does a request nobody expected (Codex PR #352).
+      assert.deepEqual(unexpected, positiveControl ? ['unexpected origin or method'] : [],
+        'all browser requests must be explicitly expected until the page closes');
+    }
+  }
+  cases++;
 }
 
 try {
@@ -283,8 +298,13 @@ try {
         await page.heading('接続を確認できません');
       });
     }
+    // Walking the screens moves on once each heading shows, so leaving a
+    // screen may abort its read before the answer. Only the reads observed
+    // abandoned in the flake runs are expected (#334): recordings (1 in 40
+    // runs) and storage (1 in 40 runs). Any other abandon still fails.
+    const viewReads = [{ method: 'GET', path: '/api/mock/recordings' }, { method: 'GET', path: '/api/mock/storage' }];
     for (const count of [0, 1, 2, 3, 4]) {
-      await scenario(viewport, { count }, async page => {
+      await scenario(viewport, { count, expectAbandoned: viewReads }, async page => {
         await page.click('カメラソース');
         await page.wait(`document.querySelectorAll('[data-source-id]').length === ${count} && Boolean(document.querySelector('.source-count'))
           && Boolean(document.querySelector('.calibration-screen'))`);
@@ -719,5 +739,5 @@ try {
     process.stdout.write(`${name}: production live view against synthetic route answers passed\n`);
   }
   await scenario({ width: 390, height: 844 }, { production: true, positiveControl: true }, page => page.heading('アクセスの確認が必要です'));
-  process.stdout.write(`${cases} browser scenarios passed (${abandonedTotal} API requests abandoned by the page before their answer); viewport emulation is not physical phone/Mac acceptance.\n`);
+  process.stdout.write(`${cases} browser scenarios passed, none with an unexpected abandoned request; viewport emulation is not physical phone/Mac acceptance.\n`);
 } finally { await browser.close(); }
