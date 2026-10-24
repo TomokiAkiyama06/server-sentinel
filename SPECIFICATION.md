@@ -1620,8 +1620,14 @@ unconfirmed local observation never counts). The cap is absolute (Owner
 decision, PR #339): a restart never sends more than `hourly_limit` in a
 rolling hour, also when it resends uncertain deliveries. An episode held back by the
 cap is logged once (`camera_offline_notification_rate_limited`) and notified
-when the hour allows if the source is still not online, and one that recovered
-meanwhile is dropped (`camera_offline_notification_dropped`). An episode in
+once when the hour allows, also when the source recovered meanwhile (Owner
+decision 2026-10-24, Issue #349, consistent with PR #320: an episode that
+reached the threshold is notified once even if it recovered before the
+drain). The cap stays absolute, so such a notice can be up to about an hour
+late. A source keeps at most one recovered episode owed besides the one in
+progress (above), so a source that recovers for longer than `after_seconds`
+and fails again twice while the cap holds drops the oldest
+(`camera_offline_notification_dropped`). An episode in
 progress is named after the source and its registry `last_seen_at` (the last
 frame time), so a restart during the same outage finds the row and does not
 notify again. Only a final row (`sent`, `failed` or `disabled`) counts as
@@ -1735,12 +1741,19 @@ continuous notification):
   item 2). A ratio alert exists only from the drain that triggers it, so one
   that ended was held for a whole quiet window; unlike a continuous episode
   that reached the threshold between two drains, it has no "recovered
-  before its first drain" case to send once. One the cap allowed but the
+  before its first drain" case to send once. This differs from a continuous
+  episode held by the cap, which is still sent once after it recovered
+  (Issue #349): the Owner decision covers the continuous rule, whose outage
+  lasted `after_seconds` and is one event worth one notice, while a ratio
+  alert the cap never allowed reports flapping in progress, and its closed
+  period means the source has already been online for a whole window. One
+  the cap allowed but the
   queue refused (delivery backpressure) is, like a refused continuous
   episode, still sent under its time and ID once the queue takes it, also
-  after its period closed, and dropped only if the cap is closed by then
-  (PR #348 review), so a backpressure lasting a window never leaves the
-  period unnotified.
+  after its period closed, and when the cap has closed by then it waits for
+  the hour like a held continuous episode (Issue #349) instead of being
+  dropped, so a backpressure lasting a window never leaves the period
+  unnotified.
 
 `MonitoringStatus.camera_offline_degraded` is also set while a ratio-opened
 period is open. Per source the not-online seconds are kept in at most 130
@@ -1781,7 +1794,13 @@ window after the last ratio alert of a source that is still flapping can
 send a new ratio alert and then that new period's continuous notification.
 All of them stay under the hourly cap. The Slack text is the fixed `ServerSentinel critical alert:
 camera_offline`: no source name, role, UUID, device path, serial, reason or
-image; the Owner identifies the source in the Web UI. `MonitoringStatus`
+image; the Owner identifies the source in the Web UI. An alert sent after its
+episode had already recovered (it recovered before the drain, while held by
+the cap, or while the queue refused it), or a refused ratio alert sent after
+its period closed, is the fixed `ServerSentinel critical alert: camera_offline
+(already recovered)` (Issue #349); the stored row is the same `camera_offline`
+kind. A restored `pending` row is resent with the plain text, since the row
+does not record whether its outage had recovered. `MonitoringStatus`
 reports `camera_offline_degraded` (counted as degraded in the daily summary)
 and `camera_offline_notifications`, false without a configured Slack endpoint
 (the local row is then `disabled`). Shutdown stops the monitor first and, when

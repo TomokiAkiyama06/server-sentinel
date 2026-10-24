@@ -85,8 +85,12 @@ The cap is absolute (Owner decision, PR #339): a resend takes a slot like any
 notification, a pending row that still holds a slot of the restored hour
 waits until that slot expires (up to about an hour late), and live alerts
 are sent before restored rows. An episode held back by the cap is logged once
-(value-free) and notified as soon as the hour allows if the source is still
-not online; one that recovered meanwhile is dropped and logged.
+(value-free) and notified as soon as the hour allows, also when it recovered
+meanwhile (Owner decision 2026-10-24, Issue #349: an episode that reached the
+threshold is notified once, as one that recovered before its drain is). An
+alert sent after its episode recovered (or its ratio period closed) carries
+the fixed text suffix ``(already recovered)``; a restored row's does not (the
+row does not name its source).
 
 Intermittent outages (Owner decision 2026-10-22, Refs #301): short outages
 that repeat notify too. A source that was not online for
@@ -121,8 +125,8 @@ when the hour has room again by the next drain (Issue #338 item 2): a ratio
 alert exists only from the drain that triggers it, so an ended one without a
 pending attempt was held for a whole quiet window. One the cap allowed but
 the queue refused is retried under its time and ID like a refused continuous
-episode, also after its period closed (dropped only if the cap is closed
-then, as a recovered episode). After a restart the in-memory period is
+episode, also after its period closed, and held by the cap like a recovered
+episode (Issue #349) rather than dropped. After a restart the in-memory period is
 gone; a continuous episode that is due while its source has no period looks
 up the source's recent ratio alert once (``flapping_id``) and, when an
 earlier process stored one within the window, restores the period as
@@ -790,7 +794,6 @@ class CameraOfflineMonitor:
                             and episode.recovered is None and not episode.notified
                             and not episode.ratio_checked and episode.attempt is None
                             and episode.qualifies(now, self.after)):
-                        episode.ratio_checked = True
                         check.append((identity, episode))
         # Issue #338 item 1 (Codex PR #335 P2): a continuous episode that is
         # due keeps the ratio rule from evaluating its source, so a restart
@@ -802,6 +805,12 @@ class CameraOfflineMonitor:
         with self._lock:
             for identity, episode, (event_id, earlier) in found:
                 source = self._sources[identity]
+                if source.episode is episode and episode.recovered is None:
+                    # Checked only once the result met the episode still in
+                    # progress (Issue #353, Codex PR #348 P2): one that
+                    # recovered during the lookup discards the result, and a
+                    # recovery folded back into it later looks up again.
+                    episode.ratio_checked = True
                 if (stopped or event_id is None or earlier is False
                         or source.period is not None or source.flap is not None
                         or source.episode is not episode or episode.recovered is not None):
@@ -849,7 +858,12 @@ class CameraOfflineMonitor:
                     # allowed but the queue refused keeps its attempt and is
                     # sent once the queue takes it, as a refused continuous
                     # episode is (PR #348 review 提案 1); like a recovered
-                    # episode, it is dropped if the cap is closed by then.
+                    # episode, it waits for the cap if it is closed by then
+                    # (Issue #349). The Owner decision of Issue #349 is the
+                    # continuous rule's: an outage that lasted the threshold
+                    # is one event worth one notice. A ratio alert the cap
+                    # never allowed reports flapping in progress, and its
+                    # period closing means it ended a whole window ago.
                     self._finish(identity, item, sent=False)
                     self.dropped += 1
                     logging.getLogger(__name__).warning(
@@ -905,16 +919,13 @@ class CameraOfflineMonitor:
             # an hour.
             if not self._window_open(now) or (attempt is not None
                                               and self._counted(attempt[1])):
+                # Held until the hour allows, also once it recovered (Owner
+                # decision 2026-10-24, Issue #349): an episode that reached
+                # the threshold is notified once, as one that recovered
+                # before its drain is (PR #320), and so is a ratio alert the
+                # cap had allowed before its period closed.
                 with self._lock:
-                    if not ongoing:
-                        # Recovered (or the flapping period closed) while
-                        # held back: nothing left to report. Not sent, so it
-                        # opens no alerted period (PR #335 review 重要 2).
-                        self._finish(identity, item, sent=False)
-                        self.dropped += 1
-                        logging.getLogger(__name__).warning(
-                            Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED)
-                    elif not item.held:
+                    if not item.held:
                         item.held = True
                         logging.getLogger(__name__).warning(
                             Event.CAMERA_OFFLINE_NOTIFICATION_RATE_LIMITED)
@@ -925,8 +936,11 @@ class CameraOfflineMonitor:
                 # Queue full or closed: retried on the next drain.
                 item.attempt = attempt
                 continue
+            # One that recovered (or whose period closed) says so in the
+            # fixed text; a restored row's source is not known.
             result = notifications.record(NotificationKind.CAMERA_OFFLINE, at=attempt[0],
-                                          confirmed=True, event_id=attempt[1])
+                                          confirmed=True, event_id=attempt[1],
+                                          recovered=not ongoing)
             if result == DeliveryResult.FAILED and not notifications.retained(attempt[1]):
                 item.attempt = attempt
                 continue

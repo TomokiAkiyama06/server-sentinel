@@ -24,7 +24,10 @@ continues. Ordinary
 person/motion/entry/camera-offline observations stay local until the summary;
 a `camera_offline` recorded `confirmed=True` (the source stayed offline for the
 deployment threshold, Issue #301 item 2, `../monitoring/cameras.py`, which
-caps it per hour) is immediate like a confirmed server movement.
+caps it per hour) is immediate like a confirmed server movement. Its
+`recovered=True` (Issue #349, only for `camera_offline`) appends the fixed
+` (already recovered)` to the text for an alert sent after the outage ended;
+the stored row is unchanged.
 `scene_reference_reacquired` and `scene_calibration_required` (Issue #205,
 Owner decision 2026-10-22, option A) are immediate as well: after a Main
 restart a stored scene calibration's reference was taken again from the
