@@ -1777,7 +1777,14 @@ continuous notification):
   ratio alert, so the ratio rule and the restart lookup (below) keep
   evaluating that source and a new flapping period gets its own alert
   (sent first, as it is in progress); the late one says `(already
-  recovered)` about its own closed period.
+  recovered)` about its own closed period. This holds for any number of
+  such closed alerts (Codex PR #359 P2): when the queue keeps refusing
+  across several periods, each closed alert waits apart, oldest first, and
+  none of them keeps the next period from being alerted. At most four wait
+  per source (`LATE_FLAPS_PER_SOURCE`, bounded memory); a fifth drops the
+  oldest one, which the queue never accepted, counted and logged as
+  `camera_offline_notification_dropped`. Each waiting one is sent once and
+  takes a slot of the hourly cap like any notification.
 
 `MonitoringStatus.camera_offline_degraded` is also set while a ratio-opened
 period is open. Per source the not-online seconds are kept in at most 130

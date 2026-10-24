@@ -27,7 +27,9 @@ from app.cameras.uvc.identity import CameraState, DeviceEvidence, HealthEvent
 from app.cameras.uvc.runtime import LocalUvcDependencies
 from app.logging import Event
 from app.main import create_app
-from app.monitoring.cameras import _BY_CONTINUOUS, _BY_RATIO, DOWN_BINS, CameraOfflineMonitor
+from app.monitoring.cameras import (
+    _BY_CONTINUOUS, _BY_RATIO, DOWN_BINS, LATE_FLAPS_PER_SOURCE, CameraOfflineMonitor,
+)
 from app.monitoring.config import CameraOfflineNotification, parse_monitoring
 from app.monitoring.runtime import (
     CAMERA_OFFLINE_RENOTIFY_CHAIN, EVENT_NAMESPACE, MonitoringDependencies,
@@ -307,6 +309,10 @@ class Refusing:
 
     def retained(self, event_id):
         return self.service.retained(event_id)
+
+    def __getattr__(self, name):
+        # poll / pending_count / close of the wrapped service.
+        return getattr(self.service, name)
 
 
 class OwedEpisodeTests(MonitorFixture, unittest.TestCase):
@@ -1584,12 +1590,12 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         with self.assertLogs("app.monitoring.cameras", level="WARNING"):
             self.drain(monitor)
             self.assertIsNone(source.flap)
-            self.assertIsNotNone(source.late_flap)
+            self.assertEqual(1, len(source.late_flaps))
             for _ in range(2):
                 self.cycle(monitor)
         self.assertEqual(_BY_RATIO, source.period)
         self.assertIsNotNone(source.flap)
-        self.assertIsNot(source.flap, source.late_flap)
+        self.assertIsNot(source.flap, source.late_flaps[0])
         self.assertEqual([], self.sent())
         for _ in range(32):
             self.cycle(monitor)
@@ -1598,8 +1604,77 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         self.assertIn((attempt[1], attempt[0]), [(row.event_id, row.at) for row in rows])
         # The new period's alert (in progress) goes first.
         self.assertEqual([ALERT, RECOVERED], self.texts())
-        self.assertIsNone(source.late_flap)
+        self.assertEqual(0, len(source.late_flaps))
         self.assertEqual(0, monitor.dropped)
+
+    def refused_closed_ratio_periods(self, monitor, count):
+        # `count` flapping periods, each closed by a whole quiet window,
+        # while the queue refuses every alert (Codex PR #359 P2).
+        source = monitor._sources[self.sources[0]]
+        attempts = []
+        for _ in range(count):
+            for _ in range(2):
+                self.cycle(monitor)
+            self.assertEqual(_BY_RATIO, source.period)
+            attempts.append(source.flap.attempt)
+            self.assertIsNotNone(attempts[-1])
+            self.run_for(monitor, 960, step=60)
+            self.assertEqual((None, None), (source.period, source.flap))
+        return attempts
+
+    def test_any_number_of_waiting_ended_ratio_alerts_never_block_a_new_period(self):
+        # Codex PR #359 P2: the queue refuses across two ratio periods
+        # separated by a whole quiet window. Both closed alerts wait apart,
+        # so a third flapping period still gets its own ratio alert, and
+        # once the queue takes them the alert in progress goes first; the
+        # late ones follow one per hour (`hourly_limit=1`), each once.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        refusing = self.service = Refusing(self.service)
+        source = monitor._sources[self.sources[0]]
+        attempts = self.refused_closed_ratio_periods(monitor, 2)
+        self.assertEqual(attempts, [flap.attempt for flap in source.late_flaps])
+        for _ in range(2):
+            self.cycle(monitor)
+        self.assertEqual(_BY_RATIO, source.period)
+        self.assertIsNotNone(source.flap)
+        self.assertFalse(source.flap.ended)
+        self.assertEqual([], self.sent())
+        refusing.accept = True
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.drain(monitor)
+        self.assertEqual([ALERT], self.texts())
+        self.run_for(monitor, 3600, step=60)
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        self.run_for(monitor, 3600, step=60)
+        self.assertEqual([ALERT, RECOVERED, RECOVERED], self.texts())
+        rows = self.sent()
+        self.assertEqual(3, len({row.event_id for row in rows}))
+        for attempt in attempts:
+            self.assertIn((attempt[1], attempt[0]), [(row.event_id, row.at) for row in rows])
+        self.assertEqual((0, 0), (len(source.late_flaps), monitor.dropped))
+        self.run_for(monitor, 3600, step=300)
+        self.assertEqual(3, len(self.sent()))
+
+    def test_waiting_ended_ratio_alerts_are_bounded_per_source(self):
+        # Memory stays bounded: beyond LATE_FLAPS_PER_SOURCE the oldest
+        # waiting alert is dropped, counted and logged value-free.
+        monitor = self.monitor()
+        self.online(monitor)
+        self.service = Refusing(self.service)
+        source = monitor._sources[self.sources[0]]
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as logs:
+            attempts = self.refused_closed_ratio_periods(monitor, LATE_FLAPS_PER_SOURCE + 1)
+        self.assertIn(
+            f"WARNING:app.monitoring.cameras:{Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED.value}",
+            logs.output)
+        self.assertEqual(1, monitor.dropped)
+        self.assertEqual(attempts[1:], [flap.attempt for flap in source.late_flaps])
+        self.service.accept = True
+        self.drain(monitor)
+        rows = self.sent()
+        self.assertEqual(LATE_FLAPS_PER_SOURCE, len(rows))
+        self.assertNotIn(attempts[0][1], [row.event_id for row in rows])
 
     def test_a_refused_continuous_episode_is_sent_after_it_recovered(self):
         # The continuous rule the refused ratio alert now matches.

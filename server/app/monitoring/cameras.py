@@ -131,8 +131,12 @@ alert exists only from the drain that triggers it, so an ended one without a
 pending attempt was held for a whole quiet window. One the cap allowed but
 the queue refused is retried under its time and ID like a refused continuous
 episode, also after its period closed, and held by the cap like a recovered
-episode (Issue #349) rather than dropped; it waits apart (``late_flap``), so
-it never blocks a new ratio period of the source. After a restart the in-memory period is
+episode (Issue #349) rather than dropped; it waits apart (``late_flaps``),
+so no number of them blocks a new ratio period of the source, and the alert
+of a period in progress goes before them (Codex PR #359 P2). At most
+``LATE_FLAPS_PER_SOURCE`` (4) wait per source; beyond that the oldest is
+dropped (counted in ``dropped``, logged as
+``camera_offline_notification_dropped``). After a restart the in-memory period is
 gone; a continuous episode that is due while its source has no period looks
 up the source's recent ratio alert once (``flapping_id``) and, when an
 earlier process stored one within the window, restores the period as
@@ -149,7 +153,7 @@ source name, role, UUID, device path, serial, reason or image (SPECIFICATION
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 import math
@@ -185,6 +189,11 @@ MAX_SOURCES = 64
 DOWN_BINS = 128
 DEFAULT_FLAPPING_WINDOW = CAMERA_FLAPPING_WINDOW_SECONDS
 DEFAULT_FLAPPING_OFFLINE = CAMERA_FLAPPING_OFFLINE_SECONDS
+# Refused ratio alerts whose period closed, kept per source while they wait
+# (``late_flaps``). Each needs a flapping period and a whole quiet window
+# under a refusing queue; beyond this the oldest is dropped (counted and
+# logged as ``camera_offline_notification_dropped``).
+LATE_FLAPS_PER_SOURCE = 4
 # Who opened a source's alerted period.
 _BY_CONTINUOUS = "continuous"
 _BY_RATIO = "ratio"
@@ -383,10 +392,11 @@ class _Source:
     period: str | None = None
     # The ratio alert of the current period, while it is not notified.
     flap: _Flap | None = None
-    # A refused ratio alert whose period closed, still owed (it has an
-    # attempt): set aside so it never blocks a new ratio period of the
-    # source (Issue #349 review 提案 3).
-    late_flap: _Flap | None = None
+    # Refused ratio alerts whose period closed, still owed (each has an
+    # attempt), oldest first: set aside so none of them blocks a new ratio
+    # period of the source (Issue #349 review 提案 3, Codex PR #359 P2). At
+    # most ``LATE_FLAPS_PER_SOURCE``.
+    late_flaps: deque = field(default_factory=deque)
     # A ratio-opened period already sent its one continuous notification.
     continuous_sent: bool = False
 
@@ -787,11 +797,19 @@ class CameraOfflineMonitor:
                     self._close_period(source, now)
                     source.down.trim(now)
                     flap = source.flap
-                    if (flap is not None and flap.ended and flap.attempt is not None
-                            and source.late_flap is None):
+                    if flap is not None and flap.ended and flap.attempt is not None:
                         # Refused, then its period closed: still sent under
-                        # its time and ID, apart from a new period's alert.
-                        source.flap, source.late_flap = None, flap
+                        # its time and ID, apart from a new period's alert,
+                        # however many are already waiting (Codex PR #359
+                        # P2). Bounded: the oldest beyond the bound is
+                        # dropped (the queue never accepted it: nothing sent).
+                        source.flap = None
+                        source.late_flaps.append(flap)
+                        while len(source.late_flaps) > LATE_FLAPS_PER_SOURCE:
+                            source.late_flaps.popleft().notified = True
+                            self.dropped += 1
+                            logging.getLogger(__name__).warning(
+                                Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED)
                     if (source.period is None and source.flap is None
                             and not self._continuous_due(source, now)
                             and source.down.flapping(now, self.flapping_offline)):
@@ -849,7 +867,7 @@ class CameraOfflineMonitor:
             # already recovered (Issue #349 review 重要 1).
             due = sorted([*((identity, item) for identity, source in self._sources.items()
                             for item in (source.owed, source.episode, source.flap,
-                                         source.late_flap)
+                                         *source.late_flaps)
                             if item is not None and not item.notified
                             and (isinstance(item, _Flap) or item.qualifies(now, self.after))),
                           *((None, item) for item in self._resend)],
@@ -977,7 +995,7 @@ class CameraOfflineMonitor:
                           and source.episode.qualifies(now, self.after))
             held = sum(1 for source in self._sources.values()
                        for item in (source.owed, source.episode, source.flap,
-                                    source.late_flap)
+                                    *source.late_flaps)
                        if item is not None and item.held and not item.notified) + sum(
                            1 for item in self._resend if item.held)
             flapping = sum(1 for source in self._sources.values()
@@ -1033,8 +1051,9 @@ class CameraOfflineMonitor:
         if isinstance(item, _Flap):
             if source.flap is item:
                 source.flap = None
-            if source.late_flap is item:
-                source.late_flap = None
+            # By identity: two alerts may hold equal fields.
+            source.late_flaps = deque(flap for flap in source.late_flaps
+                                      if flap is not item)
             return
         stale = self._stale(item, now)
         if sent and not stale:

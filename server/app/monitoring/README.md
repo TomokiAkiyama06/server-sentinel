@@ -127,7 +127,10 @@ after the wall-clock window bucket, so a restart within a window of it sends
 nothing again; a continuous episode due after a restart looks that alert up
 once and restores its period (Issue #338). A ratio alert held back by the cap
 whose period closed is dropped before the cap; one the queue refused is sent
-once the queue takes it, like a refused continuous episode. See SPECIFICATION §9 for the full rules and the known limits.
+once the queue takes it, like a refused continuous episode; such closed
+alerts wait apart from the source's current ratio alert (any number of
+them never blocks a new period, at most `LATE_FLAPS_PER_SOURCE` = 4 per
+source, the oldest beyond that dropped and logged). See SPECIFICATION §9 for the full rules and the known limits.
 
 Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
 takes the `AccessFaultMonitor` the composition root also passes to the
