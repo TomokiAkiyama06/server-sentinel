@@ -1502,26 +1502,63 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         self.assertEqual((1, 0), (len(self.sent()), monitor.dropped))
 
     def test_a_late_notice_of_a_long_recovered_outage_opens_no_period(self):
-        # Issue #349 review 提案 2: the late "already recovered" notice of an
-        # outage that ended more than a window earlier opens no alerted
-        # period, so the flapping by then still gets its ratio alert.
+        # Issue #349 review 提案 2 and Codex PR #359 P2: an outage held by
+        # the cap recovered more than a window before the source starts
+        # flapping. The held episode no longer keeps the ratio rule from
+        # evaluating the source, so the ratio alert of the current flapping
+        # is created at once and, in progress, takes the freed slot first;
+        # the late "already recovered" notice follows in the next hour and
+        # opens no period of its own, nor counts as the period's continuous
+        # notification.
         monitor = self.monitor(hourly_limit=1)
         self.online(monitor)
         monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        source = monitor._sources[self.sources[0]]
         with self.assertLogs("app.monitoring.cameras", level="WARNING"):
             self.off(monitor)
             self.run_for(monitor, 330)
             self.on(monitor)
-            self.run_for(monitor, 2400, step=60)
-            for _ in range(5):
+            self.run_for(monitor, 1200, step=60)
+            for _ in range(3):
                 self.cycle(monitor)
-        source = monitor._sources[self.sources[0]]
-        self.assertEqual([RECOVERED], self.texts())
-        self.assertEqual(_BY_RATIO, source.period)
-        self.assertIsNotNone(source.flap)
-        for _ in range(16):
+            # Triggered while the cap still holds both.
+            self.assertEqual(_BY_RATIO, source.period)
+            self.assertIsNotNone(source.flap)
+            self.assertEqual([], self.sent())
+            while self.clock.value < 1000 + 3600 + 300:
+                self.cycle(monitor)
+        self.assertEqual([ALERT], self.texts())
+        while self.clock.value < 1000 + 7200 + 300:
             self.cycle(monitor)
-        self.assertEqual([RECOVERED, ALERT], self.texts())
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        self.assertEqual((_BY_RATIO, False), (source.period, source.continuous_sent))
+        self.assertEqual(0, monitor.dropped)
+
+    def test_the_stale_boundary_is_a_window_and_one_bin(self):
+        # Issue #349 re-review 提案 1: a late notice sent one second before
+        # a window and one bin after its recovery opens the period, one
+        # second after it does not.
+        bin_width = 900 / DOWN_BINS
+        for offset, period in ((-1, _BY_CONTINUOUS), (1, None)):
+            with self.subTest(offset=offset):
+                self.clock.value = 1000.0
+                monitor = self.monitor(hourly_limit=1)
+                self.online(monitor)
+                self.off(monitor)
+                recovered = self.clock.value + 310
+                send = recovered + 900 + bin_width + offset
+                # The one slot of the hour frees exactly at `send`.
+                monitor.restore_window([(uuid4(), self.clock.value + 3600 - send)],
+                                       monotonic=self.clock.value)
+                self.advance(310)
+                with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+                    self.drain(monitor)
+                self.on(monitor)
+                self.clock.value = send - 1
+                self.assertEqual(1, self.drain(monitor).held)
+                self.clock.value = send
+                self.assertEqual(0, self.drain(monitor).held)
+                self.assertEqual(period, monitor._sources[self.sources[0]].period)
 
     def test_a_late_notice_of_a_recent_outage_still_opens_the_period(self):
         # PR #320: one that recovered within the window before it was sent

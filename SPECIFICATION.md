@@ -1723,11 +1723,15 @@ continuous notification):
 - Every `camera_offline` of a source that was sent (either rule), or that an
   earlier process already stored, opens that source's *alerted period*. One
   dropped under the cap opens none (the Owner was never told), and nor does
-  a late notice of an outage that recovered more than a window and one bin
-  before it was sent: none of its not-online time is left in the ratio
-  window, so a camera flapping by then still gets its ratio alert. One that
-  recovered more recently opens it as before, so the ratio rule never
-  reports that outage again. The period
+  a late notice of an outage that recovered a window and one bin
+  (`flapping_window_seconds / 128`) or longer before it was sent: none of
+  its not-online time is left in the ratio window. While such a notice
+  waits for the cap it also does not keep the ratio rule from evaluating
+  its source (below; Codex PR #359 P2), and it is never counted as the
+  continuous notification of a later ratio-opened period, so a camera
+  flapping by then gets its own ratio alert, which as an alert in progress
+  is sent before the late notice. One that recovered more recently opens
+  the period as before, so the ratio rule never reports that outage again. The period
   closes only once the source has stayed online (or inactive) for a whole
   `flapping_window_seconds`; a shorter online keeps it open.
 - While the period is open the ratio rule does not notify that source.
@@ -1747,6 +1751,8 @@ continuous notification):
 - While a continuous episode of the source has reached `after_seconds` and is
   not yet notified (owed, held by the cap or refused by the queue), the ratio
   rule does not evaluate that source; the continuous notification reports it.
+  An episode that recovered a window and one bin or longer ago is the
+  exception (above): its outage is no longer in the ratio window.
 - A ratio alert held back by the cap is sent when the hour allows if its
   period is still open; one refused by the queue is retried with the same
   time and ID. Once its period has closed, a ratio alert held back by the

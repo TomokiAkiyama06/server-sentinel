@@ -91,8 +91,11 @@ threshold is notified once, as one that recovered before its drain is). An
 alert sent after its episode recovered (or its ratio period closed) carries
 the fixed text suffix ``(already recovered)``; a restored row's does not (the
 row does not name its source). Such late notices go after every outage and
-ratio period still in progress, and one whose outage ended more than a
-window before it was sent opens no alerted period (Issue #349 review).
+ratio period still in progress. One whose outage ended a window and one bin
+(window/``DOWN_BINS``) or longer before it was sent opens no alerted period,
+and while it waits it does not keep the ratio rule from evaluating its
+source, so current flapping gets its own (in progress, first) ratio alert
+(Issue #349 review, Codex PR #359 P2).
 
 Intermittent outages (Owner decision 2026-10-22, Refs #301): short outages
 that repeat notify too. A source that was not online for
@@ -859,9 +862,10 @@ class CameraOfflineMonitor:
                 ongoing = _ongoing(item)
                 source = None if resend else self._sources[identity]
                 if (not flap and not resend and item.flapping and source.period == _BY_RATIO
-                        and source.continuous_sent):
+                        and source.continuous_sent and not self._stale(item, now)):
                     # A ratio-opened period yields at most one continuous
-                    # notification after its ratio alert (at most two).
+                    # notification after its ratio alert (at most two). A
+                    # stale episode belongs to an earlier period: still sent.
                     self._finish(identity, item)
                     continue
                 if flap and item.ended and item.attempt is None:
@@ -983,8 +987,22 @@ class CameraOfflineMonitor:
 
     def _continuous_due(self, source: _Source, now: float) -> bool:
         # A qualifying continuous episode is the continuous rule's to report.
+        # A stale one (its outage left the ratio window) is not the current
+        # flapping: it never keeps the ratio rule from evaluating the source
+        # (Codex PR #359 P2).
         return any(item is not None and not item.notified and item.qualifies(now, self.after)
+                   and not self._stale(item, now)
                    for item in (source.owed, source.episode))
+
+    def _stale(self, item: _Episode, now: float | None) -> bool:
+        """Recovered a window and one bin or longer ago: out of the ratio window.
+
+        ``trim`` then has removed every bin of its not-online time and its
+        end time precedes the window, so the ratio rule cannot count it.
+        """
+        return (item.recovered is not None and now is not None and math.isfinite(now)
+                and math.isfinite(item.recovered)
+                and now - item.recovered >= self.window + self.window / DOWN_BINS)
 
     def _finish(self, identity: UUID, item, *, sent: bool = True,
                 now: float | None = None) -> None:
@@ -995,10 +1013,12 @@ class CameraOfflineMonitor:
         the alerted period when none is open, so the ratio rule does not
         report the same outage again; a dropped one (``sent=False``) opens
         none, since the Owner was never told. Nor does a late notice of an
-        outage that recovered more than a window (and one bin) before it was
-        sent (``now``, Issue #349 review 提案 2): none of its not-online time
-        is left in the ratio window, so a camera flapping by then can still
-        get its ratio alert.
+        outage that recovered a window and one bin or longer before it was
+        sent (``now``, ``_stale``, Issue #349 review 提案 2): none of its
+        not-online time is left in the ratio window, so a camera flapping by
+        then still gets its ratio alert. A stale episode is never the
+        continuous notification of a ratio-opened period either: it belongs
+        to an earlier one.
         """
         item.notified = True
         if isinstance(item, _Resend):
@@ -1016,11 +1036,9 @@ class CameraOfflineMonitor:
             if source.late_flap is item:
                 source.late_flap = None
             return
-        stale = (item.recovered is not None and now is not None and math.isfinite(now)
-                 and math.isfinite(item.recovered)
-                 and now - item.recovered >= self.window + self.window / DOWN_BINS)
-        if sent:
-            if source.period is None and not stale:
+        stale = self._stale(item, now)
+        if sent and not stale:
+            if source.period is None:
                 source.period = _BY_CONTINUOUS
             elif source.period == _BY_RATIO and item.flapping:
                 source.continuous_sent = True
