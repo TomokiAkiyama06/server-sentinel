@@ -27,7 +27,9 @@ from app.cameras.uvc.identity import CameraState, DeviceEvidence, HealthEvent
 from app.cameras.uvc.runtime import LocalUvcDependencies
 from app.logging import Event
 from app.main import create_app
-from app.monitoring.cameras import DOWN_BINS, CameraOfflineMonitor
+from app.monitoring.cameras import (
+    _BY_CONTINUOUS, _BY_RATIO, DOWN_BINS, LATE_FLAPS_PER_SOURCE, CameraOfflineMonitor,
+)
 from app.monitoring.config import CameraOfflineNotification, parse_monitoring
 from app.monitoring.runtime import (
     CAMERA_OFFLINE_RENOTIFY_CHAIN, EVENT_NAMESPACE, MonitoringDependencies,
@@ -47,6 +49,8 @@ from tests.test_uvc_runtime import FAST, PROFILE, CaptureFactory, Discovery, Per
 
 AT = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
 ALERT = "ServerSentinel critical alert: camera_offline"
+# Issue #349: an alert sent after its outage had already recovered.
+RECOVERED = "ServerSentinel critical alert: camera_offline (already recovered)"
 
 
 class Clock:
@@ -116,6 +120,16 @@ class MonitorFixture:
 
     def advance(self, seconds):
         self.clock.value += seconds
+
+    def texts(self):
+        """Slack texts posted so far, once every delivery has completed."""
+        for _ in range(1000):
+            self.service.poll()
+            if not self.service.pending_count:
+                break
+            time.sleep(0.01)
+        self.assertEqual(0, self.service.pending_count)
+        return [json.loads(request.data)["text"] for request, _ in self.transport.requests]
 
 
 class EpisodeTests(MonitorFixture, unittest.TestCase):
@@ -212,6 +226,8 @@ class EpisodeTests(MonitorFixture, unittest.TestCase):
         self.advance(50)
         self.assertEqual(0, self.drain(monitor).offline_sources)
         self.assertEqual(1, len(self.sent()))
+        # Issue #349: the fixed text says the camera already recovered.
+        self.assertEqual([RECOVERED], self.texts())
         self.advance(3600)
         self.drain(monitor)
         self.assertEqual(1, len(self.sent()))
@@ -262,6 +278,22 @@ class EpisodeTests(MonitorFixture, unittest.TestCase):
         self.assertEqual([ALERT], texts)
         self.assertNotIn(str(self.sources[0]), texts[0])
 
+    def test_only_a_camera_offline_alert_can_be_marked_recovered(self):
+        # Issue #349: the suffix is the only change, and only for this kind.
+        for kind in (NotificationKind.HARDWARE_INTEGRITY_FAILURE, NotificationKind.PERSON):
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                self.service.record(kind, at=AT, confirmed=True, recovered=True)
+        with self.assertRaises(ValueError):
+            self.service.record(NotificationKind.CAMERA_OFFLINE, at=AT, confirmed=True,
+                                recovered=1)
+        event_id = uuid4()
+        self.service.record(NotificationKind.CAMERA_OFFLINE, at=AT, confirmed=True,
+                            event_id=event_id, recovered=True)
+        self.assertEqual([RECOVERED], self.texts())
+        row = self.sink.rows[event_id]
+        self.assertEqual((NotificationKind.CAMERA_OFFLINE, AT, True),
+                         (row.kind, row.at, row.confirmed))
+
 
 class Refusing:
     """A `NotificationService` whose capacity check refuses until opened."""
@@ -277,6 +309,10 @@ class Refusing:
 
     def retained(self, event_id):
         return self.service.retained(event_id)
+
+    def __getattr__(self, name):
+        # poll / pending_count / close of the wrapped service.
+        return getattr(self.service, name)
 
 
 class OwedEpisodeTests(MonitorFixture, unittest.TestCase):
@@ -312,6 +348,32 @@ class OwedEpisodeTests(MonitorFixture, unittest.TestCase):
         self.drain(monitor)
         self.assertEqual(2, len(self.sent()))
 
+    def test_one_recovered_episode_is_owed_while_the_cap_holds(self):
+        # Issue #349: held episodes that recovered wait for the cap, but a
+        # source keeps at most one owed besides the latest: after a long
+        # recovery and a third outage the oldest is dropped and logged.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        source = self.sources[0]
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as logs:
+            for _ in range(3):
+                monitor.health_sink(event(source, CameraState.OFFLINE))
+                self.advance(330)
+                self.drain(monitor)
+                monitor.health_sink(event(source, CameraState.ONLINE))
+                self.advance(330)
+                self.drain(monitor)
+        self.assertEqual(1, sum(line.endswith(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED.value)
+                                for line in logs.output))
+        self.assertEqual(([], 1), (self.sent(), monitor.dropped))
+        for _ in range(3):
+            self.advance(3600)
+            self.drain(monitor)
+        self.assertEqual(2, len(self.sent()))
+        self.assertEqual([RECOVERED] * 2, self.texts())
+        self.assertEqual(1, monitor.dropped)
+
     def test_owed_episodes_still_obey_the_cap(self):
         monitor = self.monitor(hourly_limit=1)
         self.online(monitor)
@@ -336,8 +398,11 @@ class OwedEpisodeTests(MonitorFixture, unittest.TestCase):
 
 
 class CapTests(MonitorFixture, unittest.TestCase):
-    def test_a_held_episode_that_recovers_is_dropped_and_logged(self):
-        # PR #320 re-review 提案 2: held back by the cap, then online for good.
+    def test_a_held_episode_that_recovers_is_sent_once_when_the_hour_allows(self):
+        # Owner decision 2026-10-24 (Issue #349): held back by the cap, then
+        # online for good. The outage reached the threshold, so it is still
+        # notified once when the hour allows (as PR #320's "recovered before
+        # the drain"), saying it already recovered; the cap stays absolute.
         monitor = self.monitor(hourly_limit=1)
         self.online(monitor)
         monitor.health_sink(event(self.sources[0], CameraState.OFFLINE))
@@ -351,14 +416,73 @@ class CapTests(MonitorFixture, unittest.TestCase):
         # Whichever source was held recovers and stays online.
         self.online(monitor)
         self.advance(60)
-        with self.assertLogs("app.monitoring.cameras", level="WARNING") as dropped:
+        with self.assertNoLogs("app.monitoring.cameras", level="WARNING"):
             status = self.drain(monitor)
-        self.assertEqual([f"WARNING:app.monitoring.cameras:{Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED.value}"],
-                         dropped.output)
-        self.assertEqual((0, 0, 1), (status.offline_sources, status.held, monitor.dropped))
-        self.advance(7200)
+        self.assertEqual((0, 1, 0), (status.offline_sources, status.held, monitor.dropped))
+        self.assertEqual(1, len(self.sent()))
+        # One second before the slot expires: still held.
+        self.advance(3600 - 60 - 1)
         self.drain(monitor)
         self.assertEqual(1, len(self.sent()))
+        self.advance(1)
+        status = self.drain(monitor)
+        self.assertEqual((0, 0, 0), (status.offline_sources, status.held, monitor.dropped))
+        self.assertEqual(2, len(self.sent()))
+        self.assertEqual(1, len({row.at for row in self.sent()}))
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        for _ in range(3):
+            self.advance(3600)
+            self.drain(monitor)
+        self.assertEqual(2, len(self.sent()))
+
+    def test_an_outage_in_progress_goes_before_a_recovered_one(self):
+        # Issue #349 review 重要 1: A was held and recovered, B went offline
+        # later and is still offline. When the slot frees, B (in progress)
+        # is sent first; A's late "already recovered" notice waits.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        first, second = self.sources
+        monitor.health_sink(event(first, CameraState.OFFLINE))
+        self.advance(310)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.drain(monitor)
+        monitor.health_sink(event(first, CameraState.ONLINE))
+        self.advance(10)
+        monitor.health_sink(event(second, CameraState.OFFLINE))
+        self.advance(310)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.assertEqual(2, self.drain(monitor).held)
+        self.advance(3600 - 630)
+        status = self.drain(monitor)
+        self.assertEqual((1, 1), (status.offline_sources, status.held))
+        self.assertEqual([ALERT], self.texts())
+        self.advance(3600)
+        self.drain(monitor)
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        self.assertEqual(0, monitor.dropped)
+
+    def test_held_recovered_episodes_never_exceed_the_cap(self):
+        # Issue #349: every source held and recovered; each is sent once,
+        # never more than `hourly_limit` in any rolling hour.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        for source in self.sources:
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(300)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.drain(monitor)
+        self.online(monitor)
+        times = []
+        for _ in range(200):
+            self.advance(60)
+            before = len(self.sent())
+            self.drain(monitor)
+            times.extend([self.clock.value] * (len(self.sent()) - before))
+        self.assertEqual(2, len(self.sent()))
+        self.assertEqual(1, len(times))
+        self.assertGreaterEqual(times[0] - 1300.0, 3600)
+        self.assertEqual(0, monitor.dropped)
 
     def flap(self, monitor, source, seconds=301):
         monitor.health_sink(event(source, CameraState.OFFLINE))
@@ -1121,10 +1245,12 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
             self.on(monitor)
             self.assertEqual(count, len(self.sent()))
 
-    def test_a_dropped_episode_does_not_silence_the_source(self):
-        # PR #335 review 重要 2: an outage held back by the cap and dropped
-        # (online at a drain) was never notified; the flapping that follows
-        # is, once the hour allows.
+    def test_a_held_episode_sent_late_opens_the_period(self):
+        # PR #335 review 重要 2 dropped a held episode that recovered and
+        # opened no period. Since Issue #349 it is sent once the hour allows
+        # and, sent, opens the alerted period like any notification: the
+        # flapping that follows (online shorter than the window) belongs to
+        # that period and adds no ratio alert.
         monitor = self.monitor(hourly_limit=1)
         self.online(monitor)
         second = self.sources[1]
@@ -1137,11 +1263,12 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
             self.run_for(monitor, 360)
             self.on(monitor)
             self.run_for(monitor, 30)
-        self.assertIn(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED.value, logs.output[-1])
-        self.assertEqual(1, monitor.dropped)
+        self.assertNotIn(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED.value, "".join(logs.output))
         for _ in range(60):
             self.cycle(monitor, offline=180, online=60)
         self.assertEqual(2, len(self.sent()))
+        self.assertEqual(0, monitor.dropped)
+        self.assertEqual(_BY_CONTINUOUS, monitor._sources[self.sources[0]].period)
 
     def test_an_online_shorter_than_the_window_keeps_the_period_open(self):
         monitor = self.monitor()
@@ -1358,15 +1485,305 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         self.drain(monitor)
         self.assertEqual(1, len(self.sent()))
 
-    def test_a_refused_ratio_alert_is_dropped_if_the_cap_closed_meanwhile(self):
-        # As a refused continuous episode that recovered: dropped when the
-        # hour is full by the time the queue would take it.
+    def test_a_refused_ratio_alert_waits_if_the_cap_closed_meanwhile(self):
+        # As a refused continuous episode that recovered (Issue #349): held
+        # while the hour is full by the time the queue would take it, then
+        # sent once under its time and ID, saying the camera recovered.
         monitor = self.monitor(hourly_limit=1)
-        self.refused_ratio_alert_whose_period_closed(monitor)
+        attempt = self.refused_ratio_alert_whose_period_closed(monitor)
         monitor.restore_window([(uuid4(), 60.0)], monotonic=self.clock.value)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as logs:
+            self.assertEqual(1, self.drain(monitor).held)
+        self.assertEqual(
+            [f"WARNING:app.monitoring.cameras:{Event.CAMERA_OFFLINE_NOTIFICATION_RATE_LIMITED.value}"],
+            logs.output)
+        self.assertEqual(([], 0), (self.sent(), monitor.dropped))
+        self.advance(3540)
+        self.drain(monitor)
+        self.assertEqual([(attempt[1], attempt[0])],
+                         [(row.event_id, row.at) for row in self.sent()])
+        self.assertEqual([RECOVERED], self.texts())
+        self.advance(3600)
+        self.drain(monitor)
+        self.assertEqual((1, 0), (len(self.sent()), monitor.dropped))
+
+    def test_a_late_notice_of_a_long_recovered_outage_opens_no_period(self):
+        # Issue #349 review 提案 2 and Codex PR #359 P2: an outage held by
+        # the cap recovered more than a window before the source starts
+        # flapping. The held episode no longer keeps the ratio rule from
+        # evaluating the source, so the ratio alert of the current flapping
+        # is created at once and, in progress, takes the freed slot first;
+        # the late "already recovered" notice follows in the next hour and
+        # opens no period of its own, nor counts as the period's continuous
+        # notification.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        source = monitor._sources[self.sources[0]]
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.off(monitor)
+            self.run_for(monitor, 330)
+            self.on(monitor)
+            self.run_for(monitor, 1200, step=60)
+            for _ in range(3):
+                self.cycle(monitor)
+            # Triggered while the cap still holds both.
+            self.assertEqual(_BY_RATIO, source.period)
+            self.assertIsNotNone(source.flap)
+            self.assertEqual([], self.sent())
+            while self.clock.value < 1000 + 3600 + 300:
+                self.cycle(monitor)
+        self.assertEqual([ALERT], self.texts())
+        while self.clock.value < 1000 + 7200 + 300:
+            self.cycle(monitor)
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        self.assertEqual((_BY_RATIO, False), (source.period, source.continuous_sent))
+        self.assertEqual(0, monitor.dropped)
+
+    def test_the_stale_boundary_is_a_window_and_one_bin(self):
+        # Issue #349 re-review 提案 1: a late notice sent one second before
+        # a window and one bin after its recovery opens the period, one
+        # second after it does not.
+        bin_width = 900 / DOWN_BINS
+        for offset, period in ((-1, _BY_CONTINUOUS), (1, None)):
+            with self.subTest(offset=offset):
+                self.clock.value = 1000.0
+                monitor = self.monitor(hourly_limit=1)
+                self.online(monitor)
+                self.off(monitor)
+                recovered = self.clock.value + 310
+                send = recovered + 900 + bin_width + offset
+                # The one slot of the hour frees exactly at `send`.
+                monitor.restore_window([(uuid4(), self.clock.value + 3600 - send)],
+                                       monotonic=self.clock.value)
+                self.advance(310)
+                with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+                    self.drain(monitor)
+                self.on(monitor)
+                self.clock.value = send - 1
+                self.assertEqual(1, self.drain(monitor).held)
+                self.clock.value = send
+                self.assertEqual(0, self.drain(monitor).held)
+                self.assertEqual(period, monitor._sources[self.sources[0]].period)
+
+    def test_a_late_notice_of_a_recent_outage_still_opens_the_period(self):
+        # PR #320: one that recovered within the window before it was sent
+        # opens the period, so the ratio rule does not report it again.
+        monitor = self.monitor()
+        self.online(monitor)
+        self.off(monitor)
+        self.advance(310)
+        self.on(monitor)
+        self.advance(50)
+        self.drain(monitor)
+        self.assertEqual([RECOVERED], self.texts())
+        self.assertEqual(_BY_CONTINUOUS, monitor._sources[self.sources[0]].period)
+
+    def test_a_waiting_ended_ratio_alert_never_blocks_a_new_period(self):
+        # Issue #349 review 提案 3: a refused ratio alert whose period closed
+        # waits for the cap apart from the source's current ratio alert, so
+        # new flapping is still evaluated and alerted.
+        monitor = self.monitor(hourly_limit=1)
+        attempt = self.refused_ratio_alert_whose_period_closed(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        source = monitor._sources[self.sources[0]]
         with self.assertLogs("app.monitoring.cameras", level="WARNING"):
             self.drain(monitor)
-        self.assertEqual(([], 1), (self.sent(), monitor.dropped))
+            self.assertIsNone(source.flap)
+            self.assertEqual(1, len(source.late_flaps))
+            for _ in range(2):
+                self.cycle(monitor)
+        self.assertEqual(_BY_RATIO, source.period)
+        self.assertIsNotNone(source.flap)
+        self.assertIsNot(source.flap, source.late_flaps[0])
+        self.assertEqual([], self.sent())
+        for _ in range(32):
+            self.cycle(monitor)
+        rows = sorted(self.sent(), key=lambda row: row.at)
+        self.assertEqual(2, len(rows))
+        self.assertIn((attempt[1], attempt[0]), [(row.event_id, row.at) for row in rows])
+        # The new period's alert (in progress) goes first.
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        self.assertEqual(0, len(source.late_flaps))
+        self.assertEqual(0, monitor.dropped)
+
+    def ratio_period_with_a_late_flapping_episode(self, monitor):
+        # A ratio period opens and its alert takes one slot; the other three
+        # are full for 2400 s. Its flapping episode E1 lasts the threshold
+        # under the cap and recovers; 400 s online (at least the threshold,
+        # less than a window) makes E1 owed while the period stays open.
+        source = monitor._sources[self.sources[0]]
+        self.online(monitor)
+        self.cycle(monitor)
+        self.off(monitor)
+        while source.period != _BY_RATIO:
+            self.run_for(monitor, 30)
+        self.assertEqual([ALERT], self.texts())
+        start, generation = self.clock.value, source.period_seq
+        monitor.restore_window([(uuid4(), 1200.0) for _ in range(3)], monotonic=start)
+        self.run_for(monitor, 330)
+        self.on(monitor)
+        self.run_for(monitor, 400)
+        return source, start, generation
+
+    def test_a_late_flapping_episode_of_the_open_period_is_its_continuous_notice(self):
+        # Claude re-review PR #359 重要 1 (Owner decision PR #335): E1 is
+        # sent after it recovered more than a window and one bin ago, while
+        # its period is still open. It is still that period's continuous
+        # notification, so the later flapping episode E3 is not notified:
+        # two notifications in the period.
+        monitor = self.monitor()
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            source, start, generation = self.ratio_period_with_a_late_flapping_episode(monitor)
+            while self.clock.value < start + 2460:
+                self.cycle(monitor, offline=200)
+            self.assertEqual([ALERT, RECOVERED], self.texts())
+            self.assertTrue(source.continuous_sent)
+            self.cycle(monitor, offline=330)
+            self.run_for(monitor, 600, step=60)
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        self.assertEqual((_BY_RATIO, generation), (source.period, source.period_seq))
+        self.assertEqual(0, monitor.dropped)
+
+    def test_a_late_flapping_episode_is_not_sent_after_the_period_notified(self):
+        # The reverse order: the flapping episode E2 in progress takes a
+        # freed slot first as the period's continuous notification; the late
+        # E1 of the same period is then settled without a third notice.
+        monitor = self.monitor()
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            source, start, generation = self.ratio_period_with_a_late_flapping_episode(monitor)
+            while self.clock.value + 202 < start + 2070:
+                self.cycle(monitor, offline=200)
+            self.off(monitor)
+            self.run_for(monitor, start + 2430 - self.clock.value)
+            self.on(monitor)
+            self.run_for(monitor, 600, step=60)
+        self.assertEqual([ALERT, ALERT], self.texts())
+        self.assertEqual((_BY_RATIO, generation), (source.period, source.period_seq))
+        self.assertIsNone(source.owed)
+
+    def test_two_held_flapping_episodes_of_a_closed_period_send_one(self):
+        # Claude re-review PR #359 重要 1 (after 0b9e994): two flapping
+        # episodes of one ratio period are both held by the cap and the
+        # period closes before a slot frees. Only one is sent: with the
+        # ratio alert, two notifications for the period (Owner decision PR
+        # #335 over Issue #349 inside a flapping period); the other is
+        # settled, counted and logged value-free.
+        monitor = self.monitor()
+        with self.assertLogs("app.monitoring.cameras", level="INFO") as logs:
+            source, start, generation = self.ratio_period_with_a_late_flapping_episode(monitor)
+            # An ordinary outage (after 400 s online) makes E1 owed; E2
+            # follows a 2 s online, so it is a flapping episode of the
+            # same period, and it lasts the threshold under the cap too.
+            self.off(monitor)
+            self.run_for(monitor, 100)
+            self.on(monitor)
+            self.run_for(monitor, 2)
+            self.off(monitor)
+            self.run_for(monitor, 320)
+            self.on(monitor)
+            self.assertEqual(2, self.drain(monitor).held)
+            self.assertEqual((generation, generation),
+                             (source.owed.period_seq, source.episode.period_seq))
+            self.run_for(monitor, 1000, step=60)
+            self.assertIsNone(source.period)
+            self.assertEqual([ALERT], self.texts())
+            while self.clock.value < start + 2460:
+                self.run_for(monitor, 60, step=60)
+            self.run_for(monitor, 3600, step=300)
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        self.assertEqual((None, None), (source.owed, source.episode))
+        self.assertEqual((1, 0), (monitor.suppressed, monitor.dropped))
+        self.assertIn(
+            f"INFO:app.monitoring.cameras:{Event.CAMERA_OFFLINE_NOTIFICATION_SUPPRESSED.value}",
+            logs.output)
+
+    def test_held_episodes_outside_a_ratio_period_are_each_sent(self):
+        # Issue #349 still holds outside a flapping period: two outages that
+        # each lasted the threshold, held by the cap, are each sent once.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        source = monitor._sources[self.sources[0]]
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            for _ in range(2):
+                self.off(monitor)
+                self.run_for(monitor, 330)
+                self.on(monitor)
+                self.run_for(monitor, 330)
+            self.assertIsNone(source.period)
+            self.run_for(monitor, 3 * 3600, step=300)
+        self.assertEqual([RECOVERED, RECOVERED], self.texts())
+        self.assertEqual((0, 0), (monitor.suppressed, monitor.dropped))
+
+    def refused_closed_ratio_periods(self, monitor, count):
+        # `count` flapping periods, each closed by a whole quiet window,
+        # while the queue refuses every alert (Codex PR #359 P2).
+        source = monitor._sources[self.sources[0]]
+        attempts = []
+        for _ in range(count):
+            for _ in range(2):
+                self.cycle(monitor)
+            self.assertEqual(_BY_RATIO, source.period)
+            attempts.append(source.flap.attempt)
+            self.assertIsNotNone(attempts[-1])
+            self.run_for(monitor, 960, step=60)
+            self.assertEqual((None, None), (source.period, source.flap))
+        return attempts
+
+    def test_any_number_of_waiting_ended_ratio_alerts_never_block_a_new_period(self):
+        # Codex PR #359 P2: the queue refuses across two ratio periods
+        # separated by a whole quiet window. Both closed alerts wait apart,
+        # so a third flapping period still gets its own ratio alert, and
+        # once the queue takes them the alert in progress goes first; the
+        # late ones follow one per hour (`hourly_limit=1`), each once.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        refusing = self.service = Refusing(self.service)
+        source = monitor._sources[self.sources[0]]
+        attempts = self.refused_closed_ratio_periods(monitor, 2)
+        self.assertEqual(attempts, [flap.attempt for flap in source.late_flaps])
+        for _ in range(2):
+            self.cycle(monitor)
+        self.assertEqual(_BY_RATIO, source.period)
+        self.assertIsNotNone(source.flap)
+        self.assertFalse(source.flap.ended)
+        self.assertEqual([], self.sent())
+        refusing.accept = True
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            self.drain(monitor)
+        self.assertEqual([ALERT], self.texts())
+        self.run_for(monitor, 3600, step=60)
+        self.assertEqual([ALERT, RECOVERED], self.texts())
+        self.run_for(monitor, 3600, step=60)
+        self.assertEqual([ALERT, RECOVERED, RECOVERED], self.texts())
+        rows = self.sent()
+        self.assertEqual(3, len({row.event_id for row in rows}))
+        for attempt in attempts:
+            self.assertIn((attempt[1], attempt[0]), [(row.event_id, row.at) for row in rows])
+        self.assertEqual((0, 0), (len(source.late_flaps), monitor.dropped))
+        self.run_for(monitor, 3600, step=300)
+        self.assertEqual(3, len(self.sent()))
+
+    def test_waiting_ended_ratio_alerts_are_bounded_per_source(self):
+        # Memory stays bounded: beyond LATE_FLAPS_PER_SOURCE the oldest
+        # waiting alert is dropped, counted and logged value-free.
+        monitor = self.monitor()
+        self.online(monitor)
+        self.service = Refusing(self.service)
+        source = monitor._sources[self.sources[0]]
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as logs:
+            attempts = self.refused_closed_ratio_periods(monitor, LATE_FLAPS_PER_SOURCE + 1)
+        self.assertIn(
+            f"WARNING:app.monitoring.cameras:{Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED.value}",
+            logs.output)
+        self.assertEqual(1, monitor.dropped)
+        self.assertEqual(attempts[1:], [flap.attempt for flap in source.late_flaps])
+        self.service.accept = True
+        self.drain(monitor)
+        rows = self.sent()
+        self.assertEqual(LATE_FLAPS_PER_SOURCE, len(rows))
+        self.assertNotIn(attempts[0][1], [row.event_id for row in rows])
 
     def test_a_refused_continuous_episode_is_sent_after_it_recovered(self):
         # The continuous rule the refused ratio alert now matches.
@@ -1464,6 +1881,49 @@ class FlappingTests(MonitorFixture, unittest.TestCase):
         self.drain(monitor, flapping_id=flapping_id)
         self.assertEqual(1, len(self.sent()))
         self.assertEqual([self.sources[0]], calls)
+
+    def test_a_recovery_during_the_lookup_does_not_end_it(self):
+        # Issue #353 (Codex PR #348 P2): the source recovers while the
+        # lookup runs outside the lock, so its result is discarded, and the
+        # outage resumes after a short online (folded into the same held
+        # episode). The lookup runs again for it, so the earlier process's
+        # ratio period is still restored. The hook pins the interleaving.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor, self.sources[1])
+        monitor.restore_window([(uuid4(), 60.0)], monotonic=self.clock.value)
+        ratio, calls = uuid4(), []
+
+        def flapping_id(source):
+            calls.append(source)
+            if len(calls) == 1:
+                self.on(monitor)
+            return ratio, True
+
+        self.advance(300)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING"):
+            status = self.drain(monitor, flapping_id=flapping_id)
+        self.assertEqual((1, 0), (status.held, status.flapping_sources))
+        self.advance(2)
+        self.off(monitor)
+        self.advance(60)
+        status = self.drain(monitor, flapping_id=flapping_id)
+        self.assertEqual([self.sources[0]] * 2, calls)
+        self.assertEqual(1, status.flapping_sources)
+        # The period's one continuous notification once the hour allows;
+        # later flapping episodes of the period are not notified.
+        self.advance(3600)
+        self.drain(monitor, flapping_id=flapping_id)
+        self.assertEqual(1, len(self.sent()))
+        for _ in range(2):
+            self.on(monitor)
+            self.advance(2)
+            self.off(monitor)
+            self.advance(300)
+            self.drain(monitor, flapping_id=flapping_id)
+            self.advance(3600)
+            self.drain(monitor, flapping_id=flapping_id)
+        self.assertEqual(1, len(self.sent()))
+        self.assertEqual([self.sources[0]] * 2, calls)
 
     def test_a_ratio_alert_an_earlier_process_sent_is_not_sent_again(self):
         monitor = self.monitor()
