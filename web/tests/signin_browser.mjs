@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { launchChrome, pageFor } from './chrome.mjs';
+import { launchChrome, pageFor, routeTracker, unexpectedAbandoned } from './chrome.mjs';
 import { APP_CSP, SHELL_CSP } from '../scripts/policy.mjs';
 
 const secure = 'http://localhost';
@@ -68,7 +68,7 @@ function serverStandIn(overrides) {
   return { state, handlers, denied, json };
 }
 
-async function scenario(name, { origin = secure, overrides = {}, viewport = { width: 390, height: 844 }, violations = [] }, assertions) {
+async function scenario(name, { origin = secure, overrides = {}, viewport = { width: 390, height: 844 }, violations = [], expectAbandoned = [] }, assertions) {
   const page = await pageFor(browser, viewport);
   const stand = serverStandIn(typeof overrides === 'function' ? overrides : () => ({}));
   if (typeof overrides !== 'function') Object.assign(stand.handlers, overrides);
@@ -76,7 +76,9 @@ async function scenario(name, { origin = secure, overrides = {}, viewport = { wi
   const requests = [];
   const unexpected = [];
   const exceptions = [];
-  const routeErrors = [];
+  // Interception handlers and the requests the page abandoned (#334).
+  const routes = routeTracker();
+  const abandoned = [];
   const cleanup = [
     browser.on('Runtime.exceptionThrown', (_, sessionId) => { if (sessionId === page.sessionId) exceptions.push('unhandled error'); }),
     browser.on('Network.webSocketCreated', (_, sessionId) => { if (sessionId === page.sessionId) unexpected.push('websocket'); }),
@@ -99,8 +101,14 @@ async function scenario(name, { origin = secure, overrides = {}, viewport = { wi
       History.prototype[name] = function (...args) { window.__writes.push('history ' + name); return original.apply(this, args); };
     }
   ` });
-  async function route({ requestId, request }) {
+  async function route({ requestId, networkId, request }) {
     const url = new URL(request.url);
+    // A request the page cancelled while paused here is recorded as
+    // abandoned (failing the scenario unless it expects it); any other
+    // refusal is a harness error.
+    async function send(method, params) {
+      if (!await page.answer(networkId, method, { requestId, ...params })) abandoned.push({ method: request.method, path: url.pathname });
+    }
     let body = request.postData ?? '';
     if (!body && request.postDataEntries) body = request.postDataEntries.map(entry => Buffer.from(entry.bytes ?? '', 'base64').toString()).join('');
     requests.push({ method: request.method, url: request.url, path: url.pathname, body, headers: request.headers });
@@ -108,12 +116,12 @@ async function scenario(name, { origin = secure, overrides = {}, viewport = { wi
       const responseHeaders = [{ name: 'Cache-Control', value: 'no-store' }];
       if (contentType) responseHeaders.push({ name: 'Content-Type', value: contentType });
       if (csp) responseHeaders.push({ name: 'Content-Security-Policy', value: csp });
-      await page.command('Fetch.fulfillRequest', { requestId, responseCode, responseHeaders,
+      await send('Fetch.fulfillRequest', { responseCode, responseHeaders,
         body: Buffer.from(content).toString('base64') });
     }
     if (url.origin !== origin) {
       unexpected.push(`origin ${url.origin}`);
-      await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' }); return;
+      await send('Fetch.failRequest', { errorReason: 'BlockedByClient' }); return;
     }
     if (request.method === 'GET' && files.has(url.pathname) && url.search === '') {
       const [content, type, csp] = files.get(url.pathname);
@@ -128,10 +136,10 @@ async function scenario(name, { origin = secure, overrides = {}, viewport = { wi
       return;
     }
     unexpected.push(`${request.method} ${url.pathname}`);
-    await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' });
+    await send('Fetch.failRequest', { errorReason: 'BlockedByClient' });
   }
   cleanup.push(browser.on('Fetch.requestPaused', (params, sessionId) => {
-    if (sessionId === page.sessionId) void route(params).catch(() => routeErrors.push('interception failed'));
+    if (sessionId === page.sessionId) routes.track(route(params));
   }));
   await page.command('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
   const posted = path => requests.filter(item => item.method === 'POST' && item.path === path).map(item => JSON.parse(item.body));
@@ -149,12 +157,14 @@ async function scenario(name, { origin = secure, overrides = {}, viewport = { wi
     async message(expected) { await page.wait(`document.getElementById('m').textContent === ${JSON.stringify(expected)}`); },
     async idle() { await page.wait("!document.getElementById('a').disabled && !document.getElementById('r').disabled"); },
   };
+  let checked = false;
   try {
     await page.navigate(`${origin}/`);
     await assertions({ page, ui, requests, posted, stand, text, authenticatorId });
     await delay(100);
     assert.deepEqual(exceptions, [], 'no unhandled browser errors');
-    assert.deepEqual(routeErrors, [], 'request interception must succeed');
+    assert.deepEqual(await routes.settle(), [], 'request interception must succeed');
+    assert.deepEqual(unexpectedAbandoned(abandoned, expectAbandoned), [], 'no request is abandoned unless the scenario expects it');
     assert.deepEqual(unexpected, [], 'every request is expected');
     assert.deepEqual(await page.evaluate('window.__policyViolations'), violations, 'CSP violations');
     assert.deepEqual(await page.evaluate('window.__writes'), [], 'no storage or history writes');
@@ -177,9 +187,22 @@ async function scenario(name, { origin = secure, overrides = {}, viewport = { wi
       assert.equal(request.headers.Origin ?? request.headers.origin, origin, `Origin on POST ${request.path}`);
       origins++;
     }
-    cases++;
-    process.stdout.write(`sign-in shell: ${name}\n`);
-  } finally { cleanup.forEach(remove => remove()); await page.close(); }
+    checked = true;
+  } finally {
+    // A handler the page started after the last check is still checked
+    // before the page closes (#334); the teardown's own refusals are not errors.
+    let late = [];
+    try { late = await routes.finish(page.command); } finally { cleanup.forEach(remove => remove()); await page.close(); }
+    if (checked) {
+      assert.deepEqual(late, [], 'request interception must succeed until the page closes');
+      // A request the page abandoned after the last check counts as well.
+      assert.deepEqual(unexpectedAbandoned(abandoned, expectAbandoned), [], 'no request is abandoned unless the scenario expects it');
+      // So does a request nobody expected (Codex PR #352).
+      assert.deepEqual(unexpected, [], 'every request is expected until the page closes');
+    }
+  }
+  cases++;
+  process.stdout.write(`sign-in shell: ${name}\n`);
 }
 
 try {
