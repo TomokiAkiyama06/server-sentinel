@@ -252,6 +252,10 @@ class _Source:
     calibrated_at: datetime | None = None
     acquiring: bool = False
     reacquire: bool = False
+    # Issue #355: `reacquire` was set only because the history could not be
+    # read, so whether a calibration is stored is unknown. Kept apart from
+    # `failure`, which a later attempt overwrites with its own reason.
+    history_unknown: bool = False
     failure: str | None = None
     required_notified: bool = False
 
@@ -308,8 +312,12 @@ class SceneCalibrationService:
                 phase = (CalibrationPhase.ACQUIRING if state.acquiring
                          else CalibrationPhase.REACQUIRE_PENDING if state.reacquire
                          else CalibrationPhase.IDLE)
+                # While the history is unknown the status keeps saying so,
+                # whatever a later attempt failed on (Issue #355), and never
+                # reads as a stored calibration.
+                failure = "history_unavailable" if state.history_unknown else state.failure
                 result.append(SourceCalibrationStatus(
-                    source_id, state.origin, state.version, state.calibrated_at, phase, state.failure,
+                    source_id, state.origin, state.version, state.calibrated_at, phase, failure,
                     source_id in self._templates,
                     detection.state.value if detection is not None else "inactive",
                     detection.reason if detection is not None else "unavailable"))
@@ -375,14 +383,24 @@ class SceneCalibrationService:
                     # Whether a calibration is stored is unknown, not
                     # "stored": the status says why (Issue #341), and the
                     # attempt after `start()` reports it again.
-                    state.reacquire, state.failure = True, "history_unavailable"
+                    state.reacquire, state.history_unknown = True, True
+                    state.failure = "history_unavailable"
                     continue
                 if state.failure == "history_unavailable":
                     # An earlier unreadable read is superseded by this one.
                     state.failure = None
                 # A read that finds no stored calibration withdraws an
                 # earlier mark made only because the history was unreadable.
-                state.reacquire = record is not None
+                state.reacquire, state.history_unknown = record is not None, False
+
+    def _known(self, source_id, record) -> None:
+        """An attempt read the history: settle a mark made only because it
+        was unreadable (Issue #355). An empty history withdraws the mark, a
+        stored calibration keeps it; the attempt's own failure stays."""
+        with self._lock:
+            state = self._sources[source_id]
+            if state.history_unknown and state.origin is CalibrationOrigin.NONE:
+                state.reacquire, state.history_unknown = record is not None, False
 
     def pending_reacquisitions(self) -> tuple[UUID, ...]:
         """The sources to re-acquire; none before `start()` (Issue #341)."""
@@ -420,6 +438,7 @@ class SceneCalibrationService:
 
         def plan():
             record = self._latest(binding)
+            self._known(source_id, record)
             identifier, version = ((record.identifier, record.version + 1) if record is not None
                                    else (uuid4(), 1))
             return (identifier, version, template.width, template.height, template.polygon,
@@ -446,6 +465,7 @@ class SceneCalibrationService:
 
         def plan():
             record = self._latest(binding)
+            self._known(source_id, record)
             if record is None:
                 raise CalibrationRefused("calibration_missing")
             if record.reader is None or record.reader != reader_identity(binding):
@@ -556,7 +576,7 @@ class SceneCalibrationService:
         with self._lock:
             state = self._sources[source_id]
             state.acquiring = False
-            state.failure = None
+            state.failure, state.history_unknown = None, False
             state.origin, state.version, state.calibrated_at = origin, record.version, record.created_at
             notify = origin is CalibrationOrigin.RESTART_REACQUIRED and state.reacquire
             state.reacquire = False

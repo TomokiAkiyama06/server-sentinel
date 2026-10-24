@@ -1306,7 +1306,12 @@ continues during an acquisition.
   `reacquire_pending` with `failure` `history_unavailable` (whether a
   calibration is stored is unknown, and the Web says so); the start reads
   the history again, which clears that failure or withdraws the mark when no
-  calibration is stored.
+  calibration is stored. Whether the history is known is kept apart from the
+  last failure (Issue #355): while it is unknown the status keeps
+  `history_unavailable`, whatever a later attempt failed on, and an Owner
+  calibration attempt that read the history settles it like the start does
+  (an empty history withdraws the mark, so a failed attempt then reports
+  `none` / `idle` with its own failure, never a stored calibration).
 - *Restart re-acquisition.* After every Main start, once scene monitoring
   runs, each source with a stored calibration has its reference taken again,
   every source independently and concurrently (at most four), so a camera
