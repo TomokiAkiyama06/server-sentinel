@@ -494,18 +494,20 @@ TensorFlow EfficientDet-Lite2 の TFLite 配布物は、配布ページで Apach
 
 ### Owner 判断（2026-10-26）
 
-Owner は 2026-10-26 に、下の追補の質問 Q7・Q8 について次のとおり判断しました。
+Owner は 2026-10-26 に、下の追補の質問 Q7・Q8 について次のとおり判断しました
+（Owner が作業 session の中で直接判断。出どころは [PR #362 の記録コメント](https://github.com/TomokiAkiyama06/server-sentinel/pull/362#issuecomment-6409640997)）。
+Owner の判断と、この PR が加える条件（「（この PR の追加条件）」）を、上の「実施条件」と同じタグで区別して書きます。
 
 - **Q7（EfficientDet-Lite の扱い）**：**(a)**。EfficientDet-Lite0 / Lite2（Kaggle の TFLite 配布物）は、表に候補として
   記録するだけにします。D-FINE の評価が終わるまで評価しません。TFLite の runtime 依存（LiteRT など）も、TensorFlow を
   使う変換環境も、承認していません。評価に進めるかは、D-FINE の評価の後に改めて判断します。
 - **Q8（Q1 の「配布元の明示」の範囲）**：**はい**。公式組織が配布 page の license 欄に記載した license を、Q1 の
-  「配布元の明示」とみなします。**条件：評価に進む時点で、license を再確認します。** 再確認では、少なくとも次を行い、
-  確認日とともに記録します。
-  - 対象の variation の `licenseName` が、引き続き公式組織の配布 page で `Apache 2.0` であること。
-  - 評価に使う file の配布元・version・digest を固定し、それが license を確認した配布物そのものであること
+  「配布元の明示」とみなします。**条件：評価に進む時点で、license を再確認します。**
+  （Owner の判断はここまでです。）再確認の手順として、この PR は次を加えます。どれも確認日とともに記録します。
+  - （この PR の追加条件）対象の variation の `licenseName` が、引き続き公式組織の配布 page で `Apache 2.0` であること。
+  - （この PR の追加条件）評価に使う file の配布元・version・digest を固定し、それが license を確認した配布物そのものであること
     （MediaPipe の GCS の file など、別の file には当てはめない）。
-  - 値の設定の経緯（上の「確かめた配布物とライセンス表記」の未確認事項）について、新しい情報があれば反映すること。
+  - （この PR の追加条件）値の設定の経緯（上の「確かめた配布物とライセンス表記」の未確認事項）について、新しい情報があれば反映すること。
 
 ### 追補の Owner への質問（2026-10-26 に判断済み）
 
