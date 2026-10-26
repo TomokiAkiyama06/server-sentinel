@@ -329,7 +329,8 @@ class Receiver:
         # silent outages Main itself must flag as interrupted (G5).
         self._event("ready", port=self.port,
                     stale_after_ns=int(self.config.stale_after_s * 1e9),
-                    admission_check_ns=int(self.config.admission_check_s * 1e9))
+                    admission_check_ns=int(self.config.admission_check_s * 1e9),
+                    tcp_nodelay=True)  # every accepted connection sets it (#369)
         print("ready", flush=True)
         threads = [threading.Thread(target=self._consume, daemon=True),
                    threading.Thread(target=self._sample, daemon=True)]

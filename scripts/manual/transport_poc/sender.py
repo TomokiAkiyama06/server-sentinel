@@ -407,7 +407,8 @@ class Sender:
             holder_nonce=self.holder_nonce,
             fps=self.config.fps, frame_bytes=self.config.frame_bytes, epoch=self.epoch,
             pending_limit=self.config.pending_limit, sndbuf=self.config.sndbuf,
-            loss_timeout_ns=int(self.config.loss_timeout_s * 1e9))
+            loss_timeout_ns=int(self.config.loss_timeout_s * 1e9),
+            tcp_nodelay=True)  # every connection sets it (#369; read back in ``connected``)
         for state in self.sources:
             self.writer.write("epoch_start", source=state.index, epoch=self.epoch)
         self.start_sources()

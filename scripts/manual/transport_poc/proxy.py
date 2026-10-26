@@ -314,7 +314,7 @@ def run(listen, upstream, schedule, seconds, out_path, run_id, *, buffer_bytes=M
     writer = records.JsonlWriter(out_path, run_id=run_id, role="proxy")
     proxy = Proxy(listen, upstream, writer, buffer_bytes=buffer_bytes)
     signal.signal(signal.SIGTERM, lambda *_: proxy.stop.set())
-    writer.write("ready", port=proxy.port)
+    writer.write("ready", port=proxy.port, tcp_nodelay=True)  # both sockets of a pair (#369)
     print("ready", flush=True)
     thread = threading.Thread(target=proxy.serve, daemon=True)
     thread.start()

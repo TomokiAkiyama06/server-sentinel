@@ -250,6 +250,23 @@ class RunSummary:
                 verdict = "unmeasured"
         return verdict
 
+    def tcp_nodelay(self):
+        """Every harness TCP socket of this run had Nagle off (#369).
+
+        Without ``TCP_NODELAY`` a stop-and-wait unit's tail can wait for a
+        delayed ACK (about 40 ms per unit), which throttles throughput and
+        moves drops, latency and gap results: such a run measures the
+        harness, not the candidate. True only when the sender ``start``, the
+        receiver and proxy ``ready`` records declare it and every sender
+        ``connected`` and receiver ``session_open`` read it back as true.
+        Records written before #369 carry no ``tcp_nodelay``: False.
+        """
+        declared = (_kind(self.sender, "start") + _kind(self.receiver, "ready")
+                    + _kind(self.proxy, "ready"))
+        observed = _kind(self.sender, "connected") + _kind(self.receiver, "session_open")
+        rows = declared + observed
+        return bool(declared) and all(row.get("tcp_nodelay") is True for row in rows)
+
     def production(self):
         """Every declared source produced media continuously for the run.
 
@@ -1601,15 +1618,20 @@ class RunSummary:
         # mixed records fail every applicable gate, missing evidence makes a
         # pass ``unmeasured``.
         integrity = self.integrity()
+        # #369: a run with Nagle on any harness socket is not a measurement of
+        # the candidate (pass or fail): every gate is ``unmeasured``.
+        nodelay = self.tcp_nodelay()
+        if not nodelay and integrity == "pass":
+            integrity = "unmeasured"
         for gate, verdict in self.gates.items():
             if verdict == "not_applicable":
                 continue
             if integrity == "fail":
                 self.gates[gate] = "fail"
-            elif integrity == "unmeasured" and verdict == "pass":
+            elif integrity == "unmeasured" and (verdict == "pass" or not nodelay):
                 self.gates[gate] = "unmeasured"
         self.metrics.update(self.secondary())
-        self.metrics.update(integrity=integrity, run_ids=len(self.run_ids),
+        self.metrics.update(integrity=integrity, run_ids=len(self.run_ids), tcp_nodelay=nodelay,
                             inputs_consistent=self.inputs_consistent,
                             exercised_sources=self.exercised_sources())
         return self

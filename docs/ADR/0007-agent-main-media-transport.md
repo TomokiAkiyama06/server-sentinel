@@ -197,25 +197,35 @@ Agent), and the fast `slow_stop_10s` stop is 4 s
 so the Agent detects it. Two-host G4/G5 under these rules remain
 **unmeasured** until the MANUAL_TEST.md §G run.
 
-TCP_NODELAY (Issue #369): the 2026-10-26 two-host runs without it are not
-measurements of the candidates. Every 1-source real run (~150 KB MJPEG
-frames, stop-and-wait) showed an almost constant per-unit RTT (p50 46 ms,
-p95 48 ms, per-second unit size uncorrelated with time per unit), delivered
-about 27 of 30 fps and kept the sender pending at its cap; the 2–5 source
-synthetic runs of the same day (p50 7–10 ms) were spared because other
-sources' acknowledgements released the held segments. A one-host loopback A/B
-in a CPU-limited container (1 source, 147 KB units) reproduced it (RTT p50
-41.0 ms without, 0.3 ms with `TCP_NODELAY`; a 5 ms instead of 50 ms sender
-`select` timeout changed nothing): Nagle holds each unit's sub-MSS tail until
-the receiver's delayed ACK (40 ms minimum on Linux). With a 1448-byte MSS
-(`TCP_MAXSEG`, closer to Ethernet) the stall hit a fraction of units (p50
-0.4 ms, p95 41 ms) and `TCP_NODELAY` on the Agent socket alone removed it.
-The harness now sets it on every socket; the loopback figures are not a LAN
-measurement and the real scenarios must be re-run. **Product follow-up
-(#14):** the Agent media connection (after `connect_to_main`) and the Main
-ingest session socket must set `TCP_NODELAY` (or otherwise never leave a
-unit's tail waiting for an ACK) for any stop-and-wait or small-window
-acknowledgement design; the product code does not set it today.
+TCP_NODELAY (Issue #369): no run recorded before the harness set it is a
+measurement of a candidate. The summarizer makes every run without
+`tcp_nodelay: true` in its sender, receiver and proxy records `unmeasured`
+(integrity and every gate, pass or fail); re-summarized, all 38 runs of
+2026-10-26 (real and synthetic, 1–5 sources) are `unmeasured`. On that day
+every 1-source real run (~150 KB MJPEG frames) showed an almost constant
+per-unit RTT (p50 46 ms, p95 48 ms, per-second unit size uncorrelated with
+time per unit), delivered about 27 of 30 fps and kept the sender pending at
+its cap. The 2–5 source synthetic runs had a small p50 (7–10 ms), but they
+were not unaffected: their tail latency can include the same stall (p95 up to
+32 ms there; 33 ms for 2 sources on loopback without `TCP_NODELAY`).
+
+A one-host loopback A/B in a CPU-limited container (1 source) reproduced a
+stall: Nagle holds a small segment at the end of a unit while the receiver
+delays its ACK (40 ms minimum on Linux). Whether a unit stalls depends on its
+size, the sender's 64 KiB write split and the MSS (Linux's Minshall variant
+of Nagle): 125 KB and 147 KB units stalled on almost every unit (RTT p50
+41 ms; `b_segment` 42 ms), 16 KB units did not, and with a 1448-byte MSS
+(`TCP_MAXSEG`, closer to Ethernet) a fraction stalled (p50 0.4 ms, p95
+41 ms). `TCP_NODELAY` removed it (p50 0.3 ms; `b_segment` 4.6 ms); a 5 ms
+instead of 50 ms sender `select` timeout changed nothing. On loopback both
+the sender and the proxy's upstream socket needed it; with the 1448-byte MSS
+the Agent socket alone sufficed. That the 2026-10-26 46 ms came from this
+mechanism is inferred (consistent, not re-measured on the LAN); the real
+scenarios must be re-run. **Product follow-up (#14):** the Agent media
+connection (after `connect_to_main`) and the Main ingest session socket must
+set `TCP_NODELAY` (or otherwise never leave a unit's tail waiting for an ACK)
+for any stop-and-wait or small-window acknowledgement design; the product
+code does not set it today.
 
 | Measurement | a_framed | b_chunked | b_segment | WebRTC (not in harness) | QUIC (not in harness) |
 | --- | --- | --- | --- | --- | --- |

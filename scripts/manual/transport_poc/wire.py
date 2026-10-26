@@ -35,16 +35,22 @@ SEGMENT_PATH = "/poc15/v1/segment"
 def disable_nagle(sock):
     """Set ``TCP_NODELAY`` on ``sock``; returns the value read back (bool).
 
-    Every candidate is stop-and-wait per source: the sender writes one media
-    unit and waits for Main's acknowledgement. With Nagle on, the sub-MSS
-    tail of a unit waits for the ACK of an earlier small segment, and the
-    receiver delays that ACK (Linux minimum 40 ms) because no reply data is
-    due yet. On 2026-10-26 every 1-source real run (~150 KB frames) paid
-    that ~40 ms per unit (RTT p50 46 ms, ~27 fps < 30 fps, pending at its
-    cap); a loopback A/B reproduced it and ``TCP_NODELAY`` on the sender and
-    the proxy's upstream removed it (#369). The sender, the receiver and both
-    proxy sockets set it, so neither the harness nor the impairment proxy
-    adds a Nagle stall that is not part of the transport being measured.
+    Every candidate waits for Main's acknowledgement before the next unit of
+    a source (``b_segment``: before the next segment). With Nagle on, a
+    small segment at the end of a unit can wait for the ACK of an earlier
+    small segment while the receiver delays that ACK (Linux minimum 40 ms),
+    as no reply data is due yet. Whether it happens depends on the unit
+    size, the sender's 64 KiB write split and the MSS (Linux applies
+    Minshall's variant of Nagle): on a CPU-limited loopback A/B (#369) 1
+    source of 125 KB or 147 KB units stalled on almost every unit (RTT p50
+    41 ms, b_segment 42 ms), 16 KB units did not, and a 1448-byte MSS
+    stalled a fraction (p95 41 ms); 2 sources still had p95 33 ms.
+    ``TCP_NODELAY`` on the sender and the proxy's upstream socket removed it
+    (p50 0.3 ms). The 2026-10-26 two-host real runs (1 source, ~150 KB,
+    RTT p50 46 ms, ~27 fps, pending at its cap) are consistent with this
+    mechanism; that is inferred, not re-measured on the LAN. The sender,
+    the receiver and both proxy sockets set it, so neither the harness nor
+    the impairment proxy adds a stall that is not part of the transport.
     """
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     return bool(sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
