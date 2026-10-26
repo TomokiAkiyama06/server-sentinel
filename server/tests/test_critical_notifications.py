@@ -982,6 +982,38 @@ class LifespanTests(RuntimeFixture):
         finally:
             self.transport.gate.set()
 
+    async def test_the_stop_storage_sample_shares_the_one_shutdown_settle(self):
+        # Issue #351 / PR #363 review: with a critical dispatcher the real
+        # `app.main` shutdown runs exactly one notification settle (its
+        # `dispatch_settle_seconds`); the monitoring stop's final storage
+        # sample, which alerts here (the approved UUID no longer names the
+        # root's device), then waits at most what is left of that bound, so
+        # the stop budget stays one settle. A second settle added to the
+        # shutdown, or a final wait outside the bound, fails this.
+        application = self.scene_application(dispatch_interval_seconds=3600,
+                                              dispatch_backoff_seconds=3600,
+                                              dispatch_settle_seconds=2.0)
+        settles = []
+        async with asyncio.timeout(30), application.router.lifespan_context(application):
+            monitoring = application.state.monitoring
+            settle = monitoring.settle_notifications
+
+            def spy(timeout_seconds):
+                started = time.monotonic()
+                try:
+                    return settle(timeout_seconds)
+                finally:
+                    settles.append((timeout_seconds, time.monotonic() - started))
+            monitoring.settle_notifications = spy
+            self.approved_device = self.device + 1
+        [(bound, spent), (wait, _)] = settles
+        self.assertEqual(2.0, bound)
+        # The spy measures a little more than the runtime itself does.
+        self.assertLessEqual(wait, bound - spent + 0.05)
+        self.assertGreater(wait, 1.0)
+        self.assertEqual([ALERT + "recording_health_failure"],
+                         [text for text in self.slack_texts() if "recording_health" in text])
+
     async def test_shutdown_gives_up_on_a_stalled_delivery_after_the_settle_bound(self):
         self.transport = GatedTransport()
         self.addCleanup(self.transport.gate.set)

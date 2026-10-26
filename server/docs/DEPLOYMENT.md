@@ -297,7 +297,15 @@ and the mount, yet storage stops (`STORAGE_HARD_STOP`, one immediate
 `recording_health_failure`) until the backing is hardware-only again, when
 writes resume without a restart. A refusal seen only by a write in between
 two monitoring ticks still raises the alert at the next tick, even if the
-backing was already restored. After such an episode `recording_health` stays
+backing was already restored; a service stop or restart before that tick
+raises it during the stop instead (waiting at most 12 s for its delivery,
+within the stop budget below: only what is left of an earlier notification
+settle, none when that one ended unsettled); a delivery not finished by then
+stays `pending` and `critical_notifications_unsettled` is logged. Such an
+alert may then never reach Slack (behind a stalled or backlogged delivery it
+is still queued at the exit), and a later start does not resend a `pending`
+`recording_health_failure` row, so treat that log line as a possibly lost
+alert. A crash or kill before the tick loses it (Issue #351). After such an episode `recording_health` stays
 `failed` until the next daily recording self-test, even though writes have
 resumed. Updating the recorded numbers ends this
 extra check along with the warning.
@@ -410,7 +418,9 @@ the row can stay `online` until the next start, which writes it `offline`
 before any capture opens. The local UVC stop as a whole can take up to
 `join_timeout_seconds` + 1 s for the frame-progress watchdog join + 1 s for
 pending health-sink deliveries (62 s at the 60 s maximum), and the remaining
-shutdown steps (monitoring runtime, audit retention) follow it. The installed
+shutdown steps (monitoring runtime, audit retention) follow it. The wait of
+the monitoring runtime's final storage sample (Issue #351) shares the bound of
+the notification settle before it, so it does not lengthen the stop. The installed
 unit sets `TimeoutStopSec=90` explicitly (Owner decision 2026-10-08), so the
 stop bound does not depend on the host's `DefaultTimeoutStopSec` and stays
 above that 62 s local UVC bound. A rollback restores the target release's own
