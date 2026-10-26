@@ -17,6 +17,7 @@ it, so the summarizer can tie an Agent-side connection (its loss, its route
 probe) to the Main-side session of the same run without comparing clocks.
 """
 import os
+import socket
 import struct
 from uuid import UUID, uuid5
 
@@ -30,6 +31,24 @@ MAX_HEAD_BYTES = 8192
 SESSION_HEADER = "x-poc15-session"
 STREAM_PATH = "/poc15/v1/stream"
 SEGMENT_PATH = "/poc15/v1/segment"
+
+def disable_nagle(sock):
+    """Set ``TCP_NODELAY`` on ``sock``; returns the value read back (bool).
+
+    Every candidate is stop-and-wait per source: the sender writes one media
+    unit and waits for Main's acknowledgement. With Nagle on, the sub-MSS
+    tail of a unit waits for the ACK of an earlier small segment, and the
+    receiver delays that ACK (Linux minimum 40 ms) because no reply data is
+    due yet. On 2026-10-26 every 1-source real run (~150 KB frames) paid
+    that ~40 ms per unit (RTT p50 46 ms, ~27 fps < 30 fps, pending at its
+    cap); a loopback A/B reproduced it and ``TCP_NODELAY`` on the sender and
+    the proxy's upstream removed it (#369). The sender, the receiver and both
+    proxy sockets set it, so neither the harness nor the impairment proxy
+    adds a Nagle stall that is not part of the transport being measured.
+    """
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    return bool(sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+
 
 OUTCOMES = ("accepted", "duplicate", "backpressured", "rate_limited", "rejected",
             "not_processed")

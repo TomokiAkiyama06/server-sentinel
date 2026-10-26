@@ -372,6 +372,8 @@ class Receiver:
                 continue
             connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.config.sndbuf)
             connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.config.rcvbuf)
+            # Acknowledgements are small writes: never held behind Nagle (#369).
+            wire.disable_nagle(connection)
             threading.Thread(target=self._counted_connection, args=(connection,),
                              daemon=True).start()
 
@@ -402,8 +404,9 @@ class Receiver:
             number = self._connection_counter
             self._connections[number] = session.connection
         label = self.node_index.get(node)
+        nodelay = bool(session.connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
         self._event("session_open", connection=number, generation=grant.generation,
-                    node=token(label) if label else "other")
+                    node=token(label) if label else "other", tcp_nodelay=nodelay)
         reason = "peer_closed"
         state = {"last_rx": time.monotonic(), "checked": time.monotonic(),
                  "connection": number, "session": None}

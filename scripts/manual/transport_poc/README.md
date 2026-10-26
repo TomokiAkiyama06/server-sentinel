@@ -58,6 +58,20 @@ receiver は product の bind 検証を通した上で `SO_REUSEADDR` 付きで 
 `open_ingest_listener` には無く、TIME_WAIT 中の Main 再起動で再 bind できないため。product 側の対応は
 Issue #223 で追跡）。
 
+sender（Agent 側の接続）、receiver（accept した接続）、impairment proxy の両側の socket は
+`TCP_NODELAY` を設定します（`wire.disable_nagle`。sender の `connected` と receiver の
+`session_open` に、読み戻した値を `tcp_nodelay` として記録）。どの候補も source ごとに
+stop-and-wait なので、Nagle が有効だと各 unit の末尾（MSS 未満）が受信側の delayed ACK
+（Linux の最小 40 ms）を待ちます。2026-10-26 の 2 host 実測では 1 source の real run
+（約 150 KB/frame）すべてで RTT p50 が約 46 ms になり、30 fps を送り切れず pending が上限に
+張り付きました（Issue #369）。CPU 制限付き container の loopback A/B（1 source、147 KB）では、
+無しで RTT p50 41.0 ms / p95 42.0 ms・約 24.5 unit/s・drop あり、全 socket に設定すると
+p50 0.3 ms・30 unit/s・drop 0 で、sender の socket と proxy の upstream 側の両方が必要でした
+（loopback は MSS と RTT が実 LAN と異なり、実 LAN での効果は再実測で確認する）。
+**2026-10-26 以前の real run（`tcp_nodelay` の記録が無いもの）は、この stall を含むので
+throughput / drop / G5 の判定に使わず、再実行します。** 製品の ingest / Agent 側（#14）に
+同じ設定が要ることは ADR-0007 に記載しています。
+
 ## 安全規則
 
 - Main host は production（GPU benchmark が同居）。Main 側は必ず

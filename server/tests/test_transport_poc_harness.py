@@ -129,6 +129,14 @@ class WireTests(unittest.TestCase):
         self.assertEqual((wire.ACK, source, 2, 7, "duplicate", "already_committed"), parsed[1])
         self.assertEqual((wire.HEARTBEAT, 5), parsed[2])
 
+    def test_disable_nagle_sets_tcp_nodelay(self):
+        # #369: every harness TCP socket turns Nagle off
+        with socket.create_server(("127.0.0.1", 0)) as server:
+            with socket.create_connection(server.getsockname(), timeout=5) as client:
+                self.assertFalse(client.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+                self.assertTrue(wire.disable_nagle(client))
+                self.assertTrue(client.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+
     def test_hello_carries_the_session_nonce(self):
         reader = wire.FrameReader(4096)
         nonce = wire.new_session_nonce()
@@ -268,6 +276,17 @@ class ProxyTests(unittest.TestCase):
         self.assertLessEqual(self.proxy.max_held, 4096)
         self.proxy.blackhole(False)
         self.assertTrue(wait_for(lambda: len(self.upstream.received) == 100005))
+
+    def test_both_forwarded_sockets_disable_nagle(self):
+        # #369: the proxy stands in for the network and adds no Nagle stall
+        connection = self.client()
+        connection.sendall(b"n")
+        self.assertTrue(wait_for(lambda: bytes(self.upstream.received) == b"n"))
+        with self.proxy.lock:
+            pairs = list(self.proxy.pairs)
+        self.assertEqual(1, len(pairs))
+        for sock in (pairs[0].client, pairs[0].upstream):
+            self.assertTrue(sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
 
     def test_connection_opened_during_blackhole_is_not_forwarded(self):
         self.proxy.blackhole(True)
@@ -3589,6 +3608,42 @@ class LoopbackMatrixTests(unittest.TestCase):
             records.read_jsonl(path)  # every stored value is numeric or a token
         for row in runs.values():
             self.assertEqual("pass", row["integrity"], json.dumps(row, sort_keys=True))
+
+    def test_large_units_are_not_held_by_nagle(self):
+        """#369: ~150 KB units, one source, stop-and-wait through the proxy.
+
+        With Nagle on any data-direction socket each unit's sub-MSS tail
+        waited for a delayed ACK: RTT p50 about 41 ms on loopback (46 ms on
+        the 2026-10-26 two-host runs), fewer than 30 units/s delivered and
+        the pending queue at its cap. Without the stall a loopback round
+        trip is about 1 ms; 20 ms leaves room for a slow CI runner.
+        """
+        directory = tempfile.TemporaryDirectory(prefix="poc15-")
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        materials.init(root / "m")
+        args = argparse.Namespace(
+            role="both", materials=str(root / "m"), node_root=str(root / "m" / "nodes"),
+            state=str(root / "st"), out=str(root / "out"), fast=True, sources=1, fps=30,
+            frame_bytes=147000, source_kind="builtin", holder_socket=None, real_inputs=False,
+            bind="127.0.0.1", upstream_host="127.0.0.1", upstream_port=0,
+            proxy_host="127.0.0.1", port_offset=_free_offset(), main_grace=0)
+        out = matrix.Orchestrator(args, RUN).run(["normal"], ["a_framed"])
+        sender_rows = records.read_jsonl(out / "normal-a_framed" / "sender.jsonl")
+        receiver_rows = records.read_jsonl(out / "normal-a_framed" / "receiver.jsonl")
+        connected = [row for row in sender_rows if row["kind"] == "connected"]
+        opened = [row for row in receiver_rows if row["kind"] == "session_open"]
+        self.assertTrue(connected and all(row["tcp_nodelay"] is True for row in connected))
+        self.assertTrue(opened and all(row["tcp_nodelay"] is True for row in opened))
+        rtt = [row for row in sender_rows if row["kind"] == "latency" and row["metric"] == "rtt"]
+        self.assertEqual(1, len(rtt))
+        detail = json.dumps(rtt[0], sort_keys=True)
+        self.assertGreater(rtt[0]["samples"], 100, detail)
+        self.assertLess(rtt[0]["p50_ns"], 20_000_000, detail)
+        end = [row for row in sender_rows if row["kind"] == "end"]
+        self.assertEqual(1, len(end))
+        # the stall left the pending queue at its cap and dropped units
+        self.assertEqual(0, end[0]["drops"], json.dumps(end[0], sort_keys=True))
 
     def test_two_host_roles_on_loopback(self):
         """``--role main`` and ``--role agent`` as two orchestrators (two output

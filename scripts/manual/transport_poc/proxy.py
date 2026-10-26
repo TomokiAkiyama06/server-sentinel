@@ -24,6 +24,7 @@ import threading
 import time
 
 from . import records
+from .wire import disable_nagle
 
 MAX_BUFFER = 64 * 1024
 
@@ -230,6 +231,10 @@ class Proxy:
             return
         pair.upstream.setblocking(False)
         pair.client.setblocking(False)
+        # The proxy stands in for the network path: it must not add Nagle
+        # stalls of its own to either hop (#369).
+        for sock in (pair.client, pair.upstream):
+            disable_nagle(sock)
         for source, destination, upstream in ((pair.client, pair.upstream, True),
                                               (pair.upstream, pair.client, False)):
             threading.Thread(target=self._pump, args=(pair, source, destination, upstream),
