@@ -1628,9 +1628,41 @@ late. A source keeps at most two unsent episodes: its latest one (in progress,
 or itself recovered and held) and one owed earlier episode (above). So a
 source that, while the cap holds, has three outages of at least
 `after_seconds` each separated by an online of at least `after_seconds`
-drops the oldest (`camera_offline_notification_dropped`, counted); this
-bound on memory is the one exception to "notified once" (pending Owner
-confirmation, PR #359). A late notice is sent after every outage or ratio
+drops the oldest (exception 1 below).
+
+Not-sent exceptions (Owner decision 2026-10-26, PR #359). "Notified once"
+has exactly three exceptions; in each, the notification is not sent, and
+every one not sent is counted and logged value-free:
+
+1. Third continuous outage of a source while its notices wait: while a
+   source's notifications are held back by the hourly cap (or refused by
+   the queue), a third outage of at least `after_seconds` of the same
+   source, separated from the earlier ones by an online of at least
+   `after_seconds`, drops the oldest unsent one (bounded memory: at most
+   two unsent episodes per source). Counted in `dropped`, logged at
+   WARNING as `camera_offline_notification_dropped`.
+2. Fifth closed ratio alert of a source: at most four ratio alerts whose
+   flapping period has closed wait per source (`LATE_FLAPS_PER_SOURCE`,
+   below); a fifth drops the oldest, which the queue never accepted.
+   Counted in `dropped`, logged at WARNING as
+   `camera_offline_notification_dropped`.
+3. Another flapping episode of the same flapping period: within one
+   ratio-opened flapping period, the Owner decision of PR #335 (at most two
+   notifications per flapping period) takes precedence over Issue #349 (an
+   outage of at least `after_seconds` is sent once). Once the period's one
+   continuous notification is sent, any other flapping episode of that
+   period is not sent, even when it lasted `after_seconds` and also after
+   the period closed (below). Counted in `suppressed`, logged at INFO as
+   `camera_offline_notification_suppressed`.
+
+A ratio alert that the cap held until its period closed is not owed in the
+first place and is not an exception to "notified once": it is dropped under
+Issue #338 item 2 (below), also counted in `dropped` and logged as
+`camera_offline_notification_dropped`. Outside these cases an episode held
+by the cap that recovered meanwhile is still sent once with `(already
+recovered)` (Owner decision 2026-10-24, Issue #349).
+
+A late notice is sent after every outage or ratio
 period still in progress (below), so it never delays one; and one whose
 outage recovered more than a window (`flapping_window_seconds`, plus one
 bin) before it was sent opens no alerted period (below). An episode in
@@ -1754,7 +1786,8 @@ continuous notification):
   without a notice, so two flapping episodes held by the cap across the
   period's close do not both go out. Inside a flapping period the Owner
   decision of PR #335 (at most two) takes precedence over Issue #349 (an
-  outage that lasted the threshold is sent once); outside one, every
+  outage that lasted the threshold is sent once; not-sent exception 3,
+  Owner decision 2026-10-26, PR #359); outside one, every
   held episode is still sent once. Each episode settled this way (also a
   later one skipped while the period is open) is counted (`suppressed`)
   and logged value-free at INFO as `camera_offline_notification_suppressed`.
@@ -1800,7 +1833,8 @@ continuous notification):
   none of them keeps the next period from being alerted. At most four wait
   per source (`LATE_FLAPS_PER_SOURCE`, bounded memory); a fifth drops the
   oldest one, which the queue never accepted, counted and logged as
-  `camera_offline_notification_dropped`. Each waiting one is sent once and
+  `camera_offline_notification_dropped` (not-sent exception 2, Owner
+  decision 2026-10-26, PR #359). Each waiting one is sent once and
   takes a slot of the hourly cap like any notification.
 
 `MonitoringStatus.camera_offline_degraded` is also set while a ratio-opened

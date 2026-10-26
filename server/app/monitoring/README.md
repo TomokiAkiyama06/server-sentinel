@@ -133,7 +133,16 @@ whose period closed is dropped before the cap; one the queue refused is sent
 once the queue takes it, like a refused continuous episode; such closed
 alerts wait apart from the source's current ratio alert (any number of
 them never blocks a new period, at most `LATE_FLAPS_PER_SOURCE` = 4 per
-source, the oldest beyond that dropped and logged). See SPECIFICATION §9 for the full rules and the known limits.
+source, the oldest beyond that dropped and logged). "Notified once" has
+exactly three not-sent exceptions (Owner decision 2026-10-26, PR #359), each
+counted and logged value-free: a source's third outage of at least
+`after_seconds` while its notices wait (cap or queue) drops the oldest unsent
+one (`dropped`, `camera_offline_notification_dropped`); a fifth closed ratio
+alert of a source drops the oldest (`dropped`, same log); and inside one
+flapping period PR #335 (at most two) takes precedence over Issue #349, so
+another flapping episode of that period is not sent once the period's
+continuous notification went out (`suppressed`,
+`camera_offline_notification_suppressed`). See SPECIFICATION §9 for the full rules and the known limits.
 
 Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
 takes the `AccessFaultMonitor` the composition root also passes to the
