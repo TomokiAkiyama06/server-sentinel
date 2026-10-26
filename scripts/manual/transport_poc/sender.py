@@ -334,9 +334,15 @@ class Sender:
                         self.writer.write("first_accept", connection=self.connections,
                                           session=self.session, source=state.index)
             else:
-                # Transient refusal: put the unit back in front, retry later.
+                # Transient refusal: put the unit back in front, retry later,
+                # bounded like ``_requeue_inflight`` / ``_restore``: the
+                # producer may have filled ``pending`` while the unit was in
+                # flight, so drop-oldest (each drop recorded in
+                # ``drop_ranges``, G2 accounting) keeps it at the limit (#367).
                 state.pending.appendleft(unit)
                 state.inflight = None
+                while len(state.pending) > state.pending_limit:
+                    state.drop(state.pending.popleft())
                 state.retry_at = time.monotonic() + state.backoff
                 state.backoff = min(0.5, state.backoff * 2)
 
