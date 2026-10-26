@@ -561,14 +561,25 @@ class CameraOfflineMonitor:
                     # one is dropped only once a third outage lasted the
                     # threshold (``_bound_held``; this recovered one did).
                     self._bound_held(source, now)
-                    if source.owed is not None:
-                        if source.older is not None:
-                            # Still three (the recovered one is a flapping
-                            # episode its period will not send): memory stays
-                            # bounded, the oldest is dropped.
-                            self._drop_held(source)
-                        source.older = source.owed
-                    source.owed = episode
+                    if (source.owed is not None and source.older is not None
+                            and _of_period(source, episode) and source.continuous_sent):
+                        # Still three: the recovered one is a flapping
+                        # episode its period will not send (PR #335 over
+                        # Issue #349, not-sent exception 3). It is settled
+                        # now, as the next drain would, and the two held
+                        # ones stay (Claude re-review PR #359 提案 1).
+                        identity = next(key for key, value in self._sources.items()
+                                        if value is source)
+                        self._finish(identity, episode)
+                        self._suppressed()
+                    else:
+                        if source.owed is not None:
+                            if source.older is not None:
+                                # Defensive: never more than three per
+                                # source; the oldest is dropped.
+                                self._drop_held(source)
+                            source.older = source.owed
+                        source.owed = episode
                 # Inside a ratio-opened period, an outage after a short
                 # online continues the flapping; after a longer one it is an
                 # ordinary episode.

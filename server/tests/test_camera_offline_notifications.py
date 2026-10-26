@@ -436,21 +436,71 @@ class OwedEpisodeTests(MonitorFixture, unittest.TestCase):
         self.assertEqual(1, monitor.dropped)
 
     def test_a_held_third_outage_waits_with_two_owed_and_bounds_memory(self):
-        # Bounded memory: at most two held recovered episodes and one in
-        # progress per source; a fourth outage of the threshold drops again.
+        # Bounded memory: at most two held recovered episodes and one more per
+        # source. While the fourth outage is short of the threshold all three
+        # are kept (one drop so far, by the third); once it lasts the
+        # threshold the oldest is dropped again (Claude re-review PR #359
+        # 提案 2).
         monitor = self.monitor(hourly_limit=1)
         self.online(monitor)
         monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
         source = self.sources[0]
-        self.held_outages(monitor, source, 4)
+        self.held_outages(monitor, source, 3)
         state = monitor._sources[source]
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(200)
+        self.drain(monitor)
         kept = [item for item in (state.older, state.owed, state.episode) if item is not None]
-        self.assertEqual(2, len(kept))
-        self.assertEqual(2, monitor.dropped)
+        self.assertEqual((3, 1), (len(kept), monitor.dropped))
+        self.advance(130)
+        self.drain(monitor)
+        kept = [item for item in (state.older, state.owed, state.episode) if item is not None]
+        self.assertEqual((2, 2), (len(kept), monitor.dropped))
+        self.online(monitor, source)
         for _ in range(4):
             self.advance(3600)
             self.drain(monitor)
         self.assertEqual(2, len(self.sent()))
+        self.assertEqual(2, monitor.dropped)
+
+    def test_a_third_flapping_episode_its_period_will_not_send_is_settled(self):
+        # Claude re-review PR #359 提案 1: two episodes are held by the cap
+        # and the latest recovered one is a flapping episode of a ratio period
+        # that already sent its continuous notification. When a new outage
+        # begins before any drain settled it, that flapping episode is
+        # settled without a notice (``suppressed``, PR #335 over Issue #349)
+        # and both held ones are still sent; nothing is dropped.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        source = self.sources[0]
+        self.held_outages(monitor, source, 2)
+        state = monitor._sources[source]
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        flapping = state.episode
+        self.assertIsNotNone(state.older)
+        # A ratio-opened period whose continuous notification already went
+        # out, with the third outage as its flapping episode (set directly:
+        # the path needs no drain between its threshold and the next outage).
+        state.period, state.continuous_sent = _BY_RATIO, True
+        state.period_seq += 1
+        flapping.flapping, flapping.period_seq = True, state.period_seq
+        self.advance(330)
+        monitor.health_sink(event(source, CameraState.ONLINE))
+        self.advance(330)
+        with self.assertLogs("app.monitoring.cameras", level="INFO") as logs:
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.assertIn(Event.CAMERA_OFFLINE_NOTIFICATION_SUPPRESSED.value, logs.output[-1])
+        self.assertEqual((0, 1), (monitor.dropped, monitor.suppressed))
+        self.assertTrue(flapping.notified)
+        self.assertIsNot(state.episode, flapping)
+        self.assertNotIn(flapping, (state.older, state.owed))
+        self.online(monitor, source)
+        for _ in range(4):
+            self.advance(3600)
+            self.drain(monitor)
+        self.assertEqual([RECOVERED] * 2, self.texts())
+        self.assertEqual((0, 1), (monitor.dropped, monitor.suppressed))
 
     def test_owed_episodes_still_obey_the_cap(self):
         monitor = self.monitor(hourly_limit=1)

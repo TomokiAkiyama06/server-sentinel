@@ -1630,7 +1630,11 @@ at most three episodes per source. A third outage drops the oldest held one
 only once it has lasted `after_seconds` (checked when the drain has sent what
 the hour allows, and when a further outage begins); a shorter third outage
 drops nothing, and both held ones are still sent (exception 1 below; Claude
-re-review PR #359 重要 1).
+re-review PR #359 重要 1). A latest episode that is a flapping episode its
+period will not send (exception 3 below) is not a third notice: when a
+further outage begins before a drain settled it, it is settled then
+(`suppressed`), and the two held ones stay and are sent (Claude re-review PR
+#359 提案 1).
 
 Not-sent exceptions (Owner decision 2026-10-26, PR #359). "Notified once"
 has exactly three exceptions; in each, the notification is not sent, and
