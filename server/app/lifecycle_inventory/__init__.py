@@ -214,8 +214,11 @@ TRANSIENT_TABLES = {
     # security_state (session_revocation_pending), not the table as a whole.
     "application_metadata": "key/value store; its session-revocation exposure marker "
                             "(#134) is checked in security_state",
-    # Issue #351: written at every start and deleted by the graceful stop.
-    "monitoring_run_marker": "running marker of the monitoring runtime",
+    # Issue #351 (PR #366 review): not "replays nothing" like the others, but
+    # its value changes at every start (a new random token) and a graceful
+    # stop deletes it, so no baseline value could be compared across a stop.
+    "monitoring_run_marker": "running marker of the monitoring runtime, rewritten at "
+                             "every start",
     "notification_schedule": "daily-summary schedule cursor",
     "presence_delivery_fairness": "round-robin cursor between delivery classes",
     "presence_inputs": "live presence inputs with their own validity windows",

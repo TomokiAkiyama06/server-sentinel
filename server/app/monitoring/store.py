@@ -50,11 +50,18 @@ def run_marker_migration(version: int) -> Migration:
     next start therefore means the previous process exited without that stop
     (crash, kill, OOM, power loss), so a refusal it kept only in memory may
     have been lost. The table lives in the Main database on the verified
-    recording filesystem (`admit_state_file`); creating it deletes nothing.
+    recording filesystem (`admit_state_file`).
+
+    ``notification_events.resent`` is set once a start submitted a row an
+    earlier process left `pending` again, so each such row is resent at most
+    once, never again by every start of a crash loop (PR #366 review). Rows
+    keep ``0``. Creating the table and adding the column delete nothing.
     """
     return Migration(version, "monitoring_run_marker", (
         "CREATE TABLE monitoring_run_marker (singleton INTEGER PRIMARY KEY "
         "CHECK(singleton=1), token TEXT NOT NULL)",
+        "ALTER TABLE notification_events ADD COLUMN resent INTEGER NOT NULL DEFAULT 0 "
+        "CHECK(resent IN (0,1))",
     ))
 
 
@@ -112,6 +119,16 @@ class NotificationEventStore(_Autocommit):
         return {"event_id": UUID(row[0]), "kind": NotificationKind(row[1]),
                 "at": datetime.fromisoformat(row[2]), "confirmed": bool(row[3]),
                 "delivery": DeliveryResult(row[4])}
+
+    def mark_resent(self, event_id: UUID) -> bool:
+        """Mark a row as resent once (Issue #351); False when it already was.
+
+        Written before the resubmission, so a crash in between leaves the row
+        marked: it is resent at most once, never once per later start.
+        """
+        return self._write(
+            "UPDATE notification_events SET resent=1 WHERE event_id=? AND resent=0",
+            (str(event_id),)) == 1
 
     def count_since(self, since: datetime, kinds: tuple[NotificationKind, ...]) -> int:
         marks = ",".join("?" for _ in kinds)

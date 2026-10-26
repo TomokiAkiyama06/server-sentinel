@@ -82,6 +82,12 @@ SHUTDOWN_STORAGE_SETTLE_SECONDS = 12.0
 # all would, while the queue keeps room for the start's own alerts).
 PENDING_HEALTH_RESEND_SECONDS = 24 * 60 * 60.0
 PENDING_HEALTH_RESEND_LIMIT = 4
+# PR #366 review: while a delivery is pending, the run loop polls completions
+# this often between ticks, so a delivered alert's `sent` is stored about a
+# second after Slack answered, not up to a tick (60 s) later; otherwise a
+# crash before that tick would leave a delivered alert `pending` and the next
+# start would send it again.
+NOTIFICATION_POLL_SECONDS = 1.0
 
 
 def _boot_id() -> str | None:
@@ -181,6 +187,10 @@ class MonitoringStatus:
     # Issue #321: a recorded major/minor pair is stale while the approved
     # UUID, mount and root agree; storage stays admitted.
     recording_device_numbers_stale: bool = False
+    # Issue #351 (PR #366 review): this run's marker is not written yet (its
+    # write is refused and retried), so a crash of this process would not be
+    # detected by the next start. Degraded in the daily summary.
+    unclean_exit_detection_degraded: bool = False
 
 
 class RefuseUnvalidatedSegments:
@@ -663,7 +673,7 @@ class MonitoringRuntime:
         after `retry_seconds` without holding back the other. The marker goes
         first: until it is written a crash of this process is not detected.
         """
-        self._guarded("run_marker", self._mark_running, None)
+        self._guarded("run_marker", self._mark_running, "unclean_exit_detection_degraded")
         self._guarded("pending_health", self._resend_pending_health_failures, None)
 
     def _resend_pending_health_failures(self) -> None:
@@ -675,24 +685,30 @@ class MonitoringRuntime:
         submitted again under its stored ID and time and the outcome lands in
         that row, as the stale device-number notice (#323) and camera offline
         (#339) do. If the earlier POST did reach Slack the Owner sees the
-        alert twice, never not at all. Only rows whose event time is less
-        than `PENDING_HEALTH_RESEND_SECONDS` old are taken (a time in the
-        future counts as recent; the event time, unlike `accepted_at`, never
-        moves on a resend, so a restart loop cannot keep one eligible beyond
-        a day), newest first and at most `PENDING_HEALTH_RESEND_LIMIT`; the
-        older or excess ones stay `pending` and are counted in one value-free
-        log line. A row whose ID or time cannot be read is skipped. A row this
-        process still has in flight (an alert it raised while storage was
-        refused, persisted once storage recovered) is not submitted twice.
-        Done once the rows were submitted; a full queue leaves them for a
-        later tick instead of turning them into a final `failed`.
+        alert twice, never not at all. Each row is resent at most once
+        (`notification_events.resent`, marked before the resubmission; PR
+        #366 review): a crash loop does not resend the same row at every
+        start, and a resend cut by a crash is not repeated. Only rows whose
+        event time is less than `PENDING_HEALTH_RESEND_SECONDS` from now in
+        either direction are taken (the event time, unlike `accepted_at`,
+        never moves on a resend; a time far in the future, after the clock
+        moved back, is neither kept eligible nor allowed to take the slots of
+        recent rows), nearest to now first and at most
+        `PENDING_HEALTH_RESEND_LIMIT`; the others stay `pending` and are
+        counted in one value-free log line. A row whose ID or time cannot be
+        read is skipped. A row this process still has in flight (an alert it
+        raised while storage was refused, persisted once storage recovered)
+        is not submitted twice. Done once the rows were submitted; a full
+        queue leaves them for a later tick instead of turning them into a
+        final `failed`.
         """
         if self._pending_health_resent:
             return
         now = self.dependencies.utcnow()
         horizon = timedelta(seconds=PENDING_HEALTH_RESEND_SECONDS)
         cursor = self._connection.execute(
-            "SELECT event_id, at FROM notification_events WHERE kind=? AND delivery=?",
+            "SELECT event_id, at FROM notification_events "
+            "WHERE kind=? AND delivery=? AND resent=0",
             (NotificationKind.RECORDING_HEALTH_FAILURE.value, DeliveryResult.PENDING.value))
         found, older = [], 0
         try:
@@ -704,7 +720,7 @@ class MonitoringRuntime:
                         raise ValueError
                 except (TypeError, ValueError, AttributeError):
                     continue
-                if now - stamp < horizon:
+                if abs(now - stamp) < horizon:
                     found.append((event, stamp))
                 else:
                     older += 1
@@ -714,12 +730,13 @@ class MonitoringRuntime:
         notifications = self.notifications
         found = [row for row in found
                  if not notifications.in_flight(row[0]) and not notifications.retained(row[0])]
-        found.sort(key=lambda row: row[1], reverse=True)
+        found.sort(key=lambda row: abs(now - row[1]))
         for event_id, at in found[:PENDING_HEALTH_RESEND_LIMIT]:
             if not notifications.can_accept(event_id):
                 raise RecordingError("NOTIFICATION_QUEUE_FULL")
-            notifications.record(NotificationKind.RECORDING_HEALTH_FAILURE, at=at,
-                                 event_id=event_id)
+            if self.notification_events.mark_resent(event_id):
+                notifications.record(NotificationKind.RECORDING_HEALTH_FAILURE, at=at,
+                                     event_id=event_id)
         unrestored = older + max(0, len(found) - PENDING_HEALTH_RESEND_LIMIT)
         if unrestored:
             logging.getLogger(__name__).warning(Event.RECORDING_HEALTH_FAILURE_UNRESTORED,
@@ -745,7 +762,10 @@ class MonitoringRuntime:
         resent by `_resend_pending_health_failures`. The recording-health
         verdict is not changed: the startup self-test that follows sets it.
         The marker is replaced only once that row exists, so a refused local
-        write keeps the earlier marker and retries with the same event.
+        write keeps the earlier marker and retries with the same event; a
+        full or closed queue is retried later too, never stored as a final
+        `failed` for an alert that was not sent (PR #366 review). Until the
+        marker is written, `unclean_exit_detection_degraded` is set.
         """
         if self._run_marked:
             return
@@ -753,6 +773,8 @@ class MonitoringRuntime:
         if previous is not None and previous != self._run_token:
             event_id = uuid5(EVENT_NAMESPACE, f"recording-unclean-exit:{previous}")
             if self.notification_events.get(event_id) is None:
+                if not self.notifications.can_accept(event_id):
+                    raise RecordingError("NOTIFICATION_QUEUE_FULL")
                 if self._unclean_at is None:
                     self._unclean_at = self.dependencies.utcnow()
                     logging.getLogger(__name__).error(Event.MONITORING_PREVIOUS_RUN_UNCLEAN)
@@ -888,7 +910,7 @@ class MonitoringRuntime:
             status.storage_audit_failed, status.notification_local_failed,
             status.notification_delivery_failed, status.human_access_degraded,
             status.credential_finding_degraded, status.camera_offline_degraded,
-            status.recording_device_numbers_stale,
+            status.recording_device_numbers_stale, status.unclean_exit_detection_degraded,
         ))
         elapsed = self.dependencies.monotonic() - self._started_monotonic
         monitored = int(min(86400, max(0, elapsed))) if math.isfinite(elapsed) else 0
@@ -1511,10 +1533,35 @@ class MonitoringRuntime:
         if self.status.state == RuntimeState.RUNNING:
             logging.getLogger(__name__).info(Event.MONITORING_STARTED)
 
-    async def run(self, after_tick: Callable[[], None] | None = None) -> None:
-        """Tick forever; `after_tick` refreshes lifespan-held status snapshots."""
+    def _poll_outcomes(self) -> None:
+        """Between ticks: store finished deliveries' outcomes (PR #366 review)."""
+        self._require_owner()
+        if self.notifications is not None and self.notifications.pending_count:
+            self._poll()
+
+    async def _wait_for_tick(self) -> None:
+        """Sleep one tick interval, polling outcomes while deliveries are pending."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.dependencies.tick_seconds
         while True:
-            await asyncio.sleep(self.dependencies.tick_seconds)
+            remaining = deadline - loop.time()
+            if remaining <= NOTIFICATION_POLL_SECONDS:
+                await asyncio.sleep(max(0.0, remaining))
+                return
+            await asyncio.sleep(NOTIFICATION_POLL_SECONDS)
+            try:
+                await self.call(self._poll_outcomes)
+            except Exception:
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+
+    async def run(self, after_tick: Callable[[], None] | None = None) -> None:
+        """Tick forever; `after_tick` refreshes lifespan-held status snapshots.
+
+        Between ticks a delivery's outcome is stored within about
+        `NOTIFICATION_POLL_SECONDS` of its completion (`_wait_for_tick`).
+        """
+        while True:
+            await self._wait_for_tick()
             try:
                 await self.call(self.tick)
             except Exception:

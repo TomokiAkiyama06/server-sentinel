@@ -1871,11 +1871,16 @@ before the tick submits it; it reaches Slack only if the single delivery
 worker gets to it within that wait (behind a stalled or backlogged delivery,
 or with no wait left, it may not be sent by that process). A
 `recording_health_failure` row an earlier process left `pending` is submitted
-again once by the next start under its stored ID and time when its event time
-is less than 24 h old (newest first, at most 4; the rest stay `pending` and
-`recording_health_failure_unrestored` logs their count), like the stale
-device-number notice and camera offline; if the earlier POST reached Slack the
-Owner sees it twice (Issue #351). A crash, kill, OOM or power loss before the
+again by the next start under its stored ID and time when its event time is
+less than 24 h from now in either direction (nearest first, at most 4; the
+rest stay `pending` and `recording_health_failure_unrestored` logs their
+count), like the stale device-number notice and camera offline; if the earlier
+POST reached Slack the Owner sees it twice (Issue #351). Each row is resent at
+most once (`notification_events.resent`, set before the resubmission), so a
+crash loop never resends the same row at every start. Between ticks the run
+loop stores a finished delivery's outcome within about 1 s while deliveries
+are pending, so a delivered alert is normally `sent` before a crash and not
+resent. A crash, kill, OOM or power loss before the
 tick loses the in-memory flag itself; instead, the runtime keeps a running
 marker (one row of a random per-process token in the Main database, written
 under the storage policy when it reaches `running` and deleted by the graceful
@@ -1883,13 +1888,17 @@ stop after its final sample), and a start that finds another process's marker
 logs `monitoring_previous_run_unclean` and raises one immediate value-free
 `recording_health_failure` named after that token, whether or not a refusal was
 actually lost (Owner decision 2026-10-26, option 2): every unclean exit of a
-running process is notified once, a graceful restart never. A process that
+running process is notified once, a graceful restart never. In a crash loop
+each crash therefore sends one new notice, plus at most one resend of each
+earlier notice whose outcome was never stored; there is no rate limit. A process that
 never reached `running` writes no marker (nothing was admitted). A graceful
 stop whose marker delete is refused (storage refused at the stop, already
 alerted by its final sample) or whose final sample failed leaves the marker,
-so the next start notifies once more. A refused marker write is retried by the
-tick every 15 minutes; until it succeeds, a crash of that process is not
-detected. Current numbers read no
+so the next start notifies once more. A refused marker write (or a notice the
+queue cannot take) is retried by the tick every 15 minutes, never stored as a
+final `failed`; until it succeeds, a crash of that process is not detected and
+`unclean_exit_detection_degraded` is set (one degraded item in the daily
+summary; not a separate diagnostics field). Current numbers read no
 sysfs. A mismatch at startup leaves
 the runtime `failed`, refuses writes and still attempts the immediate Slack
 alert; the open is retried every 15 minutes against the same declared identity

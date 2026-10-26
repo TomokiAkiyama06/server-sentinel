@@ -222,14 +222,16 @@ Runtime-data assumptions:
   backlogged delivery, or with no wait left, it may never reach Slack (queued
   deliveries are not sent after close, and a POST in flight may be cut by the
   exit); the next start submits such a `pending` `recording_health_failure`
-  row once more (within a day of its event, at most 4, Issue #351). A crash,
+  row once more (within a day of its event, at most 4, each row at most once,
+  Issue #351). A crash,
   kill, OOM or power loss before the tick loses the flag itself; the running
   marker the process leaves in the Main database (a random token, no host,
   device or path value, on the verified filesystem) makes the next start send
   one conservative `recording_health_failure` for every such unclean exit,
   whether or not a refusal was actually lost (Owner decision 2026-10-26).
   Residual: a crash before that process's marker was written (its write
-  refused and retried every 15 minutes) is not detected.
+  refused and retried every 15 minutes; `unclean_exit_detection_degraded`
+  meanwhile) is not detected.
   `recording_health` then stays `failed` until the next daily recording
   self-test, although writes have resumed. A change in the middle of one admitted write is not prevented
   inside that write; the next sample refuses. Current numbers never read

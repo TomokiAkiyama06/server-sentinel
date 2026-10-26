@@ -99,11 +99,18 @@ marker is replaced only once the row exists, so a crash in between repeats
 nothing. The recording-health verdict is left to the startup self-test. It
 then submits each `recording_health_failure` row an earlier process left
 `pending` again under its ID and time, when its event time is less than
-`PENDING_HEALTH_RESEND_SECONDS` (24 h) old, newest first, at most
-`PENDING_HEALTH_RESEND_LIMIT` (4), skipping rows this process has in flight;
+`PENDING_HEALTH_RESEND_SECONDS` (24 h) from now in either direction, nearest
+first, at most `PENDING_HEALTH_RESEND_LIMIT` (4), skipping rows this process
+has in flight and rows already resent once (`notification_events.resent`,
+set before the resubmission, so a crash loop resends each row at most once);
 the rest stay `pending` (`recording_health_failure_unrestored` with a count).
 Each of the two is its own guarded step, retried by the tick after
-`retry_seconds` when refused. A crash or kill before the tick therefore still
+`retry_seconds` when refused (also when the queue cannot take the notice:
+nothing is stored as `failed`); while the marker is not written
+`unclean_exit_detection_degraded` is set and counted by the daily summary.
+Between ticks the run loop polls completions every
+`NOTIFICATION_POLL_SECONDS` (1 s) while deliveries are pending, so an
+outcome is stored about a second after Slack answered. A crash or kill before the tick therefore still
 loses the flag, but the next start notifies the unclean exit, unless that
 process's marker write was still being refused. Current numbers read no sysfs. A failed startup open is
 retried every `retry_seconds` from the tick against the same declared identity;

@@ -305,14 +305,17 @@ settle, none when that one ended unsettled); a delivery not finished by then
 stays `pending` and `critical_notifications_unsettled` is logged. Such an
 alert may then never reach Slack (behind a stalled or backlogged delivery it
 is still queued at the exit); the next start then submits that `pending`
-`recording_health_failure` row once more (within a day of its event), so the
-Owner may receive it twice. A crash, kill, OOM or power loss before the tick
+`recording_health_failure` row once more (within a day of its event, and each
+row only once), so the Owner may receive it twice. A crash, kill, OOM or power loss before the tick
 loses the refusal itself; instead the next start finds the running marker the
 process left in the database and sends one `recording_health_failure` for that
 unclean exit (log `monitoring_previous_run_unclean`), whether or not a refusal
 was lost (Issue #351). Every unclean exit of the running service is notified
 once this way (a crash loop sends one per crash that had reached
-`running`; there is no rate limit); a graceful `systemctl restart` sends none. On such a notice,
+`running`, plus at most one resend of each earlier notice whose delivery
+outcome was not stored before the crash; there is no rate limit); a graceful
+`systemctl restart` sends none. While the marker cannot be written the daily
+summary counts `unclean_exit_detection_degraded`. On such a notice,
 check the journal for why the previous process ended and verify the recording
 filesystem (`--check`). After such an episode `recording_health` stays
 `failed` until the next daily recording self-test, even though writes have
