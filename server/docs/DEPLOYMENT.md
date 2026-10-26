@@ -301,8 +301,11 @@ backing was already restored; a service stop or restart before that tick
 raises it during the stop instead (waiting at most 12 s for its delivery,
 within the stop budget below: only what is left of an earlier notification
 settle, none when that one ended unsettled); a delivery not finished by then
-stays `pending` and `critical_notifications_unsettled` is logged. A crash or
-kill before the tick loses it (Issue #351). After such an episode `recording_health` stays
+stays `pending` and `critical_notifications_unsettled` is logged. Such an
+alert may then never reach Slack (behind a stalled or backlogged delivery it
+is still queued at the exit), and a later start does not resend a `pending`
+`recording_health_failure` row, so treat that log line as a possibly lost
+alert. A crash or kill before the tick loses it (Issue #351). After such an episode `recording_health` stays
 `failed` until the next daily recording self-test, even though writes have
 resumed. Updating the recorded numbers ends this
 extra check along with the warning.

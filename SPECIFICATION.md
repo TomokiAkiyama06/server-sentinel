@@ -1866,8 +1866,11 @@ only when it raised the alert, waits for the pending deliveries (up to 12 s
 when no shutdown settle ran, otherwise only what is left of that settle's
 bound, and not at all when that settle ended unsettled; an unfinished one
 stays `pending` and `critical_notifications_unsettled` is logged), so a stop
-before the tick does not drop it; a crash or kill before the tick still loses the flag
-(no durable record yet, Issue #351). Current numbers read no
+before the tick submits it; it reaches Slack only if the single delivery
+worker gets to it within that wait (behind a stalled or backlogged delivery,
+or with no wait left, it may not be sent at all, and a `pending`
+`recording_health_failure` row is not resent by a later start). A crash or
+kill before the tick still loses the flag (no durable record yet, Issue #351). Current numbers read no
 sysfs. A mismatch at startup leaves
 the runtime `failed`, refuses writes and still attempts the immediate Slack
 alert; the open is retried every 15 minutes against the same declared identity

@@ -1214,8 +1214,11 @@ class MonitoringRuntime:
         Shutdown calls it before `stop()`, so a notification submitted just
         before shutdown still completes and is recorded when the endpoint
         answers in time. Returns how many deliveries are still pending; those
-        stay `pending` in `notification_events` (uncertain, not confirmed); a
-        restarted process's reconciliation decides whether one is sent again.
+        stay `pending` in `notification_events` (uncertain, not confirmed). A
+        restarted process resends only the kinds it reconciles (the stale
+        device-number notice, camera offline, credential findings); others,
+        such as `recording_health_failure`, are not sent again, and one still
+        queued at close may never have reached Slack.
         The bound, the time spent and an unsettled end are kept, so the stop's
         final storage sample waits only within what is left (Issue #351).
         """
@@ -1273,11 +1276,14 @@ class MonitoringRuntime:
         delivery, bounded by the stop budget (PR #363 review): without an
         earlier shutdown settle up to `SHUTDOWN_STORAGE_SETTLE_SECONDS`;
         after one, at most what is left of that settle's bound, and not at all
-        when it ended with deliveries still pending (Slack did not answer, so
-        waiting again would only spend the budget on the same delivery). The
-        alert was submitted before the wait; one not finished by then stays
-        `pending` and `critical_notifications_unsettled` is logged, like the
-        other shutdown settles. A crash or kill before the tick still loses
+        when it ended with deliveries still pending (the budget is spent).
+        The alert was submitted before the wait, but the one delivery worker
+        sends in order: behind a stalled or backlogged delivery, or with no
+        wait left, it may still be queued at close and is then never sent
+        (nor resent by a later start: no `recording_health_failure`
+        reconciliation exists). It then stays `pending` and
+        `critical_notifications_unsettled` is logged, like the other shutdown
+        settles. A crash or kill before the tick still loses
         the flag (no durable record yet, Issue #351).
         """
         if (self.status.state != RuntimeState.RUNNING or self.filesystem is None
