@@ -374,6 +374,84 @@ class OwedEpisodeTests(MonitorFixture, unittest.TestCase):
         self.assertEqual([RECOVERED] * 2, self.texts())
         self.assertEqual(1, monitor.dropped)
 
+    def held_outages(self, monitor, source, count):
+        # ``count`` outages of the threshold, each followed by a long online,
+        # while the cap (hourly_limit=1, its slot taken) holds them back.
+        for _ in range(count):
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+            self.advance(330)
+            self.drain(monitor)
+            monitor.health_sink(event(source, CameraState.ONLINE))
+            self.advance(330)
+            self.drain(monitor)
+
+    def test_a_short_third_outage_never_drops_a_held_episode(self):
+        # Owner decision 2026-10-26 (a), Claude re-review PR #359 重要 1: only
+        # a third outage of at least the threshold drops the oldest held one.
+        # A 10 s blip after two held outages drops nothing, and both are sent.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        source = self.sources[0]
+        self.held_outages(monitor, source, 2)
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(10)
+        self.drain(monitor)
+        monitor.health_sink(event(source, CameraState.ONLINE))
+        self.drain(monitor)
+        self.assertEqual(([], 0), (self.sent(), monitor.dropped))
+        for _ in range(4):
+            self.advance(3600)
+            self.drain(monitor)
+        self.assertEqual(2, len(self.sent()))
+        self.assertEqual([RECOVERED] * 2, self.texts())
+        self.assertEqual(0, monitor.dropped)
+
+    def test_a_third_outage_drops_the_oldest_once_it_reaches_the_threshold(self):
+        # The third outage is in progress and short of the threshold: nothing
+        # is dropped yet. Once it lasts the threshold the oldest held one is
+        # dropped (counted, logged once) and the other two are sent.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        source = self.sources[0]
+        self.held_outages(monitor, source, 2)
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(200)
+        self.drain(monitor)
+        self.assertEqual(0, monitor.dropped)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as logs:
+            self.advance(130)
+            self.drain(monitor)
+        self.assertEqual(1, sum(line.endswith(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED.value)
+                                for line in logs.output))
+        self.assertEqual(([], 1), (self.sent(), monitor.dropped))
+        for _ in range(4):
+            self.advance(3600)
+            self.drain(monitor)
+        self.assertEqual(2, len(self.sent()))
+        # The in-progress outage goes first (plain text), then the newer held
+        # one; the oldest was dropped.
+        self.assertEqual(sorted([ALERT, RECOVERED]), sorted(self.texts()))
+        self.assertEqual(1, monitor.dropped)
+
+    def test_a_held_third_outage_waits_with_two_owed_and_bounds_memory(self):
+        # Bounded memory: at most two held recovered episodes and one in
+        # progress per source; a fourth outage of the threshold drops again.
+        monitor = self.monitor(hourly_limit=1)
+        self.online(monitor)
+        monitor.restore_window([(uuid4(), 0.0)], monotonic=self.clock.value)
+        source = self.sources[0]
+        self.held_outages(monitor, source, 4)
+        state = monitor._sources[source]
+        kept = [item for item in (state.older, state.owed, state.episode) if item is not None]
+        self.assertEqual(2, len(kept))
+        self.assertEqual(2, monitor.dropped)
+        for _ in range(4):
+            self.advance(3600)
+            self.drain(monitor)
+        self.assertEqual(2, len(self.sent()))
+
     def test_owed_episodes_still_obey_the_cap(self):
         monitor = self.monitor(hourly_limit=1)
         self.online(monitor)

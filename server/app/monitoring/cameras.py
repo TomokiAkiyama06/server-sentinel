@@ -35,7 +35,11 @@ the next drain is still notified once. If the source goes offline again
 before that drain after a recovery shorter than ``after_seconds``, the
 recovery is folded into it (still owed, the count is not restarted); after a
 longer recovery the new outage is its own episode and the old one stays owed
-under its own time and ID (one owed episode per source). A recovery is recorded in the episode
+under its own time and ID. While the cap (or, as a design extension not
+yet confirmed by the Owner, the queue) holds them, a source keeps two such
+held episodes; a third outage drops the oldest only
+once it lasted ``after_seconds`` (Owner decision 2026-10-26 (a); a shorter
+one drops nothing), so at most three episodes are kept per source. A recovery is recorded in the episode
 (``recovered``) and is not notified (no Owner decision for a recovery
 notice).
 
@@ -394,6 +398,12 @@ class _Source:
     # notification, set aside when a later outage began after it had stayed
     # recovered for at least the threshold (a new outage, not a blip).
     owed: _Episode | None = None
+    # An earlier owed episode, kept while the latest outage has not lasted the
+    # threshold yet: only a third outage of at least ``after_seconds`` drops
+    # it (Owner decision 2026-10-26 (a), Claude re-review PR #359 重要 1). So
+    # a source keeps at most three episodes: two held recovered ones and the
+    # one in progress (or recovered), until the next drain bounds them.
+    older: _Episode | None = None
     # Bumped on every signal, so a runtime status read before a newer event
     # cannot overwrite it (``observe_runtime``).
     version: int = 0
@@ -547,12 +557,17 @@ class CameraOfflineMonitor:
                 if episode is not None and not episode.notified:
                     # Recovered for at least the threshold: the new outage is
                     # its own episode (own time and ID); the old one stays
-                    # owed. Only one is kept per source; an older owed one
-                    # that is still unsent is counted and logged as dropped.
+                    # owed. A new outage alone drops nothing: the oldest held
+                    # one is dropped only once a third outage lasted the
+                    # threshold (``_bound_held``; this recovered one did).
+                    self._bound_held(source, now)
                     if source.owed is not None:
-                        self.dropped += 1
-                        logging.getLogger(__name__).warning(
-                            Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED)
+                        if source.older is not None:
+                            # Still three (the recovered one is a flapping
+                            # episode its period will not send): memory stays
+                            # bounded, the oldest is dropped.
+                            self._drop_held(source)
+                        source.older = source.owed
                     source.owed = episode
                 # Inside a ratio-opened period, an outage after a short
                 # online continues the flapping; after a longer one it is an
@@ -562,6 +577,32 @@ class CameraOfflineMonitor:
                     now, flapping=flapping,
                     period_seq=source.period_seq if flapping else None)
         source.online, source.active = online, active
+
+    def _bound_held(self, source: _Source, now: float) -> None:
+        """Drop the oldest held episode once a third one lasted the threshold.
+
+        Owner decision 2026-10-26 (a): while the cap holds a source's
+        notices, a third outage of at least ``after_seconds`` drops the
+        oldest unsent one. A shorter third outage drops nothing. The same
+        bound for notices the queue refused keeps memory bounded (a design
+        extension, not yet confirmed by the Owner). A
+        flapping episode its open period will not send (the period's
+        continuous notification went out) is not a third notice. Called with
+        the lock held.
+        """
+        newest = source.episode
+        if (source.older is None or source.owed is None or newest is None
+                or newest.notified or not newest.qualifies(now, self.after)
+                or (_of_period(source, newest) and source.continuous_sent)):
+            return
+        self._drop_held(source)
+
+    def _drop_held(self, source: _Source) -> None:
+        oldest, source.older = source.older, None
+        # Notified for good: a drain that already listed it skips it.
+        oldest.notified = True
+        self.dropped += 1
+        logging.getLogger(__name__).warning(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED)
 
     def _close_period(self, source: _Source, now: float) -> None:
         """Close the alerted period once the source stayed quiet a window."""
@@ -889,7 +930,7 @@ class CameraOfflineMonitor:
             # delivery (PR #339 重要 3) or a late notice of an outage that
             # already recovered (Issue #349 review 重要 1).
             due = sorted([*((identity, item) for identity, source in self._sources.items()
-                            for item in (source.owed, source.episode, source.flap,
+                            for item in (source.older, source.owed, source.episode, source.flap,
                                          *source.late_flaps)
                             if item is not None and not item.notified
                             and (isinstance(item, _Flap) or item.qualifies(now, self.after))),
@@ -1021,11 +1062,16 @@ class CameraOfflineMonitor:
                 item.attempt = None
                 self._finish(identity, item, now=now)
         with self._lock:
+            # After this drain sent what the hour allowed: a third outage of
+            # the threshold that is still held with two older ones drops the
+            # oldest (Owner decision 2026-10-26 (a)).
+            for source in self._sources.values():
+                self._bound_held(source, now)
             offline = sum(1 for source in self._sources.values()
                           if source.episode is not None and source.episode.recovered is None
                           and source.episode.qualifies(now, self.after))
             held = sum(1 for source in self._sources.values()
-                       for item in (source.owed, source.episode, source.flap,
+                       for item in (source.older, source.owed, source.episode, source.flap,
                                     *source.late_flaps)
                        if item is not None and item.held and not item.notified) + sum(
                            1 for item in self._resend if item.held)
@@ -1041,7 +1087,7 @@ class CameraOfflineMonitor:
         # (Codex PR #359 P2).
         return any(item is not None and not item.notified and item.qualifies(now, self.after)
                    and not self._stale(item, now)
-                   for item in (source.owed, source.episode))
+                   for item in (source.older, source.owed, source.episode))
 
     def _stale(self, item: _Episode, now: float | None) -> bool:
         """Recovered a window and one bin or longer ago: out of the ratio window.
@@ -1096,13 +1142,13 @@ class CameraOfflineMonitor:
                 source.continuous_sent = True
             if item.flapping and item.period_seq is not None:
                 # Its period's one continuous notification: any other
-                # unsent flapping episode of the same generation (the other
-                # of owed / episode) is settled without a notice, also once
+                # unsent flapping episode of the same generation (among
+                # older / owed / episode) is settled without a notice, also once
                 # the period has closed meanwhile (Owner decision PR #335
                 # over Issue #349 inside one flapping period; Claude
                 # re-review PR #359 重要 1). Later episodes of a period still
                 # open are covered by ``continuous_sent``.
-                for other in (source.owed, source.episode):
+                for other in (source.older, source.owed, source.episode):
                     if (other is not None and other is not item and not other.notified
                             and other.flapping and other.period_seq == item.period_seq):
                         other.notified = True
@@ -1117,6 +1163,8 @@ class CameraOfflineMonitor:
                 source.episode = None
             if source.owed is item:
                 source.owed = None
+            if source.older is item:
+                source.older = None
 
     def _suppressed(self) -> None:
         """One flapping episode settled without a notice (value-free log)."""

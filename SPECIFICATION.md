@@ -1609,8 +1609,8 @@ before the drain is still notified once. If it goes offline again while that
 notification is still owed, a recovery shorter than `after_seconds` is folded
 into the owed episode (notified on the next drain, the count is not
 restarted); after a longer recovery the new outage is its own episode with its
-own time and ID and the owed one keeps its own (at most one owed episode per
-source, an older unsent one is dropped and logged), so a queue that refused
+own time and ID and the owed one keeps its own (bounded per source, below),
+so a queue that refused
 the first alert for a long time never sends a later outage under the old
 time. A recovery is recorded in the episode and is not notified. At most `hourly_limit` (default 4, 1 to 60) such
 notifications go out per rolling hour for all sources together, re-seeded
@@ -1624,23 +1624,29 @@ once when the hour allows, also when the source recovered meanwhile (Owner
 decision 2026-10-24, Issue #349, consistent with PR #320: an episode that
 reached the threshold is notified once even if it recovered before the
 drain). The cap stays absolute, so such a notice can be up to about an hour
-late. A source keeps at most two unsent episodes: its latest one (in progress,
-or itself recovered and held) and one owed earlier episode (above). So a
-source that, while the cap holds, has three outages of at least
-`after_seconds` each separated by an online of at least `after_seconds`
-drops the oldest (exception 1 below).
+late. A source keeps at most two held episodes that already recovered, plus
+its latest outage (in progress, or recovered before it could be bounded), so
+at most three episodes per source. A third outage drops the oldest held one
+only once it has lasted `after_seconds` (checked when the drain has sent what
+the hour allows, and when a further outage begins); a shorter third outage
+drops nothing, and both held ones are still sent (exception 1 below; Claude
+re-review PR #359 重要 1).
 
 Not-sent exceptions (Owner decision 2026-10-26, PR #359). "Notified once"
 has exactly three exceptions; in each, the notification is not sent, and
 every one not sent is counted and logged value-free:
 
-1. Third continuous outage of a source while its notices wait: while a
-   source's notifications are held back by the hourly cap (or refused by
-   the queue), a third outage of at least `after_seconds` of the same
-   source, separated from the earlier ones by an online of at least
-   `after_seconds`, drops the oldest unsent one (bounded memory: at most
-   two unsent episodes per source). Counted in `dropped`, logged at
-   WARNING as `camera_offline_notification_dropped`.
+1. Third continuous outage of a source while the cap holds its notices:
+   while a source's notifications are held back by the hourly cap, a third
+   outage of at least `after_seconds` of the same source, separated from
+   the earlier ones by an online of at least `after_seconds`, drops the
+   oldest unsent one. A third outage shorter than `after_seconds` drops
+   nothing. Counted in `dropped`, logged at WARNING as
+   `camera_offline_notification_dropped`. Not part of the Owner decision
+   (a design extension that keeps memory bounded, not yet confirmed by the
+   Owner): the same per-source bound applies when the notices are unsent
+   because the queue refused them (delivery backpressure) rather than
+   because of the cap, with the same counter and log.
 2. Fifth closed ratio alert of a source: at most four ratio alerts whose
    flapping period has closed wait per source (`LATE_FLAPS_PER_SOURCE`,
    below); a fifth drops the oldest, which the queue never accepted.
@@ -1782,7 +1788,7 @@ continuous notification):
   still yields at most two notifications (Claude re-review PR #359 重要 1).
   This also holds after the period closed: when one flapping episode of a
   period is sent (or found sent), any other unsent flapping episode of the
-  same period (at most one more, owed or held by the cap) is settled
+  same period (held by the cap or owed, at most two more) is settled
   without a notice, so two flapping episodes held by the cap across the
   period's close do not both go out. Inside a flapping period the Owner
   decision of PR #335 (at most two) takes precedence over Issue #349 (an
