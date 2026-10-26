@@ -1763,7 +1763,11 @@ def _holder_sessions(rows):
 # Product capture counters in a holder sample (Issue #305); a sample with
 # none of them is from a holder written before they existed.
 CAPTURE_COUNTER_KEYS = ("capture_launches", "capture_restarts", "sources_never_launched",
-                        "stream_invalid", "padding_tolerated")
+                        "stream_invalid", "padding_tolerated", "launch_failures",
+                        "sources_not_running")
+# Counters that must be integers equal to 0 for the holder to pass.
+JUDGED_CAPTURE_COUNTERS = ("capture_restarts", "sources_never_launched", "stream_invalid",
+                           "launch_failures", "sources_not_running")
 
 
 def load_holders(paths, summaries):
@@ -1779,11 +1783,15 @@ def load_holders(paths, summaries):
     run, a holder that did not cover its run, or a camera profile rate
     (holder ``start`` ``fps``) that differs from the sender's declared fps.
     A holder whose last sample carries any product capture counter (Issue
-    #305) must carry ``capture_restarts``, ``sources_never_launched`` and
-    ``stream_invalid`` as integers, each computed per source by the holder,
-    and fails when any is above 0 (a GStreamer child was restarted, a camera
-    never started, or a pipeline lost JPEG framing). A file written before
-    the counters existed (none of their keys) is judged without them. The
+    #305) must carry ``capture_restarts``, ``sources_never_launched``,
+    ``stream_invalid``, ``launch_failures`` and ``sources_not_running`` as
+    integers, each computed per source by the holder, and fails when any is
+    not 0 (a GStreamer child was restarted, a camera never started, a
+    pipeline lost JPEG framing, a launch attempt failed, or a source had no
+    pipeline delivering frames at the holder's last poll, Issue #354); a
+    counter file without the two Issue #354 keys therefore fails too. A file
+    written before the counters existed (none of their keys) is judged
+    without them. The
     holder's ``end`` record carries the final counters, taken after the
     capture was closed and every pipeline reaped; when it has any counter key
     it is what is judged (an event after the last sample still counts),
@@ -1807,6 +1815,7 @@ def load_holders(paths, summaries):
     sessions = {}  # run id -> nonce -> (opens, closes, {source: forwarded})
     frames = queue_drops = forward_drops = allowed = 0
     restarts = never_launched = stream_invalid = padding = 0
+    launch_failures = not_running = 0
     for path in paths:
         rows = records.read_jsonl(path)
         ids = {row.get("run_id") for row in rows}
@@ -1849,14 +1858,15 @@ def load_holders(paths, summaries):
         capture_ok = True
         counted = ends[0] if any(key in ends[0] for key in CAPTURE_COUNTER_KEYS) else last
         if any(key in counted for key in CAPTURE_COUNTER_KEYS):
-            judged = [counted.get(key) for key in
-                      ("capture_restarts", "sources_never_launched", "stream_invalid")]
+            judged = [counted.get(key) for key in JUDGED_CAPTURE_COUNTERS]
             capture_ok = all(_is_int(value) and value == 0 for value in judged)
-            run_restarts, run_never, run_invalid = (
+            run_restarts, run_never, run_invalid, run_failures, run_not_running = (
                 value if _is_int(value) else 0 for value in judged)
             restarts += run_restarts
             never_launched += run_never
             stream_invalid += run_invalid
+            launch_failures += run_failures
+            not_running += run_not_running
             padding += counted.get("padding_tolerated") if _is_int(
                 counted.get("padding_tolerated")) else 0
         verdicts.append(_verdict((last.get("frames") or 0) > 0
@@ -1886,6 +1896,8 @@ def load_holders(paths, summaries):
                    "holder_sources_never_launched": never_launched,
                    "holder_stream_invalid": stream_invalid,
                    "holder_padding_tolerated": padding,
+                   "holder_launch_failures": launch_failures,
+                   "holder_sources_not_running": not_running,
                    "holder_verdict": _combine(verdicts)}
 
 
@@ -2027,7 +2039,9 @@ def render(report):
                      f"{holder.get('holder_capture_restarts')}, never_launched "
                      f"{holder.get('holder_sources_never_launched')}, stream_invalid "
                      f"{holder.get('holder_stream_invalid')}, padding_tolerated "
-                     f"{holder.get('holder_padding_tolerated')})")
+                     f"{holder.get('holder_padding_tolerated')}, launch_failures "
+                     f"{holder.get('holder_launch_failures')}, not_running "
+                     f"{holder.get('holder_sources_not_running')})")
     lines.append("")
     lines.append("scenario            candidate   G1   G2   G3   G4   G5   G6  missing(rep/act)"
                  "  integrity   drop_acct   production  fast")
