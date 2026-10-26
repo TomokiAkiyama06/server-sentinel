@@ -166,6 +166,10 @@ DECLARED_MUTABLE = {
         "with every delivery result or retried write; it only re-seeds the hourly access and "
         "finding notification budgets after a restart, and is NULL on rows written before "
         "migration 25"),
+    "notification_events.resent": (
+        "declared_mutable (#351): set once when a start resubmits a recording_health_failure "
+        "row an earlier process left pending, so each row is resent at most once; 0 on rows "
+        "written before migration 26"),
     "uvc_approvals.session_token": (
         "declared_mutable (#132): a per-run marker, cleared at a clean stop and replaced at "
         "every start; the Owner re-approval latch it arms (requires_approval) is compared "

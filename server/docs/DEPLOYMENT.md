@@ -306,7 +306,9 @@ stays `pending` and `critical_notifications_unsettled` is logged. Such an
 alert may then never reach Slack (behind a stalled or backlogged delivery it
 is still queued at the exit); the next start then submits that `pending`
 `recording_health_failure` row once more (within a day of its event, and each
-row only once), so the Owner may receive it twice. A crash, kill, OOM or power loss before the tick
+row only once: a row whose resend was cut by a crash is not resent again,
+and that crash is reported by the next start's unclean-exit notice instead),
+so the Owner may receive it twice. A crash, kill, OOM or power loss before the tick
 loses the refusal itself; instead the next start finds the running marker the
 process left in the database and sends one `recording_health_failure` for that
 unclean exit (log `monitoring_previous_run_unclean`), whether or not a refusal
@@ -2329,7 +2331,9 @@ compared for equality; the output lists them under `declared_mutable`:
 `notification_events.delivery` (a pending Slack delivery completes, a
 presence notification is retried), `notification_events.accepted_at` (the
 row's latest local write, rewritten with each delivery result or retried
-write; `NULL` on rows written before migration 25), `uvc_approvals.session_token` (cleared at
+write; `NULL` on rows written before migration 25), `notification_events.resent`
+(set once when a start resends a `pending` `recording_health_failure` row,
+Issue #351; `0` on older rows), `uvc_approvals.session_token` (cleared at
 a clean stop and replaced at every start; the Owner re-approval latch it arms
 is compared through the camera source's `requires_approval`, but a token
 cleared while the service was down after an unclean stop cannot be told from

@@ -1877,7 +1877,9 @@ rest stay `pending` and `recording_health_failure_unrestored` logs their
 count), like the stale device-number notice and camera offline; if the earlier
 POST reached Slack the Owner sees it twice (Issue #351). Each row is resent at
 most once (`notification_events.resent`, set before the resubmission), so a
-crash loop never resends the same row at every start. Between ticks the run
+crash loop never resends the same row at every start; a row whose resend was
+cut by a crash is not resent again (that crash is reported by the next start's
+unclean-exit notice). Between ticks the run
 loop stores a finished delivery's outcome within about 1 s while deliveries
 are pending, so a delivered alert is normally `sent` before a crash and not
 resent. A crash, kill, OOM or power loss before the

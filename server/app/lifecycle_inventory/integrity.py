@@ -184,8 +184,8 @@ def _notification_events(connection, tables) -> dict | None:
     """The local fault / notification history, every kind (#132).
 
     NotificationEventStore.upsert() writes kind, time and confirmed flag
-    once and later rewrites only the delivery result and accepted_at
-    (DECLARED_MUTABLE);
+    once and later rewrites only the delivery result and accepted_at, and
+    mark_resent() sets resent once (#351); all three are DECLARED_MUTABLE;
     expire() removes rows older than the shared 90-day retention. The daily
     summary counts these rows, and the deterministic event IDs deduplicate
     redelivery, so a lost row hides a fault and may repeat an alert.
