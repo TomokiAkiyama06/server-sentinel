@@ -2,8 +2,10 @@
 
 - Status: **Accepted（Q1〜Q6、Owner 判断 2026-10-22）**。
   下の「Owner 判断（2026-10-22）」の節を見てください。D-FINE の評価は承認済みですが、本番採用はまだ承認されていません。
-- Date: 2026-10-22
-- Related: Issue #20、`docs/THIRD_PARTY_POLICY.md`、
+  2026-10-26 に、MediaPipe / EfficientDet-Lite（TFLite）の再評価（Issue #327）を追補しました。
+  追補の Q7・Q8 は Owner の判断待ちです（「追補：MediaPipe / EfficientDet-Lite（TFLite）の再評価」の節）。
+- Date: 2026-10-22（追補 2026-10-26）
+- Related: Issue #20、Issue #327、`docs/THIRD_PARTY_POLICY.md`、
   [`2026-09-30-yolox-person-evaluation.md`](2026-09-30-yolox-person-evaluation.md)、
   `server/docs/DETECTOR_MODEL_AUDIT.md`、`server/docs/YOLOX_EVALUATION_AUDIT.md`、
   `server/docs/RTDETR_RUNTIME_AUDIT.md`、`server/docs/DETECTOR_FOUNDATION.md`
@@ -188,8 +190,9 @@ AP<sup>val</sup> です。**この調査では測定していません。** pers
 | PP-YOLOE / PP-YOLOE+ | Apache-2.0（PaddleDetection） | 明示なし。[#9499](https://github.com/PaddlePaddle/PaddleDetection/issues/9499)（PP-YOLOE+_s の重みと ONNX 再配布）が未回答 | PP-YOLOE+ は Objects365 事前学習（[configs/ppyoloe/README.md](https://github.com/PaddlePaddle/PaddleDetection/blob/develop/configs/ppyoloe/README.md)） | 除外（不明、+ は Objects365） |
 | torchvision の detection model（Faster R-CNN、RetinaNet、FCOS、SSD、SSDlite） | BSD-3-Clause | [公式 docs](https://docs.pytorch.org/vision/stable/models.html) が「may have their own licenses or terms and conditions derived from the dataset used for training. It is your responsibility to determine whether you have permission」と明記。**明示的な許諾ではない** | COCO | 除外（配布元自身が条件を保証しない） |
 | NanoDet / NanoDet-Plus | Apache-2.0 | 重みは GitHub release / Google Drive。明示なし | COCO | 除外（不明） |
-| EfficientDet（google/automl） | Apache-2.0、repository は archived | 明示を見つけられなかった（深くは未検証） | COCO | 除外（不明・保守終了） |
-| MediaPipe Object Detector（EfficientDet-Lite0/2、SSD MobileNetV2） | Apache-2.0 | [解説ページ](https://developers.google.com/edge/mediapipe/solutions/vision/object_detector)に model のライセンスの記載なし（ページ本文は CC BY 4.0） | COCO | 除外（不明、TFLite 形式） |
+| EfficientDet（google/automl の checkpoint） | Apache-2.0、repository は archived | automl の README が置く checkpoint（`cloud-tpu-checkpoints/efficientdet/coco/*`）には明示を見つけられなかった（深くは未検証）。TensorFlow 組織の Kaggle Models の配布物は別の行（下）で扱う | COCO | 除外（不明・保守終了） |
+| **EfficientDet-Lite0 / Lite2（Kaggle Models `tensorflow/efficientdet` の TFLite 配布物）**（2026-10-26 追補） | 実装は google/automl（Apache-2.0、archived） | **Apache 2.0（配布元の公式組織の metadata）**。publisher `TensorFlow` の各 TFLite variation（`lite0-detection-default` / `lite0-detection-metadata` / `lite0-int8` / `lite2-detection-default` / `lite2-detection-metadata`）の `licenseName` が `Apache 2.0`。文章による表明ではなく、配布 page の license 欄。詳細は追補の節 | COCO 2017。backbone は EfficientNet-Lite（ImageNet 系事前学習と推定、未検証）。Objects365 の記載なし | **候補として記録（license 上は Q1〜Q3 を満たす）。runtime と精度の理由で評価は保留**（追補の Q7） |
+| MediaPipe Object Detector の配布物（`storage.googleapis.com/mediapipe-models/object_detector/*`：EfficientDet-Lite0/2、SSD MobileNetV2） | Apache-2.0（google-ai-edge/mediapipe） | **不明（2026-10-26 に再確認）**。[解説ページ](https://developers.google.com/edge/mediapipe/solutions/vision/object_detector)に model のライセンスの記載なし（ページ本文は CC BY 4.0、code sample は Apache 2.0）。model card なし。GCS object の metadata にも記載なし。Kaggle の TFLite 配布物とは file size が違い、同じ file ではない | COCO（解説ページ：「The model was trained with the COCO dataset」） | 除外（不明。Kaggle の license は別 file には及ばない） |
 | OpenVINO Open Model Zoo `person-detection-0202` など | Apache-2.0（repository は「maintenance mode」） | [model README](https://github.com/openvinotoolkit/open_model_zoo/blob/master/models/intel/person-detection-0202/README.md) に重みのライセンスの記載なし。学習データの記載なし | 不明（AP 0.322 は Intel 内部 test set） | 除外（不明、OpenVINO IR で新しい runtime が必要） |
 
 DETR（`facebook/detr-resnet-50`、HF card `apache-2.0`）も重みの metadata は明示されていますが、
@@ -232,6 +235,10 @@ GPU：どの候補も upstream は ONNX → TensorRT の手順を示していま
     （どちらも uploader は `Peterande`）。
   - README の note は Objects365 系の重みを除外する否定的な文だけです。
   - HF card の `apache-2.0` は変換者（VladOS95-cyber）が付けた metadata です。
+- （2026-10-26 追補）上の「D-FINE だけ」は、2026-10-22 に調べた範囲での記述です。EfficientDet-Lite の
+  Kaggle の TFLite 配布物は、公式組織（`TensorFlow`）が配布 page の license 欄で Apache 2.0 としています。
+  文章による表明ではありませんが、配布元自身の明示で、D-FINE の根拠より弱いとは言えません。
+  ただし精度が大きく低く、TFLite 形式です（下の「追補：MediaPipe / EfficientDet-Lite（TFLite）の再評価」）。
 - 前処理と出力の形が RT-DETRv2 と同じ系統なので、既存の `RtDetrPersonDetector` と同じ形の
   adapter で扱えます（focal-loss の sigmoid score、class 0 = person、640×640 RGB、
   品質ゲート後だけ評価、異常時は `unknown`）。
@@ -280,8 +287,8 @@ GPU：どの候補も upstream は ONNX → TensorRT の手順を示していま
 - **コードが GPL / AGPL**：Ultralytics、YOLOv6/v7/v9/v10、MMYOLO。ポリシーで既定ブロックです。
   Ultralytics の Enterprise License は有償の個別契約で、Apache-2.0 で配る ServerSentinel の
   利用者全員には及ばないため、この project には合いません。
-- **重みのライセンスが不明**：YOLOX、DEIM、RTMDet、PP-YOLOE、NanoDet、EfficientDet、
-  MediaPipe、Open Model Zoo。
+- **重みのライセンスが不明**：YOLOX、DEIM、RTMDet、PP-YOLOE、NanoDet、EfficientDet（automl の checkpoint）、
+  MediaPipe の配布物、Open Model Zoo。EfficientDet-Lite の Kaggle 配布物は不明ではありません（追補の節）。
 - **配布元が許諾を保証しない**：torchvision（docs が利用者の責任と明記）。
 - **Objects365 系譜**：D-FINE obj365/obj2coco、RT-DETR の O365 版、PP-YOLOE+、RF-DETR（RF-DETR も Q3 により除外）。
 
@@ -340,6 +347,157 @@ Q1〜Q6 は 2026-10-22 に判断済みです（冒頭の節）。記録のため
    使ってよいですか（GPU 評価環境と同じ扱い）。
 6. **YOLOX**：評価専用の adapter は残しますか。それとも D-FINE の評価後に外しますか。
 
+## 追補：MediaPipe / EfficientDet-Lite（TFLite）の再評価（2026-10-26、Issue #327）
+
+PR #319 の Codex P2 は、次の点を指摘しました。この文書は MediaPipe を「解説ページに license がない」という理由だけで外しました。しかし、同じ系統の
+TensorFlow EfficientDet-Lite2 の TFLite 配布物は、配布ページで Apache 2.0 とされています。この指摘を受けて、
+配布物ごとに一次情報を確かめ直しました。確認日はすべて **2026-10-26** です。
+重み・graph・dataset は一切 download していません。精度・速度は配布元の公表値で、**測定していません**。
+
+### 確かめた配布物とライセンス表記
+
+**(1) Kaggle Models `tensorflow/efficientdet`（TF Hub から移行した公式の配布物）**
+
+- 配布 page：[kaggle.com/models/tensorflow/efficientdet](https://www.kaggle.com/models/tensorflow/efficientdet)
+  （Codex が示した [`tfLite/lite2-detection-metadata/1`](https://www.kaggle.com/models/tensorflow/efficientdet/tfLite/lite2-detection-metadata/1) を含む）。
+  page は script で描画されます。そこで、同じ内容を返す Kaggle の public API の JSON を読みました。
+  [`/api/v1/models/tensorflow/efficientdet/get`](https://www.kaggle.com/api/v1/models/tensorflow/efficientdet/get) と、
+  variation ごとの `/api/v1/models/tensorflow/efficientdet/tfLite/<variation>/get` です。
+- model の `author` は `TensorFlow`（Google の公式組織）です。`provenanceSources` は
+  [`tensorflow/tfhub.dev` の `assets/docs/tensorflow`](https://github.com/tensorflow/tfhub.dev/tree/master/assets/docs/tensorflow) です。
+  tfhub.dev の README には「TensorFlow Hub has moved to Kaggle Models」「Starting November 15th 2023, links to tfhub.dev
+  redirect to their counterparts on Kaggle Models」と書かれています（tfhub.dev の repository は archived です。
+  確認した commit は `81fdea8ffa53b5acbd66a012d17fb8f9602c714b` です）。
+- TFLite の variation と、API が返した値を次の表に示します。`licenseName` はどれも **`Apache 2.0`** です。
+
+  | variation（version 1） | 入力 | `totalUncompressedBytes` | 公表 mAP（COCO 2017 val） | `licenseName` |
+  | --- | --- | ---: | --- | --- |
+  | `lite0-detection-default`（説明：「Same TFLite model as tensorflow/efficientdet/lite0/int8/1」） | 320×320 uint8 | 4,561,184 | 25.69% | Apache 2.0 |
+  | `lite0-detection-metadata`（TFLite metadata と label file を含む） | 320×320 | 4,563,519 | 25.69% | Apache 2.0 |
+  | `lite0-int8` | 320×320 | 4,561,184 | 25.69% | Apache 2.0 |
+  | `lite2-detection-default` | 448×448 | 7,555,552 | 33.97%（metadata 版の記載） | Apache 2.0 |
+  | `lite2-detection-metadata` | 448×448 | 7,557,887 | 33.97% | Apache 2.0 |
+
+  出力は `detection_boxes` / `detection_classes` / `detection_scores` / `num_detections` で、最大 25 件です。
+  TFLite の graph の中に後処理（NMS）が含まれています。公表 latency は Pixel 4 の値で、Main host の値ではありません。
+  親の TF2 SavedModel 版（`lite0-detection` / `lite2-detection`）の説明は「trained on COCO 2017 dataset」です。
+  tfhub.dev の元の文書（[`efficientdet/lite0/detection/1.md`](https://github.com/tensorflow/tfhub.dev/blob/81fdea8ffa53b5acbd66a012d17fb8f9602c714b/assets/docs/tensorflow/models/efficientdet/lite0/detection/1.md)）は
+  `dataset: coco-2017` で、実装は [google/automl の EfficientDet](https://github.com/google/automl/tree/master/efficientdet)
+  とされています。
+- 根拠の強さ：上の「判定の基準」の 2（配布する場所にある、明示的な license metadata）にあたります。
+  ただし、metadata を付けたのは変換者ではなく、**配布元の公式組織そのもの**です。
+  RT-DETRv2 の HF metadata（変換者が付けたもの）より強く、文章による表明（基準の 1）よりは弱い、という位置です。
+  tfhub.dev の元の文書には license の tag がありません（tfhub.dev の `tags/license.yaml` には `apache-2.0` などの値が
+  定義されていますが、この文書はそれを使っていません）。Apache 2.0 という表記は、Kaggle の配布 page の license 欄で
+  だけ確認できます。
+- `*-metadata` variation に埋め込まれた TFLite metadata に `license` 欄があるかどうかは、file を download していないため未確認です。
+
+**(2) MediaPipe Object Detector の配布物（`storage.googleapis.com/mediapipe-models`）**
+
+- [解説ページ](https://developers.google.com/edge/mediapipe/solutions/vision/object_detector)（「Last updated 2026-10-01 UTC」）の
+  Models 節には、次の download link があります。EfficientDet-Lite0（int8 / float16 / float32、320×320）、
+  EfficientDet-Lite2（int8 / float16 / float32、448×448）、SSDMobileNet-V2（int8 / float32、256×256）です。
+  学習データは「The model was trained with the COCO dataset」と書かれています。
+  **model のライセンスの記載はありません。** footer は
+  「Except as otherwise noted, the content of this page is licensed under the Creative Commons Attribution 4.0 License」と
+  「code samples are licensed under the Apache 2.0 License」です。これは page の本文と code sample の条件です。
+  なお、page の EfficientDet-Lite0 float32 と SSDMobileNet-V2 int8 の link は、`float16` の path を指しています。
+  page 自体に不整合があります（SSDMobileNet-V2 の `int8/latest/ssd_mobilenet_v2.tflite` は HEAD で 404 でした）。
+- model card：MediaPipe の object detector（Tasks 版）の model card は見つかりませんでした。
+  [google-ai-edge/mediapipe の `docs/solutions/models.md`](https://github.com/google-ai-edge/mediapipe/blob/bfafeaed685be63fbf7ace1c3fbc4bfcbbc30128/docs/solutions/models.md)
+  の legacy の Object Detection 節には、model card の link がありません。その節が link する
+  `mediapipe-assets/object_detection_saved_model/README.md` は `NoSuchKey` でした。
+  repository の test data の [`efficientdet_lite0_v1.json`](https://github.com/google-ai-edge/mediapipe/blob/bfafeaed685be63fbf7ace1c3fbc4bfcbbc30128/mediapipe/tasks/testdata/metadata/efficientdet_lite0_v1.json)
+  （metadata writer の期待値）にも、`license` 欄はありません。ただし、これは test data で、配布物そのものの metadata ではありません。
+- GCS の object metadata（HEAD と JSON API で取得）：license に関する field はありません。値は次のとおりです。
+
+  | object | size（bytes） | `md5`（GCS） | 作成日 |
+  | --- | ---: | --- | --- |
+  | `object_detector/efficientdet_lite0/int8/latest/efficientdet_lite0.tflite` | 4,602,795 | `zr9kr2w15avXNElGhQZIQg==` | 2023-04-27 |
+  | `object_detector/efficientdet_lite0/float32/latest/efficientdet_lite0.tflite` | 13,836,895 | `ymabHfDr6add3N5X/geg0A==` | 2023-04-27 |
+  | `object_detector/efficientdet_lite2/int8/latest/efficientdet_lite2.tflite` | 7,515,971 | `uQw0TrvGfuxOCI6jypzUvw==` | 2023-04-27 |
+
+- **MediaPipe の file は、Kaggle の file と同じではありません**（Lite0 int8 は 4,602,795 bytes と 4,561,184 bytes、
+  Lite2 int8 は 7,515,971 bytes と 7,555,552 bytes）。MediaPipe 用の metadata を足した同じ重みである可能性はありますが、
+  未検証です。したがって、Kaggle の `Apache 2.0` を、MediaPipe の file にそのまま当てはめることはできません。
+- 第三者の package（pub.dev の Flutter wrapper など）が「Apache 2.0」と書いている例はあります。
+  しかし、配布元の表明ではないので、根拠にはしません。
+
+### 学習データ（COCO）と repository の方針
+
+- どちらの配布物も、COCO 2017 で学習したと書かれています。COCO の annotation は CC BY 4.0、画像は Flickr の
+  条件です（上の「判定の基準」）。backbone の EfficientNet-Lite は ImageNet 系の事前学習と推定しますが、
+  Lite の配布物の説明には書かれていません（未検証）。
+- repository の方針では、この残余リスクは **Q2（2026-10-22）**で受け入れ済みです。条件は「研究室内での運用に限り、
+  重みを再配布しない範囲で」です。EfficientDet-Lite でも条件は同じです。repository / CI に重みを入れず、運用者が
+  リポジトリ外に digest 固定で置く形に限ります。
+- Objects365 の使用は、Kaggle、tfhub.dev の元の文書、automl の README のどこにも書かれていません。
+  automl の Lite の checkpoint は、`cloud-tpu-checkpoints/efficientdet/coco/` に置かれています
+  （[README](https://github.com/google/automl/blob/6a54c8741e7c3265d4547c4f35f47a0391122dc5/efficientdet/README.md)）。
+
+### 精度（person class）
+
+- person class だけの AP は、Kaggle、tfhub.dev、automl、MediaPipe のどれも公表していません。
+- 全クラスの COCO val mAP は、Kaggle の TFLite 版で Lite0 が 25.69%、Lite2 が 33.97% です。automl の README の表では、
+  Lite0 が 26.41（int8 は 26.10）、Lite2 が 35.06（int8 は 34.69）です。
+- これは、D-FINE-N（42.8）、D-FINE-S（48.5）、RT-DETRv2-S（48.1）より、全クラスで約 9〜23 point 低い値です。
+  品質ゲートを通った frame での人物の見逃し（false negative）は、`unknown` に変えられない失敗です。
+  そのため、この差は小さくありません。
+
+### runtime の適合
+
+- 既存の inference worker（`app.detection.foundation`）は、`onnxruntime==1.28.0` の CPU だけを使います
+  （`server/requirements-detector.lock`、`CPUExecutionProvider`、fallback なし）。TFLite は読めません。
+- 選択肢は 2 つです。どちらも、この追補では実施しません。
+  1. **TFLite のまま使う**：LiteRT（`ai-edge-litert`）、`tflite-runtime`、MediaPipe Tasks などの、新しい runtime の
+     依存が要ります。依存のレビュー（license、transitive、wheel、network の挙動）と、Owner の判断が必要です。
+     これらの package の license は、この追補ではレビューしていません。
+  2. **ONNX に変換する**：[onnx/tensorflow-onnx（tf2onnx）](https://github.com/onnx/tensorflow-onnx)（Apache-2.0。
+     最新 release は `v1.17.0`、確認した commit は `f77f5acf9be6066ea3345887119204453d1da32e`）は、TFLite の入力に対応しています。
+     graph に含まれる後処理の custom op は、
+     [`tfl_postprocess.py`](https://github.com/onnx/tensorflow-onnx/blob/f77f5acf9be6066ea3345887119204453d1da32e/tf2onnx/tflite_handlers/tfl_postprocess.py)
+     が変換します（`TFL_TFLite_Detection_PostProcess` → ONNX の `NonMaxSuppression` など）。変換には TensorFlow などが
+     要ります。そのため、D-FINE の export（Q5）と同じく、commit しない、CPU を制限した、network なしの使い捨て container で
+     行う必要があります。TensorFlow を export 環境で使うことは、Q5（PyTorch）の許可の範囲外です。
+     int8 版の変換は量子化 op の変換になるので、float32 / float16 の file を変換元にする方が単純と見込みます（未検証）。
+- ONNX 変換のライセンス上の扱い：変換した ONNX は、Apache 2.0 の artifact の派生物になると考えます。Apache-2.0 の
+  条件（license の写しを添えること、変更した旨を表示すること、NOTICE がある場合はそれを残すこと）を守れば、
+  変換と研究室内での利用は許されると読めます。**法的な結論ではありません。** 変換した ONNX を repository や
+  release に入れる場合は、別の PR で `model_weight` の記録を加えます（上の「実施条件」と同じ扱い）。
+- graph の形：入力は uint8 の画像（320 / 448）で、出力は後処理済みの最大 25 件です。既存の `RtDetrPersonDetector`
+  とは前処理と出力の形が違うので、別の adapter が要ります。label file の何番が person かは、artifact の label file で
+  確認する必要があります（未確認）。品質ゲートの後だけ評価し、異常時は `unknown` にする、という条件は変わりません。
+
+### Q1〜Q3 に照らした判定
+
+| 配布物 | Q1（配布元の明示） | Q2（COCO / ImageNet の残余リスク） | Q3（Objects365 の除外） | 表への追加 |
+| --- | --- | --- | --- | --- |
+| EfficientDet-Lite0 / Lite2（Kaggle `tensorflow/efficientdet` の TFLite variation） | **満たすと判断**：公式組織の `TensorFlow` が、配布 page の license 欄で `Apache 2.0` としている。文章ではなく license 欄である点は、追補の Q8 で確認する | Q2 の範囲内（研究室内、再配布なし） | 該当なし（Objects365 の記載なし） | **追加**（候補。評価は保留） |
+| MediaPipe Object Detector の配布物（GCS の `mediapipe-models`） | **満たさない**：page、model card、GCS の metadata のどこにも、重みの license がない。Kaggle の file とは別の file | — | 該当なし | 除外のまま（理由を「不明、別の file」と明記） |
+| MediaPipe の SSDMobileNet-V2 | 満たさない（同上）。Kaggle の `tensorflow/ssd-mobilenet-v2` は TF2 / TF.js 版だけで、TFLite の variation はない | — | — | 除外のまま |
+
+まとめると、Codex の指摘のとおり、EfficientDet-Lite の公式の TFLite 配布物は、license の上では候補になります。
+一方で、MediaPipe の配布物そのものは、license が不明なままです。EfficientDet-Lite を評価に進めない理由は license ではなく、
+次の 2 点です。
+
+1. **精度**：全クラスの mAP が、評価中の D-FINE-N/S と、比較基準の RT-DETRv2-S より大きく低い。
+2. **runtime**：TFLite は既存の ORT CPU worker で読めない。新しい runtime の依存か、TensorFlow を使う変換環境が必要。
+
+### 追補の Owner への質問（未判断）
+
+7. **EfficientDet-Lite の扱い**：EfficientDet-Lite0 / Lite2（Kaggle の TFLite 配布物）を、次のどちらにしますか。
+   (a) 表に候補として記録するだけにして、D-FINE の評価が終わるまで評価しない（推奨）。
+   (b) D-FINE と並べて、評価専用で追加する。
+   (b) の場合は、さらに次のどちらかを判断してください。TFLite の runtime 依存（LiteRT など）を評価用に入れるか、
+   tf2onnx で ONNX に変換するために、TensorFlow を commit しない使い捨て container で使うことを許可するか（Q5 と同じ条件で）です。
+8. **Q1 の「配布元の明示」の範囲**：公式組織が配布 page の license 欄（metadata）で示した license を、文章による
+   表明と同じく、Q1 を満たすものとして扱いますか。この追補はそう扱いました。D-FINE の maintainer の Issue コメントと
+   同程度以上の根拠と考えたためです。そう扱わない場合、EfficientDet-Lite は「不明」に戻ります。
+
+この追補は、どの重みの評価・採用・同梱・自動 download も承認しません。`license/components.json` と
+`license/owner-approvals.json` も変更しません。重みを repository に commit しない限り、license gate の inventory には
+記録できないためです（上の「実施条件」と同じ扱い）。
+
 ## 確認できなかったこと
 
 - 各候補の person クラスだけの AP（どの upstream も公表していません）。
@@ -348,9 +506,17 @@ Q1〜Q6 は 2026-10-22 に判断済みです（冒頭の節）。記録のため
 - HGNetv2 / PResNet backbone の事前学習データの詳しい系譜。
 - RF-DETR の DINOv2 backbone の学習データ（LVD-142M。公開されていない web 画像の集合）の系譜と条件。
 - RF-DETR の COCO 用 checkpoint の系譜に Objects365 が入るかどうか（論文の Table 6 の注と Table 11 の caption は入ることを示唆しますが、配布された checkpoint についての明示はありません）。
-- EfficientDet（google/automl）の重みのライセンス表記（深くは調べていません）。
+- EfficientDet（google/automl）の checkpoint の重みのライセンス表記（深くは調べていません）。
+- MediaPipe の TFLite 配布物と Kaggle の TFLite 配布物の重みが同じかどうか（file size は違います。
+  確かめるには両方を download して tensor を比べる必要があり、この調査ではしていません）。
+- Kaggle の `*-metadata` variation に埋め込まれた TFLite metadata の `license` 欄の内容（file を download していません）。
+- EfficientDet-Lite の TFLite graph を tf2onnx で ONNX に変換できるか、ORT 1.28 CPU で全 node が動くか、
+  変換前後の出力が一致するか（変換していません）。
+- EfficientDet-Lite の backbone（EfficientNet-Lite）の事前学習データの系譜。
 - YOLOX の model zoo の AP（以前の audit の値を再確認していません）。
 - 法的な結論。この文書は upstream の表明と dataset の条件を並べただけです。
 
 この調査では、重み・ソース・dataset を一切 download していません（GitHub API と
 Hugging Face API の metadata、README、Issue、論文、dataset の条件ページだけを読みました）。
+2026-10-26 の追補でも同じです（Kaggle の public API の JSON、GCS の object metadata（HEAD と JSON API）、
+GitHub API、解説ページだけを読みました）。
