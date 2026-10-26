@@ -38,7 +38,8 @@ class IdentifiedRecordingFilesystem:
     read sysfs. Because a refusal raised inside a storage admission is only
     seen by that admission, it is also kept as one value-free flag
     (`take_topology_refusal`), so the next monitoring tick alerts the Owner
-    even when the topology was restored before it (Codex P1 on PR #344).
+    even when the topology was restored before it (Codex P1 on PR #344), as
+    does the final sample of a graceful stop (Issue #351).
     """
 
     def __init__(self, identity: RecordingFilesystem, metadata: Path):
