@@ -1626,6 +1626,16 @@ clock / process でのみ試験済み）でもよく、どちらで実行した�
   再起動前後の 2 つの nonce の `session_open` / `session_close` があり、`refused` が無く、sender に
   `producer_failed` が無いことを生記録で確かめた（未実施）。
 
+- 2026-10-26 `schedule`（real camera と synthetic、a_framed / b_chunked の 38 run）: harness が
+  `TCP_NODELAY` を設定していなかった。1 source の real run はすべて RTT p50 約 46 ms で 30 fps を
+  送り切れず、pending が上限に張り付いた（Issue #369。loopback では Nagle と delayed ACK の stall を
+  再現。LAN で同じ原因かは推定）。**この日の run は real / synthetic を問わず判定に使わない**
+  （summarize は `tcp_nodelay: true` の記録が無い run を全 gate `unmeasured` にする。再集計で 38 run
+  すべて `unmeasured`）。
+- [ ] Issue #369 の修正を含む HEAD で real 入力の scenario 一式を再実行し、全 run の summary JSON（`--json`）の run 行で
+  `tcp_nodelay` が `true`、1 source の `normal` の RTT が 1 unit 約 40 ms の stall を含まないこと
+  （p50 が 33 ms を大きく下回り、pending が上限に張り付かない）を生記録で確かめた（未実施）。
+
 TCP の packet loss / jitter は root の `netem` を使わないため `unmeasured` のまま残し、
 QUIC / WebRTC はこのハーネスの対象外です。
 
@@ -1651,6 +1661,7 @@ Total run time today (≤ 3 h):
 - [ ] G5: 無音断の検知 ≤ 15 s、Main の未 commit 区間が Agent 保護区間 [T−600 s, T+600 s] に含まれる;
 - [ ] G6: CPU 制限下の 4 source で backpressure 0、5 source 目は拒否;
 - [ ] 全 run が非 fast（`--fast` なし。summary の各 run 行と候補行の `fast` が `false`、`fast_runs` が 0）;
+- [ ] 全 run の summary JSON（`--json`）の run 行で `tcp_nodelay` が `true`（#369。記録の無い run は `unmeasured`）;
 - [ ] 2 host の run では G5 の Main `interrupted`（proxy blackhole）が件数照合（window との時刻対応なし）であることを結果に併記した（Main 側停止・再起動の Agent 検知と再接続は session nonce で対応付け済み）;
 - [ ] 1 / 2 / 3 / 4 source の各構成を候補ごとに実行した（`normal` / `sources_2` / `sources_3` / `capacity_4`、summary の `*_missing_source_counts` が 0）、全 run の `integrity` が `pass`（別実行の記録の混入・子 process の異常終了なし）;
 - [ ] 副次: 30 分 soak（full matrix とは別の日に実行）で予期しない切断 0、overhead ≤ 10 %、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %、latency p95（参考）;

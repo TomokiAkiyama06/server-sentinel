@@ -58,6 +58,30 @@ receiver は product の bind 検証を通した上で `SO_REUSEADDR` 付きで 
 `open_ingest_listener` には無く、TIME_WAIT 中の Main 再起動で再 bind できないため。product 側の対応は
 Issue #223 で追跡）。
 
+sender（Agent 側の接続）、receiver（accept した接続）、impairment proxy の両側の socket は
+`TCP_NODELAY` を設定します（`wire.disable_nagle`）。sender の `start`、receiver と proxy の `ready` に
+`tcp_nodelay: true` を書き、sender の `connected` と receiver の `session_open` には読み戻した値を
+`tcp_nodelay` として記録します。どの候補も source ごとに ack を待ってから次を送るので、Nagle が
+有効だと unit の末尾の小さな segment が、受信側の delayed ACK（Linux の最小 40 ms）を待つことが
+あります。待つかどうかは unit サイズ、sender の 64 KiB ごとの送信分割、MSS の組み合わせで決まります。
+CPU 制限付き container の loopback A/B（Issue #369、1 source）では、125 KB と 147 KB の unit で
+ほぼ毎回止まり（`a_framed` / `b_chunked` は RTT p50 41 ms で 30 unit/s を送り切れない。`b_segment` は
+run によって一部またはすべての segment が止まり、p50 5〜42 ms・p95 5.7〜44 ms・最大 41〜45 ms）、16 KB では止まらず、
+MSS 1448 では一部の unit だけ（p95 41 ms）、2 source でも p95 33 ms でした。全 socket に設定すると
+p50 0.3 ms（`b_segment` は最大でも約 5.8 ms）・30 unit/s です。loopback では sender と proxy の upstream 側の両方が
+必要でした（loopback は MSS と RTT が実 LAN と異なり、実 LAN での効果は再実測で確認する）。
+2026-10-26 の 2 host 実測（1 source の real run で RTT p50 約 46 ms、約 27 fps、pending が上限）は
+この機構と整合しますが、原因は推定で、LAN では再確認していません。
+
+**`tcp_nodelay: true` が記録されていない run（2026-10-26 以前の run はすべて。real / synthetic、
+source 数を問わない）は判定に使いません。** summarize は、どれか 1 つの記録に `tcp_nodelay: true` が
+無い run の `integrity` を `unmeasured` にし（crash などの `fail` はそのまま）、pass / fail を問わず全 gate を `unmeasured` にします
+（`--json` の各 run 行の `tcp_nodelay`）。候補行の副次指標（`reconnect_p95_ns`、`latency_p95_max_ns`、
+`overhead_max`、`unprotected_gap_units`、`secondary_*`）も、`tcp_nodelay` が true の run だけから計算し、
+除いた run 数を `nodelay_excluded_runs` に出します（除いた run があれば `secondary_*` の pass /
+not_applicable は `unmeasured`）。2026-10-26 の記録を再集計すると、38 run すべてが `unmeasured` に
+なります。製品の ingest / Agent 側（#14）に同じ設定が要ることは ADR-0007 に記載しています。
+
 ## 安全規則
 
 - Main host は production（GPU benchmark が同居）。Main 側は必ず

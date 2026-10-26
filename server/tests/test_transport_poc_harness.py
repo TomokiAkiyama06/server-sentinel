@@ -130,6 +130,14 @@ class WireTests(unittest.TestCase):
         self.assertEqual((wire.ACK, source, 2, 7, "duplicate", "already_committed"), parsed[1])
         self.assertEqual((wire.HEARTBEAT, 5), parsed[2])
 
+    def test_disable_nagle_sets_tcp_nodelay(self):
+        # #369: every harness TCP socket turns Nagle off
+        with socket.create_server(("127.0.0.1", 0)) as server:
+            with socket.create_connection(server.getsockname(), timeout=5) as client:
+                self.assertFalse(client.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+                self.assertTrue(wire.disable_nagle(client))
+                self.assertTrue(client.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+
     def test_hello_carries_the_session_nonce(self):
         reader = wire.FrameReader(4096)
         nonce = wire.new_session_nonce()
@@ -270,6 +278,17 @@ class ProxyTests(unittest.TestCase):
         self.proxy.blackhole(False)
         self.assertTrue(wait_for(lambda: len(self.upstream.received) == 100005))
 
+    def test_both_forwarded_sockets_disable_nagle(self):
+        # #369: the proxy stands in for the network and adds no Nagle stall
+        connection = self.client()
+        connection.sendall(b"n")
+        self.assertTrue(wait_for(lambda: bytes(self.upstream.received) == b"n"))
+        with self.proxy.lock:
+            pairs = list(self.proxy.pairs)
+        self.assertEqual(1, len(pairs))
+        for sock in (pairs[0].client, pairs[0].upstream):
+            self.assertTrue(sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+
     def test_connection_opened_during_blackhole_is_not_forwarded(self):
         self.proxy.blackhole(True)
         connection = self.client()
@@ -309,11 +328,21 @@ class ProxyTests(unittest.TestCase):
                           ("impairment_start", "reset"), ("impairment_end", "reset")], kinds)
 
 
-def _write(directory, name, rows, run_id=RUN):
+# Records whose ``tcp_nodelay`` the summarizer requires (#369), per process file.
+_NODELAY_KINDS = {"sender": ("start", "connected"), "receiver": ("ready", "session_open"),
+                  "proxy": ("ready",)}
+
+
+def _write(directory, name, rows, run_id=RUN, nodelay=True):
+    """Write ``rows``; ``nodelay`` adds ``tcp_nodelay: true`` where the harness
+    writes it (a row that sets it keeps its own value), as current records do."""
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{name}.jsonl"
+    kinds = _NODELAY_KINDS.get(name, ()) if nodelay else ()
     with open(path, "w", encoding="ascii") as stream:
         for row in rows:
+            if row.get("kind") in kinds:
+                row = {"tcp_nodelay": True, **row}
             stream.write(json.dumps({"run_id": run_id, **row}) + "\n")
 
 
@@ -591,6 +620,85 @@ class SummarizerTests(unittest.TestCase):
         self.rewrite("outage_8s-a_framed", "receiver",
                      receiver + [gap, {**durable, "duplicates": 1}])
         self.assertEqual("fail", self.report()["outage_8s"]["g2"])
+
+    def test_run_without_tcp_nodelay_is_not_a_measurement(self):
+        # #369: records written before TCP_NODELAY (no ``tcp_nodelay``) or a
+        # socket that read it back false: every gate unmeasured, pass or fail
+        orchestrator, receiver, sender_rows = _base("outage_8s")
+        durable = {"kind": "durable", "t_ns": 9, "source": 0, "epoch": 1, "min_sequence": 0,
+                   "max_sequence": 99, "units": 90, "duplicates": 0}
+        gap = {"kind": "gap", "t_ns": 5, "source": 0, "epoch": 1, "reason": "sequence_skip",
+               "after_sequence": 10, "before_sequence": 21, "missing_units": 10}
+        name = "outage_8s-a_framed"
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver + [gap, durable],
+                     sender_rows=sender_rows)
+        row = self.report()["outage_8s"]
+        self.assertEqual(("pass", "pass", True), (row["integrity"], row["g2"], row["tcp_nodelay"]))
+        directory = self.root / name
+        for role in ("sender", "receiver", "proxy"):
+            with self.subTest(missing=role):
+                self.run_dir(name, orchestrator=orchestrator,
+                             receiver=receiver + [gap, durable], sender_rows=sender_rows)
+                path = directory / f"{role}.jsonl"
+                rows = [{key: value for key, value in item.items() if key != "tcp_nodelay"}
+                        for item in records.read_jsonl(path)]
+                _write(directory, role, [{k: v for k, v in item.items() if k != "run_id"}
+                                         for item in rows], nodelay=False)
+                row = self.report()["outage_8s"]
+                self.assertEqual(("unmeasured", "unmeasured", False),
+                                 (row["integrity"], row["g2"], row["tcp_nodelay"]))
+        # a failing gate is not reported as a candidate failure either
+        self.run_dir(name, orchestrator=orchestrator,
+                     receiver=receiver + [{**gap, "missing_units": 9}, durable],
+                     sender_rows=sender_rows)
+        self.assertEqual("fail", self.report()["outage_8s"]["g2"])
+        rows = records.read_jsonl(directory / "sender.jsonl")
+        _write(directory, "sender", [{k: v for k, v in item.items()
+                                      if k not in ("run_id", "tcp_nodelay")} for item in rows],
+               nodelay=False)
+        self.assertEqual("unmeasured", self.report()["outage_8s"]["g2"])
+        # a connection that read TCP_NODELAY back as false
+        self.run_dir(name, orchestrator=orchestrator, receiver=receiver + [
+            {"kind": "session_open", "t_ns": 1, "connection": 1, "generation": 1,
+             "tcp_nodelay": False}, gap, durable], sender_rows=sender_rows)
+        row = self.report()["outage_8s"]
+        self.assertEqual(("unmeasured", False), (row["integrity"], row["tcp_nodelay"]))
+
+    def test_candidate_secondary_values_skip_runs_without_tcp_nodelay(self):
+        # #369: like the gates, the candidate's secondary values use only runs
+        # with TCP_NODELAY on every socket, and count the excluded runs
+        def latency(p95):
+            return {"kind": "latency", "t_ns": 9, "metric": "capture", "samples": 10,
+                    "p50_ns": p95, "p95_ns": p95, "p99_ns": p95, "max_ns": p95}
+
+        def drop_nodelay(name):
+            directory = self.root / name
+            rows = records.read_jsonl(directory / "sender.jsonl")
+            _write(directory, "sender", [{k: v for k, v in item.items()
+                                          if k not in ("run_id", "tcp_nodelay")}
+                                         for item in rows], nodelay=False)
+
+        def candidate():
+            return summarize.summarize([self.root])["candidates"][0]
+
+        for scenario, sources, p95 in (("normal", 1, 10**6), ("capacity_4", 4, 9 * 10**8)):
+            orchestrator, receiver, sender_rows = _base(scenario, sources=sources)
+            self.run_dir(f"{scenario}-a_framed", orchestrator=orchestrator, receiver=receiver,
+                         sender_rows=sender_rows + [latency(p95)])
+        row = candidate()
+        self.assertEqual((9 * 10**8, 0), (row["latency_p95_max_ns"], row["nodelay_excluded_runs"]))
+        self.assertEqual("pass", row["secondary_latency_reference"])
+        drop_nodelay("capacity_4-a_framed")
+        row = candidate()
+        self.assertEqual((10**6, 1), (row["latency_p95_max_ns"], row["nodelay_excluded_runs"]))
+        self.assertEqual("unmeasured", row["secondary_latency_reference"])
+        # no run with TCP_NODELAY: no secondary value at all
+        drop_nodelay("normal-a_framed")
+        row = candidate()
+        self.assertEqual((None, 2), (row["latency_p95_max_ns"], row["nodelay_excluded_runs"]))
+        self.assertIsNone(row["reconnect_p95_ns"])
+        self.assertIsNone(row["overhead_max"])
+        self.assertEqual("unmeasured", row["secondary_latency_reference"])
 
     def test_capture_restart_requires_unknown_extent(self):
         orchestrator, receiver, sender_rows = _base("capture_restart")
@@ -3703,6 +3811,63 @@ class LoopbackMatrixTests(unittest.TestCase):
             records.read_jsonl(path)  # every stored value is numeric or a token
         for row in runs.values():
             self.assertEqual("pass", row["integrity"], json.dumps(row, sort_keys=True))
+
+    def test_large_units_are_not_held_by_nagle(self):
+        """#369: ~150 KB units, one source, each candidate, through the proxy.
+
+        Without ``TCP_NODELAY`` on the data-direction sockets each unit's
+        tail waited for a delayed ACK on loopback: a_framed / b_chunked RTT
+        p50 about 41 ms, fewer than 30 units/s delivered and the pending
+        queue at its cap. b_segment (one PUT per second) stalls on some or
+        all segments depending on the run (p50 5-42 ms, p95 5.7-44 ms, max
+        41-45 ms), so it is checked on its maximum. The 46 ms of the
+        2026-10-26 two-host runs is consistent with this (inferred, not
+        re-measured). Without the stall a loopback round trip is about 0.3 ms
+        (b_segment max about 5.8 ms); 20 ms (b_segment 25 ms) leaves room for
+        a slow CI runner.
+        """
+        directory = tempfile.TemporaryDirectory(prefix="poc15-")
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        materials.init(root / "m")
+        args = argparse.Namespace(
+            role="both", materials=str(root / "m"), node_root=str(root / "m" / "nodes"),
+            state=str(root / "st"), out=str(root / "out"), fast=True, sources=1, fps=30,
+            frame_bytes=147000, source_kind="builtin", holder_socket=None, real_inputs=False,
+            bind="127.0.0.1", upstream_host="127.0.0.1", upstream_port=0,
+            proxy_host="127.0.0.1", port_offset=_free_offset(), main_grace=0)
+        candidates = ("a_framed", "b_chunked", "b_segment")
+        out = matrix.Orchestrator(args, RUN).run(["normal"], list(candidates))
+        for candidate in candidates:
+            with self.subTest(candidate=candidate):
+                name = f"normal-{candidate}"
+                sender_rows = records.read_jsonl(out / name / "sender.jsonl")
+                receiver_rows = records.read_jsonl(out / name / "receiver.jsonl")
+                connected = [row for row in sender_rows if row["kind"] == "connected"]
+                opened = [row for row in receiver_rows if row["kind"] == "session_open"]
+                self.assertTrue(connected and all(row["tcp_nodelay"] is True
+                                                  for row in connected))
+                self.assertTrue(opened and all(row["tcp_nodelay"] is True for row in opened))
+                rtt = [row for row in sender_rows
+                       if row["kind"] == "latency" and row["metric"] == "rtt"]
+                self.assertEqual(1, len(rtt))
+                detail = json.dumps(rtt[0], sort_keys=True)
+                self.assertGreater(rtt[0]["samples"], 100, detail)
+                # without TCP_NODELAY: a_framed / b_chunked p50 about 41 ms.
+                # b_segment (8 one-second PUTs) stalls on some segments only:
+                # p50 about 5 ms, p95 5.7-44 ms, but max >= 41 ms in each of 4
+                # runs. With it: p50 about 0.3 ms; b_segment max about 5.8 ms.
+                if candidate == "b_segment":
+                    self.assertLess(rtt[0]["max_ns"], 25_000_000, detail)
+                else:
+                    self.assertLess(rtt[0]["p50_ns"], 20_000_000, detail)
+                end = [row for row in sender_rows if row["kind"] == "end"]
+                self.assertEqual(1, len(end))
+                # the stall left the pending queue at its cap and dropped units
+                self.assertEqual(0, end[0]["drops"], json.dumps(end[0], sort_keys=True))
+        report = summarize.summarize([out])
+        for row in report["runs"]:
+            self.assertTrue(row["tcp_nodelay"], json.dumps(row, sort_keys=True))
 
     def test_two_host_roles_on_loopback(self):
         """``--role main`` and ``--role agent`` as two orchestrators (two output
