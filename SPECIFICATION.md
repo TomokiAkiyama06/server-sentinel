@@ -1857,8 +1857,9 @@ recorded numbers differ, on every storage sample: the sysfs topology
 or md member replacement onto loop/virtual backing that keeps the device
 number and mount refuses the next admission and raises the per-episode
 `recording_health_failure`; the refusal is not latched and a return to
-hardware-only backing admits again (Issue #340). A refusal seen only by an
-admission is kept as one value-free flag that the next tick consumes, so the
+hardware-only backing admits again (Issue #340). Any refusal seen only by an
+admission (topology, UUID, mount, `st_dev`, pinned root or metadata file;
+Issue #347) is kept as one value-free flag that the next tick consumes, so the
 episode alerts once even when restored before that tick; `recording_health`
 stays `failed` until the next daily self-test. A graceful stop takes one final
 storage sample under the same rule after every admitting component stopped and,
@@ -1868,9 +1869,27 @@ bound, and not at all when that settle ended unsettled; an unfinished one
 stays `pending` and `critical_notifications_unsettled` is logged), so a stop
 before the tick submits it; it reaches Slack only if the single delivery
 worker gets to it within that wait (behind a stalled or backlogged delivery,
-or with no wait left, it may not be sent at all, and a `pending`
-`recording_health_failure` row is not resent by a later start). A crash or
-kill before the tick still loses the flag (no durable record yet, Issue #351). Current numbers read no
+or with no wait left, it may not be sent by that process). A
+`recording_health_failure` row an earlier process left `pending` is submitted
+again once by the next start under its stored ID and time when its event time
+is less than 24 h old (newest first, at most 4; the rest stay `pending` and
+`recording_health_failure_unrestored` logs their count), like the stale
+device-number notice and camera offline; if the earlier POST reached Slack the
+Owner sees it twice (Issue #351). A crash, kill, OOM or power loss before the
+tick loses the in-memory flag itself; instead, the runtime keeps a running
+marker (one row of a random per-process token in the Main database, written
+under the storage policy when it reaches `running` and deleted by the graceful
+stop after its final sample), and a start that finds another process's marker
+logs `monitoring_previous_run_unclean` and raises one immediate value-free
+`recording_health_failure` named after that token, whether or not a refusal was
+actually lost (Owner decision 2026-10-26, option 2): every unclean exit of a
+running process is notified once, a graceful restart never. A process that
+never reached `running` writes no marker (nothing was admitted). A graceful
+stop whose marker delete is refused (storage refused at the stop, already
+alerted by its final sample) or whose final sample failed leaves the marker,
+so the next start notifies once more. A refused marker write is retried by the
+tick every 15 minutes; until it succeeds, a crash of that process is not
+detected. Current numbers read no
 sysfs. A mismatch at startup leaves
 the runtime `failed`, refuses writes and still attempts the immediate Slack
 alert; the open is retried every 15 minutes against the same declared identity

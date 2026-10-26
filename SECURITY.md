@@ -206,10 +206,12 @@ Runtime-data assumptions:
   development host) and a refusal is `STORAGE_HARD_STOP` for that sample:
   writes are refused, one immediate `recording_health_failure` is raised per
   episode, and the next sample on hardware-only backing admits again (not
-  latched). A refusal seen only by a write admission is kept as one
-  value-free flag, so the next monitoring tick (every 60 s by default) still
-  raises that episode's alert even when the backing was restored before it
-  (Codex P1 on PR #344); repeated refusals within one episode alert once.
+  latched). A refusal seen only by a write admission (this topology one, and
+  equally a UUID, mount, `st_dev`, root or metadata-file mismatch, Issue #347)
+  is kept as one value-free flag, so the next monitoring tick (every 60 s by
+  default) still raises that episode's alert even when the identity was
+  restored before it (Codex P1 on PR #344); repeated refusals within one
+  episode alert once.
   A graceful stop takes one final sample under the same rule and, when it
   raised the alert, waits for its delivery within the stop budget (at most
   12 s, and only what is left of an earlier shutdown settle's bound, none when
@@ -219,9 +221,15 @@ Runtime-data assumptions:
   notification worker reaches it within that wait: behind a stalled or
   backlogged delivery, or with no wait left, it may never reach Slack (queued
   deliveries are not sent after close, and a POST in flight may be cut by the
-  exit), and the `pending` `recording_health_failure` row is not resent by a
-  later start. A crash or kill before the tick still loses the flag, which has
-  no durable record yet (Issue #351).
+  exit); the next start submits such a `pending` `recording_health_failure`
+  row once more (within a day of its event, at most 4, Issue #351). A crash,
+  kill, OOM or power loss before the tick loses the flag itself; the running
+  marker the process leaves in the Main database (a random token, no host,
+  device or path value, on the verified filesystem) makes the next start send
+  one conservative `recording_health_failure` for every such unclean exit,
+  whether or not a refusal was actually lost (Owner decision 2026-10-26).
+  Residual: a crash before that process's marker was written (its write
+  refused and retried every 15 minutes) is not detected.
   `recording_health` then stays `failed` until the next daily recording
   self-test, although writes have resumed. A change in the middle of one admitted write is not prevented
   inside that write; the next sample refuses. Current numbers never read

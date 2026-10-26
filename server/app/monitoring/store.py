@@ -41,6 +41,23 @@ def notification_acceptance_migration(version: int) -> Migration:
     ))
 
 
+def run_marker_migration(version: int) -> Migration:
+    """The running marker of the monitoring runtime (Issue #351, #347).
+
+    One row while a process runs with storage admitted: a random per-process
+    token (no host, path, device or time value), written when the runtime
+    reaches `running` and deleted by its graceful stop. A row found at the
+    next start therefore means the previous process exited without that stop
+    (crash, kill, OOM, power loss), so a refusal it kept only in memory may
+    have been lost. The table lives in the Main database on the verified
+    recording filesystem (`admit_state_file`); creating it deletes nothing.
+    """
+    return Migration(version, "monitoring_run_marker", (
+        "CREATE TABLE monitoring_run_marker (singleton INTEGER PRIMARY KEY "
+        "CHECK(singleton=1), token TEXT NOT NULL)",
+    ))
+
+
 def _utc(at: datetime) -> str:
     if not isinstance(at, datetime) or at.tzinfo is None or at.utcoffset() is None:
         raise ValueError("AWARE_TIME_REQUIRED")
@@ -136,3 +153,26 @@ class RecordingHealthStatusStore(_Autocommit):
             return None
         return {"at": datetime.fromisoformat(row[0]), "state": HealthState(row[1]),
                 "stages": tuple(Stage(stage) for stage in json.loads(row[2]))}
+
+
+class RunMarkerStore(_Autocommit):
+    """The singleton running marker (`run_marker_migration`).
+
+    Every write is admitted by the storage policy like any other metadata
+    write, so the marker is never written outside the verified filesystem.
+    """
+
+    def read(self) -> str | None:
+        row = self.db.execute(
+            "SELECT token FROM monitoring_run_marker WHERE singleton=1").fetchone()
+        return None if row is None else str(row[0])
+
+    def mark(self, token: str) -> None:
+        self._write(
+            "INSERT INTO monitoring_run_marker VALUES (1,?) ON CONFLICT(singleton) DO UPDATE "
+            "SET token=excluded.token", (str(token),))
+
+    def clear(self, token: str) -> None:
+        """Delete the marker only when it is still ``token`` (this process's)."""
+        self._write("DELETE FROM monitoring_run_marker WHERE singleton=1 AND token=?",
+                    (str(token),))

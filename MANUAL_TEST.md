@@ -2744,6 +2744,14 @@ intercepted Slack transport. On the deployment, additionally check:
       and no recording is written; reloading it back onto the disk resumes
       writes without a restart. Until done, only the mock regression
       (`server/tests/test_device_numbers_reboot.py`) covers this;
+- [ ] (Issues #351/#347, disposable VM only, never a production host) with the
+      service running, `systemctl kill --signal=SIGKILL` it and let the unit
+      restart it: exactly one immediate `recording_health_failure` arrives and
+      the journal shows `monitoring_previous_run_unclean` once; a following
+      `systemctl restart` (graceful) sends none. With Slack blocked at a
+      stop that raised an alert (`critical_notifications_unsettled`), the next
+      start delivers that `pending` row once. Until done, only the mock
+      regressions (`server/tests/test_monitoring_unclean_exit.py`) cover this;
 - [ ] storage state transitions appear in `storage_state_audit`, and expired
       unstarred recordings/state-audit rows are removed by the running service;
 - [ ] detaching or substituting the recording mount while running yields one

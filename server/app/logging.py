@@ -18,6 +18,11 @@ class Event(StrEnum):
     MONITORING_UNCONFIGURED = "monitoring_storage_unconfigured"
     MONITORING_STARTUP_FAILED = "monitoring_startup_failed"
     MONITORING_DEGRADED = "monitoring_degraded"
+    # Issue #351: the previous process exited without its graceful stop.
+    MONITORING_PREVIOUS_RUN_UNCLEAN = "monitoring_previous_run_unclean"
+    # Issue #351: `pending` recording-health failures left out of the
+    # restart resend (beyond the limit).
+    RECORDING_HEALTH_FAILURE_UNRESTORED = "recording_health_failure_unrestored"
     LOCAL_UVC_UNCONFIGURED = "local_uvc_unconfigured"
     LOCAL_UVC_STORAGE_UNADMITTED = "local_uvc_storage_unadmitted"
     LOCAL_UVC_STARTED = "local_uvc_started"

@@ -296,16 +296,25 @@ onto a loop or virtual device while the service runs keeps the device number
 and the mount, yet storage stops (`STORAGE_HARD_STOP`, one immediate
 `recording_health_failure`) until the backing is hardware-only again, when
 writes resume without a restart. A refusal seen only by a write in between
-two monitoring ticks still raises the alert at the next tick, even if the
-backing was already restored; a service stop or restart before that tick
+two monitoring ticks (this one, or a UUID, mount or `st_dev` mismatch, Issue
+#347) still raises the alert at the next tick, even if the identity was
+already restored; a service stop or restart before that tick
 raises it during the stop instead (waiting at most 12 s for its delivery,
 within the stop budget below: only what is left of an earlier notification
 settle, none when that one ended unsettled); a delivery not finished by then
 stays `pending` and `critical_notifications_unsettled` is logged. Such an
 alert may then never reach Slack (behind a stalled or backlogged delivery it
-is still queued at the exit), and a later start does not resend a `pending`
-`recording_health_failure` row, so treat that log line as a possibly lost
-alert. A crash or kill before the tick loses it (Issue #351). After such an episode `recording_health` stays
+is still queued at the exit); the next start then submits that `pending`
+`recording_health_failure` row once more (within a day of its event), so the
+Owner may receive it twice. A crash, kill, OOM or power loss before the tick
+loses the refusal itself; instead the next start finds the running marker the
+process left in the database and sends one `recording_health_failure` for that
+unclean exit (log `monitoring_previous_run_unclean`), whether or not a refusal
+was lost (Issue #351). Every unclean exit of the running service is notified
+once this way (a crash loop sends one per crash that had reached
+`running`; there is no rate limit); a graceful `systemctl restart` sends none. On such a notice,
+check the journal for why the previous process ended and verify the recording
+filesystem (`--check`). After such an episode `recording_health` stays
 `failed` until the next daily recording self-test, even though writes have
 resumed. Updating the recorded numbers ends this
 extra check along with the warning.
@@ -2322,7 +2331,9 @@ a clean stop and replaced at every start; the Owner re-approval latch it arms
 is compared through the camera source's `requires_approval`, but a token
 cleared while the service was down after an unclean stop cannot be told from
 a clean stop), and the verdict values of `integrity_status` and
-`recording_health_status` (recomputed at startup and daily). A baseline
+`recording_health_status` (recomputed at startup and daily). The
+monitoring runtime's running marker (`monitoring_run_marker`, Issue #351:
+written at every start, deleted by a graceful stop) is not inventoried. A baseline
 recorded by a release before #132 has none of these sections; verify reports
 them `not_recorded` and they neither fail nor count as preserved.
 

@@ -36,9 +36,11 @@ parking the worker inside `policy.control()` until the caller exits;
 `main.RuntimeStorageAdmission` hands this to the security audit store once the
 runtime is running.
 
-Startup: open components, sample storage, run retention, integrity
+Startup: open components, reconcile the previous run (resend `pending`
+recording-health failures, check and write the running marker; Issue #351),
+sample storage, run retention, integrity
 `startup()`, recording-health `startup()`. Each tick: poll notification
-completions, re-verify the recording filesystem, `policy.status()`, expire
+completions, finish that reconciliation if it was refused, re-verify the recording filesystem, `policy.status()`, expire
 recordings (starred never), `storage_state_audit` and 90-day fault history, run
 the integrity/health `tick()` and the daily summary. A failing step sets its
 status flag and retries after `retry_seconds`; other steps continue. Status is a
@@ -70,8 +72,9 @@ numbers are stale this is judged on every storage sample, not only at open
 (Issue #340): a dm table reload or md member swap onto loop/virtual backing
 that keeps the number and mount is `STORAGE_HARD_STOP` (the per-episode
 filesystem alert) until the backing is hardware-only again; it is not
-latched. An admission-only refusal is kept as one flag
-(`take_topology_refusal`) that the next tick consumes, so that episode alerts
+latched. An admission-only refusal (of any kind: topology, UUID, mount,
+`st_dev`, root or metadata file, Issue #347) is kept as one flag
+(`take_refusal`) that the next tick consumes, so that episode alerts
 once even when restored before the tick; `recording_health` stays failed
 until the next daily self-test. A graceful stop (`_close`) takes one final
 storage sample under the same rule and, only when that sample raised the
@@ -83,9 +86,26 @@ unfinished delivery stays `pending` (`critical_notifications_unsettled`). So a
 stop before the tick submits the alert, but it reaches Slack only when the
 single delivery worker gets to it within that wait: queued behind a stalled or
 backlogged delivery, or with no wait left, it may never be sent (`close()`
-sends nothing still queued, and a POST in flight may be cut by the exit), and
-a `pending` `recording_health_failure` row is not resent by a later start. A
-crash or kill before the tick still loses the flag (Issue #351). Current numbers read no sysfs. A failed startup open is
+sends nothing still queued, and a POST in flight may be cut by the exit).
+Issue #351: the first running pass of every start (`_reconcile_previous_run`)
+first handles the running marker (`monitoring_run_marker`, migration 26,
+`store.RunMarkerStore`): a row of a random per-process token written under the
+storage policy once `running`, deleted by `_close` after a final sample that
+did not raise. Another process's token found there means an unclean exit
+(crash, kill, OOM, power loss): one immediate `recording_health_failure` named
+`uuid5(EVENT_NAMESPACE, "recording-unclean-exit:<token>")` is raised
+(`monitoring_previous_run_unclean` logged) unless that row exists, and the
+marker is replaced only once the row exists, so a crash in between repeats
+nothing. The recording-health verdict is left to the startup self-test. It
+then submits each `recording_health_failure` row an earlier process left
+`pending` again under its ID and time, when its event time is less than
+`PENDING_HEALTH_RESEND_SECONDS` (24 h) old, newest first, at most
+`PENDING_HEALTH_RESEND_LIMIT` (4), skipping rows this process has in flight;
+the rest stay `pending` (`recording_health_failure_unrestored` with a count).
+Each of the two is its own guarded step, retried by the tick after
+`retry_seconds` when refused. A crash or kill before the tick therefore still
+loses the flag, but the next start notifies the unclean exit, unless that
+process's marker write was still being refused. Current numbers read no sysfs. A failed startup open is
 retried every `retry_seconds` from the tick against the same declared identity;
 a failed database open (e.g. SQLite I/O error or permission change) takes the
 same alerting startup-failure path. Only the first failure of the episode alerts, and a successful retry runs the

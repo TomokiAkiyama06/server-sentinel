@@ -86,7 +86,10 @@ delivery across a crash; retrying an uncertain external POST may duplicate it.
 `close()` stops new submissions without waiting for a blocked transport/DNS call;
 in-flight/queued events remain durably pending or locally failed as recorded.
 After a process crash, the integration outbox owns reconciliation; the service
-does not automatically resend uncertain deliveries. No worker thread touches
+does not automatically resend uncertain deliveries. (The monitoring runtime
+resubmits some `pending` rows at its next start under their own IDs, e.g.
+`recording_health_failure` within a day of its event, Issue #351; see
+`../monitoring/README.md`.) No worker thread touches
 SQLite, calls the local sink or logs transport exceptions.
 
 `DailySummary` permits only validated aggregate counts/durations/bytes and storage
