@@ -210,6 +210,18 @@ Runtime-data assumptions:
   value-free flag, so the next monitoring tick (every 60 s by default) still
   raises that episode's alert even when the backing was restored before it
   (Codex P1 on PR #344); repeated refusals within one episode alert once.
+  A graceful stop takes one final sample under the same rule and, when it
+  raised the alert, waits for its delivery within the stop budget (at most
+  12 s, and only what is left of an earlier shutdown settle's bound, none when
+  that settle ended unsettled); a delivery not finished by then stays
+  `pending` and `critical_notifications_unsettled` is logged. Stopping before
+  the tick therefore submits the alert, but it is delivered only if the one
+  notification worker reaches it within that wait: behind a stalled or
+  backlogged delivery, or with no wait left, it may never reach Slack (queued
+  deliveries are not sent after close, and a POST in flight may be cut by the
+  exit), and the `pending` `recording_health_failure` row is not resent by a
+  later start. A crash or kill before the tick still loses the flag, which has
+  no durable record yet (Issue #351).
   `recording_health` then stays `failed` until the next daily recording
   self-test, although writes have resumed. A change in the middle of one admitted write is not prevented
   inside that write; the next sample refuses. Current numbers never read

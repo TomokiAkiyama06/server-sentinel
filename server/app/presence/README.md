@@ -292,7 +292,9 @@ confirmation from the final scene pass is submitted, then waits up to
 `TimeoutStopSec=90`) for submitted deliveries to complete
 before the monitoring runtime closes the service. A delivery still running then
 stays `pending` / unresolved (`critical_notifications_unsettled` is logged),
-never resent.
+never resent. The monitoring runtime's final storage sample at its stop
+(Issue #351) waits only for what is left of this bound, and not at all when
+this wait ended with deliveries pending, so it adds nothing to the stop budget.
 
 There is still no evidence-preservation port: a separate recording decision is
 pending. The dispatcher records the `evidence` rows `unavailable` and
