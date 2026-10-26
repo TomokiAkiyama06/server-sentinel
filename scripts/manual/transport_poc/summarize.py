@@ -2002,6 +2002,11 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
                 items, gate)
             if gate in TOPOLOGY_GATES:
                 missing[gate + "_missing_source_counts"] = counts
+        # #369: the secondary values come only from runs with TCP_NODELAY on
+        # every socket, like the gates; the excluded runs are counted, and a
+        # secondary pass with any excluded run is ``unmeasured``.
+        excluded = sum(1 for s in items if not s.metrics.get("tcp_nodelay"))
+        items_all, items = items, [s for s in items if s.metrics.get("tcp_nodelay")]
         unprotected = [s.metrics["unprotected_gap_units"] for s in items
                        if "unprotected_gap_units" in s.metrics]
         reconnects = [t for s in items for t in getattr(s, "reconnect_samples", [])]
@@ -2025,6 +2030,10 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
                 max(latency) <= SECOND)),
             "packet_loss": "unmeasured", "jitter": "unmeasured",
         }
+        if excluded:
+            secondary = {k: "unmeasured" if v in ("pass", "not_applicable") else v
+                         for k, v in secondary.items()}
+        items = items_all
         fast = [s.fast for s in items]
         report["candidates"].append({
             # ``fast``: True if any run used the shortened CI timing, False only
@@ -2039,6 +2048,7 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
             "reconnect_p95_ns": records.percentiles(reconnects)[95],
             "overhead_max": max(overhead) if overhead else None,
             "latency_p95_max_ns": max(latency) if latency else None,
+            "nodelay_excluded_runs": excluded,
             **{"secondary_" + k: v for k, v in secondary.items()}})
     if holder is not None:
         report["holder"] = holder

@@ -200,7 +200,9 @@ so the Agent detects it. Two-host G4/G5 under these rules remain
 TCP_NODELAY (Issue #369): no run recorded before the harness set it is a
 measurement of a candidate. The summarizer makes every run without
 `tcp_nodelay: true` in its sender, receiver and proxy records `unmeasured`
-(integrity and every gate, pass or fail); re-summarized, all 38 runs of
+(integrity and every gate, pass or fail) and leaves it out of the
+candidate's secondary values (reconnect p95, latency, overhead, unprotected
+gap units, `secondary_*`; counted in `nodelay_excluded_runs`); re-summarized, all 38 runs of
 2026-10-26 (real and synthetic, 1–5 sources) are `unmeasured`. On that day
 every 1-source real run (~150 KB MJPEG frames) showed an almost constant
 per-unit RTT (p50 46 ms, p95 48 ms, per-second unit size uncorrelated with
@@ -213,10 +215,13 @@ A one-host loopback A/B in a CPU-limited container (1 source) reproduced a
 stall: Nagle holds a small segment at the end of a unit while the receiver
 delays its ACK (40 ms minimum on Linux). Whether a unit stalls depends on its
 size, the sender's 64 KiB write split and the MSS (Linux's Minshall variant
-of Nagle): 125 KB and 147 KB units stalled on almost every unit (RTT p50
-41 ms; `b_segment` 42 ms), 16 KB units did not, and with a 1448-byte MSS
+of Nagle): with 125 KB and 147 KB units `a_framed` / `b_chunked` stalled on
+almost every unit (RTT p50 41 ms); `b_segment` (one PUT per second) stalled
+on some or all segments depending on the run (p50 5–42 ms, p95
+5.7–44 ms, max 41–45 ms); 16 KB units did not stall, and with a 1448-byte MSS
 (`TCP_MAXSEG`, closer to Ethernet) a fraction stalled (p50 0.4 ms, p95
-41 ms). `TCP_NODELAY` removed it (p50 0.3 ms; `b_segment` 4.6 ms); a 5 ms
+41 ms). `TCP_NODELAY` removed it (p50 0.3 ms; `b_segment` max about
+5.8 ms); a 5 ms
 instead of 50 ms sender `select` timeout changed nothing. On loopback both
 the sender and the proxy's upstream socket needed it; with the 1448-byte MSS
 the Agent socket alone sufficed. That the 2026-10-26 46 ms came from this

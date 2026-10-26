@@ -664,6 +664,42 @@ class SummarizerTests(unittest.TestCase):
         row = self.report()["outage_8s"]
         self.assertEqual(("unmeasured", False), (row["integrity"], row["tcp_nodelay"]))
 
+    def test_candidate_secondary_values_skip_runs_without_tcp_nodelay(self):
+        # #369: like the gates, the candidate's secondary values use only runs
+        # with TCP_NODELAY on every socket, and count the excluded runs
+        def latency(p95):
+            return {"kind": "latency", "t_ns": 9, "metric": "capture", "samples": 10,
+                    "p50_ns": p95, "p95_ns": p95, "p99_ns": p95, "max_ns": p95}
+
+        def drop_nodelay(name):
+            directory = self.root / name
+            rows = records.read_jsonl(directory / "sender.jsonl")
+            _write(directory, "sender", [{k: v for k, v in item.items()
+                                          if k not in ("run_id", "tcp_nodelay")}
+                                         for item in rows], nodelay=False)
+
+        def candidate():
+            return summarize.summarize([self.root])["candidates"][0]
+
+        for scenario, sources, p95 in (("normal", 1, 10**6), ("capacity_4", 4, 9 * 10**8)):
+            orchestrator, receiver, sender_rows = _base(scenario, sources=sources)
+            self.run_dir(f"{scenario}-a_framed", orchestrator=orchestrator, receiver=receiver,
+                         sender_rows=sender_rows + [latency(p95)])
+        row = candidate()
+        self.assertEqual((9 * 10**8, 0), (row["latency_p95_max_ns"], row["nodelay_excluded_runs"]))
+        self.assertEqual("pass", row["secondary_latency_reference"])
+        drop_nodelay("capacity_4-a_framed")
+        row = candidate()
+        self.assertEqual((10**6, 1), (row["latency_p95_max_ns"], row["nodelay_excluded_runs"]))
+        self.assertEqual("unmeasured", row["secondary_latency_reference"])
+        # no run with TCP_NODELAY: no secondary value at all
+        drop_nodelay("normal-a_framed")
+        row = candidate()
+        self.assertEqual((None, 2), (row["latency_p95_max_ns"], row["nodelay_excluded_runs"]))
+        self.assertIsNone(row["reconnect_p95_ns"])
+        self.assertIsNone(row["overhead_max"])
+        self.assertEqual("unmeasured", row["secondary_latency_reference"])
+
     def test_capture_restart_requires_unknown_extent(self):
         orchestrator, receiver, sender_rows = _base("capture_restart")
         rows = [{"kind": "durable", "t_ns": 9, "source": 0, "epoch": epoch, "min_sequence": 0,
@@ -3780,12 +3816,15 @@ class LoopbackMatrixTests(unittest.TestCase):
         """#369: ~150 KB units, one source, each candidate, through the proxy.
 
         Without ``TCP_NODELAY`` on the data-direction sockets each unit's
-        tail waited for a delayed ACK on loopback: RTT p50 about 41 ms
-        (b_segment 42 ms), fewer than 30 units/s delivered and the pending
-        queue at its cap. The 46 ms of the 2026-10-26 two-host runs is
-        consistent with this (inferred, not re-measured). Without the stall a
-        loopback round trip is about 0.3 ms (b_segment 4.6 ms); 20 ms leaves
-        room for a slow CI runner.
+        tail waited for a delayed ACK on loopback: a_framed / b_chunked RTT
+        p50 about 41 ms, fewer than 30 units/s delivered and the pending
+        queue at its cap. b_segment (one PUT per second) stalls on some or
+        all segments depending on the run (p50 5-42 ms, p95 5.7-44 ms, max
+        41-45 ms), so it is checked on its maximum. The 46 ms of the
+        2026-10-26 two-host runs is consistent with this (inferred, not
+        re-measured). Without the stall a loopback round trip is about 0.3 ms
+        (b_segment max about 5.8 ms); 20 ms (b_segment 25 ms) leaves room for
+        a slow CI runner.
         """
         directory = tempfile.TemporaryDirectory(prefix="poc15-")
         self.addCleanup(directory.cleanup)
@@ -3814,9 +3853,14 @@ class LoopbackMatrixTests(unittest.TestCase):
                 self.assertEqual(1, len(rtt))
                 detail = json.dumps(rtt[0], sort_keys=True)
                 self.assertGreater(rtt[0]["samples"], 100, detail)
-                # without TCP_NODELAY: p50 about 41 ms (a_framed, b_chunked)
-                # and 42 ms (b_segment); with it about 0.3 / 0.3 / 4.6 ms
-                self.assertLess(rtt[0]["p50_ns"], 20_000_000, detail)
+                # without TCP_NODELAY: a_framed / b_chunked p50 about 41 ms.
+                # b_segment (8 one-second PUTs) stalls on some segments only:
+                # p50 about 5 ms, p95 5.7-44 ms, but max >= 41 ms in each of 4
+                # runs. With it: p50 about 0.3 ms; b_segment max about 5.8 ms.
+                if candidate == "b_segment":
+                    self.assertLess(rtt[0]["max_ns"], 25_000_000, detail)
+                else:
+                    self.assertLess(rtt[0]["p50_ns"], 20_000_000, detail)
                 end = [row for row in sender_rows if row["kind"] == "end"]
                 self.assertEqual(1, len(end))
                 # the stall left the pending queue at its cap and dropped units
