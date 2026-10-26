@@ -1860,7 +1860,11 @@ number and mount refuses the next admission and raises the per-episode
 hardware-only backing admits again (Issue #340). A refusal seen only by an
 admission is kept as one value-free flag that the next tick consumes, so the
 episode alerts once even when restored before that tick; `recording_health`
-stays `failed` until the next daily self-test. Current numbers read no
+stays `failed` until the next daily self-test. A graceful stop takes one final
+storage sample under the same rule after every admitting component stopped and
+waits (bounded) for the delivery of an alert it raised, so a stop before the
+tick does not drop it; a crash or kill before the tick still loses the flag
+(no durable record yet, Issue #351). Current numbers read no
 sysfs. A mismatch at startup leaves
 the runtime `failed`, refuses writes and still attempts the immediate Slack
 alert; the open is retried every 15 minutes against the same declared identity

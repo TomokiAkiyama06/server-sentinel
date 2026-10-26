@@ -819,6 +819,87 @@ class StaleDeviceNumbersRuntimeTests(RuntimeFixture):
             self.assertEqual(2, len(alerts()))
             self.assertEqual(1, len(self.notices()))
 
+    async def test_an_admission_only_refusal_alerts_at_a_graceful_stop(self):
+        # Issue #351: the backing moves onto a loop device only while an
+        # admission runs, is restored, and the service then stops before the
+        # periodic tick. The stop's final storage sample must still raise and
+        # deliver the episode's one alert, since the flag is in memory only.
+        sysfs = FakeSysfs(self)
+        disk = sysfs.device(spare_device(self.device, 8, 240), "sdz")
+        loop = sysfs.device(spare_device(self.device, 7, 9), "loop9", loop=True)
+        mapped = sysfs.device(self.device, "dm-stale", dm=True, slaves=(disk,))
+
+        def alerts():
+            return [text for text in self.slack_texts() if "recording_health_failure" in text]
+
+        def admit():
+            with runtime._policy.control():
+                pass
+
+        def stored():
+            with contextlib.closing(sqlite3.connect(self.settings.database_path)) as db:
+                return (db.execute("SELECT delivery FROM notification_events "
+                                   "WHERE kind='recording_health_failure'").fetchall(),
+                        db.execute("SELECT state, stages FROM recording_health_status").fetchall())
+
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            (mapped / "slaves" / disk.name).unlink()
+            (mapped / "slaves" / loop.name).symlink_to(loop)
+            with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                await runtime.call(admit)
+            (mapped / "slaves" / loop.name).unlink()
+            (mapped / "slaves" / disk.name).symlink_to(disk)
+            self.clock.advance(timedelta(seconds=10))
+            self.assertEqual([], alerts())
+        # Sent and recorded by the stop itself (no tick ran, no settle here).
+        self.assertEqual(["ServerSentinel critical alert: recording_health_failure"], alerts())
+        self.assertEqual(([("sent",)], [("FAILED", '["STORAGE"]')]), stored())
+        self.assertEqual(RuntimeState.STOPPED, runtime.status.state)
+        # The restored backing is healthy: the restart and its own stop send
+        # nothing more, and the stale-numbers notice stays one per boot.
+        self.clock.advance(timedelta(minutes=5))
+        self.assertTrue((await self.run_once()).recording_filesystem_ok)
+        self.assertEqual(1, len(alerts()))
+        self.assertEqual(1, len(self.notices()))
+
+    async def test_a_graceful_stop_within_an_alerted_episode_does_not_alert_again(self):
+        # Issue #351: the final sample follows the tick's episode rule, so a
+        # refusal within an episode a tick already alerted adds nothing.
+        sysfs = FakeSysfs(self)
+        disk = sysfs.device(spare_device(self.device, 8, 240), "sdz")
+        loop = sysfs.device(spare_device(self.device, 7, 9), "loop9", loop=True)
+        mapped = sysfs.device(self.device, "dm-stale", dm=True, slaves=(disk,))
+
+        def alerts():
+            return [text for text in self.slack_texts() if "recording_health_failure" in text]
+
+        def admit():
+            with runtime._policy.control():
+                pass
+
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            (mapped / "slaves" / disk.name).unlink()
+            (mapped / "slaves" / loop.name).symlink_to(loop)
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertEqual(1, len(alerts()))
+            with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                await runtime.call(admit)
+            (mapped / "slaves" / loop.name).unlink()
+            (mapped / "slaves" / disk.name).symlink_to(disk)
+        self.assertEqual(1, len(alerts()))
+        # A healthy start and stop without any refusal sends nothing either.
+        self.clock.advance(timedelta(minutes=5))
+        await self.run_once()
+        self.assertEqual(1, len(alerts()))
+
     async def test_renumbered_loop_device_fails_closed_at_runtime(self):
         FakeSysfs(self).node(self.device, "loop")
         application = self.application()

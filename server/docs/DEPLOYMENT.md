@@ -297,7 +297,9 @@ and the mount, yet storage stops (`STORAGE_HARD_STOP`, one immediate
 `recording_health_failure`) until the backing is hardware-only again, when
 writes resume without a restart. A refusal seen only by a write in between
 two monitoring ticks still raises the alert at the next tick, even if the
-backing was already restored. After such an episode `recording_health` stays
+backing was already restored; a service stop or restart before that tick
+raises it during the stop instead (waiting at most 12 s for its delivery),
+but a crash or kill before the tick loses it (Issue #351). After such an episode `recording_health` stays
 `failed` until the next daily recording self-test, even though writes have
 resumed. Updating the recorded numbers ends this
 extra check along with the warning.

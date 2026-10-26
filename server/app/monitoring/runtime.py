@@ -67,6 +67,10 @@ WARNING_KINDS = (NotificationKind.HARDWARE_INTEGRITY_WARNING,
 # Kernel per-boot random UUID (Issue #321): the stale device-number notice is
 # sent once per boot and device numbers, not on every restart.
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+# Issue #351: how long a graceful stop waits for the delivery of a
+# `recording_health_failure` raised by its final storage sample; longer than
+# the 10 s Slack timeout, like the shutdown settles in `app.main`.
+SHUTDOWN_STORAGE_SETTLE_SECONDS = 12.0
 
 
 def _boot_id() -> str | None:
@@ -664,7 +668,8 @@ class MonitoringRuntime:
 
     # -- periodic work -----------------------------------------------------
 
-    def _storage_tick(self) -> None:
+    def _storage_tick(self) -> bool:
+        """One storage sample; True when it raised the episode's alert."""
         try:
             self.filesystem.check()
             healthy = True
@@ -681,7 +686,8 @@ class MonitoringRuntime:
         # episode (PR #344 review).
         if self.filesystem.take_topology_refusal() and self._filesystem_ok:
             healthy = False
-        if not healthy and self._filesystem_ok:
+        alerted = not healthy and self._filesystem_ok
+        if alerted:
             # One immediate alert per mismatch episode; recovery re-arms it.
             at = self.dependencies.utcnow()
             try:
@@ -702,6 +708,7 @@ class MonitoringRuntime:
             self._set(storage_state=self._policy.state,
                       storage_audit_failed=self._policy.audit_delivery_failed,
                       recording_filesystem_ok=healthy)
+        return alerted
 
     def _retention_tick(self) -> None:
         """Expired unstarred recordings, then state-audit and fault history."""
@@ -1233,7 +1240,32 @@ class MonitoringRuntime:
         self._camera_tick()
         self._poll()
 
+    def _final_storage_sample(self) -> None:
+        """Issue #351: take one last storage sample before a graceful stop.
+
+        The topology refusal flag of an admission-only episode lives in
+        memory only, so a stop between that refusal and the next tick would
+        otherwise drop its alert when the backing was restored meanwhile. The
+        stop runs after every admitting component stopped (`app.main`), so
+        nothing refuses after this sample. Only an alert it raised itself is
+        waited for (bounded), so a stop does not otherwise wait on Slack; a
+        delivery still unfinished then stays `pending`, like the other
+        shutdown settles. A crash or kill before the tick still loses the
+        flag (no durable record yet, Issue #351).
+        """
+        if (self.status.state != RuntimeState.RUNNING or self.filesystem is None
+                or self._policy is None or self.notifications is None):
+            return
+        try:
+            alerted = self._storage_tick()
+        except Exception:
+            logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+            return
+        if alerted and self.settle_notifications(SHUTDOWN_STORAGE_SETTLE_SECONDS):
+            logging.getLogger(__name__).error(Event.CRITICAL_NOTIFICATIONS_UNSETTLED)
+
     def _close(self) -> None:
+        self._final_storage_sample()
         if self.notifications is not None:
             self.notifications.close()
         if self.recordings is not None:
