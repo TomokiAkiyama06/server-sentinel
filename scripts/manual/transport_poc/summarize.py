@@ -1558,8 +1558,11 @@ class RunSummary:
         # candidates send every source concurrently, so which one is the
         # fifth depends on arrival order, not on its index (#368). Exactly
         # one source must have been refused (nothing accepted, every refusal
-        # for the active-source limit) and the other 4 must behave like
-        # ``capacity_4``: durable, no sender drop, no backpressure.
+        # for the active-source limit, nothing durable) and the other 4 must
+        # behave like ``capacity_4``: durable, no sender drop, no backpressure.
+        # The refused source may drop: on b_segment Main refuses one of its
+        # units per segment and returns the rest ``not_processed``, so its
+        # pending fills at the live rate and drop-oldest runs all along.
         sources = set(range(5))
         if not sources <= set(ends):
             return "fail"
@@ -1575,7 +1578,7 @@ class RunSummary:
         return _verdict(refusal and others <= durable_sources
                         and refused[0] not in durable_sources
                         and backpressured == 0 and rate_limited == 0
-                        and all(ends[index].get("drops") == 0 for index in sources))
+                        and all(ends[index].get("drops") == 0 for index in others))
 
     # -- secondary ----------------------------------------------------------
     def secondary(self):

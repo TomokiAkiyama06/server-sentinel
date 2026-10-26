@@ -813,7 +813,7 @@ class SummarizerTests(unittest.TestCase):
         self.rewrite("fifth_refused-a_framed", "sender", sender_rows + ends[:4] + [fifth])
         self.assertEqual("unmeasured", self.report()["fifth_refused"]["g6"])
 
-    def _fifth_refused_run(self, refused, **overrides):
+    def _fifth_refused_run(self, refused, candidate="a_framed", **overrides):
         """G6 of a ``fifth_refused`` run in which the sources in ``refused``
         got nothing accepted (every refusal ``source_capacity``) and the
         others are durable. ``overrides``: ``ends`` (source -> fields merged
@@ -822,7 +822,7 @@ class SummarizerTests(unittest.TestCase):
         ``extra_durable`` receiver rows."""
         for stale in self.root.iterdir():  # one run per report
             shutil.rmtree(stale)
-        orchestrator, receiver, sender_rows = _base("fifth_refused", sources=5)
+        orchestrator, receiver, sender_rows = _base("fifth_refused", candidate, sources=5)
         durable = [{"kind": "durable", "t_ns": 9, "source": index, "epoch": 1,
                     "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0}
                    for index in range(5) if index not in refused]
@@ -838,7 +838,7 @@ class SummarizerTests(unittest.TestCase):
         receiver_end = {"kind": "end", "t_ns": 9, "accepted": 10 * len(durable),
                         "backpressured": 0, "rate_limited": 0, "cpu_quota_us": 200000,
                         **overrides.get("receiver_end", {})}
-        self.run_dir("fifth_refused-a_framed", orchestrator=orchestrator,
+        self.run_dir(f"fifth_refused-{candidate}", orchestrator=orchestrator,
                      receiver=receiver + durable + overrides.get("extra_durable", [])
                      + [receiver_end], sender_rows=sender_rows + ends)
         return self.report()["fifth_refused"]["g6"]
@@ -850,17 +850,32 @@ class SummarizerTests(unittest.TestCase):
             with self.subTest(refused=refused):
                 self.assertEqual("pass", self._fifth_refused_run({refused}))
 
+    def test_fifth_refused_allows_drops_of_the_refused_source(self):
+        # b_segment: Main refuses one unit of the refused source per segment
+        # and returns the rest ``not_processed``; the sender requeues them, its
+        # pending fills at 30 fps and drop-oldest runs for the whole run
+        # (loopback 60 s: rejected 60, drops 1681). Not a G6 failure.
+        for refused in (1, 4):
+            with self.subTest(refused=refused):
+                segment_shaped = {"rejected": 60, "rejected_source_capacity": 60,
+                                  "drops": 1681, "generated": 1800}
+                self.assertEqual("pass", self._fifth_refused_run(
+                    {refused}, candidate="b_segment", ends={refused: segment_shaped}))
+
     def test_fifth_refused_failing_and_unmeasured_cases(self):
         cases = {
             "two refused": ({1, 3}, {}),
             "none refused": (set(), {}),
-            "refused source has drops": ({1}, {"ends": {1: {"drops": 2}}}),
             "an admitted source has drops": ({1}, {"ends": {2: {"drops": 1}}}),
             "backpressure on the admitted 4": ({1}, {"receiver_end": {"backpressured": 3}}),
             "rate limited": ({1}, {"receiver_end": {"rate_limited": 1}}),
             "refused for another reason": ({1}, {"ends": {1: {"rejected_source_capacity": 4}}}),
             "refused without any refusal": ({1}, {"ends": {1: {"rejected": 0,
                                                               "rejected_source_capacity": 0}}}),
+            "refused source drops and is durable on Main": ({1}, {
+                "ends": {1: {"drops": 5}}, "extra_durable": [
+                {"kind": "durable", "t_ns": 9, "source": 1, "epoch": 1, "min_sequence": 0,
+                 "max_sequence": 9, "units": 10, "duplicates": 0}]}),
             "refused source durable on Main": ({1}, {"extra_durable": [
                 {"kind": "durable", "t_ns": 9, "source": 1, "epoch": 1, "min_sequence": 0,
                  "max_sequence": 9, "units": 10, "duplicates": 0}]}),
