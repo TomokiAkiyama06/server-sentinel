@@ -68,8 +68,11 @@ WARNING_KINDS = (NotificationKind.HARDWARE_INTEGRITY_WARNING,
 # sent once per boot and device numbers, not on every restart.
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 # Issue #351: how long a graceful stop waits for the delivery of a
-# `recording_health_failure` raised by its final storage sample; longer than
-# the 10 s Slack timeout, like the shutdown settles in `app.main`.
+# `recording_health_failure` raised by its final storage sample when no
+# shutdown settle ran before it; longer than the 10 s Slack timeout, like the
+# shutdown settles in `app.main`. After such a settle the wait only uses what
+# is left of that settle's bound (`_final_storage_sample`), so the stop stays
+# within the `TimeoutStopSec=90` budget those settles were sized for.
 SHUTDOWN_STORAGE_SETTLE_SECONDS = 12.0
 
 
@@ -273,6 +276,13 @@ class MonitoringRuntime:
         # Issue #321: the stale device-number check runs once per process;
         # the notice itself is deduplicated per boot (`_report_device_numbers`).
         self._device_numbers_reported = False
+        # Issue #351 (PR #363 review): the shutdown settles' largest bound,
+        # the time they spent and whether one ended with deliveries still
+        # pending, so the final storage sample's wait never extends the stop
+        # beyond the settle budget of `TimeoutStopSec=90`.
+        self._settle_bound: float | None = None
+        self._settle_spent = 0.0
+        self._settle_unfinished = False
         self.notifications: NotificationService | None = None
         self.notification_events: NotificationEventStore | None = None
         self.recordings: RecordingStore | None = None
@@ -1206,16 +1216,25 @@ class MonitoringRuntime:
         answers in time. Returns how many deliveries are still pending; those
         stay `pending` in `notification_events` (uncertain, not confirmed); a
         restarted process's reconciliation decides whether one is sent again.
+        The bound, the time spent and an unsettled end are kept, so the stop's
+        final storage sample waits only within what is left (Issue #351).
         """
         self._require_owner()
         if self.notifications is None:
             return 0
-        deadline = time.monotonic() + timeout_seconds
-        self._poll()
-        while self.notifications.pending_count and time.monotonic() < deadline:
-            time.sleep(0.02)
+        started = time.monotonic()
+        deadline = started + timeout_seconds
+        try:
             self._poll()
-        return self.notifications.pending_count
+            while self.notifications.pending_count and time.monotonic() < deadline:
+                time.sleep(0.02)
+                self._poll()
+            pending = self.notifications.pending_count
+        finally:
+            self._settle_bound = max(self._settle_bound or 0.0, timeout_seconds)
+            self._settle_spent += time.monotonic() - started
+        self._settle_unfinished = self._settle_unfinished or pending != 0
+        return pending
 
     def tick(self) -> None:
         """One owner-thread pass; call only through `call` or the run loop."""
@@ -1247,25 +1266,42 @@ class MonitoringRuntime:
         memory only, so a stop between that refusal and the next tick would
         otherwise drop its alert when the backing was restored meanwhile. The
         stop runs after every admitting component stopped (`app.main`), so
-        nothing refuses after this sample. Only an alert it raised itself is
-        waited for (bounded), so a stop does not otherwise wait on Slack; a
-        delivery still unfinished then stays `pending`, like the other
-        shutdown settles. A crash or kill before the tick still loses the
-        flag (no durable record yet, Issue #351).
+        nothing refuses after this sample.
+
+        The wait starts only when this sample raised the alert, so a stop
+        without one never waits on Slack; it then waits for every pending
+        delivery, bounded by the stop budget (PR #363 review): without an
+        earlier shutdown settle up to `SHUTDOWN_STORAGE_SETTLE_SECONDS`;
+        after one, at most what is left of that settle's bound, and not at all
+        when it ended with deliveries still pending (Slack did not answer, so
+        waiting again would only spend the budget on the same delivery). The
+        alert was submitted before the wait; one not finished by then stays
+        `pending` and `critical_notifications_unsettled` is logged, like the
+        other shutdown settles. A crash or kill before the tick still loses
+        the flag (no durable record yet, Issue #351).
         """
         if (self.status.state != RuntimeState.RUNNING or self.filesystem is None
                 or self._policy is None or self.notifications is None):
             return
-        try:
-            alerted = self._storage_tick()
-        except Exception:
-            logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+        if not self._storage_tick():
             return
-        if alerted and self.settle_notifications(SHUTDOWN_STORAGE_SETTLE_SECONDS):
+        if self._settle_bound is None:
+            wait = SHUTDOWN_STORAGE_SETTLE_SECONDS
+        elif self._settle_unfinished:
+            wait = 0.0
+        else:
+            wait = max(0.0, min(SHUTDOWN_STORAGE_SETTLE_SECONDS,
+                                self._settle_bound - self._settle_spent))
+        if self.settle_notifications(wait):
             logging.getLogger(__name__).error(Event.CRITICAL_NOTIFICATIONS_UNSETTLED)
 
     def _close(self) -> None:
-        self._final_storage_sample()
+        try:
+            self._final_storage_sample()
+        except Exception:
+            # Never skips closing the notification service, the recording
+            # store and the database below.
+            logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
         if self.notifications is not None:
             self.notifications.close()
         if self.recordings is not None:

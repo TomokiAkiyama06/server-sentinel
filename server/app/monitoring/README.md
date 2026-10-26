@@ -74,9 +74,13 @@ latched. An admission-only refusal is kept as one flag
 (`take_topology_refusal`) that the next tick consumes, so that episode alerts
 once even when restored before the tick; `recording_health` stays failed
 until the next daily self-test. A graceful stop (`_close`) takes one final
-storage sample under the same rule and waits at most
-`SHUTDOWN_STORAGE_SETTLE_SECONDS` for an alert it raised, so a stop before the
-tick does not drop it; a crash or kill before the tick still loses the flag
+storage sample under the same rule and, only when that sample raised the
+alert, waits for the pending deliveries: up to
+`SHUTDOWN_STORAGE_SETTLE_SECONDS` when no shutdown settle ran, otherwise only
+what is left of the earlier settle's bound and not at all when it ended
+unsettled, so the stop stays within the `TimeoutStopSec=90` budget. An
+unfinished delivery stays `pending` (`critical_notifications_unsettled`). So a
+stop before the tick does not drop the alert; a crash or kill before the tick still loses the flag
 (Issue #351). Current numbers read no sysfs. A failed startup open is
 retried every `retry_seconds` from the tick against the same declared identity;
 a failed database open (e.g. SQLite I/O error or permission change) takes the
