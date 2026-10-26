@@ -289,7 +289,7 @@ GPU：どの候補も upstream は ONNX → TensorRT の手順を示していま
   Ultralytics の Enterprise License は有償の個別契約で、Apache-2.0 で配る ServerSentinel の
   利用者全員には及ばないため、この project には合いません。
 - **重みのライセンスが不明**：YOLOX、DEIM、RTMDet、PP-YOLOE、NanoDet、EfficientDet（automl の checkpoint）、
-  MediaPipe の配布物、Open Model Zoo。EfficientDet-Lite の Kaggle 配布物は、公式組織の license 欄に Apache 2.0 があるため、ここには含めません。Q1 を満たすかどうかは、追補の Q8 で Owner が判断します。
+  MediaPipe の配布物、Open Model Zoo。EfficientDet-Lite の Kaggle 配布物は、公式組織の license 欄に Apache 2.0 があるため、「不明」とも「明示あり」とも決めず、**Q8 の Owner 判断まで保留**にしています（Q8 で認められなければ、この「不明」に入れます）。
 - **配布元が許諾を保証しない**：torchvision（docs が利用者の責任と明記）。
 - **Objects365 系譜**：D-FINE obj365/obj2coco、RT-DETR の O365 版、PP-YOLOE+、RF-DETR（RF-DETR も Q3 により除外）。
 
