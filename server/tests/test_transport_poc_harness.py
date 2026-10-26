@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import selectors
+import shutil
 import socket
 import stat
 import sys
@@ -883,6 +884,82 @@ class SummarizerTests(unittest.TestCase):
         fifth = {k: v for k, v in ends[4].items() if k != "rejected_source_capacity"}
         self.rewrite("fifth_refused-a_framed", "sender", sender_rows + ends[:4] + [fifth])
         self.assertEqual("unmeasured", self.report()["fifth_refused"]["g6"])
+
+    def _fifth_refused_run(self, refused, candidate="a_framed", **overrides):
+        """G6 of a ``fifth_refused`` run in which the sources in ``refused``
+        got nothing accepted (every refusal ``source_capacity``) and the
+        others are durable. ``overrides``: ``ends`` (source -> fields merged
+        into its sender ``end``, a None value removes the field, None instead
+        of the fields removes the ``end``), ``receiver_end`` fields and
+        ``extra_durable`` receiver rows."""
+        for stale in self.root.iterdir():  # one run per report
+            shutil.rmtree(stale)
+        orchestrator, receiver, sender_rows = _base("fifth_refused", candidate, sources=5)
+        durable = [{"kind": "durable", "t_ns": 9, "source": index, "epoch": 1,
+                    "min_sequence": 0, "max_sequence": 9, "units": 10, "duplicates": 0}
+                   for index in range(5) if index not in refused]
+        ends = [{"kind": "end", "t_ns": 9, "source": index, "epoch": 1,
+                 "accepted": 0 if index in refused else 10,
+                 "rejected": 10 if index in refused else 0, "drops": 0,
+                 "rejected_source_capacity": 10 if index in refused else 0,
+                 "generated": 10, **_produced(10)} for index in range(5)]
+        for index, fields in overrides.get("ends", {}).items():
+            ends[index] = None if fields is None else {
+                k: v for k, v in {**ends[index], **fields}.items() if v is not None}
+        ends = [end for end in ends if end is not None]
+        receiver_end = {"kind": "end", "t_ns": 9, "accepted": 10 * len(durable),
+                        "backpressured": 0, "rate_limited": 0, "cpu_quota_us": 200000,
+                        **overrides.get("receiver_end", {})}
+        self.run_dir(f"fifth_refused-{candidate}", orchestrator=orchestrator,
+                     receiver=receiver + durable + overrides.get("extra_durable", [])
+                     + [receiver_end], sender_rows=sender_rows + ends)
+        return self.report()["fifth_refused"]["g6"]
+
+    def test_fifth_refused_accepts_any_refused_source(self):
+        # #368: Main admits the first 4 sources to arrive, so the refused one
+        # is whichever came fifth, not always source 4 (10-26: source 1).
+        for refused in (0, 1, 3, 4):
+            with self.subTest(refused=refused):
+                self.assertEqual("pass", self._fifth_refused_run({refused}))
+
+    def test_fifth_refused_allows_drops_of_the_refused_source(self):
+        # b_segment: Main refuses one unit of the refused source per segment
+        # and returns the rest ``not_processed``; the sender requeues them, its
+        # pending fills at 30 fps and drop-oldest runs for the whole run
+        # (loopback 60 s: rejected 60, drops 1681). Not a G6 failure.
+        for refused in (1, 4):
+            with self.subTest(refused=refused):
+                segment_shaped = {"rejected": 60, "rejected_source_capacity": 60,
+                                  "drops": 1681, "generated": 1800}
+                self.assertEqual("pass", self._fifth_refused_run(
+                    {refused}, candidate="b_segment", ends={refused: segment_shaped}))
+
+    def test_fifth_refused_failing_and_unmeasured_cases(self):
+        cases = {
+            "two refused": ({1, 3}, {}),
+            "none refused": (set(), {}),
+            "an admitted source has drops": ({1}, {"ends": {2: {"drops": 1}}}),
+            "backpressure on the admitted 4": ({1}, {"receiver_end": {"backpressured": 3}}),
+            "rate limited": ({1}, {"receiver_end": {"rate_limited": 1}}),
+            "refused for another reason": ({1}, {"ends": {1: {"rejected_source_capacity": 4}}}),
+            "refused without any refusal": ({1}, {"ends": {1: {"rejected": 0,
+                                                              "rejected_source_capacity": 0}}}),
+            "refused source drops and is durable on Main": ({1}, {
+                "ends": {1: {"drops": 5}}, "extra_durable": [
+                {"kind": "durable", "t_ns": 9, "source": 1, "epoch": 1, "min_sequence": 0,
+                 "max_sequence": 9, "units": 10, "duplicates": 0}]}),
+            "refused source durable on Main": ({1}, {"extra_durable": [
+                {"kind": "durable", "t_ns": 9, "source": 1, "epoch": 1, "min_sequence": 0,
+                 "max_sequence": 9, "units": 10, "duplicates": 0}]}),
+        }
+        for label, (refused, overrides) in cases.items():
+            with self.subTest(label):
+                self.assertEqual("fail", self._fifth_refused_run(refused, **overrides))
+        with self.subTest("a source end is missing"):
+            self.assertEqual("fail", self._fifth_refused_run({1}, ends={3: None}))
+        with self.subTest("refusal reason not recorded"):
+            self.assertEqual("unmeasured", self._fifth_refused_run(
+                {1}, ends={1: {"rejected_source_capacity": None}}))
 
     # -- regressions for the PR #222 review ------------------------------------
     def test_reconnect_episodes_are_matched_once_per_window(self):
@@ -2864,6 +2941,43 @@ class SenderProducerTests(unittest.TestCase):
         self.assertEqual([(0, 4, 9), (1, 4, 9), (0, 1, 11), (1, 1, 11)], losses)
         # ``closed`` (written by ``run``) is checked on real records in
         # LoopbackMatrixTests.test_two_host_roles_on_loopback
+
+    def test_backpressure_requeue_keeps_pending_bounded(self):
+        # #367: a transient refusal (backpressure) puts the in-flight unit back
+        # in front; the producer may have filled ``pending`` meanwhile, so the
+        # requeue must drop-oldest like ``_requeue_inflight`` / ``_restore``
+        # and record the drop (G2 ``unit_range``), never exceed the limit (G3).
+        config = sender.SenderConfig(candidate="a_framed", host="127.0.0.1", port=self.port,
+                                     n_sources=1, fps=30, pending_seconds=0.1, fast=True)
+        self.assertEqual(3, config.pending_limit)
+        out = self.root / "requeue.jsonl"
+        writer = records.JsonlWriter(out, run_id=RUN, role="sender")
+        instance = sender.Sender(config, self.root / "m" / "nodes" / "good", 1, writer)
+        self.addCleanup(instance.wake_r.close)
+        self.addCleanup(instance.wake_w.close)
+        state = instance.sources[0]
+        for number in range(3):
+            instance._offer(0, time.monotonic_ns(), b"u%d" % number)
+        [(_, unit)] = instance._next_units()
+        unit.sent_ns = time.monotonic_ns()  # as ``_session_stream`` does
+        instance._offer(0, time.monotonic_ns(), b"u3")  # pending full again: [1, 2, 3]
+        instance._ack(state.source_id, instance.epoch, unit.sequence, "backpressured", "none")
+        self.assertIsNone(state.inflight)
+        self.assertEqual([1, 2, 3], [item.sequence for item in state.pending])
+        self.assertEqual((1, 1, [[0, 0]]), (state.drops, state.drops_sent, state.drop_ranges))
+        instance._offer(0, time.monotonic_ns(), b"u4")
+        self.assertEqual([2, 3, 4], [item.sequence for item in state.pending])
+        self.assertLessEqual(state.max_pending, config.pending_limit)
+        instance._finish()
+        writer.close()
+        rows = records.read_jsonl(out)
+        [end] = [row for row in rows if row["kind"] == "end"]
+        ranges = [(row["range_kind"], row["first_sequence"], row["last_sequence"])
+                  for row in rows if row["kind"] == "unit_range"]
+        self.assertEqual([("drop", 0, 1), ("residual", 2, 4)], ranges)
+        self.assertEqual((5, 2, 1, 3, 2, 3), (end["generated"], end["drops"], end["drops_sent"],
+                                              end["residual"], end["unit_ranges"],
+                                              end["max_pending"]))
 
     def run_sender(self, source_kind, seconds=6.0, **config):
         config = sender.SenderConfig(candidate="a_framed", host="127.0.0.1", port=self.port,

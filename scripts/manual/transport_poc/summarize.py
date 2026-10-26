@@ -1571,14 +1571,31 @@ class RunSummary:
                       and metric.get("cpu_quota_us") is not None)
             all_ends = {0, 1, 2, 3} <= set(ends)
             return _verdict(healthy and all_ends and drops == 0 and capped)
-        fifth = ends.get(4)
-        if fifth is None:
+        # Main admits the first 4 sources whose units reach it; the streaming
+        # candidates send every source concurrently, so which one is the
+        # fifth depends on arrival order, not on its index (#368). Exactly
+        # one source must have been refused (nothing accepted, every refusal
+        # for the active-source limit, nothing durable) and the other 4 must
+        # behave like ``capacity_4``: durable, no sender drop, no backpressure.
+        # The refused source may drop: on b_segment Main refuses one of its
+        # units per segment and returns the rest ``not_processed``, so its
+        # pending fills at the live rate and drop-oldest runs all along.
+        sources = set(range(5))
+        if not sources <= set(ends):
             return "fail"
+        refused = [index for index in sorted(sources) if ends[index].get("accepted") == 0]
+        if len(refused) != 1:
+            return "fail"
+        fifth = ends[refused[0]]
         if "rejected_source_capacity" not in fifth:
             return "unmeasured"  # the refusal reason is not on record
-        refused = (fifth["accepted"] == 0 and fifth["rejected"] > 0
+        others = sources - {refused[0]}
+        refusal = (isinstance(fifth.get("rejected"), int) and fifth["rejected"] > 0
                    and fifth["rejected_source_capacity"] == fifth["rejected"])
-        return _verdict({0, 1, 2, 3} <= durable_sources and 4 not in durable_sources and refused)
+        return _verdict(refusal and others <= durable_sources
+                        and refused[0] not in durable_sources
+                        and backpressured == 0 and rate_limited == 0
+                        and all(ends[index].get("drops") == 0 for index in others))
 
     # -- secondary ----------------------------------------------------------
     def secondary(self):
