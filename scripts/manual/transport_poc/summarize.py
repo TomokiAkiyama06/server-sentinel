@@ -250,6 +250,23 @@ class RunSummary:
                 verdict = "unmeasured"
         return verdict
 
+    def tcp_nodelay(self):
+        """Every harness TCP socket of this run had Nagle off (#369).
+
+        Without ``TCP_NODELAY`` a stop-and-wait unit's tail can wait for a
+        delayed ACK (about 40 ms per unit), which throttles throughput and
+        moves drops, latency and gap results: such a run measures the
+        harness, not the candidate. True only when the sender ``start``, the
+        receiver and proxy ``ready`` records declare it and every sender
+        ``connected`` and receiver ``session_open`` read it back as true.
+        Records written before #369 carry no ``tcp_nodelay``: False.
+        """
+        declared = (_kind(self.sender, "start") + _kind(self.receiver, "ready")
+                    + _kind(self.proxy, "ready"))
+        observed = _kind(self.sender, "connected") + _kind(self.receiver, "session_open")
+        rows = declared + observed
+        return bool(declared) and all(row.get("tcp_nodelay") is True for row in rows)
+
     def production(self):
         """Every declared source produced media continuously for the run.
 
@@ -1554,14 +1571,31 @@ class RunSummary:
                       and metric.get("cpu_quota_us") is not None)
             all_ends = {0, 1, 2, 3} <= set(ends)
             return _verdict(healthy and all_ends and drops == 0 and capped)
-        fifth = ends.get(4)
-        if fifth is None:
+        # Main admits the first 4 sources whose units reach it; the streaming
+        # candidates send every source concurrently, so which one is the
+        # fifth depends on arrival order, not on its index (#368). Exactly
+        # one source must have been refused (nothing accepted, every refusal
+        # for the active-source limit, nothing durable) and the other 4 must
+        # behave like ``capacity_4``: durable, no sender drop, no backpressure.
+        # The refused source may drop: on b_segment Main refuses one of its
+        # units per segment and returns the rest ``not_processed``, so its
+        # pending fills at the live rate and drop-oldest runs all along.
+        sources = set(range(5))
+        if not sources <= set(ends):
             return "fail"
+        refused = [index for index in sorted(sources) if ends[index].get("accepted") == 0]
+        if len(refused) != 1:
+            return "fail"
+        fifth = ends[refused[0]]
         if "rejected_source_capacity" not in fifth:
             return "unmeasured"  # the refusal reason is not on record
-        refused = (fifth["accepted"] == 0 and fifth["rejected"] > 0
+        others = sources - {refused[0]}
+        refusal = (isinstance(fifth.get("rejected"), int) and fifth["rejected"] > 0
                    and fifth["rejected_source_capacity"] == fifth["rejected"])
-        return _verdict({0, 1, 2, 3} <= durable_sources and 4 not in durable_sources and refused)
+        return _verdict(refusal and others <= durable_sources
+                        and refused[0] not in durable_sources
+                        and backpressured == 0 and rate_limited == 0
+                        and all(ends[index].get("drops") == 0 for index in others))
 
     # -- secondary ----------------------------------------------------------
     def secondary(self):
@@ -1601,15 +1635,20 @@ class RunSummary:
         # mixed records fail every applicable gate, missing evidence makes a
         # pass ``unmeasured``.
         integrity = self.integrity()
+        # #369: a run with Nagle on any harness socket is not a measurement of
+        # the candidate (pass or fail): every gate is ``unmeasured``.
+        nodelay = self.tcp_nodelay()
+        if not nodelay and integrity == "pass":
+            integrity = "unmeasured"
         for gate, verdict in self.gates.items():
             if verdict == "not_applicable":
                 continue
             if integrity == "fail":
                 self.gates[gate] = "fail"
-            elif integrity == "unmeasured" and verdict == "pass":
+            elif integrity == "unmeasured" and (verdict == "pass" or not nodelay):
                 self.gates[gate] = "unmeasured"
         self.metrics.update(self.secondary())
-        self.metrics.update(integrity=integrity, run_ids=len(self.run_ids),
+        self.metrics.update(integrity=integrity, run_ids=len(self.run_ids), tcp_nodelay=nodelay,
                             inputs_consistent=self.inputs_consistent,
                             exercised_sources=self.exercised_sources())
         return self
@@ -1963,6 +2002,11 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
                 items, gate)
             if gate in TOPOLOGY_GATES:
                 missing[gate + "_missing_source_counts"] = counts
+        # #369: the secondary values come only from runs with TCP_NODELAY on
+        # every socket, like the gates; the excluded runs are counted, and a
+        # secondary pass with any excluded run is ``unmeasured``.
+        excluded = sum(1 for s in items if not s.metrics.get("tcp_nodelay"))
+        items_all, items = items, [s for s in items if s.metrics.get("tcp_nodelay")]
         unprotected = [s.metrics["unprotected_gap_units"] for s in items
                        if "unprotected_gap_units" in s.metrics]
         reconnects = [t for s in items for t in getattr(s, "reconnect_samples", [])]
@@ -1986,6 +2030,10 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
                 max(latency) <= SECOND)),
             "packet_loss": "unmeasured", "jitter": "unmeasured",
         }
+        if excluded:
+            secondary = {k: "unmeasured" if v in ("pass", "not_applicable") else v
+                         for k, v in secondary.items()}
+        items = items_all
         fast = [s.fast for s in items]
         report["candidates"].append({
             # ``fast``: True if any run used the shortened CI timing, False only
@@ -2000,6 +2048,7 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
             "reconnect_p95_ns": records.percentiles(reconnects)[95],
             "overhead_max": max(overhead) if overhead else None,
             "latency_p95_max_ns": max(latency) if latency else None,
+            "nodelay_excluded_runs": excluded,
             **{"secondary_" + k: v for k, v in secondary.items()}})
     if holder is not None:
         report["holder"] = holder
