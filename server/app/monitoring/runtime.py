@@ -22,7 +22,7 @@ import stat
 import threading
 import time
 from typing import Callable
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 
 from app.audit.model import AuditAction
 from app.audit.store import DEFAULT_RETENTION, UnboundStorageAdmission
@@ -44,7 +44,7 @@ from .access import HOUR_SECONDS, AccessFaultMonitor
 from .cameras import CameraOfflineMonitor
 from .config import MonitoringConfiguration
 from .filesystem import IdentifiedRecordingFilesystem
-from .store import NotificationEventStore, RecordingHealthStatusStore
+from .store import NotificationEventStore, RecordingHealthStatusStore, RunMarkerStore
 
 
 # Fixed namespace for deterministic local event IDs, so an at-least-once
@@ -74,6 +74,32 @@ BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 # is left of that settle's bound (`_final_storage_sample`), so the stop stays
 # within the `TimeoutStopSec=90` budget those settles were sized for.
 SHUTDOWN_STORAGE_SETTLE_SECONDS = 12.0
+# Issue #351: `pending` `recording_health_failure` rows an earlier process
+# left (it exited before the Slack outcome was stored) are submitted again by
+# the next start when their event time is less than this old, newest first and
+# at most `PENDING_HEALTH_RESEND_LIMIT` (as the camera offline resend, PR #339;
+# every one carries the same fixed text, so a few reach the Owner as well as
+# all would, while the queue keeps room for the start's own alerts).
+PENDING_HEALTH_RESEND_SECONDS = 24 * 60 * 60.0
+PENDING_HEALTH_RESEND_LIMIT = 4
+# Owner decision 2026-10-29 (PR #366): at most this many unclean-exit
+# notices per rolling hour, as the camera offline hourly cap. A crash loop
+# restarts the process, so the hour is counted from the persisted notices
+# (`monitoring_unclean_exit_notices`), never from memory. An unclean exit
+# beyond the cap is not notified (logged and counted, value-free); the text
+# is fixed, so it would only repeat a notice the Owner got within the hour.
+# The resend of `pending` rows (`PENDING_HEALTH_RESEND_LIMIT`, once per row)
+# does not count against it and is not held back by it.
+UNCLEAN_EXIT_HOURLY_LIMIT = 4
+UNCLEAN_EXIT_WINDOW_SECONDS = HOUR_SECONDS
+# Notice rows further than this from now are pruned on the next insert.
+UNCLEAN_EXIT_KEEP_SECONDS = 24 * 60 * 60.0
+# PR #366 review: while a delivery is pending, the run loop polls completions
+# this often between ticks, so a delivered alert's `sent` is stored about a
+# second after Slack answered, not up to a tick (60 s) later; otherwise a
+# crash before that tick would leave a delivered alert `pending` and the next
+# start would send it again.
+NOTIFICATION_POLL_SECONDS = 1.0
 
 
 def _boot_id() -> str | None:
@@ -173,6 +199,10 @@ class MonitoringStatus:
     # Issue #321: a recorded major/minor pair is stale while the approved
     # UUID, mount and root agree; storage stays admitted.
     recording_device_numbers_stale: bool = False
+    # Issue #351 (PR #366 review): this run's marker is not written yet (its
+    # write is refused and retried), so a crash of this process would not be
+    # detected by the next start. Degraded in the daily summary.
+    unclean_exit_detection_degraded: bool = False
 
 
 class RefuseUnvalidatedSegments:
@@ -283,6 +313,25 @@ class MonitoringRuntime:
         self._settle_bound: float | None = None
         self._settle_spent = 0.0
         self._settle_unfinished = False
+        # Issues #351/#347: this process's random running-marker token, whether
+        # the marker is written, whether the unclean exit of the previous
+        # process was logged and whether the pending recording-health
+        # failures were resent. The notice's time is the time its slot of the
+        # hourly cap was taken (stored, so a retry or a later start resubmits
+        # the identical event; Codex PR #366 P2).
+        self._run_token = str(uuid4())
+        self._run_marked = False
+        self._unclean_logged = False
+        self._unclean_dropped = False
+        # Owner decision 2026-10-29: unclean exits this process found beyond
+        # the hourly cap and did not notify (0 or 1; value-free). Per process
+        # only and in no status or daily summary: the journal line
+        # `unclean_exit_notification_dropped` is the record (PR #366 review).
+        self.unclean_exit_notices_dropped = 0
+        self._pending_health_resent = False
+        # Codex PR #366 P2: the rows this start selected for the resend, kept
+        # across queue-capacity retries so the per-start limit holds.
+        self._pending_health_batch: list[tuple[UUID, datetime]] | None = None
         self.notifications: NotificationService | None = None
         self.notification_events: NotificationEventStore | None = None
         self.recordings: RecordingStore | None = None
@@ -293,6 +342,7 @@ class MonitoringRuntime:
         self.scheduler: DailySummaryScheduler | None = None
         self.storage_audit: StorageAudit | None = None
         self.filesystem: IdentifiedRecordingFilesystem | None = None
+        self.run_marker: RunMarkerStore | None = None
 
     # -- status -----------------------------------------------------------
 
@@ -374,10 +424,11 @@ class MonitoringRuntime:
         return not (retry is not None and math.isfinite(now)
                     and retry - self.dependencies.retry_seconds <= now < retry)
 
-    def _guarded(self, name: str, function, flag: str) -> None:
+    def _guarded(self, name: str, function, flag: str | None) -> None:
         """Run one worker step; a failure is visible and retried later.
 
-        Failures record only the fixed flag, never exception text or values.
+        Failures record only the fixed flag (none for ``None``: the logged
+        event only), never exception text or values.
         """
         now = self.dependencies.monotonic()
         if not self._due(name, now):
@@ -386,11 +437,13 @@ class MonitoringRuntime:
             function()
         except Exception:
             self._retry_at[name] = now + self.dependencies.retry_seconds
-            self._set(**{flag: True})
+            if flag is not None:
+                self._set(**{flag: True})
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
         else:
             self._retry_at.pop(name, None)
-            self._set(**{flag: False})
+            if flag is not None:
+                self._set(**{flag: False})
 
     # -- owner-thread construction -----------------------------------------
 
@@ -483,6 +536,7 @@ class MonitoringRuntime:
             )
             policy.bind(recordings, RetentionService(recordings))
             health_status = RecordingHealthStatusStore(connection, policy.control)
+            run_marker = RunMarkerStore(connection, policy.control)
             scheduler = DailySummaryScheduler(
                 connection, configuration.time_zone, self.notifications, policy.control,
                 hour=configuration.summary_hour, minute=configuration.summary_minute,
@@ -522,6 +576,7 @@ class MonitoringRuntime:
         self.recordings, self.health_status, self.scheduler = recordings, health_status, scheduler
         self.integrity_store, self.integrity = integrity_store, integrity
         self.recording_health = recording_health
+        self.run_marker = run_marker
         self._startup_alerted = False
         self._filesystem_ok = True
         self._retry_at.pop("startup", None)
@@ -529,6 +584,9 @@ class MonitoringRuntime:
         self._set(state=RuntimeState.RUNNING, storage_state=policy.state,
                   recording_filesystem_ok=True, recording_health=None,
                   recording_device_numbers_stale=stale)
+        # Issue #351: before anything else, so the marker covers as much of
+        # this run as possible; retried by the tick while refused.
+        self._reconcile_previous_run()
         if stale and not self._device_numbers_reported:
             self._device_numbers_reported = True
             self._report_device_numbers()
@@ -553,6 +611,7 @@ class MonitoringRuntime:
         self.storage_audit = None
         self._policy = None
         self.filesystem = None
+        self.run_marker = None
         self._migrated = not self._migrations
         if connection is not None:
             with suppress(Exception):
@@ -627,6 +686,192 @@ class MonitoringRuntime:
         self.notifications.record(NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED,
                                   at=at, event_id=event_id)
 
+    # -- previous run (Issues #351, #347) ------------------------------------
+
+    def _reconcile_previous_run(self) -> None:
+        """Once per process while running: the marker, then pending failures.
+
+        Run from `_open` and from every running tick; each part is its own
+        guarded step with its own done flag, so a refused part is retried
+        after `retry_seconds` without holding back the other. The marker goes
+        first: until it is written a crash of this process is not detected.
+        """
+        self._guarded("run_marker", self._mark_running, "unclean_exit_detection_degraded")
+        self._guarded("pending_health", self._resend_pending_health_failures, None)
+
+    def _resend_pending_health_failures(self) -> None:
+        """Submit `pending` `recording_health_failure` rows again (Issue #351).
+
+        A `pending` row is a delivery whose outcome an earlier process never
+        stored (it exited before the Slack worker finished, or a stop's
+        settle gave up): it is not confirmed (notifications README), so it is
+        submitted again under its stored ID and time and the outcome lands in
+        that row, as the stale device-number notice (#323) and camera offline
+        (#339) do. If the earlier POST did reach Slack the Owner sees the
+        alert twice, never not at all. Each row is resent at most once
+        (`notification_events.resent`, marked before the resubmission; PR
+        #366 review): a crash loop does not resend the same row at every
+        start, and a resend cut by a crash is not repeated (an accepted loss,
+        Owner decision 2026-10-29). These resends are neither counted against
+        nor held back by the unclean-exit hourly cap. Only rows whose
+        event time is less than `PENDING_HEALTH_RESEND_SECONDS` from now in
+        either direction are taken (the event time, unlike `accepted_at`,
+        never moves on a resend; a time far in the future, after the clock
+        moved back, is neither kept eligible nor allowed to take the slots of
+        recent rows), nearest to now first and at most
+        `PENDING_HEALTH_RESEND_LIMIT`; the others stay `pending` and are
+        counted in one value-free log line. A row whose ID or time cannot be
+        read is skipped. A row this process still has in flight (an alert it
+        raised while storage was refused, persisted once storage recovered)
+        is not submitted twice. Done once the rows were submitted; a full
+        queue leaves them for a later tick instead of turning them into a
+        final `failed`. The rows are selected once per process and that
+        batch is kept across those retries (Codex PR #366 P2): a retry
+        submits what is left of it and never selects a new batch, so a start
+        resends at most `PENDING_HEALTH_RESEND_LIMIT` rows however often the
+        queue was full.
+        """
+        if self._pending_health_resent:
+            return
+        if self._pending_health_batch is None:
+            self._pending_health_batch = self._select_pending_health_failures()
+        notifications = self.notifications
+        batch = self._pending_health_batch
+        while batch:
+            event_id, at = batch[0]
+            if not notifications.can_accept(event_id):
+                raise RecordingError("NOTIFICATION_QUEUE_FULL")
+            if self.notification_events.mark_resent(event_id):
+                notifications.record(NotificationKind.RECORDING_HEALTH_FAILURE, at=at,
+                                     event_id=event_id)
+            batch.pop(0)
+        self._pending_health_resent = True
+
+    def _select_pending_health_failures(self) -> list[tuple[UUID, datetime]]:
+        """This start's resend batch; the rows left out are logged once."""
+        now = self.dependencies.utcnow()
+        horizon = timedelta(seconds=PENDING_HEALTH_RESEND_SECONDS)
+        cursor = self._connection.execute(
+            "SELECT event_id, at FROM notification_events "
+            "WHERE kind=? AND delivery=? AND resent=0",
+            (NotificationKind.RECORDING_HEALTH_FAILURE.value, DeliveryResult.PENDING.value))
+        found, older = [], 0
+        try:
+            for event_id, at in cursor:
+                try:
+                    event = UUID(event_id)
+                    stamp = datetime.fromisoformat(at)
+                    if stamp.tzinfo is None:
+                        raise ValueError
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if abs(now - stamp) < horizon:
+                    found.append((event, stamp))
+                else:
+                    older += 1
+        finally:
+            # An unfinished statement would keep its read lock.
+            cursor.close()
+        notifications = self.notifications
+        found = [row for row in found
+                 if not notifications.in_flight(row[0]) and not notifications.retained(row[0])]
+        found.sort(key=lambda row: abs(now - row[1]))
+        unrestored = older + max(0, len(found) - PENDING_HEALTH_RESEND_LIMIT)
+        if unrestored:
+            logging.getLogger(__name__).warning(Event.RECORDING_HEALTH_FAILURE_UNRESTORED,
+                                                extra={"count": min(unrestored, 1_000_000)})
+        return found[:PENDING_HEALTH_RESEND_LIMIT]
+
+    def _mark_running(self) -> None:
+        """Write this run's marker; notify once when the last run was unclean.
+
+        Issue #351 (Owner decision 2026-10-26, option 2), together with #347:
+        a refusal seen only by an admission is kept in memory until the next
+        tick (or a graceful stop's final sample) alerts it, so a crash, kill,
+        OOM or power loss in between would lose it. The marker is a row in
+        the Main database (on the verified filesystem, written under the
+        storage policy) holding a random per-process token; a graceful stop
+        deletes it after its final storage sample. A marker of another token
+        found here means the previous running process ended without that
+        stop. Whether it had lost a refusal cannot be known, so the Owner is
+        notified conservatively: one immediate value-free
+        `recording_health_failure`, named after that token, so a restart
+        that finds the same marker again (a crash before it was replaced)
+        finds the row and sends nothing new; a `pending` one of those is
+        resent by `_resend_pending_health_failures`. The recording-health
+        verdict is not changed: the startup self-test that follows sets it.
+        The marker is replaced only once that row exists, so a refused local
+        write keeps the earlier marker and retries with the same event; a
+        full or closed queue is retried later too, never stored as a final
+        `failed` for an alert that was not sent (PR #366 review). Until the
+        marker is written, `unclean_exit_detection_degraded` is set.
+
+        Owner decision 2026-10-29: at most `UNCLEAN_EXIT_HOURLY_LIMIT`
+        notices per rolling hour, counted from the persisted notice rows
+        (time less than an hour from now either way, as the 24 h resend
+        window), so the cap holds across the restarts of a crash loop. A
+        notice is taken under the cap (its row written) before it is
+        submitted, so a crash in between keeps it counted and the next start
+        sends that same notice without taking a second slot. An unclean exit
+        found while the hour is full is not notified: one value-free
+        `unclean_exit_notification_dropped` line (the record of the drop;
+        `unclean_exit_notices_dropped` is only this process's 0/1 value and
+        is reported nowhere), then the marker is replaced as usual (a
+        refusal it lost is not notified; the text is fixed). The resends of
+        `_resend_pending_health_failures` are not counted: each notice is
+        posted at most twice (first submission plus one resend), so the
+        posts are finite, but a resend can land in a later 60-minute
+        interval than its notice, and with a Slack too slow to store
+        outcomes an interval can hold more than
+        2 * `UNCLEAN_EXIT_HOURLY_LIMIT` posts of the same text.
+        """
+        if self._run_marked:
+            return
+        previous = self.run_marker.read()
+        if previous is not None and previous != self._run_token:
+            event_id = uuid5(EVENT_NAMESPACE, f"recording-unclean-exit:{previous}")
+            if self.notification_events.get(event_id) is None:
+                if not self._unclean_logged:
+                    self._unclean_logged = True
+                    logging.getLogger(__name__).error(Event.MONITORING_PREVIOUS_RUN_UNCLEAN)
+                # Taken by this process or a start that crashed before
+                # submitting it: sent under that time without a second slot.
+                taken = self.run_marker.notice_time(event_id)
+                if taken is None and not self._unclean_dropped and self.run_marker.notices_within(
+                        self.dependencies.utcnow(),
+                        timedelta(seconds=UNCLEAN_EXIT_WINDOW_SECONDS)) >= UNCLEAN_EXIT_HOURLY_LIMIT:
+                    self._unclean_dropped = True
+                    self.unclean_exit_notices_dropped += 1
+                    logging.getLogger(__name__).warning(Event.UNCLEAN_EXIT_NOTIFICATION_DROPPED)
+                if not self._unclean_dropped:
+                    if not self.notifications.can_accept(event_id):
+                        raise RecordingError("NOTIFICATION_QUEUE_FULL")
+                    if taken is None:
+                        # The slot is stamped when it is taken, not when the
+                        # exit was first found: a queue full for longer than
+                        # the hour must not insert an already expired row
+                        # (Codex PR #366 P2). The notice carries that time.
+                        taken = self.dependencies.utcnow()
+                        self.run_marker.take_notice(
+                            event_id, taken, keep=timedelta(seconds=UNCLEAN_EXIT_KEEP_SECONDS))
+                    self.notifications.record(NotificationKind.RECORDING_HEALTH_FAILURE,
+                                              at=taken, event_id=event_id)
+                    if self.notification_events.get(event_id) is None:
+                        raise RecordingError("UNCLEAN_EXIT_NOT_PERSISTED")
+        self.run_marker.mark(self._run_token)
+        self._run_marked = True
+
+    def _clear_run_marker(self) -> None:
+        """Graceful stop: delete this run's marker (only when it was written).
+
+        A refused delete (storage refused at the stop, which the final sample
+        has then alerted) leaves the marker, so the next start notifies once
+        more: delivered twice rather than never.
+        """
+        if self._run_marked and self.run_marker is not None:
+            self.run_marker.clear(self._run_token)
+            self._run_marked = False
+
     # -- bridges -----------------------------------------------------------
 
     def _integrity_sink(self, row_id: int, at: datetime, immediate: bool, findings) -> None:
@@ -685,16 +930,17 @@ class MonitoringRuntime:
             healthy = True
         except RecordingError:
             healthy = False
-        # Issue #340 / Codex P1 on PR #344: a topology refusal seen only by an
+        # Issue #340 / Codex P1 on PR #344, Issue #347: a refusal (topology,
+        # UUID, mount, `st_dev`, root or metadata file) seen only by an
         # admission since the last healthy tick starts an episode too, even
-        # when the backing was restored before this check, and alerts once
+        # when the identity was restored before this check, and alerts once
         # like any other mismatch. Consumed after `check` (which may set it
         # again); refusals during an episode already alerted belong to it, so
         # a healthy check then ends the episode as before. `take` must run
         # first, on every tick: a flag raised during the episode is discarded
         # here, never left for the tick after recovery to re-alert the ended
         # episode (PR #344 review).
-        if self.filesystem.take_topology_refusal() and self._filesystem_ok:
+        if self.filesystem.take_refusal() and self._filesystem_ok:
             healthy = False
         alerted = not healthy and self._filesystem_ok
         if alerted:
@@ -740,7 +986,7 @@ class MonitoringRuntime:
             status.storage_audit_failed, status.notification_local_failed,
             status.notification_delivery_failed, status.human_access_degraded,
             status.credential_finding_degraded, status.camera_offline_degraded,
-            status.recording_device_numbers_stale,
+            status.recording_device_numbers_stale, status.unclean_exit_detection_degraded,
         ))
         elapsed = self.dependencies.monotonic() - self._started_monotonic
         monitored = int(min(86400, max(0, elapsed))) if math.isfinite(elapsed) else 0
@@ -1216,9 +1462,10 @@ class MonitoringRuntime:
         answers in time. Returns how many deliveries are still pending; those
         stay `pending` in `notification_events` (uncertain, not confirmed). A
         restarted process resends only the kinds it reconciles (the stale
-        device-number notice, camera offline, credential findings); others,
-        such as `recording_health_failure`, are not sent again, and one still
-        queued at close may never have reached Slack.
+        device-number notice, camera offline, credential findings and, within
+        a day of its event, `recording_health_failure`, Issue #351); others
+        are not sent again, and one still queued at close may never have
+        reached Slack.
         The bound, the time spent and an unsettled end are kept, so the stop's
         final storage sample waits only within what is left (Issue #351).
         """
@@ -1253,6 +1500,7 @@ class MonitoringRuntime:
                 self._attempt_open()
             return
         self._poll()
+        self._reconcile_previous_run()
         self._storage_tick()
         self._guarded("retention", self._retention_tick, "retention_degraded")
         self._guarded("integrity", self.integrity.tick, "integrity_degraded")
@@ -1279,12 +1527,13 @@ class MonitoringRuntime:
         when it ended with deliveries still pending (the budget is spent).
         The alert was submitted before the wait, but the one delivery worker
         sends in order: behind a stalled or backlogged delivery, or with no
-        wait left, it may still be queued at close and is then never sent
-        (nor resent by a later start: no `recording_health_failure`
-        reconciliation exists). It then stays `pending` and
+        wait left, it may still be queued at close and is then not sent by
+        this process. It then stays `pending` and
         `critical_notifications_unsettled` is logged, like the other shutdown
-        settles. A crash or kill before the tick still loses
-        the flag (no durable record yet, Issue #351).
+        settles, and the next start submits it again
+        (`_resend_pending_health_failures`). A crash or kill before the tick
+        loses the flag itself; the running marker left behind then makes the
+        next start notify instead (`_mark_running`).
         """
         if (self.status.state != RuntimeState.RUNNING or self.filesystem is None
                 or self._policy is None or self.notifications is None):
@@ -1306,8 +1555,17 @@ class MonitoringRuntime:
             self._final_storage_sample()
         except Exception:
             # Never skips closing the notification service, the recording
-            # store and the database below.
+            # store and the database below. The running marker stays: a
+            # refusal flag may not have been consumed, so the next start
+            # notifies conservatively (Issue #351).
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+        else:
+            try:
+                # After the final sample: nothing admits after it (`app.main`),
+                # so no refusal can follow the cleared marker.
+                self._clear_run_marker()
+            except Exception:
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
         if self.notifications is not None:
             self.notifications.close()
         if self.recordings is not None:
@@ -1351,10 +1609,35 @@ class MonitoringRuntime:
         if self.status.state == RuntimeState.RUNNING:
             logging.getLogger(__name__).info(Event.MONITORING_STARTED)
 
-    async def run(self, after_tick: Callable[[], None] | None = None) -> None:
-        """Tick forever; `after_tick` refreshes lifespan-held status snapshots."""
+    def _poll_outcomes(self) -> None:
+        """Between ticks: store finished deliveries' outcomes (PR #366 review)."""
+        self._require_owner()
+        if self.notifications is not None and self.notifications.pending_count:
+            self._poll()
+
+    async def _wait_for_tick(self) -> None:
+        """Sleep one tick interval, polling outcomes while deliveries are pending."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.dependencies.tick_seconds
         while True:
-            await asyncio.sleep(self.dependencies.tick_seconds)
+            remaining = deadline - loop.time()
+            if remaining <= NOTIFICATION_POLL_SECONDS:
+                await asyncio.sleep(max(0.0, remaining))
+                return
+            await asyncio.sleep(NOTIFICATION_POLL_SECONDS)
+            try:
+                await self.call(self._poll_outcomes)
+            except Exception:
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+
+    async def run(self, after_tick: Callable[[], None] | None = None) -> None:
+        """Tick forever; `after_tick` refreshes lifespan-held status snapshots.
+
+        Between ticks a delivery's outcome is stored within about
+        `NOTIFICATION_POLL_SECONDS` of its completion (`_wait_for_tick`).
+        """
+        while True:
+            await self._wait_for_tick()
             try:
                 await self.call(self.tick)
             except Exception:

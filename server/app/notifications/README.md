@@ -89,7 +89,15 @@ delivery across a crash; retrying an uncertain external POST may duplicate it.
 `close()` stops new submissions without waiting for a blocked transport/DNS call;
 in-flight/queued events remain durably pending or locally failed as recorded.
 After a process crash, the integration outbox owns reconciliation; the service
-does not automatically resend uncertain deliveries. No worker thread touches
+does not automatically resend uncertain deliveries. (The monitoring runtime
+resubmits some `pending` rows at its next start under their own IDs, e.g.
+`recording_health_failure` within a day of its event and at most once per
+row, Issue #351; a notice lost by a crash in the middle of that resend is an
+accepted loss, and new unclean-exit notices are capped at 4 per rolling
+hour, each posted at most twice (its resend is not counted; a 60-minute
+interval can hold more than 8 posts with a slow Slack), Owner decision
+2026-10-29; see
+`../monitoring/README.md`.) No worker thread touches
 SQLite, calls the local sink or logs transport exceptions.
 
 `DailySummary` permits only validated aggregate counts/durations/bytes and storage

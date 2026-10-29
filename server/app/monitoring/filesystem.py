@@ -35,10 +35,13 @@ class IdentifiedRecordingFilesystem:
     the mount or `st_dev`, so the sysfs topology is walked again each time and
     a refusal is `STORAGE_HARD_STOP` for that sample only (not latched: the
     next sample on hardware-only backing admits again). Current numbers never
-    read sysfs. Because a refusal raised inside a storage admission is only
-    seen by that admission, it is also kept as one value-free flag
-    (`take_topology_refusal`), so the next monitoring tick alerts the Owner
-    even when the topology was restored before it (Codex P1 on PR #344), as
+    read sysfs.
+
+    Because a refusal raised inside a storage admission is only seen by that
+    admission, every refusal of a sample (topology, UUID, mount, `st_dev`,
+    pinned root or metadata file) is also kept as one value-free flag
+    (`take_refusal`), so the next monitoring tick alerts the Owner even when
+    the identity was restored before it (Codex P1 on PR #344, Issue #347), as
     does the final sample of a graceful stop (Issue #351).
     """
 
@@ -47,7 +50,7 @@ class IdentifiedRecordingFilesystem:
         # One bool under a lock: admissions may run on another thread than
         # the tick that consumes it. It carries no cause, device or count.
         self._refusal_lock = threading.Lock()
-        self._topology_refused = False
+        self._refused = False
         try:
             info = os.stat(identity.root, follow_symlinks=False)
         except OSError:
@@ -86,14 +89,19 @@ class IdentifiedRecordingFilesystem:
         except Exception:
             acceptable = False
         if acceptable is not True:
-            with self._refusal_lock:
-                self._topology_refused = True
             raise RecordingError("STORAGE_HARD_STOP")
 
-    def take_topology_refusal(self) -> bool:
-        """Whether a sample refused the topology since the last call; clears it."""
+    def take_refusal(self) -> bool:
+        """Whether a sample refused since the last call; clears it.
+
+        Any refusal counts (Issue #347), not only the topology one: a UUID,
+        mount or `st_dev` mismatch, or a replaced root or metadata file, seen
+        only by an admission between two ticks is an episode the Owner must
+        hear about too. The refusal of `__init__` is not kept (the instance
+        does not exist then; the caller's open fails and alerts itself).
+        """
         with self._refusal_lock:
-            refused, self._topology_refused = self._topology_refused, False
+            refused, self._refused = self._refused, False
         return refused
 
     def check(self) -> None:
@@ -101,5 +109,11 @@ class IdentifiedRecordingFilesystem:
         self.snapshot()
 
     def snapshot(self) -> FilesystemSpace:
-        self._verify_identity()
-        return self._checker.snapshot()
+        try:
+            self._verify_identity()
+            return self._checker.snapshot()
+        except Exception:
+            # Anything that keeps a sample from admitting is a refusal.
+            with self._refusal_lock:
+                self._refused = True
+            raise

@@ -14,7 +14,10 @@ from app.detection.roi.schema import roi_calibration_migration
 from app.integrity.store import integrity_migration
 from app.media.health.artifacts import recording_health_migration
 from app.media.recording.schema import recording_migration
-from app.monitoring.store import monitoring_migration, notification_acceptance_migration
+from app.monitoring.store import (
+    monitoring_migration, notification_acceptance_migration, run_marker_migration,
+    unclean_exit_notice_migration,
+)
 from app.notifications.schedule import notification_migration
 from app.presence.schema import presence_gap_migration, presence_migration
 from app.storage.migrations import BUILTIN_MIGRATIONS
@@ -72,4 +75,10 @@ APPLICATION_MIGRATIONS = (
     # restores the hourly access and finding budgets from the acceptance
     # rather than from the event time a retry keeps.
     notification_acceptance_migration(25),
+    # Issues #351/#347: the monitoring runtime's running marker, so a start
+    # after a crash, kill or power loss notifies the Owner conservatively.
+    run_marker_migration(26),
+    # Owner decision 2026-10-29 (PR #366): the unclean-exit notices of the
+    # last day, so their hourly cap holds across the restarts of a crash loop.
+    unclean_exit_notice_migration(27),
 )

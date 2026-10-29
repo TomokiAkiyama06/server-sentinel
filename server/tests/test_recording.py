@@ -81,7 +81,8 @@ class RecordingTests(unittest.TestCase):
              (21, "pairing_renewal_certificate"), (22, "human_access_invitation_clock"),
              (23, "human_access_step_up_clock"),
              (24, "human_access_credential_handle"),
-             (25, "notification_acceptance_time")],
+             (25, "notification_acceptance_time"), (26, "monitoring_run_marker"),
+             (27, "monitoring_unclean_exit_notices")],
         )
         self.policy = Reservation()
         self.validator = SyntheticValidator()

@@ -41,6 +41,47 @@ def notification_acceptance_migration(version: int) -> Migration:
     ))
 
 
+def run_marker_migration(version: int) -> Migration:
+    """The running marker of the monitoring runtime (Issue #351, #347).
+
+    One row while a process runs with storage admitted: a random per-process
+    token (no host, path, device or time value), written when the runtime
+    reaches `running` and deleted by its graceful stop. A row found at the
+    next start therefore means the previous process exited without that stop
+    (crash, kill, OOM, power loss), so a refusal it kept only in memory may
+    have been lost. The table lives in the Main database on the verified
+    recording filesystem (`admit_state_file`).
+
+    ``notification_events.resent`` is set once a start submitted a row an
+    earlier process left `pending` again, so each such row is resent at most
+    once, never again by every start of a crash loop (PR #366 review). Rows
+    keep ``0``. Creating the table and adding the column delete nothing.
+    """
+    return Migration(version, "monitoring_run_marker", (
+        "CREATE TABLE monitoring_run_marker (singleton INTEGER PRIMARY KEY "
+        "CHECK(singleton=1), token TEXT NOT NULL)",
+        "ALTER TABLE notification_events ADD COLUMN resent INTEGER NOT NULL DEFAULT 0 "
+        "CHECK(resent IN (0,1))",
+    ))
+
+
+def unclean_exit_notice_migration(version: int) -> Migration:
+    """The unclean-exit notices of the last day (Issue #351, PR #366).
+
+    Owner decision 2026-10-29: at most `UNCLEAN_EXIT_HOURLY_LIMIT` unclean-exit
+    notices per rolling hour. A crash loop restarts the process, so the cap
+    is counted from these rows, not from memory. Each row is the notice's
+    event ID (derived from the earlier process's random marker token) and
+    the wall-clock time it was taken under the cap; no host, path, device or
+    other value. Rows more than a day from now are pruned on the next insert.
+    Creating the table deletes nothing.
+    """
+    return Migration(version, "monitoring_unclean_exit_notices", (
+        "CREATE TABLE monitoring_unclean_exit_notices (event_id TEXT PRIMARY KEY, "
+        "at TEXT NOT NULL)",
+    ))
+
+
 def _utc(at: datetime) -> str:
     if not isinstance(at, datetime) or at.tzinfo is None or at.utcoffset() is None:
         raise ValueError("AWARE_TIME_REQUIRED")
@@ -96,6 +137,16 @@ class NotificationEventStore(_Autocommit):
                 "at": datetime.fromisoformat(row[2]), "confirmed": bool(row[3]),
                 "delivery": DeliveryResult(row[4])}
 
+    def mark_resent(self, event_id: UUID) -> bool:
+        """Mark a row as resent once (Issue #351); False when it already was.
+
+        Written before the resubmission, so a crash in between leaves the row
+        marked: it is resent at most once, never once per later start.
+        """
+        return self._write(
+            "UPDATE notification_events SET resent=1 WHERE event_id=? AND resent=0",
+            (str(event_id),)) == 1
+
     def count_since(self, since: datetime, kinds: tuple[NotificationKind, ...]) -> int:
         marks = ",".join("?" for _ in kinds)
         return self.db.execute(
@@ -136,3 +187,75 @@ class RecordingHealthStatusStore(_Autocommit):
             return None
         return {"at": datetime.fromisoformat(row[0]), "state": HealthState(row[1]),
                 "stages": tuple(Stage(stage) for stage in json.loads(row[2]))}
+
+
+class RunMarkerStore(_Autocommit):
+    """The singleton running marker (`run_marker_migration`).
+
+    Every write is admitted by the storage policy like any other metadata
+    write, so the marker is never written outside the verified filesystem.
+    """
+
+    def read(self) -> str | None:
+        row = self.db.execute(
+            "SELECT token FROM monitoring_run_marker WHERE singleton=1").fetchone()
+        return None if row is None else str(row[0])
+
+    def mark(self, token: str) -> None:
+        self._write(
+            "INSERT INTO monitoring_run_marker VALUES (1,?) ON CONFLICT(singleton) DO UPDATE "
+            "SET token=excluded.token", (str(token),))
+
+    def clear(self, token: str) -> None:
+        """Delete the marker only when it is still ``token`` (this process's)."""
+        self._write("DELETE FROM monitoring_run_marker WHERE singleton=1 AND token=?",
+                    (str(token),))
+
+    # -- unclean-exit notices (`unclean_exit_notice_migration`) -------------
+
+    def notice_time(self, event_id: UUID) -> datetime | None:
+        """The time an unclean-exit notice was taken under the cap, or None."""
+        row = self.db.execute(
+            "SELECT at FROM monitoring_unclean_exit_notices WHERE event_id=?",
+            (str(event_id),)).fetchone()
+        if row is None:
+            return None
+        try:
+            at = datetime.fromisoformat(row[0])
+        except (TypeError, ValueError):
+            return None
+        return at if at.tzinfo is not None else None
+
+    def notices_within(self, now: datetime, window: timedelta) -> int:
+        """Notices whose time is less than ``window`` from ``now`` either way.
+
+        As the pending-failure resend's 24 h window (`abs(now - at)`): a row
+        stamped slightly in the future after the clock moved back still
+        counts, one further away than ``window`` does not, so a clock step
+        never holds the cap closed for longer than the window. A row whose
+        time cannot be read is not counted (at worst one notice more).
+        """
+        _utc(now)
+        count = 0
+        rows = self.db.execute("SELECT at FROM monitoring_unclean_exit_notices")
+        try:
+            for (at,) in rows:
+                try:
+                    stamp = datetime.fromisoformat(at)
+                    if stamp.tzinfo is None:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    continue
+                if abs(now - stamp) < window:
+                    count += 1
+        finally:
+            # An unfinished statement would keep its read lock.
+            rows.close()
+        return count
+
+    def take_notice(self, event_id: UUID, at: datetime, *, keep: timedelta) -> None:
+        """Count one notice under the cap; prune rows ``keep`` or more from ``at``."""
+        self._write("DELETE FROM monitoring_unclean_exit_notices WHERE at<? OR at>?",
+                    (_utc(at - keep), _utc(at + keep)))
+        self._write("INSERT INTO monitoring_unclean_exit_notices VALUES (?,?) "
+                    "ON CONFLICT(event_id) DO NOTHING", (str(event_id), _utc(at)))

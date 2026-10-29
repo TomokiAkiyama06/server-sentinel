@@ -36,9 +36,11 @@ parking the worker inside `policy.control()` until the caller exits;
 `main.RuntimeStorageAdmission` hands this to the security audit store once the
 runtime is running.
 
-Startup: open components, sample storage, run retention, integrity
+Startup: open components, reconcile the previous run (resend `pending`
+recording-health failures, check and write the running marker; Issue #351),
+sample storage, run retention, integrity
 `startup()`, recording-health `startup()`. Each tick: poll notification
-completions, re-verify the recording filesystem, `policy.status()`, expire
+completions, finish that reconciliation if it was refused, re-verify the recording filesystem, `policy.status()`, expire
 recordings (starred never), `storage_state_audit` and 90-day fault history, run
 the integrity/health `tick()` and the daily summary. A failing step sets its
 status flag and retries after `retry_seconds`; other steps continue. Status is a
@@ -70,8 +72,9 @@ numbers are stale this is judged on every storage sample, not only at open
 (Issue #340): a dm table reload or md member swap onto loop/virtual backing
 that keeps the number and mount is `STORAGE_HARD_STOP` (the per-episode
 filesystem alert) until the backing is hardware-only again; it is not
-latched. An admission-only refusal is kept as one flag
-(`take_topology_refusal`) that the next tick consumes, so that episode alerts
+latched. An admission-only refusal (of any kind: topology, UUID, mount,
+`st_dev`, root or metadata file, Issue #347) is kept as one flag
+(`take_refusal`) that the next tick consumes, so that episode alerts
 once even when restored before the tick; `recording_health` stays failed
 until the next daily self-test. A graceful stop (`_close`) takes one final
 storage sample under the same rule and, only when that sample raised the
@@ -83,9 +86,56 @@ unfinished delivery stays `pending` (`critical_notifications_unsettled`). So a
 stop before the tick submits the alert, but it reaches Slack only when the
 single delivery worker gets to it within that wait: queued behind a stalled or
 backlogged delivery, or with no wait left, it may never be sent (`close()`
-sends nothing still queued, and a POST in flight may be cut by the exit), and
-a `pending` `recording_health_failure` row is not resent by a later start. A
-crash or kill before the tick still loses the flag (Issue #351). Current numbers read no sysfs. A failed startup open is
+sends nothing still queued, and a POST in flight may be cut by the exit).
+Issue #351: the first running pass of every start (`_reconcile_previous_run`)
+first handles the running marker (`monitoring_run_marker`, migration 26,
+`store.RunMarkerStore`): a row of a random per-process token written under the
+storage policy once `running`, deleted by `_close` after a final sample that
+did not raise. Another process's token found there means an unclean exit
+(crash, kill, OOM, power loss): one immediate `recording_health_failure` named
+`uuid5(EVENT_NAMESPACE, "recording-unclean-exit:<token>")` is raised
+(`monitoring_previous_run_unclean` logged) unless that row exists, and the
+marker is replaced only once the row exists, so a crash in between repeats
+nothing. Owner decision 2026-10-29: at most `UNCLEAN_EXIT_HOURLY_LIMIT` (4)
+such notices per rolling hour, counted from `monitoring_unclean_exit_notices`
+(migration 27; event ID and time only) rather than memory, so a crash loop
+cannot reset the hour: a row counts while `abs(now - at)` is under an hour
+(as the 24 h resend window), and rows a day or more away are pruned on the next
+insert. The row is written before the notice is submitted and stamped with
+the time the slot is taken, also the notice's event time (a queue full for
+longer than the hour never inserts an expired slot), so a crash in between
+keeps the slot and the next start sends that notice under the stored time
+without a second slot. Beyond the cap nothing is notified:
+`unclean_exit_notification_dropped` is logged (value-free; the journal line
+is the record, since `unclean_exit_notices_dropped` is a per-process 0/1 value
+shown in no status or daily summary), and the marker is replaced as usual;
+a refusal lost in such a crash is not notified (the text is fixed). The
+recording-health verdict is left to the startup self-test. It
+then submits each `recording_health_failure` row an earlier process left
+`pending` again under its ID and time, when its event time is less than
+`PENDING_HEALTH_RESEND_SECONDS` (24 h) from now in either direction, nearest
+first, at most `PENDING_HEALTH_RESEND_LIMIT` (4) per start (the batch is
+selected once per process and kept across full-queue retries), skipping rows this process
+has in flight and rows already resent once (`notification_events.resent`,
+set before the resubmission, so a crash loop resends each row at most once);
+the rest stay `pending` (`recording_health_failure_unrestored` with a count).
+These resends are not counted against the unclean-exit cap and are not held
+back by it: new unclean-exit notices are at most 4 per rolling hour and
+each is posted at most twice (first submission plus one resend;
+`CrashLoopTests`). The posts are finite, but with a Slack too slow to store
+outcomes a 60-minute interval can hold more than 8, since a resend can land
+in a later interval than its notice. A notice lost because the process crashes again in the middle of
+this resend (its row already marked `resent`) is an accepted loss (Owner
+decision 2026-10-29).
+Each of the two is its own guarded step, retried by the tick after
+`retry_seconds` when refused (also when the queue cannot take the notice:
+nothing is stored as `failed`); while the marker is not written
+`unclean_exit_detection_degraded` is set and counted by the daily summary.
+Between ticks the run loop polls completions every
+`NOTIFICATION_POLL_SECONDS` (1 s) while deliveries are pending, so an
+outcome is stored about a second after Slack answered. A crash or kill before the tick therefore still
+loses the flag, but the next start notifies the unclean exit, unless that
+process's marker write was still being refused. Current numbers read no sysfs. A failed startup open is
 retried every `retry_seconds` from the tick against the same declared identity;
 a failed database open (e.g. SQLite I/O error or permission change) takes the
 same alerting startup-failure path. Only the first failure of the episode alerts, and a successful retry runs the

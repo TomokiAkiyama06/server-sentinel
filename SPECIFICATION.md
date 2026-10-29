@@ -1976,8 +1976,9 @@ recorded numbers differ, on every storage sample: the sysfs topology
 or md member replacement onto loop/virtual backing that keeps the device
 number and mount refuses the next admission and raises the per-episode
 `recording_health_failure`; the refusal is not latched and a return to
-hardware-only backing admits again (Issue #340). A refusal seen only by an
-admission is kept as one value-free flag that the next tick consumes, so the
+hardware-only backing admits again (Issue #340). Any refusal seen only by an
+admission (topology, UUID, mount, `st_dev`, pinned root or metadata file;
+Issue #347) is kept as one value-free flag that the next tick consumes, so the
 episode alerts once even when restored before that tick; `recording_health`
 stays `failed` until the next daily self-test. A graceful stop takes one final
 storage sample under the same rule after every admitting component stopped and,
@@ -1987,9 +1988,69 @@ bound, and not at all when that settle ended unsettled; an unfinished one
 stays `pending` and `critical_notifications_unsettled` is logged), so a stop
 before the tick submits it; it reaches Slack only if the single delivery
 worker gets to it within that wait (behind a stalled or backlogged delivery,
-or with no wait left, it may not be sent at all, and a `pending`
-`recording_health_failure` row is not resent by a later start). A crash or
-kill before the tick still loses the flag (no durable record yet, Issue #351). Current numbers read no
+or with no wait left, it may not be sent by that process). A
+`recording_health_failure` row an earlier process left `pending` is submitted
+again by the next start under its stored ID and time when its event time is
+less than 24 h from now in either direction (nearest first, at most 4 per
+start: the batch is selected once and kept across retries after a full queue,
+so a retry never selects a new one; the rest stay `pending` and
+`recording_health_failure_unrestored` logs their count), like the stale device-number notice and camera offline; if the earlier
+POST reached Slack the Owner sees it twice (Issue #351). Each row is resent at
+most once (`notification_events.resent`, set before the resubmission), so a
+crash loop never resends the same row at every start; a row whose resend was
+cut by a crash is not resent again (that crash is reported by the next start's
+unclean-exit notice, unless the hourly cap below holds it back). A notice lost
+because the process crashes again in the middle of that startup resend is an
+accepted loss (Owner decision 2026-10-29). Between ticks the run
+loop stores a finished delivery's outcome within about 1 s while deliveries
+are pending, so a delivered alert is normally `sent` before a crash and not
+resent. A crash, kill, OOM or power loss before the
+tick loses the in-memory flag itself; instead, the runtime keeps a running
+marker (one row of a random per-process token in the Main database, written
+under the storage policy when it reaches `running` and deleted by the graceful
+stop after its final sample), and a start that finds another process's marker
+logs `monitoring_previous_run_unclean` and raises one immediate value-free
+`recording_health_failure` named after that token, whether or not a refusal was
+actually lost (Owner decision 2026-10-26, option 2): every unclean exit of a
+running process is notified once, a graceful restart never, but at most 4
+unclean-exit notices per rolling hour (Owner decision 2026-10-29, the shape of
+the camera offline hourly cap). The hour is counted from persisted rows
+(`monitoring_unclean_exit_notices`, migration 27: the notice's event ID and the
+time it was taken, nothing else), not from process memory, so a crash loop
+cannot reset it: a row counts while its time is less than one hour from now in
+either direction (as the 24 h resend window; a row exactly one hour old or one
+hour or more ahead after the clock moved back does not count), and rows a day
+or more from now are pruned on the next insert. A notice's row is written
+before it is submitted and stamped with the time the slot is taken, which is
+also the notice's event time (not the time the exit was first found: a notice
+held back by a full queue for longer than an hour must not take an already
+expired slot); a start that crashed in between leaves its slot taken and the
+next start sends that same notice under that time without taking another. An
+unclean exit found while the hour is full is not notified: the start logs the
+value-free `unclean_exit_notification_dropped` and replaces the marker as
+usual. That journal line is the record of the drop: the runtime's
+`unclean_exit_notices_dropped` is a per-process value (0 or 1, lost with the
+process) and appears in no status, diagnostics or daily summary. A refusal
+lost in such a crash beyond the cap is therefore not notified; the notice text
+is fixed, so within the hour it would only repeat one already sent. The resend
+of `pending` rows above is neither counted against nor held back by the cap
+(it is bounded by its own limits: each row once, at most 4 per start, within
+24 h). New unclean-exit notices are therefore at most 4 per rolling hour, and
+each notice is posted at most twice (its first submission plus at most one
+resend, when its outcome was not stored before the next crash). The number of
+posts is finite, but it is not bounded by 8 in every 60-minute interval: a
+resend can fall into a later interval than its notice (the resend of a notice
+just before the interval, or a resend delayed to a later start), so while
+Slack stays too slow for outcomes to be stored, a 60-minute interval can hold
+more than 8 posts of the same text. A process that
+never reached `running` writes no marker (nothing was admitted). A graceful
+stop whose marker delete is refused (storage refused at the stop, already
+alerted by its final sample) or whose final sample failed leaves the marker,
+so the next start notifies once more. A refused marker write (or a notice the
+queue cannot take) is retried by the tick every 15 minutes, never stored as a
+final `failed`; until it succeeds, a crash of that process is not detected and
+`unclean_exit_detection_degraded` is set (one degraded item in the daily
+summary; not a separate diagnostics field). Current numbers read no
 sysfs. A mismatch at startup leaves
 the runtime `failed`, refuses writes and still attempts the immediate Slack
 alert; the open is retried every 15 minutes against the same declared identity

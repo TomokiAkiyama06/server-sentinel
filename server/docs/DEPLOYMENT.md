@@ -296,16 +296,42 @@ onto a loop or virtual device while the service runs keeps the device number
 and the mount, yet storage stops (`STORAGE_HARD_STOP`, one immediate
 `recording_health_failure`) until the backing is hardware-only again, when
 writes resume without a restart. A refusal seen only by a write in between
-two monitoring ticks still raises the alert at the next tick, even if the
-backing was already restored; a service stop or restart before that tick
+two monitoring ticks (this one, or a UUID, mount or `st_dev` mismatch, Issue
+#347) still raises the alert at the next tick, even if the identity was
+already restored; a service stop or restart before that tick
 raises it during the stop instead (waiting at most 12 s for its delivery,
 within the stop budget below: only what is left of an earlier notification
 settle, none when that one ended unsettled); a delivery not finished by then
 stays `pending` and `critical_notifications_unsettled` is logged. Such an
 alert may then never reach Slack (behind a stalled or backlogged delivery it
-is still queued at the exit), and a later start does not resend a `pending`
-`recording_health_failure` row, so treat that log line as a possibly lost
-alert. A crash or kill before the tick loses it (Issue #351). After such an episode `recording_health` stays
+is still queued at the exit); the next start then submits that `pending`
+`recording_health_failure` row once more (within a day of its event, and each
+row only once: a row whose resend was cut by a crash is not resent again,
+and that crash is reported by the next start's unclean-exit notice instead,
+unless the hourly cap below holds it back; a notice lost because the service
+crashes again in the middle of that resend is an accepted loss, Owner decision
+2026-10-29), so the Owner may receive it twice. A crash, kill, OOM or power loss before the tick
+loses the refusal itself; instead the next start finds the running marker the
+process left in the database and sends one `recording_health_failure` for that
+unclean exit (log `monitoring_previous_run_unclean`), whether or not a refusal
+was lost (Issue #351). Every unclean exit of the running service is notified
+once this way, at most 4 per rolling hour (Owner decision 2026-10-29; the
+hour is counted from the database, so restarts do not reset it): a crash loop
+sends one per crash that had reached `running` up to that cap, plus at most
+one resend of each earlier notice whose delivery outcome was not stored before
+the crash (the resend is not counted against the cap: at most 4 new notices
+per rolling hour, each posted at most twice, first submission plus one
+resend; the posts are finite, but with a Slack too slow to store outcomes a
+60-minute interval can hold more than 8, since a resend can land in a later
+interval than its notice). A crash beyond the cap
+is not notified (journal: `unclean_exit_notification_dropped`, the only
+record of the drop; it is not in the daily summary), so a refusal
+lost in it is not notified either; check the journal when the notices stop
+during a crash loop. A graceful
+`systemctl restart` sends none. While the marker cannot be written the daily
+summary counts `unclean_exit_detection_degraded`. On such a notice,
+check the journal for why the previous process ended and verify the recording
+filesystem (`--check`). After such an episode `recording_health` stays
 `failed` until the next daily recording self-test, even though writes have
 resumed. Updating the recorded numbers ends this
 extra check along with the warning.
@@ -2317,12 +2343,19 @@ compared for equality; the output lists them under `declared_mutable`:
 `notification_events.delivery` (a pending Slack delivery completes, a
 presence notification is retried), `notification_events.accepted_at` (the
 row's latest local write, rewritten with each delivery result or retried
-write; `NULL` on rows written before migration 25), `uvc_approvals.session_token` (cleared at
+write; `NULL` on rows written before migration 25), `notification_events.resent`
+(set once when a start resends a `pending` `recording_health_failure` row,
+Issue #351; `0` on older rows), `uvc_approvals.session_token` (cleared at
 a clean stop and replaced at every start; the Owner re-approval latch it arms
 is compared through the camera source's `requires_approval`, but a token
 cleared while the service was down after an unclean stop cannot be told from
 a clean stop), and the verdict values of `integrity_status` and
-`recording_health_status` (recomputed at startup and daily). A baseline
+`recording_health_status` (recomputed at startup and daily). The
+monitoring runtime's running marker (`monitoring_run_marker`, Issue #351:
+written at every start, deleted by a graceful stop) and the unclean-exit
+notices counted by its hourly cap (`monitoring_unclean_exit_notices`, Owner
+decision 2026-10-29; losing them only lets more notices through) are not
+inventoried. A baseline
 recorded by a release before #132 has none of these sections; verify reports
 them `not_recorded` and they neither fail nor count as preserved.
 
