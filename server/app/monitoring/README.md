@@ -132,14 +132,38 @@ period: a sent notification of a source opens its alerted period, which
 closes after a whole window online; while it is open the ratio rule stays
 silent, and in a period a ratio alert opened only the first outage that
 stays offline for `after_seconds` after a short online is notified once more
-(at most two per flapping period, Owner decision 2026-10-23); an outage after
+(at most two per flapping period, Owner decision 2026-10-23; a flapping
+episode belongs to its period by generation, and once one is sent any other
+unsent one of that period is settled without a notice, counted in
+`suppressed`, also after the period closed); an outage after
 an online of at least `after_seconds` is an ordinary episode. A ratio alert is named
 `uuid5(EVENT_NAMESPACE, "camera-offline-flapping:<source>:<window>:<bucket>")`
 after the wall-clock window bucket, so a restart within a window of it sends
 nothing again; a continuous episode due after a restart looks that alert up
 once and restores its period (Issue #338). A ratio alert held back by the cap
 whose period closed is dropped before the cap; one the queue refused is sent
-once the queue takes it, like a refused continuous episode. See SPECIFICATION §9 for the full rules and the known limits.
+once the queue takes it, like a refused continuous episode; such closed
+alerts wait apart from the source's current ratio alert (any number of
+them never blocks a new period, at most `LATE_FLAPS_PER_SOURCE` = 4 per
+source, the oldest beyond that dropped and logged). "Notified once" has
+exactly three not-sent exceptions (Owner decisions 2026-10-26 and
+2026-10-29, PR #359), each counted and logged value-free: (a) a source's
+third outage of at least `after_seconds` while its notices are held drops
+the oldest unsent one once it has lasted `after_seconds` (a shorter third
+outage drops nothing; a source holds at most two unsent episodes that
+reached the threshold (the newest of them and one owed), and at most three
+episodes in all counting a further outage still in progress short of the
+threshold; the limit is applied after each drain's sends and when a further
+outage begins, so until then a third outage that just reached the threshold
+briefly makes three; `dropped`,
+`camera_offline_notification_dropped`; notices the cap holds and notices the
+queue refused share this one hold limit, Owner decision 2026-10-29); (b) a
+fifth closed ratio alert of a source drops the oldest (`dropped`, same log);
+and (c) inside one flapping period PR #335 (at most two) takes precedence
+over Issue #349, so
+another flapping episode of that period is not sent once the period's
+continuous notification went out (`suppressed`,
+`camera_offline_notification_suppressed`). See SPECIFICATION §9 for the full rules and the known limits.
 
 Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
 takes the `AccessFaultMonitor` the composition root also passes to the
