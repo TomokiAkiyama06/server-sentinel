@@ -1912,10 +1912,14 @@ lost in such a crash beyond the cap is therefore not notified; the notice text
 is fixed, so within the hour it would only repeat one already sent. The resend
 of `pending` rows above is neither counted against nor held back by the cap
 (it is bounded by its own limits: each row once, at most 4 per start, within
-24 h), so a crash loop sends at most 4 new notices an hour plus at most one
-resend of each notice whose outcome was never stored: while Slack stays too
-slow for any outcome to be stored before the next crash, the worst case is 8
-posts of the same text an hour (4 new notices plus one resend of each). A process that
+24 h). New unclean-exit notices are therefore at most 4 per rolling hour, and
+each notice is posted at most twice (its first submission plus at most one
+resend, when its outcome was not stored before the next crash). The number of
+posts is finite, but it is not bounded by 8 in every 60-minute interval: a
+resend can fall into a later interval than its notice (the resend of a notice
+just before the interval, or a resend delayed to a later start), so while
+Slack stays too slow for outcomes to be stored, a 60-minute interval can hold
+more than 8 posts of the same text. A process that
 never reached `running` writes no marker (nothing was admitted). A graceful
 stop whose marker delete is refused (storage refused at the stop, already
 alerted by its final sample) or whose final sample failed leaves the marker,

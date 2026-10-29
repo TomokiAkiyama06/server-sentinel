@@ -416,9 +416,10 @@ class CrashLoopTests(RefusalFixture):
         self.assertEqual([0, 1, 2, 2, 2, 1, 0, 0], per_start)
         self.assertEqual(UNCLEAN_EXIT_HOURLY_LIMIT, len(set(submitted)))
         self.assertLessEqual(max(submitted.count(event_id) for event_id in submitted), 2)
-        # PR #366 review 提案 1: the worst case with a Slack that never
-        # answers in time is 8 posts of the same text an hour (4 notices
-        # plus one resend of each).
+        # PR #366 review: in this run (all starts within one hour, from an
+        # empty history) the 4 notices are each posted twice, 8 in total.
+        # This is not a bound for every 60-minute interval: a resend can land
+        # in a later interval than its notice, so one can hold more than 8.
         self.assertEqual(2 * UNCLEAN_EXIT_HOURLY_LIMIT, len(submitted))
 
 

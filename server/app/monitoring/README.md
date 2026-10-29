@@ -117,9 +117,11 @@ has in flight and rows already resent once (`notification_events.resent`,
 set before the resubmission, so a crash loop resends each row at most once);
 the rest stay `pending` (`recording_health_failure_unrestored` with a count).
 These resends are not counted against the unclean-exit cap and are not held
-back by it, so with a Slack too slow to store any outcome before the next
-crash a crash loop posts the same text at worst 8 times an hour (4 notices
-plus one resend of each; `CrashLoopTests`). A notice lost because the process crashes again in the middle of
+back by it: new unclean-exit notices are at most 4 per rolling hour and
+each is posted at most twice (first submission plus one resend;
+`CrashLoopTests`). The posts are finite, but with a Slack too slow to store
+outcomes a 60-minute interval can hold more than 8, since a resend can land
+in a later interval than its notice. A notice lost because the process crashes again in the middle of
 this resend (its row already marked `resent`) is an accepted loss (Owner
 decision 2026-10-29).
 Each of the two is its own guarded step, retried by the tick after

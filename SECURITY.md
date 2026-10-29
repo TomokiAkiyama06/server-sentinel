@@ -231,7 +231,8 @@ Runtime-data assumptions:
   whether or not a refusal was actually lost (Owner decision 2026-10-26), at
   most 4 per rolling hour counted from the database (Owner decision
   2026-10-29; the resend of a notice whose outcome was not stored is not
-  counted, so with a slow Slack at worst 8 posts of the same text an hour): a
+  counted, so each notice may be posted twice, and with a slow Slack a
+  60-minute interval can hold more than 8 posts of the same text): a
   refusal lost in a crash beyond that cap is not notified
   (`unclean_exit_notification_dropped` in the journal only; not in the daily
   summary), and a notice lost by a

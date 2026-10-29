@@ -799,10 +799,12 @@ class MonitoringRuntime:
         `unclean_exit_notices_dropped` is only this process's 0/1 value and
         is reported nowhere), then the marker is replaced as usual (a
         refusal it lost is not notified; the text is fixed). The resends of
-        `_resend_pending_health_failures` are not counted, so with a Slack
-        too slow to store any outcome before the next crash a crash loop
-        posts the same text at worst 2 * `UNCLEAN_EXIT_HOURLY_LIMIT` (8)
-        times an hour.
+        `_resend_pending_health_failures` are not counted: each notice is
+        posted at most twice (first submission plus one resend), so the
+        posts are finite, but a resend can land in a later 60-minute
+        interval than its notice, and with a Slack too slow to store
+        outcomes an interval can hold more than
+        2 * `UNCLEAN_EXIT_HOURLY_LIMIT` posts of the same text.
         """
         if self._run_marked:
             return
