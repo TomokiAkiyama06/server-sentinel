@@ -228,7 +228,12 @@ Runtime-data assumptions:
   marker the process leaves in the Main database (a random token, no host,
   device or path value, on the verified filesystem) makes the next start send
   one conservative `recording_health_failure` for every such unclean exit,
-  whether or not a refusal was actually lost (Owner decision 2026-10-26).
+  whether or not a refusal was actually lost (Owner decision 2026-10-26), at
+  most 4 per rolling hour counted from the database (Owner decision
+  2026-10-29): a refusal lost in a crash beyond that cap is not notified
+  (`unclean_exit_notification_dropped` in the journal), and a notice lost by a
+  crash in the middle of the startup resend is an accepted loss (same
+  decision).
   Residual: a crash before that process's marker was written (its write
   refused and retried every 15 minutes; `unclean_exit_detection_degraded`
   meanwhile) is not detected.

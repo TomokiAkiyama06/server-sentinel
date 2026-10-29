@@ -82,6 +82,18 @@ SHUTDOWN_STORAGE_SETTLE_SECONDS = 12.0
 # all would, while the queue keeps room for the start's own alerts).
 PENDING_HEALTH_RESEND_SECONDS = 24 * 60 * 60.0
 PENDING_HEALTH_RESEND_LIMIT = 4
+# Owner decision 2026-10-29 (PR #366): at most this many unclean-exit
+# notices per rolling hour, as the camera offline hourly cap. A crash loop
+# restarts the process, so the hour is counted from the persisted notices
+# (`monitoring_unclean_exit_notices`), never from memory. An unclean exit
+# beyond the cap is not notified (logged and counted, value-free); the text
+# is fixed, so it would only repeat a notice the Owner got within the hour.
+# The resend of `pending` rows (`PENDING_HEALTH_RESEND_LIMIT`, once per row)
+# does not count against it and is not held back by it.
+UNCLEAN_EXIT_HOURLY_LIMIT = 4
+UNCLEAN_EXIT_WINDOW_SECONDS = HOUR_SECONDS
+# Notice rows further than this from now are pruned on the next insert.
+UNCLEAN_EXIT_KEEP_SECONDS = 24 * 60 * 60.0
 # PR #366 review: while a delivery is pending, the run loop polls completions
 # this often between ticks, so a delivered alert's `sent` is stored about a
 # second after Slack answered, not up to a tick (60 s) later; otherwise a
@@ -308,6 +320,10 @@ class MonitoringRuntime:
         self._run_token = str(uuid4())
         self._run_marked = False
         self._unclean_at: datetime | None = None
+        self._unclean_dropped = False
+        # Owner decision 2026-10-29: unclean exits this process found beyond
+        # the hourly cap and did not notify (0 or 1; value-free).
+        self.unclean_exit_notices_dropped = 0
         self._pending_health_resent = False
         self.notifications: NotificationService | None = None
         self.notification_events: NotificationEventStore | None = None
@@ -688,7 +704,9 @@ class MonitoringRuntime:
         alert twice, never not at all. Each row is resent at most once
         (`notification_events.resent`, marked before the resubmission; PR
         #366 review): a crash loop does not resend the same row at every
-        start, and a resend cut by a crash is not repeated. Only rows whose
+        start, and a resend cut by a crash is not repeated (an accepted loss,
+        Owner decision 2026-10-29). These resends are neither counted against
+        nor held back by the unclean-exit hourly cap. Only rows whose
         event time is less than `PENDING_HEALTH_RESEND_SECONDS` from now in
         either direction are taken (the event time, unlike `accepted_at`,
         never moves on a resend; a time far in the future, after the clock
@@ -766,6 +784,18 @@ class MonitoringRuntime:
         full or closed queue is retried later too, never stored as a final
         `failed` for an alert that was not sent (PR #366 review). Until the
         marker is written, `unclean_exit_detection_degraded` is set.
+
+        Owner decision 2026-10-29: at most `UNCLEAN_EXIT_HOURLY_LIMIT`
+        notices per rolling hour, counted from the persisted notice rows
+        (time less than an hour from now either way, as the 24 h resend
+        window), so the cap holds across the restarts of a crash loop. A
+        notice is taken under the cap (its row written) before it is
+        submitted, so a crash in between keeps it counted and the next start
+        sends that same notice without taking a second slot. An unclean exit
+        found while the hour is full is not notified: one value-free
+        `unclean_exit_notification_dropped` line and the
+        `unclean_exit_notices_dropped` counter, then the marker is replaced
+        as usual (a refusal it lost is not notified; the text is fixed).
         """
         if self._run_marked:
             return
@@ -773,15 +803,30 @@ class MonitoringRuntime:
         if previous is not None and previous != self._run_token:
             event_id = uuid5(EVENT_NAMESPACE, f"recording-unclean-exit:{previous}")
             if self.notification_events.get(event_id) is None:
-                if not self.notifications.can_accept(event_id):
-                    raise RecordingError("NOTIFICATION_QUEUE_FULL")
                 if self._unclean_at is None:
                     self._unclean_at = self.dependencies.utcnow()
                     logging.getLogger(__name__).error(Event.MONITORING_PREVIOUS_RUN_UNCLEAN)
-                self.notifications.record(NotificationKind.RECORDING_HEALTH_FAILURE,
-                                          at=self._unclean_at, event_id=event_id)
-                if self.notification_events.get(event_id) is None:
-                    raise RecordingError("UNCLEAN_EXIT_NOT_PERSISTED")
+                taken = self.run_marker.notice_time(event_id)
+                if taken is not None:
+                    # Taken by a start that crashed before submitting it.
+                    self._unclean_at = taken
+                if taken is None and not self._unclean_dropped and self.run_marker.notices_within(
+                        self.dependencies.utcnow(),
+                        timedelta(seconds=UNCLEAN_EXIT_WINDOW_SECONDS)) >= UNCLEAN_EXIT_HOURLY_LIMIT:
+                    self._unclean_dropped = True
+                    self.unclean_exit_notices_dropped += 1
+                    logging.getLogger(__name__).warning(Event.UNCLEAN_EXIT_NOTIFICATION_DROPPED)
+                if not self._unclean_dropped:
+                    if not self.notifications.can_accept(event_id):
+                        raise RecordingError("NOTIFICATION_QUEUE_FULL")
+                    if taken is None:
+                        self.run_marker.take_notice(
+                            event_id, self._unclean_at,
+                            keep=timedelta(seconds=UNCLEAN_EXIT_KEEP_SECONDS))
+                    self.notifications.record(NotificationKind.RECORDING_HEALTH_FAILURE,
+                                              at=self._unclean_at, event_id=event_id)
+                    if self.notification_events.get(event_id) is None:
+                        raise RecordingError("UNCLEAN_EXIT_NOT_PERSISTED")
         self.run_marker.mark(self._run_token)
         self._run_marked = True
 

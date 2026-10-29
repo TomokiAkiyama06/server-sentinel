@@ -223,6 +223,10 @@ TRANSIENT_TABLES = {
     # stop deletes it, so no baseline value could be compared across a stop.
     "monitoring_run_marker": "running marker of the monitoring runtime, rewritten at "
                              "every start",
+    # Owner decision 2026-10-29 (PR #366): only the hourly cap of the
+    # unclean-exit notices is counted from it; losing it lets more notices
+    # through, never fewer, and the notices themselves are notification_events.
+    "monitoring_unclean_exit_notices": "unclean-exit notices counted by their hourly cap",
     "notification_schedule": "daily-summary schedule cursor",
     "presence_delivery_fairness": "round-robin cursor between delivery classes",
     "presence_inputs": "live presence inputs with their own validity windows",

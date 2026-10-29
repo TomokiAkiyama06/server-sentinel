@@ -307,15 +307,22 @@ alert may then never reach Slack (behind a stalled or backlogged delivery it
 is still queued at the exit); the next start then submits that `pending`
 `recording_health_failure` row once more (within a day of its event, and each
 row only once: a row whose resend was cut by a crash is not resent again,
-and that crash is reported by the next start's unclean-exit notice instead),
-so the Owner may receive it twice. A crash, kill, OOM or power loss before the tick
+and that crash is reported by the next start's unclean-exit notice instead,
+unless the hourly cap below holds it back; a notice lost because the service
+crashes again in the middle of that resend is an accepted loss, Owner decision
+2026-10-29), so the Owner may receive it twice. A crash, kill, OOM or power loss before the tick
 loses the refusal itself; instead the next start finds the running marker the
 process left in the database and sends one `recording_health_failure` for that
 unclean exit (log `monitoring_previous_run_unclean`), whether or not a refusal
 was lost (Issue #351). Every unclean exit of the running service is notified
-once this way (a crash loop sends one per crash that had reached
-`running`, plus at most one resend of each earlier notice whose delivery
-outcome was not stored before the crash; there is no rate limit); a graceful
+once this way, at most 4 per rolling hour (Owner decision 2026-10-29; the
+hour is counted from the database, so restarts do not reset it): a crash loop
+sends one per crash that had reached `running` up to that cap, plus at most
+one resend of each earlier notice whose delivery outcome was not stored before
+the crash (the resend is not counted against the cap). A crash beyond the cap
+is not notified (journal: `unclean_exit_notification_dropped`), so a refusal
+lost in it is not notified either; check the journal when the notices stop
+during a crash loop. A graceful
 `systemctl restart` sends none. While the marker cannot be written the daily
 summary counts `unclean_exit_detection_degraded`. On such a notice,
 check the journal for why the previous process ended and verify the recording
@@ -2340,7 +2347,10 @@ cleared while the service was down after an unclean stop cannot be told from
 a clean stop), and the verdict values of `integrity_status` and
 `recording_health_status` (recomputed at startup and daily). The
 monitoring runtime's running marker (`monitoring_run_marker`, Issue #351:
-written at every start, deleted by a graceful stop) is not inventoried. A baseline
+written at every start, deleted by a graceful stop) and the unclean-exit
+notices counted by its hourly cap (`monitoring_unclean_exit_notices`, Owner
+decision 2026-10-29; losing them only lets more notices through) are not
+inventoried. A baseline
 recorded by a release before #132 has none of these sections; verify reports
 them `not_recorded` and they neither fail nor count as preserved.
 

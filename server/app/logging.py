@@ -20,6 +20,9 @@ class Event(StrEnum):
     MONITORING_DEGRADED = "monitoring_degraded"
     # Issue #351: the previous process exited without its graceful stop.
     MONITORING_PREVIOUS_RUN_UNCLEAN = "monitoring_previous_run_unclean"
+    # Owner decision 2026-10-29 (PR #366): an unclean exit found while the
+    # hourly cap of unclean-exit notices was full; not notified.
+    UNCLEAN_EXIT_NOTIFICATION_DROPPED = "unclean_exit_notification_dropped"
     # Issue #351: `pending` recording-health failures left out of the
     # restart resend (beyond the limit).
     RECORDING_HEALTH_FAILURE_UNRESTORED = "recording_health_failure_unrestored"

@@ -2761,7 +2761,11 @@ intercepted Slack transport. On the deployment, additionally check:
       the journal shows `monitoring_previous_run_unclean` once; a following
       `systemctl restart` (graceful) sends none. With Slack blocked at a
       stop that raised an alert (`critical_notifications_unsettled`), the next
-      start delivers that `pending` row once. Until done, only the mock
+      start delivers that `pending` row once. Kill it 6 times within an
+      hour (Owner decision 2026-10-29): only the first 4 unclean exits are
+      notified, the journal shows `unclean_exit_notification_dropped` for the
+      others, and a kill more than an hour after the first notice is notified
+      again. Until done, only the mock
       regressions (`server/tests/test_monitoring_unclean_exit.py`) cover this;
 - [ ] storage state transitions appear in `storage_state_audit`, and expired
       unstarred recordings/state-audit rows are removed by the running service;

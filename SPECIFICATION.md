@@ -1879,7 +1879,9 @@ POST reached Slack the Owner sees it twice (Issue #351). Each row is resent at
 most once (`notification_events.resent`, set before the resubmission), so a
 crash loop never resends the same row at every start; a row whose resend was
 cut by a crash is not resent again (that crash is reported by the next start's
-unclean-exit notice). Between ticks the run
+unclean-exit notice, unless the hourly cap below holds it back). A notice lost
+because the process crashes again in the middle of that startup resend is an
+accepted loss (Owner decision 2026-10-29). Between ticks the run
 loop stores a finished delivery's outcome within about 1 s while deliveries
 are pending, so a delivered alert is normally `sent` before a crash and not
 resent. A crash, kill, OOM or power loss before the
@@ -1890,9 +1892,26 @@ stop after its final sample), and a start that finds another process's marker
 logs `monitoring_previous_run_unclean` and raises one immediate value-free
 `recording_health_failure` named after that token, whether or not a refusal was
 actually lost (Owner decision 2026-10-26, option 2): every unclean exit of a
-running process is notified once, a graceful restart never. In a crash loop
-each crash therefore sends one new notice, plus at most one resend of each
-earlier notice whose outcome was never stored; there is no rate limit. A process that
+running process is notified once, a graceful restart never, but at most 4
+unclean-exit notices per rolling hour (Owner decision 2026-10-29, the shape of
+the camera offline hourly cap). The hour is counted from persisted rows
+(`monitoring_unclean_exit_notices`, migration 27: the notice's event ID and the
+time it was taken, nothing else), not from process memory, so a crash loop
+cannot reset it: a row counts while its time is less than one hour from now in
+either direction (as the 24 h resend window; a row exactly one hour old or one
+hour or more ahead after the clock moved back does not count), and rows a day
+or more from now are pruned on the next insert. A notice's row is written
+before it is submitted, so a start that crashed in between leaves its slot
+taken and the next start sends that same notice without taking another. An
+unclean exit found while the hour is full is not notified: the start logs the
+value-free `unclean_exit_notification_dropped`, counts it in the runtime's
+`unclean_exit_notices_dropped` and replaces the marker as usual. A refusal
+lost in such a crash beyond the cap is therefore not notified; the notice text
+is fixed, so within the hour it would only repeat one already sent. The resend
+of `pending` rows above is neither counted against nor held back by the cap
+(it is bounded by its own limits: each row once, at most 4 per start, within
+24 h), so a crash loop sends at most 4 new notices an hour plus at most one
+resend of each notice whose outcome was never stored. A process that
 never reached `running` writes no marker (nothing was admitted). A graceful
 stop whose marker delete is refused (storage refused at the stop, already
 alerted by its final sample) or whose final sample failed leaves the marker,
