@@ -96,7 +96,7 @@ not_applicable は `unmeasured`）。2026-10-26 の記録を再集計すると�
   （ハーネスは repository 内の path を拒否）。
 - 実カメラ frame は holder → sender の unix socket（0700 directory 内）経由で memory 上のみ。
   映像を見る・保存する操作はしない。撮影範囲に研究室の関係者が映ってもよい（Owner 決定
-  2026-10-29。全員が試験を承知している）。frame は保存しないため、関係者以外が映る場所では行わない。
+  2026-10-29。全員が試験を承知している）。関係者以外（来訪者など）が映りうる場所・時間には行わない。
 - 緊急停止（kill switch）: 両 host で `systemctl --user stop 'ss-poc15-*'`（`schedule` を
   `ss-poc15-schedule` scope で動かしていれば scheduler 自身も止まり、以後の slot は起動しない）。
   `timeout -k` は二重の上限です。
@@ -351,9 +351,10 @@ soak（1800 s）には短すぎて途中で kill され、integrity `fail` に�
 - holder（実カメラ時）: `timeout -k 30 50m ... holder ... --seconds 2700`（agent より先に
   終わらないように agent の上限より長くする）
 
-soak 以外の full matrix は scenario 長の合計が 1 候補あたり約 36 分だが、2 host では scenario ごとの
-起動・停止と Main の grace を含めて 1 候補あたり約 42 分、3 候補で約 2 時間 7 分かかる。soak は
-1 run 約 31 分 30 秒（3 候補で約 1 時間 35 分）。1 日の上限は無いので、full matrix と同じ日に行ってよい。
+soak 以外の full matrix は scenario 長の合計が 1 候補あたり約 36 分だが、`schedule` の時刻表は
+scenario ごとの起動・停止、Main の grace と slot 間の余裕を含めて 1 候補 1 時間 3 分 30 秒、3 候補
+3 時間 10 分 30 秒になる。soak は 1 run 31 分 30 秒（3 候補で 1 時間 34 分 30 秒）。1 日の上限は
+無いので、full matrix と同じ日に行ってよい。
 `schedule` では各 slot の `timeout` 上限と holder の `--seconds` を scenario 長から自動で決める
 （slot 開始から scenario 長 + 55 s、holder は scenario 長 + 45 s）ので、上の 45 分 / 2700 s の値は
 手動実行用です。
