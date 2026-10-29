@@ -334,9 +334,15 @@ class Sender:
                         self.writer.write("first_accept", connection=self.connections,
                                           session=self.session, source=state.index)
             else:
-                # Transient refusal: put the unit back in front, retry later.
+                # Transient refusal: put the unit back in front, retry later,
+                # bounded like ``_requeue_inflight`` / ``_restore``: the
+                # producer may have filled ``pending`` while the unit was in
+                # flight, so drop-oldest (each drop recorded in
+                # ``drop_ranges``, G2 accounting) keeps it at the limit (#367).
                 state.pending.appendleft(unit)
                 state.inflight = None
+                while len(state.pending) > state.pending_limit:
+                    state.drop(state.pending.popleft())
                 state.retry_at = time.monotonic() + state.backoff
                 state.backoff = min(0.5, state.backoff * 2)
 
@@ -382,11 +388,14 @@ class Sender:
                                                              or str(error)))
             return None
         connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.config.sndbuf)
+        # No Nagle stall on the sub-MSS tail of each stop-and-wait unit (#369).
+        nodelay = wire.disable_nagle(connection)
         # The TLS handshake completed (Agent clock), before this connection's
         # HELLO is written: a two-host G4 reconnect after a Main-side window
         # adds this connection's ``connected`` -> ``first_accept`` interval
         # to Main's window end -> ``session_hello`` (#237).
-        self.writer.write("connected", connection=self.connections + 1, session=session)
+        self.writer.write("connected", connection=self.connections + 1, session=session,
+                          tcp_nodelay=nodelay)
         self.connections += 1
         self.session = session
         self.last_echo_ns = None
@@ -404,7 +413,8 @@ class Sender:
             holder_nonce=self.holder_nonce,
             fps=self.config.fps, frame_bytes=self.config.frame_bytes, epoch=self.epoch,
             pending_limit=self.config.pending_limit, sndbuf=self.config.sndbuf,
-            loss_timeout_ns=int(self.config.loss_timeout_s * 1e9))
+            loss_timeout_ns=int(self.config.loss_timeout_s * 1e9),
+            tcp_nodelay=True)  # every connection sets it (#369; read back in ``connected``)
         for state in self.sources:
             self.writer.write("epoch_start", source=state.index, epoch=self.epoch)
         self.start_sources()

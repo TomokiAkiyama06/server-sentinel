@@ -58,6 +58,30 @@ receiver は product の bind 検証を通した上で `SO_REUSEADDR` 付きで 
 `open_ingest_listener` には無く、TIME_WAIT 中の Main 再起動で再 bind できないため。product 側の対応は
 Issue #223 で追跡）。
 
+sender（Agent 側の接続）、receiver（accept した接続）、impairment proxy の両側の socket は
+`TCP_NODELAY` を設定します（`wire.disable_nagle`）。sender の `start`、receiver と proxy の `ready` に
+`tcp_nodelay: true` を書き、sender の `connected` と receiver の `session_open` には読み戻した値を
+`tcp_nodelay` として記録します。どの候補も source ごとに ack を待ってから次を送るので、Nagle が
+有効だと unit の末尾の小さな segment が、受信側の delayed ACK（Linux の最小 40 ms）を待つことが
+あります。待つかどうかは unit サイズ、sender の 64 KiB ごとの送信分割、MSS の組み合わせで決まります。
+CPU 制限付き container の loopback A/B（Issue #369、1 source）では、125 KB と 147 KB の unit で
+ほぼ毎回止まり（`a_framed` / `b_chunked` は RTT p50 41 ms で 30 unit/s を送り切れない。`b_segment` は
+run によって一部またはすべての segment が止まり、p50 5〜42 ms・p95 5.7〜44 ms・最大 41〜45 ms）、16 KB では止まらず、
+MSS 1448 では一部の unit だけ（p95 41 ms）、2 source でも p95 33 ms でした。全 socket に設定すると
+p50 0.3 ms（`b_segment` は最大でも約 5.8 ms）・30 unit/s です。loopback では sender と proxy の upstream 側の両方が
+必要でした（loopback は MSS と RTT が実 LAN と異なり、実 LAN での効果は再実測で確認する）。
+2026-10-26 の 2 host 実測（1 source の real run で RTT p50 約 46 ms、約 27 fps、pending が上限）は
+この機構と整合しますが、原因は推定で、LAN では再確認していません。
+
+**`tcp_nodelay: true` が記録されていない run（2026-10-26 以前の run はすべて。real / synthetic、
+source 数を問わない）は判定に使いません。** summarize は、どれか 1 つの記録に `tcp_nodelay: true` が
+無い run の `integrity` を `unmeasured` にし（crash などの `fail` はそのまま）、pass / fail を問わず全 gate を `unmeasured` にします
+（`--json` の各 run 行の `tcp_nodelay`）。候補行の副次指標（`reconnect_p95_ns`、`latency_p95_max_ns`、
+`overhead_max`、`unprotected_gap_units`、`secondary_*`）も、`tcp_nodelay` が true の run だけから計算し、
+除いた run 数を `nodelay_excluded_runs` に出します（除いた run があれば `secondary_*` の pass /
+not_applicable は `unmeasured`）。2026-10-26 の記録を再集計すると、38 run すべてが `unmeasured` に
+なります。製品の ingest / Agent 側（#14）に同じ設定が要ることは ADR-0007 に記載しています。
+
 ## 安全規則
 
 - Main host は production（GPU benchmark が同居）。Main 側は必ず
@@ -553,7 +577,7 @@ session が 1 回だけ開閉され、宣言した全 source で `forwarded` ≥
 | G3 | receiver と sender の両方の sample が必要（片方でも無ければ `unmeasured`）。receiver queue ≤ 設定上限、sender pending ≤ 上限、kernel send queue の滞留 byte（`TIOCOUTQ`、`ss -tmi` があれば skmem `w`）≤ 2×SO_SNDBUF + 64 KiB、VmHWM ≤ 上限、warmup 後の RSS 増加 ≤ max(16 MiB, 10 %)（sample < 4 なら `unmeasured`）。skmem `tb` は送信 buffer の上限値で、SO_SNDBUF 設定前に kernel が拡大しうるため記録のみ。実入力の run で `ss` が無い（socket を 1 つも報告した sample が無い）なら `unmeasured`。proxy 保持量は 1 回の `recv()` buffer で構造的に有界なので記録のみ |
 | G4 | 切断を伴う impairment から手動操作なしで再接続、p95 ≤ 10 s（再接続時間は impairment の終了から測り、Main の停止時間そのものは含めない。2 host で Main 側 action の場合は、window 開始時に live だった session（session nonce で対応付け）が切れた window について、Main 時計の「window 終了（SIGCONT / 再起動後の `ready`）→ 後続接続の `session_hello`」と Agent 時計の「その接続の `connected` → `first_accept`」の和で測る（真の値より小さくならない。#237）。対応する session が無い window は再接続 0 として数え、nonce や `connected` の記録が無ければ `unmeasured`。ただし対応付けができなくても、再接続が必要な window の終了以後に Main が `session_hello` を 1 つも受けていなければ `fail`）。切断と初回受理は impairment ごとに 1 組ずつ対応させ（同じ記録を複数回使わない）、各 impairment の対応範囲は次に予定された impairment の開始で打ち切る（切断は [開始, min(終了 + 30 s, 次の開始))、初回受理は次の開始より前。後の impairment の後に起きた切断・受理を前の impairment の再接続として数えない）、必要な再接続数は予定された reset / Main 再起動と、Agent loss timeout + 1 s 以上の blackhole / SIGSTOP の数だけで決まる（scenario 名による追加要求はない） |
 | G5 | 無音断の検知 ≤ 15 s（Agent / Main とも）、Main の未 commit 区間（Agent capture 時刻）⊆ Agent 保護区間 [T−600 s, T+600 s]。proxy blackhole は予定数の `impairment_start` 記録が必要（`proxy.jsonl` が無ければ `unmeasured`、不足は `fail`）、Main の stale 閾値以上の blackhole には source ごとに Main の `interrupted`（最後の受信から ≤ 15 s）が必要。Main 側停止（`slow_stop_10s` / `slow_stop_60s` / `main_restart`）は停止ごとに Agent の loss 検知が必要で、遅延は Agent 時計で最後の受信からの経過（`idle_ns`）≤ 15 s（2 host では停止開始時に live だった session のうち、停止を生き延びていない（Main 時計で window 終了 + 15 s + 5 s（`SESSION_CLOSE_GRACE_NS`）以内に終わり、停止開始後（Main が応答をやめたことを記録で示せる場合はその時刻以後）の Main の heartbeat 応答を Agent が受けていない）session の loss episode だけを数える）。Main 側 orchestrator 記録が無ければ `unmeasured`。予定された proxy reset はそれぞれ Agent 時計で 15 s 以内の `loss_detected` が必要（`proxy.jsonl` が無ければ `unmeasured`）。`loss_detected` は source ごとに出るが connection 単位で 1 episode とし、reset / Agent loss timeout + 1 s 以上の blackhole（G4 の再接続要求と同じ規則。timeout と同じ長さの窓は検知が保証されないので求めない。#308）ごとに別の episode を 1 つずつ消費する（1 回の検知を 2 つの reset に使わない）。対応づけの範囲は [impairment 開始, min(開始 + 15 s, 次に予定された impairment の開始)) で、後の impairment の後に出た検知は前の impairment の検知として数えない（最後の impairment は開始 + 15 s まで）。1 host の Main 側停止と Main の `interrupted` の照合も同様に次の window の開始で打ち切る。Main の `interrupted` は最後の `session_close` 以前のものだけを数える（sender 終了後の stale 判定は障害検知ではない） |
-| G6 | 4 source で backpressure / rate limit / sender drop 0（4 source すべての sender `end` 記録が必要、1 つも無ければ `unmeasured`）、かつ Main / Agent とも cgroup v2 `cpu.max` の CPU 上限下で実行（`capacity_4`、上限が無ければ `fail`）。5 source 目は active-source 上限（`source_capacity`）で拒否 |
+| G6 | 4 source で backpressure / rate limit / sender drop 0（4 source すべての sender `end` 記録が必要、1 つも無ければ `unmeasured`）、かつ Main / Agent とも cgroup v2 `cpu.max` の CPU 上限下で実行（`capacity_4`、上限が無ければ `fail`）。`fifth_refused` は 5 source（0〜4）すべての sender `end` 記録が必要（欠ければ `fail`）。Main は最初に届いた 4 source を受け付け、streaming 候補は source ごとに並行して送るので、拒否されるのがどの source かは到着順で決まる（index で決め打ちしない。#368）。ちょうど 1 source が accepted 0（2 つ以上・0 個なら `fail`）で、その拒否が 1 件以上かつすべて active-source 上限（`source_capacity`）であり、Main に durable unit を持たないこと（拒否理由の件数 `rejected_source_capacity` の記録が無ければ `unmeasured`）。残りの 4 source はすべて durable で sender drop 0、Main の backpressure / rate limit 0。拒否 source の sender drop は問わない（`b_segment` では Main が拒否 source の unit を 1 segment に 1 件だけ `rejected` とし残りを `not_processed` で返すので、pending が生成速度で埋まり drop-oldest が続く） |
 | 副次 | soak 30 分で予期しない切断 0、overhead ≤ 10 %（proxy の上り byte / payload）、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %（最初の sample からの差分で算出）、latency p95 ≤ 1 s（参考） |
 
 すべての比較は 1 host の時計内、または envelope の Agent capture 時刻と Agent 自身の
