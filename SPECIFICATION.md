@@ -1624,15 +1624,17 @@ once when the hour allows, also when the source recovered meanwhile (Owner
 decision 2026-10-24, Issue #349, consistent with PR #320: an episode that
 reached the threshold is notified once even if it recovered before the
 drain). The cap stays absolute, so such a notice can be up to about an hour
-late. A source keeps at most two held episodes that already recovered, plus
-its latest outage (in progress, or recovered before it could be bounded), so
-at most three episodes per source; the same limit applies whether the cap
-held them or the send queue refused them (Owner decision 2026-10-29). A third outage drops the oldest held one
-only once it has lasted `after_seconds` (checked when the drain has sent what
-the hour allows, and when a further outage begins); a shorter third outage
-drops nothing, and both held ones are still sent (exception 1 below; Claude
-re-review PR #359 重要 1). A latest episode that is a flapping episode its
-period will not send (exception 3 below) is not a third notice: when a
+late. Hold limit (exception 1 below): a source holds at most two unsent
+episodes that reached the threshold (the newest of them and one owed), and
+at most three episodes in all counting a further outage still in progress
+short of the threshold; the same limit
+applies whether the cap held them or the send queue refused them (Owner
+decision 2026-10-29). A third outage drops the oldest held one only once it
+has lasted `after_seconds` (checked when the drain has sent what the hour
+allows, and when a further outage begins); a shorter third outage drops
+nothing, and both held ones are still sent (exception 1 below; Claude
+re-review PR #359 重要 1). A most recent outage that is a flapping episode
+its period will not send (exception 3 below) is not a third notice: when a
 further outage begins before a drain settled it, it is settled then
 (`suppressed`), and the two held ones stay and are sent (Claude re-review PR
 #359 提案 1).
@@ -1646,7 +1648,9 @@ not sent, and every one not sent is counted and logged value-free:
    a third outage of at least `after_seconds` of the same source, separated
    from the earlier ones by an online of at least `after_seconds`, drops
    the oldest unsent one, so a source holds at most two unsent episodes
-   that reached the threshold (its latest and one owed). A third outage
+   that reached the threshold (the newest of them and one owed), and at
+   most three episodes in all counting a further outage still in progress
+   short of the threshold. A third outage
    shorter than `after_seconds` drops nothing. "Held" covers both causes
    (Owner decision 2026-10-29): notices the hourly cap holds back and
    notices the send queue refused (delivery backpressure) share this one

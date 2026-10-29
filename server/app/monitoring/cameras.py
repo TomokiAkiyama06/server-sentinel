@@ -36,11 +36,13 @@ before that drain after a recovery shorter than ``after_seconds``, the
 recovery is folded into it (still owed, the count is not restarted); after a
 longer recovery the new outage is its own episode and the old one stays owed
 under its own time and ID. While the cap or the queue holds them (one
-shared hold limit, Owner decision 2026-10-29), a source keeps two such
-held episodes; a third outage drops the oldest only
-once it lasted ``after_seconds`` (Owner decision 2026-10-26 (a); a shorter
-one drops nothing), so at most three episodes are kept per source. A recovery is recorded in the episode
-(``recovered``) and is not notified (no Owner decision for a recovery
+shared hold limit, Owner decision 2026-10-29), a source holds at most two
+unsent episodes that reached the threshold (the newest of them and one
+owed), and at most three episodes in all counting a further outage still in
+progress short of the threshold; a third outage drops the oldest only once
+it lasted ``after_seconds`` (Owner decision 2026-10-26 (a); a shorter one
+drops nothing). A recovery is recorded in the episode (``recovered``) and is
+not notified (no Owner decision for a recovery
 notice).
 
 Event IDs: an episode still in progress is named after the source and its
@@ -402,8 +404,9 @@ class _Source:
     # An earlier owed episode, kept while the latest outage has not lasted the
     # threshold yet: only a third outage of at least ``after_seconds`` drops
     # it (Owner decision 2026-10-26 (a), Claude re-review PR #359 重要 1). So
-    # a source keeps at most three episodes: two held recovered ones and the
-    # one in progress (or recovered), until the next drain bounds them.
+    # a source holds at most two unsent episodes that reached the threshold
+    # (the newest of them and one owed), and at most three episodes in all
+    # counting a further outage still in progress short of the threshold.
     older: _Episode | None = None
     # Bumped on every signal, so a runtime status read before a newer event
     # cannot overwrite it (``observe_runtime``).

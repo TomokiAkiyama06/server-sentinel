@@ -531,7 +531,12 @@ class OwedEpisodeTests(MonitorFixture, unittest.TestCase):
         monitor.health_sink(event(source, CameraState.ONLINE))
         monitor.drain(refusing, at=AT, monotonic=self.clock.value)
         self.assertEqual(([], 0), (self.sent(), monitor.dropped))
-        self.assertEqual(2, sum(item is not None for item in (state.older, state.owed)))
+        # Each refused submission keeps its event ID: the oldest held one
+        # (``older``) and the owed one are told apart by it.
+        oldest, owed = state.older, state.owed
+        self.assertLess(oldest.since, owed.since)
+        oldest_id, owed_id = oldest.attempt[1], owed.attempt[1]
+        self.assertNotEqual(oldest_id, owed_id)
         self.advance(330)
         monitor.health_sink(event(source, CameraState.OFFLINE))
         self.advance(200)
@@ -544,10 +549,21 @@ class OwedEpisodeTests(MonitorFixture, unittest.TestCase):
                                 for line in logs.output))
         kept = [item for item in (state.older, state.owed, state.episode) if item is not None]
         self.assertEqual(([], 2, 1), (self.sent(), len(kept), monitor.dropped))
+        # The oldest was dropped; the owed one and the outage in progress stay.
+        self.assertTrue(oldest.notified)
+        self.assertNotIn(oldest, kept)
+        self.assertIn(owed, kept)
+        current = state.episode
         refusing.accept = True
         monitor.drain(refusing, at=AT, monotonic=self.clock.value)
         self.assertEqual(sorted([ALERT, RECOVERED]), sorted(self.texts()))
-        self.assertEqual(2, len({row.event_id for row in self.sent()}))
+        sent_ids = {row.event_id for row in self.sent()}
+        self.assertEqual(2, len(sent_ids))
+        # The two sent are the owed episode (its refused attempt's ID) and the
+        # outage in progress; the oldest one's ID never reaches a row.
+        self.assertIn(owed_id, sent_ids)
+        self.assertNotIn(oldest_id, sent_ids)
+        self.assertTrue(owed.notified and current.notified)
         self.online(monitor, source)
         self.advance(3600)
         monitor.drain(refusing, at=AT, monotonic=self.clock.value)
