@@ -153,7 +153,9 @@ the oldest unsent one once it has lasted `after_seconds` (a shorter third
 outage drops nothing; a source holds at most two unsent episodes that
 reached the threshold (the newest of them and one owed), and at most three
 episodes in all counting a further outage still in progress short of the
-threshold; `dropped`,
+threshold; the limit is applied after each drain's sends and when a further
+outage begins, so until then a third outage that just reached the threshold
+briefly makes three; `dropped`,
 `camera_offline_notification_dropped`; notices the cap holds and notices the
 queue refused share this one hold limit, Owner decision 2026-10-29); (b) a
 fifth closed ratio alert of a source drops the oldest (`dropped`, same log);

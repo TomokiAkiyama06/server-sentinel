@@ -1650,8 +1650,10 @@ not sent, and every one not sent is counted and logged value-free:
    the oldest unsent one, so a source holds at most two unsent episodes
    that reached the threshold (the newest of them and one owed), and at
    most three episodes in all counting a further outage still in progress
-   short of the threshold. A third outage
-   shorter than `after_seconds` drops nothing. "Held" covers both causes
+   short of the threshold (applied after each drain's sends and when a
+   further outage begins, so until then a third outage that just reached
+   the threshold briefly makes three). A third outage shorter than
+   `after_seconds` drops nothing. "Held" covers both causes
    (Owner decision 2026-10-29): notices the hourly cap holds back and
    notices the send queue refused (delivery backpressure) share this one
    per-source hold limit, with the same counter and log. Counted in

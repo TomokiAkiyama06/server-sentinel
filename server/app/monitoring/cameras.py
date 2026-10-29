@@ -41,7 +41,10 @@ unsent episodes that reached the threshold (the newest of them and one
 owed), and at most three episodes in all counting a further outage still in
 progress short of the threshold; a third outage drops the oldest only once
 it lasted ``after_seconds`` (Owner decision 2026-10-26 (a); a shorter one
-drops nothing). A recovery is recorded in the episode (``recovered``) and is
+drops nothing). The limit is applied after each drain's sends and when a
+further outage begins (``_bound_held``), so from the moment a third outage
+reaches the threshold until then, three unsent episodes that reached it can
+exist briefly. A recovery is recorded in the episode (``recovered``) and is
 not notified (no Owner decision for a recovery
 notice).
 
@@ -407,6 +410,9 @@ class _Source:
     # a source holds at most two unsent episodes that reached the threshold
     # (the newest of them and one owed), and at most three episodes in all
     # counting a further outage still in progress short of the threshold.
+    # The limit is applied after each drain's sends and when a further outage
+    # begins (``_bound_held``); until then a third outage that just reached
+    # the threshold briefly makes three.
     older: _Episode | None = None
     # Bumped on every signal, so a runtime status read before a newer event
     # cannot overwrite it (``observe_runtime``).
