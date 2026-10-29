@@ -1626,7 +1626,8 @@ reached the threshold is notified once even if it recovered before the
 drain). The cap stays absolute, so such a notice can be up to about an hour
 late. A source keeps at most two held episodes that already recovered, plus
 its latest outage (in progress, or recovered before it could be bounded), so
-at most three episodes per source. A third outage drops the oldest held one
+at most three episodes per source; the same limit applies whether the cap
+held them or the send queue refused them (Owner decision 2026-10-29). A third outage drops the oldest held one
 only once it has lasted `after_seconds` (checked when the drain has sent what
 the hour allows, and when a further outage begins); a shorter third outage
 drops nothing, and both held ones are still sent (exception 1 below; Claude
@@ -1636,30 +1637,31 @@ further outage begins before a drain settled it, it is settled then
 (`suppressed`), and the two held ones stay and are sent (Claude re-review PR
 #359 提案 1).
 
-Not-sent exceptions (Owner decision 2026-10-26, PR #359). "Notified once"
-has exactly three exceptions; in each, the notification is not sent, and
-every one not sent is counted and logged value-free:
+Not-sent exceptions (Owner decisions 2026-10-26 and 2026-10-29, PR #359).
+"Notified once" has exactly three exceptions; in each, the notification is
+not sent, and every one not sent is counted and logged value-free:
 
-1. Third continuous outage of a source while the cap holds its notices:
-   while a source's notifications are held back by the hourly cap, a third
-   outage of at least `after_seconds` of the same source, separated from
-   the earlier ones by an online of at least `after_seconds`, drops the
-   oldest unsent one. A third outage shorter than `after_seconds` drops
-   nothing. Counted in `dropped`, logged at WARNING as
-   `camera_offline_notification_dropped`. Not part of the Owner decision
-   (a design extension that keeps memory bounded, not yet confirmed by the
-   Owner): the same per-source bound applies when the notices are unsent
-   because the queue refused them (delivery backpressure) rather than
-   because of the cap, with the same counter and log.
-2. Fifth closed ratio alert of a source: at most four ratio alerts whose
-   flapping period has closed wait per source (`LATE_FLAPS_PER_SOURCE`,
-   below); a fifth drops the oldest, which the queue never accepted.
-   Counted in `dropped`, logged at WARNING as
+1. Third continuous outage of a source while its notices are held (Owner
+   decision 2026-10-26 (a)): while a source's notifications are held back,
+   a third outage of at least `after_seconds` of the same source, separated
+   from the earlier ones by an online of at least `after_seconds`, drops
+   the oldest unsent one, so a source holds at most two unsent episodes
+   that reached the threshold (its latest and one owed). A third outage
+   shorter than `after_seconds` drops nothing. "Held" covers both causes
+   (Owner decision 2026-10-29): notices the hourly cap holds back and
+   notices the send queue refused (delivery backpressure) share this one
+   per-source hold limit, with the same counter and log. Counted in
+   `dropped`, logged at WARNING as `camera_offline_notification_dropped`.
+2. Fifth closed ratio alert of a source (Owner decision 2026-10-26 (b)): at
+   most four ratio alerts whose flapping period has closed wait per source
+   (`LATE_FLAPS_PER_SOURCE`, below); a fifth drops the oldest, which the
+   queue never accepted. Counted in `dropped`, logged at WARNING as
    `camera_offline_notification_dropped`.
-3. Another flapping episode of the same flapping period: within one
-   ratio-opened flapping period, the Owner decision of PR #335 (at most two
-   notifications per flapping period) takes precedence over Issue #349 (an
-   outage of at least `after_seconds` is sent once). Once the period's one
+3. Another flapping episode of the same flapping period (Owner decision
+   2026-10-26 (c)): within one ratio-opened flapping period, the Owner
+   decision of PR #335 (at most two notifications per flapping period)
+   takes precedence over Issue #349 (an outage of at least `after_seconds`
+   is sent once). Once the period's one
    continuous notification is sent, any other flapping episode of that
    period is not sent, even when it lasted `after_seconds` and also after
    the period closed (below). Counted in `suppressed`, logged at INFO as

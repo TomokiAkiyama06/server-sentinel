@@ -146,15 +146,16 @@ once the queue takes it, like a refused continuous episode; such closed
 alerts wait apart from the source's current ratio alert (any number of
 them never blocks a new period, at most `LATE_FLAPS_PER_SOURCE` = 4 per
 source, the oldest beyond that dropped and logged). "Notified once" has
-exactly three not-sent exceptions (Owner decision 2026-10-26, PR #359), each
-counted and logged value-free: a source's third outage of at least
-`after_seconds` while the cap holds its notices drops the oldest unsent one
-once it has lasted `after_seconds` (a shorter third outage drops nothing; at
-most three episodes per source; `dropped`,
-`camera_offline_notification_dropped`; the same bound for notices the queue
-refused is a design extension not yet confirmed by the Owner); a fifth closed ratio
-alert of a source drops the oldest (`dropped`, same log); and inside one
-flapping period PR #335 (at most two) takes precedence over Issue #349, so
+exactly three not-sent exceptions (Owner decisions 2026-10-26 and
+2026-10-29, PR #359), each counted and logged value-free: (a) a source's
+third outage of at least `after_seconds` while its notices are held drops
+the oldest unsent one once it has lasted `after_seconds` (a shorter third
+outage drops nothing; at most three episodes per source; `dropped`,
+`camera_offline_notification_dropped`; notices the cap holds and notices the
+queue refused share this one hold limit, Owner decision 2026-10-29); (b) a
+fifth closed ratio alert of a source drops the oldest (`dropped`, same log);
+and (c) inside one flapping period PR #335 (at most two) takes precedence
+over Issue #349, so
 another flapping episode of that period is not sent once the period's
 continuous notification went out (`suppressed`,
 `camera_offline_notification_suppressed`). See SPECIFICATION §9 for the full rules and the known limits.

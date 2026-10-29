@@ -35,8 +35,8 @@ the next drain is still notified once. If the source goes offline again
 before that drain after a recovery shorter than ``after_seconds``, the
 recovery is folded into it (still owed, the count is not restarted); after a
 longer recovery the new outage is its own episode and the old one stays owed
-under its own time and ID. While the cap (or, as a design extension not
-yet confirmed by the Owner, the queue) holds them, a source keeps two such
+under its own time and ID. While the cap or the queue holds them (one
+shared hold limit, Owner decision 2026-10-29), a source keeps two such
 held episodes; a third outage drops the oldest only
 once it lasted ``after_seconds`` (Owner decision 2026-10-26 (a); a shorter
 one drops nothing), so at most three episodes are kept per source. A recovery is recorded in the episode
@@ -205,7 +205,8 @@ DEFAULT_FLAPPING_OFFLINE = CAMERA_FLAPPING_OFFLINE_SECONDS
 # Refused ratio alerts whose period closed, kept per source while they wait
 # (``late_flaps``). Each needs a flapping period and a whole quiet window
 # under a refusing queue; beyond this the oldest is dropped (counted and
-# logged as ``camera_offline_notification_dropped``).
+# logged as ``camera_offline_notification_dropped``; Owner decision
+# 2026-10-26 (b)).
 LATE_FLAPS_PER_SOURCE = 4
 # Who opened a source's alerted period.
 _BY_CONTINUOUS = "continuous"
@@ -594,9 +595,8 @@ class CameraOfflineMonitor:
 
         Owner decision 2026-10-26 (a): while the cap holds a source's
         notices, a third outage of at least ``after_seconds`` drops the
-        oldest unsent one. A shorter third outage drops nothing. The same
-        bound for notices the queue refused keeps memory bounded (a design
-        extension, not yet confirmed by the Owner). A
+        oldest unsent one. A shorter third outage drops nothing. Notices the
+        queue refused share the same bound (Owner decision 2026-10-29). A
         flapping episode its open period will not send (the period's
         continuous notification went out) is not a third notice. Called with
         the lock held.

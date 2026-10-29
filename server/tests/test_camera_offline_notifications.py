@@ -502,6 +502,57 @@ class OwedEpisodeTests(MonitorFixture, unittest.TestCase):
         self.assertEqual([RECOVERED] * 2, self.texts())
         self.assertEqual((0, 1), (monitor.dropped, monitor.suppressed))
 
+    def refused_outages(self, monitor, refusing, source, count):
+        # ``count`` outages of the threshold, each followed by a long online,
+        # while the queue refuses them (the cap is open: hourly_limit=4).
+        for _ in range(count):
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+            self.advance(330)
+            monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+            monitor.health_sink(event(source, CameraState.ONLINE))
+            self.advance(330)
+            monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+
+    def test_queue_refused_notices_share_the_per_source_hold_limit(self):
+        # Owner decision 2026-10-29: notices the queue refused are held under
+        # the same per-source limit as notices the cap held (latest + one
+        # owed). A short third outage drops nothing; a third outage of the
+        # threshold drops the oldest (counted, logged once) and the other two
+        # are sent once the queue takes them.
+        monitor = self.monitor()
+        self.online(monitor)
+        refusing = Refusing(self.service)
+        source = self.sources[0]
+        state = monitor._sources[source]
+        self.refused_outages(monitor, refusing, source, 2)
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(10)
+        monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+        monitor.health_sink(event(source, CameraState.ONLINE))
+        monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+        self.assertEqual(([], 0), (self.sent(), monitor.dropped))
+        self.assertEqual(2, sum(item is not None for item in (state.older, state.owed)))
+        self.advance(330)
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(200)
+        monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+        self.assertEqual(0, monitor.dropped)
+        with self.assertLogs("app.monitoring.cameras", level="WARNING") as logs:
+            self.advance(130)
+            monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+        self.assertEqual(1, sum(line.endswith(Event.CAMERA_OFFLINE_NOTIFICATION_DROPPED.value)
+                                for line in logs.output))
+        kept = [item for item in (state.older, state.owed, state.episode) if item is not None]
+        self.assertEqual(([], 2, 1), (self.sent(), len(kept), monitor.dropped))
+        refusing.accept = True
+        monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+        self.assertEqual(sorted([ALERT, RECOVERED]), sorted(self.texts()))
+        self.assertEqual(2, len({row.event_id for row in self.sent()}))
+        self.online(monitor, source)
+        self.advance(3600)
+        monitor.drain(refusing, at=AT, monotonic=self.clock.value)
+        self.assertEqual((2, 1), (len(self.texts()), monitor.dropped))
+
     def test_owed_episodes_still_obey_the_cap(self):
         monitor = self.monitor(hourly_limit=1)
         self.online(monitor)
