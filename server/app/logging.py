@@ -89,6 +89,9 @@ class Event(StrEnum):
     UNRECORDED_CRITICAL_ALERTS_UNSENT = "unrecorded_critical_alerts_unsent"
     CAMERA_OFFLINE_NOTIFICATION_RATE_LIMITED = "camera_offline_notification_rate_limited"
     CAMERA_OFFLINE_NOTIFICATION_DROPPED = "camera_offline_notification_dropped"
+    # PR #335: a later flapping episode of a ratio period that already had
+    # its one continuous notification, settled without a notice.
+    CAMERA_OFFLINE_NOTIFICATION_SUPPRESSED = "camera_offline_notification_suppressed"
     # PR #339: pending rows beyond the hourly limit left out of the restart resend.
     CAMERA_OFFLINE_NOTIFICATION_UNRESTORED = "camera_offline_notification_unrestored"
     CAMERA_OFFLINE_NOTIFICATIONS_UNSETTLED = "camera_offline_notifications_unsettled"
