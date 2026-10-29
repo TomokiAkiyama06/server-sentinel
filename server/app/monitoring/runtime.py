@@ -322,7 +322,9 @@ class MonitoringRuntime:
         self._unclean_at: datetime | None = None
         self._unclean_dropped = False
         # Owner decision 2026-10-29: unclean exits this process found beyond
-        # the hourly cap and did not notify (0 or 1; value-free).
+        # the hourly cap and did not notify (0 or 1; value-free). Per process
+        # only and in no status or daily summary: the journal line
+        # `unclean_exit_notification_dropped` is the record (PR #366 review).
         self.unclean_exit_notices_dropped = 0
         self._pending_health_resent = False
         self.notifications: NotificationService | None = None
@@ -793,9 +795,14 @@ class MonitoringRuntime:
         submitted, so a crash in between keeps it counted and the next start
         sends that same notice without taking a second slot. An unclean exit
         found while the hour is full is not notified: one value-free
-        `unclean_exit_notification_dropped` line and the
-        `unclean_exit_notices_dropped` counter, then the marker is replaced
-        as usual (a refusal it lost is not notified; the text is fixed).
+        `unclean_exit_notification_dropped` line (the record of the drop;
+        `unclean_exit_notices_dropped` is only this process's 0/1 value and
+        is reported nowhere), then the marker is replaced as usual (a
+        refusal it lost is not notified; the text is fixed). The resends of
+        `_resend_pending_health_failures` are not counted, so with a Slack
+        too slow to store any outcome before the next crash a crash loop
+        posts the same text at worst 2 * `UNCLEAN_EXIT_HOURLY_LIMIT` (8)
+        times an hour.
         """
         if self._run_marked:
             return

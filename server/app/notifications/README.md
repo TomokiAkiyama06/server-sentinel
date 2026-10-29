@@ -91,6 +91,7 @@ resubmits some `pending` rows at its next start under their own IDs, e.g.
 `recording_health_failure` within a day of its event and at most once per
 row, Issue #351; a notice lost by a crash in the middle of that resend is an
 accepted loss, and unclean-exit notices are capped at 4 per rolling hour,
+their resends not counted, so at worst 8 posts an hour with a slow Slack,
 Owner decision 2026-10-29; see
 `../monitoring/README.md`.) No worker thread touches
 SQLite, calls the local sink or logs transport exceptions.

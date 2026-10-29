@@ -230,8 +230,11 @@ Runtime-data assumptions:
   one conservative `recording_health_failure` for every such unclean exit,
   whether or not a refusal was actually lost (Owner decision 2026-10-26), at
   most 4 per rolling hour counted from the database (Owner decision
-  2026-10-29): a refusal lost in a crash beyond that cap is not notified
-  (`unclean_exit_notification_dropped` in the journal), and a notice lost by a
+  2026-10-29; the resend of a notice whose outcome was not stored is not
+  counted, so with a slow Slack at worst 8 posts of the same text an hour): a
+  refusal lost in a crash beyond that cap is not notified
+  (`unclean_exit_notification_dropped` in the journal only; not in the daily
+  summary), and a notice lost by a
   crash in the middle of the startup resend is an accepted loss (same
   decision).
   Residual: a crash before that process's marker was written (its write

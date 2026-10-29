@@ -1904,14 +1904,18 @@ or more from now are pruned on the next insert. A notice's row is written
 before it is submitted, so a start that crashed in between leaves its slot
 taken and the next start sends that same notice without taking another. An
 unclean exit found while the hour is full is not notified: the start logs the
-value-free `unclean_exit_notification_dropped`, counts it in the runtime's
-`unclean_exit_notices_dropped` and replaces the marker as usual. A refusal
+value-free `unclean_exit_notification_dropped` and replaces the marker as
+usual. That journal line is the record of the drop: the runtime's
+`unclean_exit_notices_dropped` is a per-process value (0 or 1, lost with the
+process) and appears in no status, diagnostics or daily summary. A refusal
 lost in such a crash beyond the cap is therefore not notified; the notice text
 is fixed, so within the hour it would only repeat one already sent. The resend
 of `pending` rows above is neither counted against nor held back by the cap
 (it is bounded by its own limits: each row once, at most 4 per start, within
 24 h), so a crash loop sends at most 4 new notices an hour plus at most one
-resend of each notice whose outcome was never stored. A process that
+resend of each notice whose outcome was never stored: while Slack stays too
+slow for any outcome to be stored before the next crash, the worst case is 8
+posts of the same text an hour (4 new notices plus one resend of each). A process that
 never reached `running` writes no marker (nothing was admitted). A graceful
 stop whose marker delete is refused (storage refused at the stop, already
 alerted by its final sample) or whose final sample failed leaves the marker,

@@ -319,8 +319,11 @@ once this way, at most 4 per rolling hour (Owner decision 2026-10-29; the
 hour is counted from the database, so restarts do not reset it): a crash loop
 sends one per crash that had reached `running` up to that cap, plus at most
 one resend of each earlier notice whose delivery outcome was not stored before
-the crash (the resend is not counted against the cap). A crash beyond the cap
-is not notified (journal: `unclean_exit_notification_dropped`), so a refusal
+the crash (the resend is not counted against the cap; with a Slack too slow
+to store any outcome before the next crash, at worst 8 posts of the same text
+an hour: 4 new notices plus one resend of each). A crash beyond the cap
+is not notified (journal: `unclean_exit_notification_dropped`, the only
+record of the drop; it is not in the daily summary), so a refusal
 lost in it is not notified either; check the journal when the notices stop
 during a crash loop. A graceful
 `systemctl restart` sends none. While the marker cannot be written the daily

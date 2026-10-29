@@ -104,8 +104,9 @@ cannot reset the hour: a row counts while `abs(now - at)` is under an hour
 insert. The row is written before the notice is submitted, so a crash in
 between keeps the slot and the next start sends that notice under the stored
 time without a second slot. Beyond the cap nothing is notified:
-`unclean_exit_notification_dropped` is logged (value-free),
-`unclean_exit_notices_dropped` counts it, and the marker is replaced as usual;
+`unclean_exit_notification_dropped` is logged (value-free; the journal line
+is the record, since `unclean_exit_notices_dropped` is a per-process 0/1 value
+shown in no status or daily summary), and the marker is replaced as usual;
 a refusal lost in such a crash is not notified (the text is fixed). The
 recording-health verdict is left to the startup self-test. It
 then submits each `recording_health_failure` row an earlier process left
@@ -116,7 +117,9 @@ has in flight and rows already resent once (`notification_events.resent`,
 set before the resubmission, so a crash loop resends each row at most once);
 the rest stay `pending` (`recording_health_failure_unrestored` with a count).
 These resends are not counted against the unclean-exit cap and are not held
-back by it. A notice lost because the process crashes again in the middle of
+back by it, so with a Slack too slow to store any outcome before the next
+crash a crash loop posts the same text at worst 8 times an hour (4 notices
+plus one resend of each; `CrashLoopTests`). A notice lost because the process crashes again in the middle of
 this resend (its row already marked `resent`) is an accepted loss (Owner
 decision 2026-10-29).
 Each of the two is its own guarded step, retried by the tick after

@@ -405,16 +405,21 @@ class CrashLoopTests(RefusalFixture):
             return record(service, kind, **values)
         per_start = []
         with patch.object(NotificationService, "record", spy):
-            for _ in range(6):
+            for _ in range(8):
                 before = len(submitted)
                 await self.crash_soon(0.2)
                 per_start.append(len(submitted) - before)
         # The 6th start finds a 5th crash within the hour: no notice of its
         # own (Owner decision 2026-10-29), only the once-per-row resend of
-        # the 5th start's notice, which the cap does not hold back.
-        self.assertEqual([0, 1, 2, 2, 2, 1], per_start)
+        # the 5th start's notice, which the cap does not hold back; later
+        # starts within the hour submit nothing.
+        self.assertEqual([0, 1, 2, 2, 2, 1, 0, 0], per_start)
         self.assertEqual(UNCLEAN_EXIT_HOURLY_LIMIT, len(set(submitted)))
         self.assertLessEqual(max(submitted.count(event_id) for event_id in submitted), 2)
+        # PR #366 review 提案 1: the worst case with a Slack that never
+        # answers in time is 8 posts of the same text an hour (4 notices
+        # plus one resend of each).
+        self.assertEqual(2 * UNCLEAN_EXIT_HOURLY_LIMIT, len(submitted))
 
 
 class UncleanExitHourlyCapTests(RefusalFixture):
