@@ -314,12 +314,14 @@ class MonitoringRuntime:
         self._settle_spent = 0.0
         self._settle_unfinished = False
         # Issues #351/#347: this process's random running-marker token, whether
-        # the marker is written, the time of the unclean-exit notice for the
-        # previous process (kept so a retry resubmits the identical event) and
-        # whether the pending recording-health failures were resent.
+        # the marker is written, whether the unclean exit of the previous
+        # process was logged and whether the pending recording-health
+        # failures were resent. The notice's time is the time its slot of the
+        # hourly cap was taken (stored, so a retry or a later start resubmits
+        # the identical event; Codex PR #366 P2).
         self._run_token = str(uuid4())
         self._run_marked = False
-        self._unclean_at: datetime | None = None
+        self._unclean_logged = False
         self._unclean_dropped = False
         # Owner decision 2026-10-29: unclean exits this process found beyond
         # the hourly cap and did not notify (0 or 1; value-free). Per process
@@ -327,6 +329,9 @@ class MonitoringRuntime:
         # `unclean_exit_notification_dropped` is the record (PR #366 review).
         self.unclean_exit_notices_dropped = 0
         self._pending_health_resent = False
+        # Codex PR #366 P2: the rows this start selected for the resend, kept
+        # across queue-capacity retries so the per-start limit holds.
+        self._pending_health_batch: list[tuple[UUID, datetime]] | None = None
         self.notifications: NotificationService | None = None
         self.notification_events: NotificationEventStore | None = None
         self.recordings: RecordingStore | None = None
@@ -720,10 +725,30 @@ class MonitoringRuntime:
         raised while storage was refused, persisted once storage recovered)
         is not submitted twice. Done once the rows were submitted; a full
         queue leaves them for a later tick instead of turning them into a
-        final `failed`.
+        final `failed`. The rows are selected once per process and that
+        batch is kept across those retries (Codex PR #366 P2): a retry
+        submits what is left of it and never selects a new batch, so a start
+        resends at most `PENDING_HEALTH_RESEND_LIMIT` rows however often the
+        queue was full.
         """
         if self._pending_health_resent:
             return
+        if self._pending_health_batch is None:
+            self._pending_health_batch = self._select_pending_health_failures()
+        notifications = self.notifications
+        batch = self._pending_health_batch
+        while batch:
+            event_id, at = batch[0]
+            if not notifications.can_accept(event_id):
+                raise RecordingError("NOTIFICATION_QUEUE_FULL")
+            if self.notification_events.mark_resent(event_id):
+                notifications.record(NotificationKind.RECORDING_HEALTH_FAILURE, at=at,
+                                     event_id=event_id)
+            batch.pop(0)
+        self._pending_health_resent = True
+
+    def _select_pending_health_failures(self) -> list[tuple[UUID, datetime]]:
+        """This start's resend batch; the rows left out are logged once."""
         now = self.dependencies.utcnow()
         horizon = timedelta(seconds=PENDING_HEALTH_RESEND_SECONDS)
         cursor = self._connection.execute(
@@ -751,17 +776,11 @@ class MonitoringRuntime:
         found = [row for row in found
                  if not notifications.in_flight(row[0]) and not notifications.retained(row[0])]
         found.sort(key=lambda row: abs(now - row[1]))
-        for event_id, at in found[:PENDING_HEALTH_RESEND_LIMIT]:
-            if not notifications.can_accept(event_id):
-                raise RecordingError("NOTIFICATION_QUEUE_FULL")
-            if self.notification_events.mark_resent(event_id):
-                notifications.record(NotificationKind.RECORDING_HEALTH_FAILURE, at=at,
-                                     event_id=event_id)
         unrestored = older + max(0, len(found) - PENDING_HEALTH_RESEND_LIMIT)
         if unrestored:
             logging.getLogger(__name__).warning(Event.RECORDING_HEALTH_FAILURE_UNRESTORED,
                                                 extra={"count": min(unrestored, 1_000_000)})
-        self._pending_health_resent = True
+        return found[:PENDING_HEALTH_RESEND_LIMIT]
 
     def _mark_running(self) -> None:
         """Write this run's marker; notify once when the last run was unclean.
@@ -812,13 +831,12 @@ class MonitoringRuntime:
         if previous is not None and previous != self._run_token:
             event_id = uuid5(EVENT_NAMESPACE, f"recording-unclean-exit:{previous}")
             if self.notification_events.get(event_id) is None:
-                if self._unclean_at is None:
-                    self._unclean_at = self.dependencies.utcnow()
+                if not self._unclean_logged:
+                    self._unclean_logged = True
                     logging.getLogger(__name__).error(Event.MONITORING_PREVIOUS_RUN_UNCLEAN)
+                # Taken by this process or a start that crashed before
+                # submitting it: sent under that time without a second slot.
                 taken = self.run_marker.notice_time(event_id)
-                if taken is not None:
-                    # Taken by a start that crashed before submitting it.
-                    self._unclean_at = taken
                 if taken is None and not self._unclean_dropped and self.run_marker.notices_within(
                         self.dependencies.utcnow(),
                         timedelta(seconds=UNCLEAN_EXIT_WINDOW_SECONDS)) >= UNCLEAN_EXIT_HOURLY_LIMIT:
@@ -829,11 +847,15 @@ class MonitoringRuntime:
                     if not self.notifications.can_accept(event_id):
                         raise RecordingError("NOTIFICATION_QUEUE_FULL")
                     if taken is None:
+                        # The slot is stamped when it is taken, not when the
+                        # exit was first found: a queue full for longer than
+                        # the hour must not insert an already expired row
+                        # (Codex PR #366 P2). The notice carries that time.
+                        taken = self.dependencies.utcnow()
                         self.run_marker.take_notice(
-                            event_id, self._unclean_at,
-                            keep=timedelta(seconds=UNCLEAN_EXIT_KEEP_SECONDS))
+                            event_id, taken, keep=timedelta(seconds=UNCLEAN_EXIT_KEEP_SECONDS))
                     self.notifications.record(NotificationKind.RECORDING_HEALTH_FAILURE,
-                                              at=self._unclean_at, event_id=event_id)
+                                              at=taken, event_id=event_id)
                     if self.notification_events.get(event_id) is None:
                         raise RecordingError("UNCLEAN_EXIT_NOT_PERSISTED")
         self.run_marker.mark(self._run_token)

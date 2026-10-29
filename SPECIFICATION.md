@@ -1872,9 +1872,10 @@ worker gets to it within that wait (behind a stalled or backlogged delivery,
 or with no wait left, it may not be sent by that process). A
 `recording_health_failure` row an earlier process left `pending` is submitted
 again by the next start under its stored ID and time when its event time is
-less than 24 h from now in either direction (nearest first, at most 4; the
-rest stay `pending` and `recording_health_failure_unrestored` logs their
-count), like the stale device-number notice and camera offline; if the earlier
+less than 24 h from now in either direction (nearest first, at most 4 per
+start: the batch is selected once and kept across retries after a full queue,
+so a retry never selects a new one; the rest stay `pending` and
+`recording_health_failure_unrestored` logs their count), like the stale device-number notice and camera offline; if the earlier
 POST reached Slack the Owner sees it twice (Issue #351). Each row is resent at
 most once (`notification_events.resent`, set before the resubmission), so a
 crash loop never resends the same row at every start; a row whose resend was
@@ -1901,8 +1902,11 @@ cannot reset it: a row counts while its time is less than one hour from now in
 either direction (as the 24 h resend window; a row exactly one hour old or one
 hour or more ahead after the clock moved back does not count), and rows a day
 or more from now are pruned on the next insert. A notice's row is written
-before it is submitted, so a start that crashed in between leaves its slot
-taken and the next start sends that same notice without taking another. An
+before it is submitted and stamped with the time the slot is taken, which is
+also the notice's event time (not the time the exit was first found: a notice
+held back by a full queue for longer than an hour must not take an already
+expired slot); a start that crashed in between leaves its slot taken and the
+next start sends that same notice under that time without taking another. An
 unclean exit found while the hour is full is not notified: the start logs the
 value-free `unclean_exit_notification_dropped` and replaces the marker as
 usual. That journal line is the record of the drop: the runtime's

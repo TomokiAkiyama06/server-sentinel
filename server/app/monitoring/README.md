@@ -101,9 +101,11 @@ such notices per rolling hour, counted from `monitoring_unclean_exit_notices`
 (migration 27; event ID and time only) rather than memory, so a crash loop
 cannot reset the hour: a row counts while `abs(now - at)` is under an hour
 (as the 24 h resend window), and rows a day or more away are pruned on the next
-insert. The row is written before the notice is submitted, so a crash in
-between keeps the slot and the next start sends that notice under the stored
-time without a second slot. Beyond the cap nothing is notified:
+insert. The row is written before the notice is submitted and stamped with
+the time the slot is taken, also the notice's event time (a queue full for
+longer than the hour never inserts an expired slot), so a crash in between
+keeps the slot and the next start sends that notice under the stored time
+without a second slot. Beyond the cap nothing is notified:
 `unclean_exit_notification_dropped` is logged (value-free; the journal line
 is the record, since `unclean_exit_notices_dropped` is a per-process 0/1 value
 shown in no status or daily summary), and the marker is replaced as usual;
@@ -112,7 +114,8 @@ recording-health verdict is left to the startup self-test. It
 then submits each `recording_health_failure` row an earlier process left
 `pending` again under its ID and time, when its event time is less than
 `PENDING_HEALTH_RESEND_SECONDS` (24 h) from now in either direction, nearest
-first, at most `PENDING_HEALTH_RESEND_LIMIT` (4), skipping rows this process
+first, at most `PENDING_HEALTH_RESEND_LIMIT` (4) per start (the batch is
+selected once per process and kept across full-queue retries), skipping rows this process
 has in flight and rows already resent once (`notification_events.resent`,
 set before the resubmission, so a crash loop resends each row at most once);
 the rest stay `pending` (`recording_health_failure_unrestored` with a count).

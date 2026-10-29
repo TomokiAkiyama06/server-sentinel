@@ -547,6 +547,41 @@ class UncleanExitHourlyCapTests(RefusalFixture):
         self.assertEqual([(pending, at, "sent")], self.stored_alerts())
         self.assertEqual(4, len(self.notices()))
 
+    async def test_a_queue_full_for_over_an_hour_stamps_the_slot_when_taken(self):
+        # Codex PR #366 P2: the exit is found while the queue is full and the
+        # queue recovers more than an hour later. The slot (and the notice)
+        # carry the recovery time, so the hour after it still holds only
+        # 4 new notices; stamped with the first refused attempt the row
+        # would already have expired and a fifth would go out.
+        await self.run_once()
+        self.seed()
+        full = patch.object(NotificationService, "can_accept", return_value=False)
+        application = self.application()
+        full.start()
+        try:
+            async with application.router.lifespan_context(application):
+                runtime = application.state.monitoring
+                await self.settle(runtime)
+                self.assertEqual([], self.alerts())
+                self.assertEqual([], self.notices())
+                full.stop()
+                self.clock.advance(timedelta(minutes=61))
+                await runtime.call(runtime.tick)
+                await self.settle(runtime)
+                now = self.clock.utcnow().isoformat()
+                self.assertEqual([ALERT], self.alerts())
+                self.assertEqual([now], [at for _event_id, at in self.notices()])
+                self.assertEqual([now], [at for _event_id, at, _ in self.stored_alerts()])
+                crash(runtime)
+        finally:
+            with contextlib.suppress(RuntimeError):
+                full.stop()
+        self.clock.advance(timedelta(minutes=5))
+        for _ in range(4):
+            await self.run_once(crashed=True)
+        self.assertEqual(UNCLEAN_EXIT_HOURLY_LIMIT, len(self.alerts()))
+        self.assertEqual(UNCLEAN_EXIT_HOURLY_LIMIT, len(self.notices()))
+
     async def test_without_slack_the_cap_still_limits_the_local_rows(self):
         self.slack = False
         await self.run_once()
@@ -662,6 +697,46 @@ class PendingHealthFailureResendTests(RefusalFixture):
                 "WHERE kind='recording_health_failure'").fetchall())
         self.assertEqual(["sent"] * PENDING_HEALTH_RESEND_LIMIT, [outcome[i] for i in recent])
         self.assertEqual("pending", outcome[future])
+
+    async def test_queue_capacity_retries_keep_the_per_start_limit(self):
+        # Codex PR #366 P2: six recent pending rows and a queue with room for
+        # one resend per attempt. Each refused attempt is retried by a later
+        # tick, which continues this start's batch of 4 instead of selecting
+        # a new one, so the start resends 4 rows, not 6.
+        await self.run_once()
+        now = self.clock.utcnow()
+        rows = [str(uuid4()) for _ in range(6)]
+        for index, event_id in enumerate(rows):
+            self.sql("INSERT INTO notification_events(event_id,kind,at,confirmed,delivery) "
+                     "VALUES (?, 'recording_health_failure', ?, 0, 'pending')",
+                     (event_id, (now - timedelta(minutes=index + 1)).isoformat()))
+        original = NotificationService.can_accept
+        room = [1]
+
+        def one_at_a_time(service, event_id):
+            if str(event_id) in rows:
+                if room[0] <= 0:
+                    return False
+                room[0] -= 1
+            return original(service, event_id)
+        application = self.application()
+        with patch.object(NotificationService, "can_accept", one_at_a_time):
+            async with application.router.lifespan_context(application):
+                runtime = application.state.monitoring
+                await self.settle(runtime)
+                for _ in range(6):
+                    room[0] = 1
+                    self.clock.advance(timedelta(minutes=20))
+                    await runtime.call(runtime.tick)
+                    await self.settle(runtime)
+        self.assertEqual(PENDING_HEALTH_RESEND_LIMIT, len(self.alerts()))
+        with contextlib.closing(sqlite3.connect(self.settings.database_path)) as db:
+            outcome = dict(db.execute(
+                "SELECT event_id, delivery FROM notification_events "
+                "WHERE kind='recording_health_failure'").fetchall())
+        self.assertEqual(["sent"] * PENDING_HEALTH_RESEND_LIMIT
+                         + ["pending"] * (len(rows) - PENDING_HEALTH_RESEND_LIMIT),
+                         [outcome[event_id] for event_id in rows])
 
     async def test_without_slack_a_pending_row_becomes_disabled(self):
         await self.raise_one_alert()
