@@ -90,12 +90,13 @@ not_applicable は `unmeasured`）。2026-10-26 の記録を再集計すると�
 - ハーネスと PoC の実行手順は sudo / root / `tc` / firewall 変更 / Tailscale 設定変更をしない（上の
   firewall 許可規則は Owner が PoC の前後に別途 root で追加・削除する）。Main から capture host へ
   SSH しない（`schedule` も host 間通信をしない）。
-- 1 日の合計実行は **3 時間まで**（scenario 長の合計 + 起動・停止の余裕。`timeout` は暴走時の
-  上限）。soak は下の「soak の上限」の通り、上限値の 1 run 45 分で数える。
+- 1 日の合計実行時間の上限は無い（Owner 決定 2026-10-29 で 3 時間上限を撤廃）。暴走の歯止めは
+  process ごとの `CPUQuota` / `MemoryMax` / `timeout` で、これは変わらない。
 - `--materials` / `--state` / `--out` / holder の state・socket は repository の外の 0700 directory
   （ハーネスは repository 内の path を拒否）。
 - 実カメラ frame は holder → sender の unix socket（0700 directory 内）経由で memory 上のみ。
-  映像を見る・保存する操作はしない。実在人物が映る場合は撮影範囲に人がいない時間に行う。
+  映像を見る・保存する操作はしない。撮影範囲に研究室の関係者が映ってもよい（Owner 決定
+  2026-10-29。全員が試験を承知している）。frame は保存しないため、関係者以外が映る場所では行わない。
 - 緊急停止（kill switch）: 両 host で `systemctl --user stop 'ss-poc15-*'`（`schedule` を
   `ss-poc15-schedule` scope で動かしていれば scheduler 自身も止まり、以後の slot は起動しない）。
   `timeout -k` は二重の上限です。
@@ -291,18 +292,16 @@ bind を妨げないよう slot ごとに別 directory にし、空になった 
 - 既存の記録を上書きしない: 時刻表のどれかの run id の `--out/<RUN_ID>` または
   `holder-<RUN_ID>.jsonl` が既にあれば起動しない（同じ `--start` の再実行は記録が追記されて
   integrity `fail` になるため、新しい `--start` を選ぶ）。
-- 1 日 3 時間上限: 時刻表の合計（最後の slot の終わりまで）が 3 時間を超える schedule は拒否します
-  （既定 matrix は 1 候補 1 時間 3 分 30 秒、2 候補 2 時間 7 分、3 候補 3 時間 10 分 30 秒で拒否）。
-  scheduler が数えるのは自分の時刻表だけなので、同じ日の手動 run（`auth_revoked_live` など）も
-  合わせて 3 時間以内に収める。
+- 時刻表の合計時間の上限は無い（既定 matrix は 1 候補 1 時間 3 分 30 秒、2 候補 2 時間 7 分、
+  3 候補 3 時間 10 分 30 秒）。`--start` は 24 時間先までです。
 
-日程の分け方（例）:
+日程の分け方（例。1 日にまとめてもよい）:
 
 | 日 | 内容 | 合計 |
 | --- | --- | --- |
 | 1 日目 | `schedule --candidates a_framed,b_chunked` | 2 時間 7 分 |
 | 2 日目 | `schedule --candidates b_segment` + 3 候補の `auth_revoked_live`（候補ごとに新しい `revoked_live` bundle で手動実行） | 約 1 時間 20 分 |
-| 別の日 | soak: `schedule --candidates a_framed,b_chunked,b_segment --scenarios soak` | 1 時間 34 分 30 秒 |
+| 3 日目 | soak: `schedule --candidates a_framed,b_chunked,b_segment --scenarios soak` | 1 時間 34 分 30 秒 |
 
 `auth_revoked_live` は実行のたびに `revoked_live` の bundle を作り直す必要があるため（Step 1）、
 `schedule` は指定を拒否します。上の手動 2 host 手順で 1 run ずつ実行してください。
@@ -352,14 +351,12 @@ soak（1800 s）には短すぎて途中で kill され、integrity `fail` に�
 - holder（実カメラ時）: `timeout -k 30 50m ... holder ... --seconds 2700`（agent より先に
   終わらないように agent の上限より長くする）
 
-3 時間上限には 1 soak run を 45 分（実行は約 31 分、`timeout` 上限の値）で数える。soak 以外の full matrix は
-scenario 長の合計が 1 候補あたり約 36 分だが、2 host では scenario ごとの起動・停止と Main の
-grace を含めて 1 候補あたり約 42 分、3 候補で約 2 時間 7 分かかる。soak 1 run（45 分）を足すと
-約 2 時間 52 分で 3 時間上限に余裕が無いため、**soak は full matrix と別の日に行う**。soak の日は
-1 日最大 3 run（3 × 45 分 = 2 時間 15 分）。
+soak 以外の full matrix は scenario 長の合計が 1 候補あたり約 36 分だが、2 host では scenario ごとの
+起動・停止と Main の grace を含めて 1 候補あたり約 42 分、3 候補で約 2 時間 7 分かかる。soak は
+1 run 約 31 分 30 秒（3 候補で約 1 時間 35 分）。1 日の上限は無いので、full matrix と同じ日に行ってよい。
 `schedule` では各 slot の `timeout` 上限と holder の `--seconds` を scenario 長から自動で決める
 （slot 開始から scenario 長 + 55 s、holder は scenario 長 + 45 s）ので、上の 45 分 / 2700 s の値は
-手動実行用です。schedule の 3 時間上限は時刻表の合計（soak 1 run = 31 分 30 秒）で数えます。
+手動実行用です。
 loopback の `timeout -k 30 90m` も soak を含めない既定の matrix 用で、`--scenarios soak` を
 加えるときは soak 1 run につき 45 分を足す。
 
