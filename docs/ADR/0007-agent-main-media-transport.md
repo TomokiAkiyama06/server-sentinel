@@ -1,10 +1,9 @@
 # ADR-0007: Agent-to-Main media transport selection and continuity contract
 
 Status: Continuity contract accepted (Owner decision, 2026-11-02).
-`a_framed` (TLS 1.3 mTLS framed stream) is the **provisionally** selected
-transport (same decision), based on the real-LAN measurements below; it stays
-provisional until the Owner's raw record review below is complete. It is a
-harness candidate, not a product implementation: no product ingest path uses
+`a_framed` (TLS 1.3 mTLS framed stream) is the selected transport (same
+decision), based on the real-LAN measurements below. The Owner's review covered
+the summary table, not the raw records (see below). It is a harness candidate, not a product implementation: no product ingest path uses
 it yet (#14).
 Owner decision (2026-09-30): the transport is decided only after real-LAN
 measurement with the capture host.
@@ -126,7 +125,7 @@ forbidden by the Issue.
 `server/app/cameras/remote_agent/continuity.py` implements items 1–4 as a
 transport-neutral, listener-free domain object with synthetic tests only.
 
-### Transport selection (provisional, Owner decision 2026-11-02)
+### Transport selection (Owner decision 2026-11-02)
 
 `a_framed`: length-prefixed frames over TLS 1.3 mTLS, stop-and-wait per
 source, 1 s heartbeat, `TCP_NODELAY` set. Measured against `b_chunked` the
@@ -324,7 +323,7 @@ human/admin API boundary (the harness `route_probe` shows only that its own
 receiver serves no human route); real cameras at 2–4 sources; packet loss and
 jitter; glass-to-glass latency.
 
-### Raw record review (required by MANUAL_TEST.md §G before this table is final)
+### Record review (MANUAL_TEST.md §G)
 
 - **Claude, 2026-10-29 and 2026-11-02:** the raw JSONL of all 66 runs on both
   hosts. No broken JSON, missing record or mixed-in run; every process exited
@@ -338,17 +337,16 @@ jitter; glass-to-glass latency.
   for all 3 candidates, as connection attempts time out during the window
   (it also appears 9 times per candidate in `auth_other_ca`, as that scenario
   intends).
-- **Owner, 2026-11-02:** accepted the recommended selection and contract from
-  the results Claude reported in chat. **The Owner has not reviewed the raw
-  JSONL**, so MANUAL_TEST.md §G's review before transcription is incomplete and
-  this table and the selection stay provisional.
+- **Owner, 2026-11-02:** confirmed the summary table of the 60 matrix runs
+  (`summary-1029c`) and the selection. **The Owner did not read the raw JSONL**
+  or the separate summaries of the 3 reruns and 3 `soak` runs, so this is
+  narrower than the all-run raw review MANUAL_TEST.md §G asks for; the Owner
+  confirmed knowing that this scope would be recorded here.
 
 ## Follow-up
 
 - Agent-side envelope sender and `capture_epoch` persistence (#12/#16).
 - Dedicated ingest listener with mTLS (ADR-0006 adapters, #13/#14).
 - Durable consumer for drained gap events (timeline / recording health).
-- Owner raw record review of the 2026-10-29 runs, then confirm or change the
-  selection (#15).
 - Real camera delivery of about 28.8 fps against 30 declared: cause not
   established.

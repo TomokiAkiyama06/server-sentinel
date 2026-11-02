@@ -835,7 +835,7 @@ Required behavior regardless of protocol:
 - no silent loss while reporting healthy.
 
 Transport-independent continuity contract (ADR-0007, accepted 2026-11-02;
-`a_framed` is the provisional transport selection, not yet a product ingest
+`a_framed` is the selected transport, not yet a product ingest
 path). Every media unit carries `(source_id, capture_epoch, sequence,
 capture_time_ns)`: `capture_epoch` is a strictly increasing Agent capture-process
 epoch, `sequence` counts units per source within an epoch and survives transport
