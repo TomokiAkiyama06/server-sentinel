@@ -29,8 +29,8 @@ Fail-closed rules: slots never overlap (each slot waits for its own
 processes); a slot whose start already passed by more than
 ``START_TOLERANCE_S`` (a previous launch overran) stops the whole schedule
 with a non-zero exit, and the other host then simply fails to connect, which
-the records show. A schedule longer than the README's 3 h/day budget is
-refused (split the candidates across days). ``auth_revoked_live`` needs a
+the records show. There is no daily total limit (Owner decision 2026-10-29);
+each slot keeps its own ``timeout`` bound. ``auth_revoked_live`` needs a
 fresh ``revoked_live`` bundle per candidate and stays a manual run. SIGINT /
 SIGTERM stop the current slot's processes and start no further slot. An
 Agent schedule with a real slot first runs the holder's launch trust checks
@@ -59,7 +59,6 @@ HOLDER_EXTRA_S = 45          # holder ``--seconds`` = duration + this (outlives 
 HOLDER_STOP_S = 15           # SIGTERM -> SIGKILL wait for the holder after the Agent exits
 START_TOLERANCE_S = 5        # a slot this late was missed: the schedule stops
 MAX_AHEAD_S = 24 * 3600
-DAILY_BUDGET_S = 3 * 3600    # README: at most 3 h of runs per day
 MANUAL_ONLY = {
     "auth_revoked_live": "auth_revoked_live needs a fresh revoked_live bundle per candidate "
                          "(node-key + issue); run it manually with matrix --role, not in a "
@@ -164,11 +163,6 @@ def validate(slots, now):
         raise SystemExit("--start is in the past")
     if first > now + MAX_AHEAD_S:
         raise SystemExit("--start is more than 24 h ahead")
-    total = slots[-1].end - first
-    if total > DAILY_BUDGET_S:
-        raise SystemExit(f"schedule takes {format_span(total)}, over the 3 h/day budget: "
-                         "split the candidates across days (e.g. --candidates "
-                         "a_framed,b_chunked today, b_segment on another day)")
 
 
 def format_span(seconds):

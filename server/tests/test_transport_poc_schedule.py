@@ -133,7 +133,7 @@ class TimetableTests(unittest.TestCase):
         self.assertGreater(schedule.HOLDER_EXTRA_S, schedule.AGENT_OFFSET_S + 15)
         self.assertLess(schedule.HOLDER_EXTRA_S, schedule.RUN_LIMIT_EXTRA_S)
 
-    def test_past_far_and_over_budget_starts_are_refused(self):
+    def test_past_and_far_starts_are_refused_and_long_schedules_are_not(self):
         slots = schedule.timetable(START, ["a_framed"], ["normal"], False)
         schedule.validate(slots, START)  # exactly now is accepted
         with self.assertRaisesRegex(SystemExit, "past"):
@@ -141,19 +141,12 @@ class TimetableTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "24 h"):
             schedule.validate(slots, START - schedule.MAX_AHEAD_S - 1)
         schedule.validate(slots, START - schedule.MAX_AHEAD_S)
-        three = schedule.timetable(START, ["a_framed", "b_chunked", "b_segment"],
-                                   schedule.DEFAULT_SCENARIOS, False)
-        with self.assertRaisesRegex(SystemExit, "3 h/day budget"):
-            schedule.validate(three, NOW)
-        schedule.validate(three[:38], NOW)  # two candidates fit
-        # exactly at the budget passes; one second more does not
-        soak = schedule.timetable(START, ["a_framed"], ["soak"], False)
-        self.assertLessEqual(soak[0].end - soak[0].start, schedule.DAILY_BUDGET_S)
-        with mock.patch.object(schedule, "DAILY_BUDGET_S", soak[0].end - soak[0].start):
-            schedule.validate(soak, NOW)
-        with mock.patch.object(schedule, "DAILY_BUDGET_S", soak[0].end - soak[0].start - 1):
-            with self.assertRaises(SystemExit):
-                schedule.validate(soak, NOW)
+        # no daily total limit (Owner decision 2026-10-29): the full three-candidate
+        # matrix plus soak (over 3 h) is accepted
+        full = schedule.timetable(START, ["a_framed", "b_chunked", "b_segment"],
+                                  schedule.DEFAULT_SCENARIOS + ["soak"], False)
+        self.assertGreater(full[-1].end - full[0].start, 3 * 3600)
+        schedule.validate(full, NOW)
         with self.assertRaises(SystemExit):
             schedule.validate([], NOW)
 
@@ -502,12 +495,14 @@ class CliTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             for extra, message in ((["--start", "2026-10-20T01:00:00Z"], "past"),
                                    (["--start", "2026-10-21T01:00:00Z", "--scenarios",
-                                     "auth_revoked_live"], "manually"),
-                                   (["--start", "2026-10-21T01:00:00Z", "--candidates",
-                                     "a_framed,b_chunked,b_segment"], "budget")):
+                                     "auth_revoked_live"], "manually")):
                 with self.subTest(message=message):
                     with self.assertRaisesRegex(SystemExit, message):
                         poc15.main(base + extra)
+            # over 3 h is accepted: no daily total limit (Owner decision 2026-10-29)
+            self.assertEqual(0, poc15.main(base + ["--start", "2026-10-21T01:00:00Z",
+                                                   "--candidates",
+                                                   "a_framed,b_chunked,b_segment"]))
 
 
 if __name__ == "__main__":

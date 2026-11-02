@@ -1604,7 +1604,7 @@ attach private addresses, credentials or real footage.
 
 手順は [`scripts/manual/transport_poc/README.md`](scripts/manual/transport_poc/README.md)
 （step 0 の read-only inventory、使い捨て materials、1 scenario ずつの実行、kill switch
-`systemctl --user stop 'ss-poc15-*'`、1 日 3 時間上限、cleanup checklist）。ハーネスの PR
+`systemctl --user stop 'ss-poc15-*'`、cleanup checklist）。ハーネスの PR
 時点の確認は同一 host の loopback・synthetic 入力だけで、以下は**どれも実機では未実施**です。
 2 host の実行は 1 scenario ずつ手動 hand-off でも、`poc15.py schedule`（両 host が同じ `--start` /
 `--candidates` / `--scenarios` / `--real-camera` から同じ時刻表を計算して 1 slot ずつ起動。mock の
@@ -1649,7 +1649,7 @@ Profile / bitrate:
 CPU cap (Main CPUQuota / capture CPUQuota):
 Launch: manual hand-off / schedule (--start, --candidates, --scenarios, --real-camera)
 Run id(s):
-Total run time today (≤ 3 h):
+Total run time today:
 ```
 
 - [ ] step 0 inventory を両 host で取得し、47200–47214 が未使用であることを確認した;
@@ -1664,7 +1664,7 @@ Total run time today (≤ 3 h):
 - [ ] 全 run の summary JSON（`--json`）の run 行で `tcp_nodelay` が `true`（#369。記録の無い run は `unmeasured`）;
 - [ ] 2 host の run では G5 の Main `interrupted`（proxy blackhole）が件数照合（window との時刻対応なし）であることを結果に併記した（Main 側停止・再起動の Agent 検知と再接続は session nonce で対応付け済み）;
 - [ ] 1 / 2 / 3 / 4 source の各構成を候補ごとに実行した（`normal` / `sources_2` / `sources_3` / `capacity_4`、summary の `*_missing_source_counts` が 0）、全 run の `integrity` が `pass`（別実行の記録の混入・子 process の異常終了なし）;
-- [ ] 副次: 30 分 soak（full matrix とは別の日に実行）で予期しない切断 0、overhead ≤ 10 %、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %、latency p95（参考）;
+- [ ] 副次: 30 分 soak で予期しない切断 0、overhead ≤ 10 %、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %、latency p95（参考）;
 - [ ] cleanup checklist を完了（使い捨て CA / ledger / node 鍵 / holder state を削除、`ss-poc15-*` scope なし）;
 - [ ] ADR-0007 へ転記する前に、Claude と Owner が全 run の生 JSONL 記録（各 run directory の
   orchestrator / receiver / sender / proxy と holder の記録。summary だけではない）を確認し、
