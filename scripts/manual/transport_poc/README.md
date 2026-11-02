@@ -3,11 +3,10 @@
 このディレクトリは Issue #15 / ADR-0007 の transport 比較を **同じ決定的 impairment
 matrix と同じ Main 側判定** で測るためのハーネスです。製品ではありません。
 `server/` と `agent/` の package はここを import せず、release artifact にも含めません。
-**本 README の実機手順は測定として一度も完了していません**（PR 時点の確認は loopback の
-synthetic 実行のみ。2026-10-20 に 2 host の smoke 1 run を手動 hand-off で行ったが、同じ run id で
-agent 側を 2 回起動したため integrity `fail` で、測定には数えない。MANUAL_TEST §G 参照）。
-`schedule`（下記）は 2026-10-20 に実機で 1 日目を実行したが、real camera の slot は holder の起動拒否で
-未実行（MANUAL_TEST §G）。holder の信頼検査の preflight は mock でのみ試験済みです。
+**本 README の実機手順は 2026-10-29 に 2 host で 66 run 実行しました**（`f2b6142`、`schedule` と
+`auth_revoked_live` の手動 hand-off。`--dev-checkout-helper` を使用。結果は ADR-0007、記録は
+MANUAL_TEST §G）。それより前の run は測定に数えません。real camera は 1 台だけで、2〜4 source は
+synthetic 入力です。holder の信頼検査の preflight は、正規の配置先の helper に対しては実機で未確認です。
 実機の結果は `MANUAL_TEST.md` §G の記録テンプレートと
 ADR-0007 Validation 表へ記入し、未実施の構成を検証済みと書かないでください。
 
