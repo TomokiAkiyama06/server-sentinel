@@ -262,7 +262,7 @@ routes, and provide the revocable authenticated session required by Issue #13.
 
 ## Transport-neutral continuity core
 
-`continuity.py` sits in front of `ingest.py` and implements the Proposed
+`continuity.py` sits in front of `ingest.py` and implements the accepted
 ADR-0007 contract: Main-assigned session generations for an already
 mTLS-authenticated node, the `(source_id, capture_epoch, sequence,
 capture_time_ns)` media envelope (carried in full on each queued
