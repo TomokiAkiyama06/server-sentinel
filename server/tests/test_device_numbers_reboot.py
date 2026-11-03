@@ -22,6 +22,8 @@ import os
 import sqlite3
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -39,6 +41,7 @@ from app.storage.policy import StorageState
 
 from tests.test_diagnostic_sources import CompositeDiagnosticSource, FakeMonitoring, values
 from tests.test_monitoring_runtime import RECORDING_LIMITS, STORAGE_LIMITS, RuntimeFixture
+from tests.test_storage_notifications import Transport
 
 
 UUID = "00000000-1111-2222-3333-444444444444"
@@ -507,7 +510,7 @@ class RecordingFilesystemTests(unittest.TestCase):
     def test_a_topology_refusal_is_kept_as_one_value_free_flag(self):
         # Codex P1 on PR #344: an admission's refusal must reach the next tick
         # even when the topology is restored before it; repeated refusals are
-        # one flag (bounded), and a UUID/mount refusal does not set it.
+        # one flag (bounded). Issue #347: a UUID/mount refusal sets it too.
         sysfs = FakeSysfs(self)
         disk = sysfs.device(spare_device(self.device, 8, 240), "sdz")
         loop = sysfs.device(spare_device(self.device, 7, 9), "loop9", loop=True)
@@ -515,7 +518,7 @@ class RecordingFilesystemTests(unittest.TestCase):
         filesystem = IdentifiedRecordingFilesystem(
             self.identity(other_numbers(self.device)), self.metadata())
         filesystem.check()
-        self.assertFalse(filesystem.take_topology_refusal())
+        self.assertFalse(filesystem.take_refusal())
         (mapped / "slaves" / disk.name).unlink()
         (mapped / "slaves" / loop.name).symlink_to(loop)
         for _ in range(3):
@@ -524,12 +527,52 @@ class RecordingFilesystemTests(unittest.TestCase):
         (mapped / "slaves" / loop.name).unlink()
         (mapped / "slaves" / disk.name).symlink_to(disk)
         filesystem.check()
-        self.assertIs(True, filesystem.take_topology_refusal())
-        self.assertIs(False, filesystem.take_topology_refusal())
+        self.assertIs(True, filesystem.take_refusal())
+        self.assertIs(False, filesystem.take_refusal())
         self.approved = self.device + 7
         with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
             filesystem.check()
-        self.assertFalse(filesystem.take_topology_refusal())
+        self.assertIs(True, filesystem.take_refusal())
+
+    def test_every_identity_refusal_is_kept_as_one_value_free_flag(self):
+        # Issue #347: a UUID, mount or `st_dev` mismatch, or a replaced root,
+        # seen only by an admission and restored before the next tick, is kept
+        # like the topology refusal (current numbers: no sysfs involved).
+        current = (os.major(self.device), os.minor(self.device))
+        filesystem = IdentifiedRecordingFilesystem(self.identity(current), self.metadata())
+        healthy_identity = filesystem.identity
+        other_mount = Path("/proc")
+        self.assertNotEqual(self.device, other_mount.stat().st_dev)
+
+        def uuid_moved():
+            self.approved = self.device + 7
+
+        def unmounted():
+            self.mounted = False
+
+        def mount_on_another_device():
+            filesystem.identity = replace(healthy_identity, mount_point=other_mount)
+
+        def root_exposed():
+            self.recordings.chmod(0o755)
+
+        def restore():
+            self.approved, self.mounted = self.device, True
+            filesystem.identity = healthy_identity
+            self.recordings.chmod(0o700)
+
+        for change in (uuid_moved, unmounted, mount_on_another_device, root_exposed):
+            with self.subTest(change=change.__name__):
+                filesystem.check()
+                self.assertIs(False, filesystem.take_refusal())
+                change()
+                for _ in range(3):
+                    with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                        filesystem.snapshot()
+                restore()
+                filesystem.check()
+                self.assertIs(True, filesystem.take_refusal())
+                self.assertIs(False, filesystem.take_refusal())
 
     def test_a_raising_topology_judgement_fails_closed(self):
         filesystem = IdentifiedRecordingFilesystem(
@@ -557,6 +600,21 @@ class RecordingFilesystemTests(unittest.TestCase):
                 filesystem.check()
                 filesystem.snapshot()
             walked.assert_not_called()
+
+
+class HeldAlertTransport(Transport):
+    """Mock Slack transport that holds every `recording_health_failure` POST
+    until released (a Slack endpoint that does not answer in time)."""
+
+    def __init__(self):
+        super().__init__()
+        self.release = threading.Event()
+
+    def open(self, request, *, timeout):
+        reply = super().open(request, timeout=timeout)
+        if b"recording_health_failure" in request.data:
+            self.release.wait(30)
+        return reply
 
 
 class StaleDeviceNumbersRuntimeTests(RuntimeFixture):
@@ -818,6 +876,297 @@ class StaleDeviceNumbersRuntimeTests(RuntimeFixture):
             await self.settle(runtime)
             self.assertEqual(2, len(alerts()))
             self.assertEqual(1, len(self.notices()))
+
+    async def test_an_admission_only_refusal_alerts_at_a_graceful_stop(self):
+        # Issue #351: the backing moves onto a loop device only while an
+        # admission runs, is restored, and the service then stops before the
+        # periodic tick. The stop's final storage sample must still raise and
+        # deliver the episode's one alert, since the flag is in memory only.
+        sysfs = FakeSysfs(self)
+        disk = sysfs.device(spare_device(self.device, 8, 240), "sdz")
+        loop = sysfs.device(spare_device(self.device, 7, 9), "loop9", loop=True)
+        mapped = sysfs.device(self.device, "dm-stale", dm=True, slaves=(disk,))
+
+        def alerts():
+            return [text for text in self.slack_texts() if "recording_health_failure" in text]
+
+        def admit():
+            with runtime._policy.control():
+                pass
+
+        def stored():
+            with contextlib.closing(sqlite3.connect(self.settings.database_path)) as db:
+                return (db.execute("SELECT delivery FROM notification_events "
+                                   "WHERE kind='recording_health_failure'").fetchall(),
+                        db.execute("SELECT state, stages FROM recording_health_status").fetchall())
+
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            (mapped / "slaves" / disk.name).unlink()
+            (mapped / "slaves" / loop.name).symlink_to(loop)
+            with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                await runtime.call(admit)
+            (mapped / "slaves" / loop.name).unlink()
+            (mapped / "slaves" / disk.name).symlink_to(disk)
+            self.clock.advance(timedelta(seconds=10))
+            self.assertEqual([], alerts())
+        # Sent and recorded by the stop itself (no tick ran, no settle here).
+        self.assertEqual(["ServerSentinel critical alert: recording_health_failure"], alerts())
+        self.assertEqual(([("sent",)], [("FAILED", '["STORAGE"]')]), stored())
+        self.assertEqual(RuntimeState.STOPPED, runtime.status.state)
+        # The restored backing is healthy: the restart and its own stop send
+        # nothing more, and the stale-numbers notice stays one per boot.
+        self.clock.advance(timedelta(minutes=5))
+        self.assertTrue((await self.run_once()).recording_filesystem_ok)
+        self.assertEqual(1, len(alerts()))
+        self.assertEqual(1, len(self.notices()))
+
+    async def test_a_graceful_stop_within_an_alerted_episode_does_not_alert_again(self):
+        # Issue #351: the final sample follows the tick's episode rule, so a
+        # refusal within an episode a tick already alerted adds nothing.
+        sysfs = FakeSysfs(self)
+        disk = sysfs.device(spare_device(self.device, 8, 240), "sdz")
+        loop = sysfs.device(spare_device(self.device, 7, 9), "loop9", loop=True)
+        mapped = sysfs.device(self.device, "dm-stale", dm=True, slaves=(disk,))
+
+        def alerts():
+            return [text for text in self.slack_texts() if "recording_health_failure" in text]
+
+        def admit():
+            with runtime._policy.control():
+                pass
+
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            (mapped / "slaves" / disk.name).unlink()
+            (mapped / "slaves" / loop.name).symlink_to(loop)
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertEqual(1, len(alerts()))
+            with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                await runtime.call(admit)
+            (mapped / "slaves" / loop.name).unlink()
+            (mapped / "slaves" / disk.name).symlink_to(disk)
+        self.assertEqual(1, len(alerts()))
+        # A healthy start and stop without any refusal sends nothing either.
+        self.clock.advance(timedelta(minutes=5))
+        await self.run_once()
+        self.assertEqual(1, len(alerts()))
+
+    async def test_an_admission_only_refusal_before_a_crash_alerts_at_the_next_start(self):
+        # Issue #351 (Owner decision 2026-10-26, option 2): the backing moves
+        # onto a loop device only while an admission runs, is restored, and
+        # the process is then killed before the tick (no final sample). The
+        # flag is lost with the process, but its running marker remains, so
+        # the next start notifies the Owner once.
+        to_loop, restore = self.dm_on_disk()
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            to_loop()
+            self.assertEqual("STORAGE_HARD_STOP", await self.refuse_once(runtime))
+            restore()
+
+            def killed():
+                # What a SIGKILL leaves: no final sample, no marker delete.
+                runtime.notifications.close()
+                runtime.recordings.close()
+                runtime._connection.close()
+            runtime._close = killed
+        self.assertEqual([], self.alert_texts())
+        self.clock.advance(timedelta(minutes=5))
+        self.assertTrue((await self.run_once()).recording_filesystem_ok)
+        self.assertEqual(["ServerSentinel critical alert: recording_health_failure"],
+                         self.alert_texts())
+        self.assertEqual([("sent",)], self.stored_alerts())
+        # That start stopped gracefully; the stale-numbers notice stays one.
+        self.clock.advance(timedelta(minutes=5))
+        await self.run_once()
+        self.assertEqual(1, len(self.alert_texts()))
+        self.assertEqual(1, len(self.notices()))
+
+    def dm_on_disk(self):
+        """A stale dm device on a hardware disk; returns (to_loop, restore)."""
+        sysfs = FakeSysfs(self)
+        disk = sysfs.device(spare_device(self.device, 8, 240), "sdz")
+        loop = sysfs.device(spare_device(self.device, 7, 9), "loop9", loop=True)
+        mapped = sysfs.device(self.device, "dm-stale", dm=True, slaves=(disk,))
+
+        def to_loop():
+            (mapped / "slaves" / disk.name).unlink()
+            (mapped / "slaves" / loop.name).symlink_to(loop)
+
+        def restore():
+            (mapped / "slaves" / loop.name).unlink()
+            (mapped / "slaves" / disk.name).symlink_to(disk)
+        return to_loop, restore
+
+    def alert_texts(self):
+        return [text for text in self.slack_texts() if "recording_health_failure" in text]
+
+    @staticmethod
+    def spy_settles(runtime):
+        """Record every `settle_notifications` bound (the call still runs)."""
+        waits, settle = [], runtime.settle_notifications
+
+        def spy(timeout_seconds):
+            waits.append(timeout_seconds)
+            return settle(timeout_seconds)
+        runtime.settle_notifications = spy
+        return waits
+
+    @staticmethod
+    async def refuse_once(runtime):
+        def admit():
+            with runtime._policy.control():
+                pass
+        try:
+            await runtime.call(admit)
+        except RecordingError as error:
+            return str(error)
+        return None
+
+    def stored_alerts(self):
+        with contextlib.closing(sqlite3.connect(self.settings.database_path)) as db:
+            return db.execute("SELECT delivery FROM notification_events "
+                              "WHERE kind='recording_health_failure'").fetchall()
+
+    async def test_a_graceful_stop_without_an_alert_does_not_wait(self):
+        # PR #363 review: only an alert raised by the final sample starts a
+        # wait; an ordinary stop never waits on Slack.
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            waits = self.spy_settles(runtime)
+        self.assertEqual([], waits)
+        self.assertEqual([], self.alert_texts())
+        self.assertEqual(RuntimeState.STOPPED, runtime.status.state)
+
+    async def test_an_unanswered_stop_alert_stays_pending_within_the_bound(self):
+        # PR #363 review: Slack does not answer the final sample's alert. The
+        # stop gives up after the bound, logs the unsettled critical delivery,
+        # leaves the row `pending` and still closes everything.
+        self.transport = HeldAlertTransport()
+        self.addCleanup(self.transport.release.set)
+        to_loop, restore = self.dm_on_disk()
+        application = self.application()
+        with patch("app.monitoring.runtime.SHUTDOWN_STORAGE_SETTLE_SECONDS", 0.3):
+            async with application.router.lifespan_context(application):
+                runtime = application.state.monitoring
+                await self.settle(runtime)
+                to_loop()
+                self.assertEqual("STORAGE_HARD_STOP", await self.refuse_once(runtime))
+                restore()
+                waits = self.spy_settles(runtime)
+                started = time.monotonic()
+                with self.assertLogs("app.monitoring.runtime", "ERROR") as logs:
+                    await runtime.stop()
+                elapsed = time.monotonic() - started
+        self.assertEqual([0.3], waits)
+        self.assertLess(elapsed, 10.0)
+        self.assertIn("critical_notifications_unsettled", "\n".join(logs.output))
+        self.assertEqual(["ServerSentinel critical alert: recording_health_failure"],
+                         self.alert_texts())
+        self.assertEqual([("pending",)], self.stored_alerts())
+        self.assertTrue(runtime.notifications.closed)
+        self.assertEqual(RuntimeState.STOPPED, runtime.status.state)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            runtime._connection.execute("SELECT 1")
+
+    async def test_the_stop_wait_only_uses_what_is_left_of_an_earlier_settle(self):
+        # PR #363 review: the final sample's wait shares the shutdown settle
+        # budget (`TimeoutStopSec=90`): after an earlier settle it waits at
+        # most what is left of that bound, and not at all once one ended with
+        # a delivery still pending.
+        to_loop, restore = self.dm_on_disk()
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            self.assertEqual(0, await runtime.call(runtime.settle_notifications, 5.0))
+            to_loop()
+            self.assertEqual("STORAGE_HARD_STOP", await self.refuse_once(runtime))
+            restore()
+            waits = self.spy_settles(runtime)
+        [wait] = waits
+        self.assertLess(wait, 5.0)
+        self.assertGreater(wait, 4.0)
+        self.assertEqual([("sent",)], self.stored_alerts())
+        # An earlier settle that ended unsettled leaves nothing to wait for.
+        self.transport = HeldAlertTransport()
+        self.addCleanup(self.transport.release.set)
+        self.clock.advance(timedelta(minutes=5))
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            to_loop()
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            self.assertNotEqual(0, await runtime.call(runtime.settle_notifications, 0.1))
+            restore()
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            self.assertTrue(runtime.status.recording_filesystem_ok)
+            to_loop()
+            self.assertEqual("STORAGE_HARD_STOP", await self.refuse_once(runtime))
+            restore()
+            waits = self.spy_settles(runtime)
+            with self.assertLogs("app.monitoring.runtime", "ERROR") as logs:
+                await runtime.stop()
+        self.assertEqual([0.0], waits)
+        self.assertIn("critical_notifications_unsettled", "\n".join(logs.output))
+
+    async def test_a_raising_stop_sample_or_settle_still_closes(self):
+        # PR #363 review: a raise in the final sample or in its wait is
+        # logged and never skips closing the service, store and database.
+        to_loop, restore = self.dm_on_disk()
+        for broken in ("_storage_tick", "settle_notifications"):
+            with self.subTest(broken=broken):
+                application = self.application()
+                async with application.router.lifespan_context(application):
+                    runtime = application.state.monitoring
+                    await self.settle(runtime)
+                    to_loop()
+                    self.assertEqual("STORAGE_HARD_STOP", await self.refuse_once(runtime))
+                    restore()
+
+                    def fail(*_args):
+                        raise sqlite3.OperationalError("disk I/O error")
+                    setattr(runtime, broken, fail)
+                    with self.assertLogs("app.monitoring.runtime", "ERROR") as logs:
+                        await runtime.stop()
+                self.assertIn("monitoring_degraded", "\n".join(logs.output))
+                self.assertTrue(runtime.notifications.closed)
+                self.assertEqual(RuntimeState.STOPPED, runtime.status.state)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    runtime._connection.execute("SELECT 1")
+                self.clock.advance(timedelta(minutes=5))
+
+    async def test_a_refusal_lasting_through_the_stop_still_reaches_slack(self):
+        # PR #363 review: the backing is still on loop at the stop. The local
+        # row is refused (hard stop), yet the alert is still sent; the next
+        # start fails closed and alerts once more (one per process).
+        to_loop, restore = self.dm_on_disk()
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            to_loop()
+        self.assertEqual(["ServerSentinel critical alert: recording_health_failure"],
+                         self.alert_texts())
+        self.assertEqual([], self.stored_alerts())
+        self.assertEqual(RuntimeState.STOPPED, runtime.status.state)
+        self.clock.advance(timedelta(minutes=5))
+        self.assertEqual(RuntimeState.FAILED, (await self.run_once()).state)
+        self.assertEqual(2, len(self.alert_texts()))
 
     async def test_renumbered_loop_device_fails_closed_at_runtime(self):
         FakeSysfs(self).node(self.device, "loop")

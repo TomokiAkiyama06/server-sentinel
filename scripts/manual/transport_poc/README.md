@@ -3,11 +3,10 @@
 このディレクトリは Issue #15 / ADR-0007 の transport 比較を **同じ決定的 impairment
 matrix と同じ Main 側判定** で測るためのハーネスです。製品ではありません。
 `server/` と `agent/` の package はここを import せず、release artifact にも含めません。
-**本 README の実機手順は測定として一度も完了していません**（PR 時点の確認は loopback の
-synthetic 実行のみ。2026-10-20 に 2 host の smoke 1 run を手動 hand-off で行ったが、同じ run id で
-agent 側を 2 回起動したため integrity `fail` で、測定には数えない。MANUAL_TEST §G 参照）。
-`schedule`（下記）は 2026-10-20 に実機で 1 日目を実行したが、real camera の slot は holder の起動拒否で
-未実行（MANUAL_TEST §G）。holder の信頼検査の preflight は mock でのみ試験済みです。
+**本 README の実機手順は 2026-10-29 に 2 host で 66 run 実行しました**（`f2b6142`、`schedule` と
+`auth_revoked_live` の手動 hand-off。`--dev-checkout-helper` を使用。結果は ADR-0007、記録は
+MANUAL_TEST §G）。それより前の run は測定に数えません。real camera は 1 台だけで、2〜4 source は
+synthetic 入力です。holder の信頼検査の preflight は、正規の配置先の helper に対しては実機で未確認です。
 実機の結果は `MANUAL_TEST.md` §G の記録テンプレートと
 ADR-0007 Validation 表へ記入し、未実施の構成を検証済みと書かないでください。
 
@@ -58,6 +57,30 @@ receiver は product の bind 検証を通した上で `SO_REUSEADDR` 付きで 
 `open_ingest_listener` には無く、TIME_WAIT 中の Main 再起動で再 bind できないため。product 側の対応は
 Issue #223 で追跡）。
 
+sender（Agent 側の接続）、receiver（accept した接続）、impairment proxy の両側の socket は
+`TCP_NODELAY` を設定します（`wire.disable_nagle`）。sender の `start`、receiver と proxy の `ready` に
+`tcp_nodelay: true` を書き、sender の `connected` と receiver の `session_open` には読み戻した値を
+`tcp_nodelay` として記録します。どの候補も source ごとに ack を待ってから次を送るので、Nagle が
+有効だと unit の末尾の小さな segment が、受信側の delayed ACK（Linux の最小 40 ms）を待つことが
+あります。待つかどうかは unit サイズ、sender の 64 KiB ごとの送信分割、MSS の組み合わせで決まります。
+CPU 制限付き container の loopback A/B（Issue #369、1 source）では、125 KB と 147 KB の unit で
+ほぼ毎回止まり（`a_framed` / `b_chunked` は RTT p50 41 ms で 30 unit/s を送り切れない。`b_segment` は
+run によって一部またはすべての segment が止まり、p50 5〜42 ms・p95 5.7〜44 ms・最大 41〜45 ms）、16 KB では止まらず、
+MSS 1448 では一部の unit だけ（p95 41 ms）、2 source でも p95 33 ms でした。全 socket に設定すると
+p50 0.3 ms（`b_segment` は最大でも約 5.8 ms）・30 unit/s です。loopback では sender と proxy の upstream 側の両方が
+必要でした（loopback は MSS と RTT が実 LAN と異なり、実 LAN での効果は再実測で確認する）。
+2026-10-26 の 2 host 実測（1 source の real run で RTT p50 約 46 ms、約 27 fps、pending が上限）は
+この機構と整合しますが、原因は推定で、LAN では再確認していません。
+
+**`tcp_nodelay: true` が記録されていない run（2026-10-26 以前の run はすべて。real / synthetic、
+source 数を問わない）は判定に使いません。** summarize は、どれか 1 つの記録に `tcp_nodelay: true` が
+無い run の `integrity` を `unmeasured` にし（crash などの `fail` はそのまま）、pass / fail を問わず全 gate を `unmeasured` にします
+（`--json` の各 run 行の `tcp_nodelay`）。候補行の副次指標（`reconnect_p95_ns`、`latency_p95_max_ns`、
+`overhead_max`、`unprotected_gap_units`、`secondary_*`）も、`tcp_nodelay` が true の run だけから計算し、
+除いた run 数を `nodelay_excluded_runs` に出します（除いた run があれば `secondary_*` の pass /
+not_applicable は `unmeasured`）。2026-10-26 の記録を再集計すると、38 run すべてが `unmeasured` に
+なります。製品の ingest / Agent 側（#14）に同じ設定が要ることは ADR-0007 に記載しています。
+
 ## 安全規則
 
 - Main host は production（GPU benchmark が同居）。Main 側は必ず
@@ -66,12 +89,13 @@ Issue #223 で追跡）。
 - ハーネスと PoC の実行手順は sudo / root / `tc` / firewall 変更 / Tailscale 設定変更をしない（上の
   firewall 許可規則は Owner が PoC の前後に別途 root で追加・削除する）。Main から capture host へ
   SSH しない（`schedule` も host 間通信をしない）。
-- 1 日の合計実行は **3 時間まで**（scenario 長の合計 + 起動・停止の余裕。`timeout` は暴走時の
-  上限）。soak は下の「soak の上限」の通り、上限値の 1 run 45 分で数える。
+- 1 日の合計実行時間の上限は無い（Owner 決定 2026-10-29 で 3 時間上限を撤廃）。暴走の歯止めは
+  process ごとの `CPUQuota` / `MemoryMax` / `timeout` で、これは変わらない。
 - `--materials` / `--state` / `--out` / holder の state・socket は repository の外の 0700 directory
   （ハーネスは repository 内の path を拒否）。
 - 実カメラ frame は holder → sender の unix socket（0700 directory 内）経由で memory 上のみ。
-  映像を見る・保存する操作はしない。実在人物が映る場合は撮影範囲に人がいない時間に行う。
+  映像を見る・保存する操作はしない。撮影範囲に研究室の関係者が映ってもよい（Owner 決定
+  2026-10-29。全員が試験を承知している）。関係者以外（来訪者など）が映りうる場所・時間には行わない。
 - 緊急停止（kill switch）: 両 host で `systemctl --user stop 'ss-poc15-*'`（`schedule` を
   `ss-poc15-schedule` scope で動かしていれば scheduler 自身も止まり、以後の slot は起動しない）。
   `timeout -k` は二重の上限です。
@@ -267,18 +291,16 @@ bind を妨げないよう slot ごとに別 directory にし、空になった 
 - 既存の記録を上書きしない: 時刻表のどれかの run id の `--out/<RUN_ID>` または
   `holder-<RUN_ID>.jsonl` が既にあれば起動しない（同じ `--start` の再実行は記録が追記されて
   integrity `fail` になるため、新しい `--start` を選ぶ）。
-- 1 日 3 時間上限: 時刻表の合計（最後の slot の終わりまで）が 3 時間を超える schedule は拒否します
-  （既定 matrix は 1 候補 1 時間 3 分 30 秒、2 候補 2 時間 7 分、3 候補 3 時間 10 分 30 秒で拒否）。
-  scheduler が数えるのは自分の時刻表だけなので、同じ日の手動 run（`auth_revoked_live` など）も
-  合わせて 3 時間以内に収める。
+- 時刻表の合計時間の上限は無い（既定 matrix は 1 候補 1 時間 3 分 30 秒、2 候補 2 時間 7 分、
+  3 候補 3 時間 10 分 30 秒）。`--start` は 24 時間先までです。
 
-日程の分け方（例）:
+日程の分け方（例。1 日にまとめてもよい）:
 
 | 日 | 内容 | 合計 |
 | --- | --- | --- |
 | 1 日目 | `schedule --candidates a_framed,b_chunked` | 2 時間 7 分 |
 | 2 日目 | `schedule --candidates b_segment` + 3 候補の `auth_revoked_live`（候補ごとに新しい `revoked_live` bundle で手動実行） | 約 1 時間 20 分 |
-| 別の日 | soak: `schedule --candidates a_framed,b_chunked,b_segment --scenarios soak` | 1 時間 34 分 30 秒 |
+| 3 日目 | soak: `schedule --candidates a_framed,b_chunked,b_segment --scenarios soak` | 1 時間 34 分 30 秒 |
 
 `auth_revoked_live` は実行のたびに `revoked_live` の bundle を作り直す必要があるため（Step 1）、
 `schedule` は指定を拒否します。上の手動 2 host 手順で 1 run ずつ実行してください。
@@ -328,14 +350,13 @@ soak（1800 s）には短すぎて途中で kill され、integrity `fail` に�
 - holder（実カメラ時）: `timeout -k 30 50m ... holder ... --seconds 2700`（agent より先に
   終わらないように agent の上限より長くする）
 
-3 時間上限には 1 soak run を 45 分（実行は約 31 分、`timeout` 上限の値）で数える。soak 以外の full matrix は
-scenario 長の合計が 1 候補あたり約 36 分だが、2 host では scenario ごとの起動・停止と Main の
-grace を含めて 1 候補あたり約 42 分、3 候補で約 2 時間 7 分かかる。soak 1 run（45 分）を足すと
-約 2 時間 52 分で 3 時間上限に余裕が無いため、**soak は full matrix と別の日に行う**。soak の日は
-1 日最大 3 run（3 × 45 分 = 2 時間 15 分）。
+soak 以外の full matrix は scenario 長の合計が 1 候補あたり約 36 分だが、`schedule` の時刻表は
+scenario ごとの起動・停止、Main の grace と slot 間の余裕を含めて 1 候補 1 時間 3 分 30 秒、3 候補
+3 時間 10 分 30 秒になる。soak は 1 run 31 分 30 秒（3 候補で 1 時間 34 分 30 秒）。1 日の上限は
+無いので、full matrix と同じ日に行ってよい。
 `schedule` では各 slot の `timeout` 上限と holder の `--seconds` を scenario 長から自動で決める
 （slot 開始から scenario 長 + 55 s、holder は scenario 長 + 45 s）ので、上の 45 分 / 2700 s の値は
-手動実行用です。schedule の 3 時間上限は時刻表の合計（soak 1 run = 31 分 30 秒）で数えます。
+手動実行用です。
 loopback の `timeout -k 30 90m` も soak を含めない既定の matrix 用で、`--scenarios soak` を
 加えるときは soak 1 run につき 45 分を足す。
 
@@ -553,7 +574,7 @@ session が 1 回だけ開閉され、宣言した全 source で `forwarded` ≥
 | G3 | receiver と sender の両方の sample が必要（片方でも無ければ `unmeasured`）。receiver queue ≤ 設定上限、sender pending ≤ 上限、kernel send queue の滞留 byte（`TIOCOUTQ`、`ss -tmi` があれば skmem `w`）≤ 2×SO_SNDBUF + 64 KiB、VmHWM ≤ 上限、warmup 後の RSS 増加 ≤ max(16 MiB, 10 %)（sample < 4 なら `unmeasured`）。skmem `tb` は送信 buffer の上限値で、SO_SNDBUF 設定前に kernel が拡大しうるため記録のみ。実入力の run で `ss` が無い（socket を 1 つも報告した sample が無い）なら `unmeasured`。proxy 保持量は 1 回の `recv()` buffer で構造的に有界なので記録のみ |
 | G4 | 切断を伴う impairment から手動操作なしで再接続、p95 ≤ 10 s（再接続時間は impairment の終了から測り、Main の停止時間そのものは含めない。2 host で Main 側 action の場合は、window 開始時に live だった session（session nonce で対応付け）が切れた window について、Main 時計の「window 終了（SIGCONT / 再起動後の `ready`）→ 後続接続の `session_hello`」と Agent 時計の「その接続の `connected` → `first_accept`」の和で測る（真の値より小さくならない。#237）。対応する session が無い window は再接続 0 として数え、nonce や `connected` の記録が無ければ `unmeasured`。ただし対応付けができなくても、再接続が必要な window の終了以後に Main が `session_hello` を 1 つも受けていなければ `fail`）。切断と初回受理は impairment ごとに 1 組ずつ対応させ（同じ記録を複数回使わない）、各 impairment の対応範囲は次に予定された impairment の開始で打ち切る（切断は [開始, min(終了 + 30 s, 次の開始))、初回受理は次の開始より前。後の impairment の後に起きた切断・受理を前の impairment の再接続として数えない）、必要な再接続数は予定された reset / Main 再起動と、Agent loss timeout + 1 s 以上の blackhole / SIGSTOP の数だけで決まる（scenario 名による追加要求はない） |
 | G5 | 無音断の検知 ≤ 15 s（Agent / Main とも）、Main の未 commit 区間（Agent capture 時刻）⊆ Agent 保護区間 [T−600 s, T+600 s]。proxy blackhole は予定数の `impairment_start` 記録が必要（`proxy.jsonl` が無ければ `unmeasured`、不足は `fail`）、Main の stale 閾値以上の blackhole には source ごとに Main の `interrupted`（最後の受信から ≤ 15 s）が必要。Main 側停止（`slow_stop_10s` / `slow_stop_60s` / `main_restart`）は停止ごとに Agent の loss 検知が必要で、遅延は Agent 時計で最後の受信からの経過（`idle_ns`）≤ 15 s（2 host では停止開始時に live だった session のうち、停止を生き延びていない（Main 時計で window 終了 + 15 s + 5 s（`SESSION_CLOSE_GRACE_NS`）以内に終わり、停止開始後（Main が応答をやめたことを記録で示せる場合はその時刻以後）の Main の heartbeat 応答を Agent が受けていない）session の loss episode だけを数える）。Main 側 orchestrator 記録が無ければ `unmeasured`。予定された proxy reset はそれぞれ Agent 時計で 15 s 以内の `loss_detected` が必要（`proxy.jsonl` が無ければ `unmeasured`）。`loss_detected` は source ごとに出るが connection 単位で 1 episode とし、reset / Agent loss timeout + 1 s 以上の blackhole（G4 の再接続要求と同じ規則。timeout と同じ長さの窓は検知が保証されないので求めない。#308）ごとに別の episode を 1 つずつ消費する（1 回の検知を 2 つの reset に使わない）。対応づけの範囲は [impairment 開始, min(開始 + 15 s, 次に予定された impairment の開始)) で、後の impairment の後に出た検知は前の impairment の検知として数えない（最後の impairment は開始 + 15 s まで）。1 host の Main 側停止と Main の `interrupted` の照合も同様に次の window の開始で打ち切る。Main の `interrupted` は最後の `session_close` 以前のものだけを数える（sender 終了後の stale 判定は障害検知ではない） |
-| G6 | 4 source で backpressure / rate limit / sender drop 0（4 source すべての sender `end` 記録が必要、1 つも無ければ `unmeasured`）、かつ Main / Agent とも cgroup v2 `cpu.max` の CPU 上限下で実行（`capacity_4`、上限が無ければ `fail`）。5 source 目は active-source 上限（`source_capacity`）で拒否 |
+| G6 | 4 source で backpressure / rate limit / sender drop 0（4 source すべての sender `end` 記録が必要、1 つも無ければ `unmeasured`）、かつ Main / Agent とも cgroup v2 `cpu.max` の CPU 上限下で実行（`capacity_4`、上限が無ければ `fail`）。`fifth_refused` は 5 source（0〜4）すべての sender `end` 記録が必要（欠ければ `fail`）。Main は最初に届いた 4 source を受け付け、streaming 候補は source ごとに並行して送るので、拒否されるのがどの source かは到着順で決まる（index で決め打ちしない。#368）。ちょうど 1 source が accepted 0（2 つ以上・0 個なら `fail`）で、その拒否が 1 件以上かつすべて active-source 上限（`source_capacity`）であり、Main に durable unit を持たないこと（拒否理由の件数 `rejected_source_capacity` の記録が無ければ `unmeasured`）。残りの 4 source はすべて durable で sender drop 0、Main の backpressure / rate limit 0。拒否 source の sender drop は問わない（`b_segment` では Main が拒否 source の unit を 1 segment に 1 件だけ `rejected` とし残りを `not_processed` で返すので、pending が生成速度で埋まり drop-oldest が続く） |
 | 副次 | soak 30 分で予期しない切断 0、overhead ≤ 10 %（proxy の上り byte / payload）、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %（最初の sample からの差分で算出）、latency p95 ≤ 1 s（参考） |
 
 すべての比較は 1 host の時計内、または envelope の Agent capture 時刻と Agent 自身の

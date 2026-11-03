@@ -31,13 +31,40 @@ def held_identities() -> set[tuple[int, int]]:
         return set(storage_database._HELD)
 
 
-def posix_locks_of_this_process(identity: tuple[int, int]) -> list[str]:
-    """``/proc/locks`` lines for this process on ``identity``'s inode."""
+PosixLock = tuple[str, str, int, str, str]
+
+
+def posix_locks_of_this_process(identity: tuple[int, int]) -> list[PosixLock]:
+    """This process's held POSIX locks on ``identity``'s file, sorted.
+
+    Each lock is ``(mandatory, mode, pid, start, end)`` parsed from a
+    ``/proc/locks`` line. The leading ordinal is dropped: it is numbered
+    across the whole host, so it shifts whenever another process takes or
+    drops a lock between two reads (Issue #350). Waiters (``->``) are not
+    held locks and are skipped. The file is matched by device and inode,
+    which the kernel prints as ``MAJOR:MINOR:INODE`` (major/minor in hex).
+    """
     with open("/proc/locks", encoding="ascii") as stream:
         lines = stream.read().splitlines()
-    inode = str(identity[1])
-    return [line for line in lines if "POSIX" in line and f" {os.getpid()} " in line
-            and line.split()[5].rsplit(":", 1)[-1] == inode]
+    device, inode = identity
+    target = (os.major(device), os.minor(device), inode)
+    pid = os.getpid()
+    locks: list[PosixLock] = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 8 or fields[1] != "POSIX":
+            continue
+        # Another process's lock on a file without an inode prints
+        # ``<none>:0``; it is not ours, so it is skipped, not an error.
+        try:
+            major, minor, number = fields[5].split(":")
+            entry = (int(major, 16), int(minor, 16), int(number))
+        except ValueError:
+            continue
+        if entry != target or int(fields[4]) != pid:
+            continue
+        locks.append((fields[2], fields[3], int(fields[4]), fields[6], fields[7]))
+    return sorted(locks)
 
 
 def second_process_writer(path: Path) -> str:

@@ -250,6 +250,23 @@ class RunSummary:
                 verdict = "unmeasured"
         return verdict
 
+    def tcp_nodelay(self):
+        """Every harness TCP socket of this run had Nagle off (#369).
+
+        Without ``TCP_NODELAY`` a stop-and-wait unit's tail can wait for a
+        delayed ACK (about 40 ms per unit), which throttles throughput and
+        moves drops, latency and gap results: such a run measures the
+        harness, not the candidate. True only when the sender ``start``, the
+        receiver and proxy ``ready`` records declare it and every sender
+        ``connected`` and receiver ``session_open`` read it back as true.
+        Records written before #369 carry no ``tcp_nodelay``: False.
+        """
+        declared = (_kind(self.sender, "start") + _kind(self.receiver, "ready")
+                    + _kind(self.proxy, "ready"))
+        observed = _kind(self.sender, "connected") + _kind(self.receiver, "session_open")
+        rows = declared + observed
+        return bool(declared) and all(row.get("tcp_nodelay") is True for row in rows)
+
     def production(self):
         """Every declared source produced media continuously for the run.
 
@@ -1554,14 +1571,31 @@ class RunSummary:
                       and metric.get("cpu_quota_us") is not None)
             all_ends = {0, 1, 2, 3} <= set(ends)
             return _verdict(healthy and all_ends and drops == 0 and capped)
-        fifth = ends.get(4)
-        if fifth is None:
+        # Main admits the first 4 sources whose units reach it; the streaming
+        # candidates send every source concurrently, so which one is the
+        # fifth depends on arrival order, not on its index (#368). Exactly
+        # one source must have been refused (nothing accepted, every refusal
+        # for the active-source limit, nothing durable) and the other 4 must
+        # behave like ``capacity_4``: durable, no sender drop, no backpressure.
+        # The refused source may drop: on b_segment Main refuses one of its
+        # units per segment and returns the rest ``not_processed``, so its
+        # pending fills at the live rate and drop-oldest runs all along.
+        sources = set(range(5))
+        if not sources <= set(ends):
             return "fail"
+        refused = [index for index in sorted(sources) if ends[index].get("accepted") == 0]
+        if len(refused) != 1:
+            return "fail"
+        fifth = ends[refused[0]]
         if "rejected_source_capacity" not in fifth:
             return "unmeasured"  # the refusal reason is not on record
-        refused = (fifth["accepted"] == 0 and fifth["rejected"] > 0
+        others = sources - {refused[0]}
+        refusal = (isinstance(fifth.get("rejected"), int) and fifth["rejected"] > 0
                    and fifth["rejected_source_capacity"] == fifth["rejected"])
-        return _verdict({0, 1, 2, 3} <= durable_sources and 4 not in durable_sources and refused)
+        return _verdict(refusal and others <= durable_sources
+                        and refused[0] not in durable_sources
+                        and backpressured == 0 and rate_limited == 0
+                        and all(ends[index].get("drops") == 0 for index in others))
 
     # -- secondary ----------------------------------------------------------
     def secondary(self):
@@ -1601,15 +1635,20 @@ class RunSummary:
         # mixed records fail every applicable gate, missing evidence makes a
         # pass ``unmeasured``.
         integrity = self.integrity()
+        # #369: a run with Nagle on any harness socket is not a measurement of
+        # the candidate (pass or fail): every gate is ``unmeasured``.
+        nodelay = self.tcp_nodelay()
+        if not nodelay and integrity == "pass":
+            integrity = "unmeasured"
         for gate, verdict in self.gates.items():
             if verdict == "not_applicable":
                 continue
             if integrity == "fail":
                 self.gates[gate] = "fail"
-            elif integrity == "unmeasured" and verdict == "pass":
+            elif integrity == "unmeasured" and (verdict == "pass" or not nodelay):
                 self.gates[gate] = "unmeasured"
         self.metrics.update(self.secondary())
-        self.metrics.update(integrity=integrity, run_ids=len(self.run_ids),
+        self.metrics.update(integrity=integrity, run_ids=len(self.run_ids), tcp_nodelay=nodelay,
                             inputs_consistent=self.inputs_consistent,
                             exercised_sources=self.exercised_sources())
         return self
@@ -1763,7 +1802,11 @@ def _holder_sessions(rows):
 # Product capture counters in a holder sample (Issue #305); a sample with
 # none of them is from a holder written before they existed.
 CAPTURE_COUNTER_KEYS = ("capture_launches", "capture_restarts", "sources_never_launched",
-                        "stream_invalid", "padding_tolerated")
+                        "stream_invalid", "padding_tolerated", "launch_failures",
+                        "sources_not_running")
+# Counters that must be integers equal to 0 for the holder to pass.
+JUDGED_CAPTURE_COUNTERS = ("capture_restarts", "sources_never_launched", "stream_invalid",
+                           "launch_failures", "sources_not_running")
 
 
 def load_holders(paths, summaries):
@@ -1779,11 +1822,15 @@ def load_holders(paths, summaries):
     run, a holder that did not cover its run, or a camera profile rate
     (holder ``start`` ``fps``) that differs from the sender's declared fps.
     A holder whose last sample carries any product capture counter (Issue
-    #305) must carry ``capture_restarts``, ``sources_never_launched`` and
-    ``stream_invalid`` as integers, each computed per source by the holder,
-    and fails when any is above 0 (a GStreamer child was restarted, a camera
-    never started, or a pipeline lost JPEG framing). A file written before
-    the counters existed (none of their keys) is judged without them. The
+    #305) must carry ``capture_restarts``, ``sources_never_launched``,
+    ``stream_invalid``, ``launch_failures`` and ``sources_not_running`` as
+    integers, each computed per source by the holder, and fails when any is
+    not 0 (a GStreamer child was restarted, a camera never started, a
+    pipeline lost JPEG framing, a launch attempt failed, or a source had no
+    pipeline delivering frames at the holder's last poll, Issue #354); a
+    counter file without the two Issue #354 keys therefore fails too. A file
+    written before the counters existed (none of their keys) is judged
+    without them. The
     holder's ``end`` record carries the final counters, taken after the
     capture was closed and every pipeline reaped; when it has any counter key
     it is what is judged (an event after the last sample still counts),
@@ -1807,6 +1854,7 @@ def load_holders(paths, summaries):
     sessions = {}  # run id -> nonce -> (opens, closes, {source: forwarded})
     frames = queue_drops = forward_drops = allowed = 0
     restarts = never_launched = stream_invalid = padding = 0
+    launch_failures = not_running = 0
     for path in paths:
         rows = records.read_jsonl(path)
         ids = {row.get("run_id") for row in rows}
@@ -1849,14 +1897,15 @@ def load_holders(paths, summaries):
         capture_ok = True
         counted = ends[0] if any(key in ends[0] for key in CAPTURE_COUNTER_KEYS) else last
         if any(key in counted for key in CAPTURE_COUNTER_KEYS):
-            judged = [counted.get(key) for key in
-                      ("capture_restarts", "sources_never_launched", "stream_invalid")]
+            judged = [counted.get(key) for key in JUDGED_CAPTURE_COUNTERS]
             capture_ok = all(_is_int(value) and value == 0 for value in judged)
-            run_restarts, run_never, run_invalid = (
+            run_restarts, run_never, run_invalid, run_failures, run_not_running = (
                 value if _is_int(value) else 0 for value in judged)
             restarts += run_restarts
             never_launched += run_never
             stream_invalid += run_invalid
+            launch_failures += run_failures
+            not_running += run_not_running
             padding += counted.get("padding_tolerated") if _is_int(
                 counted.get("padding_tolerated")) else 0
         verdicts.append(_verdict((last.get("frames") or 0) > 0
@@ -1886,6 +1935,8 @@ def load_holders(paths, summaries):
                    "holder_sources_never_launched": never_launched,
                    "holder_stream_invalid": stream_invalid,
                    "holder_padding_tolerated": padding,
+                   "holder_launch_failures": launch_failures,
+                   "holder_sources_not_running": not_running,
                    "holder_verdict": _combine(verdicts)}
 
 
@@ -1951,6 +2002,11 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
                 items, gate)
             if gate in TOPOLOGY_GATES:
                 missing[gate + "_missing_source_counts"] = counts
+        # #369: the secondary values come only from runs with TCP_NODELAY on
+        # every socket, like the gates; the excluded runs are counted, and a
+        # secondary pass with any excluded run is ``unmeasured``.
+        excluded = sum(1 for s in items if not s.metrics.get("tcp_nodelay"))
+        items_all, items = items, [s for s in items if s.metrics.get("tcp_nodelay")]
         unprotected = [s.metrics["unprotected_gap_units"] for s in items
                        if "unprotected_gap_units" in s.metrics]
         reconnects = [t for s in items for t in getattr(s, "reconnect_samples", [])]
@@ -1974,6 +2030,10 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
                 max(latency) <= SECOND)),
             "packet_loss": "unmeasured", "jitter": "unmeasured",
         }
+        if excluded:
+            secondary = {k: "unmeasured" if v in ("pass", "not_applicable") else v
+                         for k, v in secondary.items()}
+        items = items_all
         fast = [s.fast for s in items]
         report["candidates"].append({
             # ``fast``: True if any run used the shortened CI timing, False only
@@ -1988,6 +2048,7 @@ def summarize(directories, *, rss_limit=512 * 1024 * 1024, single_host=True, hol
             "reconnect_p95_ns": records.percentiles(reconnects)[95],
             "overhead_max": max(overhead) if overhead else None,
             "latency_p95_max_ns": max(latency) if latency else None,
+            "nodelay_excluded_runs": excluded,
             **{"secondary_" + k: v for k, v in secondary.items()}})
     if holder is not None:
         report["holder"] = holder
@@ -2027,7 +2088,9 @@ def render(report):
                      f"{holder.get('holder_capture_restarts')}, never_launched "
                      f"{holder.get('holder_sources_never_launched')}, stream_invalid "
                      f"{holder.get('holder_stream_invalid')}, padding_tolerated "
-                     f"{holder.get('holder_padding_tolerated')})")
+                     f"{holder.get('holder_padding_tolerated')}, launch_failures "
+                     f"{holder.get('holder_launch_failures')}, not_running "
+                     f"{holder.get('holder_sources_not_running')})")
     lines.append("")
     lines.append("scenario            candidate   G1   G2   G3   G4   G5   G6  missing(rep/act)"
                  "  integrity   drop_acct   production  fast")

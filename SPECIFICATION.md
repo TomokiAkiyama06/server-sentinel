@@ -834,8 +834,9 @@ Required behavior regardless of protocol:
 - no arbitrary filesystem paths;
 - no silent loss while reporting healthy.
 
-Transport-independent continuity contract (ADR-0007, Proposed; protocol still
-unselected). Every media unit carries `(source_id, capture_epoch, sequence,
+Transport-independent continuity contract (ADR-0007, accepted 2026-11-02;
+`a_framed` is the selected transport, not yet a product ingest
+path). Every media unit carries `(source_id, capture_epoch, sequence,
 capture_time_ns)`: `capture_epoch` is a strictly increasing Agent capture-process
 epoch, `sequence` counts units per source within an epoch and survives transport
 reconnects, and `capture_time_ns` is the Agent monotonic capture clock within
@@ -1235,7 +1236,7 @@ unresolved for an audited Owner requeue; a final `sent`/`failed`/`disabled` row
 completes such a claim at the next start. Shutdown runs one last step after
 scene `stop()`, then drains these alerts once more (a last step refused by
 storage escalates the watched records to it), and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s, so that with the other stop steps shutdown stays within `TimeoutStopSec=90`) for submitted deliveries before the
-notification service closes. With Slack unconfigured the local row is
+notification service closes; the monitoring stop's final storage sample (Issue #351) waits only for what is left of that bound, so it adds nothing to the stop budget. With Slack unconfigured the local row is
 `disabled` and `critical_notifications` stays `unavailable`. No
 evidence-preservation port exists yet (a separate recording decision), so
 `critical_evidence` stays `unavailable` in Owner status, and the production
@@ -1614,8 +1615,8 @@ before the drain is still notified once. If it goes offline again while that
 notification is still owed, a recovery shorter than `after_seconds` is folded
 into the owed episode (notified on the next drain, the count is not
 restarted); after a longer recovery the new outage is its own episode with its
-own time and ID and the owed one keeps its own (at most one owed episode per
-source, an older unsent one is dropped and logged), so a queue that refused
+own time and ID and the owed one keeps its own (bounded per source, below),
+so a queue that refused
 the first alert for a long time never sends a later outage under the old
 time. A recovery is recorded in the episode and is not notified. At most `hourly_limit` (default 4, 1 to 60) such
 notifications go out per rolling hour for all sources together, re-seeded
@@ -1625,8 +1626,70 @@ unconfirmed local observation never counts). The cap is absolute (Owner
 decision, PR #339): a restart never sends more than `hourly_limit` in a
 rolling hour, also when it resends uncertain deliveries. An episode held back by the
 cap is logged once (`camera_offline_notification_rate_limited`) and notified
-when the hour allows if the source is still not online, and one that recovered
-meanwhile is dropped (`camera_offline_notification_dropped`). An episode in
+once when the hour allows, also when the source recovered meanwhile (Owner
+decision 2026-10-24, Issue #349, consistent with PR #320: an episode that
+reached the threshold is notified once even if it recovered before the
+drain). The cap stays absolute, so such a notice can be up to about an hour
+late. Hold limit (exception 1 below): a source holds at most two unsent
+episodes that reached the threshold (the newest of them and one owed), and
+at most three episodes in all counting a further outage still in progress
+short of the threshold; the same limit
+applies whether the cap held them or the send queue refused them (Owner
+decision 2026-10-29). A third outage drops the oldest held one only once it
+has lasted `after_seconds` (checked when the drain has sent what the hour
+allows, and when a further outage begins); a shorter third outage drops
+nothing, and both held ones are still sent (exception 1 below; Claude
+re-review PR #359 重要 1). A most recent outage that is a flapping episode
+its period will not send (exception 3 below) is not a third notice: when a
+further outage begins before a drain settled it, it is settled then
+(`suppressed`), and the two held ones stay and are sent (Claude re-review PR
+#359 提案 1).
+
+Not-sent exceptions (Owner decisions 2026-10-26 and 2026-10-29, PR #359).
+"Notified once" has exactly three exceptions; in each, the notification is
+not sent, and every one not sent is counted and logged value-free:
+
+1. Third continuous outage of a source while its notices are held (Owner
+   decision 2026-10-26 (a)): while a source's notifications are held back,
+   a third outage of at least `after_seconds` of the same source, separated
+   from the earlier ones by an online of at least `after_seconds`, drops
+   the oldest unsent one, so a source holds at most two unsent episodes
+   that reached the threshold (the newest of them and one owed), and at
+   most three episodes in all counting a further outage still in progress
+   short of the threshold (applied after each drain's sends and when a
+   further outage begins, so until then a third outage that just reached
+   the threshold briefly makes three). A third outage shorter than
+   `after_seconds` drops nothing. "Held" covers both causes
+   (Owner decision 2026-10-29): notices the hourly cap holds back and
+   notices the send queue refused (delivery backpressure) share this one
+   per-source hold limit, with the same counter and log. Counted in
+   `dropped`, logged at WARNING as `camera_offline_notification_dropped`.
+2. Fifth closed ratio alert of a source (Owner decision 2026-10-26 (b)): at
+   most four ratio alerts whose flapping period has closed wait per source
+   (`LATE_FLAPS_PER_SOURCE`, below); a fifth drops the oldest, which the
+   queue never accepted. Counted in `dropped`, logged at WARNING as
+   `camera_offline_notification_dropped`.
+3. Another flapping episode of the same flapping period (Owner decision
+   2026-10-26 (c)): within one ratio-opened flapping period, the Owner
+   decision of PR #335 (at most two notifications per flapping period)
+   takes precedence over Issue #349 (an outage of at least `after_seconds`
+   is sent once). Once the period's one
+   continuous notification is sent, any other flapping episode of that
+   period is not sent, even when it lasted `after_seconds` and also after
+   the period closed (below). Counted in `suppressed`, logged at INFO as
+   `camera_offline_notification_suppressed`.
+
+A ratio alert that the cap held until its period closed is not owed in the
+first place and is not an exception to "notified once": it is dropped under
+Issue #338 item 2 (below), also counted in `dropped` and logged as
+`camera_offline_notification_dropped`. Outside these cases an episode held
+by the cap that recovered meanwhile is still sent once with `(already
+recovered)` (Owner decision 2026-10-24, Issue #349).
+
+A late notice is sent after every outage or ratio
+period still in progress (below), so it never delays one; and one whose
+outage recovered more than a window (`flapping_window_seconds`, plus one
+bin) before it was sent opens no alerted period (below). An episode in
 progress is named after the source and its registry `last_seen_at` (the last
 frame time), so a restart during the same outage finds the row and does not
 notify again. Only a final row (`sent`, `failed` or `disabled`) counts as
@@ -1643,8 +1706,11 @@ before the drain (the row does not name its source, so it opens no alerted
 period and is never dropped as recovered). A resend takes a slot like any
 notification: one whose uncertain delivery still holds a slot of the restored
 hour waits until that slot has expired, so a resend can be up to about an hour
-late, and live alerts (outages and ratio alerts of this process) are sent
-before resends, which follow in stored-time order. An episode or ratio alert
+late. The send order is: outages and ratio periods of this process still in
+progress, by their start; then its episodes that already recovered and its
+ratio alerts whose period closed, by their start; then resends, in
+stored-time order (Issue #349 review: a late "already recovered" notice
+never takes the freed slot ahead of a camera that is still offline). An episode or ratio alert
 whose durable name is such a row is covered by it as soon as it is named,
 before the cap is consulted, and sends nothing twice. Only the outage in
 progress since the service started (each source's first episode) and a ratio
@@ -1712,7 +1778,16 @@ continuous notification):
 
 - Every `camera_offline` of a source that was sent (either rule), or that an
   earlier process already stored, opens that source's *alerted period*. One
-  dropped under the cap opens none (the Owner was never told). The period
+  dropped under the cap opens none (the Owner was never told), and nor does
+  a late notice of an outage that recovered a window and one bin
+  (`flapping_window_seconds / 128`) or longer before it was sent: none of
+  its not-online time is left in the ratio window. While such a notice
+  waits for the cap it also does not keep the ratio rule from evaluating
+  its source (below; Codex PR #359 P2), and it is never counted as the
+  continuous notification of a later ratio-opened period, so a camera
+  flapping by then gets its own ratio alert, which as an alert in progress
+  is sent before the late notice. One that recovered more recently opens
+  the period as before, so the ratio rule never reports that outage again. The period
   closes only once the source has stayed online (or inactive) for a whole
   `flapping_window_seconds`; a shorter online keeps it open.
 - While the period is open the ratio rule does not notify that source.
@@ -1723,7 +1798,25 @@ continuous notification):
   episode that stays offline for `after_seconds` is notified once by the
   continuous rule; the episode in progress at the alert counts that time from
   the alert, not from its own start. Later flapping episodes of the period
-  are not notified. An outage that begins after an online of at least
+  are not notified. An episode belongs to the period by the period's
+  generation, not by how long ago it recovered: a flapping episode held by
+  the cap and sent late, while its period is still open, is that period's
+  continuous notification (or is not sent once the period sent one), even
+  when it recovered a window and one bin or longer before; so a period
+  still yields at most two notifications (Claude re-review PR #359 重要 1).
+  This also holds after the period closed: when one flapping episode of a
+  period is sent (or found sent), any other unsent flapping episode of the
+  same period (held by the cap or owed, at most two more) is settled
+  without a notice, so two flapping episodes held by the cap across the
+  period's close do not both go out. Inside a flapping period the Owner
+  decision of PR #335 (at most two) takes precedence over Issue #349 (an
+  outage that lasted the threshold is sent once; not-sent exception 3,
+  Owner decision 2026-10-26, PR #359); outside one, every
+  held episode is still sent once. Each episode settled this way (also a
+  later one skipped while the period is open) is counted (`suppressed`)
+  and logged value-free at INFO as `camera_offline_notification_suppressed`.
+  A flapping episode of an earlier, closed period is never counted as, or
+  skipped by, a later period's continuous notification. An outage that begins after an online of at least
   `after_seconds` is an ordinary episode, notified once it lasts
   `after_seconds` as before, however long the period stays open.
 - In a period a continuous notification opened, the continuous rule is
@@ -1732,6 +1825,8 @@ continuous notification):
 - While a continuous episode of the source has reached `after_seconds` and is
   not yet notified (owed, held by the cap or refused by the queue), the ratio
   rule does not evaluate that source; the continuous notification reports it.
+  An episode that recovered a window and one bin or longer ago is the
+  exception (above): its outage is no longer in the ratio window.
 - A ratio alert held back by the cap is sent when the hour allows if its
   period is still open; one refused by the queue is retried with the same
   time and ID. Once its period has closed, a ratio alert held back by the
@@ -1740,12 +1835,31 @@ continuous notification):
   item 2). A ratio alert exists only from the drain that triggers it, so one
   that ended was held for a whole quiet window; unlike a continuous episode
   that reached the threshold between two drains, it has no "recovered
-  before its first drain" case to send once. One the cap allowed but the
+  before its first drain" case to send once. This differs from a continuous
+  episode held by the cap, which is still sent once after it recovered
+  (Issue #349): the Owner decision covers the continuous rule, whose outage
+  lasted `after_seconds` and is one event worth one notice, while a ratio
+  alert the cap never allowed reports flapping in progress, and its closed
+  period means the source has already been online for a whole window. One
+  the cap allowed but the
   queue refused (delivery backpressure) is, like a refused continuous
   episode, still sent under its time and ID once the queue takes it, also
-  after its period closed, and dropped only if the cap is closed by then
-  (PR #348 review), so a backpressure lasting a window never leaves the
-  period unnotified.
+  after its period closed, and when the cap has closed by then it waits for
+  the hour like a held continuous episode (Issue #349) instead of being
+  dropped, so a backpressure lasting a window never leaves the period
+  unnotified. While it waits it is set aside from the source's current
+  ratio alert, so the ratio rule and the restart lookup (below) keep
+  evaluating that source and a new flapping period gets its own alert
+  (sent first, as it is in progress); the late one says `(already
+  recovered)` about its own closed period. This holds for any number of
+  such closed alerts (Codex PR #359 P2): when the queue keeps refusing
+  across several periods, each closed alert waits apart, oldest first, and
+  none of them keeps the next period from being alerted. At most four wait
+  per source (`LATE_FLAPS_PER_SOURCE`, bounded memory); a fifth drops the
+  oldest one, which the queue never accepted, counted and logged as
+  `camera_offline_notification_dropped` (not-sent exception 2, Owner
+  decision 2026-10-26, PR #359). Each waiting one is sent once and
+  takes a slot of the hourly cap like any notification.
 
 `MonitoringStatus.camera_offline_degraded` is also set while a ratio-opened
 period is open. Per source the not-online seconds are kept in at most 130
@@ -1786,7 +1900,13 @@ window after the last ratio alert of a source that is still flapping can
 send a new ratio alert and then that new period's continuous notification.
 All of them stay under the hourly cap. The Slack text is the fixed `ServerSentinel critical alert:
 camera_offline`: no source name, role, UUID, device path, serial, reason or
-image; the Owner identifies the source in the Web UI. `MonitoringStatus`
+image; the Owner identifies the source in the Web UI. An alert sent after its
+episode had already recovered (it recovered before the drain, while held by
+the cap, or while the queue refused it), or a refused ratio alert sent after
+its period closed, is the fixed `ServerSentinel critical alert: camera_offline
+(already recovered)` (Issue #349); the stored row is the same `camera_offline`
+kind. A restored `pending` row is resent with the plain text, since the row
+does not record whether its outage had recovered. `MonitoringStatus`
 reports `camera_offline_degraded` (counted as degraded in the daily summary)
 and `camera_offline_notifications`, false without a configured Slack endpoint
 (the local row is then `disabled`). Shutdown stops the monitor first and, when
@@ -1862,10 +1982,81 @@ recorded numbers differ, on every storage sample: the sysfs topology
 or md member replacement onto loop/virtual backing that keeps the device
 number and mount refuses the next admission and raises the per-episode
 `recording_health_failure`; the refusal is not latched and a return to
-hardware-only backing admits again (Issue #340). A refusal seen only by an
-admission is kept as one value-free flag that the next tick consumes, so the
+hardware-only backing admits again (Issue #340). Any refusal seen only by an
+admission (topology, UUID, mount, `st_dev`, pinned root or metadata file;
+Issue #347) is kept as one value-free flag that the next tick consumes, so the
 episode alerts once even when restored before that tick; `recording_health`
-stays `failed` until the next daily self-test. Current numbers read no
+stays `failed` until the next daily self-test. A graceful stop takes one final
+storage sample under the same rule after every admitting component stopped and,
+only when it raised the alert, waits for the pending deliveries (up to 12 s
+when no shutdown settle ran, otherwise only what is left of that settle's
+bound, and not at all when that settle ended unsettled; an unfinished one
+stays `pending` and `critical_notifications_unsettled` is logged), so a stop
+before the tick submits it; it reaches Slack only if the single delivery
+worker gets to it within that wait (behind a stalled or backlogged delivery,
+or with no wait left, it may not be sent by that process). A
+`recording_health_failure` row an earlier process left `pending` is submitted
+again by the next start under its stored ID and time when its event time is
+less than 24 h from now in either direction (nearest first, at most 4 per
+start: the batch is selected once and kept across retries after a full queue,
+so a retry never selects a new one; the rest stay `pending` and
+`recording_health_failure_unrestored` logs their count), like the stale device-number notice and camera offline; if the earlier
+POST reached Slack the Owner sees it twice (Issue #351). Each row is resent at
+most once (`notification_events.resent`, set before the resubmission), so a
+crash loop never resends the same row at every start; a row whose resend was
+cut by a crash is not resent again (that crash is reported by the next start's
+unclean-exit notice, unless the hourly cap below holds it back). A notice lost
+because the process crashes again in the middle of that startup resend is an
+accepted loss (Owner decision 2026-10-29). Between ticks the run
+loop stores a finished delivery's outcome within about 1 s while deliveries
+are pending, so a delivered alert is normally `sent` before a crash and not
+resent. A crash, kill, OOM or power loss before the
+tick loses the in-memory flag itself; instead, the runtime keeps a running
+marker (one row of a random per-process token in the Main database, written
+under the storage policy when it reaches `running` and deleted by the graceful
+stop after its final sample), and a start that finds another process's marker
+logs `monitoring_previous_run_unclean` and raises one immediate value-free
+`recording_health_failure` named after that token, whether or not a refusal was
+actually lost (Owner decision 2026-10-26, option 2): every unclean exit of a
+running process is notified once, a graceful restart never, but at most 4
+unclean-exit notices per rolling hour (Owner decision 2026-10-29, the shape of
+the camera offline hourly cap). The hour is counted from persisted rows
+(`monitoring_unclean_exit_notices`, migration 27: the notice's event ID and the
+time it was taken, nothing else), not from process memory, so a crash loop
+cannot reset it: a row counts while its time is less than one hour from now in
+either direction (as the 24 h resend window; a row exactly one hour old or one
+hour or more ahead after the clock moved back does not count), and rows a day
+or more from now are pruned on the next insert. A notice's row is written
+before it is submitted and stamped with the time the slot is taken, which is
+also the notice's event time (not the time the exit was first found: a notice
+held back by a full queue for longer than an hour must not take an already
+expired slot); a start that crashed in between leaves its slot taken and the
+next start sends that same notice under that time without taking another. An
+unclean exit found while the hour is full is not notified: the start logs the
+value-free `unclean_exit_notification_dropped` and replaces the marker as
+usual. That journal line is the record of the drop: the runtime's
+`unclean_exit_notices_dropped` is a per-process value (0 or 1, lost with the
+process) and appears in no status, diagnostics or daily summary. A refusal
+lost in such a crash beyond the cap is therefore not notified; the notice text
+is fixed, so within the hour it would only repeat one already sent. The resend
+of `pending` rows above is neither counted against nor held back by the cap
+(it is bounded by its own limits: each row once, at most 4 per start, within
+24 h). New unclean-exit notices are therefore at most 4 per rolling hour, and
+each notice is posted at most twice (its first submission plus at most one
+resend, when its outcome was not stored before the next crash). The number of
+posts is finite, but it is not bounded by 8 in every 60-minute interval: a
+resend can fall into a later interval than its notice (the resend of a notice
+just before the interval, or a resend delayed to a later start), so while
+Slack stays too slow for outcomes to be stored, a 60-minute interval can hold
+more than 8 posts of the same text. A process that
+never reached `running` writes no marker (nothing was admitted). A graceful
+stop whose marker delete is refused (storage refused at the stop, already
+alerted by its final sample) or whose final sample failed leaves the marker,
+so the next start notifies once more. A refused marker write (or a notice the
+queue cannot take) is retried by the tick every 15 minutes, never stored as a
+final `failed`; until it succeeds, a crash of that process is not detected and
+`unclean_exit_detection_degraded` is set (one degraded item in the daily
+summary; not a separate diagnostics field). Current numbers read no
 sysfs. A mismatch at startup leaves
 the runtime `failed`, refuses writes and still attempts the immediate Slack
 alert; the open is retried every 15 minutes against the same declared identity

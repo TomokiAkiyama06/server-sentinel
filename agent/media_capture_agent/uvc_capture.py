@@ -100,13 +100,18 @@ class CaptureCounters:
     malformed (whatever path then tore the pipeline down; a stall, EOF,
     startup timeout or reader failure is not counted here, only in
     ``launches``); ``padding_tolerated`` the inter-frame gaps above the 4 KiB
-    default that the profile bound skipped before a valid frame. Counts of a
-    pipeline still running or not yet reaped are included as they stand.
+    default that the profile bound skipped before a valid frame;
+    ``launch_failures`` the launch attempts (open, identity re-check, mode
+    check, pipeline start or reader start) that failed and were scheduled for
+    a backoff retry (Issue #354: a source whose relaunch keeps failing never
+    raises ``launches``). Counts of a pipeline still running or not yet
+    reaped are included as they stand.
     """
 
     launches: int
     stream_invalid: int
     padding_tolerated: int
+    launch_failures: int = 0
 
 
 @dataclass(frozen=True)
@@ -329,6 +334,7 @@ class _Source:
         # Value-free counters (``CaptureCounters``) of pipelines already reaped.
         self.stream_invalid = 0
         self.retired_padding = 0
+        self.launch_failures = 0
         # Last capture failure while no pipeline runs; cleared by real frames.
         self.failure = None
         # The exact device evidence found not to offer this source's profile.
@@ -611,6 +617,7 @@ class UvcCapture:
             self._storage_failure(source)
             return
         except (CaptureRefused, PipelineError, ProbeError, OSError, ValueError):
+            source.launch_failures += 1
             if not controller.requires_approval:
                 controller.capture_failed()
                 source.failure = "capture_failed"
@@ -632,6 +639,7 @@ class UvcCapture:
         try:
             active.thread.start()
         except RuntimeError:
+            source.launch_failures += 1
             self._teardown(source)
             controller.capture_failed()
             source.failure = "capture_failed"
@@ -731,7 +739,7 @@ class UvcCapture:
             live = ([source.active] if source.active is not None else []) + source.stuck
             padding = source.retired_padding + sum(a.parser.large_gaps for a in live)
             invalid = source.stream_invalid + sum(a.error == "stream_invalid" for a in live)
-            return CaptureCounters(source.generation, invalid, padding)
+            return CaptureCounters(source.generation, invalid, padding, source.launch_failures)
 
     def frames(self, source_id):
         """Bounded compressed-frame queue for a later ring/transport consumer."""

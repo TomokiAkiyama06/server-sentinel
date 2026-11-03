@@ -1140,15 +1140,22 @@ Installation/service checkboxes above remain open.
       to the approved source, and a second identical camera
       (duplicate/no-serial ambiguity) requires manual intervention.
 
-### Issue #305 padding 付き MJPG buffer での連続 capture（未実施）
+### Issue #305 padding 付き MJPG buffer での連続 capture（一部実施）
 
-unit test（synthetic な JPEG 形の byte 列と非 0 の padding）でのみ確認済み。以下の実機確認はまだ実施していない。
+unit test（synthetic な JPEG 形の byte 列と非 0 の padding）で確認済み。実機では、PR #306 の修正（commit `190582c`、PR #346 の counter より前）で、frame rate と、再起動の代わりの指標（CPU 秒の減少）を確かめた。counter による確認は、まだ実施していない。
 カメラは無人の壁またはテストチャートに向け、映像は保存・表示しない。serial・by-id 名・IP・hostname は記録しない。
 
-- [ ] 未実施: Yamaha CS-800、MJPG 1280x720@30 で、製品の `UvcCapture` + `GStreamerLauncher` を 5 分以上連続実行し、GStreamer child の再起動が 0 回（`stream_invalid` / `capture_failed` が出ない）。`UvcCapture.counters()`（transport PoC holder の `sample` 行の `capture_launches` / `capture_restarts` / `sources_never_launched` / `stream_invalid` / `padding_tolerated`）で、source ごとに `launches` が 1 のまま（holder の `capture_restarts` = 各 source の `max(0, launches - 1)` の合計が 0、一度も起動しなかった source の数 `sources_never_launched` が 0）、`stream_invalid` が 0 であることを記録する。`launches` の合計だけを source 数と比べると、ある source の再起動を、起動しなかった別の source が隠すので使わない。`stream_invalid` は framing の喪失・構造エラーだけを数える（stall・EOF・startup timeout による再起動は `launches` だけが増える）。PoC の `summarize.py --holder` は、`capture_restarts` / `sources_never_launched` / `stream_invalid` のどれかが 0 より大きい（または counter の key が 1 つでもあるのに、この 3 つのどれかが整数で無い）と holder を `fail` にし、`holder_capture_restarts` / `holder_sources_never_launched` / `holder_stream_invalid` / `holder_padding_tolerated` を report に出す。counter の key が 1 つも無い古い file は、従来どおり判定する。holder は最後に、capture を閉じて全 pipeline を回収した後の counter を `end` 行に書く。summarize は `end` 行に counter があればそれを判定に使うので、最後の 1 秒ごとの `sample` より後の framing 喪失・再起動も見落とさない（`end` に counter が無い古い file は最後の `sample` で判定）。
+- [x] **実機記録（PR #306 の修正、commit `190582c`）**：capture host、Yamaha CS-800、MJPG 1280x720@30、1 source。transport PoC の holder（`poc15.py holder --sources 1 --profile 1280x720@30 --seconds 300`、`systemd-run --user --scope -p CPUQuota=100% -p MemoryMax=512M`）で、製品の `UvcCapture` を 5 分ずつ実行した。映像は保存も表示もせず、memory 上で frame 数を数えただけ。
+  - 再起動の回数は、`sample` 行の `child_cpu_seconds`（今生きている子孫 process の CPU 秒の合計）が減った回数で数えた。GStreamer child が作り直されると、この合計が減るため。1 source なので、この数え方が使える。ただし、1 秒ごとの sample の間に child が作り直され、新しい child が前の値以上の CPU を使った場合は、減らないので見逃す。そのため、下の「CPU 秒の減少 0 回」は「減少が観測されなかった」という意味で、再起動が無かったことの確定ではない（frame が 0 だった秒も 0 なので、約 1 秒の途切れを伴う再起動は無かったと見られる）。これは代わりの指標で、PR #346 以降の `capture_restarts` counter による確認の代わりにはならない。この commit には `UvcCapture.counters()` がまだ無いので、`stream_invalid` / `padding_tolerated` は記録していない。
+  - 修正前（2026-10-21、暗い時間）：約 16 fps、5 分で CPU 秒の減少 51 回（見逃しがありうるので、再起動は少なくとも 51 回。約 6 秒に 1 回）、frame が 0 だった秒 55。
+  - 修正後・照明あり（2026-10-22、2 回）：どちらも 28.8 fps、CPU 秒の減少（再起動の代わりの指標）0 回、frame が 0 だった秒 0、queue で捨てた frame 0。
+  - 修正後・レンズを覆った暗い状態（2026-10-23、1 回）：28.8 fps（299 秒で 8,600 frame）、CPU 秒の減少 0 回、frame が 0 だった秒 0、queue で捨てた frame 0。
+  - 28.8 fps は宣言値 30 fps の 96 % で、PoC の下限（80 % = 24 fps）を超えている。30 fps にわずかに届かない理由は、まだ調べていない。照明ありと暗い状態で値が同じなので、露出の自動調整だけでは説明しにくい。`queue_drops` が数えるのは `FrameQueue` が捨てた frame だけで、parser が捨てた buffer は含まない。
+- [ ] 未実施: Yamaha CS-800、MJPG 1280x720@30 で、製品の `UvcCapture` + `GStreamerLauncher` を 5 分以上連続実行し、GStreamer child の再起動が 0 回（`stream_invalid` / `capture_failed` が出ない）。`UvcCapture.counters()`（transport PoC holder の `sample` 行の `capture_launches` / `capture_restarts` / `sources_never_launched` / `stream_invalid` / `padding_tolerated` / `launch_failures` / `sources_not_running`）で、source ごとに `launches` が 1 のまま（holder の `capture_restarts` = 各 source の `max(0, launches - 1)` の合計が 0、一度も起動しなかった source の数 `sources_never_launched` が 0）、`stream_invalid` が 0 であることを記録する。`launches` の合計だけを source 数と比べると、ある source の再起動を、起動しなかった別の source が隠すので使わない。`stream_invalid` は framing の喪失・構造エラーだけを数える（stall・EOF・startup timeout による再起動は `launches` だけが増える）。PoC の `summarize.py --holder` は、`capture_restarts` / `sources_never_launched` / `stream_invalid` / `launch_failures` / `sources_not_running` のどれかが 0 でない（または counter の key が 1 つでもあるのに、この 5 つのどれかが整数で無い）と holder を `fail` にし、`holder_capture_restarts` / `holder_sources_never_launched` / `holder_stream_invalid` / `holder_padding_tolerated` / `holder_launch_failures` / `holder_sources_not_running` を report に出す。counter の key が 1 つも無い古い file は、従来どおり判定する。holder は最後に、capture を閉じて全 pipeline を回収した後の counter を `end` 行に書く。summarize は `end` 行に counter があればそれを判定に使うので、最後の 1 秒ごとの `sample` より後の framing 喪失・再起動も見落とさない（`end` に counter が無い古い file は最後の `sample` で判定）。
+- [ ] 未実施: 同じ実行で、holder の `launch_failures` と `sources_not_running` が 0 であることを記録する（Issue #354）。`launch_failures` は、open・identity の再確認・mode の確認・pipeline の起動のどれかに失敗して backoff の再試行になった回数で、件数だけを数える（path・device 名・stderr は記録しない）。stall・EOF・timeout の後の relaunch が失敗し続けると `launches` は増えないので、`capture_restarts` / `stream_invalid` は 0 のままになる。この counter が無いと、別の source に frame があれば holder は `pass` になる。`sources_not_running` は、capture を閉じる前の最後の poll で、frame を出している pipeline が無かった source の数（health が `online` / `video_ready` でも `degraded` / `capture_overloaded` でもない source）。run の終わりに backoff 中だった source も、これで `fail` になる。この 2 つの key が無い counter 付きの file（Issue #354 より前の holder）は、source が動き続けたことを示せないので `fail` になる。USB の失敗状態（dmesg に `uvcvideo ... Failed to set UVC probe control : -71` のような error が出て、agent が `capture_failed` と backoff を報告する状態）が起きた実行は、`launch_failures` か `sources_not_running` で holder が `fail` になることを確認する。あわせて、source ごとの fps / frame 数も記録する。
 - [ ] 未実施: 同じ実行で `padding_tolerated` が 0 より大きい（padding 付き buffer が実際に来て、再起動せずに読み飛ばされた証拠）。値の目安は Issue #305 の測定（1,800 buffer 中 約 11 個 = 約 0.6 %、5 分で約 50 回前後）。0 のままなら、その実行では padding 付き buffer が出ておらず、本修正の確認にならない（照明・解像度を Issue と揃えて再実行）。
-- [ ] 未実施: 同じ実行で実効 frame rate が約 30 fps（frame 数 / 経過時間を記録）。
-- [ ] 未実施: 照明あり、およびレンズを覆った暗い状態の両方で上の 2 点を確認。
+- [x] 実施済み（上の実機記録）: 実効 frame rate は 28.8 fps（frame 数 / 経過時間）。照明ありと暗い状態のどちらでも同じ。PR #346 以降の code で counter を記録する実行でも、同じ実行の fps を記録し直す。
+- [ ] 一部実施: 照明あり、およびレンズを覆った暗い状態の両方で、frame rate と、CPU 秒の減少が無いこと（再起動の代わりの指標）は確認した（上の実機記録）。counter（`stream_invalid` 0、`padding_tolerated` > 0）は、PR #346 以降の code で両方の状態について確かめる必要がある。
 - [ ] 未実施: 取り出した frame に 10 KB 未満などの不自然に小さい frame が無い（padding からの誤切り出しが無い目安）。
 - [ ] 未実施: 確認後、Issue #15 の実カメラ slot を再実行し §G に記録。
 
@@ -1570,8 +1577,10 @@ Record:
 - audit event;
 - manual-intervention requirement if automatic recovery is unsafe.
 
-### Agent-to-Main transport PoC (Issue #15, ADR-0007 — pending physical execution)
+### Agent-to-Main transport PoC (Issue #15, ADR-0007 — harness run 2026-10-29; product ingest path pending)
 
+The checklist below is for the product path and stays open; the harness runs of
+2026-10-29 are recorded in the template section that follows.
 Synthetic continuity tests do not verify any transport. For each candidate
 (WebRTC, QUIC, authenticated HTTP/WebSocket streaming; SRT was dropped by the
 Owner decision of 2026-10-11, see ADR-0007) on the real Main
@@ -1593,12 +1602,11 @@ codec/container and recording-extraction impact, and the exact dependency
 versions/licences. Enter the results in the ADR-0007 validation table; do not
 attach private addresses, credentials or real footage.
 
-### 実機記録テンプレート: Issue #15 transport PoC 計測ハーネス（未実施）
+### 実機記録テンプレート: Issue #15 transport PoC 計測ハーネス（2026-10-29 実施）
 
 手順は [`scripts/manual/transport_poc/README.md`](scripts/manual/transport_poc/README.md)
 （step 0 の read-only inventory、使い捨て materials、1 scenario ずつの実行、kill switch
-`systemctl --user stop 'ss-poc15-*'`、1 日 3 時間上限、cleanup checklist）。ハーネスの PR
-時点の確認は同一 host の loopback・synthetic 入力だけで、以下は**どれも実機では未実施**です。
+`systemctl --user stop 'ss-poc15-*'`、cleanup checklist）。下の 2026-10-29 の記録だけが判定に使える実機の run です。
 2 host の実行は 1 scenario ずつ手動 hand-off でも、`poc15.py schedule`（両 host が同じ `--start` /
 `--candidates` / `--scenarios` / `--real-camera` から同じ時刻表を計算して 1 slot ずつ起動。mock の
 clock / process でのみ試験済み）でもよく、どちらで実行したかと `--start` を記録に書きます。
@@ -1615,12 +1623,43 @@ clock / process でのみ試験済み）でもよく、どちらで実行した�
   `producer_failed`（`exception`）で `fail`。原因は harness の holder（前の sender の切断を次の frame
   送信まで検知せず、camera frame が止まっていた間に再起動後の sender を拒否した。Issue #307）で、
   transport 候補の問題ではない。修正後の 3 候補の `capture_restart` は実機では**未確認**:
-- [ ] Issue #307 の修正を含む HEAD で 3 候補の `capture_restart`（real camera）を再実行し、holder 記録に
+- [x] Issue #307 の修正を含む HEAD で 3 候補の `capture_restart`（real camera）を再実行し、holder 記録に
   再起動前後の 2 つの nonce の `session_open` / `session_close` があり、`refused` が無く、sender に
-  `producer_failed` が無いことを生記録で確かめた（未実施）。
+  `producer_failed` が無いことを生記録で確かめた（2026-10-29、Claude）。
+
+- 2026-10-26 `schedule`（real camera と synthetic、a_framed / b_chunked の 38 run）: harness が
+  `TCP_NODELAY` を設定していなかった。1 source の real run はすべて RTT p50 約 46 ms で 30 fps を
+  送り切れず、pending が上限に張り付いた（Issue #369。loopback では Nagle と delayed ACK の stall を
+  再現。LAN で同じ原因かは推定）。**この日の run は real / synthetic を問わず判定に使わない**
+  （summarize は `tcp_nodelay: true` の記録が無い run を全 gate `unmeasured` にする。再集計で 38 run
+  すべて `unmeasured`）。
+- [x] Issue #369 の修正を含む HEAD で real 入力の scenario 一式を再実行し、全 run の summary JSON（`--json`）の run 行で
+  `tcp_nodelay` が `true`、1 source の `normal` の RTT が 1 unit 約 40 ms の stall を含まないこと
+  （p50 が 33 ms を大きく下回り、pending が上限に張り付かない）を生記録で確かめた（2026-10-29、Claude。`normal` の RTT p50 は `a_framed` / `b_chunked` とも 3.9 ms、pending 最大 1。`b_segment` は 1 s segment のため p50 74.7 ms、pending 最大 31）。
 
 TCP の packet loss / jitter は root の `netem` を使わないため `unmeasured` のまま残し、
 QUIC / WebRTC はこのハーネスの対象外です。
+
+2026-10-29 の記録（判定に使う run。結果の表は ADR-0007 Validation）:
+
+```text
+Date / tester: 2026-10-29 / Claude（Main host と capture host の操作）
+ServerSentinel Git commit (harness HEAD): f2b6142（capture host は同じ commit の archive）
+Main host / capture host: private LAN の 2 host
+Candidate(s): a_framed / b_chunked / b_segment
+Sources: n=1, 2, 3, 4 / real cameras=1（CS-800）/ 2〜4 source と auth_*、route_probe は synthetic
+Profile / bitrate: MJPEG 1280x720 30 fps 宣言 / 約 34 Mbit/s
+CPU cap: README の値（各 process の CPUQuota / MemoryMax / timeout）
+Launch: schedule（--real-camera --dev-checkout-helper）、auth_revoked_live 3 run は手動 hand-off
+Run id(s): ~/poc15/out-1029/ の全 66 run（matrix 60、b_segment の slow_stop_10s 再実行 3、soak 3）
+Total run time today: 09:43〜17:5x JST（途中の空き時間を含む）
+```
+
+- 未確認の項目: step 0 inventory を 2026-10-29 に取得した記録は確かめていない（下の checkbox は未完了のまま）。
+- `b_segment` の G3 は `slow_stop_10s`（`r20261029t054210`）で fail。下の G3 の checkbox は `a_framed` / `b_chunked` だけの結果。
+- 生記録の確認: Claude は全 66 run を確認済み（2026-10-29、2026-11-02）。Owner は 2026-11-02 に 60 run の要約表（`summary-1029c`）を確認し、方式の選定を確定した。**生 JSONL と、再実行 3 run・soak 3 run の別の要約は読んでいない**。下の全 run の確認より範囲が狭いことを承知のうえでの確認で、下の checkbox は未完了のまま残す。
+
+記入用テンプレート:
 
 ```text
 Date / tester:
@@ -1632,27 +1671,28 @@ Profile / bitrate:
 CPU cap (Main CPUQuota / capture CPUQuota):
 Launch: manual hand-off / schedule (--start, --candidates, --scenarios, --real-camera)
 Run id(s):
-Total run time today (≤ 3 h):
+Total run time today:
 ```
 
 - [ ] step 0 inventory を両 host で取得し、47200–47214 が未使用であることを確認した;
-- [ ] G1: `auth_unpaired` / `auth_other_ca` / `auth_revoked` / `auth_revoked_live` で受理 media 0、`route_probe` でハーネス receiver に human route なし（製品の human/admin API は上の transport PoC 項目で別途確認）;
-- [ ] G2: 各 impairment 後の報告 gap が実欠落と一致（epoch 内は完全一致、capture 再起動は範囲不明）、重複 commit 0、sender の unit 収支（末尾 drop を含む）が照合済み（`drop_accounting` が `pass`）;
-- [ ] G3: receiver queue / kernel send queue の滞留 byte（`TIOCOUTQ` と `ss -tmi` の skmem `w`）/ VmHWM が設定上限内で warmup 後に増加しない;
-- [ ] G4: 手動操作なしで再接続し p95 ≤ 10 s（再接続時間は impairment の終了から。2 host の Main 側停止・再起動は Main 時計「window 終了 → 後続接続の `session_hello`」+ Agent 時計「`connected` → `first_accept`」で、Main の停止時間を含めない。#237 の変更後の 2 host / 実 LAN での確認は**未実施**）;
-- [ ] #237 の harness 修正（heartbeat 応答記録と停止の協調、`stopped` / `stopping` 記録、応答への echo 付け直し、fast `slow_stop_10s` 4 s）を含む HEAD で実行し、2 host run の receiver 記録に `stopping`（`coordinated: true`）、Main 側 orchestrator 記録に `sigstop` の後の `stopped` があることを生記録レビューで確かめた（未実施）;
-- [ ] G5: 無音断の検知 ≤ 15 s、Main の未 commit 区間が Agent 保護区間 [T−600 s, T+600 s] に含まれる;
-- [ ] G6: CPU 制限下の 4 source で backpressure 0、5 source 目は拒否;
-- [ ] 全 run が非 fast（`--fast` なし。summary の各 run 行と候補行の `fast` が `false`、`fast_runs` が 0）;
-- [ ] 2 host の run では G5 の Main `interrupted`（proxy blackhole）が件数照合（window との時刻対応なし）であることを結果に併記した（Main 側停止・再起動の Agent 検知と再接続は session nonce で対応付け済み）;
-- [ ] 1 / 2 / 3 / 4 source の各構成を候補ごとに実行した（`normal` / `sources_2` / `sources_3` / `capacity_4`、summary の `*_missing_source_counts` が 0）、全 run の `integrity` が `pass`（別実行の記録の混入・子 process の異常終了なし）;
-- [ ] 副次: 30 分 soak（full matrix とは別の日に実行）で予期しない切断 0、overhead ≤ 10 %、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %、latency p95（参考）;
+- [x] G1: `auth_unpaired` / `auth_other_ca` / `auth_revoked` / `auth_revoked_live` で受理 media 0、`route_probe` でハーネス receiver に human route なし（製品の human/admin API は上の transport PoC 項目で別途確認）;
+- [x] G2: 各 impairment 後の報告 gap が実欠落と一致（epoch 内は完全一致、capture 再起動は範囲不明）、重複 commit 0、sender の unit 収支（末尾 drop を含む）が照合済み（`drop_accounting` が `pass`）;
+- [x] G3: receiver queue / kernel send queue の滞留 byte（`TIOCOUTQ` と `ss -tmi` の skmem `w`）/ VmHWM が設定上限内で warmup 後に増加しない;
+- [x] G4: 手動操作なしで再接続し p95 ≤ 10 s（再接続時間は impairment の終了から。2 host の Main 側停止・再起動は Main 時計「window 終了 → 後続接続の `session_hello`」+ Agent 時計「`connected` → `first_accept`」で、Main の停止時間を含めない。#237 の変更後の 2 host / 実 LAN での確認は**未実施**）;
+- [x] #237 の harness 修正（heartbeat 応答記録と停止の協調、`stopped` / `stopping` 記録、応答への echo 付け直し、fast `slow_stop_10s` 4 s）を含む HEAD で実行し、2 host run の receiver 記録に `stopping`（`coordinated: true`）、Main 側 orchestrator 記録に `sigstop` の後の `stopped` があることを生記録レビューで確かめた（2026-10-29 の `sigstop` 全 9 run、Claude）;
+- [x] G5: 無音断の検知 ≤ 15 s、Main の未 commit 区間が Agent 保護区間 [T−600 s, T+600 s] に含まれる;
+- [x] G6: CPU 制限下の 4 source で backpressure 0、5 source 目は拒否;
+- [x] 全 run が非 fast（`--fast` なし。summary の各 run 行と候補行の `fast` が `false`、`fast_runs` が 0）;
+- [x] 全 run の summary JSON（`--json`）の run 行で `tcp_nodelay` が `true`（#369。記録の無い run は `unmeasured`）;
+- [x] 2 host の run では G5 の Main `interrupted`（proxy blackhole）が件数照合（window との時刻対応なし）であることを結果に併記した（Main 側停止・再起動の Agent 検知と再接続は session nonce で対応付け済み）;
+- [x] 1 / 2 / 3 / 4 source の各構成を候補ごとに実行した（`normal` / `sources_2` / `sources_3` / `capacity_4`、summary の `*_missing_source_counts` が 0）、全 run の `integrity` が `pass`（別実行の記録の混入・子 process の異常終了なし）;
+- [x] 副次: 30 分 soak で予期しない切断 0、overhead ≤ 10 %、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %、latency p95（参考）;
 - [ ] cleanup checklist を完了（使い捨て CA / ledger / node 鍵 / holder state を削除、`ss-poc15-*` scope なし）;
 - [ ] ADR-0007 へ転記する前に、Claude と Owner が全 run の生 JSONL 記録（各 run directory の
   orchestrator / receiver / sender / proxy と holder の記録。summary だけではない）を確認し、
   summary の判定が記録と食い違わないこと（想定外の `fail` / `unmeasured`、記録の欠落・混在、
   不自然な時刻や件数が無いこと）を確かめ、確認した run id と確認者を記録した;
-- [ ] 結果を ADR-0007 Validation 表へ転記し、real / synthetic の内訳と未測定項目を明記した。
+- [x] 結果を ADR-0007 Validation 表へ転記し、real / synthetic の内訳と未測定項目を明記した。
 
 ### LAN baseline measurement (2026-09-30, Issue #15; no transport candidate yet)
 
@@ -2737,6 +2777,18 @@ intercepted Slack transport. On the deployment, additionally check:
       and no recording is written; reloading it back onto the disk resumes
       writes without a restart. Until done, only the mock regression
       (`server/tests/test_device_numbers_reboot.py`) covers this;
+- [ ] (Issues #351/#347, disposable VM only, never a production host) with the
+      service running, `systemctl kill --signal=SIGKILL` it and let the unit
+      restart it: exactly one immediate `recording_health_failure` arrives and
+      the journal shows `monitoring_previous_run_unclean` once; a following
+      `systemctl restart` (graceful) sends none. With Slack blocked at a
+      stop that raised an alert (`critical_notifications_unsettled`), the next
+      start delivers that `pending` row once. Kill it 6 times within an
+      hour (Owner decision 2026-10-29): only the first 4 unclean exits are
+      notified, the journal shows `unclean_exit_notification_dropped` for the
+      others, and a kill more than an hour after the first notice is notified
+      again. Until done, only the mock
+      regressions (`server/tests/test_monitoring_unclean_exit.py`) cover this;
 - [ ] storage state transitions appear in `storage_state_audit`, and expired
       unstarred recordings/state-audit rows are removed by the running service;
 - [ ] detaching or substituting the recording mount while running yields one

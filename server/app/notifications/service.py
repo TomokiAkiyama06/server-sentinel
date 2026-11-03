@@ -75,6 +75,10 @@ RECOVERY_KINDS = frozenset({NotificationKind.HUMAN_ACCESS_RECOVERED})
 # Immediate, but a condition needing Owner attention rather than a failure:
 # monitoring and recording continue (Issue #321).
 ATTENTION_KINDS = frozenset({NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED})
+# Kinds whose alert may be sent after the condition already ended: the text
+# then says so (Issue #349, a held camera outage that recovered first).
+RECOVERED_SUFFIX = " (already recovered)"
+RECOVERED_KINDS = frozenset({NotificationKind.CAMERA_OFFLINE})
 
 
 def aware(value: datetime) -> None:
@@ -342,11 +346,12 @@ class NotificationService:
 
     def record(self, kind: NotificationKind, *, at: datetime,
                confirmed: bool = False, event_id: UUID | None = None,
-               on_complete=None) -> DeliveryResult:
+               on_complete=None, recovered: bool = False) -> DeliveryResult:
         self._check()
         aware(at)
         if (not isinstance(kind, NotificationKind) or type(confirmed) is not bool
-                or event_id is not None and not isinstance(event_id, UUID)):
+                or event_id is not None and not isinstance(event_id, UUID)
+                or type(recovered) is not bool or recovered and kind not in RECOVERED_KINDS):
             raise ValueError("invalid notification event")
         if kind == NotificationKind.DAILY_SUMMARY:
             raise ValueError("daily summary requires aggregate data")
@@ -373,7 +378,9 @@ class NotificationService:
         prefix = ("ServerSentinel recovery notice" if kind in RECOVERY_KINDS
                   else "ServerSentinel attention notice" if kind in ATTENTION_KINDS
                   else "ServerSentinel critical alert")
-        return self._enqueue(event, f"{prefix}: {kind.value}", on_complete, retain=True)
+        # ``recovered`` changes only the fixed text, never the stored row.
+        suffix = RECOVERED_SUFFIX if recovered else ""
+        return self._enqueue(event, f"{prefix}: {kind.value}{suffix}", on_complete, retain=True)
 
     def daily(self, summary: DailySummary, *, at: datetime, on_complete=None) -> DeliveryResult:
         self._check()

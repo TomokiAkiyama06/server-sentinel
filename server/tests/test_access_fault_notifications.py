@@ -662,7 +662,7 @@ class NotificationAcceptanceMigrationTests(TestCase):
             _require_current_schema(connection)
             self.assertEqual(
                 tuple(connection.execute("SELECT version, name FROM schema_migrations "
-                                         "ORDER BY version DESC LIMIT 1").fetchone()),
+                                         "WHERE version=25").fetchone()),
                 (25, "notification_acceptance_time"))
             self.assertEqual(
                 [tuple(row) for row in connection.execute(

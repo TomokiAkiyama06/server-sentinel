@@ -139,7 +139,11 @@ the stream lose JPEG framing or turn malformed, whichever path then tore them
 down: supervision, reconcile, a device conflict, discovery failure, approval or
 close; a stall, EOF, startup timeout or reader failure raises only `launches`)
 and `padding_tolerated` (inter-frame gaps above the 4 KiB default that the
-profile bound skipped before a valid frame, Issue #305). A pipeline's counts
+profile bound skipped before a valid frame, Issue #305) and `launch_failures`
+(launch attempts whose open, identity re-check, mode check, pipeline start
+or reader start failed and were scheduled for a backoff retry, Issue #354; a
+relaunch that keeps failing after a stall never raises `launches`; a stable
+`capture_unsupported` verdict is not counted). A pipeline's counts
 are folded in after its process is stopped and its reader joined, so bytes
 read during teardown are included; a running or not-yet-reaped (stuck)
 pipeline is included with its current counts. They hold no sizes, offsets, timestamps, device
@@ -147,9 +151,13 @@ details or bytes, are not logged per frame and are not part of the Main
 heartbeat contract; the transport PoC holder records them in its samples,
 judging restarts per source (`capture_restarts`, the sum of each source's
 `launches - 1`, and `sources_never_launched`) so one camera's restart cannot
-hide behind another that never started. Its `end` record repeats them
-after the capture is closed and every pipeline reaped; the summarizer judges
-those final counters when present.
+hide behind another that never started, plus `launch_failures` and
+`sources_not_running` (sources whose latest `poll()` health was neither
+`online`/`video_ready` nor `degraded`/`capture_overloaded`, so a run ending
+in backoff fails, Issue #354). Its `end` record repeats them after the
+capture is closed and every pipeline reaped (`sources_not_running` from the
+last poll before the close); the summarizer judges those final counters
+when present.
 
 | State | Reasons |
 | --- | --- |

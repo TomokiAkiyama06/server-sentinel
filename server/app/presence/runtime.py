@@ -93,6 +93,8 @@ DEFAULT_DISPATCH_BACKOFF_SECONDS = 60.0
 # slow POST still completes. It is bounded to 30 s because the whole shutdown
 # (capture and scene stop, outbox finish, this wait, monitoring stop) must end
 # within the unit's `TimeoutStopSec=90` (`install.py`), or systemd kills it.
+# The monitoring stop's own wait for a final-sample storage alert (Issue #351)
+# only uses what is left of this bound, so it adds nothing to that total.
 DEFAULT_DISPATCH_SETTLE_SECONDS = 12.0
 MAXIMUM_DISPATCH_SETTLE_SECONDS = 30.0
 

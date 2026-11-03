@@ -24,7 +24,10 @@ continues. Ordinary
 person/motion/entry/camera-offline observations stay local until the summary;
 a `camera_offline` recorded `confirmed=True` (the source stayed offline for the
 deployment threshold, Issue #301 item 2, `../monitoring/cameras.py`, which
-caps it per hour) is immediate like a confirmed server movement.
+caps it per hour) is immediate like a confirmed server movement. Its
+`recovered=True` (Issue #349, only for `camera_offline`) appends the fixed
+` (already recovered)` to the text for an alert sent after the outage ended;
+the stored row is unchanged.
 `scene_reference_reacquired` and `scene_calibration_required` (Issue #205,
 Owner decision 2026-10-22, option A) are immediate as well: after a Main
 restart a stored scene calibration's reference was taken again from the
@@ -86,7 +89,15 @@ delivery across a crash; retrying an uncertain external POST may duplicate it.
 `close()` stops new submissions without waiting for a blocked transport/DNS call;
 in-flight/queued events remain durably pending or locally failed as recorded.
 After a process crash, the integration outbox owns reconciliation; the service
-does not automatically resend uncertain deliveries. No worker thread touches
+does not automatically resend uncertain deliveries. (The monitoring runtime
+resubmits some `pending` rows at its next start under their own IDs, e.g.
+`recording_health_failure` within a day of its event and at most once per
+row, Issue #351; a notice lost by a crash in the middle of that resend is an
+accepted loss, and new unclean-exit notices are capped at 4 per rolling
+hour, each posted at most twice (its resend is not counted; a 60-minute
+interval can hold more than 8 posts with a slow Slack), Owner decision
+2026-10-29; see
+`../monitoring/README.md`.) No worker thread touches
 SQLite, calls the local sink or logs transport exceptions.
 
 `DailySummary` permits only validated aggregate counts/durations/bytes and storage

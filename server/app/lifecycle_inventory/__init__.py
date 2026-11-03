@@ -166,6 +166,10 @@ DECLARED_MUTABLE = {
         "with every delivery result or retried write; it only re-seeds the hourly access and "
         "finding notification budgets after a restart, and is NULL on rows written before "
         "migration 25"),
+    "notification_events.resent": (
+        "declared_mutable (#351): set once when a start resubmits a recording_health_failure "
+        "row an earlier process left pending, so each row is resent at most once; 0 on rows "
+        "written before migration 26"),
     "uvc_approvals.session_token": (
         "declared_mutable (#132): a per-run marker, cleared at a clean stop and replaced at "
         "every start; the Owner re-approval latch it arms (requires_approval) is compared "
@@ -214,6 +218,15 @@ TRANSIENT_TABLES = {
     # security_state (session_revocation_pending), not the table as a whole.
     "application_metadata": "key/value store; its session-revocation exposure marker "
                             "(#134) is checked in security_state",
+    # Issue #351 (PR #366 review): not "replays nothing" like the others, but
+    # its value changes at every start (a new random token) and a graceful
+    # stop deletes it, so no baseline value could be compared across a stop.
+    "monitoring_run_marker": "running marker of the monitoring runtime, rewritten at "
+                             "every start",
+    # Owner decision 2026-10-29 (PR #366): only the hourly cap of the
+    # unclean-exit notices is counted from it; losing it lets more notices
+    # through, never fewer, and the notices themselves are notification_events.
+    "monitoring_unclean_exit_notices": "unclean-exit notices counted by their hourly cap",
     "notification_schedule": "daily-summary schedule cursor",
     "presence_delivery_fairness": "round-robin cursor between delivery classes",
     "presence_inputs": "live presence inputs with their own validity windows",

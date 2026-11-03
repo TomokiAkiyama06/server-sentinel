@@ -18,6 +18,14 @@ class Event(StrEnum):
     MONITORING_UNCONFIGURED = "monitoring_storage_unconfigured"
     MONITORING_STARTUP_FAILED = "monitoring_startup_failed"
     MONITORING_DEGRADED = "monitoring_degraded"
+    # Issue #351: the previous process exited without its graceful stop.
+    MONITORING_PREVIOUS_RUN_UNCLEAN = "monitoring_previous_run_unclean"
+    # Owner decision 2026-10-29 (PR #366): an unclean exit found while the
+    # hourly cap of unclean-exit notices was full; not notified.
+    UNCLEAN_EXIT_NOTIFICATION_DROPPED = "unclean_exit_notification_dropped"
+    # Issue #351: `pending` recording-health failures left out of the
+    # restart resend (beyond the limit).
+    RECORDING_HEALTH_FAILURE_UNRESTORED = "recording_health_failure_unrestored"
     LOCAL_UVC_UNCONFIGURED = "local_uvc_unconfigured"
     LOCAL_UVC_STORAGE_UNADMITTED = "local_uvc_storage_unadmitted"
     LOCAL_UVC_STARTED = "local_uvc_started"
@@ -81,6 +89,9 @@ class Event(StrEnum):
     UNRECORDED_CRITICAL_ALERTS_UNSENT = "unrecorded_critical_alerts_unsent"
     CAMERA_OFFLINE_NOTIFICATION_RATE_LIMITED = "camera_offline_notification_rate_limited"
     CAMERA_OFFLINE_NOTIFICATION_DROPPED = "camera_offline_notification_dropped"
+    # PR #335: a later flapping episode of a ratio period that already had
+    # its one continuous notification, settled without a notice.
+    CAMERA_OFFLINE_NOTIFICATION_SUPPRESSED = "camera_offline_notification_suppressed"
     # PR #339: pending rows beyond the hourly limit left out of the restart resend.
     CAMERA_OFFLINE_NOTIFICATION_UNRESTORED = "camera_offline_notification_unrestored"
     CAMERA_OFFLINE_NOTIFICATIONS_UNSETTLED = "camera_offline_notifications_unsettled"

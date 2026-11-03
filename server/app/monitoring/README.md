@@ -36,9 +36,11 @@ parking the worker inside `policy.control()` until the caller exits;
 `main.RuntimeStorageAdmission` hands this to the security audit store once the
 runtime is running.
 
-Startup: open components, sample storage, run retention, integrity
+Startup: open components, reconcile the previous run (resend `pending`
+recording-health failures, check and write the running marker; Issue #351),
+sample storage, run retention, integrity
 `startup()`, recording-health `startup()`. Each tick: poll notification
-completions, re-verify the recording filesystem, `policy.status()`, expire
+completions, finish that reconciliation if it was refused, re-verify the recording filesystem, `policy.status()`, expire
 recordings (starred never), `storage_state_audit` and 90-day fault history, run
 the integrity/health `tick()` and the daily summary. A failing step sets its
 status flag and retries after `retry_seconds`; other steps continue. Status is a
@@ -70,10 +72,70 @@ numbers are stale this is judged on every storage sample, not only at open
 (Issue #340): a dm table reload or md member swap onto loop/virtual backing
 that keeps the number and mount is `STORAGE_HARD_STOP` (the per-episode
 filesystem alert) until the backing is hardware-only again; it is not
-latched. An admission-only refusal is kept as one flag
-(`take_topology_refusal`) that the next tick consumes, so that episode alerts
+latched. An admission-only refusal (of any kind: topology, UUID, mount,
+`st_dev`, root or metadata file, Issue #347) is kept as one flag
+(`take_refusal`) that the next tick consumes, so that episode alerts
 once even when restored before the tick; `recording_health` stays failed
-until the next daily self-test. Current numbers read no sysfs. A failed startup open is
+until the next daily self-test. A graceful stop (`_close`) takes one final
+storage sample under the same rule and, only when that sample raised the
+alert, waits for the pending deliveries: up to
+`SHUTDOWN_STORAGE_SETTLE_SECONDS` when no shutdown settle ran, otherwise only
+what is left of the earlier settle's bound and not at all when it ended
+unsettled, so the stop stays within the `TimeoutStopSec=90` budget. An
+unfinished delivery stays `pending` (`critical_notifications_unsettled`). So a
+stop before the tick submits the alert, but it reaches Slack only when the
+single delivery worker gets to it within that wait: queued behind a stalled or
+backlogged delivery, or with no wait left, it may never be sent (`close()`
+sends nothing still queued, and a POST in flight may be cut by the exit).
+Issue #351: the first running pass of every start (`_reconcile_previous_run`)
+first handles the running marker (`monitoring_run_marker`, migration 26,
+`store.RunMarkerStore`): a row of a random per-process token written under the
+storage policy once `running`, deleted by `_close` after a final sample that
+did not raise. Another process's token found there means an unclean exit
+(crash, kill, OOM, power loss): one immediate `recording_health_failure` named
+`uuid5(EVENT_NAMESPACE, "recording-unclean-exit:<token>")` is raised
+(`monitoring_previous_run_unclean` logged) unless that row exists, and the
+marker is replaced only once the row exists, so a crash in between repeats
+nothing. Owner decision 2026-10-29: at most `UNCLEAN_EXIT_HOURLY_LIMIT` (4)
+such notices per rolling hour, counted from `monitoring_unclean_exit_notices`
+(migration 27; event ID and time only) rather than memory, so a crash loop
+cannot reset the hour: a row counts while `abs(now - at)` is under an hour
+(as the 24 h resend window), and rows a day or more away are pruned on the next
+insert. The row is written before the notice is submitted and stamped with
+the time the slot is taken, also the notice's event time (a queue full for
+longer than the hour never inserts an expired slot), so a crash in between
+keeps the slot and the next start sends that notice under the stored time
+without a second slot. Beyond the cap nothing is notified:
+`unclean_exit_notification_dropped` is logged (value-free; the journal line
+is the record, since `unclean_exit_notices_dropped` is a per-process 0/1 value
+shown in no status or daily summary), and the marker is replaced as usual;
+a refusal lost in such a crash is not notified (the text is fixed). The
+recording-health verdict is left to the startup self-test. It
+then submits each `recording_health_failure` row an earlier process left
+`pending` again under its ID and time, when its event time is less than
+`PENDING_HEALTH_RESEND_SECONDS` (24 h) from now in either direction, nearest
+first, at most `PENDING_HEALTH_RESEND_LIMIT` (4) per start (the batch is
+selected once per process and kept across full-queue retries), skipping rows this process
+has in flight and rows already resent once (`notification_events.resent`,
+set before the resubmission, so a crash loop resends each row at most once);
+the rest stay `pending` (`recording_health_failure_unrestored` with a count).
+These resends are not counted against the unclean-exit cap and are not held
+back by it: new unclean-exit notices are at most 4 per rolling hour and
+each is posted at most twice (first submission plus one resend;
+`CrashLoopTests`). The posts are finite, but with a Slack too slow to store
+outcomes a 60-minute interval can hold more than 8, since a resend can land
+in a later interval than its notice. A notice lost because the process crashes again in the middle of
+this resend (its row already marked `resent`) is an accepted loss (Owner
+decision 2026-10-29).
+Each of the two is its own guarded step, retried by the tick after
+`retry_seconds` when refused (also when the queue cannot take the notice:
+nothing is stored as `failed`); while the marker is not written
+`unclean_exit_detection_degraded` is set and counted by the daily summary.
+Between ticks the run loop polls completions every
+`NOTIFICATION_POLL_SECONDS` (1 s) while deliveries are pending, so an
+outcome is stored about a second after Slack answered. A crash or kill before the tick therefore still
+loses the flag, but the next start notifies the unclean exit, unless that
+process's marker write was still being refused. Current numbers read no sysfs. A failed startup open is
 retried every `retry_seconds` from the tick against the same declared identity;
 a failed database open (e.g. SQLite I/O error or permission change) takes the
 same alerting startup-failure path. Only the first failure of the episode alerts, and a successful retry runs the
@@ -120,14 +182,38 @@ period: a sent notification of a source opens its alerted period, which
 closes after a whole window online; while it is open the ratio rule stays
 silent, and in a period a ratio alert opened only the first outage that
 stays offline for `after_seconds` after a short online is notified once more
-(at most two per flapping period, Owner decision 2026-10-23); an outage after
+(at most two per flapping period, Owner decision 2026-10-23; a flapping
+episode belongs to its period by generation, and once one is sent any other
+unsent one of that period is settled without a notice, counted in
+`suppressed`, also after the period closed); an outage after
 an online of at least `after_seconds` is an ordinary episode. A ratio alert is named
 `uuid5(EVENT_NAMESPACE, "camera-offline-flapping:<source>:<window>:<bucket>")`
 after the wall-clock window bucket, so a restart within a window of it sends
 nothing again; a continuous episode due after a restart looks that alert up
 once and restores its period (Issue #338). A ratio alert held back by the cap
 whose period closed is dropped before the cap; one the queue refused is sent
-once the queue takes it, like a refused continuous episode. See SPECIFICATION §9 for the full rules and the known limits.
+once the queue takes it, like a refused continuous episode; such closed
+alerts wait apart from the source's current ratio alert (any number of
+them never blocks a new period, at most `LATE_FLAPS_PER_SOURCE` = 4 per
+source, the oldest beyond that dropped and logged). "Notified once" has
+exactly three not-sent exceptions (Owner decisions 2026-10-26 and
+2026-10-29, PR #359), each counted and logged value-free: (a) a source's
+third outage of at least `after_seconds` while its notices are held drops
+the oldest unsent one once it has lasted `after_seconds` (a shorter third
+outage drops nothing; a source holds at most two unsent episodes that
+reached the threshold (the newest of them and one owed), and at most three
+episodes in all counting a further outage still in progress short of the
+threshold; the limit is applied after each drain's sends and when a further
+outage begins, so until then a third outage that just reached the threshold
+briefly makes three; `dropped`,
+`camera_offline_notification_dropped`; notices the cap holds and notices the
+queue refused share this one hold limit, Owner decision 2026-10-29); (b) a
+fifth closed ratio alert of a source drops the oldest (`dropped`, same log);
+and (c) inside one flapping period PR #335 (at most two) takes precedence
+over Issue #349, so
+another flapping episode of that period is not sent once the period's
+continuous notification went out (`suppressed`,
+`camera_offline_notification_suppressed`). See SPECIFICATION §9 for the full rules and the known limits.
 
 Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
 takes the `AccessFaultMonitor` the composition root also passes to the
