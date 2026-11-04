@@ -515,7 +515,8 @@ its reference.
   instead of `none`/`idle` (Issue #341); `pending_reacquisitions()` stays
   empty and `reacquire()` does nothing until `start()`. An unreadable
   history marks the source with `failure="history_unavailable"` (unknown,
-  not "stored"; an attempt's own refusal already shown is kept); `start()` reads the history again, clearing that failure or
+  not "stored"; an attempt's own refusal already shown is kept); `start()`
+  reads the history again, clearing that failure or
   withdrawing the mark when nothing is stored. "History unknown" is its own
   state, not the last failure (Issue #355): `status()` reports it as
   `history_unknown` (Issue #377) while it lasts, with `failure` the last
