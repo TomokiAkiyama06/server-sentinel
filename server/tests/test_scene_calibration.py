@@ -815,14 +815,15 @@ class RestartReacquisitionTests(unittest.TestCase):
         calls = self.unreadable_at_mark(harness)
         harness.service.mark_stored()
         status = harness.status()
-        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, "history_unavailable"),
-                         (status.origin, status.phase, status.failure))
+        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, "history_unavailable", True),
+                         (status.origin, status.phase, status.failure, status.history_unknown))
         self.assertEqual((), harness.service.take_notices())
         harness.runtime.start()
         harness.service.start()
         self.assertEqual([OTHER, OTHER], calls)
         status = harness.status()
-        self.assertEqual((CalibrationPhase.REACQUIRE_PENDING, None), (status.phase, status.failure))
+        self.assertEqual((CalibrationPhase.REACQUIRE_PENDING, None, False),
+                         (status.phase, status.failure, status.history_unknown))
         self.assertEqual((OTHER,), harness.service.pending_reacquisitions())
         with Feed(harness.runtime):
             record = harness.service.reacquire(OTHER, commit_with(self.database.database))
@@ -922,15 +923,62 @@ class RestartReacquisitionTests(unittest.TestCase):
 
         with self.assertRaises(CalibrationRefused):
             harness.service.calibrate(OTHER, refused_before_prepare)
+        # Issue #377: the history stays unknown in its own field, and the
+        # failure is the attempt's own refusal.
         status = harness.status()
-        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, "history_unavailable"),
-                         (status.origin, status.phase, status.failure))
-        # `start()` reads the history again and withdraws the guessed mark;
-        # the attempt's own failure is reported again.
+        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, "cancelled", True),
+                         (status.origin, status.phase, status.failure, status.history_unknown))
+        # `start()` reads the history again and withdraws the guessed mark.
         harness.runtime.start()
         harness.service.start()
         status = harness.status()
-        self.assertEqual((CalibrationPhase.IDLE, "cancelled"), (status.phase, status.failure))
+        self.assertEqual((CalibrationPhase.IDLE, "cancelled", False),
+                         (status.phase, status.failure, status.history_unknown))
+
+    def test_an_unreadable_scan_during_a_successful_owner_calibration_is_cleared(self):
+        # Claude review of PR #361 (HEAD db8f8b1), proposal 1: the Owner
+        # attempt read the history, then the `start()` scan cannot read it,
+        # then the attempt succeeds. Success settles the history.
+        self.database.store(stored())
+        harness = Service(self, self.database.database, start=False)
+        harness.runtime.start()
+        read, latest = harness.service._read, harness.service._latest
+
+        def unreadable(binding):
+            raise CalibrationRefused("history_unavailable")
+
+        def overlapping_read(*arguments):
+            harness.service._latest = unreadable
+            harness.service.start()
+            harness.service._latest = latest
+            self.assertTrue(harness.status().history_unknown)
+            return read(*arguments)
+
+        harness.service._read = overlapping_read
+        with Feed(harness.runtime):
+            record = harness.service.calibrate(OTHER, commit_with(self.database.database))
+        self.assertEqual(2, record.version)
+        status = harness.status()
+        self.assertEqual((CalibrationOrigin.OWNER, CalibrationPhase.IDLE, None, False),
+                         (status.origin, status.phase, status.failure, status.history_unknown))
+
+    def test_a_failed_save_with_a_known_history_is_not_reported_as_unknown(self):
+        # Issue #377 item 1: the history was read (a stored calibration waits
+        # for its re-acquisition), then the commit could not save: the
+        # failure is `history_unavailable`, the history is still known.
+        self.database.store(stored())
+        harness = Service(self, self.database.database)
+        harness.service.start()
+
+        def refused_save(source_id, prepare, persist):
+            prepare()
+            raise CalibrationRefused("history_unavailable")
+
+        with Feed(harness.runtime), self.assertRaises(CalibrationRefused):
+            harness.service.calibrate(OTHER, refused_save)
+        status = harness.status()
+        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, "history_unavailable", False),
+                         (status.origin, status.phase, status.failure, status.history_unknown))
 
     def test_a_failed_owner_calibration_overlapping_the_marks_keeps_the_reacquisition(self):
         # Codex P2 on PR #345: an Owner calibration in flight across both the

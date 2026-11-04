@@ -27,7 +27,8 @@ const render = (element) => renderToStaticMarkup(element).replaceAll('&#x27;', "
 
 const source = (overrides = {}) => ({
   source_id: sourceId, origin: 'owner', version: 2, calibrated_at: at, phase: 'idle', failure: null,
-  owner_calibration_available: true, detection: 'active', detection_reason: 'evaluated', ...overrides,
+  owner_calibration_available: true, history_unknown: false, detection: 'active', detection_reason: 'evaluated',
+  ...overrides,
 });
 
 function fake(routes) {
@@ -95,6 +96,7 @@ test('one malformed source fails the whole status closed', () => {
     { ...source(), version: null }, { ...source(), calibrated_at: null },
     { ...source(), origin: 'none' }, { ...source(), calibrated_at: '2026-10-22 01:02:03' },
     { ...source(), phase: 'done' }, { ...source(), failure: 'other' }, { ...source(), owner_calibration_available: 1 },
+    { ...source(), history_unknown: 'yes' }, (({ history_unknown, ...rest }) => rest)(source()),
     { ...source(), detection: 'unknown' }, { ...source(), detection_reason: 'Bad Reason' },
     { ...source(), detection_reason: '' },
   ];
@@ -201,12 +203,13 @@ test('a restart re-acquired reference warns that it was not confirmed by the Own
   assert.doesNotMatch(messages.ja.calibrationOriginPending, /未校正/);
   assert.match(messages.ja.calibrationPhase_reacquire_pending, /検知が始まるまでの間も含みます/);
   assert.match(messages.en.calibrationPhase_reacquire_pending, /while detection has not started/);
-  // An unreadable history (`history_unavailable`) is unknown, never "stored"
+  // An unreadable history (`history_unknown`) is unknown, never "stored"
   // nor "not calibrated" (Claude review of PR #345, proposal 3).
   for (const locale of ['ja', 'en']) {
     const m = messages[locale];
     const unknown = render(createElement(CalibrationCard, { t: m, item: source({ origin: 'none', version: null,
-      calibrated_at: null, phase: 'reacquire_pending', failure: 'history_unavailable', detection: 'inactive',
+      calibrated_at: null, phase: 'reacquire_pending', failure: 'history_unavailable', history_unknown: true,
+      detection: 'inactive',
       detection_reason: 'unavailable' }), name: null, disabled: false, confirmed: false, onConfirm: noop }));
     for (const text of [m.calibrationOriginUnknown, m.calibrationHistoryUnknown]) assert.ok(unknown.includes(text), `${locale} ${text}`);
     for (const text of [m.calibrationOriginPending, m.calibrationOrigin_none, m.calibrationPhase_reacquire_pending,
@@ -235,15 +238,49 @@ test('a failed Owner calibration after the empty history was read is not shown a
     }
     for (const text of [m.calibrationOriginPending, m.calibrationPhase_reacquire_pending, m.calibrationOriginUnknown,
       m.calibrationHistoryUnknown]) assert.ok(!known.includes(text), `${locale} ${text}`);
-    // While the history is still unknown the server keeps reporting
-    // `history_unavailable`, whatever the attempt failed on: still unknown.
+    // While the history is still unknown the server says so in its own
+    // field (Issue #377); the failure is the attempt's own refusal.
     const unknown = render(createElement(CalibrationCard, { t: m, item: source({ origin: 'none', version: null,
-      calibrated_at: null, phase: 'reacquire_pending', failure: 'history_unavailable', detection: 'inactive',
-      detection_reason: 'unavailable' }), name: null, disabled: false, confirmed: false, onConfirm: noop }));
-    assert.ok(unknown.includes(m.calibrationOriginUnknown), locale);
+      calibrated_at: null, phase: 'reacquire_pending', failure: 'cancelled', history_unknown: true,
+      detection: 'inactive', detection_reason: 'unavailable' }), name: null, disabled: false, confirmed: false,
+      onConfirm: noop }));
+    for (const text of [m.calibrationOriginUnknown, m.calibrationHistoryUnknown, m.calibrationRefused_cancelled]) {
+      assert.ok(unknown.includes(text), `${locale} ${text}`);
+    }
     assert.ok(!unknown.includes(m.calibrationOriginPending), locale);
   }
   assert.equal(messages.ja.calibrationOrigin_none, '未校正');
+});
+
+test('the history being unknown comes from the server, not from the failure', () => {
+  // Issue #377 item 1: a stored calibration known to the server whose save
+  // failed (`history_unavailable`) is still "stored", with the refusal line.
+  // Item 2: an Owner calibration acquiring while the history is unknown is
+  // "unknown", never "not calibrated".
+  for (const locale of ['ja', 'en']) {
+    const m = messages[locale];
+    const saved = render(createElement(CalibrationCard, { t: m, item: source({ origin: 'none', version: null,
+      calibrated_at: null, phase: 'reacquire_pending', failure: 'history_unavailable', detection: 'inactive',
+      detection_reason: 'unavailable' }), name: null, disabled: false, confirmed: false, onConfirm: noop }));
+    for (const text of [m.calibrationOriginPending, m.calibrationPhase_reacquire_pending,
+      m.calibrationRefused_history_unavailable]) assert.ok(saved.includes(text), `${locale} ${text}`);
+    for (const text of [m.calibrationOriginUnknown, m.calibrationHistoryUnknown]) {
+      assert.ok(!saved.includes(text), `${locale} ${text}`);
+    }
+    const acquiring = render(createElement(CalibrationCard, { t: m, item: source({ origin: 'none', version: null,
+      calibrated_at: null, phase: 'acquiring', failure: 'history_unavailable', history_unknown: true,
+      detection: 'inactive', detection_reason: 'unavailable' }), name: null, disabled: false, confirmed: false,
+      onConfirm: noop }));
+    for (const text of [m.calibrationOriginUnknown, m.calibrationHistoryUnknown, m.calibrationPhase_acquiring]) {
+      assert.ok(acquiring.includes(text), `${locale} ${text}`);
+    }
+    for (const text of [m.calibrationOrigin_none, m.calibrationRefused_history_unavailable]) {
+      assert.ok(!acquiring.includes(text), `${locale} ${text}`);
+    }
+  }
+  const [parsed] = parseSceneCalibration({ sources: [source({ origin: 'none', version: null, calibrated_at: null,
+    history_unknown: true })] });
+  assert.equal(parsed.history_unknown, true);
 });
 
 test('every refusal and calibration text exists in both locales', () => {

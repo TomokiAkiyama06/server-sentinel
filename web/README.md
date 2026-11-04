@@ -496,7 +496,7 @@ only the calibration section is shown there). Routes
 ```text
 GET  /api/scene/calibration                           200 {"sources":[{source_id, origin, version, calibrated_at,
                                                            phase, failure, owner_calibration_available,
-                                                           detection, detection_reason}]}
+                                                           history_unknown, detection, detection_reason}]}
 POST /api/scene/sources/<id>/calibration  {"normal_position_confirmed":true}
                                                       200 {"outcome":"calibrated","version","calibrated_at"}
                                                       200 {"outcome":"refused","reason":<fixed reason>}
