@@ -289,7 +289,9 @@ and after scene `stop()` and the outbox finish it runs one more step, so a
 confirmation from the final scene pass is submitted, then waits up to
 `dispatch_settle_seconds` (default 12 s, above the 10 s Slack timeout; at most
 30 s, because this wait plus the other stop steps must stay within the unit's
-`TimeoutStopSec=90`) for submitted deliveries to complete
+`TimeoutStopSec=90`: `create_app()` refuses a composition whose local UVC stop
+bound plus this settle exceeds 80 s, see `app/stop_budget.py`, Issue #364)
+for submitted deliveries to complete
 before the monitoring runtime closes the service. A delivery still running then
 stays `pending` / unresolved (`critical_notifications_unsettled` is logged),
 never resent. The monitoring runtime's final storage sample at its stop

@@ -22,6 +22,7 @@ from app.deployment import (
     DEVICE_NUMBERS_STALE_WARNING, CaptureCaSettingMissing, Deployment, WebAssetsRefused,
 )
 from app.settings import ConfigurationError
+from app.stop_budget import UNIT_STOP_TIMEOUT_SECONDS
 
 
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
@@ -481,7 +482,7 @@ RequiresMountsFor={_quote(deployment.runtime_root)}
 Type=notify
 NotifyAccess=main
 TimeoutStartSec=60
-TimeoutStopSec=90
+TimeoutStopSec={UNIT_STOP_TIMEOUT_SECONDS}
 User={account.pw_name}
 Group={account.pw_gid}
 WorkingDirectory={_unit_path(current)}
