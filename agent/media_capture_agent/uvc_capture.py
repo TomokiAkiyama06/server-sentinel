@@ -103,9 +103,10 @@ class CaptureCounters:
     default that the profile bound skipped before a valid frame;
     ``launch_failures`` the launch attempts (open, identity re-check, mode
     check, pipeline start or reader start) that failed and were scheduled for
-    a backoff retry (Issue #354: a source whose relaunch keeps failing never
-    raises ``launches``). Counts of a pipeline still running or not yet
-    reaped are included as they stand.
+    a backoff retry (Issue #354: a source whose open, identity re-check, mode
+    check or pipeline start keeps failing never raises ``launches``; a failed
+    reader start follows a started pipeline and raises both). Counts of a
+    pipeline still running or not yet reaped are included as they stand.
     """
 
     launches: int
