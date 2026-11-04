@@ -157,7 +157,10 @@ hide behind another that never started, plus `launch_failures` and
 in backoff fails, Issue #354). Its `end` record repeats them after the
 capture is closed and every pipeline reaped (`sources_not_running` from the
 last poll before the close); the summarizer judges those final counters
-when present.
+when present. `sources_not_running` sees only that last poll (the holder
+polls every 0.5 s): a source that stops after it, or near the end of the run
+without reaching `stall_timeout`, is not counted, so the run also records
+each source's fps and frame count (Issue #360).
 
 | State | Reasons |
 | --- | --- |

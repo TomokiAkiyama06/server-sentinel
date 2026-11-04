@@ -1753,6 +1753,8 @@ class CaptureTests(CaptureCase):
             elapsed = time.monotonic() - started
         self.assertEqual(len(self.launcher.pipelines), 4)
         self.assertEqual([item.reason for item in health], ["capture_cleanup_failed"] * 4)
+        # Issue #360: a reader that cannot start is a failed launch attempt.
+        self.assertEqual([capture.counters(source).launch_failures for source in SOURCES[:4]], [1] * 4)
         # Old behavior: 4 x stop_timeout after the shared deadline was cleared.
         self.assertLess(elapsed, 1.8 * self.limits.stop_timeout)
         for pipeline in self.launcher.pipelines:
