@@ -54,13 +54,13 @@ const CALIBRATE = `/api/scene/sources/${sourceId}/calibration`;
 function status(calibrated) {
   return { sources: [
     { source_id: sourceId, origin: calibrated ? 'owner' : 'restart_reacquired', version: calibrated ? 3 : 2,
-      calibrated_at: at, phase: 'idle', failure: null, owner_calibration_available: true, detection: 'active',
+      calibrated_at: at, phase: 'idle', failure: null, owner_calibration_available: true, history_unknown: false, detection: 'active',
       detection_reason: 'evaluated', sha256: DIGEST, polygon: [[4, 4], [7, 4], [7, 7]] },
     { source_id: otherId, origin: 'none', version: null, calibrated_at: null, phase: 'reacquire_pending',
-      failure: 'reader_changed', owner_calibration_available: false, detection: 'inactive',
+      failure: 'reader_changed', owner_calibration_available: false, history_unknown: false, detection: 'inactive',
       detection_reason: 'calibration_reference_unavailable' },
     { source_id: unknownId, origin: 'none', version: null, calibrated_at: null, phase: 'reacquire_pending',
-      failure: 'history_unavailable', owner_calibration_available: false, detection: 'inactive',
+      failure: 'history_unavailable', owner_calibration_available: false, history_unknown: true, detection: 'inactive',
       detection_reason: 'unavailable' },
   ] };
 }

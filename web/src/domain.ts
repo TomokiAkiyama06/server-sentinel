@@ -167,6 +167,8 @@ export interface SceneCalibrationSource {
   failure: CalibrationReason | null;
   /** The deployment configures a calibration template for this source. */
   owner_calibration_available: boolean;
+  /** The calibration history could not be read: whether one is stored is unknown (Issue #377). */
+  history_unknown: boolean;
   detection: SceneDetectionState;
   /** The scene runtime's fixed reason code, shown as a diagnostic only. */
   detection_reason: string;

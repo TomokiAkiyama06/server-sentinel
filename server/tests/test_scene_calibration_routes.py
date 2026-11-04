@@ -37,7 +37,7 @@ from tests.test_uvc_runtime import wait_for
 
 CONFIRMED = {"normal_position_confirmed": True}
 STATUS_KEYS = {"source_id", "origin", "version", "calibrated_at", "phase", "failure",
-               "owner_calibration_available", "detection", "detection_reason"}
+               "owner_calibration_available", "history_unknown", "detection", "detection_reason"}
 
 
 class SceneRouteFixture(AdminRouteFixture):
@@ -103,9 +103,9 @@ class SceneRouteTests(SceneRouteFixture):
         self.assertEqual(200, status(result))
         (item,) = payload(result)["sources"]
         self.assertEqual(STATUS_KEYS, set(item))
-        self.assertEqual((str(OTHER), "none", None, "idle", None, True, "inactive"),
+        self.assertEqual((str(OTHER), "none", None, "idle", None, True, False, "inactive"),
                          (item["source_id"], item["origin"], item["version"], item["phase"], item["failure"],
-                          item["owner_calibration_available"], item["detection"]))
+                          item["owner_calibration_available"], item["history_unknown"], item["detection"]))
         with Feed(self.runtime):
             result = await self.calibrate()
             self.assertEqual(200, status(result))
