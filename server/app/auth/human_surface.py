@@ -1760,8 +1760,9 @@ class HumanSurface:
         ``calibrated_at``, ``phase`` (``idle`` / ``acquiring`` /
         ``reacquire_pending``), ``failure`` (a fixed reason or null),
         ``owner_calibration_available``, ``history_unknown`` (the history
-        could not be read, so whether a calibration is stored is unknown) and
-        the scene runtime's ``detection`` state and ``detection_reason``. No pixel, frame,
+        could not be read, so whether a calibration is stored is unknown),
+        ``stored_known`` (none is in use but one is known to be stored, also
+        while acquiring) and the scene runtime's ``detection`` state and ``detection_reason``. No pixel, frame,
         digest, polygon, policy, device or camera name.
         """
         service = self._scene_service()
@@ -1782,7 +1783,7 @@ class HumanSurface:
             "calibrated_at": _utc_iso(item.calibrated_at) if item.calibrated_at is not None else None,
             "phase": item.phase.value, "failure": item.failure,
             "owner_calibration_available": item.owner_calibration_available,
-            "history_unknown": item.history_unknown,
+            "history_unknown": item.history_unknown, "stored_known": item.stored_known,
             "detection": item.detection, "detection_reason": item.detection_reason,
         } for item in sources]})
 

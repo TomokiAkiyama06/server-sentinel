@@ -527,8 +527,10 @@ its reference.
   (Issue #381: not a failed save that finished while `start()` read the
   history either).
 - `status()` is value-free: origin, version, time, phase, last refusal,
-  whether a template exists, whether the history is unknown, and the
-  runtime's own source state and reason.
+  whether a template exists, whether the history is unknown, whether a
+  calibration is known to be stored while none is in use (`stored_known`,
+  also while acquiring, Issue #382), and the runtime's own source state and
+  reason.
 
 Synthetic verification: `server/tests/test_scene_calibration.py` (runtime
 acquisition, history, service, and the application lifespan with an

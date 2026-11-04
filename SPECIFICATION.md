@@ -1296,7 +1296,9 @@ continues during an acquisition.
   configured source `source_id`, `origin` (`none` / `owner` /
   `restart_reacquired`), `version`, `calibrated_at`, `phase` (`idle` /
   `acquiring` / `reacquire_pending`), `failure`, `owner_calibration_available`,
-  `history_unknown`, and the scene runtime's `detection` state and `detection_reason`; never a
+  `history_unknown`, `stored_known` (no calibration is in use but one is
+  known to be stored, also while acquiring; never with `history_unknown`,
+  Issue #382), and the scene runtime's `detection` state and `detection_reason`; never a
   pixel, frame, digest, polygon or policy value. A source with a stored
   calibration reports `reacquire_pending` from the start of Main, also while
   scene monitoring still waits for a deferred start (a timeline outbox open
@@ -1320,7 +1322,10 @@ continues during an acquisition.
   decides "unknown" from `history_unknown` only, so a known stored
   calibration whose save failed (`history_unavailable`) is still shown as
   stored with that refusal, and an Owner calibration acquiring while the
-  history is unknown is shown as unknown, never as not calibrated.
+  history is unknown is shown as unknown, never as not calibrated. The Web
+  decides "stored" from `stored_known` only, not from `phase`, so a stored
+  calibration whose re-acquisition (or an Owner calibration) is acquiring is
+  still shown as stored (Issue #382).
 - *Restart re-acquisition.* After every Main start, once scene monitoring
   runs, each source with a stored calibration has its reference taken again,
   every source independently and concurrently (at most four), so a camera

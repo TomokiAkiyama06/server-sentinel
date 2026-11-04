@@ -496,7 +496,8 @@ only the calibration section is shown there). Routes
 ```text
 GET  /api/scene/calibration                           200 {"sources":[{source_id, origin, version, calibrated_at,
                                                            phase, failure, owner_calibration_available,
-                                                           history_unknown, detection, detection_reason}]}
+                                                           history_unknown, stored_known, detection,
+                                                           detection_reason}]}
 POST /api/scene/sources/<id>/calibration  {"normal_position_confirmed":true}
                                                       200 {"outcome":"calibrated","version","calibrated_at"}
                                                       200 {"outcome":"refused","reason":<fixed reason>}
@@ -511,12 +512,14 @@ POST /api/scene/sources/<id>/calibration  {"normal_position_confirmed":true}
   without the Owner. The latter carries a warning that a camera or server
   moved while Main was down is not detected against it, and asks the Owner to
   check the live view and calibrate again. A source with a stored
-  calibration whose restart re-acquisition is still pending (`origin: none`,
-  `phase: reacquire_pending`, also while scene detection waits for a deferred
-  start) is shown as a stored calibration waiting for its reference, never as
-  "not calibrated" (Issue #341). With `failure: history_unavailable` the
-  history could not be read, so the badge and text say only that the state
-  is unknown and ask the Owner to check the storage.
+  calibration but none in use (`origin: none`, `stored_known: true`: its
+  restart re-acquisition is pending, also while scene detection waits for a
+  deferred start, or it is acquiring) is shown as a stored calibration
+  waiting for its reference, never as "not calibrated" (Issues #341, #382).
+  With `history_unknown: true` the history could not be read, so the badge
+  and text say only that the state is unknown and ask the Owner to check the
+  storage (Issue #377). The parser refuses `stored_known` together with a
+  calibration in use or an unknown history.
 - The calibrate button is enabled only after the Owner ticks the explicit
   normal-position statement; the request carries that statement. A
   `step_up_required` answer runs the same step-up prompt and single retry as

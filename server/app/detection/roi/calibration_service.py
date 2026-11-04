@@ -234,6 +234,11 @@ class SourceCalibrationStatus:
     # stored is unknown (Issue #377): kept apart from `failure`, which is
     # the last attempt's own refusal.
     history_unknown: bool = False
+    # No calibration is in use (`origin` none), but one is known to be stored
+    # (Issue #382): true while its restart re-acquisition is pending and also
+    # while an attempt is acquiring, so the Web never calls it "not
+    # calibrated". False while the history is unknown.
+    stored_known: bool = False
 
 
 @dataclass(frozen=True)
@@ -328,7 +333,9 @@ class SceneCalibrationService:
                     source_id in self._templates,
                     detection.state.value if detection is not None else "inactive",
                     detection.reason if detection is not None else "unavailable",
-                    state.history_unknown))
+                    state.history_unknown,
+                    state.origin is CalibrationOrigin.NONE and state.reacquire
+                    and not state.history_unknown))
             return tuple(result)
 
     def take_notices(self) -> tuple[Notice, ...]:
