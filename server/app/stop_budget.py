@@ -23,7 +23,7 @@ UNIT_STOP_TIMEOUT_SECONDS = 90
 #   shutdown starts (`timeout_graceful_shutdown`);
 HTTP_GRACEFUL_SHUTDOWN_SECONDS = 5.0
 # - the human access stop waits for an in-flight hostname reservation check:
-#   all its enumerations share one deadline (`CHECK_DEADLINE_SECONDS`), plus
+#   all its enumerations share one deadline (`ENUMERATION_TIMEOUT_SECONDS`), plus
 #   one SQLite busy timeout for loading the listener exceptions;
 RESERVATION_CHECK_STOP_SECONDS = 10.0 + 5.0
 # - the scene runtime stop: worker join and final delivery pass, each 5 s,
@@ -34,8 +34,10 @@ PROCESS_EXIT_SECONDS = 4.0
 # Not bounded yet (Issue #383 phase 2, separate Issue): waits for the storage
 # admission behind a monitoring job, the SQLite busy timeouts of the writes in
 # the human access stop, the timeline finish and the dispatch, and a hung
-# filesystem call. A monitoring tick no longer starts or continues its long
-# steps once the stop began (`MonitoringRuntime.begin_stop`).
+# filesystem call, and the one monitoring step already running when the stop
+# began (an integrity probe run or the recording self-test): a tick starts no
+# further long step after it (`MonitoringRuntime.begin_stop`), and the
+# settles queue behind it. PROCESS_EXIT_SECONDS is an estimate, not derived.
 OTHER_STOP_STEPS_RESERVE_SECONDS = (HTTP_GRACEFUL_SHUTDOWN_SECONDS + RESERVATION_CHECK_STOP_SECONDS
                                     + SCENE_STOP_SECONDS + PROCESS_EXIT_SECONDS)
 # On top of `join_timeout_seconds`, a local UVC stop waits at most 1 s for the

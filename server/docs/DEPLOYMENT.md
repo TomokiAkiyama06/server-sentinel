@@ -451,15 +451,18 @@ follow it. Issue #364: the local UVC stop bound plus the notification settle
 must stay within 55 s, `TimeoutStopSec=90` less a 35 s reserve for the steps
 without a configurable bound (Issue #383: 5 s HTTP graceful shutdown, 15 s for
 an in-flight hostname reservation check whose enumerations share one 10 s
-deadline plus one SQLite busy timeout, 11 s scene stop, 4 s process exit; a
-monitoring tick starts no long step once the stop began); `create_app()`
+deadline plus one SQLite busy timeout, 11 s scene stop, about 4 s for the
+process exit; once the stop began a monitoring tick starts no further long
+step); `create_app()`
 refuses a composition that exceeds it (`app/stop_budget.py`). This file
 accepts `join_timeout_seconds` up to 40 s, the most that fits with the 12 s
 settle, so `--check` refuses a longer join (before Issue #383 it accepted up
 to 60 s: check an existing deployment file before updating). Not yet bounded
 (Issue #383 phase 2): a wait for the storage admission behind a monitoring
 job, the SQLite busy timeouts of the writes in the human access stop, timeline
-finish and dispatch, and a hung filesystem call. The wait of
+finish and dispatch, a hung filesystem call, and the one monitoring step
+already running when the stop began (an integrity probe run, about 10 s per
+probe, or the recording self-test), which the settles queue behind. The wait of
 the monitoring runtime's final storage sample (Issue #351) shares the bound of
 the notification settle before it, so it does not lengthen the stop. The installed
 unit sets `TimeoutStopSec=90` explicitly (Owner decision 2026-10-08), so the

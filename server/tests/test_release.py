@@ -783,7 +783,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK", lines)
         self.assertIn("ProtectControlGroups=true", lines)
         # Owner decision 2026-10-08 (Issue #173, PR #188): the local UVC stop can
-        # take ~63 s and the remaining shutdown steps follow it, so the stop
+        # take ~43 s (40 s join maximum, Issue #383) and the remaining shutdown steps follow it, so the stop
         # bound is set explicitly in [Service] instead of relying on the host's
         # DefaultTimeoutStopSec.
         for rendered in (lines, legacy.splitlines()):
