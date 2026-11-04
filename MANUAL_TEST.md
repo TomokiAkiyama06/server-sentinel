@@ -1687,7 +1687,12 @@ Total run time today:
 - [x] 2 host の run では G5 の Main `interrupted`（proxy blackhole）が件数照合（window との時刻対応なし）であることを結果に併記した（Main 側停止・再起動の Agent 検知と再接続は session nonce で対応付け済み）;
 - [x] 1 / 2 / 3 / 4 source の各構成を候補ごとに実行した（`normal` / `sources_2` / `sources_3` / `capacity_4`、summary の `*_missing_source_counts` が 0）、全 run の `integrity` が `pass`（別実行の記録の混入・子 process の異常終了なし）;
 - [x] 副次: 30 分 soak で予期しない切断 0、overhead ≤ 10 %、実カメラ passthrough 1 台あたり Agent CPU ≤ 1 core の 50 %、latency p95（参考）;
-- [ ] cleanup checklist を完了（使い捨て CA / ledger / node 鍵 / holder state を削除、`ss-poc15-*` scope なし）;
+- [x] cleanup checklist を完了（使い捨て CA / ledger / node 鍵 / holder state を削除、`ss-poc15-*` scope なし）;
+  （2026-11-03。削除は Owner が実行し、確認は Claude。両 host で `ss-poc15-*` unit なし、47200–47214 の待ち受けなし、
+  `~/poc15` の materials / state / node 鍵 / holder の state・socket を削除し、秘密鍵の PEM・`*.key`・`*.pem`・`*.crt` が
+  残っていない（ソースの写しで一致したのは test と文書の中の文字列だけ）。PoC 用の firewall 許可は 2026-10-29 の run 後に削除済み。ソースの写しの tar / directory とログは残している。
+  鍵は含まないが、README の「残すのは数値 JSONL / summary だけ」より範囲が広く、private な値が無いことは確かめていない。
+  どちらの host の外にも出さない）
 - [ ] ADR-0007 へ転記する前に、Claude と Owner が全 run の生 JSONL 記録（各 run directory の
   orchestrator / receiver / sender / proxy と holder の記録。summary だけではない）を確認し、
   summary の判定が記録と食い違わないこと（想定外の `fail` / `unmeasured`、記録の欠落・混在、

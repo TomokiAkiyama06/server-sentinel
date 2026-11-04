@@ -58,9 +58,19 @@ class _Owner:
             raise PermissionError("synthetic denial")
 
 
-def free_port() -> int:
-    with socket.create_server(("127.0.0.1", 0)) as probe:
-        return probe.getsockname()[1]
+def free_port(exclude=()) -> int:
+    """An unbound loopback port that is not in ``exclude``.
+
+    The probe closes before returning, so the kernel can hand the same number
+    out again; callers pass the ports the test already chose (Issue #365).
+    """
+    excluded = {int(port) for port in exclude}
+    for _attempt in range(100):
+        with socket.create_server(("127.0.0.1", 0)) as probe:
+            port = probe.getsockname()[1]
+        if port not in excluded:
+            return port
+    raise RuntimeError("no free loopback port outside the excluded set")
 
 
 class TtyProcess:
@@ -313,6 +323,11 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         for process in self.processes:
             process.kill()
 
+    def listener_port(self, *exclude):
+        # The enrollment listener must differ from the human listener, or the
+        # product correctly refuses the approval (Issue #365).
+        return free_port((self.human_port, *exclude))
+
     def run_cli(self, *arguments, module, tty=True):
         command = [sys.executable, "-m", module, *map(str, arguments)]
         process = TtyProcess(command, env=self.environment, controlling_terminal=tty)
@@ -406,7 +421,7 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         return result, output.decode().strip()
 
     def test_enroll_over_bootstrap_listener_then_mtls_ingest(self):
-        listen_port = free_port()
+        listen_port = self.listener_port()
         relay = RecordingRelay(listen_port)
         self.addCleanup(relay.close)
         deployment, bundle, bundle_digest = self.initialise_main(relay.port)
@@ -503,7 +518,7 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         again = self.main_cli("approve", "--database", self.database,
                               "--authority-dir", self.authority_dir,
                               "--listener-dir", self.listener_dir, "--request", request,
-                              "--listen", f"127.0.0.1:{free_port()}",
+                              "--listen", f"127.0.0.1:{self.listener_port()}",
                               "--human-port", self.human_port)
         status, output, error = again.finish()
         self.assertEqual(2, status)
@@ -525,7 +540,7 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         # Issue #109: the CA child decides from its own issuance log. A key the
         # log binds to another node is refused after the Owner's APPROVE; the
         # code is never shown and no listener serves it.
-        listen_port = free_port()
+        listen_port = self.listener_port()
         self.initialise_main(listen_port)
         request, key_digest = self.agent_request()
         with open(self.authority_dir / "issuance-log.jsonl", "a") as log:
@@ -553,7 +568,7 @@ class CaptureEnrollmentScenario(unittest.TestCase):
                 "SELECT COUNT(*) FROM pairing_node_credentials").fetchone()[0])
 
     def test_interrupted_approval_is_retried_for_the_same_bound_node(self):
-        listen_port = free_port()
+        listen_port = self.listener_port()
         deployment, bundle, bundle_digest = self.initialise_main(listen_port)
         request, key_digest = self.agent_request()
         first, _grouped = self.start_approval(request, listen_port, key_digest)
@@ -596,7 +611,7 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         # Issue #116, Owner policy 2026-10-01. The first credential is issued
         # in-process with a three-second lifetime so it really expires; every
         # re-pairing step then runs through the real Main and Agent CLIs.
-        listen_port = free_port()
+        listen_port = self.listener_port()
         deployment, bundle, bundle_digest = self.initialise_main(listen_port)
         request, key_digest = self.agent_request()
         database = Database(self.database)
@@ -656,7 +671,7 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         refused = self.main_cli("approve", "--database", self.database,
                                 "--authority-dir", self.authority_dir,
                                 "--listener-dir", self.listener_dir, "--request", repair,
-                                "--listen", f"127.0.0.1:{free_port()}",
+                                "--listen", f"127.0.0.1:{self.listener_port()}",
                                 "--human-port", self.human_port)
         status, _output, error = refused.finish()
         self.assertEqual(2, status)
@@ -664,7 +679,7 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         revoked_request, new_digest = self.agent_request("--repair", "revoked", name="revoked.json")
         self.assertNotEqual(key_digest, new_digest)
         # A fresh port: the first listener's port may still be in TIME_WAIT.
-        second_port = free_port()
+        second_port = self.listener_port(listen_port)
         main, grouped = self.start_approval(revoked_request, second_port, new_digest)
         self.assertIn(b"new capture node", main.transcript)
         main.wait_for(b"Type it only")
@@ -693,7 +708,7 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         # Issue #125: rotating the Main listener leaf keeps the CA, so the
         # exported bundle is byte-identical and a paired Agent's existing
         # trust authenticates the new certificate without any Agent change.
-        listen_port = free_port()
+        listen_port = self.listener_port()
         deployment, bundle, bundle_digest = self.initialise_main(listen_port)
         request, key_digest = self.agent_request()
         main, grouped = self.start_approval(request, listen_port, key_digest)
@@ -736,7 +751,7 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         self.assertEqual(node, session.identity.node_id)
 
     def test_untrusted_or_plaintext_main_never_receives_a_code(self):
-        deployment, bundle, bundle_digest = self.initialise_main(free_port())
+        deployment, bundle, bundle_digest = self.initialise_main(self.listener_port())
         self.agent_request()
         # An impostor with its own CA and the same server name and ALPN.
         impostor = DeploymentAuthority.create(PrivateDirectory(self.root / "impostor-ca"),
@@ -793,13 +808,13 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         self.assertEqual(pairing_cli.REQUEST_FORMAT, enroll.REQUEST_FORMAT)
 
     def test_main_approval_requires_a_controlling_terminal(self):
-        self.initialise_main(free_port())
+        self.initialise_main(self.listener_port())
         request, _digest = self.agent_request()
         before = self.database.read_bytes()
         status, output, error = self.main_cli(
             "approve", "--database", self.database, "--authority-dir", self.authority_dir,
             "--listener-dir", self.listener_dir, "--request", request,
-            "--listen", f"127.0.0.1:{free_port()}", "--human-port", self.human_port,
+            "--listen", f"127.0.0.1:{self.listener_port()}", "--human-port", self.human_port,
             tty=False).finish()
         self.assertEqual((2, ""), (status, output))
         self.assertIn("controlling_terminal_required", error)
