@@ -220,6 +220,32 @@ test('a restart re-acquired reference warns that it was not confirmed by the Own
   assert.doesNotMatch(messages.ja.calibrationOriginUnknown, /保存済み|未校正/);
 });
 
+test('a failed Owner calibration after the empty history was read is not shown as stored', () => {
+  // Issue #355: the Owner attempt read an empty history and then failed
+  // (`unavailable`, a deferred runtime). The server withdraws the mark made
+  // only for the unreadable history, so the card says "not calibrated" with
+  // the attempt's own failure, never "stored, waiting for re-acquisition".
+  for (const locale of ['ja', 'en']) {
+    const m = messages[locale];
+    const known = render(createElement(CalibrationCard, { t: m, item: source({ origin: 'none', version: null,
+      calibrated_at: null, phase: 'idle', failure: 'unavailable', detection: 'inactive',
+      detection_reason: 'unavailable' }), name: null, disabled: false, confirmed: false, onConfirm: noop }));
+    for (const text of [m.calibrationOrigin_none, m.calibrationRefused_unavailable]) {
+      assert.ok(known.includes(text), `${locale} ${text}`);
+    }
+    for (const text of [m.calibrationOriginPending, m.calibrationPhase_reacquire_pending, m.calibrationOriginUnknown,
+      m.calibrationHistoryUnknown]) assert.ok(!known.includes(text), `${locale} ${text}`);
+    // While the history is still unknown the server keeps reporting
+    // `history_unavailable`, whatever the attempt failed on: still unknown.
+    const unknown = render(createElement(CalibrationCard, { t: m, item: source({ origin: 'none', version: null,
+      calibrated_at: null, phase: 'reacquire_pending', failure: 'history_unavailable', detection: 'inactive',
+      detection_reason: 'unavailable' }), name: null, disabled: false, confirmed: false, onConfirm: noop }));
+    assert.ok(unknown.includes(m.calibrationOriginUnknown), locale);
+    assert.ok(!unknown.includes(m.calibrationOriginPending), locale);
+  }
+  assert.equal(messages.ja.calibrationOrigin_none, '未校正');
+});
+
 test('every refusal and calibration text exists in both locales', () => {
   for (const reason of calibrationReasons) {
     for (const locale of ['ja', 'en']) assert.ok(refusalText(messages[locale], reason), `${locale} ${reason}`);
