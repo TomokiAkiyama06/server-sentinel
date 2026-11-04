@@ -1296,7 +1296,7 @@ continues during an acquisition.
   configured source `source_id`, `origin` (`none` / `owner` /
   `restart_reacquired`), `version`, `calibrated_at`, `phase` (`idle` /
   `acquiring` / `reacquire_pending`), `failure`, `owner_calibration_available`,
-  and the scene runtime's `detection` state and `detection_reason`; never a
+  `history_unknown`, and the scene runtime's `detection` state and `detection_reason`; never a
   pixel, frame, digest, polygon or policy value. A source with a stored
   calibration reports `reacquire_pending` from the start of Main, also while
   scene monitoring still waits for a deferred start (a timeline outbox open
@@ -1304,15 +1304,20 @@ continues during an acquisition.
   it, but nothing is re-acquired, refused or notified before the runtime
   runs or has ended (a status that cannot be read counts as ended) (Issue
   #341). A history that cannot be read at that time is reported as
-  `reacquire_pending` with `failure` `history_unavailable` (whether a
-  calibration is stored is unknown, and the Web says so); the start reads
-  the history again, which clears that failure or withdraws the mark when no
-  calibration is stored. Whether the history is known is kept apart from the
-  last failure (Issue #355): while it is unknown the status keeps
-  `history_unavailable`, whatever a later attempt failed on, and an Owner
+  `reacquire_pending` with `history_unknown` true and `failure`
+  `history_unavailable` (whether a calibration is stored is unknown, and the
+  Web says so); the start reads the history again, which clears both or
+  withdraws the mark when no calibration is stored. Whether the history is
+  known is kept apart from the last failure (Issue #355) and is reported as
+  its own field (Issue #377): while it is unknown `history_unknown` stays
+  true and `failure` is the last attempt's own refusal, and an Owner
   calibration attempt that read the history settles it like the start does
   (an empty history withdraws the mark, so a failed attempt then reports
-  `none` / `idle` with its own failure, never a stored calibration).
+  `none` / `idle` with its own failure, never a stored calibration). The Web
+  decides "unknown" from `history_unknown` only, so a known stored
+  calibration whose save failed (`history_unavailable`) is still shown as
+  stored with that refusal, and an Owner calibration acquiring while the
+  history is unknown is shown as unknown, never as not calibrated.
 - *Restart re-acquisition.* After every Main start, once scene monitoring
   runs, each source with a stored calibration has its reference taken again,
   every source independently and concurrently (at most four), so a camera
