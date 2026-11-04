@@ -888,6 +888,30 @@ class RestartReacquisitionTests(unittest.TestCase):
                          (status.origin, status.phase, status.failure))
         self.assertEqual((), harness.service.take_notices())
 
+    def test_a_reacquisition_that_reads_the_history_reports_its_own_refusal(self):
+        # Claude review of PR #361, proposal 1: `start()` cannot read the
+        # history, then the re-acquisition reads it. Its own refusal must be
+        # shown, not hidden behind `history_unavailable`.
+        cases = (("reader_changed", stored(reader="packed:yuyv:24x24"),
+                  CalibrationPhase.REACQUIRE_PENDING, [REQUIRED]),
+                 ("calibration_missing", None, CalibrationPhase.IDLE, []))
+        for reason, record, phase, notices in cases:
+            with self.subTest(reason=reason):
+                database = Database_(self)
+                if record is not None:
+                    database.store(record)
+                harness = Service(self, database.database, start=False)
+                self.unreadable_at_mark(harness)
+                harness.runtime.start()
+                harness.service.start()
+                self.assertEqual((CalibrationPhase.REACQUIRE_PENDING, "history_unavailable"),
+                                 (harness.status().phase, harness.status().failure))
+                self.assertIsNone(harness.service.reacquire(OTHER, commit_with(database.database)))
+                status = harness.status()
+                self.assertEqual((CalibrationOrigin.NONE, phase, reason),
+                                 (status.origin, status.phase, status.failure))
+                self.assertEqual(notices, [item.kind for item in harness.service.take_notices()])
+
     def test_an_owner_attempt_failing_before_the_history_read_keeps_it_unknown(self):
         harness = Service(self, self.database.database, start=False)
         self.unreadable_at_mark(harness)
