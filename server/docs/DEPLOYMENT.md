@@ -443,13 +443,21 @@ the same way, so its closing `offline` can still be written. If that write never
 the row can stay `online` until the next start, which writes it `offline`
 before any capture opens. The local UVC stop as a whole can take up to
 `join_timeout_seconds` + 1 s for the frame-progress watchdog join + 1 s for
-pending health-sink deliveries (62 s at the 60 s maximum), and the remaining
-shutdown steps (monitoring runtime, audit retention) follow it. The wait of
+the fenced `offline` writes of workers that outlived the join + 1 s for
+pending health-sink deliveries (63 s at the 60 s maximum), and the remaining
+shutdown steps (notification settle, monitoring runtime, audit retention)
+follow it. Issue #364: the local UVC stop bound plus the notification settle
+(12 s without a scene timeline, else the timeline's `dispatch_settle_seconds`)
+must stay within 80 s, `TimeoutStopSec=90` less a 10 s reserve for the steps
+without a configurable bound (the reserve does not yet bound an in-flight
+hostname reservation check or a queued monitoring job, Issue #383); `create_app()` refuses a composition that
+exceeds it (`app/stop_budget.py`). Every `local_uvc` setting this file
+accepts fits with the 12 s settle, so `--check` is never refused by it. The wait of
 the monitoring runtime's final storage sample (Issue #351) shares the bound of
 the notification settle before it, so it does not lengthen the stop. The installed
 unit sets `TimeoutStopSec=90` explicitly (Owner decision 2026-10-08), so the
 stop bound does not depend on the host's `DefaultTimeoutStopSec` and stays
-above that 62 s local UVC bound. A rollback restores the target release's own
+above that 63 s local UVC bound. A rollback restores the target release's own
 unit snapshot, so a release installed before this change runs with that
 snapshot's (default) stop timeout.
 `frame_stall_reopen_seconds` (0.5–300, not less than `frame_stall_seconds`,

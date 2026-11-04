@@ -1235,7 +1235,7 @@ or `uncertain` outcomes, and claims an earlier process left `submitting` or
 unresolved for an audited Owner requeue; a final `sent`/`failed`/`disabled` row
 completes such a claim at the next start. Shutdown runs one last step after
 scene `stop()`, then drains these alerts once more (a last step refused by
-storage escalates the watched records to it), and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s, so that with the other stop steps shutdown stays within `TimeoutStopSec=90`) for submitted deliveries before the
+storage escalates the watched records to it), and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s; `create_app()` refuses a composition whose local UVC stop bound, `join_timeout_seconds` + 3 s, plus this settle exceeds 80 s, i.e. `TimeoutStopSec=90` less a 10 s reserve for the other stop steps, Issue #364; that reserve does not yet bound an in-flight reservation check or a queued monitoring job, Issue #383) for submitted deliveries before the
 notification service closes; the monitoring stop's final storage sample (Issue #351) waits only for what is left of that bound, so it adds nothing to the stop budget. With Slack unconfigured the local row is
 `disabled` and `critical_notifications` stays `unavailable`. No
 evidence-preservation port exists yet (a separate recording decision), so
