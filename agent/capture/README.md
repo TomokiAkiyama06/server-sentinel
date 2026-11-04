@@ -142,7 +142,9 @@ and `padding_tolerated` (inter-frame gaps above the 4 KiB default that the
 profile bound skipped before a valid frame, Issue #305) and `launch_failures`
 (launch attempts whose open, identity re-check, mode check, pipeline start
 or reader start failed and were scheduled for a backoff retry, Issue #354; a
-relaunch that keeps failing after a stall never raises `launches`; a stable
+relaunch whose open, identity re-check, mode check or pipeline start keeps
+failing after a stall never raises `launches`, while a failed reader start
+follows a started pipeline and raises both counters; a stable
 `capture_unsupported` verdict is not counted). A pipeline's counts
 are folded in after its process is stopped and its reader joined, so bytes
 read during teardown are included; a running or not-yet-reaped (stuck)
@@ -157,7 +159,13 @@ hide behind another that never started, plus `launch_failures` and
 in backoff fails, Issue #354). Its `end` record repeats them after the
 capture is closed and every pipeline reaped (`sources_not_running` from the
 last poll before the close); the summarizer judges those final counters
-when present.
+when present. `sources_not_running` sees only that last poll (the holder
+polls about every 0.5 s, later when a loop iteration runs long): a source that
+stops after it, or near the end of the run without reaching `stall_timeout`,
+is not counted. The holder's `sample`/`end` `frames` is the sum over all
+sources and its per-session `forwarded` records count only frames sent while a
+sender was connected, so the operator records each source's fps and frame
+count separately (Issue #360).
 
 | State | Reasons |
 | --- | --- |
