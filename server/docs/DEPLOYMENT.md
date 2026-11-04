@@ -448,8 +448,9 @@ pending health-sink deliveries (63 s at the 60 s maximum), and the remaining
 shutdown steps (notification settle, monitoring runtime, audit retention)
 follow it. Issue #364: the local UVC stop bound plus the notification settle
 (12 s without a scene timeline, else the timeline's `dispatch_settle_seconds`)
-must stay within 80 s, `TimeoutStopSec=90` less 10 s kept for the steps
-without a configurable bound; `create_app()` refuses a composition that
+must stay within 80 s, `TimeoutStopSec=90` less a 10 s reserve for the steps
+without a configurable bound (the reserve does not yet bound an in-flight
+hostname reservation check or a queued monitoring job, Issue #383); `create_app()` refuses a composition that
 exceeds it (`app/stop_budget.py`). Every `local_uvc` setting this file
 accepts fits with the 12 s settle, so `--check` is never refused by it. The wait of
 the monitoring runtime's final storage sample (Issue #351) shares the bound of

@@ -18,7 +18,9 @@ from app.settings import ConfigurationError
 UNIT_STOP_TIMEOUT_SECONDS = 90
 # Left for the stop steps that have no configurable bound here (human access
 # stop, scene stop, timeline finish, the monitoring runtime stop) and for the
-# process exit.
+# process exit. Not derived from their bounds: an in-flight hostname
+# reservation check (each enumeration bounded separately) or a monitoring job
+# queued ahead of the settle can take longer (Issue #383).
 OTHER_STOP_STEPS_RESERVE_SECONDS = 10.0
 # On top of `join_timeout_seconds`, a local UVC stop waits at most 1 s for the
 # frame-progress watchdog join (`WorkerSupervisor.WATCHDOG_JOIN_MINIMUM_SECONDS`),
