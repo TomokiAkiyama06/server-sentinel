@@ -399,7 +399,11 @@ class SceneCalibrationService:
                     # "stored": the status says why (Issue #341), and the
                     # attempt after `start()` reports it again.
                     state.reacquire, state.history_unknown = True, True
-                    state.failure, state.failure_from_mark = "history_unavailable", True
+                    if state.failure is None or state.failure_from_mark:
+                        # An attempt's own refusal that finished while this
+                        # read ran stays shown; `history_unknown` reports the
+                        # unreadable history either way (Issue #381).
+                        state.failure, state.failure_from_mark = "history_unavailable", True
                     continue
                 if state.failure_from_mark:
                     # An earlier unreadable read is superseded by this one.

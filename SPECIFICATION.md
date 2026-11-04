@@ -1307,7 +1307,7 @@ continues during an acquisition.
   runs or has ended (a status that cannot be read counts as ended) (Issue
   #341). A history that cannot be read at that time is reported as
   `reacquire_pending` with `history_unknown` true and `failure`
-  `history_unavailable` (whether a calibration is stored is unknown, and the
+  `history_unavailable` unless an attempt's own refusal is already shown (whether a calibration is stored is unknown, and the
   Web says so); the start reads the history again, which clears both or
   withdraws the mark when no calibration is stored. That read clears only a
   failure an unreadable read set, never an attempt's own refusal (Issue

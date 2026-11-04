@@ -1046,6 +1046,41 @@ class RestartReacquisitionTests(unittest.TestCase):
         self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, "history_unavailable", False),
                          (status.origin, status.phase, status.failure, status.history_unknown))
 
+    def test_an_unreadable_mark_keeps_a_refusal_that_finished_during_its_read(self):
+        # Issue #381 (Claude review of PR #384, proposal 1): `mark_stored()`
+        # cannot read the history while an Owner attempt finishes with its
+        # own refusal. The unreadable read must not overwrite that refusal,
+        # or the readable `start()` scan clears it and it is never shown.
+        harness = Service(self, self.database.database, start=False)
+        nested = []
+
+        def no_frame(*arguments):
+            raise CalibrationRefused("no_frame")
+
+        def unreadable(binding):
+            if not nested:
+                nested.append(True)
+                harness.service._latest = latest
+                with self.assertRaises(CalibrationRefused):
+                    harness.service.calibrate(OTHER, commit_with(self.database.database))
+                harness.service._latest = unreadable
+            raise CalibrationRefused("history_unavailable")
+
+        latest = harness.service._latest
+        harness.service._read = no_frame
+        harness.service._latest = unreadable
+        harness.service.mark_stored()
+        self.assertEqual([True], nested)
+        status = harness.status()
+        self.assertEqual((CalibrationPhase.REACQUIRE_PENDING, "no_frame", True),
+                         (status.phase, status.failure, status.history_unknown))
+        harness.service._latest = latest
+        harness.runtime.start()
+        harness.service.start()
+        status = harness.status()
+        self.assertEqual((CalibrationPhase.IDLE, "no_frame", False),
+                         (status.phase, status.failure, status.history_unknown))
+
     def test_an_attempt_history_failure_is_kept_by_a_later_readable_scan(self):
         # Issue #381: a failure is cleared by a readable scan only when an
         # unreadable scan set it, not when the attempt's own history read
