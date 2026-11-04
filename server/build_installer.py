@@ -16,6 +16,8 @@ INSTALLER_MODULES = (
     # The optional human_access section (Issue #10); standard library only.
     "auth/__init__.py", "auth/access_config.py",
     "cameras/uvc/config.py",
+    # The local UVC join bound comes from the stop budget (Issue #383).
+    "stop_budget.py",
     "monitoring/__init__.py", "monitoring/config.py",
     "media/recording/__init__.py", "media/recording/model.py", "media/recording/store.py",
     "notifications/__init__.py", "notifications/slack.py",
