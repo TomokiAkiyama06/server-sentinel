@@ -519,7 +519,8 @@ POST /api/scene/sources/<id>/calibration  {"normal_position_confirmed":true}
   With `history_unknown: true` the history could not be read, so the badge
   and text say only that the state is unknown and ask the Owner to check the
   storage (Issue #377). The parser refuses `stored_known` together with a
-  calibration in use or an unknown history.
+  calibration in use or an unknown history, and `phase: reacquire_pending`
+  with neither `stored_known` nor `history_unknown`.
 - The calibrate button is enabled only after the Owner ticks the explicit
   normal-position statement; the request carries that statement. A
   `step_up_required` answer runs the same step-up prompt and single retry as

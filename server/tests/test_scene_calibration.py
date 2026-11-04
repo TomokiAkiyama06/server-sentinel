@@ -1005,6 +1005,33 @@ class RestartReacquisitionTests(unittest.TestCase):
         status = harness.status()
         self.assertEqual((CalibrationOrigin.RESTART_REACQUIRED, False), (status.origin, status.stored_known))
 
+    def test_an_owner_calibration_of_a_stored_source_is_reported_stored_while_acquiring(self):
+        # Issue #382 (Claude review proposal 3): with the history known at
+        # start, and with an unknown history that the attempt itself reads.
+        for unknown_at_start in (False, True):
+            with self.subTest(unknown_at_start=unknown_at_start):
+                database = Database_(self)
+                database.store(stored())
+                harness = Service(self, database.database, start=False)
+                if unknown_at_start:
+                    self.unreadable_at_mark(harness)
+                harness.service.mark_stored()
+                self.assertEqual(unknown_at_start, harness.status().history_unknown)
+                read, during = harness.service._read, []
+
+                def observed_read(*arguments):
+                    during.append((harness.status().phase, harness.status().stored_known,
+                                   harness.status().history_unknown))
+                    return read(*arguments)
+
+                harness.service._read = observed_read
+                harness.runtime.start()
+                with Feed(harness.runtime):
+                    record = harness.service.calibrate(OTHER, commit_with(database.database))
+                self.assertEqual(2, record.version)
+                self.assertEqual([(CalibrationPhase.ACQUIRING, True, False)], during)
+                self.assertFalse(harness.status().stored_known)
+
     def test_nothing_stored_or_an_unknown_history_is_not_reported_as_stored(self):
         harness = Service(self, self.database.database, start=False)
         harness.runtime.start()

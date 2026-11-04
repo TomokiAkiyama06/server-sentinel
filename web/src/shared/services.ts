@@ -258,8 +258,12 @@ export function parseSceneCalibration(value: unknown): SceneCalibrationSource[] 
     const stored = bool(item.stored_known);
     // Known to be stored only while none is in use and the history is known.
     if (stored && (origin !== 'none' || unknown)) throw new ApiError('invalid_response');
+    const phase = member(PHASES, item.phase);
+    // A pending re-acquisition is of a stored (or unknown) calibration, so the
+    // badge never reads "not calibrated" beside the waiting text (Issue #382).
+    if (phase === 'reacquire_pending' && !stored && !unknown) throw new ApiError('invalid_response');
     return {
-      source_id: id, origin, version: current, calibrated_at: at, phase: member(PHASES, item.phase), failure,
+      source_id: id, origin, version: current, calibrated_at: at, phase, failure,
       owner_calibration_available: bool(item.owner_calibration_available),
       history_unknown: unknown, stored_known: stored,
       detection: member(DETECTION, item.detection), detection_reason: reason,

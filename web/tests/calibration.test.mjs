@@ -101,6 +101,7 @@ test('one malformed source fails the whole status closed', () => {
     { ...source(), stored_known: 'yes' }, (({ stored_known, ...rest }) => rest)(source()),
     { ...source(), stored_known: true },
     { ...source(), origin: 'none', version: null, calibrated_at: null, history_unknown: true, stored_known: true },
+    { ...source(), origin: 'none', version: null, calibrated_at: null, phase: 'reacquire_pending' },
     { ...source(), detection: 'unknown' }, { ...source(), detection_reason: 'Bad Reason' },
     { ...source(), detection_reason: '' },
   ];
