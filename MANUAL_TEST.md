@@ -1675,6 +1675,10 @@ Total run time today:
 ```
 
 - [ ] step 0 inventory を両 host で取得し、47200–47214 が未使用であることを確認した;
+  （2026-11-04 に確認、未完了のまま残す。両 host に 2026-10-29 の step 0 の結果の記録は無い。shell の履歴は時刻を持たず、
+  Main には port の確認（`ss -ltnu`）の履歴が無く、NTP 同期の確認だけがある。capture host には port と NTP の確認の履歴があるが、
+  実行日と結果は分からない。間接の証拠として、同日の全 66 run の receiver 記録に `ready` があり（計 69 回、再起動を含む）、全 run の `integrity` が `pass`
+  だったので port の競合は起きていないと考えられるが、step 0 の記録の代わりにはしない。後から取り直しても 10-29 の状態は示せない）
 - [x] G1: `auth_unpaired` / `auth_other_ca` / `auth_revoked` / `auth_revoked_live` で受理 media 0、`route_probe` でハーネス receiver に human route なし（製品の human/admin API は上の transport PoC 項目で別途確認）;
 - [x] G2: 各 impairment 後の報告 gap が実欠落と一致（epoch 内は完全一致、capture 再起動は範囲不明）、重複 commit 0、sender の unit 収支（末尾 drop を含む）が照合済み（`drop_accounting` が `pass`）;
 - [x] G3: receiver queue / kernel send queue の滞留 byte（`TIOCOUTQ` と `ss -tmi` の skmem `w`）/ VmHWM が設定上限内で warmup 後に増加しない;
@@ -1697,6 +1701,9 @@ Total run time today:
   orchestrator / receiver / sender / proxy と holder の記録。summary だけではない）を確認し、
   summary の判定が記録と食い違わないこと（想定外の `fail` / `unmeasured`、記録の欠落・混在、
   不自然な時刻や件数が無いこと）を確かめ、確認した run id と確認者を記録した;
+  （未完了のまま残す。Claude は全 66 run の生記録を確認済み。Owner の確認は 60 run の要約表（`summary-1029c`）までで、
+  生 JSONL と再実行 3 run・soak 3 run の要約は読んでいない（上の「生記録の確認」を参照）。ADR-0007 への転記は済んでいるので、
+  この順序の条件は後から満たせない）
 - [x] 結果を ADR-0007 Validation 表へ転記し、real / synthetic の内訳と未測定項目を明記した。
 
 ### LAN baseline measurement (2026-09-30, Issue #15; no transport candidate yet)
