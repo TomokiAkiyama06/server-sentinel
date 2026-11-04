@@ -43,17 +43,12 @@ from app.notifications.slack import DeliveryResult
 from app.presence.delivery import NotificationAdapter
 from app.presence.runtime import CriticalDispatcher, SceneTimeline, SceneTimelineConfiguration
 from app.settings import Settings
+from app.stop_budget import CAMERA_OFFLINE_SETTLE_SECONDS, check_stop_budget
 from app.storage.database import Database, PinnedDatabase
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
 
-# Issue #301 item 2: without a scene critical dispatcher (whose shutdown
-# settle already waits for every pending notification), shutdown waits at
-# most this long for a camera offline notification still being delivered,
-# longer than the 10 s Slack timeout, before the monitoring runtime stops.
-# The scene calibration notices (#205) use the same bound.
-CAMERA_OFFLINE_SETTLE_SECONDS = 12.0
 
 
 class RuntimeStorageAdmission:
@@ -195,6 +190,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # without authorized live viewer demand; only the S7 frame pull reads it.
     if local_uvc is not None and not isinstance(local_uvc, LocalUvcConfiguration):
         raise TypeError("local UVC configuration is invalid")
+    # Issue #364 (Owner decision 2026-11-04): the bounded stop steps must
+    # finish inside the unit's `TimeoutStopSec`, or systemd kills Main while
+    # a critical notification is still settling. Refused here, not shortened
+    # at stop time. Without a scene timeline the camera offline settle applies.
+    check_stop_budget(local_uvc, scene_timeline.dispatch_settle_seconds
+                      if isinstance(scene_timeline, SceneTimelineConfiguration) else None)
     uvc_dependencies = local_uvc_dependencies or LocalUvcDependencies()
     local_preview = LocalPreviewHub(local_uvc.source_ids if local_uvc is not None else ())
     # Calibrated ROI movement / camera tamper (#205). Capture threads only
