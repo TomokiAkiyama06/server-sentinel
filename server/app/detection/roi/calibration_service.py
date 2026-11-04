@@ -261,6 +261,10 @@ class _Source:
     # `failure`, which a later attempt overwrites with its own reason.
     history_unknown: bool = False
     failure: str | None = None
+    # Issue #381: `failure` is the `history_unavailable` of an unreadable
+    # `_mark` read, not an attempt's own refusal. Only such a failure is
+    # superseded by a later readable `_mark` read.
+    failure_from_mark: bool = False
     required_notified: bool = False
 
 
@@ -388,11 +392,14 @@ class SceneCalibrationService:
                     # "stored": the status says why (Issue #341), and the
                     # attempt after `start()` reports it again.
                     state.reacquire, state.history_unknown = True, True
-                    state.failure = "history_unavailable"
+                    state.failure, state.failure_from_mark = "history_unavailable", True
                     continue
-                if state.failure == "history_unavailable":
+                if state.failure_from_mark:
                     # An earlier unreadable read is superseded by this one.
-                    state.failure = None
+                    # An attempt's own failure (even `history_unavailable`
+                    # from a failed save that finished while this read ran,
+                    # Issue #381) stays.
+                    state.failure, state.failure_from_mark = None, False
                 # A read that finds no stored calibration withdraws an
                 # earlier mark made only because the history was unreadable.
                 state.reacquire, state.history_unknown = record is not None, False
@@ -580,7 +587,7 @@ class SceneCalibrationService:
         with self._lock:
             state = self._sources[source_id]
             state.acquiring = False
-            state.failure, state.history_unknown = None, False
+            state.failure, state.failure_from_mark, state.history_unknown = None, False, False
             state.origin, state.version, state.calibrated_at = origin, record.version, record.created_at
             notify = origin is CalibrationOrigin.RESTART_REACQUIRED and state.reacquire
             state.reacquire = False
@@ -599,7 +606,7 @@ class SceneCalibrationService:
         with self._lock:
             state = self._sources[source_id]
             state.acquiring = False
-            state.failure = failure
+            state.failure, state.failure_from_mark = failure, False
 
     def _read(self, source_id, width, height, timeout) -> GrayFrame:
         try:

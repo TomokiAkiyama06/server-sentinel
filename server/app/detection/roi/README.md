@@ -522,7 +522,10 @@ its reference.
   attempt's own refusal, and an attempt that read the history (an Owner
   calibration that then fails, for example) settles the mark the same way.
   A save that fails after the history was read reports `failure`
-  `history_unavailable` with `history_unknown` false.
+  `history_unavailable` with `history_unknown` false. A later readable read
+  clears only the failure an unreadable read set, never an attempt's own
+  (Issue #381: not a failed save that finished while `start()` read the
+  history either).
 - `status()` is value-free: origin, version, time, phase, last refusal,
   whether a template exists, whether the history is unknown, and the
   runtime's own source state and reason.

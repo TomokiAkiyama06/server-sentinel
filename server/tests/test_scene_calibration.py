@@ -980,6 +980,56 @@ class RestartReacquisitionTests(unittest.TestCase):
         self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, "history_unavailable", False),
                          (status.origin, status.phase, status.failure, status.history_unknown))
 
+    def test_a_failed_save_finishing_during_a_readable_mark_keeps_its_failure(self):
+        # Issue #381: the `start()` scan reads the history, then an Owner
+        # attempt that read the history too fails to save before the scan
+        # takes the lock. The scan must not clear that attempt's own
+        # `history_unavailable`, or the Owner never sees the failed save.
+        self.database.store(stored())
+        harness = Service(self, self.database.database, start=False)
+        harness.runtime.start()
+        latest, nested = harness.service._latest, []
+
+        def refused_save(source_id, prepare, persist):
+            prepare()
+            raise CalibrationRefused("history_unavailable")
+
+        def scan_read(binding):
+            record = latest(binding)
+            if not nested:
+                nested.append(True)
+                with Feed(harness.runtime), self.assertRaises(CalibrationRefused):
+                    harness.service.calibrate(OTHER, refused_save)
+            return record
+
+        harness.service._latest = scan_read
+        harness.service.start()
+        self.assertEqual([True], nested)
+        status = harness.status()
+        self.assertEqual((CalibrationOrigin.NONE, CalibrationPhase.REACQUIRE_PENDING, "history_unavailable", False),
+                         (status.origin, status.phase, status.failure, status.history_unknown))
+
+    def test_an_attempt_history_failure_is_kept_by_a_later_readable_scan(self):
+        # Issue #381: a failure is cleared by a readable scan only when an
+        # unreadable scan set it, not when the attempt's own history read
+        # failed.
+        self.database.store(stored())
+        harness = Service(self, self.database.database, start=False)
+        harness.runtime.start()
+        latest = harness.service._latest
+
+        def unreadable(binding):
+            raise CalibrationRefused("history_unavailable")
+
+        harness.service._latest = unreadable
+        with self.assertRaises(CalibrationRefused):
+            harness.service.calibrate(OTHER, commit_with(self.database.database))
+        harness.service._latest = latest
+        harness.service.start()
+        status = harness.status()
+        self.assertEqual((CalibrationPhase.REACQUIRE_PENDING, "history_unavailable", False),
+                         (status.phase, status.failure, status.history_unknown))
+
     def test_a_failed_owner_calibration_overlapping_the_marks_keeps_the_reacquisition(self):
         # Codex P2 on PR #345: an Owner calibration in flight across both the
         # early `mark_stored()` and the `start()` scan, which then fails, must
