@@ -230,6 +230,10 @@ class SourceCalibrationStatus:
     # The scene runtime's own value-free source state and reason.
     detection: str
     detection_reason: str
+    # The last read of the history failed, so whether a calibration is
+    # stored is unknown (Issue #377): kept apart from `failure`, which is
+    # the last attempt's own refusal.
+    history_unknown: bool = False
 
 
 @dataclass(frozen=True)
@@ -312,15 +316,15 @@ class SceneCalibrationService:
                 phase = (CalibrationPhase.ACQUIRING if state.acquiring
                          else CalibrationPhase.REACQUIRE_PENDING if state.reacquire
                          else CalibrationPhase.IDLE)
-                # While the history is unknown the status keeps saying so,
-                # whatever a later attempt failed on (Issue #355), and never
-                # reads as a stored calibration.
-                failure = "history_unavailable" if state.history_unknown else state.failure
+                # Whether the history is known is its own field (Issue #377),
+                # so a stored calibration is never shown while it is unknown
+                # and `failure` stays the last attempt's own refusal.
                 result.append(SourceCalibrationStatus(
-                    source_id, state.origin, state.version, state.calibrated_at, phase, failure,
+                    source_id, state.origin, state.version, state.calibrated_at, phase, state.failure,
                     source_id in self._templates,
                     detection.state.value if detection is not None else "inactive",
-                    detection.reason if detection is not None else "unavailable"))
+                    detection.reason if detection is not None else "unavailable",
+                    state.history_unknown))
             return tuple(result)
 
     def take_notices(self) -> tuple[Notice, ...]:

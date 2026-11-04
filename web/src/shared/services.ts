@@ -257,6 +257,7 @@ export function parseSceneCalibration(value: unknown): SceneCalibrationSource[] 
     return {
       source_id: id, origin, version: current, calibrated_at: at, phase: member(PHASES, item.phase), failure,
       owner_calibration_available: bool(item.owner_calibration_available),
+      history_unknown: bool(item.history_unknown),
       detection: member(DETECTION, item.detection), detection_reason: reason,
     };
   });
