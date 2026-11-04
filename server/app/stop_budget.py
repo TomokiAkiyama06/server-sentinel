@@ -1,7 +1,8 @@
 """The Main shutdown time budget (Issue #364).
 
-Standard library only: the installer writes the unit's stop timeout from
-this module, and `app.main.create_app()` refuses a composition whose bounded
+Standard library only. `UNIT_STOP_TIMEOUT_SECONDS` names the installed
+unit's literal `TimeoutStopSec` (`tests.test_stop_budget` checks they
+match), and `app.main.create_app()` refuses a composition whose bounded
 stop steps cannot finish inside it, rather than letting systemd kill Main in
 the middle of a critical notification settle (Owner decision 2026-11-04:
 refuse the configuration, do not shorten the settle at stop time).

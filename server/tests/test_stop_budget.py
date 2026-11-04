@@ -69,9 +69,11 @@ class StopBudgetTests(unittest.TestCase):
                 create_app(settings, local_uvc=uvc(60), scene_timeline=timeline(12))
 
     def test_the_installed_unit_uses_the_budget_timeout(self):
+        # The unit template stays literal (`test_listener_owner_contract`
+        # reads it as text); the budget must name the same timeout.
         source = (Path(__file__).resolve().parents[1] / "install.py").read_text()
-        self.assertIn("TimeoutStopSec={UNIT_STOP_TIMEOUT_SECONDS}", source)
-        self.assertEqual(90, stop_budget.UNIT_STOP_TIMEOUT_SECONDS)
+        self.assertEqual(1, source.count("\nTimeoutStopSec="))
+        self.assertIn(f"\nTimeoutStopSec={stop_budget.UNIT_STOP_TIMEOUT_SECONDS}\n", source)
 
 
 if __name__ == "__main__":
