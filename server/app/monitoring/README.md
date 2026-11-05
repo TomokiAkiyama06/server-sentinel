@@ -214,6 +214,11 @@ over Issue #349, so
 another flapping episode of that period is not sent once the period's
 continuous notification went out (`suppressed`,
 `camera_offline_notification_suppressed`). See SPECIFICATION §9 for the full rules and the known limits.
+Without a configured Slack endpoint the rows are `disabled` and
+`MonitoringStatus.camera_offline_unnotified` (`camera_offline_degraded` and
+not `camera_offline_notifications`) is what the Owner's dashboard shows
+instead, through `GET /api/monitoring/camera-offline` (`OWNER_READ`, one
+boolean; `app.auth.human_surface`).
 
 Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
 takes the `AccessFaultMonitor` the composition root also passes to the

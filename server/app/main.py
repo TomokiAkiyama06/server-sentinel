@@ -409,6 +409,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # already refused an access store on any other database, so the
             # history cannot split (Claude review proposal 7).
             human_access.attach_scene_calibration(scene_calibration_service)
+        if monitoring_runtime is not None:
+            # Issue #301 item 2: the Owner's dashboard notice while a camera
+            # offline alert reaches no notification destination (no Slack).
+            # A lock-protected read of the runtime's value-free status.
+            human_access.attach_camera_offline_notice(
+                lambda: monitoring_runtime.status.camera_offline_unnotified)
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(

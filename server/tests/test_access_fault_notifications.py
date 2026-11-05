@@ -389,6 +389,39 @@ class CompositionTests(MonitoredAccessFixture):
         with self.assertRaises(ValueError):
             fresh.attach(self.access)
 
+    async def test_the_camera_offline_notice_reads_the_monitoring_status(self):
+        """Issue #301 item 2: the Owner's notice route reads the runtime's
+        value-free status; without a monitoring runtime it stays unmounted."""
+        fresh = AccessFaultMonitor()
+        check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker, sink=fresh)
+        access = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets,
+                             store=self.store, reservation=check,
+                             ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=check,
+                                                          clock=self.ceremony_clock, findings=fresh))
+        application = create_app(self.settings(), database=self.database, human_access=access,
+                                 storage_reservation=self.admission, monitoring=self.monitoring(),
+                                 monitoring_dependencies=MonitoringDependencies(access_faults=fresh))
+        runtime = application.state.monitoring
+        read = access.camera_offline_notice
+        self.assertIs(False, read())
+        # No Slack in this configuration: a current offline condition is unnotified.
+        runtime._set(camera_offline_degraded=True)
+        self.assertIs(True, read())
+        runtime._set(camera_offline_notifications=True)
+        self.assertIs(False, read())
+        runtime._set(camera_offline_degraded=False, camera_offline_notifications=False)
+        self.assertIs(False, read())
+        # No monitoring runtime: no notice reader, so the route is the generic denial.
+        other_check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker)
+        unmonitored = HumanAccess(
+            HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
+            reservation=other_check,
+            ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=other_check,
+                                         clock=self.ceremony_clock))
+        create_app(self.settings(), database=self.database, human_access=unmonitored,
+                   storage_reservation=self.admission)
+        self.assertIsNone(unmonitored.camera_offline_notice)
+
     async def test_a_monitor_left_out_of_the_runtime_is_refused(self):
         """Codex PR #271 (P2): a monitor installed as a sink but not handed to
         the monitoring runtime would never be drained."""
