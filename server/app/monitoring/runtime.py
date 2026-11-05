@@ -313,6 +313,8 @@ class MonitoringRuntime:
         self._settle_bound: float | None = None
         self._settle_spent = 0.0
         self._settle_unfinished = False
+        # Issue #383: set once the Main shutdown began (`begin_stop`).
+        self._stopping = threading.Event()
         # Issues #351/#347: this process's random running-marker token, whether
         # the marker is written, whether the unclean exit of the previous
         # process was logged and whether the pending recording-health
@@ -1486,26 +1488,43 @@ class MonitoringRuntime:
         self._settle_unfinished = self._settle_unfinished or pending != 0
         return pending
 
+    def begin_stop(self) -> None:
+        """Issue #383: the Main shutdown began (any thread, idempotent).
+
+        The run loop starts no further tick, and a tick in flight skips the
+        steps it has not reached among the startup retry, retention, the
+        integrity and recording-health checks and the daily summary, so the
+        shutdown settles and `stop()` queue behind at most the rest of one
+        pass. They run again at the next start (the integrity check and the
+        recording self-test always run at startup). Notification polling,
+        the storage sample and the access and camera drains still run.
+        """
+        self._stopping.set()
+
     def tick(self) -> None:
         """One owner-thread pass; call only through `call` or the run loop."""
         if threading.get_ident() != self._owner:
             raise RuntimeError("monitoring owner thread required")
+        stopping = self._stopping.is_set
         if self.status.state != RuntimeState.RUNNING:
             if self.notifications is not None:
                 self._access_tick()
                 self._camera_tick()
                 self._poll()
-            if (self.status.state == RuntimeState.FAILED
+            if (self.status.state == RuntimeState.FAILED and not stopping()
                     and self._due("startup", self.dependencies.monotonic())):
                 self._attempt_open()
             return
         self._poll()
         self._reconcile_previous_run()
         self._storage_tick()
-        self._guarded("retention", self._retention_tick, "retention_degraded")
-        self._guarded("integrity", self.integrity.tick, "integrity_degraded")
-        self._guarded("health", self.recording_health.tick, "recording_health_degraded")
-        self._guarded("summary", self._summary_tick, "summary_degraded")
+        for name, step, reason in (("retention", self._retention_tick, "retention_degraded"),
+                                   ("integrity", self.integrity.tick, "integrity_degraded"),
+                                   ("health", self.recording_health.tick, "recording_health_degraded"),
+                                   ("summary", self._summary_tick, "summary_degraded")):
+            if stopping():
+                break
+            self._guarded(name, step, reason)
         self._access_tick()
         self._camera_tick()
         self._poll()
@@ -1638,6 +1657,9 @@ class MonitoringRuntime:
         """
         while True:
             await self._wait_for_tick()
+            if self._stopping.is_set():
+                # Issue #383: no new tick once the shutdown began.
+                continue
             try:
                 await self.call(self.tick)
             except Exception:

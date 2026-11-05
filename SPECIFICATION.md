@@ -324,7 +324,7 @@ starts one worker per deployment-configured `local_uvc` source (`local_uvc`
 deployment object, 1 to 4 registry UUIDs, no physical evidence) after storage
 migration/admission and stops them, with bounded joins, before the monitoring
 runtime stops. The workers stop in parallel under one total join bound,
-`join_timeout_seconds` (default 10 s, configurable 0.1–60 s), which covers a
+`join_timeout_seconds` (default 10 s, configurable 0.1–40 s, the most that fits the Main stop budget, Issue #383), which covers a
 worker's device teardown (up to 5.5 s observed on a real C960 after an unplug)
 plus `HEALTH_SETTLE_SECONDS` (1 s) for its offline health write; a worker
 still alive at the bound stays watched, is never reported `online`, and the
@@ -1235,7 +1235,7 @@ or `uncertain` outcomes, and claims an earlier process left `submitting` or
 unresolved for an audited Owner requeue; a final `sent`/`failed`/`disabled` row
 completes such a claim at the next start. Shutdown runs one last step after
 scene `stop()`, then drains these alerts once more (a last step refused by
-storage escalates the watched records to it), and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s; `create_app()` refuses a composition whose local UVC stop bound, `join_timeout_seconds` + 3 s, plus this settle exceeds 80 s, i.e. `TimeoutStopSec=90` less a 10 s reserve for the other stop steps, Issue #364; that reserve does not yet bound an in-flight reservation check or a queued monitoring job, Issue #383) for submitted deliveries before the
+storage escalates the watched records to it), and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s; `create_app()` refuses a composition whose local UVC stop bound, `join_timeout_seconds` + 3 s, plus this settle exceeds 55 s, i.e. `TimeoutStopSec=90` less a 35 s reserve derived from the bounded other stop steps, Issues #364, #383; storage admission waits, SQLite busy timeouts of the stop's writes and a monitoring step already running when the stop began are not bounded yet, Issue #385) for submitted deliveries before the
 notification service closes; the monitoring stop's final storage sample (Issue #351) waits only for what is left of that bound, so it adds nothing to the stop budget. With Slack unconfigured the local row is
 `disabled` and `critical_notifications` stays `unavailable`. No
 evidence-preservation port exists yet (a separate recording decision), so

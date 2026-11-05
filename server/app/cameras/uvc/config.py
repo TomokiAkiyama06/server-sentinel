@@ -10,13 +10,16 @@ from dataclasses import dataclass, field
 from uuid import UUID
 
 from app.settings import ConfigurationError
+from app.stop_budget import MAXIMUM_LOCAL_UVC_JOIN_SECONDS
 
 
 MAX_LOCAL_UVC_SOURCES = 4
 _TIMING_BOUNDS = {
     "poll_timeout_seconds": (0.05, 30.0),
     "retry_delay_seconds": (0.05, 60.0),
-    "join_timeout_seconds": (0.1, 60.0),
+    # At most what fits the Main stop budget with the camera offline settle
+    # (40 s, Issue #383), so `--check` refuses a longer join.
+    "join_timeout_seconds": (0.1, MAXIMUM_LOCAL_UVC_JOIN_SECONDS),
     # Frame-progress watchdog: no frame for this long on a live capture reports
     # ``degraded`` (``video_frame_stalled``) instead of ``online``. The
     # effective window is never shorter than 10 negotiated frame intervals.
