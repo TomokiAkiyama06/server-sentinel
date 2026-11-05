@@ -5,6 +5,7 @@ network connection. The installer tests reuse the synthetic release
 lifecycle of ``tests/test_release.py``.
 """
 
+import fcntl
 import io
 import json
 import os
@@ -15,12 +16,15 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 import zipfile
 
+from app import stop_budget
 from app.notifications.slack import SlackEndpoint
 from build_installer import build as build_installer
 import failure_notice
@@ -311,8 +315,62 @@ class NotifierTests(unittest.TestCase):
         source = (SERVER / "failure_notice.py").read_text()
         modules = set(re.findall(r"^(?:from|import) ([a-z_.]+)", source, re.MULTILINE))
         self.assertEqual({module.split(".")[0] for module in modules},
-                         {"json", "os", "re", "ssl", "stat", "subprocess", "sys", "time",
-                          "urllib"})
+                         {"fcntl", "json", "os", "re", "ssl", "stat", "subprocess", "sys",
+                          "time", "urllib"})
+
+    def test_the_two_units_never_send_one_failure_twice(self):
+        # The notice unit and the start watch race (PR #392 review): the second
+        # waits for the first one's delivery, then sees its record.
+        delivering = threading.Event()
+        release = threading.Event()
+
+        class SlowOpener(Opener):
+            def open(self, request, timeout):
+                delivering.set()
+                release.wait(10)
+                return super().open(request, timeout)
+
+        first = SlowOpener(Response())
+        second = Opener(Response())
+        results = {}
+
+        def notice(name, opener, **options):
+            results[name] = failure_notice.run(
+                str(self.config), environ=self.environ, opener=opener, clock=Clock(500.0),
+                sleep=lambda seconds: time.sleep(0.01), stderr=io.StringIO(), **options)
+
+        a = threading.Thread(target=notice, args=("notice", first))
+        a.start()
+        self.assertTrue(delivering.wait(10))
+        b = threading.Thread(target=notice, args=("watch", second), kwargs={
+            "unless_active": True,
+            "runner": lambda *x, **k: SimpleNamespace(returncode=0, stdout=b"failed")})
+        b.start()
+        b.join(0.3)
+        self.assertTrue(b.is_alive())  # waiting for the lock
+        release.set()
+        a.join(10)
+        b.join(10)
+        self.assertEqual(results, {"notice": 0, "watch": 0})
+        self.assertEqual((len(first.requests), len(second.requests)), (1, 0))
+
+    def test_a_lock_that_is_not_released_does_not_lose_the_notice(self):
+        holder = os.open(self.state / "lock", os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        opener = Opener(Response())
+        with patch("failure_notice.LOCK_WAIT_SECONDS", 0):
+            self.assertEqual(self.run_notice(opener)[0], 0)
+        self.assertEqual(len(opener.requests), 1)
+        # The lock file itself is private and is not followed as a symlink.
+        self.assertEqual(stat.S_IMODE((self.state / "lock").stat().st_mode), 0o600)
+        (self.state / "lock").unlink()
+        (self.state / "lock").symlink_to(self.root / "elsewhere-lock")
+        (self.state / "last-notice").unlink()
+        opener = Opener(Response())
+        self.assertEqual(self.run_notice(opener)[0], 0)
+        self.assertEqual(len(opener.requests), 1)
+        self.assertFalse((self.root / "elsewhere-lock").exists())
 
     def test_unless_active_sends_nothing_while_the_service_is_active(self):
         calls = []
@@ -504,15 +562,72 @@ class FailureNoticeInstallerTests(unittest.TestCase):
         start = value(service, "TimeoutStartSec")
         stop = value(service, "TimeoutStopSec")
         restart = value(service, "RestartSec")
-        self.assertEqual((burst, interval, start, stop, restart), (5, 1200, 60, 90, 5))
-        # The refused (burst + 1)-th start comes at most burst attempts after
-        # the first. An attempt that hangs lasts TimeoutStartSec, then (it
-        # ignores SIGTERM) TimeoutStopSec before SIGKILL, then RestartSec
-        # (PR #392 P2): still inside the window.
+        # Owner decision 2026-11-05: 1200 s; the stop bound is app.stop_budget's.
+        self.assertEqual((burst, interval, restart), (5, 1200, 5))
+        self.assertEqual(stop, stop_budget.UNIT_STOP_TIMEOUT_SECONDS)
+        # TimeoutStartSec is armed again for every start command (PR #392
+        # review): ExecStartPre= and ExecStart=. After them, a start that does
+        # not end on SIGTERM waits TimeoutStopSec for SIGKILL, then RestartSec.
+        commands = len([line for line in service if line.startswith(("ExecStartPre=", "ExecStart="))])
+        self.assertEqual(commands, 2)
         self.assertFalse(any(line.startswith(("TimeoutStartFailureMode=", "TimeoutSec=",
-                                              "ExecStopPost=", "ExecStop="))
+                                              "ExecStartPost=", "ExecStopPost=", "ExecStop="))
                              for line in service))
-        self.assertLess(burst * (start + stop + restart), interval)
+        attempt = commands * start + stop + restart
+        self.assertEqual(attempt, 215)
+        # The refused (burst + 1)-th start comes at most burst attempts after the first.
+        self.assertLess(burst * attempt, interval)
+
+    def test_every_installer_restart_first_flushes_the_start_limit(self):
+        # PR #392 review: the installer's own starts count against the limit.
+        self.perform(self.arguments("install", "1.0.0"))
+        self.perform(self.arguments("update", "1.1.0"))
+        self.runner.fail_version = "1.2.0"  # forward restart fails, restore restarts 1.1.0
+        with self.assertRaises(OSError):
+            self.perform(self.arguments("update", "1.2.0"))
+        self.runner.fail_version = None
+        self.perform(self.arguments("rollback"))
+        calls = [arguments for arguments, _ in self.runner.calls]
+        restarts = [index for index, arguments in enumerate(calls)
+                    if arguments[:2] == ["systemctl", "restart"]]
+        self.assertGreaterEqual(len(restarts), 5)
+        for index in restarts:
+            self.assertEqual(calls[index - 1],
+                             ["systemctl", "reset-failed", "server-sentinel.service"])
+
+    def test_the_notice_interpreter_path_is_checked_as_given(self):
+        # The unresolved --python directory must be root-controlled itself, so
+        # /bin/python3 through a usrmerge /bin link is refused (PR #392 review).
+        checked = []
+        arguments = self.arguments("install", "1.0.0")
+        given = Path(sys.executable)
+        real = install._failure_notice_files
+
+        def capture(*args):
+            # perform() stubs _protected_parent; read its calls at this point.
+            checked.extend(call.args[0] for call in install._protected_parent.call_args_list)
+            return real(*args)
+
+        with patch("install._failure_notice_files", side_effect=capture):
+            self.perform(arguments)
+        self.assertIn(given.parent, checked)
+        arguments = self.arguments("install", "1.0.1")
+        arguments.python = Path("/usr/bin/../bin/python3")
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            self.perform(arguments)
+        self.assertFalse((self.installation / "releases/1.0.1").exists())
+
+    def test_a_failing_reset_does_not_stop_the_operation(self):
+        original = self.runner.__call__
+
+        def runner(arguments, **options):
+            if arguments[:2] == ["systemctl", "reset-failed"]:
+                raise OSError("synthetic reset-failed failure")
+            return original(arguments, **options)
+
+        self.runner = runner
+        self.perform(self.arguments("install", "1.0.0"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
 
     def test_update_repairs_and_rollback_leaves_the_notice_alone(self):
         self.perform(self.arguments("install", "1.0.0"))

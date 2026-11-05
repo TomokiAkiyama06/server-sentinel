@@ -36,6 +36,7 @@ into the failed state, so ``OnFailure=`` never fires. A state that cannot be
 read counts as not active: a spurious notice rather than a silent outage.
 """
 
+import fcntl
 import json
 import os
 import re
@@ -60,6 +61,11 @@ ATTEMPTS = 3
 RETRY_SECONDS = 15
 COOLDOWN_SECONDS = 3600
 STATE_FILE = "last-notice"
+LOCK_FILE = "lock"
+# The other unit holds the lock for at most one delivery (60 s, see ATTEMPTS);
+# past this the notice is tried without it rather than not at all.
+LOCK_WAIT_SECONDS = 65
+LOCK_POLL_SECONDS = 0.5
 MAX_STATE_BYTES = 32
 PREFIX = "ServerSentinel failure notice: "
 SERVICE = "server-sentinel.service"
@@ -201,6 +207,45 @@ def record_notice(path: str | None, now: float) -> None:
         pass
 
 
+def _lock(directory: str | None, *, monotonic=time.monotonic, sleep=time.sleep):
+    """Hold an exclusive lock in the runtime directory, or ``None``.
+
+    The notice unit and the start watch share the directory; holding the lock
+    over check, delivery and record keeps one failure seen by both from being
+    sent twice (PR #392 review). A lock that cannot be opened or is not
+    released within ``LOCK_WAIT_SECONDS`` is given up: a duplicate is better
+    than a lost notice.
+    """
+    if directory is None:
+        return None
+    try:
+        descriptor = os.open(os.path.join(directory, LOCK_FILE),
+                             os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    except Exception:
+        return None
+    deadline = monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return descriptor
+        except BlockingIOError:
+            if monotonic() >= deadline:
+                break
+            sleep(LOCK_POLL_SECONDS)
+        except Exception:
+            break
+    os.close(descriptor)
+    return None
+
+
+def _unlock(descriptor) -> None:
+    if descriptor is not None:
+        try:
+            os.close(descriptor)
+        except Exception:
+            pass
+
+
 def _boot_clock() -> float:
     return time.clock_gettime(time.CLOCK_BOOTTIME)
 
@@ -221,6 +266,14 @@ def run(config: str, *, environ=None, opener=None, clock=_boot_clock, sleep=time
         _say(stderr, "not sent (reason=service_active)")
         return 0
     state = _state_path(environ)
+    lock = _lock(os.path.dirname(state) if state else None, sleep=sleep)
+    try:
+        return _notify(config, state, opener=opener, clock=clock, sleep=sleep, stderr=stderr)
+    finally:
+        _unlock(lock)
+
+
+def _notify(config, state, *, opener, clock, sleep, stderr) -> int:
     now = clock()
     if recently_notified(state, now):
         _say(stderr, "suppressed (reason=recent_notice)")

@@ -1799,7 +1799,13 @@ root-controlled interpreter and runs Python isolated from the invoking directory
 and inherited `PYTHON*` environment. Preflight runs as the dedicated account.
 `current` and `previous`
 are atomically replaced relative symlinks; a failed update restart restores and
-restarts the prior release. Rollback defaults to `previous`, or accepts an
+restarts the prior release. Before each restart, forward and restore, the
+installer runs `systemctl reset-failed server-sentinel.service` (its result is
+ignored): the start limit of the unit (`StartLimitBurst=5` in 1200 s, see
+"Start-failure notice") counts the installer's own starts too, so a few
+updates, rollbacks and restores within 20 minutes would otherwise reach it and
+leave the service stopped by a refused start. It also clears a failed state the
+service was left in. Rollback defaults to `previous`, or accepts an
 already installed `--version`. Both release pointers and the service unit move
 inside one guarded transaction: a failure at any point restores both pointers and
 the previous unit and restarts the release that was running before the attempt.
@@ -2063,7 +2069,11 @@ section (it is never enabled; only `OnFailure=` starts it). It runs, as the
 dedicated account, `<python> -I -S <destination>/failure_notice.py --config
 <deployment configuration>`, where `<python>` is the interpreter path given to
 the installer (`--python`, default `/usr/bin/python3`) as given, not the
-release's virtual environment. The script uses the standard library only and
+release's virtual environment. That path must be absolute, without `..`, and
+its directory and every ancestor must be root-owned real directories that no
+one else can write: a path through a symbolic-link directory, such as
+`/bin/python3` where `/bin` links to `usr/bin` (usrmerge), is refused before
+any change; give `/usr/bin/python3`. The script uses the standard library only and
 imports no application code, so it works when the release's `--check` refuses
 the configuration, when the release or its virtual environment is broken, and
 when the runtime filesystem is missing (the notice unit has no
@@ -2099,13 +2109,18 @@ restart recovers from; `RestartMode=direct` skips that state, as systemd before
 - a start that keeps failing (the `--check` refusal of the 2026-10 outage, a
   launcher failure, a readiness timeout) is retried every 5 s; the sixth start
   within 1200 s is refused with `Result=start-limit-hit`, the unit enters the
-  failed state, and one notice is sent. One attempt lasts at most
-  `TimeoutStartSec=60`, then, for a start that does not end on SIGTERM,
-  `TimeoutStopSec=90` before the final SIGKILL (`TimeoutStartFailureMode=terminate`,
-  the default, systemd.service(5)), then `RestartSec=5`: 155 s. Five attempts
-  take at most 775 s, so the limit is always reached within the window, however
-  each attempt fails (about 30 s for a `--check` that fails at once, at most
-  about 13 minutes for starts that hang);
+  failed state, and one notice is sent. The window (Owner decision 2026-11-05:
+  1200 s) is sized for a start that hangs in the ordinary way:
+  `TimeoutStartSec=60` is armed again for `ExecStartPre=` and for `ExecStart=`,
+  so a `--check` that finishes just in time and a launcher that then hangs take
+  2 x 60 s, then, for a start that does not end on SIGTERM, `TimeoutStopSec=90`
+  before the final SIGKILL (`TimeoutStartFailureMode=terminate`, the default,
+  systemd.service(5)), then `RestartSec=5`: 215 s per attempt, 1075 s for five,
+  inside the window (about 30 s for a `--check` that fails at once). A process
+  that even SIGKILL cannot end at once (stuck in uninterruptible disk I/O) can
+  stretch an attempt past that, so the counter may reset and the service keep
+  retrying without entering the failed state; in a boot, the start watch below
+  still reports it;
 - a crash that the next restart recovers from sends no notice here; the
   restarted service reports it itself (Issue #351, `recording_health_failure`
   for an unclean exit). Six starts within 1200 s (a crash loop) end in the
@@ -2140,15 +2155,22 @@ bus as the dedicated account, 10 s timeout) and sends nothing when the answer
 is `active` (`not sent (reason=service_active)`). Any other state (`inactive`,
 `failed`, `activating` -- still waiting for its mount, the clock, or in its
 restart loop) or an unreadable answer sends the same notice: a spurious notice
-rather than a silent outage. Both units share the runtime directory below, so a
-failure reported by `OnFailure=` is not sent a second time by the watch within
-the hour. Limits: the watch runs only in a boot in which the service was started
-(enabled, or started by hand); it checks once, so a service that stops failing
-later in the boot, or fails after the check without entering the failed state,
-is not reported by it; an Owner who stops the service on purpose within 15
-minutes of boot gets the notice; the timer behavior and the `Wants=` start
-under a failed mount are taken from the manual pages and not yet verified on
-real systemd (`MANUAL_TEST.md` V).
+rather than a silent outage (Owner decision 2026-11-05). Both units share the
+runtime directory below and hold an exclusive lock in it (`lock`) around the
+check, the delivery and the record, so a failure reported by `OnFailure=` is
+not sent a second time by the watch within the hour, also when both run at the
+same moment; a lock not released within 65 s is given up (a duplicate rather
+than a lost notice). Limits: the watch runs only in a boot in which the service
+was started (enabled, or started by hand); it checks once, so a service that
+stops failing later in the boot, or fails after the check without entering the
+failed state, is not reported by it. It also sends a notice that may be a false
+alert (accepted, Owner decision 2026-11-05) when, 15 minutes after the first
+start attempt, the service is not active for an ordinary reason: the Owner
+stopped it on purpose; a long file-system check (`fsck`) of the runtime volume
+or a long clock wait still holds its start; or a crash's restart is just in its
+5 s `RestartSec=` wait. The timer behavior and the `Wants=` start under a
+failed mount are taken from the manual pages and not yet verified on real
+systemd (`MANUAL_TEST.md` V).
 
 At most one notice per failure episode. The time of the last notice sent is
 kept in the notice units' `RuntimeDirectory=` (`/run/server-sentinel-failure-notice/last-notice`,
@@ -2174,7 +2196,12 @@ webhook was removed or broken, a host without network or DNS, an interpreter
 at `--python` that no longer runs, and a release from before Issue #321 (its
 own unit snapshot has no `OnFailure=`, so a rollback to it switches the notice
 off; the notice unit stays installed and a later update switches it on again).
-A host that is down or never boots sends nothing either. Removing
+A host that is down or never boots sends nothing either, and neither does
+one whose boot stops in emergency mode: a runtime mount listed in `/etc/fstab`
+without `nofail` is required by `local-fs.target`, so its failure stops the
+boot before the network and the notice units, and only the console shows it
+(keep `nofail` on that entry if a notice is wanted; `RequiresMountsFor=` still
+keeps the service from starting without it). Removing
 `server-sentinel-failure-notice.service` (or a drop-in that resets
 `OnFailure=`) switches it off, and removing the start-watch timer or service
 switches the watch off; the next update places the files again.

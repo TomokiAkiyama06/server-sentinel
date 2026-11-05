@@ -100,15 +100,18 @@ MAX_FAILURE_NOTICE_BYTES = 32 * 1024
 # Issue #321 item 2: with Restart=on-failure, the service enters the failed
 # state (and OnFailure= fires) only once its start limit is hit, and
 # RestartMode=direct (systemd 254+) keeps the attempts before it from passing
-# through the failed state, as systemd before 254 already did. One attempt
-# lasts at most TimeoutStartSec (60 s), then, for a start that does not end
-# on SIGTERM, TimeoutStopSec (90 s) before the final SIGKILL
-# (TimeoutStartFailureMode=terminate, the default; PR #392 review P2), then
-# RestartSec (5 s): 155 s. The sixth start comes at most five such attempts
-# (775 s) after the first, inside the 1200 s window, so a start that keeps
-# failing always ends in the failed state, however it fails.
-START_TIMEOUT_SECONDS = 60
-STOP_TIMEOUT_SECONDS = 90
+# through the failed state, as systemd before 254 already did. The window
+# (Owner decision 2026-11-05: 1200 s) is sized for a start that hangs in the
+# ordinary way: TimeoutStartSec (60 s) is armed again for ExecStartPre and for
+# ExecStart, so a check that finishes just in time and a launcher that then
+# hangs take 2 x 60 s, then, when it does not end on SIGTERM, TimeoutStopSec
+# (90 s) before the final SIGKILL (TimeoutStartFailureMode=terminate, the
+# default; PR #392 review), then RestartSec (5 s): 215 s. Five such attempts
+# take 1075 s, inside the window, so the sixth start is refused and the
+# service enters the failed state. A process that SIGKILL cannot end (stuck
+# in uninterruptible I/O) can stretch an attempt past that; the boot-time
+# start watch below still reports such a boot. tests/test_failure_notice.py
+# recomputes this from the rendered unit and app.stop_budget.
 RESTART_SECONDS = 5
 START_LIMIT_BURST = 5
 START_LIMIT_INTERVAL_SECONDS = 1200
@@ -536,8 +539,8 @@ StartLimitBurst={START_LIMIT_BURST}
 [Service]
 Type=notify
 NotifyAccess=main
-TimeoutStartSec={START_TIMEOUT_SECONDS}
-TimeoutStopSec={STOP_TIMEOUT_SECONDS}
+TimeoutStartSec=60
+TimeoutStopSec=90
 User={account.pw_name}
 Group={account.pw_gid}
 WorkingDirectory={_unit_path(current)}
@@ -589,7 +592,25 @@ def _set_link(root: Path, name: str, target: str | None) -> None:
     os.replace(temporary, path)
 
 
+def _reset_start_limit(runner) -> None:
+    """``systemctl reset-failed`` before an installer restart (PR #392 review).
+
+    The start limit (``StartLimitBurst=5`` in 1200 s) counts every start,
+    the installer's own included: an update, its restore after a failed
+    restart, and further updates or rollbacks within 20 minutes could
+    otherwise reach it and leave the service stopped by a refused start.
+    ``reset-failed`` flushes the counter (systemd.unit(5)). A failure here is
+    ignored: the restart that follows reports its own result.
+    """
+    try:
+        runner(["systemctl", "reset-failed", "server-sentinel.service"], check=False,
+               timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def _restart(runner) -> None:
+    _reset_start_limit(runner)
     runner(["systemctl", "restart", "server-sentinel.service"], check=True, timeout=90)
     runner(["systemctl", "is-active", "--quiet", "server-sentinel.service"],
            check=True, timeout=30)
