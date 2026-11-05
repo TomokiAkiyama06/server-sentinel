@@ -485,7 +485,9 @@ class AdminCliTests(unittest.TestCase):
                 code, stdout, stderr, terminal = self.run_cli(*argv, console=console)
                 self.assertEqual((code, stdout, terminal), (2, "", ""))
                 self.assertIn("refused: service_running", stderr)
-                self.assertIn("systemctl stop", stderr)
+                # With socket activation a connection restarts a service stopped alone.
+                self.assertIn("sudo systemctl stop server-sentinel-upstream.socket "
+                              "server-sentinel.service", stderr)
                 # Another local admin command holding the database also counts.
                 self.assertIn("bootstrap_cli", stderr)
                 self.assertIn("a second admin_cli", stderr)
