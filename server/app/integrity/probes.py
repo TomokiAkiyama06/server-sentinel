@@ -122,11 +122,35 @@ class CommandRunner:
                             # signal. Reap it anyway; a skipped wait() leaves a
                             # zombie until an unrelated spawn or backend exit.
                             pass
-                        process.wait(timeout=reap)
+                        self._reap(process, reap)
                 except (OSError, subprocess.SubprocessError):
                     pass
                 finally:
                     process.stdout.close()
+
+
+    def _reap(self, process, reap: float) -> None:
+        """Wait up to `reap` for the killed command, in stop poll slices.
+
+        Issue #385 (Codex PR #389 P2): a stop that begins during this wait
+        shortens what is left of it to STOP_REAP_SECONDS, so a command in
+        flight still ends within STOP_POLL_SECONDS + STOP_REAP_SECONDS of the
+        stop. Raises `TimeoutExpired` once the wait is spent (abandoned).
+        """
+        deadline = time.monotonic() + reap
+        shortened = False
+        while True:
+            remaining = deadline - time.monotonic()
+            try:
+                process.wait(timeout=max(0.001, min(remaining, STOP_POLL_SECONDS)))
+                return
+            except subprocess.TimeoutExpired:
+                now = time.monotonic()
+                if not shortened and self.interrupted():
+                    shortened = True
+                    deadline = min(deadline, now + STOP_REAP_SECONDS)
+                if now >= deadline:
+                    raise
 
 
 def _read_bytes(path: Path) -> bytes:

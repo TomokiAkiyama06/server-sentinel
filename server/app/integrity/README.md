@@ -44,7 +44,8 @@ timeout, one-MiB stdout cap, no shell/sudo, discarded stderr and a minimal
 environment without inherited secrets. A command that does not end in time is
 killed and waited for at most five more seconds, then abandoned. Issue #385:
 once the Main shutdown began (`interrupted`), no further probe starts and a
-command in flight is killed within 0.25 s and waited for at most 1 s; the
+command in flight is killed within 0.25 s and waited for at most 1 s (a stop
+during the normal five-second reap cuts what is left of it to 1 s too); the
 collection then raises `StopInterrupted` instead of returning a partial
 inventory, and `IntegrityService` records nothing (no change, warning, notice
 or baseline update; `monitoring_check_interrupted` is logged). The next start's

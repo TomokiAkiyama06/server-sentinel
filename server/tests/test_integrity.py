@@ -975,13 +975,17 @@ class _Stream:
 
 
 class _StuckChild:
-    """Synthetic child that stays unreapable, like uninterruptible disk I/O."""
+    """Synthetic child that stays unreapable, like uninterruptible disk I/O.
+
+    Each wait blocks for its whole timeout on the synthetic clock.
+    """
 
     pid = 424242
 
-    def __init__(self, descriptor):
+    def __init__(self, descriptor, clock):
         self.closed = False
         self.waits = []
+        self.clock = clock
         self.stdout = _Stream(descriptor, self)
 
     def poll(self):
@@ -989,17 +993,17 @@ class _StuckChild:
 
     def wait(self, timeout=None):
         self.waits.append(timeout)
+        self.clock.now += timeout
         raise subprocess.TimeoutExpired("synthetic-probe", timeout)
 
 
 class _Clock:
-    """Synthetic `time` whose monotonic clock advances on every reading."""
+    """Synthetic `time`: only the child's waits advance its monotonic clock."""
 
     def __init__(self):
         self.now = 0.0
 
     def monotonic(self):
-        self.now += 1.0
         return self.now
 
 
@@ -1029,50 +1033,47 @@ class ProbeCleanupTests(TestCase):
         reader, writer = os.pipe()
         os.close(writer)
         self.addCleanup(os.close, reader)
-        self.child = _StuckChild(reader)
+        self.clock = _Clock()
+        self.child = _StuckChild(reader, self.clock)
         self.killed = []
 
-    def run_probe(self, killpg, *, interrupted=None, expected=ProbeUnavailable):
+    def run_probe(self, killpg=None, *, interrupted=None, expected=ProbeUnavailable):
+        def kill(pid, number):
+            self.killed.append((pid, number, self.clock.now, len(self.child.waits)))
+            if killpg is not None:
+                killpg(pid, number)
+
         spawn, signals, clock = probes.subprocess, probes.os, probes.time
-        # Each reading of the synthetic clock advances it one second, so the
-        # five-second output deadline passes after a few status waits.
-        probes.subprocess, probes.os, probes.time = _Spawn(self.child), _Signals(killpg), _Clock()
+        probes.subprocess, probes.os, probes.time = _Spawn(self.child), _Signals(kill), self.clock
         self.addCleanup(setattr, probes, "subprocess", spawn)
         self.addCleanup(setattr, probes, "os", signals)
         self.addCleanup(setattr, probes, "time", clock)
         runner = CommandRunner() if interrupted is None else CommandRunner(interrupted)
         with self.assertRaises(expected):
             runner.run(("dmidecode", "--type", "17"))
-
-    def assert_bounded_waits(self, reap):
-        # Status waits of at most one stop poll slice each, then the cleanup
-        # reap, all bounded, so a wedged disk cannot stall the check.
-        *status, last = self.child.waits
-        self.assertTrue(status)
-        self.assertTrue(all(0 < timeout <= probes.STOP_POLL_SECONDS for timeout in status))
-        self.assertEqual(reap, last)
+        self.assertEqual([(_StuckChild.pid, signal.SIGKILL)], [item[:2] for item in self.killed])
+        self.assertTrue(self.child.closed)
+        # Every wait, status or reap, is at most one stop poll slice.
+        self.assertTrue(all(0 < timeout <= probes.STOP_POLL_SECONDS for timeout in self.child.waits))
+        killed_at = self.killed[0][2]
+        return killed_at, self.clock.now - killed_at
 
     def test_unkillable_probe_does_not_block_the_worker(self):
-        self.run_probe(lambda pid, number: self.killed.append((pid, number)))
-        self.assertEqual(self.killed, [(_StuckChild.pid, signal.SIGKILL)])
-        self.assert_bounded_waits(probes.COMMAND_REAP_SECONDS)
-        self.assertTrue(self.child.closed)
+        # The status wait and the cleanup reap are both bounded, so a wedged
+        # disk cannot stall the startup/daily check.
+        killed_at, reaped = self.run_probe()
+        self.assertAlmostEqual(probes.COMMAND_OUTPUT_SECONDS, killed_at, delta=0.01)
+        self.assertAlmostEqual(probes.COMMAND_REAP_SECONDS, reaped, delta=0.01)
 
     def test_a_stop_kills_the_command_in_flight_and_reaps_briefly(self):
         # Issue #385: the stop is noticed within one poll slice of the status
         # wait; the read-only command is killed and reaped for at most
         # STOP_REAP_SECONDS, and no partial output is returned.
-        checks = []
-
-        def interrupted():
-            checks.append(1)
-            return len(checks) > 3
-
-        self.run_probe(lambda pid, number: self.killed.append((pid, number)),
-                       interrupted=interrupted, expected=StopInterrupted)
-        self.assertEqual(self.killed, [(_StuckChild.pid, signal.SIGKILL)])
-        self.assert_bounded_waits(probes.STOP_REAP_SECONDS)
-        self.assertTrue(self.child.closed)
+        stop = 2.0
+        killed_at, reaped = self.run_probe(interrupted=lambda: self.clock.now >= stop,
+                                           expected=StopInterrupted)
+        self.assertLessEqual(killed_at, stop + probes.STOP_POLL_SECONDS)
+        self.assertAlmostEqual(probes.STOP_REAP_SECONDS, reaped, delta=0.01)
 
     def test_a_stop_while_reading_the_output_kills_and_reaps_briefly(self):
         checks = []
@@ -1081,11 +1082,20 @@ class ProbeCleanupTests(TestCase):
             checks.append(1)
             return len(checks) > 1
 
-        self.run_probe(lambda pid, number: self.killed.append((pid, number)),
-                       interrupted=interrupted, expected=StopInterrupted)
-        self.assertEqual(self.killed, [(_StuckChild.pid, signal.SIGKILL)])
-        self.assertEqual([probes.STOP_REAP_SECONDS], self.child.waits)
-        self.assertTrue(self.child.closed)
+        killed_at, reaped = self.run_probe(interrupted=interrupted, expected=StopInterrupted)
+        self.assertEqual(0.0, killed_at)
+        self.assertAlmostEqual(probes.STOP_REAP_SECONDS, reaped, delta=0.01)
+
+    def test_a_stop_during_the_normal_reap_shortens_it(self):
+        # Codex PR #389 P2: the command timed out on its own and is being
+        # reaped for COMMAND_REAP_SECONDS when the stop begins; what is left
+        # of that wait is cut to STOP_REAP_SECONDS, so the stop still waits
+        # at most INTEGRITY_PROBE_STOP_SECONDS for the probe.
+        stop = probes.COMMAND_OUTPUT_SECONDS + 2.0
+        killed_at, reaped = self.run_probe(interrupted=lambda: self.clock.now >= stop)
+        self.assertAlmostEqual(probes.COMMAND_OUTPUT_SECONDS, killed_at, delta=0.01)
+        self.assertLessEqual(self.clock.now - stop, probes.STOP_POLL_SECONDS + probes.STOP_REAP_SECONDS)
+        self.assertLess(reaped, probes.COMMAND_REAP_SECONDS)
 
     def test_a_stop_before_the_command_spawns_nothing(self):
         def spawn(*arguments, **options):
@@ -1098,10 +1108,7 @@ class ProbeCleanupTests(TestCase):
     def test_failed_signal_still_reaps_and_closes_the_probe_pipe(self):
         """A child exiting between poll() and the signal must not stay a zombie."""
         def refuse(pid, number):
-            self.killed.append((pid, number))
             raise ProcessLookupError("synthetic-probe")
 
-        self.run_probe(refuse)
-        self.assertEqual(self.killed, [(_StuckChild.pid, signal.SIGKILL)])
-        self.assert_bounded_waits(probes.COMMAND_REAP_SECONDS)
-        self.assertTrue(self.child.closed)
+        _, reaped = self.run_probe(refuse)
+        self.assertAlmostEqual(probes.COMMAND_REAP_SECONDS, reaped, delta=0.01)
