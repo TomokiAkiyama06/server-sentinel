@@ -48,8 +48,12 @@ def run(settings: Settings, monitoring=None, local_uvc=None, *, human_access=Non
     except SocketActivationError:
         logging.getLogger(__name__).error(Event.HUMAN_LISTENER_ACTIVATION_INVALID)
         return 1
+    from app.stop_budget import HTTP_GRACEFUL_SHUTDOWN_SECONDS
+    # Issue #383: open requests (a live stream, for example) are cut after
+    # this bound instead of holding the lifespan shutdown indefinitely.
     options = dict(server_header=False, date_header=False, access_log=False, log_config=None,
-                   proxy_headers=False, forwarded_allow_ips="", ws="none")
+                   proxy_headers=False, forwarded_allow_ips="", ws="none",
+                   timeout_graceful_shutdown=HTTP_GRACEFUL_SHUTDOWN_SECONDS)
     composed, closed = {}, None
     if human_access is not None and human_access.enabled:
         from app.auth.composition import build_human_access
