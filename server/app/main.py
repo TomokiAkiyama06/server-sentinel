@@ -895,6 +895,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
 
         async def shutdown() -> None:
             uvc_lifecycle["stopping"] = True
+            if monitoring_runtime is not None:
+                # Issue #383: no new monitoring tick, and one in flight skips
+                # its long steps, so the settles and the stop below do not
+                # queue behind them.
+                monitoring_runtime.begin_stop()
             if camera_offline is not None:
                 # Issue #301 item 2: capture stopping lowers every source; no
                 # episode starts and nothing more is notified from here on.
