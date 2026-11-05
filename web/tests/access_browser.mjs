@@ -77,6 +77,8 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true, e
   const handlers = {
     'GET /api/session': () => json(200, { csrf, role: 'owner', permissions: ['live:view', 'recordings:view'] }),
     'GET /api/admin/principals': () => { state.inventoryLoads += 1; return json(200, inventory()); },
+    // Issue #301: the Owner's camera offline notice, sampled after sign-in.
+    'GET /api/monitoring/camera-offline': () => json(200, { offline_unnotified: false }),
     'POST /api/auth/step-up/options': () => {
       const challenge = b64(randomBytes(32));
       state.challenges.push(challenge);

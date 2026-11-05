@@ -663,7 +663,7 @@ What happens:
   notification is stored locally as `disabled`, and the Owner's dashboard
   shows "カメラのオフラインを通知できません" / "Camera offline cannot be
   notified" above every screen instead (an Owner session only; invited
-  viewers never see it). It is sampled when a screen opens and every minute,
+  viewers never see it). It is sampled after sign-in and every minute,
   and it disappears at the first monitoring tick (about a minute) after the
   camera is online again, or, after an alert for repeated short outages,
   once the camera has stayed online for the whole window (default

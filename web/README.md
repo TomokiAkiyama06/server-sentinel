@@ -550,10 +550,12 @@ GET /api/monitoring/camera-offline   200 {"offline_unnotified": <boolean>}
 ```
 
 - Loaded only for an Owner session when the provider offers
-  `loadCameraOfflineNotice` (the production provider always does), when a
-  screen opens and every `CAMERA_OFFLINE_NOTICE_REFRESH_MS` (60 s) after each
-  answer, one request at a time. A refresh keeps the last answer until the
-  next one arrives.
+  `loadCameraOfflineNotice` (the production provider always does), once the
+  session is loaded and every `CAMERA_OFFLINE_NOTICE_REFRESH_MS` (60 s) after
+  each answer, one request at a time; changing screens neither restarts nor
+  abandons it. The server reads it without an idle touch, so this background
+  poll never keeps an unattended session alive (Codex PR #388). A refresh
+  keeps the last answer until the next one arrives.
 - `parseCameraOfflineNotice` accepts only a JSON boolean; anything else fails
   closed. A failed check is shown as `cameraOfflineNoticeUnavailable`
   ("could not be checked"), never as nothing to report.

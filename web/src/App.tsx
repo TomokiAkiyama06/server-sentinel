@@ -189,16 +189,19 @@ export function App({ services = deniedServices }: { services?: DashboardService
 
   useEffect(() => {
     // Issue #301: whether a camera offline reaches the Owner is Owner-only
-    // (the server refuses everyone else). Sampled when a screen opens and
-    // every CAMERA_OFFLINE_NOTICE_REFRESH_MS after that, on every screen, so
-    // the notice does not depend on which screen the Owner left open. A
-    // refresh keeps the last answer until the next one arrives; a failed one
-    // replaces it with the "could not be checked" line.
+    // (the server refuses everyone else). Sampled once the session is loaded
+    // and every CAMERA_OFFLINE_NOTICE_REFRESH_MS after each answer, shown on
+    // every screen, so the notice does not depend on which screen the Owner
+    // left open. Changing screens neither restarts nor abandons a sample. The
+    // server reads it without an idle touch (Codex PR #388), so this
+    // background poll never keeps an unattended session alive. A refresh
+    // keeps the last answer until the next one arrives; a failed one replaces
+    // it with the "could not be checked" line.
     const loader = services.loadCameraOfflineNotice;
     if (!loader || access.state !== 'allowed' || access.role !== 'owner') return;
-    setOfflineNotice(current => current.state === 'ready' || current.state === 'failed' ? current : { state: 'loading' });
+    setOfflineNotice({ state: 'loading' });
     return startOfflineNoticeSampling(loader, setOfflineNotice);
-  }, [services, access, view]);
+  }, [services, access]);
 
   useEffect(() => {
     // Wizard progress is Owner-only and loaded fresh whenever Setup opens, so a
