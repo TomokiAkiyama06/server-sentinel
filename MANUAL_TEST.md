@@ -2921,9 +2921,11 @@ Record separate performance results for 1, 2, 3, and 4 active sources, including
 Current Issue #23 automation uses generated inventory and synthetic compressed
 bytes only. The lifespan runtime now runs startup/daily integrity comparison and
 recording-health checks and bridges faults to durable local notification rows
-and optional Slack (mock-verified only). Before physical acceptance, wire the
-approved Owner authorizer and the actual source/encoder/codec callbacks; until
-then the self-test reports `UNAVAILABLE` and no baseline can be approved. Verify optional read-only tools under the
+and optional Slack (mock-verified only). The Owner approves the baseline with
+the local command `python -m app.integrity.admin_cli` (Issue #390; below,
+"本番での baseline 承認"). Before physical acceptance, wire the actual
+source/encoder/codec callbacks; until then the self-test reports
+`UNAVAILABLE`. Verify optional read-only tools under the
 dedicated non-root account; unavailable fields must stay unknown. Do not publish
 collected identifiers or self-test bytes.
 
@@ -2966,6 +2968,33 @@ storage probe と `compare()` を直接実行した（read-only）。識別子�
 - 未確認: USB bridge 接続 disk・SAS/SCSI disk の実機、専用 service account での
   実行、Owner baseline 承認・監査、startup/daily 実行と通知。上の checklist は
   それらの確認まで未チェックのままとする。
+
+#### 本番での baseline 承認（Issue #390、Owner 判断 2026-11-05）
+
+`python -m app.integrity.admin_cli`（手順は `server/docs/DEPLOYMENT.md`
+「Approving the hardware baseline locally」）を本番の Main Server（VM 構成では
+VM guest の中）で実行する。出力・記録には kind / state / 件数だけを残し、
+識別子の値は記録しない。CI の test は synthetic な probe と pseudo-terminal で
+確認しただけで、実機の inventory・本番 DB・Slack は確認していない。
+
+- [ ] service account で `show` を実行し、承認前は 4 kind すべて
+  `UNVERIFIABLE` / `BASELINE_REQUIRED`、STORAGE が `notify=failure` と表示される。
+  出力に serial / UUID / WWN / PCI address / model 文字列 / path が含まれない;
+- [ ] service を動かしたまま `approve` を実行すると `service_running` で拒否され、
+  baseline・audit が変わらない;
+- [ ] service を止めて `approve` を実行し、terminal に表示された件数が実機
+  （VM 構成では VM 定義）と一致することを確かめてから `APPROVE` を入力する。
+  `APPROVE` 以外を入力すると `owner_confirmation_declined` で何も変わらない;
+- [ ] 承認後、`security_admin_audit_records` に `approve_hardware_baseline` /
+  `succeeded` が 1 行、`integrity_audit` に 1 行増え、どちらにも識別子の値がない;
+- [ ] service を起動し、次の startup check の結果（`show` の
+  `last recorded check`）が `hardware_integrity_failure` ではない。STORAGE / GPU が
+  `OK` になり、残るのは CPU の `UNIQUE_ID_UNAVAILABLE` や probe を読めない kind の
+  `PROBE_UNAVAILABLE` などの warning だけであることを記録する;
+- [ ] その起動とその後の daily check で Slack に `hardware_integrity_failure` が
+  届かない（warning は daily summary の件数にだけ現れる）;
+- [ ] VM 構成では、baseline が VM の仮想 hardware と passthrough 機器だけを
+  対象にし、物理 host の変更を検知しないことを記録に残す（Owner 判断 2026-10-22）。
 
 ### Recording-health daily self-test
 
