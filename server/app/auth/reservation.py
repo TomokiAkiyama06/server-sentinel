@@ -53,6 +53,8 @@ from app.logging import Event
 
 DAILY_SECONDS = 86400
 RETRY_WHILE_CLOSED_SECONDS = 300
+# The total of every enumeration of one check, shared (Issue #383): a check
+# never spends longer in them, so the Main stop budget can bound it.
 ENUMERATION_TIMEOUT_SECONDS = 10.0
 MAX_PROC_NET_LINES = 1_000_000
 MAX_SERVE_STATUS_BYTES = 1_048_576
@@ -1261,6 +1263,7 @@ class HostnameReservationCheck:
         self._routes = routes
         self._sink = sink
         self._timeout = float(timeout)
+        self._check_deadline: float | None = None
         self._retry = float(retry_seconds)
         self._monotonic = monotonic
         self._utcnow = utcnow
@@ -1610,11 +1613,28 @@ class HostnameReservationCheck:
             self._epoch += 1
         self._verdict = verdict
 
+    def _remaining(self) -> float:
+        """Issue #383: what is left of the running check's shared deadline.
+
+        Every enumeration of one check shares the enumeration timeout, so a
+        check (and a shutdown waiting for it) takes at most that long in its
+        enumerations, not that long per enumeration. Real elapsed time,
+        independent of the injected scheduling clock.
+        """
+        deadline = self._check_deadline
+        if deadline is None:
+            return self._timeout
+        return max(0.0, deadline - time.monotonic())
+
     def _enumerate(self, name: str, call: Callable[[], Iterable], timeout_reason: Reason,
                    error_reason: Reason, item_type: type | tuple[type, ...]):
         previous = self._inflight.get(name)
         if previous is not None and previous.is_alive():
             # A hung enumeration is never stacked; it keeps the check closed.
+            return timeout_reason
+        remaining = self._remaining()
+        if remaining <= 0:
+            # Issue #383: the check's shared deadline is spent; fail closed.
             return timeout_reason
         box: dict[str, object] = {}
 
@@ -1627,7 +1647,7 @@ class HostnameReservationCheck:
         worker = threading.Thread(target=run, name=f"reservation-{name}", daemon=True)
         self._inflight[name] = worker
         worker.start()
-        worker.join(self._timeout)
+        worker.join(remaining)
         if worker.is_alive():
             return timeout_reason
         value = box.get("value")
@@ -1647,6 +1667,9 @@ class HostnameReservationCheck:
         previous = self._inflight.get(name)
         if previous is not None and previous.is_alive():
             return None
+        remaining = self._remaining()
+        if remaining <= 0:
+            return None  # the check's shared deadline is spent (Issue #383)
         box: dict[str, object] = {}
 
         def run():
@@ -1658,7 +1681,7 @@ class HostnameReservationCheck:
         worker = threading.Thread(target=run, name=f"reservation-{name}", daemon=True)
         self._inflight[name] = worker
         worker.start()
-        worker.join(self._timeout)
+        worker.join(remaining)
         value = box.get("value")
         if worker.is_alive() or "error" in box or not isinstance(value, dict) or any(
                 type(key) is not int or not valid(item) for key, item in value.items()):
@@ -1723,6 +1746,7 @@ class HostnameReservationCheck:
         if not self._exceptions_loaded:
             # Load (or retry) the stored set; until it loads, access stays closed.
             self._load_exceptions()
+        self._check_deadline = time.monotonic() + self._timeout
         try:
             if self._resolver is None:
                 resolved = Reason.HOSTNAME_RESOLUTION_UNAVAILABLE
@@ -1755,6 +1779,8 @@ class HostnameReservationCheck:
                 sole, self._upstream_privileged())
         except Exception:
             reasons, extra_listeners, extra_routes = (Reason.LISTENER_ENUMERATION_UNAVAILABLE,), 0, 0
+        finally:
+            self._check_deadline = None
         if not self._exceptions_loaded:
             reasons = (self._exceptions_reason,) + reasons
         # Decide + commit under the session gate (Issue #144): the marker,
