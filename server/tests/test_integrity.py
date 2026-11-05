@@ -1074,6 +1074,19 @@ class ProbeCleanupTests(TestCase):
         self.assert_bounded_waits(probes.STOP_REAP_SECONDS)
         self.assertTrue(self.child.closed)
 
+    def test_a_stop_while_reading_the_output_kills_and_reaps_briefly(self):
+        checks = []
+
+        def interrupted():
+            checks.append(1)
+            return len(checks) > 1
+
+        self.run_probe(lambda pid, number: self.killed.append((pid, number)),
+                       interrupted=interrupted, expected=StopInterrupted)
+        self.assertEqual(self.killed, [(_StuckChild.pid, signal.SIGKILL)])
+        self.assertEqual([probes.STOP_REAP_SECONDS], self.child.waits)
+        self.assertTrue(self.child.closed)
+
     def test_a_stop_before_the_command_spawns_nothing(self):
         def spawn(*arguments, **options):
             raise AssertionError("spawned")
