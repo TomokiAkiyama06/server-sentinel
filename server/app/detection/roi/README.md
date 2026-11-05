@@ -515,7 +515,8 @@ its reference.
   instead of `none`/`idle` (Issue #341); `pending_reacquisitions()` stays
   empty and `reacquire()` does nothing until `start()`. An unreadable
   history marks the source with `failure="history_unavailable"` (unknown,
-  not "stored"; an attempt's own refusal already shown is kept); `start()` reads the history again, clearing that failure or
+  not "stored"; an attempt's own refusal already shown is kept); `start()`
+  reads the history again, clearing that failure or
   withdrawing the mark when nothing is stored. "History unknown" is its own
   state, not the last failure (Issue #355): `status()` reports it as
   `history_unknown` (Issue #377) while it lasts, with `failure` the last
@@ -527,8 +528,10 @@ its reference.
   (Issue #381: not a failed save that finished while `start()` read the
   history either).
 - `status()` is value-free: origin, version, time, phase, last refusal,
-  whether a template exists, whether the history is unknown, and the
-  runtime's own source state and reason.
+  whether a template exists, whether the history is unknown, whether a
+  calibration is known to be stored while none is in use (`stored_known`,
+  also while acquiring, Issue #382), and the runtime's own source state and
+  reason.
 
 Synthetic verification: `server/tests/test_scene_calibration.py` (runtime
 acquisition, history, service, and the application lifespan with an
