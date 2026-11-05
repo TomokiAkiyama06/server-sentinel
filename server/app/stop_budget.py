@@ -68,8 +68,10 @@ STOP_ADMISSION_WAIT_SECONDS = 5.0
 # when the stop began (retention `_trim`, the storage sample, the daily
 # summary, a startup retry, a recording self-test adapter stage), the SQLite
 # busy timeouts summed over the many writes in the human access stop, the
-# timeline finish and the dispatch, a hung filesystem call, and the dispatch
-# steps before the critical settle.
+# timeline finish and the dispatch, and of a check that completed just before
+# the stop (the integrity `store.record` / `deliver` and the self-test's
+# `record_result` writes), a hung filesystem call, and the dispatch steps
+# before the critical settle.
 # On top of `join_timeout_seconds`, a local UVC stop waits at most 1 s for the
 # frame-progress watchdog join (`WorkerSupervisor.WATCHDOG_JOIN_MINIMUM_SECONDS`),
 # 1 s for the fenced `offline` writes of workers that outlived the join

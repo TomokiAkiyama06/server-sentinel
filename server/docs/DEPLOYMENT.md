@@ -560,9 +560,14 @@ further stage, still cleans up and records only a failure that really
 happened; a notification settle ends at most one outcome write (one 5 s
 SQLite busy timeout) past its configured bound, which is not shortened (an
 outcome not written by then stays `pending`). `monitoring_check_interrupted`
-is logged when a check was cut short. A write from another thread waits at
-most 5 s for the storage admission and is then refused like any storage
-refusal (`storage_admission_stop_timeout`, nothing written). That cap is not
+is logged when a check was cut short; a probe command ended by SIGTERM (the
+systemd stop signals the whole control group, before the lifespan shutdown
+starts) counts as cut short too, any other signal as a failed probe. Every write from another thread (for
+example the scene timeline finish and dispatch, the local UVC `offline` and
+fenced writes, audit records and the human access writes) waits at most 5 s
+for the storage admission once the stop began and is then refused like any
+storage refusal (`storage_admission_stop_timeout`, nothing written); what it
+would have written is done, or found again, by the next start. That cap is not
 in the reserve: behind the bounded integrity check the wait ends with it and
 adds nothing, and the cap only matters behind the steps still unbounded below.
 A refused write is done by the next start; for the human access durable

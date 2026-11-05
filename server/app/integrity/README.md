@@ -49,7 +49,9 @@ during the normal five-second reap cuts what is left of it to 1 s too); the
 collection then raises `StopInterrupted` instead of returning a partial
 inventory, and `IntegrityService` records nothing (no change, warning, notice
 or baseline update; `monitoring_check_interrupted` is logged). The next start's
-startup check runs it. Utilities/drivers are not installed or
+startup check runs it. A command ended by SIGTERM (the systemd stop signals the
+whole control group before `begin_stop()` runs) is treated the same way; any
+other signal is a failed probe. Utilities/drivers are not installed or
 bundled. Keep deployment permissions narrow; never run the backend as root for
 inventory. CI does not invoke these host utilities.
 

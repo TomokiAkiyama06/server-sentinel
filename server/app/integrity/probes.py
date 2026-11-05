@@ -100,6 +100,14 @@ class CommandRunner:
                         raise StopInterrupted() from None
                     if time.monotonic() >= deadline:
                         raise
+            if status == -signal.SIGTERM:
+                # Issue #385 (PR #389 review): systemd's stop sends SIGTERM to
+                # the whole control group, so a probe child can end before
+                # `begin_stop()` runs (after the HTTP graceful wait). Its
+                # output is partial: the check is interrupted, never a
+                # failure or unavailable kind. Other signals (SIGKILL by the
+                # OOM killer, for example) stay real failures.
+                raise StopInterrupted()
             # smartctl returns a bitmask: health warnings are useful output.
             if status and not (command[0] == "smartctl" and status >= 0 and not status & 7):
                 raise ProbeUnavailable()

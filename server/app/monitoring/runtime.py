@@ -496,6 +496,12 @@ class MonitoringRuntime:
                 self._set(**{flag: True})
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
         else:
+            if self._stopping.is_set():
+                # Issue #385 (PR #389 review): once the stop began a check may
+                # have been cut short and returned without a result, so a
+                # return here proves nothing; the flag and retry stay as
+                # they were.
+                return
             self._retry_at.pop(name, None)
             if flag is not None:
                 self._set(**{flag: False})
@@ -1691,8 +1697,16 @@ class MonitoringRuntime:
             logging.getLogger(__name__).info(Event.MONITORING_STARTED)
 
     def _poll_outcomes(self) -> None:
-        """Between ticks: store finished deliveries' outcomes (PR #366 review)."""
+        """Between ticks: store finished deliveries' outcomes (PR #366 review).
+
+        Issue #385 (PR #389 review): a no-op once the stop began. The shutdown
+        settles own the polling then, with their deadline; a deadline-less
+        poll queued behind a settle would run every write the settle left
+        for later, unbounded and outside the settle's spent time.
+        """
         self._require_owner()
+        if self._stopping.is_set():
+            return
         if self.notifications is not None and self.notifications.pending_count:
             self._poll()
 
@@ -1706,6 +1720,9 @@ class MonitoringRuntime:
                 await asyncio.sleep(max(0.0, remaining))
                 return
             await asyncio.sleep(NOTIFICATION_POLL_SECONDS)
+            if self._stopping.is_set():
+                # Issue #385: the settles poll from here on (`_poll_outcomes`).
+                continue
             try:
                 await self.call(self._poll_outcomes)
             except Exception:

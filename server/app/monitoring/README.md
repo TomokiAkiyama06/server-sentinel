@@ -93,7 +93,12 @@ cross-thread `reservation()` waits at most `STOP_ADMISSION_WAIT_SECONDS` (5 s)
 for the worker: a reservation not granted by then is withdrawn before the
 worker takes it and refused as `STORAGE_ADMISSION_STOPPING`
 (`storage_admission_stop_timeout`, nothing written), so the caller handles it
-like any storage refusal. For the human access durable revocation marker the
+like any storage refusal. This applies to every cross-thread write (scene timeline finish and dispatch,
+local UVC `offline` / fenced writes, audit, human access); the next start
+does or finds the refused write again. Once the stop began the run loop polls
+no more outcomes between ticks (`_poll_outcomes` is a no-op), so only the
+settles poll, with their deadline, and a step returning then leaves its
+degraded flag and retry unchanged. For the human access durable revocation marker the
 requirement then stays in memory only and a restart can lose it (the next
 start's check finds the exposure again only if it still exists); Owner
 decision 2026-11-05 accepts this trade-off. The cap is not a stop budget

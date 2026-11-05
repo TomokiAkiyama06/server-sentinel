@@ -14,6 +14,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -403,6 +404,48 @@ class LifespanTests(RuntimeFixture):
             with contextlib.suppress(asyncio.CancelledError):
                 await loop
             self.assertEqual([], ticks)
+
+    async def test_once_stopping_no_poll_outside_the_settles(self):
+        # Issue #385 (PR #389 review): a deadline-less poll queued behind a
+        # settle would run every write the settle deferred, unbounded.
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            polls, notifications = [], runtime.notifications
+            runtime._poll = lambda deadline=None: polls.append(deadline)
+            runtime.notifications = types.SimpleNamespace(pending_count=1)
+            try:
+                await runtime.call(runtime._poll_outcomes)
+                self.assertEqual([None], polls)
+                runtime.begin_stop()
+                await runtime.call(runtime._poll_outcomes)
+                self.assertEqual([None], polls)
+                # Nor does the run loop submit one between ticks.
+                submitted = []
+                runtime._poll_outcomes = lambda: submitted.append(1)
+                runtime.dependencies = replace(runtime.dependencies, tick_seconds=0.2)
+                with patch("app.monitoring.runtime.NOTIFICATION_POLL_SECONDS", 0.01):
+                    await runtime._wait_for_tick()
+                self.assertEqual([], submitted)
+            finally:
+                runtime.notifications = notifications
+                del runtime._poll
+
+    async def test_a_step_returning_after_the_stop_leaves_its_flag(self):
+        # Issue #385 (PR #389 review): an interrupted check returns without a
+        # result, so it neither clears its degraded flag nor its retry.
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+
+            def run():
+                runtime._set(integrity_degraded=True)
+                runtime._retry_at["integrity"] = -1.0
+                runtime.begin_stop()
+                runtime._guarded("integrity", lambda: None, "integrity_degraded")
+                return runtime.status.integrity_degraded, runtime._retry_at.get("integrity")
+
+            self.assertEqual((True, -1.0), await runtime.call(run))
 
     async def test_retention_expires_unstarred_and_keeps_starred(self):
         application = self.application()

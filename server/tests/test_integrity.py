@@ -788,6 +788,16 @@ class LinuxProbeTests(TestCase):
             self.probe.runner = FakeRunner({"smartctl": json.dumps(payload).encode()})
             self.assertEqual(self.probe.storage_health(("/dev/synthetic0",)), (expected,))
 
+    def test_a_device_health_read_cut_by_the_stop_is_not_unverifiable(self):
+        # Issue #385: the self-test then records nothing (`RecordingHealthService`).
+        class Runner:
+            def run(self, command):
+                raise StopInterrupted()
+
+        self.probe.runner = Runner()
+        with self.assertRaises(StopInterrupted):
+            self.probe.storage_health(("/dev/synthetic0",))
+
     def test_arbitrary_commands_rejected_before_spawn(self):
         with self.assertRaises(ProbeUnavailable):
             CommandRunner().run(("sh", "-c", "anything"))
@@ -997,6 +1007,23 @@ class _StuckChild:
         raise subprocess.TimeoutExpired("synthetic-probe", timeout)
 
 
+class _ExitedChild:
+    """Synthetic child that already ended with `returncode`."""
+
+    pid = 424243
+
+    def __init__(self, descriptor, returncode):
+        self.returncode = returncode
+        self.closed = False
+        self.stdout = _Stream(descriptor, self)
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
 class _Clock:
     """Synthetic `time`: only the child's waits advance its monotonic clock."""
 
@@ -1096,6 +1123,23 @@ class ProbeCleanupTests(TestCase):
         self.assertAlmostEqual(probes.COMMAND_OUTPUT_SECONDS, killed_at, delta=0.01)
         self.assertLessEqual(self.clock.now - stop, probes.STOP_POLL_SECONDS + probes.STOP_REAP_SECONDS)
         self.assertLess(reaped, probes.COMMAND_REAP_SECONDS)
+
+    def test_a_child_ended_by_sigterm_is_an_interrupted_check(self):
+        # Issue #385 (PR #389 review): systemd's stop SIGTERMs the whole
+        # control group before `begin_stop()`; that partial output is an
+        # interrupted check, while another signal (an OOM SIGKILL) stays a
+        # real failure.
+        for returncode, expected in ((-signal.SIGTERM, StopInterrupted),
+                                     (-signal.SIGKILL, ProbeUnavailable)):
+            with self.subTest(returncode=returncode):
+                child = _ExitedChild(self.child.stdout.fileno(), returncode)
+                spawn = probes.subprocess
+                probes.subprocess = _Spawn(child)
+                try:
+                    with self.assertRaises(expected):
+                        CommandRunner().run(("dmidecode", "--type", "17"))
+                finally:
+                    probes.subprocess = spawn
 
     def test_a_stop_before_the_command_spawns_nothing(self):
         def spawn(*arguments, **options):
