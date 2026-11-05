@@ -858,7 +858,18 @@ visibility only; human access was already closed by the check, and the
 notification carries no hostname, identity, principal, credential or reason. Tests use generated dummy components and intercepted transports.
 The webhook is read only from the administrator-owned, non-world-readable
 deployment configuration (`monitoring.slack_webhook_url`); it never enters
-repr, validation messages or logs. The monitoring runtime binds the Main
+repr, validation messages or logs. The start-failure notice (Issue #321 item
+2) reads the same key from the same file as the dedicated account, outside the
+application: `failure_notice.py`, placed root-owned (0444) in the installation
+root by the installer, standard library only, run by a hardened oneshot unit
+that only `OnFailure=` of the service starts, and by an identically hardened
+once-per-boot start watch (a timer the service `Wants=`) that additionally reads
+only the service's `ActiveState` through `systemctl show` over the system bus. It applies the `SlackEndpoint`
+rules, uses no proxy and no redirect, sends one fixed text, and prints one fixed
+journal line; no URL, configuration value, response or exception text leaves
+it. Its only writable path is its `/run` runtime directory (the time of the last
+notice). A hand-placed file at either of its paths is refused by the installer
+before any change. The monitoring runtime binds the Main
 storage policy only from explicit deployment thresholds and an Owner-declared
 recording filesystem identity; missing thresholds leave writes refused, and a
 missing, reformatted or substituted recording filesystem is refused without a
