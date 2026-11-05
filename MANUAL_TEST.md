@@ -2982,15 +2982,21 @@ VM guest の中）で実行する。出力・記録には kind / state / 件数�
   出力に serial / UUID / WWN / PCI address / model 文字列 / path が含まれない;
 - [ ] service を動かしたまま `approve` を実行すると `service_running` で拒否され、
   baseline・audit が変わらない;
-- [ ] service を止めて `approve` を実行し、terminal に表示された件数が実機
-  （VM 構成では VM 定義）と一致することを確かめてから `APPROVE` を入力する。
+- [ ] upstream socket と service を止めて（`sudo systemctl stop
+  server-sentinel-upstream.socket server-sentinel.service`）`approve` を実行し、
+  terminal に表示された件数が実機（VM 構成では VM 定義）と一致し、
+  `current vs baseline` に意図しない `CHANGED` / `MISSING` / `NEW_DEVICE` が
+  ないことを確かめてから `APPROVE` を入力する。
   `APPROVE` 以外を入力すると `owner_confirmation_declined` で何も変わらない;
 - [ ] 承認後、`security_admin_audit_records` に `approve_hardware_baseline` /
   `succeeded` が 1 行、`integrity_audit` に 1 行増え、どちらにも識別子の値がない;
 - [ ] service を起動し、次の startup check の結果（`show` の
-  `last recorded check`）が `hardware_integrity_failure` ではない。STORAGE / GPU が
-  `OK` になり、残るのは CPU の `UNIQUE_ID_UNAVAILABLE` や probe を読めない kind の
-  `PROBE_UNAVAILABLE` などの warning だけであることを記録する;
+  `last recorded check`）が `hardware_integrity_failure` ではない。各 kind の
+  state を本番の `show` で確かめて記録する。残ってよいのは warning だけ
+  （CPU の `UNIQUE_ID_UNAVAILABLE`、probe を読めない kind の `PROBE_UNAVAILABLE`、
+  VM の仮想 display device など `nvidia-smi` の UUID がない GPU の
+  `UNIQUE_ID_UNAVAILABLE`）。STORAGE が `notify=failure` のまま残る場合は、
+  serial / WWID のない disk があるので原因を記録する;
 - [ ] その起動とその後の daily check で Slack に `hardware_integrity_failure` が
   届かない（warning は daily summary の件数にだけ現れる）;
 - [ ] VM 構成では、baseline が VM の仮想 hardware と passthrough 機器だけを

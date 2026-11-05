@@ -2130,11 +2130,13 @@ controlling terminal, has no non-interactive bypass, and authorizes exactly one
 `integrity_audit` row and the `approve_hardware_baseline` security audit record
 (target the fixed logical baseline ID) commit in one transaction. It approves
 the inventory freshly collected by the service's own read-only `LinuxProbe`
-and shown to the Owner (re-collected after the confirmation; a difference is
+and shown to the Owner as counts and as findings against the baseline it
+replaces (re-collected after the confirmation; a difference is
 refused as `inventory_changed`), with the baseline revision read before the
 prompt as `expected_revision` (`baseline_revision_changed`). `approve`
 refuses while the service runs (`service_running`, checked before the prompt
-and inside the transaction), so the next startup check compares against the
+and inside the transaction; the upstream socket is stopped with the service so
+socket activation cannot restart it), so the next startup check compares against the
 new baseline; `show` is read-only and allowed while it runs. Output is fixed
 kind/state/reason words and counts only, never an observed identifier, model
 string, PCI id or path. In a VM deployment (Owner decision 2026-10-22) the

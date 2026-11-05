@@ -1,7 +1,8 @@
 """Local Owner command for the Main Server hardware baseline (Issue #390; D3).
 
 Commands (``python -m app.integrity.admin_cli``), run as the service account
-that owns the application database, never as root and never with ``sudo``::
+that owns the application database, never as root: an administrator runs it
+with ``sudo -u <service account>``, never plain ``sudo``::
 
     python -m app.integrity.admin_cli show --config <deployment.json>
     python -m app.integrity.admin_cli approve --config <deployment.json>
@@ -25,7 +26,7 @@ never approved automatically: the service only compares.
 What is approved. ``approve`` collects the inventory with the same read-only
 probe the service uses (``app.integrity.probes.LinuxProbe``, the
 ``MonitoringDependencies`` default), as the same account, shows it as counts
-per kind, asks for the confirmation, collects it again and refuses
+per kind and compared with the baseline it replaces, asks for the confirmation, collects it again and refuses
 (``inventory_changed``) unless the second collection equals the one shown,
 then approves exactly that inventory with the baseline revision read before
 the prompt as ``expected_revision``: a baseline changed meanwhile is refused
@@ -35,7 +36,12 @@ unavailable (for example ``MEMORY`` without ``dmidecode`` permission) can be
 approved; it then stays ``UNVERIFIABLE`` / ``PROBE_UNAVAILABLE`` at every
 check, which the preview states. Inside a VM/LXD guest the probe sees only
 the guest's virtual hardware (Owner decision 2026-10-22): the baseline
-covers that, never the physical host.
+covers that, never the physical host. The command does not run under the
+service unit's ``NoNewPrivileges`` / ``RestrictSUIDSGID``: on a host where
+``dmidecode`` is setuid or has file capabilities it may read memory
+identifiers the service cannot, and the service then reports ``MEMORY``
+``UNVERIFIABLE`` (a warning, never an immediate alert); ``show`` after the
+next start states it.
 
 Output. Only fixed words and numbers: per-kind component counts, unavailable
 kinds, the baseline revision and the comparison findings grouped as
@@ -53,7 +59,9 @@ runs (``service_running``): the running service compares only at startup and
 then every 24 hours, so a baseline approved under it would leave its
 current, stale verdict and alerts in place until the next daily check; with
 the service stopped, the next start compares against the new baseline at
-once. The running service is detected exactly as the camera command does
+once. Stop the upstream socket together with the service
+(``server-sentinel-upstream.socket``): with socket activation an incoming
+connection would start a service that was stopped alone. The running service is detected exactly as the camera command does
 (``app.cameras.uvc.admin_cli._database_holders``: any other process of the
 service account that holds the database file open, also another local admin
 command), checked before the prompt and again inside the approval's
@@ -113,9 +121,11 @@ _REASON = re.compile(r"[A-Z][A-Z_]{0,63}")
 _STATE_ORDER = {state: index for index, state in enumerate(State)}
 _KIND_ORDER = {kind: index for index, kind in enumerate(Kind)}
 _HINTS = {
-    "service_running": ("stop the service (sudo systemctl stop server-sentinel.service), run "
-                        "'approve', then start it again; the next start compares against the new "
-                        "baseline. Any other process of the service account holding the "
+    "service_running": ("stop the upstream socket and the service (sudo systemctl stop "
+                        "server-sentinel-upstream.socket server-sentinel.service; with socket "
+                        "activation a connection restarts a service stopped alone), run "
+                        "'approve', then start both again; the next start compares against the "
+                        "new baseline. Any other process of the service account holding the "
                         "database counts, also another local admin command (bootstrap_cli, "
                         "pairing_cli, reservation_cli, a camera or a second integrity "
                         "admin_cli): let it finish first"),
@@ -298,11 +308,16 @@ def _approve(context: _Context) -> list[str]:
     if not current.components:
         raise CliRefused("inventory_empty")
     preview = compare(current, current)
+    # What changes: the current inventory compared with the baseline it
+    # replaces, so a same-count replacement shows as CHANGED here.
+    findings = compare(baseline, current)
     prompt = "\n".join([
         f"Approve the current hardware inventory as the Main Server baseline "
         f"(revision {revision} -> {revision + 1}).",
         f"  baseline now: {inventory_counts(baseline)}",
         f"  current:      {inventory_counts(current)}",
+        f"  current vs baseline: {_verdict(findings)}",
+        *finding_lines(findings, "    "),
         "  Only the hardware this host (or VM guest) itself exposes is covered.",
         f"  An unchanged host would then report: {_verdict(preview)}",
         *finding_lines(preview, "    "),

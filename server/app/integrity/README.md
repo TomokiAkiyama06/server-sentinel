@@ -77,7 +77,7 @@ pending bootstrap/session/recovery policy or expose a human route.
 that boundary: a local Owner command with the camera command's D3 trust model
 (`server/docs/DEPLOYMENT.md`, "Approving the hardware baseline locally").
 `show` compares a fresh `LinuxProbe` inventory with the baseline; `approve`
-refuses while the service runs, asks for `APPROVE` on the controlling
+refuses while the service runs, shows the same comparison, asks for `APPROVE` on the controlling
 terminal (no bypass flag), re-collects and refuses an inventory that differs
 from the one shown, and approves it with the revision read before the prompt.
 The store's `OwnerApproval` there is armed only by the one console grant the

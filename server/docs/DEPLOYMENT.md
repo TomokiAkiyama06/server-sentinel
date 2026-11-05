@@ -421,8 +421,15 @@ fixed logical baseline ID only) commit in one transaction.
   the database, also another local admin command), before the prompt and
   again inside the transaction: the running service compares only at start
   and every 24 hours, so stop it, approve, and start it; the startup check
-  then compares against the new baseline at once. It shows the counts and
-  the preview, asks for `APPROVE`, collects the inventory again and refuses
+  then compares against the new baseline at once. Stop the upstream socket
+  together with the service (`server-sentinel-upstream.socket`, "Human
+  upstream through socket activation" below): with socket activation an
+  incoming dashboard connection starts a service that was stopped alone, and
+  `approve` is then refused again. On a host without that socket unit, stop
+  and start the service only. It shows the counts, the current inventory
+  compared with the baseline it replaces (`current vs baseline` with its
+  findings, so a same-count replacement shows as `CHANGED`) and the preview,
+  asks for `APPROVE`, collects the inventory again and refuses
   (`inventory_changed`) unless it is the one shown, and approves it with the
   baseline revision read before the prompt: a baseline changed meanwhile is
   refused (`baseline_revision_changed`). A collection without any component
@@ -432,11 +439,11 @@ fixed logical baseline ID only) commit in one transaction.
 cd /opt/server-sentinel-main/current
 sudo -u <service account> ./venv/bin/python -m app.integrity.admin_cli \
   show --config /etc/server-sentinel/deployment.json
-sudo systemctl stop server-sentinel.service
+sudo systemctl stop server-sentinel-upstream.socket server-sentinel.service
 sudo -u <service account> ./venv/bin/python -m app.integrity.admin_cli \
   approve --config /etc/server-sentinel/deployment.json      # type APPROVE
 #    prints: baseline approved: revision=<n> components: CPU=<n> MEMORY=<n|unavailable> STORAGE=<n> GPU=<n>
-sudo systemctl start server-sentinel.service
+sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
 sudo -u <service account> ./venv/bin/python -m app.integrity.admin_cli \
   show --config /etc/server-sentinel/deployment.json      # last recorded check
 ```
@@ -453,11 +460,21 @@ Expected residual findings after an approval: a CPU exposes no unique
 identifier, so it stays `UNVERIFIABLE` / `UNIQUE_ID_UNAVAILABLE` (a warning,
 not the immediate failure; CPU model and topology alone cannot prove the
 same physical part). A kind whose probe is unavailable (for example `MEMORY`
-when `dmidecode --type 17` is not readable by the service account, or the
-GPU UUID/serial without `nvidia-smi`) is approved as unavailable and stays
-`UNVERIFIABLE` / `PROBE_UNAVAILABLE`; a disk without a serial or WWID stays
-`UNVERIFIABLE`, which for storage keeps the immediate failure. The preview
-states which apply before the confirmation.
+when `dmidecode --type 17` is not readable by the service account) is
+approved as unavailable and stays `UNVERIFIABLE` / `PROBE_UNAVAILABLE`. A
+display controller without a UUID/serial from `nvidia-smi` (no NVIDIA driver,
+an integrated GPU, a VM's virtual display device) is still listed by its PCI
+fields but stays `UNVERIFIABLE` / `UNIQUE_ID_UNAVAILABLE`; a disk without a
+serial or WWID stays `UNVERIFIABLE`, which for storage keeps the immediate
+failure. The preview states which apply before the confirmation.
+
+The command runs as the service account but not under the service unit's
+`NoNewPrivileges=true` / `RestrictSUIDSGID=true`. On a host where `dmidecode`
+is setuid or has file capabilities, the command may therefore read memory
+identifiers that the service cannot; the approved `MEMORY` components then
+compare as `UNVERIFIABLE` / `PROBE_UNAVAILABLE` in the service (a warning,
+never the immediate failure). Run `show` after the next start to see what
+the service itself reports.
 
 **VM deployment (Owner decision 2026-10-22).** Inside the VM the probe sees
 only the VM's virtual CPU, memory, disks and display device plus the devices

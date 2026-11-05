@@ -215,6 +215,24 @@ class IntegrityAdminCliTests(unittest.TestCase):
         self.assertEqual(2, self.baseline()[0])
         self.assertEqual(2, len(self.rows(AUDIT)))
 
+    def test_the_approve_prompt_shows_a_same_count_replacement_against_the_baseline(self):
+        self.assertEqual(0, self.run_cli("approve", lines=("APPROVE",))[0])
+        self.probe = FakeProbe(inventory(cpu(), memory(), disk(serial="SYNTH-SERIAL-OTHER"),
+                                         disk("sda", "SYNTH-SERIAL-DISK-2", "SYNTH-WWID-2"), gpu()))
+        code, _, stderr, terminal = self.run_cli("approve", lines=("no",))
+        self.assertEqual(2, code)
+        self.assertIn("refused: owner_confirmation_declined", stderr)
+        # The counts are unchanged; only the comparison reveals the replacement.
+        self.assertIn("baseline now: CPU=1 MEMORY=1 STORAGE=2 GPU=1", terminal)
+        self.assertIn("current:      CPU=1 MEMORY=1 STORAGE=2 GPU=1", terminal)
+        self.assertIn("current vs baseline: hardware_integrity_failure", terminal)
+        self.assertIn("    STORAGE CHANGED reason=APPROVED_COMPONENT_CHANGED count=1 notify=failure",
+                      terminal)
+        self.assertLess(terminal.index("current vs baseline"),
+                        terminal.index("An unchanged host would then report"))
+        self.assertPrivateAbsent(terminal)
+        self.assertEqual(1, self.baseline()[0])
+
     def test_an_unavailable_kind_is_approved_and_stays_unverifiable(self):
         self.probe = FakeProbe(inventory(cpu(), disk(), gpu(), unavailable=(Kind.MEMORY,)))
         code, stdout, _, terminal = self.run_cli("approve", lines=("APPROVE",))
@@ -255,7 +273,9 @@ class IntegrityAdminCliTests(unittest.TestCase):
         code, stdout, stderr, terminal = self.run_cli("approve")
         self.assertEqual((code, stdout, terminal), (2, "", ""))
         self.assertIn("refused: service_running", stderr)
-        self.assertIn("systemctl stop", stderr)
+        # With socket activation a connection restarts a service stopped alone.
+        self.assertIn("sudo systemctl stop server-sentinel-upstream.socket server-sentinel.service",
+                      stderr)
         self.assertIn("bootstrap_cli", stderr)
         self.assertEqual(0, self.probe.calls)
         self.assertNothingRecorded()
