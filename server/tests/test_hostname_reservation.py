@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
+import time
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -631,8 +632,44 @@ class ReservationCheckTests(TestCase):
             check.startup()
             self.assertClosed(check, Reason.ROUTE_ENUMERATION_TIMEOUT)
             self.assertEqual(len(calls), 1)
+            # Issue #383: the first check's hung routes spent the shared
+            # deadline, so its owner lookups were not started (unverified).
+            # The second check does not wait on the hung routes again, so its
+            # owner lookups run within the deadline.
             self.assertEqual([event.reasons for event in sink.events],
-                             [(Reason.ROUTE_ENUMERATION_TIMEOUT,)] * 2)
+                             [(Reason.LISTENER_OWNER_UNVERIFIED, Reason.ROUTE_ENUMERATION_TIMEOUT),
+                              (Reason.ROUTE_ENUMERATION_TIMEOUT,)])
+        finally:
+            release.set()
+
+    def test_the_enumerations_of_one_check_share_one_deadline(self):
+        # Issue #383: a shutdown waits for an in-flight check, so the check
+        # takes the enumeration timeout once, not once per enumeration. Once
+        # the hung resolver spent it, later enumerations are not started and
+        # report their own timeout (fail closed).
+        release = threading.Event()
+        calls = []
+
+        class Hung:
+            def resolve(self, hostname):
+                release.wait(5)
+                return (V4, V6)
+
+        def routes():
+            calls.append(1)
+            return serve()
+
+        try:
+            check, _, _, _ = checker(resolver=Hung(), timeout=0.3)
+            check._routes = ServeStatusRoutes(routes)
+            started = time.monotonic()
+            verdict = check.startup()
+            elapsed = time.monotonic() - started
+            self.assertFalse(verdict.open)
+            self.assertLess(elapsed, 0.55)
+            self.assertIn(Reason.HOSTNAME_RESOLUTION_TIMEOUT, verdict.reasons)
+            self.assertIn(Reason.ROUTE_ENUMERATION_TIMEOUT, verdict.reasons)
+            self.assertEqual([], calls)
         finally:
             release.set()
 
@@ -1692,7 +1729,11 @@ class HostnameResolutionTests(TestCase):
 
         try:
             check, _, _, _ = checker(resolver=Hung(), timeout=0.05)
-            self.assertEqual(check.startup().reasons, (Reason.HOSTNAME_RESOLUTION_TIMEOUT,))
+            # Issue #383: the hung resolver spent the check's shared deadline,
+            # so the enumerations after it are not started and time out too.
+            self.assertEqual(check.startup().reasons, (Reason.HOSTNAME_RESOLUTION_TIMEOUT,
+                                                       Reason.LISTENER_ENUMERATION_TIMEOUT,
+                                                       Reason.ROUTE_ENUMERATION_TIMEOUT))
         finally:
             release.set()
 

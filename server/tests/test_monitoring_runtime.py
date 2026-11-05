@@ -3,6 +3,8 @@ synthetic hardware probe and an intercepted Slack transport. No real Slack
 endpoint, host inventory, block device or network is used."""
 
 import asyncio
+import contextlib
+from dataclasses import replace
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import json
@@ -360,6 +362,45 @@ class LifespanTests(RuntimeFixture):
                     break
                 await asyncio.sleep(0.01)
             self.assertTrue(any("daily summary" in text for text in self.slack_texts()))
+
+    async def test_a_tick_in_flight_skips_its_long_steps_once_the_stop_began(self):
+        # Issue #383: the shutdown settles and `stop()` queue behind a tick in
+        # flight on the one monitoring worker; once the stop began it skips
+        # the steps it has not reached, and the run loop starts no new tick.
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            calls = []
+
+            def step(name, stop=False):
+                def run():
+                    calls.append(name)
+                    if stop:
+                        runtime.begin_stop()
+                return run
+
+            runtime._retention_tick = step("retention")
+            runtime.integrity.tick = step("integrity", stop=True)
+            runtime.recording_health.tick = step("health")
+            runtime._summary_tick = step("summary")
+            polls = []
+            poll = runtime._poll
+            runtime._poll = lambda: (polls.append(1), poll())[1]
+            await runtime.call(runtime.tick)
+            self.assertEqual(["retention", "integrity"], calls)
+            # Notification polling still runs after the skipped steps.
+            self.assertEqual(2, len(polls))
+            await runtime.call(runtime.tick)
+            self.assertEqual(["retention", "integrity"], calls)
+            ticks = []
+            runtime.tick = lambda: ticks.append(1)
+            runtime.dependencies = replace(runtime.dependencies, tick_seconds=0.01)
+            loop = asyncio.create_task(runtime.run())
+            await asyncio.sleep(0.1)
+            loop.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop
+            self.assertEqual([], ticks)
 
     async def test_retention_expires_unstarred_and_keeps_starred(self):
         application = self.application()

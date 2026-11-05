@@ -2525,11 +2525,14 @@ class ConfigurationParsingTests(unittest.TestCase):
         self.assertGreaterEqual(
             LocalUvcConfiguration((uuid4(),)).join_timeout_seconds, required)
         self.assertEqual(10.0, parsed.join_timeout_seconds)
-        # The bound stays configurable within the validated range.
+        # The bound stays configurable within the validated range, at most
+        # what fits the Main stop budget (Issue #383).
         identity = str(uuid4())
-        for value in (1, 30, 60):
+        for value in (1, 30, 40):
             self.assertEqual(float(value), parse_local_uvc(
                 {"source_ids": [identity], "join_timeout_seconds": value}).join_timeout_seconds)
+        with self.assertRaises(ConfigurationError):
+            parse_local_uvc({"source_ids": [identity], "join_timeout_seconds": 60})
         self.assertEqual(0.25, parse_local_uvc({
             "source_ids": [identity], "join_timeout_seconds": 0.25,
             "frame_stall_seconds": 0.25}).join_timeout_seconds)
