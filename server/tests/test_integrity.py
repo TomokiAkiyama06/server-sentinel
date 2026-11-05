@@ -26,6 +26,7 @@ from app.integrity import probes
 from app.integrity.model import Component, Finding, Inventory, Kind, State, _explained, compare
 from app.integrity.probes import CommandRunner, LinuxProbe, ProbeUnavailable
 from app.integrity.service import IntegrityService
+from app.stop_budget import StopInterrupted
 from app.integrity.store import IntegrityStore, integrity_migration
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -488,6 +489,44 @@ class StoreTests(TestCase):
         service.startup()
         self.assertEqual(probe.calls, 3)
 
+    def test_a_probe_run_interrupted_by_the_stop_records_nothing(self):
+        # Issue #385: a partial inventory is neither a hardware change nor an
+        # unverifiable warning; the baseline and the outbox stay untouched.
+        self.store.approval = Owner()
+        self.approve(Inventory((disk(),)), expected_revision=0)
+
+        class Probe:
+            interrupt = False
+            calls = 0
+
+            def collect(self):
+                self.calls += 1
+                if self.interrupt:
+                    raise StopInterrupted()
+                return Inventory((disk(),))
+
+        probe = Probe()
+        clock = [0.0]
+        delivered = []
+        service = IntegrityService(self.store, probe, lambda *args: delivered.append(args),
+                                   monotonic=lambda: clock[0], utcnow=lambda: NOW)
+        service.startup()
+        status = self.db.execute("SELECT * FROM integrity_status").fetchall()
+        outbox = self.db.execute("SELECT COUNT(*) FROM integrity_outbox").fetchone()[0]
+        probe.interrupt = True
+        clock[0] = 86400
+        with self.assertLogs("app.integrity.service", "WARNING") as logs:
+            self.assertIsNone(service.tick())
+        self.assertIn("monitoring_check_interrupted", "\n".join(logs.output))
+        self.assertEqual(status, self.db.execute("SELECT * FROM integrity_status").fetchall())
+        self.assertEqual(outbox, self.db.execute("SELECT COUNT(*) FROM integrity_outbox").fetchone()[0])
+        self.assertEqual(self.store.baseline()[1], Inventory((disk(),)))
+        self.assertEqual([], [args for args in delivered if args[2]])
+        # Not completed: the next tick checks again.
+        probe.interrupt = False
+        service.tick()
+        self.assertEqual(3, probe.calls)
+
     def test_probe_exception_sanitized(self):
         class Probe:
             def collect(self):
@@ -682,6 +721,39 @@ class LinuxProbeTests(TestCase):
         self.assertNotIn("synthetic-serial", repr(inventory))
         self.probe.runner = FakeRunner({"nvidia-smi": b"00010000:01:00.0, GPU-other-domain, [N/A]\n"})
         self.assertEqual(self.probe._gpu()[0].identity, ())
+
+    def test_a_stop_between_probes_ends_the_collection_without_a_result(self):
+        # Issue #385: no further probe starts, and the partial inventory is
+        # not returned (it would compare as unavailable or missing).
+        self.put("proc/cpuinfo", "processor : 0\nphysical id : 0\nmodel name : Synthetic CPU\n\n")
+        commands = []
+
+        class Runner:
+            def run(self, command):
+                commands.append(command[0])
+                raise ProbeUnavailable()
+
+        checks = []
+        stop_after = [1]
+
+        def interrupted():
+            checks.append(1)
+            return len(checks) > stop_after[0]
+
+        probe = LinuxProbe(self.root, Runner(), interrupted)
+        with self.assertRaises(StopInterrupted):
+            probe.collect()
+        self.assertEqual([], commands)
+        # A stop during the last probe also discards the result.
+        checks.clear()
+        stop_after[0] = 4
+        with self.assertRaises(StopInterrupted):
+            probe.collect()
+        self.assertEqual(["dmidecode", "nvidia-smi"], commands)
+        # Without a stop the collection completes.
+        stop_after[0] = 99
+        checks.clear()
+        self.assertIsInstance(probe.collect(), Inventory)
 
     def test_unavailable_hardware_is_unknown(self):
         self.assertEqual(self.probe.collect().unavailable, frozenset(Kind))
@@ -920,6 +992,17 @@ class _StuckChild:
         raise subprocess.TimeoutExpired("synthetic-probe", timeout)
 
 
+class _Clock:
+    """Synthetic `time` whose monotonic clock advances on every reading."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        self.now += 1.0
+        return self.now
+
+
 class _Spawn:
     def __init__(self, child):
         self._child = child
@@ -949,22 +1032,55 @@ class ProbeCleanupTests(TestCase):
         self.child = _StuckChild(reader)
         self.killed = []
 
-    def run_probe(self, killpg):
-        spawn, signals = probes.subprocess, probes.os
-        probes.subprocess, probes.os = _Spawn(self.child), _Signals(killpg)
+    def run_probe(self, killpg, *, interrupted=None, expected=ProbeUnavailable):
+        spawn, signals, clock = probes.subprocess, probes.os, probes.time
+        # Each reading of the synthetic clock advances it one second, so the
+        # five-second output deadline passes after a few status waits.
+        probes.subprocess, probes.os, probes.time = _Spawn(self.child), _Signals(killpg), _Clock()
         self.addCleanup(setattr, probes, "subprocess", spawn)
         self.addCleanup(setattr, probes, "os", signals)
-        with self.assertRaises(ProbeUnavailable):
-            CommandRunner().run(("dmidecode", "--type", "17"))
+        self.addCleanup(setattr, probes, "time", clock)
+        runner = CommandRunner() if interrupted is None else CommandRunner(interrupted)
+        with self.assertRaises(expected):
+            runner.run(("dmidecode", "--type", "17"))
+
+    def assert_bounded_waits(self, reap):
+        # Status waits of at most one stop poll slice each, then the cleanup
+        # reap, all bounded, so a wedged disk cannot stall the check.
+        *status, last = self.child.waits
+        self.assertTrue(status)
+        self.assertTrue(all(0 < timeout <= probes.STOP_POLL_SECONDS for timeout in status))
+        self.assertEqual(reap, last)
 
     def test_unkillable_probe_does_not_block_the_worker(self):
         self.run_probe(lambda pid, number: self.killed.append((pid, number)))
         self.assertEqual(self.killed, [(_StuckChild.pid, signal.SIGKILL)])
-        # The status wait and the cleanup reap, both bounded, so a wedged disk
-        # cannot stall the startup/daily check.
-        self.assertEqual(len(self.child.waits), 2)
-        self.assertTrue(all(timeout is not None for timeout in self.child.waits))
+        self.assert_bounded_waits(probes.COMMAND_REAP_SECONDS)
         self.assertTrue(self.child.closed)
+
+    def test_a_stop_kills_the_command_in_flight_and_reaps_briefly(self):
+        # Issue #385: the stop is noticed within one poll slice of the status
+        # wait; the read-only command is killed and reaped for at most
+        # STOP_REAP_SECONDS, and no partial output is returned.
+        checks = []
+
+        def interrupted():
+            checks.append(1)
+            return len(checks) > 3
+
+        self.run_probe(lambda pid, number: self.killed.append((pid, number)),
+                       interrupted=interrupted, expected=StopInterrupted)
+        self.assertEqual(self.killed, [(_StuckChild.pid, signal.SIGKILL)])
+        self.assert_bounded_waits(probes.STOP_REAP_SECONDS)
+        self.assertTrue(self.child.closed)
+
+    def test_a_stop_before_the_command_spawns_nothing(self):
+        def spawn(*arguments, **options):
+            raise AssertionError("spawned")
+
+        with patch.object(probes.subprocess, "Popen", spawn):
+            with self.assertRaises(StopInterrupted):
+                CommandRunner(lambda: True).run(("dmidecode", "--type", "17"))
 
     def test_failed_signal_still_reaps_and_closes_the_probe_pipe(self):
         """A child exiting between poll() and the signal must not stay a zombie."""
@@ -974,6 +1090,5 @@ class ProbeCleanupTests(TestCase):
 
         self.run_probe(refuse)
         self.assertEqual(self.killed, [(_StuckChild.pid, signal.SIGKILL)])
-        self.assertEqual(len(self.child.waits), 2)
-        self.assertTrue(all(timeout is not None for timeout in self.child.waits))
+        self.assert_bounded_waits(probes.COMMAND_REAP_SECONDS)
         self.assertTrue(self.child.closed)

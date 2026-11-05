@@ -18,6 +18,7 @@ from app.settings import ConfigurationError, Settings
 from app.auth.reservation import ENUMERATION_TIMEOUT_SECONDS
 from app.detection.roi.runtime import DECODER_REAP_TIMEOUT_SECONDS, SceneMonitoringRuntime
 from app.storage.database import BUSY_TIMEOUT_SECONDS
+from app.integrity import probes
 import inspect
 
 
@@ -56,6 +57,24 @@ class StopBudgetTests(unittest.TestCase):
         # The HTTP server is built with the graceful bound.
         source = (Path(__file__).resolve().parents[1] / "app" / "__main__.py").read_text()
         self.assertIn("timeout_graceful_shutdown=HTTP_GRACEFUL_SHUTDOWN_SECONDS", source)
+
+    def test_the_phase_2_bounds_are_derived_and_not_yet_in_the_reserve(self):
+        # Issue #385: each new bound names its own constants. They are not
+        # in the reserve (an Owner decision: they lower the longest join).
+        self.assertEqual(stop_budget.INTEGRITY_PROBE_STOP_SECONDS,
+                         probes.STOP_POLL_SECONDS + probes.STOP_REAP_SECONDS)
+        self.assertLess(probes.STOP_POLL_SECONDS + probes.STOP_REAP_SECONDS,
+                        probes.COMMAND_OUTPUT_SECONDS + probes.COMMAND_REAP_SECONDS)
+        self.assertEqual(stop_budget.SETTLE_POLL_OVERSHOOT_SECONDS, BUSY_TIMEOUT_SECONDS)
+        self.assertEqual(5.0, stop_budget.STOP_ADMISSION_WAIT_SECONDS)
+        with_phase_2 = (stop_budget.OTHER_STOP_STEPS_RESERVE_SECONDS
+                        + stop_budget.INTEGRITY_PROBE_STOP_SECONDS
+                        + stop_budget.SETTLE_POLL_OVERSHOOT_SECONDS)
+        self.assertEqual(41.25, with_phase_2)
+        # The longest join they would leave (documented in DEPLOYMENT.md).
+        self.assertEqual(33.75, stop_budget.UNIT_STOP_TIMEOUT_SECONDS - with_phase_2
+                         - stop_budget.LOCAL_UVC_STOP_OVERHEAD_SECONDS
+                         - stop_budget.CAMERA_OFFLINE_SETTLE_SECONDS)
 
     def test_the_deployment_file_refuses_a_join_over_the_budget(self):
         # Issue #383: `--check` refuses it, not only `create_app()`.

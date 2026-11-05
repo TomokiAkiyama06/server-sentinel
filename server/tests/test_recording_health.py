@@ -3,6 +3,7 @@
 from unittest import TestCase
 
 from app.media.health.service import HealthState, PipelineStatus, RecordingHealthService, Stage
+from app.stop_budget import StopInterrupted
 
 
 class FakeRecorder:
@@ -161,3 +162,76 @@ class RecordingHealthTests(TestCase):
         with self.assertRaises(OSError):
             self.service.startup()
         self.assertIsNone(self.service._last_check)
+
+
+class StopInterruptionTests(TestCase):
+    """Issue #385: a self-test the Main shutdown cut short."""
+
+    def setUp(self):
+        self.adapter = FakeRecorder()
+        self.recorded = []
+        self.stop_at = None
+        self.service = RecordingHealthService(self.adapter, lambda *args: self.recorded.append(args),
+                                              monotonic=lambda: 0.0, stopping=self.stopping)
+
+    def stopping(self):
+        # The stop begins once the adapter ran `stop_at`.
+        return self.stop_at is not None and self.stop_at in self.adapter.calls
+
+    def run_interrupted(self):
+        with self.assertLogs("app.media.health.service", "WARNING") as logs:
+            self.assertIsNone(self.service.startup())
+        self.assertIn("monitoring_check_interrupted", "\n".join(logs.output))
+
+    def test_no_further_stage_starts_and_nothing_is_recorded(self):
+        for stop_at, ran in (("cleanup", ["cleanup", "cleanup"]),
+                             ("pipeline", ["cleanup", "pipeline", "cleanup"]),
+                             ("storage", ["cleanup", "pipeline", "storage", "cleanup"]),
+                             ("write", ["cleanup", "pipeline", "storage", "write", "cleanup"]),
+                             ("decode", ["cleanup", "pipeline", "storage", "write", "decode", "cleanup"])):
+            with self.subTest(stop_at=stop_at):
+                self.adapter.calls.clear()
+                self.stop_at = stop_at
+                self.run_interrupted()
+                # The cleanup still runs (INTEGRITY-004); the device health
+                # read is skipped; neither a failure nor OK is recorded.
+                self.assertEqual(ran, self.adapter.calls)
+                self.assertFalse(self.adapter.leftover)
+                self.assertEqual([], self.recorded)
+                self.assertIsNone(self.service._last_check)
+
+    def test_a_real_failure_before_the_stop_is_still_recorded(self):
+        # A stage that ran and failed, or a failed cleanup, is complete.
+        self.adapter.fail = "write"
+        self.stop_at = "write"
+        self.run_interrupted()
+        self.assertEqual([(HealthState.FAILED, (Stage.WRITE,))],
+                         [(result.state, result.stages) for result, _ in self.recorded])
+        self.recorded.clear()
+        self.adapter.calls.clear()
+        self.adapter.fail = None
+        cleanup = self.adapter.cleanup
+
+        def failing_final_cleanup():
+            cleanup()
+            if self.adapter.calls.count("cleanup") == 2:
+                raise OSError("synthetic")
+
+        self.adapter.cleanup = failing_final_cleanup
+        self.stop_at = "storage"
+        self.run_interrupted()
+        self.assertEqual([(HealthState.FAILED, (Stage.CLEANUP,))],
+                         [(result.state, result.stages) for result, _ in self.recorded])
+
+    def test_a_device_health_read_killed_at_the_stop_records_nothing(self):
+        def killed():
+            raise StopInterrupted()
+
+        self.adapter.storage_health = killed
+        self.run_interrupted()
+        self.assertEqual([], self.recorded)
+
+    def test_without_a_stop_the_test_completes(self):
+        self.stop_at = "never"
+        self.assertEqual(HealthState.OK, self.service.startup().state)
+        self.assertEqual(1, len(self.recorded))

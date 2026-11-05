@@ -41,7 +41,14 @@ into `MISSING`. Kernel/baseline enumeration order is not replacement evidence.
 backing block-device paths and returns `OK`, `CRITICAL` or `UNVERIFIABLE`, without
 lifetime prediction. Commands have a fixed read-only allowlist, five-second
 timeout, one-MiB stdout cap, no shell/sudo, discarded stderr and a minimal
-environment without inherited secrets. Utilities/drivers are not installed or
+environment without inherited secrets. A command that does not end in time is
+killed and waited for at most five more seconds, then abandoned. Issue #385:
+once the Main shutdown began (`interrupted`), no further probe starts and a
+command in flight is killed within 0.25 s and waited for at most 1 s; the
+collection then raises `StopInterrupted` instead of returning a partial
+inventory, and `IntegrityService` records nothing (no change, warning, notice
+or baseline update; `monitoring_check_interrupted` is logged). The next start's
+startup check runs it. Utilities/drivers are not installed or
 bundled. Keep deployment permissions narrow; never run the backend as root for
 inventory. CI does not invoke these host utilities.
 

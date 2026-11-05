@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import Callable
 from uuid import UUID, uuid4
 import threading
+import time
 
 from app.notifications.slack import DeliveryResult, SlackDelivery
 from app.notifications.worker import DeliveryWorker
@@ -269,8 +270,10 @@ class NotificationService:
             return True
         return False
 
-    def _flush_unpersisted(self) -> None:
+    def _flush_unpersisted(self, past=lambda: False) -> None:
         for identifier, event in tuple(self._unpersisted.items()):
+            if past():
+                return
             if self._local(event):
                 del self._unpersisted[identifier]
 
@@ -312,16 +315,26 @@ class NotificationService:
                 return DeliveryResult.FAILED
         return result
 
-    def poll(self) -> tuple[NotificationEvent, ...]:
-        """Persist completed results without waiting; failed persistence retries locally."""
+    def poll(self, deadline: float | None = None) -> tuple[NotificationEvent, ...]:
+        """Persist completed results without waiting; failed persistence retries locally.
+
+        Issue #385: with a ``deadline`` (``time.monotonic``) no further local
+        write or completion callback starts once it passed; the rest stay
+        pending, unchanged, for the next poll. A poll then ends at most one
+        write or callback after the deadline.
+        """
         self._check()
-        self._flush_unpersisted()
+        past = ((lambda: False) if deadline is None
+                else (lambda: time.monotonic() >= deadline))
+        self._flush_unpersisted(past)
         for identifier, result in self._worker.results():
             self._pending[identifier][2] = result
         completed = []
         for identifier, (event, callbacks, result) in tuple(self._pending.items()):
             if result is None:
                 continue
+            if past():
+                break
             update = replace(event, delivery=result)
             if result == DeliveryResult.FAILED:
                 self.delivery_failed = True
@@ -329,12 +342,23 @@ class NotificationService:
                 continue
             # Every submitter of a coalesced delivery is told; a callback that
             # raised is retried on the next poll, the others are not repeated.
+            # Past the deadline the callbacks not yet called are left for the
+            # next poll the same way, without counting as a failure.
             failed = []
-            for callback in callbacks:
+            deferred = []
+            for index, callback in enumerate(callbacks):
+                if past():
+                    deferred = list(callbacks[index:])
+                    break
                 try:
                     callback(result)
                 except Exception:
                     failed.append(callback)
+            if deferred:
+                if failed:
+                    self.local_delivery_failed = True
+                self._pending[identifier][1] = failed + deferred
+                continue
             if failed:
                 self.local_delivery_failed = True
                 self._pending[identifier][1] = failed

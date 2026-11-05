@@ -457,12 +457,25 @@ step); `create_app()`
 refuses a composition that exceeds it (`app/stop_budget.py`). This file
 accepts `join_timeout_seconds` up to 40 s, the most that fits with the 12 s
 settle, so `--check` refuses a longer join (before Issue #383 it accepted up
-to 60 s: check an existing deployment file before updating). Not yet bounded
-(Issue #383 phase 2): a wait for the storage admission behind a monitoring
-job, the SQLite busy timeouts of the writes in the human access stop, timeline
-finish and dispatch, a hung filesystem call, and the one monitoring step
-already running when the stop began (an integrity probe run, about 10 s per
-probe, or the recording self-test), which the settles queue behind. The wait of
+to 60 s: check an existing deployment file before updating). Issue #385 bounds
+three more waits once the stop began, but they are not in the 35 s reserve yet
+(adding them would lower the longest accepted join from 40 s to 33.75 s, an
+Owner decision; until then a stop that hits them can run past the budget by
+up to their sum): an integrity check already running kills its probe command
+within 0.25 s, reaps it for at most 1 s and records nothing (no change, no
+warning, no notice; the next start checks again), and a recording self-test
+starts no further stage, still cleans up and records only a failure that
+really happened; a write from another thread waits at most 5 s for the storage
+admission and is then refused like any storage refusal
+(`storage_admission_stop_timeout`, nothing written); and a notification
+settle ends at most one outcome write (one 5 s SQLite busy timeout) past its
+configured bound, which is not shortened (an outcome not written by then stays
+`pending`). `monitoring_check_interrupted` is logged when a check was cut
+short. Still not bounded: the other monitoring steps already running when the
+stop began (retention, storage sample, daily summary, startup retry, a
+self-test adapter stage), the SQLite busy timeouts summed over the many writes
+in the human access stop, timeline finish and dispatch, a hung filesystem
+call, and the dispatch steps before the critical settle. The wait of
 the monitoring runtime's final storage sample (Issue #351) shares the bound of
 the notification settle before it, so it does not lengthen the stop. The installed
 unit sets `TimeoutStopSec=90` explicitly (Owner decision 2026-10-08), so the

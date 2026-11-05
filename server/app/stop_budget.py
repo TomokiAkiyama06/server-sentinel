@@ -14,6 +14,13 @@ from __future__ import annotations
 from app.settings import ConfigurationError
 
 
+class StopInterrupted(Exception):
+    """Issue #385: a check stopped part-way because the Main shutdown began.
+
+    Its partial result is discarded, never recorded as a finding.
+    """
+
+
 # The installed unit's `TimeoutStopSec` (Owner decision 2026-10-08). Past it
 # systemd sends SIGKILL.
 UNIT_STOP_TIMEOUT_SECONDS = 90
@@ -31,15 +38,39 @@ RESERVATION_CHECK_STOP_SECONDS = 10.0 + 5.0
 SCENE_STOP_SECONDS = 5.0 + 5.0 + 1.0
 # - process exit and the short steps between them.
 PROCESS_EXIT_SECONDS = 4.0
-# Not bounded yet (Issue #383 phase 2, separate Issue): waits for the storage
-# admission behind a monitoring job, the SQLite busy timeouts of the writes in
-# the human access stop, the timeline finish and the dispatch, and a hung
-# filesystem call, and the one monitoring step already running when the stop
-# began (an integrity probe run or the recording self-test): a tick starts no
-# further long step after it (`MonitoringRuntime.begin_stop`), and the
-# settles queue behind it. PROCESS_EXIT_SECONDS is an estimate, not derived.
+# PROCESS_EXIT_SECONDS is an estimate, not derived.
 OTHER_STOP_STEPS_RESERVE_SECONDS = (HTTP_GRACEFUL_SHUTDOWN_SECONDS + RESERVATION_CHECK_STOP_SECONDS
                                     + SCENE_STOP_SECONDS + PROCESS_EXIT_SECONDS)
+# Issue #385 (phase 2): bounds derived for waits that had none. They are NOT
+# in the reserve above yet: adding them lowers MAXIMUM_LOCAL_UVC_JOIN_SECONDS
+# below 40 s (to 33.75 s with both terms), which is an Owner decision.
+# Until then a stop that hits them can exceed the budget by their sum.
+# - The monitoring step already running when the stop began, when it is the
+#   hardware integrity check: its probe in flight is killed within one poll
+#   slice and reaped for at most 1 s (`integrity.probes.STOP_POLL_SECONDS`
+#   + `STOP_REAP_SECONDS`), and nothing is recorded. The settles and every
+#   cross-thread storage admission queue behind this step, so it counts once.
+INTEGRITY_PROBE_STOP_SECONDS = 0.25 + 1.0
+# - A shutdown settle checks its deadline between polls; a poll started
+#   before it begins no further outcome write or callback after it
+#   (`NotificationService.poll(deadline=)`), so it overshoots by at most the
+#   one write in progress: one SQLite busy timeout (`BUSY_TIMEOUT_SECONDS`)
+#   plus that write's own I/O. Only one settle runs at a stop and the final
+#   storage sample's wait already counts this overshoot as settle time.
+SETTLE_POLL_OVERSHOOT_SECONDS = 5.0
+# - Once the stop began, a write from another thread waits at most this long
+#   for the storage admission (`MonitoringRuntime.reservation`) and is then
+#   refused as a denial (nothing written; the caller handles it as any storage
+#   refusal and the next start does it again). It caps each such wait even
+#   behind a step with no bound below; behind a bounded step it adds nothing
+#   to that step's bound.
+STOP_ADMISSION_WAIT_SECONDS = 5.0
+# Still not bounded (Issue #385): the other monitoring steps already running
+# when the stop began (retention `_trim`, the storage sample, the daily
+# summary, a startup retry, a recording self-test adapter stage), the SQLite
+# busy timeouts summed over the many writes in the human access stop, the
+# timeline finish and the dispatch, a hung filesystem call, and the dispatch
+# steps before the critical settle.
 # On top of `join_timeout_seconds`, a local UVC stop waits at most 1 s for the
 # frame-progress watchdog join (`WorkerSupervisor.WATCHDOG_JOIN_MINIMUM_SECONDS`),
 # 1 s for the fenced `offline` writes of workers that outlived the join

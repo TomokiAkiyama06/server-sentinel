@@ -18,6 +18,12 @@ class Event(StrEnum):
     MONITORING_UNCONFIGURED = "monitoring_storage_unconfigured"
     MONITORING_STARTUP_FAILED = "monitoring_startup_failed"
     MONITORING_DEGRADED = "monitoring_degraded"
+    # Issue #385: the Main shutdown interrupted the hardware integrity check
+    # or the recording self-test; nothing was recorded, the next start runs it.
+    MONITORING_CHECK_INTERRUPTED = "monitoring_check_interrupted"
+    # Issue #385: during the Main shutdown a write waited the bounded time
+    # for the storage admission and was refused (nothing written).
+    STORAGE_ADMISSION_STOP_TIMEOUT = "storage_admission_stop_timeout"
     # Issue #351: the previous process exited without its graceful stop.
     MONITORING_PREVIOUS_RUN_UNCLEAN = "monitoring_previous_run_unclean"
     # Owner decision 2026-10-29 (PR #366): an unclean exit found while the

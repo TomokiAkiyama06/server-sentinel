@@ -34,6 +34,14 @@ free-space accounting. Missing/substituted roots fail without creating a fallbac
 directory. Tests cover disposable-file I/O, reopen/decode failure, cleanup retry,
 interrupted recovery and substituted-directory refusal.
 
+Issue #385: once the Main shutdown began (`stopping`), the self-test starts no
+further stage and skips the storage health read, but still runs its cleanup.
+A stage that already ran and failed, or a failed cleanup, is recorded as
+`FAILED` (and notified); otherwise nothing is recorded, so a test cut short is
+neither a failure nor healthy, and `monitoring_check_interrupted` is logged.
+The next start's startup self-test runs it again. A stage already running is
+not cut short: its time is bounded only by the adapter.
+
 The injected `record_result(result, aware_time)` must durably retain fixed state/
 stage codes locally and enqueue #21 `RECORDING_HEALTH_FAILURE` immediately for
 `FAILED`. Unavailable SMART alone is a visible `UNAVAILABLE` warning, never a

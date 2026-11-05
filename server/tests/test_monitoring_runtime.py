@@ -13,6 +13,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -27,7 +28,8 @@ from app.main import create_app
 from app.media.health.service import HealthState, PipelineStatus, Stage
 from app.media.recording import Segment
 from app.monitoring.config import MonitoringConfiguration, RecordingFilesystem, parse_monitoring
-from app.monitoring.runtime import MonitoringDependencies, RuntimeState
+from app.media.recording.model import RecordingError
+from app.monitoring.runtime import MonitoringDependencies, RuntimeState, default_integrity_probe
 from app.settings import ConfigurationError, Settings
 from app.storage.database import Database
 from app.storage.policy import FilesystemSpace, StorageLimits, StorageState
@@ -940,3 +942,108 @@ class ReservationThreadTests(RuntimeFixture):
             await owner
             await asyncio.to_thread(thread.join, 2)
             self.assertEqual(["writer", "owner"], order)
+
+    async def test_the_stop_bounds_an_admission_wait_and_refuses_it(self):
+        # Issue #385: behind a monitoring job in flight, a write from another
+        # thread waits without a timeout until the stop began, and from then
+        # at most STOP_ADMISSION_WAIT_SECONDS (0 here): it is refused like a
+        # denial and its reservation is withdrawn, never taken later.
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            running, release = threading.Event(), threading.Event()
+
+            def busy():
+                running.set()
+                release.wait(10)
+
+            def writer(outcome, entered=None):
+                try:
+                    with runtime.reservation():
+                        if entered is not None:
+                            entered.set()
+                        outcome.append("written")
+                except RecordingError as error:
+                    outcome.append(str(error))
+
+            with patch("app.monitoring.runtime.STOP_ADMISSION_WAIT_SECONDS", 0.0):
+                # Without a stop the wait is not bounded: written once free.
+                job = asyncio.ensure_future(runtime.call(busy))
+                self.assertTrue(await asyncio.to_thread(running.wait, 2))
+                before = []
+                thread = threading.Thread(target=writer, args=(before,))
+                thread.start()
+                await asyncio.to_thread(thread.join, 0.4)
+                self.assertTrue(thread.is_alive())
+                release.set()
+                await job
+                await asyncio.to_thread(thread.join, 2)
+                self.assertEqual(["written"], before)
+                # At the stop: a wait begun before it, and one begun after it.
+                running.clear()
+                release.clear()
+                job = asyncio.ensure_future(runtime.call(busy))
+                self.assertTrue(await asyncio.to_thread(running.wait, 2))
+                early, late, entered = [], [], threading.Event()
+                waiting = threading.Thread(target=writer, args=(early, entered))
+                waiting.start()
+                with self.assertLogs("app.monitoring.runtime", "ERROR") as logs:
+                    runtime.begin_stop()
+                    await asyncio.to_thread(waiting.join, 2)
+                    writer(late)
+                self.assertFalse(waiting.is_alive())
+                self.assertEqual(["STORAGE_ADMISSION_STOPPING"], early)
+                self.assertEqual(["STORAGE_ADMISSION_STOPPING"], late)
+                self.assertEqual(2, "\n".join(logs.output).count("storage_admission_stop_timeout"))
+                release.set()
+                await job
+                # The withdrawn reservations never ran: the worker is free.
+                self.assertEqual("free", await asyncio.wait_for(runtime.call(lambda: "free"), 2))
+                self.assertFalse(entered.is_set())
+            # With the worker free, a write at the stop is still admitted.
+            after = []
+            await asyncio.to_thread(writer, after)
+            self.assertEqual(["written"], after)
+
+    async def test_a_settle_gives_every_poll_its_deadline(self):
+        # Issue #385: a poll started before the settle's deadline begins no
+        # outcome write after it, so the settle overshoots by one write at
+        # most, and the configured bound is not shortened.
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            deadlines, poll = [], runtime.notifications.poll
+
+            def spy(deadline=None):
+                deadlines.append(deadline)
+                return poll(deadline)
+
+            runtime.notifications.poll = spy
+            before = time.monotonic()
+            self.assertEqual(0, await runtime.call(runtime.settle_notifications, 7.0))
+            after = time.monotonic()
+            self.assertTrue(deadlines)
+            self.assertTrue(all(deadline is not None and before + 7.0 <= deadline <= after + 7.0
+                                for deadline in deadlines))
+
+    async def test_the_checks_are_given_the_stop_flag(self):
+        # Issue #385: the default host probe and its command runner, and the
+        # recording self-test, end once the stop began.
+        flag = threading.Event()
+        probe = default_integrity_probe(flag.is_set)
+        self.assertIs(probe.interrupted, probe.runner.interrupted)
+        self.assertFalse(probe.interrupted())
+        flag.set()
+        self.assertTrue(probe.runner.interrupted())
+        made = []
+
+        def default(stopping):
+            made.append(stopping)
+            return self.probe
+
+        with patch("app.monitoring.runtime.default_integrity_probe", default):
+            application = self.application(integrity_probe=None)
+            async with application.router.lifespan_context(application):
+                runtime = application.state.monitoring
+                self.assertEqual([runtime._stopping.is_set], made)
+                self.assertEqual(runtime._stopping.is_set, runtime.recording_health.stopping)

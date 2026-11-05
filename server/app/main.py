@@ -902,9 +902,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 # run on worker threads that cancelling cannot stop; run()
                 # defers the cancellation until the in-flight call returns
                 # (bounded by the check's enumeration timeout, plus for a
-                # write at most one in-flight monitoring job ahead of it in
-                # the storage admission, which has no timeout of its own,
-                # plus the SQLite busy timeout), so no verdict or
+                # write the storage admission wait behind an in-flight
+                # monitoring job, at most `STOP_ADMISSION_WAIT_SECONDS` once
+                # the stop began and then refused, Issue #385, plus the
+                # SQLite busy timeout), so no verdict or
                 # revocation/expiry write lands after the admission below is
                 # unbound or the monitoring runtime is stopped.
                 human_access.stop()

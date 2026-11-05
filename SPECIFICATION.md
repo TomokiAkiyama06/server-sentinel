@@ -1235,7 +1235,7 @@ or `uncertain` outcomes, and claims an earlier process left `submitting` or
 unresolved for an audited Owner requeue; a final `sent`/`failed`/`disabled` row
 completes such a claim at the next start. Shutdown runs one last step after
 scene `stop()`, then drains these alerts once more (a last step refused by
-storage escalates the watched records to it), and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s; `create_app()` refuses a composition whose local UVC stop bound, `join_timeout_seconds` + 3 s, plus this settle exceeds 55 s, i.e. `TimeoutStopSec=90` less a 35 s reserve derived from the bounded other stop steps, Issues #364, #383; storage admission waits, SQLite busy timeouts of the stop's writes and a monitoring step already running when the stop began are not bounded yet, Issue #385) for submitted deliveries before the
+storage escalates the watched records to it), and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s; `create_app()` refuses a composition whose local UVC stop bound, `join_timeout_seconds` + 3 s, plus this settle exceeds 55 s, i.e. `TimeoutStopSec=90` less a 35 s reserve derived from the bounded other stop steps, Issues #364, #383; Issue #385 bounds, once the stop began, an integrity check in flight (its probe is killed within about 1.25 s and nothing is recorded), a cross-thread storage admission wait (5 s, then refused like a storage denial) and this settle's overshoot (one outcome write past the bound, which is not shortened), but these are not yet in the reserve, an Owner decision since adding them lowers the longest local UVC join from 40 s to 33.75 s; the other monitoring steps in flight, SQLite busy timeouts summed over the stop's writes and a hung filesystem call are not bounded yet) for submitted deliveries before the
 notification service closes; the monitoring stop's final storage sample (Issue #351) waits only for what is left of that bound, so it adds nothing to the stop budget. With Slack unconfigured the local row is
 `disabled` and `critical_notifications` stays `unavailable`. No
 evidence-preservation port exists yet (a separate recording decision), so
@@ -2120,6 +2120,8 @@ UNVERIFIABLE
 
 Hardware drift never mutates the approved baseline automatically. The Owner must explicitly approve a new baseline/change. That approval is audited.
 
+A check that the ServerSentinel shutdown interrupts (Issue #385) did not complete: its partial inventory is discarded, never compared, recorded or notified as `CHANGED`/`MISSING`/`UNVERIFIABLE`, and the baseline is untouched. The startup check of the next start runs it.
+
 ### 10.3 Recording-health self-test
 
 At least once per day, run an end-to-end recording-health check. It should verify as much of the actual recording path as practical:
@@ -2139,6 +2141,8 @@ Missing/unmounted or substituted recording filesystems refuse recording and self
 Run cleanup through the failure/cancellation path as well as the successful path. On startup, recover identified artifacts from interrupted tests and clean them before admitting another self-test segment. Cleanup verifies the expected filesystem and targets only self-test-owned artifacts; it never deletes ordinary recordings/protected incidents or creates a fallback on an unexpected mount. If cleanup fails (for example, a missing or read-only mount), record a recording-health failure, account for the leftovers in storage admission/safety-reserve checks, and block new self-test media writes until safe cleanup succeeds. Continue reporting the failed/blocked state rather than accumulating a new partial segment each day.
 
 A self-test failure must not be hidden behind a generic healthy state.
+
+A self-test that the ServerSentinel shutdown interrupts (Issue #385) starts no further step and skips the device health read, but still runs its cleanup. A step that already ran and failed, or a failed cleanup, is recorded and notified as a failure; otherwise nothing is recorded (neither failed nor healthy), and the startup self-test of the next start runs it.
 
 ### 10.4 Alerting
 

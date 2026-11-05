@@ -39,6 +39,7 @@ from app.storage.database import Database
 from app.storage.migrations import Migration, MigrationError, migrate
 from app.storage.policy import MainStoragePolicy, StorageState, StorageTransition
 from app.storage.retention import RetentionService, StorageAudit
+from app.stop_budget import STOP_ADMISSION_WAIT_SECONDS
 
 from .access import HOUR_SECONDS, AccessFaultMonitor
 from .cameras import CameraOfflineMonitor
@@ -100,6 +101,9 @@ UNCLEAN_EXIT_KEEP_SECONDS = 24 * 60 * 60.0
 # crash before that tick would leave a delivered alert `pending` and the next
 # start would send it again.
 NOTIFICATION_POLL_SECONDS = 1.0
+# Issue #385: a cross-thread storage admission wait checks this often whether
+# the Main shutdown began, which then bounds it (`reservation`).
+ADMISSION_STOP_POLL_SECONDS = 0.25
 
 
 def _boot_id() -> str | None:
@@ -116,6 +120,16 @@ def _boot_id() -> str | None:
 FINDING_AUDIT_ACTIONS = (AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
                          AuditAction.DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION)
 
+
+
+def default_integrity_probe(stopping: Callable[[], bool]):
+    """The read-only host probe; constructing it touches nothing on the host.
+
+    Issue #385: `stopping` ends a probe run (and a command in flight) once the
+    Main shutdown began, so the check records nothing partial.
+    """
+    from app.integrity.probes import CommandRunner, LinuxProbe
+    return LinuxProbe(runner=CommandRunner(interrupted=stopping), interrupted=stopping)
 
 
 def admit_state_file(configuration: MonitoringConfiguration, path) -> None:
@@ -313,8 +327,10 @@ class MonitoringRuntime:
         self._settle_bound: float | None = None
         self._settle_spent = 0.0
         self._settle_unfinished = False
-        # Issue #383: set once the Main shutdown began (`begin_stop`).
+        # Issue #383: set once the Main shutdown began (`begin_stop`), and
+        # when (`time.monotonic`, Issue #385: bounds the admission waits).
         self._stopping = threading.Event()
+        self._stop_began: float | None = None
         # Issues #351/#347: this process's random running-marker token, whether
         # the marker is written, whether the unclean exit of the previous
         # process was logged and whether the pending recording-health
@@ -382,6 +398,13 @@ class MonitoringRuntime:
         the caller's write finishes, so the serialized policy still covers that
         write through commit and no second writer overlaps it. A denial raises
         the policy's bounded `RecordingError` and nothing is written.
+
+        Issue #385: once the Main shutdown began, the caller waits at most
+        `STOP_ADMISSION_WAIT_SECONDS` (from the later of its wait's start and
+        the stop) for the worker; a reservation not granted by then is
+        withdrawn before the worker takes it and refused like a denial
+        (`STORAGE_ADMISSION_STOPPING`, nothing written). The caller's write
+        is then done by the next start, as after any storage refusal.
         """
         if threading.get_ident() == self._owner:
             with self._owner_reservation():
@@ -410,6 +433,12 @@ class MonitoringRuntime:
                 context.__exit__(None, None, None)
 
         future = executor.submit(hold)
+        if not self._await_admission(granted) and future.cancel():
+            # Withdrawn before the worker ran it: nothing was reserved.
+            logging.getLogger(__name__).error(Event.STORAGE_ADMISSION_STOP_TIMEOUT)
+            raise RecordingError("STORAGE_ADMISSION_STOPPING")
+        # Granted, or the worker already runs `hold`: entering the policy is
+        # bounded by its own checks, and `hold` then sets `granted`.
         granted.wait()
         if failure:
             future.result()
@@ -419,6 +448,23 @@ class MonitoringRuntime:
         finally:
             finished.set()
             future.result()
+
+    def _await_admission(self, granted: threading.Event) -> bool:
+        """Wait for `granted`; False once a stop's admission wait is spent.
+
+        Without a stop the wait has no timeout, as before Issue #385. It
+        wakes every `ADMISSION_STOP_POLL_SECONDS` to notice a stop begun
+        meanwhile, which then bounds it from the stop.
+        """
+        started = time.monotonic()
+        while True:
+            if not self._stopping.is_set():
+                if granted.wait(ADMISSION_STOP_POLL_SECONDS):
+                    return True
+                continue
+            began = self._stop_began if self._stop_began is not None else started
+            remaining = max(started, began) + STOP_ADMISSION_WAIT_SECONDS - time.monotonic()
+            return granted.wait(max(0.0, remaining))
 
     def _due(self, name: str, now: float) -> bool:
         retry = self._retry_at.get(name)
@@ -549,8 +595,7 @@ class MonitoringRuntime:
             )
             probe = dependencies.integrity_probe
             if probe is None:
-                from app.integrity.probes import LinuxProbe
-                probe = LinuxProbe()
+                probe = default_integrity_probe(self._stopping.is_set)
             integrity = IntegrityService(integrity_store, probe, self._integrity_sink,
                                          monotonic=dependencies.monotonic,
                                          utcnow=dependencies.utcnow)
@@ -559,6 +604,7 @@ class MonitoringRuntime:
             recording_health = RecordingHealthService(
                 adapter, self._record_recording_health,
                 monotonic=dependencies.monotonic, utcnow=dependencies.utcnow,
+                stopping=self._stopping.is_set,
             )
         except MigrationError:
             # A future/edited schema history or failed DDL is not a storage
@@ -1408,11 +1454,11 @@ class MonitoringRuntime:
             rows.close()
         return window
 
-    def _poll(self) -> None:
+    def _poll(self, deadline: float | None = None) -> None:
         if self.notifications is None:
             # The database itself could not be opened; nothing to persist.
             return
-        self.notifications.poll()
+        self.notifications.poll(deadline)
         self._set(notification_local_failed=self.notifications.local_delivery_failed,
                   notification_delivery_failed=self.notifications.delivery_failed)
 
@@ -1470,6 +1516,13 @@ class MonitoringRuntime:
         reached Slack.
         The bound, the time spent and an unsettled end are kept, so the stop's
         final storage sample waits only within what is left (Issue #351).
+
+        Issue #385: every poll here gets the deadline, so the settle ends at
+        most one outcome write or callback after it
+        (`stop_budget.SETTLE_POLL_OVERSHOOT_SECONDS`), not a whole poll's
+        writes later; the configured bound itself is never shortened. An
+        outcome not written by then stays `pending`, like a delivery that did
+        not finish in time.
         """
         self._require_owner()
         if self.notifications is None:
@@ -1477,10 +1530,10 @@ class MonitoringRuntime:
         started = time.monotonic()
         deadline = started + timeout_seconds
         try:
-            self._poll()
+            self._poll(deadline)
             while self.notifications.pending_count and time.monotonic() < deadline:
-                time.sleep(0.02)
-                self._poll()
+                time.sleep(max(0.0, min(0.02, deadline - time.monotonic())))
+                self._poll(deadline)
             pending = self.notifications.pending_count
         finally:
             self._settle_bound = max(self._settle_bound or 0.0, timeout_seconds)
@@ -1499,6 +1552,8 @@ class MonitoringRuntime:
         recording self-test always run at startup). Notification polling,
         the storage sample and the access and camera drains still run.
         """
+        if self._stop_began is None:
+            self._stop_began = time.monotonic()
         self._stopping.set()
 
     def tick(self) -> None:

@@ -1,8 +1,12 @@
 """Explicit startup/24-hour coordinator; call from the owning worker loop."""
 
 from datetime import datetime, timezone
+import logging
 import math
 import time
+
+from app.logging import Event
+from app.stop_budget import StopInterrupted
 
 from .model import Finding, Inventory, Kind, State, compare
 from .store import IntegrityOutboxFull, IntegrityStore
@@ -42,6 +46,15 @@ class IntegrityService:
             current = self.probe.collect()
             if not isinstance(current, Inventory):
                 raise ValueError("INVALID_INVENTORY")
+        except StopInterrupted:
+            # Issue #385: the Main shutdown interrupted the probes. The check
+            # did not complete: nothing is compared or recorded, so a partial
+            # inventory never becomes a hardware change, an unverifiable
+            # warning or an Owner notice, and the baseline is untouched. The
+            # last completed check stays current; the next start runs the
+            # startup check (INTEGRITY-002).
+            logging.getLogger(__name__).warning(Event.MONITORING_CHECK_INTERRUPTED)
+            return None
         except Exception:
             current = Inventory((), frozenset(Kind))
         try:
