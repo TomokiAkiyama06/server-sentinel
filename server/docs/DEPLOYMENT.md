@@ -509,7 +509,7 @@ fail `--check`). `frame_stall_seconds` (0.25–30) is how long a live capture
 may deliver no frame before its source is reported `degraded`
 (`video_frame_stalled`) instead of `online`; the effective window is never
 shorter than 10 negotiated frame intervals, so a slow profile cannot flap.
-`join_timeout_seconds` (0.1–40, default 10, and not less than
+`join_timeout_seconds` (0.1–33.75, default 10, and not less than
 `frame_stall_seconds`) bounds the total time a stop or shutdown waits for all
 source workers, which stop in parallel; it must cover the camera teardown (up
 to 5.5 s observed on a real C960 after an unplug) plus the 1 s offline
@@ -536,30 +536,54 @@ the row can stay `online` until the next start, which writes it `offline`
 before any capture opens. The local UVC stop as a whole can take up to
 `join_timeout_seconds` + 1 s for the frame-progress watchdog join + 1 s for
 the fenced `offline` writes of workers that outlived the join + 1 s for
-pending health-sink deliveries (43 s at the 40 s maximum), and the remaining
+pending health-sink deliveries (36.75 s at the 33.75 s maximum), and the remaining
 shutdown steps (notification settle, monitoring runtime, audit retention)
 follow it. Issue #364: the local UVC stop bound plus the notification settle
 (12 s without a scene timeline, else the timeline's `dispatch_settle_seconds`)
-must stay within 55 s, `TimeoutStopSec=90` less a 35 s reserve for the steps
-without a configurable bound (Issue #383: 5 s HTTP graceful shutdown, 15 s for
-an in-flight hostname reservation check whose enumerations share one 10 s
+must stay within 48.75 s, `TimeoutStopSec=90` less a 41.25 s reserve for the
+steps without a configurable bound: 5 s HTTP graceful shutdown, 15 s for an
+in-flight hostname reservation check whose enumerations share one 10 s
 deadline plus one SQLite busy timeout, 11 s scene stop, about 4 s for the
-process exit; once the stop began a monitoring tick starts no further long
-step); `create_app()`
-refuses a composition that exceeds it (`app/stop_budget.py`). This file
-accepts `join_timeout_seconds` up to 40 s, the most that fits with the 12 s
-settle, so `--check` refuses a longer join (before Issue #383 it accepted up
-to 60 s: check an existing deployment file before updating). Not yet bounded
-(Issue #383 phase 2): a wait for the storage admission behind a monitoring
-job, the SQLite busy timeouts of the writes in the human access stop, timeline
-finish and dispatch, a hung filesystem call, and the one monitoring step
-already running when the stop began (an integrity probe run, about 10 s per
-probe, or the recording self-test), which the settles queue behind. The wait of
+process exit (Issue #383), 1.25 s for an integrity check already running when
+the stop began and 5 s for the notification settle's overshoot (Issue #385,
+Owner decision 2026-11-05); `create_app()` refuses a composition that exceeds
+it (`app/stop_budget.py`). This file accepts `join_timeout_seconds` up to
+33.75 s, the most that fits with the 12 s settle, so `--check` refuses a
+longer join. Before Issue #383 it accepted up to 60 s and before Issue #385 up
+to 40 s: check an existing deployment file before updating, because an update
+whose file sets more than 33.75 s is refused by `--check` and the old release
+keeps running. Once the stop began, a monitoring tick starts no further long
+step; an integrity check already running kills its probe command within
+0.25 s, reaps it for at most 1 s and records nothing (no change, no warning,
+no notice; the next start checks again), and a recording self-test starts no
+further stage, still cleans up and records only a failure that really
+happened; a notification settle ends at most one outcome write (one 5 s
+SQLite busy timeout) past its configured bound, which is not shortened (an
+outcome not written by then stays `pending`). `monitoring_check_interrupted`
+is logged when a check was cut short; a probe command ended by SIGTERM (the
+systemd stop signals the whole control group, before the lifespan shutdown
+starts) counts as cut short too, any other signal as a failed probe. Every write from another thread (for
+example the scene timeline finish and dispatch, the local UVC `offline` and
+fenced writes, audit records and the human access writes) waits at most 5 s
+for the storage admission once the stop began and is then refused like any
+storage refusal (`storage_admission_stop_timeout`, nothing written); what it
+would have written is done, or found again, by the next start. That cap is not
+in the reserve: behind the bounded integrity check the wait ends with it and
+adds nothing, and the cap only matters behind the steps still unbounded below.
+A refused write is done by the next start; for the human access durable
+revocation marker this means the requirement is then held only in memory and
+can be lost by the restart (the next start's check finds the exposure again
+only if it still exists), a trade-off accepted by Owner decision 2026-11-05.
+Still not bounded: the other monitoring steps already running when the stop
+began (retention, storage sample, daily summary, startup retry, a self-test
+adapter stage), the SQLite busy timeouts summed over the many writes in the
+human access stop, timeline finish and dispatch, a hung filesystem
+call, and the dispatch steps before the critical settle. The wait of
 the monitoring runtime's final storage sample (Issue #351) shares the bound of
 the notification settle before it, so it does not lengthen the stop. The installed
 unit sets `TimeoutStopSec=90` explicitly (Owner decision 2026-10-08), so the
 stop bound does not depend on the host's `DefaultTimeoutStopSec` and stays
-above that 43 s local UVC bound. A rollback restores the target release's own
+above that 36.75 s local UVC bound. A rollback restores the target release's own
 unit snapshot, so a release installed before this change runs with that
 snapshot's (default) stop timeout.
 `frame_stall_reopen_seconds` (0.5–300, not less than `frame_stall_seconds`,

@@ -324,7 +324,7 @@ starts one worker per deployment-configured `local_uvc` source (`local_uvc`
 deployment object, 1 to 4 registry UUIDs, no physical evidence) after storage
 migration/admission and stops them, with bounded joins, before the monitoring
 runtime stops. The workers stop in parallel under one total join bound,
-`join_timeout_seconds` (default 10 s, configurable 0.1–40 s, the most that fits the Main stop budget, Issue #383), which covers a
+`join_timeout_seconds` (default 10 s, configurable 0.1–33.75 s, the most that fits the Main stop budget, Issues #383, #385), which covers a
 worker's device teardown (up to 5.5 s observed on a real C960 after an unplug)
 plus `HEALTH_SETTLE_SECONDS` (1 s) for its offline health write; a worker
 still alive at the bound stays watched, is never reported `online`, and the
@@ -1235,7 +1235,7 @@ or `uncertain` outcomes, and claims an earlier process left `submitting` or
 unresolved for an audited Owner requeue; a final `sent`/`failed`/`disabled` row
 completes such a claim at the next start. Shutdown runs one last step after
 scene `stop()`, then drains these alerts once more (a last step refused by
-storage escalates the watched records to it), and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s; `create_app()` refuses a composition whose local UVC stop bound, `join_timeout_seconds` + 3 s, plus this settle exceeds 55 s, i.e. `TimeoutStopSec=90` less a 35 s reserve derived from the bounded other stop steps, Issues #364, #383; storage admission waits, SQLite busy timeouts of the stop's writes and a monitoring step already running when the stop began are not bounded yet, Issue #385) for submitted deliveries before the
+storage escalates the watched records to it), and waits up to 12 s (above the 10 s Slack timeout; configurable to at most 30 s; `create_app()` refuses a composition whose local UVC stop bound, `join_timeout_seconds` + 3 s, plus this settle exceeds 48.75 s, i.e. `TimeoutStopSec=90` less a 41.25 s reserve derived from the bounded other stop steps, Issues #364, #383, #385; it includes 1.25 s for an integrity check in flight when the stop began (its probe is killed and nothing is recorded) and 5 s for this settle's overshoot (one outcome write past the bound, which is not shortened), Owner decision 2026-11-05. Once the stop began every cross-thread storage admission wait (scene timeline finish and dispatch, local UVC offline and fenced writes, audit, human access writes) ends after 5 s and is refused like a storage denial, and the next start does or finds that write again; this cap is not in the reserve, since behind a bounded step it adds nothing. A refused human access revocation-marker write leaves the requirement in memory only, so a restart can lose it (the next start's check finds the exposure again only if it still exists); this trade-off is accepted (Owner decision 2026-11-05). The other monitoring steps in flight, SQLite busy timeouts summed over the stop's writes and a hung filesystem call are not bounded yet) for submitted deliveries before the
 notification service closes; the monitoring stop's final storage sample (Issue #351) waits only for what is left of that bound, so it adds nothing to the stop budget. With Slack unconfigured the local row is
 `disabled` and `critical_notifications` stays `unavailable`. No
 evidence-preservation port exists yet (a separate recording decision), so
@@ -2182,6 +2182,8 @@ probe and therefore the baseline cover only the VM's virtual and passed-through
 hardware. A CPU exposes no unique identifier, so after approval it remains
 `UNVERIFIABLE` / `UNIQUE_ID_UNAVAILABLE` (a warning, not an immediate alert).
 
+A check that the ServerSentinel shutdown interrupts (Issue #385), including a probe command ended by the stop's SIGTERM to the service's control group, did not complete: its partial inventory is discarded, never compared, recorded or notified as `CHANGED`/`MISSING`/`UNVERIFIABLE`, and the baseline is untouched. The startup check of the next start runs it.
+
 ### 10.3 Recording-health self-test
 
 At least once per day, run an end-to-end recording-health check. It should verify as much of the actual recording path as practical:
@@ -2201,6 +2203,8 @@ Missing/unmounted or substituted recording filesystems refuse recording and self
 Run cleanup through the failure/cancellation path as well as the successful path. On startup, recover identified artifacts from interrupted tests and clean them before admitting another self-test segment. Cleanup verifies the expected filesystem and targets only self-test-owned artifacts; it never deletes ordinary recordings/protected incidents or creates a fallback on an unexpected mount. If cleanup fails (for example, a missing or read-only mount), record a recording-health failure, account for the leftovers in storage admission/safety-reserve checks, and block new self-test media writes until safe cleanup succeeds. Continue reporting the failed/blocked state rather than accumulating a new partial segment each day.
 
 A self-test failure must not be hidden behind a generic healthy state.
+
+A self-test that the ServerSentinel shutdown interrupts (Issue #385) starts no further step and skips the device health read, but still runs its cleanup. A step that already ran and failed, or a failed cleanup, is recorded and notified as a failure; otherwise nothing is recorded (neither failed nor healthy), and the startup self-test of the next start runs it.
 
 ### 10.4 Alerting
 

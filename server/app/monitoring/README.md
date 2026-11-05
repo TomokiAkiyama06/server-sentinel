@@ -82,7 +82,27 @@ alert, waits for the pending deliveries: up to
 `SHUTDOWN_STORAGE_SETTLE_SECONDS` when no shutdown settle ran, otherwise only
 what is left of the earlier settle's bound and not at all when it ended
 unsettled, so the stop stays within the `TimeoutStopSec=90` budget. An
-unfinished delivery stays `pending` (`critical_notifications_unsettled`). So a
+unfinished delivery stays `pending` (`critical_notifications_unsettled`).
+Issue #385: every poll of a settle gets its deadline
+(`NotificationService.poll(deadline=)`), so a settle ends at most one outcome
+write or completion callback after its bound; an outcome not written by then
+stays `pending` for the next poll, like a delivery not finished in time. Once
+the stop began (`begin_stop`), an integrity check or self-test in flight ends
+early and records nothing partial (`app/integrity`, `app/media/health`), and a
+cross-thread `reservation()` waits at most `STOP_ADMISSION_WAIT_SECONDS` (5 s)
+for the worker: a reservation not granted by then is withdrawn before the
+worker takes it and refused as `STORAGE_ADMISSION_STOPPING`
+(`storage_admission_stop_timeout`, nothing written), so the caller handles it
+like any storage refusal. This applies to every cross-thread write (scene timeline finish and dispatch,
+local UVC `offline` / fenced writes, audit, human access); the next start
+does or finds the refused write again. Once the stop began the run loop polls
+no more outcomes between ticks (`_poll_outcomes` is a no-op), so only the
+settles poll, with their deadline, and a step returning then leaves its
+degraded flag and retry unchanged. For the human access durable revocation marker the
+requirement then stays in memory only and a restart can lose it (the next
+start's check finds the exposure again only if it still exists); Owner
+decision 2026-11-05 accepts this trade-off. The cap is not a stop budget
+reserve term (`app/stop_budget.py`). So a
 stop before the tick submits the alert, but it reaches Slack only when the
 single delivery worker gets to it within that wait: queued behind a stalled or
 backlogged delivery, or with no wait left, it may never be sent (`close()`

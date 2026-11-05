@@ -14,6 +14,7 @@ import json
 import sqlite3
 import threading
 import time
+import types
 import unittest
 
 from app.notifications.schedule import DailySummaryScheduler, notification_migration
@@ -266,6 +267,76 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual([(threading.get_ident(), DeliveryResult.SENT)] * 2, results)
         self.assertEqual(1, len(transport.requests))
         self.assertEqual([identifier, identifier], [event.event_id for event in local])
+
+
+class PollDeadlineTests(unittest.TestCase):
+    """Issue #385: a poll given a deadline starts no write or callback after it."""
+
+    def setUp(self):
+        self.clock = [0.0]
+        clock = patch("app.notifications.service.time",
+                      types.SimpleNamespace(monotonic=lambda: self.clock[0]))
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.local = []
+        self.service = NotificationService(self.write, SlackDelivery(endpoint(), opener=Transport()))
+        self.addCleanup(self.service.close)
+
+    def write(self, event):
+        # Each outcome write takes one synthetic second.
+        self.local.append(event)
+        self.clock[0] += 1.0
+
+    def delivered(self):
+        # Collect the finished deliveries without writing any outcome.
+        for _ in range(200):
+            self.service.poll(deadline=float("-inf"))
+            if all(entry[2] is not None for entry in self.service._pending.values()):
+                # Restart the synthetic clock and drop the pending-row writes.
+                self.clock[0] = 0.0
+                self.local.clear()
+                return
+            self.service._worker.ready.wait(0.05)
+        self.fail("mock delivery did not finish")
+
+    def record(self, event_id, callback=None):
+        self.assertEqual(DeliveryResult.PENDING, self.service.record(
+            NotificationKind.CAMERA_TAMPER, at=datetime(2026, 1, 1, tzinfo=timezone.utc), confirmed=True,
+            event_id=event_id, on_complete=callback))
+
+    def test_outcome_writes_stop_at_the_deadline_and_resume_on_the_next_poll(self):
+        first, second = uuid4(), uuid4()
+        self.record(first)
+        self.record(second)
+        self.delivered()
+        # The first write ends past the deadline: the second does not start.
+        self.service.poll(deadline=0.5)
+        self.assertEqual([first], [event.event_id for event in self.local])
+        self.assertEqual(1, self.service.pending_count)
+        self.assertFalse(self.service.local_delivery_failed)
+        self.service.poll()
+        self.assertEqual([first, second], [event.event_id for event in self.local])
+        self.assertEqual(0, self.service.pending_count)
+
+    def test_callbacks_not_yet_called_wait_for_the_next_poll(self):
+        identifier, called = uuid4(), []
+
+        def slow(result):
+            called.append("slow")
+            self.clock[0] += 1.0
+
+        self.record(identifier, slow)
+        self.record(identifier, lambda result: called.append("second"))
+        self.delivered()
+        self.service.poll(deadline=1.5)
+        self.assertEqual(["slow"], called)
+        self.assertEqual(1, self.service.pending_count)
+        self.assertFalse(self.service.local_delivery_failed)
+        self.service.poll()
+        # Each submitter is told once; the outcome write is repeated.
+        self.assertEqual(["slow", "second"], called)
+        self.assertEqual(0, self.service.pending_count)
+        self.assertEqual([identifier] * 2, [event.event_id for event in self.local])
 
 
 class ScheduleTests(unittest.TestCase):

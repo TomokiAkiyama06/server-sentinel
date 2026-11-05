@@ -6,6 +6,7 @@ isolated synthetic sysfs/proc tree and an injected command runner.
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 import csv
 import io
 import json
@@ -16,7 +17,23 @@ import signal
 import subprocess
 import time
 
+from app.stop_budget import StopInterrupted
+
 from .model import Component, Inventory, Kind
+
+
+# One command's output deadline (read and exit), and how long a command still
+# running then is waited for after SIGKILL before it is abandoned (reaped by
+# subprocess later): at most COMMAND_OUTPUT_SECONDS + COMMAND_REAP_SECONDS.
+COMMAND_OUTPUT_SECONDS = 5
+COMMAND_REAP_SECONDS = 5
+# Issue #385: once the Main shutdown began (`interrupted`), a running command
+# is killed within one poll slice and waited for only this long after SIGKILL,
+# so a probe in flight ends within STOP_POLL_SECONDS + STOP_REAP_SECONDS
+# (`app.stop_budget.INTEGRITY_PROBE_STOP_SECONDS`). The probes are read-only:
+# killing one changes nothing on the host.
+STOP_POLL_SECONDS = 0.25
+STOP_REAP_SECONDS = 1.0
 
 
 class ProbeUnavailable(Exception):
@@ -24,8 +41,20 @@ class ProbeUnavailable(Exception):
         super().__init__("PROBE_UNAVAILABLE")
 
 
+def _never() -> bool:
+    return False
+
+
+@dataclass
 class CommandRunner:
-    """Fixed read-only command allowlist, no shell, inherited secrets or sudo."""
+    """Fixed read-only command allowlist, no shell, inherited secrets or sudo.
+
+    `interrupted` (Issue #385) is polled while a command runs; once it returns
+    True the command is killed and `StopInterrupted` raised, never a partial
+    output.
+    """
+
+    interrupted: Callable[[], bool] = field(default=_never, repr=False)
 
     def run(self, command: tuple[str, ...]) -> bytes:
         permitted = command in {
@@ -35,24 +64,50 @@ class CommandRunner:
               and re.fullmatch(r"/dev/[A-Za-z0-9_-]+", command[3]))
         if not permitted:
             raise ProbeUnavailable()
+        if self.interrupted():
+            raise StopInterrupted()
         process = None
+        reap = COMMAND_REAP_SECONDS
         try:
             process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                        stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True,
                                        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"})
             data = bytearray()
-            deadline = time.monotonic() + 5
+            deadline = time.monotonic() + COMMAND_OUTPUT_SECONDS
             while True:
+                if self.interrupted():
+                    reap = STOP_REAP_SECONDS
+                    raise StopInterrupted()
                 remaining = deadline - time.monotonic()
-                if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                if remaining <= 0:
                     raise ProbeUnavailable()
+                if not select.select([process.stdout], [], [], min(remaining, STOP_POLL_SECONDS))[0]:
+                    continue
                 block = os.read(process.stdout.fileno(), min(65536, 1048577 - len(data)))
                 if not block:
                     break
                 data.extend(block)
                 if len(data) > 1048576:
                     raise ProbeUnavailable()
-            status = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            while True:
+                try:
+                    status = process.wait(timeout=max(0.001, min(deadline - time.monotonic(),
+                                                                 STOP_POLL_SECONDS)))
+                    break
+                except subprocess.TimeoutExpired:
+                    if self.interrupted():
+                        reap = STOP_REAP_SECONDS
+                        raise StopInterrupted() from None
+                    if time.monotonic() >= deadline:
+                        raise
+            if status == -signal.SIGTERM:
+                # Issue #385 (PR #389 review): systemd's stop sends SIGTERM to
+                # the whole control group, so a probe child can end before
+                # `begin_stop()` runs (after the HTTP graceful wait). Its
+                # output is partial: the check is interrupted, never a
+                # failure or unavailable kind. Other signals (SIGKILL by the
+                # OOM killer, for example) stay real failures.
+                raise StopInterrupted()
             # smartctl returns a bitmask: health warnings are useful output.
             if status and not (command[0] == "smartctl" and status >= 0 and not status & 7):
                 raise ProbeUnavailable()
@@ -75,11 +130,35 @@ class CommandRunner:
                             # signal. Reap it anyway; a skipped wait() leaves a
                             # zombie until an unrelated spawn or backend exit.
                             pass
-                        process.wait(timeout=5)
+                        self._reap(process, reap)
                 except (OSError, subprocess.SubprocessError):
                     pass
                 finally:
                     process.stdout.close()
+
+
+    def _reap(self, process, reap: float) -> None:
+        """Wait up to `reap` for the killed command, in stop poll slices.
+
+        Issue #385 (Codex PR #389 P2): a stop that begins during this wait
+        shortens what is left of it to STOP_REAP_SECONDS, so a command in
+        flight still ends within STOP_POLL_SECONDS + STOP_REAP_SECONDS of the
+        stop. Raises `TimeoutExpired` once the wait is spent (abandoned).
+        """
+        deadline = time.monotonic() + reap
+        shortened = False
+        while True:
+            remaining = deadline - time.monotonic()
+            try:
+                process.wait(timeout=max(0.001, min(remaining, STOP_POLL_SECONDS)))
+                return
+            except subprocess.TimeoutExpired:
+                now = time.monotonic()
+                if not shortened and self.interrupted():
+                    shortened = True
+                    deadline = min(deadline, now + STOP_REAP_SECONDS)
+                if now >= deadline:
+                    raise
 
 
 def _read_bytes(path: Path) -> bytes:
@@ -242,16 +321,30 @@ def _pci_slot(value: str) -> str:
 class LinuxProbe:
     root: Path = field(default=Path("/"), repr=False)
     runner: CommandRunner = field(default_factory=CommandRunner, repr=False)
+    # Issue #385: checked before each probe; give the runner the same check
+    # (`CommandRunner(interrupted=...)`) to end a command already running.
+    interrupted: Callable[[], bool] = field(default=_never, repr=False)
 
     def collect(self) -> Inventory:
+        """The inventory, or `StopInterrupted` once `interrupted()`.
+
+        An interrupted collection returns nothing: a partial inventory would
+        compare components that were never probed as missing or unverifiable.
+        The runner's `StopInterrupted` is not one of the exceptions a probe
+        turns into an unavailable kind, so it ends the collection as well.
+        """
         components = []
         unavailable = set()
         for kind, probe in ((Kind.CPU, self._cpu), (Kind.MEMORY, self._memory),
                             (Kind.STORAGE, self._storage), (Kind.GPU, self._gpu)):
+            if self.interrupted():
+                raise StopInterrupted()
             try:
                 components.extend(probe())
             except (ProbeUnavailable, ValueError, KeyError, TypeError, OSError):
                 unavailable.add(kind)
+        if self.interrupted():
+            raise StopInterrupted()
         return Inventory(tuple(components), frozenset(unavailable))
 
     def _cpu(self):
