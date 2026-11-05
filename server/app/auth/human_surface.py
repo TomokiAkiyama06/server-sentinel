@@ -116,7 +116,9 @@ WebSocket and error path gets the same generic denial):
   a camera source has stayed not online past the deployment threshold (or
   is in an alerted flapping period) and no notification destination (Slack)
   is configured, so the Owner is not notified outside the dashboard. One
-  boolean: no source id, name, count, time, reason or setting value.
+  boolean: no source id, name, count, time, reason or setting value. The
+  Web polls it in the background, so it never extends the session's idle
+  expiry (``touch=False``, Codex PR #388).
 
 The four ceremony routes run before a credential exists (AUTH-013). Each is
 rate-limited per verified proxy identity before the request body is parsed
@@ -1829,11 +1831,16 @@ class HumanSurface:
         scene calibration status. ``200 {"offline_unnotified": <bool>}``.
         Anything but a ``bool`` from the reader, or a reader failure, is the
         generic denial, never a guessed ``false``.
+
+        Authorized with ``touch=False`` (Codex PR #388 P1): the Web samples
+        this route every 60 s without user interaction, so a read must never
+        renew the session's idle expiry; an unattended Owner dashboard still
+        ends at the idle and absolute limits.
         """
         read = self.access.camera_offline_notice
         if read is None:
             raise _Denied()
-        authorized = await self._authorize(request, Requirement.OWNER_READ)
+        authorized = await self._authorize(request, Requirement.OWNER_READ, touch=False)
         access = self.access
 
         def answer():

@@ -1929,14 +1929,16 @@ GET /api/monitoring/camera-offline -> OWNER_READ: 200 {"offline_unnotified": <bo
 
 mounted whenever a monitoring runtime exists (otherwise, like every other
 refusal, the generic not-found denial). The read runs inside `admit` of the
-authorization's epoch after the Owner session was read again, takes no query
+authorization's epoch after the Owner session was read again, commits no
+idle touch (`touch=False`: the Web's background poll must not keep an
+unattended session alive past its idle limit, Codex PR #388), takes no query
 and returns one boolean only: no source id, name, count, time, reason or
 notification setting value. A non-Owner session (`live:view` or
 `recordings:view` alike) gets the generic denial, so the notification
 configuration stays Owner-only. A reader failure or a non-boolean value is
 the generic denial, never a guessed `false`. The Web shows it for an Owner
 session on every screen (`web/src/dashboard/offline_notice.tsx`), sampled
-when a screen opens and every 60 s; the parser accepts only a JSON boolean,
+once the session is loaded and every 60 s after each answer; the parser accepts only a JSON boolean,
 and a failed check is shown as "could not be checked", not as nothing to
 report. The flag follows `camera_offline_degraded`: it clears at the first
 monitoring tick after the outage ended, or, after a ratio alert, when that

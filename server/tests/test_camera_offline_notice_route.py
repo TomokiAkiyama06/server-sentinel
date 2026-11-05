@@ -11,7 +11,9 @@ browser, proxy, Tailscale, Slack or real authenticator is involved.
 
 from unittest import TestCase
 
-from app.auth.human_surface import CAMERA_OFFLINE_NOTICE_PATH, HumanAccessUnavailable, match_route
+from app.auth.human_surface import (
+    CAMERA_OFFLINE_NOTICE_PATH, SESSION_PATH, HumanAccessUnavailable, match_route,
+)
 from app.auth.store import Requirement
 from app.monitoring.runtime import MonitoringStatus, RuntimeState
 
@@ -71,6 +73,27 @@ class CameraOfflineNoticeRouteTests(AdminRouteFixture):
         self.elapse(minutes=6)
         self.reader.value = True
         self.assertEqual({"offline_unnotified": True}, payload(await self.read()))
+
+    async def test_background_polls_never_renew_the_idle_expiry(self):
+        # Codex PR #388 (P1): the Web samples this route every 60 s with no
+        # user interaction; it must not keep an unattended session alive.
+        self.reader.value = True
+        for _ in range(5):  # 25 minutes of polling after the last touch
+            self.elapse(minutes=5)
+            self.assertEqual(200, status(await self.read()))
+        self.elapse(minutes=6)  # 31 minutes: past the idle limit (30)
+        self.assertEqual(GENERIC, await self.read())
+        self.assertEqual(GENERIC, await self.admin("GET", SESSION_PATH, csrf=None))
+
+    async def test_a_session_read_still_renews_while_polls_do_not(self):
+        # Control for the test above: the same timeline with one touching
+        # session read in the middle keeps the session alive.
+        for _ in range(5):
+            self.elapse(minutes=5)
+            self.assertEqual(200, status(await self.read()))
+        self.assertEqual(200, status(await self.admin("GET", SESSION_PATH, csrf=None)))
+        self.elapse(minutes=6)
+        self.assertEqual(200, status(await self.read()))
 
     async def test_closed_access_is_refused_before_the_reader(self):
         self.close_access()
