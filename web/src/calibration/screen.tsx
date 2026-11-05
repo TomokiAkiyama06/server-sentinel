@@ -186,17 +186,17 @@ export function CalibrationScreen({ services, t }: { services: DashboardServices
 }
 
 /**
- * The origin badge. A source still waiting for its restart re-acquisition has
- * no reference in use yet (`origin: none`) but does have a stored calibration
- * (Issue #341), so it is not called "not calibrated". When the history could
+ * The origin badge. A source with no reference in use yet (`origin: none`)
+ * but a stored calibration (Issue #341) is not called "not calibrated": the
+ * server says it is stored (`stored_known`, Issue #382), also while its
+ * re-acquisition or an Owner calibration is acquiring. When the history could
  * not be read the server says so (`history_unknown`, Issue #377): whether one
- * is stored is unknown, also while an Owner calibration is acquiring, and the
- * badge says only that.
+ * is stored is unknown, and the badge says only that.
  */
 export function originText(t: Catalog, item: SceneCalibrationSource): string {
   if (item.origin !== 'none') return t[`calibrationOrigin_${item.origin}`];
   if (item.history_unknown) return t.calibrationOriginUnknown;
-  return item.phase === 'reacquire_pending' ? t.calibrationOriginPending : t.calibrationOrigin_none;
+  return item.stored_known ? t.calibrationOriginPending : t.calibrationOrigin_none;
 }
 
 /** A source whose calibration history could not be read (never in use). */

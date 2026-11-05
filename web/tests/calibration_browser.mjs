@@ -44,7 +44,7 @@ const TEXT = {
   done: '校正しました',
   noFrame: '時間内にカメラの映像を取得できませんでした。カメラの接続を確認してください。',
   restart: '再起動後に自動で取り直した基準（未確認）',
-  pending: '保存済みの校正あり（基準の取り直し待ち）',
+  pending: '保存済みの校正あり（基準は未取得）',
   pendingPhase: '（検知が始まるまでの間も含みます）',
   none: '未校正',
   unknown: '校正の状態を確認できません',
@@ -54,13 +54,15 @@ const CALIBRATE = `/api/scene/sources/${sourceId}/calibration`;
 function status(calibrated) {
   return { sources: [
     { source_id: sourceId, origin: calibrated ? 'owner' : 'restart_reacquired', version: calibrated ? 3 : 2,
-      calibrated_at: at, phase: 'idle', failure: null, owner_calibration_available: true, history_unknown: false, detection: 'active',
+      calibrated_at: at, phase: 'idle', failure: null, owner_calibration_available: true, history_unknown: false, stored_known: false, detection: 'active',
       detection_reason: 'evaluated', sha256: DIGEST, polygon: [[4, 4], [7, 4], [7, 7]] },
     { source_id: otherId, origin: 'none', version: null, calibrated_at: null, phase: 'reacquire_pending',
-      failure: 'reader_changed', owner_calibration_available: false, history_unknown: false, detection: 'inactive',
+      failure: 'reader_changed', owner_calibration_available: false, history_unknown: false, stored_known: true,
+      detection: 'inactive',
       detection_reason: 'calibration_reference_unavailable' },
     { source_id: unknownId, origin: 'none', version: null, calibrated_at: null, phase: 'reacquire_pending',
-      failure: 'history_unavailable', owner_calibration_available: false, history_unknown: true, detection: 'inactive',
+      failure: 'history_unavailable', owner_calibration_available: false, history_unknown: true, stored_known: false,
+      detection: 'inactive',
       detection_reason: 'unavailable' },
   ] };
 }
