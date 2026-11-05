@@ -199,6 +199,10 @@ export interface DashboardServices {
    *  `ApiError('step_up_required')` and changed nothing. */
   loadSceneCalibration?(signal: AbortSignal): Promise<readonly SceneCalibrationSource[]>;
   calibrateSource?(sourceId: string, signal: AbortSignal): Promise<CalibrationResult>;
+  /** The Owner's camera offline notice (Issue #301, `GET /api/monitoring/camera-offline`):
+   *  `true` while a camera offline condition the Owner would be notified of
+   *  is current and no notification destination (Slack) is configured. */
+  loadCameraOfflineNotice?(signal: AbortSignal): Promise<boolean>;
   /** The Owner's step-up ceremony (S3): a fresh user-verified assertion of
    *  this session's own passkey. Resolves only when the server accepted it. */
   stepUp?(signal: AbortSignal): Promise<void>;

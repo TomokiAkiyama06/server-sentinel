@@ -218,6 +218,13 @@ class MonitoringStatus:
     # detected by the next start. Degraded in the daily summary.
     unclean_exit_detection_degraded: bool = False
 
+    @property
+    def camera_offline_unnotified(self) -> bool:
+        """Issue #301 item 2: a camera offline condition the Owner would be
+        notified of is current, but no notification reaches the Owner outside
+        the local store. The Owner's dashboard shows a notice instead."""
+        return self.camera_offline_degraded and not self.camera_offline_notifications
+
 
 class RefuseUnvalidatedSegments:
     """Default segment validator: refuses every segment.

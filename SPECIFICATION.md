@@ -1924,7 +1924,35 @@ kind. A restored `pending` row is resent with the plain text, since the row
 does not record whether its outage had recovered. `MonitoringStatus`
 reports `camera_offline_degraded` (counted as degraded in the daily summary)
 and `camera_offline_notifications`, false without a configured Slack endpoint
-(the local row is then `disabled`). Shutdown stops the monitor first and, when
+(the local row is then `disabled`). Their conjunction
+`camera_offline_unnotified` (`camera_offline_degraded` and not
+`camera_offline_notifications`) reaches the Owner's dashboard (Issue #301
+item 2, REQUIREMENTS NOTIFY-002: disabling Slack does not suppress the UI
+fault report):
+
+```text
+GET /api/monitoring/camera-offline -> OWNER_READ: 200 {"offline_unnotified": <bool>}
+```
+
+mounted only when a monitoring runtime and a camera offline monitor exist,
+i.e. with configured `local_uvc` sources (otherwise, like every other
+refusal, the generic not-found denial, which the Web shows as "could not be
+checked": a deployment with no monitored camera, `remote_agent` only for
+now, is never told a guessed `false`). The read runs inside `admit` of the
+authorization's epoch after the Owner session was read again, commits no
+idle touch (`touch=False`: the Web's background poll must not keep an
+unattended session alive past its idle limit, Codex PR #388), takes no query
+and returns one boolean only: no source id, name, count, time, reason or
+notification setting value. A non-Owner session (`live:view` or
+`recordings:view` alike) gets the generic denial, so the notification
+configuration stays Owner-only. A reader failure or a non-boolean value is
+the generic denial, never a guessed `false`. The Web shows it for an Owner
+session on every screen (`web/src/dashboard/offline_notice.tsx`), sampled
+once the session is loaded and every 60 s after each answer; the parser accepts only a JSON boolean,
+and a failed check is shown as "could not be checked", not as nothing to
+report. The flag follows `camera_offline_degraded`: it clears at the first
+monitoring tick after the outage ended, or, after a ratio alert, when that
+alerted period closes (a full window online). Shutdown stops the monitor first and, when
 no scene critical dispatcher settles them, waits at most 12 s for a submitted
 notification before the monitoring runtime stops. Only `local_uvc` sources are
 wired: `remote_agent` sources have no Main runtime yet; `observe()` is the
