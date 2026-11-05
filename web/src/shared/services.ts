@@ -40,6 +40,8 @@ export const STEP_UP_PATH = '/api/auth/step-up';
 /** The Owner's scene calibration (Issue #205). */
 export const SCENE_CALIBRATION_PATH = '/api/scene/calibration';
 export const SCENE_SOURCES_PATH = '/api/scene/sources';
+/** The Owner's camera offline notice (Issue #301). */
+export const CAMERA_OFFLINE_NOTICE_PATH = '/api/monitoring/camera-offline';
 /** A calibration reads the next good camera frames before it answers (the
  *  server bounds that at 30 s at most), so its request gets a longer bound. */
 export const CALIBRATION_REQUEST_MS = 45000;
@@ -261,6 +263,15 @@ export function parseSceneCalibration(value: unknown): SceneCalibrationSource[] 
       detection: member(DETECTION, item.detection), detection_reason: reason,
     };
   });
+}
+
+/** `GET /api/monitoring/camera-offline` body `{"offline_unnotified": <boolean>}` (Issue #301).
+ *
+ * Anything but a JSON boolean fails closed: a missing, `null`, numeric or
+ * string value is never read as "nothing to show". Nothing else is copied. */
+export function parseCameraOfflineNotice(value: unknown): boolean {
+  if (!record(value) || typeof value.offline_unnotified !== 'boolean') throw new ApiError('invalid_response');
+  return value.offline_unnotified;
 }
 
 /** One calibration's answer: calibrated with its version and time, or a fixed refusal. */
@@ -559,6 +570,15 @@ export function createDashboardServices(origin: string, request: typeof fetch = 
           signal: bound });
         if (response.status !== 200) throw new ApiError('unavailable');
         return parseSceneCalibration(await json(response, bound));
+      });
+    },
+
+    async loadCameraOfflineNotice(signal) {
+      return bounded(signal, async bound => {
+        const response = await send({ method: 'GET', path: CAMERA_OFFLINE_NOTICE_PATH, accept: 'application/json',
+          signal: bound });
+        if (response.status !== 200) throw new ApiError('unavailable');
+        return parseCameraOfflineNotice(await json(response, bound));
       });
     },
 

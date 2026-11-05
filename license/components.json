@@ -84,6 +84,10 @@
     {
       "path": "web/tests/calibration_browser.mjs",
       "sha256": "sha256:94a5bbd2ca0effe755e093e655564ac9086b97a4e9e8ae81f756f0e4c83231aa"
+    },
+    {
+      "path": "web/tests/offline_notice.test.mjs",
+      "sha256": "sha256:dbfa43f810082932a5d6bbfc15fb76972e2cc6d8833f979b7b9fba6523366e42"
     }
   ],
   "inputs": [

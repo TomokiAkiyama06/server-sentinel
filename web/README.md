@@ -537,6 +537,36 @@ more, a refusal, a declined step-up, a failed ceremony, CSP, no storage
 write, no digest or image on screen). Neither proves the real routes, a real
 camera or a real passkey provider (MANUAL_TEST.md §E).
 
+## Owner camera offline notice for #301
+
+`src/dashboard/offline_notice.tsx` shows the Owner, above every screen, that a
+camera offline condition the Owner would be notified of is current while no
+notification destination (Slack) is configured, so no notification leaves the
+Main Server (Issue #301 item 2). Route (server-side `OWNER_READ`; any other
+session gets the generic denial):
+
+```text
+GET /api/monitoring/camera-offline   200 {"offline_unnotified": <boolean>}
+```
+
+- Loaded only for an Owner session when the provider offers
+  `loadCameraOfflineNotice` (the production provider always does), when a
+  screen opens and every `CAMERA_OFFLINE_NOTICE_REFRESH_MS` (60 s) after each
+  answer, one request at a time. A refresh keeps the last answer until the
+  next one arrives.
+- `parseCameraOfflineNotice` accepts only a JSON boolean; anything else fails
+  closed. A failed check is shown as `cameraOfflineNoticeUnavailable`
+  ("could not be checked"), never as nothing to report.
+- The notice (`role="alert"`) states facts only: a camera has been offline
+  longer than the configured time, and the Owner is not notified because no
+  destination is configured. Which camera it is shows on the Live screen; the
+  notice names no source and claims no cause.
+
+Tests: `tests/offline_notice.test.mjs` (fake `fetch` and manual timers: strict
+decoding, request shape without CSRF, refusals, the rendered states in ja and
+en, the sampling and its stop). Neither proves the real route or a real
+outage (MANUAL_TEST.md §J, Issue #301).
+
 ## Sign-in shell and build split for #10 phase 2 S5a
 
 Owner decisions S5-1 .. S5-5 (Issue #10, 2026-10-14). The Web build produces
