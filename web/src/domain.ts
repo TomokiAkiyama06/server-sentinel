@@ -169,6 +169,8 @@ export interface SceneCalibrationSource {
   owner_calibration_available: boolean;
   /** The calibration history could not be read: whether one is stored is unknown (Issue #377). */
   history_unknown: boolean;
+  /** None is in use (`origin: none`) but one is known to be stored, also while acquiring (Issue #382). */
+  stored_known: boolean;
   detection: SceneDetectionState;
   /** The scene runtime's fixed reason code, shown as a diagnostic only. */
   detection_reason: string;

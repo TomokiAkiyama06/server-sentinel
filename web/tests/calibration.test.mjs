@@ -27,8 +27,8 @@ const render = (element) => renderToStaticMarkup(element).replaceAll('&#x27;', "
 
 const source = (overrides = {}) => ({
   source_id: sourceId, origin: 'owner', version: 2, calibrated_at: at, phase: 'idle', failure: null,
-  owner_calibration_available: true, history_unknown: false, detection: 'active', detection_reason: 'evaluated',
-  ...overrides,
+  owner_calibration_available: true, history_unknown: false, stored_known: false, detection: 'active',
+  detection_reason: 'evaluated', ...overrides,
 });
 
 function fake(routes) {
@@ -74,7 +74,7 @@ test('status decodes strictly and copies only the documented fields', async () =
   const body = { sources: [
     { ...source(), sha256: 'f'.repeat(64), polygon: [[1, 2]], policy: { movement_pixels: 1 }, pixels: 'AAAA' },
     source({ source_id: otherId, origin: 'none', version: null, calibrated_at: null, phase: 'reacquire_pending',
-      failure: 'reader_changed', owner_calibration_available: false, detection: 'inactive',
+      failure: 'reader_changed', owner_calibration_available: false, stored_known: true, detection: 'inactive',
       detection_reason: 'calibration_reference_unavailable' }),
   ] };
   const parsed = parseSceneCalibration(body);
@@ -97,6 +97,11 @@ test('one malformed source fails the whole status closed', () => {
     { ...source(), origin: 'none' }, { ...source(), calibrated_at: '2026-10-22 01:02:03' },
     { ...source(), phase: 'done' }, { ...source(), failure: 'other' }, { ...source(), owner_calibration_available: 1 },
     { ...source(), history_unknown: 'yes' }, (({ history_unknown, ...rest }) => rest)(source()),
+    // Issue #382: stored and not in use, never with a calibration in use or an unknown history.
+    { ...source(), stored_known: 'yes' }, (({ stored_known, ...rest }) => rest)(source()),
+    { ...source(), stored_known: true },
+    { ...source(), origin: 'none', version: null, calibrated_at: null, history_unknown: true, stored_known: true },
+    { ...source(), origin: 'none', version: null, calibrated_at: null, phase: 'reacquire_pending' },
     { ...source(), detection: 'unknown' }, { ...source(), detection_reason: 'Bad Reason' },
     { ...source(), detection_reason: '' },
   ];
@@ -179,7 +184,7 @@ test('a restart re-acquired reference warns that it was not confirmed by the Own
   assert.match(messages.en.calibrationRestartWarning, /not detected/);
   const pending = render(createElement(CalibrationCard, { t, item: source({ origin: 'none', version: null,
     calibrated_at: null, phase: 'reacquire_pending', failure: 'no_frame', owner_calibration_available: false,
-    detection: 'inactive', detection_reason: 'calibration_reference_unavailable' }), name: null, disabled: false,
+    stored_known: true, detection: 'inactive', detection_reason: 'calibration_reference_unavailable' }), name: null, disabled: false,
     confirmed: false, onConfirm: noop }));
   for (const text of [t.calibrationOriginPending, t.calibrationPhase_reacquire_pending, t.calibrationRefused_no_frame,
     t.calibrationNoTemplate, 'calibration_reference_unavailable']) assert.ok(pending.includes(text), text);
@@ -190,7 +195,7 @@ test('a restart re-acquired reference warns that it was not confirmed by the Own
   assert.match(pending, /data-calibration-origin="none"/);
   for (const locale of ['ja', 'en']) {
     const deferred = render(createElement(CalibrationCard, { t: messages[locale], item: source({ origin: 'none',
-      version: null, calibrated_at: null, phase: 'reacquire_pending', detection: 'inactive',
+      version: null, calibrated_at: null, phase: 'reacquire_pending', stored_known: true, detection: 'inactive',
       detection_reason: 'unavailable' }), name: null, disabled: false, confirmed: false, onConfirm: noop }));
     assert.ok(deferred.includes(messages[locale].calibrationOriginPending), locale);
     assert.ok(!deferred.includes(messages[locale].calibrationOrigin_none), locale);
@@ -260,7 +265,8 @@ test('the history being unknown comes from the server, not from the failure', ()
   for (const locale of ['ja', 'en']) {
     const m = messages[locale];
     const saved = render(createElement(CalibrationCard, { t: m, item: source({ origin: 'none', version: null,
-      calibrated_at: null, phase: 'reacquire_pending', failure: 'history_unavailable', detection: 'inactive',
+      calibrated_at: null, phase: 'reacquire_pending', failure: 'history_unavailable', stored_known: true,
+      detection: 'inactive',
       detection_reason: 'unavailable' }), name: null, disabled: false, confirmed: false, onConfirm: noop }));
     for (const text of [m.calibrationOriginPending, m.calibrationPhase_reacquire_pending,
       m.calibrationRefused_history_unavailable]) assert.ok(saved.includes(text), `${locale} ${text}`);
@@ -281,6 +287,33 @@ test('the history being unknown comes from the server, not from the failure', ()
   const [parsed] = parseSceneCalibration({ sources: [source({ origin: 'none', version: null, calibrated_at: null,
     history_unknown: true })] });
   assert.equal(parsed.history_unknown, true);
+});
+
+test('a known stored calibration stays stored while it is acquiring', () => {
+  // Issue #382: the restart re-acquisition (or an Owner calibration) of a
+  // known stored calibration is `acquiring`; the server says it is stored
+  // (`stored_known`), so the badge never reads "not calibrated". A source
+  // with nothing stored that is acquiring is still "not calibrated".
+  for (const locale of ['ja', 'en']) {
+    const m = messages[locale];
+    const item = { origin: 'none', version: null, calibrated_at: null, phase: 'acquiring', detection: 'inactive',
+      detection_reason: 'unavailable' };
+    const stored = render(createElement(CalibrationCard, { t: m, item: source({ ...item, stored_known: true }),
+      name: null, disabled: false, confirmed: false, onConfirm: noop }));
+    for (const text of [m.calibrationOriginPending, m.calibrationPhase_acquiring]) {
+      assert.ok(stored.includes(text), `${locale} ${text}`);
+    }
+    for (const text of [m.calibrationOrigin_none, m.calibrationOriginUnknown]) {
+      assert.ok(!stored.includes(text), `${locale} ${text}`);
+    }
+    const never = render(createElement(CalibrationCard, { t: m, item: source(item), name: null, disabled: false,
+      confirmed: false, onConfirm: noop }));
+    assert.ok(never.includes(m.calibrationOrigin_none), locale);
+    assert.ok(!never.includes(m.calibrationOriginPending), locale);
+  }
+  const [parsed] = parseSceneCalibration({ sources: [source({ origin: 'none', version: null, calibrated_at: null,
+    phase: 'acquiring', stored_known: true })] });
+  assert.equal(parsed.stored_known, true);
 });
 
 test('every refusal and calibration text exists in both locales', () => {
