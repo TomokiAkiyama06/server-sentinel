@@ -391,6 +391,98 @@ with the value-free validation message, and `python -m app` logs
 with the mandatory checks silently absent. Supplying only some of them, or any
 invalid value, also fails `--check`.
 
+#### Approving the hardware baseline locally (Issue #390, Owner decision 2026-11-05)
+
+Until an Owner approves a baseline, every startup and daily check reports
+all four kinds `UNVERIFIABLE` / `BASELINE_REQUIRED`, and the storage one
+raises the immediate `hardware_integrity_failure` each time. The service
+never approves a baseline itself. The Owner approves it with a local command
+on the Main Server (`python -m app.integrity.admin_cli`), with the same trust
+model as the camera command below (Owner decision D3): run it **as the
+service account**, from an interactive SSH or console session of an
+administrator, with the installed release's interpreter, never as root or
+from a checkout. There is no Web approval and no WebAuthn step-up; `approve`
+needs the word `APPROVE` typed on the controlling terminal (`/dev/tty`) and
+has no flag that skips it. That confirmation authorizes exactly one audited
+Owner operation: the new baseline, its `integrity_audit` row and the
+`approve_hardware_baseline` security audit record (actor `owner`, target the
+fixed logical baseline ID only) commit in one transaction.
+
+- `show` (read-only, allowed while the service runs) collects the inventory
+  with the service's own read-only probe and prints, per kind, the component
+  count (or `unavailable`), the stored baseline's revision and counts, the
+  comparison as `kind state reason count notify` lines (`notify=failure` is
+  the immediate `hardware_integrity_failure`, `warning` a daily-summary
+  warning), a preview of what an unchanged host would report once the current
+  inventory is approved, and the service's last recorded check. It never
+  prints a serial, UUID, WWN/WWID, PCI address or id, model string or path.
+- `approve` refuses while the service runs (`service_running`), detected as
+  in the camera command (any other process of the service account holding
+  the database, also another local admin command), before the prompt and
+  again inside the transaction: the running service compares only at start
+  and every 24 hours, so stop it, approve, and start it; the startup check
+  then compares against the new baseline at once. Stop the upstream socket
+  together with the service (`server-sentinel-upstream.socket`, "Human
+  upstream through socket activation" below): with socket activation an
+  incoming dashboard connection starts a service that was stopped alone, and
+  `approve` is then refused again. On a host without that socket unit, stop
+  and start the service only. It shows the counts, the current inventory
+  compared with the baseline it replaces (`current vs baseline` with its
+  findings, so a same-count replacement shows as `CHANGED`) and the preview,
+  asks for `APPROVE`, collects the inventory again and refuses
+  (`inventory_changed`) unless it is the one shown, and approves it with the
+  baseline revision read before the prompt: a baseline changed meanwhile is
+  refused (`baseline_revision_changed`). A collection without any component
+  is refused (`inventory_empty`).
+
+```sh
+cd /opt/server-sentinel-main/current
+sudo -u <service account> ./venv/bin/python -m app.integrity.admin_cli \
+  show --config /etc/server-sentinel/deployment.json
+sudo systemctl stop server-sentinel-upstream.socket server-sentinel.service
+sudo -u <service account> ./venv/bin/python -m app.integrity.admin_cli \
+  approve --config /etc/server-sentinel/deployment.json      # type APPROVE
+#    prints: baseline approved: revision=<n> components: CPU=<n> MEMORY=<n|unavailable> STORAGE=<n> GPU=<n>
+sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
+sudo -u <service account> ./venv/bin/python -m app.integrity.admin_cli \
+  show --config /etc/server-sentinel/deployment.json      # last recorded check
+```
+
+Approve only an inventory the Owner recognizes as this host's intended
+hardware: check the counts against the machine (or the VM definition) before
+typing `APPROVE`. After an intended hardware change (a replaced disk, added
+memory, another GPU), the check reports it as `CHANGED` / `MISSING` /
+`NEW_DEVICE` until approved: confirm the change was the intended one with
+`show`, then run the same stop, `approve`, start sequence. Never approve to
+silence an unexplained `CHANGED` or `MISSING`; investigate it first.
+
+Expected residual findings after an approval: a CPU exposes no unique
+identifier, so it stays `UNVERIFIABLE` / `UNIQUE_ID_UNAVAILABLE` (a warning,
+not the immediate failure; CPU model and topology alone cannot prove the
+same physical part). A kind whose probe is unavailable (for example `MEMORY`
+when `dmidecode --type 17` is not readable by the service account) is
+approved as unavailable and stays `UNVERIFIABLE` / `PROBE_UNAVAILABLE`. A
+display controller without a UUID/serial from `nvidia-smi` (no NVIDIA driver,
+an integrated GPU, a VM's virtual display device) is still listed by its PCI
+fields but stays `UNVERIFIABLE` / `UNIQUE_ID_UNAVAILABLE`; a disk without a
+serial or WWID stays `UNVERIFIABLE`, which for storage keeps the immediate
+failure. The preview states which apply before the confirmation.
+
+The command runs as the service account but not under the service unit's
+`NoNewPrivileges=true` / `RestrictSUIDSGID=true`. On a host where `dmidecode`
+is setuid or has file capabilities, the command may therefore read memory
+identifiers that the service cannot; the approved `MEMORY` components then
+compare as `UNVERIFIABLE` / `PROBE_UNAVAILABLE` in the service (a warning,
+never the immediate failure). Run `show` after the next start to see what
+the service itself reports.
+
+**VM deployment (Owner decision 2026-10-22).** Inside the VM the probe sees
+only the VM's virtual CPU, memory, disks and display device plus the devices
+passed through to it, never the physical host. The approved baseline is the
+VM's view: a change of host hardware that is not passed into the VM is not
+detected. Run the command inside the VM guest (as for the camera command),
+never from the host.
+
 ### Local UVC section (optional)
 
 The optional `local_uvc` object names the logical Camera Registry sources
@@ -515,8 +607,11 @@ service runs with; the database is that deployment's existing one, of exactly
 this release's schema (never created or migrated).
 
 The service reads its sources and approvals when it starts, so **stop it
-first**: `create-source` and `approve` refuse while it runs
-(`service_running`). The running service is detected as any other process of
+first, together with the upstream socket** (`server-sentinel-upstream.socket`,
+"Human upstream through socket activation" below; with socket activation an
+incoming dashboard connection starts a service that was stopped alone; on a
+host without that socket unit, stop and start the service only):
+`create-source` and `approve` refuse while it runs (`service_running`). The running service is detected as any other process of
 the service account that holds the application database open (every Main
 process keeps a descriptor on it for its whole lifetime): no camera is probed
 for that, and a crash leaves nothing behind that would block the command. A
@@ -544,7 +639,7 @@ service started within that last transaction is not refused.
 
 ```sh
 cd /opt/server-sentinel-main/current
-sudo systemctl stop server-sentinel.service
+sudo systemctl stop server-sentinel-upstream.socket server-sentinel.service
 # 1. create a source (repeat for up to 4); prints its UUID
 sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
   create-source --config /etc/server-sentinel/deployment.json \
@@ -561,7 +656,7 @@ sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
 # 4. approve one camera for one source (type APPROVE on the terminal)
 sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
   approve --config /etc/server-sentinel/deployment.json <source uuid> cam-<10 hex>
-sudo systemctl start server-sentinel.service
+sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
 ```
 
 - `create-source` creates an **enabled** `local_uvc` source with that

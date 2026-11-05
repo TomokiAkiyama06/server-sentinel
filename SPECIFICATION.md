@@ -2130,6 +2130,30 @@ UNVERIFIABLE
 
 Hardware drift never mutates the approved baseline automatically. The Owner must explicitly approve a new baseline/change. That approval is audited.
 
+Owner approval entry point (Issue #390, Owner decision 2026-11-05): until an
+Owner Web screen exists, the only approval path is the local Owner command
+`python -m app.integrity.admin_cli` (`show` / `approve --config
+<deployment.json>`), with the camera command's D3 trust model: run as the
+service account, never root; `approve` needs the word `APPROVE` typed on the
+controlling terminal, has no non-interactive bypass, and authorizes exactly one
+`OwnerAdministration.approve_integrity_baseline()` call, so the baseline, its
+`integrity_audit` row and the `approve_hardware_baseline` security audit record
+(target the fixed logical baseline ID) commit in one transaction. It approves
+the inventory freshly collected by the service's own read-only `LinuxProbe`
+and shown to the Owner as counts and as findings against the baseline it
+replaces (re-collected after the confirmation; a difference is
+refused as `inventory_changed`), with the baseline revision read before the
+prompt as `expected_revision` (`baseline_revision_changed`). `approve`
+refuses while the service runs (`service_running`, checked before the prompt
+and inside the transaction; the upstream socket is stopped with the service so
+socket activation cannot restart it), so the next startup check compares against the
+new baseline; `show` is read-only and allowed while it runs. Output is fixed
+kind/state/reason words and counts only, never an observed identifier, model
+string, PCI id or path. In a VM deployment (Owner decision 2026-10-22) the
+probe and therefore the baseline cover only the VM's virtual and passed-through
+hardware. A CPU exposes no unique identifier, so after approval it remains
+`UNVERIFIABLE` / `UNIQUE_ID_UNAVAILABLE` (a warning, not an immediate alert).
+
 A check that the ServerSentinel shutdown interrupts (Issue #385) did not complete: its partial inventory is discarded, never compared, recorded or notified as `CHANGED`/`MISSING`/`UNVERIFIABLE`, and the baseline is untouched. The startup check of the next start runs it.
 
 ### 10.3 Recording-health self-test
