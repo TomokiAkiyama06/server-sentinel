@@ -116,7 +116,7 @@ location stores its own immutable pin evidence in that same record, so a lockfil
 SHA256/SRI or resolved artifact URL that changes while the version string stays
 the same is a gate failure.
 
-Each command has a 600-second limit. The Python `lint` and `test` commands run
+Each command has a 900-second limit. The Python `lint` and `test` commands run
 with `PYTHONFAULTHANDLER=1` (equivalent to `python -X faulthandler`). When one
 exceeds the limit, CI sends it `SIGABRT`, so faulthandler writes every thread's
 traceback, and kills it if it has not exited 15 seconds later. A failure
