@@ -382,7 +382,11 @@ least 60):
   is sent from them (their not-online total stays far below five minutes in
   fifteen) and record the observed rate;
 - [ ] `systemctl stop` / restart with every camera connected sends nothing;
-- [ ] with Slack unconfigured the row is `disabled`;
+- [ ] with Slack unconfigured the row is `disabled`, and the Owner's
+  dashboard shows the camera offline notice (Issue #301 item 2,
+  mock-verified only: `server/tests/test_camera_offline_notice_route.py`,
+  `web/tests/offline_notice.test.mjs`); the browser check is in §J
+  ("Issue #301 camera not passed back to the VM");
 - [ ] LXD VM configuration (D2): reproduce the host USB re-enumeration of
   Issue #301 (the VM loses the camera) and confirm the notification arrives;
   the host-side automatic re-pass (Issue #301 item 1) is separate.
@@ -2616,6 +2620,42 @@ addresses, serials and disk ids are in the private record only.
   pairing over the LAN (step 10), D2 host bind check, CT lookup, phone and
   desktop viewers and the second-device denial, hardware-integrity baseline
   in the VM, host-load measurements, rollback.
+
+### Issue #301 camera not passed back to the VM (pending, not executed)
+
+Procedure: `server/docs/REMOTE_LIVE_VIEW_SETUP.md`, "When a passed camera
+does not come back (Issue #301)". The behaviour was observed once on the real
+host (2026-10-19, record above); the dashboard notice and the documented
+recovery are mock-verified only (`server/tests/test_camera_offline_notice_route.py`,
+`server/tests/test_access_fault_notifications.py`,
+`web/tests/offline_notice.test.mjs`). Changing the LXD devices changes the
+production host and needs the Owner. Record serials and device names only in
+the private record. The host-side automatic re-pass (Issue #301 item 1) is
+outside ServerSentinel and not part of this check.
+
+- [ ] reproduce: a camera is lost by the guest while the host lists it (a
+  host re-enumeration, or `sudo lxc config device remove <vm> <camN>` as a
+  stand-in, recorded as such); the Live screen shows that source `offline`
+  and the other source stays `online`;
+- [ ] with Slack configured: one `camera_offline` arrives after
+  `after_seconds` (+ one monitoring tick), and the Owner's dashboard shows no
+  camera offline notice;
+- [ ] without `slack_webhook_url` (a temporary deployment change, restored
+  afterwards): no Slack request; within one minute after `after_seconds`
+  (+ one tick) the Owner's dashboard shows "カメラのオフラインを通知できません"
+  / "Camera offline cannot be notified" on every screen, on phone and
+  desktop, in ja and en; a `live:view`-only and a `recordings:view`-only
+  viewer see no such notice, and their `GET /api/monitoring/camera-offline`
+  is the generic not-found response (browser devtools);
+- [ ] the notice names no camera, shows no setting value, and claims no
+  cause;
+- [ ] recover with the documented `lxc config device remove` / `add` of that
+  camera's serial-identified `usb` device: no VM or service restart; the
+  guest lists the camera again, the source returns to `online` by itself,
+  and the notice disappears at about the next monitoring tick;
+- [ ] while the notice is shown, stopping the network between the browser
+  and the Main Server for over a minute replaces it with the "could not be
+  checked" line, not with nothing.
 
 ### Uninvited ordinary Tailnet member
 
