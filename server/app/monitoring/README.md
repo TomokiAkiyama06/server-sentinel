@@ -93,7 +93,11 @@ cross-thread `reservation()` waits at most `STOP_ADMISSION_WAIT_SECONDS` (5 s)
 for the worker: a reservation not granted by then is withdrawn before the
 worker takes it and refused as `STORAGE_ADMISSION_STOPPING`
 (`storage_admission_stop_timeout`, nothing written), so the caller handles it
-like any storage refusal. So a
+like any storage refusal. For the human access durable revocation marker the
+requirement then stays in memory only and a restart can lose it (the next
+start's check finds the exposure again only if it still exists); Owner
+decision 2026-11-05 accepts this trade-off. The cap is not a stop budget
+reserve term (`app/stop_budget.py`). So a
 stop before the tick submits the alert, but it reaches Slack only when the
 single delivery worker gets to it within that wait: queued behind a stalled or
 backlogged delivery, or with no wait left, it may never be sent (`close()`
