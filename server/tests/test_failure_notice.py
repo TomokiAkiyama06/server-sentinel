@@ -197,9 +197,16 @@ class NotifierTests(unittest.TestCase):
                                              f"(reason={reason})\n")
                     # A notice that was not delivered is not remembered.
                     self.assertFalse((self.state / "last-notice").exists())
-        # The worst case fits inside the unit's TimeoutStartSec=90.
-        self.assertLess(failure_notice.ATTEMPTS * failure_notice.TIMEOUT_SECONDS
-                        + (failure_notice.ATTEMPTS - 1) * failure_notice.RETRY_SECONDS, 90)
+        self.assertEqual(failure_notice.DELIVERY_SECONDS,
+                         failure_notice.ATTEMPTS * failure_notice.TIMEOUT_SECONDS
+                         + (failure_notice.ATTEMPTS - 1) * failure_notice.RETRY_SECONDS)
+
+    def test_the_lock_wait_outlasts_the_other_units_delivery(self):
+        # The later unit must wait out a whole delivery of the first, or both send.
+        self.assertGreater(failure_notice.LOCK_WAIT_SECONDS, failure_notice.DELIVERY_SECONDS)
+        self.assertEqual(failure_notice.WORST_CASE_SECONDS,
+                         failure_notice.SYSTEMCTL_TIMEOUT_SECONDS
+                         + failure_notice.LOCK_WAIT_SECONDS + failure_notice.DELIVERY_SECONDS)
 
     def test_reads_only_the_webhook_and_tolerates_the_rest(self):
         # A configuration the release refuses for another reason still names
@@ -507,7 +514,7 @@ class FailureNoticeInstallerTests(unittest.TestCase):
         self.assertNotIn("current", without_python)
         for expected in ("Type=oneshot", "User=" + account.pw_name, f"Group={account.pw_gid}",
                          "Wants=network-online.target", "After=network-online.target",
-                         "TimeoutStartSec=90", "RuntimeDirectory=server-sentinel-failure-notice",
+                         "RuntimeDirectory=server-sentinel-failure-notice",
                          "RuntimeDirectoryMode=0700", "RuntimeDirectoryPreserve=yes",
                          "NoNewPrivileges=true", "ProtectSystem=strict", "ProtectHome=true",
                          "PrivateTmp=true", "PrivateDevices=true", "CapabilityBoundingSet=",
@@ -547,6 +554,19 @@ class FailureNoticeInstallerTests(unittest.TestCase):
         for path in (self.watch_unit, self.watch_timer):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
         self.assertNotIn(b"--unless-active", self.notice_unit.read_bytes())
+
+    def test_systemd_never_stops_a_notice_that_could_still_be_sent(self):
+        # PR #392 review: the unit timeout covers the script's worst case, the
+        # watch's state query and the lock wait included, with a margin.
+        self.perform(self.arguments("install", "1.0.0"))
+        for path in (self.notice_unit, self.watch_unit):
+            with self.subTest(unit=path.name):
+                [line] = [line for line in path.read_text().splitlines()
+                          if line.startswith("TimeoutStartSec=")]
+                timeout = int(line.split("=", 1)[1])
+                self.assertEqual(timeout, 165)
+                self.assertGreaterEqual(timeout, failure_notice.WORST_CASE_SECONDS + 30)
+        self.assertEqual(failure_notice.WORST_CASE_SECONDS, 135)
 
     def test_start_limit_is_always_reached_by_a_start_that_keeps_failing(self):
         self.perform(self.arguments("install", "1.0.0"))

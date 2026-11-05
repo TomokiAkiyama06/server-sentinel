@@ -96,6 +96,12 @@ FAILURE_NOTICE_SCRIPT = "failure_notice.py"
 FAILURE_NOTICE_MARKER = (
     "# server-sentinel-failure-notice: placed by the ServerSentinel Main installer (Issue #321)")
 FAILURE_NOTICE_RUNTIME_DIRECTORY = "server-sentinel-failure-notice"
+# TimeoutStartSec= of both notice units (PR #392 review): the script's own
+# worst case (state query + lock wait + delivery = 135 s) plus 30 s for name
+# resolution and the configuration read, which no socket timeout bounds.
+FAILURE_NOTICE_TIMEOUT_MARGIN_SECONDS = 30
+FAILURE_NOTICE_TIMEOUT_SECONDS = (failure_notice.WORST_CASE_SECONDS
+                                  + FAILURE_NOTICE_TIMEOUT_MARGIN_SECONDS)
 MAX_FAILURE_NOTICE_BYTES = 32 * 1024
 # Issue #321 item 2: with Restart=on-failure, the service enters the failed
 # state (and OnFailure= fires) only once its start limit is hit, and
@@ -1293,7 +1299,7 @@ Type=oneshot
 User={account.pw_name}
 Group={account.pw_gid}
 ExecStart={_quote(python)} -I -S {_quote(script)} --config {_quote(config)}{mode}
-TimeoutStartSec=90
+TimeoutStartSec={FAILURE_NOTICE_TIMEOUT_SECONDS}
 RuntimeDirectory={FAILURE_NOTICE_RUNTIME_DIRECTORY}
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes

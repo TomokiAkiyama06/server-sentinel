@@ -2282,8 +2282,11 @@ The notice unit runs with `NoNewPrivileges=true`, `ProtectSystem=strict`
 sockets (name resolution and HTTPS). systemd cannot restrict a unit to one host
 name; the script itself only connects to a webhook that passes the rules above.
 It waits for `network-online.target` (`Wants=`/`After=`, not required), so a
-failure early in boot is reported once the network is up, bounded by its
-`TimeoutStartSec=90`.
+failure early in boot is reported once the network is up. Both notice units
+have `TimeoutStartSec=165`: the longest run of the script (the watch's 10 s
+state query, up to 65 s waiting for the other unit's lock, and a 60 s
+delivery) plus 30 s for name resolution and reading the configuration, so
+systemd never stops a run that would still have sent the notice.
 
 What it cannot report: a deployment without Slack (nothing else is
 configured to receive it), a configuration that is not readable JSON or whose

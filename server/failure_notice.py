@@ -54,16 +54,15 @@ MESSAGE = "ServerSentinel critical alert: service_start_failed"
 # The deployment loader's own bound (app/deployment.py MAX_CONFIGURATION_BYTES).
 MAX_CONFIGURATION_BYTES = 16 * 1024
 TIMEOUT_SECONDS = 10
-# Three attempts, 15 s apart: at most 3 * 10 + 2 * 15 = 60 s, inside the
-# unit's TimeoutStartSec=90. Only a failure that a later attempt can fix
-# (no answer, 429, 5xx) is retried.
+# Three attempts, 15 s apart: at most 3 * 10 + 2 * 15 = 60 s of delivery.
+# Only a failure that a later attempt can fix (no answer, 429, 5xx) is retried.
 ATTEMPTS = 3
 RETRY_SECONDS = 15
 COOLDOWN_SECONDS = 3600
 STATE_FILE = "last-notice"
 LOCK_FILE = "lock"
-# The other unit holds the lock for at most one delivery (60 s, see ATTEMPTS);
-# past this the notice is tried without it rather than not at all.
+# The other unit holds the lock for at most one delivery (DELIVERY_SECONDS,
+# 60 s); past this the notice is tried without it rather than not at all.
 LOCK_WAIT_SECONDS = 65
 LOCK_POLL_SECONDS = 0.5
 MAX_STATE_BYTES = 32
@@ -71,6 +70,13 @@ PREFIX = "ServerSentinel failure notice: "
 SERVICE = "server-sentinel.service"
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSTEMCTL_TIMEOUT_SECONDS = 10
+# The longest one run can take (PR #392 review): the watch's state query, the
+# wait for the other unit's lock, and a whole delivery. The installer derives
+# both units' TimeoutStartSec= from it (plus a margin for name resolution and
+# the configuration read, which the socket timeout does not bound), so
+# systemd never stops a run that would still have sent the notice.
+DELIVERY_SECONDS = ATTEMPTS * TIMEOUT_SECONDS + (ATTEMPTS - 1) * RETRY_SECONDS
+WORST_CASE_SECONDS = SYSTEMCTL_TIMEOUT_SECONDS + LOCK_WAIT_SECONDS + DELIVERY_SECONDS
 SLACK_PATH = re.compile(r"/services/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+")
 
 
