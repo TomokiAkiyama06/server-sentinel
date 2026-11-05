@@ -73,6 +73,21 @@ security audit record in one transaction, so a baseline change cannot commit
 without its durable audit record. Polling never updates it. This domain boundary does not decide the
 pending bootstrap/session/recovery policy or expose a human route.
 
+`admin_cli.py` (Issue #390, Owner decision 2026-11-05) is the only caller of
+that boundary: a local Owner command with the camera command's D3 trust model
+(`server/docs/DEPLOYMENT.md`, "Approving the hardware baseline locally").
+`show` compares a fresh `LinuxProbe` inventory with the baseline; `approve`
+refuses while the service runs, shows the same comparison, asks for `APPROVE` on the controlling
+terminal (no bypass flag), re-collects and refuses an inventory that differs
+from the one shown, and approves it with the revision read before the prompt.
+The store's `OwnerApproval` there is armed only by the one console grant the
+audit boundary consumed and returns the fixed `LOCAL_CONSOLE_OWNER_ID` as the
+`integrity_audit` actor (the console Owner has no application principal). Its
+output is fixed kind/state/reason words and counts only: raw observations,
+model strings, PCI ids and paths are never printed. Inside a VM the probe and
+the baseline cover only the VM's virtual and passed-through hardware (Owner
+decision 2026-10-22).
+
 `IntegrityService.startup()` always compares. The owning worker calls `tick()`
 regularly; monotonic timing enforces the 24-hour interval despite wall-clock
 rollback. This is a coordinator, not an installed timer. The #21 integration

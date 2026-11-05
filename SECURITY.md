@@ -903,7 +903,12 @@ Hardware inventory/SMART collection must use least privilege. If a privileged he
 
 The Issue #23 foundation uses fixed read-only command arguments, bounded output
 and time, a minimal environment, and no sudo or shell. Baseline approval denies by
-default, checks the expected revision and audits the approved principal. Raw
+default, checks the expected revision and audits the approved principal.
+The only approval entry point is the local Owner command
+`app.integrity.admin_cli` (Issue #390, D3 trust model): service account only,
+a confirmation typed on the controlling terminal with no bypass flag, refused
+while the service runs, and identifier-free output (kinds, states, fixed
+reasons and counts). Raw
 inventory never enters the fixed-category fault outbox. Self-test I/O shares the
 recorder worker's pinned root and reservations; only a journaled UUID artifact
 can be cleaned. Domain interfaces do not enable a human API or replace pending
