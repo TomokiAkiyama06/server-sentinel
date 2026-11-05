@@ -561,8 +561,9 @@ socket を監視し、EOF（または想定外の受信）で frame の送信を
 開いている間に来た接続は、その session の sender がすでに切断していれば古い session を閉じて受け付け、
 まだ接続中なら閉じて `refused`（`connection_limit`）を記録します（Issue #307: camera frame が止まって
 いる間の `capture_restart` で、再起動後の sender が古い session のせいで拒否されていた）。
-report の holder 行には、この `refused` 記録の件数を `holder_refused` として出します（1 回の holder
-実行として受け付けた、run ごとに 1 つの holder ファイルの合計）。残っていた別の process が camera を
+report の holder 行には、この `refused` 記録の件数を `holder_refused` として出します（`holder_frames`
+と同じく、集計対象の real 入力 run に対応しその run を覆う holder ファイルだけの合計。同じ run の重複
+ファイル・どの run とも対応しないファイル・不完全なファイルは数えない）。残っていた別の process が camera を
 取ろうとして拒否されたことを report から分かるようにするためで、gate ではなく `holder_verdict` は
 変わりません（#237）。
 集計は sender の各 `start`（= 1 epoch）について、同じ `run_id` の holder ファイルにその nonce の

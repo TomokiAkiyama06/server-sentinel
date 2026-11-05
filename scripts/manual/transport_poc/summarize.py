@@ -1852,10 +1852,12 @@ def load_holders(paths, summaries):
     a session per sender start nonce with consistent forwarded counts.
 
     ``holder_refused`` counts the holder's ``refused`` records (a connection
-    turned away while a live sender held the session, #307) over the holder
-    files accepted as one execution of a distinct run, so a leftover process
-    that tried to take the camera is visible. Informational only: it does not
-    change ``holder_verdict`` (#237).
+    turned away while a live sender held the session, #307), so a leftover
+    process that tried to take the camera is visible. Like ``holder_frames``
+    it counts only holder files matched to (and covering) a real-input run of
+    this report: a duplicate file of a run, a stale / unrelated file and a
+    rejected file add nothing. Informational only: it does not change
+    ``holder_verdict`` (#237).
 
     Returns ``(rates, linkage, row)``: holder CPU cores per run id (valid
     holders only), the linkage verdict per real-input summary (by ``id``) and
@@ -1884,7 +1886,6 @@ def load_holders(paths, summaries):
             continue
         seen.add(run_id)
         sessions[run_id] = _holder_sessions(rows)
-        refused += len(_kind(rows, "refused"))
         summary = real.get(run_id)
         samples = _kind(rows, "sample")
         if summary is None or not samples:
@@ -1907,6 +1908,7 @@ def load_holders(paths, summaries):
         run_allowed = 1 + sum(1 for a in _kind(summary.orchestrator, "action")
                               if a.get("action") == "restart_sender")
         frames += last.get("frames") or 0
+        refused += len(_kind(rows, "refused"))
         queue_drops += last.get("queue_drops") or 0
         forward_drops += last.get("forward_drops") or 0
         allowed += run_allowed

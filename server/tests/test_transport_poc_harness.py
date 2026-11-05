@@ -1311,6 +1311,23 @@ class SummarizerTests(unittest.TestCase):
         report = summarize.summarize([self.root], holder_files=[path])
         self.assertEqual(("fail", 1), (report["holder"]["holder_verdict"],
                                        report["holder"]["holder_refused"]))
+        # only files matched to a real-input run count, like holder_frames: a
+        # duplicate file of the run and an unrelated (stale) file add nothing
+        _write(self.root, "holder", _holder([sample, refused]))
+        _write(self.root, "duplicate", _holder([sample, refused, refused]))
+        _write(self.root, "stale", _holder([sample, refused, refused, refused]),
+               run_id="r20261010t000000ab")
+        report = summarize.summarize([self.root], holder_files=[
+            path, self.root / "duplicate.jsonl", self.root / "stale.jsonl"])
+        self.assertEqual((1, 100), (report["holder"]["holder_refused"],
+                                    report["holder"]["holder_frames"]))
+        report = summarize.summarize([self.root], holder_files=[self.root / "stale.jsonl"])
+        self.assertEqual(0, report["holder"]["holder_refused"])
+        # a holder that did not cover its run is not counted either
+        _write(self.root, "holder", _holder([sample, refused], end=2))
+        report = summarize.summarize([self.root], holder_files=[path])
+        self.assertEqual(("fail", 0), (report["holder"]["holder_verdict"],
+                                       report["holder"]["holder_refused"]))
 
     def test_holder_capture_counters_are_checked(self):
         # Issue #305: a restarted GStreamer child or a framing loss fails the
@@ -3415,6 +3432,20 @@ class ReceiverHeartbeatAckTests(unittest.TestCase):
         self.assertEqual((b"", []), instance._with_echo(stale, b"", []))
 
 
+def _loss_window_floor(fast):
+    """Shortest silent window (s) every candidate must detect (#237).
+
+    b_segment detects at worst at the window start + ``segment_seconds`` +
+    the loss timeout; the window must outlast that by ``LOSS_MARGIN_NS``
+    (the margin ``_must_disconnect`` keeps over the timeout). The scenarios
+    keep the documented loss timeout + 2.5 s rule, above this floor.
+    """
+    config = sender.SenderConfig(candidate="b_segment", host="127.0.0.1", port=1,
+                                 n_sources=1, fast=fast)
+    margin = summarize.LOSS_MARGIN_NS / summarize.SECOND
+    return config.loss_timeout_s + config.segment_seconds + margin
+
+
 class MiscTests(unittest.TestCase):
     def test_every_main_stop_outlasts_the_agent_loss_timeout(self):
         # #237: G5 requires an Agent loss detection for every Main stop, so
@@ -3422,13 +3453,12 @@ class MiscTests(unittest.TestCase):
         # timeout of that timing by the b_segment cadence + reply timeout
         # margin; the old 2 s fast stop could end undetected.
         for fast in (True, False):
-            loss_timeout = sender.SenderConfig(candidate="b_segment", host="127.0.0.1",
-                                               port=1, n_sources=1, fast=fast).loss_timeout_s
+            required = _loss_window_floor(fast)
             for name, spec in matrix.SCENARIOS.items():
                 for item in spec["fast" if fast else "full"].get("actions", []):
                     if item[1] == "sigstop":
                         with self.subTest(scenario=name, fast=fast):
-                            self.assertGreaterEqual(item[2], loss_timeout + 2.5)
+                            self.assertGreaterEqual(item[2], required)
 
     def test_no_blackhole_is_borderline_to_the_agent_loss_timeout(self):
         # #308: a 5 s blackhole against the 5 s loss timeout was detected
@@ -3438,13 +3468,14 @@ class MiscTests(unittest.TestCase):
         for fast in (True, False):
             loss_timeout = sender.SenderConfig(candidate="b_segment", host="127.0.0.1",
                                                port=1, n_sources=1, fast=fast).loss_timeout_s
+            required = _loss_window_floor(fast)
             for name, spec in matrix.SCENARIOS.items():
                 for item in spec["fast" if fast else "full"].get("proxy", []):
                     if item[1] != "blackhole":
                         continue
                     with self.subTest(scenario=name, fast=fast, at=item[0]):
                         if name in summarize.DISCONNECT_SCENARIOS:
-                            self.assertGreaterEqual(item[2], loss_timeout + 2.5)
+                            self.assertGreaterEqual(item[2], required)
                             self.assertTrue(summarize._must_disconnect(
                                 item, int(loss_timeout * 10**9)))
                         else:
@@ -3585,6 +3616,15 @@ class MiscTests(unittest.TestCase):
         # #237: ``select.select`` raised ValueError for fd >= 1024
         import fcntl
         import resource
+        # the soft limit is often 1024 (CI container): raise it for this test
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        wanted = 2048 if hard == resource.RLIM_INFINITY else min(hard, 2048)
+        if soft == resource.RLIM_INFINITY or soft < wanted:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+            except (ValueError, OSError):
+                self.skipTest("cannot raise the descriptor limit above 1024")
+            self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
         if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 1100:
             self.skipTest("descriptor limit too low for fd >= 1024")
         for event in ("open", "eof", "data"):
@@ -3596,13 +3636,19 @@ class MiscTests(unittest.TestCase):
                 self.addCleanup(high.close)
                 high.settimeout(1.0)  # like a holder session; must not wait
                 self.assertGreaterEqual(high.fileno(), 1024)
+                selector = selectors.DefaultSelector()
+                self.addCleanup(selector.close)
+                selector.register(high, selectors.EVENT_READ)
                 if event == "eof":
                     left.close()
                 elif event == "data":
                     left.sendall(b"x")
                 started = time.monotonic()
-                self.assertEqual(event != "open", holder.peer_gone(high))
+                self.assertEqual(event != "open", holder.peer_gone(selector, high))
                 self.assertLess(time.monotonic() - started, 0.5)
+                # the caller's selector is only queried, its registrations unchanged
+                self.assertEqual([high], [key.fileobj for key in
+                                          selector.get_map().values()])
 
     def test_holder_forwards_frames_from_capture_in_memory(self):
         frame = mock.Mock(data=b"\xff\xd8x\xff\xd9", received_monotonic=1.5)
@@ -3783,9 +3829,9 @@ class MiscTests(unittest.TestCase):
                 self.assertEqual(b"", third.recv(1))
             except ConnectionResetError:
                 pass  # closed with its HELLO unread
-            self.assertFalse(holder.peer_gone(instance.client))
+            self.assertFalse(holder.peer_gone(instance.selector, instance.client))
             second.close()
-            self.assertTrue(holder.peer_gone(instance.client))
+            self.assertTrue(holder.peer_gone(instance.selector, instance.client))
             instance.close()
             writer.close()
             rows = records.read_jsonl(out)
