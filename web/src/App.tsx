@@ -5,6 +5,7 @@ import { ApiError } from './api';
 import { AccessScreen } from './access/screen';
 import { CalibrationScreen } from './calibration/screen';
 import { LiveScreen } from './dashboard/live';
+import { CameraOfflineNotice, startOfflineNoticeSampling, type OfflineNoticeState } from './dashboard/offline_notice';
 import { messages, type Locale } from './i18n';
 import { RecordingsView } from './recordings/view';
 import { StorageView } from './setup/storage';
@@ -70,6 +71,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const [recordings, setRecordings] = useState<Recordings>({ state: 'pending' });
   const [storage, setStorage] = useState<Storage>({ state: 'pending' });
   const [wizard, setWizard] = useState<Wizard>({ state: 'pending' });
+  const [offlineNotice, setOfflineNotice] = useState<OfflineNoticeState>({ state: 'pending' });
   const [wizardBusy, setWizardBusy] = useState(false);
   const [wizardFailed, setWizardFailed] = useState(false);
   const [view, setView] = useState<View>('overview');
@@ -93,6 +95,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
     setRecordings({ state: 'pending' });
     setStorage({ state: 'pending' });
     setWizard({ state: 'pending' });
+    setOfflineNotice({ state: 'pending' });
     setWizardBusy(false);
     setWizardFailed(false);
     setView('overview');
@@ -183,6 +186,22 @@ export function App({ services = deniedServices }: { services?: DashboardService
     })();
     return () => controller.abort();
   }, [services, access, refresh, view]);
+
+  useEffect(() => {
+    // Issue #301: whether a camera offline reaches the Owner is Owner-only
+    // (the server refuses everyone else). Sampled once the session is loaded
+    // and every CAMERA_OFFLINE_NOTICE_REFRESH_MS after each answer, shown on
+    // every screen, so the notice does not depend on which screen the Owner
+    // left open. Changing screens neither restarts nor abandons a sample. The
+    // server reads it without an idle touch (Codex PR #388), so this
+    // background poll never keeps an unattended session alive. A refresh
+    // keeps the last answer until the next one arrives; a failed one replaces
+    // it with the "could not be checked" line.
+    const loader = services.loadCameraOfflineNotice;
+    if (!loader || access.state !== 'allowed' || access.role !== 'owner') return;
+    setOfflineNotice({ state: 'loading' });
+    return startOfflineNoticeSampling(loader, setOfflineNotice);
+  }, [services, access]);
 
   useEffect(() => {
     // Wizard progress is Owner-only and loaded fresh whenever Setup opens, so a
@@ -305,6 +324,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
           {access.state === 'failed' && <section className="notice" role="alert"><h1>{t.failedTitle}</h1><p>{t.failed}</p><button className="primary" onClick={() => setAttempt(value => value + 1)}>{t.retry}</button></section>}
           {access.state === 'allowed' && <>
             {signOut === 'failed' && <p role="alert" className="notice-inline">{t.signOutFailed}</p>}
+            {access.role === 'owner' && <CameraOfflineNotice t={t} notice={offlineNotice} />}
             <div className="page-heading"><div><span className="eyebrow">{t[access.role]}</span><h1>{t[selected]}</h1><p>{t[hint]}</p></div><span className="badge">{t.pending}</span></div>
             {selected === 'live' && canVisit(session, 'live') ? <LiveScreen services={services} t={t} />
               : selected === 'timeline' && canVisit(session, 'timeline') ? <TimelineScreen services={services} t={t} />
