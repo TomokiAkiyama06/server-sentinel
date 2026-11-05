@@ -38,7 +38,6 @@ numeric JSONL only (counts, fps, drops, CPU, RSS): no serial, path or port.
 import hashlib
 import os
 from pathlib import Path
-import select
 import selectors
 import signal
 import socket
@@ -106,8 +105,15 @@ def read_hello(connection):
 
 def peer_gone(connection):
     """Holder side: True if the sender closed (EOF / error) or sent anything
-    after its ``HELLO`` (it never does): its socket is readable. Never blocks."""
-    return bool(select.select([connection], [], [], 0)[0])
+    after its ``HELLO`` (it never does): its socket is readable. Never blocks.
+
+    Uses ``selectors`` like the holder loop and the sender: ``select.select``
+    raises ``ValueError`` for a descriptor >= 1024 (#237). A ``recv`` peek is
+    not used because on a socket with a timeout Python waits for readability
+    (up to that timeout) before the ``recv`` call, even with ``MSG_DONTWAIT``."""
+    with selectors.DefaultSelector() as selector:
+        selector.register(connection, selectors.EVENT_READ)
+        return bool(selector.select(timeout=0))
 
 
 def encode_frame(index, capture_ns, payload):

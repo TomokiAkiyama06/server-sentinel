@@ -64,6 +64,7 @@ SIDE_PROCESSES = {"both": ("receiver", "proxy", "sender"), "main": ("receiver",)
 # Impairments after which the Agent must have dropped the connection (G4):
 # always for reset / restart, and for a silent window only when it is longer
 # than the Agent loss timeout by a full second (no borderline expectation).
+# Sufficient only with the scenario rule of timeout + 2.5 s: see ``_must_disconnect``.
 LOSS_MARGIN_NS = SECOND
 # Two hosts: a connection only detects a Main-side stop/restart when Main
 # (Main clock) saw it end by the window end + DETECTION_NS + this grace, and
@@ -1657,7 +1658,15 @@ class RunSummary:
 def _must_disconnect(item, loss_timeout):
     """Whether a scheduled impairment ``[at, action, length?]`` must make the
     Agent drop the connection (G4): every reset / restart, and a silent
-    window at least the Agent loss timeout + ``LOSS_MARGIN_NS`` long."""
+    window at least the Agent loss timeout + ``LOSS_MARGIN_NS`` long.
+
+    The 1 s margin alone does not guarantee detection; it holds only because
+    of the scenario rule in ``matrix.py`` that every blackhole / Main stop is
+    at least the loss timeout + 2.5 s. ``b_segment`` replies once per segment,
+    so at worst it detects a window at its start + ``segment_seconds`` + the
+    loss timeout (fast: 1 s + 1.5 s): a window shorter than that can end
+    before the reply timeout and leave no loss to detect. Lowering that rule
+    (or raising ``segment_seconds``) needs this margin re-derived (#237)."""
     action, length = item[1], (item[2] if len(item) > 2 else 0)
     if action in ("reset", "restart_receiver"):
         return True
@@ -1842,6 +1851,12 @@ def load_holders(paths, summaries):
     Every real-input run is also linked to the holder (``holder_linkage``):
     a session per sender start nonce with consistent forwarded counts.
 
+    ``holder_refused`` counts the holder's ``refused`` records (a connection
+    turned away while a live sender held the session, #307) over the holder
+    files accepted as one execution of a distinct run, so a leftover process
+    that tried to take the camera is visible. Informational only: it does not
+    change ``holder_verdict`` (#237).
+
     Returns ``(rates, linkage, row)``: holder CPU cores per run id (valid
     holders only), the linkage verdict per real-input summary (by ``id``) and
     the report row (None without ``--holder``).
@@ -1854,7 +1869,7 @@ def load_holders(paths, summaries):
     sessions = {}  # run id -> nonce -> (opens, closes, {source: forwarded})
     frames = queue_drops = forward_drops = allowed = 0
     restarts = never_launched = stream_invalid = padding = 0
-    launch_failures = not_running = 0
+    launch_failures = not_running = refused = 0
     for path in paths:
         rows = records.read_jsonl(path)
         ids = {row.get("run_id") for row in rows}
@@ -1869,6 +1884,7 @@ def load_holders(paths, summaries):
             continue
         seen.add(run_id)
         sessions[run_id] = _holder_sessions(rows)
+        refused += len(_kind(rows, "refused"))
         summary = real.get(run_id)
         samples = _kind(rows, "sample")
         if summary is None or not samples:
@@ -1937,6 +1953,7 @@ def load_holders(paths, summaries):
                    "holder_padding_tolerated": padding,
                    "holder_launch_failures": launch_failures,
                    "holder_sources_not_running": not_running,
+                   "holder_refused": refused,
                    "holder_verdict": _combine(verdicts)}
 
 
@@ -2090,7 +2107,8 @@ def render(report):
                      f"{holder.get('holder_stream_invalid')}, padding_tolerated "
                      f"{holder.get('holder_padding_tolerated')}, launch_failures "
                      f"{holder.get('holder_launch_failures')}, not_running "
-                     f"{holder.get('holder_sources_not_running')})")
+                     f"{holder.get('holder_sources_not_running')}, holder_refused "
+                     f"{holder.get('holder_refused')})")
     lines.append("")
     lines.append("scenario            candidate   G1   G2   G3   G4   G5   G6  missing(rep/act)"
                  "  integrity   drop_acct   production  fast")

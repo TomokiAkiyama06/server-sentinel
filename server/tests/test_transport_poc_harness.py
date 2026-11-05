@@ -1285,6 +1285,33 @@ class SummarizerTests(unittest.TestCase):
         self.assertEqual("fail", report["holder"]["holder_verdict"])
         self.assertIn("holder: fail", summarize.render(report))
 
+    def test_holder_refused_is_reported_but_not_judged(self):
+        # #237: a connection the holder turned away (a leftover process while
+        # the sender held the session) is shown, without changing the verdict
+        orchestrator, receiver, sender_rows = _base("normal")
+        self.run_dir("normal-a_framed", orchestrator=[{**orchestrator[0], "inputs": "real"}],
+                     receiver=receiver, sender_rows=sender_rows)
+        sample = {"kind": "sample", "t_ns": 1, "frames": 100, "queue_drops": 0,
+                  "forward_drops": 0, "cpu_seconds": 0.1, "child_cpu_seconds": 0.0}
+        refused = {"kind": "refused", "t_ns": 2, "reason": "connection_limit"}
+        path = self.root / "holder.jsonl"
+        _write(self.root, "holder", _holder([sample]))
+        report = summarize.summarize([self.root], holder_files=[path])
+        self.assertEqual(("pass", 0), (report["holder"]["holder_verdict"],
+                                       report["holder"]["holder_refused"]))
+        self.assertIn("holder_refused 0)", summarize.render(report))
+        _write(self.root, "holder", _holder([sample, refused, {**refused, "t_ns": 3}]))
+        report = summarize.summarize([self.root], holder_files=[path])
+        self.assertEqual(("pass", 2), (report["holder"]["holder_verdict"],
+                                       report["holder"]["holder_refused"]))
+        self.assertIn("holder: pass (", summarize.render(report))
+        self.assertIn("holder_refused 2)", summarize.render(report))
+        # a failing holder still shows its refusals
+        _write(self.root, "holder", _holder([{**sample, "queue_drops": 1}, refused]))
+        report = summarize.summarize([self.root], holder_files=[path])
+        self.assertEqual(("fail", 1), (report["holder"]["holder_verdict"],
+                                       report["holder"]["holder_refused"]))
+
     def test_holder_capture_counters_are_checked(self):
         # Issue #305: a restarted GStreamer child or a framing loss fails the
         # holder; tolerated padding alone does not. Files without the
@@ -3554,6 +3581,29 @@ class MiscTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 holder.send_hello(right, bad)
 
+    def test_holder_peer_gone_accepts_a_descriptor_above_1023(self):
+        # #237: ``select.select`` raised ValueError for fd >= 1024
+        import fcntl
+        import resource
+        if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 1100:
+            self.skipTest("descriptor limit too low for fd >= 1024")
+        for event in ("open", "eof", "data"):
+            with self.subTest(event=event):
+                left, right = socket.socketpair()
+                self.addCleanup(left.close)
+                high = socket.socket(fileno=fcntl.fcntl(right.fileno(), fcntl.F_DUPFD, 1024))
+                right.close()
+                self.addCleanup(high.close)
+                high.settimeout(1.0)  # like a holder session; must not wait
+                self.assertGreaterEqual(high.fileno(), 1024)
+                if event == "eof":
+                    left.close()
+                elif event == "data":
+                    left.sendall(b"x")
+                started = time.monotonic()
+                self.assertEqual(event != "open", holder.peer_gone(high))
+                self.assertLess(time.monotonic() - started, 0.5)
+
     def test_holder_forwards_frames_from_capture_in_memory(self):
         frame = mock.Mock(data=b"\xff\xd8x\xff\xd9", received_monotonic=1.5)
         queue = mock.Mock()
@@ -3779,10 +3829,12 @@ class LoopbackMatrixTests(unittest.TestCase):
         orchestrator = matrix.Orchestrator(args, RUN)
         out = orchestrator.run(["normal", "outage_8s", "auth_other_ca", "route_probe"],
                                ["a_framed"])
-        orchestrator.run(["rst", "route_probe"], ["b_chunked"])
+        # #237: the fast blackhole (4 s, loss timeout + 2.5 s) is detected by
+        # every candidate, including b_segment, which replies once per segment
+        orchestrator.run(["rst", "outage_8s", "route_probe"], ["b_chunked"])
         # #237: the fast Main stop is long enough for b_segment's Agent to
         # detect it (G5), and the orchestrator confirms the SIGSTOP
-        orchestrator.run(["normal", "slow_stop_10s"], ["b_segment"])
+        orchestrator.run(["normal", "outage_8s", "slow_stop_10s"], ["b_segment"])
         actions = [row["action"] for row in records.read_jsonl(
             out / "slow_stop_10s-b_segment" / "orchestrator-both.jsonl")
             if row["kind"] == "action"]
@@ -3800,7 +3852,11 @@ class LoopbackMatrixTests(unittest.TestCase):
                                  row["g3"], detail)
                 self.assertIn(row["g4"], ("pass", "not_applicable"), detail)
                 self.assertIn(row["g5"], ("pass", "not_applicable"), detail)
-        self.assertGreater(runs[("outage_8s", "a_framed")]["reported_missing"], 0)
+        for candidate in ("a_framed", "b_chunked", "b_segment"):
+            row = runs[("outage_8s", candidate)]
+            detail = json.dumps(row, sort_keys=True)
+            self.assertEqual(("pass", "pass"), (row["g4"], row["g5"]), detail)
+            self.assertGreater(row["reported_missing"], 0, detail)
         self.assertEqual(0, runs[("auth_other_ca", "a_framed")]["receiver_accepted"])
         self.assertGreater(runs[("normal", "b_segment")]["receiver_accepted"], 0)
         for candidate in ("a_framed", "b_chunked"):
