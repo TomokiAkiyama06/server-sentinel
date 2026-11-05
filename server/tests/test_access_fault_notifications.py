@@ -31,6 +31,7 @@ from app.auth.passkeys import CredentialFinding, PasskeyCeremonies
 from app.auth.reservation import (
     DAILY_SECONDS, RETRY_WHILE_CLOSED_SECONDS, CheckKind, Reason, ReservationFault,
 )
+from app.cameras.uvc.config import LocalUvcConfiguration
 from app.main import HumanAccessCompositionRefused, create_app
 from app.media.recording.model import Limits
 from app.monitoring.config import MonitoringConfiguration, RecordingFilesystem
@@ -388,6 +389,55 @@ class CompositionTests(MonitoredAccessFixture):
         self.assertIs(fresh.attached, access)
         with self.assertRaises(ValueError):
             fresh.attach(self.access)
+
+    async def test_the_camera_offline_notice_reads_the_monitoring_status(self):
+        """Issue #301 item 2: the Owner's notice route reads the runtime's
+        value-free status; without a camera offline monitor (no local UVC
+        source) or without a monitoring runtime it stays unmounted, so the Web
+        shows "could not be checked" rather than a guessed false (PR #388)."""
+        def monitored_access():
+            fresh = AccessFaultMonitor()
+            check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker, sink=fresh)
+            access = HumanAccess(HumanAccessConfiguration(enabled=True), assets=self.assets,
+                                 store=self.store, reservation=check,
+                                 ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=check,
+                                                              clock=self.ceremony_clock, findings=fresh))
+            return access, MonitoringDependencies(access_faults=fresh)
+
+        # A monitoring runtime but no local UVC source (e.g. remote_agent only).
+        access, dependencies = monitored_access()
+        application = create_app(self.settings(), database=self.database, human_access=access,
+                                 storage_reservation=self.admission, monitoring=self.monitoring(),
+                                 monitoring_dependencies=dependencies)
+        self.assertIsNone(application.state.camera_offline)
+        self.assertIsNone(access.camera_offline_notice)
+        # With local UVC sources: the monitor exists and the reader is attached.
+        access, dependencies = monitored_access()
+        application = create_app(self.settings(), database=self.database, human_access=access,
+                                 storage_reservation=self.admission, monitoring=self.monitoring(),
+                                 monitoring_dependencies=dependencies,
+                                 local_uvc=LocalUvcConfiguration((uuid4(),)))
+        self.assertIsNotNone(application.state.camera_offline)
+        runtime = application.state.monitoring
+        read = access.camera_offline_notice
+        self.assertIs(False, read())
+        # No Slack in this configuration: a current offline condition is unnotified.
+        runtime._set(camera_offline_degraded=True)
+        self.assertIs(True, read())
+        runtime._set(camera_offline_notifications=True)
+        self.assertIs(False, read())
+        runtime._set(camera_offline_degraded=False, camera_offline_notifications=False)
+        self.assertIs(False, read())
+        # No monitoring runtime: no notice reader, so the route is the generic denial.
+        other_check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker)
+        unmonitored = HumanAccess(
+            HumanAccessConfiguration(enabled=True), assets=self.assets, store=self.store,
+            reservation=other_check,
+            ceremonies=PasskeyCeremonies(self.store, self.rp, session_gate=other_check,
+                                         clock=self.ceremony_clock))
+        create_app(self.settings(), database=self.database, human_access=unmonitored,
+                   storage_reservation=self.admission)
+        self.assertIsNone(unmonitored.camera_offline_notice)
 
     async def test_a_monitor_left_out_of_the_runtime_is_refused(self):
         """Codex PR #271 (P2): a monitor installed as a sink but not handed to

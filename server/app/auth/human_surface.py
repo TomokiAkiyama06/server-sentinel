@@ -108,7 +108,17 @@ WebSocket and error path gets the same generic denial):
   authorization's epoch). ``200 {"outcome": "calibrated", "version",
   "calibrated_at"}`` or ``200 {"outcome": "refused", "reason"}`` with a
   fixed reason (no frame, insufficient quality, an unsuitable scene, ...);
-  every other refusal is the generic denial.
+  every other refusal is the generic denial;
+- the Owner's camera offline notice (Issue #301 item 2), mounted only when
+  the embedder attached its reader (``HumanAccess.attach_camera_offline_notice``;
+  otherwise the generic denial): ``GET /api/monitoring/camera-offline``
+  (``OWNER_READ``) answers ``200 {"offline_unnotified": <bool>}``, true while
+  a camera source has stayed not online past the deployment threshold (or
+  is in an alerted flapping period) and no notification destination (Slack)
+  is configured, so the Owner is not notified outside the dashboard. One
+  boolean: no source id, name, count, time, reason or setting value. The
+  Web polls it in the background, so it never extends the session's idle
+  expiry (``touch=False``, Codex PR #388).
 
 The four ceremony routes run before a credential exists (AUTH-013). Each is
 rate-limited per verified proxy identity before the request body is parsed
@@ -152,7 +162,8 @@ reaches SQLite only for a live session held for that token, so closes are
 bounded by opens); frame polls to the
 service's own in-memory budget per live session, charged only to its holder. No recording,
 timeline, event, health or version route is mounted here; the scene
-calibration routes (Issue #205) report calibration state, not events. The step-up routes require ``OWNER_READ`` (an Owner
+calibration routes (Issue #205) report calibration state, not events, and
+the camera offline notice (Issue #301) one Owner-only boolean. The step-up routes require ``OWNER_READ`` (an Owner
 session, fresh or stale),
 so a non-Owner gets the generic denial inside the authorization transaction.
 Neither step-up route commits an idle touch: only a successful step-up
@@ -243,6 +254,8 @@ LIVE_SESSIONS_PATH = "/api/live/sessions"
 # The Owner's scene calibration (Issue #205).
 SCENE_CALIBRATION_PATH = "/api/scene/calibration"
 SCENE_SOURCES_PATH = "/api/scene/sources"
+# Issue #301 item 2: the Owner's camera offline notice.
+CAMERA_OFFLINE_NOTICE_PATH = "/api/monitoring/camera-offline"
 MAX_CALIBRATE_BODY = 128
 MAX_LIVE_OPEN_BODY = 128
 MAX_OPTIONS_BODY = 1024
@@ -472,6 +485,11 @@ ROUTES: tuple[Route, ...] = (
           mutating=False, csrf=False, body_limit=0),
     Route("POST", _with_ids(SCENE_SOURCES_PATH, "/", ("source",), "/calibration"), Requirement.OWNER_OP,
           "_scene_calibrate", mutating=True, csrf=True, body_limit=MAX_CALIBRATE_BODY),
+    # Issue #301 item 2: whether a camera offline the Owner would be notified
+    # of reaches no notification destination. OWNER_READ: the notification
+    # configuration is the Owner's alone.
+    Route("GET", _exact(CAMERA_OFFLINE_NOTICE_PATH), Requirement.OWNER_READ, "_camera_offline_notice",
+          mutating=False, csrf=False, body_limit=0),
 )
 
 
@@ -805,6 +823,9 @@ class HumanAccess:
         # Optional component (``attach_scene_calibration``): without it both
         # scene calibration routes are the generic denial.
         self.scene_calibration: SceneCalibrationService | None = None
+        # Optional component (``attach_camera_offline_notice``, Issue #301):
+        # without it the notice route is the generic denial.
+        self.camera_offline_notice: Callable[[], bool] | None = None
         # S7 interim live (optional component, ``attach_live``): without it
         # every live route is the generic denial.
         self.live: LiveFrameService | None = None
@@ -855,6 +876,22 @@ class HumanAccess:
         if self.scene_calibration is not None and self.scene_calibration is not service:
             raise HumanAccessUnavailable()
         self.scene_calibration = service
+
+    def attach_camera_offline_notice(self, read: Callable[[], bool]) -> None:
+        """Mount the Owner's camera offline notice route over ``read`` (#301).
+
+        ``read()`` answers whether a camera offline condition the Owner would
+        be notified of is current while no notification destination is
+        configured (``MonitoringStatus.camera_offline_unnotified``). It must
+        be quick and never block: it runs on a worker thread inside ``admit``
+        of the authorization's epoch. Attached once; another reader is
+        refused.
+        """
+        if not callable(read):
+            raise HumanAccessUnavailable()
+        if self.camera_offline_notice is not None and self.camera_offline_notice is not read:
+            raise HumanAccessUnavailable()
+        self.camera_offline_notice = read
 
     def _attach_live(self, live: LiveFrameService) -> None:
         previous = self.live
@@ -1786,6 +1823,39 @@ class HumanSurface:
             "history_unknown": item.history_unknown, "stored_known": item.stored_known,
             "detection": item.detection, "detection_reason": item.detection_reason,
         } for item in sources]})
+
+    async def _camera_offline_notice(self, request: _Request) -> None:
+        """``GET /api/monitoring/camera-offline`` (``OWNER_READ``, Issue #301).
+
+        Read inside ``admit`` of the authorization's epoch after the Owner
+        session was read again (``require_owner_read_session``), like the
+        scene calibration status. ``200 {"offline_unnotified": <bool>}``.
+        Anything but a ``bool`` from the reader, or a reader failure, is the
+        generic denial, never a guessed ``false``.
+
+        Authorized with ``touch=False`` (Codex PR #388 P1): the Web samples
+        this route every 60 s without user interaction, so a read must never
+        renew the session's idle expiry; an unattended Owner dashboard still
+        ends at the idle and absolute limits.
+        """
+        read = self.access.camera_offline_notice
+        if read is None:
+            raise _Denied()
+        authorized = await self._authorize(request, Requirement.OWNER_READ, touch=False)
+        access = self.access
+
+        def answer():
+            with access.admit(authorized.epoch):
+                access.store.require_owner_read_session(authorized.session)
+                return read()
+
+        try:
+            value = await asyncio.to_thread(answer)
+        except Exception:
+            raise _Denied() from None
+        if type(value) is not bool:
+            raise _Denied()
+        await self._json(request.send, 200, {"offline_unnotified": value})
 
     async def _scene_calibrate(self, request: _Request) -> None:
         """``POST /api/scene/sources/<source>/calibration`` (``OWNER_OP``, CSRF).
