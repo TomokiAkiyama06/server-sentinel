@@ -12,6 +12,11 @@ import threading
 from urllib.parse import quote
 
 
+# SQLite busy timeout of every connection, per statement (Issue #383 counts
+# it in the Main stop budget, `app.stop_budget`).
+BUSY_TIMEOUT_SECONDS = 5
+
+
 # POSIX record locks belong to a process and an inode, not to a descriptor:
 # closing *any* descriptor this process holds on a file releases every fcntl
 # lock the process holds on it, including the SHARED/RESERVED/PENDING locks of
@@ -269,7 +274,7 @@ class Database:
                 pass
             else:
                 _adopt_locked(descriptor)
-        connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+        connection = sqlite3.connect(self.path, timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
@@ -305,7 +310,7 @@ class Database:
             raise ValueError("database location is unavailable")
         connection = sqlite3.connect(
             "file:" + quote(str(self.path)) + "?mode=ro", uri=True,
-            timeout=5, isolation_level=None,
+            timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
         )
         try:
             header = read_database_prefix(self.path, 20)
@@ -438,7 +443,7 @@ class PinnedDatabase:
         self._verify()
         connection = sqlite3.connect(
             "file:" + quote(str(self.path)) + "?mode=" + mode, uri=True,
-            timeout=5, isolation_level=None,
+            timeout=BUSY_TIMEOUT_SECONDS, isolation_level=None,
         )
         try:
             # The path could have been swapped between the check and the open.

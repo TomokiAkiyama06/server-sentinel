@@ -417,7 +417,7 @@ fail `--check`). `frame_stall_seconds` (0.25–30) is how long a live capture
 may deliver no frame before its source is reported `degraded`
 (`video_frame_stalled`) instead of `online`; the effective window is never
 shorter than 10 negotiated frame intervals, so a slow profile cannot flap.
-`join_timeout_seconds` (0.1–60, default 10, and not less than
+`join_timeout_seconds` (0.1–40, default 10, and not less than
 `frame_stall_seconds`) bounds the total time a stop or shutdown waits for all
 source workers, which stop in parallel; it must cover the camera teardown (up
 to 5.5 s observed on a real C960 after an unplug) plus the 1 s offline
@@ -444,20 +444,30 @@ the row can stay `online` until the next start, which writes it `offline`
 before any capture opens. The local UVC stop as a whole can take up to
 `join_timeout_seconds` + 1 s for the frame-progress watchdog join + 1 s for
 the fenced `offline` writes of workers that outlived the join + 1 s for
-pending health-sink deliveries (63 s at the 60 s maximum), and the remaining
+pending health-sink deliveries (43 s at the 40 s maximum), and the remaining
 shutdown steps (notification settle, monitoring runtime, audit retention)
 follow it. Issue #364: the local UVC stop bound plus the notification settle
 (12 s without a scene timeline, else the timeline's `dispatch_settle_seconds`)
-must stay within 80 s, `TimeoutStopSec=90` less a 10 s reserve for the steps
-without a configurable bound (the reserve does not yet bound an in-flight
-hostname reservation check or a queued monitoring job, Issue #383); `create_app()` refuses a composition that
-exceeds it (`app/stop_budget.py`). Every `local_uvc` setting this file
-accepts fits with the 12 s settle, so `--check` is never refused by it. The wait of
+must stay within 55 s, `TimeoutStopSec=90` less a 35 s reserve for the steps
+without a configurable bound (Issue #383: 5 s HTTP graceful shutdown, 15 s for
+an in-flight hostname reservation check whose enumerations share one 10 s
+deadline plus one SQLite busy timeout, 11 s scene stop, about 4 s for the
+process exit; once the stop began a monitoring tick starts no further long
+step); `create_app()`
+refuses a composition that exceeds it (`app/stop_budget.py`). This file
+accepts `join_timeout_seconds` up to 40 s, the most that fits with the 12 s
+settle, so `--check` refuses a longer join (before Issue #383 it accepted up
+to 60 s: check an existing deployment file before updating). Not yet bounded
+(Issue #383 phase 2): a wait for the storage admission behind a monitoring
+job, the SQLite busy timeouts of the writes in the human access stop, timeline
+finish and dispatch, a hung filesystem call, and the one monitoring step
+already running when the stop began (an integrity probe run, about 10 s per
+probe, or the recording self-test), which the settles queue behind. The wait of
 the monitoring runtime's final storage sample (Issue #351) shares the bound of
 the notification settle before it, so it does not lengthen the stop. The installed
 unit sets `TimeoutStopSec=90` explicitly (Owner decision 2026-10-08), so the
 stop bound does not depend on the host's `DefaultTimeoutStopSec` and stays
-above that 63 s local UVC bound. A rollback restores the target release's own
+above that 43 s local UVC bound. A rollback restores the target release's own
 unit snapshot, so a release installed before this change runs with that
 snapshot's (default) stop timeout.
 `frame_stall_reopen_seconds` (0.5–300, not less than `frame_stall_seconds`,
