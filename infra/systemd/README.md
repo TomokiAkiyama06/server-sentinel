@@ -14,3 +14,10 @@ creates the loopback human upstream as root and passes it to the unprivileged
 backend gets no capability for it; the hostname reservation check verifies
 through unprivileged sock_diag that the upstream was created by this unit.
 Installation steps are in `server/docs/DEPLOYMENT.md`.
+
+`server-sentinel-failure-notice.service` is rendered and placed by
+`server/install.py` too (Issue #321 item 2): a hardened oneshot unit, started
+only by `OnFailure=` of `server-sentinel.service`, that runs the
+standard-library-only `failure_notice.py` from the installation root and sends
+one fixed Slack message when the service cannot start. See
+`server/docs/DEPLOYMENT.md`, "Start-failure notice".

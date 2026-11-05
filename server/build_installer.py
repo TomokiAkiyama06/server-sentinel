@@ -36,6 +36,9 @@ def build(destination: Path) -> str:
     with tempfile.TemporaryDirectory(prefix="server-sentinel-installer-") as temporary:
         stage = Path(temporary)
         shutil.copyfile(ROOT / "install.py", stage / "install.py")
+        # Issue #321: copied unchanged to the installation root, standard
+        # library only.
+        shutil.copyfile(ROOT / "failure_notice.py", stage / "failure_notice.py")
         # Deployment validation, including the optional monitoring section,
         # needs only these standard-library modules; no third-party package.
         for name in INSTALLER_MODULES:

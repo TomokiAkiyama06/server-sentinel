@@ -1771,7 +1771,10 @@ a different definition when the installer restarts the logical service.
 wrapper (Issue #180; see "The `serversentinel-pairing` wrapper" above). It
 names no release and follows `current`, so a switch never rewrites it and
 `rollback` leaves it alone; a hand-placed file at that path is refused before
-any change.
+any change. They also place the start-failure notice (Issue #321; see "Start-failure
+notice" below): `/etc/systemd/system/server-sentinel-failure-notice.service` and
+`<destination>/failure_notice.py`, both outside every release, with the same rule
+for a file the installer did not place.
 
 `--destination` is created when it does not exist. An existing directory is
 adopted only when it is empty or is already a ServerSentinel installation root,
@@ -2022,6 +2025,142 @@ fails rather than accepting a merely spawned process. Enabling the unit at boot
 remains an explicit administrator action. Install the Ubuntu package providing
 `venv` for the selected Python before the first release operation; the installer
 fails closed if it cannot create the per-release environment.
+
+**Start-failure notice (Issue #321 item 2, Owner decision 2026-11-05).**
+The monitoring runtime, and with it every in-service Owner notification, runs
+inside `server-sentinel.service`. A service that cannot start therefore could
+not tell anyone: production stayed down for about 12 days in October/November
+2026 because `--check` refused at every boot and no notice left the host. The
+generated unit now names a separate unit in `OnFailure=`:
+
+```ini
+[Unit]
+OnFailure=server-sentinel-failure-notice.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+[Service]
+Restart=on-failure
+RestartSec=5
+RestartMode=direct
+```
+
+When the service enters the failed state, systemd starts
+`server-sentinel-failure-notice.service`, a oneshot unit with no `[Install]`
+section (it is never enabled; only `OnFailure=` starts it). It runs, as the
+dedicated account, `<python> -I -S <destination>/failure_notice.py --config
+<deployment configuration>`, where `<python>` is the interpreter path given to
+the installer (`--python`, default `/usr/bin/python3`) as given, not the
+release's virtual environment. The script uses the standard library only and
+imports no application code, so it works when the release's `--check` refuses
+the configuration, when the release or its virtual environment is broken, and
+when the runtime filesystem is missing (the notice unit has no
+`RequiresMountsFor=`). It reads only `monitoring.slack_webhook_url`, accepts
+it only under the rules of the in-service sender (`https://hooks.slack.com/services/...`,
+no proxy, no redirect), and sends the fixed text
+
+```text
+ServerSentinel critical alert: service_start_failed
+```
+
+with a 10 s timeout per attempt and at most three attempts 15 s apart (a
+`429`, `5xx` or no answer is retried; any other answer is final). It prints one
+fixed line on its journal and never a URL, path, configuration value, response
+or exception text:
+
+| Journal line (`journalctl -u server-sentinel-failure-notice`) | Meaning |
+|---|---|
+| `ServerSentinel failure notice: sent` | Slack accepted the message |
+| `... suppressed (reason=recent_notice)` | a notice was already sent less than an hour ago in this boot |
+| `... not sent (reason=slack_not_configured)` | the configuration has no `slack_webhook_url` (exit 0) |
+| `... not sent (reason=webhook_unavailable)` | the configuration could not be read or parsed, or the webhook is invalid |
+| `... not sent (reason=delivery_failed)` / `delivery_rejected` | no answer after three attempts / Slack refused it |
+
+When it enters the failed state. With `Restart=on-failure` the service is
+restarted after every failed start or crash, and enters the failed state only
+when its start limit is hit (systemd.unit(5)). Since systemd 254 an automatic
+restart passes through the failed state by default and would start the
+`OnFailure=` unit on every failed attempt, and also after a crash that the next
+restart recovers from; `RestartMode=direct` skips that state, as systemd before
+254 already did (there the key is unknown and only logged as ignored). So:
+
+- a start that keeps failing (the `--check` refusal of the 2026-10 outage, a
+  launcher failure, a readiness timeout) is retried every 5 s; the sixth start
+  within 600 s is refused with `Result=start-limit-hit`, the unit enters the
+  failed state, and one notice is sent. Each attempt lasts at most
+  `TimeoutStartSec=60` plus `RestartSec=5`, so the limit is always reached
+  within the window, however slow each attempt is (about 30 s for a `--check`
+  that fails at once);
+- a crash that the next restart recovers from sends no notice here; the
+  restarted service reports it itself (Issue #351, `recording_health_failure`
+  for an unclean exit). Six starts within 600 s (a crash loop) end in the
+  failed state and send the notice;
+- a graceful `systemctl stop` (and a shutdown) leaves the unit inactive, not
+  failed, and sends nothing. A stop that exceeds `TimeoutStopSec=90` ends in
+  the failed state and does send it. During a shutdown the notice unit's
+  default `Conflicts=shutdown.target` is expected to keep it from starting;
+  that is not verified on real systemd;
+- a manual `systemctl start` within the 600 s window after the limit was hit
+  is refused at once. Whether systemd starts the notice unit again for a unit
+  that was already failed is not verified on real systemd; if it does, the
+  notice within the hour is suppressed (below). `sudo systemctl reset-failed
+  server-sentinel.service` clears the limit, and a later start that keeps
+  failing ends in the failed state again.
+
+At most one notice per failure episode. The time of the last notice sent is
+kept in the notice unit's `RuntimeDirectory=` (`/run/server-sentinel-failure-notice/last-notice`,
+`RuntimeDirectoryPreserve=yes`), which does not depend on the runtime root and
+is empty again after every reboot: a further failure within an hour in the same
+boot is suppressed, and the first failure of every boot is always reported
+(three boots that each fail send three notices). A notice that was not
+delivered is not remembered, so the next failure tries again.
+
+The notice unit runs with `NoNewPrivileges=true`, `ProtectSystem=strict`
+(its runtime directory is its only writable path), `ProtectHome=true`,
+`PrivateTmp=true`, `PrivateDevices=true`, no capabilities, the
+`@system-service` system-call filter and only `AF_UNIX AF_INET AF_INET6`
+sockets (name resolution and HTTPS). systemd cannot restrict a unit to one host
+name; the script itself only connects to a webhook that passes the rules above.
+It waits for `network-online.target` (`Wants=`/`After=`, not required), so a
+failure early in boot is reported once the network is up, bounded by its
+`TimeoutStartSec=90`.
+
+What it cannot report: a deployment without Slack (nothing else is
+configured to receive it), a configuration that is not readable JSON or whose
+webhook was removed or broken, a host without network or DNS, an interpreter
+at `--python` that no longer runs, and a release from before Issue #321 (its
+own unit snapshot has no `OnFailure=`, so a rollback to it switches the notice
+off; the notice unit stays installed and a later update switches it on again).
+A host that is down or never boots sends nothing either. Removing
+`server-sentinel-failure-notice.service` (or a drop-in that resets
+`OnFailure=`) switches it off; the next update places the file again.
+
+To try it on a disposable host or VM, never the production Main host, with a
+Slack webhook configured (a test channel):
+
+```bash
+# 1. make --check refuse: an unknown key is refused, the webhook stays readable
+sudoedit /etc/server-sentinel/deployment.json   # add "synthetic_check_failure": true
+sudo systemctl restart server-sentinel.service  # fails; restarts every 5 s
+# 2. about 30 s later: failed with start-limit-hit, and one message in Slack
+systemctl show -p ActiveState -p Result server-sentinel.service
+#    expect: ActiveState=failed, Result=start-limit-hit
+journalctl -u server-sentinel-failure-notice -b   # one "ServerSentinel failure notice: sent"
+# 3. a second failure within the hour sends no second message
+sudo systemctl reset-failed server-sentinel.service
+sudo systemctl start server-sentinel.service    # fails again, start limit after ~30 s
+journalctl -u server-sentinel-failure-notice -b   # "... suppressed (reason=recent_notice)"
+# 4. restore: remove the key again, clear the limit, start
+sudoedit /etc/server-sentinel/deployment.json
+sudo systemctl reset-failed server-sentinel.service
+sudo systemctl start server-sentinel.service
+# 5. a graceful stop sends nothing (no new journal line, no message)
+sudo systemctl stop server-sentinel.service && sudo systemctl start server-sentinel.service
+```
+
+`sudo rm /run/server-sentinel-failure-notice/last-notice` lets the next
+failure within the hour send again (for repeating the test). The record
+belongs in `MANUAL_TEST.md` (section V); do not paste the webhook, journal
+lines with host values, or the configuration into GitHub.
 
 **Database volume maintenance (Issue #152).** The service and the pairing CLI
 never close a descriptor they opened on the application database file, because

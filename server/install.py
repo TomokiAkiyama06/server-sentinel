@@ -22,6 +22,7 @@ from app.deployment import (
     DEVICE_NUMBERS_STALE_WARNING, CaptureCaSettingMissing, Deployment, WebAssetsRefused,
 )
 from app.settings import ConfigurationError
+import failure_notice
 
 
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
@@ -71,6 +72,29 @@ PAIRING_WRAPPER_MARKER = (
 PAIRING_MODULE = "app.cameras.remote_agent.pairing_cli"
 PAIRING_WRAPPER_OWNER = (0, 0)  # root:root; only root may replace the wrapper
 MAX_WRAPPER_BYTES = 16 * 1024
+# Issue #321 item 2 (Owner decision 2026-11-05): when server-sentinel.service
+# enters the failed state, systemd starts this oneshot unit (OnFailure=), which
+# runs failure_notice.py with the host interpreter and sends one fixed,
+# value-free Slack message. Both files live outside every release, so a
+# release that cannot start (or a runtime filesystem that is gone) cannot
+# silence the notice. The installer places them on install and update, next
+# to the service unit and in the installation root; rollback leaves them.
+FAILURE_NOTICE_UNIT = "server-sentinel-failure-notice.service"
+FAILURE_NOTICE_SCRIPT = "failure_notice.py"
+FAILURE_NOTICE_MARKER = (
+    "# server-sentinel-failure-notice: placed by the ServerSentinel Main installer (Issue #321)")
+FAILURE_NOTICE_RUNTIME_DIRECTORY = "server-sentinel-failure-notice"
+MAX_FAILURE_NOTICE_BYTES = 32 * 1024
+# Issue #321 item 2: with Restart=on-failure, the service enters the failed
+# state (and OnFailure= fires) only once its start limit is hit, and
+# RestartMode=direct (systemd 254+) keeps the attempts before it from passing
+# through the failed state, as systemd before 254 already did. Each attempt
+# lasts at most TimeoutStartSec (60 s) plus RestartSec, so five attempts, and
+# the refused sixth, always fall inside the 600 s window: a start that keeps
+# failing always ends in the failed state, however slow each attempt is.
+RESTART_SECONDS = 5
+START_LIMIT_BURST = 5
+START_LIMIT_INTERVAL_SECONDS = 600
 # Issue #10 phase 2 S5c: each release keeps the release manifest it was
 # installed from, so its Web build can be checked again before a rollback.
 RELEASE_MANIFEST = "release-manifest.json"
@@ -445,6 +469,15 @@ def render_unit(root: Path, config: Path, deployment: Deployment,
     ``ProtectControlGroups=true`` (not ``private``/``strict``), which keep
     sock_diag and ``/sys/fs/cgroup`` ids consistent.
 
+    ``OnFailure=`` (Issue #321 item 2, Owner decision 2026-11-05) starts
+    ``server-sentinel-failure-notice.service`` when the service enters the
+    failed state: with ``Restart=on-failure`` that is only once the start
+    limit is hit, and ``RestartMode=direct`` keeps every earlier failed
+    attempt (and a crash followed by a successful restart) out of the failed
+    state on systemd 254 and later, as it was before 254 (where the key is
+    unknown and only logged). The explicit start limit makes a start that
+    keeps failing always reach that state (see ``START_LIMIT_*``).
+
     ``After=time-sync.target`` (Issue #235 item 4, Owner decision
     2026-10-14): at boot the service waits until the host reports a
     synchronized clock, or until the wait service gives up (chrony-wait:
@@ -476,6 +509,9 @@ Description=ServerSentinel Main Server
 After=local-fs.target network.target
 After=time-sync.target
 RequiresMountsFor={_quote(deployment.runtime_root)}
+OnFailure={FAILURE_NOTICE_UNIT}
+StartLimitIntervalSec={START_LIMIT_INTERVAL_SECONDS}
+StartLimitBurst={START_LIMIT_BURST}
 
 [Service]
 Type=notify
@@ -488,6 +524,8 @@ WorkingDirectory={_unit_path(current)}
 ExecStartPre={_quote(python)} -m app.deployment --config {_quote(config)} --check
 ExecStart={_quote(python)} -m app.deployment --config {_quote(config)}
 {sockets}Restart=on-failure
+RestartSec={RESTART_SECONDS}
+RestartMode=direct
 UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
@@ -1148,6 +1186,153 @@ def _place_pairing_wrapper(root: Path, existing: bytes | None) -> bool:
     return existing is None
 
 
+class FailureNoticeConflict(OwnerActionRequired):
+    """A file this installer did not create is where the failure notice goes (Issue #321)."""
+
+
+def failure_notice_source() -> bytes:
+    """The bytes of ``failure_notice.py`` shipped with this installer, copied unchanged."""
+    content = failure_notice.__loader__.get_data(failure_notice.__file__)
+    if (not isinstance(content, bytes) or len(content) > MAX_FAILURE_NOTICE_BYTES
+            or content.split(b"\n", 1)[0] != FAILURE_NOTICE_MARKER.encode("ascii")):
+        raise ValueError("failure notice script is invalid")
+    return content
+
+
+def render_failure_notice_unit(root: Path, config: Path, account: pwd.struct_passwd,
+                               python: Path) -> str:
+    """Render ``server-sentinel-failure-notice.service`` (Issue #321 item 2).
+
+    A oneshot unit with no ``[Install]`` section: only the service's
+    ``OnFailure=`` starts it. It runs ``failure_notice.py`` from the
+    installation root with the host interpreter (``python`` as given to the
+    installer, not the release's virtual environment), isolated (``-I -S``),
+    as the dedicated account, so it reads the private deployment
+    configuration exactly as the service does and holds no privilege. It
+    depends on nothing of the service (no ``RequiresMountsFor=`` on the
+    runtime root, no release path), and waits for ``network-online.target``
+    without requiring it, so a boot-time failure is reported once the network
+    is up. Its only writable path is its ``RuntimeDirectory=`` under ``/run``
+    (kept between runs, gone at reboot), where it remembers the last notice.
+    systemd cannot restrict a unit to one host name, so the address families
+    are limited to what name resolution and HTTPS need, and the script itself
+    only connects to an endpoint that passes the ``SlackEndpoint`` rules.
+    """
+    root = _clean_absolute(Path(root))
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]*[$]?", account.pw_name):
+        raise ValueError("invalid dedicated account")
+    python = _clean_absolute(Path(python))
+    script = root / FAILURE_NOTICE_SCRIPT
+    return f"""{FAILURE_NOTICE_MARKER}
+# Started only by OnFailure= of server-sentinel.service; sends one fixed,
+# value-free Slack message (server/docs/DEPLOYMENT.md, Start-failure notice).
+# The installer replaces this file on install and update; do not edit it.
+[Unit]
+Description=ServerSentinel start-failure notice
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User={account.pw_name}
+Group={account.pw_gid}
+ExecStart={_quote(python)} -I -S {_quote(script)} --config {_quote(config)}
+TimeoutStartSec=90
+RuntimeDirectory={FAILURE_NOTICE_RUNTIME_DIRECTORY}
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+"""
+
+
+def _failure_notice_paths(root: Path, unit: Path) -> tuple[Path, Path]:
+    return unit.with_name(FAILURE_NOTICE_UNIT), root / FAILURE_NOTICE_SCRIPT
+
+
+def _existing_failure_notice(args, path: Path, mode: int) -> bytes | None:
+    """Return an installer-placed file's content, ``None`` when absent, or refuse.
+
+    As for the pairing wrapper, only a file whose first line is the marker is
+    ever replaced; anything else is the Owner's and the operation is refused
+    before any change. ``b""`` marks a placed file whose mode or link count
+    is no longer the placed one, so it is rewritten even when its text matches.
+    """
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    content = None
+    if stat.S_ISREG(info.st_mode) and info.st_size <= MAX_FAILURE_NOTICE_BYTES:
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as stream:
+                opened = os.fstat(stream.fileno())
+                content = stream.read(MAX_FAILURE_NOTICE_BYTES + 1)
+        except OSError:
+            content = None
+        else:
+            if (opened.st_ino, opened.st_dev) != (info.st_ino, info.st_dev):
+                content = None
+    if content is None or content.split(b"\n", 1)[0] != FAILURE_NOTICE_MARKER.encode("ascii"):
+        raise FailureNoticeConflict(
+            "ServerSentinel release operation refused before any change: "
+            f"{path} exists and was not created by this installer.\n"
+            "As the Owner:\n"
+            "  1. check what it is, then move it out of the way, for example\n"
+            f"     sudo mv {path} /root/{path.name}.before-installer\n"
+            f"  2. rerun the same command ({args.command} ...)\n"
+            "The installer then places its own start-failure notice there "
+            "(server/docs/DEPLOYMENT.md, Start-failure notice).\n")
+    if (info.st_uid != RELEASE_OWNER_UID or stat.S_IMODE(info.st_mode) != mode
+            or info.st_nlink != 1):
+        return b""
+    return content
+
+
+def _place_failure_notice(files) -> list[Path]:
+    """Place each ``(path, content, mode, existing)``; return the paths created.
+
+    Unchanged files are left alone. When anything fails, the files this call
+    created are removed before the error propagates (as for the wrapper); a
+    file that replaced an installer-placed one is kept.
+    """
+    created = []
+    try:
+        for path, content, mode, existing in files:
+            if existing == content:
+                continue
+            if existing is None:
+                # Before the write: a rename that succeeded before a failed
+                # directory fsync still leaves no created file behind.
+                created.append(path)
+            _replace_unit(path, content.decode("utf-8"), mode=mode)
+    except BaseException:
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
+    return created
+
+
 def _run_release_check(args, release: Path, account: pwd.struct_passwd, runner) -> None:
     """Run ``release``'s own deployment check against the current configuration.
 
@@ -1365,7 +1550,19 @@ def _execute_locked(args, runner) -> None:
 
     render(False)  # validate the account and paths before any change
     if args.command in {"install", "update"}:
+        # Issue #321: the failure notice runs the interpreter by the path the
+        # Owner gave (default /usr/bin/python3), not the release's resolved
+        # copy, so a host Python upgrade that breaks the release's virtual
+        # environment still leaves the notice able to say so.
+        notice_python = _clean_absolute(Path(args.python))
         args.python = _trusted_python(args.python)
+        _protected_parent(notice_python.parent)
+        notice_unit, notice_script = _failure_notice_paths(args.destination, args.unit)
+        notice_files = [
+            (notice_unit, render_failure_notice_unit(
+                args.destination, args.config, account, notice_python).encode("utf-8"), 0o644),
+            (notice_script, failure_notice_source(), RELEASE_FILE_MODE),
+        ]
         if args.command == "install":
             if _link_target(args.destination, "current") is not None or args.unit.exists():
                 raise ValueError("deployment already installed")
@@ -1374,6 +1571,10 @@ def _execute_locked(args, runner) -> None:
         # Before any change: a wrapper this installer did not create is refused.
         render_pairing_wrapper(args.destination)
         existing_wrapper = _existing_pairing_wrapper(args)
+        # Before any change too: a failure-notice file the installer did not
+        # place is refused (Issue #321).
+        notice_files = [(path, content, mode, _existing_failure_notice(args, path, mode))
+                        for path, content, mode in notice_files]
         previous_unit = None
         if args.command == "update":
             current = _link_target(args.destination, "current")
@@ -1393,14 +1594,19 @@ def _execute_locked(args, runner) -> None:
         if args.command == "install":
             created_unit = False
             created_wrapper = False
+            created_notice = []
             try:
                 _create_unit(args.unit, unit_content)
                 created_unit = True
                 created_wrapper = _place_pairing_wrapper(args.destination, existing_wrapper)
+                # Before daemon-reload, so OnFailure= names a loaded unit.
+                created_notice = _place_failure_notice(notice_files)
                 runner(["systemctl", "daemon-reload"], check=True, timeout=30)
                 _switch(args.destination, target, runner)
             except Exception:
                 # Only a unit or wrapper this transaction created may be removed.
+                for path in created_notice:
+                    path.unlink(missing_ok=True)
                 if created_wrapper:
                     PAIRING_WRAPPER.unlink(missing_ok=True)
                 if created_unit:
@@ -1426,6 +1632,10 @@ def _execute_locked(args, runner) -> None:
                 # The wrapper names no release (it follows "current"), so a
                 # failed update keeps it: it then runs the restored release.
                 _place_pairing_wrapper(args.destination, existing_wrapper)
+                # Release-independent like the wrapper: a failed update keeps
+                # them, and the restored unit either names this notice unit
+                # or (a release from before Issue #321) does not start it.
+                _place_failure_notice(notice_files)
                 _replace_unit(args.unit, unit_content)
                 runner(["systemctl", "daemon-reload"], check=True, timeout=30)
                 _switch(args.destination, target, runner, restore_service=restore_unit)
