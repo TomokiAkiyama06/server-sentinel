@@ -19,5 +19,8 @@ Installation steps are in `server/docs/DEPLOYMENT.md`.
 `server/install.py` too (Issue #321 item 2): a hardened oneshot unit, started
 only by `OnFailure=` of `server-sentinel.service`, that runs the
 standard-library-only `failure_notice.py` from the installation root and sends
-one fixed Slack message when the service cannot start. See
+one fixed Slack message when the service cannot start, plus
+`server-sentinel-start-watch.timer` / `.service`, a once-per-boot check (the
+service `Wants=` the timer) for a start that a failed dependency, such as the
+runtime mount, never ran. See
 `server/docs/DEPLOYMENT.md`, "Start-failure notice".

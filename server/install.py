@@ -80,6 +80,18 @@ MAX_WRAPPER_BYTES = 16 * 1024
 # silence the notice. The installer places them on install and update, next
 # to the service unit and in the installation root; rollback leaves them.
 FAILURE_NOTICE_UNIT = "server-sentinel-failure-notice.service"
+# PR #392 review (P1): a start job that fails on a dependency -- the runtime
+# mount of RequiresMountsFor=, or the device it waits for -- never puts the
+# service into the failed state (systemd.unit(5), Requires=: "this unit will
+# not be started"), so OnFailure= cannot report it. The service therefore
+# also Wants= this timer: a Wants= unit is started even when the rest of the
+# transaction fails (systemd.unit(5), Wants=). START_WATCH_DELAY after the
+# first start attempt of each boot (RemainAfterElapse= defaults to true, so
+# later starts in the same boot do not re-arm it), the watch unit sends the
+# same notice unless the service is active.
+START_WATCH_TIMER = "server-sentinel-start-watch.timer"
+START_WATCH_UNIT = "server-sentinel-start-watch.service"
+START_WATCH_DELAY = "15min"
 FAILURE_NOTICE_SCRIPT = "failure_notice.py"
 FAILURE_NOTICE_MARKER = (
     "# server-sentinel-failure-notice: placed by the ServerSentinel Main installer (Issue #321)")
@@ -88,13 +100,18 @@ MAX_FAILURE_NOTICE_BYTES = 32 * 1024
 # Issue #321 item 2: with Restart=on-failure, the service enters the failed
 # state (and OnFailure= fires) only once its start limit is hit, and
 # RestartMode=direct (systemd 254+) keeps the attempts before it from passing
-# through the failed state, as systemd before 254 already did. Each attempt
-# lasts at most TimeoutStartSec (60 s) plus RestartSec, so five attempts, and
-# the refused sixth, always fall inside the 600 s window: a start that keeps
-# failing always ends in the failed state, however slow each attempt is.
+# through the failed state, as systemd before 254 already did. One attempt
+# lasts at most TimeoutStartSec (60 s), then, for a start that does not end
+# on SIGTERM, TimeoutStopSec (90 s) before the final SIGKILL
+# (TimeoutStartFailureMode=terminate, the default; PR #392 review P2), then
+# RestartSec (5 s): 155 s. The sixth start comes at most five such attempts
+# (775 s) after the first, inside the 1200 s window, so a start that keeps
+# failing always ends in the failed state, however it fails.
+START_TIMEOUT_SECONDS = 60
+STOP_TIMEOUT_SECONDS = 90
 RESTART_SECONDS = 5
 START_LIMIT_BURST = 5
-START_LIMIT_INTERVAL_SECONDS = 600
+START_LIMIT_INTERVAL_SECONDS = 1200
 # Issue #10 phase 2 S5c: each release keeps the release manifest it was
 # installed from, so its Web build can be checked again before a rollback.
 RELEASE_MANIFEST = "release-manifest.json"
@@ -477,6 +494,8 @@ def render_unit(root: Path, config: Path, deployment: Deployment,
     state on systemd 254 and later, as it was before 254 (where the key is
     unknown and only logged). The explicit start limit makes a start that
     keeps failing always reach that state (see ``START_LIMIT_*``).
+    ``Wants=`` the start-watch timer covers a start that never runs because a
+    dependency (the runtime mount) failed, which ``OnFailure=`` cannot see.
 
     ``After=time-sync.target`` (Issue #235 item 4, Owner decision
     2026-10-14): at boot the service waits until the host reports a
@@ -510,14 +529,15 @@ After=local-fs.target network.target
 After=time-sync.target
 RequiresMountsFor={_quote(deployment.runtime_root)}
 OnFailure={FAILURE_NOTICE_UNIT}
+Wants={START_WATCH_TIMER}
 StartLimitIntervalSec={START_LIMIT_INTERVAL_SECONDS}
 StartLimitBurst={START_LIMIT_BURST}
 
 [Service]
 Type=notify
 NotifyAccess=main
-TimeoutStartSec=60
-TimeoutStopSec=90
+TimeoutStartSec={START_TIMEOUT_SECONDS}
+TimeoutStopSec={STOP_TIMEOUT_SECONDS}
 User={account.pw_name}
 Group={account.pw_gid}
 WorkingDirectory={_unit_path(current)}
@@ -1200,7 +1220,7 @@ def failure_notice_source() -> bytes:
 
 
 def render_failure_notice_unit(root: Path, config: Path, account: pwd.struct_passwd,
-                               python: Path) -> str:
+                               python: Path, *, watch: bool = False) -> str:
     """Render ``server-sentinel-failure-notice.service`` (Issue #321 item 2).
 
     A oneshot unit with no ``[Install]`` section: only the service's
@@ -1217,18 +1237,33 @@ def render_failure_notice_unit(root: Path, config: Path, account: pwd.struct_pas
     systemd cannot restrict a unit to one host name, so the address families
     are limited to what name resolution and HTTPS need, and the script itself
     only connects to an endpoint that passes the ``SlackEndpoint`` rules.
+
+    With ``watch`` it renders ``server-sentinel-start-watch.service`` instead,
+    started by ``server-sentinel-start-watch.timer``: the same script with
+    ``--unless-active``, which first asks systemd (``systemctl show``, over
+    the system bus, as the dedicated account) whether the service is active
+    and sends nothing when it is. Both units share the runtime directory, so
+    one failure reported by both sends one notice.
     """
+    if type(watch) is not bool:
+        raise ValueError("invalid start watch")
     root = _clean_absolute(Path(root))
     if not re.fullmatch(r"[a-z_][a-z0-9_-]*[$]?", account.pw_name):
         raise ValueError("invalid dedicated account")
     python = _clean_absolute(Path(python))
     script = root / FAILURE_NOTICE_SCRIPT
+    started_by = (f"{START_WATCH_TIMER} once per boot; sends the notice unless\n"
+                  "# server-sentinel.service is active" if watch else
+                  "OnFailure= of server-sentinel.service; sends one fixed,\n"
+                  "# value-free Slack message")
+    description = ("ServerSentinel start watch" if watch
+                   else "ServerSentinel start-failure notice")
+    mode = " --unless-active" if watch else ""
     return f"""{FAILURE_NOTICE_MARKER}
-# Started only by OnFailure= of server-sentinel.service; sends one fixed,
-# value-free Slack message (server/docs/DEPLOYMENT.md, Start-failure notice).
+# Started only by {started_by} (server/docs/DEPLOYMENT.md, Start-failure notice).
 # The installer replaces this file on install and update; do not edit it.
 [Unit]
-Description=ServerSentinel start-failure notice
+Description={description}
 Wants=network-online.target
 After=network-online.target
 
@@ -1236,7 +1271,7 @@ After=network-online.target
 Type=oneshot
 User={account.pw_name}
 Group={account.pw_gid}
-ExecStart={_quote(python)} -I -S {_quote(script)} --config {_quote(config)}
+ExecStart={_quote(python)} -I -S {_quote(script)} --config {_quote(config)}{mode}
 TimeoutStartSec=90
 RuntimeDirectory={FAILURE_NOTICE_RUNTIME_DIRECTORY}
 RuntimeDirectoryMode=0700
@@ -1265,8 +1300,39 @@ SystemCallFilter=@system-service
 """
 
 
-def _failure_notice_paths(root: Path, unit: Path) -> tuple[Path, Path]:
-    return unit.with_name(FAILURE_NOTICE_UNIT), root / FAILURE_NOTICE_SCRIPT
+def render_start_watch_timer() -> str:
+    """Render ``server-sentinel-start-watch.timer`` (PR #392 review P1).
+
+    No ``[Install]``: only the service's ``Wants=`` starts it, at the first
+    start attempt of each boot; it fires once, ``START_WATCH_DELAY`` later.
+    """
+    return f"""{FAILURE_NOTICE_MARKER}
+# Started only by Wants= of server-sentinel.service. Once per boot, it starts
+# {START_WATCH_UNIT}, which sends the start-failure notice unless the service
+# is active (server/docs/DEPLOYMENT.md, Start-failure notice).
+# The installer replaces this file on install and update; do not edit it.
+[Unit]
+Description=ServerSentinel start watch timer
+
+[Timer]
+OnActiveSec={START_WATCH_DELAY}
+AccuracySec=1min
+RemainAfterElapse=true
+Unit={START_WATCH_UNIT}
+"""
+
+
+def _failure_notice_files(root: Path, unit: Path, config: Path, account: pwd.struct_passwd,
+                          python: Path) -> list[tuple[Path, bytes, int]]:
+    """Every start-failure notice file: ``(path, content, mode)``."""
+    return [
+        (unit.with_name(FAILURE_NOTICE_UNIT), render_failure_notice_unit(
+            root, config, account, python).encode("utf-8"), 0o644),
+        (unit.with_name(START_WATCH_UNIT), render_failure_notice_unit(
+            root, config, account, python, watch=True).encode("utf-8"), 0o644),
+        (unit.with_name(START_WATCH_TIMER), render_start_watch_timer().encode("utf-8"), 0o644),
+        (root / FAILURE_NOTICE_SCRIPT, failure_notice_source(), RELEASE_FILE_MODE),
+    ]
 
 
 def _existing_failure_notice(args, path: Path, mode: int) -> bytes | None:
@@ -1557,12 +1623,8 @@ def _execute_locked(args, runner) -> None:
         notice_python = _clean_absolute(Path(args.python))
         args.python = _trusted_python(args.python)
         _protected_parent(notice_python.parent)
-        notice_unit, notice_script = _failure_notice_paths(args.destination, args.unit)
-        notice_files = [
-            (notice_unit, render_failure_notice_unit(
-                args.destination, args.config, account, notice_python).encode("utf-8"), 0o644),
-            (notice_script, failure_notice_source(), RELEASE_FILE_MODE),
-        ]
+        notice_files = _failure_notice_files(args.destination, args.unit, args.config,
+                                             account, notice_python)
         if args.command == "install":
             if _link_target(args.destination, "current") is not None or args.unit.exists():
                 raise ValueError("deployment already installed")

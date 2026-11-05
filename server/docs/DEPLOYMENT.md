@@ -1772,8 +1772,9 @@ wrapper (Issue #180; see "The `serversentinel-pairing` wrapper" above). It
 names no release and follows `current`, so a switch never rewrites it and
 `rollback` leaves it alone; a hand-placed file at that path is refused before
 any change. They also place the start-failure notice (Issue #321; see "Start-failure
-notice" below): `/etc/systemd/system/server-sentinel-failure-notice.service` and
-`<destination>/failure_notice.py`, both outside every release, with the same rule
+notice" below): `/etc/systemd/system/server-sentinel-failure-notice.service`,
+`server-sentinel-start-watch.service`, `server-sentinel-start-watch.timer` and
+`<destination>/failure_notice.py`, all outside every release, with the same rule
 for a file the installer did not place.
 
 `--destination` is created when it does not exist. An existing directory is
@@ -2031,12 +2032,14 @@ The monitoring runtime, and with it every in-service Owner notification, runs
 inside `server-sentinel.service`. A service that cannot start therefore could
 not tell anyone: production stayed down for about 12 days in October/November
 2026 because `--check` refused at every boot and no notice left the host. The
-generated unit now names a separate unit in `OnFailure=`:
+generated unit now names a separate unit in `OnFailure=`, and a once-per-boot
+start watch for the case `OnFailure=` cannot see (below):
 
 ```ini
 [Unit]
 OnFailure=server-sentinel-failure-notice.service
-StartLimitIntervalSec=600
+Wants=server-sentinel-start-watch.timer
+StartLimitIntervalSec=1200
 StartLimitBurst=5
 [Service]
 Restart=on-failure
@@ -2085,29 +2088,60 @@ restart recovers from; `RestartMode=direct` skips that state, as systemd before
 
 - a start that keeps failing (the `--check` refusal of the 2026-10 outage, a
   launcher failure, a readiness timeout) is retried every 5 s; the sixth start
-  within 600 s is refused with `Result=start-limit-hit`, the unit enters the
-  failed state, and one notice is sent. Each attempt lasts at most
-  `TimeoutStartSec=60` plus `RestartSec=5`, so the limit is always reached
-  within the window, however slow each attempt is (about 30 s for a `--check`
-  that fails at once);
+  within 1200 s is refused with `Result=start-limit-hit`, the unit enters the
+  failed state, and one notice is sent. One attempt lasts at most
+  `TimeoutStartSec=60`, then, for a start that does not end on SIGTERM,
+  `TimeoutStopSec=90` before the final SIGKILL (`TimeoutStartFailureMode=terminate`,
+  the default, systemd.service(5)), then `RestartSec=5`: 155 s. Five attempts
+  take at most 775 s, so the limit is always reached within the window, however
+  each attempt fails (about 30 s for a `--check` that fails at once, at most
+  about 13 minutes for starts that hang);
 - a crash that the next restart recovers from sends no notice here; the
   restarted service reports it itself (Issue #351, `recording_health_failure`
-  for an unclean exit). Six starts within 600 s (a crash loop) end in the
+  for an unclean exit). Six starts within 1200 s (a crash loop) end in the
   failed state and send the notice;
 - a graceful `systemctl stop` (and a shutdown) leaves the unit inactive, not
   failed, and sends nothing. A stop that exceeds `TimeoutStopSec=90` ends in
   the failed state and does send it. During a shutdown the notice unit's
   default `Conflicts=shutdown.target` is expected to keep it from starting;
   that is not verified on real systemd;
-- a manual `systemctl start` within the 600 s window after the limit was hit
+- a manual `systemctl start` within the 1200 s window after the limit was hit
   is refused at once. Whether systemd starts the notice unit again for a unit
   that was already failed is not verified on real systemd; if it does, the
   notice within the hour is suppressed (below). `sudo systemctl reset-failed
   server-sentinel.service` clears the limit, and a later start that keeps
   failing ends in the failed state again.
 
+A start that never runs (PR #392 review). When a dependency fails -- the
+runtime mount named by `RequiresMountsFor=` (a missing or replaced data
+disk, the device it waits for timing out) -- systemd fails the service's
+start job with `result=dependency` without starting the service: the service
+stays inactive and never enters the failed state (systemd.unit(5), `Requires=`:
+"this unit will not be started"), so neither `Restart=` nor `OnFailure=` runs.
+The mount dependency itself stays as it is. The service therefore also
+`Wants=` `server-sentinel-start-watch.timer`; a `Wants=` unit is started even
+when the rest of the transaction fails (systemd.unit(5), `Wants=`). The timer
+(no `[Install]`, `OnActiveSec=15min`, `RemainAfterElapse=true`) fires once, 15
+minutes after the first start attempt of each boot -- a later start in the same
+boot does not re-arm it -- and starts `server-sentinel-start-watch.service`,
+the notice unit with `--unless-active`: it asks systemd (`/usr/bin/systemctl
+show --property=ActiveState --value server-sentinel.service`, over the system
+bus as the dedicated account, 10 s timeout) and sends nothing when the answer
+is `active` (`not sent (reason=service_active)`). Any other state (`inactive`,
+`failed`, `activating` -- still waiting for its mount, the clock, or in its
+restart loop) or an unreadable answer sends the same notice: a spurious notice
+rather than a silent outage. Both units share the runtime directory below, so a
+failure reported by `OnFailure=` is not sent a second time by the watch within
+the hour. Limits: the watch runs only in a boot in which the service was started
+(enabled, or started by hand); it checks once, so a service that stops failing
+later in the boot, or fails after the check without entering the failed state,
+is not reported by it; an Owner who stops the service on purpose within 15
+minutes of boot gets the notice; the timer behavior and the `Wants=` start
+under a failed mount are taken from the manual pages and not yet verified on
+real systemd (`MANUAL_TEST.md` V).
+
 At most one notice per failure episode. The time of the last notice sent is
-kept in the notice unit's `RuntimeDirectory=` (`/run/server-sentinel-failure-notice/last-notice`,
+kept in the notice units' `RuntimeDirectory=` (`/run/server-sentinel-failure-notice/last-notice`,
 `RuntimeDirectoryPreserve=yes`), which does not depend on the runtime root and
 is empty again after every reboot: a further failure within an hour in the same
 boot is suppressed, and the first failure of every boot is always reported
@@ -2132,7 +2166,8 @@ own unit snapshot has no `OnFailure=`, so a rollback to it switches the notice
 off; the notice unit stays installed and a later update switches it on again).
 A host that is down or never boots sends nothing either. Removing
 `server-sentinel-failure-notice.service` (or a drop-in that resets
-`OnFailure=`) switches it off; the next update places the file again.
+`OnFailure=`) switches it off, and removing the start-watch timer or service
+switches the watch off; the next update places the files again.
 
 To try it on a disposable host or VM, never the production Main host, with a
 Slack webhook configured (a test channel):

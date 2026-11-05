@@ -26,6 +26,14 @@ kept in the unit's ``RuntimeDirectory=`` (``/run``, independent of the
 runtime root), and a further failure less than ``COOLDOWN_SECONDS`` later in
 the same boot is suppressed. ``/run`` starts empty at every boot, so the
 first failure of every boot is reported.
+
+With ``--unless-active`` (``server-sentinel-start-watch.service``, started
+once per boot by its timer; PR #392 review P1) it first asks systemd whether
+the service is active and sends nothing when it is. That covers a start that
+never ran because a dependency failed (the runtime mount of
+``RequiresMountsFor=``): such a start job fails without putting the service
+into the failed state, so ``OnFailure=`` never fires. A state that cannot be
+read counts as not active: a spurious notice rather than a silent outage.
 """
 
 import json
@@ -33,6 +41,7 @@ import os
 import re
 import ssl
 import stat
+import subprocess
 import sys
 import time
 from urllib.error import HTTPError
@@ -53,6 +62,9 @@ COOLDOWN_SECONDS = 3600
 STATE_FILE = "last-notice"
 MAX_STATE_BYTES = 32
 PREFIX = "ServerSentinel failure notice: "
+SERVICE = "server-sentinel.service"
+SYSTEMCTL = "/usr/bin/systemctl"
+SYSTEMCTL_TIMEOUT_SECONDS = 10
 SLACK_PATH = re.compile(r"/services/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+")
 
 
@@ -132,6 +144,19 @@ def send(url: str, *, opener=None, timeout=TIMEOUT_SECONDS) -> str:
         return "failed"
 
 
+def service_active(runner=subprocess.run) -> bool:
+    """Whether systemd reports ``server-sentinel.service`` as active; unknown is False."""
+    try:
+        result = runner([SYSTEMCTL, "show", "--property=ActiveState", "--value", SERVICE],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, timeout=SYSTEMCTL_TIMEOUT_SECONDS,
+                        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SYSTEMD_PAGER": "",
+                             "SYSTEMD_COLORS": "0"}, check=False)
+        return result.returncode == 0 and result.stdout.strip() == b"active"
+    except Exception:
+        return False
+
+
 def _state_path(environ) -> str | None:
     directory = environ.get("RUNTIME_DIRECTORY")
     # systemd sets one absolute directory for one RuntimeDirectory= entry.
@@ -189,9 +214,12 @@ def _say(stream, words: str) -> None:
 
 
 def run(config: str, *, environ=None, opener=None, clock=_boot_clock, sleep=time.sleep,
-        stderr=None) -> int:
+        stderr=None, unless_active=False, runner=subprocess.run) -> int:
     environ = os.environ if environ is None else environ
     stderr = sys.stderr if stderr is None else stderr
+    if unless_active and service_active(runner):
+        _say(stderr, "not sent (reason=service_active)")
+        return 0
     state = _state_path(environ)
     now = clock()
     if recently_notified(state, now):
@@ -222,10 +250,12 @@ def run(config: str, *, environ=None, opener=None, clock=_boot_clock, sleep=time
 
 def main(arguments=None) -> int:
     arguments = sys.argv[1:] if arguments is None else arguments
-    if len(arguments) != 2 or arguments[0] != "--config" or not arguments[1].startswith("/"):
+    unless_active = arguments[2:] == ["--unless-active"]
+    if (len(arguments) != 2 + unless_active or arguments[0] != "--config"
+            or not arguments[1].startswith("/")):
         _say(sys.stderr, "not sent (reason=usage)")
         return 2
-    return run(arguments[1])
+    return run(arguments[1], unless_active=unless_active)
 
 
 if __name__ == "__main__":

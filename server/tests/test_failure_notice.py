@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 import zipfile
@@ -310,7 +311,89 @@ class NotifierTests(unittest.TestCase):
         source = (SERVER / "failure_notice.py").read_text()
         modules = set(re.findall(r"^(?:from|import) ([a-z_.]+)", source, re.MULTILINE))
         self.assertEqual({module.split(".")[0] for module in modules},
-                         {"json", "os", "re", "ssl", "stat", "sys", "time", "urllib"})
+                         {"json", "os", "re", "ssl", "stat", "subprocess", "sys", "time",
+                          "urllib"})
+
+    def test_unless_active_sends_nothing_while_the_service_is_active(self):
+        calls = []
+
+        def runner(arguments, **options):
+            calls.append((arguments, options))
+            return SimpleNamespace(returncode=0, stdout=b"active\n")
+
+        opener = Opener()
+        stderr = io.StringIO()
+        code = failure_notice.run(str(self.config), environ=self.environ, opener=opener,
+                                  stderr=stderr, unless_active=True, runner=runner)
+        self.assertEqual((code, stderr.getvalue()),
+                         (0, "ServerSentinel failure notice: not sent (reason=service_active)\n"))
+        self.assertEqual(opener.requests, [])
+        [(arguments, options)] = calls
+        self.assertEqual(arguments, ["/usr/bin/systemctl", "show", "--property=ActiveState",
+                                     "--value", "server-sentinel.service"])
+        self.assertEqual(options["timeout"], 10)
+        self.assertEqual(options["env"]["PATH"], "/usr/bin:/bin")
+        self.assertNotIn(str(self.config), repr(options))
+
+    def test_unless_active_sends_when_the_service_is_not_active_or_unknown(self):
+        for outcome in ((0, b"inactive\n"), (0, b"failed\n"), (0, b"activating\n"),
+                        (0, b"active-ish\n"), (0, b""), (1, b"active\n"),
+                        subprocess.TimeoutExpired("systemctl", 10), OSError("no systemctl")):
+            with self.subTest(outcome=outcome):
+                (self.state / "last-notice").unlink(missing_ok=True)
+
+                def runner(arguments, **options):
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                    return SimpleNamespace(returncode=outcome[0], stdout=outcome[1])
+
+                opener = Opener(Response())
+                stderr = io.StringIO()
+                code = failure_notice.run(str(self.config), environ=self.environ,
+                                          opener=opener, clock=Clock(), sleep=self.sleeps.append,
+                                          stderr=stderr, unless_active=True, runner=runner)
+                self.assertEqual((code, stderr.getvalue()),
+                                 (0, "ServerSentinel failure notice: sent\n"))
+                self.assertEqual(len(opener.requests), 1)
+
+    def test_the_on_failure_notice_never_asks_systemd(self):
+        # OnFailure= already means failed; a racing restart must not hide it.
+        queried = []
+
+        def runner(*arguments, **options):
+            queried.append(arguments)
+            return SimpleNamespace(returncode=0, stdout=b"active\n")
+
+        opener = Opener(Response())
+        stderr = io.StringIO()
+        code = failure_notice.run(str(self.config), environ=self.environ, opener=opener,
+                                  stderr=stderr, runner=runner)
+        self.assertEqual((code, stderr.getvalue()), (0, "ServerSentinel failure notice: sent\n"))
+        self.assertEqual(len(opener.requests), 1)
+        self.assertEqual(queried, [])
+
+    def test_the_notice_and_the_watch_share_one_episode(self):
+        # OnFailure= reported it; the watch 15 minutes later in the same boot does not repeat it.
+        self.assertEqual(self.run_notice(Opener(Response()), Clock(100.0))[0], 0)
+        opener = Opener()
+        stderr = io.StringIO()
+        failure_notice.run(str(self.config), environ=self.environ, opener=opener,
+                           clock=Clock(100.0 + 900), stderr=stderr, unless_active=True,
+                           runner=lambda *a, **k: SimpleNamespace(returncode=0, stdout=b"failed"))
+        self.assertEqual(stderr.getvalue(),
+                         "ServerSentinel failure notice: suppressed (reason=recent_notice)\n")
+        self.assertEqual(opener.requests, [])
+
+    def test_command_line_accepts_only_the_watch_flag(self):
+        with patch("failure_notice.run", return_value=0) as run:
+            self.assertEqual(failure_notice.main(["--config", "/x", "--unless-active"]), 0)
+            self.assertEqual(failure_notice.main(["--config", "/x"]), 0)
+        self.assertEqual([call.kwargs["unless_active"] for call in run.call_args_list],
+                         [True, False])
+        for arguments in (["--config", "/x", "--unless-active", "x"],
+                          ["--config", "/x", "--unless-activ"], ["--unless-active", "/x"]):
+            with self.subTest(arguments=arguments), patch("sys.stderr", io.StringIO()):
+                self.assertEqual(failure_notice.main(arguments), 2)
 
 
 class FailureNoticeInstallerTests(unittest.TestCase):
@@ -323,6 +406,18 @@ class FailureNoticeInstallerTests(unittest.TestCase):
     @property
     def notice_unit(self):
         return self.unit.with_name("server-sentinel-failure-notice.service")
+
+    @property
+    def watch_unit(self):
+        return self.unit.with_name("server-sentinel-start-watch.service")
+
+    @property
+    def watch_timer(self):
+        return self.unit.with_name("server-sentinel-start-watch.timer")
+
+    @property
+    def notice_files(self):
+        return (self.notice_unit, self.watch_unit, self.watch_timer, self.notice_script)
 
     @property
     def notice_script(self):
@@ -347,9 +442,11 @@ class FailureNoticeInstallerTests(unittest.TestCase):
         # The interpreter as given (not the release's venv), isolated.
         self.assertIn(f'ExecStart="{sys.executable}" -I -S "{script}" --config "{self.config}"',
                       lines)
-        self.assertNotIn("venv", text)
-        self.assertNotIn("releases", text)
-        self.assertNotIn("current", text)
+        # (the test interpreter itself may live in a venv, as on CI)
+        without_python = text.replace(sys.executable, "<python>")
+        self.assertNotIn("venv", without_python)
+        self.assertNotIn("releases", without_python)
+        self.assertNotIn("current", without_python)
         for expected in ("Type=oneshot", "User=" + account.pw_name, f"Group={account.pw_gid}",
                          "Wants=network-online.target", "After=network-online.target",
                          "TimeoutStartSec=90", "RuntimeDirectory=server-sentinel-failure-notice",
@@ -369,6 +466,29 @@ class FailureNoticeInstallerTests(unittest.TestCase):
         self.assertIn("OnFailure=server-sentinel-failure-notice.service", unit_section)
         for expected in ("Restart=on-failure", "RestartMode=direct", "RestartSec=5"):
             self.assertIn(expected, service_section)
+        # PR #392 P1: a start that a failed dependency never runs is caught by the watch.
+        self.assertIn("Wants=server-sentinel-start-watch.timer", unit_section)
+        watch = self.watch_unit.read_text()
+        self.assertEqual(watch, install.render_failure_notice_unit(
+            self.installation, self.config, account, Path(sys.executable), watch=True))
+        self.assertIn(f'ExecStart="{sys.executable}" -I -S "{script}" --config "{self.config}"'
+                      " --unless-active", watch.splitlines())
+        # The same unit otherwise: same hardening, same runtime directory.
+        self.assertEqual([line for line in watch.splitlines()
+                          if not line.startswith(("#", "Description=", "ExecStart="))],
+                         [line for line in lines
+                          if not line.startswith(("#", "Description=", "ExecStart="))])
+        timer = self.watch_timer.read_text()
+        timer_lines = timer.splitlines()
+        self.assertEqual(timer_lines[0], install.FAILURE_NOTICE_MARKER)
+        for expected in ("OnActiveSec=15min", "RemainAfterElapse=true",
+                         "Unit=server-sentinel-start-watch.service"):
+            self.assertIn(expected, timer_lines)
+        for absent in ("[Install]", "OnBootSec", "OnCalendar", "Persistent"):
+            self.assertNotIn(absent, timer)
+        for path in (self.watch_unit, self.watch_timer):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+        self.assertNotIn(b"--unless-active", self.notice_unit.read_bytes())
 
     def test_start_limit_is_always_reached_by_a_start_that_keeps_failing(self):
         self.perform(self.arguments("install", "1.0.0"))
@@ -382,22 +502,28 @@ class FailureNoticeInstallerTests(unittest.TestCase):
         burst = value(unit_section, "StartLimitBurst")
         interval = value(unit_section, "StartLimitIntervalSec")
         start = value(service, "TimeoutStartSec")
+        stop = value(service, "TimeoutStopSec")
         restart = value(service, "RestartSec")
-        self.assertEqual((burst, interval, restart), (5, 600, 5))
-        # The refused (burst + 1)-th start comes at most burst attempts of
-        # (TimeoutStartSec + RestartSec) after the first: inside the window.
-        self.assertLess(burst * (start + restart), interval)
+        self.assertEqual((burst, interval, start, stop, restart), (5, 1200, 60, 90, 5))
+        # The refused (burst + 1)-th start comes at most burst attempts after
+        # the first. An attempt that hangs lasts TimeoutStartSec, then (it
+        # ignores SIGTERM) TimeoutStopSec before SIGKILL, then RestartSec
+        # (PR #392 P2): still inside the window.
+        self.assertFalse(any(line.startswith(("TimeoutStartFailureMode=", "TimeoutSec=",
+                                              "ExecStopPost=", "ExecStop="))
+                             for line in service))
+        self.assertLess(burst * (start + stop + restart), interval)
 
     def test_update_repairs_and_rollback_leaves_the_notice_alone(self):
         self.perform(self.arguments("install", "1.0.0"))
         expected_unit = self.notice_unit.read_bytes()
         expected_script = self.notice_script.read_bytes()
         # An installation from before Issue #321: update adds them.
-        self.notice_unit.unlink()
-        self.notice_script.unlink()
+        expected = {path: path.read_bytes() for path in self.notice_files}
+        for path in self.notice_files:
+            path.unlink()
         self.perform(self.arguments("update", "1.1.0"))
-        self.assertEqual(self.notice_unit.read_bytes(), expected_unit)
-        self.assertEqual(self.notice_script.read_bytes(), expected_script)
+        self.assertEqual({path: path.read_bytes() for path in self.notice_files}, expected)
         # An installer-placed file with other text or a widened mode is rewritten.
         self.notice_script.chmod(0o644)
         self.notice_script.write_bytes(expected_script + b"# edited\n")
@@ -414,7 +540,7 @@ class FailureNoticeInstallerTests(unittest.TestCase):
 
     def test_foreign_files_are_refused_before_any_change(self):
         arguments = self.arguments("install", "1.0.0")
-        for path_name in ("notice_unit", "notice_script"):
+        for path_name in ("notice_unit", "watch_unit", "watch_timer", "notice_script"):
             for kind in ("text", "symlink", "directory"):
                 with self.subTest(path=path_name, kind=kind):
                     path = getattr(self, path_name)
@@ -468,8 +594,8 @@ class FailureNoticeInstallerTests(unittest.TestCase):
         arguments = self.arguments("install", "1.0.0")
         with self.assertRaises(OSError):
             self.perform(arguments)
-        self.assertFalse(self.notice_unit.exists())
-        self.assertFalse(self.notice_script.exists())
+        for path in self.notice_files:
+            self.assertFalse(path.exists())
         self.assertFalse(self.unit.exists())
         # A placed file from an earlier attempt stays.
         script = (SERVER / "failure_notice.py").read_bytes()
@@ -492,8 +618,8 @@ class FailureNoticeInstallerTests(unittest.TestCase):
         with patch("install._fsync_directory", side_effect=fail_for_script):
             with self.assertRaises(OSError):
                 self.perform(arguments)
-        self.assertFalse(self.notice_unit.exists())
-        self.assertFalse(self.notice_script.exists())
+        for path in self.notice_files:
+            self.assertFalse(path.exists())
         self.assertFalse(self.unit.exists())
         self.perform(arguments)
         self.assertTrue(self.notice_script.exists())
