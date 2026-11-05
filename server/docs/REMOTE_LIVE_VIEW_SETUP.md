@@ -251,11 +251,8 @@ sudo lxc config device add <vm> eth0 nic nictype=macvlan parent=<lan nic>
    re-enumerated one camera (`USB disconnect` and reconnect in the same
    second, no unplug), LXD did **not** pass it back to the running VM; the
    guest lost the camera and its source stayed `offline` until the device was
-   re-added. Until #301 is resolved, recover with
-   `sudo lxc config device remove <vm> <camN>` (the device whose serial
-   belongs to the offline source) followed by its
-   `lxc config device add` line (no VM restart; the service rebinds the
-   serial-identified camera by itself), and watch the source state.
+   re-added. How ServerSentinel reports this and how to recover by hand:
+   "When a passed camera does not come back (Issue #301)" below.
 3. Up to 4 cameras are supported by ServerSentinel; add `cam3` / `cam4` the
    same way if more `local_uvc` cameras are used. Nothing in this procedure
    assumes exactly two.
@@ -644,6 +641,77 @@ VM's LAN IP literal (not a MagicDNS name; no Tailscale on the capture host is
 needed). A capture node paired with a previous host deployment trusts that
 deployment's CA, not the VM's, and must be re-paired with the VM.
 
+## When a passed camera does not come back (Issue #301)
+
+What happens:
+
+- The host can re-enumerate a camera (`USB disconnect` and reconnect, even
+  within the same second and without anyone touching it). On the real host
+  (2026-10-19, LXD 5.21) LXD did not pass the re-enumerated camera back to the
+  running VM: the host lists it, the guest does not. ServerSentinel runs in
+  the guest without host access and cannot bring it back.
+- ServerSentinel shows that source as `offline` (the Live screen's
+  "オフライン" / "Offline"). No frames arrive from that camera, so nothing from
+  it is recorded or analysed until it is back; the other sources are not
+  affected.
+- Once the source has been offline for
+  `camera_offline_notification.after_seconds` (default 300 s), the Owner is
+  notified once (`ServerSentinel critical alert: camera_offline` on Slack, a
+  fixed text without the camera's name). Repeated short outages notify too
+  (SPECIFICATION §9).
+- Without `slack_webhook_url` nothing leaves the Main Server: the
+  notification is stored locally as `disabled`, and the Owner's dashboard
+  shows "カメラのオフラインを通知できません" / "Camera offline cannot be
+  notified" above every screen instead (an Owner session only; invited
+  viewers never see it). It is sampled after sign-in and every minute,
+  and it disappears at the first monitoring tick (about a minute) after the
+  camera is online again, or, after an alert for repeated short outages,
+  once the camera has stayed online for the whole window (default
+  15 minutes). On 2026-10-19 the camera stayed offline for about six hours
+  unnoticed because no destination was configured; configuring Slack
+  (`DEPLOYMENT.md`) avoids that, and the dashboard notice is seen only when
+  someone opens it.
+- Neither the notification nor the notice says why the camera is offline: a
+  re-enumeration that was not passed back, an unplugged cable and a failed
+  camera look the same.
+
+Recovery by hand (only for cameras passed by `vendorid` + `productid` +
+`serial` as in Step 2; keep the serials out of GitHub):
+
+1. [Web] Note which source is `offline` on the Live screen.
+2. [host] Confirm that the host re-enumerated it and still lists it, and
+   that the guest does not:
+   ```sh
+   sudo journalctl -k --since '-1 day' | grep -i 'usb.*disconnect'
+   # the sysfs loop of Step 2: the camera's serial is listed on the host again
+   sudo lxc exec <vm> -- v4l2-ctl --list-devices   # one camera fewer than passed
+   ```
+3. [host] Find the LXD `usb` device whose `serial` belongs to that camera
+   (`sudo lxc config device show <vm>`), then remove it and add it again with
+   the same three values:
+   ```sh
+   sudo lxc config device remove <vm> <camN> && \
+     sudo lxc config device add <vm> <camN> usb vendorid=<vvvv> productid=<pppp> serial=<serial N>
+   ```
+   If the `add` fails after the `remove`, run the `add` line again; the
+   camera is not passed until it succeeds. No VM restart and no service
+   restart is needed: ServerSentinel finds the serial-identified camera
+   again and the source returns to `online` by itself (observed 2026-10-19).
+4. [guest / Web] `v4l2-ctl --list-devices` lists the camera again, the
+   Live screen shows the source `online`, and the Owner notice (if shown)
+   disappears as described above.
+5. If the source does not return to `online`, or shows
+   `manual_intervention_required` ("管理者の確認が必要"), the reconnect was not
+   unambiguous and needs the Owner's re-approval (`DEPLOYMENT.md`, "Creating
+   sources and approving cameras locally"). Never pass a camera by
+   vendor/product only or by bus/device number to get it back.
+
+Not provided: an automatic re-pass on the host (Issue #301 item 1). It would
+live outside ServerSentinel, on the host (for example a udev rule or a small
+watcher run by the host's root for the serial-identified `usb` devices only);
+ServerSentinel and `media-capture-agent` get no root for it. Record the check
+in `MANUAL_TEST.md` (section J).
+
 ## After a host or VM reboot
 
 The kernel may number the passed disk differently after a reboot (on
@@ -695,6 +763,12 @@ in the dedicated environment"), without private values:
   no longer lists the passed cameras; the guest lists both; re-plugging one
   camera brings it back in the guest only (hotplug) and the other is
   untouched;
+- [ ] when a camera does not come back to the guest, "When a passed camera
+  does not come back (Issue #301)" was followed: the source showed
+  `offline`, the Owner was notified (Slack) or, without Slack, the Owner's
+  dashboard showed the notice and an invited viewer's did not, and the
+  `remove` / `add` of that camera's `usb` device brought the source back to
+  `online` without a VM or service restart;
 - [ ] the runtime filesystem is the passed disk (not the guest root), and
   with the disk detached the service refuses to start instead of writing to
   `/srv/ss-data` on the root filesystem;
