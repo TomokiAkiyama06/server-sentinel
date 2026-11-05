@@ -1927,8 +1927,11 @@ fault report):
 GET /api/monitoring/camera-offline -> OWNER_READ: 200 {"offline_unnotified": <bool>}
 ```
 
-mounted whenever a monitoring runtime exists (otherwise, like every other
-refusal, the generic not-found denial). The read runs inside `admit` of the
+mounted only when a monitoring runtime and a camera offline monitor exist,
+i.e. with configured `local_uvc` sources (otherwise, like every other
+refusal, the generic not-found denial, which the Web shows as "could not be
+checked": a deployment with no monitored camera, `remote_agent` only for
+now, is never told a guessed `false`). The read runs inside `admit` of the
 authorization's epoch after the Owner session was read again, commits no
 idle touch (`touch=False`: the Web's background poll must not keep an
 unattended session alive past its idle limit, Codex PR #388), takes no query

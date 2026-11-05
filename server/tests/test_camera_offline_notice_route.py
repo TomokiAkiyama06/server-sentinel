@@ -12,8 +12,9 @@ browser, proxy, Tailscale, Slack or real authenticator is involved.
 from unittest import TestCase
 
 from app.auth.human_surface import (
-    CAMERA_OFFLINE_NOTICE_PATH, SESSION_PATH, HumanAccessUnavailable, match_route,
+    ADMIN_PRINCIPALS_PATH, CAMERA_OFFLINE_NOTICE_PATH, SESSION_PATH, HumanAccessUnavailable, match_route,
 )
+from app.auth.model import Permission
 from app.auth.store import Requirement
 from app.monitoring.runtime import MonitoringStatus, RuntimeState
 
@@ -63,10 +64,25 @@ class CameraOfflineNoticeRouteTests(AdminRouteFixture):
                 self.assertEqual({"offline_unnotified": value}, payload(result))
 
     async def test_non_owner_sessions_are_refused_before_the_reader(self):
+        # The notification configuration is the Owner's alone: neither
+        # permission, alone or together, nor a revoked session reaches it.
         self.reader.value = True
-        self.assertEqual(GENERIC, await self.read(cookie=self.target_cookie))
-        self.assertEqual(GENERIC, await self.read(cookie=None))
+        cookies = {"live:view only": self.target_cookie, "no session": None}
+        for name, permissions in (("recordings:view only", (Permission.RECORDINGS_VIEW,)),
+                                  ("both permissions", (Permission.LIVE_VIEW, Permission.RECORDINGS_VIEW))):
+            _, key, _ = self.enroll(permissions)
+            cookies[name] = await self.sign_in(key)
+        revoked, revoked_key, _ = self.enroll((Permission.LIVE_VIEW, Permission.RECORDINGS_VIEW))
+        cookies["revoked"] = await self.sign_in(revoked_key)
+        self.assertEqual(204, status(await self.admin(
+            "POST", f"{ADMIN_PRINCIPALS_PATH}/{revoked.id}/revoke", {})))
+        for name, cookie in cookies.items():
+            with self.subTest(name):
+                self.assertEqual(GENERIC, await self.read(cookie=cookie))
         self.assertEqual(0, self.reader.calls)
+        # Control: the sessions above were current before the revocation.
+        self.assertEqual(200, status(await self.admin("GET", SESSION_PATH, csrf=None,
+                                                      cookie=cookies["both permissions"])))
 
     async def test_a_stale_owner_is_still_served(self):
         # OWNER_READ: no fresh user verification is required to see it.

@@ -111,6 +111,19 @@ test('every notice text exists in both locales and states facts only', () => {
   }
   assert.match(messages.ja.cameraOfflineUnnotified, /通知先（Slack）が未設定/);
   assert.match(messages.en.cameraOfflineUnnotified, /No notification destination \(Slack\) is configured/);
+  // The reader is the Owner: the text says what does not leave this screen,
+  // not that "the administrator" is not told (PR #388 review).
+  assert.match(messages.ja.cameraOfflineUnnotified, /Slack など画面の外には通知されません/);
+  assert.match(messages.en.cameraOfflineUnnotified, /not notified outside this screen/);
+  assert.doesNotMatch(messages.ja.cameraOfflineUnnotified, /管理者/);
+  assert.doesNotMatch(messages.en.cameraOfflineUnnotified, /\bOwner\b/);
+  // During a ratio (flapping) alert period the camera may be online now:
+  // the hint covers both and points to the current state.
+  assert.match(messages.ja.cameraOfflineUnnotifiedHint, /停止が続いているか、断続的に止まっています/);
+  assert.match(messages.en.cameraOfflineUnnotifiedHint, /still stopped or has been stopping intermittently/);
+  for (const locale of ['ja', 'en']) {
+    assert.doesNotMatch(messages[locale].cameraOfflineUnnotifiedHint, /どのカメラがオフラインか|which camera is offline/);
+  }
 });
 
 /** Manual timers: `fire()` runs the one pending callback. */

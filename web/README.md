@@ -558,11 +558,17 @@ GET /api/monitoring/camera-offline   200 {"offline_unnotified": <boolean>}
   keeps the last answer until the next one arrives.
 - `parseCameraOfflineNotice` accepts only a JSON boolean; anything else fails
   closed. A failed check is shown as `cameraOfflineNoticeUnavailable`
-  ("could not be checked"), never as nothing to report.
-- The notice (`role="alert"`) states facts only: a camera has been offline
-  longer than the configured time, and the Owner is not notified because no
-  destination is configured. Which camera it is shows on the Live screen; the
-  notice names no source and claims no cause.
+  ("could not be checked"), never as nothing to report. The server mounts the
+  route only with configured `local_uvc` sources (a camera offline monitor),
+  so a deployment without one sees "could not be checked", not a guessed
+  "nothing to report".
+- The notice (`role="alert"`) states facts only, addressed to the Owner who
+  reads it: a camera has been offline longer than the configured time, and
+  with no destination configured this is not notified outside the screen
+  (such as to Slack). The hint covers a camera still stopped and one that
+  stopped intermittently and may be online now (a flapping alert period);
+  the Live screen shows the current state. The notice names no source and
+  claims no cause.
 
 Tests: `tests/offline_notice.test.mjs` (fake `fetch` and manual timers: strict
 decoding, request shape without CSRF, refusals, the rendered states in ja and

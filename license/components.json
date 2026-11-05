@@ -87,7 +87,7 @@
     },
     {
       "path": "web/tests/offline_notice.test.mjs",
-      "sha256": "sha256:dbfa43f810082932a5d6bbfc15fb76972e2cc6d8833f979b7b9fba6523366e42"
+      "sha256": "sha256:86e933131c2930cc9697f25a907e656f6abe3430d08fbea4a4ade9568cb3d678"
     }
   ],
   "inputs": [
