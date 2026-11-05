@@ -1,7 +1,8 @@
 """Local camera administration on the Main Server (Issue #11; Owner decision D3, 2026-10-16).
 
 Commands (``python -m app.cameras.uvc.admin_cli``), run as the service account
-that owns the application database, never as root and never with ``sudo``::
+that owns the application database, never as root: an administrator runs it
+with ``sudo -u <service account>``, never plain ``sudo``::
 
     python -m app.cameras.uvc.admin_cli sources --config <deployment.json>
     python -m app.cameras.uvc.admin_cli candidates --config <deployment.json>
@@ -31,7 +32,10 @@ command never creates or migrates a database.
 
 Applied on restart. The service reads its ``local_uvc.source_ids`` and the
 approvals at startup, so a mutation refuses while the service is running
-(``service_running``): stop it, run the command, then start it again. The
+(``service_running``): stop it together with its upstream socket
+(``server-sentinel-upstream.socket``; with socket activation an incoming
+connection starts a service stopped alone), run the command, then start both
+again. The
 running service is detected as any other process of the service account that
 holds the database file open (``_database_holders``: ``/proc/<pid>/fd`` of
 every process whose real, effective, saved or filesystem uid is this
@@ -153,8 +157,10 @@ _PROFILE = re.compile(r"([0-9]{1,5})x([0-9]{1,5})@([0-9]{1,4})/([0-9A-Z]{4})")
 _USB_ID = re.compile(r"[0-9a-f]{4}")
 _MAX_TEXT = 128
 _HINTS = {
-    "service_running": ("stop the service (sudo systemctl stop server-sentinel.service), run the "
-                        "command, then start it again; changes apply on start. Any other process "
+    "service_running": ("stop the upstream socket and the service (sudo systemctl stop "
+                        "server-sentinel-upstream.socket server-sentinel.service; with socket "
+                        "activation a connection restarts a service stopped alone), run the "
+                        "command, then start both again; changes apply on start. Any other process "
                         "of the service account holding the database counts, also another local "
                         "admin command (bootstrap_cli, pairing_cli, reservation_cli, a second "
                         "admin_cli): let it finish first"),
