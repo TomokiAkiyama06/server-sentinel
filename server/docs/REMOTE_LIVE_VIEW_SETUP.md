@@ -499,7 +499,7 @@ cannot see the guest's service). In short, from the guest root shell:
 
 ```sh
 cd /opt/server-sentinel-main/current
-systemctl stop server-sentinel.service
+systemctl stop server-sentinel-upstream.socket server-sentinel.service
 sudo -u server-sentinel ./venv/bin/python -m app.cameras.uvc.admin_cli \
   create-source --config /etc/server-sentinel/deployment.json \
   --name "<display name>" --profile 1920x1080@30/MJPG          # type CREATE; repeat per camera
@@ -510,7 +510,7 @@ sudo -u server-sentinel ./venv/bin/python -m app.cameras.uvc.admin_cli \
   candidates --config /etc/server-sentinel/deployment.json        # two cam-… labels, serial=present
 sudo -u server-sentinel ./venv/bin/python -m app.cameras.uvc.admin_cli \
   approve --config /etc/server-sentinel/deployment.json <source uuid> cam-<label>   # type APPROVE; per camera
-systemctl start server-sentinel.service
+systemctl start server-sentinel-upstream.socket server-sentinel.service
 ```
 
 `candidates` never prints a serial or device path. The approval binds each
