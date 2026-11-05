@@ -578,8 +578,11 @@ service runs with; the database is that deployment's existing one, of exactly
 this release's schema (never created or migrated).
 
 The service reads its sources and approvals when it starts, so **stop it
-first**: `create-source` and `approve` refuse while it runs
-(`service_running`). The running service is detected as any other process of
+first, together with the upstream socket** (`server-sentinel-upstream.socket`,
+"Human upstream through socket activation" below; with socket activation an
+incoming dashboard connection starts a service that was stopped alone; on a
+host without that socket unit, stop and start the service only):
+`create-source` and `approve` refuse while it runs (`service_running`). The running service is detected as any other process of
 the service account that holds the application database open (every Main
 process keeps a descriptor on it for its whole lifetime): no camera is probed
 for that, and a crash leaves nothing behind that would block the command. A
@@ -607,7 +610,7 @@ service started within that last transaction is not refused.
 
 ```sh
 cd /opt/server-sentinel-main/current
-sudo systemctl stop server-sentinel.service
+sudo systemctl stop server-sentinel-upstream.socket server-sentinel.service
 # 1. create a source (repeat for up to 4); prints its UUID
 sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
   create-source --config /etc/server-sentinel/deployment.json \
@@ -624,7 +627,7 @@ sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
 # 4. approve one camera for one source (type APPROVE on the terminal)
 sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
   approve --config /etc/server-sentinel/deployment.json <source uuid> cam-<10 hex>
-sudo systemctl start server-sentinel.service
+sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
 ```
 
 - `create-source` creates an **enabled** `local_uvc` source with that
