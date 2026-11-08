@@ -216,11 +216,9 @@ class CaptureIngestServer:
                     if admitted:
                         self._connections.add(connection)
                         self._handshakes[address] = self._handshakes.get(address, 0) + 1
-                    else:
-                        self._refused += 1
                 if not admitted:
+                    self._count_refusal()
                     _close(connection)
-                    LOGGER.debug(Event.CAPTURE_INGEST_REFUSED)
                     continue
                 thread = threading.Thread(target=self._serve, args=(connection, address),
                                           daemon=True, name="capture-ingest-session")
@@ -233,6 +231,20 @@ class CaptureIngestServer:
                 self._state = "stopped"
 
     # -- one connection ------------------------------------------------------
+
+    def _count_refusal(self) -> None:
+        """Count a refused connection; log the first and every power of two.
+
+        An unauthenticated LAN host can open connections as fast as it likes,
+        so one log line per refusal would let it flood the journal. The
+        acceptor's own per-refusal log is off (`log_refusals=False`); this
+        record carries only the running count.
+        """
+        with self._lock:
+            self._refused += 1
+            count = self._refused
+        if count & (count - 1) == 0:
+            LOGGER.warning(Event.CAPTURE_INGEST_REFUSED, extra={"count": count})
 
     def _handshake_done(self, address: str) -> None:
         with self._lock:
@@ -260,16 +272,14 @@ class CaptureIngestServer:
             try:
                 session = self._acceptor.accept(connection, on_wrapped=wrapped)
             except IngestTlsError:
-                with self._lock:
-                    self._refused += 1
+                self._count_refusal()
                 return
             finally:
                 self._handshake_done(address)
             tls = session.connection
             if tls.selected_alpn_protocol() != INGEST_ALPN:
                 self._close_with(tls, "alpn_refused")
-                with self._lock:
-                    self._refused += 1
+                self._count_refusal()
                 return
             self._session(session, tls)
         except Exception:

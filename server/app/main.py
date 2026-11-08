@@ -445,7 +445,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
         capture_acceptor = CaptureIngestAcceptor(
             capture_ingest.context,
             CaptureNodeAdmission(capture_ledger, capture_ingest.deployment_id),
-            handshake_timeout_seconds=capture_ingest.listener.handshake_timeout_seconds)
+            handshake_timeout_seconds=capture_ingest.listener.handshake_timeout_seconds,
+            # The listener logs refusals rate-limited (`ingest_server`).
+            log_refusals=False)
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(

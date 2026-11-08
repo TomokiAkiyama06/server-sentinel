@@ -194,7 +194,14 @@ class CaptureIngestAcceptor:
     """Performs the server-side handshake and ledger admission for one connection."""
 
     def __init__(self, context: ssl.SSLContext, admission: CaptureNodeAdmission, *,
-                 handshake_timeout_seconds: float = DEFAULT_HANDSHAKE_TIMEOUT_SECONDS):
+                 handshake_timeout_seconds: float = DEFAULT_HANDSHAKE_TIMEOUT_SECONDS,
+                 log_refusals: bool = True):
+        """``log_refusals=False`` leaves logging each refusal to the caller.
+
+        The LAN-facing listener (``ingest_server``) logs refusals rate-limited
+        itself, so an unauthenticated host cannot write one log line per
+        connection attempt (Issue #14).
+        """
         if (not isinstance(context, ssl.SSLContext) or context.verify_mode != ssl.CERT_REQUIRED
                 or context.minimum_version < ssl.TLSVersion.TLSv1_3
                 or not isinstance(admission, CaptureNodeAdmission)):
@@ -205,6 +212,11 @@ class CaptureIngestAcceptor:
         self._context = context
         self._admission = admission
         self._timeout = float(handshake_timeout_seconds)
+        self._log = bool(log_refusals)
+
+    def _refused(self, reason: str) -> None:
+        if self._log:
+            LOGGER.info("capture ingest refused: reason=%s", reason)
 
     def accept(self, connection: socket.socket, *,
                on_wrapped: Callable[[ssl.SSLSocket], None] | None = None,
@@ -221,7 +233,7 @@ class CaptureIngestAcceptor:
                                             do_handshake_on_connect=False)
         except (ssl.SSLError, OSError):
             _close(connection)
-            LOGGER.info("capture ingest refused: reason=tls_handshake_failed")
+            self._refused("tls_handshake_failed")
             raise IngestTlsError("tls_handshake_failed") from None
         try:
             if on_wrapped is not None:
@@ -229,7 +241,7 @@ class CaptureIngestAcceptor:
             tls.do_handshake()
         except (ssl.SSLError, OSError):
             _close(tls)
-            LOGGER.info("capture ingest refused: reason=tls_handshake_failed")
+            self._refused("tls_handshake_failed")
             raise IngestTlsError("tls_handshake_failed") from None
         except BaseException:
             _close(tls)
@@ -247,11 +259,11 @@ class CaptureIngestAcceptor:
             tls.settimeout(None)
         except IngestTlsError as error:
             _close(tls)
-            LOGGER.info("capture ingest refused: reason=%s", error.reason)
+            self._refused(error.reason)
             raise
         except (ssl.SSLError, OSError):
             _close(tls)
-            LOGGER.info("capture ingest refused: reason=tls_session_failed")
+            self._refused("tls_session_failed")
             raise IngestTlsError("tls_session_failed") from None
         return AuthenticatedCaptureSession(tls, identity, self._admission)
 

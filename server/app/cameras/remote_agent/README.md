@@ -183,9 +183,13 @@ this protocol.
   and shuts every socket down, waiting for nothing (no term of
   `app.stop_budget`); the connection threads end on their own.
 - *Logs.* Value-free events only: `capture_ingest_started` / `_stopped` /
-  `_unavailable`, `capture_ingest_connection_refused`,
-  `capture_ingest_session_opened` / `_closed` (an ordinary end) /
-  `_refused` (protocol, rate or credential).
+  `_unavailable`, `capture_ingest_session_opened` / `_closed` (an ordinary
+  end) / `_refused` (protocol, rate or credential), and
+  `capture_ingest_connection_refused` for refused connections (limits,
+  handshake, admission, ALPN) only at the first refusal and every power of
+  two, with the running count: an unauthenticated host cannot write one log
+  line per attempt (the acceptor's own per-refusal log is off,
+  `log_refusals=False`).
 
 Not yet (follow-ups of #14): media frames and their continuity/ingest path
 with the durable consumer; the Agent's ingest session client; the Owner

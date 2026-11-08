@@ -5,7 +5,7 @@ Every key, CA and certificate is generated in a temporary directory
 real host, address, credential or media is used.
 """
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 import json
 import socket
 import ssl
@@ -21,6 +21,7 @@ from app.cameras.remote_agent.ingest_config import (
     CaptureIngestUnavailable, IngestListenerConfig, load_capture_ingest_material,
 )
 from app.cameras.remote_agent.ingest_server import CaptureIngestServer
+from app.cameras.remote_agent.ingest_tls import CaptureIngestAcceptor
 from app.cameras.remote_agent.ingest_wire import (
     HEADER, INGEST_ALPN, FrameType, PeerClosed, encode_frame, read_frame,
 )
@@ -237,6 +238,25 @@ class CaptureIngestServerTests(CaptureTlsHarness):
         # Closed at accept, before any handshake byte.
         self.assertEqual(extra.recv(1), b"")
         self.assertEqual(server.status().refused_connections, 1)
+
+    def test_refusals_are_logged_rate_limited_without_values(self):
+        # An unauthenticated host must not write one log line per attempt.
+        self.acceptor = CaptureIngestAcceptor(self.context, self.admission,
+                                              handshake_timeout_seconds=10, log_refusals=False)
+        server = self.serve()
+        with self.assertLogs("serversentinel.capture_ingest", "DEBUG") as logs:
+            for _ in range(9):
+                with socket.create_connection(self.address, timeout=5) as raw:
+                    raw.sendall(b"GET / HTTP/1.1\r\n\r\n")
+                    with suppress(OSError):
+                        raw.recv(64)
+            self.assertTrue(self.wait_for(lambda: server.status().refused_connections == 9))
+        refused = [record for record in logs.records
+                   if record.msg == "capture_ingest_connection_refused"]
+        self.assertEqual([record.count for record in refused], [1, 2, 4, 8])
+        self.assertFalse(any(record.name == "serversentinel.capture_ingest.tls"
+                             for record in logs.records))
+        self.assertNotIn("127.0.0.1", "\n".join(logs.output))
 
     # -- stop -----------------------------------------------------------------
 
