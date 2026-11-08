@@ -2664,6 +2664,12 @@ outside ServerSentinel and checked separately below.
   "Slack に届いていません" / "has not reached Slack" text (nothing is sent for
   that outage); with `hourly_limit` reached, a further camera's outage past
   the threshold shows the same text until its alert is sent;
+- [ ] (Issue #394, mock-verified only) during a flapping period whose ratio
+  alert was sent, make the period's continuous notification fail (Slack
+  delivery blocked while the camera stays out for `after_seconds` more),
+  restore delivery and keep flapping: the notice stays until the camera has
+  stayed online for a whole `flapping_window_seconds` (Owner decision
+  2026-11-08);
 - [ ] the notice names no camera, shows no setting value, and claims no
   cause;
 - [ ] recover with the documented `lxc config device remove` / `add` of that

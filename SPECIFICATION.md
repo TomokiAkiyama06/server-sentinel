@@ -1930,9 +1930,13 @@ offline condition: its outage in progress past the threshold has its own
 alert (the episode's, submitted by this process or the earlier process's row
 of the same outage found by its durable name after a restart); an outage
 settled without one (its ratio-opened period's alert covers it) and a
-ratio-opened alerted period use the period's ratio alert. A late notice of
-another outage of the source (`(already recovered)`) or of a closed period
-never stands for the current condition. `camera_offline_delivery_failing`
+ratio-opened alerted period use every alert of that period: its ratio alert
+and the one continuous notification of its flapping outages. While the
+period lasts, one of them that did not reach Slack keeps the notice, even
+after a later alert of the period was sent; it ends when the period closes
+(Owner decision 2026-11-08). A late notice of another outage of the source
+(`(already recovered)`) or of a closed period never stands for the current
+condition. `camera_offline_delivery_failing`
 is true when such an alert did not reach Slack: its final value is not
 `sent` (`failed`, and also `disabled` or `suppressed`: an earlier process
 without Slack never sent it, so after Slack is configured and the service

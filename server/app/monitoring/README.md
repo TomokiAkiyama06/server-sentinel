@@ -271,8 +271,9 @@ Without a configured Slack endpoint the rows are `disabled`; with one, a
 delivery whose final Slack outcome is `failed` is not sent again. Issue #394
 (Owner decision 2026-11-08) judges that per camera source: the monitor
 reports the alert of each source's current condition
-(`CameraOfflineStatus.alert_ids`: the outage in progress's own alert, else
-its ratio period's; `undelivered` counts current conditions whose alert was
+(`CameraOfflineStatus.alert_ids`: the outage in progress's own alert, and
+every alert of a ratio-opened period in progress, which keeps an undelivered
+one until the period closes; `undelivered` counts current conditions whose alert was
 held by the cap or refused), and the camera step reads each final value once
 (`NotificationService.final_outcome`, else `NotificationEventStore.get`; only
 `sent` is delivered; an unreadable one is `unverified` and read again next
