@@ -179,9 +179,19 @@ class StopInterruptionTests(TestCase):
         return self.stop_at is not None and self.stop_at in self.adapter.calls
 
     def run_interrupted(self):
+        """Run a self-test the stop cuts short; returns what it returned.
+
+        Issue #396: `INTERRUPTED` when nothing was recorded, else the one
+        recorded result.
+        """
         with self.assertLogs("app.media.health.service", "WARNING") as logs:
-            self.assertIs(INTERRUPTED, self.service.startup())
+            returned = self.service.startup()
         self.assertIn("monitoring_check_interrupted", "\n".join(logs.output))
+        if self.recorded:
+            self.assertIs(self.recorded[-1][0], returned)
+        else:
+            self.assertIs(INTERRUPTED, returned)
+        return returned
 
     def test_no_further_stage_starts_and_nothing_is_recorded(self):
         for stop_at, ran in (("cleanup", ["cleanup", "cleanup"]),

@@ -560,12 +560,15 @@ step; an integrity check already running kills its probe command within
 0.25 s, reaps it for at most 1 s and records nothing (no change, no warning,
 no notice; the next start checks again), and a recording self-test starts no
 further stage, still cleans up and records only a failure that really
-happened; a notification settle ends at most one outcome write (one 5 s
-SQLite busy timeout) past its configured bound, which is not shortened. The
+happened; a notification settle ends at most 5 s past its configured bound,
+which is not shortened: every SQLite lock wait of its outcome writes and of
+the completion callbacks they run ends by then, however many locks one
+transaction waits for (Issue #396), and a poll without a deadline does
+nothing once the stop began. The
 outcomes of deliveries that finish after it (or after a settle that ended
 unsettled) are written once more just before the notification service closes,
-all in one transaction whose two lock waits (RESERVED at `BEGIN`, EXCLUSIVE
-at `COMMIT`) share one 5 s busy timeout, in the reserve, so the next start
+all in one transaction whose lock waits (SHARED and RESERVED at `BEGIN`,
+EXCLUSIVE at `COMMIT`) share one 5 s busy timeout, in the reserve, so the next start
 does not send a reconciled kind a second time; the running marker is cleared
 only after that write and stays when its admission was refused, so the next
 start then notifies conservatively; their completion
@@ -576,8 +579,10 @@ systemd stop signals the whole control group, before the lifespan shutdown
 starts) makes the check wait, without blocking the monitoring worker: it is
 dropped as cut short if the stop begins within 90 s (`TimeoutStopSec`) and
 otherwise recorded with that probe unavailable, so a SIGTERM from anything
-else delays the warning by at most that long plus one tick; any other signal
-is a failed probe at once. A self-test stage that fails once the stop began is
+else delays the warning by at most that long plus one tick; a command that
+handles SIGTERM and exits with 143 (128 + SIGTERM) counts the same, and a
+check still held when the stop runs is dropped and logged (Issue #396); any
+other signal, or another exit code, is a failed probe at once. A self-test stage that fails once the stop began is
 not recorded as a failure, but a failed cleanup always is.
 Every write from another thread (for
 example the scene timeline finish and dispatch, the local UVC `offline` and

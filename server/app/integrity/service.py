@@ -80,8 +80,25 @@ class IntegrityService:
             return INTERRUPTED
         return self._record(started, current)
 
+    def abandon_held(self) -> bool:
+        """Issue #396: the Main stop drops a check still held after a SIGTERM.
+
+        After `begin_stop()` the tick loop no longer runs this step, so a held
+        check would otherwise end with the process unlogged. It is the stop's
+        SIGTERM (the stop began within `SIGTERM_HOLD_SECONDS`), so nothing is
+        recorded, like `_release_held` below; the next start runs the startup
+        check. Returns whether one was held.
+        """
+        if self._held is None:
+            return False
+        self._held = None
+        logging.getLogger(__name__).warning(Event.MONITORING_CHECK_INTERRUPTED)
+        return True
+
     def _release_held(self, now: float):
         started, current, held_at = self._held
+        # Reached when a tick passed its stop check just before the stop
+        # began; otherwise the stop drops the held check (`abandon_held`).
         if getattr(self.probe, "interrupted", never)():
             self._held = None
             logging.getLogger(__name__).warning(Event.MONITORING_CHECK_INTERRUPTED)

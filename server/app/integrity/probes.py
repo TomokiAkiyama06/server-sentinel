@@ -41,6 +41,11 @@ class ProbeUnavailable(Exception):
         super().__init__("PROBE_UNAVAILABLE")
 
 
+# Issue #396: the exit statuses of a command ended by SIGTERM: killed by the
+# signal, or handling it and exiting with the shell convention 128 + SIGTERM.
+SIGTERM_STATUSES = frozenset({-signal.SIGTERM, 128 + signal.SIGTERM})
+
+
 @dataclass
 class CommandRunner:
     """Fixed read-only command allowlist, no shell, inherited secrets or sudo.
@@ -103,7 +108,7 @@ class CommandRunner:
                         raise StopInterrupted() from None
                     if time.monotonic() >= deadline:
                         raise
-            if status == -signal.SIGTERM:
+            if status in SIGTERM_STATUSES:
                 # Issue #385 (PR #389 reviews): partial output either way. Once
                 # the stop began it is an interrupted check. Otherwise the
                 # probe is unavailable and `terminated` is set: the stop's
@@ -111,6 +116,9 @@ class CommandRunner:
                 # `IntegrityService` holds the check instead of recording it
                 # at once, and records it if no stop follows. Other signals
                 # (SIGKILL by the OOM killer, for example) are unavailable.
+                # Issue #396: a command that handles SIGTERM itself and exits
+                # with the shell convention 128 + SIGTERM counts the same; one
+                # that exits with another code cannot be told from a failure.
                 if self.interrupted():
                     raise StopInterrupted()
                 self.terminated = True

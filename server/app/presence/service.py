@@ -15,7 +15,7 @@ from .access import DenyAccess
 from .delivery import ActionResult
 from .models import (CRITICAL, InvalidObservation, Kind, Observation, PresenceState, Quality,
                      Value, timestamp, utc)
-from app.storage.database import PinnedDatabase, read_database_prefix
+from app.storage.database import PinnedDatabase, bounded_transaction, read_database_prefix
 from app.storage.retention import RetentionPeriods
 
 
@@ -411,18 +411,16 @@ class PresenceService:
                 return
             db = reserved.enter_context(closing(self.database.connect()))
             db.execute("PRAGMA synchronous=FULL")
-            db.execute("BEGIN IMMEDIATE")
-            try:
+            # Issue #396: inside a bounded settle poll (a completion callback)
+            # all the lock waits of this write share that poll's budget
+            # (`bounded_lock_waits`); outside it this is the plain transaction.
+            with bounded_transaction(db):
                 yield db
-                db.commit()
-                if committed is not None:
-                    try:
-                        committed()
-                    except Exception:
-                        pass
-            except BaseException:
-                db.rollback()
-                raise
+            if committed is not None:
+                try:
+                    committed()
+                except Exception:
+                    pass
 
     @staticmethod
     def _clock_trust(db, now, trusted):

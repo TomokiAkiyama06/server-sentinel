@@ -10,6 +10,7 @@ import time
 
 from app.notifications.slack import DeliveryResult, SlackDelivery
 from app.notifications.worker import DeliveryWorker
+from app.storage.database import bounded_lock_waits
 from app.storage.policy import StorageState
 
 
@@ -158,11 +159,26 @@ class NotificationService:
 
     def __init__(self, local_sink: Callable[[NotificationEvent], None],
                  slack: SlackDelivery | None = None, *, queue_capacity: int = 16,
-                 local_batch_sink: Callable[[tuple[NotificationEvent, ...]], None] | None = None):
+                 local_batch_sink: Callable[[tuple[NotificationEvent, ...]], None] | None = None,
+                 stopping: Callable[[], bool] | None = None,
+                 settle_overshoot_seconds: float = 0.0):
         if type(queue_capacity) is not int or not 1 <= queue_capacity <= 1024:
             raise ValueError("invalid notification capacity")
         if local_batch_sink is not None and not callable(local_batch_sink):
             raise ValueError("invalid notification batch sink")
+        if stopping is not None and not callable(stopping):
+            raise ValueError("invalid notification stop check")
+        if (type(settle_overshoot_seconds) not in (int, float)
+                or not 0 <= settle_overshoot_seconds <= 60):
+            raise ValueError("invalid notification settle overshoot")
+        # Issue #396: once ``stopping()`` is true a poll without a deadline
+        # does nothing (the one gate for every deadline-less poll, the
+        # owner's and this service's own); the shutdown settles poll with
+        # their deadline. ``settle_overshoot_seconds`` is how long after a
+        # poll's deadline the lock waits of the write or callback in progress
+        # may still run (`stop_budget.SETTLE_POLL_OVERSHOOT_SECONDS`).
+        self._stopping = stopping or (lambda: False)
+        self._settle_overshoot = float(settle_overshoot_seconds)
         self._local_sink = local_sink
         # Issue #385 (Owner decision 2026-11-08): writes several final
         # outcomes as one write (`persist_completed`); without it they are
@@ -327,12 +343,28 @@ class NotificationService:
 
         Issue #385: with a ``deadline`` (``time.monotonic``) no further local
         write or completion callback starts once it passed; the rest stay
-        pending, unchanged, for the next poll. A poll then ends at most one
-        write or callback after the deadline.
+        pending, unchanged, for the next poll. Issue #396: every SQLite lock
+        wait of the writes it makes, its own outcome writes and those of the
+        completion callbacks (`app.storage.database.bounded_lock_waits`),
+        ends by ``settle_overshoot_seconds`` after the deadline, so the poll
+        ends then plus the I/O of the write in progress, however many locks
+        a callback's transaction waits for. A write that cannot get its lock
+        in time is refused like an exhausted busy timeout: an outcome write
+        stays pending for the next poll (or the stop's `persist_completed`),
+        a callback is retried by the next poll.
+
+        Without a deadline, a no-op once ``stopping()`` is true (Issue #396):
+        the shutdown settles own the polling then.
         """
         self._check()
-        past = ((lambda: False) if deadline is None
-                else (lambda: time.monotonic() >= deadline))
+        if deadline is None:
+            if self._stopping():
+                return ()
+            return self._poll(lambda: False)
+        with bounded_lock_waits(deadline + self._settle_overshoot):
+            return self._poll(lambda: time.monotonic() >= deadline)
+
+    def _poll(self, past) -> tuple[NotificationEvent, ...]:
         self._flush_unpersisted(past)
         for identifier, result in self._worker.results():
             self._pending[identifier][2] = result
@@ -385,7 +417,7 @@ class NotificationService:
         `notification_events`, and the next start could send a reconciled
         kind a second time. With ``local_batch_sink`` the rows (the finished
         deliveries and the retained refused writes) go in one transaction,
-        bounded by one SQLite busy timeout
+        all of its lock waits bounded by one SQLite busy timeout
         (`stop_budget.LATE_OUTCOME_WRITE_SECONDS`). No completion callback is
         called: a callback can take several writes, and the outbox reconciles
         its unconfirmed claims from these rows at the next start. The daily
@@ -409,11 +441,12 @@ class NotificationService:
         if any(update.delivery == DeliveryResult.FAILED for _identifier, update in finished):
             self.delivery_failed = True
         if self._local_batch_sink is None:
-            written = 0
-            for identifier, event in retained:
-                if self._local(event):
-                    del self._unpersisted[identifier]
-                    written += 1
+            # Without a batch sink (an embedder or a test; the Main
+            # composition always passes one) the rows are written one by one,
+            # through the same writes as `poll()`, so not as one write.
+            before = len(self._unpersisted)
+            self._flush_unpersisted()
+            written = before - len(self._unpersisted)
             for _identifier, update in finished:
                 if self._local(update):
                     self.last_delivery = update.delivery

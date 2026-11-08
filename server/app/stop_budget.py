@@ -73,17 +73,21 @@ INTEGRITY_PROBE_STOP_SECONDS = 0.25 + 1.0
 #   plus that write's own I/O. Only one settle runs at a stop (or, when none
 #   did, the stop's own poll, `MonitoringRuntime._persist_outcomes`) and the
 #   final storage sample's wait already counts this overshoot as settle time.
-#   A completion callback whose transaction waits for more than one lock
-#   (a rollback-journal commit) can take longer; that is not bounded yet
-#   (Issue #396).
+#   Issue #396: every SQLite lock wait of that poll's writes, its outcome
+#   writes and those of the completion callbacks (presence claims, the daily
+#   summary schedule row), however many locks a transaction waits for, ends
+#   by this long after the deadline (`app.storage.database.bounded_lock_waits`),
+#   so a callback's rollback-journal commit cannot stretch it either;
 SETTLE_POLL_OVERSHOOT_SECONDS = 5.0
 # - the stop's last outcome write (Owner decision 2026-11-08): the deliveries
 #   that finished after the last settle's deadline (or while it ended
 #   unsettled) and the retained refused writes are written by
 #   `NotificationService.persist_completed` in one transaction whose
-#   RESERVED (`BEGIN IMMEDIATE`) and EXCLUSIVE (`COMMIT`) lock waits share
-#   one SQLite busy timeout (`BUSY_TIMEOUT_SECONDS`,
-#   `NotificationEventStore.upsert_many`), plus its own I/O, once per stop. Without it the next start could send a reconciled kind again.
+#   lock waits (SHARED and RESERVED at `BEGIN IMMEDIATE`, EXCLUSIVE at
+#   `COMMIT`) share one SQLite busy timeout (`BUSY_TIMEOUT_SECONDS`,
+#   `NotificationEventStore.upsert_many`, `bounded_lock_waits`), plus its
+#   own I/O, once per stop. Without it the next start could send a
+#   reconciled kind again.
 LATE_OUTCOME_WRITE_SECONDS = 5.0
 OTHER_STOP_STEPS_RESERVE_SECONDS = (HTTP_GRACEFUL_SHUTDOWN_SECONDS + RESERVATION_CHECK_STOP_SECONDS
                                     + SCENE_STOP_SECONDS + PROCESS_EXIT_SECONDS
@@ -107,7 +111,9 @@ STOP_ADMISSION_WAIT_SECONDS = 5.0
 # timeline finish and the dispatch, and of a check that completed just before
 # the stop (the integrity `store.record` / `deliver` and the self-test's
 # `record_result` writes), a hung filesystem call, and the dispatch steps
-# before the critical settle, with their deadline-less polls. The completion
+# before the critical settle (their polls do nothing once the stop began,
+# `NotificationService.poll`, Issue #396; their submissions still write).
+# The completion
 # callbacks of deliveries that finished after the last settle's deadline are
 # not called; their outcome rows are written (`LATE_OUTCOME_WRITE_SECONDS`).
 # On top of `join_timeout_seconds`, a local UVC stop waits at most 1 s for the
