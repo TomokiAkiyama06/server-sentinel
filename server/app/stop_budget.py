@@ -21,6 +21,26 @@ class StopInterrupted(Exception):
     """
 
 
+class _Interrupted:
+    """The type of `INTERRUPTED`; it has a single instance."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "INTERRUPTED"
+
+
+# Issue #385 (PR #389 review): what a check returns when the Main shutdown cut
+# it short, so the monitoring runtime can tell it from a check that completed
+# (and keeps the step's degraded flag and retry as they were).
+INTERRUPTED = _Interrupted()
+
+
+def never() -> bool:
+    """The default `interrupted` / `stopping` check: no shutdown ever begins."""
+    return False
+
+
 # The installed unit's `TimeoutStopSec` (Owner decision 2026-10-08). Past it
 # systemd sends SIGKILL.
 UNIT_STOP_TIMEOUT_SECONDS = 90
@@ -50,19 +70,25 @@ INTEGRITY_PROBE_STOP_SECONDS = 0.25 + 1.0
 #   before it begins no further outcome write or callback after it
 #   (`NotificationService.poll(deadline=)`), so it overshoots by at most the
 #   one write in progress: one SQLite busy timeout (`BUSY_TIMEOUT_SECONDS`)
-#   plus that write's own I/O. Only one settle runs at a stop and the final
-#   storage sample's wait already counts this overshoot as settle time.
+#   plus that write's own I/O. Only one settle runs at a stop (or, when none
+#   did, the stop's own poll, `MonitoringRuntime._persist_outcomes`) and the
+#   final storage sample's wait already counts this overshoot as settle time.
+#   A completion callback whose transaction waits for more than one lock
+#   (a rollback-journal commit) can take longer; that is not bounded yet.
 SETTLE_POLL_OVERSHOOT_SECONDS = 5.0
 OTHER_STOP_STEPS_RESERVE_SECONDS = (HTTP_GRACEFUL_SHUTDOWN_SECONDS + RESERVATION_CHECK_STOP_SECONDS
                                     + SCENE_STOP_SECONDS + PROCESS_EXIT_SECONDS
                                     + INTEGRITY_PROBE_STOP_SECONDS + SETTLE_POLL_OVERSHOOT_SECONDS)
-# Once the stop began, a write from another thread waits at most this long for
-# the storage admission (`MonitoringRuntime.reservation`) and is then refused
-# as a denial (nothing written; the caller handles it as any storage refusal
-# and the next start does it again). Not in the reserve (Owner decision
-# 2026-11-05): behind a bounded step (the integrity check above) the wait ends
-# with that step and adds nothing; the cap only matters behind the steps that
-# are still unbounded (below), whose own time the reserve cannot cover anyway.
+# Once the stop began, a write from another thread waits for the storage
+# admission (`MonitoringRuntime.reservation`) at most until this long after the
+# stop while the jobs queued at the stop still run (every such wait shares
+# that deadline, PR #389 review), and this long from the later of its start
+# and their end afterwards; it is then refused as a denial (nothing written;
+# the caller handles it as any storage refusal and the next start does it
+# again). Not in the reserve (Owner decision 2026-11-05): behind a bounded
+# step (the integrity check above) the wait ends with that step and adds
+# nothing; the cap only matters behind the steps that are still unbounded
+# (below), whose own time the reserve cannot cover anyway.
 STOP_ADMISSION_WAIT_SECONDS = 5.0
 # Still not bounded (Issue #385): the other monitoring steps already running
 # when the stop began (retention `_trim`, the storage sample, the daily
@@ -71,7 +97,10 @@ STOP_ADMISSION_WAIT_SECONDS = 5.0
 # timeline finish and the dispatch, and of a check that completed just before
 # the stop (the integrity `store.record` / `deliver` and the self-test's
 # `record_result` writes), a hung filesystem call, and the dispatch steps
-# before the critical settle.
+# before the critical settle, with their deadline-less polls. A delivery that
+# finished after a settle ended unsettled is not written (the final storage
+# sample has no wait left), so the next start may send a reconciled kind
+# again; writing it would need one more busy timeout in the reserve.
 # On top of `join_timeout_seconds`, a local UVC stop waits at most 1 s for the
 # frame-progress watchdog join (`WorkerSupervisor.WATCHDOG_JOIN_MINIMUM_SECONDS`),
 # 1 s for the fenced `offline` writes of workers that outlived the join

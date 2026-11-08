@@ -36,11 +36,14 @@ interrupted recovery and substituted-directory refusal.
 
 Issue #385: once the Main shutdown began (`stopping`), the self-test starts no
 further stage and skips the storage health read, but still runs its cleanup.
-A stage that already ran and failed, or a failed cleanup, is recorded as
-`FAILED` (and notified); otherwise nothing is recorded, so a test cut short is
-neither a failure nor healthy, and `monitoring_check_interrupted` is logged.
-The next start's startup self-test runs it again. A stage already running is
-not cut short: its time is bounded only by the adapter.
+A stage that failed before the stop began, or a failed cleanup, is recorded as
+`FAILED` (and notified); a stage that fails (or a pipeline found not ready)
+once the stop has begun is not, since the shutdown tears capture and storage
+down while it runs (PR #389 review). Otherwise nothing is recorded, so a test
+cut short is neither a failure nor healthy, `monitoring_check_interrupted` is
+logged and `INTERRUPTED` returned. The next start's startup self-test runs it
+again. A stage already running is not cut short: its time is bounded only by
+the adapter.
 
 The injected `record_result(result, aware_time)` must durably retain fixed state/
 stage codes locally and enqueue #21 `RECORDING_HEALTH_FAILURE` immediately for

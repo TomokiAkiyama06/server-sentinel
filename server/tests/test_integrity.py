@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from itertools import permutations
 
 from app.audit import (
@@ -26,7 +27,7 @@ from app.integrity import probes
 from app.integrity.model import Component, Finding, Inventory, Kind, State, _explained, compare
 from app.integrity.probes import CommandRunner, LinuxProbe, ProbeUnavailable
 from app.integrity.service import IntegrityService
-from app.stop_budget import StopInterrupted
+from app.stop_budget import INTERRUPTED, StopInterrupted
 from app.integrity.store import IntegrityStore, integrity_migration
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -516,7 +517,7 @@ class StoreTests(TestCase):
         probe.interrupt = True
         clock[0] = 86400
         with self.assertLogs("app.integrity.service", "WARNING") as logs:
-            self.assertIsNone(service.tick())
+            self.assertIs(INTERRUPTED, service.tick())
         self.assertIn("monitoring_check_interrupted", "\n".join(logs.output))
         self.assertEqual(status, self.db.execute("SELECT * FROM integrity_status").fetchall())
         self.assertEqual(outbox, self.db.execute("SELECT COUNT(*) FROM integrity_outbox").fetchone()[0])
@@ -1124,22 +1125,53 @@ class ProbeCleanupTests(TestCase):
         self.assertLessEqual(self.clock.now - stop, probes.STOP_POLL_SECONDS + probes.STOP_REAP_SECONDS)
         self.assertLess(reaped, probes.COMMAND_REAP_SECONDS)
 
-    def test_a_child_ended_by_sigterm_is_an_interrupted_check(self):
+    def run_exited(self, returncode, interrupted=None):
+        child = _ExitedChild(self.child.stdout.fileno(), returncode)
+        spawn = probes.subprocess
+        probes.subprocess = _Spawn(child)
+        try:
+            runner = CommandRunner() if interrupted is None else CommandRunner(interrupted)
+            started = time.monotonic()
+            try:
+                runner.run(("dmidecode", "--type", "17"))
+            except (StopInterrupted, ProbeUnavailable) as error:
+                return type(error), time.monotonic() - started
+            raise AssertionError("no error")
+        finally:
+            probes.subprocess = spawn
+
+    def test_a_child_ended_by_sigterm_is_an_interrupted_check_only_at_a_stop(self):
         # Issue #385 (PR #389 review): systemd's stop SIGTERMs the whole
-        # control group before `begin_stop()`; that partial output is an
-        # interrupted check, while another signal (an OOM SIGKILL) stays a
-        # real failure.
-        for returncode, expected in ((-signal.SIGTERM, StopInterrupted),
-                                     (-signal.SIGKILL, ProbeUnavailable)):
-            with self.subTest(returncode=returncode):
-                child = _ExitedChild(self.child.stdout.fileno(), returncode)
-                spawn = probes.subprocess
-                probes.subprocess = _Spawn(child)
-                try:
-                    with self.assertRaises(expected):
-                        CommandRunner().run(("dmidecode", "--type", "17"))
-                finally:
-                    probes.subprocess = spawn
+        # control group before `begin_stop()`, so a SIGTERM followed by the
+        # stop is an interrupted check; another signal (an OOM SIGKILL) stays
+        # unavailable.
+        began = time.monotonic() + 0.4
+        kind, elapsed = self.run_exited(-signal.SIGTERM, lambda: time.monotonic() >= began)
+        self.assertIs(StopInterrupted, kind)
+        # Ends within a poll slice of the stop, not at the end of the window.
+        self.assertLess(elapsed, 0.4 + probes.STOP_POLL_SECONDS + 0.2)
+        self.assertIs(ProbeUnavailable, self.run_exited(-signal.SIGKILL)[0])
+
+    def test_a_sigterm_without_a_stop_stays_unavailable(self):
+        # PR #389 review: a SIGTERM from anything else (`pkill`, a watchdog)
+        # must not silently discard the check; it stays unavailable, so the
+        # check records it.
+        kind, elapsed = self.run_exited(-signal.SIGTERM)
+        self.assertIs(ProbeUnavailable, kind)
+        self.assertLess(elapsed, 0.2)  # `never` cannot become true: no wait
+        with patch.object(probes, "SIGTERM_STOP_WAIT_SECONDS", 0.3):
+            kind, elapsed = self.run_exited(-signal.SIGTERM, lambda: False)
+        self.assertIs(ProbeUnavailable, kind)
+        self.assertGreaterEqual(elapsed, 0.3)
+        self.assertEqual(probes.SIGTERM_STOP_WAIT_SECONDS,
+                         probes.HTTP_GRACEFUL_SHUTDOWN_SECONDS + 1.0)
+
+    def test_a_probe_without_a_runner_gives_it_its_own_check(self):
+        # PR #389 review: one `interrupted` for the probe and the command.
+        check = lambda: False  # noqa: E731
+        self.assertIs(check, LinuxProbe(interrupted=check).runner.interrupted)
+        runner = CommandRunner()
+        self.assertIs(runner, LinuxProbe(runner=runner, interrupted=check).runner)
 
     def test_a_stop_before_the_command_spawns_nothing(self):
         def spawn(*arguments, **options):

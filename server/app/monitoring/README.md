@@ -89,16 +89,27 @@ write or completion callback after its bound; an outcome not written by then
 stays `pending` for the next poll, like a delivery not finished in time. Once
 the stop began (`begin_stop`), an integrity check or self-test in flight ends
 early and records nothing partial (`app/integrity`, `app/media/health`), and a
-cross-thread `reservation()` waits at most `STOP_ADMISSION_WAIT_SECONDS` (5 s)
-for the worker: a reservation not granted by then is withdrawn before the
+cross-thread `reservation()` waits for the worker at most until
+`STOP_ADMISSION_WAIT_SECONDS` (5 s) after the stop while the jobs queued at the
+stop still run (all such waits share that deadline, so writes made one after
+another add up to 5 s once, PR #389 review), and 5 s from the later of its start
+and their end afterwards: a reservation not granted by then is withdrawn before the
 worker takes it and refused as `STORAGE_ADMISSION_STOPPING`
 (`storage_admission_stop_timeout`, nothing written), so the caller handles it
 like any storage refusal. This applies to every cross-thread write (scene timeline finish and dispatch,
 local UVC `offline` / fenced writes, audit, human access); the next start
 does or finds the refused write again. Once the stop began the run loop polls
-no more outcomes between ticks (`_poll_outcomes` is a no-op), so only the
-settles poll, with their deadline, and a step returning then leaves its
-degraded flag and retry unchanged. For the human access durable revocation marker the
+no more outcomes between ticks (`_poll_outcomes` is a no-op) and a tick in
+flight skips its own polls, so only the settles poll, with their deadline;
+when no settle ran, the stop polls once with a `SHUTDOWN_STORAGE_SETTLE_SECONDS`
+deadline counted as settle time (`_persist_outcomes`). A check the stop cut
+short returns `INTERRUPTED` and leaves its degraded flag and retry unchanged;
+a step that completed clears them as usual. The dispatch steps of the
+critical settle still poll without a deadline (not bounded yet). A delivery
+that finishes after a settle ended unsettled keeps its `pending` row: the
+final storage sample then has no wait left and writes no outcome, so the next
+start may send a reconciled kind again (PR #389 review; restoring it needs a
+larger reserve). For the human access durable revocation marker the
 requirement then stays in memory only and a restart can lose it (the next
 start's check finds the exposure again only if it still exists); Owner
 decision 2026-11-05 accepts this trade-off. The cap is not a stop budget

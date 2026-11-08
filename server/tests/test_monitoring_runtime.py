@@ -30,7 +30,9 @@ from app.media.health.service import HealthState, PipelineStatus, Stage
 from app.media.recording import Segment
 from app.monitoring.config import MonitoringConfiguration, RecordingFilesystem, parse_monitoring
 from app.media.recording.model import RecordingError
+from app.monitoring import runtime as runtime_module
 from app.monitoring.runtime import MonitoringDependencies, RuntimeState, default_integrity_probe
+from app.stop_budget import INTERRUPTED
 from app.settings import ConfigurationError, Settings
 from app.storage.database import Database
 from app.storage.policy import FilesystemSpace, StorageLimits, StorageState
@@ -391,10 +393,13 @@ class LifespanTests(RuntimeFixture):
             runtime._poll = lambda: (polls.append(1), poll())[1]
             await runtime.call(runtime.tick)
             self.assertEqual(["retention", "integrity"], calls)
-            # Notification polling still runs after the skipped steps.
-            self.assertEqual(2, len(polls))
+            # PR #389 review: only the poll before the stop; the tick's own
+            # trailing poll is skipped once the stop began (the settles, or
+            # `_persist_outcomes`, write the outcomes with a deadline).
+            self.assertEqual(1, len(polls))
             await runtime.call(runtime.tick)
             self.assertEqual(["retention", "integrity"], calls)
+            self.assertEqual(1, len(polls))
             ticks = []
             runtime.tick = lambda: ticks.append(1)
             runtime.dependencies = replace(runtime.dependencies, tick_seconds=0.01)
@@ -431,21 +436,23 @@ class LifespanTests(RuntimeFixture):
                 runtime.notifications = notifications
                 del runtime._poll
 
-    async def test_a_step_returning_after_the_stop_leaves_its_flag(self):
-        # Issue #385 (PR #389 review): an interrupted check returns without a
-        # result, so it neither clears its degraded flag nor its retry.
+    async def test_an_interrupted_step_leaves_its_flag(self):
+        # Issue #385 (PR #389 review): an interrupted check proves nothing, so
+        # it neither clears its degraded flag nor its retry; a step that
+        # completed after the stop began clears them as usual.
         application = self.application()
         async with application.router.lifespan_context(application):
             runtime = application.state.monitoring
 
-            def run():
+            def run(result):
                 runtime._set(integrity_degraded=True)
                 runtime._retry_at["integrity"] = -1.0
                 runtime.begin_stop()
-                runtime._guarded("integrity", lambda: None, "integrity_degraded")
+                runtime._guarded("integrity", lambda: result, "integrity_degraded")
                 return runtime.status.integrity_degraded, runtime._retry_at.get("integrity")
 
-            self.assertEqual((True, -1.0), await runtime.call(run))
+            self.assertEqual((True, -1.0), await runtime.call(run, INTERRUPTED))
+            self.assertEqual((False, None), await runtime.call(run, None))
 
     async def test_retention_expires_unstarred_and_keeps_starred(self):
         application = self.application()
@@ -1047,6 +1054,75 @@ class ReservationThreadTests(RuntimeFixture):
             after = []
             await asyncio.to_thread(writer, after)
             self.assertEqual(["written"], after)
+
+    async def test_writes_behind_a_stuck_step_share_one_stop_deadline(self):
+        # PR #389 review: behind a step still running at the stop, writes made
+        # one after another are refused together once the stop's admission
+        # wait is spent, not after a fresh wait each; once the worker is free
+        # again a write is admitted.
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            running, release = threading.Event(), threading.Event()
+
+            def busy():
+                running.set()
+                release.wait(10)
+
+            def writes(outcome, count):
+                for _ in range(count):
+                    try:
+                        with runtime.reservation():
+                            outcome.append("written")
+                    except RecordingError as error:
+                        outcome.append(str(error))
+
+            with patch("app.monitoring.runtime.STOP_ADMISSION_WAIT_SECONDS", 0.4):
+                job = asyncio.ensure_future(runtime.call(busy))
+                self.assertTrue(await asyncio.to_thread(running.wait, 2))
+                outcome = []
+                with self.assertLogs("app.monitoring.runtime", "ERROR"):
+                    runtime.begin_stop()
+                    started = time.monotonic()
+                    await asyncio.to_thread(writes, outcome, 4)
+                    elapsed = time.monotonic() - started
+                self.assertEqual(["STORAGE_ADMISSION_STOPPING"] * 4, outcome)
+                # One shared wait (0.4 s), not four (1.6 s).
+                self.assertLess(elapsed, 0.9)
+                release.set()
+                await job
+                # The worker drained the jobs queued before the stop: a write
+                # is admitted again, its wait bounded from then.
+                after = []
+                await asyncio.to_thread(writes, after, 2)
+                self.assertEqual(["written", "written"], after)
+
+    async def test_the_stop_polls_once_when_no_settle_ran(self):
+        # PR #389 review: a tick in flight no longer polls after the stop, so
+        # the stop itself writes finished outcomes, with a deadline counted as
+        # settle time; never after a settle, and never without a stop.
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            deadlines = []
+            runtime._poll = lambda deadline=None: deadlines.append(deadline)
+
+            def persist():
+                started = time.monotonic()
+                runtime._persist_outcomes()
+                return started
+
+            await runtime.call(persist)
+            self.assertEqual([], deadlines)
+            runtime.begin_stop()
+            started = await runtime.call(persist)
+            self.assertEqual(1, len(deadlines))
+            self.assertAlmostEqual(started + runtime_module.SHUTDOWN_STORAGE_SETTLE_SECONDS,
+                                   deadlines[0], delta=0.5)
+            self.assertEqual(runtime_module.SHUTDOWN_STORAGE_SETTLE_SECONDS, runtime._settle_bound)
+            # The settle budget is now taken: a second call does nothing.
+            await runtime.call(persist)
+            self.assertEqual(1, len(deadlines))
 
     async def test_a_settle_gives_every_poll_its_deadline(self):
         # Issue #385: a poll started before the settle's deadline begins no

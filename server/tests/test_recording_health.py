@@ -3,7 +3,7 @@
 from unittest import TestCase
 
 from app.media.health.service import HealthState, PipelineStatus, RecordingHealthService, Stage
-from app.stop_budget import StopInterrupted
+from app.stop_budget import INTERRUPTED, StopInterrupted
 
 
 class FakeRecorder:
@@ -180,7 +180,7 @@ class StopInterruptionTests(TestCase):
 
     def run_interrupted(self):
         with self.assertLogs("app.media.health.service", "WARNING") as logs:
-            self.assertIsNone(self.service.startup())
+            self.assertIs(INTERRUPTED, self.service.startup())
         self.assertIn("monitoring_check_interrupted", "\n".join(logs.output))
 
     def test_no_further_stage_starts_and_nothing_is_recorded(self):
@@ -201,12 +201,14 @@ class StopInterruptionTests(TestCase):
                 self.assertIsNone(self.service._last_check)
 
     def test_a_real_failure_before_the_stop_is_still_recorded(self):
-        # A stage that ran and failed, or a failed cleanup, is complete.
+        # A stage that failed before the stop began, or a failed cleanup, is
+        # complete. Here the stop begins during the final cleanup.
         self.adapter.fail = "write"
-        self.stop_at = "write"
+        self.service.stopping = lambda: self.adapter.calls.count("cleanup") >= 2
         self.run_interrupted()
         self.assertEqual([(HealthState.FAILED, (Stage.WRITE,))],
                          [(result.state, result.stages) for result, _ in self.recorded])
+        self.service.stopping = self.stopping
         self.recorded.clear()
         self.adapter.calls.clear()
         self.adapter.fail = None
@@ -222,6 +224,34 @@ class StopInterruptionTests(TestCase):
         self.run_interrupted()
         self.assertEqual([(HealthState.FAILED, (Stage.CLEANUP,))],
                          [(result.state, result.stages) for result, _ in self.recorded])
+
+    def test_a_stage_failing_once_the_stop_began_records_nothing(self):
+        # PR #389 review: the shutdown tears capture and storage down while a
+        # stage runs, so its failure then proves nothing and is no alarm.
+        for stage in ("storage", "write", "decode"):
+            with self.subTest(stage=stage):
+                self.adapter.calls.clear()
+                self.recorded.clear()
+                self.adapter.fail = stage
+                self.stop_at = stage
+                self.run_interrupted()
+                self.assertEqual([], self.recorded)
+                self.assertFalse(self.adapter.leftover)
+        # A pipeline found not ready once the stop began is the same.
+        self.adapter.calls.clear()
+        self.adapter.fail = None
+        self.adapter.status = PipelineStatus((False,), True, True)
+        self.stop_at = "pipeline"
+        self.run_interrupted()
+        self.assertEqual([], self.recorded)
+        # Without a stop both stay real failures.
+        self.stop_at = None
+        self.assertEqual((HealthState.FAILED, (Stage.PIPELINE,)),
+                         (lambda r: (r.state, r.stages))(self.service.startup()))
+        self.adapter.status = PipelineStatus((True,), True, True)
+        self.adapter.fail = "write"
+        self.assertEqual((HealthState.FAILED, (Stage.WRITE,)),
+                         (lambda r: (r.state, r.stages))(self.service.startup()))
 
     def test_a_device_health_read_killed_at_the_stop_records_nothing(self):
         def killed():

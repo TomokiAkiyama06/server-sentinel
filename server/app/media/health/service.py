@@ -14,7 +14,7 @@ import math
 import time
 
 from app.logging import Event
-from app.stop_budget import StopInterrupted
+from app.stop_budget import INTERRUPTED, StopInterrupted, never
 
 
 class HealthState(StrEnum):
@@ -73,14 +73,10 @@ class RecorderProbe(Protocol):
         """OK, CRITICAL or UNVERIFIABLE for configured recording devices."""
 
 
-def _never() -> bool:
-    return False
-
-
 class RecordingHealthService:
     def __init__(self, adapter: RecorderProbe | None, record_result, *,
                  monotonic=time.monotonic, utcnow=lambda: datetime.now(timezone.utc),
-                 stopping: Callable[[], bool] = _never):
+                 stopping: Callable[[], bool] = never):
         self.adapter = adapter
         # The integration supplies a durable local/UI result recorder plus #21
         # immediate notification enqueue; a failed call must propagate.
@@ -111,9 +107,10 @@ class RecordingHealthService:
     def _interrupted(self, failures):
         """Issue #385: end a self-test the Main shutdown cut short.
 
-        A stage that ran and failed, or a failed cleanup, is a complete and
-        real failure and is recorded (and notified) as one; without one the
-        test is neither failed nor healthy, so nothing is recorded.
+        A stage that failed before the stop began, or a failed cleanup, is a
+        complete and real failure and is recorded (and notified) as one;
+        without one the test is neither failed nor healthy, so nothing is
+        recorded.
         """
         if failures:
             self.record_result(HealthResult(HealthState.FAILED, tuple(dict.fromkeys(failures))),
@@ -121,12 +118,15 @@ class RecordingHealthService:
         logging.getLogger(__name__).warning(Event.MONITORING_CHECK_INTERRUPTED)
 
     def _run(self):
-        """One self-test; None when the Main shutdown interrupted it.
+        """One self-test; `INTERRUPTED` when the Main shutdown cut it short.
 
         Once the stop began no further stage starts and the device health
         read is skipped; the cleanup still runs (INTEGRITY-004). A partial
-        test is never reported as failed or healthy (`_interrupted`). The
-        next start runs the startup self-test.
+        test is never reported as failed or healthy (`_interrupted`). A stage
+        that fails once the stop has begun is not counted as a failure either
+        (PR #389 review): the shutdown tears capture and storage down while it
+        runs, so its failure proves nothing. The next start runs the startup
+        self-test.
         """
         started = self.monotonic()
         if not math.isfinite(started):
@@ -146,6 +146,8 @@ class RecordingHealthService:
                 stage = Stage.PIPELINE
                 self._stage()
                 if not adapter.pipeline_status().ready:
+                    if self.stopping():
+                        raise StopInterrupted()
                     failures.append(stage)
                 else:
                     stage = Stage.STORAGE
@@ -160,7 +162,10 @@ class RecordingHealthService:
             except StopInterrupted:
                 interrupted = True
             except Exception:
-                failures.append(stage)
+                if self.stopping():
+                    interrupted = True
+                else:
+                    failures.append(stage)
             except BaseException as exc:
                 cancelled = exc
                 failures.append(stage)
@@ -174,7 +179,7 @@ class RecordingHealthService:
                     failures.append(Stage.CLEANUP)
             if cancelled is None and (interrupted or self.stopping()):
                 self._interrupted(failures)
-                return None
+                return INTERRUPTED
             if cancelled is None:
                 try:
                     health = adapter.storage_health()
@@ -187,7 +192,7 @@ class RecordingHealthService:
                 except StopInterrupted:
                     # A device health read killed at the stop (Issue #385).
                     self._interrupted(failures)
-                    return None
+                    return INTERRUPTED
                 except Exception:
                     unavailable = True
                 except BaseException as exc:

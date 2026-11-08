@@ -562,10 +562,15 @@ SQLite busy timeout) past its configured bound, which is not shortened (an
 outcome not written by then stays `pending`). `monitoring_check_interrupted`
 is logged when a check was cut short; a probe command ended by SIGTERM (the
 systemd stop signals the whole control group, before the lifespan shutdown
-starts) counts as cut short too, any other signal as a failed probe. Every write from another thread (for
+starts) counts as cut short too when the stop begins within 6 s of it; a
+SIGTERM from anything else, and any other signal, is a failed probe. A
+self-test stage that fails once the stop began is not recorded as a failure.
+Every write from another thread (for
 example the scene timeline finish and dispatch, the local UVC `offline` and
-fenced writes, audit records and the human access writes) waits at most 5 s
-for the storage admission once the stop began and is then refused like any
+fenced writes, audit records and the human access writes) waits for the
+storage admission once the stop began at most until 5 s after the stop while
+the monitoring work queued at the stop still runs (all of them together), and
+at most 5 s each afterwards, and is then refused like any
 storage refusal (`storage_admission_stop_timeout`, nothing written); what it
 would have written is done, or found again, by the next start. That cap is not
 in the reserve: behind the bounded integrity check the wait ends with it and

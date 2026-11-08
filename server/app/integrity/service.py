@@ -6,7 +6,7 @@ import math
 import time
 
 from app.logging import Event
-from app.stop_budget import StopInterrupted
+from app.stop_budget import INTERRUPTED, StopInterrupted
 
 from .model import Finding, Inventory, Kind, State, compare
 from .store import IntegrityOutboxFull, IntegrityStore
@@ -52,9 +52,10 @@ class IntegrityService:
             # inventory never becomes a hardware change, an unverifiable
             # warning or an Owner notice, and the baseline is untouched. The
             # last completed check stays current; the next start runs the
-            # startup check (INTEGRITY-002).
+            # startup check (INTEGRITY-002). `INTERRUPTED` tells the runtime
+            # the check proved nothing (PR #389 review).
             logging.getLogger(__name__).warning(Event.MONITORING_CHECK_INTERRUPTED)
-            return None
+            return INTERRUPTED
         except Exception:
             current = Inventory((), frozenset(Kind))
         try:
