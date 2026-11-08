@@ -688,7 +688,12 @@ class MonitoringRuntime:
         self._guarded("retention", self._retention_tick, "retention_degraded")
         self._guarded("integrity", self.integrity.startup, "integrity_degraded")
         self._guarded("health", self.recording_health.startup, "recording_health_degraded")
-        self._poll()
+        # Issue #385 (second PR #389 review): an open retried by a tick can
+        # still be running when the stop begins. Its poll then has no
+        # deadline, so it is left to the stop's bounded settle or
+        # `_close`'s one bounded poll, like a running tick's.
+        if not self._stopping.is_set():
+            self._poll()
 
     def _drop_connection(self) -> None:
         """Forget the database of a failed attempt; the retry reopens it.

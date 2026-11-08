@@ -23,7 +23,9 @@ _TIMING_BOUNDS = {
     # Frame-progress watchdog: no frame for this long on a live capture reports
     # ``degraded`` (``video_frame_stalled``) instead of ``online``. The
     # effective window is never shorter than 10 negotiated frame intervals.
-    "frame_stall_seconds": (0.25, 30.0),
+    # Never above the join bound (the join must cover a stall), so the range
+    # itself refuses what the join check would (second PR #389 review).
+    "frame_stall_seconds": (0.25, min(30.0, MAXIMUM_LOCAL_UVC_JOIN_SECONDS)),
     # A stall lasting this long closes and reopens the capture (``offline``).
     "frame_stall_reopen_seconds": (0.5, 300.0),
     # While capture is live, the full device scan (which opens every video

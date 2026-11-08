@@ -6,10 +6,20 @@ import math
 import time
 
 from app.logging import Event
-from app.stop_budget import INTERRUPTED, StopInterrupted
+from app.stop_budget import INTERRUPTED, UNIT_STOP_TIMEOUT_SECONDS, StopInterrupted, never
 
 from .model import Finding, Inventory, Kind, State, compare
 from .store import IntegrityOutboxFull, IntegrityStore
+
+# Issue #385 (second PR #389 review): a check in which a probe command ended
+# on SIGTERM before the stop began is held this long before it is recorded.
+# systemd's stop signals the whole control group before `begin_stop()` runs
+# (after the HTTP graceful wait, or after a startup still running), and it
+# kills the service once TimeoutStopSec passes, so a service still running
+# without a stop that long after was not being stopped: the SIGTERM came from
+# something else (an operator's `pkill`, a watchdog) and the check is recorded
+# with that probe unavailable, never dropped. The worker is never blocked.
+SIGTERM_HOLD_SECONDS = float(UNIT_STOP_TIMEOUT_SECONDS)
 
 
 class IntegrityService:
@@ -21,15 +31,20 @@ class IntegrityService:
         self.monotonic = monotonic
         self.utcnow = utcnow
         self._last_check = None
+        # (started, inventory, held at) of a check held after a SIGTERM.
+        self._held = None
 
     def startup(self):
         """Always compare on startup, regardless of the previous boot's clock."""
+        self._held = None
         return self._check()
 
     def tick(self):
         now = self.monotonic()
         if not math.isfinite(now):
             raise ValueError("INVALID_MONOTONIC_CLOCK")
+        if self._held is not None:
+            return self._release_held(now)
         if self._last_check is None or now < self._last_check or now - self._last_check >= 86400:
             return self._check()
         self.store.deliver(self.sink)
@@ -58,6 +73,27 @@ class IntegrityService:
             return INTERRUPTED
         except Exception:
             current = Inventory((), frozenset(Kind))
+        if getattr(self.probe, "terminated", False):
+            # Issue #385: possibly the stop's SIGTERM; decided at a later tick
+            # (`_release_held`). The step's flag and retry stay as they were.
+            self._held = (started, current, self.monotonic())
+            return INTERRUPTED
+        return self._record(started, current)
+
+    def _release_held(self, now: float):
+        started, current, held_at = self._held
+        if getattr(self.probe, "interrupted", never)():
+            self._held = None
+            logging.getLogger(__name__).warning(Event.MONITORING_CHECK_INTERRUPTED)
+            return INTERRUPTED
+        if held_at <= now < held_at + SIGTERM_HOLD_SECONDS:
+            self.store.deliver(self.sink)
+            return INTERRUPTED
+        # No stop followed (a backwards clock never holds it longer).
+        self._held = None
+        return self._record(started, current)
+
+    def _record(self, started: float, current: Inventory):
         try:
             _, baseline = self.store.baseline()
             findings = compare(baseline, current)

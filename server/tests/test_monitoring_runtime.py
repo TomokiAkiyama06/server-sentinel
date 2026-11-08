@@ -412,6 +412,34 @@ class LifespanTests(RuntimeFixture):
                 await loop
             self.assertEqual([], ticks)
 
+    async def test_a_retried_open_running_at_the_stop_leaves_its_poll(self):
+        # Issue #385 (second PR #389 review): an open retried by a tick can
+        # still run when the stop begins; its deadline-less trailing poll is
+        # skipped (the stop's settle or `_close` writes the outcomes).
+        self.approved_device = self.device + 1
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            await self.settle(runtime)
+            collect = self.probe.collect
+
+            def collect_then_stop():
+                runtime.begin_stop()
+                return collect()
+
+            self.probe.collect = collect_then_stop
+            polls = []
+            poll = runtime._poll
+            runtime._poll = lambda *args, **kwargs: (polls.append(1), poll(*args, **kwargs))[1]
+            self.approved_device = self.device
+            self.clock.advance(timedelta(minutes=20))
+            await runtime.call(runtime.tick)
+            self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
+            self.assertTrue(runtime._stopping.is_set())
+            # The tick's own poll before the open ran; none after the stop.
+            self.assertEqual(1, len(polls))
+
     async def test_once_stopping_no_poll_outside_the_settles(self):
         # Issue #385 (PR #389 review): a deadline-less poll queued behind a
         # settle would run every write the settle deferred, unbounded.

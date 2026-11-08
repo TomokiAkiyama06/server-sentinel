@@ -75,7 +75,7 @@ INTEGRITY_PROBE_STOP_SECONDS = 0.25 + 1.0
 #   final storage sample's wait already counts this overshoot as settle time.
 #   A completion callback whose transaction waits for more than one lock
 #   (a rollback-journal commit) can take longer; that is not bounded yet
-#   (別 Issue で扱う).
+#   (Issue #396).
 SETTLE_POLL_OVERSHOOT_SECONDS = 5.0
 # - the stop's last outcome write (Owner decision 2026-11-08): the deliveries
 #   that finished after the last settle's deadline (or while it ended

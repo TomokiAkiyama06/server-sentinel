@@ -126,8 +126,11 @@ class RecordingHealthService:
         that fails once the stop has begun is not counted as a failure either
         (PR #389 review): the shutdown tears capture and storage down while it
         runs, so its failure proves nothing. A failed cleanup, the first or
-        the final one, is always kept and recorded (PR #389 Codex P1). The
-        next start runs the startup self-test.
+        the final one, is always kept and recorded (PR #389 Codex P1): it only
+        removes the test's own files, and the recording filesystem stays open
+        until the monitoring runtime closes after this test, so the failure
+        leaves real leftovers rather than reflecting the teardown. The next
+        start runs the startup self-test.
         """
         started = self.monotonic()
         if not math.isfinite(started):

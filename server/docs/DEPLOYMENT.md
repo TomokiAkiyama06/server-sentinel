@@ -505,7 +505,7 @@ The optional `local_uvc` object names the logical Camera Registry sources
 for each source is selected only by the audited Owner approval and stays in the
 private approval store. A listed source without that approval stays `offline`
 and never opens a device. The timing keys are optional (bounded; invalid values
-fail `--check`). `frame_stall_seconds` (0.25–30) is how long a live capture
+fail `--check`). `frame_stall_seconds` (0.25–28.75, the join bound) is how long a live capture
 may deliver no frame before its source is reported `degraded`
 (`video_frame_stalled`) instead of `online`; the effective window is never
 shorter than 10 negotiated frame intervals, so a slow profile cannot flap.
@@ -570,9 +570,12 @@ callbacks are not called (the outbox reconciles from those rows at the next
 start). A delivery still running at that write stays `pending`. `monitoring_check_interrupted`
 is logged when a check was cut short; a probe command ended by SIGTERM (the
 systemd stop signals the whole control group, before the lifespan shutdown
-starts) counts as cut short too when the stop begins within 6 s of it; a
-SIGTERM from anything else, and any other signal, is a failed probe. A
-self-test stage that fails once the stop began is not recorded as a failure.
+starts) makes the check wait, without blocking the monitoring worker: it is
+dropped as cut short if the stop begins within 90 s (`TimeoutStopSec`) and
+otherwise recorded with that probe unavailable, so a SIGTERM from anything
+else delays the warning by at most that long plus one tick; any other signal
+is a failed probe at once. A self-test stage that fails once the stop began is
+not recorded as a failure, but a failed cleanup always is.
 Every write from another thread (for
 example the scene timeline finish and dispatch, the local UVC `offline` and
 fenced writes, audit records and the human access writes) waits for the

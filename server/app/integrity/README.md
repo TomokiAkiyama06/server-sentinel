@@ -49,12 +49,15 @@ during the normal five-second reap cuts what is left of it to 1 s too); the
 collection then raises `StopInterrupted` instead of returning a partial
 inventory, and `IntegrityService` records nothing (no change, warning, notice
 or baseline update; `monitoring_check_interrupted` is logged). The next start's
-startup check runs it. A command ended by SIGTERM is treated the same way only
-when the stop begins within `SIGTERM_STOP_WAIT_SECONDS` (6 s: the systemd stop
-signals the whole control group before `begin_stop()` runs, which follows the
-5 s HTTP graceful wait); a SIGTERM from anything else (an operator's `pkill`, a
-watchdog) and any other signal are a failed probe, so the check records it
-(PR #389 review). An interrupted check returns `INTERRUPTED`, so the
+startup check runs it. A command ended by SIGTERM before the stop began is
+unavailable and marks the runner `terminated`: the systemd stop signals the
+whole control group before `begin_stop()` runs (after the HTTP graceful wait,
+or after a startup still running), so `IntegrityService` holds that check
+without blocking the worker, drops it if the stop begins within
+`SIGTERM_HOLD_SECONDS` (`TimeoutStopSec`, 90 s) and otherwise records it with
+the probe unavailable; a SIGTERM from anything else (an operator's `pkill`, a
+watchdog) is therefore never dropped, only delayed, and any other signal is a
+failed probe at once (PR #389 reviews). An interrupted check returns `INTERRUPTED`, so the
 monitoring runtime keeps the step's degraded flag and retry. Utilities/drivers are not installed or
 bundled. Keep deployment permissions narrow; never run the backend as root for
 inventory. CI does not invoke these host utilities.

@@ -388,7 +388,10 @@ class NotificationService:
         bounded by one SQLite busy timeout
         (`stop_budget.LATE_OUTCOME_WRITE_SECONDS`). No completion callback is
         called: a callback can take several writes, and the outbox reconciles
-        its unconfirmed claims from these rows at the next start. Returns how
+        its unconfirmed claims from these rows at the next start. The daily
+        summary's schedule row, which only its callback updates, then keeps
+        `pending` (uncertain, as for any delivery not confirmed): nothing reads
+        it and the next date replaces it (second PR #389 review). Returns how
         many rows were written; a refused write writes none, is counted in
         `local_delivery_failed` and raises nothing.
         """

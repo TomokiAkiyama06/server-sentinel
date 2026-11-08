@@ -17,7 +17,7 @@ import signal
 import subprocess
 import time
 
-from app.stop_budget import HTTP_GRACEFUL_SHUTDOWN_SECONDS, StopInterrupted, never
+from app.stop_budget import StopInterrupted, never
 
 from .model import Component, Inventory, Kind
 
@@ -34,14 +34,6 @@ COMMAND_REAP_SECONDS = 5
 # killing one changes nothing on the host.
 STOP_POLL_SECONDS = 0.25
 STOP_REAP_SECONDS = 1.0
-# Issue #385 (PR #389 review): systemd's stop sends SIGTERM to the whole
-# control group, so a probe child can end on it before `begin_stop()` runs,
-# which follows the HTTP server's graceful wait. A child ended by SIGTERM is
-# an interrupted check only when the stop begins within this long; otherwise
-# (an operator's `pkill`, a watchdog) the command is unavailable, as before.
-# The wait ends within one poll slice of the stop, so it adds nothing to
-# `app.stop_budget.INTEGRITY_PROBE_STOP_SECONDS`.
-SIGTERM_STOP_WAIT_SECONDS = HTTP_GRACEFUL_SHUTDOWN_SECONDS + 1.0
 
 
 class ProbeUnavailable(Exception):
@@ -56,9 +48,16 @@ class CommandRunner:
     `interrupted` (Issue #385) is polled while a command runs; once it returns
     True the command is killed and `StopInterrupted` raised, never a partial
     output.
+
+    `terminated` is set when a command ended on SIGTERM while `interrupted()`
+    was still false (Issue #385, second PR #389 review). systemd's stop
+    signals the whole control group before `begin_stop()` runs, so the
+    caller decides later whether that check was cut short by the stop
+    (`IntegrityService` holds it); the runner itself never waits for it.
     """
 
     interrupted: Callable[[], bool] = field(default=never, repr=False)
+    terminated: bool = field(default=False, init=False, repr=False)
 
     def run(self, command: tuple[str, ...]) -> bytes:
         permitted = command in {
@@ -105,15 +104,16 @@ class CommandRunner:
                     if time.monotonic() >= deadline:
                         raise
             if status == -signal.SIGTERM:
-                # Issue #385 (PR #389 review): partial output either way. It is
-                # an interrupted check only when the Main shutdown began or
-                # begins within SIGTERM_STOP_WAIT_SECONDS (systemd's SIGTERM
-                # reaches the child first); a SIGTERM from anything else stays
-                # an unavailable command, so the check still records it and
-                # never ends in silence. Other signals (SIGKILL by the OOM
-                # killer, for example) are unavailable at once.
-                if self._stop_follows():
+                # Issue #385 (PR #389 reviews): partial output either way. Once
+                # the stop began it is an interrupted check. Otherwise the
+                # probe is unavailable and `terminated` is set: the stop's
+                # SIGTERM reaches the child before `begin_stop()`, so
+                # `IntegrityService` holds the check instead of recording it
+                # at once, and records it if no stop follows. Other signals
+                # (SIGKILL by the OOM killer, for example) are unavailable.
+                if self.interrupted():
                     raise StopInterrupted()
+                self.terminated = True
                 raise ProbeUnavailable()
             # smartctl returns a bitmask: health warnings are useful output.
             if status and not (command[0] == "smartctl" and status >= 0 and not status & 7):
@@ -143,19 +143,6 @@ class CommandRunner:
                 finally:
                     process.stdout.close()
 
-
-    def _stop_follows(self) -> bool:
-        """Whether `interrupted()` is or becomes true within SIGTERM_STOP_WAIT_SECONDS."""
-        if self.interrupted is never:
-            return False
-        deadline = time.monotonic() + SIGTERM_STOP_WAIT_SECONDS
-        while True:
-            if self.interrupted():
-                return True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return False
-            time.sleep(min(remaining, STOP_POLL_SECONDS))
 
     def _reap(self, process, reap: float) -> None:
         """Wait up to `reap` for the killed command, in stop poll slices.
@@ -359,6 +346,8 @@ class LinuxProbe:
         The runner's `StopInterrupted` is not one of the exceptions a probe
         turns into an unavailable kind, so it ends the collection as well.
         """
+        if hasattr(self.runner, "terminated"):
+            self.runner.terminated = False
         components = []
         unavailable = set()
         for kind, probe in ((Kind.CPU, self._cpu), (Kind.MEMORY, self._memory),
@@ -372,6 +361,11 @@ class LinuxProbe:
         if self.interrupted():
             raise StopInterrupted()
         return Inventory(tuple(components), frozenset(unavailable))
+
+    @property
+    def terminated(self) -> bool:
+        """Whether a command of the last collection ended on SIGTERM (Issue #385)."""
+        return bool(getattr(self.runner, "terminated", False))
 
     def _cpu(self):
         text = _read(self.root / "proc/cpuinfo")
