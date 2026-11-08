@@ -560,12 +560,15 @@ step; an integrity check already running kills its probe command within
 0.25 s, reaps it for at most 1 s and records nothing (no change, no warning,
 no notice; the next start checks again), and a recording self-test starts no
 further stage, still cleans up and records only a failure that really
-happened; a notification settle ends at most one outcome write (one 5 s
-SQLite busy timeout) past its configured bound, which is not shortened. The
+happened; a notification settle ends at most 5 s past its configured bound,
+which is not shortened: every SQLite lock wait of its outcome writes and of
+the completion callbacks they run ends by then, however many locks one
+transaction waits for (Issue #396), and a poll without a deadline does
+nothing once the stop began. The
 outcomes of deliveries that finish after it (or after a settle that ended
 unsettled) are written once more just before the notification service closes,
-all in one transaction whose two lock waits (RESERVED at `BEGIN`, EXCLUSIVE
-at `COMMIT`) share one 5 s busy timeout, in the reserve, so the next start
+all in one transaction whose lock waits (SHARED and RESERVED at `BEGIN`,
+EXCLUSIVE at `COMMIT`) share one 5 s busy timeout, in the reserve, so the next start
 does not send a reconciled kind a second time; the running marker is cleared
 only after that write and stays when its admission was refused, so the next
 start then notifies conservatively; their completion
@@ -576,8 +579,13 @@ systemd stop signals the whole control group, before the lifespan shutdown
 starts) makes the check wait, without blocking the monitoring worker: it is
 dropped as cut short if the stop begins within 90 s (`TimeoutStopSec`) and
 otherwise recorded with that probe unavailable, so a SIGTERM from anything
-else delays the warning by at most that long plus one tick; any other signal
-is a failed probe at once. A self-test stage that fails once the stop began is
+else delays the warning by at most that long plus one tick; a command that
+handles SIGTERM and exits with 143 (128 + SIGTERM) counts the same, except
+smartctl, whose exit status is a bitmask (143 is a set of findings, so only
+the signal itself counts), and a check still held when the stop runs is
+dropped and logged, never recorded after the settles (the next start's
+startup check probes again; Issue #396); any other signal, or another exit
+code, is a failed probe at once. A self-test stage that fails once the stop began is
 not recorded as a failure, but a failed cleanup always is.
 Every write from another thread (for
 example the scene timeline finish and dispatch, the local UVC `offline` and
@@ -1084,7 +1092,11 @@ sudo systemctl restart server-sentinel.service
 On the shared GPU Main host, ServerSentinel runs in a dedicated LXD VM with
 its own `tailscaled` (Owner decision D2, 2026-10-16); the step-by-step Owner
 procedure for that environment, the camera passthrough and the order of the
-steps below is `server/docs/REMOTE_LIVE_VIEW_SETUP.md`.
+steps below is `server/docs/REMOTE_LIVE_VIEW_SETUP.md`. LXD does not pass a
+camera the host re-enumerated back to the running VM (Issue #301); the
+optional host-side re-pass in `infra/lxd/` (installed on the LXD host by the
+Owner, outside the release and without any privilege for ServerSentinel)
+re-adds such a serial-identified camera automatically.
 
 Without the optional `"human_access"` key every human path stays closed
 (`ClosedHumanSurface`): the backend answers every request with the generic

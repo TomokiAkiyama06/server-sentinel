@@ -457,6 +457,7 @@ class NotificationBatchWriteTests(unittest.TestCase):
             at = datetime(2026, 1, 1, tzinfo=timezone.utc)
             started = time.monotonic()
             with mock.patch.object(store_module, "BUSY_TIMEOUT_SECONDS", budget), \
+                    mock.patch("app.storage.database.BUSY_TIMEOUT_SECONDS", budget), \
                     self.assertRaises(sqlite3.OperationalError):
                 store.upsert_many(self.events(2), accepted_at=at)
             elapsed = time.monotonic() - started

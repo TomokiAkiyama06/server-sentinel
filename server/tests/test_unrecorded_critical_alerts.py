@@ -88,6 +88,41 @@ class HandOverTests(Unrecorded, unittest.TestCase):
         self.assertEqual((NotificationKind.SERVER_MOVEMENT, True, DeliveryResult.SENT),
                          (stored.kind, stored.confirmed, stored.delivery))
 
+    def test_after_the_stop_a_finished_alert_frees_its_share_without_a_write(self):
+        # Issue #396 (PR #400 review): once the stop began a poll without a
+        # deadline writes nothing, so a finished but unwritten alert must not
+        # keep its share of the queue: the last confirmed critical of the
+        # shutdown dispatch is still submitted. Before the stop it keeps it,
+        # as before (the next poll writes and frees it).
+        transport = Transport()
+        service = self.notifications(transport, capacity=2)
+        alerts = UnrecordedCriticalAlerts(self.adapter(service))
+        self.store.refuse = True
+        first, second = uuid4(), uuid4()
+        alerts.refused(first, CriticalKind.SERVER_MOVEMENT)
+        with self.assertLogs("app.presence.delivery", level="WARNING"):
+            alerts.drain(at=NOW)
+        deadline = time.monotonic() + 10
+        while not transport.requests:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        stopping = [False]
+        service._stopping = lambda: stopping[0]
+        alerts.refused(second, CriticalKind.CAMERA_TAMPER)
+        # Before the stop the finished, unwritten alert keeps its share.
+        self.assertEqual(1, alerts.drain(at=NOW))
+        self.assertTrue(service.holds_capacity(first))
+        stopping[0] = True
+        while service.holds_capacity(first):
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        self.assertTrue(service.in_flight(first))  # its outcome is not written
+        with self.assertLogs("app.presence.delivery", level="WARNING"):
+            self.assertEqual(0, alerts.drain(at=NOW))
+        self.assertTrue(service.in_flight(second))
+        self.assertEqual((), service.poll())
+        self.assertTrue(service.can_accept(uuid4()))
+
     def test_hand_over_never_touches_the_service_or_blocks_on_another_thread(self):
         class Untouchable:
             def __getattr__(self, name):

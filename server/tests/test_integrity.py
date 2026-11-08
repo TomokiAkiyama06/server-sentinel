@@ -587,6 +587,41 @@ class StoreTests(TestCase):
         self.assertEqual(service_module.SIGTERM_HOLD_SECONDS,
                          float(service_module.UNIT_STOP_TIMEOUT_SECONDS))
 
+    def test_the_stop_drops_and_logs_a_held_check(self):
+        # Issue #396: after `begin_stop()` the tick loop no longer runs the
+        # integrity step, so the stop ends a held check itself: dropped and
+        # logged, never recorded after the settles (PR #400 review), whatever
+        # the age of the hold; the next start's startup check probes again.
+        from app.integrity import service as service_module
+
+        class Probe:
+            terminated = True
+
+            def collect(self):
+                return Inventory((), frozenset({Kind.STORAGE}))
+
+        def outbox():
+            return (self.db.execute("SELECT * FROM integrity_status").fetchall(),
+                    self.db.execute("SELECT COUNT(*) FROM integrity_outbox").fetchone()[0])
+
+        hold = service_module.SIGTERM_HOLD_SECONDS
+        for age in (0.0, hold - 1, hold, hold * 10):
+            with self.subTest(age=age):
+                clock = [0.0]
+                service = IntegrityService(self.store, Probe(), lambda *args: None,
+                                           monotonic=lambda: clock[0], utcnow=lambda: NOW)
+                self.assertFalse(service.abandon_held())
+                before = outbox()
+                self.assertIs(INTERRUPTED, service.startup())
+                clock[0] = age
+                with self.assertLogs("app.integrity.service", "WARNING") as logs:
+                    self.assertTrue(service.abandon_held())
+                self.assertIn("monitoring_check_interrupted", "\n".join(logs.output))
+                self.assertEqual(before, outbox())
+                self.assertIsNone(service._held)
+                self.assertIsNone(service._last_check)
+                self.assertFalse(service.abandon_held())
+
     def test_probe_exception_sanitized(self):
         class Probe:
             def collect(self):
@@ -1184,7 +1219,8 @@ class ProbeCleanupTests(TestCase):
         self.assertLessEqual(self.clock.now - stop, probes.STOP_POLL_SECONDS + probes.STOP_REAP_SECONDS)
         self.assertLess(reaped, probes.COMMAND_REAP_SECONDS)
 
-    def run_exited(self, returncode, interrupted=None, runner=None):
+    def run_exited(self, returncode, interrupted=None, runner=None,
+                   command=("dmidecode", "--type", "17")):
         child = _ExitedChild(self.child.stdout.fileno(), returncode)
         spawn = probes.subprocess
         probes.subprocess = _Spawn(child)
@@ -1193,7 +1229,7 @@ class ProbeCleanupTests(TestCase):
                 runner = CommandRunner() if interrupted is None else CommandRunner(interrupted)
             started = time.monotonic()
             try:
-                runner.run(("dmidecode", "--type", "17"))
+                runner.run(command)
             except (StopInterrupted, ProbeUnavailable) as error:
                 return type(error), time.monotonic() - started
             raise AssertionError("no error")
@@ -1220,6 +1256,29 @@ class ProbeCleanupTests(TestCase):
         self.assertLess(elapsed, 0.2)
         self.assertTrue(runner.terminated)
         self.assertFalse(hasattr(probes, "SIGTERM_STOP_WAIT_SECONDS"))
+
+    def test_a_command_handling_sigterm_with_143_counts_as_sigterm(self):
+        # Issue #396: a probe that handles SIGTERM itself and exits with the
+        # shell convention 128 + SIGTERM is held like one killed by it; other
+        # exit codes cannot be told from a failure and stay unavailable.
+        self.assertEqual(frozenset({-signal.SIGTERM, 128 + signal.SIGTERM}), probes.SIGTERM_STATUSES)
+        self.assertIs(StopInterrupted, self.run_exited(143, lambda: True)[0])
+        runner = CommandRunner(lambda: False)
+        self.assertIs(ProbeUnavailable, self.run_exited(143, runner=runner)[0])
+        self.assertTrue(runner.terminated)
+        runner = CommandRunner(lambda: False)
+        self.assertIs(ProbeUnavailable, self.run_exited(1, runner=runner)[0])
+        self.assertFalse(runner.terminated)
+        # smartctl's status is a bitmask: 143 is a set of findings, not a
+        # handled SIGTERM (PR #400 review); only the signal itself counts.
+        smartctl = ("smartctl", "--json", "--health", "/dev/sda")
+        runner = CommandRunner(lambda: False)
+        self.assertIs(ProbeUnavailable, self.run_exited(143, runner=runner, command=smartctl)[0])
+        self.assertFalse(runner.terminated)
+        runner = CommandRunner(lambda: False)
+        self.assertIs(ProbeUnavailable,
+                      self.run_exited(-signal.SIGTERM, runner=runner, command=smartctl)[0])
+        self.assertTrue(runner.terminated)
 
     def test_a_probe_without_a_runner_gives_it_its_own_check(self):
         # PR #389 review: one `interrupted` for the probe and the command.

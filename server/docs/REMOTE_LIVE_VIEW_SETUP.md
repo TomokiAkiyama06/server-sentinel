@@ -706,11 +706,16 @@ Recovery by hand (only for cameras passed by `vendorid` + `productid` +
    sources and approving cameras locally"). Never pass a camera by
    vendor/product only or by bus/device number to get it back.
 
-Not provided: an automatic re-pass on the host (Issue #301 item 1). It would
-live outside ServerSentinel, on the host (for example a udev rule or a small
-watcher run by the host's root for the serial-identified `usb` devices only);
-ServerSentinel and `media-capture-agent` get no root for it. Record the check
-in `MANUAL_TEST.md` (section J).
+Automatic re-pass on the host (Issue #301 item 1, optional): `infra/lxd/`
+holds a udev rule, a timer and a root oneshot for the LXD host that does the
+`remove` / `add` above by itself, for the serial-identified `usb` devices
+named in its configuration only, when the VM's QEMU process no longer holds
+that camera's current host node (`infra/lxd/README.md`; install, `--check`
+and removal there). It lives outside ServerSentinel: ServerSentinel and
+`media-capture-agent` get no root, capability or LXD access for it. The
+manual steps above stay the fallback (an `absent`, `ambiguous` or
+rate-limited camera is left to the Owner). Record the checks in
+`MANUAL_TEST.md` (section J).
 
 ## After a host or VM reboot
 
