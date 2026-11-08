@@ -438,6 +438,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
             CaptureIngestAcceptor, CaptureNodeAdmission,
         )
         from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
+        from app.cameras.remote_agent.ingest_wire import INGEST_ALPN
         # No approval is ever made through this ledger (only the pairing
         # CLI approves), so its code verifier key is per process and unused.
         capture_ledger = PairingLedger(store, HmacCodeVerifier(secrets.token_bytes(32)),
@@ -446,8 +447,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
             capture_ingest.context,
             CaptureNodeAdmission(capture_ledger, capture_ingest.deployment_id),
             handshake_timeout_seconds=capture_ingest.listener.handshake_timeout_seconds,
-            # The listener logs refusals rate-limited (`ingest_server`).
-            log_refusals=False)
+            # The listener logs refusals rate-limited (`ingest_server`) and
+            # serves one protocol, checked before any ledger read.
+            log_refusals=False, required_alpn=INGEST_ALPN)
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(
@@ -514,29 +516,39 @@ def create_app(settings: Settings, *, database: Database | None = None,
         capture_lifecycle = {"server": None, "task": None}
 
         async def run_capture_ingest() -> None:
-            """Issue #14: open the capture ingest listener, retrying its bind.
+            """Issue #14: open the capture ingest listener, retrying it.
 
-            A bind that fails (the private address not assigned yet at boot,
-            the port taken) is retried every `CAPTURE_INGEST_BIND_RETRY_SECONDS`
-            while the state stays `unavailable`; nothing else depends on it.
+            Any failure to open it (the private address not assigned yet at
+            boot, the port taken, descriptors exhausted) keeps the state
+            `unavailable` and is retried every
+            `CAPTURE_INGEST_BIND_RETRY_SECONDS`; nothing else depends on it.
+            `capture_ingest_unavailable` is logged at the first failure and
+            then only at every power of two, with the count (PR #401 review),
+            so a port that stays taken does not write a line every 30 s.
             """
             from app.cameras.remote_agent.ingest_server import CaptureIngestServer
-            from app.cameras.remote_agent.ingest_tls import (
-                IngestConfigurationError, open_ingest_listener,
-            )
+            from app.cameras.remote_agent.ingest_tls import open_ingest_listener
+            failures = 0
             while True:
+                listener = None
                 try:
                     listener = open_ingest_listener(capture_ingest.listener)
-                except IngestConfigurationError:
+                    server = CaptureIngestServer(listener, capture_acceptor,
+                                                 limits=capture_ingest.limits)
+                    server.start()
+                except Exception:
+                    if listener is not None:
+                        with suppress(OSError):
+                            listener.close()
+                    failures += 1
                     application.state.capture_ingest_state = "unavailable"
-                    logging.getLogger(__name__).error(Event.CAPTURE_INGEST_UNAVAILABLE)
+                    if failures & (failures - 1) == 0:
+                        logging.getLogger(__name__).error(Event.CAPTURE_INGEST_UNAVAILABLE,
+                                                          extra={"count": failures})
                     await asyncio.sleep(CAPTURE_INGEST_BIND_RETRY_SECONDS)
                     continue
-                server = CaptureIngestServer(listener, capture_acceptor,
-                                             limits=capture_ingest.limits)
                 capture_lifecycle["server"] = server
                 application.state.capture_ingest = server
-                server.start()
                 application.state.capture_ingest_state = "running"
                 return
 
@@ -969,9 +981,17 @@ def create_app(settings: Settings, *, database: Database | None = None,
             task = capture_lifecycle["task"]
             if task is not None:
                 task.cancel()
-                with suppress(asyncio.CancelledError):
+                try:
                     await task
-            stop_capture_ingest()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    # Never skips the rest of the stop (PR #401 review).
+                    logging.getLogger(__name__).error(Event.CAPTURE_INGEST_UNAVAILABLE)
+            try:
+                stop_capture_ingest()
+            except Exception:
+                logging.getLogger(__name__).error(Event.CAPTURE_INGEST_UNAVAILABLE)
             if camera_offline is not None:
                 # Issue #301 item 2: capture stopping lowers every source; no
                 # episode starts and nothing more is notified from here on.

@@ -195,12 +195,17 @@ class CaptureIngestAcceptor:
 
     def __init__(self, context: ssl.SSLContext, admission: CaptureNodeAdmission, *,
                  handshake_timeout_seconds: float = DEFAULT_HANDSHAKE_TIMEOUT_SECONDS,
-                 log_refusals: bool = True):
+                 log_refusals: bool = True, required_alpn: str | None = None):
         """``log_refusals=False`` leaves logging each refusal to the caller.
 
         The LAN-facing listener (``ingest_server``) logs refusals rate-limited
         itself, so an unauthenticated host cannot write one log line per
         connection attempt (Issue #14).
+
+        ``required_alpn`` is the protocol the listener serves; a session that
+        did not negotiate it is refused ``alpn_refused`` right after the
+        handshake, before the ledger is consulted, so it can cause no ledger
+        read or staged-renewal promotion (PR #401 review).
         """
         if (not isinstance(context, ssl.SSLContext) or context.verify_mode != ssl.CERT_REQUIRED
                 or context.minimum_version < ssl.TLSVersion.TLSv1_3
@@ -213,6 +218,9 @@ class CaptureIngestAcceptor:
         self._admission = admission
         self._timeout = float(handshake_timeout_seconds)
         self._log = bool(log_refusals)
+        if required_alpn is not None and not isinstance(required_alpn, str):
+            raise IngestConfigurationError("ingest_alpn_invalid")
+        self._alpn = required_alpn
 
     def _refused(self, reason: str) -> None:
         if self._log:
@@ -249,6 +257,8 @@ class CaptureIngestAcceptor:
         try:
             if tls.version() != "TLSv1.3":
                 raise IngestTlsError("tls_version_refused")
+            if self._alpn is not None and tls.selected_alpn_protocol() != self._alpn:
+                raise IngestTlsError("alpn_refused")
             peer = tls.getpeercert(binary_form=True)
             if not peer:
                 raise IngestTlsError("capture_node_certificate_missing")
@@ -273,7 +283,13 @@ def open_ingest_listener(config: IngestListenerConfig) -> socket.socket:
     if not isinstance(config, IngestListenerConfig):
         raise IngestConfigurationError("ingest_listener_config_invalid")
     family = socket.AF_INET6 if ipaddress.ip_address(config.bind_host).version == 6 else socket.AF_INET
-    listener = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        # Creating the socket can fail too (descriptor exhaustion, a sandbox
+        # refusing the family); every failure is the same retryable refusal
+        # (PR #401 review).
+        listener = socket.socket(family, socket.SOCK_STREAM)
+    except OSError:
+        raise IngestConfigurationError("ingest_listener_bind_failed") from None
     try:
         # SO_REUSEADDR lets Main rebind right after a restart while the previous
         # process's capture connections sit in TIME_WAIT, so agents can

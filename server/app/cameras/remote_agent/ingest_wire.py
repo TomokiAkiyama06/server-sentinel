@@ -59,6 +59,10 @@ MAXIMUM_NODE_REASONS = 16
 # The MVP's active-source limit (1-4 sources per deployment).
 MAXIMUM_HEARTBEAT_SOURCES = 4
 _WORD = re.compile(r"[a-z][a-z0-9_]{0,63}")
+# The Agent's storage and source reasons are its refusal codes, some upper
+# case (`StorageRefused("STORAGE_HARD_STOP")`, sent as `str(exc)` by
+# `runtime.py`). They are validated as codes but never kept here.
+_CODE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}")
 _HEARTBEAT_KEYS = frozenset({
     "schema_version", "node_id", "sequence", "utc_seconds", "monotonic_seconds",
     "node_state", "node_reasons", "clock", "storage", "sources",
@@ -192,6 +196,10 @@ def _word(value) -> bool:
     return isinstance(value, str) and _WORD.fullmatch(value) is not None
 
 
+def _code(value) -> bool:
+    return isinstance(value, str) and _CODE.fullmatch(value) is not None
+
+
 def _counter(value) -> bool:
     return type(value) is int and 0 <= value <= _MAXIMUM_COUNTER
 
@@ -236,7 +244,7 @@ def parse_heartbeat(body: bytes) -> NodeHeartbeat:
         storage = value["storage"]
         if (not isinstance(storage, dict) or not {"state"} <= set(storage) <= _STORAGE_KEYS
                 or storage["state"] not in STORAGE_STATES
-                or ("reason" in storage and not _word(storage["reason"]))
+                or ("reason" in storage and not _code(storage["reason"]))
                 or any(name in storage and not _counter(storage[name])
                        for name in ("available_bytes", "safety_reserve_bytes"))):
             raise ValueError
@@ -246,7 +254,7 @@ def parse_heartbeat(body: bytes) -> NodeHeartbeat:
         seen = set()
         for source in sources:
             if (not isinstance(source, dict) or set(source) != _SOURCE_KEYS
-                    or not _word(source["state"]) or not _word(source["reason"])):
+                    or not _code(source["state"]) or not _code(source["reason"])):
                 raise ValueError
             identity = _uuid(source["source_id"])
             if identity in seen:

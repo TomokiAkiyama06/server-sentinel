@@ -1056,13 +1056,13 @@ local record.
   heartbeat over the private LAN is answered with `HEARTBEAT_ACK`; without
   the ALPN, without a client certificate, with another deployment's
   certificate and after `revoke`, the session is refused
-  (`capture_ingest_session_refused` or `capture_ingest_connection_refused`
+  (`capture_ingest_session_refused` or a `capture_ingest_refused_*` event
   in the journal, never a node identity);
 - [ ] a plain HTTP request and a browser to the ingest port get no HTTP
   answer and no dashboard route; the dashboard is not reachable from the
   capture host through the ingest port;
 - [ ] three idle TCP connections from one capture host address: the third is
-  closed at once; a session that sends nothing is closed after about 10 s;
+  closed at once; a session that sends nothing is closed after about 30 s;
 - [ ] `systemctl stop` while a session is open: the stop completes within
   `TimeoutStopSec` and the journal shows `capture_ingest_stopped` before the
   monitoring settles; after restart the port rebinds at once.

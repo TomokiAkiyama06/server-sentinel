@@ -111,7 +111,11 @@ class Event(StrEnum):
     CAPTURE_INGEST_STARTED = "capture_ingest_started"
     CAPTURE_INGEST_STOPPED = "capture_ingest_stopped"
     CAPTURE_INGEST_UNAVAILABLE = "capture_ingest_unavailable"
-    CAPTURE_INGEST_REFUSED = "capture_ingest_connection_refused"
+    # Refused connections by category, rate-limited with a count (PR #401).
+    CAPTURE_INGEST_REFUSED_LIMIT = "capture_ingest_refused_connection_limit"
+    CAPTURE_INGEST_REFUSED_HANDSHAKE = "capture_ingest_refused_handshake"
+    CAPTURE_INGEST_REFUSED_NOT_ADMITTED = "capture_ingest_refused_not_admitted"
+    CAPTURE_INGEST_REFUSED_ALPN = "capture_ingest_refused_alpn"
     CAPTURE_INGEST_SESSION_OPENED = "capture_ingest_session_opened"
     CAPTURE_INGEST_SESSION_CLOSED = "capture_ingest_session_closed"
     CAPTURE_INGEST_SESSION_REFUSED = "capture_ingest_session_refused"

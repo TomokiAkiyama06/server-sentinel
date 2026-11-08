@@ -114,7 +114,7 @@ all runtime/media data outside the Git checkout and the application install:
 | `service_uid` | Dedicated non-root numeric UID |
 | `safety_reserve_bytes` | Positive Owner-configured hard reserve |
 | `max_segment_bytes` | Positive bound for each opaque video segment |
-| `heartbeat_seconds` | Positive finite interval |
+| `heartbeat_seconds` | Positive finite interval, at most 5 s: the Main closes an ingest session after its idle timeout (30 s by default) without a frame, which must allow three intervals plus a slow tick (Issue #14) |
 | `clock_offset_limit_seconds` | Positive finite acceptable absolute clock offset |
 | `clock_uncertainty_limit_seconds` | Positive finite clock-exchange uncertainty bound |
 | `clock_step_limit_seconds` | Positive finite wall/monotonic elapsed-time disagreement bound |

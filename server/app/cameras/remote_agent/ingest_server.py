@@ -56,6 +56,27 @@ from .node_health import CaptureNodeHealthRegistry
 LOGGER = logging.getLogger("serversentinel.capture_ingest")
 ACCEPT_POLL_SECONDS = 0.25
 _ORDINARY_ENDS = frozenset({"peer_closed", "stopping", "superseded", "idle_timeout", "closed"})
+# Refused connections by fixed category (PR #401 review): each category has
+# its own count and its own value-free, rate-limited log event.
+_REFUSAL_CATEGORIES = {
+    "connection_limit": "connection_limit",
+    "tls_handshake_failed": "handshake", "tls_session_failed": "handshake",
+    "tls_version_refused": "handshake",
+    "capture_node_certificate_invalid": "not_admitted",
+    "capture_node_certificate_missing": "not_admitted",
+    "capture_node_not_admitted": "not_admitted",
+    "alpn_refused": "alpn",
+}
+_REFUSAL_EVENTS = {
+    "connection_limit": Event.CAPTURE_INGEST_REFUSED_LIMIT,
+    "handshake": Event.CAPTURE_INGEST_REFUSED_HANDSHAKE,
+    "not_admitted": Event.CAPTURE_INGEST_REFUSED_NOT_ADMITTED,
+    "alpn": Event.CAPTURE_INGEST_REFUSED_ALPN,
+}
+# Rate-check refusals (`AgentIngestQueue.charge_attempt`) by reason: a node
+# without a live session here was replaced meanwhile, not rate limited.
+_RATE_ENDS = {"rate_limit": "rate_limited", "rate_window_capacity": "rate_limited",
+              "unauthorized": "superseded", "clock_regression": "clock_regression"}
 
 
 @dataclass(frozen=True)
@@ -66,6 +87,9 @@ class CaptureIngestStatus:
     open_connections: int
     refused_connections: int
     closed_sessions: int
+    # Refused connections per fixed category (`connection_limit`,
+    # `handshake`, `not_admitted`, `alpn`).
+    refused_by_category: tuple[tuple[str, int], ...] = ()
 
 
 class _LiveNodes:
@@ -135,6 +159,7 @@ class CaptureIngestServer:
         self._live: dict[UUID, tuple[int, object]] = {}
         self._generation = 0
         self._refused = 0
+        self._refused_by: dict[str, int] = {}
         self._closed = 0
         # The latest session end reasons (fixed words), bounded.
         self._reasons: deque[str] = deque(maxlen=32)
@@ -179,7 +204,7 @@ class CaptureIngestServer:
     def status(self) -> CaptureIngestStatus:
         with self._lock:
             return CaptureIngestStatus(self._state, len(self._connections), self._refused,
-                                       self._closed)
+                                       self._closed, tuple(sorted(self._refused_by.items())))
 
     def last_close_reasons(self) -> tuple[str, ...]:
         with self._lock:
@@ -217,7 +242,7 @@ class CaptureIngestServer:
                         self._connections.add(connection)
                         self._handshakes[address] = self._handshakes.get(address, 0) + 1
                 if not admitted:
-                    self._count_refusal()
+                    self._count_refusal("connection_limit")
                     _close(connection)
                     continue
                 thread = threading.Thread(target=self._serve, args=(connection, address),
@@ -232,19 +257,22 @@ class CaptureIngestServer:
 
     # -- one connection ------------------------------------------------------
 
-    def _count_refusal(self) -> None:
-        """Count a refused connection; log the first and every power of two.
+    def _count_refusal(self, reason: str) -> None:
+        """Count a refused connection by category; log the first and every power of two.
 
         An unauthenticated LAN host can open connections as fast as it likes,
         so one log line per refusal would let it flood the journal. The
-        acceptor's own per-refusal log is off (`log_refusals=False`); this
-        record carries only the running count.
+        acceptor's own per-refusal log is off (`log_refusals=False`); each
+        category has its own event and running count, so the reason is kept
+        without any value (PR #401 review).
         """
+        category = _REFUSAL_CATEGORIES.get(reason, "handshake")
         with self._lock:
             self._refused += 1
-            count = self._refused
+            count = self._refused_by.get(category, 0) + 1
+            self._refused_by[category] = count
         if count & (count - 1) == 0:
-            LOGGER.warning(Event.CAPTURE_INGEST_REFUSED, extra={"count": count})
+            LOGGER.warning(_REFUSAL_EVENTS[category], extra={"count": count})
 
     def _handshake_done(self, address: str) -> None:
         with self._lock:
@@ -271,15 +299,17 @@ class CaptureIngestServer:
         try:
             try:
                 session = self._acceptor.accept(connection, on_wrapped=wrapped)
-            except IngestTlsError:
-                self._count_refusal()
+            except IngestTlsError as refused:
+                self._count_refusal(refused.reason)
                 return
             finally:
                 self._handshake_done(address)
             tls = session.connection
             if tls.selected_alpn_protocol() != INGEST_ALPN:
+                # Defense in depth: the production acceptor already refuses
+                # it before the ledger (`required_alpn`).
                 self._close_with(tls, "alpn_refused")
-                self._count_refusal()
+                self._count_refusal("alpn_refused")
                 return
             self._session(session, tls)
         except Exception:
@@ -325,6 +355,18 @@ class CaptureIngestServer:
             reason = self._frames(session, tls, node, generation)
         finally:
             self._end(node, generation)
+            if reason not in ("not_admitted", "superseded") and not self._stopping():
+                # A node revoked while it sent nothing more (it went quiet,
+                # timed out or closed) is forgotten too, not kept as offline
+                # (PR #401 review). One ledger read per ended session, on this
+                # session's thread; never during the stop.
+                try:
+                    revoked = not session.still_admitted()
+                except Exception:
+                    revoked = False
+                if revoked:
+                    self.registry.forget(node)
+                    self._rate.forget_revoked_node(node)
             with self._lock:
                 self._closed += 1
             # Value-free (`app.logging`): an ordinary end, or a refusal of
@@ -372,6 +414,9 @@ class CaptureIngestServer:
             except (PeerClosed, OSError, ssl.SSLError):
                 return "superseded" if not self._current(node, generation) else (
                     "stopping" if self._stopping() else "peer_closed")
+            # The Main's receive time for the Agent's clock estimate, taken
+            # before the ledger and rate checks (PR #401 review).
+            received = self._utc()
             if self._stopping():
                 return "stopping"
             if not self._current(node, generation):
@@ -384,8 +429,10 @@ class CaptureIngestServer:
                 return "not_admitted"
             refusal = self._rate.charge_attempt(node)
             if refusal is not None:
-                self._close_with(tls, "rate_limited")
-                return "rate_limited"
+                ended = _RATE_ENDS.get(refusal.reason, "rate_refused")
+                if ended != "superseded":
+                    self._close_with(tls, ended)
+                return ended
             if frame.kind is not FrameType.HEARTBEAT:
                 self._close_with(tls, "frame_type_refused")
                 return "frame_type_refused"
@@ -397,7 +444,6 @@ class CaptureIngestServer:
             if heartbeat.node_id != node:
                 self._close_with(tls, "node_identity_mismatch")
                 return "node_identity_mismatch"
-            received = self._utc()
             if not self.registry.heartbeat(generation, heartbeat):
                 return "superseded"
             try:

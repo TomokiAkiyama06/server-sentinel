@@ -98,7 +98,10 @@ class CaptureIngestLimits:
     maximum_connections: int = 16
     maximum_handshakes_per_address: int = 2
     maximum_frame_bytes: int = 16 * 1024
-    idle_timeout_seconds: float = 10.0
+    # The heartbeat contract (Issue #14): at least three of the Agent's
+    # longest heartbeat intervals (`MAXIMUM_HEARTBEAT_SECONDS`, 5 s) plus
+    # 15 s for a slow tick; `tests.test_capture_ingest_contract` checks it.
+    idle_timeout_seconds: float = 30.0
     frames_per_second: int = 10
     maximum_nodes: int = 64
 

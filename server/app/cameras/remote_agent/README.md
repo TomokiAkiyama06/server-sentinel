@@ -149,8 +149,9 @@ this protocol.
 
 - *Admission.* Every connection goes through `CaptureIngestAcceptor` (TLS 1.3
   mTLS against the deployment CA and the ledger's current record) and must
-  negotiate the ALPN protocol `serversentinel-capture-ingest/1`
-  (`alpn_refused` otherwise). Every frame re-checks `still_admitted()` before
+  negotiate the ALPN protocol `serversentinel-capture-ingest/1`, checked
+  right after the handshake and before the ledger is read (`alpn_refused`
+  otherwise, `required_alpn`). Every frame re-checks `still_admitted()` before
   it is acted on, so a revocation ends the session at the next frame and the
   node's health and rate window are forgotten.
 - *Frames.* `uint32` big-endian body length, `uint8` type, body; the length is
@@ -170,7 +171,7 @@ this protocol.
   authenticates nothing), one live session per node (a newer admitted session
   supersedes the older; the replacement and the health registration are one
   step under the listener lock, so an older session can never register after
-  a newer one), one deadline per frame (default 10 s from the end of the
+  a newer one), one deadline per frame (default 30 s from the end of the
   previous frame, for the whole header and body however the peer splits its
   bytes, so a trickling peer cannot hold a session open), and
   every frame charged to the node's rate budget (default 10 per second,
@@ -189,11 +190,22 @@ this protocol.
 - *Logs.* Value-free events only: `capture_ingest_started` / `_stopped` /
   `_unavailable`, `capture_ingest_session_opened` / `_closed` (an ordinary
   end) / `_refused` (protocol, rate or credential), and
-  `capture_ingest_connection_refused` for refused connections (limits,
-  handshake, admission, ALPN) only at the first refusal and every power of
-  two, with the running count: an unauthenticated host cannot write one log
-  line per attempt (the acceptor's own per-refusal log is off,
-  `log_refusals=False`).
+  one event per refusal category, `capture_ingest_refused_connection_limit`
+  / `_handshake` / `_not_admitted` / `_alpn`, only at that category's first
+  refusal and every power of two, with its running count: an
+  unauthenticated host cannot write one log line per attempt (the
+  acceptor's own per-refusal log is off, `log_refusals=False`).
+  `capture_ingest_unavailable` follows the same rule while the bind is
+  retried. A session that ends without a further frame re-reads the ledger
+  once (never during the stop), so a node revoked while quiet is forgotten,
+  not kept as offline.
+- *Heartbeat contract.* The Agent's `heartbeat_seconds` is at most 5 s
+  (`media_capture_agent.config.MAXIMUM_HEARTBEAT_SECONDS`) and the Main's
+  idle timeout is 30 s by default: at least three intervals plus 15 s for a
+  slow tick (storage check, clock exchange).
+  `server/tests/test_capture_ingest_contract.py` checks the pair and parses
+  heartbeats produced by the Agent's own `tick()`, including its upper-case
+  refusal codes such as `STORAGE_HARD_STOP` (validated, never kept).
 
 Not yet (follow-ups of #14): media frames and their continuity/ingest path
 with the durable consumer; the Agent's ingest session client; the Owner

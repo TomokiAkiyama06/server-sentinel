@@ -620,10 +620,6 @@ class Deployment:
             forbidden_roots=(runtime_root, *roots,
                              *((capture_ca,) if capture_ca is not None else ())))
             if "capture_ingest" in value else None)
-        if (capture_ingest is not None and capture_ca is not None
-                and capture_ca.is_relative_to(capture_ingest.listener_directory)):
-            raise ConfigurationError(
-                "capture ingest listener directory must be outside runtime data, code and the CA")
         return cls(runtime_root, uid, settings, directories[1], directories[2], monitoring,
                    local_uvc=local_uvc, detection=detection, capture_ca_directory=capture_ca,
                    capture_ca_configured=configured, human_access=human_access,

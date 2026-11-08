@@ -20,8 +20,10 @@ from app.cameras.remote_agent.ingest_config import (
     CaptureIngestDeployment, CaptureIngestLimits, CaptureIngestMaterial,
     CaptureIngestUnavailable, IngestListenerConfig, load_capture_ingest_material,
 )
+from app.cameras.remote_agent.ingest import IngestAdmission, IngestOutcome
 from app.cameras.remote_agent.ingest_server import CaptureIngestServer
-from app.cameras.remote_agent.ingest_tls import CaptureIngestAcceptor
+from app.cameras.remote_agent import ingest_tls
+from app.cameras.remote_agent.ingest_tls import CaptureIngestAcceptor, IngestConfigurationError
 from app.cameras.remote_agent.ingest_wire import (
     HEADER, INGEST_ALPN, FrameType, PeerClosed, encode_frame, read_frame,
 )
@@ -40,13 +42,18 @@ class CaptureIngestServerTests(CaptureTlsHarness):
         self.claim, _, self.certificate, self.key = self._paired_node("a")
         self.node = self.claim.node_id
 
-    def serve(self, **limits):
+    def serve(self, *, utc=None, **limits):
         listener = socket.create_server(("127.0.0.1", 0))
         self.address = listener.getsockname()
         options = dict(idle_timeout_seconds=5, frames_per_second=10)
         options.update(limits)
+        # As composed by the application (`app.main`).
+        self.acceptor = CaptureIngestAcceptor(self.context, self.admission,
+                                              handshake_timeout_seconds=10, log_refusals=False,
+                                              required_alpn=INGEST_ALPN)
         server = CaptureIngestServer(listener, self.acceptor,
-                                     limits=CaptureIngestLimits(**options))
+                                     limits=CaptureIngestLimits(**options),
+                                     **({"utc": utc} if utc is not None else {}))
         server.start()
         self.addCleanup(lambda: (server.stop(), server.join(10)))
         return server
@@ -119,11 +126,70 @@ class CaptureIngestServerTests(CaptureTlsHarness):
 
     # -- refusals ------------------------------------------------------------
 
-    def test_a_session_without_the_ingest_alpn_is_refused(self):
+    def test_a_session_without_the_ingest_alpn_is_refused_before_the_ledger(self):
+        # PR #401 review: refused right after the handshake, so it causes no
+        # ledger read (and no staged-renewal promotion).
         server = self.serve()
-        tls = self.connect(alpn=False)
-        self.assertEqual(self.closed_with(tls), "alpn_refused")
+        with patch.object(self.admission, "authorize",
+                          wraps=self.admission.authorize) as authorize:
+            tls = self.connect(alpn=False)
+            self.assertPeerGone(tls)
+            self.assertTrue(self.wait_for(lambda: server.status().refused_connections == 1))
+        authorize.assert_not_called()
+        self.assertEqual(server.status().refused_by_category, (("alpn", 1),))
         self.assertEqual(server.registry.snapshot().known_nodes, 0)
+
+    def test_the_receive_time_is_taken_before_the_ledger_and_rate_checks(self):
+        # PR #401 review: every ledger read advances the synthetic clock, so
+        # an ack whose receive time were taken after the checks would show
+        # no gap to its send time.
+        clock = [1_800_000_000.0]
+        server = self.serve(utc=lambda: clock[0])
+        original = self.admission.is_admitted
+
+        def slow(identity):
+            clock[0] += 100
+            return original(identity)
+
+        with patch.object(self.admission, "is_admitted", side_effect=slow):
+            tls = self.connect()
+            self.send_heartbeat(tls)
+            kind, value = self.reply(tls)
+        self.assertIs(kind, FrameType.HEARTBEAT_ACK)
+        self.assertGreaterEqual(value["send_utc"] - value["receive_utc"], 100)
+        self.assertEqual(server.registry.state(self.node), "online")
+
+    def test_a_replaced_node_is_not_reported_as_rate_limited(self):
+        # PR #401 review: a rate-check refusal because the node no longer has
+        # a live session here ends the session as superseded, without CLOSE.
+        server = self.serve()
+        refusal = IngestAdmission(IngestOutcome.REJECTED, "unauthorized", 0, 0)
+        with patch.object(server._rate, "charge_attempt", return_value=refusal):
+            tls = self.connect()
+            self.send_heartbeat(tls)
+            self.assertPeerGone(tls)
+        self.assertTrue(self.wait_for(lambda: "superseded" in server.last_close_reasons()))
+        self.assertNotIn("rate_limited", server.last_close_reasons())
+
+    def test_a_node_revoked_while_quiet_is_forgotten(self):
+        # PR #401 review: revoked, then it sends nothing more and closes; the
+        # ended session's ledger check forgets it instead of keeping it offline.
+        server = self.serve()
+        tls = self.connect()
+        self.send_heartbeat(tls)
+        self.assertIs(self.reply(tls)[0], FrameType.HEARTBEAT_ACK)
+        self.ledger.revoke(Owner(), "owner", node_id=self.node)
+        tls.close()
+        self.assertTrue(self.wait_for(lambda: server.registry.state(self.node) is None))
+        self.assertEqual(server.registry.snapshot().known_nodes, 0)
+
+    def test_a_node_that_merely_closes_stays_known_as_offline(self):
+        server = self.serve()
+        tls = self.connect()
+        self.send_heartbeat(tls)
+        self.assertIs(self.reply(tls)[0], FrameType.HEARTBEAT_ACK)
+        tls.close()
+        self.assertTrue(self.wait_for(lambda: server.registry.state(self.node) == "offline"))
 
     def test_a_heartbeat_for_another_node_is_refused(self):
         server = self.serve()
@@ -286,9 +352,8 @@ class CaptureIngestServerTests(CaptureTlsHarness):
         self.assertEqual(server.status().refused_connections, 1)
 
     def test_refusals_are_logged_rate_limited_without_values(self):
-        # An unauthenticated host must not write one log line per attempt.
-        self.acceptor = CaptureIngestAcceptor(self.context, self.admission,
-                                              handshake_timeout_seconds=10, log_refusals=False)
+        # An unauthenticated host must not write one log line per attempt;
+        # the category is kept as its own event (PR #401 review).
         server = self.serve()
         with self.assertLogs("serversentinel.capture_ingest", "DEBUG") as logs:
             for _ in range(9):
@@ -298,11 +363,12 @@ class CaptureIngestServerTests(CaptureTlsHarness):
                         raw.recv(64)
             self.assertTrue(self.wait_for(lambda: server.status().refused_connections == 9))
         refused = [record for record in logs.records
-                   if record.msg == "capture_ingest_connection_refused"]
+                   if record.msg == "capture_ingest_refused_handshake"]
         self.assertEqual([record.count for record in refused], [1, 2, 4, 8])
         self.assertFalse(any(record.name == "serversentinel.capture_ingest.tls"
                              for record in logs.records))
         self.assertNotIn("127.0.0.1", "\n".join(logs.output))
+        self.assertEqual(server.status().refused_by_category, (("handshake", 9),))
 
     # -- stop -----------------------------------------------------------------
 
@@ -430,6 +496,69 @@ class CaptureIngestApplicationTests(CaptureTlsHarness):
             server = asyncio.run(scenario())
         finally:
             blocker.close()
+        self.assertTrue(server.join(5))
+
+    def test_unavailable_is_logged_at_powers_of_two_and_any_failure_is_retried(self):
+        # PR #401 review: a socket that cannot even be created (descriptor
+        # exhaustion) is retried like a failed bind, the log line is not
+        # repeated on every attempt, and the stop is never skipped.
+        application = self.application(capture_ingest=self.material)
+        real_open = ingest_tls.open_ingest_listener
+        attempts = [0]
+
+        def failing(config):
+            attempts[0] += 1
+            if attempts[0] <= 5:
+                raise IngestConfigurationError("ingest_listener_bind_failed")
+            return real_open(config)
+
+        async def scenario():
+            with patch("app.main.CAPTURE_INGEST_BIND_RETRY_SECONDS", 0.02), \
+                    patch("app.cameras.remote_agent.ingest_tls.open_ingest_listener",
+                          side_effect=failing):
+                async with application.router.lifespan_context(application):
+                    self.assertTrue(await self.until(
+                        lambda: application.state.capture_ingest_state == "running"))
+            return application.state.capture_ingest
+
+        with self.assertLogs("app.main", "ERROR") as logs:
+            server = asyncio.run(scenario())
+        counts = [record.count for record in logs.records
+                  if record.msg == "capture_ingest_unavailable"]
+        self.assertEqual(counts, [1, 2, 4])
+        self.assertEqual(application.state.capture_ingest_state, "stopped")
+        self.assertFalse(application.state.ready)
+        self.assertTrue(server.join(5))
+
+    def test_a_socket_that_cannot_be_created_is_a_retryable_refusal(self):
+        with patch("socket.socket", side_effect=OSError("synthetic exhaustion")):
+            with self.assertRaises(IngestConfigurationError) as refused:
+                ingest_tls.open_ingest_listener(self.material.listener)
+        self.assertEqual(refused.exception.reason, "ingest_listener_bind_failed")
+
+    def test_a_start_that_raises_is_retried(self):
+        application = self.application(capture_ingest=self.material)
+        original = CaptureIngestServer.start
+        calls = [0]
+
+        def start(server):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise RuntimeError("synthetic")
+            return original(server)
+
+        async def scenario():
+            with patch("app.main.CAPTURE_INGEST_BIND_RETRY_SECONDS", 0.02), \
+                    patch.object(CaptureIngestServer, "start", start):
+                async with application.router.lifespan_context(application):
+                    self.assertTrue(await self.until(
+                        lambda: application.state.capture_ingest_state == "running"))
+                    self.assertIs(await asyncio.to_thread(self.heartbeat_round_trip),
+                                  FrameType.HEARTBEAT_ACK)
+            return application.state.capture_ingest
+
+        server = asyncio.run(scenario())
+        self.assertEqual(calls[0], 2)
         self.assertTrue(server.join(5))
 
     def test_without_material_no_listener_exists(self):
