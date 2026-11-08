@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 import contextlib
 import io
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -425,6 +426,52 @@ class NotificationBatchWriteTests(unittest.TestCase):
         self.assertFalse(self.db.in_transaction)
         with self.assertRaises(ValueError):
             self.store.upsert_many(("not an event",), accepted_at=at)
+
+    def test_the_begin_and_commit_lock_waits_share_one_busy_timeout(self):
+        # Third PR #389 review: on the rollback journal BEGIN IMMEDIATE waits
+        # for RESERVED and COMMIT for EXCLUSIVE; together they get one busy
+        # timeout (`stop_budget.LATE_OUTCOME_WRITE_SECONDS`), not one each.
+        from unittest import mock
+        from app.monitoring import store as store_module
+        from app.monitoring.store import NotificationEventStore
+        from app.storage.schema import APPLICATION_MIGRATIONS
+        budget = 0.6
+        with TemporaryDirectory(prefix="sentinel-busy-budget-") as directory:
+            path = os.path.join(directory, "state.sqlite3")
+            writer = sqlite3.connect(path, timeout=budget, isolation_level=None)
+            reader = sqlite3.connect(path, timeout=budget, isolation_level=None)
+            other = sqlite3.connect(path, timeout=budget, isolation_level=None,
+                                    check_same_thread=False)
+            for connection in (writer, reader, other):
+                self.addCleanup(connection.close)
+            migrate(writer, APPLICATION_MIGRATIONS)
+            # A reader keeps SHARED (blocks COMMIT); another writer keeps
+            # RESERVED for 0.4 s (delays BEGIN IMMEDIATE).
+            reader.execute("BEGIN")
+            reader.execute("SELECT count(*) FROM notification_events").fetchall()
+            other.execute("BEGIN IMMEDIATE")
+            release = threading.Timer(0.4, lambda: other.execute("ROLLBACK"))
+            release.start()
+            self.addCleanup(release.cancel)
+            store = NotificationEventStore(writer, self.reservation)
+            at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            started = time.monotonic()
+            with mock.patch.object(store_module, "BUSY_TIMEOUT_SECONDS", budget), \
+                    self.assertRaises(sqlite3.OperationalError):
+                store.upsert_many(self.events(2), accepted_at=at)
+            elapsed = time.monotonic() - started
+            release.join()
+            # BEGIN IMMEDIATE got RESERVED once the other writer let go; the
+            # COMMIT then waited only what was left of the budget.
+            self.assertGreater(elapsed, 0.4)
+            # About one budget (0.6 s), never two (1.0 s here).
+            self.assertLess(elapsed, budget + 0.25)
+            self.assertFalse(writer.in_transaction)
+            self.assertEqual(int(budget * 1000),
+                             writer.execute("PRAGMA busy_timeout").fetchone()[0])
+            reader.execute("ROLLBACK")
+            self.assertEqual([], writer.execute(
+                "SELECT delivery FROM notification_events").fetchall())
 
 
 class ScheduleTests(unittest.TestCase):

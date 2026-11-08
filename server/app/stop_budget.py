@@ -80,9 +80,10 @@ SETTLE_POLL_OVERSHOOT_SECONDS = 5.0
 # - the stop's last outcome write (Owner decision 2026-11-08): the deliveries
 #   that finished after the last settle's deadline (or while it ended
 #   unsettled) and the retained refused writes are written by
-#   `NotificationService.persist_completed` in one transaction, so one
-#   SQLite busy timeout (`BUSY_TIMEOUT_SECONDS`) plus its own I/O, once per
-#   stop. Without it the next start could send a reconciled kind again.
+#   `NotificationService.persist_completed` in one transaction whose
+#   RESERVED (`BEGIN IMMEDIATE`) and EXCLUSIVE (`COMMIT`) lock waits share
+#   one SQLite busy timeout (`BUSY_TIMEOUT_SECONDS`,
+#   `NotificationEventStore.upsert_many`), plus its own I/O, once per stop. Without it the next start could send a reconciled kind again.
 LATE_OUTCOME_WRITE_SECONDS = 5.0
 OTHER_STOP_STEPS_RESERVE_SECONDS = (HTTP_GRACEFUL_SHUTDOWN_SECONDS + RESERVATION_CHECK_STOP_SECONDS
                                     + SCENE_STOP_SECONDS + PROCESS_EXIT_SECONDS

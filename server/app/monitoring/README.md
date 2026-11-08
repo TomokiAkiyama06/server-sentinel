@@ -111,10 +111,14 @@ deadline counted as settle time (`_persist_outcomes`). A check the stop cut
 short returns `INTERRUPTED` and leaves its degraded flag and retry unchanged;
 a step that completed clears them as usual. The dispatch steps of the
 critical settle still poll without a deadline (not bounded yet). A delivery
-that finishes after a settle ended unsettled keeps its `pending` row: the
-final storage sample then has no wait left and writes no outcome, so the next
-start may send a reconciled kind again (PR #389 review; restoring it needs a
-larger reserve). For the human access durable revocation marker the
+that finishes after a settle's deadline (or after a settle ended unsettled) is
+written by the stop's last write, `NotificationService.persist_completed`, in
+one transaction whose RESERVED and EXCLUSIVE lock waits share one SQLite busy
+timeout (`stop_budget.LATE_OUTCOME_WRITE_SECONDS`, Owner decision
+2026-11-08); its completion callbacks are not called (the outbox reconciles
+from the row at the next start). That write follows the final storage sample,
+so the running marker is cleared only after it and stays when it was refused
+(Issue #351). For the human access durable revocation marker the
 requirement then stays in memory only and a restart can lose it (the next
 start's check finds the exposure again only if it still exists); Owner
 decision 2026-11-05 accepts this trade-off. The cap is not a stop budget

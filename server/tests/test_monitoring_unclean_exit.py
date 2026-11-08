@@ -225,6 +225,37 @@ class BetweenTickIdentityRefusalTests(RefusalFixture):
         await self.run_once()
         self.assertEqual([ALERT], self.alerts())
 
+    async def test_a_refusal_of_the_stops_last_write_keeps_the_marker(self):
+        # Third PR #389 review: the late-outcome write is admitted after the
+        # final storage sample, so no tick alerts a refusal it meets. The
+        # marker then stays and the next start notifies (Issue #351).
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            persist = runtime.notifications.persist_completed
+
+            def refused_during_the_write():
+                self.approved_device = self.device + 7
+                try:
+                    with runtime._policy.control():
+                        pass
+                except RecordingError:
+                    pass
+                finally:
+                    self.approved_device = self.device
+                return persist()
+
+            runtime.notifications.persist_completed = refused_during_the_write
+        self.assertEqual([], self.alerts())
+        self.assertEqual(1, len(self.marker()))
+        self.clock.advance(timedelta(minutes=5))
+        with self.assertLogs("app.monitoring.runtime", "ERROR") as logs:
+            await self.run_once()
+        self.assertIn("monitoring_previous_run_unclean", "\n".join(logs.output))
+        self.assertEqual([ALERT], self.alerts())
+        self.assertEqual([], self.marker())
+
 
 class UncleanExitTests(RefusalFixture):
     """Issue #351 (option 2): a start after an unclean exit notifies once."""

@@ -1725,21 +1725,29 @@ class MonitoringRuntime:
             # refusal flag may not have been consumed, so the next start
             # notifies conservatively (Issue #351).
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+            sampled = False
         else:
+            sampled = True
+        if self.notifications is not None:
             try:
-                # After the final sample: nothing admits after it (`app.main`),
-                # so no refusal can follow the cleared marker.
+                # Issue #385 (Owner decision 2026-11-08): the outcomes of the
+                # deliveries that finished after the last settle's deadline
+                # (also those of the final sample's own settle), as one write
+                # (`stop_budget.LATE_OUTCOME_WRITE_SECONDS`).
+                self.notifications.persist_completed()
+            except Exception:
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+        # The marker is cleared last (third PR #389 review): the write above
+        # is admitted after the final sample, so a refusal it met is no longer
+        # alerted by a tick. The marker then stays and the next start notifies
+        # conservatively (Issue #351); nothing admits after this point.
+        refused = self.filesystem is not None and self.filesystem.take_refusal()
+        if sampled and not refused:
+            try:
                 self._clear_run_marker()
             except Exception:
                 logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
         if self.notifications is not None:
-            try:
-                # Issue #385 (Owner decision 2026-11-08): the outcomes of the
-                # deliveries that finished after the last settle's deadline,
-                # as one write (`stop_budget.LATE_OUTCOME_WRITE_SECONDS`).
-                self.notifications.persist_completed()
-            except Exception:
-                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
             self.notifications.close()
         if self.recordings is not None:
             self.recordings.close()

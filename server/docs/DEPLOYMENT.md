@@ -564,8 +564,11 @@ happened; a notification settle ends at most one outcome write (one 5 s
 SQLite busy timeout) past its configured bound, which is not shortened. The
 outcomes of deliveries that finish after it (or after a settle that ended
 unsettled) are written once more just before the notification service closes,
-all in one transaction (one more 5 s busy timeout, in the reserve), so the
-next start does not send a reconciled kind a second time; their completion
+all in one transaction whose two lock waits (RESERVED at `BEGIN`, EXCLUSIVE
+at `COMMIT`) share one 5 s busy timeout, in the reserve, so the next start
+does not send a reconciled kind a second time; the running marker is cleared
+only after that write and stays when its admission was refused, so the next
+start then notifies conservatively; their completion
 callbacks are not called (the outbox reconciles from those rows at the next
 start). A delivery still running at that write stays `pending`. `monitoring_check_interrupted`
 is logged when a check was cut short; a probe command ended by SIGTERM (the
