@@ -14,7 +14,6 @@ import sqlite3
 import tempfile
 import threading
 import time
-import types
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -391,12 +390,14 @@ class LifespanTests(RuntimeFixture):
             runtime.recording_health.tick = step("health")
             runtime._summary_tick = step("summary")
             polls = []
-            poll = runtime._poll
-            runtime._poll = lambda: (polls.append(1), poll())[1]
+            # Issue #396: the gate is the notification service's own poll;
+            # count the polls that did their writes.
+            work = runtime.notifications._poll
+            runtime.notifications._poll = lambda past: (polls.append(1), work(past))[1]
             await runtime.call(runtime.tick)
             self.assertEqual(["retention", "integrity"], calls)
             # PR #389 review: only the poll before the stop; the tick's own
-            # trailing poll is skipped once the stop began (the settles, or
+            # trailing poll does nothing once the stop began (the settles, or
             # `_persist_outcomes`, write the outcomes with a deadline).
             self.assertEqual(1, len(polls))
             await runtime.call(runtime.tick)
@@ -430,8 +431,9 @@ class LifespanTests(RuntimeFixture):
 
             self.probe.collect = collect_then_stop
             polls = []
-            poll = runtime._poll
-            runtime._poll = lambda *args, **kwargs: (polls.append(1), poll(*args, **kwargs))[1]
+            # Issue #396: count the polls that did their writes.
+            work = runtime.notifications._poll
+            runtime.notifications._poll = lambda past: (polls.append(1), work(past))[1]
             self.approved_device = self.device
             self.clock.advance(timedelta(minutes=20))
             await runtime.call(runtime.tick)
@@ -443,18 +445,26 @@ class LifespanTests(RuntimeFixture):
     async def test_once_stopping_no_poll_outside_the_settles(self):
         # Issue #385 (PR #389 review): a deadline-less poll queued behind a
         # settle would run every write the settle deferred, unbounded.
+        # Issue #396: one gate, `NotificationService.poll`, covers every
+        # deadline-less poll (the tick's, the open's, `_poll_outcomes`, the
+        # dispatch steps' and the service's own after a failed submission).
         application = self.application()
         async with application.router.lifespan_context(application):
             runtime = application.state.monitoring
             polls, notifications = [], runtime.notifications
-            runtime._poll = lambda deadline=None: polls.append(deadline)
-            runtime.notifications = types.SimpleNamespace(pending_count=1)
+            work = notifications._poll
+            notifications._poll = lambda past: (polls.append(past), work(past))[1]
             try:
-                await runtime.call(runtime._poll_outcomes)
-                self.assertEqual([None], polls)
+                await runtime.call(lambda: notifications.poll())
+                self.assertEqual(1, len(polls))
                 runtime.begin_stop()
-                await runtime.call(runtime._poll_outcomes)
-                self.assertEqual([None], polls)
+                for poll in (runtime._poll, lambda: runtime.dispatch_notifications(lambda: 0),
+                             notifications.poll):
+                    await runtime.call(poll)
+                self.assertEqual(1, len(polls))
+                # A settle's poll (with a deadline) still runs.
+                await runtime.call(runtime._poll, time.monotonic() + 1)
+                self.assertEqual(2, len(polls))
                 # Nor does the run loop submit one between ticks.
                 submitted = []
                 runtime._poll_outcomes = lambda: submitted.append(1)
@@ -463,8 +473,7 @@ class LifespanTests(RuntimeFixture):
                     await runtime._wait_for_tick()
                 self.assertEqual([], submitted)
             finally:
-                runtime.notifications = notifications
-                del runtime._poll
+                del notifications._poll
 
     async def test_an_interrupted_step_leaves_its_flag(self):
         # Issue #385 (PR #389 review): an interrupted check proves nothing, so
@@ -483,6 +492,16 @@ class LifespanTests(RuntimeFixture):
 
             self.assertEqual((True, -1.0), await runtime.call(run, INTERRUPTED))
             self.assertEqual((False, None), await runtime.call(run, None))
+
+    async def test_the_stop_drops_a_held_hardware_check(self):
+        # Issue #396: a check held after a SIGTERM is dropped (and logged) by
+        # the stop's close, not left unlogged at the process exit.
+        application = self.application()
+        dropped = []
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            runtime.integrity.abandon_held = lambda: dropped.append(1)
+        self.assertEqual([1], dropped)
 
     async def test_retention_expires_unstarred_and_keeps_starred(self):
         application = self.application()

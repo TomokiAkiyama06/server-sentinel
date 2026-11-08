@@ -9,7 +9,8 @@ from uuid import UUID
 from app.media.health.service import HealthResult, HealthState, Stage
 from app.notifications.service import NotificationEvent, NotificationKind
 from app.notifications.slack import DeliveryResult
-from app.storage.database import BUSY_TIMEOUT_SECONDS
+from app.storage.database import (BUSY_TIMEOUT_SECONDS, bounded_execute, bounded_lock_waits,
+                                  bounded_transaction)
 from app.storage.migrations import Migration
 
 
@@ -114,7 +115,9 @@ class _Autocommit:
         if self.db.in_transaction:
             raise RuntimeError("MONITORING_DATABASE_BUSY")
         with self._reservation():
-            return self.db.execute(statement, values).rowcount
+            # Issue #396: inside a bounded settle poll all the lock waits of
+            # this write share one budget (`bounded_lock_waits`).
+            return bounded_execute(self.db, statement, values)
 
 
 class NotificationEventStore(_Autocommit):
@@ -140,10 +143,9 @@ class NotificationEventStore(_Autocommit):
         write (`NotificationService.persist_completed`) waits for the
         database lock once, not once per row. All rows are written or none.
 
-        On the rollback journal the RESERVED lock (``BEGIN IMMEDIATE``) and
-        the EXCLUSIVE lock (``COMMIT``) can each wait a busy timeout (third
-        PR #389 review), so both share one `BUSY_TIMEOUT_SECONDS` budget: the
-        lock waits after ``BEGIN`` get only what is left of it, and a commit
+        On the rollback journal one write can wait for a lock more than once
+        (third PR #389 review; Issue #396), so all its lock waits share one
+        `BUSY_TIMEOUT_SECONDS` budget (`bounded_lock_waits`), and a write
         that cannot finish within it rolls back (nothing written) and raises.
         """
         rows = [_notification_row(event, accepted_at) for event in events]
@@ -152,19 +154,9 @@ class NotificationEventStore(_Autocommit):
         if self.db.in_transaction:
             raise RuntimeError("MONITORING_DATABASE_BUSY")
         with self._reservation():
-            started = time.monotonic()
-            self.db.execute("BEGIN IMMEDIATE")
-            try:
-                left = BUSY_TIMEOUT_SECONDS - (time.monotonic() - started)
-                self.db.execute(f"PRAGMA busy_timeout={max(0, int(left * 1000))}")
-                self.db.executemany(_UPSERT_NOTIFICATION, rows)
-                self.db.execute("COMMIT")
-            except BaseException:
-                if self.db.in_transaction:
-                    self.db.execute("ROLLBACK")
-                raise
-            finally:
-                self.db.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_SECONDS * 1000)}")
+            with bounded_lock_waits(time.monotonic() + BUSY_TIMEOUT_SECONDS):
+                with bounded_transaction(self.db):
+                    self.db.executemany(_UPSERT_NOTIFICATION, rows)
 
     def get(self, event_id: UUID) -> dict | None:
         row = self.db.execute(

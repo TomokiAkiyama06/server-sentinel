@@ -104,16 +104,29 @@ worker takes it and refused as `STORAGE_ADMISSION_STOPPING`
 like any storage refusal. This applies to every cross-thread write (scene timeline finish and dispatch,
 local UVC `offline` / fenced writes, audit, human access); the next start
 does or finds the refused write again. Once the stop began the run loop polls
-no more outcomes between ticks (`_poll_outcomes` is a no-op) and a tick in
-flight skips its own polls, so only the settles poll, with their deadline;
+no more outcomes between ticks and every poll without a deadline does nothing
+(one gate, `NotificationService.poll` with its `stopping` check, Issue #396: the tick's, the
+open's, the dispatch steps' and the service's own after a failed submission),
+so only the settles poll, with their deadline; every SQLite lock wait of a
+settle poll's writes, the completion callbacks' included, ends 5 s after its
+deadline (`SETTLE_POLL_OVERSHOOT_SECONDS`, `bounded_lock_waits`);
 when no settle ran, the stop polls once with a `SHUTDOWN_STORAGE_SETTLE_SECONDS`
 deadline counted as settle time (`_persist_outcomes`). A check the stop cut
 short returns `INTERRUPTED` and leaves its degraded flag and retry unchanged;
-a step that completed clears them as usual. The dispatch steps of the
-critical settle still poll without a deadline (not bounded yet). A delivery
+a step that completed clears them as usual; a self-test that recorded a
+failure while the stop interrupted it returns that result (Issue #396). A
+hardware check held after a SIGTERM (`IntegrityService`) is dropped and
+logged by the stop (`abandon_held`), never recorded after the settles; the
+next start's startup check probes again. A submission the delivery worker
+refuses once the stop began goes to the bounded local retry buffer, so it is
+no longer in flight and the settles write its `failed` row. Once the stop began a
+finished delivery whose outcome is not yet written no longer counts against
+the notification queue capacity, so the shutdown dispatch can still submit
+the last confirmed criticals (PR #400 review); the settle or
+`persist_completed` writes it. A delivery
 that finishes after a settle's deadline (or after a settle ended unsettled) is
 written by the stop's last write, `NotificationService.persist_completed`, in
-one transaction whose RESERVED and EXCLUSIVE lock waits share one SQLite busy
+one transaction whose lock waits share one SQLite busy
 timeout (`stop_budget.LATE_OUTCOME_WRITE_SECONDS`, Owner decision
 2026-11-08); its completion callbacks are not called (the outbox reconciles
 from the row at the next start). That write follows the final storage sample,
