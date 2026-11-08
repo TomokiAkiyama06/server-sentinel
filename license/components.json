@@ -75,7 +75,7 @@
     },
     {
       "path": "web/tests/access_browser.mjs",
-      "sha256": "sha256:14ccfc59fee55ef2a9632b5e8456335b3061510b997f43ff5171ffbf2138b4cb"
+      "sha256": "sha256:76248a5e5009fb8a3fab135b4ee2cc28e7a877549cee3effb11c518a1f56fafc"
     },
     {
       "path": "web/tests/calibration.test.mjs",
@@ -83,11 +83,11 @@
     },
     {
       "path": "web/tests/calibration_browser.mjs",
-      "sha256": "sha256:d534f04db93f929673a21e4675b09187229a7ef37f2b0988ea825de0036a536a"
+      "sha256": "sha256:40a723c4a073eab7c27357b10a839fe0b0e7be8b6a99597dc02cbc27ed65a342"
     },
     {
       "path": "web/tests/offline_notice.test.mjs",
-      "sha256": "sha256:86e933131c2930cc9697f25a907e656f6abe3430d08fbea4a4ade9568cb3d678"
+      "sha256": "sha256:3803431ef38e9395c9ba89e46e57f1ed50c685d56bed4ca14539f155f95f62da"
     }
   ],
   "inputs": [
