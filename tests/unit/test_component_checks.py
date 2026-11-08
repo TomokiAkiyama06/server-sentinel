@@ -189,9 +189,9 @@ class ComponentChecksTests(unittest.TestCase):
         self.assertEqual([call.kwargs.get("timeout") for call in process.wait.call_args_list],
                          [ci.COMMAND_TIMEOUT, ci.TRACEBACK_GRACE, None])
         process.kill.assert_called_once_with()
-        self.assertIn("exceeded 600s", str(caught.exception))
+        self.assertIn("exceeded 900s", str(caught.exception))
         self.assertIn("SIGKILL", str(caught.exception))
-        self.assertTrue(errors.getvalue().startswith("\n[server] command exceeded 600s"))
+        self.assertTrue(errors.getvalue().startswith("\n[server] command exceeded 900s"))
         # Only the first (lint) check ran; nothing after the timeout.
         self.assertEqual(self.popen.call_count, 1)
         self.assertFalse(any(command[:2] == ["docker", "run"] for command in self.commands()))
