@@ -345,6 +345,9 @@ class MonitoringRuntime:
         # Issue #301 item 2: the camera offline hourly cap is re-seeded from
         # the stored rows once, on the first running tick.
         self._camera_window_restored = False
+        # Issue #394: the final delivery of each alert that decides a current
+        # camera offline condition, read once (at most two per source).
+        self._camera_finals: dict[UUID, DeliveryResult] = {}
         # Issue #321: the stale device-number check runs once per process;
         # the notice itself is deduplicated per boot (`_report_device_numbers`).
         self._device_numbers_reported = False
@@ -1193,45 +1196,57 @@ class MonitoringRuntime:
         except Exception:
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
             return
-        failing, unverified = self._camera_alert_outcomes(status.alert_ids, running)
+        failing, unverified = self._camera_alert_outcomes(status, running)
         self._set(camera_offline_degraded=status.offline_sources > 0
                   or status.flapping_sources > 0,
                   camera_offline_delivery_failing=failing,
                   camera_offline_delivery_unverified=unverified)
 
-    def _camera_alert_outcomes(self, alert_ids, running: bool) -> tuple[bool, bool]:
-        """``(failing, unverified)`` of the sources' latest alerts (Issue #394).
+    def _camera_alert_outcomes(self, status, running: bool) -> tuple[bool, bool]:
+        """``(not delivered, unverified)`` of the current conditions' alerts (#394).
 
-        Owner decision 2026-11-08: judged per camera source. An alert this
-        process submitted is decided by its final Slack outcome
-        (`NotificationService.final_outcome`; one still in flight is not
-        failing); otherwise by its stored row, read by its event ID (an
-        earlier process's alert of the same outage after a restart; `pending`
-        is being sent again and is not failing). A row that cannot be read
-        (no running storage, a failing read) is ``unverified`` and read again
-        on the next tick; it is never guessed as delivered.
+        Owner decision 2026-11-08: judged per camera source, by the alert of
+        each source's current condition (``CameraOfflineStatus.alert_ids``).
+        Delivered means a final `sent`: `failed`, and also `disabled` or
+        `suppressed` (an earlier process without Slack, PR #398 review), did
+        not reach Slack. A condition whose alert was not submitted (held by
+        the hourly cap, refused by the queue, ``undelivered``) is not
+        delivered either. A delivery in flight, or a `pending` row being sent
+        again, is not failing. The final value is read once per event ID and
+        kept while that alert decides (``_camera_finals``): the outcome this
+        process saw (`NotificationService.final_outcome`), else the stored
+        row (`NotificationEventStore.get`). One that cannot be read (no
+        running storage, a failing read, no row) is ``unverified`` and read
+        again on the next tick; never guessed as delivered.
         """
-        failing = unverified = False
-        for event_id in alert_ids:
-            result = self.notifications.final_outcome(event_id)
+        finals = {event_id: self._camera_finals[event_id] for event_id in status.alert_ids
+                  if event_id in self._camera_finals}
+        self._camera_finals = finals
+        failing, unverified = status.undelivered > 0, False
+        for event_id in status.alert_ids:
+            result = finals.get(event_id)
+            if result is None:
+                result = self.notifications.final_outcome(event_id)
             if result is None and self.notifications.in_flight(event_id):
                 continue
             if result is None:
-                if not running:
+                if not running or self.notification_events is None:
                     unverified = True
                     continue
                 try:
-                    row = self._connection.execute(
-                        "SELECT delivery FROM notification_events WHERE event_id=? AND kind=?",
-                        (str(event_id), NotificationKind.CAMERA_OFFLINE.value)).fetchone()
+                    row = self.notification_events.get(event_id)
                 except Exception:
                     unverified = True
                     continue
-                if row is None:
+                if row is None or row["kind"] != NotificationKind.CAMERA_OFFLINE:
                     unverified = True
                     continue
-                result = row[0]
-            if result == DeliveryResult.FAILED or result == DeliveryResult.FAILED.value:
+                result = row["delivery"]
+                if result == DeliveryResult.PENDING:
+                    # Sent again under its ID (Issue #336): not failing.
+                    continue
+            finals[event_id] = result
+            if result != DeliveryResult.SENT:
                 failing = True
         return failing, unverified
 

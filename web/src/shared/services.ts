@@ -22,7 +22,8 @@
 import { ApiError } from '../api';
 import {
   calibrationReasons, type AccessCredential, type AccessPrincipal, type CalibrationReason, type CalibrationResult,
-  type CameraHealth, type DashboardServices, type IssuedInvitation, type LiveFrame, type LiveGrant, type LiveSource,
+  type CameraHealth, type CameraOfflineCause, type DashboardServices, type IssuedInvitation, type LiveFrame,
+  type LiveGrant, type LiveSource,
   type Permission, type SceneCalibrationSource, type Session,
 } from '../domain';
 import { decodeRequestOptions, serializeAssertion, type AssertionJSON } from './webauthn';
@@ -273,8 +274,6 @@ export function parseSceneCalibration(value: unknown): SceneCalibrationSource[] 
   });
 }
 
-/** Why a current camera offline condition is not notified outside the dashboard. */
-export type CameraOfflineCause = 'not_configured' | 'delivery_failed';
 const CAMERA_OFFLINE_CAUSES: readonly CameraOfflineCause[] = ['not_configured', 'delivery_failed'];
 
 /** `GET /api/monitoring/camera-offline` body `{"offline_unnotified": <boolean>,

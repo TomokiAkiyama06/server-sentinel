@@ -181,6 +181,10 @@ export type CalibrationResult =
   | { outcome: 'calibrated'; version: number; calibrated_at: string }
   | { outcome: 'refused'; reason: CalibrationReason };
 
+/** Why a current camera offline condition is not notified outside the dashboard
+ *  (Issues #301, #394). */
+export type CameraOfflineCause = 'not_configured' | 'delivery_failed';
+
 export interface DashboardServices {
   loadSession(signal: AbortSignal): Promise<Session>;
   /** Owner access administration (Issue #10 phase 2 S4b routes A1-A6). The
@@ -204,7 +208,7 @@ export interface DashboardServices {
    *  current, why it does not leave the Main Server — `'not_configured'` (no
    *  Slack) or `'delivery_failed'` (Slack configured, the latest alert of a
    *  currently offline camera did not reach it); `null` otherwise. */
-  loadCameraOfflineNotice?(signal: AbortSignal): Promise<'not_configured' | 'delivery_failed' | null>;
+  loadCameraOfflineNotice?(signal: AbortSignal): Promise<CameraOfflineCause | null>;
   /** The Owner's step-up ceremony (S3): a fresh user-verified assertion of
    *  this session's own passkey. Resolves only when the server accepted it. */
   stepUp?(signal: AbortSignal): Promise<void>;

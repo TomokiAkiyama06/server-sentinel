@@ -256,11 +256,14 @@ continuous notification went out (`suppressed`,
 `camera_offline_notification_suppressed`). See SPECIFICATION §9 for the full rules and the known limits.
 Without a configured Slack endpoint the rows are `disabled`; with one, a
 delivery whose final Slack outcome is `failed` is not sent again. Issue #394
-(Owner decision 2026-11-08) judges that per camera source: the monitor keeps
-each current source's latest alert ID (`CameraOfflineStatus.alert_ids`, the
-earlier process's row of the same outage after a restart), and the camera
-step reads its outcome (`NotificationService.final_outcome`, else the row by
-event ID; an unreadable one is `unverified` and read again next tick). While
+(Owner decision 2026-11-08) judges that per camera source: the monitor
+reports the alert of each source's current condition
+(`CameraOfflineStatus.alert_ids`: the outage in progress's own alert, else
+its ratio period's; `undelivered` counts current conditions whose alert was
+held by the cap or refused), and the camera step reads each final value once
+(`NotificationService.final_outcome`, else `NotificationEventStore.get`; only
+`sent` is delivered; an unreadable one is `unverified` and read again next
+tick). While
 a camera offline condition is current, `MonitoringStatus.camera_offline_cause`
 (`not_configured`, `delivery_failed`, `unverified` or `notified`, the words
 in `app.monitoring.cameras`) is what the Owner's dashboard shows, through

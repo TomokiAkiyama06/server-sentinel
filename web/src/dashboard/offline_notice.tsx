@@ -13,6 +13,7 @@
  * The notice states facts only: which camera is offline is on the Live
  * screen, and nothing here claims a cause, an intrusion or a culprit.
  */
+import type { CameraOfflineCause } from '../domain';
 import type { Catalog } from '../i18n';
 
 /** How often the App samples the notice while an Owner session is open. The
@@ -21,7 +22,7 @@ export const CAMERA_OFFLINE_NOTICE_REFRESH_MS = 60000;
 
 export type OfflineNoticeState =
   | { state: 'pending' | 'loading' | 'failed' }
-  | { state: 'ready'; cause: 'not_configured' | 'delivery_failed' | null };
+  | { state: 'ready'; cause: CameraOfflineCause | null };
 
 type Timers = {
   set(run: () => void, ms: number): unknown;
@@ -36,7 +37,7 @@ const realTimers: Timers = {
  *  every answer (or failure) until the returned `stop()`. Nothing is
  *  reported after `stop()`, and one sample is in flight at a time. */
 export function startOfflineNoticeSampling(
-  load: (signal: AbortSignal) => Promise<'not_configured' | 'delivery_failed' | null>,
+  load: (signal: AbortSignal) => Promise<CameraOfflineCause | null>,
   report: (next: OfflineNoticeState) => void,
   { refreshMs = CAMERA_OFFLINE_NOTICE_REFRESH_MS, timers = realTimers }: { refreshMs?: number; timers?: Timers } = {}) {
   const controller = new AbortController();

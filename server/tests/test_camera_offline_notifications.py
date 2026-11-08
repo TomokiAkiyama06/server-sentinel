@@ -1205,11 +1205,13 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
 class DeliveryFailingTests(MonitorFixture, unittest.TestCase):
     """Issue #394 (Owner decision 2026-11-08): judged per camera source."""
 
-    def outcomes(self, alert_ids, *, running=True, connection=None):
+    def outcomes(self, alert_ids, *, running=True, connection=None, undelivered=0, holder=None):
         # The runtime's resolution, over this fixture's service and an
-        # optional synthetic connection (rows by event ID).
-        holder = SimpleNamespace(notifications=self.service, _connection=connection)
-        return MonitoringRuntime._camera_alert_outcomes(holder, alert_ids, running)
+        # optional synthetic event store (rows by event ID).
+        holder = holder or SimpleNamespace(notifications=self.service, _camera_finals={})
+        holder.notification_events = connection
+        status = SimpleNamespace(alert_ids=tuple(alert_ids), undelivered=undelivered)
+        return MonitoringRuntime._camera_alert_outcomes(holder, status, running)
 
     def offline_both(self, monitor):
         self.online(monitor)
@@ -1244,19 +1246,91 @@ class DeliveryFailingTests(MonitorFixture, unittest.TestCase):
         failed = next(alert for alert in status.alert_ids
                       if self.service.final_outcome(alert) is DeliveryResult.FAILED)
         failed_source = next(source for source in self.sources
-                             if monitor._sources[source].alert_id == failed)
+                             if monitor._sources[source].episode.alert_id == failed)
         monitor.health_sink(event(failed_source, CameraState.ONLINE, "video_capture_ready"))
         status = self.drain(monitor)
         self.assertNotIn(failed, status.alert_ids)
-        self.assertIsNone(monitor._sources[failed_source].alert_id)
         self.assertEqual((False, False), self.outcomes(status.alert_ids))
 
-    def test_a_delivery_in_flight_or_pending_is_not_failing(self):
+    def test_only_a_final_sent_is_delivered(self):
         alert = uuid4()
         connection = Rows({alert: "pending"})
         self.assertEqual((False, False), self.outcomes((alert,), connection=connection))
-        self.assertEqual((True, False), self.outcomes((alert,), connection=Rows({alert: "failed"})))
         self.assertEqual((False, False), self.outcomes((alert,), connection=Rows({alert: "sent"})))
+        # PR #398 review 1: an earlier process's `disabled` (no Slack then)
+        # or `suppressed` row never reached Slack either.
+        for delivery in ("failed", "disabled", "suppressed"):
+            with self.subTest(delivery=delivery):
+                self.assertEqual((True, False),
+                                 self.outcomes((alert,), connection=Rows({alert: delivery})))
+        # Another kind's row of that ID is not this alert.
+        self.assertEqual((False, True), self.outcomes(
+            (alert,), connection=Rows({alert: "failed"}, kind=NotificationKind.DAILY_SUMMARY)))
+
+    def test_a_condition_whose_alert_was_not_submitted_is_not_delivered(self):
+        # PR #398 review 4: held by the cap or refused by the queue.
+        self.assertEqual((True, False), self.outcomes((), undelivered=1))
+
+    def test_a_final_value_read_once_is_kept_while_it_decides(self):
+        # PR #398 review 3: a later tick without running storage keeps it,
+        # and the row is not read again.
+        alert = uuid4()
+        holder = SimpleNamespace(notifications=self.service, _camera_finals={})
+        rows = Rows({alert: "failed"})
+        self.assertEqual((True, False), self.outcomes((alert,), connection=rows, holder=holder))
+        self.assertEqual(1, rows.reads)
+        self.assertEqual((True, False), self.outcomes((alert,), connection=None, running=False,
+                                                     holder=holder))
+        self.assertEqual((True, False), self.outcomes((alert,), connection=rows, holder=holder))
+        self.assertEqual(1, rows.reads)
+        # Once that alert no longer decides, it is forgotten.
+        self.assertEqual((False, False), self.outcomes((), connection=rows, holder=holder))
+        self.assertEqual({}, holder._camera_finals)
+        # A pending row is not kept: read again until final.
+        pending = Rows({alert: "pending"})
+        self.outcomes((alert,), connection=pending, holder=holder)
+        self.outcomes((alert,), connection=pending, holder=holder)
+        self.assertEqual(2, pending.reads)
+
+    def test_a_late_notice_of_another_outage_never_replaces_the_current_alert(self):
+        # PR #398 review 2: an owed "(already recovered)" notice of an
+        # earlier outage of the same source, sent after the current
+        # outage's alert, is not the current outage's alert.
+        monitor = self.monitor(hourly_limit=1)
+        source, other = self.sources
+        self.online(monitor)
+        monitor.health_sink(event(other, CameraState.OFFLINE))
+        self.advance(301)
+        self.drain(monitor)  # the other camera's alert fills the hour
+        monitor.health_sink(event(other, CameraState.ONLINE, "video_capture_ready"))
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(301)
+        status = self.drain(monitor)  # outage 1 held by the cap
+        self.assertEqual(1, status.undelivered)
+        monitor.health_sink(event(source, CameraState.ONLINE, "video_capture_ready"))
+        self.advance(301)  # recovered past the threshold: outage 1 is owed
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(301)
+        self.drain(monitor)  # outage 2 qualifies, still held
+        self.advance(3600)
+        status = self.drain(monitor)  # outage 2 (in progress) goes first
+        current = monitor._sources[source].episode
+        alert = current.alert_id
+        self.assertIsNotNone(alert)
+        self.assertEqual((alert,), status.alert_ids)
+        before = {event_id for event_id, row in self.sink.rows.items()
+                  if row.kind is NotificationKind.CAMERA_OFFLINE}
+        self.advance(3600)
+        status = self.drain(monitor)  # outage 1's late notice
+        self.assertIn(RECOVERED, self.texts())
+        late = {event_id for event_id, row in self.sink.rows.items()
+                if row.kind is NotificationKind.CAMERA_OFFLINE} - before
+        self.assertEqual(1, len(late))
+        self.assertIs(current, monitor._sources[source].episode)
+        self.assertEqual(alert, current.alert_id)
+        self.assertEqual((alert,), status.alert_ids)
+        self.assertNotIn(late.pop(), status.alert_ids)
+        self.assertEqual(0, status.undelivered)
 
     def test_an_unreadable_row_is_unverified_never_delivered(self):
         alert = uuid4()
@@ -1336,19 +1410,21 @@ class DeliveryFailingTests(MonitorFixture, unittest.TestCase):
 
 
 class Rows:
-    """A synthetic connection answering the delivery of a row by event ID."""
+    """A synthetic `NotificationEventStore.get` over rows by event ID."""
 
-    def __init__(self, rows, *, fail=False, fail_for=()):
-        self.rows = {str(key): value for key, value in rows.items()}
-        self.fail, self.fail_for = fail, {str(item) for item in fail_for}
+    def __init__(self, rows, *, fail=False, fail_for=(), kind=NotificationKind.CAMERA_OFFLINE):
+        self.rows = dict(rows)
+        self.fail, self.fail_for, self.kind = fail, set(fail_for), kind
+        self.reads = 0
 
-    def execute(self, sql, parameters):
-        event_id, kind = parameters
-        assert kind == NotificationKind.CAMERA_OFFLINE.value
+    def get(self, event_id):
+        self.reads += 1
         if self.fail or event_id in self.fail_for:
             raise sqlite3.OperationalError("synthetic")
         value = self.rows.get(event_id)
-        return SimpleNamespace(fetchone=lambda: None if value is None else (value,))
+        if value is None:
+            return None
+        return {"event_id": event_id, "kind": self.kind, "delivery": DeliveryResult(value)}
 
 
 class RuntimeSignalTests(MonitorFixture, unittest.TestCase):
@@ -2873,7 +2949,9 @@ class LifespanTests(RuntimeFixture):
         for rows, expected, texts in (
                 ({"own": "failed"}, "delivery_failed", []),
                 ({"own": "sent"}, "notified", []),
-                ({"own": "disabled"}, "notified", []),
+                # PR #398 review 1: Slack is configured now, but the earlier
+                # process (without it) never sent this outage's alert.
+                ({"own": "disabled"}, "delivery_failed", []),
                 # Pending: not a failure; it is sent again under its ID once
                 # its slot of the hour expires (PR #339), not within this test.
                 ({"own": "pending"}, "notified", []),

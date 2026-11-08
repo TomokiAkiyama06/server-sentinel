@@ -226,6 +226,8 @@ CAMERA_OFFLINE_DELIVERY_FAILED = "delivery_failed"
 CAMERA_OFFLINE_UNVERIFIED = "unverified"
 CAMERA_OFFLINE_CAUSES = frozenset({CAMERA_OFFLINE_NOTIFIED, CAMERA_OFFLINE_NOT_CONFIGURED,
                                    CAMERA_OFFLINE_DELIVERY_FAILED, CAMERA_OFFLINE_UNVERIFIED})
+# A current condition whose alert was not submitted yet (`_current_alert`).
+_UNDELIVERED = object()
 
 
 def valid_offline_seconds(value) -> bool:
@@ -269,6 +271,9 @@ class _Episode:
     # The recent ratio alert of the source was looked up once for this
     # episode from the continuous path (Issue #338 item 1).
     ratio_checked: bool = False
+    # Issue #394: the event ID of this episode's own alert, submitted by this
+    # process or an earlier process's row of the same outage.
+    alert_id: UUID | None = None
 
     def qualifies(self, now: float, after: float) -> bool:
         end = self.recovered if self.recovered is not None else now
@@ -444,12 +449,10 @@ class _Source:
     continuous_sent: bool = False
     # Generation of the ratio-opened periods, bumped each time one opens.
     period_seq: int = 0
-    # Issue #394 (Owner decision 2026-11-08): the event ID of this source's
-    # latest alert, submitted by this process or found as an earlier
-    # process's row of its outage, while the source's offline condition is
-    # current; cleared once it is not (the source recovered and its ratio
-    # period, if any, closed).
-    alert_id: UUID | None = None
+    # Issue #394 (Owner decision 2026-11-08): the event ID of the ratio alert
+    # of the ratio-opened period in progress (submitted by this process or an
+    # earlier process's row), cleared when another period opens or it closes.
+    ratio_alert_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -462,10 +465,13 @@ class CameraOfflineStatus:
     held: int
     # Sources in an alerted period opened by the ratio rule.
     flapping_sources: int = 0
-    # Issue #394: the latest alert of each source whose offline condition is
-    # current (counted above), at most one per source; a source whose
-    # condition has no alert yet (held by the cap, refused) has none.
+    # Issue #394: per source whose offline condition is current (counted
+    # above), the alert of that condition: the outage in progress's own alert,
+    # else the ratio alert of its period. ``undelivered`` counts the current
+    # conditions whose alert was not submitted (held by the cap, refused by
+    # the queue): not notified either.
     alert_ids: tuple[UUID, ...] = ()
+    undelivered: int = 0
 
 
 class CameraOfflineMonitor:
@@ -919,6 +925,7 @@ class CameraOfflineMonitor:
                         # continuous rule only if it lasts `after_seconds`
                         # more (Owner decision 2026-10-23, PR #335).
                         source.period, source.flap = _BY_RATIO, _Flap(now)
+                        source.ratio_alert_id = None
                         source.continuous_sent = False
                         source.period_seq += 1
                         episode = source.episode
@@ -960,6 +967,7 @@ class CameraOfflineMonitor:
                 # nothing; pending: covered by a restored resend or sent
                 # again under its ID and time).
                 source.period, source.continuous_sent = _BY_RATIO, False
+                source.ratio_alert_id = None
                 source.period_seq += 1
                 source.flap = _Flap(now, name=(event_id, earlier))
                 episode.flapping, episode.period_seq = True, source.period_seq
@@ -1061,9 +1069,8 @@ class CameraOfflineMonitor:
                     # An earlier process already notified this outage.
                     self._used.add(event_id)
                     with self._lock:
-                        if source is not None:
-                            # Issue #394: that row is this source's alert.
-                            source.alert_id = event_id
+                        # Issue #394: that row is this outage's (or period's) alert.
+                        self._note_alert(source, item, event_id)
                         self._finish(identity, item)
                     continue
             # The cap is absolute (Owner decision, PR #339 重要 2): every
@@ -1103,8 +1110,7 @@ class CameraOfflineMonitor:
                 self._sent.append((now, attempt[1]))
             with self._lock:
                 item.attempt = None
-                if source is not None:
-                    source.alert_id = attempt[1]
+                self._note_alert(source, item, attempt[1])
                 self._finish(identity, item, now=now)
         with self._lock:
             # After this drain sent what the hour allowed: a third outage of
@@ -1112,19 +1118,18 @@ class CameraOfflineMonitor:
             # oldest (Owner decision 2026-10-26 (a)).
             for source in self._sources.values():
                 self._bound_held(source, now)
-            current = [source for source in self._sources.values()
-                       if source.episode is not None and source.episode.recovered is None
-                       and source.episode.qualifies(now, self.after)
-                       or source.period == _BY_RATIO]
             offline = sum(1 for source in self._sources.values()
                           if source.episode is not None and source.episode.recovered is None
                           and source.episode.qualifies(now, self.after))
+            alerts, undelivered = [], 0
             for source in self._sources.values():
-                if not any(source is item for item in current):
-                    # Issue #394: the condition ended, so its alert no
-                    # longer decides the notice.
-                    source.alert_id = None
-            alerts = tuple(source.alert_id for source in current if source.alert_id is not None)
+                if source.period != _BY_RATIO:
+                    source.ratio_alert_id = None
+                alert = self._current_alert(source, now)
+                if alert is _UNDELIVERED:
+                    undelivered += 1
+                elif alert is not None:
+                    alerts.append(alert)
             held = sum(1 for source in self._sources.values()
                        for item in (source.older, source.owed, source.episode, source.flap,
                                     *source.late_flaps)
@@ -1133,7 +1138,48 @@ class CameraOfflineMonitor:
             flapping = sum(1 for source in self._sources.values()
                            if source.period == _BY_RATIO)
         return CameraOfflineStatus(offline_sources=offline, held=held,
-                                   flapping_sources=flapping, alert_ids=alerts)
+                                   flapping_sources=flapping, alert_ids=tuple(alerts),
+                                   undelivered=undelivered)
+
+    @staticmethod
+    def _note_alert(source, item, event_id: UUID) -> None:
+        """Issue #394: record ``event_id`` as the alert of ``item``.
+
+        An episode keeps its own alert; a ratio alert is the period's only
+        while it is the period in progress (``source.flap``). A late notice
+        of another outage or of a closed period, and a restored row whose
+        source is not known, decide nothing for the current condition.
+        """
+        if source is None:
+            return
+        if isinstance(item, _Flap):
+            if source.flap is item:
+                source.ratio_alert_id = event_id
+        elif isinstance(item, _Episode):
+            item.alert_id = event_id
+
+    def _current_alert(self, source, now: float):
+        """The alert deciding ``source``'s current condition (Issue #394).
+
+        Its outage in progress past the threshold: that episode's own alert;
+        ``_UNDELIVERED`` while it was not submitted (held, refused). One
+        settled without an alert of its own (its ratio-opened period's alert
+        covers it) and a ratio-opened period: the period's ratio alert, or
+        ``_UNDELIVERED`` while it was not submitted. ``None``: no current
+        condition.
+        """
+        episode = source.episode
+        if (episode is not None and episode.recovered is None
+                and episode.qualifies(now, self.after)):
+            if episode.alert_id is not None:
+                return episode.alert_id
+            if not episode.notified:
+                return _UNDELIVERED
+        if source.period == _BY_RATIO:
+            if source.flap is not None and not source.flap.notified:
+                return _UNDELIVERED
+            return source.ratio_alert_id
+        return None
 
     def _continuous_due(self, source: _Source, now: float) -> bool:
         # A qualifying continuous episode is the continuous rule's to report.

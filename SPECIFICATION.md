@@ -1925,22 +1925,28 @@ does not record whether its outage had recovered. `MonitoringStatus`
 reports `camera_offline_degraded` (counted as degraded in the daily summary)
 and `camera_offline_notifications`, false without a configured Slack endpoint
 (the local row is then `disabled`). Issue #394 (Owner decision 2026-11-08)
-judges delivery per camera source: the monitor keeps, for each source whose
-offline condition is current (its outage past the threshold, or its
-ratio-opened alerted period), the event ID of that source's latest alert,
-one this process submitted or the earlier process's row of the same outage
-found by its durable name after a restart; it is cleared once the
-condition ends. `camera_offline_delivery_failing` is true when the final
-Slack outcome of such an alert is `failed` (there is no automatic resend, so
-it never reaches the Owner); the outcome this process saw
-(`NotificationService.final_outcome`, kept for the last 256 deliveries)
-decides first, then the stored row read by its event ID. A delivery in
-flight, or a `pending` row that is sent again, is not failing; another
-source's `sent` never clears a source's `failed`; a submission the queue
-refused and that the next drain sent again under the same ID is judged by
-that new delivery; a resubmission refused because it does not match the
-delivery in flight is not an outcome. A row that cannot be read (no running
-storage, a failing read, no such row) sets
+judges delivery per camera source, by the alert of each source's current
+offline condition: its outage in progress past the threshold has its own
+alert (the episode's, submitted by this process or the earlier process's row
+of the same outage found by its durable name after a restart); an outage
+settled without one (its ratio-opened period's alert covers it) and a
+ratio-opened alerted period use the period's ratio alert. A late notice of
+another outage of the source (`(already recovered)`) or of a closed period
+never stands for the current condition. `camera_offline_delivery_failing`
+is true when such an alert did not reach Slack: its final value is not
+`sent` (`failed`, and also `disabled` or `suppressed`: an earlier process
+without Slack never sent it, so after Slack is configured and the service
+restarts mid-outage the notice shows), or the current condition's alert was
+not submitted (held by the hourly cap, refused by the queue). The outcome
+this process saw (`NotificationService.final_outcome`, kept for the last 256
+deliveries) decides first, then the stored row
+(`NotificationEventStore.get`); a final value is read once and kept while
+that alert decides. A delivery in flight, or a `pending` row that is sent
+again, is not failing; another source's `sent` never clears a source's
+alert; a submission the queue refused and that the next drain sent again
+under the same ID is judged by that new delivery; a resubmission refused
+because it does not match the delivery in flight is not an outcome. A row
+that cannot be read (no running storage, a failing read, no such row) sets
 `camera_offline_delivery_unverified`, read again on the next tick. A
 restored `pending` row whose source is not known decides nothing. The
 outcome is read on the monitoring tick's camera step, so a delivery that
@@ -1948,7 +1954,7 @@ finishes after it shows on the next tick. They combine into one fixed word,
 `camera_offline_cause`: `not_configured` (a current condition,
 `camera_offline_degraded`, and not `camera_offline_notifications`),
 `delivery_failed` (a current condition, Slack configured and some source's
-alert `failed`), `unverified` (none known failed, some unreadable) or
+alert not delivered), `unverified` (none known failed, some unreadable) or
 `notified`. It reaches the Owner's dashboard (Issue #301 item 2, Issue #394,
 REQUIREMENTS NOTIFY-002: disabling Slack, or Slack failing, does not
 suppress the UI fault report):
