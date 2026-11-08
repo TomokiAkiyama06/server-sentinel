@@ -39,6 +39,7 @@ from app.storage.database import Database
 from app.storage.migrations import Migration, MigrationError, migrate
 from app.storage.policy import MainStoragePolicy, StorageState, StorageTransition
 from app.storage.retention import RetentionService, StorageAudit
+from app.stop_budget import INTERRUPTED, STOP_ADMISSION_WAIT_SECONDS
 
 from .access import HOUR_SECONDS, AccessFaultMonitor
 from .cameras import CameraOfflineMonitor
@@ -116,6 +117,16 @@ def _boot_id() -> str | None:
 FINDING_AUDIT_ACTIONS = (AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
                          AuditAction.DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION)
 
+
+
+def default_integrity_probe(stopping: Callable[[], bool]):
+    """The read-only host probe; constructing it touches nothing on the host.
+
+    Issue #385: `stopping` ends a probe run (and a command in flight) once the
+    Main shutdown began, so the check records nothing partial.
+    """
+    from app.integrity.probes import LinuxProbe
+    return LinuxProbe(interrupted=stopping)
 
 
 def admit_state_file(configuration: MonitoringConfiguration, path) -> None:
@@ -320,8 +331,17 @@ class MonitoringRuntime:
         self._settle_bound: float | None = None
         self._settle_spent = 0.0
         self._settle_unfinished = False
-        # Issue #383: set once the Main shutdown began (`begin_stop`).
+        # Issue #383: set once the Main shutdown began (`begin_stop`), and
+        # when (`time.monotonic`, Issue #385: bounds the admission waits).
         self._stopping = threading.Event()
+        self._stop_began: float | None = None
+        # Issue #385 (PR #389 review): set (with the time) once the worker
+        # finished every job queued before the stop began; until then every
+        # cross-thread admission wait shares one deadline from the stop.
+        # `_admission_changed` wakes the waiters on a grant, the stop and this.
+        self._stop_drained = threading.Event()
+        self._stop_drained_at: float | None = None
+        self._admission_changed = threading.Condition()
         # Issues #351/#347: this process's random running-marker token, whether
         # the marker is written, whether the unclean exit of the previous
         # process was logged and whether the pending recording-health
@@ -389,6 +409,17 @@ class MonitoringRuntime:
         the caller's write finishes, so the serialized policy still covers that
         write through commit and no second writer overlaps it. A denial raises
         the policy's bounded `RecordingError` and nothing is written.
+
+        Issue #385: once the Main shutdown began, the wait for the worker is
+        bounded by `STOP_ADMISSION_WAIT_SECONDS`; a reservation not granted
+        by then is withdrawn before the worker takes it and refused like a
+        denial (`STORAGE_ADMISSION_STOPPING`, nothing written). The caller's
+        write is then done by the next start, as after any storage refusal.
+        Behind the jobs queued when the stop began (a monitoring step still
+        running) every wait ends `STOP_ADMISSION_WAIT_SECONDS` after the stop,
+        so writes made one after another add up to that once, not once each
+        (PR #389 review); once those jobs finished, each wait is bounded
+        from the later of its start and that moment.
         """
         if threading.get_ident() == self._owner:
             with self._owner_reservation():
@@ -408,15 +439,21 @@ class MonitoringRuntime:
                 context.__enter__()
             except BaseException as error:
                 failure.append(error)
-                granted.set()
+                self._admission_event(granted)
                 return
-            granted.set()
+            self._admission_event(granted)
             try:
                 finished.wait()
             finally:
                 context.__exit__(None, None, None)
 
         future = executor.submit(hold)
+        if not self._await_admission(granted) and future.cancel():
+            # Withdrawn before the worker ran it: nothing was reserved.
+            logging.getLogger(__name__).error(Event.STORAGE_ADMISSION_STOP_TIMEOUT)
+            raise RecordingError("STORAGE_ADMISSION_STOPPING")
+        # Granted, or the worker already runs `hold`: entering the policy is
+        # bounded by its own checks, and `hold` then sets `granted`.
         granted.wait()
         if failure:
             future.result()
@@ -426,6 +463,40 @@ class MonitoringRuntime:
         finally:
             finished.set()
             future.result()
+
+    def _admission_event(self, event: threading.Event | None = None) -> None:
+        """Set `event` (if any) and wake every admission waiter."""
+        with self._admission_changed:
+            if event is not None:
+                event.set()
+            self._admission_changed.notify_all()
+
+    def _stop_jobs_drained(self) -> None:
+        """Runs on the worker after every job queued before the stop."""
+        self._stop_drained_at = time.monotonic()
+        self._admission_event(self._stop_drained)
+
+    def _await_admission(self, granted: threading.Event) -> bool:
+        """Wait for `granted`; False once a stop's admission wait is spent.
+
+        Without a stop the wait has no timeout, as before Issue #385; a stop
+        begun meanwhile wakes it (`begin_stop`) and then bounds it.
+        """
+        started = time.monotonic()
+        with self._admission_changed:
+            while not granted.is_set():
+                if not self._stopping.is_set():
+                    self._admission_changed.wait()
+                    continue
+                if self._stop_drained.is_set():
+                    end = max(started, self._stop_drained_at) + STOP_ADMISSION_WAIT_SECONDS
+                else:
+                    end = self._stop_began + STOP_ADMISSION_WAIT_SECONDS
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._admission_changed.wait(remaining)
+            return True
 
     def _due(self, name: str, now: float) -> bool:
         retry = self._retry_at.get(name)
@@ -443,13 +514,19 @@ class MonitoringRuntime:
         if not self._due(name, now):
             return
         try:
-            function()
+            result = function()
         except Exception:
             self._retry_at[name] = now + self.dependencies.retry_seconds
             if flag is not None:
                 self._set(**{flag: True})
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
         else:
+            if result is INTERRUPTED:
+                # Issue #385 (PR #389 review): the stop cut the check short, so
+                # it proves nothing; the flag and retry stay as they were. A
+                # step that completed after the stop began clears them as
+                # usual.
+                return
             self._retry_at.pop(name, None)
             if flag is not None:
                 self._set(**{flag: False})
@@ -464,6 +541,11 @@ class MonitoringRuntime:
             # The database was not opened yet; Slack still gets the alert.
             raise RecordingError("NOTIFICATION_STORE_UNAVAILABLE")
         self.notification_events.upsert(event, accepted_at=self.dependencies.utcnow())
+
+    def _persist_notifications(self, events) -> None:
+        if self.notification_events is None:
+            raise RecordingError("NOTIFICATION_STORE_UNAVAILABLE")
+        self.notification_events.upsert_many(events, accepted_at=self.dependencies.utcnow())
 
     def _admit_database_open(self) -> None:
         """Refuse to open or create the database outside verified storage.
@@ -501,6 +583,7 @@ class MonitoringRuntime:
             self.notifications = NotificationService(
                 self._persist_notification, slack,
                 queue_capacity=dependencies.notification_queue_capacity,
+                local_batch_sink=self._persist_notifications,
             )
         if self._connection is None:
             connection = None
@@ -556,8 +639,7 @@ class MonitoringRuntime:
             )
             probe = dependencies.integrity_probe
             if probe is None:
-                from app.integrity.probes import LinuxProbe
-                probe = LinuxProbe()
+                probe = default_integrity_probe(self._stopping.is_set)
             integrity = IntegrityService(integrity_store, probe, self._integrity_sink,
                                          monotonic=dependencies.monotonic,
                                          utcnow=dependencies.utcnow)
@@ -566,6 +648,7 @@ class MonitoringRuntime:
             recording_health = RecordingHealthService(
                 adapter, self._record_recording_health,
                 monotonic=dependencies.monotonic, utcnow=dependencies.utcnow,
+                stopping=self._stopping.is_set,
             )
         except MigrationError:
             # A future/edited schema history or failed DDL is not a storage
@@ -605,7 +688,12 @@ class MonitoringRuntime:
         self._guarded("retention", self._retention_tick, "retention_degraded")
         self._guarded("integrity", self.integrity.startup, "integrity_degraded")
         self._guarded("health", self.recording_health.startup, "recording_health_degraded")
-        self._poll()
+        # Issue #385 (second PR #389 review): an open retried by a tick can
+        # still be running when the stop begins. Its poll then has no
+        # deadline, so it is left to the stop's bounded settle or
+        # `_close`'s one bounded poll, like a running tick's.
+        if not self._stopping.is_set():
+            self._poll()
 
     def _drop_connection(self) -> None:
         """Forget the database of a failed attempt; the retry reopens it.
@@ -1415,11 +1503,11 @@ class MonitoringRuntime:
             rows.close()
         return window
 
-    def _poll(self) -> None:
+    def _poll(self, deadline: float | None = None) -> None:
         if self.notifications is None:
             # The database itself could not be opened; nothing to persist.
             return
-        self.notifications.poll()
+        self.notifications.poll(deadline)
         self._set(notification_local_failed=self.notifications.local_delivery_failed,
                   notification_delivery_failed=self.notifications.delivery_failed)
 
@@ -1477,6 +1565,14 @@ class MonitoringRuntime:
         reached Slack.
         The bound, the time spent and an unsettled end are kept, so the stop's
         final storage sample waits only within what is left (Issue #351).
+
+        Issue #385: every poll here gets the deadline, so the settle ends at
+        most one outcome write or callback after it
+        (`stop_budget.SETTLE_POLL_OVERSHOOT_SECONDS`), not a whole poll's
+        writes later; the configured bound itself is never shortened. An
+        outcome not written by then is written by the stop's last outcome
+        write (`_close`, `NotificationService.persist_completed`, Owner
+        decision 2026-11-08); a delivery still running then stays `pending`.
         """
         self._require_owner()
         if self.notifications is None:
@@ -1484,10 +1580,10 @@ class MonitoringRuntime:
         started = time.monotonic()
         deadline = started + timeout_seconds
         try:
-            self._poll()
+            self._poll(deadline)
             while self.notifications.pending_count and time.monotonic() < deadline:
-                time.sleep(0.02)
-                self._poll()
+                time.sleep(max(0.0, min(0.02, deadline - time.monotonic())))
+                self._poll(deadline)
             pending = self.notifications.pending_count
         finally:
             self._settle_bound = max(self._settle_bound or 0.0, timeout_seconds)
@@ -1503,10 +1599,25 @@ class MonitoringRuntime:
         integrity and recording-health checks and the daily summary, so the
         shutdown settles and `stop()` queue behind at most the rest of one
         pass. They run again at the next start (the integrity check and the
-        recording self-test always run at startup). Notification polling,
-        the storage sample and the access and camera drains still run.
+        recording self-test always run at startup). The storage sample and
+        the access and camera drains still run; its notification polls do
+        not (PR #389 review): the shutdown settles, or `_persist_outcomes`
+        when none ran, write the outcomes within the settle budget. The
+        cross-thread admission waits queued behind the jobs already on the
+        worker share one deadline from now (`reservation`).
         """
+        if self._stop_began is None:
+            self._stop_began = time.monotonic()
+            executor = self._executor
+            try:
+                if executor is None:
+                    raise RuntimeError("monitoring worker unavailable")
+                # After the jobs already queued (FIFO, one worker).
+                executor.submit(self._stop_jobs_drained)
+            except RuntimeError:
+                self._stop_jobs_drained()
         self._stopping.set()
+        self._admission_event()
 
     def tick(self) -> None:
         """One owner-thread pass; call only through `call` or the run loop."""
@@ -1517,12 +1628,14 @@ class MonitoringRuntime:
             if self.notifications is not None:
                 self._access_tick()
                 self._camera_tick()
-                self._poll()
+                if not stopping():
+                    self._poll()
             if (self.status.state == RuntimeState.FAILED and not stopping()
                     and self._due("startup", self.dependencies.monotonic())):
                 self._attempt_open()
             return
-        self._poll()
+        if not stopping():
+            self._poll()
         self._reconcile_previous_run()
         self._storage_tick()
         for name, step, reason in (("retention", self._retention_tick, "retention_degraded"),
@@ -1534,7 +1647,11 @@ class MonitoringRuntime:
             self._guarded(name, step, reason)
         self._access_tick()
         self._camera_tick()
-        self._poll()
+        if not stopping():
+            # Issue #385 (PR #389 review): after the stop began the outcomes
+            # are written only by the shutdown settles, or by the stop's own
+            # poll when none ran (`_close`), all within the settle budget.
+            self._poll()
 
     def _final_storage_sample(self) -> None:
         """Issue #351: take one last storage sample before a graceful stop.
@@ -1576,7 +1693,30 @@ class MonitoringRuntime:
         if self.settle_notifications(wait):
             logging.getLogger(__name__).error(Event.CRITICAL_NOTIFICATIONS_UNSETTLED)
 
+    def _persist_outcomes(self) -> None:
+        """Issue #385 (PR #389 review): the stop's poll when no settle ran.
+
+        A tick in flight at the stop no longer polls (`tick`), so the
+        outcomes of deliveries that finished are written here, by one poll
+        with a deadline of `SHUTDOWN_STORAGE_SETTLE_SECONDS`, counted as
+        settle time: the stop budget holds one settle, and none ran. It waits
+        for no pending delivery. After a settle that settle wrote them.
+        """
+        if (not self._stopping.is_set() or self._settle_bound is not None
+                or self.notifications is None):
+            return
+        started = time.monotonic()
+        try:
+            self._poll(started + SHUTDOWN_STORAGE_SETTLE_SECONDS)
+        finally:
+            self._settle_bound = SHUTDOWN_STORAGE_SETTLE_SECONDS
+            self._settle_spent += time.monotonic() - started
+
     def _close(self) -> None:
+        try:
+            self._persist_outcomes()
+        except Exception:
+            logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
         try:
             self._final_storage_sample()
         except Exception:
@@ -1585,10 +1725,25 @@ class MonitoringRuntime:
             # refusal flag may not have been consumed, so the next start
             # notifies conservatively (Issue #351).
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+            sampled = False
         else:
+            sampled = True
+        if self.notifications is not None:
             try:
-                # After the final sample: nothing admits after it (`app.main`),
-                # so no refusal can follow the cleared marker.
+                # Issue #385 (Owner decision 2026-11-08): the outcomes of the
+                # deliveries that finished after the last settle's deadline
+                # (also those of the final sample's own settle), as one write
+                # (`stop_budget.LATE_OUTCOME_WRITE_SECONDS`).
+                self.notifications.persist_completed()
+            except Exception:
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+        # The marker is cleared last (third PR #389 review): the write above
+        # is admitted after the final sample, so a refusal it met is no longer
+        # alerted by a tick. The marker then stays and the next start notifies
+        # conservatively (Issue #351); nothing admits after this point.
+        refused = self.filesystem is not None and self.filesystem.take_refusal()
+        if sampled and not refused:
+            try:
                 self._clear_run_marker()
             except Exception:
                 logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
@@ -1636,8 +1791,16 @@ class MonitoringRuntime:
             logging.getLogger(__name__).info(Event.MONITORING_STARTED)
 
     def _poll_outcomes(self) -> None:
-        """Between ticks: store finished deliveries' outcomes (PR #366 review)."""
+        """Between ticks: store finished deliveries' outcomes (PR #366 review).
+
+        Issue #385 (PR #389 review): a no-op once the stop began. The shutdown
+        settles own the polling then, with their deadline; a deadline-less
+        poll queued behind a settle would run every write the settle left
+        for later, unbounded and outside the settle's spent time.
+        """
         self._require_owner()
+        if self._stopping.is_set():
+            return
         if self.notifications is not None and self.notifications.pending_count:
             self._poll()
 
@@ -1651,6 +1814,9 @@ class MonitoringRuntime:
                 await asyncio.sleep(max(0.0, remaining))
                 return
             await asyncio.sleep(NOTIFICATION_POLL_SECONDS)
+            if self._stopping.is_set():
+                # Issue #385: the settles poll from here on (`_poll_outcomes`).
+                continue
             try:
                 await self.call(self._poll_outcomes)
             except Exception:

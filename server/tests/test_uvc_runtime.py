@@ -2528,11 +2528,12 @@ class ConfigurationParsingTests(unittest.TestCase):
         # The bound stays configurable within the validated range, at most
         # what fits the Main stop budget (Issue #383).
         identity = str(uuid4())
-        for value in (1, 30, 40):
+        for value in (1, 20, 28.75):
             self.assertEqual(float(value), parse_local_uvc(
                 {"source_ids": [identity], "join_timeout_seconds": value}).join_timeout_seconds)
-        with self.assertRaises(ConfigurationError):
-            parse_local_uvc({"source_ids": [identity], "join_timeout_seconds": 60})
+        for value in (28.76, 30, 40, 60):
+            with self.assertRaises(ConfigurationError):
+                parse_local_uvc({"source_ids": [identity], "join_timeout_seconds": value})
         self.assertEqual(0.25, parse_local_uvc({
             "source_ids": [identity], "join_timeout_seconds": 0.25,
             "frame_stall_seconds": 0.25}).join_timeout_seconds)
@@ -2551,6 +2552,16 @@ class ConfigurationParsingTests(unittest.TestCase):
                                  "frame_stall_seconds": stall})
         with self.assertRaises(ConfigurationError):
             LocalUvcConfiguration((uuid4(),), join_timeout_seconds=0.5)
+        # Second PR #389 review: the stall range ends at the join bound, so the
+        # range itself refuses a stall no join could cover.
+        from app.cameras.uvc import config as uvc_config
+        self.assertEqual(uvc_config.MAXIMUM_LOCAL_UVC_JOIN_SECONDS,
+                         uvc_config._TIMING_BOUNDS["frame_stall_seconds"][1])
+        bound = uvc_config.MAXIMUM_LOCAL_UVC_JOIN_SECONDS
+        self.assertEqual((bound, bound), (lambda parsed: (
+            parsed.join_timeout_seconds, parsed.frame_stall_seconds))(parse_local_uvc(
+                {"source_ids": [identity], "join_timeout_seconds": bound,
+                 "frame_stall_seconds": bound, "frame_stall_reopen_seconds": bound})))
         for join, stall in ((1.0, 1.0), (5, 5), (10, 1)):
             parsed = parse_local_uvc({"source_ids": [identity], "join_timeout_seconds": join,
                                       "frame_stall_seconds": stall})

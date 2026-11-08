@@ -41,7 +41,24 @@ into `MISSING`. Kernel/baseline enumeration order is not replacement evidence.
 backing block-device paths and returns `OK`, `CRITICAL` or `UNVERIFIABLE`, without
 lifetime prediction. Commands have a fixed read-only allowlist, five-second
 timeout, one-MiB stdout cap, no shell/sudo, discarded stderr and a minimal
-environment without inherited secrets. Utilities/drivers are not installed or
+environment without inherited secrets. A command that does not end in time is
+killed and waited for at most five more seconds, then abandoned. Issue #385:
+once the Main shutdown began (`interrupted`), no further probe starts and a
+command in flight is killed within 0.25 s and waited for at most 1 s (a stop
+during the normal five-second reap cuts what is left of it to 1 s too); the
+collection then raises `StopInterrupted` instead of returning a partial
+inventory, and `IntegrityService` records nothing (no change, warning, notice
+or baseline update; `monitoring_check_interrupted` is logged). The next start's
+startup check runs it. A command ended by SIGTERM before the stop began is
+unavailable and marks the runner `terminated`: the systemd stop signals the
+whole control group before `begin_stop()` runs (after the HTTP graceful wait,
+or after a startup still running), so `IntegrityService` holds that check
+without blocking the worker, drops it if the stop begins within
+`SIGTERM_HOLD_SECONDS` (`TimeoutStopSec`, 90 s) and otherwise records it with
+the probe unavailable; a SIGTERM from anything else (an operator's `pkill`, a
+watchdog) is therefore never dropped, only delayed, and any other signal is a
+failed probe at once (PR #389 reviews). An interrupted check returns `INTERRUPTED`, so the
+monitoring runtime keeps the step's degraded flag and retry. Utilities/drivers are not installed or
 bundled. Keep deployment permissions narrow; never run the backend as root for
 inventory. CI does not invoke these host utilities.
 

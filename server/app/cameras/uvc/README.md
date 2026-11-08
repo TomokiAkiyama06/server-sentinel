@@ -219,7 +219,7 @@ that fails to start is `worker_failed` and its camera is written `offline`.
 Service state (`running` / `degraded` / `failed` / `stopped` / `stop_failed`)
 is separate from each camera's registry health. Workers stop in parallel under
 one total join bound, `join_timeout_seconds` (default 10 s, configurable
-0.1–40 s, the most that fits the Main stop budget, Issue #383). It must cover a worker's `STREAMOFF`/unmap/close (up to 5.5 s
+0.1–28.75 s, the most that fits the Main stop budget, Issues #383, #385). It must cover a worker's `STREAMOFF`/unmap/close (up to 5.5 s
 observed on a real C960 after an unplug, MANUAL_TEST P-7) plus
 `HEALTH_SETTLE_SECONDS` (1 s); a bound below that can turn a clean shutdown of
 a camera mid-teardown into `stop_failed`. After the workers are joined,

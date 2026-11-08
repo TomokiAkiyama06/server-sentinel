@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import Callable
 from uuid import UUID, uuid4
 import threading
+import time
 
 from app.notifications.slack import DeliveryResult, SlackDelivery
 from app.notifications.worker import DeliveryWorker
@@ -156,10 +157,17 @@ class NotificationService:
     """
 
     def __init__(self, local_sink: Callable[[NotificationEvent], None],
-                 slack: SlackDelivery | None = None, *, queue_capacity: int = 16):
+                 slack: SlackDelivery | None = None, *, queue_capacity: int = 16,
+                 local_batch_sink: Callable[[tuple[NotificationEvent, ...]], None] | None = None):
         if type(queue_capacity) is not int or not 1 <= queue_capacity <= 1024:
             raise ValueError("invalid notification capacity")
+        if local_batch_sink is not None and not callable(local_batch_sink):
+            raise ValueError("invalid notification batch sink")
         self._local_sink = local_sink
+        # Issue #385 (Owner decision 2026-11-08): writes several final
+        # outcomes as one write (`persist_completed`); without it they are
+        # written one by one.
+        self._local_batch_sink = local_batch_sink
         self._slack = slack or SlackDelivery()
         self._worker = DeliveryWorker(self._slack, queue_capacity)
         self._capacity = queue_capacity
@@ -269,8 +277,10 @@ class NotificationService:
             return True
         return False
 
-    def _flush_unpersisted(self) -> None:
+    def _flush_unpersisted(self, past=lambda: False) -> None:
         for identifier, event in tuple(self._unpersisted.items()):
+            if past():
+                return
             if self._local(event):
                 del self._unpersisted[identifier]
 
@@ -312,16 +322,26 @@ class NotificationService:
                 return DeliveryResult.FAILED
         return result
 
-    def poll(self) -> tuple[NotificationEvent, ...]:
-        """Persist completed results without waiting; failed persistence retries locally."""
+    def poll(self, deadline: float | None = None) -> tuple[NotificationEvent, ...]:
+        """Persist completed results without waiting; failed persistence retries locally.
+
+        Issue #385: with a ``deadline`` (``time.monotonic``) no further local
+        write or completion callback starts once it passed; the rest stay
+        pending, unchanged, for the next poll. A poll then ends at most one
+        write or callback after the deadline.
+        """
         self._check()
-        self._flush_unpersisted()
+        past = ((lambda: False) if deadline is None
+                else (lambda: time.monotonic() >= deadline))
+        self._flush_unpersisted(past)
         for identifier, result in self._worker.results():
             self._pending[identifier][2] = result
         completed = []
         for identifier, (event, callbacks, result) in tuple(self._pending.items()):
             if result is None:
                 continue
+            if past():
+                break
             update = replace(event, delivery=result)
             if result == DeliveryResult.FAILED:
                 self.delivery_failed = True
@@ -329,12 +349,23 @@ class NotificationService:
                 continue
             # Every submitter of a coalesced delivery is told; a callback that
             # raised is retried on the next poll, the others are not repeated.
+            # Past the deadline the callbacks not yet called are left for the
+            # next poll the same way, without counting as a failure.
             failed = []
-            for callback in callbacks:
+            deferred = []
+            for index, callback in enumerate(callbacks):
+                if past():
+                    deferred = list(callbacks[index:])
+                    break
                 try:
                     callback(result)
                 except Exception:
                     failed.append(callback)
+            if deferred:
+                if failed:
+                    self.local_delivery_failed = True
+                self._pending[identifier][1] = failed + deferred
+                continue
             if failed:
                 self.local_delivery_failed = True
                 self._pending[identifier][1] = failed
@@ -343,6 +374,61 @@ class NotificationService:
             completed.append(update)
             del self._pending[identifier]
         return tuple(completed)
+
+    def persist_completed(self) -> int:
+        """Write every final outcome not yet written, as one local write.
+
+        Issue #385 (Owner decision 2026-11-08): the Main stop calls it once,
+        just before `close()`. A settle ends at its deadline, so a delivery
+        that finished after it (or while it ended unsettled, when the final
+        storage sample has no wait left) would otherwise stay `pending` in
+        `notification_events`, and the next start could send a reconciled
+        kind a second time. With ``local_batch_sink`` the rows (the finished
+        deliveries and the retained refused writes) go in one transaction,
+        bounded by one SQLite busy timeout
+        (`stop_budget.LATE_OUTCOME_WRITE_SECONDS`). No completion callback is
+        called: a callback can take several writes, and the outbox reconciles
+        its unconfirmed claims from these rows at the next start. The daily
+        summary's schedule row, which only its callback updates, then keeps
+        `pending` (uncertain, as for any delivery not confirmed): nothing reads
+        it and the next date replaces it (second PR #389 review). Returns how
+        many rows were written; a refused write writes none, is counted in
+        `local_delivery_failed` and raises nothing.
+        """
+        self._check()
+        for identifier, result in self._worker.results():
+            self._pending[identifier][2] = result
+        finished = [(identifier, replace(event, delivery=result))
+                    for identifier, (event, _callbacks, result) in self._pending.items()
+                    if result is not None]
+        retained = list(self._unpersisted.items())
+        events = tuple(event for _identifier, event in retained) + tuple(
+            update for _identifier, update in finished)
+        if not events:
+            return 0
+        if any(update.delivery == DeliveryResult.FAILED for _identifier, update in finished):
+            self.delivery_failed = True
+        if self._local_batch_sink is None:
+            written = 0
+            for identifier, event in retained:
+                if self._local(event):
+                    del self._unpersisted[identifier]
+                    written += 1
+            for _identifier, update in finished:
+                if self._local(update):
+                    self.last_delivery = update.delivery
+                    written += 1
+            return written
+        try:
+            self._local_batch_sink(events)
+        except Exception:
+            self.local_delivery_failed = True
+            return 0
+        for identifier, _event in retained:
+            del self._unpersisted[identifier]
+        if finished:
+            self.last_delivery = finished[-1][1].delivery
+        return len(events)
 
     def record(self, kind: NotificationKind, *, at: datetime,
                confirmed: bool = False, event_id: UUID | None = None,

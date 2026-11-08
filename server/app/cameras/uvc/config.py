@@ -18,12 +18,14 @@ _TIMING_BOUNDS = {
     "poll_timeout_seconds": (0.05, 30.0),
     "retry_delay_seconds": (0.05, 60.0),
     # At most what fits the Main stop budget with the camera offline settle
-    # (40 s, Issue #383), so `--check` refuses a longer join.
+    # (28.75 s, Issues #383, #385), so `--check` refuses a longer join.
     "join_timeout_seconds": (0.1, MAXIMUM_LOCAL_UVC_JOIN_SECONDS),
     # Frame-progress watchdog: no frame for this long on a live capture reports
     # ``degraded`` (``video_frame_stalled``) instead of ``online``. The
     # effective window is never shorter than 10 negotiated frame intervals.
-    "frame_stall_seconds": (0.25, 30.0),
+    # Never above the join bound (the join must cover a stall), so the range
+    # itself refuses what the join check would (second PR #389 review).
+    "frame_stall_seconds": (0.25, min(30.0, MAXIMUM_LOCAL_UVC_JOIN_SECONDS)),
     # A stall lasting this long closes and reopens the capture (``offline``).
     "frame_stall_reopen_seconds": (0.5, 300.0),
     # While capture is live, the full device scan (which opens every video

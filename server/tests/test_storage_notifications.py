@@ -11,9 +11,11 @@ from zoneinfo import ZoneInfo
 import contextlib
 import io
 import json
+import os
 import sqlite3
 import threading
 import time
+import types
 import unittest
 
 from app.notifications.schedule import DailySummaryScheduler, notification_migration
@@ -266,6 +268,210 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual([(threading.get_ident(), DeliveryResult.SENT)] * 2, results)
         self.assertEqual(1, len(transport.requests))
         self.assertEqual([identifier, identifier], [event.event_id for event in local])
+
+
+class PollDeadlineTests(unittest.TestCase):
+    """Issue #385: a poll given a deadline starts no write or callback after it."""
+
+    def setUp(self):
+        self.clock = [0.0]
+        clock = patch("app.notifications.service.time",
+                      types.SimpleNamespace(monotonic=lambda: self.clock[0]))
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.local = []
+        self.service = NotificationService(self.write, SlackDelivery(endpoint(), opener=Transport()))
+        self.addCleanup(self.service.close)
+
+    def write(self, event):
+        # Each outcome write takes one synthetic second.
+        self.local.append(event)
+        self.clock[0] += 1.0
+
+    def delivered(self):
+        # Collect the finished deliveries without writing any outcome.
+        for _ in range(200):
+            self.service.poll(deadline=float("-inf"))
+            if all(entry[2] is not None for entry in self.service._pending.values()):
+                # Restart the synthetic clock and drop the pending-row writes.
+                self.clock[0] = 0.0
+                self.local.clear()
+                return
+            self.service._worker.ready.wait(0.05)
+        self.fail("mock delivery did not finish")
+
+    def record(self, event_id, callback=None):
+        self.assertEqual(DeliveryResult.PENDING, self.service.record(
+            NotificationKind.CAMERA_TAMPER, at=datetime(2026, 1, 1, tzinfo=timezone.utc), confirmed=True,
+            event_id=event_id, on_complete=callback))
+
+    def test_outcome_writes_stop_at_the_deadline_and_resume_on_the_next_poll(self):
+        first, second = uuid4(), uuid4()
+        self.record(first)
+        self.record(second)
+        self.delivered()
+        # The first write ends past the deadline: the second does not start.
+        self.service.poll(deadline=0.5)
+        self.assertEqual([first], [event.event_id for event in self.local])
+        self.assertEqual(1, self.service.pending_count)
+        self.assertFalse(self.service.local_delivery_failed)
+        self.service.poll()
+        self.assertEqual([first, second], [event.event_id for event in self.local])
+        self.assertEqual(0, self.service.pending_count)
+
+    def test_callbacks_not_yet_called_wait_for_the_next_poll(self):
+        identifier, called = uuid4(), []
+
+        def slow(result):
+            called.append("slow")
+            self.clock[0] += 1.0
+
+        self.record(identifier, slow)
+        self.record(identifier, lambda result: called.append("second"))
+        self.delivered()
+        self.service.poll(deadline=1.5)
+        self.assertEqual(["slow"], called)
+        self.assertEqual(1, self.service.pending_count)
+        self.assertFalse(self.service.local_delivery_failed)
+        self.service.poll()
+        # Each submitter is told once; the outcome write is repeated.
+        self.assertEqual(["slow", "second"], called)
+        self.assertEqual(0, self.service.pending_count)
+        self.assertEqual([identifier] * 2, [event.event_id for event in self.local])
+
+    def test_the_stop_writes_finished_outcomes_past_the_deadline_in_one_write(self):
+        # Owner decision 2026-11-08 (PR #389 finding 1): a poll past its
+        # deadline writes nothing, so the stop's `persist_completed` writes
+        # every finished outcome as one batch, without calling a callback.
+        batches, called = [], []
+        self.service._local_batch_sink = lambda events: batches.append(events)
+        first, second = uuid4(), uuid4()
+        self.record(first, lambda result: called.append(result))
+        self.record(second)
+        self.delivered()
+        self.service.poll(deadline=0.0)
+        self.assertEqual([], self.local)
+        self.assertEqual(2, self.service.persist_completed())
+        self.assertEqual(1, len(batches))
+        self.assertEqual({first, second}, {event.event_id for event in batches[0]})
+        self.assertTrue(all(event.delivery == DeliveryResult.SENT for event in batches[0]))
+        self.assertEqual([], self.local)
+        self.assertEqual([], called)
+        self.assertFalse(self.service.local_delivery_failed)
+
+    def test_a_refused_last_write_writes_nothing_and_is_counted(self):
+        def refused(events):
+            raise OSError("synthetic")
+
+        self.service._local_batch_sink = refused
+        self.record(uuid4())
+        self.delivered()
+        self.assertEqual(0, self.service.persist_completed())
+        self.assertTrue(self.service.local_delivery_failed)
+
+    def test_without_a_batch_sink_the_outcomes_are_written_one_by_one(self):
+        first, second = uuid4(), uuid4()
+        self.record(first)
+        self.record(second)
+        self.delivered()
+        self.assertEqual(2, self.service.persist_completed())
+        self.assertEqual({first, second}, {event.event_id for event in self.local})
+        self.assertEqual(0, NotificationService(lambda event: None).persist_completed())
+
+
+class NotificationBatchWriteTests(unittest.TestCase):
+    """Owner decision 2026-11-08: the stop's last outcome write is one transaction."""
+
+    def setUp(self):
+        from app.storage.schema import APPLICATION_MIGRATIONS
+        self.db = sqlite3.connect(":memory:", isolation_level=None)
+        self.addCleanup(self.db.close)
+        migrate(self.db, APPLICATION_MIGRATIONS)
+        self.reservations = []
+        from app.monitoring.store import NotificationEventStore
+        self.store = NotificationEventStore(self.db, self.reservation)
+
+    @contextlib.contextmanager
+    def reservation(self):
+        self.reservations.append(1)
+        yield
+
+    def events(self, count, delivery=DeliveryResult.SENT):
+        from app.notifications.service import NotificationEvent
+        at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        return tuple(NotificationEvent(NotificationKind.CAMERA_TAMPER, at, True, uuid4(), delivery)
+                     for _ in range(count))
+
+    def rows(self):
+        return self.db.execute("SELECT delivery FROM notification_events").fetchall()
+
+    def test_all_rows_in_one_admitted_transaction(self):
+        at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self.store.upsert_many(self.events(3), accepted_at=at)
+        self.assertEqual([("sent",)] * 3, self.rows())
+        self.assertEqual([1], self.reservations)
+        self.assertFalse(self.db.in_transaction)
+        self.store.upsert_many((), accepted_at=at)
+        self.assertEqual([1], self.reservations)
+
+    def test_a_failed_row_writes_none(self):
+        at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        good = self.events(2)
+        self.db.execute("CREATE TRIGGER refuse BEFORE INSERT ON notification_events "
+                        "WHEN (SELECT count(*) FROM notification_events) >= 1 "
+                        "BEGIN SELECT RAISE(ABORT, 'synthetic'); END")
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.store.upsert_many(good, accepted_at=at)
+        self.assertEqual([], self.rows())
+        self.assertFalse(self.db.in_transaction)
+        with self.assertRaises(ValueError):
+            self.store.upsert_many(("not an event",), accepted_at=at)
+
+    def test_the_begin_and_commit_lock_waits_share_one_busy_timeout(self):
+        # Third PR #389 review: on the rollback journal BEGIN IMMEDIATE waits
+        # for RESERVED and COMMIT for EXCLUSIVE; together they get one busy
+        # timeout (`stop_budget.LATE_OUTCOME_WRITE_SECONDS`), not one each.
+        from unittest import mock
+        from app.monitoring import store as store_module
+        from app.monitoring.store import NotificationEventStore
+        from app.storage.schema import APPLICATION_MIGRATIONS
+        budget = 0.6
+        with TemporaryDirectory(prefix="sentinel-busy-budget-") as directory:
+            path = os.path.join(directory, "state.sqlite3")
+            writer = sqlite3.connect(path, timeout=budget, isolation_level=None)
+            reader = sqlite3.connect(path, timeout=budget, isolation_level=None)
+            other = sqlite3.connect(path, timeout=budget, isolation_level=None,
+                                    check_same_thread=False)
+            for connection in (writer, reader, other):
+                self.addCleanup(connection.close)
+            migrate(writer, APPLICATION_MIGRATIONS)
+            # A reader keeps SHARED (blocks COMMIT); another writer keeps
+            # RESERVED for 0.4 s (delays BEGIN IMMEDIATE).
+            reader.execute("BEGIN")
+            reader.execute("SELECT count(*) FROM notification_events").fetchall()
+            other.execute("BEGIN IMMEDIATE")
+            release = threading.Timer(0.4, lambda: other.execute("ROLLBACK"))
+            release.start()
+            self.addCleanup(release.cancel)
+            store = NotificationEventStore(writer, self.reservation)
+            at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            started = time.monotonic()
+            with mock.patch.object(store_module, "BUSY_TIMEOUT_SECONDS", budget), \
+                    self.assertRaises(sqlite3.OperationalError):
+                store.upsert_many(self.events(2), accepted_at=at)
+            elapsed = time.monotonic() - started
+            release.join()
+            # BEGIN IMMEDIATE got RESERVED once the other writer let go; the
+            # COMMIT then waited only what was left of the budget.
+            self.assertGreater(elapsed, 0.4)
+            # About one budget (0.6 s), never two (1.0 s here).
+            self.assertLess(elapsed, budget + 0.25)
+            self.assertFalse(writer.in_transaction)
+            self.assertEqual(int(budget * 1000),
+                             writer.execute("PRAGMA busy_timeout").fetchone()[0])
+            reader.execute("ROLLBACK")
+            self.assertEqual([], writer.execute(
+                "SELECT delivery FROM notification_events").fetchall())
 
 
 class ScheduleTests(unittest.TestCase):

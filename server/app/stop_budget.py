@@ -14,6 +14,33 @@ from __future__ import annotations
 from app.settings import ConfigurationError
 
 
+class StopInterrupted(Exception):
+    """Issue #385: a check stopped part-way because the Main shutdown began.
+
+    Its partial result is discarded, never recorded as a finding.
+    """
+
+
+class _Interrupted:
+    """The type of `INTERRUPTED`; it has a single instance."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "INTERRUPTED"
+
+
+# Issue #385 (PR #389 review): what a check returns when the Main shutdown cut
+# it short, so the monitoring runtime can tell it from a check that completed
+# (and keeps the step's degraded flag and retry as they were).
+INTERRUPTED = _Interrupted()
+
+
+def never() -> bool:
+    """The default `interrupted` / `stopping` check: no shutdown ever begins."""
+    return False
+
+
 # The installed unit's `TimeoutStopSec` (Owner decision 2026-10-08). Past it
 # systemd sends SIGKILL.
 UNIT_STOP_TIMEOUT_SECONDS = 90
@@ -29,17 +56,60 @@ RESERVATION_CHECK_STOP_SECONDS = 10.0 + 5.0
 # - the scene runtime stop: worker join and final delivery pass, each 5 s,
 #   plus the decoder reap (`DECODER_REAP_TIMEOUT_SECONDS`);
 SCENE_STOP_SECONDS = 5.0 + 5.0 + 1.0
-# - process exit and the short steps between them.
+# - process exit and the short steps between them (an estimate, not derived);
 PROCESS_EXIT_SECONDS = 4.0
-# Not bounded yet (Issue #383 phase 2, separate Issue): waits for the storage
-# admission behind a monitoring job, the SQLite busy timeouts of the writes in
-# the human access stop, the timeline finish and the dispatch, and a hung
-# filesystem call, and the one monitoring step already running when the stop
-# began (an integrity probe run or the recording self-test): a tick starts no
-# further long step after it (`MonitoringRuntime.begin_stop`), and the
-# settles queue behind it. PROCESS_EXIT_SECONDS is an estimate, not derived.
+# Issue #385 (phase 2; Owner decisions 2026-11-05 and 2026-11-08: these three
+# terms are in the reserve, so the longest local UVC join is 28.75 s):
+# - the monitoring step already running when the stop began, when it is the
+#   hardware integrity check: its probe in flight is killed within one poll
+#   slice and reaped for at most 1 s (`integrity.probes.STOP_POLL_SECONDS`
+#   + `STOP_REAP_SECONDS`), and nothing is recorded. The settles and every
+#   cross-thread storage admission queue behind this step, so it counts once;
+INTEGRITY_PROBE_STOP_SECONDS = 0.25 + 1.0
+# - a shutdown settle checks its deadline between polls; a poll started
+#   before it begins no further outcome write or callback after it
+#   (`NotificationService.poll(deadline=)`), so it overshoots by at most the
+#   one write in progress: one SQLite busy timeout (`BUSY_TIMEOUT_SECONDS`)
+#   plus that write's own I/O. Only one settle runs at a stop (or, when none
+#   did, the stop's own poll, `MonitoringRuntime._persist_outcomes`) and the
+#   final storage sample's wait already counts this overshoot as settle time.
+#   A completion callback whose transaction waits for more than one lock
+#   (a rollback-journal commit) can take longer; that is not bounded yet
+#   (Issue #396).
+SETTLE_POLL_OVERSHOOT_SECONDS = 5.0
+# - the stop's last outcome write (Owner decision 2026-11-08): the deliveries
+#   that finished after the last settle's deadline (or while it ended
+#   unsettled) and the retained refused writes are written by
+#   `NotificationService.persist_completed` in one transaction whose
+#   RESERVED (`BEGIN IMMEDIATE`) and EXCLUSIVE (`COMMIT`) lock waits share
+#   one SQLite busy timeout (`BUSY_TIMEOUT_SECONDS`,
+#   `NotificationEventStore.upsert_many`), plus its own I/O, once per stop. Without it the next start could send a reconciled kind again.
+LATE_OUTCOME_WRITE_SECONDS = 5.0
 OTHER_STOP_STEPS_RESERVE_SECONDS = (HTTP_GRACEFUL_SHUTDOWN_SECONDS + RESERVATION_CHECK_STOP_SECONDS
-                                    + SCENE_STOP_SECONDS + PROCESS_EXIT_SECONDS)
+                                    + SCENE_STOP_SECONDS + PROCESS_EXIT_SECONDS
+                                    + INTEGRITY_PROBE_STOP_SECONDS + SETTLE_POLL_OVERSHOOT_SECONDS
+                                    + LATE_OUTCOME_WRITE_SECONDS)
+# Once the stop began, a write from another thread waits for the storage
+# admission (`MonitoringRuntime.reservation`) at most until this long after the
+# stop while the jobs queued at the stop still run (every such wait shares
+# that deadline, PR #389 review), and this long from the later of its start
+# and their end afterwards; it is then refused as a denial (nothing written;
+# the caller handles it as any storage refusal and the next start does it
+# again). Not in the reserve (Owner decision 2026-11-05): behind a bounded
+# step (the integrity check above) the wait ends with that step and adds
+# nothing; the cap only matters behind the steps that are still unbounded
+# (below), whose own time the reserve cannot cover anyway.
+STOP_ADMISSION_WAIT_SECONDS = 5.0
+# Still not bounded (Issue #385): the other monitoring steps already running
+# when the stop began (retention `_trim`, the storage sample, the daily
+# summary, a startup retry, a recording self-test adapter stage), the SQLite
+# busy timeouts summed over the many writes in the human access stop, the
+# timeline finish and the dispatch, and of a check that completed just before
+# the stop (the integrity `store.record` / `deliver` and the self-test's
+# `record_result` writes), a hung filesystem call, and the dispatch steps
+# before the critical settle, with their deadline-less polls. The completion
+# callbacks of deliveries that finished after the last settle's deadline are
+# not called; their outcome rows are written (`LATE_OUTCOME_WRITE_SECONDS`).
 # On top of `join_timeout_seconds`, a local UVC stop waits at most 1 s for the
 # frame-progress watchdog join (`WorkerSupervisor.WATCHDOG_JOIN_MINIMUM_SECONDS`),
 # 1 s for the fenced `offline` writes of workers that outlived the join
