@@ -1,0 +1,12 @@
+# LXD host only (Issue #301 item 1): the safety net for a missed udev event
+# and for a re-enumeration while the service was already running.
+[Unit]
+Description=Periodic ServerSentinel host USB camera re-pass check
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

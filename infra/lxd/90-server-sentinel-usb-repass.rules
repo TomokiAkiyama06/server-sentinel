@@ -1,0 +1,4 @@
+# LXD host only (Issue #301 item 1). On any USB device add, ask systemd to run
+# the re-pass check; the service itself decides from the configured,
+# serial-identified LXD usb devices and changes nothing for other devices.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", TAG+="systemd", ENV{SYSTEMD_WANTS}+="server-sentinel-usb-repass.service"
