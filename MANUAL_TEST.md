@@ -722,9 +722,10 @@ loopback tests with temporary CAs (`server/tests/test_capture_mtls.py`,
 `server/tests/test_capture_enrollment.py`, `agent/tests/test_node_tls.py`,
 `agent/tests/test_enroll.py`, `tests/e2e/test_capture_mtls_scenarios.py`,
 `tests/e2e/test_capture_enrollment_scenarios.py`). No real Main host, capture
-host or LAN has run these steps. The ingest listener is not started by the
-application yet, so the steps marked *(needs ingest wiring, #14/#15)* wait for
-that. Use a disposable deployment CA and synthetic server name; never paste
+host or LAN has run these steps. The application opens the ingest listener
+for a `capture_ingest` section since Issue #14 (first part, below), but no
+Agent ingest client exists yet, so the steps marked *(needs ingest wiring,
+#14/#15)* still wait for it. Use a disposable deployment CA and synthetic server name; never paste
 keys, codes, certificates, bundle contents, LAN addresses or hostnames into
 Issues, PRs or CI artifacts. Below, `MAIN_CLI` means the
 `serversentinel-pairing` wrapper that the installer places in
@@ -1031,6 +1032,40 @@ Health:
 - [ ] heartbeat does not falsely imply that video frames are arriving.
 
 Apply the exact-model, UVC-capability, stable-identity, and reconnect checks in section A to capture-node cameras as well as Main Server cameras.
+
+### Issue #14 capture ingest listener on the two hosts (pending, not executed)
+
+Mock/loopback-verified only: `server/tests/test_capture_ingest_server.py`
+(real loopback TLS 1.3 mTLS with a temporary CA and a synthetic in-process
+client) and `server/tests/test_capture_ingest_wire.py`. No real Main host,
+capture host or LAN has run the listener, and no Agent ingest client exists
+yet; until it does, the capture-host steps use a stand-in client that sends
+synthetic heartbeats with the node's real credential (never commit it).
+Record addresses, node UUIDs and certificate details only in the private
+local record.
+
+- [ ] on the Main, with `capture_ingest` naming its private LAN address, the
+  service starts, `--check` passes with no warning, and the journal shows
+  `capture_ingest_started`; `ss -ltn` shows the ingest port bound to that
+  address only (no wildcard) and the human listener unchanged on loopback;
+- [ ] with the listener directory made unreadable (restored afterwards):
+  `--check` passes with `capture ingest stays closed
+  (reason=listener_material_unavailable)`, the service starts, recording and
+  the integrity/self-test run, and the ingest port is not bound;
+- [ ] from the capture host, which is not on the Tailnet, a paired node's
+  heartbeat over the private LAN is answered with `HEARTBEAT_ACK`; without
+  the ALPN, without a client certificate, with another deployment's
+  certificate and after `revoke`, the session is refused
+  (`capture_ingest_session_refused` or `capture_ingest_connection_refused`
+  in the journal, never a node identity);
+- [ ] a plain HTTP request and a browser to the ingest port get no HTTP
+  answer and no dashboard route; the dashboard is not reachable from the
+  capture host through the ingest port;
+- [ ] three idle TCP connections from one capture host address: the third is
+  closed at once; a session that sends nothing is closed after about 10 s;
+- [ ] `systemctl stop` while a session is open: the stop completes within
+  `TimeoutStopSec` and the journal shows `capture_ingest_stopped` before the
+  monitoring settles; after restart the port rebinds at once.
 
 ### Record: Issue #12 sandboxed UVC capture re-run (2026-09-30, PR #88 head `4be6aa9`)
 

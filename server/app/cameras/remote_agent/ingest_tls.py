@@ -7,9 +7,10 @@ principal. It performs no HTTP routing and cannot reach dashboard routes. The
 transport-neutral ingest core (Issue #14/#15) can consume the session's
 ``identity`` and ``still_admitted()`` result without importing ``ssl``.
 
-Nothing here is started by the application: the ingest listener stays
-disabled until a deployment explicitly configures a non-wildcard bind address
-and port that differ from the human listener.
+Nothing here starts a listener: the application opens one
+(``ingest_server``) only for a deployment ``capture_ingest`` section, which
+names a non-wildcard bind address and port that differ from the human
+listener (Issue #14).
 
 Admission requires all of:
 
@@ -38,13 +39,19 @@ import socket
 import ssl
 from pathlib import Path
 from typing import Callable
-
-from .addresses import is_tailscale_address
 from uuid import UUID
 
 from cryptography import x509
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
+# The listener configuration and the fixed-reason errors are standard library
+# only (the installer validates `capture_ingest` with them, Issue #14); they
+# keep their names here.
+from .ingest_config import (  # noqa: F401 (re-exported)
+    DEFAULT_HANDSHAKE_TIMEOUT_SECONDS, IngestConfigurationError, IngestListenerConfig,
+    IngestTlsError,
+)
+from .ingest_wire import INGEST_ALPN
 from .node_ca import (
     DEPLOYMENT_URI_PREFIX, NODE_URI_PREFIX, deployment_uri, public_key_digest,
 )
@@ -53,63 +60,10 @@ from .pairing import PairingError, PairingLedger
 
 LOGGER = logging.getLogger("serversentinel.capture_ingest.tls")
 MAX_PEER_CERTIFICATE_BYTES = 16 * 1024
-DEFAULT_HANDSHAKE_TIMEOUT_SECONDS = 10.0
 
 
 def _utc_now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
-
-
-class IngestTlsError(RuntimeError):
-    """A fixed-reason refusal; it never contains peer, key or certificate bytes."""
-
-    def __init__(self, reason: str):
-        super().__init__(reason)
-        self.reason = reason
-
-
-class IngestConfigurationError(IngestTlsError):
-    pass
-
-
-@dataclass(frozen=True)
-class IngestListenerConfig:
-    """Explicit ingest bind; there is no default address, port or wildcard.
-
-    ``human_host``/``human_port`` are the dashboard listener's values so the
-    two listeners can never share a socket address. Ingest is private-LAN only
-    and needs no Tailscale, so a Tailscale address (IPv4 ``100.64.0.0/10``,
-    IPv6 ``fd7a:115c:a1e0::/48``, or the IPv4-mapped spelling) is refused
-    (Issue #150).
-    """
-
-    bind_host: str
-    port: int
-    human_host: str
-    human_port: int
-    handshake_timeout_seconds: float = DEFAULT_HANDSHAKE_TIMEOUT_SECONDS
-    backlog: int = 8
-
-    def __post_init__(self):
-        try:
-            bind = ipaddress.ip_address(self.bind_host)
-            human = ipaddress.ip_address(self.human_host)
-        except (TypeError, ValueError):
-            raise IngestConfigurationError("ingest_bind_requires_ip_literal") from None
-        if bind.is_unspecified or bind.is_multicast:
-            raise IngestConfigurationError("ingest_bind_wildcard_refused")
-        if is_tailscale_address(bind):
-            raise IngestConfigurationError("ingest_bind_tailscale_address_refused")
-        for port in (self.port, self.human_port):
-            if type(port) is not int or not 1 <= port <= 65535:
-                raise IngestConfigurationError("ingest_port_invalid")
-        if self.port == self.human_port and (bind == human or human.is_unspecified):
-            raise IngestConfigurationError("ingest_listener_must_differ_from_human_listener")
-        if (not isinstance(self.handshake_timeout_seconds, (int, float))
-                or not 0 < self.handshake_timeout_seconds <= 60):
-            raise IngestConfigurationError("ingest_handshake_timeout_invalid")
-        if type(self.backlog) is not int or not 1 <= self.backlog <= 128:
-            raise IngestConfigurationError("ingest_backlog_invalid")
 
 
 def build_ingest_server_context(ca_certificate_pem: bytes, certificate_path: Path,
@@ -128,6 +82,9 @@ def build_ingest_server_context(ca_certificate_pem: bytes, certificate_path: Pat
     context.verify_flags |= ssl.VERIFY_X509_STRICT
     context.options |= ssl.OP_NO_TICKET
     context.num_tickets = 0
+    # Issue #14: only the capture ingest protocol is offered; the listener
+    # (`ingest_server`) refuses a session that did not negotiate it.
+    context.set_alpn_protocols([INGEST_ALPN])
     try:
         context.load_verify_locations(cadata=ca_certificate_pem.decode("ascii"))
         context.load_cert_chain(certfile=str(certificate_path), keyfile=str(key_path))
@@ -249,14 +206,34 @@ class CaptureIngestAcceptor:
         self._admission = admission
         self._timeout = float(handshake_timeout_seconds)
 
-    def accept(self, connection: socket.socket) -> AuthenticatedCaptureSession:
+    def accept(self, connection: socket.socket, *,
+               on_wrapped: Callable[[ssl.SSLSocket], None] | None = None,
+               ) -> AuthenticatedCaptureSession:
+        """Handshake and admit one connection.
+
+        ``on_wrapped`` receives the TLS socket before the handshake starts
+        (``wrap_socket`` detaches ``connection``), so a listener can shut a
+        handshake in progress down when it stops (Issue #14).
+        """
         connection.settimeout(self._timeout)
         try:
-            tls = self._context.wrap_socket(connection, server_side=True)
+            tls = self._context.wrap_socket(connection, server_side=True,
+                                            do_handshake_on_connect=False)
         except (ssl.SSLError, OSError):
             _close(connection)
             LOGGER.info("capture ingest refused: reason=tls_handshake_failed")
             raise IngestTlsError("tls_handshake_failed") from None
+        try:
+            if on_wrapped is not None:
+                on_wrapped(tls)
+            tls.do_handshake()
+        except (ssl.SSLError, OSError):
+            _close(tls)
+            LOGGER.info("capture ingest refused: reason=tls_handshake_failed")
+            raise IngestTlsError("tls_handshake_failed") from None
+        except BaseException:
+            _close(tls)
+            raise
         try:
             if tls.version() != "TLSv1.3":
                 raise IngestTlsError("tls_version_refused")

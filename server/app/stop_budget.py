@@ -58,6 +58,13 @@ RESERVATION_CHECK_STOP_SECONDS = 10.0 + 5.0
 SCENE_STOP_SECONDS = 5.0 + 5.0 + 1.0
 # - process exit and the short steps between them (an estimate, not derived);
 PROCESS_EXIT_SECONDS = 4.0
+# The capture ingest listener (Issue #14) is not a term: its stop, the first
+# step after `begin_stop()`, only shuts its sockets down and waits for no
+# thread (`CaptureIngestServer.stop`). Its connection threads keep node health
+# in memory only; the one write they can cause, the pairing ledger promoting a
+# staged renewal inside an admission read, goes through the storage admission
+# like any other. `tests.test_capture_ingest_server` checks that the stop
+# returns at once while a handshake and a session are blocked.
 # Issue #385 (phase 2; Owner decisions 2026-11-05 and 2026-11-08: these three
 # terms are in the reserve, so the longest local UVC join is 28.75 s):
 # - the monitoring step already running when the stop began, when it is the

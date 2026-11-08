@@ -19,6 +19,7 @@ from app.audit.model import ActorCategory, AuditAction, AuditOutcome, TargetKind
 from app.audit.integration import OwnerAdministration
 from app.audit.runtime import AuditRetentionRuntime
 from app.cameras.registry import CameraRegistry
+from app.cameras.remote_agent.ingest_config import CaptureIngestMaterial
 from app.cameras.uvc.config import LocalUvcConfiguration
 from app.cameras.uvc.runtime import LocalUvcDependencies, LocalUvcRuntime, LocalUvcRuntimeState
 from app.completion import run_to_completion
@@ -48,7 +49,8 @@ from app.storage.database import Database, PinnedDatabase
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
-
+# Issue #14: how often a capture ingest bind that failed is retried.
+CAPTURE_INGEST_BIND_RETRY_SECONDS = 30.0
 
 
 class RuntimeStorageAdmission:
@@ -137,7 +139,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
                scene_monitoring_dependencies: SceneMonitoringDependencies | None = None,
                scene_timeline: SceneTimelineConfiguration | None = None,
                scene_calibration: SceneCalibrationConfiguration | None = None,
-               human_access: HumanAccess | None = None) -> FastAPI:
+               human_access: HumanAccess | None = None,
+               capture_ingest: CaptureIngestMaterial | None = None,
+               capture_ingest_unavailable: bool = False) -> FastAPI:
     # Closed unless the embedder passes a validated composition: it exists
     # only when the deployment explicitly enabled human access and the
     # hostname reservation check is fully configured. In production only the
@@ -419,6 +423,29 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # than a guessed false (Claude review, PR #388).
             human_access.attach_camera_offline_notice(
                 lambda: monitoring_runtime.status.camera_offline_unnotified)
+    # Issue #14: the dedicated capture ingest listener, from the deployment's
+    # `capture_ingest` section (`remote_agent.ingest_config`). Its acceptor
+    # reads this application's pairing ledger on every connection and frame;
+    # the ledger's own writes (a staged renewal's promotion) use this audit
+    # store and its storage admission. The socket is opened in the lifespan.
+    if capture_ingest is not None and not isinstance(capture_ingest, CaptureIngestMaterial):
+        raise TypeError("capture ingest material is invalid")
+    capture_acceptor = None
+    if capture_ingest is not None:
+        import secrets
+
+        from app.cameras.remote_agent.ingest_tls import (
+            CaptureIngestAcceptor, CaptureNodeAdmission,
+        )
+        from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
+        # No approval is ever made through this ledger (only the pairing
+        # CLI approves), so its code verifier key is per process and unused.
+        capture_ledger = PairingLedger(store, HmacCodeVerifier(secrets.token_bytes(32)),
+                                       audit=audit_store)
+        capture_acceptor = CaptureIngestAcceptor(
+            capture_ingest.context,
+            CaptureNodeAdmission(capture_ledger, capture_ingest.deployment_id),
+            handshake_timeout_seconds=capture_ingest.listener.handshake_timeout_seconds)
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(
@@ -482,6 +509,42 @@ def create_app(settings: Settings, *, database: Database | None = None,
                            "notified": False, "stopping": False, "scrubbed": False}
 
         uvc_lifecycle = {"deferred": None, "stopping": False}
+        capture_lifecycle = {"server": None, "task": None}
+
+        async def run_capture_ingest() -> None:
+            """Issue #14: open the capture ingest listener, retrying its bind.
+
+            A bind that fails (the private address not assigned yet at boot,
+            the port taken) is retried every `CAPTURE_INGEST_BIND_RETRY_SECONDS`
+            while the state stays `unavailable`; nothing else depends on it.
+            """
+            from app.cameras.remote_agent.ingest_server import CaptureIngestServer
+            from app.cameras.remote_agent.ingest_tls import (
+                IngestConfigurationError, open_ingest_listener,
+            )
+            while True:
+                try:
+                    listener = open_ingest_listener(capture_ingest.listener)
+                except IngestConfigurationError:
+                    application.state.capture_ingest_state = "unavailable"
+                    logging.getLogger(__name__).error(Event.CAPTURE_INGEST_UNAVAILABLE)
+                    await asyncio.sleep(CAPTURE_INGEST_BIND_RETRY_SECONDS)
+                    continue
+                server = CaptureIngestServer(listener, capture_acceptor,
+                                             limits=capture_ingest.limits)
+                capture_lifecycle["server"] = server
+                application.state.capture_ingest = server
+                server.start()
+                application.state.capture_ingest_state = "running"
+                return
+
+        def stop_capture_ingest() -> None:
+            # Signal only (`CaptureIngestServer.stop`): it waits for nothing,
+            # so it adds no bounded wait to the stop budget.
+            server = capture_lifecycle["server"]
+            if server is not None:
+                server.stop()
+                application.state.capture_ingest_state = "stopped"
 
         def local_uvc_storage_admitted() -> bool:
             if monitoring_runtime is not None:
@@ -900,6 +963,13 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 # its long steps, so the settles and the stop below do not
                 # queue behind them.
                 monitoring_runtime.begin_stop()
+            # Issue #14: no capture node connects or heartbeats from here on.
+            task = capture_lifecycle["task"]
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            stop_capture_ingest()
             if camera_offline is not None:
                 # Issue #301 item 2: capture stopping lowers every source; no
                 # episode starts and nothing more is notified from here on.
@@ -1050,6 +1120,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
             await start_local_uvc()
             if local_uvc_runtime is not None:
                 uvc_watch_task = asyncio.create_task(watch_local_uvc())
+            if capture_acceptor is not None:
+                capture_lifecycle["task"] = asyncio.create_task(run_capture_ingest())
             if human_access is not None:
                 # The reservation check starts closed; its startup and
                 # periodic checks run here, off the request path.
@@ -1115,6 +1187,17 @@ def create_app(settings: Settings, *, database: Database | None = None,
     application.state.critical_dispatcher = critical_dispatcher
     application.state.diagnostic_export_endpoint = diagnostic_export_endpoint
     application.state.human_access = human_access
+    # Internal only (Issue #14): the capture ingest listener and its state
+    # word (`disabled` without the deployment section, `unavailable` when its
+    # material did not load or its bind is being retried, then `running` /
+    # `stopped`). No human route reads either; the Owner status and notice
+    # are a follow-up.
+    application.state.capture_ingest = None
+    application.state.capture_ingest_state = (
+        "unavailable" if capture_ingest_unavailable
+        else "starting" if capture_acceptor is not None else "disabled")
+    if capture_ingest_unavailable:
+        logging.getLogger(__name__).error(Event.CAPTURE_INGEST_UNAVAILABLE)
     # No FastAPI human router is ever included: the surface below answers
     # every HTTP/WebSocket request itself, before any router or error handler.
     if human_access is None:

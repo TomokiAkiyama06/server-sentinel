@@ -1239,8 +1239,8 @@ installed release; see "The `serversentinel-pairing` wrapper" below and
 `server/app/cameras/remote_agent/README.md`) keeps the deployment CA key and
 the Main capture listener credential in two different owner-only directories
 owned by two different accounts, both outside the checkout and media trees.
-The application does not start the ingest listener yet (#14/#15); these steps
-prepare it.
+These steps prepare the ingest listener; the application opens it only with the
+`capture_ingest` section ("Capture ingest listener" below, Issue #14).
 
 **Accounts, ownership and modes (Issue #109).** No network-facing or
 database-owning process may load the CA private key.
@@ -1576,6 +1576,49 @@ exits 2). The listener expiry is taken from the certificate verified or issued
 in the same run, so `export-bundle` exits 0 once the bundle is written.
 Replacing an expiring CA means a new `init` and re-pairing every Agent; plan
 it before the CA has 397 days left.
+
+### Capture ingest listener (Issue #14, first part)
+
+Optional. Without a `capture_ingest` section the Main opens no ingest socket.
+With it, the service opens the dedicated capture ingest listener
+(`server/app/cameras/remote_agent/README.md`, "Capture ingest listener"):
+
+```json
+"capture_ingest": {"bind_host": "<Main private LAN IP>", "port": <port>,
+                   "listener_directory": "<listener_dir>"}
+```
+
+- `bind_host` is the Main's private LAN address as an IP literal. A wildcard,
+  a Tailscale address and the human listener's address and port are refused;
+  capture nodes on the same private LAN need no Tailscale. `port` must be
+  1024 or above (the service holds no capability to bind a privileged port)
+  and differ from the bootstrap enrollment one (`approve --listen`).
+- `listener_directory` is the `<listener_dir>` that `init` prepared (owned by
+  the service account, `0700`). It must be outside the runtime root, the code
+  and the capture-node CA directory.
+- Optional `maximum_connections` (1-256, default 16) bounds the sockets the
+  listener holds, handshakes included.
+- Restrict the port to the capture hosts with the host firewall where the
+  addresses are stable. This narrows exposure; it is not authentication, which
+  is the node certificate plus the pairing ledger's current record.
+
+`--check` (the unit's `ExecStartPre`) and the launcher load the listener key,
+certificate and public CA copy as the service account. When they do not load,
+the check still passes, the service starts with the ingest listener closed and
+both print one value-free word:
+`ServerSentinel deployment warning: capture ingest stays closed
+(reason=listener_credential_incomplete | listener_material_unavailable |
+listener_authority_mismatch); recording and monitoring start`. An interrupted
+`rotate-listener` is not completed by the service: rerun it, then restart the
+service. After `rotate-listener` the service must be restarted to load the new
+certificate. A bind that fails (the address not assigned yet, the port taken)
+is retried every 30 s; the journal shows `capture_ingest_unavailable` until it
+binds. An Owner notice and a dashboard status for the listener and for capture
+node health are follow-ups of #14, as is the Agent's ingest session client: in
+this release no Agent connects to the listener yet.
+
+A release before Issue #14 refuses the key as unknown; the installer's
+rollback check explains how to remove it first.
 
 ### Capture-node re-pairing (expired or revoked node)
 
