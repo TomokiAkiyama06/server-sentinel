@@ -255,14 +255,17 @@ another flapping episode of that period is not sent once the period's
 continuous notification went out (`suppressed`,
 `camera_offline_notification_suppressed`). See SPECIFICATION §9 for the full rules and the known limits.
 Without a configured Slack endpoint the rows are `disabled`; with one, a
-delivery whose final Slack outcome is `failed` is not sent again
-(`NotificationService.delivery_failing`, the latest final outcome per kind,
-Issue #394; restored after a restart from the newest final confirmed
-`camera_offline` row of the last 24 h). While a camera offline condition is
-current, `MonitoringStatus.camera_offline_cause` (`not_configured`,
-`delivery_failed` or `notified`) is what the Owner's dashboard shows,
-through `GET /api/monitoring/camera-offline` (`OWNER_READ`, one boolean and
-one fixed word; `app.auth.human_surface`).
+delivery whose final Slack outcome is `failed` is not sent again. Issue #394
+(Owner decision 2026-11-08) judges that per camera source: the monitor keeps
+each current source's latest alert ID (`CameraOfflineStatus.alert_ids`, the
+earlier process's row of the same outage after a restart), and the camera
+step reads its outcome (`NotificationService.final_outcome`, else the row by
+event ID; an unreadable one is `unverified` and read again next tick). While
+a camera offline condition is current, `MonitoringStatus.camera_offline_cause`
+(`not_configured`, `delivery_failed`, `unverified` or `notified`, the words
+in `app.monitoring.cameras`) is what the Owner's dashboard shows, through
+`GET /api/monitoring/camera-offline` (`OWNER_READ`, one boolean and one fixed
+word; `unverified` is the generic denial; `app.auth.human_surface`).
 
 Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
 takes the `AccessFaultMonitor` the composition root also passes to the

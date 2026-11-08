@@ -17,6 +17,7 @@ from app.auth.human_surface import (
 )
 from app.auth.model import Permission
 from app.auth.store import Requirement
+from app.monitoring.cameras import CAMERA_OFFLINE_CAUSES
 from app.monitoring.runtime import MonitoringStatus, RuntimeState
 
 from tests.test_human_admin_routes import AdminRouteFixture
@@ -124,8 +125,10 @@ class CameraOfflineNoticeRouteTests(AdminRouteFixture):
         self.assertEqual(0, self.reader.calls)
 
     async def test_a_failing_or_unknown_reader_answer_is_never_a_guessed_one(self):
+        # `unverified` (an outcome that could not be read, Issue #394) is the
+        # generic denial too: "could not be checked" on the Web.
         for value in (RuntimeError("synthetic"), None, 0, 1, True, False, "true", "false",
-                      "", "NOTIFIED", "delivery_failed ", "failed"):
+                      "", "NOTIFIED", "delivery_failed ", "failed", "unverified"):
             with self.subTest(value=value):
                 self.reader.value = value
                 self.assertEqual(GENERIC, await self.read())
@@ -153,32 +156,24 @@ class WithoutReaderTests(AdminRouteFixture):
 
 class UnnotifiedStatusTests(TestCase):
     def test_the_cause_word_follows_the_status(self):
-        # Issue #394: (degraded, notifications, delivery failing) -> word.
+        # Issue #394: (degraded, notifications, failing, unverified) -> word.
         cases = {
-            (False, False, False): "notified",
-            (False, True, True): "notified",
-            (True, False, False): "not_configured",
-            (True, False, True): "not_configured",
-            (True, True, False): "notified",
-            (True, True, True): "delivery_failed",
+            (False, False, False, False): "notified",
+            (False, True, True, True): "notified",
+            (True, False, False, False): "not_configured",
+            (True, False, True, True): "not_configured",
+            (True, True, False, False): "notified",
+            (True, True, True, False): "delivery_failed",
+            # A failure found decides even if another source is unverified.
+            (True, True, True, True): "delivery_failed",
+            (True, True, False, True): "unverified",
         }
-        for (degraded, notifications, failing), expected in cases.items():
-            with self.subTest(degraded=degraded, notifications=notifications, failing=failing):
+        for (degraded, notifications, failing, unverified), expected in cases.items():
+            with self.subTest(degraded=degraded, notifications=notifications,
+                              failing=failing, unverified=unverified):
                 status_ = MonitoringStatus(RuntimeState.RUNNING, camera_offline_degraded=degraded,
                                            camera_offline_notifications=notifications,
-                                           camera_offline_delivery_failing=failing)
+                                           camera_offline_delivery_failing=failing,
+                                           camera_offline_delivery_unverified=unverified)
                 self.assertEqual(expected, status_.camera_offline_cause)
-                self.assertIs(expected != "notified", status_.camera_offline_unnotified)
-
-    def test_only_a_current_condition_without_a_destination_is_unnotified(self):
-        cases = {
-            (False, False): False,
-            (False, True): False,
-            (True, True): False,
-            (True, False): True,
-        }
-        for (degraded, notifications), expected in cases.items():
-            with self.subTest(degraded=degraded, notifications=notifications):
-                status_ = MonitoringStatus(RuntimeState.RUNNING, camera_offline_degraded=degraded,
-                                           camera_offline_notifications=notifications)
-                self.assertIs(expected, status_.camera_offline_unnotified)
+                self.assertIn(status_.camera_offline_cause, CAMERA_OFFLINE_CAUSES)

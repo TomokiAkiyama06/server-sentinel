@@ -216,6 +216,16 @@ LATE_FLAPS_PER_SOURCE = 4
 # Who opened a source's alerted period.
 _BY_CONTINUOUS = "continuous"
 _BY_RATIO = "ratio"
+# The fixed words of the Owner's camera offline notice (Issues #301, #394),
+# `MonitoringStatus.camera_offline_cause`; the human route serves the first
+# three and answers ``unverified`` with the generic denial ("could not be
+# checked" on the Web, never a guessed ``false``).
+CAMERA_OFFLINE_NOTIFIED = "notified"
+CAMERA_OFFLINE_NOT_CONFIGURED = "not_configured"
+CAMERA_OFFLINE_DELIVERY_FAILED = "delivery_failed"
+CAMERA_OFFLINE_UNVERIFIED = "unverified"
+CAMERA_OFFLINE_CAUSES = frozenset({CAMERA_OFFLINE_NOTIFIED, CAMERA_OFFLINE_NOT_CONFIGURED,
+                                   CAMERA_OFFLINE_DELIVERY_FAILED, CAMERA_OFFLINE_UNVERIFIED})
 
 
 def valid_offline_seconds(value) -> bool:
@@ -434,6 +444,12 @@ class _Source:
     continuous_sent: bool = False
     # Generation of the ratio-opened periods, bumped each time one opens.
     period_seq: int = 0
+    # Issue #394 (Owner decision 2026-11-08): the event ID of this source's
+    # latest alert, submitted by this process or found as an earlier
+    # process's row of its outage, while the source's offline condition is
+    # current; cleared once it is not (the source recovered and its ratio
+    # period, if any, closed).
+    alert_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -446,6 +462,10 @@ class CameraOfflineStatus:
     held: int
     # Sources in an alerted period opened by the ratio rule.
     flapping_sources: int = 0
+    # Issue #394: the latest alert of each source whose offline condition is
+    # current (counted above), at most one per source; a source whose
+    # condition has no alert yet (held by the cap, refused) has none.
+    alert_ids: tuple[UUID, ...] = ()
 
 
 class CameraOfflineMonitor:
@@ -1041,6 +1061,9 @@ class CameraOfflineMonitor:
                     # An earlier process already notified this outage.
                     self._used.add(event_id)
                     with self._lock:
+                        if source is not None:
+                            # Issue #394: that row is this source's alert.
+                            source.alert_id = event_id
                         self._finish(identity, item)
                     continue
             # The cap is absolute (Owner decision, PR #339 重要 2): every
@@ -1080,6 +1103,8 @@ class CameraOfflineMonitor:
                 self._sent.append((now, attempt[1]))
             with self._lock:
                 item.attempt = None
+                if source is not None:
+                    source.alert_id = attempt[1]
                 self._finish(identity, item, now=now)
         with self._lock:
             # After this drain sent what the hour allowed: a third outage of
@@ -1087,9 +1112,19 @@ class CameraOfflineMonitor:
             # oldest (Owner decision 2026-10-26 (a)).
             for source in self._sources.values():
                 self._bound_held(source, now)
+            current = [source for source in self._sources.values()
+                       if source.episode is not None and source.episode.recovered is None
+                       and source.episode.qualifies(now, self.after)
+                       or source.period == _BY_RATIO]
             offline = sum(1 for source in self._sources.values()
                           if source.episode is not None and source.episode.recovered is None
                           and source.episode.qualifies(now, self.after))
+            for source in self._sources.values():
+                if not any(source is item for item in current):
+                    # Issue #394: the condition ended, so its alert no
+                    # longer decides the notice.
+                    source.alert_id = None
+            alerts = tuple(source.alert_id for source in current if source.alert_id is not None)
             held = sum(1 for source in self._sources.values()
                        for item in (source.older, source.owed, source.episode, source.flap,
                                     *source.late_flaps)
@@ -1098,7 +1133,7 @@ class CameraOfflineMonitor:
             flapping = sum(1 for source in self._sources.values()
                            if source.period == _BY_RATIO)
         return CameraOfflineStatus(offline_sources=offline, held=held,
-                                   flapping_sources=flapping)
+                                   flapping_sources=flapping, alert_ids=alerts)
 
     def _continuous_due(self, source: _Source, now: float) -> bool:
         # A qualifying continuous episode is the continuous rule's to report.

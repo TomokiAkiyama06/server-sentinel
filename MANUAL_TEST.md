@@ -2651,10 +2651,13 @@ outside ServerSentinel and not part of this check.
   delivery failing (a temporary webhook URL Slack rejects, or the Main
   Server's outbound HTTPS blocked; restored afterwards): the `camera_offline`
   row is `failed` and within one minute after `after_seconds` (+ one tick)
-  the Owner's dashboard shows the same title with the "Slack に届きませんでした"
-  / "did not reach Slack" text; restart the service while the camera is still
-  out: the notice stays; restore delivery and let a later outage's alert be
-  sent: the notice is gone at about the next tick;
+  the Owner's dashboard shows, within about two monitoring ticks, the same
+  title with the "Slack に届きませんでした" / "did not reach Slack" text;
+  restart the service while the camera is still out: the notice stays (or
+  shows "could not be checked" until the row can be read); with two cameras,
+  a second camera's alert that is delivered does not remove it; plug the
+  first camera back: the notice is gone at about the next tick (Owner
+  decision 2026-11-08);
 - [ ] the notice names no camera, shows no setting value, and claims no
   cause;
 - [ ] recover with the documented `lxc config device remove` / `add` of that

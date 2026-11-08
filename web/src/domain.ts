@@ -202,8 +202,8 @@ export interface DashboardServices {
   /** The Owner's camera offline notice (Issues #301, #394, `GET /api/monitoring/camera-offline`):
    *  while a camera offline condition the Owner would be notified of is
    *  current, why it does not leave the Main Server — `'not_configured'` (no
-   *  Slack) or `'delivery_failed'` (Slack configured, the latest delivery did
-   *  not reach it); `null` otherwise. */
+   *  Slack) or `'delivery_failed'` (Slack configured, the latest alert of a
+   *  currently offline camera did not reach it); `null` otherwise. */
   loadCameraOfflineNotice?(signal: AbortSignal): Promise<'not_configured' | 'delivery_failed' | null>;
   /** The Owner's step-up ceremony (S3): a fresh user-verified assertion of
    *  this session's own passkey. Resolves only when the server accepted it. */

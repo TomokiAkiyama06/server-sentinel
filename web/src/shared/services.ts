@@ -280,7 +280,8 @@ const CAMERA_OFFLINE_CAUSES: readonly CameraOfflineCause[] = ['not_configured', 
 /** `GET /api/monitoring/camera-offline` body `{"offline_unnotified": <boolean>,
  * "cause": "not_configured" | "delivery_failed" | null}` (Issues #301, #394).
  *
- * Returns the cause, or `null` when there is nothing to show. Anything else
+ * Returns the cause, or `null` when there is nothing to show. A delivery
+ * state the server could not read arrives as the generic denial. Anything else
  * fails closed: a missing, `null`, numeric or string `offline_unnotified`, a
  * cause outside the two words, a cause without `true` or `true` without a
  * cause is never read as "nothing to show". Nothing else is copied. */

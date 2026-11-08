@@ -128,8 +128,8 @@ test('every notice text exists in both locales and states facts only', () => {
   }
   assert.match(messages.ja.cameraOfflineUnnotified, /通知先（Slack）が未設定/);
   // Issue #394: configured, but the latest notification did not reach Slack.
-  assert.match(messages.ja.cameraOfflineDeliveryFailed, /設定されていますが、最後のカメラのオフラインの通知は Slack に届きませんでした/);
-  assert.match(messages.en.cameraOfflineDeliveryFailed, /is configured, but the latest camera offline notification did not reach Slack/);
+  assert.match(messages.ja.cameraOfflineDeliveryFailed, /設定されていますが、そのカメラのオフラインの通知は Slack に届きませんでした/);
+  assert.match(messages.en.cameraOfflineDeliveryFailed, /is configured, but the offline notification of that camera did not reach Slack/);
   for (const locale of ['ja', 'en']) {
     assert.doesNotMatch(messages[locale].cameraOfflineDeliveryFailed, /管理者|\bOwner\b|hooks\.slack|https?:/);
   }

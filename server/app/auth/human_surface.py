@@ -118,7 +118,9 @@ WebSocket and error path gets the same generic denial):
   flapping period) and the Owner is not notified outside the dashboard:
   ``cause`` is then ``"not_configured"`` (no notification destination,
   Slack) or ``"delivery_failed"`` (Slack is configured but the latest camera
-  offline delivery did not reach it, Issue #394), otherwise ``null``. One
+  offline alert of a source whose condition is current did not reach it,
+  Issue #394, judged per source), otherwise ``null``; one that could not be
+  read is the generic denial. One
   boolean and one fixed word: no source id, name, count, time, error or
   setting value. The
   Web polls it in the background, so it never extends the session's idle
@@ -214,6 +216,9 @@ from app.completion import run_to_completion
 from app.detection.roi.calibration_service import CalibrationRefused, SceneCalibrationService
 from app.logging import Event
 from app.media.live.frame_pull import LiveFrameService
+from app.monitoring.cameras import (
+    CAMERA_OFFLINE_CAUSES, CAMERA_OFFLINE_NOTIFIED, CAMERA_OFFLINE_UNVERIFIED,
+)
 from app.storage.database import Database, PinnedDatabase
 from .invitation_code import InvalidInvitationCode, parse_invitation_code
 from .live_access import BoundLiveAccess
@@ -260,8 +265,6 @@ SCENE_CALIBRATION_PATH = "/api/scene/calibration"
 SCENE_SOURCES_PATH = "/api/scene/sources"
 # Issue #301 item 2: the Owner's camera offline notice.
 CAMERA_OFFLINE_NOTICE_PATH = "/api/monitoring/camera-offline"
-# The reader's closed set of words (`MonitoringStatus.camera_offline_cause`).
-_CAMERA_OFFLINE_CAUSES = frozenset({"notified", "not_configured", "delivery_failed"})
 MAX_CALIBRATE_BODY = 128
 MAX_LIVE_OPEN_BODY = 128
 MAX_OPTIONS_BODY = 1024
@@ -831,7 +834,7 @@ class HumanAccess:
         self.scene_calibration: SceneCalibrationService | None = None
         # Optional component (``attach_camera_offline_notice``, Issue #301):
         # without it the notice route is the generic denial.
-        self.camera_offline_notice: Callable[[], bool] | None = None
+        self.camera_offline_notice: Callable[[], str] | None = None
         # S7 interim live (optional component, ``attach_live``): without it
         # every live route is the generic denial.
         self.live: LiveFrameService | None = None
@@ -883,14 +886,16 @@ class HumanAccess:
             raise HumanAccessUnavailable()
         self.scene_calibration = service
 
-    def attach_camera_offline_notice(self, read: Callable[[], bool]) -> None:
+    def attach_camera_offline_notice(self, read: Callable[[], str]) -> None:
         """Mount the Owner's camera offline notice route over ``read`` (#301).
 
         ``read()`` answers one fixed word (``MonitoringStatus.camera_offline_cause``):
         ``"notified"``, ``"not_configured"`` (a current camera offline
         condition reaches no notification destination) or
-        ``"delivery_failed"`` (Slack is configured but the latest camera
-        offline delivery did not reach it, Issue #394). It must
+        ``"delivery_failed"`` (Slack is configured but the latest alert of a
+        camera source whose condition is current did not reach it, Issue
+        #394) or ``"unverified"`` (that could not be read; served as the
+        generic denial). It must
         be quick and never block: it runs on a worker thread inside ``admit``
         of the authorization's epoch. Attached once; another reader is
         refused.
@@ -1838,9 +1843,9 @@ class HumanSurface:
         Read inside ``admit`` of the authorization's epoch after the Owner
         session was read again (``require_owner_read_session``), like the
         scene calibration status. ``200 {"offline_unnotified": <bool>,
-        "cause": "not_configured" | "delivery_failed" | null}``. Anything but
-        one of the three fixed words from the reader, or a reader failure, is
-        the generic denial, never a guessed ``false``.
+        "cause": "not_configured" | "delivery_failed" | null}``. ``unverified``,
+        any other value from the reader, or a reader failure is the generic
+        denial, never a guessed ``false``.
 
         Authorized with ``touch=False`` (Codex PR #388 P1): the Web samples
         this route every 60 s without user interaction, so a read must never
@@ -1862,9 +1867,12 @@ class HumanSurface:
             value = await asyncio.to_thread(answer)
         except Exception:
             raise _Denied() from None
-        if type(value) is not str or value not in _CAMERA_OFFLINE_CAUSES:
+        if (type(value) is not str or value not in CAMERA_OFFLINE_CAUSES
+                or value == CAMERA_OFFLINE_UNVERIFIED):
+            # Issue #394: an outcome that could not be read is "could not be
+            # checked" on the Web, never a guessed `false`.
             raise _Denied()
-        cause = None if value == "notified" else value
+        cause = None if value == CAMERA_OFFLINE_NOTIFIED else value
         await self._json(request.send, 200, {"offline_unnotified": cause is not None,
                                              "cause": cause})
 

@@ -5,8 +5,9 @@
  * one boolean and one fixed word: a camera offline condition the Owner would
  * be notified of is current and no notification leaves the Main Server,
  * because no notification destination (Slack) is configured
- * (`not_configured`) or because Slack is configured but the latest camera
- * offline delivery did not reach it (`delivery_failed`, Issue #394). The App loads it only for an Owner
+ * (`not_configured`) or because Slack is configured but the latest alert of
+ * a camera whose condition is current did not reach it (`delivery_failed`,
+ * Issue #394, judged per camera on the server; which camera is never said). The App loads it only for an Owner
  * session; the server repeats that check and refuses everyone else.
  *
  * The notice states facts only: which camera is offline is on the Live
