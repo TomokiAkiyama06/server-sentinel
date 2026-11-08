@@ -115,8 +115,13 @@ deadline counted as settle time (`_persist_outcomes`). A check the stop cut
 short returns `INTERRUPTED` and leaves its degraded flag and retry unchanged;
 a step that completed clears them as usual; a self-test that recorded a
 failure while the stop interrupted it returns that result (Issue #396). A
-hardware check held after a SIGTERM (`IntegrityService`) is dropped and
-logged by the stop (`abandon_held`). A delivery
+hardware check held after a SIGTERM (`IntegrityService`) is decided by the
+stop (`abandon_held`, by when the stop began): dropped and logged when the
+stop began within 90 s of the hold, otherwise recorded. Once the stop began a
+finished delivery whose outcome is not yet written no longer counts against
+the notification queue capacity, so the shutdown dispatch can still submit
+the last confirmed criticals (PR #400 review); the settle or
+`persist_completed` writes it. A delivery
 that finishes after a settle's deadline (or after a settle ended unsettled) is
 written by the stop's last write, `NotificationService.persist_completed`, in
 one transaction whose lock waits share one SQLite busy

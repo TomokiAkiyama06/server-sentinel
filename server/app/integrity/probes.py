@@ -43,7 +43,15 @@ class ProbeUnavailable(Exception):
 
 # Issue #396: the exit statuses of a command ended by SIGTERM: killed by the
 # signal, or handling it and exiting with the shell convention 128 + SIGTERM.
+# smartctl's status is a bitmask (143 is a set of findings), so for smartctl
+# only the signal itself counts (`_ended_by_sigterm`).
 SIGTERM_STATUSES = frozenset({-signal.SIGTERM, 128 + signal.SIGTERM})
+
+
+def _ended_by_sigterm(command: tuple[str, ...], status: int) -> bool:
+    if command[0] == "smartctl":
+        return status == -signal.SIGTERM
+    return status in SIGTERM_STATUSES
 
 
 @dataclass
@@ -108,7 +116,7 @@ class CommandRunner:
                         raise StopInterrupted() from None
                     if time.monotonic() >= deadline:
                         raise
-            if status in SIGTERM_STATUSES:
+            if _ended_by_sigterm(command, status):
                 # Issue #385 (PR #389 reviews): partial output either way. Once
                 # the stop began it is an interrupted check. Otherwise the
                 # probe is unavailable and `terminated` is set: the stop's

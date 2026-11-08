@@ -126,6 +126,17 @@ class BoundedTransactionTests(unittest.TestCase):
         self.assertFalse(self.db.in_transaction)
         self.assertEqual([(2,)], self.db.execute("SELECT v FROM t").fetchall())
 
+    def test_the_connections_own_busy_timeout_is_restored(self):
+        # PR #400 review: the timeout the connection had, not the default.
+        self.db.execute("PRAGMA busy_timeout=1234")
+        with bounded_lock_waits(time.monotonic() + 1):
+            with bounded_transaction(self.db):
+                # The statements inside get what is left of the budget.
+                self.assertGreater(self.busy_ms(), 500)
+                self.assertLessEqual(self.busy_ms(), 1000)
+                self.db.execute("INSERT INTO t VALUES (4)")
+        self.assertEqual(1234, self.busy_ms())
+
     def test_an_inner_bound_never_extends_an_outer_one(self):
         outer = time.monotonic() + 1
         with bounded_lock_waits(outer):

@@ -33,6 +33,9 @@ class IntegrityService:
         self._last_check = None
         # (started, inventory, held at) of a check held after a SIGTERM.
         self._held = None
+        # Issue #396: when the Main stop began (`stop_began`), on this
+        # service's clock.
+        self._stop_at = None
 
     def startup(self):
         """Always compare on startup, regardless of the previous boot's clock."""
@@ -80,20 +83,36 @@ class IntegrityService:
             return INTERRUPTED
         return self._record(started, current)
 
-    def abandon_held(self) -> bool:
-        """Issue #396: the Main stop drops a check still held after a SIGTERM.
+    def stop_began(self) -> None:
+        """Issue #396: note when the Main stop began (any thread).
 
-        After `begin_stop()` the tick loop no longer runs this step, so a held
-        check would otherwise end with the process unlogged. It is the stop's
-        SIGTERM (the stop began within `SIGTERM_HOLD_SECONDS`), so nothing is
-        recorded, like `_release_held` below; the next start runs the startup
-        check. Returns whether one was held.
+        `abandon_held` decides by this time, not by when the stop reaches
+        the close, which can be tens of seconds later.
+        """
+        if self._stop_at is None:
+            self._stop_at = self.monotonic()
+
+    def abandon_held(self):
+        """Issue #396: the Main stop decides a check still held after a SIGTERM.
+
+        After `begin_stop()` the tick loop no longer runs this step, so the
+        stop decides it here, as `_release_held` would: when the stop began
+        within `SIGTERM_HOLD_SECONDS` of the hold the SIGTERM was the stop's
+        own, so nothing is recorded and the drop is logged; otherwise (an
+        unrelated SIGTERM whose hold had run out, or a backwards clock) the
+        check is recorded with the probe unavailable, never dropped (PR #400
+        review). Returns the findings recorded, `INTERRUPTED` when it was
+        dropped, or None when no check was held.
         """
         if self._held is None:
-            return False
+            return None
+        started, current, held_at = self._held
         self._held = None
-        logging.getLogger(__name__).warning(Event.MONITORING_CHECK_INTERRUPTED)
-        return True
+        stopped = self._stop_at if self._stop_at is not None else self.monotonic()
+        if math.isfinite(stopped) and held_at <= stopped < held_at + SIGTERM_HOLD_SECONDS:
+            logging.getLogger(__name__).warning(Event.MONITORING_CHECK_INTERRUPTED)
+            return INTERRUPTED
+        return self._record(started, current)
 
     def _release_held(self, now: float):
         started, current, held_at = self._held

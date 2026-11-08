@@ -1612,6 +1612,11 @@ class MonitoringRuntime:
         """
         if self._stop_began is None:
             self._stop_began = time.monotonic()
+            # Issue #396: a held hardware check is decided by this time.
+            noted = getattr(self.integrity, "stop_began", None)
+            if callable(noted):
+                with suppress(Exception):
+                    noted()
             executor = self._executor
             try:
                 if executor is None:
@@ -1716,12 +1721,15 @@ class MonitoringRuntime:
             self._settle_spent += time.monotonic() - started
 
     def _close(self) -> None:
-        # Issue #396: a hardware check still held after a SIGTERM is dropped
-        # by the stop and logged (`IntegrityService.abandon_held`).
+        # Issue #396: a hardware check still held after a SIGTERM is decided
+        # by the stop (`IntegrityService.abandon_held`): dropped and logged
+        # when the SIGTERM was the stop's, otherwise recorded.
         abandon = getattr(self.integrity, "abandon_held", None)
         if callable(abandon):
-            with suppress(Exception):
+            try:
                 abandon()
+            except Exception:
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
         try:
             self._persist_outcomes()
         except Exception:

@@ -390,7 +390,11 @@ class UnrecordedCriticalAlerts:
             with self._lock:
                 self._queued.clear()
             return 0
-        self._in_flight = {item for item in self._in_flight if service.in_flight(item)}
+        # Issue #396 (PR #400 review): the share counts what holds queue
+        # capacity: before the stop every alert not yet written, once it began
+        # only those still being sent (a poll then writes nothing).
+        holds = getattr(service, "holds_capacity", service.in_flight)
+        self._in_flight = {item for item in self._in_flight if holds(item)}
         # Half of the queue, and at least one slot (a queue of one).
         limit = max(1, service.capacity // 2)
         with self._lock:

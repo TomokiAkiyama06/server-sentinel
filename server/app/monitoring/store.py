@@ -9,8 +9,8 @@ from uuid import UUID
 from app.media.health.service import HealthResult, HealthState, Stage
 from app.notifications.service import NotificationEvent, NotificationKind
 from app.notifications.slack import DeliveryResult
-from app.storage.database import (BUSY_TIMEOUT_SECONDS, bounded_lock_waits, bounded_transaction,
-                                  lock_waits_bounded)
+from app.storage.database import (BUSY_TIMEOUT_SECONDS, bounded_execute, bounded_lock_waits,
+                                  bounded_transaction)
 from app.storage.migrations import Migration
 
 
@@ -115,12 +115,9 @@ class _Autocommit:
         if self.db.in_transaction:
             raise RuntimeError("MONITORING_DATABASE_BUSY")
         with self._reservation():
-            if not lock_waits_bounded():
-                return self.db.execute(statement, values).rowcount
             # Issue #396: inside a bounded settle poll all the lock waits of
             # this write share one budget (`bounded_lock_waits`).
-            with bounded_transaction(self.db):
-                return self.db.execute(statement, values).rowcount
+            return bounded_execute(self.db, statement, values)
 
 
 class NotificationEventStore(_Autocommit):

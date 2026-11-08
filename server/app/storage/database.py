@@ -82,13 +82,14 @@ def bounded_transaction(connection: sqlite3.Connection):
     """One ``BEGIN IMMEDIATE`` ... ``COMMIT`` write; no transaction may be open.
 
     Outside `bounded_lock_waits` this is the plain transaction (SQLite's own
-    busy timeout per lock). Inside one (Issue #396) the busy timeout is 0 and
-    ``BEGIN IMMEDIATE`` and ``COMMIT`` are retried while busy, so all the
-    lock waits of this write share one budget (`bounded_lock_waits`); a
-    retried ``COMMIT`` after ``SQLITE_BUSY`` keeps the transaction, as SQLite
-    documents. The statements inside run with the busy timeout 0 as well. On
-    any failure the transaction is rolled back and the error raised; the
-    connection's busy timeout is restored either way.
+    busy timeout per lock). Inside one (Issue #396) ``BEGIN IMMEDIATE`` and
+    ``COMMIT`` run with the busy timeout 0 and are retried while busy, so
+    all the lock waits of this write share one budget (`bounded_lock_waits`);
+    a retried ``COMMIT`` after ``SQLITE_BUSY`` keeps the transaction, as
+    SQLite documents. The statements inside get what is left of the budget
+    as their busy timeout (one lock each, at most). On any failure the
+    transaction is rolled back and the error raised; the connection's own
+    busy timeout is restored either way.
     """
     if connection.in_transaction:
         raise RuntimeError("DATABASE_TRANSACTION_OPEN")
@@ -103,17 +104,37 @@ def bounded_transaction(connection: sqlite3.Connection):
             raise
         return
     end = min(end, time.monotonic() + BUSY_TIMEOUT_SECONDS)
-    connection.execute("PRAGMA busy_timeout=0")
+    previous = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+
+    def busy_timeout(milliseconds: int) -> None:
+        connection.execute(f"PRAGMA busy_timeout={max(0, int(milliseconds))}")
+
+    busy_timeout(0)
     try:
         _retry_busy(lambda: connection.execute("BEGIN IMMEDIATE"), end)
         try:
+            busy_timeout((end - time.monotonic()) * 1000)
             yield connection
+            busy_timeout(0)
             _retry_busy(connection.commit, end)
         except BaseException:
             connection.rollback()
             raise
     finally:
-        connection.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_SECONDS * 1000)}")
+        busy_timeout(previous)
+
+
+def bounded_execute(connection: sqlite3.Connection, statement: str, parameters=()) -> int:
+    """One write statement; returns its row count.
+
+    Outside `bounded_lock_waits` it runs as before, in autocommit; inside
+    one (Issue #396) as its own `bounded_transaction`, so all of its lock
+    waits share that budget.
+    """
+    if _LOCK_WAIT_END.get() is None:
+        return connection.execute(statement, parameters).rowcount
+    with bounded_transaction(connection):
+        return connection.execute(statement, parameters).rowcount
 
 
 # POSIX record locks belong to a process and an inode, not to a descriptor:

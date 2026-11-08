@@ -581,7 +581,8 @@ dropped as cut short if the stop begins within 90 s (`TimeoutStopSec`) and
 otherwise recorded with that probe unavailable, so a SIGTERM from anything
 else delays the warning by at most that long plus one tick; a command that
 handles SIGTERM and exits with 143 (128 + SIGTERM) counts the same, and a
-check still held when the stop runs is dropped and logged (Issue #396); any
+check still held when the stop runs is dropped and logged if the stop began
+within 90 s of the hold, and recorded otherwise (Issue #396); any
 other signal, or another exit code, is a failed probe at once. A self-test stage that fails once the stop began is
 not recorded as a failure, but a failed cleanup always is.
 Every write from another thread (for

@@ -11,6 +11,7 @@ import time
 from app.notifications.slack import DeliveryResult, SlackDelivery
 from app.notifications.worker import DeliveryWorker
 from app.storage.database import bounded_lock_waits
+from app.stop_budget import SETTLE_POLL_OVERSHOOT_SECONDS
 from app.storage.policy import StorageState
 
 
@@ -161,7 +162,7 @@ class NotificationService:
                  slack: SlackDelivery | None = None, *, queue_capacity: int = 16,
                  local_batch_sink: Callable[[tuple[NotificationEvent, ...]], None] | None = None,
                  stopping: Callable[[], bool] | None = None,
-                 settle_overshoot_seconds: float = 0.0):
+                 settle_overshoot_seconds: float = SETTLE_POLL_OVERSHOOT_SECONDS):
         if type(queue_capacity) is not int or not 1 <= queue_capacity <= 1024:
             raise ValueError("invalid notification capacity")
         if local_batch_sink is not None and not callable(local_batch_sink):
@@ -201,6 +202,41 @@ class NotificationService:
     @property
     def pending_count(self) -> int:
         return len(self._pending)
+
+    def _collect(self) -> None:
+        """Take the delivery worker's finished results (no I/O)."""
+        for identifier, result in self._worker.results():
+            self._pending[identifier][2] = result
+
+    def _occupied(self) -> int:
+        """How many submissions count against the queue capacity.
+
+        Every delivery not yet persisted, as before; once the stop began
+        (Issue #396, PR #400 review) only those still being sent. A poll
+        without a deadline then writes nothing, so the finished ones would
+        otherwise keep their slots until the settle and refuse the last
+        confirmed criticals the shutdown dispatch submits (`can_accept`).
+        The finished ones stay in `_pending` and are written by the settle or
+        the stop's `persist_completed`.
+        """
+        if not self._stopping():
+            return len(self._pending)
+        self._collect()
+        return sum(1 for _event, _callbacks, result in self._pending.values() if result is None)
+
+    def holds_capacity(self, event_id: UUID) -> bool:
+        """Whether ``event_id`` counts against the queue capacity (`_occupied`).
+
+        Before the stop that is `in_flight`: a finished delivery whose outcome
+        is not yet persisted keeps its place until a poll writes it. Once the
+        stop began (Issue #396) only a delivery still being sent does.
+        """
+        self._check()
+        entry = self._pending.get(event_id)
+        if entry is None or not self._stopping():
+            return entry is not None
+        self._collect()
+        return entry[2] is None
 
     @property
     def unpersisted_count(self) -> int:
@@ -258,7 +294,7 @@ class NotificationService:
             return True
         if not self._slack.configured:
             return len(self._unpersisted) < self._capacity
-        return not self.closed and len(self._pending) < self._capacity
+        return not self.closed and self._occupied() < self._capacity
 
     def retained(self, event_id: UUID) -> bool:
         """Whether ``event_id`` is final but its local write is still being retried.
@@ -315,7 +351,7 @@ class NotificationService:
             return DeliveryResult.PENDING
         if not self._slack.configured:
             result = DeliveryResult.DISABLED
-        elif self.closed or len(self._pending) >= self._capacity:
+        elif self.closed or self._occupied() >= self._capacity:
             result = DeliveryResult.FAILED
             self.delivery_failed = True
         else:
@@ -359,6 +395,9 @@ class NotificationService:
         self._check()
         if deadline is None:
             if self._stopping():
+                # No write, but the finished results are taken, so they no
+                # longer hold queue capacity (`_occupied`).
+                self._collect()
                 return ()
             return self._poll(lambda: False)
         with bounded_lock_waits(deadline + self._settle_overshoot):
@@ -366,8 +405,7 @@ class NotificationService:
 
     def _poll(self, past) -> tuple[NotificationEvent, ...]:
         self._flush_unpersisted(past)
-        for identifier, result in self._worker.results():
-            self._pending[identifier][2] = result
+        self._collect()
         completed = []
         for identifier, (event, callbacks, result) in tuple(self._pending.items()):
             if result is None:
@@ -428,8 +466,7 @@ class NotificationService:
         `local_delivery_failed` and raises nothing.
         """
         self._check()
-        for identifier, result in self._worker.results():
-            self._pending[identifier][2] = result
+        self._collect()
         finished = [(identifier, replace(event, delivery=result))
                     for identifier, (event, _callbacks, result) in self._pending.items()
                     if result is not None]
