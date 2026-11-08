@@ -105,7 +105,7 @@ like any storage refusal. This applies to every cross-thread write (scene timeli
 local UVC `offline` / fenced writes, audit, human access); the next start
 does or finds the refused write again. Once the stop began the run loop polls
 no more outcomes between ticks and every poll without a deadline does nothing
-(one gate, `NotificationService.poll(stopping=)`, Issue #396: the tick's, the
+(one gate, `NotificationService.poll` with its `stopping` check, Issue #396: the tick's, the
 open's, the dispatch steps' and the service's own after a failed submission),
 so only the settles poll, with their deadline; every SQLite lock wait of a
 settle poll's writes, the completion callbacks' included, ends 5 s after its

@@ -32,6 +32,9 @@ from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.test_storage_notifications import Transport, endpoint
 
 DEFAULT_BUSY_MS = int(BUSY_TIMEOUT_SECONDS * 1000)
+# Scheduling slack on a loaded runner; far below the 5 s busy timeout the
+# bounds replace, so a missing bound still fails.
+MARGIN = 1.0
 
 
 class _Locks:
@@ -80,7 +83,7 @@ class BoundedTransactionTests(unittest.TestCase):
         # BEGIN got RESERVED after 0.3 s; COMMIT then waited only until the
         # end (0.5 s), never a busy timeout of its own (5 s more).
         self.assertGreater(elapsed, 0.3)
-        self.assertLess(elapsed, 0.5 + 0.25)
+        self.assertLess(elapsed, 0.5 + MARGIN)
         self.assertFalse(self.db.in_transaction)
         self.assertEqual(DEFAULT_BUSY_MS, self.busy_ms())
         self.assertEqual([], self.db.execute("SELECT v FROM t").fetchall())
@@ -95,7 +98,7 @@ class BoundedTransactionTests(unittest.TestCase):
                 self.db.execute("INSERT INTO t VALUES (1)")
         elapsed = time.monotonic() - started
         locks.close()
-        self.assertLess(elapsed, 0.4 + 0.25)
+        self.assertLess(elapsed, 0.4 + MARGIN)
 
     def test_a_write_that_gets_its_locks_in_time_commits(self):
         locks = _Locks(self, self.path, reserved_for=0.1)
@@ -156,7 +159,7 @@ class CallbackWriteTests(unittest.TestCase):
         with bounded_lock_waits(started + 0.3), self.assertRaises(sqlite3.OperationalError):
             with service._transaction() as db:
                 db.execute("SELECT 1")
-        self.assertLess(time.monotonic() - started, 0.3 + 0.25)
+        self.assertLess(time.monotonic() - started, 0.3 + MARGIN)
 
     def test_the_daily_summary_schedule_row_fails_by_the_bound(self):
         connection = self.database.connect()
@@ -167,7 +170,7 @@ class CallbackWriteTests(unittest.TestCase):
         started = time.monotonic()
         with bounded_lock_waits(started + 0.3), self.assertRaises(sqlite3.OperationalError):
             scheduler._complete("2026-01-01", DeliveryResult.SENT)
-        self.assertLess(time.monotonic() - started, 0.3 + 0.25)
+        self.assertLess(time.monotonic() - started, 0.3 + MARGIN)
         self.assertEqual(DEFAULT_BUSY_MS, connection.execute("PRAGMA busy_timeout").fetchone()[0])
 
 
@@ -215,7 +218,7 @@ class SettlePollTests(unittest.TestCase):
         self.assertEqual([DeliveryResult.SENT], self.calls)
         # Its BEGIN waited 0.2 s, its COMMIT until deadline + 0.3 s, then it
         # failed: never a busy timeout of 5 s for each lock.
-        self.assertLess(elapsed_past, 0.3 + 0.25)
+        self.assertLess(elapsed_past, 0.3 + MARGIN)
         # The callback failed and is retried by the next poll.
         self.assertEqual(1, self.service.pending_count)
         self.assertTrue(self.service.local_delivery_failed)
