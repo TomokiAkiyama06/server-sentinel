@@ -39,7 +39,7 @@ from app.storage.database import Database
 from app.storage.migrations import Migration, MigrationError, migrate
 from app.storage.policy import MainStoragePolicy, StorageState, StorageTransition
 from app.storage.retention import RetentionService, StorageAudit
-from app.stop_budget import INTERRUPTED, STOP_ADMISSION_WAIT_SECONDS
+from app.stop_budget import INTERRUPTED, SETTLE_POLL_OVERSHOOT_SECONDS, STOP_ADMISSION_WAIT_SECONDS
 
 from .access import HOUR_SECONDS, AccessFaultMonitor
 from .cameras import (
@@ -611,6 +611,10 @@ class MonitoringRuntime:
                 self._persist_notification, slack,
                 queue_capacity=dependencies.notification_queue_capacity,
                 local_batch_sink=self._persist_notifications,
+                # Issue #396: the one gate for the deadline-less polls after
+                # the stop began, and the settle polls' lock-wait bound.
+                stopping=self._stopping.is_set,
+                settle_overshoot_seconds=SETTLE_POLL_OVERSHOOT_SECONDS,
             )
         if self._connection is None:
             connection = None
@@ -717,10 +721,10 @@ class MonitoringRuntime:
         self._guarded("health", self.recording_health.startup, "recording_health_degraded")
         # Issue #385 (second PR #389 review): an open retried by a tick can
         # still be running when the stop begins. Its poll then has no
-        # deadline, so it is left to the stop's bounded settle or
-        # `_close`'s one bounded poll, like a running tick's.
-        if not self._stopping.is_set():
-            self._poll()
+        # deadline and writes nothing (`NotificationService.poll`, Issue #396),
+        # so it is left to the stop's bounded settle or `_close`'s one
+        # bounded poll, like a running tick's.
+        self._poll()
 
     def _drop_connection(self) -> None:
         """Forget the database of a failed attempt; the retry reopens it.
@@ -1706,14 +1710,12 @@ class MonitoringRuntime:
             if self.notifications is not None:
                 self._access_tick()
                 self._camera_tick()
-                if not stopping():
-                    self._poll()
+                self._poll()
             if (self.status.state == RuntimeState.FAILED and not stopping()
                     and self._due("startup", self.dependencies.monotonic())):
                 self._attempt_open()
             return
-        if not stopping():
-            self._poll()
+        self._poll()
         self._reconcile_previous_run()
         self._storage_tick()
         for name, step, reason in (("retention", self._retention_tick, "retention_degraded"),
@@ -1725,11 +1727,12 @@ class MonitoringRuntime:
             self._guarded(name, step, reason)
         self._access_tick()
         self._camera_tick()
-        if not stopping():
-            # Issue #385 (PR #389 review): after the stop began the outcomes
-            # are written only by the shutdown settles, or by the stop's own
-            # poll when none ran (`_close`), all within the settle budget.
-            self._poll()
+        # Issue #385 (PR #389 review): after the stop began the outcomes are
+        # written only by the shutdown settles, or by the stop's own poll
+        # when none ran (`_close`), all within the settle budget; a
+        # deadline-less poll then writes nothing (`NotificationService.poll`,
+        # Issue #396), whichever path calls it.
+        self._poll()
 
     def _final_storage_sample(self) -> None:
         """Issue #351: take one last storage sample before a graceful stop.
@@ -1791,6 +1794,15 @@ class MonitoringRuntime:
             self._settle_spent += time.monotonic() - started
 
     def _close(self) -> None:
+        # Issue #396: a hardware check still held after a SIGTERM is dropped
+        # and logged by the stop (`IntegrityService.abandon_held`); the next
+        # start's startup check probes again.
+        abandon = getattr(self.integrity, "abandon_held", None)
+        if callable(abandon):
+            try:
+                abandon()
+            except Exception:
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
         try:
             self._persist_outcomes()
         except Exception:
@@ -1874,11 +1886,10 @@ class MonitoringRuntime:
         Issue #385 (PR #389 review): a no-op once the stop began. The shutdown
         settles own the polling then, with their deadline; a deadline-less
         poll queued behind a settle would run every write the settle left
-        for later, unbounded and outside the settle's spent time.
+        for later, unbounded and outside the settle's spent time. The gate is
+        `NotificationService.poll` itself (Issue #396).
         """
         self._require_owner()
-        if self._stopping.is_set():
-            return
         if self.notifications is not None and self.notifications.pending_count:
             self._poll()
 

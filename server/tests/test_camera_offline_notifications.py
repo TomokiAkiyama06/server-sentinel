@@ -1403,6 +1403,37 @@ class DeliveryFailingTests(MonitorFixture, unittest.TestCase):
         settle(self, self.service)
         self.assertIs(DeliveryResult.SENT, self.service.final_outcome(alert))
 
+    def test_outcomes_taken_once_the_stop_began_are_noted(self):
+        # PR #400 merge: the result-only poll after the stop began (Issue
+        # #396) writes nothing but still notes the outcome, and a submission
+        # refused then (`_unsubmitted`, moved to the retry buffer) is `failed`.
+        kind = NotificationKind.CAMERA_OFFLINE
+        stopping = [False]
+        rows = {}
+        def sink(event):
+            rows[event.event_id] = event
+
+        service = NotificationService(sink, SlackDelivery(endpoint(), opener=self.transport),
+                                      stopping=lambda: stopping[0])
+        self.addCleanup(service.close)
+        sent = uuid4()
+        service.record(kind, at=AT, confirmed=True, event_id=sent)
+        self.assertTrue(service._worker.ready.wait(2))
+        stopping[0] = True
+        self.assertEqual((), service.poll())
+        self.assertEqual(DeliveryResult.PENDING, rows[sent].delivery)  # nothing written
+        self.assertIs(DeliveryResult.SENT, service.final_outcome(sent))
+        refused = uuid4()
+
+        def broken(*args):
+            raise RuntimeError("synthetic")
+
+        service._worker.submit = broken
+        self.assertEqual(DeliveryResult.FAILED,
+                         service.record(kind, at=AT, confirmed=True, event_id=refused))
+        self.assertFalse(service.in_flight(refused))
+        self.assertIs(DeliveryResult.FAILED, service.final_outcome(refused))
+
     def test_the_outcome_memory_is_bounded(self):
         for _ in range(OUTCOME_MEMORY + 5):
             self.service._note_outcome(uuid4(), DeliveryResult.SENT)

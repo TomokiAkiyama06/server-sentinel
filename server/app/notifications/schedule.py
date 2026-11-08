@@ -6,6 +6,7 @@ import sqlite3
 
 from app.notifications.service import DailySummary, NotificationService, aware
 from app.notifications.slack import DeliveryResult
+from app.storage.database import bounded_execute
 from app.storage.migrations import Migration
 
 
@@ -76,6 +77,8 @@ class DailySummaryScheduler:
         return result
 
     def _complete(self, date: str, result: DeliveryResult) -> None:
+        statement = "UPDATE notification_schedule SET result=? WHERE schedule_id=? AND local_date=?"
         with self._reservation():
-            self.db.execute("UPDATE notification_schedule SET result=? WHERE schedule_id=? AND local_date=?",
-                            (result.value, self._key, date))
+            # Issue #396: as the completion callback of a bounded settle poll
+            # its lock waits share that poll's budget.
+            bounded_execute(self.db, statement, (result.value, self._key, date))

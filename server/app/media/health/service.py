@@ -110,15 +110,22 @@ class RecordingHealthService:
         A stage that failed before the stop began, or a failed cleanup, is a
         complete and real failure and is recorded (and notified) as one;
         without one the test is neither failed nor healthy, so nothing is
-        recorded.
+        recorded. Returns the recorded result, or `INTERRUPTED` when nothing
+        was recorded (Issue #396): a recorded failure is a completed step for
+        the runtime, which then updates its degraded flag and retry as for any
+        result instead of keeping them as if the test proved nothing. The
+        daily schedule is not advanced; the next start runs the startup test.
         """
-        if failures:
-            self.record_result(HealthResult(HealthState.FAILED, tuple(dict.fromkeys(failures))),
-                               self.utcnow())
         logging.getLogger(__name__).warning(Event.MONITORING_CHECK_INTERRUPTED)
+        if not failures:
+            return INTERRUPTED
+        result = HealthResult(HealthState.FAILED, tuple(dict.fromkeys(failures)))
+        self.record_result(result, self.utcnow())
+        return result
 
     def _run(self):
-        """One self-test; `INTERRUPTED` when the Main shutdown cut it short.
+        """One self-test; `INTERRUPTED` when the Main shutdown cut it short
+        and nothing was recorded (a recorded failure is returned, Issue #396).
 
         Once the stop began no further stage starts and the device health
         read is skipped; the cleanup still runs (INTEGRITY-004). A partial
@@ -189,8 +196,7 @@ class RecordingHealthService:
                     cancelled = cancelled or exc
                     failures.append(Stage.CLEANUP)
             if cancelled is None and (interrupted or self.stopping()):
-                self._interrupted(failures)
-                return INTERRUPTED
+                return self._interrupted(failures)
             if cancelled is None:
                 try:
                     health = adapter.storage_health()
@@ -202,8 +208,7 @@ class RecordingHealthService:
                         unavailable = True
                 except StopInterrupted:
                     # A device health read killed at the stop (Issue #385).
-                    self._interrupted(failures)
-                    return INTERRUPTED
+                    return self._interrupted(failures)
                 except Exception:
                     unavailable = True
                 except BaseException as exc:
