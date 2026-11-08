@@ -125,8 +125,9 @@ class RecordingHealthService:
         test is never reported as failed or healthy (`_interrupted`). A stage
         that fails once the stop has begun is not counted as a failure either
         (PR #389 review): the shutdown tears capture and storage down while it
-        runs, so its failure proves nothing. The next start runs the startup
-        self-test.
+        runs, so its failure proves nothing. A failed cleanup, the first or
+        the final one, is always kept and recorded (PR #389 Codex P1). The
+        next start runs the startup self-test.
         """
         started = self.monotonic()
         if not math.isfinite(started):
@@ -162,9 +163,16 @@ class RecordingHealthService:
             except StopInterrupted:
                 interrupted = True
             except Exception:
-                if self.stopping():
+                if self.stopping() and stage != Stage.CLEANUP:
                     interrupted = True
                 else:
+                    # A failed startup/previous-run cleanup is kept even
+                    # once the stop began (PR #389 Codex P1): it is the
+                    # cleanup INTEGRITY-004 requires, not a stage the
+                    # shutdown tore down, so it is recorded and notified
+                    # like the final cleanup's failure.
+                    if self.stopping():
+                        interrupted = True
                     failures.append(stage)
             except BaseException as exc:
                 cancelled = exc

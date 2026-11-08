@@ -225,6 +225,25 @@ class StopInterruptionTests(TestCase):
         self.assertEqual([(HealthState.FAILED, (Stage.CLEANUP,))],
                          [(result.state, result.stages) for result, _ in self.recorded])
 
+    def test_a_first_cleanup_failing_once_the_stop_began_is_recorded(self):
+        # PR #389 Codex P1: the startup/previous-run cleanup fails while the
+        # stop begins, and the final cleanup succeeds. The cleanup failure is
+        # real (INTEGRITY-004), so it is recorded, not dropped as interrupted.
+        cleanup = self.adapter.cleanup
+
+        def failing_first_cleanup():
+            cleanup()
+            if self.adapter.calls.count("cleanup") == 1:
+                raise OSError("synthetic")
+
+        self.adapter.cleanup = failing_first_cleanup
+        self.stop_at = "cleanup"
+        self.run_interrupted()
+        self.assertEqual(["cleanup", "cleanup"], self.adapter.calls)
+        self.assertEqual([(HealthState.FAILED, (Stage.CLEANUP,))],
+                         [(result.state, result.stages) for result, _ in self.recorded])
+        self.assertIsNone(self.service._last_check)
+
     def test_a_stage_failing_once_the_stop_began_records_nothing(self):
         # PR #389 review: the shutdown tears capture and storage down while a
         # stage runs, so its failure then proves nothing and is no alarm.
