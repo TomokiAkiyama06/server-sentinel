@@ -694,7 +694,7 @@ class MonitoringRuntime:
         self._guarded("health", self.recording_health.startup, "recording_health_degraded")
         # Issue #385 (second PR #389 review): an open retried by a tick can
         # still be running when the stop begins. Its poll then has no
-        # deadline and does nothing (`NotificationService.poll`, Issue #396),
+        # deadline and writes nothing (`NotificationService.poll`, Issue #396),
         # so it is left to the stop's bounded settle or `_close`'s one
         # bounded poll, like a running tick's.
         self._poll()
@@ -1612,11 +1612,6 @@ class MonitoringRuntime:
         """
         if self._stop_began is None:
             self._stop_began = time.monotonic()
-            # Issue #396: a held hardware check is decided by this time.
-            noted = getattr(self.integrity, "stop_began", None)
-            if callable(noted):
-                with suppress(Exception):
-                    noted()
             executor = self._executor
             try:
                 if executor is None:
@@ -1657,7 +1652,7 @@ class MonitoringRuntime:
         # Issue #385 (PR #389 review): after the stop began the outcomes are
         # written only by the shutdown settles, or by the stop's own poll
         # when none ran (`_close`), all within the settle budget; a
-        # deadline-less poll then does nothing (`NotificationService.poll`,
+        # deadline-less poll then writes nothing (`NotificationService.poll`,
         # Issue #396), whichever path calls it.
         self._poll()
 
@@ -1721,9 +1716,9 @@ class MonitoringRuntime:
             self._settle_spent += time.monotonic() - started
 
     def _close(self) -> None:
-        # Issue #396: a hardware check still held after a SIGTERM is decided
-        # by the stop (`IntegrityService.abandon_held`): dropped and logged
-        # when the SIGTERM was the stop's, otherwise recorded.
+        # Issue #396: a hardware check still held after a SIGTERM is dropped
+        # and logged by the stop (`IntegrityService.abandon_held`); the next
+        # start's startup check probes again.
         abandon = getattr(self.integrity, "abandon_held", None)
         if callable(abandon):
             try:

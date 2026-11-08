@@ -173,9 +173,11 @@ class NotificationService:
                 or not 0 <= settle_overshoot_seconds <= 60):
             raise ValueError("invalid notification settle overshoot")
         # Issue #396: once ``stopping()`` is true a poll without a deadline
-        # does nothing (the one gate for every deadline-less poll, the
-        # owner's and this service's own); the shutdown settles poll with
-        # their deadline. ``settle_overshoot_seconds`` is how long after a
+        # writes nothing and calls no callback (the one gate for every
+        # deadline-less poll; it only takes the worker's finished results),
+        # and a refused submission goes to the retry buffer instead of a
+        # poll (`_unsubmitted`); the shutdown settles poll with their
+        # deadline. ``settle_overshoot_seconds`` is how long after a
         # poll's deadline the lock waits of the write or callback in progress
         # may still run (`stop_budget.SETTLE_POLL_OVERSHOOT_SECONDS`).
         self._stopping = stopping or (lambda: False)
@@ -329,6 +331,23 @@ class NotificationService:
             return True
         return False
 
+    def _unsubmitted(self, event_id: UUID) -> None:
+        """Issue #396 (PR #400 review): a submission refused once the stop began.
+
+        A poll without a deadline writes nothing then, so the refused
+        delivery would stay in `_pending` and in flight, and a caller asking
+        `in_flight` would take it as submitted. It leaves `_pending` for the
+        bounded local retry buffer instead (no I/O here): the settles and the
+        stop's `persist_completed` write its `failed` row. Its callbacks are
+        not called; the caller already got `failed` from `record()`. When the
+        buffer is full it stays in `_pending`, written the same way.
+        """
+        entry = self._pending[event_id]
+        if event_id not in self._unpersisted and len(self._unpersisted) >= self._capacity:
+            return
+        del self._pending[event_id]
+        self._unpersisted[event_id] = replace(entry[0], delivery=DeliveryResult.FAILED)
+
     def _flush_unpersisted(self, past=lambda: False) -> None:
         for identifier, event in tuple(self._unpersisted.items()):
             if past():
@@ -370,7 +389,10 @@ class NotificationService:
             except Exception:
                 self._pending[event.event_id][2] = DeliveryResult.FAILED
                 self.delivery_failed = True
-                self.poll()
+                if self._stopping():
+                    self._unsubmitted(event.event_id)
+                else:
+                    self.poll()
                 return DeliveryResult.FAILED
         return result
 
@@ -389,8 +411,10 @@ class NotificationService:
         stays pending for the next poll (or the stop's `persist_completed`),
         a callback is retried by the next poll.
 
-        Without a deadline, a no-op once ``stopping()`` is true (Issue #396):
-        the shutdown settles own the polling then.
+        Without a deadline, once ``stopping()`` is true (Issue #396), it
+        writes nothing and calls no callback; it only takes the worker's
+        finished results, so they no longer hold queue capacity. The
+        shutdown settles own the polling then.
         """
         self._check()
         if deadline is None:

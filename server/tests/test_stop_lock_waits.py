@@ -248,15 +248,41 @@ class SettlePollTests(unittest.TestCase):
         self.assertEqual(1, len(self.service.poll(time.monotonic() + 1)))
         self.assertEqual([DeliveryResult.SENT], self.calls)
 
-    def test_a_failed_submission_does_not_poll_once_stopping(self):
-        # `_enqueue`'s own poll after a failed submission is gated the same way.
+    def test_a_failed_submission_once_stopping_is_not_left_in_flight(self):
+        # `_enqueue`'s own poll after a failed submission is gated the same
+        # way; the refused delivery then moves to the bounded retry buffer
+        # (PR #400 review), so it is not taken as in flight, and the stop's
+        # last write records it as `failed`.
         self.stopping = True
-        with mock.patch.object(self.service, "_poll", wraps=self.service._poll) as work, \
-                mock.patch.object(self.service._worker, "submit", side_effect=RuntimeError):
-            self.assertEqual(DeliveryResult.FAILED, self.service.record(
-                NotificationKind.RECORDING_HEALTH_FAILURE, at=datetime.now(timezone.utc)))
+        written = []
+        service = NotificationService(
+            written.append, SlackDelivery(endpoint(), opener=Transport()),
+            stopping=lambda: self.stopping, local_batch_sink=lambda events: written.extend(events))
+        self.addCleanup(service.close)
+        event_id = uuid4()
+        with mock.patch.object(service, "_poll", wraps=service._poll) as work, \
+                mock.patch.object(service._worker, "submit", side_effect=RuntimeError):
+            self.assertEqual(DeliveryResult.FAILED, service.record(
+                NotificationKind.RECORDING_HEALTH_FAILURE, at=datetime.now(timezone.utc),
+                event_id=event_id))
         work.assert_not_called()
-        self.assertEqual(1, self.service.pending_count)
+        self.assertFalse(service.in_flight(event_id))
+        self.assertTrue(service.retained(event_id))
+        self.assertEqual(0, service.pending_count)
+        written.clear()
+        self.assertEqual(1, service.persist_completed())
+        self.assertEqual([(event_id, DeliveryResult.FAILED)],
+                         [(event.event_id, event.delivery) for event in written])
+        # Before the stop the submission failure is written at once, as before.
+        self.stopping = False
+        written.clear()
+        with mock.patch.object(service._worker, "submit", side_effect=RuntimeError):
+            other = uuid4()
+            service.record(NotificationKind.RECORDING_HEALTH_FAILURE,
+                           at=datetime.now(timezone.utc), event_id=other)
+        self.assertFalse(service.in_flight(other))
+        self.assertFalse(service.retained(other))
+        self.assertEqual(DeliveryResult.FAILED, written[-1].delivery)
 
     def test_without_a_stop_a_poll_without_deadline_is_unbounded_as_before(self):
         self.submit_and_finish()

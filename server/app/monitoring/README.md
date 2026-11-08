@@ -115,9 +115,11 @@ deadline counted as settle time (`_persist_outcomes`). A check the stop cut
 short returns `INTERRUPTED` and leaves its degraded flag and retry unchanged;
 a step that completed clears them as usual; a self-test that recorded a
 failure while the stop interrupted it returns that result (Issue #396). A
-hardware check held after a SIGTERM (`IntegrityService`) is decided by the
-stop (`abandon_held`, by when the stop began): dropped and logged when the
-stop began within 90 s of the hold, otherwise recorded. Once the stop began a
+hardware check held after a SIGTERM (`IntegrityService`) is dropped and
+logged by the stop (`abandon_held`), never recorded after the settles; the
+next start's startup check probes again. A submission the delivery worker
+refuses once the stop began goes to the bounded local retry buffer, so it is
+no longer in flight and the settles write its `failed` row. Once the stop began a
 finished delivery whose outcome is not yet written no longer counts against
 the notification queue capacity, so the shutdown dispatch can still submit
 the last confirmed criticals (PR #400 review); the settle or

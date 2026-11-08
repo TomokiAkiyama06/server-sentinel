@@ -111,7 +111,7 @@ STOP_ADMISSION_WAIT_SECONDS = 5.0
 # timeline finish and the dispatch, and of a check that completed just before
 # the stop (the integrity `store.record` / `deliver` and the self-test's
 # `record_result` writes), a hung filesystem call, and the dispatch steps
-# before the critical settle (their polls do nothing once the stop began,
+# before the critical settle (their polls write nothing once the stop began,
 # `NotificationService.poll`, Issue #396; their submissions still write).
 # The completion
 # callbacks of deliveries that finished after the last settle's deadline are

@@ -587,13 +587,11 @@ class StoreTests(TestCase):
         self.assertEqual(service_module.SIGTERM_HOLD_SECONDS,
                          float(service_module.UNIT_STOP_TIMEOUT_SECONDS))
 
-    def test_the_stop_decides_a_held_check_by_when_it_began(self):
+    def test_the_stop_drops_and_logs_a_held_check(self):
         # Issue #396: after `begin_stop()` the tick loop no longer runs the
-        # integrity step, so the stop decides a held check itself. Within
-        # SIGTERM_HOLD_SECONDS of the hold the SIGTERM was the stop's: dropped
-        # and logged. Past it (an unrelated SIGTERM; PR #400 review) the check
-        # is recorded, never dropped. The time is when the stop began, not
-        # when it reaches the close.
+        # integrity step, so the stop ends a held check itself: dropped and
+        # logged, never recorded after the settles (PR #400 review), whatever
+        # the age of the hold; the next start's startup check probes again.
         from app.integrity import service as service_module
 
         class Probe:
@@ -607,31 +605,22 @@ class StoreTests(TestCase):
                     self.db.execute("SELECT COUNT(*) FROM integrity_outbox").fetchone()[0])
 
         hold = service_module.SIGTERM_HOLD_SECONDS
-        for stop_at, dropped in ((hold - 1, True), (hold, False), (-1.0, False)):
-            with self.subTest(stop_at=stop_at):
+        for age in (0.0, hold - 1, hold, hold * 10):
+            with self.subTest(age=age):
                 clock = [0.0]
                 service = IntegrityService(self.store, Probe(), lambda *args: None,
                                            monotonic=lambda: clock[0], utcnow=lambda: NOW)
-                self.assertIsNone(service.abandon_held())
+                self.assertFalse(service.abandon_held())
                 before = outbox()
                 self.assertIs(INTERRUPTED, service.startup())
-                clock[0] = stop_at
-                service.stop_began()
-                clock[0] = stop_at + 60  # the close runs later
-                service.stop_began()  # only the first call counts
-                if dropped:
-                    with self.assertLogs("app.integrity.service", "WARNING") as logs:
-                        self.assertIs(INTERRUPTED, service.abandon_held())
-                    self.assertIn("monitoring_check_interrupted", "\n".join(logs.output))
-                    self.assertEqual(before, outbox())
-                    self.assertIsNone(service._last_check)
-                else:
-                    findings = service.abandon_held()
-                    self.assertIn(State.UNVERIFIABLE, [finding.state for finding in findings
-                                                       if finding.kind == Kind.STORAGE])
-                    self.assertEqual(0.0, service._last_check)  # recorded
+                clock[0] = age
+                with self.assertLogs("app.integrity.service", "WARNING") as logs:
+                    self.assertTrue(service.abandon_held())
+                self.assertIn("monitoring_check_interrupted", "\n".join(logs.output))
+                self.assertEqual(before, outbox())
                 self.assertIsNone(service._held)
-                self.assertIsNone(service.abandon_held())
+                self.assertIsNone(service._last_check)
+                self.assertFalse(service.abandon_held())
 
     def test_probe_exception_sanitized(self):
         class Probe:
