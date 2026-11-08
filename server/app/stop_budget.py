@@ -58,8 +58,8 @@ RESERVATION_CHECK_STOP_SECONDS = 10.0 + 5.0
 SCENE_STOP_SECONDS = 5.0 + 5.0 + 1.0
 # - process exit and the short steps between them (an estimate, not derived);
 PROCESS_EXIT_SECONDS = 4.0
-# Issue #385 (phase 2; Owner decision 2026-11-05: both terms are in the
-# reserve, so the longest local UVC join is 33.75 s):
+# Issue #385 (phase 2; Owner decisions 2026-11-05 and 2026-11-08: these three
+# terms are in the reserve, so the longest local UVC join is 28.75 s):
 # - the monitoring step already running when the stop began, when it is the
 #   hardware integrity check: its probe in flight is killed within one poll
 #   slice and reaped for at most 1 s (`integrity.probes.STOP_POLL_SECONDS`
@@ -74,11 +74,20 @@ INTEGRITY_PROBE_STOP_SECONDS = 0.25 + 1.0
 #   did, the stop's own poll, `MonitoringRuntime._persist_outcomes`) and the
 #   final storage sample's wait already counts this overshoot as settle time.
 #   A completion callback whose transaction waits for more than one lock
-#   (a rollback-journal commit) can take longer; that is not bounded yet.
+#   (a rollback-journal commit) can take longer; that is not bounded yet
+#   (別 Issue で扱う).
 SETTLE_POLL_OVERSHOOT_SECONDS = 5.0
+# - the stop's last outcome write (Owner decision 2026-11-08): the deliveries
+#   that finished after the last settle's deadline (or while it ended
+#   unsettled) and the retained refused writes are written by
+#   `NotificationService.persist_completed` in one transaction, so one
+#   SQLite busy timeout (`BUSY_TIMEOUT_SECONDS`) plus its own I/O, once per
+#   stop. Without it the next start could send a reconciled kind again.
+LATE_OUTCOME_WRITE_SECONDS = 5.0
 OTHER_STOP_STEPS_RESERVE_SECONDS = (HTTP_GRACEFUL_SHUTDOWN_SECONDS + RESERVATION_CHECK_STOP_SECONDS
                                     + SCENE_STOP_SECONDS + PROCESS_EXIT_SECONDS
-                                    + INTEGRITY_PROBE_STOP_SECONDS + SETTLE_POLL_OVERSHOOT_SECONDS)
+                                    + INTEGRITY_PROBE_STOP_SECONDS + SETTLE_POLL_OVERSHOOT_SECONDS
+                                    + LATE_OUTCOME_WRITE_SECONDS)
 # Once the stop began, a write from another thread waits for the storage
 # admission (`MonitoringRuntime.reservation`) at most until this long after the
 # stop while the jobs queued at the stop still run (every such wait shares
@@ -97,10 +106,9 @@ STOP_ADMISSION_WAIT_SECONDS = 5.0
 # timeline finish and the dispatch, and of a check that completed just before
 # the stop (the integrity `store.record` / `deliver` and the self-test's
 # `record_result` writes), a hung filesystem call, and the dispatch steps
-# before the critical settle, with their deadline-less polls. A delivery that
-# finished after a settle ended unsettled is not written (the final storage
-# sample has no wait left), so the next start may send a reconciled kind
-# again; writing it would need one more busy timeout in the reserve.
+# before the critical settle, with their deadline-less polls. The completion
+# callbacks of deliveries that finished after the last settle's deadline are
+# not called; their outcome rows are written (`LATE_OUTCOME_WRITE_SECONDS`).
 # On top of `join_timeout_seconds`, a local UVC stop waits at most 1 s for the
 # frame-progress watchdog join (`WorkerSupervisor.WATCHDOG_JOIN_MINIMUM_SECONDS`),
 # 1 s for the fenced `offline` writes of workers that outlived the join

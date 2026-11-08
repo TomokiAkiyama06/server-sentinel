@@ -86,7 +86,12 @@ unfinished delivery stays `pending` (`critical_notifications_unsettled`).
 Issue #385: every poll of a settle gets its deadline
 (`NotificationService.poll(deadline=)`), so a settle ends at most one outcome
 write or completion callback after its bound; an outcome not written by then
-stays `pending` for the next poll, like a delivery not finished in time. Once
+is written by the stop's last outcome write just before the notification
+service closes (`NotificationService.persist_completed`: the finished
+deliveries and the retained refused writes in one transaction, one SQLite busy
+timeout, `stop_budget.LATE_OUTCOME_WRITE_SECONDS`; no completion callback is
+called; Owner decision 2026-11-08), so the next start does not resend a
+reconciled kind; a delivery still running then stays `pending`. Once
 the stop began (`begin_stop`), an integrity check or self-test in flight ends
 early and records nothing partial (`app/integrity`, `app/media/health`), and a
 cross-thread `reservation()` waits for the worker at most until

@@ -18,7 +18,7 @@ _TIMING_BOUNDS = {
     "poll_timeout_seconds": (0.05, 30.0),
     "retry_delay_seconds": (0.05, 60.0),
     # At most what fits the Main stop budget with the camera offline settle
-    # (33.75 s, Issues #383, #385), so `--check` refuses a longer join.
+    # (28.75 s, Issues #383, #385), so `--check` refuses a longer join.
     "join_timeout_seconds": (0.1, MAXIMUM_LOCAL_UVC_JOIN_SECONDS),
     # Frame-progress watchdog: no frame for this long on a live capture reports
     # ``degraded`` (``video_frame_stalled``) instead of ``online``. The

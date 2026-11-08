@@ -338,6 +338,94 @@ class PollDeadlineTests(unittest.TestCase):
         self.assertEqual(0, self.service.pending_count)
         self.assertEqual([identifier] * 2, [event.event_id for event in self.local])
 
+    def test_the_stop_writes_finished_outcomes_past_the_deadline_in_one_write(self):
+        # Owner decision 2026-11-08 (PR #389 finding 1): a poll past its
+        # deadline writes nothing, so the stop's `persist_completed` writes
+        # every finished outcome as one batch, without calling a callback.
+        batches, called = [], []
+        self.service._local_batch_sink = lambda events: batches.append(events)
+        first, second = uuid4(), uuid4()
+        self.record(first, lambda result: called.append(result))
+        self.record(second)
+        self.delivered()
+        self.service.poll(deadline=0.0)
+        self.assertEqual([], self.local)
+        self.assertEqual(2, self.service.persist_completed())
+        self.assertEqual(1, len(batches))
+        self.assertEqual({first, second}, {event.event_id for event in batches[0]})
+        self.assertTrue(all(event.delivery == DeliveryResult.SENT for event in batches[0]))
+        self.assertEqual([], self.local)
+        self.assertEqual([], called)
+        self.assertFalse(self.service.local_delivery_failed)
+
+    def test_a_refused_last_write_writes_nothing_and_is_counted(self):
+        def refused(events):
+            raise OSError("synthetic")
+
+        self.service._local_batch_sink = refused
+        self.record(uuid4())
+        self.delivered()
+        self.assertEqual(0, self.service.persist_completed())
+        self.assertTrue(self.service.local_delivery_failed)
+
+    def test_without_a_batch_sink_the_outcomes_are_written_one_by_one(self):
+        first, second = uuid4(), uuid4()
+        self.record(first)
+        self.record(second)
+        self.delivered()
+        self.assertEqual(2, self.service.persist_completed())
+        self.assertEqual({first, second}, {event.event_id for event in self.local})
+        self.assertEqual(0, NotificationService(lambda event: None).persist_completed())
+
+
+class NotificationBatchWriteTests(unittest.TestCase):
+    """Owner decision 2026-11-08: the stop's last outcome write is one transaction."""
+
+    def setUp(self):
+        from app.storage.schema import APPLICATION_MIGRATIONS
+        self.db = sqlite3.connect(":memory:", isolation_level=None)
+        self.addCleanup(self.db.close)
+        migrate(self.db, APPLICATION_MIGRATIONS)
+        self.reservations = []
+        from app.monitoring.store import NotificationEventStore
+        self.store = NotificationEventStore(self.db, self.reservation)
+
+    @contextlib.contextmanager
+    def reservation(self):
+        self.reservations.append(1)
+        yield
+
+    def events(self, count, delivery=DeliveryResult.SENT):
+        from app.notifications.service import NotificationEvent
+        at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        return tuple(NotificationEvent(NotificationKind.CAMERA_TAMPER, at, True, uuid4(), delivery)
+                     for _ in range(count))
+
+    def rows(self):
+        return self.db.execute("SELECT delivery FROM notification_events").fetchall()
+
+    def test_all_rows_in_one_admitted_transaction(self):
+        at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self.store.upsert_many(self.events(3), accepted_at=at)
+        self.assertEqual([("sent",)] * 3, self.rows())
+        self.assertEqual([1], self.reservations)
+        self.assertFalse(self.db.in_transaction)
+        self.store.upsert_many((), accepted_at=at)
+        self.assertEqual([1], self.reservations)
+
+    def test_a_failed_row_writes_none(self):
+        at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        good = self.events(2)
+        self.db.execute("CREATE TRIGGER refuse BEFORE INSERT ON notification_events "
+                        "WHEN (SELECT count(*) FROM notification_events) >= 1 "
+                        "BEGIN SELECT RAISE(ABORT, 'synthetic'); END")
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.store.upsert_many(good, accepted_at=at)
+        self.assertEqual([], self.rows())
+        self.assertFalse(self.db.in_transaction)
+        with self.assertRaises(ValueError):
+            self.store.upsert_many(("not an event",), accepted_at=at)
+
 
 class ScheduleTests(unittest.TestCase):
     def setUp(self):

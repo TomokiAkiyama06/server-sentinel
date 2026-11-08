@@ -88,6 +88,19 @@ def _utc(at: datetime) -> str:
     return at.astimezone(timezone.utc).isoformat()
 
 
+_UPSERT_NOTIFICATION = (
+    "INSERT INTO notification_events(event_id,kind,at,confirmed,delivery,accepted_at) "
+    "VALUES (?,?,?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET "
+    "delivery=excluded.delivery,accepted_at=excluded.accepted_at")
+
+
+def _notification_row(event: NotificationEvent, accepted_at: datetime) -> tuple:
+    if not isinstance(event, NotificationEvent):
+        raise ValueError("invalid notification event")
+    return (str(event.event_id), event.kind.value, _utc(event.at), int(event.confirmed),
+            event.delivery.value, _utc(accepted_at))
+
+
 class _Autocommit:
     def __init__(self, connection: sqlite3.Connection, reservation):
         if connection.isolation_level is not None or not callable(reservation):
@@ -116,15 +129,29 @@ class NotificationEventStore(_Autocommit):
         retry accepted hours after the event's ``at`` is counted from the
         retry (Issue #287); kind, time and confirmed flag never change.
         """
-        if not isinstance(event, NotificationEvent):
-            raise ValueError("invalid notification event")
-        self._write(
-            "INSERT INTO notification_events(event_id,kind,at,confirmed,delivery,accepted_at) "
-            "VALUES (?,?,?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET "
-            "delivery=excluded.delivery,accepted_at=excluded.accepted_at",
-            (str(event.event_id), event.kind.value, _utc(event.at), int(event.confirmed),
-             event.delivery.value, _utc(accepted_at)),
-        )
+        self._write(_UPSERT_NOTIFICATION, _notification_row(event, accepted_at))
+
+    def upsert_many(self, events, *, accepted_at: datetime) -> None:
+        """Write ``events`` in one transaction, so as one write.
+
+        Issue #385 (Owner decision 2026-11-08): the Main stop's last outcome
+        write (`NotificationService.persist_completed`) waits for the
+        database lock once, not once per row. All rows are written or none.
+        """
+        rows = [_notification_row(event, accepted_at) for event in events]
+        if not rows:
+            return
+        if self.db.in_transaction:
+            raise RuntimeError("MONITORING_DATABASE_BUSY")
+        with self._reservation():
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                self.db.executemany(_UPSERT_NOTIFICATION, rows)
+                self.db.execute("COMMIT")
+            except BaseException:
+                if self.db.in_transaction:
+                    self.db.execute("ROLLBACK")
+                raise
 
     def get(self, event_id: UUID) -> dict | None:
         row = self.db.execute(

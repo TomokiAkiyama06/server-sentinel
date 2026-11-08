@@ -1168,7 +1168,9 @@ class ProbeCleanupTests(TestCase):
 
     def test_a_probe_without_a_runner_gives_it_its_own_check(self):
         # PR #389 review: one `interrupted` for the probe and the command.
-        check = lambda: False  # noqa: E731
+        def check():
+            return False
+
         self.assertIs(check, LinuxProbe(interrupted=check).runner.interrupted)
         runner = CommandRunner()
         self.assertIs(runner, LinuxProbe(runner=runner, interrupted=check).runner)

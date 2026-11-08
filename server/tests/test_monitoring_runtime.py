@@ -32,6 +32,8 @@ from app.monitoring.config import MonitoringConfiguration, RecordingFilesystem, 
 from app.media.recording.model import RecordingError
 from app.monitoring import runtime as runtime_module
 from app.monitoring.runtime import MonitoringDependencies, RuntimeState, default_integrity_probe
+from app.notifications.service import NotificationKind
+from app.notifications.slack import DeliveryResult
 from app.stop_budget import INTERRUPTED
 from app.settings import ConfigurationError, Settings
 from app.storage.database import Database
@@ -1123,6 +1125,38 @@ class ReservationThreadTests(RuntimeFixture):
             # The settle budget is now taken: a second call does nothing.
             await runtime.call(persist)
             self.assertEqual(1, len(deadlines))
+
+    async def test_a_delivery_finished_after_the_settle_is_written_at_the_stop(self):
+        # Owner decision 2026-11-08 (PR #389 finding 1): the settle's wait is
+        # spent (`wait=0.0` in the final storage sample), so no poll writes
+        # the finished delivery; the stop's last write does, in one
+        # transaction, and the next start does not resend it.
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            at = self.clock.utcnow()
+
+            def submit():
+                return runtime.notifications.record(
+                    NotificationKind.CAMERA_TAMPER, at=at, confirmed=True)
+
+            self.assertEqual(DeliveryResult.PENDING, await runtime.call(submit))
+            for _ in range(200):
+                if runtime.notifications._worker.ready.wait(0.05):
+                    break
+            await runtime.call(runtime.settle_notifications, 0.0)
+            self.assertIn(("camera_tamper", "pending"), self.events())
+            batches, upsert_many = [], runtime.notification_events.upsert_many
+
+            def spy(events, **keywords):
+                batches.append(len(events))
+                return upsert_many(events, **keywords)
+
+            runtime.notification_events.upsert_many = spy
+        self.assertIn(("camera_tamper", "sent"), self.events())
+        self.assertNotIn(("camera_tamper", "pending"), self.events())
+        self.assertEqual([1], batches)
 
     async def test_a_settle_gives_every_poll_its_deadline(self):
         # Issue #385: a poll started before the settle's deadline begins no

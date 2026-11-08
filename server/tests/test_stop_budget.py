@@ -40,7 +40,7 @@ class StopBudgetTests(unittest.TestCase):
         self.assertEqual(stop_budget.LOCAL_UVC_STOP_OVERHEAD_SECONDS,
                          LocalUvcSupervisor.WATCHDOG_JOIN_MINIMUM_SECONDS
                          + HEALTH_FENCE_SECONDS + HEALTH_SINK_SETTLE_SECONDS)
-        self.assertEqual(36.75, stop_budget.local_uvc_stop_seconds(uvc(33.75)))
+        self.assertEqual(31.75, stop_budget.local_uvc_stop_seconds(uvc(28.75)))
         self.assertEqual(0.0, stop_budget.local_uvc_stop_seconds(None))
 
     def test_the_reserve_is_derived_from_the_stop_step_constants(self):
@@ -53,11 +53,13 @@ class StopBudgetTests(unittest.TestCase):
                          stop_budget.HTTP_GRACEFUL_SHUTDOWN_SECONDS + stop_budget.RESERVATION_CHECK_STOP_SECONDS
                          + stop_budget.SCENE_STOP_SECONDS + stop_budget.PROCESS_EXIT_SECONDS
                          + stop_budget.INTEGRITY_PROBE_STOP_SECONDS
-                         + stop_budget.SETTLE_POLL_OVERSHOOT_SECONDS)
+                         + stop_budget.SETTLE_POLL_OVERSHOOT_SECONDS
+                         + stop_budget.LATE_OUTCOME_WRITE_SECONDS)
         # Owner decision 2026-11-05 (Issue #385): the admission wait cap is
-        # not a reserve term.
-        self.assertEqual(41.25, stop_budget.OTHER_STOP_STEPS_RESERVE_SECONDS)
-        self.assertEqual(33.75, stop_budget.MAXIMUM_LOCAL_UVC_JOIN_SECONDS)
+        # not a reserve term. Owner decision 2026-11-08: the stop's last
+        # outcome write is.
+        self.assertEqual(46.25, stop_budget.OTHER_STOP_STEPS_RESERVE_SECONDS)
+        self.assertEqual(28.75, stop_budget.MAXIMUM_LOCAL_UVC_JOIN_SECONDS)
         # The HTTP server is built with the graceful bound.
         source = (Path(__file__).resolve().parents[1] / "app" / "__main__.py").read_text()
         self.assertIn("timeout_graceful_shutdown=HTTP_GRACEFUL_SHUTDOWN_SECONDS", source)
@@ -69,12 +71,13 @@ class StopBudgetTests(unittest.TestCase):
         self.assertLess(probes.STOP_POLL_SECONDS + probes.STOP_REAP_SECONDS,
                         probes.COMMAND_OUTPUT_SECONDS + probes.COMMAND_REAP_SECONDS)
         self.assertEqual(stop_budget.SETTLE_POLL_OVERSHOOT_SECONDS, BUSY_TIMEOUT_SECONDS)
+        self.assertEqual(stop_budget.LATE_OUTCOME_WRITE_SECONDS, BUSY_TIMEOUT_SECONDS)
         self.assertEqual(5.0, stop_budget.STOP_ADMISSION_WAIT_SECONDS)
 
     def test_the_deployment_file_refuses_a_join_over_the_budget(self):
         # Issue #383: `--check` refuses it, not only `create_app()`.
-        parse_local_uvc({"source_ids": [str(uuid4())], "join_timeout_seconds": 33.75})
-        for join in (33.76, 40, 60):
+        parse_local_uvc({"source_ids": [str(uuid4())], "join_timeout_seconds": 28.75})
+        for join in (28.76, 40, 60):
             with self.assertRaises(ConfigurationError):
                 parse_local_uvc({"source_ids": [str(uuid4())], "join_timeout_seconds": join})
 
@@ -82,19 +85,19 @@ class StopBudgetTests(unittest.TestCase):
         # The deployment file holds no notification settle, so `--check` can
         # never be refused by this budget: even the longest join fits with
         # the camera offline settle.
-        longest = parse_local_uvc({"source_ids": [str(uuid4())], "join_timeout_seconds": 33.75})
+        longest = parse_local_uvc({"source_ids": [str(uuid4())], "join_timeout_seconds": 28.75})
         stop_budget.check_stop_budget(longest, None)
         stop_budget.check_stop_budget(None, MAXIMUM_DISPATCH_SETTLE_SECONDS)
         stop_budget.check_stop_budget(LocalUvcConfiguration((uuid4(),)), DEFAULT_DISPATCH_SETTLE_SECONDS)
 
     def test_bounds_whose_sum_exceeds_the_budget_are_refused(self):
-        # Issue #364: the longest join (36.75 s stop) + 30 s settle overruns.
+        # Issue #364: the longest join (31.75 s stop) + 30 s settle overruns.
         with self.assertRaises(ConfigurationError):
-            stop_budget.check_stop_budget(uvc(33.75), MAXIMUM_DISPATCH_SETTLE_SECONDS)
-        edge = LIMIT - 36.75
-        stop_budget.check_stop_budget(uvc(33.75), edge)
+            stop_budget.check_stop_budget(uvc(28.75), MAXIMUM_DISPATCH_SETTLE_SECONDS)
+        edge = LIMIT - 31.75
+        stop_budget.check_stop_budget(uvc(28.75), edge)
         with self.assertRaises(ConfigurationError):
-            stop_budget.check_stop_budget(uvc(33.75), edge + 0.01)
+            stop_budget.check_stop_budget(uvc(28.75), edge + 0.01)
         stop_budget.check_stop_budget(uvc(LIMIT - 3.0 - MAXIMUM_DISPATCH_SETTLE_SECONDS),
                                       MAXIMUM_DISPATCH_SETTLE_SECONDS)
 
@@ -102,11 +105,11 @@ class StopBudgetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             settings = Settings(Path(directory))
             with self.assertRaises(ConfigurationError):
-                create_app(settings, local_uvc=uvc(33.75), scene_timeline=timeline(30))
+                create_app(settings, local_uvc=uvc(28.75), scene_timeline=timeline(30))
             # Within the budget the check passes; the composition is then
             # refused for its own reason (no scene monitoring), not this one.
             with self.assertRaises(TypeError):
-                create_app(settings, local_uvc=uvc(33.75), scene_timeline=timeline(12))
+                create_app(settings, local_uvc=uvc(28.75), scene_timeline=timeline(12))
 
     def test_the_installed_unit_uses_the_budget_timeout(self):
         # The unit template stays literal (`test_listener_owner_contract`

@@ -542,6 +542,11 @@ class MonitoringRuntime:
             raise RecordingError("NOTIFICATION_STORE_UNAVAILABLE")
         self.notification_events.upsert(event, accepted_at=self.dependencies.utcnow())
 
+    def _persist_notifications(self, events) -> None:
+        if self.notification_events is None:
+            raise RecordingError("NOTIFICATION_STORE_UNAVAILABLE")
+        self.notification_events.upsert_many(events, accepted_at=self.dependencies.utcnow())
+
     def _admit_database_open(self) -> None:
         """Refuse to open or create the database outside verified storage.
 
@@ -578,6 +583,7 @@ class MonitoringRuntime:
             self.notifications = NotificationService(
                 self._persist_notification, slack,
                 queue_capacity=dependencies.notification_queue_capacity,
+                local_batch_sink=self._persist_notifications,
             )
         if self._connection is None:
             connection = None
@@ -1559,8 +1565,9 @@ class MonitoringRuntime:
         most one outcome write or callback after it
         (`stop_budget.SETTLE_POLL_OVERSHOOT_SECONDS`), not a whole poll's
         writes later; the configured bound itself is never shortened. An
-        outcome not written by then stays `pending`, like a delivery that did
-        not finish in time.
+        outcome not written by then is written by the stop's last outcome
+        write (`_close`, `NotificationService.persist_completed`, Owner
+        decision 2026-11-08); a delivery still running then stays `pending`.
         """
         self._require_owner()
         if self.notifications is None:
@@ -1721,6 +1728,13 @@ class MonitoringRuntime:
             except Exception:
                 logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
         if self.notifications is not None:
+            try:
+                # Issue #385 (Owner decision 2026-11-08): the outcomes of the
+                # deliveries that finished after the last settle's deadline,
+                # as one write (`stop_budget.LATE_OUTCOME_WRITE_SECONDS`).
+                self.notifications.persist_completed()
+            except Exception:
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
             self.notifications.close()
         if self.recordings is not None:
             self.recordings.close()
