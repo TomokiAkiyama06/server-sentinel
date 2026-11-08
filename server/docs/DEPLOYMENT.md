@@ -1084,7 +1084,11 @@ sudo systemctl restart server-sentinel.service
 On the shared GPU Main host, ServerSentinel runs in a dedicated LXD VM with
 its own `tailscaled` (Owner decision D2, 2026-10-16); the step-by-step Owner
 procedure for that environment, the camera passthrough and the order of the
-steps below is `server/docs/REMOTE_LIVE_VIEW_SETUP.md`.
+steps below is `server/docs/REMOTE_LIVE_VIEW_SETUP.md`. LXD does not pass a
+camera the host re-enumerated back to the running VM (Issue #301); the
+optional host-side re-pass in `infra/lxd/` (installed on the LXD host by the
+Owner, outside the release and without any privilege for ServerSentinel)
+re-adds such a serial-identified camera automatically.
 
 Without the optional `"human_access"` key every human path stays closed
 (`ClosedHumanSurface`): the backend answers every request with the generic
