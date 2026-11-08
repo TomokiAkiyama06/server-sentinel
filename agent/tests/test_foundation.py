@@ -335,6 +335,20 @@ class ConfigurationTests(unittest.TestCase):
                 with self.subTest(key=key), self.assertRaises(ConfigurationError):
                     Settings.parse(dict(value, **{key: bad}), code_root=root / "code")
 
+    def test_heartbeat_interval_fits_the_main_ingest_contract(self):
+        # Issue #14: at most 5 s, so the Main's ingest idle timeout (30 s by
+        # default) allows three intervals plus a slow tick.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = configuration(root)
+            for accepted in (0.01, 1, 5):
+                self.assertEqual(Settings.parse(dict(value, heartbeat_seconds=accepted),
+                                                code_root=root / "code").heartbeat_seconds,
+                                 accepted)
+            for refused in (5.01, 30, float("inf")):
+                with self.subTest(refused=refused), self.assertRaises(ConfigurationError):
+                    Settings.parse(dict(value, heartbeat_seconds=refused), code_root=root / "code")
+
     def test_fifo_configuration_is_rejected_without_waiting_for_a_writer(self):
         with tempfile.TemporaryDirectory() as temporary:
             fifo = Path(temporary) / "configuration.fifo"

@@ -8,7 +8,8 @@ from app.settings import ConfigurationError, Settings
 
 
 def run(settings: Settings, monitoring=None, local_uvc=None, *, human_access=None,
-        human_access_unavailable: bool = False) -> int:
+        human_access_unavailable: bool = False, capture_ingest=None,
+        capture_ingest_unavailable: bool = False) -> int:
     """Serve the Main Server; `monitoring` comes from the deployment.
 
     Without a storage-configured monitoring section the mandatory startup/daily
@@ -33,7 +34,14 @@ def run(settings: Settings, monitoring=None, local_uvc=None, *, human_access=Non
     the monitoring health degraded until a restart composes access (Codex
     PR #282, REQUIREMENTS NOTIFY-002): recording and the integrity and
     recording-health checks keep running.
+
+    `capture_ingest` is the deployment's loaded capture ingest material
+    (`remote_agent.ingest_config`, Issue #14), or None; with
+    `capture_ingest_unavailable` the section's material did not load and the
+    listener stays closed (state `unavailable`) while everything else runs.
     """
+    ingest = dict(capture_ingest=capture_ingest,
+                  capture_ingest_unavailable=capture_ingest_unavailable)
     configure_logging(settings.log_level)
     if monitoring is None or not monitoring.storage_configured:
         logging.getLogger(__name__).error(Event.MONITORING_UNCONFIGURED)
@@ -82,7 +90,7 @@ def run(settings: Settings, monitoring=None, local_uvc=None, *, human_access=Non
     if composed is not None:
         try:
             application = create_app(settings, monitoring=monitoring, local_uvc=local_uvc,
-                                     **composed)
+                                     **composed, **ingest)
         except HumanAccessCompositionRefused:
             # create_app refused the composition (for example a Web build or
             # fault monitor that does not match): handled like a failed build.
@@ -94,7 +102,8 @@ def run(settings: Settings, monitoring=None, local_uvc=None, *, human_access=Non
         # by the monitoring runtime, notifies the Owner (Codex PR #282).
         logging.getLogger(__name__).error(Event.HUMAN_ACCESS_COMPOSITION_FAILED)
         faults.composition_failed()
-        application = create_app(settings, monitoring=monitoring, local_uvc=local_uvc, **closed)
+        application = create_app(settings, monitoring=monitoring, local_uvc=local_uvc, **closed,
+                                 **ingest)
     if listener is None:
         build_server(application, host=settings.human_host, port=settings.human_port, **options).run()
     else:

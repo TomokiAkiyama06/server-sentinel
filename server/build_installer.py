@@ -16,6 +16,10 @@ INSTALLER_MODULES = (
     # The optional human_access section (Issue #10); standard library only.
     "auth/__init__.py", "auth/access_config.py",
     "cameras/uvc/config.py",
+    # The optional capture_ingest section (Issue #14); its parser and the
+    # listener configuration import only the standard library.
+    "cameras/remote_agent/__init__.py", "cameras/remote_agent/addresses.py",
+    "cameras/remote_agent/ingest_config.py",
     # The local UVC join bound comes from the stop budget (Issue #383).
     "stop_budget.py",
     "monitoring/__init__.py", "monitoring/config.py",

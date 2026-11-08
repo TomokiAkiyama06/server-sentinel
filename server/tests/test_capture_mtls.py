@@ -433,12 +433,23 @@ class CaptureMtlsTests(CaptureTlsHarness):
         self.assertEqual(ssl.CERT_REQUIRED, self.context.verify_mode)
         self.assertEqual(0, self.context.num_tickets)
 
-    def test_application_does_not_start_or_import_the_ingest_listener(self):
+    def test_application_loads_the_ingest_listener_only_when_configured(self):
+        # Issue #14: the application wires the listener only for a deployment
+        # `capture_ingest` section; importing it loads neither the TLS
+        # adapter, the listener nor the CA module, and the human surface
+        # never reaches the capture node code.
         source = (SERVER_ROOT / "app" / "main.py").read_text()
-        self.assertNotIn("ingest_tls", source)
         self.assertNotIn("node_ca", source)
         auth_sources = "".join(path.read_text() for path in (SERVER_ROOT / "app" / "auth").glob("*.py"))
         self.assertNotIn("remote_agent", auth_sources)
+        probe = ("import sys, app.main\n"
+                 "names = ('ingest_tls', 'ingest_server', 'node_ca', 'pairing')\n"
+                 "print(sorted(n for n in names\n"
+                 "             if 'app.cameras.remote_agent.' + n in sys.modules))\n")
+        result = subprocess.run([sys.executable, "-c", probe], cwd=SERVER_ROOT,
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        self.assertEqual(result.stdout.strip(), "[]")
 
     def test_concurrent_admission_checks_follow_revocation(self):
         claim, issued, _, _ = self._paired_node()

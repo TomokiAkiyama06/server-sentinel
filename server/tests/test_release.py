@@ -651,6 +651,38 @@ class ReleaseLifecycleTests(unittest.TestCase):
                 load(invitation_lifetime_hours=value)
             self.assertNotIn(repr(value), str(refused.exception))
 
+    def test_capture_ingest_section_is_optional_and_validated(self):
+        # Issue #14: absent means no ingest listener; present it names an
+        # explicit private bind and a listener directory outside runtime data.
+        code_root = self.root / "code"
+        code_root.mkdir()
+        base = json.loads(self.config.read_text())
+
+        def load(**extra):
+            self.config.write_text(json.dumps({**base, **extra}))
+            with patch("app.deployment.ADMINISTRATOR_UID", self.uid), patch(
+                    "app.deployment._approved_filesystem_device",
+                    side_effect=self.approved_device_lookup()), patch(
+                    "app.deployment.os.path.ismount", return_value=True), patch(
+                    "app.deployment._operating_system_root_device",
+                    return_value=self.runtime.stat().st_dev + 1):
+                return Deployment.load(self.config, code_root=code_root)
+
+        self.assertIsNone(load().capture_ingest)
+        section = {"bind_host": "192.168.0.10", "port": 47200,
+                   "listener_directory": str(self.root / "capture-listener")}
+        loaded = load(capture_ingest=section).capture_ingest
+        self.assertEqual(loaded.listener.port, 47200)
+        self.assertEqual(loaded.listener_directory, self.root / "capture-listener")
+        for changes in ({"bind_host": "0.0.0.0"}, {"bind_host": "100.64.0.1"},
+                        {"bind_host": base["human_host"], "port": base["human_port"]},
+                        {"listener_directory": str(self.runtime / "state")},
+                        {"listener_directory": str(code_root / "x")},
+                        {"listener_directory": "relative"}, {"extra": 1}):
+            with self.subTest(changes=changes), self.assertRaises(ConfigurationError) as refused:
+                load(capture_ingest={**section, **changes})
+            self.assertNotIn("192.168", str(refused.exception))
+
     def test_rollback_runs_the_target_release_check_and_refuses_before_any_change(self):
         # Review of PR #234: a rollback target from before
         # ``invitation_lifetime_hours`` refuses it as an unknown key, so the

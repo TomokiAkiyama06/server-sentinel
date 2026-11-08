@@ -10,6 +10,10 @@ import stat
 import sys
 
 from app.auth.access_config import HumanAccessDeployment, HumanAccessRefused, parse_human_access
+from app.cameras.remote_agent.ingest_config import (
+    CaptureIngestDeployment, CaptureIngestUnavailable, load_capture_ingest_material,
+    parse_capture_ingest,
+)
 from app.cameras.uvc.config import LocalUvcConfiguration, parse_local_uvc
 from app.detection.foundation.config import DetectionConfiguration, parse_detection
 from app.monitoring.config import (
@@ -436,6 +440,10 @@ class Deployment:
     # the production composition (``app.auth.composition``); one it cannot
     # build keeps every human path closed and notifies the Owner.
     human_access: HumanAccessDeployment | None = field(default=None, repr=False)
+    # The optional ``capture_ingest`` section (Issue #14). Absent, no capture
+    # ingest listener exists; present, the launcher loads its TLS material and
+    # the application opens the listener (`remote_agent.ingest_config`).
+    capture_ingest: CaptureIngestDeployment | None = field(default=None, repr=False)
 
     @property
     def state_directory(self) -> Path:
@@ -465,7 +473,8 @@ class Deployment:
                 or not set(value) <= allowed | {"monitoring", "local_uvc", "detection",
                                                 "capture_ca_directory",
                                                 "invitation_lifetime_hours",
-                                                "web_assets_directory", "human_access"}
+                                                "web_assets_directory", "human_access",
+                                                "capture_ingest"}
                 or type(value.get("service_uid")) is not int):
             raise ConfigurationError("invalid deployment configuration")
         # Required (Owner decision 2026-10-07, Issue #109): every configuration
@@ -602,10 +611,20 @@ class Deployment:
         if capture_ca is not None and (capture_ca.is_relative_to(runtime_root)
                                        or any(capture_ca.is_relative_to(root) for root in roots)):
             raise ConfigurationError("capture CA directory must be outside runtime data and code")
+        # Optional (Issue #14): the capture ingest listener. Its directory
+        # holds only the Main listener credential and the public CA copy, so
+        # it is never the CA directory, runtime data or code.
+        capture_ingest = (parse_capture_ingest(
+            value["capture_ingest"], human_host=value["human_host"],
+            human_port=value["human_port"],
+            forbidden_roots=(runtime_root, *roots,
+                             *((capture_ca,) if capture_ca is not None else ())))
+            if "capture_ingest" in value else None)
         return cls(runtime_root, uid, settings, directories[1], directories[2], monitoring,
                    local_uvc=local_uvc, detection=detection, capture_ca_directory=capture_ca,
                    capture_ca_configured=configured, human_access=human_access,
-                   filesystem_device_numbers_stale=device_numbers_stale)
+                   filesystem_device_numbers_stale=device_numbers_stale,
+                   capture_ingest=capture_ingest)
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -654,6 +673,18 @@ def main(arguments: list[str] | None = None) -> int:
                     human_access.tailscale_executable))
             except HumanAccessRefused as refused:
                 human_access_unavailable = refused.reason
+        # Issue #14: the capture ingest listener's TLS material, loaded as
+        # this account before every start (ExecStartPre) and by the launcher.
+        # Like an unusable Tailscale CLI above, material that does not load
+        # keeps only the ingest listener closed; recording and the integrity
+        # and recording-health checks still start.
+        capture_ingest = None
+        capture_ingest_unavailable = None
+        if deployment.capture_ingest is not None:
+            try:
+                capture_ingest = load_capture_ingest_material(deployment.capture_ingest)
+            except CaptureIngestUnavailable as refused:
+                capture_ingest_unavailable = refused.reason
     except CaptureCaSettingMissing:
         parser.exit(1, "ServerSentinel deployment validation failed: "
                        + CaptureCaSettingMissing.REASON + "\n")
@@ -674,6 +705,11 @@ def main(arguments: list[str] | None = None) -> int:
         sys.stderr.write("ServerSentinel deployment warning: human access stays closed "
                          f"(reason={human_access_unavailable}); recording and monitoring "
                          "start\n")
+    if capture_ingest_unavailable is not None:
+        # One value-free word; the check passes so the unit starts.
+        sys.stderr.write("ServerSentinel deployment warning: capture ingest stays closed "
+                         f"(reason={capture_ingest_unavailable}); recording and monitoring "
+                         "start\n")
     if deployment.filesystem_device_numbers_stale:
         # Issue #321: the UUID, the mount and the runtime root agree, so the
         # service starts; the recorded numbers are only out of date. Value-free
@@ -685,7 +721,9 @@ def main(arguments: list[str] | None = None) -> int:
     from app.__main__ import run
     return run(deployment.settings, deployment.monitoring, deployment.local_uvc,
                human_access=human_access,
-               human_access_unavailable=human_access_unavailable is not None)
+               human_access_unavailable=human_access_unavailable is not None,
+               capture_ingest=capture_ingest,
+               capture_ingest_unavailable=capture_ingest_unavailable is not None)
 
 
 if __name__ == "__main__":
