@@ -2677,13 +2677,15 @@ private record.
   (`v4l2-ctl --list-devices`), the source returns to `online` without a VM
   or service restart, and `--check` then prints `usb_repass_held`;
 - [ ] unplug a camera and plug it back into the same port: within about
-  15 s of the reconnect (udev trigger, 5 s settle, 2 s second sample, the
-  re-pass) the journal shows `usb_repass_done` once, and the outage stays
+  30 s of the reconnect (udev trigger, 5 s settle, 2 s second sample, the
+  re-pass, a 5 s settle and up to 10 s of verification) the journal shows
+  `usb_repass_done` once, and the outage stays
   shorter than `camera_offline_notification.after_seconds` (no Slack
   `camera_offline`);
 - [ ] the other C960 resetting about a second later (memory 2026-09-30) is
-  either still `held` or re-passed once; no loop (at most once per 60 s and
-  five per hour per device; `usb_repass_rate_limited` otherwise);
+  either still `held` or re-passed in the same pass; both end
+  `usb_repass_done`; no loop (at most once per 60 s and five per hour per
+  device; `usb_repass_rate_limited` otherwise);
 - [ ] a camera left unplugged stays `usb_repass_absent` and its LXD device is
   never removed;
 - [ ] a configured device without `serial` (a temporary copy of the
