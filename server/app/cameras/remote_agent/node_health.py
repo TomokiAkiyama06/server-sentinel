@@ -65,12 +65,17 @@ class CaptureNodeHealthRegistry:
     def connected(self, node_id: UUID, generation: int) -> bool:
         """Record a newly admitted session; False when the table is full.
 
-        A node already known is always admitted (its newer session replaces
-        the older); a new node needs room, made by dropping the oldest entry
-        that is not connected, or it is refused (fail closed, bounded).
+        A node already known is admitted when ``generation`` is newer than
+        the one it holds (its newer session replaces the older); an older or
+        equal generation is refused, so a late registration can never
+        replace a newer session (PR #401 review). A new node needs room, made
+        by dropping the oldest entry that is not connected, or it is refused
+        (fail closed, bounded).
         """
         with self._lock:
             entry = self._nodes.get(node_id)
+            if entry is not None and generation <= entry.generation:
+                return False
             if entry is None:
                 if len(self._nodes) >= self._maximum:
                     idle = next((node for node, item in self._nodes.items()

@@ -295,21 +295,30 @@ class CaptureIngestServer:
 
     def _session(self, session, tls: ssl.SSLSocket) -> None:
         node = session.identity.node_id
+        # The replacement and the health registration are one step under this
+        # lock (PR #401 Codex review): a concurrent admission of the same node
+        # can then never register an older generation after a newer one, so
+        # the newer session always wins. Lock order: this lock, then the
+        # registry's (the registry never calls back here).
         with self._lock:
             if self._state != "running":
                 return
             self._generation += 1
             generation = self._generation
-            previous = self._live.get(node)
-            self._live[node] = (generation, tls)
+            if not self.registry.connected(node, generation):
+                registered = False
+                previous = None
+            else:
+                registered = True
+                previous = self._live.get(node)
+                self._live[node] = (generation, tls)
+        if not registered:
+            self._close_with(tls, "node_capacity")
+            return
         if previous is not None:
             # ADR-0007 item 2: the newer session wins; the older one's thread
             # sees its socket shut down and ends.
             _abort(previous[1])
-        if not self.registry.connected(node, generation):
-            self._end(node, generation)
-            self._close_with(tls, "node_capacity")
-            return
         LOGGER.info(Event.CAPTURE_INGEST_SESSION_OPENED)
         reason = "closed"
         try:
@@ -335,15 +344,25 @@ class CaptureIngestServer:
 
     def _close_with(self, tls, reason: str) -> None:
         try:
+            # `read_frame` leaves the socket at the rest of a frame deadline;
+            # a send gets the whole idle timeout.
+            tls.settimeout(self.limits.idle_timeout_seconds)
             tls.sendall(encode_frame(FrameType.CLOSE, {"reason": reason}))
         except (OSError, ValueError):
             pass
 
     def _frames(self, session, tls, node: UUID, generation: int) -> str:
-        tls.settimeout(self.limits.idle_timeout_seconds)
         while True:
+            # One deadline per frame, from the end of the previous one: the
+            # whole next frame must arrive within the idle timeout, however
+            # the peer splits it (PR #401 Codex review). A peer that trickles
+            # bytes therefore cannot hold a session open, and a session that
+            # never completes a frame is closed at that deadline, so neither
+            # the per-frame ledger re-check nor the rate budget is skipped for
+            # longer than the idle timeout.
             try:
-                frame = read_frame(tls, self.limits.maximum_frame_bytes)
+                frame = read_frame(tls, self.limits.maximum_frame_bytes,
+                                   deadline=time.monotonic() + self.limits.idle_timeout_seconds)
             except WireRefused as refused:
                 self._close_with(tls, refused.reason)
                 return refused.reason
@@ -382,6 +401,7 @@ class CaptureIngestServer:
             if not self.registry.heartbeat(generation, heartbeat):
                 return "superseded"
             try:
+                tls.settimeout(self.limits.idle_timeout_seconds)
                 tls.sendall(encode_frame(FrameType.HEARTBEAT_ACK, {
                     "sequence": heartbeat.sequence, "receive_utc": received,
                     "send_utc": self._utc()}))

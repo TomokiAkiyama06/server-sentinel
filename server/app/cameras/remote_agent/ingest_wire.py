@@ -35,6 +35,8 @@ import math
 import re
 import socket
 import struct
+import time
+from typing import Callable
 from uuid import UUID
 
 
@@ -107,10 +109,19 @@ class NodeHeartbeat:
     source_count: int
 
 
-def _receive_exactly(connection: socket.socket, size: int) -> bytes:
+def _receive_exactly(connection: socket.socket, size: int, deadline: float | None,
+                     clock: Callable[[], float]) -> bytes:
     chunks = []
     remaining = size
     while remaining:
+        if deadline is not None:
+            left = deadline - clock()
+            if left <= 0:
+                raise socket.timeout("frame deadline")
+            # Every receive gets only what is left of the frame's one
+            # deadline, so a peer trickling a byte per receive cannot keep a
+            # frame open past it (PR #401 Codex review).
+            connection.settimeout(left)
         chunk = connection.recv(min(remaining, 65536))
         if not chunk:
             raise PeerClosed()
@@ -119,16 +130,20 @@ def _receive_exactly(connection: socket.socket, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def read_frame(connection: socket.socket, maximum_body_bytes: int) -> Frame:
+def read_frame(connection: socket.socket, maximum_body_bytes: int, *,
+               deadline: float | None = None,
+               clock: Callable[[], float] = time.monotonic) -> Frame:
     """Read one frame; the length is refused before its body is read.
 
-    ``socket.timeout`` and ``OSError`` propagate to the caller, which owns the
-    idle deadline; a stream that ends between or inside frames is
+    With ``deadline`` (a ``clock`` value), the whole frame -- header and body
+    -- must arrive before it, however the peer splits its bytes; otherwise
+    ``socket.timeout`` is raised. ``socket.timeout`` and ``OSError`` propagate
+    to the caller; a stream that ends between or inside frames is
     ``PeerClosed``.
     """
     if type(maximum_body_bytes) is not int or maximum_body_bytes <= 0:
         raise ValueError("invalid frame limit")
-    length, kind = HEADER.unpack(_receive_exactly(connection, HEADER.size))
+    length, kind = HEADER.unpack(_receive_exactly(connection, HEADER.size, deadline, clock))
     if length == 0:
         raise WireRefused("frame_empty")
     if length > maximum_body_bytes:
@@ -137,7 +152,7 @@ def read_frame(connection: socket.socket, maximum_body_bytes: int) -> Frame:
         frame_type = FrameType(kind)
     except ValueError:
         raise WireRefused("frame_type_refused") from None
-    return Frame(frame_type, _receive_exactly(connection, length))
+    return Frame(frame_type, _receive_exactly(connection, length, deadline, clock))
 
 
 def encode_frame(kind: FrameType, payload: dict) -> bytes:

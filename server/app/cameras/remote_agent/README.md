@@ -168,7 +168,11 @@ this protocol.
   `maximum_handshakes_per_address` handshakes in progress per peer address
   (default 2; this limits what an unauthenticated LAN host can occupy, it
   authenticates nothing), one live session per node (a newer admitted session
-  supersedes the older), an idle timeout without any frame (default 10 s), and
+  supersedes the older; the replacement and the health registration are one
+  step under the listener lock, so an older session can never register after
+  a newer one), one deadline per frame (default 10 s from the end of the
+  previous frame, for the whole header and body however the peer splits its
+  bytes, so a trickling peer cannot hold a session open), and
   every frame charged to the node's rate budget (default 10 per second,
   `AgentIngestQueue.charge_attempt`).
 - *Node health.* `node_health.py` keeps, in memory and bounded (64 nodes), the

@@ -186,6 +186,52 @@ class CaptureIngestServerTests(CaptureTlsHarness):
         self.send_heartbeat(second, sequence=3)
         self.assertIs(self.reply(second)[0], FrameType.HEARTBEAT_ACK)
 
+    def test_replacement_and_registration_are_one_step(self):
+        # PR #401 Codex review: the health registration happens under the
+        # same lock as the replacement, in generation order, so a concurrent
+        # admission of the same node can never register after a newer one.
+        server = self.serve()
+        original = server.registry.connected
+        calls = []
+
+        def observed(node, generation):
+            calls.append((generation, server._lock.locked()))
+            return original(node, generation)
+
+        server.registry.connected = observed
+        sessions = [self.connect(), self.connect()]
+        self.assertTrue(self.wait_for(lambda: len(calls) == 2))
+        self.assertEqual([locked for _, locked in calls], [True, True])
+        self.assertLess(calls[0][0], calls[1][0])
+        # Exactly one session survives, the one registered last, and its
+        # heartbeats are kept.
+        acknowledged = []
+        for sequence, tls in enumerate(sessions, 1):
+            tls.settimeout(3)
+            try:
+                self.send_heartbeat(tls, sequence=sequence)
+                if self.reply(tls)[0] is FrameType.HEARTBEAT_ACK:
+                    acknowledged.append(tls)
+            except (PeerClosed, OSError, ssl.SSLError):
+                pass
+        self.assertEqual(len(acknowledged), 1)
+        self.assertEqual(server.registry.state(self.node), "online")
+
+    def test_a_trickled_frame_cannot_hold_the_session(self):
+        # PR #401 Codex review: one byte per receive must not keep the frame
+        # read (and with it the ledger re-check and rate charge) waiting.
+        server = self.serve(idle_timeout_seconds=1)
+        tls = self.connect()
+        frame = encode_frame(FrameType.HEARTBEAT, heartbeat(self.node))
+        started = time.monotonic()
+        tls.settimeout(4)
+        with self.assertRaises((PeerClosed, OSError, ssl.SSLError)):
+            for byte in frame:
+                tls.sendall(bytes([byte]))
+                time.sleep(0.3)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertTrue(self.wait_for(lambda: "idle_timeout" in server.last_close_reasons()))
+
     def test_frames_beyond_the_rate_are_refused(self):
         self.serve(frames_per_second=2)
         tls = self.connect()

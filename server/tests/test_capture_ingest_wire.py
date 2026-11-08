@@ -2,10 +2,13 @@
 
 Synthetic only: no real host, address, credential or media.
 """
+from contextlib import suppress
 import json
 from pathlib import Path
 import socket
 import struct
+import threading
+import time
 import unittest
 from uuid import uuid4
 
@@ -71,6 +74,44 @@ class FrameTests(unittest.TestCase):
         with self.assertRaises(WireRefused) as refused:
             read_frame(right, 1024)
         self.assertEqual(refused.exception.reason, "frame_type_refused")
+
+    def test_a_trickled_frame_ends_at_its_one_deadline(self):
+        # PR #401 Codex review: a byte per receive must not keep a frame open.
+        left, right = self.pair()
+        frame = encode_frame(FrameType.HEARTBEAT, {"a": 1})
+        stop = threading.Event()
+
+        def trickle():
+            for byte in frame:
+                if stop.wait(0.15):
+                    return
+                with suppress(OSError):
+                    left.sendall(bytes([byte]))
+
+        sender = threading.Thread(target=trickle)
+        sender.start()
+        self.addCleanup(sender.join)
+        self.addCleanup(stop.set)
+        started = time.monotonic()
+        with self.assertRaises(socket.timeout):
+            read_frame(right, 1024, deadline=started + 0.6)
+        self.assertLess(time.monotonic() - started, 1.2)
+
+    def test_a_stalled_frame_ends_at_its_deadline_not_the_socket_timeout(self):
+        # Each receive is capped to what is left of the deadline.
+        left, right = self.pair()
+        right.settimeout(10)
+        left.sendall(b"\x00\x00")
+        started = time.monotonic()
+        with self.assertRaises(socket.timeout):
+            read_frame(right, 1024, deadline=started + 0.5)
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_a_frame_within_its_deadline_is_read(self):
+        left, right = self.pair()
+        left.sendall(encode_frame(FrameType.HEARTBEAT, {"a": 1}))
+        self.assertIs(read_frame(right, 1024, deadline=time.monotonic() + 2).kind,
+                      FrameType.HEARTBEAT)
 
     def test_a_truncated_frame_is_peer_closed(self):
         left, right = self.pair()
@@ -185,6 +226,17 @@ class NodeHealthTests(unittest.TestCase):
         self.registry.disconnected(node, 1)
         self.assertEqual(self.registry.snapshot().connected_nodes, 1)
         self.assertTrue(self.beat(node, 2))
+
+    def test_an_older_generation_never_replaces_a_newer(self):
+        # PR #401 Codex review: a late registration of an older session must
+        # not overwrite the newer one, whose heartbeats then keep working.
+        node = uuid4()
+        self.assertTrue(self.registry.connected(node, 2))
+        self.assertFalse(self.registry.connected(node, 1))
+        self.assertFalse(self.registry.connected(node, 2))
+        self.assertTrue(self.beat(node, 2))
+        self.assertFalse(self.beat(node, 1))
+        self.assertEqual(self.registry.state(node), "online")
 
     def test_the_table_is_bounded(self):
         first, second, third = uuid4(), uuid4(), uuid4()
