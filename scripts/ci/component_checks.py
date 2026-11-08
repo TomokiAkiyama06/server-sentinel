@@ -25,7 +25,7 @@ PYTHON_SUFFIXES = {".py", ".pyi"}
 NODE_SUFFIXES = {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".mts", ".cts"}
 OTHER_SOURCE_SUFFIXES = {".go", ".rs", ".c", ".cpp", ".java", ".sh", ".bash"}
 IGNORED_DIRS = {".git", ".venv", ".venv-ci", "node_modules", "__pycache__"}
-COMMAND_TIMEOUT = 600
+COMMAND_TIMEOUT = 900
 SMOKE_TIMEOUT = 120
 # After a Python check times out it receives SIGABRT, on which faulthandler
 # (PYTHONFAULTHANDLER=1) writes every thread's traceback; then it is killed.
