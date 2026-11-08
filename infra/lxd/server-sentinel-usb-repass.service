@@ -1,0 +1,40 @@
+# LXD host only (Issue #301 item 1): re-pass a serial-identified USB camera the
+# host re-enumerated to the ServerSentinel VM. Started by the udev rule on a
+# USB add and by the timer. Runs as root on the host because it changes the
+# LXD instance; ServerSentinel and media-capture-agent get no root for it.
+[Unit]
+Description=ServerSentinel host USB camera re-pass to the LXD VM
+After=snap.lxd.daemon.service
+ConditionPathExists=/etc/server-sentinel-usb-repass.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -S /usr/local/lib/server-sentinel-usb-repass/usb_repass.py --config /etc/server-sentinel-usb-repass.json
+StateDirectory=server-sentinel-usb-repass
+StateDirectoryMode=0700
+TimeoutStartSec=300
+# Reads /proc/<qemu pid>/fd (CAP_SYS_PTRACE) and sysfs; talks to the LXD unix
+# socket only. No network, no other capability.
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+MemoryMax=128M
