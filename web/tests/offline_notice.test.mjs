@@ -19,7 +19,7 @@ const json = (value, status = 200) => new Response(JSON.stringify(value), { stat
 const signal = () => new AbortController().signal;
 const render = (element) => renderToStaticMarkup(element).replaceAll('&#x27;', "'").replaceAll('&quot;', '"');
 const KEYS = ['cameraOfflineUnnotifiedTitle', 'cameraOfflineUnnotified', 'cameraOfflineUnnotifiedHint',
-  'cameraOfflineNoticeUnavailable'];
+  'cameraOfflineDeliveryFailed', 'cameraOfflineDeliveryFailedHint', 'cameraOfflineNoticeUnavailable'];
 
 function fake(routes) {
   const calls = [];
@@ -44,13 +44,20 @@ async function signedIn(routes = {}) {
 
 const rejectsWith = (promise, code) => assert.rejects(promise, error => error instanceof ApiError && error.code === code);
 
-test('the notice decodes exactly one boolean and fails closed on anything else', () => {
-  assert.equal(parseCameraOfflineNotice({ offline_unnotified: true }), true);
-  assert.equal(parseCameraOfflineNotice({ offline_unnotified: false }), false);
-  // Only the documented field is read.
-  assert.equal(parseCameraOfflineNotice({ offline_unnotified: true, source_id: 'x', slack: 'y' }), true);
+test('the notice decodes one boolean and one fixed cause and fails closed on anything else', () => {
+  assert.equal(parseCameraOfflineNotice({ offline_unnotified: true, cause: 'not_configured' }), 'not_configured');
+  assert.equal(parseCameraOfflineNotice({ offline_unnotified: true, cause: 'delivery_failed' }), 'delivery_failed');
+  assert.equal(parseCameraOfflineNotice({ offline_unnotified: false, cause: null }), null);
+  // Only the documented fields are read.
+  assert.equal(parseCameraOfflineNotice({ offline_unnotified: true, cause: 'delivery_failed', source_id: 'x',
+    slack: 'y' }), 'delivery_failed');
   for (const body of [null, [], 'true', true, {}, { offline_unnotified: null }, { offline_unnotified: 0 },
-    { offline_unnotified: 1 }, { offline_unnotified: 'false' }, { offline_unnotified: [] }, { unnotified: true }]) {
+    { offline_unnotified: 1 }, { offline_unnotified: 'false' }, { offline_unnotified: [] }, { unnotified: true },
+    // Issue #394: the cause must match the boolean and be one of two words.
+    { offline_unnotified: true }, { offline_unnotified: false }, { offline_unnotified: true, cause: null },
+    { offline_unnotified: false, cause: 'not_configured' }, { offline_unnotified: true, cause: 'failed' },
+    { offline_unnotified: true, cause: 'notified' }, { offline_unnotified: true, cause: '' },
+    { offline_unnotified: true, cause: 1 }, { offline_unnotified: true, cause: ['delivery_failed'] }]) {
     assert.throws(() => parseCameraOfflineNotice(body),
       error => error instanceof ApiError && error.code === 'invalid_response', JSON.stringify(body));
   }
@@ -59,8 +66,8 @@ test('the notice decodes exactly one boolean and fails closed on anything else',
 test('the provider reads the Owner route same-origin without CSRF and maps refusals', async () => {
   const route = `GET ${CAMERA_OFFLINE_NOTICE_PATH}`;
   assert.equal(CAMERA_OFFLINE_NOTICE_PATH, '/api/monitoring/camera-offline');
-  const { services, calls } = await signedIn({ [route]: json({ offline_unnotified: true }) });
-  assert.equal(await services.loadCameraOfflineNotice(signal()), true);
+  const { services, calls } = await signedIn({ [route]: json({ offline_unnotified: true, cause: 'not_configured' }) });
+  assert.equal(await services.loadCameraOfflineNotice(signal()), 'not_configured');
   const call = calls.find(item => item.key === route);
   assert.equal(call.url.search, '');
   assert.equal(call.init.credentials, 'same-origin');
@@ -76,7 +83,7 @@ test('the provider reads the Owner route same-origin without CSRF and maps refus
     'unavailable');
   await rejectsWith((await signedIn({ [route]: json({ offline_unnotified: 'true' }) }))
     .services.loadCameraOfflineNotice(signal()), 'invalid_response');
-  await rejectsWith((await signedIn({ [route]: new Response('{"offline_unnotified":true}',
+  await rejectsWith((await signedIn({ [route]: new Response('{"offline_unnotified":true,"cause":"not_configured"}',
     { status: 200, headers: { 'Content-Type': 'text/plain' } }) })).services.loadCameraOfflineNotice(signal()),
   'invalid_response');
 });
@@ -84,13 +91,23 @@ test('the provider reads the Owner route same-origin without CSRF and maps refus
 test('the notice is shown only for an unnotified offline, and a failed check is said so', () => {
   for (const locale of ['ja', 'en']) {
     const t = messages[locale];
-    const shown = render(createElement(CameraOfflineNotice, { t, notice: { state: 'ready', unnotified: true } }));
+    const shown = render(createElement(CameraOfflineNotice, { t, notice: { state: 'ready', cause: 'not_configured' } }));
     assert.match(shown, /role="alert"/);
     assert.match(shown, /data-camera-offline-unnotified="true"/);
+    assert.match(shown, /data-camera-offline-cause="not_configured"/);
     for (const key of ['cameraOfflineUnnotifiedTitle', 'cameraOfflineUnnotified', 'cameraOfflineUnnotifiedHint']) {
       assert.ok(shown.includes(t[key]), `${locale} ${key}`);
     }
-    assert.equal(render(createElement(CameraOfflineNotice, { t, notice: { state: 'ready', unnotified: false } })), '');
+    assert.ok(!shown.includes(t.cameraOfflineDeliveryFailed));
+    // Issue #394: Slack configured, the latest delivery did not reach it.
+    const failed = render(createElement(CameraOfflineNotice, { t, notice: { state: 'ready', cause: 'delivery_failed' } }));
+    assert.match(failed, /role="alert"/);
+    assert.match(failed, /data-camera-offline-cause="delivery_failed"/);
+    for (const key of ['cameraOfflineUnnotifiedTitle', 'cameraOfflineDeliveryFailed', 'cameraOfflineDeliveryFailedHint']) {
+      assert.ok(failed.includes(t[key]), `${locale} ${key}`);
+    }
+    assert.ok(!failed.includes(t.cameraOfflineUnnotified));
+    assert.equal(render(createElement(CameraOfflineNotice, { t, notice: { state: 'ready', cause: null } })), '');
     for (const state of ['pending', 'loading']) {
       assert.equal(render(createElement(CameraOfflineNotice, { t, notice: { state } })), '');
     }
@@ -110,6 +127,12 @@ test('every notice text exists in both locales and states facts only', () => {
     }
   }
   assert.match(messages.ja.cameraOfflineUnnotified, /通知先（Slack）が未設定/);
+  // Issue #394: configured, but the latest notification did not reach Slack.
+  assert.match(messages.ja.cameraOfflineDeliveryFailed, /設定されていますが、最後のカメラのオフラインの通知は Slack に届きませんでした/);
+  assert.match(messages.en.cameraOfflineDeliveryFailed, /is configured, but the latest camera offline notification did not reach Slack/);
+  for (const locale of ['ja', 'en']) {
+    assert.doesNotMatch(messages[locale].cameraOfflineDeliveryFailed, /管理者|\bOwner\b|hooks\.slack|https?:/);
+  }
   assert.match(messages.en.cameraOfflineUnnotified, /No notification destination \(Slack\) is configured/);
   // The reader is the Owner: the text says what does not leave this screen,
   // not that "the administrator" is not told (PR #388 review).
@@ -146,7 +169,7 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 
 test('sampling reports each answer, refreshes after it, and a failure is reported as failed', async () => {
   assert.equal(CAMERA_OFFLINE_NOTICE_REFRESH_MS, 60000);
-  const answers = [true, new Error('synthetic'), false];
+  const answers = ['delivery_failed', new Error('synthetic'), null];
   const reports = [];
   const timers = manualTimers();
   let loads = 0;
@@ -157,14 +180,14 @@ test('sampling reports each answer, refreshes after it, and a failure is reporte
     return answer;
   }, next => reports.push(next), { timers });
   await settle();
-  assert.deepEqual(reports, [{ state: 'ready', unnotified: true }]);
+  assert.deepEqual(reports, [{ state: 'ready', cause: 'delivery_failed' }]);
   assert.equal([...timers.pending.values()][0].ms, CAMERA_OFFLINE_NOTICE_REFRESH_MS);
   timers.fire();
   await settle();
   assert.deepEqual(reports.at(-1), { state: 'failed' });
   timers.fire();
   await settle();
-  assert.deepEqual(reports.at(-1), { state: 'ready', unnotified: false });
+  assert.deepEqual(reports.at(-1), { state: 'ready', cause: null });
   assert.equal(loads, 3);
   stop();
   assert.equal(timers.pending.size, 0);
@@ -181,7 +204,7 @@ test('nothing is reported or scheduled after stop, even for a sample in flight',
   }, next => reports.push(next), { timers });
   stop();
   assert.equal(seen.aborted, true);
-  release(true);
+  release('not_configured');
   await settle();
   assert.deepEqual(reports, []);
   assert.equal(timers.pending.size, 0);

@@ -1924,15 +1924,32 @@ kind. A restored `pending` row is resent with the plain text, since the row
 does not record whether its outage had recovered. `MonitoringStatus`
 reports `camera_offline_degraded` (counted as degraded in the daily summary)
 and `camera_offline_notifications`, false without a configured Slack endpoint
-(the local row is then `disabled`). Their conjunction
-`camera_offline_unnotified` (`camera_offline_degraded` and not
-`camera_offline_notifications`) reaches the Owner's dashboard (Issue #301
-item 2, REQUIREMENTS NOTIFY-002: disabling Slack does not suppress the UI
-fault report):
+(the local row is then `disabled`), and `camera_offline_delivery_failing`:
+Slack is configured but the latest final Slack outcome of a `camera_offline`
+delivery is `failed` (Issue #394). There is no automatic resend, so such an
+alert never reaches the Owner; a failure that a later `camera_offline`
+delivery overcame (a submission the queue refused and the next drain sent,
+or the next alert sent) no longer counts, and an outcome of another kind
+changes nothing. A restarted process restores it at its first running tick
+from the newest final (`sent` / `failed`) confirmed `camera_offline` row
+whose event time is less than 24 h old, unless this process already had a
+`camera_offline` outcome. They combine into one fixed word,
+`camera_offline_cause`: `not_configured` (a current condition,
+`camera_offline_degraded`, and not `camera_offline_notifications`),
+`delivery_failed` (a current condition, Slack configured and
+`camera_offline_delivery_failing`) or `notified`; `camera_offline_unnotified`
+is "not `notified`". It reaches the Owner's dashboard (Issue #301 item 2,
+Issue #394, REQUIREMENTS NOTIFY-002: disabling Slack, or Slack failing, does
+not suppress the UI fault report):
 
 ```text
-GET /api/monitoring/camera-offline -> OWNER_READ: 200 {"offline_unnotified": <bool>}
+GET /api/monitoring/camera-offline -> OWNER_READ:
+  200 {"offline_unnotified": <bool>, "cause": "not_configured" | "delivery_failed" | null}
 ```
+
+The notice is tied to a current condition: once the camera recovers (and an
+alerted flapping period closed) it is no longer shown, even if its alert
+never reached Slack; the Live screen and the local `failed` row remain.
 
 mounted only when a monitoring runtime and a camera offline monitor exist,
 i.e. with configured `local_uvc` sources (otherwise, like every other
@@ -1942,11 +1959,11 @@ now, is never told a guessed `false`). The read runs inside `admit` of the
 authorization's epoch after the Owner session was read again, commits no
 idle touch (`touch=False`: the Web's background poll must not keep an
 unattended session alive past its idle limit, Codex PR #388), takes no query
-and returns one boolean only: no source id, name, count, time, reason or
-notification setting value. A non-Owner session (`live:view` or
+and returns one boolean and one fixed word only: no source id, name, count,
+time, error or notification setting value. A non-Owner session (`live:view` or
 `recordings:view` alike) gets the generic denial, so the notification
-configuration stays Owner-only. A reader failure or a non-boolean value is
-the generic denial, never a guessed `false`. The Web shows it for an Owner
+configuration stays Owner-only. A reader failure or a value outside the three
+words is the generic denial, never a guessed `false`. The Web shows it for an Owner
 session on every screen (`web/src/dashboard/offline_notice.tsx`), sampled
 once the session is loaded and every 60 s after each answer; the parser accepts only a JSON boolean,
 and a failed check is shown as "could not be checked", not as nothing to

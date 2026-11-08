@@ -112,11 +112,15 @@ WebSocket and error path gets the same generic denial):
 - the Owner's camera offline notice (Issue #301 item 2), mounted only when
   the embedder attached its reader (``HumanAccess.attach_camera_offline_notice``;
   otherwise the generic denial): ``GET /api/monitoring/camera-offline``
-  (``OWNER_READ``) answers ``200 {"offline_unnotified": <bool>}``, true while
-  a camera source has stayed not online past the deployment threshold (or
-  is in an alerted flapping period) and no notification destination (Slack)
-  is configured, so the Owner is not notified outside the dashboard. One
-  boolean: no source id, name, count, time, reason or setting value. The
+  (``OWNER_READ``) answers ``200 {"offline_unnotified": <bool>, "cause":
+  <word or null>}``. ``offline_unnotified`` is true while a camera source
+  has stayed not online past the deployment threshold (or is in an alerted
+  flapping period) and the Owner is not notified outside the dashboard:
+  ``cause`` is then ``"not_configured"`` (no notification destination,
+  Slack) or ``"delivery_failed"`` (Slack is configured but the latest camera
+  offline delivery did not reach it, Issue #394), otherwise ``null``. One
+  boolean and one fixed word: no source id, name, count, time, error or
+  setting value. The
   Web polls it in the background, so it never extends the session's idle
   expiry (``touch=False``, Codex PR #388).
 
@@ -256,6 +260,8 @@ SCENE_CALIBRATION_PATH = "/api/scene/calibration"
 SCENE_SOURCES_PATH = "/api/scene/sources"
 # Issue #301 item 2: the Owner's camera offline notice.
 CAMERA_OFFLINE_NOTICE_PATH = "/api/monitoring/camera-offline"
+# The reader's closed set of words (`MonitoringStatus.camera_offline_cause`).
+_CAMERA_OFFLINE_CAUSES = frozenset({"notified", "not_configured", "delivery_failed"})
 MAX_CALIBRATE_BODY = 128
 MAX_LIVE_OPEN_BODY = 128
 MAX_OPTIONS_BODY = 1024
@@ -880,9 +886,11 @@ class HumanAccess:
     def attach_camera_offline_notice(self, read: Callable[[], bool]) -> None:
         """Mount the Owner's camera offline notice route over ``read`` (#301).
 
-        ``read()`` answers whether a camera offline condition the Owner would
-        be notified of is current while no notification destination is
-        configured (``MonitoringStatus.camera_offline_unnotified``). It must
+        ``read()`` answers one fixed word (``MonitoringStatus.camera_offline_cause``):
+        ``"notified"``, ``"not_configured"`` (a current camera offline
+        condition reaches no notification destination) or
+        ``"delivery_failed"`` (Slack is configured but the latest camera
+        offline delivery did not reach it, Issue #394). It must
         be quick and never block: it runs on a worker thread inside ``admit``
         of the authorization's epoch. Attached once; another reader is
         refused.
@@ -1829,9 +1837,10 @@ class HumanSurface:
 
         Read inside ``admit`` of the authorization's epoch after the Owner
         session was read again (``require_owner_read_session``), like the
-        scene calibration status. ``200 {"offline_unnotified": <bool>}``.
-        Anything but a ``bool`` from the reader, or a reader failure, is the
-        generic denial, never a guessed ``false``.
+        scene calibration status. ``200 {"offline_unnotified": <bool>,
+        "cause": "not_configured" | "delivery_failed" | null}``. Anything but
+        one of the three fixed words from the reader, or a reader failure, is
+        the generic denial, never a guessed ``false``.
 
         Authorized with ``touch=False`` (Codex PR #388 P1): the Web samples
         this route every 60 s without user interaction, so a read must never
@@ -1853,9 +1862,11 @@ class HumanSurface:
             value = await asyncio.to_thread(answer)
         except Exception:
             raise _Denied() from None
-        if type(value) is not bool:
+        if type(value) is not str or value not in _CAMERA_OFFLINE_CAUSES:
             raise _Denied()
-        await self._json(request.send, 200, {"offline_unnotified": value})
+        cause = None if value == "notified" else value
+        await self._json(request.send, 200, {"offline_unnotified": cause is not None,
+                                             "cause": cause})
 
     async def _scene_calibrate(self, request: _Request) -> None:
         """``POST /api/scene/sources/<source>/calibration`` (``OWNER_OP``, CSRF).

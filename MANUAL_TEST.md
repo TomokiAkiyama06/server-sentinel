@@ -2647,6 +2647,14 @@ outside ServerSentinel and not part of this check.
   desktop, in ja and en; a `live:view`-only and a `recordings:view`-only
   viewer see no such notice, and their `GET /api/monitoring/camera-offline`
   is the generic not-found response (browser devtools);
+- [ ] (Issue #394, mock-verified only) with Slack configured but its
+  delivery failing (a temporary webhook URL Slack rejects, or the Main
+  Server's outbound HTTPS blocked; restored afterwards): the `camera_offline`
+  row is `failed` and within one minute after `after_seconds` (+ one tick)
+  the Owner's dashboard shows the same title with the "Slack に届きませんでした"
+  / "did not reach Slack" text; restart the service while the camera is still
+  out: the notice stays; restore delivery and let a later outage's alert be
+  sent: the notice is gone at about the next tick;
 - [ ] the notice names no camera, shows no setting value, and claims no
   cause;
 - [ ] recover with the documented `lxc config device remove` / `add` of that

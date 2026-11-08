@@ -181,6 +181,45 @@ class NotificationService:
         self.last_delivery = DeliveryResult.DISABLED
         self.local_delivery_failed = False
         self.delivery_failed = False
+        # Issue #394: the latest final Slack outcome (`sent` / `failed`) per
+        # kind, so a kind whose last delivery did not reach Slack is told
+        # apart from one whose failure a later delivery (a retry) overcame.
+        self._latest_outcome: dict[NotificationKind, DeliveryResult] = {}
+
+    def _note_outcome(self, kind: NotificationKind, result: DeliveryResult) -> None:
+        if result in (DeliveryResult.SENT, DeliveryResult.FAILED):
+            self._latest_outcome[kind] = result
+
+    def _collect_results(self) -> None:
+        """Take the worker's finished deliveries, in their completion order.
+
+        Each outcome is noted once here (Issue #394), whether or not its row
+        is written later: a refused local write retried on a later poll never
+        notes an older outcome again over a newer one.
+        """
+        for identifier, result in self._worker.results():
+            entry = self._pending[identifier]
+            entry[2] = result
+            self._note_outcome(entry[0].kind, result)
+
+    def delivery_failing(self, kind: NotificationKind) -> bool:
+        """Whether the latest final Slack outcome of ``kind`` is `failed` (#394).
+
+        A failure a later delivery of the same kind overcame (a retry of a
+        submission the queue refused, the next notification) is no longer
+        failing; `disabled` and `suppressed` change nothing. Value-free.
+        """
+        return self._latest_outcome.get(kind) == DeliveryResult.FAILED
+
+    def seed_delivery_failing(self, kind: NotificationKind) -> None:
+        """Issue #394: a stored `failed` row of an earlier process (restart).
+
+        Only when this process has no outcome of ``kind`` yet, so a delivery
+        this process already made is never overridden by an older row.
+        """
+        if not isinstance(kind, NotificationKind):
+            raise ValueError("invalid notification kind")
+        self._latest_outcome.setdefault(kind, DeliveryResult.FAILED)
 
     @property
     def pending_count(self) -> int:
@@ -290,6 +329,7 @@ class NotificationService:
             prior = self._pending[event.event_id][0]
             if (event.kind, event.at, event.confirmed) != (prior.kind, prior.at, prior.confirmed):
                 self.delivery_failed = True
+                self._note_outcome(event.kind, DeliveryResult.FAILED)
                 return DeliveryResult.FAILED
             # A coalesced resubmission (for example an Owner requeue, which
             # starts a new presence claim generation) is told the outcome of
@@ -302,6 +342,7 @@ class NotificationService:
         elif self.closed or len(self._pending) >= self._capacity:
             result = DeliveryResult.FAILED
             self.delivery_failed = True
+            self._note_outcome(event.kind, result)
         else:
             result = DeliveryResult.PENDING
         event = replace(event, delivery=result)
@@ -318,6 +359,7 @@ class NotificationService:
             except Exception:
                 self._pending[event.event_id][2] = DeliveryResult.FAILED
                 self.delivery_failed = True
+                self._note_outcome(event.kind, DeliveryResult.FAILED)
                 self.poll()
                 return DeliveryResult.FAILED
         return result
@@ -334,8 +376,7 @@ class NotificationService:
         past = ((lambda: False) if deadline is None
                 else (lambda: time.monotonic() >= deadline))
         self._flush_unpersisted(past)
-        for identifier, result in self._worker.results():
-            self._pending[identifier][2] = result
+        self._collect_results()
         completed = []
         for identifier, (event, callbacks, result) in tuple(self._pending.items()):
             if result is None:
@@ -396,8 +437,7 @@ class NotificationService:
         `local_delivery_failed` and raises nothing.
         """
         self._check()
-        for identifier, result in self._worker.results():
-            self._pending[identifier][2] = result
+        self._collect_results()
         finished = [(identifier, replace(event, delivery=result))
                     for identifier, (event, _callbacks, result) in self._pending.items()
                     if result is not None]

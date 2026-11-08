@@ -80,7 +80,7 @@ async function scenario(name, { handlers: extra = () => ({}), verified = true, e
     'GET /api/scene/calibration': () => { state.statusLoads += 1; return json(200, status(state.calibrated)); },
     'GET /api/live/sources': () => json(200, { sources: [{ id: sourceId, name: '生成カメラ', health: 'online' }] }),
     // Issue #301: the Owner's camera offline notice, sampled after sign-in.
-    'GET /api/monitoring/camera-offline': () => json(200, { offline_unnotified: false }),
+    'GET /api/monitoring/camera-offline': () => json(200, { offline_unnotified: false, cause: null }),
     'POST /api/auth/step-up/options': () => {
       const challenge = b64(randomBytes(32));
       state.challenges.push(challenge);
@@ -248,7 +248,7 @@ try {
   await scenario('the Owner sees the camera offline notice on every screen, once per sign-in sample', {
     handlers: (json, _stepUp, state) => ({ 'GET /api/monitoring/camera-offline': () => {
       state.noticeLoads = (state.noticeLoads ?? 0) + 1;
-      return json(200, { offline_unnotified: true });
+      return json(200, { offline_unnotified: true, cause: 'not_configured' });
     } }),
   }, async ({ page, ui, requests, state }) => {
     await page.wait("Boolean(document.querySelector('[data-camera-offline-unnotified][role=alert]'))");

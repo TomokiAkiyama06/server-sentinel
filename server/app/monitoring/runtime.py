@@ -207,6 +207,10 @@ class MonitoringStatus:
     # store: False without a configured Slack endpoint (the local row is then
     # `disabled`) or without a camera offline monitor.
     camera_offline_notifications: bool = False
+    # Issue #394: Slack is configured but the latest `camera_offline`
+    # delivery did not reach it (its final outcome is `failed`); a failure a
+    # later delivery overcame (a retry, the next alert) is not counted.
+    camera_offline_delivery_failing: bool = False
     # Issue #321: a recorded major/minor pair is stale while the approved
     # UUID, mount and root agree; storage stays admitted.
     recording_device_numbers_stale: bool = False
@@ -220,7 +224,33 @@ class MonitoringStatus:
         """Issue #301 item 2: a camera offline condition the Owner would be
         notified of is current, but no notification reaches the Owner outside
         the local store. The Owner's dashboard shows a notice instead."""
-        return self.camera_offline_degraded and not self.camera_offline_notifications
+        return self.camera_offline_cause != CAMERA_OFFLINE_NOTIFIED
+
+    @property
+    def camera_offline_cause(self) -> str:
+        """One fixed word for the Owner's notice (Issues #301, #394).
+
+        ``not_configured``: a current camera offline condition reaches no
+        notification destination (no Slack, or no camera offline monitor).
+        ``delivery_failed``: Slack is configured but the latest camera
+        offline delivery did not reach it. ``notified`` otherwise (no
+        current condition, or its notification reaches the Owner).
+        """
+        if not self.camera_offline_degraded:
+            return CAMERA_OFFLINE_NOTIFIED
+        if not self.camera_offline_notifications:
+            return CAMERA_OFFLINE_NOT_CONFIGURED
+        if self.camera_offline_delivery_failing:
+            return CAMERA_OFFLINE_DELIVERY_FAILED
+        return CAMERA_OFFLINE_NOTIFIED
+
+
+# The closed set of `MonitoringStatus.camera_offline_cause` words.
+CAMERA_OFFLINE_NOTIFIED = "notified"
+CAMERA_OFFLINE_NOT_CONFIGURED = "not_configured"
+CAMERA_OFFLINE_DELIVERY_FAILED = "delivery_failed"
+CAMERA_OFFLINE_CAUSES = frozenset({CAMERA_OFFLINE_NOTIFIED, CAMERA_OFFLINE_NOT_CONFIGURED,
+                                   CAMERA_OFFLINE_DELIVERY_FAILED})
 
 
 class RefuseUnvalidatedSegments:
@@ -1156,6 +1186,11 @@ class MonitoringRuntime:
                     monotonic=self.dependencies.monotonic())
                 rows, unrestored = self._camera_pending_rows(monitor.hourly_limit, now)
                 monitor.restore_pending(rows, unrestored=unrestored)
+                if self._camera_latest_failed(now):
+                    # Issue #394: the latest alert of an earlier process did
+                    # not reach Slack; it is not sent again (a final row),
+                    # so the Owner's notice must survive the restart.
+                    self.notifications.seed_delivery_failing(NotificationKind.CAMERA_OFFLINE)
                 # Issue #342 D/E: each source's initial episode is named once
                 # now, so it still matches a restored row of its outage after
                 # it recovered, or after it was sent while not running.
@@ -1170,7 +1205,9 @@ class MonitoringRuntime:
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
             return
         self._set(camera_offline_degraded=status.offline_sources > 0
-                  or status.flapping_sources > 0)
+                  or status.flapping_sources > 0,
+                  camera_offline_delivery_failing=self.notifications.delivery_failing(
+                      NotificationKind.CAMERA_OFFLINE))
 
     def _camera_flapping_event(self, source_id: UUID) -> tuple[UUID, bool | datetime] | None:
         """``(event ID, already notified)`` of a ratio (flapping) alert.
@@ -1322,6 +1359,35 @@ class MonitoringRuntime:
             cursor.close()
         found.sort(key=lambda row: row[1], reverse=True)
         return found[:limit], max(0, len(found) - limit)
+
+    def _camera_latest_failed(self, now: datetime) -> bool:
+        """Whether the newest final confirmed `camera_offline` row is `failed`.
+
+        Issue #394: rows with a final Slack outcome (`sent` / `failed`) whose
+        event time is less than ``CAMERA_OFFLINE_RENOTIFY_SECONDS`` (24 h)
+        old, newest by event time; an older outage is named anew after a day
+        (Issue #301). A row whose time cannot be read is skipped.
+        """
+        horizon = timedelta(seconds=CAMERA_OFFLINE_RENOTIFY_SECONDS)
+        cursor = self._connection.execute(
+            "SELECT at, delivery FROM notification_events "
+            "WHERE kind=? AND confirmed=1 AND delivery IN (?, ?)",
+            (NotificationKind.CAMERA_OFFLINE.value, DeliveryResult.SENT.value,
+             DeliveryResult.FAILED.value))
+        newest = None
+        try:
+            for at, delivery in cursor:
+                try:
+                    stamp = datetime.fromisoformat(at)
+                    if stamp.tzinfo is None:
+                        raise ValueError
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if now - stamp < horizon and (newest is None or stamp >= newest[0]):
+                    newest = (stamp, delivery)
+        finally:
+            cursor.close()
+        return newest is not None and newest[1] == DeliveryResult.FAILED.value
 
     def _latest_finding(self, *, since: datetime | None = None) -> tuple[str, int] | None:
         """``(id, occurred_at_us)`` of the newest finding audit record.
@@ -1509,7 +1575,9 @@ class MonitoringRuntime:
             return
         self.notifications.poll(deadline)
         self._set(notification_local_failed=self.notifications.local_delivery_failed,
-                  notification_delivery_failed=self.notifications.delivery_failed)
+                  notification_delivery_failed=self.notifications.delivery_failed,
+                  camera_offline_delivery_failing=self.notifications.delivery_failing(
+                      NotificationKind.CAMERA_OFFLINE))
 
     # -- presence critical notifications (Issue #26) -------------------------
 

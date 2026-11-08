@@ -43,7 +43,7 @@ from app.storage.schema import APPLICATION_MIGRATIONS
 
 from tests.test_monitoring_runtime import RuntimeFixture
 from tests.test_recording import SyntheticValidator
-from tests.test_storage_notifications import Transport, endpoint
+from tests.test_storage_notifications import Transport, drain as settle, endpoint
 from tests.test_uvc_runtime import FAST, PROFILE, CaptureFactory, Discovery, PermitOwner
 
 
@@ -1200,6 +1200,98 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
         self.advance(60)
         monitor.drain(service, at=AT, monotonic=self.clock.value)
         self.assertEqual(1, len(self.sent()))
+
+
+class DeliveryFailingTests(MonitorFixture, unittest.TestCase):
+    """Issue #394: the latest final Slack outcome per kind."""
+
+    def record(self):
+        result = self.service.record(NotificationKind.CAMERA_OFFLINE, at=AT, confirmed=True)
+        self.texts()
+        return result
+
+    def test_a_failed_delivery_is_failing_until_a_later_one_is_sent(self):
+        kind = NotificationKind.CAMERA_OFFLINE
+        self.assertFalse(self.service.delivery_failing(kind))
+        self.transport.error = OSError("synthetic")
+        self.record()
+        self.assertTrue(self.service.delivery_failing(kind))
+        # Another kind's outcome changes nothing for this one.
+        self.transport.error = None
+        self.service.record(NotificationKind.RECORDING_HEALTH_FAILURE, at=AT)
+        self.texts()
+        self.assertTrue(self.service.delivery_failing(kind))
+        self.assertFalse(self.service.delivery_failing(NotificationKind.RECORDING_HEALTH_FAILURE))
+        self.record()
+        self.assertFalse(self.service.delivery_failing(kind))
+
+    def test_a_queue_refusal_overcome_by_its_retry_is_not_failing(self):
+        kind = NotificationKind.CAMERA_OFFLINE
+        self.service.close()
+        closed = NotificationService(self.sink, SlackDelivery(endpoint(), opener=self.transport))
+        closed.closed = True
+        self.assertEqual(DeliveryResult.FAILED,
+                         closed.record(kind, at=AT, confirmed=True))
+        self.assertTrue(closed.delivery_failing(kind))
+        closed.closed = False
+        self.assertEqual(DeliveryResult.PENDING, closed.record(kind, at=AT, confirmed=True))
+        settle(self, closed)
+        self.assertFalse(closed.delivery_failing(kind))
+        closed.close()
+
+    def test_a_retried_local_write_never_brings_back_an_older_failure(self):
+        # The `failed` outcome of A cannot be written (its row is refused) and
+        # is retried on every poll; B is sent later. B's outcome stays the
+        # latest: the retry of A's write does not note A's failure again.
+        kind = NotificationKind.CAMERA_OFFLINE
+        refused = set()
+        rows = {}
+
+        def sink(event):
+            if event.event_id in refused and event.delivery is DeliveryResult.FAILED:
+                raise RuntimeError("synthetic STORAGE_HARD_STOP")
+            rows[event.event_id] = event
+
+        transport = Transport(error=OSError("synthetic"))
+        service = NotificationService(sink, SlackDelivery(endpoint(), opener=transport))
+        self.addCleanup(service.close)
+        first = uuid4()
+        refused.add(first)
+        service.record(kind, at=AT, confirmed=True, event_id=first)
+        self.assertTrue(service._worker.ready.wait(2))
+        service.poll()
+        self.assertTrue(service.delivery_failing(kind))
+        self.assertTrue(service.in_flight(first))
+        transport.error = None
+        service.record(kind, at=AT, confirmed=True)
+        for _ in range(200):
+            service.poll()
+            if service.pending_count == 1:
+                break
+            time.sleep(0.01)
+        self.assertEqual(1, service.pending_count)  # only A, still retried
+        for _ in range(3):
+            service.poll()
+        self.assertFalse(service.delivery_failing(kind))
+
+    def test_seed_never_overrides_an_outcome_of_this_process(self):
+        kind = NotificationKind.CAMERA_OFFLINE
+        self.record()
+        self.service.seed_delivery_failing(kind)
+        self.assertFalse(self.service.delivery_failing(kind))
+        fresh = NotificationService(self.sink, SlackDelivery(endpoint(), opener=self.transport))
+        self.addCleanup(fresh.close)
+        fresh.seed_delivery_failing(kind)
+        self.assertTrue(fresh.delivery_failing(kind))
+        with self.assertRaises(ValueError):
+            fresh.seed_delivery_failing("camera_offline")
+
+    def test_without_slack_nothing_is_failing(self):
+        kind = NotificationKind.CAMERA_OFFLINE
+        service = NotificationService(self.sink)
+        self.addCleanup(service.close)
+        self.assertEqual(DeliveryResult.DISABLED, service.record(kind, at=AT, confirmed=True))
+        self.assertFalse(service.delivery_failing(kind))
 
 
 class RuntimeSignalTests(MonitorFixture, unittest.TestCase):
@@ -2675,6 +2767,80 @@ class LifespanTests(RuntimeFixture):
                     await self.tick(runtime)
                 self.assertEqual([], self.slack_texts())
                 self.assertEqual([(1, delivery)], self.offline_rows())
+
+    async def test_a_failed_delivery_shows_the_notice_until_a_later_one_is_sent(self):
+        # Issue #394: Slack is configured but the alert did not reach it.
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.bring_online(application)
+            self.assertEqual("notified", runtime.status.camera_offline_cause)
+            self.transport.error = OSError("synthetic unreachable endpoint")
+            self.discovery.devices = []
+            self.assertTrue(await self.until(lambda: self.health() is SourceHealthState.OFFLINE))
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+            self.assertEqual([(1, "failed")], self.offline_rows())
+            self.assertTrue(runtime.status.camera_offline_notifications)
+            self.assertEqual("delivery_failed", runtime.status.camera_offline_cause)
+            self.assertTrue(runtime.status.camera_offline_unnotified)
+            # No automatic resend: it stays shown while the outage lasts.
+            self.transport.error = None
+            self.clock.advance(timedelta(minutes=30))
+            await self.tick(runtime)
+            self.assertEqual("delivery_failed", runtime.status.camera_offline_cause)
+            # The camera recovers: no current condition, nothing shown.
+            self.discovery.devices = [self.camera]
+            monitor = application.state.camera_offline
+            self.assertTrue(await self.until(lambda: self.health() is SourceHealthState.ONLINE))
+            self.assertTrue(await self.until(lambda: monitor._sources[self.source.id].online))
+            await self.tick(runtime)
+            self.assertEqual("notified", runtime.status.camera_offline_cause)
+            # A later outage whose alert is sent clears the failure.
+            self.clock.advance(timedelta(minutes=30))
+            self.discovery.devices = []
+            self.assertTrue(await self.until(lambda: self.health() is SourceHealthState.OFFLINE))
+            self.assertTrue(await self.until(lambda: not monitor._sources[self.source.id].online))
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+            self.assertTrue(runtime.status.camera_offline_degraded)
+            self.assertIn((1, "sent"), self.offline_rows())
+            self.assertEqual("notified", runtime.status.camera_offline_cause)
+
+    async def test_a_failed_row_of_an_earlier_process_keeps_the_notice(self):
+        # Issue #394: a final `failed` row is not sent again after a restart,
+        # so the notice is restored from it; a newer `sent` row clears it.
+        for rows, expected in ((("failed",), "delivery_failed"),
+                               (("sent",), "notified"),
+                               (("failed", "sent"), "notified"),
+                               (("sent", "failed"), "delivery_failed"),
+                               (("disabled",), "notified")):
+            with self.subTest(rows=rows):
+                self.delete_rows()
+                for index, delivery in enumerate(rows):
+                    self.stored_row(confirmed=True, delivery=delivery,
+                                    age=3600 - 600 * index,
+                                    event_id=self.chain_name() if index == len(rows) - 1 else None)
+                self.discovery.devices = []
+                application = self.uvc_application()
+                async with asyncio.timeout(60), application.router.lifespan_context(application):
+                    runtime = application.state.monitoring
+                    self.clock.advance(timedelta(seconds=301))
+                    await self.tick(runtime)
+                    self.assertTrue(runtime.status.camera_offline_degraded)
+                    self.assertEqual(expected, runtime.status.camera_offline_cause)
+                self.assertEqual([], self.slack_texts())
+
+    async def test_a_failed_row_older_than_a_day_is_not_restored(self):
+        self.stored_row(confirmed=True, delivery="failed", age=24 * 3600 + 60)
+        self.discovery.devices = []
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+            self.assertTrue(runtime.status.camera_offline_degraded)
+            self.assertEqual("notified", runtime.status.camera_offline_cause)
 
     async def test_a_pending_alert_of_a_recovered_outage_is_sent_again(self):
         # The outage ended while the service was down; the alert reached the

@@ -417,8 +417,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # without one nothing watches the cameras, so the route stays the
             # generic denial and the Web shows "could not be checked" rather
             # than a guessed false (Claude review, PR #388).
+            # Issue #394: also while Slack is configured but the latest
+            # camera offline delivery did not reach it; one fixed word.
             human_access.attach_camera_offline_notice(
-                lambda: monitoring_runtime.status.camera_offline_unnotified)
+                lambda: monitoring_runtime.status.camera_offline_cause)
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(
