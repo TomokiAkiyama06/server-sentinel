@@ -64,8 +64,10 @@ OPERATION_LIMIT_SECONDS = 60
 # Worst cases, derived (PR #399 review): a PUT is its GET, the PUT and polls
 # until OPERATION_LIMIT_SECONDS, the last poll starting just before it.
 PUT_WORST_SECONDS = 2 * REQUEST_TIMEOUT_SECONDS + OPERATION_LIMIT_SECONDS + REQUEST_TIMEOUT_SECONDS
-# A remove, and the re-read that decides an ambiguous failure.
-REMOVE_WORST_SECONDS = PUT_WORST_SECONDS + REQUEST_TIMEOUT_SECONDS
+# A remove, a second poll of its operation when it had not finished, and the
+# re-read that decides an ambiguous failure.
+REMOVE_WORST_SECONDS = (PUT_WORST_SECONDS + OPERATION_LIMIT_SECONDS + REQUEST_TIMEOUT_SECONDS
+                        + REQUEST_TIMEOUT_SECONDS)
 # Each add attempt reads the device first; one more read after the last.
 ADD_WORST_SECONDS = (ADD_ATTEMPTS * (REQUEST_TIMEOUT_SECONDS + PUT_WORST_SECONDS)
                      + (ADD_ATTEMPTS - 1) * ADD_RETRY_GAP_SECONDS + REQUEST_TIMEOUT_SECONDS)
@@ -77,7 +79,7 @@ VERIFY_WORST_SECONDS = SETTLE_SECONDS + VERIFY_SECONDS + 5.0
 # between a remove and its add. The unit's TimeoutStartSec is this plus
 # STARTUP_MARGIN_SECONDS (interpreter start, the first reads before the
 # first deadline check are inside the limit).
-RUN_LIMIT_SECONDS = 900
+RUN_LIMIT_SECONDS = 1200
 STARTUP_MARGIN_SECONDS = 60
 UNIT_TIMEOUT_SECONDS = RUN_LIMIT_SECONDS + STARTUP_MARGIN_SECONDS
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -90,6 +92,14 @@ PUT_KEYS = ("architecture", "config", "devices", "ephemeral", "profiles", "state
 
 class Failure(Exception):
     """A fixed, value-free reason."""
+
+
+class Uncertain(Failure):
+    """An update whose outcome is not known; `operation` is its LXD operation, if any."""
+
+    def __init__(self, reason, operation=None):
+        super().__init__(reason)
+        self.operation = operation
 
 
 def log(event, device=None):
@@ -129,17 +139,25 @@ class Lxd:
             connection.request(method, url, body=payload, headers=headers)
             response = connection.getresponse()
             data = json.loads(response.read() or b"{}")
-            return response.status, response.getheader("ETag"), data
+            status, tag = response.status, response.getheader("ETag")
         except (OSError, ValueError, http.client.HTTPException):
             raise Failure("usb_repass_lxd_unreachable") from None
         finally:
             connection.close()
+        # Any JSON that is not an object is refused with a fixed word
+        # (PR #399 review), never a traceback.
+        if not isinstance(data, dict):
+            raise Failure("usb_repass_lxd_invalid")
+        return status, tag, data
 
     def instance(self, name):
         status, etag, data = self.request("GET", f"/1.0/instances/{name}")
         if status != 200 or not isinstance(data.get("metadata"), dict):
             raise Failure("usb_repass_instance_unreadable")
-        return data["metadata"], etag
+        metadata = data["metadata"]
+        if not isinstance(metadata.get("devices", {}), dict):
+            raise Failure("usb_repass_instance_unreadable")
+        return metadata, etag
 
     def state(self, name):
         status, _, data = self.request("GET", f"/1.0/instances/{name}/state")
@@ -147,21 +165,51 @@ class Lxd:
             raise Failure("usb_repass_instance_unreadable")
         return data["metadata"]
 
+    def wait_operation(self, operation, limit=OPERATION_LIMIT_SECONDS):
+        """`Success`, `Failure` (a terminal state other than success) or None (not finished)."""
+        deadline = self.monotonic() + limit
+        while True:
+            wait = max(1, min(OPERATION_POLL_SECONDS, int(deadline - self.monotonic())))
+            try:
+                status, _, data = self.request("GET", f"{operation}/wait?timeout={wait}")
+            except Failure:
+                return None
+            metadata = data.get("metadata")
+            outcome = metadata.get("status") if isinstance(metadata, dict) else None
+            if status == 200 and outcome == "Success":
+                return "Success"
+            if status == 200 and outcome in ("Running", "Pending"):
+                if self.monotonic() < deadline:
+                    continue
+                return None
+            if status == 200 and isinstance(outcome, str):
+                return "Failure"
+            return None
+
     def put_devices(self, name, devices, require=None):
         """Replace the instance's own devices (fresh GET + ETag), wait for it.
 
         ``require`` sees the devices of that same GET; when it is false the
         instance changed since the caller's snapshot and nothing is sent
         (`usb_repass_changed`). An edit between the GET and the PUT makes LXD
-        refuse the PUT on the ETag (`usb_repass_update_refused`).
+        refuse the PUT on the ETag (`usb_repass_update_refused`); a GET
+        without an ETag sends nothing (`usb_repass_etag_missing`, PR #399
+        review). A failure whose outcome is not known (the PUT's answer was
+        lost, or its operation had not finished within the poll limit) is
+        `Uncertain` and carries the operation when one is known.
         """
         metadata, etag = self.instance(name)
+        if not etag:
+            raise Failure("usb_repass_etag_missing")
         current = dict(metadata.get("devices") or {})
         if require is not None and not require(current):
             raise Failure("usb_repass_changed")
         body = {key: metadata[key] for key in PUT_KEYS if key in metadata}
         body["devices"] = devices(current)
-        status, _, data = self.request("PUT", f"/1.0/instances/{name}", body, etag)
+        try:
+            status, _, data = self.request("PUT", f"/1.0/instances/{name}", body, etag)
+        except Failure:
+            raise Uncertain("usb_repass_update_unanswered") from None
         if status == 200 and data.get("type") == "sync":
             return
         operation = data.get("operation")
@@ -169,19 +217,12 @@ class Lxd:
             raise Failure("usb_repass_update_refused")
         # Polled until it finishes or OPERATION_LIMIT_SECONDS pass (PR #399
         # review): one wait that timed out is not a failed update.
-        deadline = self.monotonic() + OPERATION_LIMIT_SECONDS
-        while True:
-            wait = max(1, min(OPERATION_POLL_SECONDS, int(deadline - self.monotonic())))
-            status, _, data = self.request("GET", f"{operation}/wait?timeout={wait}")
-            metadata = data.get("metadata") if isinstance(data, dict) else None
-            outcome = metadata.get("status") if isinstance(metadata, dict) else None
-            if status == 200 and outcome == "Success":
-                return
-            if status == 200 and outcome in ("Running", "Pending"):
-                if self.monotonic() < deadline:
-                    continue
-                raise Failure("usb_repass_update_unfinished")
+        outcome = self.wait_operation(operation)
+        if outcome == "Success":
+            return
+        if outcome == "Failure":
             raise Failure("usb_repass_update_failed")
+        raise Uncertain("usb_repass_update_unfinished", operation)
 
 
 def load_config(path, owner=0):
@@ -332,7 +373,9 @@ class State:
             os.close(directory)
 
     def allowed(self, device, now):
-        times = [t for t in self.history.get(device, []) if now - t < 3600]
+        # A stamp in the future (the wall clock was stepped back) is dropped,
+        # not kept as a block (PR #399 review).
+        times = [t for t in self.history.get(device, []) if 0 <= now - t < 3600]
         self.history[device] = times
         return not times or (now - max(times) >= MIN_INTERVAL_SECONDS and len(times) < MAX_PER_HOUR)
 
@@ -421,10 +464,18 @@ def remove_device(lxd, instance, name, config):
     could not be read; the pending record restores it on a later run). An
     ambiguous failure is decided by reading the device again (PR #399 review).
     """
+    uncertain = False
     try:
         lxd.put_devices(instance, lambda d: {k: v for k, v in d.items() if k != name},
                         require=lambda d: d.get(name) == config)
         return "removed"
+    except Uncertain as error:
+        # The remove may still happen (PR #399 review): its operation is
+        # polled again; while its end is not known the device counts as
+        # possibly removed, so the pending record stays.
+        log(f"{error.args[0]} step=remove", name)
+        outcome = lxd.wait_operation(error.operation) if error.operation else None
+        uncertain = outcome is None
     except Failure as error:
         if error.args[0] == "usb_repass_changed":
             return "changed"
@@ -434,7 +485,9 @@ def remove_device(lxd, instance, name, config):
     except Failure as error:
         log(f"{error.args[0]} step=remove", name)
         return "unknown"
-    return {"absent": "removed", "same": "kept", "other": "changed"}[current]
+    if current == "same":
+        return "unknown" if uncertain else "kept"
+    return "removed" if current == "absent" else "changed"
 
 
 def run(config_path, state_dir, check=False, lxd_factory=Lxd, sleep=time.sleep, now=time.time,
@@ -535,14 +588,18 @@ def run(config_path, state_dir, check=False, lxd_factory=Lxd, sleep=time.sleep, 
             continue
         repassed.append(name)
     if repassed:
+        # Every configured camera that was held before is checked too
+        # (PR #399 review): a re-pass can reset its sibling.
+        siblings = [name for name in names if verdicts[name][0] == "held"]
+        watched = repassed + siblings
         sleep(SETTLE_SECONDS)
         deadline = monotonic() + VERIFY_SECONDS
         while True:
             nodes, held = host_nodes(sysfs), held_nodes(pid, proc)
-            verified = {name for name in repassed
+            verified = {name for name in watched
                         if len(nodes.get(identity(devices[name]), [])) == 1
                         and nodes[identity(devices[name])][0] in held}
-            if len(verified) == len(repassed) or monotonic() >= deadline:
+            if len(verified) == len(watched) or monotonic() >= deadline:
                 break
             sleep(1.0)
         for name in repassed:
@@ -551,6 +608,12 @@ def run(config_path, state_dir, check=False, lxd_factory=Lxd, sleep=time.sleep, 
             else:
                 # The unit fails, so `systemctl --failed` shows it (PR #399 review).
                 log("usb_repass_unverified", name)
+                failed = True
+        for name in siblings:
+            if name not in verified:
+                # Not re-passed again in this run (no back and forth); the
+                # next run (udev or the timer) judges it afresh.
+                log("usb_repass_sibling_lost", name)
                 failed = True
     return 1 if failed else 0
 

@@ -12,8 +12,8 @@ Type=oneshot
 ExecStart=/usr/bin/python3 -I -S /usr/local/lib/server-sentinel-usb-repass/usb_repass.py --config /etc/server-sentinel-usb-repass.json
 StateDirectory=server-sentinel-usb-repass
 StateDirectoryMode=0700
-# usb_repass.UNIT_TIMEOUT_SECONDS: RUN_LIMIT_SECONDS (900) + STARTUP_MARGIN_SECONDS (60).
-TimeoutStartSec=960
+# usb_repass.UNIT_TIMEOUT_SECONDS: RUN_LIMIT_SECONDS (1200) + STARTUP_MARGIN_SECONDS (60).
+TimeoutStartSec=1260
 # Reads /proc/<qemu pid>/fd (CAP_SYS_PTRACE) and sysfs; talks to the LXD unix
 # socket only. No network, no other capability.
 CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH

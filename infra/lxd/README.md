@@ -51,13 +51,23 @@ re-enumerating cannot make it loop. All cameras found not passed are
 re-passed in one pass and verified together afterwards (the two C960 reset
 each other), each counted once.
 
-A run ends within 900 s (`RUN_LIMIT_SECONDS`; the unit's `TimeoutStartSec=960`
-adds 60 s for the interpreter start). Each LXD request has a 30 s timeout and
-an operation is polled for up to 60 s, so a remove takes at most 180 s and an
-add (three attempts, each read first, and a final read) at most 574 s. A
-remove starts only while that remove, its add and the final verification
-(20 s) still fit (`usb_repass_deferred` otherwise; the timer runs again within
-about two minutes), so a run is never cut between a remove and its add.
+A run ends within 1200 s (`RUN_LIMIT_SECONDS`; the unit's
+`TimeoutStartSec=1260` adds 60 s for the interpreter start). Each LXD request
+has a 30 s timeout and an operation is polled for up to 60 s, so a remove
+takes at most 270 s (an operation not finished is polled once more, then the
+device is read again) and an add (three attempts, each read first, and a
+final read) at most 574 s. A remove starts only while that remove, its add
+and the final verification (20 s) still fit (`usb_repass_deferred` otherwise;
+the timer runs again within about two minutes), so a run is never cut between
+a remove and its add. A remove whose outcome stays unknown (its operation
+still running, or its answer lost) keeps the pending record and fails the
+unit; the next run restores the device if it is gone. A missing ETag or an
+answer that is not a JSON object sends nothing (`usb_repass_etag_missing`,
+`usb_repass_lxd_invalid`). After a re-pass, every configured camera that was
+held before is checked again; one no longer held is reported
+(`usb_repass_sibling_lost`, the unit fails) and judged afresh by the next run.
+Re-pass times in the state that lie in the future (the wall clock was set
+back) are dropped.
 
 Triggers: `90-server-sentinel-usb-repass.rules` starts
 `server-sentinel-usb-repass.service` on every USB device add (the service
