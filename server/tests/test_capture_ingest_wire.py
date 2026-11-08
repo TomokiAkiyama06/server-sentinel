@@ -238,6 +238,15 @@ class NodeHealthTests(unittest.TestCase):
         self.assertFalse(self.beat(node, 1))
         self.assertEqual(self.registry.state(node), "online")
 
+    def test_forgetting_one_generation_keeps_a_newer_one(self):
+        node = uuid4()
+        self.registry.connected(node, 1)
+        self.registry.connected(node, 2)
+        self.assertFalse(self.registry.forget(node, 1))
+        self.assertTrue(self.beat(node, 2))
+        self.assertTrue(self.registry.forget(node, 2))
+        self.assertIsNone(self.registry.state(node))
+
     def test_the_table_is_bounded(self):
         first, second, third = uuid4(), uuid4(), uuid4()
         self.assertTrue(self.registry.connected(first, 1))

@@ -365,8 +365,7 @@ class CaptureIngestServer:
                 except Exception:
                     revoked = False
                 if revoked:
-                    self.registry.forget(node)
-                    self._rate.forget_revoked_node(node)
+                    self._forget_revoked(node, generation)
             with self._lock:
                 self._closed += 1
             # Value-free (`app.logging`): an ordinary end, or a refusal of
@@ -376,6 +375,24 @@ class CaptureIngestServer:
                         else Event.CAPTURE_INGEST_SESSION_REFUSED)
             with self._lock:
                 self._reasons.append(reason)
+
+    def _forget_revoked(self, node: UUID, generation: int) -> None:
+        """Forget this session's health entry after its credential stopped being admitted.
+
+        Only this generation's entry, and only while no newer session of the
+        node is live: a renewed certificate also makes the old one no longer
+        admitted, and its newer session must keep its health (PR #401
+        review). Done under this lock, where a newer session registers, so a
+        registration cannot slip in between the check and the removal. The
+        rate window is not dropped here: it belongs to the node, a newer
+        session may be using it, and an unused window expires on its own and
+        is reclaimed when the table needs room (`AgentIngestQueue`).
+        """
+        with self._lock:
+            current = self._live.get(node)
+            if current is not None and current[0] != generation:
+                return
+            self.registry.forget(node, generation)
 
     def _end(self, node: UUID, generation: int) -> None:
         with self._lock:
@@ -424,8 +441,7 @@ class CaptureIngestServer:
             # The ledger's current record decides every frame (Issue #13):
             # a revocation committed since the last frame ends the session.
             if not session.still_admitted():
-                self.registry.forget(node)
-                self._rate.forget_revoked_node(node)
+                self._forget_revoked(node, generation)
                 return "not_admitted"
             refusal = self._rate.charge_attempt(node)
             if refusal is not None:

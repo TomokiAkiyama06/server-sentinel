@@ -105,9 +105,21 @@ class CaptureNodeHealthRegistry:
             if entry is not None and entry.generation == generation:
                 entry.connected = False
 
-    def forget(self, node_id: UUID) -> None:
+    def forget(self, node_id: UUID, generation: int | None = None) -> bool:
+        """Forget a node; with ``generation``, only that session's entry.
+
+        A revocation found when a session ends must not remove a newer
+        session of the same node registered meanwhile (a renewed certificate
+        also makes the old one no longer admitted; PR #401 review), so the
+        listener passes the ending session's generation. Returns whether an
+        entry was removed.
+        """
         with self._lock:
-            self._nodes.pop(node_id, None)
+            entry = self._nodes.get(node_id)
+            if entry is None or (generation is not None and entry.generation != generation):
+                return False
+            del self._nodes[node_id]
+            return True
 
     def state(self, node_id: UUID) -> str | None:
         """The node's §5.8 state, or None for an unknown (or revoked) node."""

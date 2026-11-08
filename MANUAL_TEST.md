@@ -1044,6 +1044,10 @@ synthetic heartbeats with the node's real credential (never commit it).
 Record addresses, node UUIDs and certificate details only in the private
 local record.
 
+- [ ] before deploying this release to a capture host: its Agent
+  configuration's `heartbeat_seconds` is 5 or less (Issue #14 heartbeat
+  contract); a larger value is now refused by the Agent's `--check` and
+  start, so run `--check` with the existing configuration first;
 - [ ] on the Main, with `capture_ingest` naming its private LAN address, the
   service starts, `--check` passes with no warning, and the journal shows
   `capture_ingest_started`; `ss -ltn` shows the ingest port bound to that

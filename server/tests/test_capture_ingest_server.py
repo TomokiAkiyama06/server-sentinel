@@ -183,6 +183,40 @@ class CaptureIngestServerTests(CaptureTlsHarness):
         self.assertTrue(self.wait_for(lambda: server.registry.state(self.node) is None))
         self.assertEqual(server.registry.snapshot().known_nodes, 0)
 
+    def test_an_ended_session_never_forgets_a_newer_session_of_its_node(self):
+        # PR #401 review: the ended session's ledger re-check finds it no
+        # longer admitted (as after a renewal superseded its certificate)
+        # while a newer session of the same node registered meanwhile; the
+        # newer one keeps its health entry and its heartbeats.
+        server = self.serve()
+        first = self.connect()
+        self.send_heartbeat(first)
+        self.assertIs(self.reply(first)[0], FrameType.HEARTBEAT_ACK)
+        original = self.admission.is_admitted
+        entered, release = threading.Event(), threading.Event()
+        held = []
+
+        def gate(identity):
+            if not held:
+                held.append(True)
+                entered.set()
+                self.assertTrue(release.wait(10))
+                return False
+            return original(identity)
+
+        with patch.object(self.admission, "is_admitted", side_effect=gate):
+            first.close()
+            # The first session's end check is held here.
+            self.assertTrue(entered.wait(5))
+            second = self.connect()
+            self.send_heartbeat(second, sequence=2)
+            self.assertIs(self.reply(second)[0], FrameType.HEARTBEAT_ACK)
+            release.set()
+            self.assertTrue(self.wait_for(lambda: "peer_closed" in server.last_close_reasons()))
+        self.assertEqual(server.registry.state(self.node), "online")
+        self.send_heartbeat(second, sequence=3)
+        self.assertIs(self.reply(second)[0], FrameType.HEARTBEAT_ACK)
+
     def test_a_node_that_merely_closes_stays_known_as_offline(self):
         server = self.serve()
         tls = self.connect()

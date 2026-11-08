@@ -198,7 +198,10 @@ this protocol.
   `capture_ingest_unavailable` follows the same rule while the bind is
   retried. A session that ends without a further frame re-reads the ledger
   once (never during the stop), so a node revoked while quiet is forgotten,
-  not kept as offline.
+  not kept as offline. Only that session's own health entry is forgotten,
+  under the listener lock and only while no newer session of the node is
+  live: a renewed certificate also makes the old one no longer admitted,
+  and the node's newer session keeps its health and rate window.
 - *Heartbeat contract.* The Agent's `heartbeat_seconds` is at most 5 s
   (`media_capture_agent.config.MAXIMUM_HEARTBEAT_SECONDS`) and the Main's
   idle timeout is 30 s by default: at least three intervals plus 15 s for a
