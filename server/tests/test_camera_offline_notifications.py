@@ -2831,6 +2831,36 @@ class LifespanTests(RuntimeFixture):
                     self.assertEqual(expected, runtime.status.camera_offline_cause)
                 self.assertEqual([], self.slack_texts())
 
+    async def test_a_failing_restore_read_never_repeats_the_window_restore(self):
+        # Issue #394: the notice's restart read comes after the one-shot
+        # window and pending restores; its failure does not run them again.
+        self.discovery.devices = []
+        application = self.uvc_application()
+        calls = []
+        monitor = application.state.camera_offline
+        original = monitor.restore_window
+
+        def counted(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        monitor.restore_window = counted
+        runtime = application.state.monitoring
+
+        def broken(now):
+            raise sqlite3.OperationalError("synthetic")
+
+        runtime._camera_latest_failed = broken
+        with self.assertLogs("app.monitoring.runtime", "ERROR"):
+            async with asyncio.timeout(60), application.router.lifespan_context(application):
+                for _ in range(3):
+                    self.clock.advance(timedelta(seconds=301))
+                    await self.tick(runtime)
+                self.assertTrue(runtime.status.camera_offline_degraded)
+                self.assertEqual("notified", runtime.status.camera_offline_cause)
+        self.assertEqual(1, len(calls))
+        self.assertEqual([ALERT], self.slack_texts())
+
     async def test_a_failed_row_older_than_a_day_is_not_restored(self):
         self.stored_row(confirmed=True, delivery="failed", age=24 * 3600 + 60)
         self.discovery.devices = []

@@ -1186,16 +1186,22 @@ class MonitoringRuntime:
                     monotonic=self.dependencies.monotonic())
                 rows, unrestored = self._camera_pending_rows(monitor.hourly_limit, now)
                 monitor.restore_pending(rows, unrestored=unrestored)
-                if self._camera_latest_failed(now):
-                    # Issue #394: the latest alert of an earlier process did
-                    # not reach Slack; it is not sent again (a final row),
-                    # so the Owner's notice must survive the restart.
-                    self.notifications.seed_delivery_failing(NotificationKind.CAMERA_OFFLINE)
                 # Issue #342 D/E: each source's initial episode is named once
                 # now, so it still matches a restored row of its outage after
                 # it recovered, or after it was sent while not running.
                 monitor.name_initial(self._camera_offline_event)
                 self._camera_window_restored = True
+                try:
+                    if self._camera_latest_failed(now):
+                        # Issue #394: the latest alert of an earlier process
+                        # did not reach Slack; it is not sent again (a final
+                        # row), so the Owner's notice survives the restart.
+                        # Read once, after the restores above (never repeated
+                        # by a failure here); an unreadable store loses only
+                        # this notice, logged as degraded.
+                        self.notifications.seed_delivery_failing(NotificationKind.CAMERA_OFFLINE)
+                except Exception:
+                    logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
                                    monotonic=self.dependencies.monotonic(),
                                    durable_id=self._camera_offline_event if running else None,
