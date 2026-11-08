@@ -107,6 +107,18 @@ class Event(StrEnum):
     CAPTURE_CONTINUITY_RELEASED_EVICTED = "capture_continuity_released_evicted"
     CAPTURE_CONTINUITY_ACK_NODE_MISMATCH = "capture_continuity_ack_node_mismatch"
     CAPTURE_CONTINUITY_ACK_UNKNOWN_SOURCE = "capture_continuity_ack_unknown_source"
+    # Issue #14: the capture ingest listener (`remote_agent.ingest_server`).
+    CAPTURE_INGEST_STARTED = "capture_ingest_started"
+    CAPTURE_INGEST_STOPPED = "capture_ingest_stopped"
+    CAPTURE_INGEST_UNAVAILABLE = "capture_ingest_unavailable"
+    # Refused connections by category, rate-limited with a count (PR #401).
+    CAPTURE_INGEST_REFUSED_LIMIT = "capture_ingest_refused_connection_limit"
+    CAPTURE_INGEST_REFUSED_HANDSHAKE = "capture_ingest_refused_handshake"
+    CAPTURE_INGEST_REFUSED_NOT_ADMITTED = "capture_ingest_refused_not_admitted"
+    CAPTURE_INGEST_REFUSED_ALPN = "capture_ingest_refused_alpn"
+    CAPTURE_INGEST_SESSION_OPENED = "capture_ingest_session_opened"
+    CAPTURE_INGEST_SESSION_CLOSED = "capture_ingest_session_closed"
+    CAPTURE_INGEST_SESSION_REFUSED = "capture_ingest_session_refused"
     UNSTRUCTURED = "unstructured_redacted"
 
 

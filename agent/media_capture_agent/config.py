@@ -61,6 +61,13 @@ class ExpectedMount:
                    absolute_path(value["filesystem_root"]), filesystem_uuid)
 
 
+# The longest heartbeat interval (Issue #14). The Main's capture ingest idle
+# timeout (30 s by default, `server/app/cameras/remote_agent/ingest_config.py`)
+# is at least three of these plus 15 s for a slow tick (storage check, clock
+# exchange); `server/tests/test_capture_ingest_contract.py` checks the pair.
+MAXIMUM_HEARTBEAT_SECONDS = 5.0
+
+
 @dataclass(frozen=True)
 class Settings:
     node_id: UUID
@@ -100,6 +107,10 @@ class Settings:
                     "clock_uncertainty_limit_seconds", "clock_step_limit_seconds"):
             if not positive_number(value[key]):
                 raise ConfigurationError("positive finite timing limits required")
+        # The Main closes an ingest session after its idle timeout without a
+        # frame (Issue #14), which allows several of these intervals.
+        if value["heartbeat_seconds"] > MAXIMUM_HEARTBEAT_SECONDS:
+            raise ConfigurationError("heartbeat interval exceeds the Main ingest contract")
         return cls(node_id, runtime, media, expected, value["service_uid"],
                    value["safety_reserve_bytes"], value["max_segment_bytes"],
                    value["heartbeat_seconds"], value["clock_offset_limit_seconds"],

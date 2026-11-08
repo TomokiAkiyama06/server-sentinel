@@ -135,8 +135,86 @@ Every connection re-reads the ledger's active record; `still_admitted()` must be
 called before committing queued work and closes the session after revocation.
 `IngestListenerConfig` refuses wildcard binds, Tailscale addresses
 (`ingest_bind_tailscale_address_refused`, same ranges as below) and the human
-listener's address/port. Nothing starts this listener yet: the ingest core below and #14/#15
-own wiring, per-connection byte limits and connection counts.
+listener's address/port. The listener below (Issue #14) owns the wiring,
+the per-connection byte limits and the connection counts.
+
+## Capture ingest listener (Issue #14, first part)
+
+`ingest_server.py` is the dedicated ingest listener the application opens for a
+deployment `capture_ingest` section (`ingest_config.py`; absent, there is no
+listener). It serves only the wire protocol of `ingest_wire.py` (ADR-0007
+`a_framed`, version 1) and has no HTTP parser and no route, so the human
+dashboard is unreachable from it and a capture credential reaches nothing but
+this protocol.
+
+- *Admission.* Every connection goes through `CaptureIngestAcceptor` (TLS 1.3
+  mTLS against the deployment CA and the ledger's current record) and must
+  negotiate the ALPN protocol `serversentinel-capture-ingest/1`, checked
+  right after the handshake and before the ledger is read (`alpn_refused`
+  otherwise, `required_alpn`). Every frame re-checks `still_admitted()` before
+  it is acted on, so a revocation ends the session at the next frame and the
+  node's health and rate window are forgotten.
+- *Frames.* `uint32` big-endian body length, `uint8` type, body; the length is
+  refused before any body byte is read (`frame_too_large`, default 16 KiB).
+  Version 1 has `HEARTBEAT` (Agent to Main: the Agent's schema-1 heartbeat
+  JSON, validated strictly: unknown keys, duplicate keys, non-finite numbers,
+  more than 16 reasons or 4 sources are `heartbeat_invalid`), `HEARTBEAT_ACK`
+  (Main to Agent: the echoed sequence and the Main's UTC receive and send
+  times, for the Agent's clock-offset estimate, SPECIFICATION §5.9) and
+  `CLOSE` (Main to Agent: one fixed reason word before the Main closes). Media
+  frames are not part of version 1 (`frame_type_refused`): the Main accepts
+  media only once the durable recording consumer exists (#17 / #313), so it
+  never acknowledges media it cannot keep.
+- *Bounds.* `maximum_connections` sockets (handshakes included; default 16),
+  `maximum_handshakes_per_address` handshakes in progress per peer address
+  (default 2; this limits what an unauthenticated LAN host can occupy, it
+  authenticates nothing), one live session per node (a newer admitted session
+  supersedes the older; the replacement and the health registration are one
+  step under the listener lock, so an older session can never register after
+  a newer one), one deadline per frame (default 30 s from the end of the
+  previous frame, for the whole header and body however the peer splits its
+  bytes, so a trickling peer cannot hold a session open), and
+  every frame charged to the node's rate budget (default 10 per second,
+  `AgentIngestQueue.charge_attempt`).
+- *Node health.* `node_health.py` keeps, in memory and bounded (64 nodes), the
+  latest heartbeat of each node as fixed words: `online` / `degraded` from a
+  connected node's latest heartbeat, `offline` without one within the idle
+  timeout or after its session closed (SPECIFICATION §5.8); a revoked node is
+  forgotten. Node reasons outside the Agent's known vocabulary are kept only
+  as `other`. Its snapshot carries counts and those words only. Node health
+  never makes a camera `online`, and remote camera health is not taken from
+  the heartbeat yet (it needs source authorization).
+- *Stop.* `stop()` is the first step after `begin_stop()`: it stops accepting
+  and shuts every socket down, waiting for nothing (no term of
+  `app.stop_budget`); the connection threads end on their own.
+- *Logs.* Value-free events only: `capture_ingest_started` / `_stopped` /
+  `_unavailable`, `capture_ingest_session_opened` / `_closed` (an ordinary
+  end) / `_refused` (protocol, rate or credential), and
+  one event per refusal category, `capture_ingest_refused_connection_limit`
+  / `_handshake` / `_not_admitted` / `_alpn`, only at that category's first
+  refusal and every power of two, with its running count: an
+  unauthenticated host cannot write one log line per attempt (the
+  acceptor's own per-refusal log is off, `log_refusals=False`).
+  `capture_ingest_unavailable` follows the same rule while the bind is
+  retried. A session that ends without a further frame re-reads the ledger
+  once (never during the stop), so a node revoked while quiet is forgotten,
+  not kept as offline. Only that session's own health entry is forgotten,
+  under the listener lock and only while no newer session of the node is
+  live: a renewed certificate also makes the old one no longer admitted,
+  and the node's newer session keeps its health and rate window.
+- *Heartbeat contract.* The Agent's `heartbeat_seconds` is at most 5 s
+  (`media_capture_agent.config.MAXIMUM_HEARTBEAT_SECONDS`) and the Main's
+  idle timeout is 30 s by default: at least three intervals plus 15 s for a
+  slow tick (storage check, clock exchange).
+  `server/tests/test_capture_ingest_contract.py` checks the pair and parses
+  heartbeats produced by the Agent's own `tick()`, including its upper-case
+  refusal codes such as `STORAGE_HARD_STOP` (validated, never kept).
+
+Not yet (follow-ups of #14): media frames and their continuity/ingest path
+with the durable consumer; the Agent's ingest session client; the Owner
+notice and status for a degraded or offline node (including
+`storage_device_numbers_stale`, #324) and for an unavailable listener;
+renewal over the session (#109 PR2); heartbeat loss as an Owner notice (#397).
 
 ## Bootstrap enrollment listener and local approval CLI (Issue #13)
 
