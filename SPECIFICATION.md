@@ -1931,7 +1931,9 @@ alert (the episode's, submitted by this process or the earlier process's row
 of the same outage found by its durable name after a restart); an outage
 settled without one (its ratio-opened period's alert covers it) and a
 ratio-opened alerted period use every alert of that period: its ratio alert
-and the one continuous notification of its flapping outages. While the
+and the alert of every outage of the period (the one continuous
+notification of its flapping outages, and an ordinary outage that began
+after the period opened, Codex PR #398 P2). While the
 period lasts, one of them that did not reach Slack keeps the notice, even
 after a later alert of the period was sent; it ends when the period closes
 (Owner decision 2026-11-08). A late notice of another outage of the source

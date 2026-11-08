@@ -1338,6 +1338,50 @@ class DeliveryFailingTests(MonitorFixture, unittest.TestCase):
         self.assertEqual((), status.alert_ids)
         self.assertEqual((False, False), self.outcomes(status.alert_ids))
 
+    def test_an_ordinary_outage_of_a_ratio_period_keeps_its_failure_until_it_closes(self):
+        # Codex PR #398 P2: after the ratio alert was sent, a recovery of at
+        # least `after_seconds` makes the next outage an ordinary (not
+        # flapping) one; its alert fails. After it recovers the period is
+        # still open, so the notice stays until the quiet window closes it.
+        monitor = self.monitor()
+        source = self.sources[0]
+        self.online(monitor)
+
+        def down(seconds):
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+            self.advance(seconds)
+
+        def up(seconds):
+            monitor.health_sink(event(source, CameraState.ONLINE, "video_capture_ready"))
+            self.advance(seconds)
+
+        down(200)
+        up(10)
+        down(110)
+        status = self.drain(monitor)  # the ratio alert: sent
+        self.texts()
+        self.assertEqual((False, False), self.outcomes(status.alert_ids))
+        up(301)
+        self.drain(monitor)
+        self.transport.error = OSError("synthetic")
+        down(301)
+        status = self.drain(monitor)  # the ordinary outage's alert: failed
+        self.texts()
+        episode = monitor._sources[source].episode
+        self.assertFalse(episode.flapping)
+        self.assertIsNotNone(episode.alert_id)
+        self.assertEqual((True, False), self.outcomes(status.alert_ids))
+        self.transport.error = None
+        up(60)
+        status = self.drain(monitor)  # recovered, the period still open
+        self.assertEqual(_BY_RATIO, monitor._sources[source].period)
+        self.assertIn(episode.alert_id, status.alert_ids)
+        self.assertEqual((True, False), self.outcomes(status.alert_ids))
+        self.advance(901)
+        status = self.drain(monitor)  # a whole quiet window: closed
+        self.assertIsNone(monitor._sources[source].period)
+        self.assertEqual((False, False), self.outcomes(status.alert_ids))
+
     def test_a_late_notice_of_another_outage_never_replaces_the_current_alert(self):
         # PR #398 review 2: an owed "(already recovered)" notice of an
         # earlier outage of the same source, sent after the current

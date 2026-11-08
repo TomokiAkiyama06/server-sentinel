@@ -454,6 +454,10 @@ class _Source:
     # them not reaching Slack keeps the notice; cleared when another period
     # opens or it closes.
     period_alert_ids: list[UUID] = field(default_factory=list)
+    # When the ratio-opened period in progress opened (monotonic): an outage
+    # that began since then is one of its outages, flapping or not (Codex
+    # PR #398 P2).
+    period_since: float | None = None
 
 
 @dataclass(frozen=True)
@@ -926,7 +930,7 @@ class CameraOfflineMonitor:
                         # continuous rule only if it lasts `after_seconds`
                         # more (Owner decision 2026-10-23, PR #335).
                         source.period, source.flap = _BY_RATIO, _Flap(now)
-                        source.period_alert_ids = []
+                        source.period_alert_ids, source.period_since = [], now
                         source.continuous_sent = False
                         source.period_seq += 1
                         episode = source.episode
@@ -968,7 +972,7 @@ class CameraOfflineMonitor:
                 # nothing; pending: covered by a restored resend or sent
                 # again under its ID and time).
                 source.period, source.continuous_sent = _BY_RATIO, False
-                source.period_alert_ids = []
+                source.period_alert_ids, source.period_since = [], now
                 source.period_seq += 1
                 source.flap = _Flap(now, name=(event_id, earlier))
                 episode.flapping, episode.period_seq = True, source.period_seq
@@ -1125,7 +1129,7 @@ class CameraOfflineMonitor:
             alerts, undelivered = [], 0
             for source in self._sources.values():
                 if source.period != _BY_RATIO:
-                    source.period_alert_ids = []
+                    source.period_alert_ids, source.period_since = [], None
                 ids, unsent = self._current_alerts(source, now)
                 alerts.extend(ids)
                 undelivered += unsent
@@ -1145,10 +1149,11 @@ class CameraOfflineMonitor:
         """Issue #394: record ``event_id`` as the alert of ``item``.
 
         An episode keeps its own alert. The ratio alert of the period in
-        progress (``source.flap``) and the continuous notification of one of
-        its flapping outages (``_of_period``) are also the period's alerts
-        (Owner decision 2026-11-08). A late notice of another outage or of a
-        closed period, and a restored row whose source is not known, decide
+        progress (``source.flap``) and the alert of any outage of that period
+        (a flapping one, ``_of_period``, or one that began after the period
+        opened, Codex PR #398 P2) are also the period's alerts (Owner decision
+        2026-11-08). A late notice of an outage from before the period or of
+        a closed period, and a restored row whose source is not known, decide
         nothing for the current condition.
         """
         if source is None:
@@ -1158,7 +1163,8 @@ class CameraOfflineMonitor:
                 source.period_alert_ids.append(event_id)
         elif isinstance(item, _Episode):
             item.alert_id = event_id
-            if _of_period(source, item) and event_id not in source.period_alert_ids:
+            if ((_of_period(source, item) or _since_period(source, item))
+                    and event_id not in source.period_alert_ids):
                 source.period_alert_ids.append(event_id)
 
     def _current_alerts(self, source, now: float) -> tuple[list[UUID], int]:
@@ -1326,6 +1332,12 @@ def _ongoing(item) -> bool:
     if isinstance(item, _Flap):
         return not item.ended
     return item.recovered is None
+
+
+def _since_period(source: _Source, item: _Episode) -> bool:
+    """An outage that began while the source's ratio-opened period is open."""
+    return (source.period == _BY_RATIO and source.period_since is not None
+            and item.since >= source.period_since)
 
 
 def _of_period(source: _Source, item: _Episode) -> bool:
