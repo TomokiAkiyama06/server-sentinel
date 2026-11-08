@@ -40,6 +40,7 @@ class FakeLxd:
         self.etag = 0
         self.puts = []
         self.fail = []  # "remove" / "add" outcomes to fail, in order
+        self.before_put = []  # edits made just before the next PUT's GET
         self.host = host
 
     def __call__(self, socket_path):
@@ -52,8 +53,13 @@ class FakeLxd:
     def state(self, name):
         return {"pid": PID, "status": self.status}
 
-    def put_devices(self, name, change):
-        new = change(json.loads(json.dumps(self.devices)))
+    def put_devices(self, name, change, require=None):
+        if self.before_put:
+            self.before_put.pop(0)()
+        current = json.loads(json.dumps(self.devices))
+        if require is not None and not require(current):
+            raise repass.Failure("usb_repass_changed")
+        new = change(current)
         kind = "add" if len(new) > len(self.devices) else "remove"
         if self.fail and self.fail[0] == kind:
             self.fail.pop(0)
@@ -258,6 +264,42 @@ class RepassTests(unittest.TestCase):
         self.run_once()
         self.assertEqual([("remove", ["cam2", "eth0"]), ("add", ["cam1", "cam2", "eth0"])], self.lxd.puts)
 
+    def test_a_device_changed_after_the_snapshot_is_neither_removed_nor_overwritten(self):
+        # PR #399 Codex P2: the Owner edits cam1 during the settle.
+        self.needs_repass()
+        original = self.sleep
+
+        def edit_during_settle(seconds):
+            original(seconds)
+            if seconds == repass.SETTLE_SECONDS:
+                self.lxd.devices["cam1"] = camera("SYNTH0009")
+        self.sleep = edit_during_settle
+        code, lines = self.run_once()
+        self.assertEqual((0, ["usb_repass_changed step=remove device=cam1"]), (code, lines))
+        self.assertEqual([], self.lxd.puts)
+        self.assertEqual(camera("SYNTH0009"), self.lxd.devices["cam1"])
+        saved = json.loads((self.state / "state.json").read_text())
+        self.assertEqual(({}, []), (saved["pending"], saved["history"]["cam1"]))
+        # Removed by the Owner meanwhile: not added back either.
+        self.sleep = original
+        self.lxd.devices["cam1"] = camera(SERIAL_1)
+
+        def owner_removes():
+            del self.lxd.devices["cam1"]
+        self.lxd.before_put = [owner_removes]
+        code, lines = self.run_once()
+        self.assertEqual((0, ["usb_repass_changed step=remove device=cam1"]), (code, lines))
+        self.assertNotIn("cam1", self.lxd.devices)
+
+    def test_a_device_added_again_before_the_add_is_not_overwritten(self):
+        self.needs_repass()
+        self.lxd.before_put = [lambda: None,
+                               lambda: self.lxd.devices.__setitem__("cam1", camera("SYNTH0009"))]
+        code, lines = self.run_once()
+        self.assertEqual((0, ["usb_repass_changed step=add device=cam1"]), (code, lines))
+        self.assertEqual(camera("SYNTH0009"), self.lxd.devices["cam1"])
+        self.assertEqual({}, json.loads((self.state / "state.json").read_text())["pending"])
+
     def test_not_running_or_starting_vm_is_not_judged(self):
         self.needs_repass()
         self.lxd.status = "Stopped"
@@ -379,6 +421,14 @@ class LxdClientTests(unittest.TestCase):
         self.assertEqual(set(repass.PUT_KEYS), set(body))
         self.assertEqual("GET", self.server.seen[-1][0])
         self.assertTrue(self.server.seen[-1][1].startswith("/1.0/operations/op1/wait?timeout="))
+
+    def test_require_sees_the_fresh_devices_and_blocks_the_put(self):
+        client = repass.Lxd(self.path)
+        with self.assertRaisesRegex(repass.Failure, "usb_repass_changed"):
+            client.put_devices("vm", dict, require=lambda d: d.get("cam1") == camera("OTHER"))
+        self.assertEqual([], [entry for entry in self.server.seen if entry[0] == "PUT"])
+        client.put_devices("vm", dict, require=lambda d: d.get("cam1") == camera(SERIAL_1))
+        self.assertEqual(1, len([entry for entry in self.server.seen if entry[0] == "PUT"]))
 
     def test_refused_or_failed_updates_raise(self):
         client = repass.Lxd(self.path)

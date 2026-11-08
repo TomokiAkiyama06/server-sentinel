@@ -117,11 +117,20 @@ class Lxd:
             raise Failure("usb_repass_instance_unreadable")
         return data["metadata"]
 
-    def put_devices(self, name, devices):
-        """Replace the instance's own devices (fresh GET + ETag), wait for it."""
+    def put_devices(self, name, devices, require=None):
+        """Replace the instance's own devices (fresh GET + ETag), wait for it.
+
+        ``require`` sees the devices of that same GET; when it is false the
+        instance changed since the caller's snapshot and nothing is sent
+        (`usb_repass_changed`). An edit between the GET and the PUT makes LXD
+        refuse the PUT on the ETag (`usb_repass_update_refused`).
+        """
         metadata, etag = self.instance(name)
+        current = dict(metadata.get("devices") or {})
+        if require is not None and not require(current):
+            raise Failure("usb_repass_changed")
         body = {key: metadata[key] for key in PUT_KEYS if key in metadata}
-        body["devices"] = devices(dict(metadata.get("devices") or {}))
+        body["devices"] = devices(current)
         status, _, data = self.request("PUT", f"/1.0/instances/{name}", body, etag)
         if status == 200 and data.get("type") == "sync":
             return
@@ -314,10 +323,16 @@ def run(config_path, state_dir, check=False, lxd_factory=Lxd, sleep=time.sleep, 
                 del state.pending[name]
                 continue
             try:
-                lxd.put_devices(instance, lambda d, n=name, c=config: {**d, n: c})
+                lxd.put_devices(instance, lambda d, n=name, c=config: {**d, n: c},
+                                require=lambda d, n=name: n not in d)
                 del state.pending[name]
                 log("usb_repass_restored", name)
             except Failure as error:
+                if error.args[0] == "usb_repass_changed":
+                    # Added again meanwhile (by the Owner): that one stands.
+                    del state.pending[name]
+                    log("usb_repass_changed step=restore", name)
+                    continue
                 log(f"{error.args[0]} step=restore", name)
                 failed = True
         state.save()
@@ -350,22 +365,44 @@ def run(config_path, state_dir, check=False, lxd_factory=Lxd, sleep=time.sleep, 
         state.history.setdefault(name, []).append(moment)
         state.save()
         try:
-            lxd.put_devices(instance, lambda d, n=name: {k: v for k, v in d.items() if k != n})
+            # PR #399 Codex P2: only the configuration this run judged is
+            # removed. A device the Owner changed or removed since the
+            # snapshot (during the settle, or while another device was
+            # handled) is left as it is and judged again on the next run.
+            lxd.put_devices(instance, lambda d, n=name: {k: v for k, v in d.items() if k != n},
+                            require=lambda d, n=name, c=config: d.get(n) == c)
         except Failure as error:
+            if error.args[0] == "usb_repass_changed":
+                del state.pending[name]
+                state.history[name].remove(moment)
+                state.save()
+                log("usb_repass_changed step=remove", name)
+                continue
             # Not removed (or unknown): the next run restores it if it is gone.
             log(f"{error.args[0]} step=remove", name)
             failed = True
             continue
         added = False
+        superseded = False
         for attempt in range(ADD_ATTEMPTS):
             try:
-                lxd.put_devices(instance, lambda d, n=name, c=config: {**d, n: c})
+                # Never over a device of that name added meanwhile.
+                lxd.put_devices(instance, lambda d, n=name, c=config: {**d, n: c},
+                                require=lambda d, n=name: n not in d)
                 added = True
                 break
             except Failure as error:
+                if error.args[0] == "usb_repass_changed":
+                    superseded = True
+                    break
                 log(f"{error.args[0]} step=add", name)
                 if attempt + 1 < ADD_ATTEMPTS:
                     sleep(2.0)
+        if superseded:
+            del state.pending[name]
+            state.save()
+            log("usb_repass_changed step=add", name)
+            continue
         if not added:
             log("usb_repass_add_failed", name)
             failed = True
