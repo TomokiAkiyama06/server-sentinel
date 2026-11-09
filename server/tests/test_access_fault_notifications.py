@@ -420,14 +420,18 @@ class CompositionTests(MonitoredAccessFixture):
         self.assertIsNotNone(application.state.camera_offline)
         runtime = application.state.monitoring
         read = access.camera_offline_notice
-        self.assertIs(False, read())
+        self.assertEqual("notified", read())
         # No Slack in this configuration: a current offline condition is unnotified.
         runtime._set(camera_offline_degraded=True)
-        self.assertIs(True, read())
+        self.assertEqual("not_configured", read())
         runtime._set(camera_offline_notifications=True)
-        self.assertIs(False, read())
-        runtime._set(camera_offline_degraded=False, camera_offline_notifications=False)
-        self.assertIs(False, read())
+        self.assertEqual("notified", read())
+        # Issue #394: Slack configured but the latest delivery failed.
+        runtime._set(camera_offline_delivery_failing=True)
+        self.assertEqual("delivery_failed", read())
+        runtime._set(camera_offline_degraded=False, camera_offline_notifications=False,
+                     camera_offline_delivery_failing=False)
+        self.assertEqual("notified", read())
         # No monitoring runtime: no notice reader, so the route is the generic denial.
         other_check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker)
         unmonitored = HumanAccess(

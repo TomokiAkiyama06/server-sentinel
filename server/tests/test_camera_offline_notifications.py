@@ -32,9 +32,9 @@ from app.monitoring.cameras import (
 )
 from app.monitoring.config import CameraOfflineNotification, parse_monitoring
 from app.monitoring.runtime import (
-    CAMERA_OFFLINE_RENOTIFY_CHAIN, EVENT_NAMESPACE, MonitoringDependencies,
+    CAMERA_OFFLINE_RENOTIFY_CHAIN, EVENT_NAMESPACE, MonitoringDependencies, MonitoringRuntime,
 )
-from app.notifications.service import NotificationKind, NotificationService
+from app.notifications.service import OUTCOME_MEMORY, NotificationKind, NotificationService
 from app.notifications.slack import DeliveryResult, SlackDelivery
 from app.settings import ConfigurationError
 from app.storage.database import Database
@@ -43,7 +43,7 @@ from app.storage.schema import APPLICATION_MIGRATIONS
 
 from tests.test_monitoring_runtime import RuntimeFixture
 from tests.test_recording import SyntheticValidator
-from tests.test_storage_notifications import Transport, endpoint
+from tests.test_storage_notifications import Transport, drain as settle, endpoint
 from tests.test_uvc_runtime import FAST, PROFILE, CaptureFactory, Discovery, PermitOwner
 
 
@@ -1200,6 +1200,437 @@ class IdentityTests(MonitorFixture, unittest.TestCase):
         self.advance(60)
         monitor.drain(service, at=AT, monotonic=self.clock.value)
         self.assertEqual(1, len(self.sent()))
+
+
+class DeliveryFailingTests(MonitorFixture, unittest.TestCase):
+    """Issue #394 (Owner decision 2026-11-08): judged per camera source."""
+
+    def outcomes(self, alert_ids, *, running=True, connection=None, undelivered=0, holder=None):
+        # The runtime's resolution, over this fixture's service and an
+        # optional synthetic event store (rows by event ID).
+        holder = holder or SimpleNamespace(notifications=self.service, _camera_finals={})
+        holder.notification_events = connection
+        status = SimpleNamespace(alert_ids=tuple(alert_ids), undelivered=undelivered)
+        return MonitoringRuntime._camera_alert_outcomes(holder, status, running)
+
+    def offline_both(self, monitor):
+        self.online(monitor)
+        for source in self.sources:
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(301)
+
+    def test_each_source_is_judged_by_its_own_latest_alert(self):
+        # Camera A's alert fails, camera B's is sent: B never clears A.
+        monitor = self.monitor()
+        self.offline_both(monitor)
+        failing_first = Transport(error=OSError("synthetic"))
+        order = []
+
+        class Split:
+            def open(_, request, *, timeout):
+                order.append(1)
+                if len(order) == 1:
+                    return failing_first.open(request, timeout=timeout)
+                return Transport().open(request, timeout=timeout)
+
+        self.service.close()
+        self.service = NotificationService(self.sink, SlackDelivery(endpoint(), opener=Split()))
+        self.addCleanup(self.service.close)
+        status = self.drain(monitor)
+        self.texts()
+        self.assertEqual(2, len(status.alert_ids))
+        results = {self.service.final_outcome(alert) for alert in status.alert_ids}
+        self.assertEqual({DeliveryResult.FAILED, DeliveryResult.SENT}, results)
+        self.assertEqual((True, False), self.outcomes(status.alert_ids))
+        # The failed source recovers: only the sent one remains, nothing shows.
+        failed = next(alert for alert in status.alert_ids
+                      if self.service.final_outcome(alert) is DeliveryResult.FAILED)
+        failed_source = next(source for source in self.sources
+                             if monitor._sources[source].episode.alert_id == failed)
+        monitor.health_sink(event(failed_source, CameraState.ONLINE, "video_capture_ready"))
+        status = self.drain(monitor)
+        self.assertNotIn(failed, status.alert_ids)
+        self.assertEqual((False, False), self.outcomes(status.alert_ids))
+
+    def test_only_a_final_sent_is_delivered(self):
+        alert = uuid4()
+        connection = Rows({alert: "pending"})
+        self.assertEqual((False, False), self.outcomes((alert,), connection=connection))
+        self.assertEqual((False, False), self.outcomes((alert,), connection=Rows({alert: "sent"})))
+        # PR #398 review 1: an earlier process's `disabled` (no Slack then)
+        # or `suppressed` row never reached Slack either.
+        for delivery in ("failed", "disabled", "suppressed"):
+            with self.subTest(delivery=delivery):
+                self.assertEqual((True, False),
+                                 self.outcomes((alert,), connection=Rows({alert: delivery})))
+        # Another kind's row of that ID is not this alert.
+        self.assertEqual((False, True), self.outcomes(
+            (alert,), connection=Rows({alert: "failed"}, kind=NotificationKind.DAILY_SUMMARY)))
+
+    def test_a_condition_whose_alert_was_not_submitted_is_not_delivered(self):
+        # PR #398 review 4: held by the cap or refused by the queue.
+        self.assertEqual((True, False), self.outcomes((), undelivered=1))
+
+    def test_a_final_value_read_once_is_kept_while_it_decides(self):
+        # PR #398 review 3: a later tick without running storage keeps it,
+        # and the row is not read again.
+        alert = uuid4()
+        holder = SimpleNamespace(notifications=self.service, _camera_finals={})
+        rows = Rows({alert: "failed"})
+        self.assertEqual((True, False), self.outcomes((alert,), connection=rows, holder=holder))
+        self.assertEqual(1, rows.reads)
+        self.assertEqual((True, False), self.outcomes((alert,), connection=None, running=False,
+                                                     holder=holder))
+        self.assertEqual((True, False), self.outcomes((alert,), connection=rows, holder=holder))
+        self.assertEqual(1, rows.reads)
+        # Once that alert no longer decides, it is forgotten.
+        self.assertEqual((False, False), self.outcomes((), connection=rows, holder=holder))
+        self.assertEqual({}, holder._camera_finals)
+        # A pending row is not kept: read again until final.
+        pending = Rows({alert: "pending"})
+        self.outcomes((alert,), connection=pending, holder=holder)
+        self.outcomes((alert,), connection=pending, holder=holder)
+        self.assertEqual(2, pending.reads)
+
+    def test_an_undelivered_alert_of_a_ratio_period_is_shown_until_it_closes(self):
+        # Owner decision 2026-11-08 (PR #398 delta review): the period's one
+        # continuous notification failed; a brief recovery later the next
+        # flapping outage is settled without a notice (continuous_sent) and
+        # the period's ratio alert was sent. The notice stays while the
+        # period lasts and ends when it closes.
+        monitor = self.monitor()
+        source = self.sources[0]
+        self.online(monitor)
+
+        def down(seconds):
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+            self.advance(seconds)
+
+        def up(seconds):
+            monitor.health_sink(event(source, CameraState.ONLINE, "video_capture_ready"))
+            self.advance(seconds)
+
+        down(200)
+        up(10)
+        down(110)
+        status = self.drain(monitor)  # the ratio alert: sent
+        self.texts()
+        self.assertEqual(_BY_RATIO, monitor._sources[source].period)
+        self.assertEqual((False, False), self.outcomes(status.alert_ids))
+        self.transport.error = OSError("synthetic")
+        self.advance(301)
+        status = self.drain(monitor)  # the period's continuous notice: failed
+        self.texts()
+        self.assertTrue(monitor._sources[source].continuous_sent)
+        self.assertEqual((True, False), self.outcomes(status.alert_ids))
+        self.transport.error = None
+        up(10)
+        down(301)
+        status = self.drain(monitor)  # suppressed: no notice of its own
+        self.texts()
+        self.assertEqual(_BY_RATIO, monitor._sources[source].period)
+        self.assertIsNone(monitor._sources[source].episode.alert_id)
+        self.assertEqual((True, False), self.outcomes(status.alert_ids))
+        # The period closes after a whole quiet window: nothing is shown.
+        up(901)
+        status = self.drain(monitor)
+        self.assertIsNone(monitor._sources[source].period)
+        self.assertEqual((), status.alert_ids)
+        self.assertEqual((False, False), self.outcomes(status.alert_ids))
+
+    def test_an_ordinary_outage_of_a_ratio_period_keeps_its_failure_until_it_closes(self):
+        # Codex PR #398 P2: after the ratio alert was sent, a recovery of at
+        # least `after_seconds` makes the next outage an ordinary (not
+        # flapping) one; its alert fails. After it recovers the period is
+        # still open, so the notice stays until the quiet window closes it.
+        monitor = self.monitor()
+        source = self.sources[0]
+        self.online(monitor)
+
+        def down(seconds):
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+            self.advance(seconds)
+
+        def up(seconds):
+            monitor.health_sink(event(source, CameraState.ONLINE, "video_capture_ready"))
+            self.advance(seconds)
+
+        down(200)
+        up(10)
+        down(110)
+        status = self.drain(monitor)  # the ratio alert: sent
+        self.texts()
+        self.assertEqual((False, False), self.outcomes(status.alert_ids))
+        up(301)
+        self.drain(monitor)
+        self.transport.error = OSError("synthetic")
+        down(301)
+        status = self.drain(monitor)  # the ordinary outage's alert: failed
+        self.texts()
+        episode = monitor._sources[source].episode
+        self.assertFalse(episode.flapping)
+        self.assertIsNotNone(episode.alert_id)
+        self.assertEqual((True, False), self.outcomes(status.alert_ids))
+        self.transport.error = None
+        up(60)
+        status = self.drain(monitor)  # recovered, the period still open
+        self.assertEqual(_BY_RATIO, monitor._sources[source].period)
+        self.assertIn(episode.alert_id, status.alert_ids)
+        self.assertEqual((True, False), self.outcomes(status.alert_ids))
+        self.advance(901)
+        status = self.drain(monitor)  # a whole quiet window: closed
+        self.assertIsNone(monitor._sources[source].period)
+        self.assertEqual((False, False), self.outcomes(status.alert_ids))
+
+    def test_a_held_notice_of_a_ratio_period_is_unsent_until_it_closes(self):
+        # Codex PR #398 P2 (70a3f81): the cap holds the alert of an ordinary
+        # outage of the period; the outage recovers with its notice still
+        # held. The period is still open, so the notice stays until it closes.
+        monitor = self.monitor(hourly_limit=1)
+        source = self.sources[0]
+        self.online(monitor)
+
+        def down(seconds):
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+            self.advance(seconds)
+
+        def up(seconds):
+            monitor.health_sink(event(source, CameraState.ONLINE, "video_capture_ready"))
+            self.advance(seconds)
+
+        down(200)
+        up(10)
+        down(110)
+        status = self.drain(monitor)  # the ratio alert: sent, fills the hour
+        self.texts()
+        self.assertEqual((False, False), self.outcomes(status.alert_ids))
+        up(301)
+        self.drain(monitor)
+        down(301)
+        status = self.drain(monitor)  # the ordinary outage's alert: held
+        self.assertEqual(1, status.undelivered)
+        up(60)
+        status = self.drain(monitor)  # recovered, still held, period open
+        self.assertEqual(_BY_RATIO, monitor._sources[source].period)
+        self.assertEqual(1, status.undelivered)
+        self.assertEqual((True, False), self.outcomes(status.alert_ids,
+                                                     undelivered=status.undelivered))
+        self.advance(901)
+        status = self.drain(monitor)  # a whole quiet window: closed
+        self.assertIsNone(monitor._sources[source].period)
+        self.assertEqual(0, status.undelivered)
+        self.assertEqual((False, False), self.outcomes(status.alert_ids,
+                                                      undelivered=status.undelivered))
+
+    def test_a_dropped_notice_of_a_ratio_period_is_unsent_until_it_closes(self):
+        # Codex PR #398 P2: a third outage of the period held by the cap
+        # drops the oldest held notice. The later two are sent once the hour
+        # allows; the dropped one never reached Slack, so the notice stays
+        # until the period closes.
+        monitor = self.monitor(hourly_limit=1)
+        source = self.sources[0]
+        self.online(monitor)
+
+        def down(seconds):
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+            self.advance(seconds)
+
+        def up(seconds):
+            monitor.health_sink(event(source, CameraState.ONLINE, "video_capture_ready"))
+            self.advance(seconds)
+
+        down(200)
+        up(10)
+        down(110)
+        self.drain(monitor)  # the ratio alert: sent, fills the hour
+        self.texts()
+        for _ in range(3):  # three ordinary outages of the period, all held
+            up(301)
+            self.drain(monitor)
+            down(301)
+            self.drain(monitor)
+        self.assertEqual(1, monitor.dropped)
+        self.assertTrue(monitor._sources[source].period_dropped)
+        for _ in range(2):  # the hour allows one each: the other two are sent
+            self.advance(3600)
+            status = self.drain(monitor)
+        self.texts()
+        self.assertEqual(_BY_RATIO, monitor._sources[source].period)
+        self.assertIsNone(monitor._sources[source].owed)
+        self.assertIsNone(monitor._sources[source].older)
+        self.assertEqual(1, status.undelivered)
+        self.assertEqual((True, False), self.outcomes(status.alert_ids,
+                                                     undelivered=status.undelivered))
+        up(901)
+        status = self.drain(monitor)  # a whole quiet window: closed
+        self.assertIsNone(monitor._sources[source].period)
+        self.assertFalse(monitor._sources[source].period_dropped)
+        self.assertEqual(0, status.undelivered)
+
+    def test_a_late_notice_of_another_outage_never_replaces_the_current_alert(self):
+        # PR #398 review 2: an owed "(already recovered)" notice of an
+        # earlier outage of the same source, sent after the current
+        # outage's alert, is not the current outage's alert.
+        monitor = self.monitor(hourly_limit=1)
+        source, other = self.sources
+        self.online(monitor)
+        monitor.health_sink(event(other, CameraState.OFFLINE))
+        self.advance(301)
+        self.drain(monitor)  # the other camera's alert fills the hour
+        monitor.health_sink(event(other, CameraState.ONLINE, "video_capture_ready"))
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(301)
+        status = self.drain(monitor)  # outage 1 held by the cap
+        self.assertEqual(1, status.undelivered)
+        monitor.health_sink(event(source, CameraState.ONLINE, "video_capture_ready"))
+        self.advance(301)  # recovered past the threshold: outage 1 is owed
+        monitor.health_sink(event(source, CameraState.OFFLINE))
+        self.advance(301)
+        self.drain(monitor)  # outage 2 qualifies, still held
+        self.advance(3600)
+        status = self.drain(monitor)  # outage 2 (in progress) goes first
+        current = monitor._sources[source].episode
+        alert = current.alert_id
+        self.assertIsNotNone(alert)
+        self.assertEqual((alert,), status.alert_ids)
+        before = {event_id for event_id, row in self.sink.rows.items()
+                  if row.kind is NotificationKind.CAMERA_OFFLINE}
+        self.advance(3600)
+        status = self.drain(monitor)  # outage 1's late notice
+        self.assertIn(RECOVERED, self.texts())
+        late = {event_id for event_id, row in self.sink.rows.items()
+                if row.kind is NotificationKind.CAMERA_OFFLINE} - before
+        self.assertEqual(1, len(late))
+        self.assertIs(current, monitor._sources[source].episode)
+        self.assertEqual(alert, current.alert_id)
+        self.assertEqual((alert,), status.alert_ids)
+        self.assertNotIn(late.pop(), status.alert_ids)
+        self.assertEqual(0, status.undelivered)
+
+    def test_an_unreadable_row_is_unverified_never_delivered(self):
+        alert = uuid4()
+        for connection, running in ((Rows({}, fail=True), True), (Rows({}), True), (None, False)):
+            with self.subTest(running=running):
+                self.assertEqual((False, True),
+                                 self.outcomes((alert,), connection=connection, running=running))
+        # A failure found elsewhere still decides the notice.
+        other = uuid4()
+        self.assertEqual((True, True), self.outcomes(
+            (alert, other), connection=Rows({other: "failed"}, fail_for={alert})))
+
+    def test_this_process_outcome_wins_over_its_row(self):
+        kind = NotificationKind.CAMERA_OFFLINE
+        alert = uuid4()
+        self.transport.error = OSError("synthetic")
+        self.service.record(kind, at=AT, confirmed=True, event_id=alert)
+        self.texts()
+        self.assertIs(DeliveryResult.FAILED, self.service.final_outcome(alert))
+        # Even with a row that says otherwise (or none), the outcome decides.
+        self.assertEqual((True, False), self.outcomes((alert,), connection=Rows({alert: "sent"})))
+
+    def test_a_queue_refusal_then_resubmission_is_judged_by_the_new_delivery(self):
+        kind = NotificationKind.CAMERA_OFFLINE
+        alert = uuid4()
+        self.service.closed = True
+        self.assertEqual(DeliveryResult.FAILED,
+                         self.service.record(kind, at=AT, confirmed=True, event_id=alert))
+        self.service.closed = False
+        gate = threading.Event()
+
+        class Gated(Transport):
+            def open(self, request, *, timeout):
+                gate.wait(5)
+                return super().open(request, timeout=timeout)
+
+        self.service.close()
+        self.service = NotificationService(self.sink, SlackDelivery(endpoint(), opener=Gated()))
+        self.addCleanup(self.service.close)
+        self.service._note_outcome(alert, DeliveryResult.FAILED)
+        self.assertEqual(DeliveryResult.PENDING,
+                         self.service.record(kind, at=AT, confirmed=True, event_id=alert))
+        # In flight: the earlier refused attempt's `failed` no longer counts.
+        self.assertIsNone(self.service.final_outcome(alert))
+        self.assertEqual((False, False), self.outcomes((alert,), connection=Rows({alert: "failed"})))
+        gate.set()
+        settle(self, self.service)
+        self.assertIs(DeliveryResult.SENT, self.service.final_outcome(alert))
+
+    def test_a_mismatched_resubmission_is_not_an_outcome(self):
+        # Codex/Claude PR #398 review 5: a resubmission refused because it
+        # does not match the delivery in flight says nothing about Slack.
+        kind = NotificationKind.CAMERA_OFFLINE
+        alert = uuid4()
+        gate = threading.Event()
+
+        class Gated(Transport):
+            def open(self, request, *, timeout):
+                gate.wait(5)
+                return super().open(request, timeout=timeout)
+
+        self.service.close()
+        self.service = NotificationService(self.sink, SlackDelivery(endpoint(), opener=Gated()))
+        self.addCleanup(self.service.close)
+        self.service.record(kind, at=AT, confirmed=True, event_id=alert)
+        self.assertEqual(DeliveryResult.FAILED, self.service.record(
+            kind, at=AT + timedelta(seconds=1), confirmed=True, event_id=alert))
+        self.assertIsNone(self.service.final_outcome(alert))
+        gate.set()
+        settle(self, self.service)
+        self.assertIs(DeliveryResult.SENT, self.service.final_outcome(alert))
+
+    def test_outcomes_taken_once_the_stop_began_are_noted(self):
+        # PR #400 merge: the result-only poll after the stop began (Issue
+        # #396) writes nothing but still notes the outcome, and a submission
+        # refused then (`_unsubmitted`, moved to the retry buffer) is `failed`.
+        kind = NotificationKind.CAMERA_OFFLINE
+        stopping = [False]
+        rows = {}
+        def sink(event):
+            rows[event.event_id] = event
+
+        service = NotificationService(sink, SlackDelivery(endpoint(), opener=self.transport),
+                                      stopping=lambda: stopping[0])
+        self.addCleanup(service.close)
+        sent = uuid4()
+        service.record(kind, at=AT, confirmed=True, event_id=sent)
+        self.assertTrue(service._worker.ready.wait(2))
+        stopping[0] = True
+        self.assertEqual((), service.poll())
+        self.assertEqual(DeliveryResult.PENDING, rows[sent].delivery)  # nothing written
+        self.assertIs(DeliveryResult.SENT, service.final_outcome(sent))
+        refused = uuid4()
+
+        def broken(*args):
+            raise RuntimeError("synthetic")
+
+        service._worker.submit = broken
+        self.assertEqual(DeliveryResult.FAILED,
+                         service.record(kind, at=AT, confirmed=True, event_id=refused))
+        self.assertFalse(service.in_flight(refused))
+        self.assertIs(DeliveryResult.FAILED, service.final_outcome(refused))
+
+    def test_the_outcome_memory_is_bounded(self):
+        for _ in range(OUTCOME_MEMORY + 5):
+            self.service._note_outcome(uuid4(), DeliveryResult.SENT)
+        self.assertEqual(OUTCOME_MEMORY, len(self.service._outcomes))
+
+
+class Rows:
+    """A synthetic `NotificationEventStore.get` over rows by event ID."""
+
+    def __init__(self, rows, *, fail=False, fail_for=(), kind=NotificationKind.CAMERA_OFFLINE):
+        self.rows = dict(rows)
+        self.fail, self.fail_for, self.kind = fail, set(fail_for), kind
+        self.reads = 0
+
+    def get(self, event_id):
+        self.reads += 1
+        if self.fail or event_id in self.fail_for:
+            raise sqlite3.OperationalError("synthetic")
+        value = self.rows.get(event_id)
+        if value is None:
+            return None
+        return {"event_id": event_id, "kind": self.kind, "delivery": DeliveryResult(value)}
 
 
 class RuntimeSignalTests(MonitorFixture, unittest.TestCase):
@@ -2675,6 +3106,97 @@ class LifespanTests(RuntimeFixture):
                     await self.tick(runtime)
                 self.assertEqual([], self.slack_texts())
                 self.assertEqual([(1, delivery)], self.offline_rows())
+
+    async def test_a_failed_delivery_shows_the_notice_until_a_later_one_is_sent(self):
+        # Issue #394: Slack is configured but the alert did not reach it.
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.bring_online(application)
+            self.assertEqual("notified", runtime.status.camera_offline_cause)
+            self.transport.error = OSError("synthetic unreachable endpoint")
+            self.discovery.devices = []
+            self.assertTrue(await self.until(lambda: self.health() is SourceHealthState.OFFLINE))
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+            self.assertEqual([(1, "failed")], self.offline_rows())
+            self.assertTrue(runtime.status.camera_offline_notifications)
+            # The outcome is read on the camera step: the tick that sent the
+            # alert still had it in flight; the next one shows it.
+            self.assertEqual("notified", runtime.status.camera_offline_cause)
+            await self.tick(runtime)
+            self.assertEqual("delivery_failed", runtime.status.camera_offline_cause)
+            # No automatic resend: it stays shown while the outage lasts.
+            self.transport.error = None
+            self.clock.advance(timedelta(minutes=30))
+            await self.tick(runtime)
+            self.assertEqual("delivery_failed", runtime.status.camera_offline_cause)
+            # The camera recovers: no current condition, nothing shown.
+            self.discovery.devices = [self.camera]
+            monitor = application.state.camera_offline
+            self.assertTrue(await self.until(lambda: self.health() is SourceHealthState.ONLINE))
+            self.assertTrue(await self.until(lambda: monitor._sources[self.source.id].online))
+            await self.tick(runtime)
+            self.assertEqual("notified", runtime.status.camera_offline_cause)
+            # A later outage whose alert is sent clears the failure.
+            self.clock.advance(timedelta(minutes=30))
+            self.discovery.devices = []
+            self.assertTrue(await self.until(lambda: self.health() is SourceHealthState.OFFLINE))
+            self.assertTrue(await self.until(lambda: not monitor._sources[self.source.id].online))
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+            self.assertTrue(runtime.status.camera_offline_degraded)
+            self.assertIn((1, "sent"), self.offline_rows())
+            self.assertEqual("notified", runtime.status.camera_offline_cause)
+
+    async def test_the_earlier_process_alert_of_this_outage_decides_after_a_restart(self):
+        # Owner decision 2026-11-08 (Q3): the source's own alert of the same
+        # outage (its durable name), not the newest row of any camera.
+        for rows, expected, texts in (
+                ({"own": "failed"}, "delivery_failed", []),
+                ({"own": "sent"}, "notified", []),
+                # PR #398 review 1: Slack is configured now, but the earlier
+                # process (without it) never sent this outage's alert.
+                ({"own": "disabled"}, "delivery_failed", []),
+                # Pending: not a failure; it is sent again under its ID once
+                # its slot of the hour expires (PR #339), not within this test.
+                ({"own": "pending"}, "notified", []),
+                # Another camera's (or another outage's) rows decide nothing.
+                ({"own": "sent", "other": "failed"}, "notified", []),
+                ({"own": "failed", "other": "sent"}, "delivery_failed", [])):
+            with self.subTest(rows=rows):
+                self.delete_rows()
+                self.transport.requests.clear()
+                for name, delivery in rows.items():
+                    self.stored_row(confirmed=True, delivery=delivery,
+                                    age=600 if name == "own" else 60,
+                                    event_id=self.chain_name() if name == "own" else None)
+                self.discovery.devices = []
+                application = self.uvc_application()
+                async with asyncio.timeout(60), application.router.lifespan_context(application):
+                    runtime = application.state.monitoring
+                    self.clock.advance(timedelta(seconds=301))
+                    await self.tick(runtime)
+                    await self.tick(runtime)
+                    self.assertTrue(runtime.status.camera_offline_degraded)
+                    self.assertEqual(expected, runtime.status.camera_offline_cause)
+                self.assertEqual(texts, self.slack_texts())
+
+    async def test_a_failed_alert_older_than_a_day_is_a_new_outage(self):
+        # Its name is no longer trusted (Issue #301): a new alert is sent and
+        # decides the notice.
+        self.stored_row(confirmed=True, delivery="failed", age=24 * 3600 + 60,
+                        event_id=self.chain_name())
+        self.discovery.devices = []
+        application = self.uvc_application()
+        async with asyncio.timeout(60), application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.clock.advance(timedelta(seconds=301))
+            await self.tick(runtime)
+            await self.tick(runtime)
+            self.assertTrue(runtime.status.camera_offline_degraded)
+            self.assertEqual("notified", runtime.status.camera_offline_cause)
+        self.assertEqual([ALERT], self.slack_texts())
 
     async def test_a_pending_alert_of_a_recovered_outage_is_sent_again(self):
         # The outage ended while the service was down; the alert reached the

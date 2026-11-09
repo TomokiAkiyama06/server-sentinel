@@ -267,11 +267,24 @@ over Issue #349, so
 another flapping episode of that period is not sent once the period's
 continuous notification went out (`suppressed`,
 `camera_offline_notification_suppressed`). See SPECIFICATION §9 for the full rules and the known limits.
-Without a configured Slack endpoint the rows are `disabled` and
-`MonitoringStatus.camera_offline_unnotified` (`camera_offline_degraded` and
-not `camera_offline_notifications`) is what the Owner's dashboard shows
-instead, through `GET /api/monitoring/camera-offline` (`OWNER_READ`, one
-boolean; `app.auth.human_surface`).
+Without a configured Slack endpoint the rows are `disabled`; with one, a
+delivery whose final Slack outcome is `failed` is not sent again. Issue #394
+(Owner decision 2026-11-08) judges that per camera source: the monitor
+reports the alert of each source's current condition
+(`CameraOfflineStatus.alert_ids`: the outage in progress's own alert, and
+every alert of a ratio-opened period in progress (its ratio alert and the
+alert of every outage that is flapping in it or began after it opened),
+which keeps an undelivered one until the period closes; `undelivered` counts current conditions whose alert was
+held by the cap or refused, and a period in progress one of whose recovered
+outages is still held or refused, or was dropped by the cap), and the camera step reads each final value once
+(`NotificationService.final_outcome`, else `NotificationEventStore.get`; only
+`sent` is delivered; an unreadable one is `unverified` and read again next
+tick). While
+a camera offline condition is current, `MonitoringStatus.camera_offline_cause`
+(`not_configured`, `delivery_failed`, `unverified` or `notified`, the words
+in `app.monitoring.cameras`) is what the Owner's dashboard shows, through
+`GET /api/monitoring/camera-offline` (`OWNER_READ`, one boolean and one fixed
+word; `unverified` is the generic denial; `app.auth.human_surface`).
 
 Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
 takes the `AccessFaultMonitor` the composition root also passes to the

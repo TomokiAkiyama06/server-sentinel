@@ -1,8 +1,9 @@
 """Issue #301 item 2: the Owner's camera offline notice on the human surface.
 
 When a camera source stays not online past the deployment threshold and no
-notification destination (Slack) is configured, the Owner is not notified
-outside the dashboard; ``GET /api/monitoring/camera-offline`` (``OWNER_READ``)
+notification destination (Slack) is configured, or Slack is configured but
+the latest camera offline delivery did not reach it (Issue #394), the Owner
+is not notified outside the dashboard; ``GET /api/monitoring/camera-offline`` (``OWNER_READ``)
 lets the Owner's dashboard show that fact. Synthetic only: software
 authenticators, synthetic ``/proc/net`` rows, a temporary SQLite database and
 the in-process ASGI driver of ``test_human_surface``. Mock only: no camera,
@@ -16,6 +17,7 @@ from app.auth.human_surface import (
 )
 from app.auth.model import Permission
 from app.auth.store import Requirement
+from app.monitoring.cameras import CAMERA_OFFLINE_CAUSES
 from app.monitoring.runtime import MonitoringStatus, RuntimeState
 
 from tests.test_human_admin_routes import AdminRouteFixture
@@ -26,7 +28,7 @@ from tests.test_human_surface import payload, status
 class Reader:
     """A synthetic notice reader that records its calls."""
 
-    def __init__(self, value=False):
+    def __init__(self, value="notified"):
         self.value = value
         self.calls = 0
 
@@ -55,18 +57,23 @@ class CameraOfflineNoticeRouteTests(AdminRouteFixture):
         for other in (path + "/", "/api/monitoring", "/api/monitoring/camera-offline/x"):
             self.assertIsNone(match_route({"method": "GET", "path": other, "raw_path": other.encode()}))
 
-    async def test_the_owner_reads_exactly_one_boolean(self):
-        for value in (False, True, False):
+    async def test_the_owner_reads_one_boolean_and_one_fixed_word(self):
+        for value, expected in (("notified", {"offline_unnotified": False, "cause": None}),
+                                ("not_configured", {"offline_unnotified": True,
+                                                    "cause": "not_configured"}),
+                                ("delivery_failed", {"offline_unnotified": True,
+                                                     "cause": "delivery_failed"}),
+                                ("notified", {"offline_unnotified": False, "cause": None})):
             with self.subTest(value=value):
                 self.reader.value = value
                 result = await self.read()
                 self.assertEqual(200, status(result))
-                self.assertEqual({"offline_unnotified": value}, payload(result))
+                self.assertEqual(expected, payload(result))
 
     async def test_non_owner_sessions_are_refused_before_the_reader(self):
         # The notification configuration is the Owner's alone: neither
         # permission, alone or together, nor a revoked session reaches it.
-        self.reader.value = True
+        self.reader.value = "delivery_failed"
         cookies = {"live:view only": self.target_cookie, "no session": None}
         for name, permissions in (("recordings:view only", (Permission.RECORDINGS_VIEW,)),
                                   ("both permissions", (Permission.LIVE_VIEW, Permission.RECORDINGS_VIEW))):
@@ -87,13 +94,14 @@ class CameraOfflineNoticeRouteTests(AdminRouteFixture):
     async def test_a_stale_owner_is_still_served(self):
         # OWNER_READ: no fresh user verification is required to see it.
         self.elapse(minutes=6)
-        self.reader.value = True
-        self.assertEqual({"offline_unnotified": True}, payload(await self.read()))
+        self.reader.value = "not_configured"
+        self.assertEqual({"offline_unnotified": True, "cause": "not_configured"},
+                         payload(await self.read()))
 
     async def test_background_polls_never_renew_the_idle_expiry(self):
         # Codex PR #388 (P1): the Web samples this route every 60 s with no
         # user interaction; it must not keep an unattended session alive.
-        self.reader.value = True
+        self.reader.value = "not_configured"
         for _ in range(5):  # 25 minutes of polling after the last touch
             self.elapse(minutes=5)
             self.assertEqual(200, status(await self.read()))
@@ -116,14 +124,17 @@ class CameraOfflineNoticeRouteTests(AdminRouteFixture):
         self.assertEqual(GENERIC, await self.read())
         self.assertEqual(0, self.reader.calls)
 
-    async def test_a_failing_or_non_boolean_reader_is_never_a_guessed_answer(self):
-        for value in (RuntimeError("synthetic"), None, 0, 1, "true", "false"):
+    async def test_a_failing_or_unknown_reader_answer_is_never_a_guessed_one(self):
+        # `unverified` (an outcome that could not be read, Issue #394) is the
+        # generic denial too: "could not be checked" on the Web.
+        for value in (RuntimeError("synthetic"), None, 0, 1, True, False, "true", "false",
+                      "", "NOTIFIED", "delivery_failed ", "failed", "unverified"):
             with self.subTest(value=value):
                 self.reader.value = value
                 self.assertEqual(GENERIC, await self.read())
 
     async def test_the_route_takes_no_query(self):
-        self.reader.value = True
+        self.reader.value = "not_configured"
         self.assertEqual(GENERIC, await self.read(query=b"source=1"))
         self.assertEqual(0, self.reader.calls)
 
@@ -144,15 +155,25 @@ class WithoutReaderTests(AdminRouteFixture):
 
 
 class UnnotifiedStatusTests(TestCase):
-    def test_only_a_current_condition_without_a_destination_is_unnotified(self):
+    def test_the_cause_word_follows_the_status(self):
+        # Issue #394: (degraded, notifications, failing, unverified) -> word.
         cases = {
-            (False, False): False,
-            (False, True): False,
-            (True, True): False,
-            (True, False): True,
+            (False, False, False, False): "notified",
+            (False, True, True, True): "notified",
+            (True, False, False, False): "not_configured",
+            (True, False, True, True): "not_configured",
+            (True, True, False, False): "notified",
+            (True, True, True, False): "delivery_failed",
+            # A failure found decides even if another source is unverified.
+            (True, True, True, True): "delivery_failed",
+            (True, True, False, True): "unverified",
         }
-        for (degraded, notifications), expected in cases.items():
-            with self.subTest(degraded=degraded, notifications=notifications):
+        for (degraded, notifications, failing, unverified), expected in cases.items():
+            with self.subTest(degraded=degraded, notifications=notifications,
+                              failing=failing, unverified=unverified):
                 status_ = MonitoringStatus(RuntimeState.RUNNING, camera_offline_degraded=degraded,
-                                           camera_offline_notifications=notifications)
-                self.assertIs(expected, status_.camera_offline_unnotified)
+                                           camera_offline_notifications=notifications,
+                                           camera_offline_delivery_failing=failing,
+                                           camera_offline_delivery_unverified=unverified)
+                self.assertEqual(expected, status_.camera_offline_cause)
+                self.assertIn(status_.camera_offline_cause, CAMERA_OFFLINE_CAUSES)

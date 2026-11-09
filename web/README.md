@@ -545,13 +545,20 @@ camera or a real passkey provider (MANUAL_TEST.md §E).
 
 `src/dashboard/offline_notice.tsx` shows the Owner, above every screen, that a
 camera offline condition the Owner would be notified of is current while no
-notification destination (Slack) is configured, so no notification leaves the
-Main Server (Issue #301 item 2). Route (server-side `OWNER_READ`; any other
-session gets the generic denial):
+notification leaves the Main Server: no notification destination (Slack) is
+configured (Issue #301 item 2), or Slack is configured but the latest
+notification of a camera whose offline condition is current did not reach it
+(Issue #394, judged per camera on the server; there is no automatic resend).
+It never says which camera; a delivery state the server could not read is
+the generic denial, shown as "could not be checked". Each cause has its own text under the same title. Route
+(server-side `OWNER_READ`; any other session gets the generic denial):
 
 ```text
-GET /api/monitoring/camera-offline   200 {"offline_unnotified": <boolean>}
+GET /api/monitoring/camera-offline   200 {"offline_unnotified": <boolean>, "cause": "not_configured" | "delivery_failed" | null}
 ```
+
+A cause that does not match the boolean, or a word outside the two, fails
+closed as `invalid_response` ("could not be checked").
 
 - Loaded only for an Owner session when the provider offers
   `loadCameraOfflineNotice` (the production provider always does), once the

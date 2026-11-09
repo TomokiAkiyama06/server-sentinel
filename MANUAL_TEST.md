@@ -2686,6 +2686,29 @@ outside ServerSentinel and checked separately below.
   desktop, in ja and en; a `live:view`-only and a `recordings:view`-only
   viewer see no such notice, and their `GET /api/monitoring/camera-offline`
   is the generic not-found response (browser devtools);
+- [ ] (Issue #394, mock-verified only) with Slack configured but its
+  delivery failing (a temporary webhook URL Slack rejects, or the Main
+  Server's outbound HTTPS blocked; restored afterwards): the `camera_offline`
+  row is `failed` and within one minute after `after_seconds` (+ one tick)
+  the Owner's dashboard shows, within about two monitoring ticks, the same
+  title with the "Slack に届いていません" / "has not reached Slack" text;
+  restart the service while the camera is still out: the notice stays (or
+  shows "could not be checked" until the row can be read); with two cameras,
+  a second camera's alert that is delivered does not remove it; plug the
+  first camera back: the notice is gone at about the next tick (Owner
+  decision 2026-11-08);
+- [ ] (Issue #394, mock-verified only) start without `slack_webhook_url`,
+  unplug a camera past `after_seconds` (the row is `disabled`), then
+  configure Slack and restart while it is still out: the notice shows the
+  "Slack に届いていません" / "has not reached Slack" text (nothing is sent for
+  that outage); with `hourly_limit` reached, a further camera's outage past
+  the threshold shows the same text until its alert is sent;
+- [ ] (Issue #394, mock-verified only) during a flapping period whose ratio
+  alert was sent, make the period's continuous notification fail (Slack
+  delivery blocked while the camera stays out for `after_seconds` more),
+  restore delivery and keep flapping: the notice stays until the camera has
+  stayed online for a whole `flapping_window_seconds` (Owner decision
+  2026-11-08);
 - [ ] the notice names no camera, shows no setting value, and claims no
   cause;
 - [ ] recover with the documented `lxc config device remove` / `add` of that

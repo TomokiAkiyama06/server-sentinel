@@ -1,5 +1,6 @@
 """Sparse immediate alerts plus fixed, aggregate daily summary data."""
 
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
@@ -82,6 +83,10 @@ ATTENTION_KINDS = frozenset({NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED})
 # then says so (Issue #349, a held camera outage that recovered first).
 RECOVERED_SUFFIX = " (already recovered)"
 RECOVERED_KINDS = frozenset({NotificationKind.CAMERA_OFFLINE})
+# Issue #394: how many final outcomes `final_outcome` remembers. Far above
+# what one process keeps referring to (one latest alert per camera source,
+# at most four sources) and bounded whatever the delivery rate.
+OUTCOME_MEMORY = 256
 
 
 def aware(value: datetime) -> None:
@@ -200,15 +205,42 @@ class NotificationService:
         self.last_delivery = DeliveryResult.DISABLED
         self.local_delivery_failed = False
         self.delivery_failed = False
+        # Issue #394: the final Slack outcome of recent deliveries by event
+        # ID (bounded, oldest dropped first), so the camera offline monitor
+        # can tell whether a source's latest alert reached Slack even while
+        # its row could not be written yet.
+        self._outcomes: OrderedDict[UUID, DeliveryResult] = OrderedDict()
+
+    def _note_outcome(self, event_id: UUID, result: DeliveryResult) -> None:
+        self._outcomes[event_id] = result
+        self._outcomes.move_to_end(event_id)
+        while len(self._outcomes) > OUTCOME_MEMORY:
+            self._outcomes.popitem(last=False)
+
+    def final_outcome(self, event_id: UUID) -> DeliveryResult | None:
+        """The final Slack outcome of ``event_id`` known to this process (#394).
+
+        ``sent`` / ``failed`` (or ``disabled``) of a delivery this process
+        submitted and that finished, whether or not its row is written yet;
+        ``None`` for one still in flight, never submitted here, or forgotten
+        (beyond ``OUTCOME_MEMORY``). Value-free.
+        """
+        return self._outcomes.get(event_id)
 
     @property
     def pending_count(self) -> int:
         return len(self._pending)
 
     def _collect(self) -> None:
-        """Take the delivery worker's finished results (no I/O)."""
+        """Take the delivery worker's finished results (no I/O).
+
+        Each outcome is noted once here (Issue #394, `final_outcome`), also
+        by the result-only poll once the stop began (Issue #396), whether or
+        not its row is written later.
+        """
         for identifier, result in self._worker.results():
             self._pending[identifier][2] = result
+            self._note_outcome(identifier, result)
 
     def _occupied(self) -> int:
         """How many submissions count against the queue capacity.
@@ -373,6 +405,7 @@ class NotificationService:
         elif self.closed or self._occupied() >= self._capacity:
             result = DeliveryResult.FAILED
             self.delivery_failed = True
+            self._note_outcome(event.event_id, result)
         else:
             result = DeliveryResult.PENDING
         event = replace(event, delivery=result)
@@ -384,11 +417,17 @@ class NotificationService:
         self.last_delivery = result
         if result == DeliveryResult.PENDING:
             self._pending[event.event_id] = [event, [on_complete] if on_complete else [], None]
+            # A new delivery of this ID: an earlier refused attempt's outcome
+            # no longer describes it (Issue #394).
+            self._outcomes.pop(event.event_id, None)
             try:
                 self._worker.submit(event.event_id, text)
             except Exception:
                 self._pending[event.event_id][2] = DeliveryResult.FAILED
                 self.delivery_failed = True
+                # Issue #394: a refused submission is this delivery's outcome,
+                # also when it moves to the retry buffer once the stop began.
+                self._note_outcome(event.event_id, DeliveryResult.FAILED)
                 if self._stopping():
                     self._unsubmitted(event.event_id)
                 else:

@@ -22,7 +22,8 @@
 import { ApiError } from '../api';
 import {
   calibrationReasons, type AccessCredential, type AccessPrincipal, type CalibrationReason, type CalibrationResult,
-  type CameraHealth, type DashboardServices, type IssuedInvitation, type LiveFrame, type LiveGrant, type LiveSource,
+  type CameraHealth, type CameraOfflineCause, type DashboardServices, type IssuedInvitation, type LiveFrame,
+  type LiveGrant, type LiveSource,
   type Permission, type SceneCalibrationSource, type Session,
 } from '../domain';
 import { decodeRequestOptions, serializeAssertion, type AssertionJSON } from './webauthn';
@@ -273,13 +274,25 @@ export function parseSceneCalibration(value: unknown): SceneCalibrationSource[] 
   });
 }
 
-/** `GET /api/monitoring/camera-offline` body `{"offline_unnotified": <boolean>}` (Issue #301).
+const CAMERA_OFFLINE_CAUSES: readonly CameraOfflineCause[] = ['not_configured', 'delivery_failed'];
+
+/** `GET /api/monitoring/camera-offline` body `{"offline_unnotified": <boolean>,
+ * "cause": "not_configured" | "delivery_failed" | null}` (Issues #301, #394).
  *
- * Anything but a JSON boolean fails closed: a missing, `null`, numeric or
- * string value is never read as "nothing to show". Nothing else is copied. */
-export function parseCameraOfflineNotice(value: unknown): boolean {
+ * Returns the cause, or `null` when there is nothing to show. A delivery
+ * state the server could not read arrives as the generic denial. Anything else
+ * fails closed: a missing, `null`, numeric or string `offline_unnotified`, a
+ * cause outside the two words, a cause without `true` or `true` without a
+ * cause is never read as "nothing to show". Nothing else is copied. */
+export function parseCameraOfflineNotice(value: unknown): CameraOfflineCause | null {
   if (!record(value) || typeof value.offline_unnotified !== 'boolean') throw new ApiError('invalid_response');
-  return value.offline_unnotified;
+  if (!value.offline_unnotified) {
+    if (value.cause !== null) throw new ApiError('invalid_response');
+    return null;
+  }
+  const cause = CAMERA_OFFLINE_CAUSES.find(item => item === value.cause);
+  if (cause === undefined) throw new ApiError('invalid_response');
+  return cause;
 }
 
 /** One calibration's answer: calibrated with its version and time, or a fixed refusal. */

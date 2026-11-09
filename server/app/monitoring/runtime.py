@@ -42,7 +42,10 @@ from app.storage.retention import RetentionService, StorageAudit
 from app.stop_budget import INTERRUPTED, SETTLE_POLL_OVERSHOOT_SECONDS, STOP_ADMISSION_WAIT_SECONDS
 
 from .access import HOUR_SECONDS, AccessFaultMonitor
-from .cameras import CameraOfflineMonitor
+from .cameras import (
+    CAMERA_OFFLINE_DELIVERY_FAILED, CAMERA_OFFLINE_NOT_CONFIGURED, CAMERA_OFFLINE_NOTIFIED,
+    CAMERA_OFFLINE_UNVERIFIED, CameraOfflineMonitor,
+)
 from .config import MonitoringConfiguration
 from .filesystem import IdentifiedRecordingFilesystem
 from .store import NotificationEventStore, RecordingHealthStatusStore, RunMarkerStore
@@ -207,6 +210,13 @@ class MonitoringStatus:
     # store: False without a configured Slack endpoint (the local row is then
     # `disabled`) or without a camera offline monitor.
     camera_offline_notifications: bool = False
+    # Issue #394 (Owner decision 2026-11-08): some source whose offline
+    # condition is current has a latest alert whose final Slack outcome is
+    # `failed` (`delivery_failing`), or whose outcome could not be read
+    # (`delivery_unverified`, the earlier process's row; read again on the
+    # next tick).
+    camera_offline_delivery_failing: bool = False
+    camera_offline_delivery_unverified: bool = False
     # Issue #321: a recorded major/minor pair is stale while the approved
     # UUID, mount and root agree; storage stays admitted.
     recording_device_numbers_stale: bool = False
@@ -216,11 +226,25 @@ class MonitoringStatus:
     unclean_exit_detection_degraded: bool = False
 
     @property
-    def camera_offline_unnotified(self) -> bool:
-        """Issue #301 item 2: a camera offline condition the Owner would be
-        notified of is current, but no notification reaches the Owner outside
-        the local store. The Owner's dashboard shows a notice instead."""
-        return self.camera_offline_degraded and not self.camera_offline_notifications
+    def camera_offline_cause(self) -> str:
+        """One fixed word for the Owner's notice (Issues #301, #394).
+
+        ``not_configured``: a current camera offline condition reaches no
+        notification destination (no Slack, or no camera offline monitor).
+        ``delivery_failed``: Slack is configured and the latest alert of a
+        source whose condition is current did not reach it.
+        ``unverified``: that could not be read (served as the generic
+        denial, "could not be checked"). ``notified`` otherwise.
+        """
+        if not self.camera_offline_degraded:
+            return CAMERA_OFFLINE_NOTIFIED
+        if not self.camera_offline_notifications:
+            return CAMERA_OFFLINE_NOT_CONFIGURED
+        if self.camera_offline_delivery_failing:
+            return CAMERA_OFFLINE_DELIVERY_FAILED
+        if self.camera_offline_delivery_unverified:
+            return CAMERA_OFFLINE_UNVERIFIED
+        return CAMERA_OFFLINE_NOTIFIED
 
 
 class RefuseUnvalidatedSegments:
@@ -321,6 +345,9 @@ class MonitoringRuntime:
         # Issue #301 item 2: the camera offline hourly cap is re-seeded from
         # the stored rows once, on the first running tick.
         self._camera_window_restored = False
+        # Issue #394: the final delivery of each alert that decides a current
+        # camera offline condition, read once (at most two per source).
+        self._camera_finals: dict[UUID, DeliveryResult] = {}
         # Issue #321: the stale device-number check runs once per process;
         # the notice itself is deduplicated per boot (`_report_device_numbers`).
         self._device_numbers_reported = False
@@ -1173,8 +1200,59 @@ class MonitoringRuntime:
         except Exception:
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
             return
+        failing, unverified = self._camera_alert_outcomes(status, running)
         self._set(camera_offline_degraded=status.offline_sources > 0
-                  or status.flapping_sources > 0)
+                  or status.flapping_sources > 0,
+                  camera_offline_delivery_failing=failing,
+                  camera_offline_delivery_unverified=unverified)
+
+    def _camera_alert_outcomes(self, status, running: bool) -> tuple[bool, bool]:
+        """``(not delivered, unverified)`` of the current conditions' alerts (#394).
+
+        Owner decision 2026-11-08: judged per camera source, by the alert of
+        each source's current condition (``CameraOfflineStatus.alert_ids``).
+        Delivered means a final `sent`: `failed`, and also `disabled` or
+        `suppressed` (an earlier process without Slack, PR #398 review), did
+        not reach Slack. A condition whose alert was not submitted (held by
+        the hourly cap, refused by the queue, ``undelivered``) is not
+        delivered either. A delivery in flight, or a `pending` row being sent
+        again, is not failing. The final value is read once per event ID and
+        kept while that alert decides (``_camera_finals``): the outcome this
+        process saw (`NotificationService.final_outcome`), else the stored
+        row (`NotificationEventStore.get`). One that cannot be read (no
+        running storage, a failing read, no row) is ``unverified`` and read
+        again on the next tick; never guessed as delivered.
+        """
+        finals = {event_id: self._camera_finals[event_id] for event_id in status.alert_ids
+                  if event_id in self._camera_finals}
+        self._camera_finals = finals
+        failing, unverified = status.undelivered > 0, False
+        for event_id in status.alert_ids:
+            result = finals.get(event_id)
+            if result is None:
+                result = self.notifications.final_outcome(event_id)
+            if result is None and self.notifications.in_flight(event_id):
+                continue
+            if result is None:
+                if not running or self.notification_events is None:
+                    unverified = True
+                    continue
+                try:
+                    row = self.notification_events.get(event_id)
+                except Exception:
+                    unverified = True
+                    continue
+                if row is None or row["kind"] != NotificationKind.CAMERA_OFFLINE:
+                    unverified = True
+                    continue
+                result = row["delivery"]
+                if result == DeliveryResult.PENDING:
+                    # Sent again under its ID (Issue #336): not failing.
+                    continue
+            finals[event_id] = result
+            if result != DeliveryResult.SENT:
+                failing = True
+        return failing, unverified
 
     def _camera_flapping_event(self, source_id: UUID) -> tuple[UUID, bool | datetime] | None:
         """``(event ID, already notified)`` of a ratio (flapping) alert.

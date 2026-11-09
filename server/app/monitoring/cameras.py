@@ -216,6 +216,16 @@ LATE_FLAPS_PER_SOURCE = 4
 # Who opened a source's alerted period.
 _BY_CONTINUOUS = "continuous"
 _BY_RATIO = "ratio"
+# The fixed words of the Owner's camera offline notice (Issues #301, #394),
+# `MonitoringStatus.camera_offline_cause`; the human route serves the first
+# three and answers ``unverified`` with the generic denial ("could not be
+# checked" on the Web, never a guessed ``false``).
+CAMERA_OFFLINE_NOTIFIED = "notified"
+CAMERA_OFFLINE_NOT_CONFIGURED = "not_configured"
+CAMERA_OFFLINE_DELIVERY_FAILED = "delivery_failed"
+CAMERA_OFFLINE_UNVERIFIED = "unverified"
+CAMERA_OFFLINE_CAUSES = frozenset({CAMERA_OFFLINE_NOTIFIED, CAMERA_OFFLINE_NOT_CONFIGURED,
+                                   CAMERA_OFFLINE_DELIVERY_FAILED, CAMERA_OFFLINE_UNVERIFIED})
 
 
 def valid_offline_seconds(value) -> bool:
@@ -259,6 +269,9 @@ class _Episode:
     # The recent ratio alert of the source was looked up once for this
     # episode from the continuous path (Issue #338 item 1).
     ratio_checked: bool = False
+    # Issue #394: the event ID of this episode's own alert, submitted by this
+    # process or an earlier process's row of the same outage.
+    alert_id: UUID | None = None
 
     def qualifies(self, now: float, after: float) -> bool:
         end = self.recovered if self.recovered is not None else now
@@ -434,6 +447,21 @@ class _Source:
     continuous_sent: bool = False
     # Generation of the ratio-opened periods, bumped each time one opens.
     period_seq: int = 0
+    # Issue #394 (Owner decisions 2026-11-08): the event IDs of every alert
+    # of the ratio-opened period in progress (its ratio alert and the one
+    # continuous notification of its flapping outages, submitted by this
+    # process or an earlier process's row). While the period lasts, one of
+    # them not reaching Slack keeps the notice; cleared when another period
+    # opens or it closes.
+    period_alert_ids: list[UUID] = field(default_factory=list)
+    # When the ratio-opened period in progress opened (monotonic): an outage
+    # that began since then is one of its outages, flapping or not (Codex
+    # PR #398 P2).
+    period_since: float | None = None
+    # One of the period's outage notices was dropped by the cap (never
+    # reached Slack): the notice stays until the period closes (Codex PR
+    # #398 P2). Cleared with ``period_alert_ids``.
+    period_dropped: bool = False
 
 
 @dataclass(frozen=True)
@@ -446,6 +474,13 @@ class CameraOfflineStatus:
     held: int
     # Sources in an alerted period opened by the ratio rule.
     flapping_sources: int = 0
+    # Issue #394: per source whose offline condition is current (counted
+    # above), the alert of that condition: the outage in progress's own alert,
+    # else the ratio alert of its period. ``undelivered`` counts the current
+    # conditions whose alert was not submitted (held by the cap, refused by
+    # the queue): not notified either.
+    alert_ids: tuple[UUID, ...] = ()
+    undelivered: int = 0
 
 
 class CameraOfflineMonitor:
@@ -619,6 +654,10 @@ class CameraOfflineMonitor:
 
     def _drop_held(self, source: _Source) -> None:
         oldest, source.older = source.older, None
+        if _of_period(source, oldest) or _since_period(source, oldest):
+            # Never reached Slack: keeps the notice while its period lasts
+            # (Codex PR #398 P2).
+            source.period_dropped = True
         # Notified for good: a drain that already listed it skips it.
         oldest.notified = True
         self.dropped += 1
@@ -899,6 +938,8 @@ class CameraOfflineMonitor:
                         # continuous rule only if it lasts `after_seconds`
                         # more (Owner decision 2026-10-23, PR #335).
                         source.period, source.flap = _BY_RATIO, _Flap(now)
+                        source.period_alert_ids, source.period_since = [], now
+                        source.period_dropped = False
                         source.continuous_sent = False
                         source.period_seq += 1
                         episode = source.episode
@@ -940,6 +981,8 @@ class CameraOfflineMonitor:
                 # nothing; pending: covered by a restored resend or sent
                 # again under its ID and time).
                 source.period, source.continuous_sent = _BY_RATIO, False
+                source.period_alert_ids, source.period_since = [], now
+                source.period_dropped = False
                 source.period_seq += 1
                 source.flap = _Flap(now, name=(event_id, earlier))
                 episode.flapping, episode.period_seq = True, source.period_seq
@@ -1041,6 +1084,8 @@ class CameraOfflineMonitor:
                     # An earlier process already notified this outage.
                     self._used.add(event_id)
                     with self._lock:
+                        # Issue #394: that row is this outage's (or period's) alert.
+                        self._note_alert(source, item, event_id)
                         self._finish(identity, item)
                     continue
             # The cap is absolute (Owner decision, PR #339 重要 2): every
@@ -1080,6 +1125,7 @@ class CameraOfflineMonitor:
                 self._sent.append((now, attempt[1]))
             with self._lock:
                 item.attempt = None
+                self._note_alert(source, item, attempt[1])
                 self._finish(identity, item, now=now)
         with self._lock:
             # After this drain sent what the hour allowed: a third outage of
@@ -1090,6 +1136,14 @@ class CameraOfflineMonitor:
             offline = sum(1 for source in self._sources.values()
                           if source.episode is not None and source.episode.recovered is None
                           and source.episode.qualifies(now, self.after))
+            alerts, undelivered = [], 0
+            for source in self._sources.values():
+                if source.period != _BY_RATIO:
+                    source.period_alert_ids, source.period_since = [], None
+                    source.period_dropped = False
+                ids, unsent = self._current_alerts(source, now)
+                alerts.extend(ids)
+                undelivered += unsent
             held = sum(1 for source in self._sources.values()
                        for item in (source.older, source.owed, source.episode, source.flap,
                                     *source.late_flaps)
@@ -1098,7 +1152,69 @@ class CameraOfflineMonitor:
             flapping = sum(1 for source in self._sources.values()
                            if source.period == _BY_RATIO)
         return CameraOfflineStatus(offline_sources=offline, held=held,
-                                   flapping_sources=flapping)
+                                   flapping_sources=flapping, alert_ids=tuple(alerts),
+                                   undelivered=undelivered)
+
+    @staticmethod
+    def _note_alert(source, item, event_id: UUID) -> None:
+        """Issue #394: record ``event_id`` as the alert of ``item``.
+
+        An episode keeps its own alert. The ratio alert of the period in
+        progress (``source.flap``) and the alert of any outage of that period
+        (a flapping one, ``_of_period``, or one that began after the period
+        opened, Codex PR #398 P2) are also the period's alerts (Owner decision
+        2026-11-08). A late notice of an outage from before the period or of
+        a closed period, and a restored row whose source is not known, decide
+        nothing for the current condition.
+        """
+        if source is None:
+            return
+        if isinstance(item, _Flap):
+            if source.flap is item and event_id not in source.period_alert_ids:
+                source.period_alert_ids.append(event_id)
+        elif isinstance(item, _Episode):
+            item.alert_id = event_id
+            if ((_of_period(source, item) or _since_period(source, item))
+                    and event_id not in source.period_alert_ids):
+                source.period_alert_ids.append(event_id)
+
+    def _current_alerts(self, source, now: float) -> tuple[list[UUID], int]:
+        """``(alert IDs, unsent)`` deciding ``source``'s current condition (#394).
+
+        Its outage in progress past the threshold: that episode's own alert,
+        or one unsent while it was not submitted (held, refused). A
+        ratio-opened period in progress (Owner decision 2026-11-08): every
+        alert of the period, so one that did not reach Slack (the period's
+        one continuous notification included) keeps the notice until the
+        period closes even after a later alert of it was sent; its ratio
+        alert counts as unsent while it was not submitted, and so does an
+        outage of the period that recovered with its notice still unsent
+        (held, refused) or dropped by the cap (Codex PR #398 P2). Nothing
+        without a current condition. At most one unsent per source.
+        """
+        ids, unsent = [], False
+        episode = source.episode
+        if (episode is not None and episode.recovered is None
+                and episode.qualifies(now, self.after)):
+            if episode.alert_id is not None:
+                ids.append(episode.alert_id)
+            elif not episode.notified:
+                unsent = True
+        if source.period == _BY_RATIO:
+            if source.flap is not None and not source.flap.notified:
+                unsent = True
+            if source.period_dropped:
+                unsent = True
+            for item in (source.older, source.owed, episode):
+                # Checked after the drain: a qualifying one still without a
+                # notice was held or refused, never in flight.
+                if (item is not None and item.recovered is not None
+                        and not item.notified and item.alert_id is None
+                        and (_of_period(source, item) or _since_period(source, item))
+                        and item.qualifies(now, self.after)):
+                    unsent = True
+            ids.extend(alert for alert in source.period_alert_ids if alert not in ids)
+        return ids, int(unsent)
 
     def _continuous_due(self, source: _Source, now: float) -> bool:
         # A qualifying continuous episode is the continuous rule's to report.
@@ -1239,6 +1355,12 @@ def _ongoing(item) -> bool:
     if isinstance(item, _Flap):
         return not item.ended
     return item.recovered is None
+
+
+def _since_period(source: _Source, item: _Episode) -> bool:
+    """An outage that began while the source's ratio-opened period is open."""
+    return (source.period == _BY_RATIO and source.period_since is not None
+            and item.since >= source.period_since)
 
 
 def _of_period(source: _Source, item: _Episode) -> bool:
