@@ -1382,6 +1382,91 @@ class DeliveryFailingTests(MonitorFixture, unittest.TestCase):
         self.assertIsNone(monitor._sources[source].period)
         self.assertEqual((False, False), self.outcomes(status.alert_ids))
 
+    def test_a_held_notice_of_a_ratio_period_is_unsent_until_it_closes(self):
+        # Codex PR #398 P2 (70a3f81): the cap holds the alert of an ordinary
+        # outage of the period; the outage recovers with its notice still
+        # held. The period is still open, so the notice stays until it closes.
+        monitor = self.monitor(hourly_limit=1)
+        source = self.sources[0]
+        self.online(monitor)
+
+        def down(seconds):
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+            self.advance(seconds)
+
+        def up(seconds):
+            monitor.health_sink(event(source, CameraState.ONLINE, "video_capture_ready"))
+            self.advance(seconds)
+
+        down(200)
+        up(10)
+        down(110)
+        status = self.drain(monitor)  # the ratio alert: sent, fills the hour
+        self.texts()
+        self.assertEqual((False, False), self.outcomes(status.alert_ids))
+        up(301)
+        self.drain(monitor)
+        down(301)
+        status = self.drain(monitor)  # the ordinary outage's alert: held
+        self.assertEqual(1, status.undelivered)
+        up(60)
+        status = self.drain(monitor)  # recovered, still held, period open
+        self.assertEqual(_BY_RATIO, monitor._sources[source].period)
+        self.assertEqual(1, status.undelivered)
+        self.assertEqual((True, False), self.outcomes(status.alert_ids,
+                                                     undelivered=status.undelivered))
+        self.advance(901)
+        status = self.drain(monitor)  # a whole quiet window: closed
+        self.assertIsNone(monitor._sources[source].period)
+        self.assertEqual(0, status.undelivered)
+        self.assertEqual((False, False), self.outcomes(status.alert_ids,
+                                                      undelivered=status.undelivered))
+
+    def test_a_dropped_notice_of_a_ratio_period_is_unsent_until_it_closes(self):
+        # Codex PR #398 P2: a third outage of the period held by the cap
+        # drops the oldest held notice. The later two are sent once the hour
+        # allows; the dropped one never reached Slack, so the notice stays
+        # until the period closes.
+        monitor = self.monitor(hourly_limit=1)
+        source = self.sources[0]
+        self.online(monitor)
+
+        def down(seconds):
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+            self.advance(seconds)
+
+        def up(seconds):
+            monitor.health_sink(event(source, CameraState.ONLINE, "video_capture_ready"))
+            self.advance(seconds)
+
+        down(200)
+        up(10)
+        down(110)
+        self.drain(monitor)  # the ratio alert: sent, fills the hour
+        self.texts()
+        for _ in range(3):  # three ordinary outages of the period, all held
+            up(301)
+            self.drain(monitor)
+            down(301)
+            self.drain(monitor)
+        self.assertEqual(1, monitor.dropped)
+        self.assertTrue(monitor._sources[source].period_dropped)
+        for _ in range(2):  # the hour allows one each: the other two are sent
+            self.advance(3600)
+            status = self.drain(monitor)
+        self.texts()
+        self.assertEqual(_BY_RATIO, monitor._sources[source].period)
+        self.assertIsNone(monitor._sources[source].owed)
+        self.assertIsNone(monitor._sources[source].older)
+        self.assertEqual(1, status.undelivered)
+        self.assertEqual((True, False), self.outcomes(status.alert_ids,
+                                                     undelivered=status.undelivered))
+        up(901)
+        status = self.drain(monitor)  # a whole quiet window: closed
+        self.assertIsNone(monitor._sources[source].period)
+        self.assertFalse(monitor._sources[source].period_dropped)
+        self.assertEqual(0, status.undelivered)
+
     def test_a_late_notice_of_another_outage_never_replaces_the_current_alert(self):
         # PR #398 review 2: an owed "(already recovered)" notice of an
         # earlier outage of the same source, sent after the current

@@ -458,6 +458,10 @@ class _Source:
     # that began since then is one of its outages, flapping or not (Codex
     # PR #398 P2).
     period_since: float | None = None
+    # One of the period's outage notices was dropped by the cap (never
+    # reached Slack): the notice stays until the period closes (Codex PR
+    # #398 P2). Cleared with ``period_alert_ids``.
+    period_dropped: bool = False
 
 
 @dataclass(frozen=True)
@@ -650,6 +654,10 @@ class CameraOfflineMonitor:
 
     def _drop_held(self, source: _Source) -> None:
         oldest, source.older = source.older, None
+        if _of_period(source, oldest) or _since_period(source, oldest):
+            # Never reached Slack: keeps the notice while its period lasts
+            # (Codex PR #398 P2).
+            source.period_dropped = True
         # Notified for good: a drain that already listed it skips it.
         oldest.notified = True
         self.dropped += 1
@@ -931,6 +939,7 @@ class CameraOfflineMonitor:
                         # more (Owner decision 2026-10-23, PR #335).
                         source.period, source.flap = _BY_RATIO, _Flap(now)
                         source.period_alert_ids, source.period_since = [], now
+                        source.period_dropped = False
                         source.continuous_sent = False
                         source.period_seq += 1
                         episode = source.episode
@@ -973,6 +982,7 @@ class CameraOfflineMonitor:
                 # again under its ID and time).
                 source.period, source.continuous_sent = _BY_RATIO, False
                 source.period_alert_ids, source.period_since = [], now
+                source.period_dropped = False
                 source.period_seq += 1
                 source.flap = _Flap(now, name=(event_id, earlier))
                 episode.flapping, episode.period_seq = True, source.period_seq
@@ -1130,6 +1140,7 @@ class CameraOfflineMonitor:
             for source in self._sources.values():
                 if source.period != _BY_RATIO:
                     source.period_alert_ids, source.period_since = [], None
+                    source.period_dropped = False
                 ids, unsent = self._current_alerts(source, now)
                 alerts.extend(ids)
                 undelivered += unsent
@@ -1176,8 +1187,10 @@ class CameraOfflineMonitor:
         alert of the period, so one that did not reach Slack (the period's
         one continuous notification included) keeps the notice until the
         period closes even after a later alert of it was sent; its ratio
-        alert counts as unsent while it was not submitted. Nothing without a
-        current condition. At most one unsent per source.
+        alert counts as unsent while it was not submitted, and so does an
+        outage of the period that recovered with its notice still unsent
+        (held, refused) or dropped by the cap (Codex PR #398 P2). Nothing
+        without a current condition. At most one unsent per source.
         """
         ids, unsent = [], False
         episode = source.episode
@@ -1190,6 +1203,16 @@ class CameraOfflineMonitor:
         if source.period == _BY_RATIO:
             if source.flap is not None and not source.flap.notified:
                 unsent = True
+            if source.period_dropped:
+                unsent = True
+            for item in (source.older, source.owed, episode):
+                # Checked after the drain: a qualifying one still without a
+                # notice was held or refused, never in flight.
+                if (item is not None and item.recovered is not None
+                        and not item.notified and item.alert_id is None
+                        and (_of_period(source, item) or _since_period(source, item))
+                        and item.qualifies(now, self.after)):
+                    unsent = True
             ids.extend(alert for alert in source.period_alert_ids if alert not in ids)
         return ids, int(unsent)
 

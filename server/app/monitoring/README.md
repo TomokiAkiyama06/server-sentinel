@@ -275,7 +275,8 @@ reports the alert of each source's current condition
 every alert of a ratio-opened period in progress (its ratio alert and the
 alert of every outage that is flapping in it or began after it opened),
 which keeps an undelivered one until the period closes; `undelivered` counts current conditions whose alert was
-held by the cap or refused), and the camera step reads each final value once
+held by the cap or refused, and a period in progress one of whose recovered
+outages is still held or refused, or was dropped by the cap), and the camera step reads each final value once
 (`NotificationService.final_outcome`, else `NotificationEventStore.get`; only
 `sent` is delivered; an unreadable one is `unverified` and read again next
 tick). While

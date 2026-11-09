@@ -1944,7 +1944,9 @@ notification of its flapping outages, and an ordinary outage that began
 after the period opened, Codex PR #398 P2). While the
 period lasts, one of them that did not reach Slack keeps the notice, even
 after a later alert of the period was sent; it ends when the period closes
-(Owner decision 2026-11-08). A late notice of another outage of the source
+(Owner decision 2026-11-08). So does an outage of the period whose notice the
+cap or the queue still holds after it recovered, or that the cap dropped
+(Codex PR #398 P2). A late notice of another outage of the source
 (`(already recovered)`) or of a closed period never stands for the current
 condition. `camera_offline_delivery_failing`
 is true when such an alert did not reach Slack: its final value is not
