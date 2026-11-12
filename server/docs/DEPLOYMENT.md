@@ -688,8 +688,27 @@ sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
 # 4. approve one camera for one source (type APPROVE on the terminal)
 sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
   approve --config /etc/server-sentinel/deployment.json <source uuid> cam-<10 hex>
+# 5. optional: give a source a display name that says where it looks (type
+#    RENAME); its camera approval, profile and health are unchanged
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  rename-source --config /etc/server-sentinel/deployment.json <source uuid> \
+  --name "<display name>"
 sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
 ```
+
+- `rename-source` changes only the display name the live view and the
+  sources listing show, as one audited Owner operation (`update_source`,
+  target the source UUID only). Like the other mutations it needs the typed
+  confirmation and the stopped service (`service_running` otherwise). A
+  source of another type is refused (`source_not_local_uvc`).
+- `create-source` and `rename-source` refuse, before the confirmation, a
+  name that is blank, longer than 128 characters (the prompt shows it in
+  full) or contains a control, format (such as a bidirectional override or a
+  zero-width character), surrogate, line or paragraph separator character
+  (`source_name_rejected`), the rule a person's display name follows. Plain
+  Japanese, spaces and most emoji are accepted; an emoji joined with a
+  zero-width joiner (for example a person at a laptop) or a flag built from
+  tag characters is refused.
 
 - `create-source` creates an **enabled** `local_uvc` source with that
   explicit capture profile (`WIDTHxHEIGHT@FPS/FOURCC`). The registry refuses
