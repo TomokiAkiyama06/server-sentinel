@@ -599,6 +599,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 if capture_ledger_reads is not None:
                     # One pin attempt before `running` (PR #409 review), so
                     # the watch is not reported paused right after a start.
+                    # Issue #410 item 4: the storage admission waits for the
+                    # monitoring worker's job in flight, so this attempt can
+                    # keep the state `starting` (the listener already
+                    # accepts connections) for at most one such job. A
+                    # failed attempt does not wait again: it is retried
+                    # below, after `running`.
                     with suppress(Exception):
                         await asyncio.to_thread(capture_ledger_reads.pin,
                                                 storage_reservation or runtime_admission)
