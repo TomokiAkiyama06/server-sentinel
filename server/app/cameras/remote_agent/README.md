@@ -210,8 +210,16 @@ this protocol.
   heartbeats produced by the Agent's own `tick()`, including its upper-case
   refusal codes such as `STORAGE_HARD_STOP` (validated, never kept).
 
+- *Agent session.* The Agent's client (`agent/media_capture_agent/ingest_session.py`,
+  stdlib only) keeps its own copy of the framing, ALPN and frame types;
+  `server/tests/test_capture_ingest_session.py` runs it, with heartbeats from
+  the Agent's own `tick()`, against this listener (accepted heartbeat and
+  clock, revocation, superseded session) and compares both copies. The
+  accepted socket sets `TCP_NODELAY` before the handshake, like the Agent's
+  side (Issue #369).
+
 Not yet (follow-ups of #14): media frames and their continuity/ingest path
-with the durable consumer; the Agent's ingest session client; the Owner
+with the durable consumer; the Owner
 notice and status for a degraded or offline node (including
 `storage_device_numbers_stale`, #324) and for an unavailable listener;
 renewal over the session (#109 PR2); heartbeat loss as an Owner notice (#397).
@@ -245,10 +253,10 @@ name is not resolved on the Main; the Agent refuses
 lives in `agent/media_capture_agent/addresses.py`, kept equal by
 `tests/unit/test_tailscale_ranges_match.py`). The refusal checks addresses,
 not routing, and is not authentication or isolation (see `SECURITY.md`). The
-connected-peer check lives in the Agent's `connect_to_main`; the future ingest
-client (#14 / #15) must open its Main connections through `connect_to_main`
-(not its own `socket.create_connection`) so the same post-connect check
-applies.
+connected-peer check lives in the Agent's `connect_to_main`; the ingest
+session client (#14) opens its Main connections through `connect_to_main`
+(not its own `socket.create_connection`), so the same post-connect check
+applies, and so must the media transport (#15).
 
 `pairing_cli.py` (`python -m app.cameras.remote_agent.pairing_cli`, run on an
 installed Main as `serversentinel-pairing`: the root-owned

@@ -245,6 +245,13 @@ class CaptureIngestServer:
                     self._count_refusal("connection_limit")
                     _close(connection)
                     continue
+                try:
+                    # Stop-and-wait over small frames: without this, Nagle
+                    # and delayed ACK add ~40 ms per reply (Issue #369,
+                    # ADR-0007); the Agent sets it on its side too.
+                    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
                 thread = threading.Thread(target=self._serve, args=(connection, address),
                                           daemon=True, name="capture-ingest-session")
                 with self._lock:

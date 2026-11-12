@@ -9,6 +9,8 @@ import re
 import stat
 from uuid import UUID
 
+from .addresses import is_tailscale_host, valid_endpoint_host
+
 
 class ConfigurationError(ValueError):
     """A deployment setting failed validation (never includes setting values)."""
@@ -61,6 +63,32 @@ class ExpectedMount:
                    absolute_path(value["filesystem_root"]), filesystem_uuid)
 
 
+@dataclass(frozen=True)
+class MainIngestEndpoint:
+    """Where the Agent opens its capture ingest session (Issue #14).
+
+    The Main's dedicated ingest listener (its deployment section
+    ``capture_ingest``), not the enrollment endpoint of the trust bundle. The
+    TLS server name and trust anchor come from the installed credential, never
+    from here. A Tailscale IP literal is refused (Issue #150); a DNS name is
+    checked by its connected peer address in ``main_link.connect_to_main``.
+    """
+
+    host: str
+    port: int
+
+    @classmethod
+    def parse(cls, value):
+        if not isinstance(value, dict) or set(value) != {"host", "port"}:
+            raise ConfigurationError("main ingest endpoint requires host and port")
+        host, port = value["host"], value["port"]
+        if not valid_endpoint_host(host) or type(port) is not int or not 1 <= port <= 65535:
+            raise ConfigurationError("invalid main ingest endpoint")
+        if is_tailscale_host(host):
+            raise ConfigurationError("main ingest endpoint must not be a Tailscale address")
+        return cls(host, port)
+
+
 # The longest heartbeat interval (Issue #14). The Main's capture ingest idle
 # timeout (30 s by default, `server/app/cameras/remote_agent/ingest_config.py`)
 # is at least three of these plus 15 s for a slow tick (storage check, clock
@@ -81,10 +109,14 @@ class Settings:
     clock_offset_limit_seconds: float
     clock_uncertainty_limit_seconds: float
     clock_step_limit_seconds: float
+    # Optional (Issue #14): without it the Agent opens no ingest session.
+    main_ingest: MainIngestEndpoint | None = None
 
     @classmethod
     def parse(cls, value, *, code_root):
-        if not isinstance(value, dict) or set(value) != set(cls.__dataclass_fields__):
+        required = set(cls.__dataclass_fields__) - set(_OPTIONAL_SETTINGS)
+        if not isinstance(value, dict) or not required <= set(value) <= required | set(
+                _OPTIONAL_SETTINGS):
             raise ConfigurationError("settings contain missing or unsupported keys")
         try:
             node_id = UUID(value["node_id"])
@@ -111,10 +143,15 @@ class Settings:
         # frame (Issue #14), which allows several of these intervals.
         if value["heartbeat_seconds"] > MAXIMUM_HEARTBEAT_SECONDS:
             raise ConfigurationError("heartbeat interval exceeds the Main ingest contract")
+        # Absent or ``null``: no ingest session (``dataclasses.asdict`` of
+        # unconfigured settings round-trips).
+        main_ingest = (MainIngestEndpoint.parse(value["main_ingest"])
+                       if value.get("main_ingest") is not None else None)
         return cls(node_id, runtime, media, expected, value["service_uid"],
                    value["safety_reserve_bytes"], value["max_segment_bytes"],
                    value["heartbeat_seconds"], value["clock_offset_limit_seconds"],
-                   value["clock_uncertainty_limit_seconds"], value["clock_step_limit_seconds"])
+                   value["clock_uncertainty_limit_seconds"], value["clock_step_limit_seconds"],
+                   main_ingest)
 
     @classmethod
     def load(cls, path, *, code_root):
@@ -124,6 +161,7 @@ class Settings:
         return cls.parse(value, code_root=code_root)
 
 
+_OPTIONAL_SETTINGS = ("main_ingest",)
 MAX_CONFIGURATION_BYTES = 65536
 
 

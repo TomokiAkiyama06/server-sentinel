@@ -1037,10 +1037,13 @@ Apply the exact-model, UVC-capability, stable-identity, and reconnect checks in 
 
 Mock/loopback-verified only: `server/tests/test_capture_ingest_server.py`
 (real loopback TLS 1.3 mTLS with a temporary CA and a synthetic in-process
-client) and `server/tests/test_capture_ingest_wire.py`. No real Main host,
-capture host or LAN has run the listener, and no Agent ingest client exists
-yet; until it does, the capture-host steps use a stand-in client that sends
-synthetic heartbeats with the node's real credential (never commit it).
+client), `server/tests/test_capture_ingest_wire.py`,
+`server/tests/test_capture_ingest_session.py` (the Agent's real session
+client against the real listener) and `agent/tests/test_ingest_session.py`.
+No real Main host, capture host or LAN has run the listener or the session.
+The capture-host steps use the Agent service itself with `main_ingest` set;
+the refusal steps (no ALPN, no client certificate) still need a stand-in
+client with the node's real credential (never commit it).
 Record addresses, node UUIDs and certificate details only in the private
 local record.
 
@@ -1062,6 +1065,13 @@ local record.
   certificate and after `revoke`, the session is refused
   (`capture_ingest_session_refused` or a `capture_ingest_refused_*` event
   in the journal, never a node identity);
+- [ ] Agent session: with `main_ingest` naming the Main's ingest address and
+  port, the Agent's `--check` passes and its status lines show no
+  `main_unavailable` or `clock_unavailable` after the first seconds; without
+  `main_ingest` they show `main_ingest_unconfigured` and no connection is
+  made (`ss -tn` on the capture host); stopping the Main makes the Agent
+  report `main_unavailable` and reconnect within about 30 s of the Main's
+  return, with no restart of the Agent;
 - [ ] a plain HTTP request and a browser to the ingest port get no HTTP
   answer and no dashboard route; the dashboard is not reachable from the
   capture host through the ingest port;

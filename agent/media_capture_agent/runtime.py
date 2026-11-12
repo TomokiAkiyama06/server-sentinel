@@ -22,6 +22,10 @@ class OutboundSession(Protocol):
 
     Implementations initiate the Main connection; this process never listens or
     accesses human/admin API routes. Missing identity never falls back to plaintext.
+    ``unavailable_reason`` is the node reason while ``authenticated`` is False
+    (``pairing_required`` when absent). ``exchange_clock`` returns the latest
+    exchange, which the production session (``ingest_session``) takes from the
+    previous heartbeat's acknowledgement.
     """
 
     @property
@@ -41,6 +45,7 @@ class UnconfiguredCapture:
 
 class UnpairedSession:
     authenticated = False
+    unavailable_reason = "pairing_required"
 
     def exchange_clock(self):
         return None
@@ -50,6 +55,15 @@ class UnpairedSession:
 
     def close(self):
         pass
+
+
+class UnconfiguredIngestSession(UnpairedSession):
+    """No ``main_ingest`` endpoint is configured: no session is opened (Issue #14)."""
+
+    unavailable_reason = "main_ingest_unconfigured"
+
+    def send_heartbeat(self, heartbeat):
+        raise ConnectionError("main_ingest_unconfigured")
 
 
 class Agent:
@@ -84,8 +98,17 @@ class Agent:
         self.utc = utc
         self.monotonic = monotonic
         self.sequence = 0
+        self.clock_refresh_due = False
 
     def tick(self):
+        """Build one heartbeat and send it.
+
+        ``clock_refresh_due`` is set when this heartbeat had no clock exchange
+        yet (a new session) and its acknowledgement now gives one: the caller
+        then sends the next heartbeat at once, so a fresh session does not
+        report ``clock_unavailable`` for a whole interval.
+        """
+        self.clock_refresh_due = False
         self.sequence += 1
         reasons = []
         try:
@@ -113,7 +136,7 @@ class Agent:
             reasons.append("capture_unconfigured")
         exchange = None
         if not self.session.authenticated:
-            reasons.append("pairing_required")
+            reasons.append(getattr(self.session, "unavailable_reason", "pairing_required"))
         else:
             try:
                 exchange = self.session.exchange_clock()
@@ -137,6 +160,12 @@ class Agent:
                 heartbeat["node_state"] = "degraded"
                 if "main_unavailable" not in reasons:
                     reasons.append("main_unavailable")
+            else:
+                if exchange is None:
+                    try:
+                        self.clock_refresh_due = self.session.exchange_clock() is not None
+                    except (ConnectionError, TimeoutError, OSError):
+                        pass
         return heartbeat
 
     def close(self):

@@ -144,7 +144,7 @@ class NodeTlsTests(NodeTlsHarness):
 
     def test_connect_refuses_tailscale_literals_and_resolved_tailscale_peers(self):
         context = build_capture_client_context(self.bundle.ca_certificate_pem)
-        with patch("media_capture_agent.node_tls.socket.create_connection") as connect:
+        with patch("media_capture_agent.main_link.socket.create_connection") as connect:
             for host in ("100.64.0.1", "fd7a:115c:a1e0::1", "::ffff:100.100.100.100"):
                 with self.subTest(host=host):
                     with self.assertRaisesRegex(PairingRefused,
@@ -166,7 +166,7 @@ class NodeTlsTests(NodeTlsHarness):
         for peer in (("100.101.102.103", 7443), ("fd7a:115c:a1e0::9", 7443, 0, 0)):
             raw = Raw(peer)
             with self.subTest(peer=peer[0]), \
-                    patch("media_capture_agent.node_tls.socket.create_connection",
+                    patch("media_capture_agent.main_link.socket.create_connection",
                           return_value=raw), \
                     patch.object(ssl.SSLContext, "wrap_socket") as wrap:
                 with self.assertRaisesRegex(PairingRefused,

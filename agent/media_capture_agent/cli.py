@@ -9,7 +9,9 @@ import threading
 import zipimport
 
 from .config import ConfigurationError, Settings
-from .runtime import Agent
+from .ingest_session import IngestSession
+from .pairing import NodeCredentialStore
+from .runtime import Agent, UnconfiguredIngestSession
 from .storage import DEVICE_NUMBERS_STALE, MediaStore, StorageRefused
 
 
@@ -102,7 +104,13 @@ def main(argv=None):
         settings = Settings.load(args.config, code_root=code_root)
         store = MediaStore(settings)
         runtime_phase = True
-        agent = Agent(settings, store)
+        # Issue #14: the ingest session opens only with a configured endpoint;
+        # `--check` builds it but never connects.
+        session = (IngestSession(NodeCredentialStore(settings.runtime_root,
+                                                     owner_uid=settings.service_uid),
+                                 settings.main_ingest, settings.node_id)
+                   if settings.main_ingest is not None else UnconfiguredIngestSession())
+        agent = Agent(settings, store, session=session)
         runtime_phase = False
         if args.check:
             store.check()
@@ -125,7 +133,10 @@ def main(argv=None):
             print(json.dumps({"service": "media-capture-agent",
                               "node_state": heartbeat["node_state"],
                               "reasons": heartbeat["node_reasons"]}), flush=True)
-            stopped.wait(settings.heartbeat_seconds)
+            # A new session's first acknowledgement gives the clock exchange:
+            # send the next heartbeat at once rather than a whole interval
+            # later (once per session; `Agent.tick`).
+            stopped.wait(0 if agent.clock_refresh_due else settings.heartbeat_seconds)
     except Exception as exc:  # noqa: BLE001 - report a fixed code, never exception text
         reason = check_reason(exc, runtime=runtime_phase)
         if args.json:
