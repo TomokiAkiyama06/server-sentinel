@@ -6,6 +6,7 @@ stopped::
     python -m media_capture_agent.capture_admin candidates --config <agent config>
     python -m media_capture_agent.capture_admin approve --config <agent config> \\
         <source id> <candidate label>
+    python -m media_capture_agent.capture_admin revoke --config <agent config> <source id>
 
 The Agent opens a camera only for a source of its ``capture`` section whose
 Owner approval names that exact device (``uvc_identity``). This is the
@@ -53,6 +54,7 @@ from .config import ConfigurationError, Settings
 
 PROG = "python -m media_capture_agent.capture_admin"
 APPROVE_WORD = "APPROVE"
+REVOKE_WORD = "REVOKE"
 _LABEL = re.compile(r"cam-[0-9a-f]{10}")
 _LABEL_DOMAIN = b"serversentinel-agent-uvc-candidate-label-v1\0"
 
@@ -231,6 +233,16 @@ def _approve(settings, discovery, source_id: UUID, label: str, *, confirm) -> li
             if isinstance(getattr(error, "__cause__", None), BlockingIOError):
                 raise AdminRefused("service_running") from None
             raise AdminRefused("approval_state_unavailable") from None
+        # Re-checked under the approval store's lock (PR #412 review): a
+        # concurrent approval of this camera for another source, or a latch
+        # set meanwhile, is seen here.
+        locked = {source: capture.store.load(source) for source in configured}
+        state = locked[source_id]
+        if (getattr(state, "serial_ambiguous", False) and state.approved is not None
+                and state.approved.strong_key == device.strong_key):
+            raise AdminRefused("camera_serial_not_unique")
+        if any(holder != source_id for holder in _holders(device, locked)):
+            raise AdminRefused("camera_approved_for_another_source")
         fresh = capture.candidates(source_id)
         current = [candidate for candidate in fresh if candidate_label(candidate) == label]
         if len(current) != 1:
@@ -244,6 +256,8 @@ def _approve(settings, discovery, source_id: UUID, label: str, *, confirm) -> li
         except (CaptureRefused, ValueError):
             # The camera changed, vanished or became ambiguous meanwhile.
             raise AdminRefused("candidate_unavailable") from None
+        # Persisted: an interruption from here on must not report a refusal.
+        _ignore_interruptions()
     except CaptureRefused:
         raise AdminRefused("candidate_unavailable") from None
     finally:
@@ -260,10 +274,46 @@ class _Interrupted(Exception):
     pass
 
 
+_SIGNALS = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+
+
+def _ignore_interruptions() -> None:
+    for signum in _SIGNALS:
+        signal.signal(signum, signal.SIG_IGN)
+
+
 def _interrupt(signum, frame):
     # A hang-up or stop while waiting at the prompt still releases the
     # approval session in `finally` (PR #412 review).
     raise _Interrupted()
+
+
+def _revoke(settings, source_id: UUID, *, confirm) -> list[str]:
+    """Remove a source's camera approval, so the camera can be approved again."""
+    from .uvc_approvals import ApprovalStorageError
+    if source_id not in {source.source_id for source in settings.capture.sources}:
+        raise AdminRefused("source_not_configured")
+    store = _store(settings)
+    try:
+        state = store.load(source_id)
+        if state is None or state.approved is None:
+            raise AdminRefused("source_not_approved")
+        word = confirm(f"Remove the camera approval of source {source_id}; the Agent will not "
+                       f"use any camera for it until one is approved again. "
+                       f"Type {REVOKE_WORD} to confirm: ")
+        if word != REVOKE_WORD:
+            raise AdminRefused("owner_confirmation_declined")
+        try:
+            token = store.start_session(source_id).session_token
+            store.save(source_id, None, True, session_token=token, serial_ambiguous=False,
+                       release=True)
+        except ApprovalStorageError:
+            raise AdminRefused("approval_state_unavailable") from None
+        _ignore_interruptions()
+    finally:
+        store.close()
+    return [f"camera approval removed: source_id={source_id}",
+            "next: approve a camera for it with 'approve', then start the service"]
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -272,11 +322,13 @@ def _parser() -> argparse.ArgumentParser:
         "service stopped."))
     commands = parser.add_subparsers(dest="command", required=True)
     for name, text in (("candidates", "list connected cameras by label (no serial or path)"),
-                       ("approve", "approve a connected camera for a configured source")):
+                       ("approve", "approve a connected camera for a configured source"),
+                       ("revoke", "remove a configured source's camera approval")):
         command = commands.add_parser(name, help=text)
         command.add_argument("--config", type=Path, required=True)
-        if name == "approve":
+        if name in ("approve", "revoke"):
             command.add_argument("source", help="the source UUID of the capture section")
+        if name == "approve":
             command.add_argument("candidate", help="the label 'candidates' printed")
     return parser
 
@@ -286,18 +338,19 @@ def main(argv=None, *, settings_loader=_settings, discovery=None,
     args = _parser().parse_args(argv)
     previous = {}
     try:
-        for signum in (signal.SIGHUP, signal.SIGTERM):
+        for signum in _SIGNALS:
             previous[signum] = signal.signal(signum, _interrupt)
         if os.geteuid() == 0:
             raise AdminRefused("run_as_service_account")
         source_id = None
-        if args.command == "approve":
+        if args.command in ("approve", "revoke"):
             try:
                 source_id = UUID(args.source)
             except ValueError:
                 raise AdminRefused("source_id_rejected") from None
             if str(source_id) != args.source.lower():
                 raise AdminRefused("source_id_rejected")
+        if args.command == "approve":
             if not _LABEL.fullmatch(args.candidate):
                 raise AdminRefused("candidate_label_rejected")
         try:
@@ -310,6 +363,8 @@ def main(argv=None, *, settings_loader=_settings, discovery=None,
             raise AdminRefused("capture_unconfigured")
         if args.command == "candidates":
             lines = _candidates(settings, discovery)
+        elif args.command == "revoke":
+            lines = _revoke(settings, source_id, confirm=confirm)
         else:
             lines = _approve(settings, discovery, source_id, args.candidate, confirm=confirm)
     except AdminRefused as refused:

@@ -86,6 +86,10 @@ class UnitTests(unittest.TestCase):
                            Path("/etc/example/config.json"), parsed, "synthetic", 123)
         self.assertIn("DevicePolicy=closed", unit)
         self.assertIn("DeviceAllow=char-video4linux rw", unit)
+        self.assertIn("SupplementaryGroups=video", unit)
+        self.assertIn("Wants=modprobe@videodev.service", unit)
+        self.assertIn("After=modprobe@videodev.service", unit)
+        self.assertNotIn("audio", unit)
         self.assertNotIn("snd", unit)
         self.assertNotIn("char-alsa", unit)
 
@@ -343,6 +347,70 @@ class CaptureAdminTests(unittest.TestCase):
                          f"{capture_admin.PROG}: refused: candidate_unavailable")
         # The session was released: the next start is not a recovery.
         self.assertIsNone(self.approved().session_token)
+
+    def test_revoke_removes_the_approval_so_the_camera_can_move(self):
+        value = support.configuration(Path(tempfile.mkdtemp(prefix="agent-capture-move-")))
+        value["capture"] = {"gst_launch": "/usr/bin/gst-launch-1.0", "sources": [
+            {"source_id": str(SOURCES[0]), "profile": "640x480@15/MJPG"},
+            {"source_id": str(SOURCES[1]), "profile": "640x480@15/MJPG"}]}
+        two = Settings.parse(value, code_root=Path("/nonexistent/code"))
+        label = self.label(self.camera)
+        self.assertEqual(self.run_cli("approve", str(SOURCES[0]), label, settings=two)[0], 0)
+        code, _, stderr = self.run_cli("revoke", str(SOURCES[0]), typed="no", settings=two)
+        self.assertIn("refused: owner_confirmation_declined", stderr)
+        code, stdout, stderr = self.run_cli("revoke", str(SOURCES[0]), typed="REVOKE",
+                                            settings=two)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(f"camera approval removed: source_id={SOURCES[0]}", stdout)
+        self.assertIn("Type REVOKE to confirm", self.prompts[-1])
+        self.assertEqual(self.run_cli("approve", str(SOURCES[1]), label, settings=two)[0], 0)
+        code, _, stderr = self.run_cli("revoke", str(SOURCES[0]), typed="REVOKE", settings=two)
+        self.assertIn("refused: source_not_approved", stderr)
+
+    def test_a_concurrent_approval_for_another_source_is_seen_under_the_lock(self):
+        # PR #412 review: the earlier snapshot is checked again after the prompt.
+        value = support.configuration(Path(tempfile.mkdtemp(prefix="agent-capture-race-")))
+        value["capture"] = {"gst_launch": "/usr/bin/gst-launch-1.0", "sources": [
+            {"source_id": str(SOURCES[0]), "profile": "640x480@15/MJPG"},
+            {"source_id": str(SOURCES[1]), "profile": "640x480@15/MJPG"}]}
+        two = Settings.parse(value, code_root=Path("/nonexistent/code"))
+
+        def confirm_while_another_approves(prompt):
+            store = ApprovalStore(two)
+            try:
+                token = store.start_session(SOURCES[1]).session_token
+                store.save(SOURCES[1], self.camera, False, session_token=token,
+                           serial_ambiguous=False, release=True)
+            finally:
+                store.close()
+            return "APPROVE"
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = capture_admin.main(
+                ["approve", "--config", "/nonexistent", str(SOURCES[0]), self.label(self.camera)],
+                settings_loader=lambda path: two, discovery=self.discovery,
+                confirm=confirm_while_another_approves)
+        self.assertEqual(code, 2)
+        self.assertIn("refused: camera_approved_for_another_source", stderr.getvalue())
+
+    def test_ctrl_c_at_the_prompt_is_a_fixed_refusal(self):
+        import signal
+
+        def interrupted(prompt):
+            os.kill(os.getpid(), signal.SIGINT)
+            return "APPROVE"
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = capture_admin.main(
+                ["approve", "--config", "/nonexistent", str(SOURCES[0]), self.label(self.camera)],
+                settings_loader=lambda path: self.settings, discovery=self.discovery,
+                confirm=interrupted)
+        self.assertEqual(code, 2)
+        self.assertIn("refused: interrupted", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertIsNone(self.approved())
 
     def test_the_confirmation_is_read_from_a_real_terminal(self):
         # Codex P1 on PR #412: a terminal is not seekable.

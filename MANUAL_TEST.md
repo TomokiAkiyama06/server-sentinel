@@ -1106,6 +1106,9 @@ local record.
   device, and the service reaches `online` although the camera also has a
   UVC metadata node; re-plug the camera (it may get another `/dev/videoN`)
   and restart the host: both reconnect by serial without a new approval;
+  boot the capture host with the camera unplugged, then plug it in: the
+  service reaches `online` without a restart (`modprobe@videodev` ordering);
+  `revoke <source>` then `approve` moves the camera to another source;
   `approve` refuses a second source for the same camera
   (`camera_approved_for_another_source`);
 - [ ] a plain HTTP request and a browser to the ingest port get no HTTP
