@@ -75,8 +75,8 @@ def check_reason(exc, *, runtime=False):
     """Map a failure to exactly one fixed code; unknown errors -> check_failed."""
     if isinstance(exc, ConfigurationError):
         return "config_invalid"
-    # Issue #14: the configured capture (imported lazily, so a deployment
-    # without `capture` never loads the pipeline modules).
+    # Issue #14: the configured capture's failures (imported here, when a
+    # failure is being reported).
     from .uvc_approvals import ApprovalStorageError
     from .uvc_capture import CaptureRefused
     from .uvc_pipeline import PipelineError
@@ -152,18 +152,25 @@ def main(argv=None):
         session = (IngestSession(credentials, settings.main_ingest, settings.node_id)
                    if settings.main_ingest is not None
                    else UnconfiguredIngestSession(credentials))
+        # The Agent's account, runtime-root and node-identity checks come
+        # first (#116: fail closed before any capture; PR #412 review).
+        agent = Agent(settings, store, session=session)
         launcher = _capture_launcher(settings)
         if launcher is not None and not args.check:
             # The approval store holds a runtime-wide lock, so `--check`
             # (also run by the installer while the service runs) only checks
             # the pipeline launcher; the service opens the cameras.
             capture, preview = _capture(settings, launcher)
+<<<<<<< HEAD
         agent = Agent(settings, store, session=session, capture=capture)
         if preview is not None and isinstance(session, IngestSession):
             # Issue #14 (option A): the newest JPEG of each source to the Main.
             from .live_sender import LiveSender
             sender = LiveSender(session, preview,
                                 [source.source_id for source in settings.capture.sources])
+=======
+            agent.capture = capture
+>>>>>>> feat/issue-14-agent-capture-wiring
         runtime_phase = False
         if args.check:
             store.check()
@@ -201,6 +208,7 @@ def main(argv=None):
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
+<<<<<<< HEAD
         if sender is not None:
             sender.close()
         if agent is not None:
@@ -210,6 +218,24 @@ def main(argv=None):
                 capture.close()
             if store is not None:
                 store.close()
+=======
+        try:
+            if agent is not None:
+                agent.close()
+            else:
+                if capture is not None:
+                    capture.close()
+                if store is not None:
+                    store.close()
+        except Exception:  # noqa: BLE001 - a fixed code, never exception text
+            # A camera pipeline that could not be reaped keeps its recovery
+            # marker armed (the next start requires re-approval).
+            print("media-capture-agent: shutdown failed: capture_cleanup_failed",
+                  file=sys.stderr)
+            if preview is not None:
+                preview.close()
+            return 1
+>>>>>>> feat/issue-14-agent-capture-wiring
         if preview is not None:
             preview.close()
     return 0

@@ -481,6 +481,29 @@ class LiveSenderTests(unittest.TestCase):
         self.assertLessEqual(count, 6)
         self.assertGreaterEqual(count, 3)
 
+    def test_a_restarted_pipeline_with_the_same_sequence_is_sent_again(self):
+        from media_capture_agent.live_sender import LiveSender
+        from media_capture_agent.preview import PreviewFrame
+        source = uuid4()
+        frames = {source: PreviewFrame(source, b"\xff\xd8a\xff\xd9", 1, 0.0, 1)}
+        sent = []
+
+        class Session:
+            def send_live_frame(self, source, data):
+                sent.append(data)
+                return True
+
+        class Preview:
+            def latest(self, source):
+                return frames.get(source)
+
+        sender = LiveSender(Session(), Preview(), (source,))
+        self.addCleanup(sender.close)
+        time.sleep(0.4)
+        frames[source] = PreviewFrame(source, b"\xff\xd8b\xff\xd9", 1, 0.0, 2)
+        time.sleep(0.4)
+        self.assertEqual(sent, [b"\xff\xd8a\xff\xd9", b"\xff\xd8b\xff\xd9"])
+
     def test_unsent_frames_are_counted_and_retried_when_newer(self):
         from media_capture_agent.live_sender import LiveSender
         from media_capture_agent.preview import PreviewFrame

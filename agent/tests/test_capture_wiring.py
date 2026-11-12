@@ -67,6 +67,29 @@ class CaptureSettingTests(unittest.TestCase):
                     self.parse(capture)
 
 
+class UnitTests(unittest.TestCase):
+    def test_capture_allows_the_video_class_but_no_sound_device(self):
+        # PR #412 review: discovery probes every video4linux node (UVC adds a
+        # metadata node) and a re-plugged camera gets a new number.
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        self.addCleanup(sys.path.remove, str(Path(__file__).resolve().parents[1]))
+        from install import render_unit
+        temporary = tempfile.TemporaryDirectory(prefix="agent-capture-unit-")
+        self.addCleanup(temporary.cleanup)
+        value = support.configuration(Path(temporary.name))
+        value["capture"] = {"gst_launch": "/usr/bin/gst-launch-1.0",
+                            "sources": [{"source_id": str(SOURCES[0]),
+                                         "profile": "640x480@15/MJPG"}]}
+        parsed = Settings.parse(value, code_root=Path(temporary.name) / "code")
+        unit = render_unit(Path("/opt/example/0.1.0/media-capture-agent"),
+                           Path("/etc/example/config.json"), parsed, "synthetic", 123)
+        self.assertIn("DevicePolicy=closed", unit)
+        self.assertIn("DeviceAllow=char-video4linux rw", unit)
+        self.assertNotIn("snd", unit)
+        self.assertNotIn("char-alsa", unit)
+
+
 class PreviewTapTests(unittest.TestCase):
     def test_only_the_newest_frame_is_kept_and_the_queue_never_overflows(self):
         source = uuid4()
@@ -110,6 +133,29 @@ class CaptureWithPreviewTests(CaptureCase):
         self.assertEqual(capture.frames(SOURCES[0]).drop_stats()[0], 0)
 
 
+class ApprovedCameraReconnectTests(CaptureCase):
+    def test_an_admin_approval_reconnects_at_the_next_service_start(self):
+        from types import SimpleNamespace
+        device = evidence(0, serial="SYN-SERIAL-0009")
+        discovery = FakeDiscovery(device)
+        admin_settings = SimpleNamespace(
+            service_uid=self.settings.service_uid, runtime_root=self.settings.runtime_root,
+            capture=SimpleNamespace(sources=(SimpleNamespace(source_id=SOURCES[0], width=640,
+                                                             height=480, fps=15),)))
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = capture_admin.main(
+                ["approve", "--config", "/nonexistent", str(SOURCES[0]),
+                 capture_admin.candidate_label(device)],
+                settings_loader=lambda path: admin_settings, discovery=discovery,
+                confirm=lambda prompt: "APPROVE")
+        self.assertEqual(code, 0)
+        # The service's next start reconnects it by serial, without the Owner.
+        capture = self.capture(discovery)
+        self.assertEqual(self.state(capture), ("degraded", "capture_starting"))
+        self.stream(capture, self.launcher.pipelines[-1])
+        self.assertEqual(self.state(capture), ("online", "video_ready"))
+
+
 class CheckReasonTests(unittest.TestCase):
     def test_capture_failures_have_their_own_codes(self):
         from media_capture_agent.uvc_approvals import ApprovalStorageError
@@ -140,7 +186,29 @@ class CheckReasonTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cli.main(["--config", "/nonexistent", "--check"]), 0)
         self.assertEqual(len(launchers), 1)
-        self.assertIsNone(agent.call_args.kwargs["capture"])
+        self.assertNotIn("capture", agent.call_args.kwargs)
+
+    def test_the_agent_checks_run_before_any_capture_is_built(self):
+        # #116 (PR #412 review): fail closed before the cameras.
+        temporary = tempfile.TemporaryDirectory(prefix="agent-capture-order-")
+        self.addCleanup(temporary.cleanup)
+        value = support.configuration(Path(temporary.name))
+        value["capture"] = {"gst_launch": "/usr/bin/gst-launch-1.0",
+                            "sources": [{"source_id": str(SOURCES[0]),
+                                         "profile": "640x480@15/MJPG"}]}
+        parsed = Settings.parse(value, code_root=Path(temporary.name) / "code")
+        from media_capture_agent.storage import StorageRefused
+        with patch.object(cli, "_capture_launcher") as launcher, \
+                patch.object(cli, "_capture") as built, \
+                patch.object(cli.Settings, "load", return_value=parsed), \
+                patch.object(cli, "MediaStore"), \
+                patch.object(cli, "Agent",
+                             side_effect=StorageRefused("dedicated_nonroot_account_required")):
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(cli.main(["--config", "/nonexistent"]), 1)
+        self.assertIn("service_account_mismatch", stderr.getvalue())
+        launcher.assert_not_called()
+        built.assert_not_called()
 
 
 class CaptureAdminTests(unittest.TestCase):
@@ -214,7 +282,67 @@ class CaptureAdminTests(unittest.TestCase):
                 code, stdout, stderr = self.run_cli(*argv, typed=typed)
                 self.assertEqual((code, stdout), (2, ""))
                 self.assertIn(f"refused: {reason}", stderr)
-        self.assertIsNone(self.approved().approved)
+        # No session was even started: nothing is stored for the source.
+        self.assertIsNone(self.approved())
+
+    def test_candidates_start_no_session(self):
+        self.run_cli("candidates")
+        state = self.approved()
+        self.assertIsNone(state)
+
+    def test_approved_for_survives_a_new_device_instance(self):
+        # The label hashes the per-boot instance; `approved_for` uses the serial.
+        self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        replugged = evidence(0, serial="SYN-SERIAL-0001", token=(9, 999, 9))
+        self.discovery.devices = [replugged]
+        _, stdout, _ = self.run_cli("candidates")
+        self.assertIn(f"approved_for={SOURCES[0]}", stdout)
+        self.assertNotIn(self.label(self.camera), stdout)
+
+    def test_shared_or_latched_serials_are_not_approved(self):
+        twin = evidence(2, serial="SYN-SERIAL-0001")
+        self.discovery.devices = [self.camera, twin]
+        code, _, stderr = self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        self.assertEqual(code, 2)
+        self.assertIn("refused: camera_serial_not_unique", stderr)
+        self.assertIn("serial=shared", self.run_cli("candidates")[1])
+        # A latched ambiguity for the same serial refuses as well.
+        from media_capture_agent.uvc_approvals import ApprovalStore as Store
+        store = Store(self.settings)
+        try:
+            token = store.start_session(SOURCES[0]).session_token
+            store.save(SOURCES[0], self.camera, True, session_token=token,
+                       serial_ambiguous=True, release=True)
+        finally:
+            store.close()
+        self.discovery.devices = [self.camera]
+        code, _, stderr = self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        self.assertIn("refused: camera_serial_not_unique", stderr)
+
+    def test_a_camera_approved_for_another_source_is_refused(self):
+        value = support.configuration(Path(tempfile.mkdtemp(prefix="agent-capture-two-")))
+        value["capture"] = {"gst_launch": "/usr/bin/gst-launch-1.0", "sources": [
+            {"source_id": str(SOURCES[0]), "profile": "640x480@15/MJPG"},
+            {"source_id": str(SOURCES[1]), "profile": "640x480@15/MJPG"}]}
+        two = Settings.parse(value, code_root=Path("/nonexistent/code"))
+        code, _, stderr = self.run_cli("approve", str(SOURCES[0]), self.label(self.camera),
+                                       settings=two)
+        self.assertEqual(code, 0, stderr)
+        code, _, stderr = self.run_cli("approve", str(SOURCES[1]), self.label(self.camera),
+                                       settings=two)
+        self.assertEqual(code, 2)
+        self.assertIn("refused: camera_approved_for_another_source", stderr)
+
+    def test_a_camera_that_changed_at_the_prompt_is_a_fixed_refusal(self):
+        from media_capture_agent.uvc_capture import UvcCapture
+        with patch.object(UvcCapture, "approve", side_effect=ValueError("synthetic")):
+            code, stdout, stderr = self.run_cli("approve", str(SOURCES[0]),
+                                                self.label(self.camera))
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertEqual(stderr.strip().splitlines()[-1],
+                         f"{capture_admin.PROG}: refused: candidate_unavailable")
+        # The session was released: the next start is not a recovery.
+        self.assertIsNone(self.approved().session_token)
 
     def test_a_camera_without_a_serial_is_not_approved(self):
         self.discovery.devices = [evidence(4, serial=None)]

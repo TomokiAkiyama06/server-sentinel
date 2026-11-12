@@ -35,7 +35,7 @@ class LiveSender:
         self._sources = sources
         self._period = 1.0 / frames_per_second
         self._clock = clock
-        self._sent: dict[UUID, int] = {}
+        self._sent: dict[UUID, tuple[int, int]] = {}
         # Value-free counters for diagnostics and tests.
         self.frames_sent = 0
         self.frames_not_sent = 0
@@ -51,10 +51,13 @@ class LiveSender:
                 if self._stopping.is_set():
                     return
                 frame = self._preview.latest(source)
-                if frame is None or self._sent.get(source) == frame.sequence:
+                # A restarted pipeline numbers its frames from 1 again, so a
+                # frame is identified by its generation and sequence.
+                identity = (getattr(frame, "generation", 0), getattr(frame, "sequence", None))
+                if frame is None or self._sent.get(source) == identity:
                     continue
                 if self._session.send_live_frame(source, frame.data):
-                    self._sent[source] = frame.sequence
+                    self._sent[source] = identity
                     self.frames_sent += 1
                 else:
                     self.frames_not_sent += 1
