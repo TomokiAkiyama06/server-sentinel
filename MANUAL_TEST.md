@@ -1064,6 +1064,11 @@ local record.
   unwritable on the capture host and restored afterwards): Slack receives
   `capture_node_storage_failure` within one monitoring tick, once; no notice
   for `capture_unconfigured`, and none on recovery;
+- [ ] heartbeat loss (Issue #397): stop the Agent service on the capture host
+  for more than 6 min: Slack receives one `capture_node_heartbeat_lost`;
+  start it again: no recovery notice. Restart the Main with the Agent
+  stopped: one notice about 5 min after the start. A revoked node is never
+  notified;
 - [ ] from the capture host, which is not on the Tailnet, a paired node's
   heartbeat over the private LAN is answered with `HEARTBEAT_ACK`; without
   the ALPN, without a client certificate, with another deployment's

@@ -18,6 +18,7 @@ from app.notifications.service import NotificationKind, NotificationService
 from app.notifications.slack import DeliveryResult, SlackDelivery
 
 from tests.test_camera_offline_notifications import Clock, Sink
+from tests.test_capture_mtls import CaptureTlsHarness, Owner
 from tests.test_monitoring_runtime import RuntimeFixture
 from tests.test_storage_notifications import Transport, endpoint
 import unittest
@@ -28,21 +29,24 @@ STORAGE = NotificationKind.CAPTURE_NODE_STORAGE_FAILURE
 NUMBERS = NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED
 CLOCK = NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED
 LISTENER = NotificationKind.CAPTURE_INGEST_UNAVAILABLE
+LOST = NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST
 
 
 class Provider:
     def __init__(self):
         self.state = "running"
         self.nodes = {}
+        # Issue #397: the ledger's active nodes (None: not readable).
+        self.expected = None
 
     def set(self, node, state, *reasons):
         self.nodes[node] = CaptureNodeView(node, state, tuple(reasons))
 
     def __call__(self):
-        return self.state, tuple(self.nodes.values())
+        return self.state, tuple(self.nodes.values()), self.expected
 
 
-class MonitorTests(unittest.TestCase):
+class MonitorFixture:
     def setUp(self):
         self.clock = Clock()
         self.sink = Sink()
@@ -64,6 +68,19 @@ class MonitorTests(unittest.TestCase):
 
     def kinds(self):
         return sorted(event.kind.value for event in self.sink.rows.values())
+
+    def texts(self):
+        import json
+        import time
+        for _ in range(1000):
+            self.service.poll()
+            if not self.service.pending_count:
+                break
+            time.sleep(0.01)
+        return [json.loads(request.data)["text"] for request, _ in self.transport.requests]
+
+
+class MonitorTests(MonitorFixture, unittest.TestCase):
 
     def test_a_storage_failure_is_notified_at_once_and_once_per_episode(self):
         self.provider.set(self.node, "degraded", "storage_unavailable")
@@ -265,15 +282,6 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(texts, ["ServerSentinel critical alert: capture_node_storage_failure"
                                  " (already recovered)"] * 2)
 
-    def texts(self):
-        import json
-        import time
-        for _ in range(1000):
-            self.service.poll()
-            if not self.service.pending_count:
-                break
-            time.sleep(0.01)
-        return [json.loads(request.data)["text"] for request, _ in self.transport.requests]
 
     def test_an_unrecorded_notice_is_retried(self):
         self.provider.set(self.node, "degraded", "storage_unavailable")
@@ -351,6 +359,143 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(registry.nodes()[0][1], "offline")
 
 
+class HeartbeatLossTests(MonitorFixture, unittest.TestCase):
+    """Issue #397 (Owner decision 2026-11-12)."""
+
+    def setUp(self):
+        super().setUp()
+        self.provider.expected = (self.node,)
+
+    def test_a_node_that_never_connects_is_notified_after_five_minutes(self):
+        status = self.drain()
+        self.assertEqual(status.offline_nodes, 1)
+        self.advance(NOTICE_AFTER_SECONDS - 1)
+        self.drain()
+        self.assertEqual(self.kinds(), [])
+        self.advance(1)
+        self.drain()
+        self.advance(3600)
+        self.drain()
+        self.assertEqual(self.kinds(), [LOST.value])
+        self.assertEqual(self.texts(),
+                         ["ServerSentinel critical alert: capture_node_heartbeat_lost"])
+
+    def test_a_node_that_goes_quiet_is_notified_once_and_recovery_is_silent(self):
+        self.provider.set(self.node, "online")
+        self.drain()
+        self.provider.set(self.node, "offline")
+        self.drain()
+        self.advance(NOTICE_AFTER_SECONDS)
+        self.drain()
+        self.provider.set(self.node, "online")
+        self.drain()
+        self.assertEqual(self.kinds(), [LOST.value])
+        # A later loss is a new episode.
+        self.provider.set(self.node, "offline")
+        self.drain(AT + timedelta(hours=1))
+        self.advance(NOTICE_AFTER_SECONDS)
+        self.drain(AT + timedelta(hours=1))
+        self.assertEqual(self.kinds(), [LOST.value, LOST.value])
+
+    def test_a_short_gap_is_not_notified(self):
+        self.provider.set(self.node, "offline")
+        self.drain()
+        self.advance(NOTICE_AFTER_SECONDS - 10)
+        self.provider.set(self.node, "degraded", "capture_unconfigured")
+        self.drain()
+        self.advance(3600)
+        self.drain()
+        self.assertEqual(self.kinds(), [])
+
+    def test_a_revoked_node_is_not_watched(self):
+        self.drain()
+        self.provider.expected = ()
+        self.advance(3600)
+        self.drain()
+        self.assertEqual(self.kinds(), [])
+
+    def test_no_loss_notice_while_the_listener_is_down_or_the_ledger_unreadable(self):
+        for index, change in enumerate(({"state": "unavailable"}, {"expected": None})):
+            # Each episode its own time, so its own event ID.
+            at = AT + timedelta(days=index)
+            with self.subTest(change=change):
+                self.sink.rows.clear()
+                self.monitor = CaptureNodeHealthMonitor(self.provider)
+                self.provider.state, self.provider.expected = "running", (self.node,)
+                self.drain(at)
+                for name, value in change.items():
+                    setattr(self.provider, name, value)
+                self.drain(at)
+                self.advance(3600)
+                self.drain(at)
+                self.assertNotIn(LOST.value, self.kinds())
+                # Back: only observed time counts, so it is due 5 min later.
+                self.provider.state, self.provider.expected = "running", (self.node,)
+                self.drain(at)
+                self.assertNotIn(LOST.value, self.kinds())
+                self.advance(NOTICE_AFTER_SECONDS)
+                self.drain(at)
+                self.assertIn(LOST.value, self.kinds())
+
+    def held_loss(self):
+        """A loss notice owed and held by the cap; the registry forgot the node."""
+        for index in range(HOURLY_LIMIT):
+            self.provider.set(self.node, "degraded", "storage_unavailable")
+            self.drain(AT + timedelta(minutes=index))
+            self.provider.set(self.node, "online")
+            self.drain(AT + timedelta(minutes=index))
+        del self.provider.nodes[self.node]
+        self.drain()
+        self.advance(NOTICE_AFTER_SECONDS)
+        self.assertEqual(self.drain().held_notices, 1)
+
+    def test_a_revoked_node_loses_its_held_loss_notice(self):
+        self.held_loss()
+        self.provider.expected = ()
+        self.drain()
+        self.advance(3600)
+        self.drain()
+        self.assertNotIn(LOST.value, self.kinds())
+
+    def test_an_unreadable_ledger_keeps_a_held_loss_notice(self):
+        self.held_loss()
+        self.provider.expected = None
+        self.drain()
+        self.provider.expected = (self.node,)
+        self.advance(3600)
+        self.drain()
+        self.assertIn(LOST.value, self.kinds())
+
+    def test_the_loss_notice_shares_the_node_cap(self):
+        for index in range(HOURLY_LIMIT):
+            self.provider.set(self.node, "degraded", "storage_unavailable")
+            self.drain(AT + timedelta(minutes=index))
+            self.provider.set(self.node, "online")
+            self.drain(AT + timedelta(minutes=index))
+        self.provider.set(self.node, "offline")
+        self.drain()
+        self.advance(NOTICE_AFTER_SECONDS)
+        status = self.drain()
+        self.assertNotIn(LOST.value, self.kinds())
+        self.assertEqual(status.held_notices, 1)
+        self.advance(3600)
+        self.drain()
+        self.assertIn(LOST.value, self.kinds())
+
+
+class ActiveNodeLedgerTests(CaptureTlsHarness):
+    """Issue #397: the nodes the Main expects heartbeats from."""
+
+    def test_only_nodes_with_an_active_credential_are_expected(self):
+        first = self._paired_node("a")[0].node_id
+        second = self._paired_node("b")[0].node_id
+        pending = self._paired_node("c", activate=False)[0].node_id
+        self.assertEqual(set(self.ledger.active_node_ids()), {first, second})
+        self.ledger.revoke(Owner(), "owner", node_id=second)
+        self.assertEqual(self.ledger.active_node_ids(), (first,))
+        self.assertNotIn(pending, self.ledger.active_node_ids())
+
+
 class RuntimeWiringTests(RuntimeFixture):
     async def test_an_unavailable_listener_is_notified_through_the_runtime(self):
         values = dict(
@@ -382,7 +527,7 @@ class RuntimeWiringTests(RuntimeFixture):
 
     async def test_the_application_owns_the_monitor(self):
         with self.assertRaises(TypeError):
-            self.application(capture_nodes=CaptureNodeHealthMonitor(lambda: ("disabled", ())))
+            self.application(capture_nodes=CaptureNodeHealthMonitor(lambda: ("disabled", (), None)))
 
 
 if __name__ == "__main__":

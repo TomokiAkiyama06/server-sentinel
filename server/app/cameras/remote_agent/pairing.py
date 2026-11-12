@@ -752,6 +752,19 @@ class PairingLedger:
             not_after=None if row["not_after"] is None else float(row["not_after"]))
             for row in rows)
 
+    def active_node_ids(self) -> tuple[UUID, ...]:
+        """Nodes whose credential is active (not revoked or superseded), for #397.
+
+        The Main expects a heartbeat from each of them; a read only, bounded
+        like the expiry listing. No key, serial or certificate digest.
+        """
+        with self._transaction(write=False) as connection:
+            rows = connection.execute(
+                "SELECT node_id FROM pairing_node_credentials WHERE state = 'active' "
+                "ORDER BY node_id LIMIT ?", (_MAX_EXPIRY_ROWS,),
+            ).fetchall()
+        return tuple(UUID(row["node_id"]) for row in rows)
+
     def credential_expiries(self) -> tuple[CredentialExpiry, ...]:
         """Active credentials with a recorded expiry, for Owner-visible monitoring."""
         with self._transaction(write=False) as connection:

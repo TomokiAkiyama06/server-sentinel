@@ -24,7 +24,7 @@ showed the reason to the first heartbeat without it) notifies once; a
 recovery is not notified. While a node is offline (no heartbeat within the
 idle timeout) its episodes neither end nor become due, and only observed
 time counts towards the 5 min: the episode's start moves forward by the time
-it was not observed (heartbeat loss is #397). A revoked node is forgotten by
+it was not observed (heartbeat loss is below). A revoked node is forgotten by
 the registry, and its episodes with it.
 
 At most ``HOURLY_LIMIT`` (4) node notices per node per rolling hour. An
@@ -36,6 +36,20 @@ older (bounded, as the camera offline monitor's hold limit). After a Main
 restart the hour is re-seeded from the node notices accepted in the last
 hour (``restore_window``): their rows name no node, so they count against
 every node (conservative), and a restart loop cannot exceed the cap.
+
+Heartbeat loss (Issue #397, Owner decision 2026-11-12): every node whose
+pairing credential is active (the provider's ``expected`` set, read from the
+ledger) is watched, including one that has not connected since the Main
+started. A node without a heartbeat (offline in the registry, or not in it
+at all) for ``NOTICE_AFTER_SECONDS`` of observed time sends one
+``capture_node_heartbeat_lost`` per episode, under the same per-node cap and
+hold rules; the episode starts when the monitor first sees the node lost
+(within one tick of the registry's idle timeout). A heartbeat ends it,
+without a recovery notice. There is no exception for an intentional stop
+yet: an Agent stopped for longer is notified once. While the listener is not
+running, or the ledger could not be read (``expected`` is None), loss
+episodes are paused: the listener notice covers the first, and the next
+tick retries the second.
 
 The listener: configured (state ``starting`` or ``unavailable``: material
 unreadable, bind being retried) but not ``running`` for 5 min sends one
@@ -68,8 +82,9 @@ NOTICE_AFTER_SECONDS = 300.0
 NODE_NOTICE_KINDS = (
     NotificationKind.CAPTURE_NODE_STORAGE_FAILURE,
     NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED,
-    NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED,
+    NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED, NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST,
 )
+_LOST = NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST
 HOURLY_LIMIT = 4
 _HOUR = 3600.0
 _NAMESPACE = UUID("7b0c55a4-4f3e-5d4b-9c55-2f1a8e5d0c14")
@@ -150,7 +165,8 @@ class _Episode:
 
 
 class CaptureNodeHealthMonitor:
-    def __init__(self, provider: Callable[[], tuple[str, Iterable[CaptureNodeView]]], *,
+    def __init__(self, provider: Callable[[], tuple[str, Iterable[CaptureNodeView],
+                                                    Iterable[UUID] | None]], *,
                  after_seconds: float = NOTICE_AFTER_SECONDS, hourly_limit: int = HOURLY_LIMIT):
         if (not callable(provider) or type(after_seconds) not in (int, float)
                 or not math.isfinite(after_seconds) or after_seconds < 0
@@ -188,10 +204,12 @@ class CaptureNodeHealthMonitor:
     def drain(self, notifications: NotificationService, *, at: datetime,
               monotonic: float) -> CaptureHealthStatus:
         """Observe the provider once, then record every owed notice the cap allows."""
-        state, nodes = self._provider()
+        state, nodes, expected = self._provider()
         nodes = tuple(nodes)
+        expected = None if expected is None else frozenset(expected)
         self._observe_listener(state, at, monotonic)
-        self._observe_nodes(nodes, at, monotonic)
+        self._observe_nodes(nodes, expected, at, monotonic)
+        self._observe_loss(nodes, expected, state == "running", at, monotonic)
         while self._restored and monotonic - self._restored[0] >= _HOUR:
             self._restored.popleft()
         held = 0
@@ -226,10 +244,13 @@ class CaptureNodeHealthMonitor:
                 window.append(monotonic)
             if table is self._held:
                 del self._held[key]
+        seen = {node.node_id for node in nodes}
         return CaptureHealthStatus(
             online_nodes=sum(node.state == "online" for node in nodes),
             degraded_nodes=sum(node.state == "degraded" for node in nodes),
-            offline_nodes=sum(node.state == "offline" for node in nodes),
+            # An expected node not connected since the start is offline too.
+            offline_nodes=sum(node.state == "offline" for node in nodes)
+            + len((expected or frozenset()) - seen),
             notable_degraded_nodes=sum(
                 node.state == "degraded"
                 and any(matches(node.reasons) for _kind, _delay, matches in _NODE_NOTICES)
@@ -276,9 +297,29 @@ class CaptureNodeHealthMonitor:
             # notice not yet sent is not owed (the listener has no hourly cap).
             self._episodes.pop(key, None)
 
-    def _observe_nodes(self, nodes: tuple[CaptureNodeView, ...], at: datetime,
+    def _observe_loss(self, nodes: tuple[CaptureNodeView, ...], expected, running: bool,
+                      at: datetime, now: float) -> None:
+        states = {node.node_id: node.state for node in nodes}
+        if expected is None or not running:
+            for key, episode in self._episodes.items():
+                if key[1] is _LOST:
+                    episode.check(now)
+                    episode.pause(now)
+            return
+        for node in expected:
+            key = (node, _LOST)
+            if states.get(node, "offline") == "offline":
+                self._begin(key, _LOST, self._after, at, now)
+            else:
+                self._recovered(key, now)
+        for table in (self._episodes, self._held):
+            for key in [key for key in table if key[1] is _LOST and key[0] not in expected]:
+                # Revoked or superseded: no longer expected.
+                del table[key]
+
+    def _observe_nodes(self, nodes: tuple[CaptureNodeView, ...], expected, at: datetime,
                        now: float) -> None:
-        known = set()
+        known = set(expected or ())
         for node in nodes:
             known.add(node.node_id)
             if node.state == "offline":
@@ -299,8 +340,10 @@ class CaptureNodeHealthMonitor:
                 else:
                     self._recovered(key, now)
         for table in (self._episodes, self._held):
-            for key in [key for key in table if key[0] != _LISTENER and key[0] not in known]:
+            for key in [key for key in table if key[0] != _LISTENER and key[0] not in known
+                        and key[1] is not _LOST]:
                 # Forgotten by the registry (revoked, or dropped for room).
+                # Loss episodes follow the ledger (`_observe_loss`).
                 del table[key]
         active = known | {key[0] for key in self._episodes} | {key[0] for key in self._held}
         for node in [node for node in self._sent if node not in active]:

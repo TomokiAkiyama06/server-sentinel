@@ -65,6 +65,7 @@ CRITICAL_KINDS = (
     NotificationKind.SERVER_MOVEMENT, NotificationKind.CAMERA_TAMPER,
     NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.CREDENTIAL_FINDING,
     NotificationKind.CAPTURE_NODE_STORAGE_FAILURE, NotificationKind.CAPTURE_INGEST_UNAVAILABLE,
+    NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST,
 )
 # `recording_device_numbers_changed` is not listed: the daily summary counts
 # the `recording_device_numbers_stale` flag instead, every day until fixed.

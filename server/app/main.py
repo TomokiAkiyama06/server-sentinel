@@ -243,17 +243,30 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # (set in the lifespan below); it never touches SQLite or a socket.
     if monitoring_dependencies is not None and monitoring_dependencies.capture_nodes is not None:
         raise TypeError("the application owns the capture node health monitor")
+    # The pairing ledger the ingest acceptor reads (built below for a
+    # `capture_ingest` section whose material loaded).
+    capture_ledger = None
     if ((capture_ingest is not None or capture_ingest_unavailable) and monitoring is not None
             and monitoring.storage_configured):
         from app.monitoring.capture_nodes import CaptureNodeHealthMonitor, CaptureNodeView
 
         def capture_health():
-            # `application` is bound below; the first tick runs in its lifespan.
+            # `application` and `capture_ledger` are bound below; the first
+            # tick runs in the lifespan.
             server = application.state.capture_ingest
             nodes = () if server is None else tuple(
                 CaptureNodeView(node, state, reasons)
                 for node, state, reasons in server.registry.nodes())
-            return application.state.capture_ingest_state, nodes
+            # Issue #397: the nodes expected to send heartbeats. A ledger
+            # read that fails skips heartbeat-loss detection for this tick
+            # only (`capture_nodes.py`); the degraded notices go on.
+            expected = None
+            if capture_ledger is not None:
+                try:
+                    expected = capture_ledger.active_node_ids()
+                except Exception:
+                    expected = None
+            return application.state.capture_ingest_state, nodes, expected
 
         monitoring_dependencies = replace(monitoring_dependencies or MonitoringDependencies(),
                                           capture_nodes=CaptureNodeHealthMonitor(capture_health))
