@@ -203,7 +203,9 @@ every tick in every runtime state, like the camera tick, and sets
 `capture_node_degraded` (a notified reason only) /
 `capture_ingest_unavailable`. On the first running tick it re-seeds the
 per-node hourly cap from the node notice rows of the last hour
-(`restore_window`, counted for every node). The daily summary fills
+(`_capture_notice_rows` -> `restore_window`; each row is matched to its node
+by `capture_nodes.notice_id`). `capture_node_notices_held` reports an owed
+notice still held (cap, full queue, refused write). The daily summary fills
 `agents_online` / `agents_offline` from its counts; they are shown once a
 capture pipeline reports. The notice rules
 are in `capture_nodes.py` and SPECIFICATION §5.7.

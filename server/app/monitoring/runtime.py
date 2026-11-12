@@ -231,6 +231,9 @@ class MonitoringStatus:
     # the daily summary; the notices are `capture_nodes.py`'s.
     capture_node_degraded: bool = False
     capture_ingest_unavailable: bool = False
+    # PR #408 review: an owed node notice is held (cap, full queue, refused
+    # local write). Diagnostic only; it is retried on every tick.
+    capture_node_notices_held: bool = False
 
     @property
     def camera_offline_cause(self) -> str:
@@ -1241,10 +1244,8 @@ class MonitoringRuntime:
                 # PR #408 review: the per-node hourly cap holds across a
                 # restart loop; the rows name no node, so they count for
                 # every node. A `pending` row holds its slot too.
-                monitor.restore_window(self._notification_window(
-                    NODE_NOTICE_KINDS, monitor.hourly_limit, self.dependencies.utcnow(),
-                    confirmed_only=True, include_pending=True),
-                    monotonic=self.dependencies.monotonic())
+                monitor.restore_window(self._capture_notice_rows(self.dependencies.utcnow()),
+                                       monotonic=self.dependencies.monotonic())
                 self._capture_window_restored = True
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
                                    monotonic=self.dependencies.monotonic())
@@ -1255,7 +1256,35 @@ class MonitoringRuntime:
         # Only a reason that is notified counts as degraded (PR #408 review):
         # `capture_unconfigured` alone is the Agent's normal state for now.
         self._set(capture_node_degraded=status.notable_degraded_nodes > 0,
-                  capture_ingest_unavailable=status.listener_unavailable)
+                  capture_ingest_unavailable=status.listener_unavailable,
+                  capture_node_notices_held=status.held_notices > 0)
+
+    def _capture_notice_rows(self, now: datetime):
+        """``(event ID, kind, UTC at, age)`` of node notice rows accepted in the last hour.
+
+        PR #408 review: matched to nodes by `capture_nodes.notice_id`, so the
+        per-node cap holds across a restart. A `pending` row holds its slot
+        too. Bounded; an unreadable row is left out (at worst a notice goes
+        out early), as `_notification_window` does.
+        """
+        rows = self._connection.execute(
+            "SELECT event_id, kind, at, COALESCE(accepted_at, at) AS accepted "
+            "FROM notification_events WHERE kind IN ({}) AND confirmed = 1 "
+            "AND accepted > ? AND accepted <= ? ORDER BY accepted DESC LIMIT 256".format(
+                ",".join("?" for _ in NODE_NOTICE_KINDS)),
+            (*(kind.value for kind in NODE_NOTICE_KINDS),
+             (now - timedelta(seconds=HOUR_SECONDS)).astimezone(timezone.utc).isoformat(),
+             now.astimezone(timezone.utc).isoformat()),
+        ).fetchall()
+        restored = []
+        for event_id, kind, at, accepted in rows:
+            try:
+                age = (now - datetime.fromisoformat(accepted)).total_seconds()
+                restored.append((UUID(event_id), NotificationKind(kind),
+                                 datetime.fromisoformat(at), age))
+            except (TypeError, ValueError):
+                continue
+        return restored
 
     def _camera_alert_outcomes(self, status, running: bool) -> tuple[bool, bool]:
         """``(not delivered, unverified)`` of the current conditions' alerts (#394).

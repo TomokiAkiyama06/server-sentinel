@@ -34,16 +34,20 @@ so if it already recovered. Per node and kind at most one owed episode that
 already recovered is kept beside the current one; a further one replaces the
 older (bounded, as the camera offline monitor's hold limit). After a Main
 restart the hour is re-seeded from the node notices accepted in the last
-hour (``restore_window``): their rows name no node, so they count against
-every node (conservative), and a restart loop cannot exceed the cap.
+hour (``restore_window``): a row names no node, but its event ID is matched
+to a node by ``notice_id``, so a restart loop cannot exceed any node's cap
+and one node's notices never delay another's.
 
 The listener: configured (state ``starting`` or ``unavailable``: material
 unreadable, bind being retried) but not ``running`` for 5 min sends one
 ``capture_ingest_unavailable`` per episode. ``disabled`` (no deployment
 section) and ``stopped`` (the stop) start none.
 
-Event IDs are deterministic per episode (the node, the kind and the UTC time
-the episode began), and the first attempt's time is kept for every retry. A
+Only time up to the last drain that observed a condition counts towards its
+delay (at most one tick, 60 s, of resolution).
+
+Event IDs are deterministic (``notice_id``: the kind, the node and the UTC
+time of the first attempt), and that time is kept for every retry. A
 full or closed queue (``can_accept``) and an unrecorded result leave the
 notice owed; a result kept for the local write retry (``retained``) counts as
 recorded. Node health lives in memory, so a Main restart starts new episodes:
@@ -55,7 +59,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import math
 from typing import Callable, Iterable
 from uuid import UUID, uuid5
@@ -111,12 +115,23 @@ class CaptureHealthStatus:
     held_notices: int = 0
 
 
+def notice_id(kind: NotificationKind, node: object, at: datetime) -> UUID:
+    """The event ID of a node notice first attempted at ``at``.
+
+    Derived from the row's own kind and UTC time (``NotificationEventStore``
+    writes ``at`` as this text), so after a restart a row can be matched to a
+    node the registry knows again without the row naming it.
+    """
+    return uuid5(_NAMESPACE, f"{kind.value}:{node}:{at.astimezone(timezone.utc).isoformat()}")
+
+
 @dataclass
 class _Episode:
     kind: NotificationKind
     delay: float
     started: float
-    event_id: UUID
+    # The last drain that observed the condition; only time up to it counts.
+    last_seen: float
     notified: bool = False
     recovered: bool = False
     # Observed with its reason on this drain (False while the node is
@@ -124,25 +139,22 @@ class _Episode:
     observed: bool = True
     # Reached its delay while observed: owed from then on.
     reached: bool = False
-    paused_at: float | None = None
-    # The first attempt's time, kept for every retry of the same row.
+    # The first attempt's time and ID, kept for every retry of the same row.
     at: datetime | None = None
+    event_id: UUID | None = None
 
-    def pause(self, now: float) -> None:
-        if self.observed:
-            self.observed = False
-            self.paused_at = now
+    def pause(self) -> None:
+        self.observed = False
 
-    def resume(self, now: float) -> None:
+    def seen(self, now: float) -> None:
+        """Observed with its condition on this drain."""
         if not self.observed:
-            if self.paused_at is not None:
-                # Only observed time counts towards the delay.
-                self.started += max(0.0, now - self.paused_at)
+            # Only observed time counts: the gap since the last observation
+            # (offline, listener down, ledger unreadable) is left out.
+            self.started += max(0.0, now - self.last_seen)
             self.observed = True
-            self.paused_at = None
-
-    def check(self, now: float) -> None:
-        if self.observed and now - self.started >= self.delay:
+        self.last_seen = now
+        if now - self.started >= self.delay:
             self.reached = True
 
     def due(self) -> bool:
@@ -163,27 +175,35 @@ class CaptureNodeHealthMonitor:
         self._episodes: dict[tuple[object, NotificationKind], _Episode] = {}
         self._held: dict[tuple[object, NotificationKind], _Episode] = {}
         self._sent: dict[UUID, deque[float]] = {}
-        # Restored node notices of an earlier process (any node).
-        self._restored: deque[float] = deque()
+        # Restored node notice rows of an earlier process:
+        # (accepted monotonic time, event ID, kind, UTC time).
+        self._restored: list[tuple[float, UUID, NotificationKind, datetime]] = []
         # This process's own notices (bounded; only the restore reads it).
         self._own: deque[UUID] = deque(maxlen=256)
 
     def restore_window(self, rows, *, monotonic: float) -> None:
-        """Re-seed the hour from ``(event ID, age seconds)`` of accepted node notice rows.
+        """Re-seed the hour from ``(event ID, kind, UTC at, age seconds)`` of accepted rows.
 
-        The rows name no node, so each counts against every node. Rows of
-        this process's own notices are not counted twice.
+        A row counts for the node whose ``notice_id`` it matches (checked
+        when that node is next capped), so one node's notices never delay
+        another's. Rows of this process's own notices are not counted twice.
         """
         rows = tuple(rows)
         if (type(monotonic) not in (int, float) or any(
-                type(row) is not tuple or len(row) != 2 or not isinstance(row[0], UUID)
-                or type(row[1]) not in (int, float) or not math.isfinite(row[1])
+                type(row) is not tuple or len(row) != 4 or not isinstance(row[0], UUID)
+                or not isinstance(row[1], NotificationKind) or not isinstance(row[2], datetime)
+                or type(row[3]) not in (int, float) or not math.isfinite(row[3])
                 for row in rows)):
             raise ValueError("invalid restored window")
         if not math.isfinite(monotonic):
             return
-        self._restored = deque(sorted(monotonic - age for event_id, age in rows
-                                      if 0 <= age < _HOUR and event_id not in self._own))
+        self._restored = [(monotonic - age, event_id, kind, at)
+                          for event_id, kind, at, age in rows
+                          if 0 <= age < _HOUR and event_id not in self._own]
+
+    def _restored_for(self, node: UUID, now: float) -> int:
+        return sum(now - accepted < _HOUR and notice_id(kind, node, at) == event_id
+                   for accepted, event_id, kind, at in self._restored)
 
     def drain(self, notifications: NotificationService, *, at: datetime,
               monotonic: float) -> CaptureHealthStatus:
@@ -192,8 +212,7 @@ class CaptureNodeHealthMonitor:
         nodes = tuple(nodes)
         self._observe_listener(state, at, monotonic)
         self._observe_nodes(nodes, at, monotonic)
-        while self._restored and monotonic - self._restored[0] >= _HOUR:
-            self._restored.popleft()
+        self._restored = [row for row in self._restored if monotonic - row[0] < _HOUR]
         held = 0
         owed = [(key, episode, self._held) for key, episode in self._held.items()]
         owed += [(key, episode, self._episodes) for key, episode in self._episodes.items()]
@@ -202,11 +221,13 @@ class CaptureNodeHealthMonitor:
                 continue
             node = key[0]
             window = None if node == _LISTENER else self._window(node, monotonic)
-            if window is not None and len(window) + len(self._restored) >= self.hourly_limit:
+            if window is not None and (len(window) + self._restored_for(node, monotonic)
+                                       >= self.hourly_limit):
                 held += 1
                 continue
             if episode.at is None:
                 episode.at = at
+                episode.event_id = notice_id(episode.kind, node, at)
             if not notifications.can_accept(episode.event_id):
                 # Queue full or closed: retried on the next drain.
                 held += 1
@@ -249,17 +270,15 @@ class CaptureNodeHealthMonitor:
                now: float) -> None:
         current = self._episodes.get(key)
         if current is None:
-            current = self._episodes[key] = _Episode(
-                kind, delay, now, uuid5(_NAMESPACE, f"{kind.value}:{key[0]}:{at.isoformat()}"))
-        current.resume(now)
-        current.check(now)
+            current = self._episodes[key] = _Episode(kind, delay, now, now)
+        current.seen(now)
 
     def _recovered(self, key, now: float) -> None:
         """End the current episode of ``key``; keep it if it is owed."""
         episode = self._episodes.pop(key, None)
         if episode is None:
             return
-        episode.check(now)
+        # Not observed on this drain: the condition ended since `last_seen`.
         if not episode.notified and episode.reached:
             # It reached its delay while observed (the cap held it, or it
             # was reached since the last drain): still sent once, saying it
@@ -285,8 +304,7 @@ class CaptureNodeHealthMonitor:
                 for kind, _delay, _matches in _NODE_NOTICES:
                     episode = self._episodes.get((node.node_id, kind))
                     if episode is not None:
-                        episode.check(now)
-                        episode.pause(now)
+                        episode.pause()
                 continue
             reasons = node.reasons if node.state == "degraded" else ()
             for kind, delay, matches in _NODE_NOTICES:
