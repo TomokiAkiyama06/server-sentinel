@@ -64,8 +64,11 @@ and a LAN `pair --endpoint` override replaces the name. The check does not
 inspect routing (a subnet route or exit node on a capture host that optionally
 runs Tailscale can still carry LAN-addressed traffic over `tailscale0`) and is
 not authentication or isolation. The connected-peer check lives in
-`connect_to_main`; the ingest client to be added in #14 / #15 must connect
-through `connect_to_main` so it applies there too.
+`connect_to_main`; the ingest session client (#14, `ingest_session.py`)
+connects through it, so it applies there too, and the media transport (#15)
+must as well. `connect_to_main`, `build_capture_client_context` and
+`installed_credential` now live in the stdlib-only `main_link` module (the
+service does not import `cryptography`) and are re-exported by `node_tls`.
 
 Automatic renewal (Owner decision 2026-09-30): `RenewalSchedule` starts 30 days
 before the installed certificate expires and backs off from 1 hour to at most
