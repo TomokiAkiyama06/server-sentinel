@@ -253,6 +253,27 @@ class NotificationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             NotificationService(lambda _: None).daily(summary(), at=datetime(2026, 1, 1))
 
+    def test_agent_counts_are_shown_without_a_capture_pipeline(self):
+        # Issue #410 item 1: connection counts, never person observations.
+        def text(**flags):
+            return DailySummary(3600, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, StorageState.NORMAL,
+                                **flags).text()
+        shown = text(pipeline_available=False, agents_available=True)
+        self.assertIn("Agents online/offline: 2/1 (capture-node connections only)\n", shown)
+        self.assertIn("Sources: unavailable", shown)
+        self.assertIn("Person/motion/entry observations: unavailable", shown)
+        self.assertIn("Monitored seconds: unavailable", shown)
+        for flags in ({"pipeline_available": False}, {"pipeline_available": False,
+                                                      "agents_available": False},
+                      {"agents_available": False}):
+            self.assertIn("Agents: unavailable\n", text(**flags))
+            self.assertNotIn("2/1", text(**flags))
+        self.assertIn("Agents online/offline: 2/1\n", text())
+        self.assertIn("Agents online/offline: 2/1\n", text(agents_available=True))
+        for bad in (1, 0, "yes"):
+            with self.assertRaises(ValueError):
+                text(pipeline_available=False, agents_available=bad)
+
     def test_upstream_identifier_coalesces_pending_retry_and_completion_runs_on_owner(self):
         transport, local, results = Transport(), [], []
         service = NotificationService(local.append, SlackDelivery(endpoint(), opener=transport))
