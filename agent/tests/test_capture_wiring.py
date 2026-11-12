@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -432,6 +433,37 @@ class CaptureAdminTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("refused: camera_approved_for_another_source", stderr.getvalue())
 
+    def test_a_nested_cli_approval_for_another_source_is_seen_under_the_lock(self):
+        # Codex P2 on PR #412 (3f63ee1): the other approval runs through the
+        # real command while this one waits at its prompt.
+        value = support.configuration(Path(tempfile.mkdtemp(prefix="agent-capture-nested-")))
+        value["capture"] = {"gst_launch": "/usr/bin/gst-launch-1.0", "sources": [
+            {"source_id": str(SOURCES[0]), "profile": "640x480@15/MJPG"},
+            {"source_id": str(SOURCES[1]), "profile": "640x480@15/MJPG"}]}
+        two = Settings.parse(value, code_root=Path("/nonexistent/code"))
+        label = self.label(self.camera)
+        nested = []
+
+        def confirm_after_another_approval(prompt):
+            if "for source " + str(SOURCES[0]) in prompt:
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    nested.append(capture_admin.main(
+                        ["approve", "--config", "/nonexistent", str(SOURCES[1]), label],
+                        settings_loader=lambda path: two, discovery=self.discovery,
+                        confirm=lambda prompt: "APPROVE"))
+            return "APPROVE"
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = capture_admin.main(
+                ["approve", "--config", "/nonexistent", str(SOURCES[0]), label],
+                settings_loader=lambda path: two, discovery=self.discovery,
+                confirm=confirm_after_another_approval)
+        self.assertEqual(nested, [0])
+        self.assertEqual(code, 2, stdout.getvalue())
+        self.assertIn("refused: camera_approved_for_another_source", stderr.getvalue())
+
     def test_ctrl_c_at_the_prompt_is_a_fixed_refusal(self):
         import signal
 
@@ -458,7 +490,13 @@ class CaptureAdminTests(unittest.TestCase):
         os.write(master, b"APPROVE\n")
         word = capture_admin.read_confirmation("Type APPROVE: ", opener=lambda *_: slave)
         self.assertEqual(word, "APPROVE")
-        self.assertIn(b"Type APPROVE: ", os.read(master, 1024))
+        # The echo and the prompt may arrive in separate reads (Codex P2).
+        import select
+        output, deadline = b"", time.monotonic() + 5
+        while b"Type APPROVE: " not in output and time.monotonic() < deadline:
+            if select.select([master], [], [], 0.1)[0]:
+                output += os.read(master, 1024)
+        self.assertIn(b"Type APPROVE: ", output)
         not_a_terminal = os.open(os.devnull, os.O_RDWR)
         with self.assertRaises(capture_admin.AdminRefused):
             capture_admin.read_confirmation("x", opener=lambda *_: not_a_terminal)
