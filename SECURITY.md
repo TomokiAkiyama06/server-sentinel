@@ -310,7 +310,7 @@ Live preview frames (Issue #14, `LIVE_FRAME`, SPECIFICATION §5.7) are the only
 media the listener accepts today. Each is bounded from its header (1 MiB JPEG
 + 16 bytes) before its body is read and re-checks the pairing ledger. A
 malformed body or a node flooding beyond ten times its frame refill rate, or
-beyond 16 MB/s (burst 80 MB) of body bytes, is closed.
+beyond about 50 MB/s (twice the node refill of maximum-size frames, burst 5 s) of body bytes, is closed; a conforming Agent at the contract maximum (about 21 MB/s) never is.
 Otherwise a frame is kept only for an enabled `remote_agent` source whose
 `capture_node_id` is the session's ledger node (cached 1 s; at most 8
 registry lookups per node per second) and within its own token buckets (per

@@ -168,7 +168,7 @@ this protocol.
   cached 1 s and token buckets (per source 6/s burst 30, per node 24/s burst
   120, 4 sources per node); an unauthorized or over-bucket frame is dropped
   and counted, only a malformed body or a flood (ten times the node frame
-  rate, or 16 MB/s with an 80 MB burst of body bytes) closes; kept in memory only). Recording
+  rate, or about 50 MB/s of body bytes with a 5 s burst: twice the contract maximum) closes; kept in memory only). Recording
   media frames are not part of version 1 (`frame_type_refused`): the Main
   accepts them only once the durable recording consumer exists (#17 / #313),
   so it never acknowledges media it cannot keep.

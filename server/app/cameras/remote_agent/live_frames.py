@@ -49,6 +49,8 @@ import time
 from typing import Callable
 from uuid import UUID
 
+from .ingest_wire import MAXIMUM_LIVE_FRAME_BODY_BYTES
+
 
 SOURCE_REFILL_PER_SECOND = 6
 SOURCE_BURST = 30
@@ -56,9 +58,12 @@ NODE_REFILL_PER_SECOND = 24
 NODE_BURST = 120
 # Closing needs a node to sustain more than ten times its refill rate.
 FLOOD_FACTOR = 10
-# ... or more body bytes than twice the ordinary 4 sources x 5 fps x 0.4 MB.
-FLOOD_BYTES_PER_SECOND = 16_000_000
-FLOOD_BYTES_BURST = 80_000_000
+# ... or more body bytes than twice what a node may send within the contract
+# (its refill rate of maximum-size frames, about 25 MB/s; PR #416 review: a
+# conforming Agent with 4 cameras at 5 fps and large frames must never be
+# closed), with a 5 s burst. A node at 1 Gbit/s line rate is still closed.
+FLOOD_BYTES_PER_SECOND = 2 * NODE_REFILL_PER_SECOND * MAXIMUM_LIVE_FRAME_BODY_BYTES
+FLOOD_BYTES_BURST = 5 * FLOOD_BYTES_PER_SECOND
 MAXIMUM_LIVE_SOURCES_PER_NODE = 4
 AUTHORIZATION_CACHE_SECONDS = 1.0
 # Distinct sources a node may have looked up in the registry at once (each

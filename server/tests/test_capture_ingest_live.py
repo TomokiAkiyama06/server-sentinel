@@ -236,7 +236,20 @@ class LiveFrameBudgetTests(unittest.TestCase):
             self.assertFalse(self.budget.flooding(other))
 
     def test_the_byte_bound_defaults(self):
-        self.assertEqual((FLOOD_BYTES_PER_SECOND, FLOOD_BYTES_BURST), (16_000_000, 80_000_000))
+        # Twice the node refill rate of maximum-size frames, 5 s of burst.
+        self.assertEqual(FLOOD_BYTES_PER_SECOND, 2 * 24 * MAXIMUM_LIVE_FRAME_BODY_BYTES)
+        self.assertEqual(FLOOD_BYTES_BURST, 5 * FLOOD_BYTES_PER_SECOND)
+
+    def test_a_conforming_agent_at_the_contract_maximum_never_floods_by_bytes(self):
+        # PR #416 review: 4 sources x 5 fps x maximum-size frames (~21 MB/s)
+        # for ten minutes, then a 5 s backlog at once.
+        frame = MAXIMUM_LIVE_FRAME_BODY_BYTES
+        for _ in range(3000):
+            self.clock.value += SECOND // 5
+            for _ in range(4):
+                self.assertFalse(self.budget.flooding(self.node, frame))
+        self.clock.value += 5 * SECOND
+        self.assertFalse(any(self.budget.flooding(self.node, frame) for _ in range(100)))
 
     def test_ordinary_traffic_and_its_backlogs_never_flood_by_bytes(self):
         # 4 sources x 5 fps x 0.4 MB = 8 MB/s for ten minutes.
@@ -263,17 +276,18 @@ class LiveFrameBudgetTests(unittest.TestCase):
             sent += 1
             self.assertLess(sent, 1000)
         self.assertEqual(sent, FLOOD_BYTES_BURST // frame)
-        # A sustained 32 MB/s floods even with the refill.
+        # A sustained 1 Gbit/s line rate (125 MB/s) floods even with the refill.
         other = uuid4()
-        for step in range(10_000):
-            self.clock.value += SECOND // 32
+        for step in range(100_000):
+            self.clock.value += SECOND // 125
             if self.budget.flooding(other, 1_000_000):
                 break
-        self.assertLess(step, 10_000 - 1)
-        # 16 MB/s exactly is still not a flood.
+        self.assertLess(step, 100_000 - 1)
+        # Sending at the refill rate exactly is still not a flood.
         steady = uuid4()
+        per_second = FLOOD_BYTES_PER_SECOND // 1_000_000
         for _ in range(2000):
-            self.clock.value += SECOND // 16
+            self.clock.value += SECOND // per_second + 1
             self.assertFalse(self.budget.flooding(steady, 1_000_000))
         self.assertTrue(self.budget.flooding(uuid4(), -1))
 
@@ -837,7 +851,7 @@ class CaptureIngestLiveFrameTests(CaptureTlsHarness):
 
     def test_maximum_frames_beyond_the_byte_bound_close(self):
         # PR #416 review: a node sending 1 MiB frames back to back (the clock
-        # stands still here) is closed once its 80 MB burst is spent.
+        # stands still here) is closed once its byte burst is spent.
         server = self.serve(idle_timeout_seconds=30)
         tls = self.connect()
         jpeg = b"\xff\xd8" + b"x" * (MAXIMUM_LIVE_FRAME_BYTES - 4) + b"\xff\xd9"
