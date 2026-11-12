@@ -688,8 +688,20 @@ sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
 # 4. approve one camera for one source (type APPROVE on the terminal)
 sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
   approve --config /etc/server-sentinel/deployment.json <source uuid> cam-<10 hex>
+# 5. optional: give a source a display name that says where it looks (type
+#    RENAME); its camera approval, profile and health are unchanged
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  rename-source --config /etc/server-sentinel/deployment.json <source uuid> \
+  --name "<display name>"
 sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
 ```
+
+- `rename-source` changes only the display name the live view and the
+  sources listing show, as one audited Owner operation (`update_source`,
+  target the source UUID only). Like the other mutations it needs the typed
+  confirmation and the stopped service (`service_running` otherwise). A blank
+  or control-character name is refused (`source_configuration_rejected`); a
+  source of another type is refused (`source_not_local_uvc`).
 
 - `create-source` creates an **enabled** `local_uvc` source with that
   explicit capture profile (`WIDTHxHEIGHT@FPS/FOURCC`). The registry refuses

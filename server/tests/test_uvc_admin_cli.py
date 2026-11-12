@@ -475,10 +475,67 @@ class AdminCliTests(unittest.TestCase):
         ((actor, action, _kind, _target, outcome),) = self.rows(AUDIT)
         self.assertEqual(("owner", "create_source", "failed"), (actor, action, outcome))
 
+    # -- rename-source --------------------------------------------------
+
+    def test_rename_source_changes_only_the_name_and_is_audited(self):
+        source = self.local_source("camera-1")
+        code, stdout, stderr, terminal = self.run_cli(
+            "approve", str(source.id), self.labels()[0], lines=("APPROVE",))
+        self.assertEqual(0, code, stderr)
+        approved = self.approval(source.id)
+        code, stdout, stderr, terminal = self.run_cli(
+            "rename-source", str(source.id), "--name", "入口", lines=("RENAME",))
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn('name="camera-1"', terminal)
+        self.assertIn('name="入口"', terminal)
+        self.assertIn("Type RENAME to confirm", terminal)
+        self.assertIn(f"source renamed: source_id={source.id}", stdout)
+        renamed = self.fixture.get_source(source.id)
+        self.assertEqual("入口", renamed.name)
+        self.assertEqual((source.enabled, source.desired_capture_profile),
+                         (renamed.enabled, renamed.desired_capture_profile))
+        self.assertEqual(approved, self.approval(source.id))
+        self.assertEqual(("owner", "update_source", "source", str(source.id), "succeeded"),
+                         self.rows(AUDIT)[-1])
+
+    def test_rename_source_refusals_change_and_record_nothing(self):
+        source = self.local_source("camera-1")
+        before = len(self.rows(AUDIT))
+        for argv, lines, reason in (
+                (("not-a-uuid", "--name", "x"), (), "source_id_rejected"),
+                ((str(uuid4()), "--name", "x"), (), "source_not_found"),
+                ((str(source.id), "--name", "x"), ("no",), "owner_confirmation_declined")):
+            with self.subTest(argv=argv, lines=lines):
+                code, stdout, stderr, _ = self.run_cli("rename-source", *argv, lines=lines)
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn(f"refused: {reason}", stderr)
+        self.assertEqual("camera-1", self.fixture.get_source(source.id).name)
+        self.assertEqual(before, len(self.rows(AUDIT)))
+
+    def test_rename_source_rejects_a_blank_name_and_records_the_failure(self):
+        source = self.local_source("camera-1")
+        code, stdout, stderr, _ = self.run_cli(
+            "rename-source", str(source.id), "--name", "   ", lines=("RENAME",))
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("refused: source_configuration_rejected", stderr)
+        self.assertEqual("camera-1", self.fixture.get_source(source.id).name)
+        self.assertEqual(("owner", "update_source", "failed"),
+                         (self.rows(AUDIT)[-1][0], self.rows(AUDIT)[-1][1], self.rows(AUDIT)[-1][4]))
+
+    def test_rename_source_refuses_another_source_type(self):
+        node = self.fixture.create_capture_node(name="Synthetic node")
+        remote = self.fixture.create_source(source_type=SourceType.REMOTE_AGENT, name="remote",
+                                            capture_node_id=node.id, enabled=False)
+        code, stdout, stderr, _ = self.run_cli(
+            "rename-source", str(remote.id), "--name", "x", lines=("RENAME",))
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("refused: source_not_local_uvc", stderr)
+
     def test_mutations_refuse_while_the_service_holds_the_database(self):
         source = self.local_source()
         for argv in (("create-source", "--name", "x", "--profile", PROFILE),
-                     ("approve", str(source.id), self.labels()[0])):
+                     ("approve", str(source.id), self.labels()[0]),
+                     ("rename-source", str(source.id), "--name", "x")):
             with self.subTest(argv=argv[0]):
                 self.running = [1]
                 console = Console(self)

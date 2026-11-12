@@ -9,6 +9,8 @@ with ``sudo -u <service account>``, never plain ``sudo``::
     python -m app.cameras.uvc.admin_cli create-source --config <deployment.json> \\
         --name <name> --profile 1920x1080@30/MJPG
     python -m app.cameras.uvc.admin_cli approve --config <deployment.json> <source id> <candidate label>
+    python -m app.cameras.uvc.admin_cli rename-source --config <deployment.json> <source id> \\
+        --name <name>
 
 Same trust model as ``app.auth.bootstrap_cli`` (Owner decision D3): the local
 administrative boundary is the host itself; whoever can run this as the
@@ -19,8 +21,11 @@ confirmation authorizes exactly one audited Owner operation
 (``LocalConsoleOwner``): ``create-source`` goes through
 ``OwnerAdministration.create_source`` and ``approve`` through
 ``OwnerAdministration.approve_uvc`` (``LinuxDiscovery`` + ``LocalUvcAdapter``),
-so the change and its audit record (actor ``owner``; ``create_source`` /
-``approve_camera``, target the source's logical UUID only) commit in one
+``rename-source`` changes only a source's display name through
+``OwnerAdministration.update_source`` (its camera approval, profile and
+health are untouched), so the change and its audit record (actor ``owner``;
+``create_source`` / ``approve_camera`` / ``update_source``, target the
+source's logical UUID only) commit in one
 transaction. A refused or failed operation inside that boundary records
 ``failed``; a refusal before it changes and records nothing.
 
@@ -148,7 +153,8 @@ from .session_ledger import (
 PROG = "python -m app.cameras.uvc.admin_cli"
 CREATE_WORD = "CREATE"
 APPROVE_WORD = "APPROVE"
-MUTATIONS = ("create-source", "approve")
+RENAME_WORD = "RENAME"
+MUTATIONS = ("create-source", "approve", "rename-source")
 LABEL_PREFIX = "cam-"
 _LABEL_DIGITS = 10
 _LABEL = re.compile(r"cam-[0-9a-f]{10}")
@@ -652,6 +658,34 @@ def _create_source(context: _Context, name: str, profile: CaptureProfile) -> lis
             "a camera for it with 'approve', then start the service"]
 
 
+def _rename_source(context: _Context, source_id: UUID, name: str) -> list[str]:
+    """Change a local_uvc source's display name only (camera, profile and approval stay)."""
+    context.check.require_stopped()
+    try:
+        source = context.registry.get_source(source_id)
+    except NotFoundError:
+        raise CliRefused("source_not_found") from None
+    except Exception:
+        raise _storage_refusal(context.database) from None
+    if source.source_type is not SourceType.LOCAL_UVC:
+        raise CliRefused("source_not_local_uvc")
+    grant = context.owner.confirm(
+        context.terminal,
+        f"Rename source {source_id} from name={_quoted(source.name)} to name={_quoted(name)}; "
+        f"its camera approval is unchanged. Type {RENAME_WORD} to confirm: ", RENAME_WORD)
+    try:
+        context.admin.update_source(grant, source_id, name=name)
+    except CliRefused:
+        raise
+    except ValidationError:
+        raise CliRefused("source_configuration_rejected") from None
+    except Exception:
+        raise _storage_refusal(context.database) from None
+    _committed(context.database)
+    return [f"source renamed: source_id={source_id}",
+            "next: start the service; the live view shows the new name"]
+
+
 def _select_candidate(scan, label: str) -> DeviceEvidence:
     if scan.failures:
         # A device that could not be inspected might be the label's twin.
@@ -741,8 +775,9 @@ def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
     if os.geteuid() == 0:
         raise CliRefused("run_as_service_account")
     source_id = profile = None
-    if args.command == "approve":
+    if args.command in ("approve", "rename-source"):
         source_id = _uuid_argument(args.source, "source_id_rejected")
+    if args.command == "approve":
         if not isinstance(args.candidate, str) or not _LABEL.fullmatch(args.candidate):
             raise CliRefused("candidate_label_rejected")
     if args.command == "create-source":
@@ -780,6 +815,8 @@ def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
                 lines = _candidates(context)
             elif args.command == "create-source":
                 lines = _create_source(context, args.name, profile)
+            elif args.command == "rename-source":
+                lines = _rename_source(context, source_id, args.name)
             else:
                 lines = _approve(context, source_id, args.candidate)
         finally:
@@ -801,7 +838,8 @@ def _parser() -> argparse.ArgumentParser:
     for name, text in (("sources", "list the local_uvc sources and their approval state"),
                        ("candidates", "list connected cameras by hashed label (no serial or path)"),
                        ("create-source", "create an enabled local_uvc source"),
-                       ("approve", "approve a connected camera for a local_uvc source")):
+                       ("approve", "approve a connected camera for a local_uvc source"),
+                       ("rename-source", "change a local_uvc source's display name")):
         command = commands.add_parser(name, help=text)
         command.add_argument("--config", type=Path, required=True,
                              help="the deployment configuration the service runs with")
@@ -809,6 +847,9 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--name", required=True, help="the source's display name")
             command.add_argument("--profile", required=True,
                                  help="capture profile WIDTHxHEIGHT@FPS/FOURCC, e.g. 1920x1080@30/MJPG")
+        if name == "rename-source":
+            command.add_argument("source", help="the source's UUID (as 'sources' prints it)")
+            command.add_argument("--name", required=True, help="the new display name")
         if name == "approve":
             command.add_argument("source", help="the source's UUID (as 'sources' prints it)")
             command.add_argument("candidate", help="the camera's label (as 'candidates' prints it)")
