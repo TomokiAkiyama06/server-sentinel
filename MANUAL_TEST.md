@@ -422,6 +422,14 @@ record.
   log holds one `create_source` record (actor `owner`) with that UUID; type
   anything else: `owner_confirmation_declined`, nothing changes; with four
   enabled sources a fifth refuses `active_source_limit_reached`;
+- [ ] `rename-source <uuid> --name <name>` (PR #411; mock-verified only):
+  with the service running it refuses `service_running`; stopped, type
+  `RENAME`: the name changes, the camera approval stays, and the audit log
+  holds one `update_source` record (actor `owner`) with that UUID; anything
+  else: `owner_confirmation_declined`; a blank name or one with a
+  bidirectional override: `source_name_rejected` before any prompt; a
+  `remote_agent` source: `source_not_local_uvc`; after starting the service
+  the live view shows the new name;
 - [ ] add the UUID to `local_uvc.source_ids`, `--check`, then `approve <uuid>
   <label>`, type `APPROVE`: one `approve_camera` record; `sources` shows
   `approval=approved configured=yes`; start the service and confirm the

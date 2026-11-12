@@ -274,13 +274,14 @@ evidence, so each twin can be mapped to its own source); a
 conflicting approval is refused, and a pre-existing duplicate makes every
 conflicting source `manual_intervention_required` rather than letting startup
 order decide.
+The names `create-source` and `rename-source` take are checked before the confirmation and refused (`source_name_rejected`) when blank, longer than 128 characters, or containing a control, format, surrogate, line or paragraph separator character, the rule a person's display name follows.
 Until the Owner Web UI exists, `local_uvc` sources are created and cameras
 approved with the local command `python -m app.cameras.uvc.admin_cli
 sources|candidates|create-source|approve|rename-source --config <deployment.json>` (Owner
 decision D3, 2026-10-16): the `bootstrap_cli` trust model (service account,
 never root, the pinned existing database of exactly the current schema, no
 WebAuthn step-up), one confirmation word read from `/dev/tty` per audited
-`OwnerAdministration.create_source` / `approve_uvc` / `update_source` (`rename-source`: the display name only, at most 128 characters without control, format, surrogate or separator characters) operation (actor `owner`,
+`OwnerAdministration.create_source` / `approve_uvc` / `update_source` (`rename-source`: the display name only) operation (actor `owner`,
 the source's logical UUID only), and refusal (`service_running`) while any
 other process of the service account holds the application database open; the
 change applies when the service starts. Cameras are listed only by a hashed

@@ -705,7 +705,10 @@ sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
   name that is blank, longer than 128 characters (the prompt shows it in
   full) or contains a control, format (such as a bidirectional override or a
   zero-width character), surrogate, line or paragraph separator character
-  (`source_name_rejected`), the rule a person's display name follows.
+  (`source_name_rejected`), the rule a person's display name follows. Plain
+  Japanese, spaces and most emoji are accepted; an emoji joined with a
+  zero-width joiner (for example a person at a laptop) or a flag built from
+  tag characters is refused.
 
 - `create-source` creates an **enabled** `local_uvc` source with that
   explicit capture profile (`WIDTHxHEIGHT@FPS/FOURCC`). The registry refuses
