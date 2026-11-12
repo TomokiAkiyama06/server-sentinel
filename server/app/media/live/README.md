@@ -88,8 +88,8 @@ check.
 
 `remote_preview.RemotePreviewHub` holds the newest `LIVE_FRAME` JPEG of each
 `remote_agent` source, written only by the capture ingest listener after it
-has checked the frame's size, the pairing ledger, the live rate budget and the
-registry's authorization of the source for that node
+has checked the frame's size, the pairing ledger, the registry's
+authorization of the source for that node and the live token buckets
 (`server/app/cameras/remote_agent/live_frames.py`). It keeps a frame's bytes
 only while the source has viewer demand, one per source, plus a receive time
 per source of a current ingest session (at most 4 per node); a frame or

@@ -164,9 +164,11 @@ this protocol.
   `CLOSE` (Main to Agent: one fixed reason word before the Main closes), and
   `LIVE_FRAME = 0x10` (Agent to Main, Issue #14 option A: the 16-byte source
   UUID and one JPEG of at most 1 MiB, its own limit applied from the header;
-  no reply; `live_frames.py` and SPECIFICATION §5.7: own budget of 6 per
-  source / 24 per node per second and 4 sources per node, registry
-  authorization `source_not_authorized`, kept in memory only). Recording
+  no reply; `live_frames.py` and SPECIFICATION §5.7: registry authorization
+  cached 1 s and token buckets (per source 6/s burst 30, per node 24/s burst
+  120, 4 sources per node); an unauthorized or over-bucket frame is dropped
+  and counted, only a malformed body or a flood of ten times the node rate
+  closes; kept in memory only). Recording
   media frames are not part of version 1 (`frame_type_refused`): the Main
   accepts them only once the durable recording consumer exists (#17 / #313),
   so it never acknowledges media it cannot keep.

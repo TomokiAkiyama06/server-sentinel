@@ -26,14 +26,19 @@ Bounds (ADR-0007 item 5, Issue #14):
 Live preview frames (``LIVE_FRAME``; Issue #14, Owner decision 2026-11-12,
 option A) have their own bounds (``live_frames``): a body limit of
 ``MAXIMUM_LIVE_FRAME_BODY_BYTES`` applied from the header, the ledger
-re-check like any frame, their own rate budget (6 per source and 24 per node
-per second, 4 sources per node; never the heartbeat budget), and the camera
-registry's authorization of the source for this node. An accepted frame
-replaces the source's newest frame in the in-memory ``RemotePreviewHub`` and
-gets **no reply**: it is not stored, so it is never acknowledged. Any refusal
-closes the session with a ``CLOSE`` reason (``live_frame_invalid``,
-``rate_limited``, ``source_not_authorized``). The session's frames are dropped
-from the hub when it ends or is superseded.
+re-check like any frame, the camera registry's authorization of the source
+for this node (cached 1 s) and their own token buckets (never the heartbeat
+budget). An accepted frame replaces the source's newest frame in the
+in-memory ``RemotePreviewHub`` and gets **no reply**: it is not stored, so
+it is never acknowledged. A frame of a source the registry does not
+authorize, or beyond the buckets, is dropped and counted
+(``CaptureIngestStatus.live_frames_unauthorized`` / ``live_frames_dropped``)
+and the session goes on (PR #416 review: an Agent sends every camera it
+approved, which the Owner may not have created or may have disabled on the
+Main). Only a malformed body (``live_frame_invalid``) or a flood, more than
+ten times the node refill rate sustained (``rate_limited``), closes the
+session. The session's frames are dropped from the hub when it ends or is
+superseded.
 
 Nothing is written to the database or the disk here: the pairing ledger and
 the camera registry are only read (a staged renewal's promotion is the
@@ -64,7 +69,7 @@ from .ingest_wire import (
     INGEST_ALPN, MAXIMUM_LIVE_FRAME_BODY_BYTES, FrameType, PeerClosed, WireRefused, encode_frame,
     parse_heartbeat, parse_live_frame, read_frame,
 )
-from .live_frames import LiveFrameBudget
+from .live_frames import CachedLiveSources, LiveFrameBudget
 from .node_health import CaptureNodeHealthRegistry
 
 
@@ -105,6 +110,11 @@ class CaptureIngestStatus:
     # Refused connections per fixed category (`connection_limit`,
     # `handshake`, `not_admitted`, `alpn`).
     refused_by_category: tuple[tuple[str, int], ...] = ()
+    # Live preview frames (Issue #14): kept, dropped as unauthorized, and
+    # dropped beyond the buckets or the hub's bounds.
+    live_frames_accepted: int = 0
+    live_frames_unauthorized: int = 0
+    live_frames_dropped: int = 0
 
 
 class _LiveNodes:
@@ -161,9 +171,11 @@ class CaptureIngestServer:
         # Issue #14 (option A): without both, every live frame is refused
         # `source_not_authorized` (fail closed).
         self.live_preview = live_preview
-        self._live_sources = live_sources
+        self._live_sources = (None if live_sources is None else CachedLiveSources(
+            live_sources, maximum_nodes=limits.maximum_nodes, clock_ns=monotonic_ns))
         self._live_budget = LiveFrameBudget(maximum_nodes=limits.maximum_nodes,
                                             clock_ns=monotonic_ns)
+        self._live_counts = {"accepted": 0, "unauthorized": 0, "dropped": 0}
         self._frame_limits = {FrameType.LIVE_FRAME: MAXIMUM_LIVE_FRAME_BODY_BYTES}
         self.registry = registry or CaptureNodeHealthRegistry(
             maximum_nodes=limits.maximum_nodes,
@@ -234,7 +246,10 @@ class CaptureIngestServer:
     def status(self) -> CaptureIngestStatus:
         with self._lock:
             return CaptureIngestStatus(self._state, len(self._connections), self._refused,
-                                       self._closed, tuple(sorted(self._refused_by.items())))
+                                       self._closed, tuple(sorted(self._refused_by.items())),
+                                       self._live_counts["accepted"],
+                                       self._live_counts["unauthorized"],
+                                       self._live_counts["dropped"])
 
     def last_close_reasons(self) -> tuple[str, ...]:
         with self._lock:
@@ -434,6 +449,8 @@ class CaptureIngestServer:
             if current is not None and current[0] != generation:
                 return
             self.registry.forget(node, generation)
+        if self._live_sources is not None:
+            self._live_sources.forget(node)
 
     def _end(self, node: UUID, generation: int) -> None:
         with self._lock:
@@ -530,31 +547,37 @@ class CaptureIngestServer:
     def _live_frame(self, node: UUID, generation: int, body: bytes) -> str | None:
         """Keep one live frame in memory; ``None``, or the session's end reason.
 
-        Order: the body's form, the live rate budget (before the registry
-        read, so an over-budget node causes no read), the registry's
-        authorization of the source for this node, then the publish under
-        this lock while the session is the node's current one. Nothing is
-        sent back to the Agent for an accepted frame.
+        Order: the body's form (malformed closes), the node's flood bound
+        (closes), the registry's authorization of the source for this node
+        (cached; unauthorized is dropped), the token buckets (dropped), then
+        the publish under this lock while the session is the node's current
+        one. Nothing is sent back to the Agent, whatever happens to a frame.
         """
         try:
             live = parse_live_frame(body)
         except WireRefused as refused:
             return refused.reason
-        if not self._live_budget.charge(node, live.source_id):
+        if self._live_budget.flooding(node):
             return "rate_limited"
         authorized = False
         if self.live_preview is not None and self._live_sources is not None:
-            try:
-                authorized = self._live_sources(node, live.source_id) is True
-            except Exception:
-                authorized = False
+            authorized = self._live_sources(node, live.source_id) is True
         if not authorized:
-            return "source_not_authorized"
+            self._count_live("unauthorized")
+            return None
+        if not self._live_budget.charge(node, live.source_id):
+            self._count_live("dropped")
+            return None
         with self._lock:
             if not self._current_locked(node, generation):
                 return "superseded"
-            self.live_preview.publish(node, generation, live.source_id, live.jpeg)
+            kept = self.live_preview.publish(node, generation, live.source_id, live.jpeg)
+            self._live_counts["accepted" if kept else "dropped"] += 1
         return None
+
+    def _count_live(self, kind: str) -> None:
+        with self._lock:
+            self._live_counts[kind] += 1
 
     def _current_locked(self, node: UUID, generation: int) -> bool:
         current = self._live.get(node)

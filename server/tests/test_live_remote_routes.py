@@ -21,7 +21,7 @@ from app.cameras.registry.models import NodeHealthState
 from app.cameras.remote_agent.ingest_config import (
     CaptureIngestLimits, CaptureIngestMaterial, IngestListenerConfig,
 )
-from app.cameras.remote_agent.live_frames import RegistryLiveSources
+from app.cameras.remote_agent.live_frames import CachedLiveSources, RegistryLiveSources
 from app.main import create_app
 from app.media.live.frame_pull import LiveFrameLimits, LiveFrameService
 from app.media.live.remote_preview import RemotePreviewHub
@@ -198,7 +198,9 @@ class ApplicationWiringTests(HumanSurfaceFixture):
                 await asyncio.sleep(0.01)
             server = application.state.capture_ingest
             self.assertIs(server.live_preview, access.live.remote)
-            self.assertIsInstance(server._live_sources, RegistryLiveSources)
+            # The registry authorizer, behind the 1 s per-source cache.
+            self.assertIsInstance(server._live_sources, CachedLiveSources)
+            self.assertIsInstance(server._live_sources._authorizer, RegistryLiveSources)
 
     def test_without_capture_ingest_there_is_no_remote_hub(self):
         access = self.composition()

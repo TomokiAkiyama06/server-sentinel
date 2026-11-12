@@ -26,8 +26,9 @@ from app.cameras.remote_agent.ingest_wire import (
     PeerClosed, WireRefused, encode_frame, encode_live_frame, parse_live_frame, read_frame,
 )
 from app.cameras.remote_agent.live_frames import (
-    LIVE_FRAMES_PER_NODE_PER_SECOND, LIVE_FRAMES_PER_SOURCE_PER_SECOND,
-    MAXIMUM_LIVE_SOURCES_PER_NODE, LiveFrameBudget, RegistryLiveSources,
+    AUTHORIZATION_CACHE_SECONDS, FLOOD_FACTOR, MAXIMUM_LIVE_SOURCES_PER_NODE,
+    MAXIMUM_LOOKUPS_PER_NODE, NODE_BURST, NODE_REFILL_PER_SECOND, SOURCE_BURST,
+    SOURCE_REFILL_PER_SECOND, CachedLiveSources, LiveFrameBudget, RegistryLiveSources,
 )
 from app.media.live.remote_preview import RemotePreviewHub
 from app.media.live.sessions import LiveSessionUnavailable
@@ -161,6 +162,9 @@ class LiveFrameWireTests(unittest.TestCase):
                 read_frame(right, 1024, type_limits=limits)
 
 
+SECOND = 1_000_000_000
+
+
 class LiveFrameBudgetTests(unittest.TestCase):
     def setUp(self):
         self.clock = NanoClock()
@@ -168,60 +172,163 @@ class LiveFrameBudgetTests(unittest.TestCase):
         self.node = uuid4()
 
     def test_the_defaults_are_the_contract(self):
-        self.assertEqual((LIVE_FRAMES_PER_SOURCE_PER_SECOND, LIVE_FRAMES_PER_NODE_PER_SECOND,
-                          MAXIMUM_LIVE_SOURCES_PER_NODE), (6, 24, 4))
+        self.assertEqual((SOURCE_REFILL_PER_SECOND, SOURCE_BURST, NODE_REFILL_PER_SECOND, NODE_BURST,
+                          FLOOD_FACTOR, MAXIMUM_LIVE_SOURCES_PER_NODE), (6, 30, 24, 120, 10, 4))
 
-    def test_six_per_source_per_second(self):
+    def test_a_source_bucket_holds_thirty_and_refills_six_per_second(self):
         source = uuid4()
-        self.assertTrue(all(self.budget.charge(self.node, source) for _ in range(6)))
+        self.assertTrue(all(self.budget.charge(self.node, source) for _ in range(30)))
         self.assertFalse(self.budget.charge(self.node, source))
-        # Another source of the same node has its own window.
+        # Another source of the same node has its own bucket.
         self.assertTrue(self.budget.charge(self.node, uuid4()))
-        self.clock.value += 1_000_000_000
+        self.clock.value += SECOND // 6 + 1
         self.assertTrue(self.budget.charge(self.node, source))
+        self.assertFalse(self.budget.charge(self.node, source))
 
-    def test_twenty_four_per_node_per_second(self):
+    def test_five_per_second_with_a_pause_then_a_backlog_fits(self):
+        # PR #416 review: 5 fps for 2 s, the Main paused 1.4 s, then the
+        # Agent's 7 frames at once: every frame is accepted.
+        source = uuid4()
+        for _ in range(10):
+            self.assertTrue(self.budget.charge(self.node, source))
+            self.clock.value += SECOND // 5
+        self.clock.value += int(1.4 * SECOND)
+        self.assertTrue(all(self.budget.charge(self.node, source) for _ in range(7)))
+        # Sustained 5 fps never runs the bucket dry.
+        for _ in range(300):
+            self.clock.value += SECOND // 5
+            self.assertTrue(self.budget.charge(self.node, source))
+
+    def test_a_node_bucket_holds_one_hundred_twenty(self):
+        budget = LiveFrameBudget(maximum_nodes=1, source_burst=1000, clock_ns=self.clock)
+        source = uuid4()
+        self.assertTrue(all(budget.charge(self.node, source) for _ in range(120)))
+        self.assertFalse(budget.charge(self.node, source))
+        self.clock.value += SECOND // 24 + 1
+        self.assertTrue(budget.charge(self.node, source))
+
+    def test_four_sources_at_twenty_four_per_second_fit(self):
         sources = [uuid4() for _ in range(4)]
-        for _ in range(6):
+        for _ in range(600):
+            self.clock.value += SECOND // 6
             for source in sources:
                 self.assertTrue(self.budget.charge(self.node, source))
-        self.assertFalse(self.budget.charge(self.node, sources[0]))
-        # Another node is not charged.
-        self.assertTrue(self.budget.charge(uuid4(), sources[0]))
 
-    def test_the_node_bound_applies_with_fewer_sources_too(self):
-        budget = LiveFrameBudget(maximum_nodes=1, per_source=100, per_node=24, clock_ns=self.clock)
-        source = uuid4()
-        self.assertTrue(all(budget.charge(self.node, source) for _ in range(24)))
-        self.assertFalse(budget.charge(self.node, source))
-
-    def test_at_most_four_sources_per_node_and_expired_ones_are_reclaimed(self):
-        for _ in range(4):
-            self.assertTrue(self.budget.charge(self.node, uuid4()))
+    def test_at_most_four_sources_per_node_and_refilled_ones_are_reclaimed(self):
+        sources = [uuid4() for _ in range(4)]
+        for source in sources:
+            self.assertTrue(self.budget.charge(self.node, source))
         self.assertFalse(self.budget.charge(self.node, uuid4()))
-        self.clock.value += 1_000_000_000
+        self.clock.value += SECOND
         self.assertTrue(self.budget.charge(self.node, uuid4()))
 
-    def test_the_node_table_is_bounded_and_reclaims_expired_nodes(self):
+    def test_only_a_sustained_flood_floods(self):
+        # Burst 1200, then 240 per second.
+        self.assertFalse(any(self.budget.flooding(self.node) for _ in range(1200)))
+        self.assertTrue(self.budget.flooding(self.node))
+        self.clock.value += SECOND // 240 + 1
+        self.assertFalse(self.budget.flooding(self.node))
+        # Ten times the node's refill rate is still not a flood.
+        other = uuid4()
+        for _ in range(2000):
+            self.clock.value += SECOND // 240 + 1
+            self.assertFalse(self.budget.flooding(other))
+
+    def test_the_node_table_is_bounded_and_reclaims_refilled_nodes(self):
         self.assertTrue(self.budget.charge(uuid4(), uuid4()))
         self.assertTrue(self.budget.charge(uuid4(), uuid4()))
         self.assertFalse(self.budget.charge(uuid4(), uuid4()))
         self.assertEqual(self.budget.tracked_nodes, 2)
-        self.clock.value += 1_000_000_000
+        self.clock.value += SECOND
         self.assertTrue(self.budget.charge(uuid4(), uuid4()))
         self.assertLessEqual(self.budget.tracked_nodes, 2)
 
-    def test_a_clock_regression_refuses(self):
+    def test_a_clock_regression_refills_nothing(self):
         source = uuid4()
-        self.assertTrue(self.budget.charge(self.node, source))
-        self.clock.value -= 1
+        self.assertTrue(all(self.budget.charge(self.node, source) for _ in range(30)))
+        self.clock.value -= 10 * SECOND
         self.assertFalse(self.budget.charge(self.node, source))
 
     def test_invalid_input_is_refused(self):
         self.assertFalse(self.budget.charge(str(self.node), uuid4()))
         self.assertFalse(self.budget.charge(self.node, None))
-        with self.assertRaises(ValueError):
-            LiveFrameBudget(maximum_nodes=0)
+        self.assertTrue(self.budget.flooding("node"))
+        for options in ({"maximum_nodes": 0}, {"maximum_nodes": 1, "source_refill": 0},
+                        {"maximum_nodes": 1, "node_burst": True}):
+            with self.assertRaises(ValueError):
+                LiveFrameBudget(**options)
+
+
+class CachedLiveSourcesTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = NanoClock()
+        self.reads = []
+        self.allowed = set()
+
+        def authorizer(node, source):
+            self.reads.append((node, source))
+            return (node, source) in self.allowed
+
+        self.cache = CachedLiveSources(authorizer, maximum_nodes=2, clock_ns=self.clock)
+        self.node = uuid4()
+
+    def test_answers_are_reused_for_one_second(self):
+        source = uuid4()
+        self.allowed.add((self.node, source))
+        self.assertTrue(all(self.cache(self.node, source) for _ in range(10)))
+        self.assertEqual(len(self.reads), 1)
+        self.assertEqual(AUTHORIZATION_CACHE_SECONDS, 1.0)
+        # Disabled meanwhile: seen after the second.
+        self.allowed.clear()
+        self.clock.value += SECOND - 1
+        self.assertTrue(self.cache(self.node, source))
+        self.clock.value += 1
+        self.assertFalse(self.cache(self.node, source))
+        self.assertEqual(len(self.reads), 2)
+        # A denial is cached too.
+        self.assertFalse(self.cache(self.node, source))
+        self.assertEqual(len(self.reads), 2)
+
+    def test_the_answer_is_per_node_and_source(self):
+        source = uuid4()
+        self.allowed.add((self.node, source))
+        self.assertTrue(self.cache(self.node, source))
+        self.assertFalse(self.cache(uuid4(), source))
+        self.assertFalse(self.cache(self.node, uuid4()))
+
+    def test_a_node_cycling_source_identities_reads_at_most_eight_per_second(self):
+        self.assertEqual(MAXIMUM_LOOKUPS_PER_NODE, 8)
+        for _ in range(100):
+            self.assertFalse(self.cache(self.node, uuid4()))
+        self.assertEqual(len(self.reads), 8)
+        self.clock.value += SECOND
+        self.assertFalse(self.cache(self.node, uuid4()))
+        self.assertEqual(len(self.reads), 9)
+
+    def test_a_failing_authorizer_denies_and_is_not_cached(self):
+        calls = []
+
+        def broken(node, source):
+            calls.append(1)
+            raise RuntimeError("synthetic")
+
+        cache = CachedLiveSources(broken, maximum_nodes=1, clock_ns=self.clock)
+        source = uuid4()
+        self.assertFalse(cache(self.node, source))
+        self.assertFalse(cache(self.node, source))
+        self.assertEqual(len(calls), 2)
+
+    def test_forget_and_bounds(self):
+        source = uuid4()
+        self.allowed.add((self.node, source))
+        self.assertTrue(self.cache(self.node, source))
+        self.cache.forget(self.node)
+        self.assertTrue(self.cache(self.node, source))
+        self.assertEqual(len(self.reads), 2)
+        for options in ({"maximum_nodes": 0}, {"maximum_nodes": 1, "ttl_seconds": 0}):
+            with self.assertRaises(ValueError):
+                CachedLiveSources(lambda node, source: True, **options)
+        self.assertFalse(self.cache(str(self.node), source))
 
 
 class RegistryLiveSourcesTests(unittest.TestCase):
@@ -364,6 +471,22 @@ class RemotePreviewHubTests(unittest.TestCase):
         self.hub.open_node(other, 2)
         self.assertTrue(self.hub.publish(other, 2, uuid4(), JPEG))
         self.assertEqual(self.hub.status.tracked_sources, 5)
+        self.assertEqual(self.hub.status.refused_frames, 1)
+
+    def test_a_silent_source_gives_its_place_up_during_the_session(self):
+        # PR #416 review: the per-node count shrinks within a session too.
+        sources = [uuid4() for _ in range(4)]
+        for source in sources:
+            self.assertTrue(self.hub.publish(self.node, 1, source, JPEG))
+        self.clock.value += 3
+        self.assertTrue(self.hub.publish(self.node, 1, sources[0], JPEG))
+        self.clock.value += 2.5
+        # Three sources have been silent for 5.5 s; one place is free again.
+        newcomer = uuid4()
+        self.assertTrue(self.hub.publish(self.node, 1, newcomer, JPEG))
+        self.assertEqual(self.hub.status.tracked_sources, 2)
+        self.assertTrue(self.hub.receiving(sources[0], self.node))
+        self.assertFalse(self.hub.receiving(sources[1], self.node))
 
     def test_an_oversized_frame_is_refused(self):
         hub = RemotePreviewHub(max_frame_bytes=len(JPEG) - 1, monotonic=self.clock)
@@ -491,7 +614,9 @@ class CaptureIngestLiveFrameTests(CaptureTlsHarness):
         self.heartbeat_acknowledged(tls, 2)
         self.assertEqual(self.hub.latest(self.source).data, OTHER_JPEG)
         self.assertTrue(self.hub.receiving(self.source, self.node))
-        self.assertEqual(server.status().closed_sessions, 0)
+        status = server.status()
+        self.assertEqual((status.closed_sessions, status.live_frames_accepted,
+                          status.live_frames_unauthorized, status.live_frames_dropped), (0, 2, 0, 0))
 
     def test_live_frames_do_not_spend_the_heartbeat_budget(self):
         self.serve(frames_per_second=2)
@@ -501,48 +626,69 @@ class CaptureIngestLiveFrameTests(CaptureTlsHarness):
         self.heartbeat_acknowledged(tls, 1)
         self.heartbeat_acknowledged(tls, 2)
 
-    def test_an_unauthorized_source_closes_the_session(self):
+    def test_an_unauthorized_source_is_dropped_and_counted_and_the_session_goes_on(self):
+        # PR #416 review: an Agent sends every camera it approved, so a
+        # source the Owner has not created (or disabled) on the Main is an
+        # ordinary state; its frames are dropped, never answered, and the
+        # node's heartbeats go on.
         server = self.serve()
+        self.viewed()
         tls = self.connect()
-        tls.sendall(encode_live_frame(uuid4(), JPEG))
-        self.assertEqual(self.closed_with(tls), "source_not_authorized")
-        self.assertEqual(self.hub.status.tracked_sources, 0)
-        self.assertTrue(self.wait_for(lambda: "source_not_authorized" in server.last_close_reasons()))
+        unknown = uuid4()
+        for _ in range(3):
+            tls.sendall(encode_live_frame(unknown, JPEG))
+        tls.sendall(encode_live_frame(self.source, JPEG))
+        self.heartbeat_acknowledged(tls, 1)
+        status = server.status()
+        self.assertEqual((status.live_frames_unauthorized, status.live_frames_accepted,
+                          status.closed_sessions), (3, 1, 0))
+        self.assertFalse(self.hub.receiving(unknown, self.node))
+        self.assertEqual(self.hub.latest(self.source).data, JPEG)
+        # One registry read per source within the cache second.
+        self.assertEqual(len(self.lookups), 2)
+        self.assertNotIn(str(unknown), repr(status))
 
     def test_another_nodes_source_is_not_authorized(self):
         other = add_remote(self.database, uuid4())
-        self.serve()
+        server = self.serve()
         tls = self.connect()
         tls.sendall(encode_live_frame(other, JPEG))
-        self.assertEqual(self.closed_with(tls), "source_not_authorized")
+        self.heartbeat_acknowledged(tls, 1)
+        self.assertEqual(server.status().live_frames_unauthorized, 1)
         self.assertFalse(self.hub.receiving(other, self.node))
 
-    def test_a_disabled_source_is_refused_at_its_next_frame(self):
-        self.serve()
+    def test_a_disabled_source_is_dropped_once_its_answer_expires(self):
+        server = self.serve()
         self.viewed()
         tls = self.connect()
         tls.sendall(encode_live_frame(self.source, JPEG))
         self.heartbeat_acknowledged(tls, 1)
         CameraRegistry(self.database, unaudited_writes=True).update_source(self.source, enabled=False)
+        # Within the cached second the earlier answer stands; after it the
+        # registry is read again and the frame is dropped.
+        self.nanos.value += int(AUTHORIZATION_CACHE_SECONDS * SECOND)
         tls.sendall(encode_live_frame(self.source, OTHER_JPEG))
-        self.assertEqual(self.closed_with(tls), "source_not_authorized")
-        # The session ended, so its frames are gone too.
-        self.assertTrue(self.wait_for(lambda: self.hub.latest(self.source) is None))
+        self.heartbeat_acknowledged(tls, 2)
+        self.assertEqual(self.hub.latest(self.source).data, JPEG)
+        self.assertEqual(server.status().live_frames_unauthorized, 1)
 
-    def test_without_a_live_preview_every_frame_is_refused(self):
-        self.serve(live=False)
+    def test_without_a_live_preview_every_frame_is_dropped(self):
+        server = self.serve(live=False)
         tls = self.connect()
         tls.sendall(encode_live_frame(self.source, JPEG))
-        self.assertEqual(self.closed_with(tls), "source_not_authorized")
+        self.heartbeat_acknowledged(tls, 1)
+        self.assertEqual(server.status().live_frames_unauthorized, 1)
 
     def test_an_authorizer_failure_denies(self):
         def broken(node, source):
             raise RuntimeError("synthetic")
 
-        self.serve(authorizer=broken)
+        server = self.serve(authorizer=broken)
         tls = self.connect()
         tls.sendall(encode_live_frame(self.source, JPEG))
-        self.assertEqual(self.closed_with(tls), "source_not_authorized")
+        self.heartbeat_acknowledged(tls, 1)
+        self.assertEqual(server.status().live_frames_unauthorized, 1)
+        self.assertEqual(self.hub.status.tracked_sources, 0)
 
     def test_an_oversized_live_frame_is_refused_from_its_header(self):
         self.serve()
@@ -574,39 +720,89 @@ class CaptureIngestLiveFrameTests(CaptureTlsHarness):
         self.assertEqual(self.closed_with(tls), "live_frame_invalid")
         self.assertEqual(self.lookups, [])
 
-    def test_more_than_six_frames_per_source_per_second_close(self):
-        self.serve()
+    def test_a_backlog_after_a_pause_is_accepted(self):
+        # PR #416 review: 5 fps for 2 s, a 1.4 s pause of the Main, then the
+        # 7 frames the Agent held, at once: all are kept, none is dropped.
+        server = self.serve()
+        self.viewed()
         tls = self.connect()
-        for _ in range(LIVE_FRAMES_PER_SOURCE_PER_SECOND + 1):
+        for sequence in range(1, 11):
             tls.sendall(encode_live_frame(self.source, JPEG))
-        self.assertEqual(self.closed_with(tls), "rate_limited")
-        # The over-budget frame caused no registry read.
-        self.assertEqual(len(self.lookups), LIVE_FRAMES_PER_SOURCE_PER_SECOND)
+            self.heartbeat_acknowledged(tls, sequence)
+            self.nanos.value += SECOND // 5
+        self.nanos.value += int(1.4 * SECOND)
+        for _ in range(7):
+            tls.sendall(encode_live_frame(self.source, OTHER_JPEG))
+        self.heartbeat_acknowledged(tls, 11)
+        status = server.status()
+        self.assertEqual((status.live_frames_accepted, status.live_frames_dropped,
+                          status.closed_sessions), (17, 0, 0))
+        self.assertEqual(self.hub.latest(self.source).data, OTHER_JPEG)
 
-    def test_more_than_twenty_four_frames_per_node_per_second_close(self):
+    def test_frames_beyond_a_source_bucket_are_dropped_not_closed(self):
+        server = self.serve()
+        tls = self.connect()
+        for _ in range(SOURCE_BURST + 5):
+            tls.sendall(encode_live_frame(self.source, JPEG))
+        self.heartbeat_acknowledged(tls, 1)
+        status = server.status()
+        self.assertEqual((status.live_frames_accepted, status.live_frames_dropped,
+                          status.closed_sessions), (SOURCE_BURST, 5, 0))
+        # Refilled: accepted again.
+        self.nanos.value += SECOND
+        tls.sendall(encode_live_frame(self.source, JPEG))
+        self.heartbeat_acknowledged(tls, 2)
+        self.assertEqual(server.status().live_frames_accepted, SOURCE_BURST + 1)
+
+    def test_four_sources_bursts_fill_the_node_bucket_exactly(self):
         CameraRegistry(self.database, unaudited_writes=True).set_active_limit(8)
         sources = [self.source] + [add_remote(self.database, self.node, node_row=False)
                                    for _ in range(3)]
-        self.serve()
+        server = self.serve()
         tls = self.connect()
-        for _ in range(LIVE_FRAMES_PER_SOURCE_PER_SECOND):
+        for _ in range(SOURCE_BURST):
             for source in sources:
                 tls.sendall(encode_live_frame(source, JPEG))
-        self.heartbeat_acknowledged(tls, 1)
         tls.sendall(encode_live_frame(sources[0], JPEG))
-        self.assertEqual(self.closed_with(tls), "rate_limited")
+        self.heartbeat_acknowledged(tls, 1)
+        status = server.status()
+        self.assertEqual((status.live_frames_accepted, status.live_frames_dropped), (NODE_BURST, 1))
 
-    def test_a_fifth_source_of_a_node_closes(self):
+    def test_a_fifth_source_of_a_node_is_dropped(self):
         CameraRegistry(self.database, unaudited_writes=True).set_active_limit(8)
         sources = [self.source] + [add_remote(self.database, self.node, node_row=False)
                                    for _ in range(4)]
-        self.serve()
+        server = self.serve()
         tls = self.connect()
-        for source in sources[:4]:
+        for source in sources:
             tls.sendall(encode_live_frame(source, JPEG))
         self.heartbeat_acknowledged(tls, 1)
-        tls.sendall(encode_live_frame(sources[4], JPEG))
+        status = server.status()
+        self.assertEqual((status.live_frames_accepted, status.live_frames_dropped,
+                          status.closed_sessions), (4, 1, 0))
+
+    def test_a_frame_the_hub_refuses_is_counted_as_dropped(self):
+        # PR #416 review: a refused publish is counted, never as accepted.
+        self.hub = RemotePreviewHub(max_frame_bytes=len(JPEG) - 1, monotonic=self.clock)
+        server = self.serve()
+        tls = self.connect()
+        tls.sendall(encode_live_frame(self.source, JPEG))
+        self.heartbeat_acknowledged(tls, 1)
+        status = server.status()
+        self.assertEqual((status.live_frames_accepted, status.live_frames_dropped,
+                          status.closed_sessions), (0, 1, 0))
+
+    def test_only_a_sustained_flood_closes(self):
+        server = self.serve()
+        tls = self.connect()
+        frame = encode_live_frame(uuid4(), b"\xff\xd8\xff\xd9")
+        tls.sendall(frame * (NODE_BURST * FLOOD_FACTOR))
+        self.heartbeat_acknowledged(tls, 1)
+        self.assertEqual(server.status().closed_sessions, 0)
+        tls.sendall(frame)
         self.assertEqual(self.closed_with(tls), "rate_limited")
+        # The unknown source was read from the registry once, not per frame.
+        self.assertEqual(len(self.lookups), 1)
 
     def test_a_revocation_ends_the_session_and_drops_its_frames(self):
         server = self.serve()

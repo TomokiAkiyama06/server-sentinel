@@ -308,11 +308,14 @@ The ingest listener:
 
 Live preview frames (Issue #14, `LIVE_FRAME`, SPECIFICATION §5.7) are the only
 media the listener accepts today. Each is bounded from its header (1 MiB JPEG
-+ 16 bytes) before its body is read, re-checks the pairing ledger, is charged
-to its own budget (6 per source and 24 per node per second, 4 sources per
-node) before any registry read, and is accepted only for an enabled
-`remote_agent` source whose `capture_node_id` is the session's ledger node.
-It is kept in memory only and never acknowledged. A capture credential still
++ 16 bytes) before its body is read and re-checks the pairing ledger. A
+malformed body or a node flooding beyond ten times its refill rate is closed.
+Otherwise a frame is kept only for an enabled `remote_agent` source whose
+`capture_node_id` is the session's ledger node (cached 1 s; at most 8
+registry lookups per node per second) and within its own token buckets (per
+source 6 per second, burst 30; per node 24 per second, burst 120; 4 sources
+per node); any other frame is dropped and counted, without closing the
+session. It is kept in memory only and never acknowledged. A capture credential still
 reaches no human route: the frames reach viewers only through the human
 listener's `live:view` checks.
 

@@ -1,18 +1,28 @@
 """Authorization and rate budget of capture ingest live frames (Issue #14).
 
 Owner decision 2026-11-12 ("option A"): an Agent sends ``LIVE_FRAME``s
-(``ingest_wire``) of each approved camera, at most 5 per second per source,
-and the Main keeps only the newest one per source in memory for the live view
-(``app.media.live.remote_preview``). The listener (``ingest_server``) applies,
-per frame and in this order, after the frame's size (from its header) and the
-pairing ledger's current record:
+(``ingest_wire``) of every camera it approved, at most 5 per second per
+source, and the Main keeps only the newest one per source in memory for the
+live view (``app.media.live.remote_preview``). The listener
+(``ingest_server``) applies, per frame and in this order, after the frame's
+size (from its header) and the pairing ledger's current record:
 
-1. ``LiveFrameBudget.charge``: its own budget, separate from the heartbeat
-   budget, of at most 6 frames per source and 24 per node per second, and at
-   most 4 sources per node at once; anything beyond is ``rate_limited``;
-2. ``RegistryLiveSources``: the camera registry must hold an enabled source
-   of type ``remote_agent`` with that identity whose ``capture_node_id`` is
-   the session's node; otherwise ``source_not_authorized``.
+1. the body's form (``live_frame_invalid`` closes the session);
+2. ``LiveFrameBudget.flooding``: a per-node flood bound of ten times the node
+   refill rate (240 per second, burst 1200); only a node sustaining more than
+   that is closed (``rate_limited``);
+3. ``CachedLiveSources``: the camera registry must hold an enabled source of
+   type ``remote_agent`` with that identity whose ``capture_node_id`` is the
+   session's node (``RegistryLiveSources``), cached per (node, source) for
+   1 s; otherwise the frame is **dropped and counted**, the session stays
+   open. An Agent sends every camera it approved, so a source the Owner has
+   not created on the Main yet, or disabled, is an ordinary state (PR #416
+   review);
+4. ``LiveFrameBudget.charge``: token buckets separate from the heartbeat
+   budget, per source (refill 6 per second, burst 30) and per node (refill 24
+   per second, burst 120), at most 4 sources per node at once; a frame beyond
+   them is **dropped and counted**. The bursts absorb the frames an Agent
+   sends at once after a pause of the Main or the network.
 
 Identity (checked for this PR). The session's node is the pairing ledger's
 ``node_id``: the URI of its mTLS client certificate, checked against the
@@ -37,84 +47,143 @@ from typing import Callable
 from uuid import UUID
 
 
-LIVE_FRAMES_PER_SOURCE_PER_SECOND = 6
-LIVE_FRAMES_PER_NODE_PER_SECOND = 24
+SOURCE_REFILL_PER_SECOND = 6
+SOURCE_BURST = 30
+NODE_REFILL_PER_SECOND = 24
+NODE_BURST = 120
+# Closing needs a node to sustain more than ten times its refill rate.
+FLOOD_FACTOR = 10
 MAXIMUM_LIVE_SOURCES_PER_NODE = 4
-_WINDOW_NS = 1_000_000_000
+AUTHORIZATION_CACHE_SECONDS = 1.0
+# Distinct sources a node may have looked up in the registry at once (each
+# cached for AUTHORIZATION_CACHE_SECONDS): bounds the registry reads of a node
+# that sends many unknown source identities.
+MAXIMUM_LOOKUPS_PER_NODE = 8
+_NS = 1_000_000_000
+
+
+class _Bucket:
+    """A token bucket on an integer nanosecond clock; never refills backwards."""
+
+    __slots__ = ("tokens", "last")
+
+    def __init__(self, burst: float, now: int):
+        self.tokens = float(burst)
+        self.last = now
+
+    def refill(self, now: int, rate: float, burst: float) -> None:
+        if now > self.last:
+            self.tokens = min(float(burst), self.tokens + (now - self.last) * rate / _NS)
+            self.last = now
+
+    def full(self, now: int, rate: float, burst: float) -> bool:
+        self.refill(now, rate, burst)
+        return self.tokens >= burst
 
 
 class LiveFrameBudget:
-    """Fixed one-second windows per node and per (node, source); thread-safe.
+    """Per-node and per-(node, source) token buckets plus a per-node flood bound.
 
-    Bounded: at most ``maximum_nodes`` nodes and ``maximum_sources_per_node``
-    source windows per node are tracked; an expired window is reclaimed when
-    room is needed. Over either bound, or over a window's count, ``charge``
-    refuses. A clock that runs backwards refuses too (fail closed).
+    Thread-safe and bounded: at most ``maximum_nodes`` nodes and
+    ``maximum_sources_per_node`` source buckets per node are tracked; a bucket
+    that refilled completely is reclaimed when room is needed (a full bucket
+    carries no state). A clock that runs backwards refills nothing.
     """
 
     def __init__(self, *, maximum_nodes: int,
-                 per_source: int = LIVE_FRAMES_PER_SOURCE_PER_SECOND,
-                 per_node: int = LIVE_FRAMES_PER_NODE_PER_SECOND,
+                 source_refill: float = SOURCE_REFILL_PER_SECOND, source_burst: int = SOURCE_BURST,
+                 node_refill: float = NODE_REFILL_PER_SECOND, node_burst: int = NODE_BURST,
+                 flood_factor: int = FLOOD_FACTOR,
                  maximum_sources_per_node: int = MAXIMUM_LIVE_SOURCES_PER_NODE,
                  clock_ns: Callable[[], int] = time.monotonic_ns) -> None:
         if (any(type(value) is not int or value <= 0
-                for value in (maximum_nodes, per_source, per_node, maximum_sources_per_node))
+                for value in (maximum_nodes, source_burst, node_burst, flood_factor,
+                              maximum_sources_per_node))
+                or any(isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0
+                       for value in (source_refill, node_refill))
                 or not callable(clock_ns)):
             raise ValueError("invalid live frame budget")
         self._maximum_nodes = maximum_nodes
-        self._per_source = per_source
-        self._per_node = per_node
+        self._source = (float(source_refill), source_burst)
+        self._node = (float(node_refill), node_burst)
+        self._flood = (float(node_refill) * flood_factor, node_burst * flood_factor)
         self._per_node_sources = maximum_sources_per_node
         self._clock_ns = clock_ns
         self._lock = threading.Lock()
-        # node -> [window start, count, {source: [window start, count]}]
-        self._nodes: dict[UUID, list] = {}
+        # node -> (flood bucket, node bucket, {source: bucket})
+        self._nodes: dict[UUID, tuple[_Bucket, _Bucket, dict[UUID, _Bucket]]] = {}
 
-    @staticmethod
-    def _expired(start: int, now: int) -> bool:
-        return now >= start and now - start >= _WINDOW_NS
+    def _now(self) -> int | None:
+        now = self._clock_ns()
+        return now if type(now) is int and now >= 0 else None
+
+    def _node_locked(self, node_id: UUID, now: int):
+        entry = self._nodes.get(node_id)
+        if entry is None:
+            if len(self._nodes) >= self._maximum_nodes:
+                for key in [key for key, (flood, node, sources) in self._nodes.items()
+                            if flood.full(now, *self._flood) and node.full(now, *self._node)
+                            and all(bucket.full(now, *self._source)
+                                    for bucket in sources.values())]:
+                    del self._nodes[key]
+            if len(self._nodes) >= self._maximum_nodes:
+                return None
+            entry = self._nodes[node_id] = (_Bucket(self._flood[1], now),
+                                            _Bucket(self._node[1], now), {})
+        return entry
+
+    def flooding(self, node_id: UUID) -> bool:
+        """Charge one live frame attempt to the node's flood bound; True closes.
+
+        Every attempt is charged, whatever happens to the frame later. Only a
+        node beyond ten times the node bucket's refill rate and burst floods.
+        """
+        if not isinstance(node_id, UUID):
+            return True
+        now = self._now()
+        if now is None:
+            return True
+        with self._lock:
+            entry = self._node_locked(node_id, now)
+            if entry is None:
+                # The node table is full of nodes that are all still active:
+                # nothing is tracked for this one, so it is not charged; its
+                # frames are dropped by `charge` below.
+                return False
+            flood = entry[0]
+            flood.refill(now, *self._flood)
+            if flood.tokens < 1:
+                return True
+            flood.tokens -= 1
+            return False
 
     def charge(self, node_id: UUID, source_id: UUID) -> bool:
-        """Charge one live frame; False when it is over a bound."""
+        """Take one token from the source's and the node's bucket; False drops the frame."""
         if not isinstance(node_id, UUID) or not isinstance(source_id, UUID):
             return False
-        now = self._clock_ns()
-        if type(now) is not int or now < 0:
+        now = self._now()
+        if now is None:
             return False
         with self._lock:
-            node = self._nodes.get(node_id)
-            if node is None:
-                if len(self._nodes) >= self._maximum_nodes:
-                    for key in [key for key, value in self._nodes.items()
-                                if self._expired(value[0], now)
-                                and all(self._expired(window[0], now)
-                                        for window in value[2].values())]:
-                        del self._nodes[key]
-                if len(self._nodes) >= self._maximum_nodes:
-                    return False
-                node = self._nodes[node_id] = [now, 0, {}]
-            if now < node[0]:
+            entry = self._node_locked(node_id, now)
+            if entry is None:
                 return False
-            if self._expired(node[0], now):
-                node[0], node[1] = now, 0
-            sources = node[2]
-            window = sources.get(source_id)
-            if window is None:
+            _, node, sources = entry
+            bucket = sources.get(source_id)
+            if bucket is None:
                 if len(sources) >= self._per_node_sources:
                     for key in [key for key, value in sources.items()
-                                if self._expired(value[0], now)]:
+                                if value.full(now, *self._source)]:
                         del sources[key]
                 if len(sources) >= self._per_node_sources:
                     return False
-                window = sources[source_id] = [now, 0]
-            if now < window[0]:
+                bucket = sources[source_id] = _Bucket(self._source[1], now)
+            node.refill(now, *self._node)
+            bucket.refill(now, *self._source)
+            if node.tokens < 1 or bucket.tokens < 1:
                 return False
-            if self._expired(window[0], now):
-                window[0], window[1] = now, 0
-            if node[1] >= self._per_node or window[1] >= self._per_source:
-                return False
-            node[1] += 1
-            window[1] += 1
+            node.tokens -= 1
+            bucket.tokens -= 1
             return True
 
     @property
@@ -126,8 +195,8 @@ class LiveFrameBudget:
 class RegistryLiveSources:
     """``(node_id, source_id) -> bool`` from the camera registry, read-only.
 
-    One read-only transaction per frame on a connection that never creates
-    the database (``Database.connect_read_only``); any failure denies.
+    One read-only transaction on a connection that never creates the
+    database (``Database.connect_read_only``); any failure denies.
     """
 
     _QUERY = (
@@ -151,3 +220,75 @@ class RegistryLiveSources:
         except Exception:
             return False
         return row is not None
+
+
+class CachedLiveSources:
+    """A short-lived cache of an authorizer's answer per (node, source).
+
+    An answer (allowed or denied) is reused for ``ttl_seconds`` (1 s), so a
+    disabled source stops being shown within about a second and a node's
+    frames cost at most one registry read per source per second. At most
+    ``maximum_per_node`` sources of a node are cached at once; a further
+    unknown source while they are all current is denied without a read, so a
+    node cycling through source identities cannot drive registry reads. An
+    authorizer that raises denies and is not cached. ``forget`` drops a node.
+    """
+
+    def __init__(self, authorizer: Callable[[UUID, UUID], bool], *,
+                 maximum_nodes: int, ttl_seconds: float = AUTHORIZATION_CACHE_SECONDS,
+                 maximum_per_node: int = MAXIMUM_LOOKUPS_PER_NODE,
+                 clock_ns: Callable[[], int] = time.monotonic_ns) -> None:
+        if (not callable(authorizer) or type(maximum_nodes) is not int or maximum_nodes <= 0
+                or type(maximum_per_node) is not int or maximum_per_node <= 0
+                or isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float))
+                or not 0 < ttl_seconds <= 60 or not callable(clock_ns)):
+            raise ValueError("invalid live source cache")
+        self._authorizer = authorizer
+        self._maximum_nodes = maximum_nodes
+        self._ttl = int(ttl_seconds * _NS)
+        self._per_node = maximum_per_node
+        self._clock_ns = clock_ns
+        self._lock = threading.Lock()
+        # node -> {source: (answer, read at)}
+        self._entries: dict[UUID, dict[UUID, tuple[bool, int]]] = {}
+
+    def _current(self, read_at: int, now: int) -> bool:
+        return read_at <= now < read_at + self._ttl
+
+    def __call__(self, node_id: UUID, source_id: UUID) -> bool:
+        if not isinstance(node_id, UUID) or not isinstance(source_id, UUID):
+            return False
+        now = self._clock_ns()
+        if type(now) is not int:
+            return False
+        with self._lock:
+            node = self._entries.get(node_id, {})
+            cached = node.get(source_id)
+            if cached is not None and self._current(cached[1], now):
+                return cached[0]
+            for key in [key for key, (_, at) in node.items() if not self._current(at, now)]:
+                del node[key]
+            if len(node) >= self._per_node:
+                return False
+        # The registry read runs outside the lock (other nodes' frames go on).
+        try:
+            answer = self._authorizer(node_id, source_id) is True
+        except Exception:
+            return False
+        with self._lock:
+            node = self._entries.get(node_id)
+            if node is None:
+                if len(self._entries) >= self._maximum_nodes:
+                    for key in [key for key, values in self._entries.items()
+                                if all(not self._current(at, now) for _, at in values.values())]:
+                        del self._entries[key]
+                if len(self._entries) >= self._maximum_nodes:
+                    return answer
+                node = self._entries[node_id] = {}
+            if source_id in node or len(node) < self._per_node:
+                node[source_id] = (answer, now)
+        return answer
+
+    def forget(self, node_id: UUID) -> None:
+        with self._lock:
+            self._entries.pop(node_id, None)

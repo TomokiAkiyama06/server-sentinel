@@ -1672,8 +1672,11 @@ of the PR). Record node and source UUIDs only in the private local record.
   live screen; no download or export control exists;
 - [ ] stop the Agent: within about 5 s the frame stops updating and the source
   is `offline`; start it again: it returns without any Main action;
-- [ ] disable the source on the Main: the Agent's session is closed with
-  `source_not_authorized` (Agent journal) and the viewer stops receiving it;
+- [ ] disable the source on the Main: within about 1 s the viewer stops
+  receiving it, the Agent's session stays open (its heartbeats go on, no
+  heartbeat-loss notice) and the frames are counted as unauthorized;
+- [ ] pause the Main briefly (or the LAN link) while the Agent sends: when it
+  resumes, the session is not closed and the live view continues;
 - [ ] `serversentinel-pairing revoke` the node: its next frame ends the session
   and the remote camera disappears from live (`offline`);
 - [ ] on a 1 Gbit/s LAN the stream at 5 fps per camera does not delay the

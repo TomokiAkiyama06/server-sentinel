@@ -17,6 +17,8 @@ Retention (bounded, like ``LocalPreviewHub``):
 * per ingest session (node and generation) only the sources it sent are
   tracked, at most ``maximum_sources_per_node`` (4) of them: for each, the
   receive time (no media) that makes the source ``online`` in the live list;
+  a receive time older than ``fresh_seconds`` gives its place up to a new
+  source of the node;
 * a frame or receive time older than ``fresh_seconds`` (5 s, a little over
   ten frame intervals at the Agent's 5 fps and three at a 1 fps camera) is not
   live: it is never served and the source is listed ``offline``;
@@ -181,6 +183,13 @@ class RemotePreviewHub:
                 return False
             received = self._received.get(source_id)
             if received is None or received.node_id != node_id:
+                # A source of this node that sent nothing within the
+                # freshness bound no longer holds one of its places (PR #416
+                # review): the count shrinks during a session too.
+                for key in [key for key, item in self._received.items()
+                            if item.node_id == node_id
+                            and not self._current_locked(node_id, item.generation, item.at, now)]:
+                    del self._received[key]
                 tracked = sum(item.node_id == node_id for item in self._received.values())
                 if tracked >= self._per_node:
                     self._refused += 1
