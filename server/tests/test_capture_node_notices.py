@@ -4,6 +4,7 @@ Generated clocks, synthetic node views, an in-memory sink, disposable SQLite
 files and an intercepted Slack transport only. No real host, node, credential
 or network is used.
 """
+import asyncio
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -551,6 +552,58 @@ class ActiveNodeLedgerTests(CaptureTlsHarness):
         self.ledger.revoke(Owner(), "owner", node_id=second)
         self.assertEqual(self.ledger.active_node_ids(), (first,))
         self.assertNotIn(pending, self.ledger.active_node_ids())
+
+
+class HeartbeatLossEndToEndTests(RuntimeFixture):
+    """Issue #397 (PR #409 review): the real listener, ledger and monitoring runtime."""
+
+    async def test_a_paired_node_that_never_connects_is_notified(self):
+        import socket
+        from app.cameras.remote_agent.ingest_config import (
+            CaptureIngestLimits, CaptureIngestMaterial, IngestListenerConfig,
+        )
+        from tests.test_recording import SyntheticValidator
+        harness = CaptureTlsHarness("setUp")
+        harness.setUp()
+        self.addCleanup(harness.doCleanups)
+        node = harness._paired_node("a")[0].node_id
+        revoked = harness._paired_node("b")[0].node_id
+        harness.ledger.revoke(Owner(), "owner", node_id=revoked)
+        with socket.create_server(("127.0.0.1", 0)) as probe:
+            port = probe.getsockname()[1]
+        material = CaptureIngestMaterial(
+            IngestListenerConfig("127.0.0.1", port, "127.0.0.1", 8000),
+            CaptureIngestLimits(idle_timeout_seconds=5), harness.context, harness.deployment)
+        values = dict(
+            integrity_probe=self.probe, slack_opener=self.transport, utcnow=self.clock.utcnow,
+            monotonic=lambda: self.clock.monotonic, tick_seconds=3600.0,
+            segment_validator=SyntheticValidator())
+        application = create_app(self.settings, database=harness.database,
+                                 monitoring=self.configuration(),
+                                 monitoring_dependencies=MonitoringDependencies(**values),
+                                 capture_ingest=material)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            for _ in range(250):
+                if application.state.capture_ingest_state == "running":
+                    break
+                await asyncio.sleep(0.02)
+            self.assertEqual(application.state.capture_ingest_state, "running")
+            await runtime.call(runtime.tick)
+            for _ in range(250):
+                await runtime.call(runtime.tick)
+                if runtime.status.capture_node_lost:
+                    break
+                await asyncio.sleep(0.02)
+            self.assertTrue(runtime.status.capture_node_lost)
+            self.assertFalse(runtime.status.capture_node_watch_unavailable)
+            self.clock.advance(timedelta(seconds=NOTICE_AFTER_SECONDS))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            texts = self.slack_texts()
+        self.assertEqual(texts.count("ServerSentinel critical alert: capture_node_heartbeat_lost"),
+                         1)
+        self.assertNotIn(str(node), "".join(texts))
 
 
 class RuntimeWiringTests(RuntimeFixture):

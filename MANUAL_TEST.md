@@ -1071,7 +1071,8 @@ local record.
   for more than 6 min: Slack receives one `capture_node_heartbeat_lost`;
   start it again: no recovery notice. Restart the Main with the Agent
   stopped: one notice about 5 min after the start. A revoked node is never
-  notified;
+  notified (revoke a node taken out of service, or every Main start notifies
+  it once);
 - [ ] from the capture host, which is not on the Tailnet, a paired node's
   heartbeat over the private LAN is answered with `HEARTBEAT_ACK`; without
   the ALPN, without a client certificate, with another deployment's

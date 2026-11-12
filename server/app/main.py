@@ -243,16 +243,18 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # (set in the lifespan below); it never touches SQLite or a socket.
     if monitoring_dependencies is not None and monitoring_dependencies.capture_nodes is not None:
         raise TypeError("the application owns the capture node health monitor")
-    # The pairing ledger the ingest acceptor reads (built below for a
-    # `capture_ingest` section whose material loaded).
-    capture_ledger = None
+    # Issue #397 (PR #409 review): the monitoring provider reads the pairing
+    # ledger only on this pinned, read-only database, pinned under the
+    # storage admission by the ingest listener task (never on the monitoring
+    # worker, whose admission it would wait for), so a lost or replaced
+    # filesystem never makes it open or create a database.
+    capture_ledger_reads = PinnedDatabase(store) if capture_ingest is not None else None
     if ((capture_ingest is not None or capture_ingest_unavailable) and monitoring is not None
             and monitoring.storage_configured):
         from app.monitoring.capture_nodes import CaptureNodeHealthMonitor, CaptureNodeView
 
         def capture_health():
-            # `application` and `capture_ledger` are bound below; the first
-            # tick runs in the lifespan.
+            # `application` is bound below; the first tick runs in the lifespan.
             server = application.state.capture_ingest
             nodes = () if server is None else tuple(
                 CaptureNodeView(node, state, reasons)
@@ -261,9 +263,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # read that fails skips heartbeat-loss detection for this tick
             # only (`capture_nodes.py`); the degraded notices go on.
             expected = None
-            if capture_ledger is not None:
+            if capture_ledger_reads is not None and capture_ledger_reads.pinned:
+                from app.cameras.remote_agent.pairing import active_node_ids_on
                 try:
-                    expected = capture_ledger.active_node_ids()
+                    with closing(capture_ledger_reads.connect_read_only()) as connection:
+                        expected = active_node_ids_on(connection)
                 except Exception:
                     expected = None
             return application.state.capture_ingest_state, nodes, expected
@@ -585,7 +589,16 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 capture_lifecycle["server"] = server
                 application.state.capture_ingest = server
                 application.state.capture_ingest_state = "running"
-                return
+                break
+            # Issue #397: pin the ledger reads of the heartbeat-loss watch
+            # under the storage admission, off the monitoring worker; retried
+            # like the bind until the storage is admitted.
+            while capture_ledger_reads is not None and not capture_ledger_reads.pinned:
+                try:
+                    await asyncio.to_thread(capture_ledger_reads.pin,
+                                            storage_reservation or runtime_admission)
+                except Exception:
+                    await asyncio.sleep(CAPTURE_INGEST_BIND_RETRY_SECONDS)
 
         def stop_capture_ingest() -> None:
             # Signal only (`CaptureIngestServer.stop`): it waits for nothing,

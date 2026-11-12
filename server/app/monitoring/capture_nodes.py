@@ -128,6 +128,10 @@ class CaptureHealthStatus:
     listener_unavailable: bool = False
     # Owed node notices not recorded yet (cap, full queue, refused write).
     held_notices: int = 0
+    # Issue #397 (PR #409 review): expected nodes without a heartbeat, and a
+    # running listener whose ledger could not be read (the watch is paused).
+    lost_nodes: int = 0
+    loss_watch_unavailable: bool = False
 
 
 def notice_id(kind: NotificationKind, node: object, at: datetime) -> UUID:
@@ -285,7 +289,12 @@ class CaptureNodeHealthMonitor:
                 and any(matches(node.reasons) for _kind, _delay, matches in _NODE_NOTICES)
                 for node in nodes),
             listener_unavailable=state in _LISTENER_PENDING,
-            held_notices=held)
+            held_notices=held,
+            lost_nodes=sum(1 for node in (expected or ())
+                           if node not in seen or any(view.node_id == node
+                                                      and view.state == "offline"
+                                                      for view in nodes)),
+            loss_watch_unavailable=expected is None and state == "running")
 
     # -- observation ---------------------------------------------------------
 

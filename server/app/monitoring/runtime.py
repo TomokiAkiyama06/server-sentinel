@@ -235,6 +235,11 @@ class MonitoringStatus:
     # PR #408 review: an owed node notice is held (cap, full queue, refused
     # local write). Diagnostic only; it is retried on every tick.
     capture_node_notices_held: bool = False
+    # Issue #397 (PR #409 review): an expected node sends no heartbeat, or
+    # the heartbeat-loss watch is paused because the ledger is unreadable.
+    # Both are degraded in the daily summary.
+    capture_node_lost: bool = False
+    capture_node_watch_unavailable: bool = False
 
     @property
     def camera_offline_cause(self) -> str:
@@ -1136,6 +1141,7 @@ class MonitoringRuntime:
             status.credential_finding_degraded, status.camera_offline_degraded,
             status.recording_device_numbers_stale, status.unclean_exit_detection_degraded,
             status.capture_node_degraded, status.capture_ingest_unavailable,
+            status.capture_node_lost, status.capture_node_watch_unavailable,
         ))
         capture = self._capture_health
         elapsed = self.dependencies.monotonic() - self._started_monotonic
@@ -1262,7 +1268,9 @@ class MonitoringRuntime:
         # `capture_unconfigured` alone is the Agent's normal state for now.
         self._set(capture_node_degraded=status.notable_degraded_nodes > 0,
                   capture_ingest_unavailable=status.listener_unavailable,
-                  capture_node_notices_held=status.held_notices > 0)
+                  capture_node_notices_held=status.held_notices > 0,
+                  capture_node_lost=status.lost_nodes > 0,
+                  capture_node_watch_unavailable=status.loss_watch_unavailable)
 
     def _capture_notice_rows(self, now: datetime):
         """``(event ID, kind, UTC at, age)`` of node notice rows accepted in the last hour.

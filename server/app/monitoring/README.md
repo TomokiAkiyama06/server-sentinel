@@ -199,8 +199,10 @@ Capture nodes (Issue #14, Owner decision 2026-11-12): for a `capture_ingest`
 section `create_app` builds one `capture_nodes.CaptureNodeHealthMonitor`
 whose provider reads `application.state.capture_ingest_state`, the
 listener registry's `nodes()` (memory only) and, for heartbeat loss (Issue
-#397), the pairing ledger's `active_node_ids()` (a read without storage
-admission; a failed read pauses loss detection for that tick). `_capture_tick` drains it on
+#397), the pairing ledger's active nodes (`pairing.active_node_ids_on`, on a
+`PinnedDatabase` read-only connection that the ingest listener task pins
+under the storage admission; unpinned or failed, loss detection is paused
+for that tick and `capture_node_watch_unavailable` is set). `_capture_tick` drains it on
 every tick in every runtime state, like the camera tick, and sets
 `capture_node_degraded` (a notified reason only) /
 `capture_ingest_unavailable`. On the first running tick it re-seeds the
