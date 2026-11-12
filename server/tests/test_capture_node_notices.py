@@ -11,7 +11,7 @@ from app.cameras.remote_agent.ingest_wire import NodeHeartbeat
 from app.cameras.remote_agent.node_health import CaptureNodeHealthRegistry
 from app.main import create_app
 from app.monitoring.capture_nodes import (
-    HOURLY_LIMIT, NOTICE_AFTER_SECONDS, CaptureNodeHealthMonitor, CaptureNodeView,
+    HOURLY_LIMIT, NOTICE_AFTER_SECONDS, CaptureNodeHealthMonitor, CaptureNodeView, notice_id,
 )
 from app.monitoring.runtime import MonitoringDependencies
 from app.notifications.service import NotificationKind, NotificationService
@@ -136,7 +136,9 @@ class MonitorTests(MonitorFixture, unittest.TestCase):
         self.provider.set(self.node, "degraded", "clock_offset")
         self.drain()
         self.advance(200)
+        self.drain()
         self.provider.set(self.node, "offline")
+        self.advance(60)
         self.drain()
         self.advance(3600)
         self.drain()
@@ -173,19 +175,39 @@ class MonitorTests(MonitorFixture, unittest.TestCase):
         self.drain()
         self.assertIn(CLOCK.value, self.kinds())
 
-    def test_a_delay_reached_just_before_going_offline_is_owed(self):
-        # Observed degraded for the whole 5 min; offline seen at that drain.
+    def test_a_delay_reached_on_the_last_observation_before_offline_is_owed(self):
         self.fill_cap()
         self.provider.set(self.node, "degraded", "clock_offset")
         self.drain()
         self.advance(NOTICE_AFTER_SECONDS)
+        self.drain()
         self.provider.set(self.node, "offline")
+        self.advance(60)
         self.assertEqual(self.drain().held_notices, 1)
         self.provider.set(self.node, "online")
         self.drain()
         self.advance(3600)
         self.drain()
         self.assertIn(CLOCK.value, self.kinds())
+
+    def test_time_after_the_last_observation_does_not_count(self):
+        # PR #408 review: observed degraded for 240 s, then online (or
+        # offline) seen at 300 s: not 5 min observed, so not owed.
+        for after in ("online", "offline"):
+            with self.subTest(after=after):
+                self.sink.rows.clear()
+                self.provider.nodes.clear()
+                node = uuid4()
+                for _ in range(5):
+                    self.provider.set(node, "degraded", "clock_offset")
+                    self.drain()
+                    self.advance(60)
+                self.provider.set(node, after)
+                self.drain()
+                self.provider.set(node, "online")
+                self.advance(3600)
+                self.drain()
+                self.assertEqual(self.kinds(), [])
 
     def test_a_held_recovered_notice_is_not_lost_to_a_short_new_episode(self):
         # PR #408 review: a newer short episode does not replace it.
@@ -207,15 +229,20 @@ class MonitorTests(MonitorFixture, unittest.TestCase):
         self.assertIn("ServerSentinel attention notice: capture_node_clock_degraded"
                       " (already recovered)", self.texts())
 
-    def test_the_restored_hour_counts_against_every_node(self):
-        # PR #408 review: a restart loop cannot exceed the cap.
-        self.monitor.restore_window([(uuid4(), 60.0)] * HOURLY_LIMIT, monotonic=self.clock.value)
+    def test_the_restored_hour_counts_for_its_own_node_only(self):
+        # PR #408 review: a restart loop cannot exceed a node's cap, and one
+        # node's notices do not delay another's.
+        other = uuid4()
+        rows = [(notice_id(STORAGE, self.node, AT - timedelta(minutes=index)), STORAGE,
+                 AT - timedelta(minutes=index), 60.0) for index in range(HOURLY_LIMIT)]
+        self.monitor.restore_window(rows, monotonic=self.clock.value)
         self.provider.set(self.node, "degraded", "storage_unavailable")
+        self.provider.set(other, "degraded", "storage_unavailable")
         self.assertEqual(self.drain().held_notices, 1)
-        self.assertEqual(self.kinds(), [])
+        self.assertEqual(self.kinds(), [STORAGE.value])
         self.advance(3600 - 60)
         self.drain()
-        self.assertEqual(self.kinds(), [STORAGE.value])
+        self.assertEqual(self.kinds(), [STORAGE.value, STORAGE.value])
 
     def test_a_full_queue_keeps_the_notice_owed_with_its_first_time(self):
         # PR #408 review: the camera convention (can_accept, first `at`).
@@ -519,6 +546,31 @@ class RuntimeWiringTests(RuntimeFixture):
                           self.slack_texts())
             summary = await runtime.call(runtime._summary, self.clock.utcnow())
             self.assertEqual((summary.agents_online, summary.agents_offline), (0, 0))
+
+    async def test_the_cap_is_restored_per_node_from_the_rows(self):
+        # PR #408 review: the runtime path (rows -> restore_window).
+        node = uuid4()
+        values = dict(
+            integrity_probe=self.probe, slack_opener=self.transport, utcnow=self.clock.utcnow,
+            monotonic=lambda: self.clock.monotonic, tick_seconds=3600.0)
+        from tests.test_recording import SyntheticValidator
+        application = create_app(self.settings, monitoring=self.configuration(),
+                                 monitoring_dependencies=MonitoringDependencies(
+                                     segment_validator=SyntheticValidator(), **values),
+                                 capture_ingest_unavailable=True)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            now = self.clock.utcnow()
+            for index in range(HOURLY_LIMIT):
+                at = now - timedelta(minutes=10 + index)
+                await runtime.call(lambda at=at: runtime.notifications.record(
+                    STORAGE, at=at, confirmed=True, event_id=notice_id(STORAGE, node, at)))
+            await self.settle(runtime)
+            monitor = runtime.dependencies.capture_nodes
+            rows = await runtime.call(runtime._capture_notice_rows, now)
+            monitor.restore_window(rows, monotonic=self.clock.monotonic)
+            self.assertEqual(monitor._restored_for(node, self.clock.monotonic), HOURLY_LIMIT)
+            self.assertEqual(monitor._restored_for(uuid4(), self.clock.monotonic), 0)
 
     async def test_no_monitor_without_a_capture_ingest_section(self):
         application = self.application()
