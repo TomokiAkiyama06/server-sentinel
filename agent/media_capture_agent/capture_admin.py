@@ -85,15 +85,23 @@ def read_confirmation(prompt: str, *, opener: Callable[..., int] = os.open) -> s
     try:
         if not os.isatty(descriptor):
             raise AdminRefused("controlling_terminal_required")
-        with open(descriptor, "r+", encoding="utf-8", closefd=False, buffering=1) as terminal:
-            terminal.write(prompt)
-            terminal.flush()
-            line = terminal.readline(256)
+        # Descriptor-level I/O: a terminal is not seekable, so a buffered
+        # "r+" file object cannot be used (Codex P1 on PR #412).
+        data = prompt.encode("utf-8")
+        while data:
+            data = data[os.write(descriptor, data):]
+        line = b""
+        while len(line) < 256 and not line.endswith(b"\n"):
+            chunk = os.read(descriptor, 256 - len(line))
+            if not chunk:
+                break
+            line += chunk
+        text = line.decode("utf-8")
     except (OSError, UnicodeError):
         raise AdminRefused("controlling_terminal_required") from None
     finally:
         os.close(descriptor)
-    return line.strip()
+    return text.strip()
 
 
 def _settings(path: Path) -> Settings:
@@ -223,10 +231,14 @@ def _approve(settings, discovery, source_id: UUID, label: str, *, confirm) -> li
             if isinstance(getattr(error, "__cause__", None), BlockingIOError):
                 raise AdminRefused("service_running") from None
             raise AdminRefused("approval_state_unavailable") from None
-        current = [candidate for candidate in capture.candidates(source_id)
-                   if candidate_label(candidate) == label]
+        fresh = capture.candidates(source_id)
+        current = [candidate for candidate in fresh if candidate_label(candidate) == label]
         if len(current) != 1:
             raise AdminRefused("candidate_unavailable")
+        # Re-checked on the fresh scan (Codex P2 on PR #412): a same-serial
+        # camera connected at the prompt would make the approval unusable.
+        if sum(other.strong_key == current[0].strong_key for other in fresh) > 1:
+            raise AdminRefused("camera_serial_not_unique")
         try:
             capture.approve(source_id, current[0])
         except (CaptureRefused, ValueError):

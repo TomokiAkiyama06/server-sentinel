@@ -344,6 +344,37 @@ class CaptureAdminTests(unittest.TestCase):
         # The session was released: the next start is not a recovery.
         self.assertIsNone(self.approved().session_token)
 
+    def test_the_confirmation_is_read_from_a_real_terminal(self):
+        # Codex P1 on PR #412: a terminal is not seekable.
+        import pty
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        os.write(master, b"APPROVE\n")
+        word = capture_admin.read_confirmation("Type APPROVE: ", opener=lambda *_: slave)
+        self.assertEqual(word, "APPROVE")
+        self.assertIn(b"Type APPROVE: ", os.read(master, 1024))
+        not_a_terminal = os.open(os.devnull, os.O_RDWR)
+        with self.assertRaises(capture_admin.AdminRefused):
+            capture_admin.read_confirmation("x", opener=lambda *_: not_a_terminal)
+
+    def test_a_same_serial_camera_connected_at_the_prompt_is_refused(self):
+        # Codex P2 on PR #412.
+        def confirm_and_plug_a_twin(prompt):
+            self.discovery.devices = [self.camera, evidence(6, serial="SYN-SERIAL-0001")]
+            return "APPROVE"
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = capture_admin.main(
+                ["approve", "--config", "/nonexistent", str(SOURCES[0]), self.label(self.camera)],
+                settings_loader=lambda path: self.settings, discovery=self.discovery,
+                confirm=confirm_and_plug_a_twin)
+        self.assertEqual(code, 2)
+        self.assertIn("refused: camera_serial_not_unique", stderr.getvalue())
+        state = self.approved()
+        self.assertIsNone(state.approved)
+        self.assertIsNone(state.session_token)
+
     def test_a_camera_without_a_serial_is_not_approved(self):
         self.discovery.devices = [evidence(4, serial=None)]
         code, _, stderr = self.run_cli("approve", str(SOURCES[0]),
