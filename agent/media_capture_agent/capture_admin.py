@@ -19,11 +19,17 @@ never stdin or argv).
 (``cam-`` and 10 hex digits of a SHA-256 over the device evidence), never a
 serial, path or USB port, with the USB vendor:product, whether a serial is
 present, the formats and the configured source each is approved for. A label
-changes when the device is re-plugged. ``approve`` persists an approval of
-the exact current device for one configured source through
-``UvcCapture.approve`` (identity re-verified, a duplicate serial latched as
-ambiguous), then closes cleanly so the next service start reconnects by
-serial.
+changes when the device is re-plugged or the host restarts (it hashes the
+per-boot device instance too); ``approved_for`` compares the serial identity.
+``candidates`` only reads the approval state (no session is started).
+``approve`` refuses a camera without a serial, a serial shared with another
+connected camera or latched as ambiguous (``camera_serial_not_unique``) and a
+camera already approved for another source
+(``camera_approved_for_another_source``), because the service could never
+reconnect such an approval; it then starts only that source's session,
+persists the approval through ``UvcCapture.approve`` (identity re-verified)
+and closes cleanly, so the next service start reconnects by serial. A
+hang-up or stop at the prompt still releases the session.
 
 The service holds the approval store's runtime-wide lock, so both commands
 refuse ``service_running`` while it runs. Refusals are one fixed word.
@@ -36,6 +42,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import sys
 import zipimport
 from typing import Callable
@@ -96,57 +103,86 @@ def _settings(path: Path) -> Settings:
     return Settings.load(path, code_root=code_root)
 
 
-def _capture(settings, *, discovery=None):
-    from .uvc_approvals import ApprovalStorageError
-    from .uvc_capture import UvcCapture, UvcSourceConfig
-    from .uvc_pipeline import MjpegProfile
-    sources = [UvcSourceConfig(source.source_id,
-                               MjpegProfile(source.width, source.height, source.fps))
-               for source in settings.capture.sources]
+def _store(settings):
+    """The approval store; its runtime-wide lock refuses while the service runs."""
+    from .uvc_approvals import ApprovalStorageError, ApprovalStore
     try:
-        return UvcCapture(settings, sources, launcher=_NoPipeline(),
-                          **({} if discovery is None else {"discovery": discovery}))
+        return ApprovalStore(settings)
     except ApprovalStorageError as error:
         if isinstance(error.__cause__, BlockingIOError):
             raise AdminRefused("service_running") from None
         raise AdminRefused("approval_state_unavailable") from None
 
 
-def _approved_for(capture, settings, device) -> str:
-    holders = []
-    for source in settings.capture.sources:
-        state = capture.store.load(source.source_id)
-        approved = getattr(state, "approved", None)
-        if approved is not None and approved.to_record() == device.to_record():
-            holders.append(str(source.source_id))
-    return ",".join(holders) or "-"
-
-
-def _candidates(capture, settings) -> list[str]:
-    from .uvc_capture import CaptureRefused
+def _approvals(store, settings) -> dict:
+    """Each configured source's stored state (read only: no session is started)."""
+    from .uvc_approvals import ApprovalStorageError
     try:
-        devices = capture.candidates(settings.capture.sources[0].source_id)
-    except CaptureRefused:
+        return {source.source_id: store.load(source.source_id)
+                for source in settings.capture.sources}
+    except ApprovalStorageError:
+        raise AdminRefused("approval_state_unavailable") from None
+
+
+def _scan(discovery):
+    from .uvc_discovery import LinuxDiscovery
+    try:
+        result = (discovery or LinuxDiscovery()).scan()
+    except Exception:
         raise AdminRefused("camera_scan_incomplete") from None
-    serials = [device.serial for device in devices if device.serial is not None]
+    return tuple(result.devices), result.failures
+
+
+def _holders(device, approvals) -> list[UUID]:
+    """Sources whose approved camera is this device (by serial identity, PR #412 review).
+
+    The full evidence includes a per-boot instance token, so only the strong
+    (serial) key identifies a camera across restarts.
+    """
+    key = device.strong_key
+    return [source for source, state in approvals.items()
+            if key is not None and getattr(state, "approved", None) is not None
+            and state.approved.strong_key == key]
+
+
+def _candidates(settings, discovery) -> list[str]:
+    store = _store(settings)
+    try:
+        approvals = _approvals(store, settings)
+    finally:
+        store.close()
+    devices, failures = _scan(discovery)
     lines = []
     for device in devices:
-        serial = ("absent" if device.serial is None
-                  else "shared" if serials.count(device.serial) > 1 else "present")
+        shared = (device.serial is not None
+                  and sum(other.strong_key == device.strong_key for other in devices) > 1)
+        serial = "absent" if device.serial is None else "shared" if shared else "present"
+        holders = ",".join(str(source) for source in _holders(device, approvals)) or "-"
         lines.append(f"candidate {candidate_label(device)} usb={device.vendor}:{device.product} "
                      f"serial={serial} formats={','.join(device.formats) or '-'} "
-                     f"approved_for={_approved_for(capture, settings, device)}")
-    return lines or ["no candidates"]
+                     f"approved_for={holders}")
+    if not devices:
+        lines.append("no candidates")
+    if failures:
+        lines.append(f"devices not inspected: {failures}")
+    return lines
 
 
-def _approve(capture, settings, source_id: UUID, label: str, *, confirm) -> list[str]:
-    from .uvc_capture import CaptureRefused
-    if source_id not in {source.source_id for source in settings.capture.sources}:
+def _approve(settings, discovery, source_id: UUID, label: str, *, confirm) -> list[str]:
+    from .uvc_capture import CaptureRefused, UvcCapture, UvcSourceConfig
+    from .uvc_pipeline import MjpegProfile
+    configured = {source.source_id: source for source in settings.capture.sources}
+    if source_id not in configured:
         raise AdminRefused("source_not_configured")
+    store = _store(settings)
     try:
-        devices = capture.candidates(source_id)
-    except CaptureRefused:
-        raise AdminRefused("camera_scan_incomplete") from None
+        approvals = _approvals(store, settings)
+    finally:
+        store.close()
+    devices, failures = _scan(discovery)
+    if failures:
+        # A device that could not be inspected might be the label's twin.
+        raise AdminRefused("camera_scan_incomplete")
     matches = [device for device in devices if candidate_label(device) == label]
     if not matches:
         raise AdminRefused("candidate_not_found")
@@ -157,18 +193,65 @@ def _approve(capture, settings, source_id: UUID, label: str, *, confirm) -> list
         # Without a serial the approval would last only while the
         # descriptor this command never keeps open stays open.
         raise AdminRefused("camera_without_serial")
-    profile = next(source for source in settings.capture.sources if source.source_id == source_id)
+    state = approvals[source_id]
+    if (sum(other.strong_key == device.strong_key for other in devices) > 1
+            or getattr(state, "serial_ambiguous", False) and state.approved is not None
+            and state.approved.strong_key == device.strong_key):
+        # A shared (or latched) serial is never reconnected after a restart
+        # (PR #412 review): the approval would be unusable.
+        raise AdminRefused("camera_serial_not_unique")
+    if any(holder != source_id for holder in _holders(device, approvals)):
+        # Two sources on one camera both latch `identity_ambiguous` at start.
+        raise AdminRefused("camera_approved_for_another_source")
+    profile = configured[source_id]
     word = confirm(f"Approve camera {label} usb={device.vendor}:{device.product} for source "
                    f"{source_id} profile={profile.width}x{profile.height}@{profile.fps}/MJPG; "
                    f"the Agent uses it from its next start. Type {APPROVE_WORD} to confirm: ")
     if word != APPROVE_WORD:
         raise AdminRefused("owner_confirmation_declined")
+    # Only this source's session is started (and released on close).
+    capture = None
     try:
-        capture.approve(source_id, device)
+        try:
+            capture = UvcCapture(
+                settings, [UvcSourceConfig(source_id, MjpegProfile(profile.width, profile.height,
+                                                                   profile.fps))],
+                launcher=_NoPipeline(), **({} if discovery is None else {"discovery": discovery}))
+        except AdminRefused:
+            raise
+        except Exception as error:
+            if isinstance(getattr(error, "__cause__", None), BlockingIOError):
+                raise AdminRefused("service_running") from None
+            raise AdminRefused("approval_state_unavailable") from None
+        current = [candidate for candidate in capture.candidates(source_id)
+                   if candidate_label(candidate) == label]
+        if len(current) != 1:
+            raise AdminRefused("candidate_unavailable")
+        try:
+            capture.approve(source_id, current[0])
+        except (CaptureRefused, ValueError):
+            # The camera changed, vanished or became ambiguous meanwhile.
+            raise AdminRefused("candidate_unavailable") from None
     except CaptureRefused:
         raise AdminRefused("candidate_unavailable") from None
+    finally:
+        if capture is not None:
+            try:
+                capture.close()
+            except Exception:
+                raise AdminRefused("capture_state_not_released") from None
     return [f"camera approved: source_id={source_id} candidate={label}",
             "next: start the service; the approval applies on start"]
+
+
+class _Interrupted(Exception):
+    pass
+
+
+def _interrupt(signum, frame):
+    # A hang-up or stop while waiting at the prompt still releases the
+    # approval session in `finally` (PR #412 review).
+    raise _Interrupted()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -189,8 +272,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv=None, *, settings_loader=_settings, discovery=None,
          confirm: Callable[[str], str] = read_confirmation) -> int:
     args = _parser().parse_args(argv)
-    capture = None
+    previous = {}
     try:
+        for signum in (signal.SIGHUP, signal.SIGTERM):
+            previous[signum] = signal.signal(signum, _interrupt)
         if os.geteuid() == 0:
             raise AdminRefused("run_as_service_account")
         source_id = None
@@ -199,9 +284,10 @@ def main(argv=None, *, settings_loader=_settings, discovery=None,
                 source_id = UUID(args.source)
             except ValueError:
                 raise AdminRefused("source_id_rejected") from None
-            if str(source_id) != args.source.lower() or not _LABEL.fullmatch(args.candidate):
-                raise AdminRefused("source_id_rejected" if str(source_id) != args.source.lower()
-                                   else "candidate_label_rejected")
+            if str(source_id) != args.source.lower():
+                raise AdminRefused("source_id_rejected")
+            if not _LABEL.fullmatch(args.candidate):
+                raise AdminRefused("candidate_label_rejected")
         try:
             settings = settings_loader(args.config)
         except ConfigurationError:
@@ -210,20 +296,19 @@ def main(argv=None, *, settings_loader=_settings, discovery=None,
             raise AdminRefused("run_as_service_account")
         if settings.capture is None:
             raise AdminRefused("capture_unconfigured")
-        capture = _capture(settings, discovery=discovery)
         if args.command == "candidates":
-            lines = _candidates(capture, settings)
+            lines = _candidates(settings, discovery)
         else:
-            lines = _approve(capture, settings, source_id, args.candidate, confirm=confirm)
+            lines = _approve(settings, discovery, source_id, args.candidate, confirm=confirm)
     except AdminRefused as refused:
         print(f"{PROG}: refused: {refused.reason}", file=sys.stderr)
         return 2
+    except _Interrupted:
+        print(f"{PROG}: refused: interrupted", file=sys.stderr)
+        return 2
     finally:
-        if capture is not None:
-            try:
-                capture.close()
-            except Exception:
-                print(f"{PROG}: warning: capture_state_not_released", file=sys.stderr)
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
     for line in lines:
         print(line)
     return 0

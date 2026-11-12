@@ -32,6 +32,9 @@ class PreviewFrame:
     data: bytes = field(repr=False)
     sequence: int
     received_monotonic: float
+    # The pipeline generation: `sequence` starts again with every restarted
+    # pipeline, so a frame is identified by both (PR #412 review).
+    generation: int = 0
 
 
 class PreviewTap:
@@ -73,9 +76,11 @@ class PreviewTap:
                 continue
             data = getattr(frame, "data", None)
             sequence = getattr(frame, "sequence", None)
-            if not isinstance(data, bytes) or not data or type(sequence) is not int:
+            generation = getattr(frame, "generation", 0)
+            if (not isinstance(data, bytes) or not data or type(sequence) is not int
+                    or type(generation) is not int):
                 continue
-            kept = PreviewFrame(source, data, sequence, self._clock())
+            kept = PreviewFrame(source, data, sequence, self._clock(), generation)
             with self._lock:
                 self._latest[source] = kept
 

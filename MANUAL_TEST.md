@@ -1102,6 +1102,12 @@ local record.
   service then reports the source `online` (`video_ready`) with no
   `capture_overloaded`; while the service runs both commands refuse
   `service_running`; `/dev/snd` is never opened (`lsof` / `/proc/<pid>/fd`);
+  the installed unit has `DeviceAllow=char-video4linux rw` and no sound
+  device, and the service reaches `online` although the camera also has a
+  UVC metadata node; re-plug the camera (it may get another `/dev/videoN`)
+  and restart the host: both reconnect by serial without a new approval;
+  `approve` refuses a second source for the same camera
+  (`camera_approved_for_another_source`);
 - [ ] a plain HTTP request and a browser to the ingest port get no HTTP
   answer and no dashboard route; the dashboard is not reachable from the
   capture host through the ingest port;

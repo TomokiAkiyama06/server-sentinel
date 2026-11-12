@@ -90,6 +90,15 @@ def render_unit(executable, config, settings, account, group, devices=()):
         if not re.fullmatch(r"/dev/video[0-9]+", device):
             raise ValueError("only explicit video device nodes are supported")
     device_rules = "\n".join("DeviceAllow=" + quote(device) + " rw" for device in devices)
+    if getattr(settings, "capture", None) is not None:
+        # Issue #14 (PR #412 review): discovery probes every video4linux node
+        # (UVC adds a metadata node per camera) and a re-plugged camera gets
+        # a new number, so per-path rules would block it. The video class is
+        # allowed; which camera is used stays the identity check's decision
+        # (`uvc_identity`), and the capture child can open only the approved
+        # device (`uvc_sandbox`). No sound device is allowed.
+        device_rules = "\n".join(filter(None, (device_rules,
+                                               "DeviceAllow=char-video4linux rw")))
     return f"""[Unit]
 Description=ServerSentinel media-capture-agent
 After=local-fs.target network.target
