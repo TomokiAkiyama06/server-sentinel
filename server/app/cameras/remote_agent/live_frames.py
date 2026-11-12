@@ -8,9 +8,12 @@ live view (``app.media.live.remote_preview``). The listener
 size (from its header) and the pairing ledger's current record:
 
 1. the body's form (``live_frame_invalid`` closes the session);
-2. ``LiveFrameBudget.flooding``: a per-node flood bound of ten times the node
-   refill rate (240 per second, burst 1200); only a node sustaining more than
-   that is closed (``rate_limited``);
+2. ``LiveFrameBudget.flooding``: per-node flood bounds, of ten times the node
+   refill rate in frames (240 per second, burst 1200) and of 16 MB per second
+   (burst 80 MB, about 5 s) in body bytes, twice the ordinary 8 MB/s of four
+   sources at 5 fps with 0.4 MB frames (PR #416 review: a node sending 1 MiB
+   frames at line rate stays far below the frame bound); only a node beyond
+   either is closed (``rate_limited``);
 3. ``CachedLiveSources``: the camera registry must hold an enabled source of
    type ``remote_agent`` with that identity whose ``capture_node_id`` is the
    session's node (``RegistryLiveSources``), cached per (node, source) for
@@ -53,6 +56,9 @@ NODE_REFILL_PER_SECOND = 24
 NODE_BURST = 120
 # Closing needs a node to sustain more than ten times its refill rate.
 FLOOD_FACTOR = 10
+# ... or more body bytes than twice the ordinary 4 sources x 5 fps x 0.4 MB.
+FLOOD_BYTES_PER_SECOND = 16_000_000
+FLOOD_BYTES_BURST = 80_000_000
 MAXIMUM_LIVE_SOURCES_PER_NODE = 4
 AUTHORIZATION_CACHE_SECONDS = 1.0
 # Distinct sources a node may have looked up in the registry at once (each
@@ -94,10 +100,13 @@ class LiveFrameBudget:
                  source_refill: float = SOURCE_REFILL_PER_SECOND, source_burst: int = SOURCE_BURST,
                  node_refill: float = NODE_REFILL_PER_SECOND, node_burst: int = NODE_BURST,
                  flood_factor: int = FLOOD_FACTOR,
+                 flood_bytes_per_second: int = FLOOD_BYTES_PER_SECOND,
+                 flood_bytes_burst: int = FLOOD_BYTES_BURST,
                  maximum_sources_per_node: int = MAXIMUM_LIVE_SOURCES_PER_NODE,
                  clock_ns: Callable[[], int] = time.monotonic_ns) -> None:
         if (any(type(value) is not int or value <= 0
                 for value in (maximum_nodes, source_burst, node_burst, flood_factor,
+                              flood_bytes_per_second, flood_bytes_burst,
                               maximum_sources_per_node))
                 or any(isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0
                        for value in (source_refill, node_refill))
@@ -107,11 +116,12 @@ class LiveFrameBudget:
         self._source = (float(source_refill), source_burst)
         self._node = (float(node_refill), node_burst)
         self._flood = (float(node_refill) * flood_factor, node_burst * flood_factor)
+        self._flood_bytes = (float(flood_bytes_per_second), flood_bytes_burst)
         self._per_node_sources = maximum_sources_per_node
         self._clock_ns = clock_ns
         self._lock = threading.Lock()
-        # node -> (flood bucket, node bucket, {source: bucket})
-        self._nodes: dict[UUID, tuple[_Bucket, _Bucket, dict[UUID, _Bucket]]] = {}
+        # node -> (flood bucket, node bucket, {source: bucket}, flood byte bucket)
+        self._nodes: dict[UUID, tuple[_Bucket, _Bucket, dict[UUID, _Bucket], _Bucket]] = {}
 
     def _now(self) -> int | None:
         now = self._clock_ns()
@@ -121,24 +131,28 @@ class LiveFrameBudget:
         entry = self._nodes.get(node_id)
         if entry is None:
             if len(self._nodes) >= self._maximum_nodes:
-                for key in [key for key, (flood, node, sources) in self._nodes.items()
+                for key in [key for key, (flood, node, sources, volume) in self._nodes.items()
                             if flood.full(now, *self._flood) and node.full(now, *self._node)
+                            and volume.full(now, *self._flood_bytes)
                             and all(bucket.full(now, *self._source)
                                     for bucket in sources.values())]:
                     del self._nodes[key]
             if len(self._nodes) >= self._maximum_nodes:
                 return None
             entry = self._nodes[node_id] = (_Bucket(self._flood[1], now),
-                                            _Bucket(self._node[1], now), {})
+                                            _Bucket(self._node[1], now), {},
+                                            _Bucket(self._flood_bytes[1], now))
         return entry
 
-    def flooding(self, node_id: UUID) -> bool:
-        """Charge one live frame attempt to the node's flood bound; True closes.
+    def flooding(self, node_id: UUID, size: int = 0) -> bool:
+        """Charge one live frame attempt of ``size`` body bytes to the flood bounds; True closes.
 
-        Every attempt is charged, whatever happens to the frame later. Only a
-        node beyond ten times the node bucket's refill rate and burst floods.
+        Every attempt is charged, whatever happens to the frame later. A node
+        floods only beyond ten times the node bucket's refill rate and burst
+        in frames, or beyond ``FLOOD_BYTES_PER_SECOND`` (burst
+        ``FLOOD_BYTES_BURST``) in body bytes.
         """
-        if not isinstance(node_id, UUID):
+        if not isinstance(node_id, UUID) or type(size) is not int or size < 0:
             return True
         now = self._now()
         if now is None:
@@ -150,11 +164,13 @@ class LiveFrameBudget:
                 # nothing is tracked for this one, so it is not charged; its
                 # frames are dropped by `charge` below.
                 return False
-            flood = entry[0]
+            flood, volume = entry[0], entry[3]
             flood.refill(now, *self._flood)
-            if flood.tokens < 1:
+            volume.refill(now, *self._flood_bytes)
+            if flood.tokens < 1 or volume.tokens < size:
                 return True
             flood.tokens -= 1
+            volume.tokens -= size
             return False
 
     def charge(self, node_id: UUID, source_id: UUID) -> bool:
@@ -168,7 +184,7 @@ class LiveFrameBudget:
             entry = self._node_locked(node_id, now)
             if entry is None:
                 return False
-            _, node, sources = entry
+            _, node, sources, _ = entry
             bucket = sources.get(source_id)
             if bucket is None:
                 if len(sources) >= self._per_node_sources:

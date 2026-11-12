@@ -309,7 +309,8 @@ The ingest listener:
 Live preview frames (Issue #14, `LIVE_FRAME`, SPECIFICATION §5.7) are the only
 media the listener accepts today. Each is bounded from its header (1 MiB JPEG
 + 16 bytes) before its body is read and re-checks the pairing ledger. A
-malformed body or a node flooding beyond ten times its refill rate is closed.
+malformed body or a node flooding beyond ten times its frame refill rate, or
+beyond 16 MB/s (burst 80 MB) of body bytes, is closed.
 Otherwise a frame is kept only for an enabled `remote_agent` source whose
 `capture_node_id` is the session's ledger node (cached 1 s; at most 8
 registry lookups per node per second) and within its own token buckets (per

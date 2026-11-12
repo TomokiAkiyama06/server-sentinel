@@ -35,8 +35,9 @@ authorize, or beyond the buckets, is dropped and counted
 (``CaptureIngestStatus.live_frames_unauthorized`` / ``live_frames_dropped``)
 and the session goes on (PR #416 review: an Agent sends every camera it
 approved, which the Owner may not have created or may have disabled on the
-Main). Only a malformed body (``live_frame_invalid``) or a flood, more than
-ten times the node refill rate sustained (``rate_limited``), closes the
+Main). Only a malformed body (``live_frame_invalid``) or a flood
+(``rate_limited``: more than ten times the node refill rate in frames, or more
+than 16 MB/s with an 80 MB burst in body bytes, sustained) closes the
 session. The session's frames are dropped from the hub when it ends or is
 superseded.
 
@@ -168,8 +169,9 @@ class CaptureIngestServer:
                 or (live_sources is not None and not callable(live_sources))):
             raise ValueError("invalid capture ingest dependencies")
         self.limits = limits
-        # Issue #14 (option A): without both, every live frame is refused
-        # `source_not_authorized` (fail closed).
+        # Issue #14 (option A): without both, every live frame is dropped and
+        # counted as `live_frames_unauthorized` (fail closed); the session
+        # and its heartbeats go on.
         self.live_preview = live_preview
         self._live_sources = (None if live_sources is None else CachedLiveSources(
             live_sources, maximum_nodes=limits.maximum_nodes, clock_ns=monotonic_ns))
@@ -557,7 +559,7 @@ class CaptureIngestServer:
             live = parse_live_frame(body)
         except WireRefused as refused:
             return refused.reason
-        if self._live_budget.flooding(node):
+        if self._live_budget.flooding(node, len(body)):
             return "rate_limited"
         authorized = False
         if self.live_preview is not None and self._live_sources is not None:

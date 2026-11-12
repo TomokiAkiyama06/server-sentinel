@@ -26,7 +26,8 @@ from app.cameras.remote_agent.ingest_wire import (
     PeerClosed, WireRefused, encode_frame, encode_live_frame, parse_live_frame, read_frame,
 )
 from app.cameras.remote_agent.live_frames import (
-    AUTHORIZATION_CACHE_SECONDS, FLOOD_FACTOR, MAXIMUM_LIVE_SOURCES_PER_NODE,
+    AUTHORIZATION_CACHE_SECONDS, FLOOD_BYTES_BURST, FLOOD_BYTES_PER_SECOND, FLOOD_FACTOR,
+    MAXIMUM_LIVE_SOURCES_PER_NODE,
     MAXIMUM_LOOKUPS_PER_NODE, NODE_BURST, NODE_REFILL_PER_SECOND, SOURCE_BURST,
     SOURCE_REFILL_PER_SECOND, CachedLiveSources, LiveFrameBudget, RegistryLiveSources,
 )
@@ -233,6 +234,48 @@ class LiveFrameBudgetTests(unittest.TestCase):
         for _ in range(2000):
             self.clock.value += SECOND // 240 + 1
             self.assertFalse(self.budget.flooding(other))
+
+    def test_the_byte_bound_defaults(self):
+        self.assertEqual((FLOOD_BYTES_PER_SECOND, FLOOD_BYTES_BURST), (16_000_000, 80_000_000))
+
+    def test_ordinary_traffic_and_its_backlogs_never_flood_by_bytes(self):
+        # 4 sources x 5 fps x 0.4 MB = 8 MB/s for ten minutes.
+        frame = 400_000
+        for _ in range(3000):
+            self.clock.value += SECOND // 5
+            for _ in range(4):
+                self.assertFalse(self.budget.flooding(self.node, frame))
+        # A 5 s stall, then every held frame at once (25 per source), and
+        # back to ordinary traffic.
+        self.clock.value += 5 * SECOND
+        self.assertFalse(any(self.budget.flooding(self.node, frame) for _ in range(100)))
+        for _ in range(300):
+            self.clock.value += SECOND // 5
+            for _ in range(4):
+                self.assertFalse(self.budget.flooding(self.node, frame))
+
+    def test_maximum_frames_at_line_rate_flood_by_bytes(self):
+        # PR #416 review: 1 MiB frames stay far below 240 frames/s.
+        self.budget = LiveFrameBudget(maximum_nodes=8, clock_ns=self.clock)
+        frame = MAXIMUM_LIVE_FRAME_BODY_BYTES
+        sent = 0
+        while not self.budget.flooding(self.node, frame):
+            sent += 1
+            self.assertLess(sent, 1000)
+        self.assertEqual(sent, FLOOD_BYTES_BURST // frame)
+        # A sustained 32 MB/s floods even with the refill.
+        other = uuid4()
+        for step in range(10_000):
+            self.clock.value += SECOND // 32
+            if self.budget.flooding(other, 1_000_000):
+                break
+        self.assertLess(step, 10_000 - 1)
+        # 16 MB/s exactly is still not a flood.
+        steady = uuid4()
+        for _ in range(2000):
+            self.clock.value += SECOND // 16
+            self.assertFalse(self.budget.flooding(steady, 1_000_000))
+        self.assertTrue(self.budget.flooding(uuid4(), -1))
 
     def test_the_node_table_is_bounded_and_reclaims_refilled_nodes(self):
         self.assertTrue(self.budget.charge(uuid4(), uuid4()))
@@ -791,6 +834,21 @@ class CaptureIngestLiveFrameTests(CaptureTlsHarness):
         status = server.status()
         self.assertEqual((status.live_frames_accepted, status.live_frames_dropped,
                           status.closed_sessions), (0, 1, 0))
+
+    def test_maximum_frames_beyond_the_byte_bound_close(self):
+        # PR #416 review: a node sending 1 MiB frames back to back (the clock
+        # stands still here) is closed once its 80 MB burst is spent.
+        server = self.serve(idle_timeout_seconds=30)
+        tls = self.connect()
+        jpeg = b"\xff\xd8" + b"x" * (MAXIMUM_LIVE_FRAME_BYTES - 4) + b"\xff\xd9"
+        frame = encode_live_frame(uuid4(), jpeg)
+        allowed = FLOOD_BYTES_BURST // MAXIMUM_LIVE_FRAME_BODY_BYTES
+        for _ in range(allowed):
+            tls.sendall(frame)
+        self.heartbeat_acknowledged(tls, 1)
+        self.assertEqual(server.status().closed_sessions, 0)
+        tls.sendall(frame)
+        self.assertEqual(self.closed_with(tls), "rate_limited")
 
     def test_only_a_sustained_flood_closes(self):
         server = self.serve()
