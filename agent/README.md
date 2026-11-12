@@ -19,6 +19,36 @@ next heartbeat. Failures report `main_unavailable` and reconnect with a
 1 s to 30 s back-off. It carries no media yet (#15 / #17). See
 `SPECIFICATION.md` §5.7.
 
+Issue #14 also wires the UVC capture into the service: with a `capture`
+section the service runs `uvc_capture.UvcCapture` for its sources (each
+camera in its sandboxed GStreamer child, see `capture/README.md`) and
+`preview.PreviewTap`, which keeps only the newest JPEG of each source in
+memory for the live preview the ingest session sends to the Main (Owner
+decision 2026-11-12, option A: the Main shows it in the live view; nothing
+is recorded yet, the ring buffer is wired later). `--check` only verifies the
+pipeline launcher (`capture_pipeline_unavailable`), never the approval state,
+because the running service holds its lock.
+
+Cameras are approved locally with the service stopped, as the service
+account, typing `APPROVE` on the controlling terminal:
+
+```bash
+sudo systemctl stop media-capture-agent.service
+sudo -u <service account> env PYTHONPATH=<installed artifact> python3 -m \
+    media_capture_agent.capture_admin candidates --config <agent config>
+#   candidate cam-<10 hex> usb=<vendor>:<product> serial=present formats=MJPG,YUYV approved_for=-
+sudo -u <service account> env PYTHONPATH=<installed artifact> python3 -m \
+    media_capture_agent.capture_admin approve --config <agent config> <source uuid> cam-<10 hex>
+sudo systemctl start media-capture-agent.service
+```
+
+`candidates` prints labels, never a serial, path or USB port; a label changes
+when the camera is re-plugged. `approve` refuses a camera without a serial
+(its approval would not survive the command), `service_running` while the
+service holds the approval state, and every other refusal with one fixed
+word. The installer's `--video-device /dev/videoN` must name the camera's
+capture node so the unit's `DeviceAllow=` lets the service open it.
+
 Issue #16 adds the tested disk-ring/incident core under `ring.py`, `ring_models.py`
 and `ring_ledger.py`. It uses real immutable disk segments and private SQLite;
 its production capture/transport/Owner-UI integration is still pending. See
@@ -98,6 +128,8 @@ is reported; fix it and rerun to reveal any later failure.
 | `runtime_root_not_writable` | The owner lacks write or search permission on the runtime root |
 | `node_identity_mismatch` | An installed node credential names a different node than the configuration's `node_id` (for example after `enroll pair --repair revoked` before `node_id` was updated); the Agent starts no capture or session |
 | `node_credential_unavailable` | The installed node credential under the runtime root is damaged or unreadable (never treated as unpaired) |
+| `capture_pipeline_unavailable` | With a `capture` section: `gst_launch` is not a root-controlled executable (not root-owned, group/world-writable, or under such a directory), its `coreelements` / `video4linux2` plugins or the sandbox helper are not root-controlled, or Landlock is unavailable (`uvc_pipeline.GStreamerLauncher`; fail closed) |
+| `capture_state_unavailable` | At service start only: the UVC approval state under the runtime root cannot be opened (unsafe ownership, damaged, or another process holds its lock) |
 | `check_failed` | Any other internal error; exception text is suppressed |
 
 `--check` can also pass with a warning (Issue #324). The exit status is 0 and
@@ -129,6 +161,7 @@ all runtime/media data outside the Git checkout and the application install:
 | `clock_offset_limit_seconds` | Positive finite acceptable absolute clock offset |
 | `clock_uncertainty_limit_seconds` | Positive finite clock-exchange uncertainty bound |
 | `clock_step_limit_seconds` | Positive finite wall/monotonic elapsed-time disagreement bound |
+| `capture` | Optional (absent or `null`: no camera is opened, reason `capture_unconfigured`). `{"gst_launch": "/usr/bin/gst-launch-1.0", "sources": [{"source_id": "<uuid>", "profile": "1920x1080@30/MJPG"}]}`: the operator-installed, root-owned `gst-launch-1.0` (never PATH-searched) and one to four sources, each with the UUID the Main gave its `remote_agent` source and an explicit MJPEG profile. A source opens a camera only after the Owner approved one for it with `capture_admin approve` (below) (Issue #14) |
 | `main_ingest` | Optional (absent or `null`: no ingest session, reason `main_ingest_unconfigured`). `{"host", "port"}` of the Main's capture ingest listener (its `capture_ingest` section, not the enrollment endpoint of the trust bundle). `host` is an IP literal (not unspecified, multicast or Tailscale) or a DNS name that resolves only to LAN addresses (Issue #14). An IP literal is recommended: name resolution has no timeout and would delay a tick |
 
 The Owner provisions paths and approves mount identity locally. Runtime never

@@ -1,0 +1,244 @@
+"""Issue #14: the Agent's capture wiring, live preview consumer and local approval CLI.
+
+Synthetic discovery, pipelines and JPEG-shaped bytes only (``test_uvc_capture``
+fakes); no real camera, device node or network is used.
+"""
+import contextlib
+import io
+import os
+from pathlib import Path
+import tempfile
+import threading
+import unittest
+from unittest.mock import patch
+from uuid import uuid4
+
+from media_capture_agent import capture_admin, cli
+from media_capture_agent.config import ConfigurationError, Settings
+from media_capture_agent.preview import PreviewTap
+from media_capture_agent.uvc_approvals import ApprovalStore
+from media_capture_agent.uvc_pipeline import Frame, FrameQueue, PipelineError
+from tests import support
+from tests.test_uvc_capture import (
+    SOURCES, CaptureCase, FakeDiscovery, evidence, synthetic_jpeg, wait_for,
+)
+
+
+class CaptureSettingTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="agent-capture-config-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.value = support.configuration(self.root)
+
+    def parse(self, capture):
+        return Settings.parse(dict(self.value, capture=capture), code_root=self.root / "code")
+
+    def test_the_capture_section_is_optional_and_explicit(self):
+        self.assertIsNone(Settings.parse(self.value, code_root=self.root / "code").capture)
+        self.assertIsNone(self.parse(None).capture)
+        source = str(uuid4())
+        capture = self.parse({"gst_launch": "/usr/bin/gst-launch-1.0",
+                              "sources": [{"source_id": source,
+                                           "profile": "1920x1080@30/MJPG"}]}).capture
+        self.assertEqual((str(capture.gst_launch), str(capture.sources[0].source_id),
+                          capture.sources[0].width, capture.sources[0].height,
+                          capture.sources[0].fps),
+                         ("/usr/bin/gst-launch-1.0", source, 1920, 1080, 30))
+
+    def test_invalid_capture_sections_are_refused(self):
+        source = {"source_id": str(uuid4()), "profile": "1920x1080@30/MJPG"}
+        for capture in ({"sources": [source]},
+                        {"gst_launch": "gst-launch-1.0", "sources": [source]},
+                        {"gst_launch": "/usr/bin/gst-launch-1.0", "sources": []},
+                        {"gst_launch": "/usr/bin/gst-launch-1.0", "sources": [source] * 2},
+                        {"gst_launch": "/usr/bin/gst-launch-1.0",
+                         "sources": [dict(source, source_id=str(uuid4())) for _ in range(5)]},
+                        {"gst_launch": "/usr/bin/gst-launch-1.0",
+                         "sources": [dict(source, profile="1920x1080@30/YUYV")]},
+                        {"gst_launch": "/usr/bin/gst-launch-1.0",
+                         "sources": [dict(source, profile="1920x1080@0/MJPG")]},
+                        {"gst_launch": "/usr/bin/gst-launch-1.0",
+                         "sources": [dict(source, audio=True)]},
+                        {"gst_launch": "/usr/bin/gst-launch-1.0",
+                         "sources": [dict(source, source_id="camera-1")]}):
+            with self.subTest(capture=capture):
+                with self.assertRaises(ConfigurationError):
+                    self.parse(capture)
+
+
+class PreviewTapTests(unittest.TestCase):
+    def test_only_the_newest_frame_is_kept_and_the_queue_never_overflows(self):
+        source = uuid4()
+        queue = FrameQueue(2)
+        tap = PreviewTap([(source, queue)])
+        self.addCleanup(tap.close)
+        self.assertIsNone(tap.latest(source))
+        for sequence in range(1, 21):
+            queue.put(Frame(synthetic_jpeg(sequence), sequence, 1, 0.0))
+            self.assertTrue(wait_for(lambda: tap.latest(source) is not None
+                                     and tap.latest(source).sequence == sequence))
+        self.assertEqual(queue.drop_stats()[0], 0)
+        self.assertEqual(tap.latest(source).data, synthetic_jpeg(20))
+        self.assertNotIn(synthetic_jpeg(20).hex()[:16], repr(tap.latest(source)))
+
+    def test_close_stops_every_thread_even_with_closed_queues(self):
+        before = set(threading.enumerate())
+        queues = [(uuid4(), FrameQueue(1)) for _ in range(4)]
+        tap = PreviewTap(queues)
+        for _, queue in queues:
+            queue.close()
+        tap.close()
+        self.assertTrue(wait_for(lambda: not [thread for thread in threading.enumerate()
+                                              if thread not in before and thread.is_alive()]))
+        self.assertEqual(tap.sources(), ())
+
+
+class CaptureWithPreviewTests(CaptureCase):
+    def test_an_online_camera_feeds_the_preview_without_queue_drops(self):
+        device = evidence(0)
+        capture, pipeline = self.approved_online(FakeDiscovery(device), device)
+        tap = PreviewTap([(SOURCES[0], capture.frames(SOURCES[0]))])
+        self.addCleanup(tap.close)
+        for number in range(1, 30):
+            # Paced like a camera: each frame is consumed before the next.
+            pipeline.feed(synthetic_jpeg(number))
+            self.assertTrue(wait_for(lambda: tap.latest(SOURCES[0]) is not None
+                                     and tap.latest(SOURCES[0]).data
+                                     == synthetic_jpeg(number)))
+        self.assertEqual(self.state(capture), ("online", "video_ready"))
+        self.assertEqual(capture.frames(SOURCES[0]).drop_stats()[0], 0)
+
+
+class CheckReasonTests(unittest.TestCase):
+    def test_capture_failures_have_their_own_codes(self):
+        from media_capture_agent.uvc_approvals import ApprovalStorageError
+        from media_capture_agent.uvc_capture import CaptureRefused
+        self.assertEqual(cli.check_reason(PipelineError("synthetic")),
+                         "capture_pipeline_unavailable")
+        for error in (ApprovalStorageError("synthetic"), CaptureRefused("synthetic")):
+            self.assertEqual(cli.check_reason(error), "capture_state_unavailable")
+        self.assertTrue({"capture_pipeline_unavailable", "capture_state_unavailable"}
+                        <= cli.CHECK_REASONS)
+
+    def test_check_builds_the_launcher_but_never_opens_the_approval_store(self):
+        temporary = tempfile.TemporaryDirectory(prefix="agent-capture-check-")
+        self.addCleanup(temporary.cleanup)
+        value = support.configuration(Path(temporary.name))
+        value["capture"] = {"gst_launch": "/usr/bin/gst-launch-1.0",
+                            "sources": [{"source_id": str(SOURCES[0]),
+                                         "profile": "640x480@15/MJPG"}]}
+        parsed = Settings.parse(value, code_root=Path(temporary.name) / "code")
+        launchers = []
+        with patch.object(cli, "_capture_launcher",
+                          side_effect=lambda settings: launchers.append(settings) or object()), \
+                patch.object(cli, "_capture", side_effect=AssertionError("opened")), \
+                patch.object(cli.Settings, "load", return_value=parsed), \
+                patch.object(cli, "MediaStore") as media, \
+                patch.object(cli, "Agent") as agent:
+            media.return_value.device_numbers_stale = False
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(["--config", "/nonexistent", "--check"]), 0)
+        self.assertEqual(len(launchers), 1)
+        self.assertIsNone(agent.call_args.kwargs["capture"])
+
+
+class CaptureAdminTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="agent-capture-admin-")
+        self.addCleanup(temporary.cleanup)
+        value = support.configuration(Path(temporary.name))
+        value["capture"] = {"gst_launch": "/usr/bin/gst-launch-1.0",
+                            "sources": [{"source_id": str(SOURCES[0]),
+                                         "profile": "640x480@15/MJPG"}]}
+        self.settings = Settings.parse(value, code_root=Path(temporary.name) / "code")
+        self.camera = evidence(0, serial="SYN-SERIAL-0001")
+        self.discovery = FakeDiscovery(self.camera, evidence(2, serial="SYN-SERIAL-0002"))
+        self.prompts = []
+
+    def run_cli(self, *argv, typed="APPROVE", settings=None):
+        def confirm(prompt):
+            self.prompts.append(prompt)
+            return typed
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = capture_admin.main([argv[0], "--config", "/nonexistent", *argv[1:]],
+                                      settings_loader=lambda path: settings or self.settings,
+                                      discovery=self.discovery, confirm=confirm)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def approved(self):
+        store = ApprovalStore(self.settings)
+        try:
+            return store.load(SOURCES[0])
+        finally:
+            store.close()
+
+    def label(self, device):
+        return capture_admin.candidate_label(device)
+
+    def test_candidates_show_labels_but_no_serial_or_path(self):
+        code, stdout, stderr = self.run_cli("candidates")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(f"candidate {self.label(self.camera)} usb=1d6b:0102 serial=present "
+                      f"formats=MJPG,YUYV approved_for=-", stdout)
+        for private in ("SYN-SERIAL", "/dev/video", "usb1/1-"):
+            self.assertNotIn(private, stdout)
+
+    def test_approve_asks_on_the_terminal_and_persists_the_exact_camera(self):
+        code, stdout, stderr = self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        self.assertEqual((code, stderr), (0, ""), stderr)
+        self.assertIn("Type APPROVE to confirm", self.prompts[0])
+        self.assertIn(f"camera approved: source_id={SOURCES[0]}", stdout)
+        state = self.approved()
+        self.assertEqual(state.approved, self.camera)
+        self.assertFalse(state.requires_approval)
+        # Closed cleanly: the next service start is not a recovery.
+        self.assertIsNone(state.session_token)
+        code, stdout, _ = self.run_cli("candidates")
+        self.assertIn(f"approved_for={SOURCES[0]}", stdout)
+
+    def test_refusals_change_nothing(self):
+        cases = (
+            (("approve", str(SOURCES[0]), self.label(self.camera)), "no",
+             "owner_confirmation_declined"),
+            (("approve", str(SOURCES[0]), "cam-0000000000"), "APPROVE", "candidate_not_found"),
+            (("approve", str(uuid4()), self.label(self.camera)), "APPROVE",
+             "source_not_configured"),
+            (("approve", "camera-1", self.label(self.camera)), "APPROVE", "source_id_rejected"),
+            (("approve", str(SOURCES[0]), "camera-1"), "APPROVE", "candidate_label_rejected"),
+        )
+        for argv, typed, reason in cases:
+            with self.subTest(reason=reason):
+                code, stdout, stderr = self.run_cli(*argv, typed=typed)
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn(f"refused: {reason}", stderr)
+        self.assertIsNone(self.approved().approved)
+
+    def test_a_camera_without_a_serial_is_not_approved(self):
+        self.discovery.devices = [evidence(4, serial=None)]
+        code, _, stderr = self.run_cli("approve", str(SOURCES[0]),
+                                       self.label(self.discovery.devices[0]))
+        self.assertEqual(code, 2)
+        self.assertIn("refused: camera_without_serial", stderr)
+
+    def test_a_running_service_is_refused(self):
+        held = ApprovalStore(self.settings)
+        self.addCleanup(held.close)
+        code, _, stderr = self.run_cli("candidates")
+        self.assertEqual(code, 2)
+        self.assertIn("refused: service_running", stderr)
+
+    def test_root_other_accounts_and_missing_capture_are_refused(self):
+        with patch.object(capture_admin.os, "geteuid", return_value=0):
+            self.assertIn("run_as_service_account", self.run_cli("candidates")[2])
+        with patch.object(capture_admin.os, "geteuid", return_value=os.geteuid() + 1):
+            self.assertIn("run_as_service_account", self.run_cli("candidates")[2])
+        bare = Settings.parse(support.configuration(Path(tempfile.mkdtemp(
+            prefix="agent-capture-bare-"))), code_root=Path("/nonexistent/code"))
+        self.assertIn("capture_unconfigured", self.run_cli("candidates", settings=bare)[2])
+
+
+if __name__ == "__main__":
+    unittest.main()

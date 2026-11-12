@@ -28,6 +28,7 @@ CHECK_REASONS = frozenset({
     "not_writable_by_service_account", "insufficient_free_space", "storage_unavailable",
     "service_account_mismatch", "runtime_root_unavailable", "runtime_root_permissions_unsafe",
     "runtime_root_not_writable", "node_identity_mismatch", "node_credential_unavailable",
+    "capture_pipeline_unavailable", "capture_state_unavailable",
     "check_failed",
 })
 
@@ -74,10 +75,50 @@ def check_reason(exc, *, runtime=False):
     """Map a failure to exactly one fixed code; unknown errors -> check_failed."""
     if isinstance(exc, ConfigurationError):
         return "config_invalid"
+    # Issue #14: the configured capture (imported lazily, so a deployment
+    # without `capture` never loads the pipeline modules).
+    from .uvc_approvals import ApprovalStorageError
+    from .uvc_capture import CaptureRefused
+    from .uvc_pipeline import PipelineError
+    if isinstance(exc, PipelineError):
+        return "capture_pipeline_unavailable"
+    if isinstance(exc, (ApprovalStorageError, CaptureRefused)):
+        return "capture_state_unavailable"
     if isinstance(exc, StorageRefused):
         table = _RUNTIME_REASONS if runtime else _STORAGE_REASONS
         return table.get(getattr(exc, "diagnostic", None), "check_failed")
     return "check_failed"
+
+
+def _capture_launcher(settings):
+    """The trusted GStreamer launcher of the `capture` section, or None (Issue #14).
+
+    Checks the root-owned `gst-launch-1.0`, its two plugins, the sandbox
+    helper and Landlock (`uvc_pipeline.GStreamerLauncher`); a failure is
+    `capture_pipeline_unavailable`.
+    """
+    if settings.capture is None:
+        return None
+    from .uvc_pipeline import GStreamerLauncher
+    return GStreamerLauncher(settings.capture.gst_launch)
+
+
+def _capture(settings, launcher):
+    """The UVC capture of the configured sources and the live preview consumer."""
+    from .preview import PreviewTap
+    from .uvc_capture import UvcCapture, UvcSourceConfig
+    from .uvc_pipeline import MjpegProfile
+    sources = [UvcSourceConfig(source.source_id,
+                               MjpegProfile(source.width, source.height, source.fps))
+               for source in settings.capture.sources]
+    capture = UvcCapture(settings, sources, launcher=launcher)
+    try:
+        preview = PreviewTap((source.source_id, capture.frames(source.source_id))
+                             for source in sources)
+    except BaseException:
+        capture.close()
+        raise
+    return capture, preview
 
 
 def main(argv=None):
@@ -91,6 +132,7 @@ def main(argv=None):
         parser.error("--json requires --check")
     agent = None
     store = None
+    capture = preview = None
     stopped = threading.Event()
     previous = {}
     runtime_phase = False
@@ -110,7 +152,13 @@ def main(argv=None):
         session = (IngestSession(credentials, settings.main_ingest, settings.node_id)
                    if settings.main_ingest is not None
                    else UnconfiguredIngestSession(credentials))
-        agent = Agent(settings, store, session=session)
+        launcher = _capture_launcher(settings)
+        if launcher is not None and not args.check:
+            # The approval store holds a runtime-wide lock, so `--check`
+            # (also run by the installer while the service runs) only checks
+            # the pipeline launcher; the service opens the cameras.
+            capture, preview = _capture(settings, launcher)
+        agent = Agent(settings, store, session=session, capture=capture)
         runtime_phase = False
         if args.check:
             store.check()
@@ -150,8 +198,13 @@ def main(argv=None):
             signal.signal(signum, handler)
         if agent is not None:
             agent.close()
-        elif store is not None:
-            store.close()
+        else:
+            if capture is not None:
+                capture.close()
+            if store is not None:
+                store.close()
+        if preview is not None:
+            preview.close()
     return 0
 
 

@@ -1094,6 +1094,14 @@ local record.
   made (`ss -tn` on the capture host); stopping the Main makes the Agent
   report `main_unavailable` and reconnect within about 30 s of the Main's
   return, with no restart of the Agent;
+- [ ] Agent capture (Issue #14, mock-verified only): with a `capture`
+  section naming the CS-800's source UUID and `1920x1080@30/MJPG`, `--check`
+  passes (`capture_pipeline_unavailable` with a non-root-owned
+  `gst_launch`); with the service stopped, `capture_admin candidates` lists
+  the camera without its serial or path, `approve` asks for `APPROVE` and the
+  service then reports the source `online` (`video_ready`) with no
+  `capture_overloaded`; while the service runs both commands refuse
+  `service_running`; `/dev/snd` is never opened (`lsof` / `/proc/<pid>/fd`);
 - [ ] a plain HTTP request and a browser to the ingest port get no HTTP
   answer and no dashboard route; the dashboard is not reachable from the
   capture host through the ingest port;
