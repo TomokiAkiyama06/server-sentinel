@@ -251,13 +251,17 @@ def _approve(settings, discovery, source_id: UUID, label: str, *, confirm) -> li
         # camera connected at the prompt would make the approval unusable.
         if sum(other.strong_key == current[0].strong_key for other in fresh) > 1:
             raise AdminRefused("camera_serial_not_unique")
+        # From just before the write: an interruption must not report a
+        # refusal for an approval that was stored (PR #412 review).
+        _block_interruptions()
         try:
             capture.approve(source_id, current[0])
         except (CaptureRefused, ValueError):
             # The camera changed, vanished or became ambiguous meanwhile.
+            _unblock_interruptions()
             raise AdminRefused("candidate_unavailable") from None
-        # Persisted: an interruption from here on must not report a refusal.
         _ignore_interruptions()
+        _unblock_interruptions()
     except CaptureRefused:
         raise AdminRefused("candidate_unavailable") from None
     finally:
@@ -282,6 +286,16 @@ def _ignore_interruptions() -> None:
         signal.signal(signum, signal.SIG_IGN)
 
 
+def _block_interruptions() -> None:
+    signal.pthread_sigmask(signal.SIG_BLOCK, _SIGNALS)
+
+
+def _unblock_interruptions() -> None:
+    # A signal held while blocked is delivered now: to the refusal handler
+    # if nothing was stored, or ignored (SIG_IGN) once it was.
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, _SIGNALS)
+
+
 def _interrupt(signum, frame):
     # A hang-up or stop while waiting at the prompt still releases the
     # approval session in `finally` (PR #412 review).
@@ -298,18 +312,27 @@ def _revoke(settings, source_id: UUID, *, confirm) -> list[str]:
         state = store.load(source_id)
         if state is None or state.approved is None:
             raise AdminRefused("source_not_approved")
+        if state.serial_ambiguous:
+            # The duplicated-serial latch lives with the approval evidence;
+            # removing it would let a later approval of the same serial
+            # reconnect automatically (SPECIFICATION §4.4, PR #412 review).
+            # Use another source UUID for that camera instead.
+            raise AdminRefused("camera_serial_latched")
         word = confirm(f"Remove the camera approval of source {source_id}; the Agent will not "
                        f"use any camera for it until one is approved again. "
                        f"Type {REVOKE_WORD} to confirm: ")
         if word != REVOKE_WORD:
             raise AdminRefused("owner_confirmation_declined")
+        _block_interruptions()
         try:
             token = store.start_session(source_id).session_token
             store.save(source_id, None, True, session_token=token, serial_ambiguous=False,
                        release=True)
         except ApprovalStorageError:
+            _unblock_interruptions()
             raise AdminRefused("approval_state_unavailable") from None
         _ignore_interruptions()
+        _unblock_interruptions()
     finally:
         store.close()
     return [f"camera approval removed: source_id={source_id}",

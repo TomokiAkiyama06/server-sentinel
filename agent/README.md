@@ -61,11 +61,24 @@ a re-plugged camera may get another number, so a per-path `--video-device`
 rule would block it. Which camera is used stays the identity check's
 decision, and the capture child can open only the approved device. The unit
 also loads the `videodev` module first (`Wants=`/`After=modprobe@videodev`),
-because systemd drops a device class unknown when the service starts. Adding
-`capture` to an installed configuration changes the generated unit, so the
-release must be installed again (an `update` refuses a differing
-configuration); restarting the old unit would let `capture_admin` approve a
-camera the service cannot open.
+because systemd drops a device class unknown when the service starts.
+
+Adding `capture` to an already installed host changes the generated unit, and
+the installer has no operation to re-render it: `update` refuses a differing
+service configuration and `install` refuses an existing installation. On such
+a host, as the administrator: stop the service, move the installed unit file
+and the installation directory (`--destination`) aside (this gives up the
+`previous` release for rollback; configuration, credentials, runtime state and
+media are elsewhere and untouched), run `install` again with the same
+arguments, then review and enable the new unit. Restarting the old unit
+instead would let `capture_admin` approve a camera the service cannot open.
+Before rolling back to a release without Issue #14 capture support, remove the
+`capture` section, which that release refuses as an unknown key.
+
+A source whose camera was latched as having a duplicated serial cannot be
+revoked (`camera_serial_latched`): the latch lives with its approval and keeps
+that serial from reconnecting automatically. Give the camera another source
+UUID instead.
 
 Issue #16 adds the tested disk-ring/incident core under `ring.py`, `ring_models.py`
 and `ring_ledger.py`. It uses real immutable disk segments and private SQLite;

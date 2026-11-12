@@ -367,6 +367,44 @@ class CaptureAdminTests(unittest.TestCase):
         code, _, stderr = self.run_cli("revoke", str(SOURCES[0]), typed="REVOKE", settings=two)
         self.assertIn("refused: source_not_approved", stderr)
 
+    def test_a_latched_serial_cannot_be_revoked_and_reapproved(self):
+        # PR #412 review: revoke must not clear the duplicated-serial latch.
+        from media_capture_agent.uvc_approvals import ApprovalStore as Store
+        store = Store(self.settings)
+        try:
+            token = store.start_session(SOURCES[0]).session_token
+            store.save(SOURCES[0], self.camera, False, session_token=token,
+                       serial_ambiguous=True, release=True)
+        finally:
+            store.close()
+        code, _, stderr = self.run_cli("revoke", str(SOURCES[0]), typed="REVOKE")
+        self.assertEqual(code, 2)
+        self.assertIn("refused: camera_serial_latched", stderr)
+        state = self.approved()
+        self.assertTrue(state.serial_ambiguous)
+        self.assertEqual(state.approved, self.camera)
+        code, _, stderr = self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        self.assertIn("refused: camera_serial_not_unique", stderr)
+
+    def test_signals_are_blocked_while_the_approval_is_written(self):
+        import signal
+        from media_capture_agent.uvc_capture import UvcCapture
+        original = UvcCapture.approve
+        seen = []
+
+        def approve(capture, source, device):
+            seen.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+            os.kill(os.getpid(), signal.SIGTERM)
+            return original(capture, source, device)
+
+        with patch.object(UvcCapture, "approve", approve):
+            code, stdout, stderr = self.run_cli("approve", str(SOURCES[0]),
+                                                self.label(self.camera))
+        self.assertIn(signal.SIGTERM, seen[0])
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("camera approved", stdout)
+        self.assertEqual(self.approved().approved, self.camera)
+
     def test_a_concurrent_approval_for_another_source_is_seen_under_the_lock(self):
         # PR #412 review: the earlier snapshot is checked again after the prompt.
         value = support.configuration(Path(tempfile.mkdtemp(prefix="agent-capture-race-")))
