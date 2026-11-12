@@ -240,7 +240,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # Issue #14 (Owner decision 2026-11-12): capture-node health and ingest
     # listener notices, for a deployment `capture_ingest` section. The
     # provider reads the listener's state word and its in-memory registry
-    # (set in the lifespan below); it never touches SQLite or a socket.
+    # (set in the lifespan below), and for heartbeat loss (Issue #397) one
+    # bounded read-only SQLite query per tick on the pinned database below:
+    # other threads write only while the runtime admission holds this
+    # worker, so the read never meets their writes; it is bounded by the
+    # busy timeout. It never opens a socket.
     if monitoring_dependencies is not None and monitoring_dependencies.capture_nodes is not None:
         raise TypeError("the application owns the capture node health monitor")
     # Issue #397 (PR #409 review): the monitoring provider reads the pairing
@@ -248,7 +252,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # storage admission by the ingest listener task (never on the monitoring
     # worker, whose admission it would wait for), so a lost or replaced
     # filesystem never makes it open or create a database.
-    capture_ledger_reads = PinnedDatabase(store) if capture_ingest is not None else None
+    # Built only when the monitor that reads it is (PR #409 review).
+    capture_ledger_reads = (
+        PinnedDatabase(store)
+        if capture_ingest is not None and monitoring is not None
+        and monitoring.storage_configured else None)
     if ((capture_ingest is not None or capture_ingest_unavailable) and monitoring is not None
             and monitoring.storage_configured):
         from app.monitoring.capture_nodes import CaptureNodeHealthMonitor, CaptureNodeView
@@ -588,6 +596,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
                     continue
                 capture_lifecycle["server"] = server
                 application.state.capture_ingest = server
+                if capture_ledger_reads is not None:
+                    # One pin attempt before `running` (PR #409 review), so
+                    # the watch is not reported paused right after a start.
+                    with suppress(Exception):
+                        await asyncio.to_thread(capture_ledger_reads.pin,
+                                                storage_reservation or runtime_admission)
                 application.state.capture_ingest_state = "running"
                 break
             # Issue #397: pin the ledger reads of the heartbeat-loss watch

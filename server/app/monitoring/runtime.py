@@ -1239,9 +1239,10 @@ class MonitoringRuntime:
         """Capture-node health and ingest listener notices (Issue #14).
 
         Runs in every runtime state once the notification service exists,
-        like the camera tick. The monitor's provider only reads in-memory
-        state; an unexpected failure is logged value-free and retried on the
-        next tick.
+        like the camera tick. The monitor's provider reads in-memory state
+        and, for heartbeat loss, one bounded read-only query on the pinned
+        ledger (`app.main`); an unexpected failure is logged value-free and
+        retried on the next tick.
         """
         monitor = self.dependencies.capture_nodes
         if monitor is None or self.notifications is None:
