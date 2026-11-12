@@ -181,19 +181,36 @@ class LocalPreviewHub:
 
 
 class AuthorizedLocalPreview:
-    """Authorization-bound local preview; confined to one scheduler thread."""
+    """Authorization-bound live preview; confined to one scheduler thread.
+
+    It reads the local hub and, with ``remote`` (a
+    ``remote_preview.RemotePreviewHub``, Issue #14), remote ``remote_agent``
+    sources too; a configured local source is always the local hub's. Both go
+    through the same ``LiveViewerSessions`` and validator.
+    """
 
     def __init__(self, hub: LocalPreviewHub, limits: LiveSessionLimits,
-                 validator: LiveAccessValidator) -> None:
+                 validator: LiveAccessValidator, *, remote=None) -> None:
+        from .remote_preview import RemotePreviewHub
         if not isinstance(hub, LocalPreviewHub):
             raise ValueError("preview hub is required")
+        if remote is not None and not isinstance(remote, RemotePreviewHub):
+            raise ValueError("remote preview hub is invalid")
         self.hub = hub
+        self.remote = remote
         self.sessions = LiveViewerSessions(limits, validator)
+
+    def _hub_of(self, source_id: UUID):
+        if source_id in self.hub.source_ids or self.remote is None:
+            return self.hub
+        return self.remote
 
     def open(self, access: LiveAccess, source_id: UUID) -> LiveSession:
         # An unknown source and a denied principal see the same generic refusal,
         # so the refusal does not reveal which local sources are configured.
-        source = self.hub.source(source_id)
+        # A remote source must have been checked against the registry by the
+        # caller (`frame_pull`), as the remote hub accepts any identity.
+        source = self._hub_of(source_id).source(source_id)
         return self.sessions.open(access, source)
 
     def read(self, access: LiveAccess, session_id: UUID,
@@ -202,7 +219,7 @@ class AuthorizedLocalPreview:
         if type(after_sequence) is not int or after_sequence < 0:
             raise ValueError("after_sequence must be a nonnegative integer")
         session = self.sessions.require(access, session_id)
-        return self.hub.latest(session.source_id, after_sequence)
+        return self._hub_of(session.source_id).latest(session.source_id, after_sequence)
 
     def close(self, access: LiveAccess, session_id: UUID) -> None:
         self.sessions.close(access, session_id)

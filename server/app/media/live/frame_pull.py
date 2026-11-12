@@ -81,6 +81,12 @@ served (counted, value-free), and only a source whose configured and
 negotiated capture format is ``MJPG`` is listed or can be opened (``online``
 only with a recorded negotiated ``MJPG``). Nothing here logs an identity, token, session
 id or media byte.
+
+Remote sources (Issue #14, Owner decision 2026-11-12, option A): with
+``remote`` (a ``RemotePreviewHub``), enabled ``remote_agent`` sources are
+listed and opened too, through the same sessions, validator and limits; their
+frames are the Agent's ``LIVE_FRAME`` JPEGs, ``online`` only while they
+arrive (``remote_preview``).
 """
 
 from __future__ import annotations
@@ -101,6 +107,7 @@ from uuid import UUID
 from app.auth.live_access import BoundLiveAccess, live_view_validator
 from app.auth.rate_limit import SourceRateLimiter
 from .local_preview import AuthorizedLocalPreview, LocalPreviewHub, PreviewFrame
+from .remote_preview import RemotePreviewHub
 from .sessions import (
     LiveSession, LiveSessionCapacityExceeded, LiveSessionLimits, LiveSessionUnavailable,
 )
@@ -214,9 +221,11 @@ class LiveFrameService:
     def __init__(self, hub: LocalPreviewHub, access_store, *,
                  limits: LiveFrameLimits | None = None,
                  monotonic: Callable[[], float] = time.monotonic,
-                 validator=None) -> None:
+                 validator=None, remote: RemotePreviewHub | None = None) -> None:
         if not isinstance(hub, LocalPreviewHub):
             raise ValueError("preview hub is required")
+        if remote is not None and not isinstance(remote, RemotePreviewHub):
+            raise ValueError("remote preview hub is invalid")
         limits = LiveFrameLimits() if limits is None else limits
         if not isinstance(limits, LiveFrameLimits) or not callable(monotonic):
             raise ValueError("live configuration is invalid")
@@ -226,13 +235,15 @@ class LiveFrameService:
         if not callable(current_session) or not callable(now) or database is None:
             raise ValueError("access store is required")
         self.hub = hub
+        self.remote = remote
         self.limits = limits
         self._store = access_store
         self._database = database
         self._monotonic = monotonic
         self.preview = AuthorizedLocalPreview(
             hub, LiveSessionLimits(limits.maximum_total_viewers, limits.maximum_viewers_per_source),
-            validator if validator is not None else live_view_validator(database, clock=now))
+            validator if validator is not None else live_view_validator(database, clock=now),
+            remote=remote)
         self._poll_limiter = SourceRateLimiter(
             per_source_capacity=limits.poll_burst, per_source_refill_seconds=limits.poll_refill_seconds,
             global_capacity=None, max_sources=8 * limits.maximum_total_viewers, monotonic=monotonic)
@@ -567,36 +578,55 @@ class LiveFrameService:
             raise LiveFrameUnavailable() from None
 
     def _viewable(self) -> tuple[LiveSourceView, ...]:
-        """The configured, enabled local sources whose capture format is MJPG.
+        """The viewable enabled sources: local MJPG ones and, with ``remote``, remote ones.
 
-        The interim frame pull passes the camera's own JPEG frames through
-        and never converts, so a source configured as ``YUYV`` or ``GREY``,
-        or whose capture negotiated another format, is not offered (and
-        cannot be opened) rather than shown as available while every frame
-        would be refused. Without a recorded negotiated format the source is
-        listed but never ``online``. Called inside the caller's ``admit``.
+        Local: the configured, enabled ``local_uvc`` sources whose capture
+        format is MJPG. The interim frame pull passes the camera's own JPEG
+        frames through and never converts, so a source configured as ``YUYV``
+        or ``GREY``, or whose capture negotiated another format, is not
+        offered (and cannot be opened) rather than shown as available while
+        every frame would be refused. Without a recorded negotiated format the
+        source is listed but never ``online``.
+
+        Remote (Issue #14, Owner decision 2026-11-12): every enabled
+        ``remote_agent`` source of the registry, whose Agent sends JPEG live
+        frames (``LIVE_FRAME``). It is ``online`` only while its node's
+        current ingest session sent one of its frames within the remote hub's
+        freshness bound, otherwise ``offline``; the registry's own health of a
+        remote source is never shown as live. Called inside the caller's
+        ``admit``.
         """
         configured = set(self.hub.source_ids)
-        if not configured:
+        if not configured and self.remote is None:
             return ()
         # Read-only and never creating: a lost or replaced filesystem makes
         # this a refusal, not a fallback database.
         with closing(self._database.connect_read_only()) as connection:
             connection.execute("BEGIN")
             rows = connection.execute(
-                "SELECT id, name, health_state, desired_capture_profile, negotiated_capture_profile"
-                " FROM camera_sources WHERE enabled=1 AND source_type='local_uvc'"
+                "SELECT id, name, health_state, desired_capture_profile, negotiated_capture_profile,"
+                " source_type, capture_node_id"
+                " FROM camera_sources WHERE enabled=1 AND source_type IN ('local_uvc', 'remote_agent')"
                 " ORDER BY created_at, id").fetchall()
             connection.execute("COMMIT")
         views = []
         for row in rows:
             try:
                 source_id = UUID(row[0])
+                remote_node = UUID(row[6]) if row[5] == "remote_agent" else None
                 profile = json.loads(row[3]) if row[3] else None
                 negotiated = json.loads(row[4]) if row[4] else None
             except (TypeError, ValueError):
                 continue
-            if (source_id not in configured or not isinstance(row[1], str)
+            if not isinstance(row[1], str):
+                continue
+            if remote_node is not None:
+                if self.remote is None or source_id in configured:
+                    continue
+                health = "online" if self.remote.receiving(source_id, remote_node) else "offline"
+                views.append(LiveSourceView(source_id, row[1], health))
+                continue
+            if (source_id not in configured
                     or not isinstance(profile, dict) or profile.get("pixel_format") != _MJPG):
                 continue
             # The format actually in use (Issue #279 item 5): a capture that

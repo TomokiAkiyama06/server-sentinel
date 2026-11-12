@@ -83,3 +83,20 @@ configured and negotiated as MJPG are listed. Nothing is written per frame
 (a binding mismatch is recorded once, coalesced, and ends the live session).
 Mock verified only; a browser decoding real MJPG frames is a manual
 check.
+
+## Remote live preview (Issue #14, Owner decision 2026-11-12, option A)
+
+`remote_preview.RemotePreviewHub` holds the newest `LIVE_FRAME` JPEG of each
+`remote_agent` source, written only by the capture ingest listener after it
+has checked the frame's size, the pairing ledger, the live rate budget and the
+registry's authorization of the source for that node
+(`server/app/cameras/remote_agent/live_frames.py`). It keeps a frame's bytes
+only while the source has viewer demand, one per source, plus a receive time
+per source of a current ingest session (at most 4 per node); a frame or
+receive time older than 5 s is not live. A newer ingest session of the node,
+the session's end and the listener's stop drop that node's frames.
+`LiveFrameService(..., remote=hub)` lists enabled `remote_agent` sources from
+the registry (`online` only while frames arrive) and serves them through the
+same `AuthorizedLocalPreview` sessions, validator, limits and routes as local
+sources. Nothing is acknowledged to the Agent and nothing is stored. Mock
+verified only.

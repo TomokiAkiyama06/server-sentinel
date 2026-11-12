@@ -161,10 +161,15 @@ this protocol.
   more than 16 reasons or 4 sources are `heartbeat_invalid`), `HEARTBEAT_ACK`
   (Main to Agent: the echoed sequence and the Main's UTC receive and send
   times, for the Agent's clock-offset estimate, SPECIFICATION §5.9) and
-  `CLOSE` (Main to Agent: one fixed reason word before the Main closes). Media
-  frames are not part of version 1 (`frame_type_refused`): the Main accepts
-  media only once the durable recording consumer exists (#17 / #313), so it
-  never acknowledges media it cannot keep.
+  `CLOSE` (Main to Agent: one fixed reason word before the Main closes), and
+  `LIVE_FRAME = 0x10` (Agent to Main, Issue #14 option A: the 16-byte source
+  UUID and one JPEG of at most 1 MiB, its own limit applied from the header;
+  no reply; `live_frames.py` and SPECIFICATION §5.7: own budget of 6 per
+  source / 24 per node per second and 4 sources per node, registry
+  authorization `source_not_authorized`, kept in memory only). Recording
+  media frames are not part of version 1 (`frame_type_refused`): the Main
+  accepts them only once the durable recording consumer exists (#17 / #313),
+  so it never acknowledges media it cannot keep.
 - *Bounds.* `maximum_connections` sockets (handshakes included; default 16),
   `maximum_handshakes_per_address` handshakes in progress per peer address
   (default 2; this limits what an unauthenticated LAN host can occupy, it
