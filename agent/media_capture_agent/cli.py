@@ -161,16 +161,12 @@ def main(argv=None):
             # (also run by the installer while the service runs) only checks
             # the pipeline launcher; the service opens the cameras.
             capture, preview = _capture(settings, launcher)
-<<<<<<< HEAD
-        agent = Agent(settings, store, session=session, capture=capture)
+            agent.capture = capture
         if preview is not None and isinstance(session, IngestSession):
             # Issue #14 (option A): the newest JPEG of each source to the Main.
             from .live_sender import LiveSender
             sender = LiveSender(session, preview,
                                 [source.source_id for source in settings.capture.sources])
-=======
-            agent.capture = capture
->>>>>>> feat/issue-14-agent-capture-wiring
         runtime_phase = False
         if args.check:
             store.check()
@@ -208,17 +204,8 @@ def main(argv=None):
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
-<<<<<<< HEAD
         if sender is not None:
             sender.close()
-        if agent is not None:
-            agent.close()
-        else:
-            if capture is not None:
-                capture.close()
-            if store is not None:
-                store.close()
-=======
         try:
             if agent is not None:
                 agent.close()
@@ -235,7 +222,6 @@ def main(argv=None):
             if preview is not None:
                 preview.close()
             return 1
->>>>>>> feat/issue-14-agent-capture-wiring
         if preview is not None:
             preview.close()
     return 0
