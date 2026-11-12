@@ -85,6 +85,7 @@ class MonitorTests(unittest.TestCase):
         for kind, reason in ((NUMBERS, "storage_device_numbers_stale"),
                              (CLOCK, "clock_offset"), (CLOCK, "clock_uncertain")):
             with self.subTest(reason=reason):
+                self.texts()  # wait for in-flight deliveries first
                 self.sink.rows.clear()
                 node = uuid4()
                 self.provider.nodes.clear()
@@ -178,6 +179,7 @@ class MonitorTests(unittest.TestCase):
         # offline) seen at 300 s: not 5 min observed, so not owed.
         for after in ("online", "offline"):
             with self.subTest(after=after):
+                self.texts()  # wait for in-flight deliveries first
                 self.sink.rows.clear()
                 self.provider.nodes.clear()
                 node = uuid4()
@@ -226,6 +228,32 @@ class MonitorTests(unittest.TestCase):
         self.advance(3600 - 60)
         self.drain()
         self.assertEqual(self.kinds(), [STORAGE.value, STORAGE.value])
+
+    def test_a_held_and_a_current_episode_sent_together_get_their_own_ids(self):
+        # PR #408 review: both attempted on one drain must stay two notices.
+        self.monitor = CaptureNodeHealthMonitor(self.provider, hourly_limit=2)
+        self.provider.set(self.node, "degraded", "storage_unavailable", "clock_offset")
+        self.drain(AT)
+        self.advance(NOTICE_AFTER_SECONDS)
+        self.drain(AT + timedelta(minutes=5))
+        self.assertEqual(len(self.sink.rows), 2)
+        self.provider.set(self.node, "online")
+        self.drain(AT + timedelta(minutes=6))
+        self.provider.set(self.node, "degraded", "storage_unavailable")
+        self.drain(AT + timedelta(minutes=10))        # held: A
+        self.provider.set(self.node, "online")
+        self.drain(AT + timedelta(minutes=20))        # A recovered, still owed
+        self.provider.set(self.node, "degraded", "storage_unavailable")
+        self.drain(AT + timedelta(minutes=30))        # held: B, ongoing
+        self.advance(3600)
+        self.drain(AT + timedelta(minutes=90))
+        storage = [event for event in self.sink.rows.values() if event.kind is STORAGE]
+        self.assertEqual(len(storage), 3)
+        texts = self.texts()
+        self.assertIn("ServerSentinel critical alert: capture_node_storage_failure"
+                      " (already recovered)", texts)
+        self.assertEqual(texts.count("ServerSentinel critical alert: capture_node_storage_failure"),
+                         2)
 
     def test_a_full_queue_keeps_the_notice_owed_with_its_first_time(self):
         # PR #408 review: the camera convention (can_accept, first `at`).
@@ -336,6 +364,7 @@ class MonitorTests(unittest.TestCase):
     def test_a_listener_not_running_for_five_minutes_is_notified_once(self):
         for state in ("starting", "unavailable"):
             with self.subTest(state=state):
+                self.texts()  # wait for in-flight deliveries first
                 self.sink.rows.clear()
                 self.provider.state = state
                 status = self.drain()
@@ -349,6 +378,7 @@ class MonitorTests(unittest.TestCase):
                 self.assertFalse(self.drain().listener_unavailable)
         for state in ("disabled", "stopped"):
             with self.subTest(state=state):
+                self.texts()  # wait for in-flight deliveries first
                 self.sink.rows.clear()
                 self.provider.state = state
                 self.drain()
@@ -426,6 +456,39 @@ class RuntimeWiringTests(RuntimeFixture):
             monitor.restore_window(rows, monotonic=self.clock.monotonic)
             self.assertEqual(monitor._restored_for(node, self.clock.monotonic), HOURLY_LIMIT)
             self.assertEqual(monitor._restored_for(uuid4(), self.clock.monotonic), 0)
+
+    async def test_the_first_running_tick_restores_the_cap_per_node(self):
+        # PR #408 review: through `_capture_tick`, not by hand.
+        from types import SimpleNamespace
+        capped, other = uuid4(), uuid4()
+        values = dict(
+            integrity_probe=self.probe, slack_opener=self.transport, utcnow=self.clock.utcnow,
+            monotonic=lambda: self.clock.monotonic, tick_seconds=3600.0)
+        from tests.test_recording import SyntheticValidator
+        application = create_app(self.settings, monitoring=self.configuration(),
+                                 monitoring_dependencies=MonitoringDependencies(
+                                     segment_validator=SyntheticValidator(), **values),
+                                 capture_ingest_unavailable=True)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            runtime._capture_window_restored = False
+            now = self.clock.utcnow()
+            for index in range(HOURLY_LIMIT):
+                at = now - timedelta(minutes=10 + index)
+                await runtime.call(lambda at=at: runtime.notifications.record(
+                    STORAGE, at=at, confirmed=True, event_id=notice_id(STORAGE, capped, at)))
+            await self.settle(runtime)
+            views = (CaptureNodeView(capped, "degraded", ("storage_unavailable",)),
+                     CaptureNodeView(other, "degraded", ("storage_unavailable",)))
+            application.state.capture_ingest = SimpleNamespace(registry=SimpleNamespace(
+                nodes=lambda: tuple((v.node_id, v.state, v.reasons) for v in views)))
+            application.state.capture_ingest_state = "running"
+            self.clock.advance(timedelta(seconds=1))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertTrue(runtime.status.capture_node_notices_held)
+            rows = [row for row in self.events() if row[0] == STORAGE.value]
+            self.assertEqual(len(rows), HOURLY_LIMIT + 1)
 
     async def test_no_monitor_without_a_capture_ingest_section(self):
         application = self.application()
