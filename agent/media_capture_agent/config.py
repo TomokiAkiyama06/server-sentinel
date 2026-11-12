@@ -94,6 +94,12 @@ class MainIngestEndpoint:
 # is at least three of these plus 15 s for a slow tick (storage check, clock
 # exchange); `server/tests/test_capture_ingest_contract.py` checks the pair.
 MAXIMUM_HEARTBEAT_SECONDS = 5.0
+# The shortest interval with an ingest session (PR #406 review): the Main
+# closes a session that sends more than 10 frames per second by default
+# (`CaptureIngestLimits.frames_per_second`). At 1 s even the one immediate
+# clock-refresh heartbeat of a new session (`runtime.Agent.tick`) keeps a node
+# at two frames in any second; the server contract test checks the pair.
+MINIMUM_INGEST_HEARTBEAT_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -147,6 +153,9 @@ class Settings:
         # unconfigured settings round-trips).
         main_ingest = (MainIngestEndpoint.parse(value["main_ingest"])
                        if value.get("main_ingest") is not None else None)
+        if (main_ingest is not None
+                and value["heartbeat_seconds"] < MINIMUM_INGEST_HEARTBEAT_SECONDS):
+            raise ConfigurationError("heartbeat interval is below the Main ingest rate budget")
         return cls(node_id, runtime, media, expected, value["service_uid"],
                    value["safety_reserve_bytes"], value["max_segment_bytes"],
                    value["heartbeat_seconds"], value["clock_offset_limit_seconds"],

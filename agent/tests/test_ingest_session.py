@@ -375,7 +375,8 @@ class MainIngestSettingTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="agent-ingest-config-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.value = support.configuration(self.root)
+        # An ingest session needs at least 1 s (`MINIMUM_INGEST_HEARTBEAT_SECONDS`).
+        self.value = dict(support.configuration(self.root), heartbeat_seconds=1)
 
     def parse(self, **changes):
         value = dict(self.value, **changes)
@@ -401,6 +402,21 @@ class MainIngestSettingTests(unittest.TestCase):
             with self.subTest(endpoint=endpoint):
                 with self.assertRaises(ConfigurationError):
                     self.parse(main_ingest=endpoint)
+
+    def test_an_ingest_session_needs_a_heartbeat_within_the_main_rate_budget(self):
+        # PR #406 review: the Main closes a session above 10 frames per second.
+        endpoint = {"host": "192.0.2.10", "port": 7444}
+        for refused in (0.01, 0.5, 0.999):
+            with self.subTest(heartbeat=refused):
+                with self.assertRaises(ConfigurationError):
+                    self.parse(main_ingest=endpoint, heartbeat_seconds=refused)
+        for accepted in (1, 1.0, 5):
+            with self.subTest(heartbeat=accepted):
+                self.assertEqual(self.parse(main_ingest=endpoint,
+                                            heartbeat_seconds=accepted).heartbeat_seconds,
+                                 accepted)
+        # Without an ingest session the interval keeps its old range.
+        self.assertEqual(self.parse(heartbeat_seconds=0.01).heartbeat_seconds, 0.01)
 
     def test_unknown_keys_are_still_refused(self):
         with self.assertRaises(ConfigurationError):

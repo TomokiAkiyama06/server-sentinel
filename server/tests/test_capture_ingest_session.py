@@ -188,6 +188,12 @@ class AgentIngestSessionTests(CaptureTlsHarness):
                              CaptureIngestLimits().maximum_frame_bytes)
         # One tick's network work fits the slow-tick allowance of the idle
         # timeout (`config.MAXIMUM_HEARTBEAT_SECONDS`, 15 s).
+        # PR #406 review: the shortest interval with a session, plus the one
+        # immediate clock-refresh heartbeat, stays within the rate budget.
+        minimum = agent.config.MINIMUM_INGEST_HEARTBEAT_SECONDS
+        self.assertLessEqual(2 * max(1, int(1 / minimum)),
+                             CaptureIngestLimits().frames_per_second)
+        self.assertLessEqual(minimum, agent.config.MAXIMUM_HEARTBEAT_SECONDS)
         self.assertLessEqual(session.CONNECT_TIMEOUT_SECONDS * 2
                              + session.REPLY_TIMEOUT_SECONDS, 15)
 
