@@ -118,14 +118,105 @@ class MonitorTests(unittest.TestCase):
     def test_an_offline_node_keeps_its_episode_without_becoming_due(self):
         self.provider.set(self.node, "degraded", "clock_offset")
         self.drain()
+        self.advance(200)
         self.provider.set(self.node, "offline")
+        self.drain()
         self.advance(3600)
         self.drain()
         self.assertEqual(self.kinds(), [])
-        # Back with the same reason: the episode is older than 5 min.
+        # Back with the same reason: only the 200 s observed count so far.
         self.provider.set(self.node, "degraded", "clock_offset")
         self.drain()
+        self.advance(NOTICE_AFTER_SECONDS - 201)
+        self.drain()
+        self.assertEqual(self.kinds(), [])
+        self.advance(1)
+        self.drain()
         self.assertEqual(self.kinds(), [CLOCK.value])
+
+    def fill_cap(self, at=AT):
+        for index in range(HOURLY_LIMIT):
+            self.provider.set(self.node, "degraded", "storage_unavailable")
+            self.drain(at + timedelta(minutes=index))
+            self.provider.set(self.node, "online")
+            self.drain(at + timedelta(minutes=index))
+        self.assertEqual(len(self.sink.rows), HOURLY_LIMIT)
+
+    def test_a_held_notice_survives_the_node_going_offline(self):
+        # PR #408 review: owed once it reached its delay while observed.
+        self.fill_cap()
+        self.provider.set(self.node, "degraded", "clock_offset")
+        self.drain()
+        self.advance(NOTICE_AFTER_SECONDS)
+        self.assertEqual(self.drain().held_notices, 1)
+        self.provider.set(self.node, "offline")
+        self.advance(1800)
+        self.assertEqual(self.drain().held_notices, 1)
+        self.advance(1800)
+        self.drain()
+        self.assertIn(CLOCK.value, self.kinds())
+
+    def test_a_delay_reached_just_before_going_offline_is_owed(self):
+        # Observed degraded for the whole 5 min; offline seen at that drain.
+        self.fill_cap()
+        self.provider.set(self.node, "degraded", "clock_offset")
+        self.drain()
+        self.advance(NOTICE_AFTER_SECONDS)
+        self.provider.set(self.node, "offline")
+        self.assertEqual(self.drain().held_notices, 1)
+        self.provider.set(self.node, "online")
+        self.drain()
+        self.advance(3600)
+        self.drain()
+        self.assertIn(CLOCK.value, self.kinds())
+
+    def test_a_held_recovered_notice_is_not_lost_to_a_short_new_episode(self):
+        # PR #408 review: a newer short episode does not replace it.
+        self.fill_cap()
+        self.provider.set(self.node, "degraded", "clock_offset")
+        self.drain()
+        self.advance(NOTICE_AFTER_SECONDS)
+        self.drain()
+        self.provider.set(self.node, "online")
+        self.drain()
+        self.provider.set(self.node, "degraded", "clock_offset")
+        self.drain()
+        self.advance(120)
+        self.provider.set(self.node, "online")
+        self.drain()
+        self.advance(3600)
+        self.drain()
+        self.assertEqual(self.kinds().count(CLOCK.value), 1)
+        self.assertIn("ServerSentinel attention notice: capture_node_clock_degraded"
+                      " (already recovered)", self.texts())
+
+    def test_the_restored_hour_counts_against_every_node(self):
+        # PR #408 review: a restart loop cannot exceed the cap.
+        self.monitor.restore_window([(uuid4(), 60.0)] * HOURLY_LIMIT, monotonic=self.clock.value)
+        self.provider.set(self.node, "degraded", "storage_unavailable")
+        self.assertEqual(self.drain().held_notices, 1)
+        self.assertEqual(self.kinds(), [])
+        self.advance(3600 - 60)
+        self.drain()
+        self.assertEqual(self.kinds(), [STORAGE.value])
+
+    def test_a_full_queue_keeps_the_notice_owed_with_its_first_time(self):
+        # PR #408 review: the camera convention (can_accept, first `at`).
+        self.provider.set(self.node, "degraded", "storage_unavailable")
+        original = self.service.can_accept
+        self.service.can_accept = lambda event_id: False
+        self.assertEqual(self.drain().held_notices, 1)
+        self.service.can_accept = original
+        self.drain(AT + timedelta(minutes=5))
+        [event] = self.sink.rows.values()
+        self.assertEqual(event.at, AT)
+
+    def test_only_notified_reasons_count_as_degraded(self):
+        self.provider.set(self.node, "degraded", "capture_unconfigured")
+        status = self.drain()
+        self.assertEqual((status.degraded_nodes, status.notable_degraded_nodes), (1, 0))
+        self.provider.set(self.node, "degraded", "capture_unconfigured", "clock_offset")
+        self.assertEqual(self.drain().notable_degraded_nodes, 1)
 
     def test_time_offline_does_not_make_a_recovered_episode_owed(self):
         self.provider.set(self.node, "degraded", "clock_offset")

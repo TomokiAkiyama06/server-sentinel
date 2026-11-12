@@ -46,7 +46,7 @@ from .cameras import (
     CAMERA_OFFLINE_DELIVERY_FAILED, CAMERA_OFFLINE_NOT_CONFIGURED, CAMERA_OFFLINE_NOTIFIED,
     CAMERA_OFFLINE_UNVERIFIED, CameraOfflineMonitor,
 )
-from .capture_nodes import CaptureHealthStatus, CaptureNodeHealthMonitor
+from .capture_nodes import NODE_NOTICE_KINDS, CaptureHealthStatus, CaptureNodeHealthMonitor
 from .config import MonitoringConfiguration
 from .filesystem import IdentifiedRecordingFilesystem
 from .store import NotificationEventStore, RecordingHealthStatusStore, RunMarkerStore
@@ -363,6 +363,7 @@ class MonitoringRuntime:
         self._camera_finals: dict[UUID, DeliveryResult] = {}
         # Issue #14: the latest capture-node counts, for the daily summary.
         self._capture_health = CaptureHealthStatus()
+        self._capture_window_restored = False
         # Issue #321: the stale device-number check runs once per process;
         # the notice itself is deduplicated per boot (`_report_device_numbers`).
         self._device_numbers_reported = False
@@ -1236,13 +1237,24 @@ class MonitoringRuntime:
         if monitor is None or self.notifications is None:
             return
         try:
+            if self.status.state == RuntimeState.RUNNING and not self._capture_window_restored:
+                # PR #408 review: the per-node hourly cap holds across a
+                # restart loop; the rows name no node, so they count for
+                # every node. A `pending` row holds its slot too.
+                monitor.restore_window(self._notification_window(
+                    NODE_NOTICE_KINDS, monitor.hourly_limit, self.dependencies.utcnow(),
+                    confirmed_only=True, include_pending=True),
+                    monotonic=self.dependencies.monotonic())
+                self._capture_window_restored = True
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
                                    monotonic=self.dependencies.monotonic())
         except Exception:
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
             return
         self._capture_health = status
-        self._set(capture_node_degraded=status.degraded_nodes > 0,
+        # Only a reason that is notified counts as degraded (PR #408 review):
+        # `capture_unconfigured` alone is the Agent's normal state for now.
+        self._set(capture_node_degraded=status.notable_degraded_nodes > 0,
                   capture_ingest_unavailable=status.listener_unavailable)
 
     def _camera_alert_outcomes(self, status, running: bool) -> tuple[bool, bool]:

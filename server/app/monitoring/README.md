@@ -200,8 +200,12 @@ section `create_app` builds one `capture_nodes.CaptureNodeHealthMonitor`
 whose provider reads `application.state.capture_ingest_state` and the
 listener registry's `nodes()` (memory only). `_capture_tick` drains it on
 every tick in every runtime state, like the camera tick, and sets
-`capture_node_degraded` / `capture_ingest_unavailable`; the daily summary
-fills `agents_online` / `agents_offline` from its counts. The notice rules
+`capture_node_degraded` (a notified reason only) /
+`capture_ingest_unavailable`. On the first running tick it re-seeds the
+per-node hourly cap from the node notice rows of the last hour
+(`restore_window`, counted for every node). The daily summary fills
+`agents_online` / `agents_offline` from its counts; they are shown once a
+capture pipeline reports. The notice rules
 are in `capture_nodes.py` and SPECIFICATION §5.7.
 
 Camera offline (Issue #301 item 2, Owner decision 2026-10-22):
