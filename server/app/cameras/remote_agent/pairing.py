@@ -231,6 +231,21 @@ def _new_code() -> PairingCode:
     return PairingCode(base64.b32encode(secrets.token_bytes(_CODE_BYTES)).decode("ascii").rstrip("="))
 
 
+def active_node_ids_on(connection) -> tuple[UUID, ...]:
+    """Nodes whose credential is active, read on ``connection`` (Issue #397).
+
+    The Main expects a heartbeat from each of them. A read only, bounded like
+    the expiry listing; no key, serial or certificate digest. The monitoring
+    provider reads it on a pinned read-only connection (``app.main``), so a
+    lost or replaced filesystem never makes it open or create a database.
+    """
+    rows = connection.execute(
+        "SELECT node_id FROM pairing_node_credentials WHERE state = 'active' "
+        "ORDER BY node_id LIMIT ?", (_MAX_EXPIRY_ROWS,),
+    ).fetchall()
+    return tuple(UUID(row[0]) for row in rows)
+
+
 class PairingLedger:
     """SQLite ledger with process-epoch expiry and single-use redemption.
 
@@ -751,6 +766,11 @@ class PairingLedger:
             credential_state=row["credential_state"],
             not_after=None if row["not_after"] is None else float(row["not_after"]))
             for row in rows)
+
+    def active_node_ids(self) -> tuple[UUID, ...]:
+        """Nodes whose credential is active (not revoked or superseded), for #397."""
+        with self._transaction(write=False) as connection:
+            return active_node_ids_on(connection)
 
     def credential_expiries(self) -> tuple[CredentialExpiry, ...]:
         """Active credentials with a recorded expiry, for Owner-visible monitoring."""

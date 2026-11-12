@@ -38,7 +38,9 @@ The capture-node kinds (Issue #14, Owner decision 2026-11-12,
 `../monitoring/capture_nodes.py`) are immediate: `capture_node_storage_failure`
 and `capture_ingest_unavailable` as critical alerts,
 `capture_node_device_numbers_changed` and `capture_node_clock_degraded` as
-attention notices. The three node kinds accept `recovered=True` for a notice
+attention notices. `capture_node_heartbeat_lost` (Issue #397) is a critical
+alert: a node with an active pairing credential sent no heartbeat for 5 min.
+The four node kinds accept `recovered=True` for a notice
 the per-node hourly cap held past the episode's end. No node, address or
 reason is in the text.
 Such a local-only event returns `suppressed` when it was written or retained for

@@ -65,6 +65,10 @@ class NotificationKind(StrEnum):
     CAPTURE_NODE_DEVICE_NUMBERS_CHANGED = "capture_node_device_numbers_changed"
     CAPTURE_NODE_CLOCK_DEGRADED = "capture_node_clock_degraded"
     CAPTURE_INGEST_UNAVAILABLE = "capture_ingest_unavailable"
+    # Issue #397 (Owner decision 2026-11-12): a node with an active pairing
+    # credential sent no heartbeat for 5 min (its Agent stopped, failed to
+    # start, or cannot reach the Main). Value-free.
+    CAPTURE_NODE_HEARTBEAT_LOST = "capture_node_heartbeat_lost"
     DAILY_SUMMARY = "daily_summary"
 
 
@@ -76,6 +80,7 @@ IMMEDIATE_KINDS = frozenset({
     NotificationKind.SCENE_REFERENCE_REACQUIRED, NotificationKind.SCENE_CALIBRATION_REQUIRED,
     NotificationKind.CAPTURE_NODE_STORAGE_FAILURE, NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED,
     NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED, NotificationKind.CAPTURE_INGEST_UNAVAILABLE,
+    NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST,
 })
 # Immediate only when confirmed: a confirmed server movement / camera tamper
 # (Issue #26), and a camera source offline for the deployment's threshold
@@ -100,7 +105,7 @@ RECOVERED_KINDS = frozenset({
     NotificationKind.CAMERA_OFFLINE,
     # Issue #14: a node notice held by its hourly cap past the episode's end.
     NotificationKind.CAPTURE_NODE_STORAGE_FAILURE, NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED,
-    NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED,
+    NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED, NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST,
 })
 # Issue #394: how many final outcomes `final_outcome` remembers. Far above
 # what one process keeps referring to (one latest alert per camera source,
