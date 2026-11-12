@@ -34,6 +34,13 @@ restart a stored scene calibration's reference was taken again from the
 camera without the Owner, or could not be; `app.main` submits them on the
 monitoring worker, at most one of each per source and process, with no
 source, image or reason in the text.
+The capture-node kinds (Issue #14, Owner decision 2026-11-12,
+`../monitoring/capture_nodes.py`) are immediate: `capture_node_storage_failure`
+and `capture_ingest_unavailable` as critical alerts,
+`capture_node_device_numbers_changed` and `capture_node_clock_degraded` as
+attention notices. The three node kinds accept `recovered=True` for a notice
+the per-node hourly cap held past the episode's end. No node, address or
+reason is in the text.
 Such a local-only event returns `suppressed` when it was written or retained for
 the `poll()` retry, and `failed` when the write was refused with the retry
 buffer full (the event is dropped), so callers can retry with the same

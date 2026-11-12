@@ -56,6 +56,15 @@ class NotificationKind(StrEnum):
     # value-free: no source, image or reason.
     SCENE_REFERENCE_REACQUIRED = "scene_reference_reacquired"
     SCENE_CALIBRATION_REQUIRED = "scene_calibration_required"
+    # Issue #14 (Owner decision 2026-11-12; `../monitoring/capture_nodes.py`):
+    # a capture node's heartbeat reports that it cannot write its ring buffer
+    # (immediate), a renumbered media disk or a clock problem (attention,
+    # after 5 min), and a configured ingest listener that has not been running
+    # for 5 min. Value-free: no node, address or reason text.
+    CAPTURE_NODE_STORAGE_FAILURE = "capture_node_storage_failure"
+    CAPTURE_NODE_DEVICE_NUMBERS_CHANGED = "capture_node_device_numbers_changed"
+    CAPTURE_NODE_CLOCK_DEGRADED = "capture_node_clock_degraded"
+    CAPTURE_INGEST_UNAVAILABLE = "capture_ingest_unavailable"
     DAILY_SUMMARY = "daily_summary"
 
 
@@ -65,6 +74,8 @@ IMMEDIATE_KINDS = frozenset({
     NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.HUMAN_ACCESS_RECOVERED,
     NotificationKind.CREDENTIAL_FINDING, NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED,
     NotificationKind.SCENE_REFERENCE_REACQUIRED, NotificationKind.SCENE_CALIBRATION_REQUIRED,
+    NotificationKind.CAPTURE_NODE_STORAGE_FAILURE, NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED,
+    NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED, NotificationKind.CAPTURE_INGEST_UNAVAILABLE,
 })
 # Immediate only when confirmed: a confirmed server movement / camera tamper
 # (Issue #26), and a camera source offline for the deployment's threshold
@@ -78,11 +89,19 @@ CONFIRMED_IMMEDIATE_KINDS = frozenset({
 RECOVERY_KINDS = frozenset({NotificationKind.HUMAN_ACCESS_RECOVERED})
 # Immediate, but a condition needing Owner attention rather than a failure:
 # monitoring and recording continue (Issue #321).
-ATTENTION_KINDS = frozenset({NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED})
+ATTENTION_KINDS = frozenset({
+    NotificationKind.RECORDING_DEVICE_NUMBERS_CHANGED,
+    NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED, NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED,
+})
 # Kinds whose alert may be sent after the condition already ended: the text
 # then says so (Issue #349, a held camera outage that recovered first).
 RECOVERED_SUFFIX = " (already recovered)"
-RECOVERED_KINDS = frozenset({NotificationKind.CAMERA_OFFLINE})
+RECOVERED_KINDS = frozenset({
+    NotificationKind.CAMERA_OFFLINE,
+    # Issue #14: a node notice held by its hourly cap past the episode's end.
+    NotificationKind.CAPTURE_NODE_STORAGE_FAILURE, NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED,
+    NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED,
+})
 # Issue #394: how many final outcomes `final_outcome` remembers. Far above
 # what one process keeps referring to (one latest alert per camera source,
 # at most four sources) and bounded whatever the delivery rate.

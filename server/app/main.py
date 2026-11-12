@@ -237,6 +237,26 @@ def create_app(settings: Settings, *, database: Database | None = None,
             flapping_offline_seconds=monitoring.camera_offline.flapping_offline_seconds,
             monotonic=dependencies.monotonic)
         monitoring_dependencies = replace(dependencies, camera_offline=camera_offline)
+    # Issue #14 (Owner decision 2026-11-12): capture-node health and ingest
+    # listener notices, for a deployment `capture_ingest` section. The
+    # provider reads the listener's state word and its in-memory registry
+    # (set in the lifespan below); it never touches SQLite or a socket.
+    if monitoring_dependencies is not None and monitoring_dependencies.capture_nodes is not None:
+        raise TypeError("the application owns the capture node health monitor")
+    if ((capture_ingest is not None or capture_ingest_unavailable) and monitoring is not None
+            and monitoring.storage_configured):
+        from app.monitoring.capture_nodes import CaptureNodeHealthMonitor, CaptureNodeView
+
+        def capture_health():
+            # `application` is bound below; the first tick runs in its lifespan.
+            server = application.state.capture_ingest
+            nodes = () if server is None else tuple(
+                CaptureNodeView(node, state, reasons)
+                for node, state, reasons in server.registry.nodes())
+            return application.state.capture_ingest_state, nodes
+
+        monitoring_dependencies = replace(monitoring_dependencies or MonitoringDependencies(),
+                                          capture_nodes=CaptureNodeHealthMonitor(capture_health))
     # Built before the scene timeline, whose critical notification port
     # submits through this runtime's `NotificationService` (Issue #26).
     monitoring_runtime = (
@@ -1214,8 +1234,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # Internal only (Issue #14): the capture ingest listener and its state
     # word (`disabled` without the deployment section, `unavailable` when its
     # material did not load or its bind is being retried, then `running` /
-    # `stopped`). No human route reads either; the Owner status and notice
-    # are a follow-up.
+    # `stopped`). No human route reads either; the monitoring runtime's
+    # capture node monitor reads both for the Owner notices (Issue #14).
     application.state.capture_ingest = None
     application.state.capture_ingest_state = (
         "unavailable" if capture_ingest_unavailable

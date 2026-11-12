@@ -1055,7 +1055,15 @@ local record.
 - [ ] with the listener directory made unreadable (restored afterwards):
   `--check` passes with `capture ingest stays closed
   (reason=listener_material_unavailable)`, the service starts, recording and
-  the integrity/self-test run, and the ingest port is not bound;
+  the integrity/self-test run, and the ingest port is not bound; about 5 min
+  later (within one more monitoring tick) Slack receives one
+  `ServerSentinel critical alert: capture_ingest_unavailable` and no second
+  one while it stays closed (Issue #14 notices);
+- [ ] with a node connected and its Agent reporting a degraded media disk
+  (a synthetic `storage_unavailable`, for example the media root made
+  unwritable on the capture host and restored afterwards): Slack receives
+  `capture_node_storage_failure` within one monitoring tick, once; no notice
+  for `capture_unconfigured`, and none on recovery;
 - [ ] from the capture host, which is not on the Tailnet, a paired node's
   heartbeat over the private LAN is answered with `HEARTBEAT_ACK`; without
   the ALPN, without a client certificate, with another deployment's

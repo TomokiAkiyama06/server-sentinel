@@ -133,6 +133,20 @@ class CaptureNodeHealthRegistry:
             return "offline"
         return entry.heartbeat.node_state
 
+    def nodes(self) -> tuple[tuple[UUID, str, tuple[str, ...]], ...]:
+        """``(node_id, state, reasons)`` of every known node, for the Owner notices.
+
+        Only the monitoring worker reads it (``app.monitoring.capture_nodes``);
+        the node UUID names an episode there and never leaves the process.
+        ``reasons`` are the latest heartbeat's fixed words (empty when it
+        reported none, or without a heartbeat yet).
+        """
+        with self._lock:
+            now = self._monotonic()
+            return tuple((node, self._state(entry, now),
+                          entry.heartbeat.reasons if entry.heartbeat is not None else ())
+                         for node, entry in self._nodes.items())
+
     def snapshot(self) -> CaptureNodeHealthSnapshot:
         with self._lock:
             now = self._monotonic()

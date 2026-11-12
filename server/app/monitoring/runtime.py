@@ -46,6 +46,7 @@ from .cameras import (
     CAMERA_OFFLINE_DELIVERY_FAILED, CAMERA_OFFLINE_NOT_CONFIGURED, CAMERA_OFFLINE_NOTIFIED,
     CAMERA_OFFLINE_UNVERIFIED, CameraOfflineMonitor,
 )
+from .capture_nodes import CaptureHealthStatus, CaptureNodeHealthMonitor
 from .config import MonitoringConfiguration
 from .filesystem import IdentifiedRecordingFilesystem
 from .store import NotificationEventStore, RecordingHealthStatusStore, RunMarkerStore
@@ -63,6 +64,7 @@ CRITICAL_KINDS = (
     NotificationKind.HARDWARE_INTEGRITY_FAILURE, NotificationKind.RECORDING_HEALTH_FAILURE,
     NotificationKind.SERVER_MOVEMENT, NotificationKind.CAMERA_TAMPER,
     NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.CREDENTIAL_FINDING,
+    NotificationKind.CAPTURE_NODE_STORAGE_FAILURE, NotificationKind.CAPTURE_INGEST_UNAVAILABLE,
 )
 # `recording_device_numbers_changed` is not listed: the daily summary counts
 # the `recording_device_numbers_stale` flag instead, every day until fixed.
@@ -224,6 +226,11 @@ class MonitoringStatus:
     # write is refused and retried), so a crash of this process would not be
     # detected by the next start. Degraded in the daily summary.
     unclean_exit_detection_degraded: bool = False
+    # Issue #14 (Owner decision 2026-11-12): a connected capture node reports
+    # degraded, or the configured ingest listener is not running. Degraded in
+    # the daily summary; the notices are `capture_nodes.py`'s.
+    capture_node_degraded: bool = False
+    capture_ingest_unavailable: bool = False
 
     @property
     def camera_offline_cause(self) -> str:
@@ -290,6 +297,9 @@ class MonitoringDependencies:
     # Issue #301 item 2: per-source offline episodes, drained on every tick.
     # `create_app` builds it for the configured local UVC sources.
     camera_offline: CameraOfflineMonitor | None = None
+    # Issue #14: capture-node health and ingest listener notices, drained on
+    # every tick. `create_app` builds it for a `capture_ingest` section.
+    capture_nodes: CaptureNodeHealthMonitor | None = None
 
     def __post_init__(self):
         for value in (self.tick_seconds, self.retry_seconds):
@@ -300,6 +310,9 @@ class MonitoringDependencies:
         if (self.camera_offline is not None
                 and not isinstance(self.camera_offline, CameraOfflineMonitor)):
             raise ValueError("invalid camera offline monitor")
+        if (self.capture_nodes is not None
+                and not isinstance(self.capture_nodes, CaptureNodeHealthMonitor)):
+            raise ValueError("invalid capture node health monitor")
 
 
 @contextmanager
@@ -348,6 +361,8 @@ class MonitoringRuntime:
         # Issue #394: the final delivery of each alert that decides a current
         # camera offline condition, read once (at most two per source).
         self._camera_finals: dict[UUID, DeliveryResult] = {}
+        # Issue #14: the latest capture-node counts, for the daily summary.
+        self._capture_health = CaptureHealthStatus()
         # Issue #321: the stale device-number check runs once per process;
         # the notice itself is deduplicated per boot (`_report_device_numbers`).
         self._device_numbers_reported = False
@@ -1115,11 +1130,14 @@ class MonitoringRuntime:
             status.notification_delivery_failed, status.human_access_degraded,
             status.credential_finding_degraded, status.camera_offline_degraded,
             status.recording_device_numbers_stale, status.unclean_exit_detection_degraded,
+            status.capture_node_degraded, status.capture_ingest_unavailable,
         ))
+        capture = self._capture_health
         elapsed = self.dependencies.monotonic() - self._started_monotonic
         monitored = int(min(86400, max(0, elapsed))) if math.isfinite(elapsed) else 0
         return DailySummary(
-            monitored, 0, 0, 0, 0, 0, 0, 0, 0,
+            monitored, 0, 0, 0,
+            capture.online_nodes + capture.degraded_nodes, capture.offline_nodes, 0, 0, 0,
             self.notification_events.count_since(since, CRITICAL_KINDS), recordings,
             self.notification_events.count_since(since, WARNING_KINDS) + degraded,
             self.recordings.usage_bytes(), self._policy.state, pipeline_available=False,
@@ -1205,6 +1223,27 @@ class MonitoringRuntime:
                   or status.flapping_sources > 0,
                   camera_offline_delivery_failing=failing,
                   camera_offline_delivery_unverified=unverified)
+
+    def _capture_tick(self) -> None:
+        """Capture-node health and ingest listener notices (Issue #14).
+
+        Runs in every runtime state once the notification service exists,
+        like the camera tick. The monitor's provider only reads in-memory
+        state; an unexpected failure is logged value-free and retried on the
+        next tick.
+        """
+        monitor = self.dependencies.capture_nodes
+        if monitor is None or self.notifications is None:
+            return
+        try:
+            status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
+                                   monotonic=self.dependencies.monotonic())
+        except Exception:
+            logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+            return
+        self._capture_health = status
+        self._set(capture_node_degraded=status.degraded_nodes > 0,
+                  capture_ingest_unavailable=status.listener_unavailable)
 
     def _camera_alert_outcomes(self, status, running: bool) -> tuple[bool, bool]:
         """``(not delivered, unverified)`` of the current conditions' alerts (#394).
@@ -1710,6 +1749,7 @@ class MonitoringRuntime:
             if self.notifications is not None:
                 self._access_tick()
                 self._camera_tick()
+                self._capture_tick()
                 self._poll()
             if (self.status.state == RuntimeState.FAILED and not stopping()
                     and self._due("startup", self.dependencies.monotonic())):
@@ -1727,6 +1767,7 @@ class MonitoringRuntime:
             self._guarded(name, step, reason)
         self._access_tick()
         self._camera_tick()
+        self._capture_tick()
         # Issue #385 (PR #389 review): after the stop began the outcomes are
         # written only by the shutdown settles, or by the stop's own poll
         # when none ran (`_close`), all within the settle budget; a
