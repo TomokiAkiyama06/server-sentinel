@@ -19,6 +19,12 @@ from .uvc_identity import DeviceEvidence
 
 
 FILENAME = "uvc-approvals.json"
+# Issue #14 (PR #412 review): the strong identities (digests only, never a
+# serial) ever latched as duplicated, kept for the whole runtime root so that
+# replacing or removing a source's approval never makes such a camera
+# approvable again. Written only under the store's lock.
+LATCHED_FILENAME = "uvc-latched-serials.json"
+MAX_LATCHED = 256
 LOCKNAME = "uvc-approvals.lock"
 TEMPORARY_PREFIX = FILENAME + ".tmp-"
 MAX_FILE_BYTES = 1024 * 1024
@@ -36,6 +42,16 @@ class ApprovalState:
     requires_approval: bool
     session_token: str | None = field(default=None, repr=False)
     serial_ambiguous: bool = False
+
+
+def strong_key_digest(device):
+    """SHA-256 of a device's strong (serial) identity, or None without a serial."""
+    import hashlib
+    key = getattr(device, "strong_key", None)
+    if key is None:
+        return None
+    return hashlib.sha256(json.dumps(list(key), separators=(",", ":"),
+                                     ensure_ascii=True).encode("ascii")).hexdigest()
 
 
 def _record(value):
@@ -122,6 +138,61 @@ class ApprovalStore:
             raise ValueError("invalid approval file")
         return {str(UUID(key)): _record(record) for key, record in value["sources"].items()}
 
+    # -- latched duplicated serials (Issue #14) -----------------------------
+
+    def latched_digests(self):
+        """Digests of every strong identity ever latched as duplicated."""
+        with self._lock:
+            if self.fd is None:
+                raise ApprovalStorageError("UVC approval store is closed")
+            try:
+                descriptor = os.open(LATCHED_FILENAME,
+                                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                                     dir_fd=self.fd)
+            except FileNotFoundError:
+                return frozenset()
+            except OSError as error:
+                raise ApprovalStorageError("UVC approval state is unavailable") from error
+            try:
+                info = self._check_private(descriptor)
+                if info.st_size > MAX_FILE_BYTES:
+                    raise ApprovalStorageError("approval file exceeds bound")
+                data = os.read(descriptor, MAX_FILE_BYTES + 1)
+                value = json.loads(data.decode("utf-8"))
+                if (not isinstance(value, dict) or set(value) != {"version", "latched"}
+                        or value["version"] != VERSION or not isinstance(value["latched"], list)
+                        or len(value["latched"]) > MAX_LATCHED
+                        or any(not isinstance(item, str) or len(item) != 64
+                               or any(char not in "0123456789abcdef" for char in item)
+                               for item in value["latched"])):
+                    raise ValueError("invalid latch file")
+                return frozenset(value["latched"])
+            except ApprovalStorageError:
+                raise
+            except (OSError, ValueError, UnicodeError) as error:
+                raise ApprovalStorageError("UVC approval state is unavailable") from error
+            finally:
+                os.close(descriptor)
+
+    def add_latched(self, digests):
+        """Add digests to the latch set; never removes one."""
+        digests = frozenset(digests)
+        current = self.latched_digests()
+        if digests <= current:
+            return
+        merged = sorted(current | digests)
+        if len(merged) > MAX_LATCHED:
+            raise ApprovalStorageError("latch record bound reached")
+        data = json.dumps({"version": VERSION, "latched": merged},
+                          separators=(",", ":")).encode("ascii")
+        with self._lock:
+            if self.fd is None:
+                raise ApprovalStorageError("UVC approval store is closed")
+            try:
+                self._replace(LATCHED_FILENAME, data)
+            except OSError as error:
+                raise ApprovalStorageError("UVC approval state could not be saved") from error
+
     def _write(self, records):
         if len(records) > MAX_RECORDS:
             raise ApprovalStorageError("approval record bound reached")
@@ -134,6 +205,9 @@ class ApprovalStore:
         data = json.dumps(document, allow_nan=False, separators=(",", ":")).encode("utf-8")
         if len(data) > MAX_FILE_BYTES:
             raise ApprovalStorageError("approval file exceeds bound")
+        self._replace(FILENAME, data)
+
+    def _replace(self, filename, data):
         name = TEMPORARY_PREFIX + uuid4().hex
         descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                              0o600, dir_fd=self.fd)
@@ -146,7 +220,7 @@ class ApprovalStore:
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = None
-            os.replace(name, FILENAME, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            os.replace(name, filename, src_dir_fd=self.fd, dst_dir_fd=self.fd)
             renamed = True
             os.fsync(self.fd)
         finally:

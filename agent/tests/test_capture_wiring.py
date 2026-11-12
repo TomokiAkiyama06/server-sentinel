@@ -368,8 +368,9 @@ class CaptureAdminTests(unittest.TestCase):
         code, _, stderr = self.run_cli("revoke", str(SOURCES[0]), typed="REVOKE", settings=two)
         self.assertIn("refused: source_not_approved", stderr)
 
-    def test_a_latched_serial_cannot_be_revoked_and_reapproved(self):
-        # PR #412 review: revoke must not clear the duplicated-serial latch.
+    def test_a_latched_serial_stays_unapprovable_after_replacing_or_revoking(self):
+        # PR #412 review: approve another camera, revoke, approve the latched
+        # one again must still be refused.
         from media_capture_agent.uvc_approvals import ApprovalStore as Store
         store = Store(self.settings)
         try:
@@ -378,14 +379,32 @@ class CaptureAdminTests(unittest.TestCase):
                        serial_ambiguous=True, release=True)
         finally:
             store.close()
+        other = evidence(2, serial="SYN-SERIAL-0002")
+        self.assertIn("serial=latched", self.run_cli("candidates")[1])
+        code, _, stderr = self.run_cli("approve", str(SOURCES[0]), self.label(other))
+        self.assertEqual(code, 0, stderr)
         code, _, stderr = self.run_cli("revoke", str(SOURCES[0]), typed="REVOKE")
-        self.assertEqual(code, 2)
-        self.assertIn("refused: camera_serial_latched", stderr)
-        state = self.approved()
-        self.assertTrue(state.serial_ambiguous)
-        self.assertEqual(state.approved, self.camera)
+        self.assertEqual(code, 0, stderr)
         code, _, stderr = self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        self.assertEqual(code, 2)
         self.assertIn("refused: camera_serial_not_unique", stderr)
+        store = Store(self.settings)
+        try:
+            latched = store.latched_digests()
+        finally:
+            store.close()
+        self.assertEqual(len(latched), 1)
+        with open(self.settings.runtime_root / "uvc-latched-serials.json") as stream:
+            self.assertNotIn("SYN-SERIAL", stream.read())
+
+    def test_the_signal_mask_is_restored_after_an_unexpected_error(self):
+        import signal
+        from media_capture_agent.uvc_capture import UvcCapture
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        with patch.object(UvcCapture, "approve", side_effect=TypeError("synthetic")):
+            with self.assertRaises(TypeError):
+                self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, []), before)
 
     def test_signals_are_blocked_while_the_approval_is_written(self):
         import signal

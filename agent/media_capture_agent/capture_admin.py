@@ -24,7 +24,9 @@ changes when the device is re-plugged or the host restarts (it hashes the
 per-boot device instance too); ``approved_for`` compares the serial identity.
 ``candidates`` only reads the approval state (no session is started).
 ``approve`` refuses a camera without a serial, a serial shared with another
-connected camera or latched as ambiguous (``camera_serial_not_unique``) and a
+connected camera or ever latched as ambiguous (``camera_serial_not_unique``;
+the latches are kept runtime-wide in ``uvc-latched-serials.json`` as digests,
+so neither replacing nor revoking an approval clears them) and a
 camera already approved for another source
 (``camera_approved_for_another_source``), because the service could never
 reconnect such an approval; it then starts only that source's session,
@@ -134,6 +136,26 @@ def _approvals(store, settings) -> dict:
         raise AdminRefused("approval_state_unavailable") from None
 
 
+def _latched(store, approvals) -> frozenset:
+    """Record every current duplicated-serial latch in the runtime-wide set, then read it.
+
+    A source's latch lives with its approval and disappears when that
+    approval is replaced or removed (PR #412 review); the set keeps the
+    serial unapprovable for good, so it never reconnects automatically
+    (SPECIFICATION §4.4).
+    """
+    from .uvc_approvals import ApprovalStorageError, strong_key_digest
+    digests = {strong_key_digest(state.approved) for state in approvals.values()
+               if state is not None and state.serial_ambiguous and state.approved is not None}
+    digests.discard(None)
+    try:
+        if digests:
+            store.add_latched(digests)
+        return store.latched_digests()
+    except ApprovalStorageError:
+        raise AdminRefused("approval_state_unavailable") from None
+
+
 def _scan(discovery):
     from .uvc_discovery import LinuxDiscovery
     try:
@@ -156,9 +178,11 @@ def _holders(device, approvals) -> list[UUID]:
 
 
 def _candidates(settings, discovery) -> list[str]:
+    from .uvc_approvals import strong_key_digest
     store = _store(settings)
     try:
         approvals = _approvals(store, settings)
+        latched = _latched(store, approvals)
     finally:
         store.close()
     devices, failures = _scan(discovery)
@@ -166,7 +190,8 @@ def _candidates(settings, discovery) -> list[str]:
     for device in devices:
         shared = (device.serial is not None
                   and sum(other.strong_key == device.strong_key for other in devices) > 1)
-        serial = "absent" if device.serial is None else "shared" if shared else "present"
+        serial = ("absent" if device.serial is None else "shared" if shared
+                  else "latched" if strong_key_digest(device) in latched else "present")
         holders = ",".join(str(source) for source in _holders(device, approvals)) or "-"
         lines.append(f"candidate {candidate_label(device)} usb={device.vendor}:{device.product} "
                      f"serial={serial} formats={','.join(device.formats) or '-'} "
@@ -184,9 +209,11 @@ def _approve(settings, discovery, source_id: UUID, label: str, *, confirm) -> li
     configured = {source.source_id: source for source in settings.capture.sources}
     if source_id not in configured:
         raise AdminRefused("source_not_configured")
+    from .uvc_approvals import strong_key_digest
     store = _store(settings)
     try:
         approvals = _approvals(store, settings)
+        latched = _latched(store, approvals)
     finally:
         store.close()
     devices, failures = _scan(discovery)
@@ -203,10 +230,8 @@ def _approve(settings, discovery, source_id: UUID, label: str, *, confirm) -> li
         # Without a serial the approval would last only while the
         # descriptor this command never keeps open stays open.
         raise AdminRefused("camera_without_serial")
-    state = approvals[source_id]
     if (sum(other.strong_key == device.strong_key for other in devices) > 1
-            or getattr(state, "serial_ambiguous", False) and state.approved is not None
-            and state.approved.strong_key == device.strong_key):
+            or strong_key_digest(device) in latched):
         # A shared (or latched) serial is never reconnected after a restart
         # (PR #412 review): the approval would be unusable.
         raise AdminRefused("camera_serial_not_unique")
@@ -237,9 +262,7 @@ def _approve(settings, discovery, source_id: UUID, label: str, *, confirm) -> li
         # concurrent approval of this camera for another source, or a latch
         # set meanwhile, is seen here.
         locked = {source: capture.store.load(source) for source in configured}
-        state = locked[source_id]
-        if (getattr(state, "serial_ambiguous", False) and state.approved is not None
-                and state.approved.strong_key == device.strong_key):
+        if strong_key_digest(device) in _latched(capture.store, locked):
             raise AdminRefused("camera_serial_not_unique")
         if any(holder != source_id for holder in _holders(device, locked)):
             raise AdminRefused("camera_approved_for_another_source")
@@ -312,12 +335,9 @@ def _revoke(settings, source_id: UUID, *, confirm) -> list[str]:
         state = store.load(source_id)
         if state is None or state.approved is None:
             raise AdminRefused("source_not_approved")
-        if state.serial_ambiguous:
-            # The duplicated-serial latch lives with the approval evidence;
-            # removing it would let a later approval of the same serial
-            # reconnect automatically (SPECIFICATION §4.4, PR #412 review).
-            # Use another source UUID for that camera instead.
-            raise AdminRefused("camera_serial_latched")
+        # A latch of this approval is kept in the runtime-wide set first, so
+        # removing the approval never makes that serial approvable again.
+        _latched(store, _approvals(store, settings))
         word = confirm(f"Remove the camera approval of source {source_id}; the Agent will not "
                        f"use any camera for it until one is approved again. "
                        f"Type {REVOKE_WORD} to confirm: ")
@@ -360,6 +380,7 @@ def main(argv=None, *, settings_loader=_settings, discovery=None,
          confirm: Callable[[str], str] = read_confirmation) -> int:
     args = _parser().parse_args(argv)
     previous = {}
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
     try:
         for signum in _SIGNALS:
             previous[signum] = signal.signal(signum, _interrupt)
@@ -399,6 +420,9 @@ def main(argv=None, *, settings_loader=_settings, discovery=None,
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
+        # Every path, an unexpected exception included, leaves the caller's
+        # signal mask as it was (PR #412 review).
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
     for line in lines:
         print(line)
     return 0

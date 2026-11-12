@@ -69,16 +69,22 @@ service configuration and `install` refuses an existing installation. On such
 a host, as the administrator: stop the service, move the installed unit file
 and the installation directory (`--destination`) aside (this gives up the
 `previous` release for rollback; configuration, credentials, runtime state and
-media are elsewhere and untouched), run `install` again with the same
-arguments, then review and enable the new unit. Restarting the old unit
+media are elsewhere and untouched), create the installation directory again
+at the same path, empty, root-owned and mode 0755, run `install` again with
+the same arguments, run `systemctl daemon-reload`, then review and enable the
+new unit. Restarting the old unit
 instead would let `capture_admin` approve a camera the service cannot open.
 Before rolling back to a release without Issue #14 capture support, remove the
 `capture` section, which that release refuses as an unknown key.
 
-A source whose camera was latched as having a duplicated serial cannot be
-revoked (`camera_serial_latched`): the latch lives with its approval and keeps
-that serial from reconnecting automatically. Give the camera another source
-UUID instead.
+A serial the Agent ever latched as duplicated stays unapprovable for good:
+`capture_admin` records every latch it sees in `uvc-latched-serials.json`
+under the runtime root (SHA-256 digests of the identity, never a serial)
+before it approves or revokes anything, so neither replacing nor revoking a
+source's approval makes that camera approvable again (`camera_serial_not_unique`;
+`candidates` shows it as `serial=latched`). Such a source can still be
+revoked and given another camera; the latched camera itself cannot be used
+by this tool.
 
 Issue #16 adds the tested disk-ring/incident core under `ring.py`, `ring_models.py`
 and `ring_ledger.py`. It uses real immutable disk segments and private SQLite;
