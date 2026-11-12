@@ -222,6 +222,14 @@ class CameraRegistry:
             _parsed_time(row["updated_at"]),
         )
 
+    def get_capture_node_on(self, connection, node_id: UUID) -> CaptureNode | None:
+        """The node read on a caller-owned transaction, or None when it has no row."""
+        identity = _identity(node_id)
+        try:
+            return self._node(connection, identity)
+        except NotFoundError:
+            return None
+
     def get_capture_node(self, node_id: UUID) -> CaptureNode:
         identity = _identity(node_id)
         with self._transaction() as connection:

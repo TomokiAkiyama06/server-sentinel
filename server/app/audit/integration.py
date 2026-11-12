@@ -12,14 +12,22 @@ from app.auth.reservation import HostnameReservationCheck
 # command (``app.auth.reservation_cli``) records the same target.
 from app.auth.reservation_store import RESERVATION_LISTENER_EXCEPTIONS_ID, ListenerExceptionStore
 from app.auth.serving_gate import ServingGate
-from app.cameras.registry import NodeHealthState
-from .model import AuditAction, TargetKind
+from app.cameras.registry import NodeHealthState, SourceType
+from .model import ActorCategory, AuditAction, AuditOutcome, TargetKind
 
 
 ACTIVE_SOURCE_LIMIT_ID = UUID("ed83d8b4-ec44-4e27-b197-8603c03d8fd2")
 # The Main Server holds one approved hardware baseline; this fixed logical ID
 # names it without exposing any hardware serial or device identifier.
 HARDWARE_BASELINE_ID = UUID("6f5f5a2e-3f0e-4a3a-9a4c-2b0f1c7d5e41")
+
+
+class CaptureNodeNotPairedError(LookupError):
+    """The capture node has no credential in the pairing ledger; carries no value."""
+
+
+class CaptureNodeRevokedError(LookupError):
+    """The capture node's credential (or its registry node) is revoked; carries no value."""
 
 
 class OwnerAdministration:
@@ -77,6 +85,56 @@ class OwnerAdministration:
             operation=lambda connection: self.registry.create_source_on(
                 connection, target, **configuration,
             ),
+        )
+
+    def create_remote_agent_source(self, actor_context, node_id, *, name, enabled=True):
+        """Create a ``remote_agent`` source bound to a paired capture node (Issue #14).
+
+        The node is named by the pairing ledger's node UUID, the identity in
+        its certificate (``urn:serversentinel:capture-node:<uuid>``); no second
+        identity is invented. Inside the one audited transaction the node's
+        ledger credential must be ``active`` (else ``CaptureNodeNotPairedError``
+        / ``CaptureNodeRevokedError``), the registry ``capture_nodes`` row of
+        that UUID is created when it is missing (its own ``create_capture_node``
+        record, target the node UUID) and refused when it is revoked, and the
+        source is admitted against the active-source limit like any other.
+        The source's own ``create_source`` record names its new UUID. A
+        refusal rolls everything back and records ``create_source`` ``failed``.
+        """
+        # Imported here: importing the application must not load the pairing
+        # ledger module (`tests.test_capture_mtls`, Issue #14).
+        from app.cameras.remote_agent.pairing import credential_state_on
+
+        if not isinstance(node_id, UUID):
+            raise CaptureNodeNotPairedError()
+        target = uuid4()
+
+        def operation(connection):
+            state = credential_state_on(connection, node_id)
+            if state == "revoked":
+                raise CaptureNodeRevokedError()
+            if state != "active":
+                raise CaptureNodeNotPairedError()
+            node = self.registry.get_capture_node_on(connection, node_id)
+            if node is None:
+                # The registry row carries the ledger's UUID; its name is that
+                # UUID too (no private value, nothing a caller typed).
+                self.registry.create_capture_node_on(connection, node_id, str(node_id))
+                self.service.store.append_on(
+                    connection, actor_category=ActorCategory.OWNER,
+                    action=AuditAction.CREATE_CAPTURE_NODE, target_kind=TargetKind.CAPTURE_NODE,
+                    target_logical_id=node_id, outcome=AuditOutcome.SUCCEEDED,
+                )
+            elif node.health_state is NodeHealthState.REVOKED:
+                raise CaptureNodeRevokedError()
+            return self.registry.create_source_on(
+                connection, target, source_type=SourceType.REMOTE_AGENT, name=name,
+                capture_node_id=node_id, enabled=enabled,
+            )
+
+        return self.service.execute_transactional(
+            actor_context, action=AuditAction.CREATE_SOURCE,
+            target_kind=TargetKind.SOURCE, target_logical_id=target, operation=operation,
         )
 
     def update_source(self, actor_context, source_id, **changes):

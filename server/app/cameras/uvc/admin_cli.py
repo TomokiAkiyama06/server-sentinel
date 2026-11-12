@@ -11,6 +11,9 @@ with ``sudo -u <service account>``, never plain ``sudo``::
     python -m app.cameras.uvc.admin_cli approve --config <deployment.json> <source id> <candidate label>
     python -m app.cameras.uvc.admin_cli rename-source --config <deployment.json> <source id> \\
         --name <name>
+    python -m app.cameras.uvc.admin_cli remote-sources --config <deployment.json>
+    python -m app.cameras.uvc.admin_cli create-remote-source --config <deployment.json> \\
+        --node <capture node uuid> --name <name>
 
 Same trust model as ``app.auth.bootstrap_cli`` (Owner decision D3): the local
 administrative boundary is the host itself; whoever can run this as the
@@ -23,9 +26,12 @@ confirmation authorizes exactly one audited Owner operation
 ``OwnerAdministration.approve_uvc`` (``LinuxDiscovery`` + ``LocalUvcAdapter``),
 ``rename-source`` changes only a source's display name through
 ``OwnerAdministration.update_source`` (its camera approval, profile and
-health are untouched), so the change and its audit record (actor ``owner``;
-``create_source`` / ``approve_camera`` / ``update_source``, target the
-source's logical UUID only) commit in one
+health are untouched), and ``create-remote-source`` goes through
+``OwnerAdministration.create_remote_agent_source``, so the change and its
+audit record (actor ``owner``; ``create_source`` / ``approve_camera`` /
+``update_source``, target the source's logical UUID only; plus
+``create_capture_node``, target the node UUID, when ``create-remote-source``
+creates the node's registry row) commit in one
 transaction. A refused or failed operation inside that boundary records
 ``failed``; a refusal before it changes and records nothing.
 
@@ -113,6 +119,22 @@ disabled or non-``local_uvc`` source (and the command refuses a source
 without a complete, supported capture profile, ``source_profile_unusable``); the registry refuses an enabled source
 beyond the active-source limit (1 to 4).
 
+Remote sources (Issue #14, Owner decision 2026-11-12). A ``remote_agent``
+source names its capture node by the pairing ledger's node UUID: the one
+``serversentinel-pairing approve`` / ``list`` print and the node certificate
+carries (``urn:serversentinel:capture-node:<uuid>``), so the Main can later
+match a node's frames to its sources. The registry's ``capture_nodes`` row
+that the source refers to is created by ``create-remote-source`` with that
+same UUID; the command never invents another node identity. It refuses a
+node without a credential in the ledger (``capture_node_not_paired``) and one
+whose credential or registry node is revoked (``capture_node_revoked``),
+before the confirmation and again inside the audited transaction. It creates
+an **enabled** source (the active-source limit counts it) and prints its
+UUID, which is the ``source_id`` the Agent's configuration names that camera
+by. ``remote-sources`` lists every ``remote_agent`` source with its node UUID
+and that node's credential state; it is read-only and allowed while the
+service runs.
+
 Exit status: ``0`` done, ``2`` refused (a fixed word on stderr).
 """
 
@@ -130,12 +152,15 @@ import sys
 from typing import Callable
 from uuid import UUID
 
-from app.audit.integration import OwnerAdministration
+from app.audit.integration import (
+    CaptureNodeNotPairedError, CaptureNodeRevokedError, OwnerAdministration,
+)
 from app.audit.service import OwnerAuditService, OwnerAuthorizationError
 from app.audit.store import AuditStore
-from app.cameras.registry import CameraRegistry, CaptureProfile, SourceType
+from app.cameras.registry import CameraRegistry, CaptureProfile, NodeHealthState, SourceType
 from app.cameras.registry.models import ValidationError
 from app.cameras.registry.repository import ActiveSourceLimitError, NotFoundError
+from app.cameras.remote_agent.pairing import credential_state_on
 from app.deployment import Deployment, _runtime_roots
 from app.local_admin import (
     CliRefused, ControllingTerminal, _existing_database, _LedgerDatabaseChanged,
@@ -155,7 +180,7 @@ PROG = "python -m app.cameras.uvc.admin_cli"
 CREATE_WORD = "CREATE"
 APPROVE_WORD = "APPROVE"
 RENAME_WORD = "RENAME"
-MUTATIONS = ("create-source", "approve", "rename-source")
+MUTATIONS = ("create-source", "approve", "rename-source", "create-remote-source")
 LABEL_PREFIX = "cam-"
 _LABEL_DIGITS = 10
 _LABEL = re.compile(r"cam-[0-9a-f]{10}")
@@ -182,6 +207,11 @@ _HINTS = {
                               "cannot tell it from an identical one after the restart"),
     "camera_serial_not_unique": ("this serial is not unique to one camera, so stored evidence cannot "
                                  "tell the cameras apart after the restart"),
+    "capture_node_not_paired": ("pair the capture node first (serversentinel-pairing approve) and "
+                                "give the node_id that 'serversentinel-pairing list' shows with "
+                                "credential=active"),
+    "capture_node_revoked": ("a revoked capture node re-pairs as a new node with a new node_id; "
+                             "create the source for that new node"),
     "committed_verification_failed": ("the change was committed, but maybe not to the database now at "
                                       "the path; run 'sources': if it is missing, investigate the state "
                                       "directory and re-run the command"),
@@ -373,6 +403,10 @@ class _StoppedServiceRegistry(CameraRegistry):
     def update_source_on(self, connection, source_id, **changes):
         self._check.require_stopped()
         return super().update_source_on(connection, source_id, **changes)
+
+    def create_capture_node_on(self, connection, node_id, name):
+        self._check.require_stopped()
+        return super().create_capture_node_on(connection, node_id, name)
 
 
 class _OfflineApprovalAdapter(LocalUvcAdapter):
@@ -700,6 +734,67 @@ def _rename_source(context: _Context, source_id: UUID, name: str) -> list[str]:
             "next: start the service; the live view shows the new name"]
 
 
+def _node_state(context: _Context, node_id: UUID) -> str:
+    """``active`` / ``revoked`` / ``none``: the node's ledger credential, revoked also by its registry row."""
+    try:
+        with closing(context.database.connect()) as connection:
+            state = credential_state_on(connection, node_id)
+            node = context.registry.get_capture_node_on(connection, node_id)
+    except Exception:
+        raise _storage_refusal(context.database) from None
+    if state == "revoked" or (node is not None and node.health_state is NodeHealthState.REVOKED):
+        return "revoked"
+    return "active" if state == "active" else "none"
+
+
+def _remote_sources(context: _Context) -> list[str]:
+    try:
+        sources = [source for source in context.registry.list_sources()
+                   if source.source_type is SourceType.REMOTE_AGENT]
+        lines = [f"source {source.id} enabled={'yes' if source.enabled else 'no'} "
+                 f"node={source.capture_node_id} "
+                 f"credential={_node_state(context, source.capture_node_id)} "
+                 f"name={_quoted(source.name)}" for source in sources]
+    except CliRefused:
+        raise
+    except Exception:
+        raise _storage_refusal(context.database) from None
+    _verify_pinned(context.database)
+    return lines or ["no remote_agent sources"]
+
+
+def _create_remote_source(context: _Context, node_id: UUID, name: str) -> list[str]:
+    """Create an enabled remote_agent source for a node whose ledger credential is active."""
+    context.check.require_stopped()
+    state = _node_state(context, node_id)
+    if state == "revoked":
+        raise CliRefused("capture_node_revoked")
+    if state != "active":
+        raise CliRefused("capture_node_not_paired")
+    grant = context.owner.confirm(
+        context.terminal,
+        f"Create an enabled remote_agent source name={_quoted(name)} for capture node "
+        f"{node_id} (credential active). Type {CREATE_WORD} to confirm: ", CREATE_WORD)
+    try:
+        source = context.admin.create_remote_agent_source(grant, node_id, name=name)
+    except CliRefused:
+        raise
+    except CaptureNodeRevokedError:
+        raise CliRefused("capture_node_revoked") from None
+    except CaptureNodeNotPairedError:
+        raise CliRefused("capture_node_not_paired") from None
+    except ActiveSourceLimitError:
+        raise CliRefused("active_source_limit_reached") from None
+    except ValidationError:
+        raise CliRefused("source_configuration_rejected") from None
+    except Exception:
+        raise _storage_refusal(context.database) from None
+    _committed(context.database)
+    return [f"remote source created: source_id={source.id} node_id={node_id}",
+            "next: name this source_id as capture.sources[].source_id in that capture node's "
+            "media-capture-agent configuration, then start the service"]
+
+
 def _select_candidate(scan, label: str) -> DeviceEvidence:
     if scan.failures:
         # A device that could not be inspected might be the label's twin.
@@ -788,15 +883,18 @@ def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
          markers: Callable[..., dict[str, frozenset[str]]]) -> int:
     if os.geteuid() == 0:
         raise CliRefused("run_as_service_account")
-    source_id = profile = None
+    source_id = profile = node_id = None
     if args.command in ("approve", "rename-source"):
         source_id = _uuid_argument(args.source, "source_id_rejected")
+    if args.command == "create-remote-source":
+        node_id = _uuid_argument(args.node, "node_id_rejected")
     if args.command == "approve":
         if not isinstance(args.candidate, str) or not _LABEL.fullmatch(args.candidate):
             raise CliRefused("candidate_label_rejected")
     if args.command == "create-source":
         profile = parse_profile(args.profile)
-    if args.command in ("create-source", "rename-source") and not source_name_acceptable(args.name):
+    if (args.command in ("create-source", "rename-source", "create-remote-source")
+            and not source_name_acceptable(args.name)):
         raise CliRefused("source_name_rejected")
     try:
         deployment = _load_deployment(args.config)
@@ -833,6 +931,10 @@ def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
                 lines = _create_source(context, args.name, profile)
             elif args.command == "rename-source":
                 lines = _rename_source(context, source_id, args.name)
+            elif args.command == "remote-sources":
+                lines = _remote_sources(context)
+            elif args.command == "create-remote-source":
+                lines = _create_remote_source(context, node_id, args.name)
             else:
                 lines = _approve(context, source_id, args.candidate)
         finally:
@@ -855,7 +957,10 @@ def _parser() -> argparse.ArgumentParser:
                        ("candidates", "list connected cameras by hashed label (no serial or path)"),
                        ("create-source", "create an enabled local_uvc source"),
                        ("approve", "approve a connected camera for a local_uvc source"),
-                       ("rename-source", "change a local_uvc source's display name")):
+                       ("rename-source", "change a local_uvc source's display name"),
+                       ("remote-sources", "list the remote_agent sources and their capture nodes"),
+                       ("create-remote-source",
+                        "create an enabled remote_agent source for a paired capture node")):
         command = commands.add_parser(name, help=text)
         command.add_argument("--config", type=Path, required=True,
                              help="the deployment configuration the service runs with")
@@ -866,6 +971,11 @@ def _parser() -> argparse.ArgumentParser:
         if name == "rename-source":
             command.add_argument("source", help="the source's UUID (as 'sources' prints it)")
             command.add_argument("--name", required=True, help="the new display name")
+        if name == "create-remote-source":
+            command.add_argument("--node", required=True,
+                                 help="the capture node's UUID (as 'serversentinel-pairing list' "
+                                      "prints it)")
+            command.add_argument("--name", required=True, help="the source's display name")
         if name == "approve":
             command.add_argument("source", help="the source's UUID (as 'sources' prints it)")
             command.add_argument("candidate", help="the camera's label (as 'candidates' prints it)")

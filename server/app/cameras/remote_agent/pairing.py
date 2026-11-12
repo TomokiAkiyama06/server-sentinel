@@ -246,6 +246,22 @@ def active_node_ids_on(connection) -> tuple[UUID, ...]:
     return tuple(UUID(row[0]) for row in rows)
 
 
+def credential_state_on(connection, node_id: UUID) -> str | None:
+    """The state of ``node_id``'s credential (``active`` / ``revoked``), or None if it has none.
+
+    Read on ``connection`` so a caller can decide inside its own write
+    transaction (Issue #14: a ``remote_agent`` source is created only for a
+    node whose credential is active, checked in the transaction that creates
+    it). The state only: no key, serial or certificate digest, and no
+    expiry: an expired but unrevoked node re-pairs under the same UUID.
+    """
+    node = _identity(node_id, "node identity")
+    row = connection.execute(
+        "SELECT state FROM pairing_node_credentials WHERE node_id = ?", (str(node),),
+    ).fetchone()
+    return None if row is None else row[0]
+
+
 class PairingLedger:
     """SQLite ledger with process-epoch expiry and single-use redemption.
 

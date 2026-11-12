@@ -824,6 +824,65 @@ sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
   committed but re-verifying the pinned database afterwards failed: run
   `sources` and investigate the state directory if the change is missing.
 
+#### Creating `remote_agent` sources locally (Issue #14, Owner decision 2026-11-12)
+
+A camera of a paired capture node gets a `remote_agent` source on the Main
+with the same command and the same trust model (service account, never
+root, typed confirmation from `/dev/tty`, one audited Owner operation,
+`service_running` while the service holds the database, the pinned existing
+database of this release's schema). The Main later accepts that node's
+frames only for an **enabled** `remote_agent` source bound to that node.
+
+The node is named by the pairing ledger's node UUID: the `node_id` that
+`serversentinel-pairing approve` printed and `serversentinel-pairing list`
+shows (the UUID in the node certificate,
+`urn:serversentinel:capture-node:<uuid>`). The registry's `capture_nodes` row
+the source refers to is created by the command with that same UUID (its own
+`create_capture_node` audit record, target the node UUID); no second node
+identity exists. Pairing alone creates no source.
+
+```sh
+cd /opt/server-sentinel-main/current
+# 1. the node's UUID, with credential=active
+sudo -u <service account> serversentinel-pairing list --database <data_dir>/state.sqlite3
+sudo systemctl stop server-sentinel-upstream.socket server-sentinel.service
+# 2. one source per camera of that node (type CREATE); prints its UUID
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  create-remote-source --config /etc/server-sentinel/deployment.json \
+  --node <node uuid> --name "<display name>"
+#    prints: remote source created: source_id=<uuid> node_id=<node uuid>
+# 3. list them (read-only, also while the service runs)
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  remote-sources --config /etc/server-sentinel/deployment.json
+#    prints: source <uuid> enabled=yes node=<node uuid> credential=active name="<display name>"
+sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
+```
+
+- The printed `source_id` is the UUID the capture node's
+  `media-capture-agent` configuration names that camera by
+  (`capture.sources[].source_id`); set it there on the capture host.
+- The source is created **enabled**, so the active-source limit counts it
+  (`active_source_limit_reached`; 1 to 4 enabled sources of every type
+  together). Several sources may share one node.
+- Refused before the confirmation, with nothing changed or recorded: a node
+  argument that is not a UUID (`node_id_rejected`), a node with no
+  credential in the ledger (`capture_node_not_paired`; an unfinished
+  enrollment has none), a node whose credential, or whose registry row, is
+  revoked (`capture_node_revoked`; a revoked node re-pairs as a new node
+  with a new UUID, "Capture-node re-pairing" below), and a name the
+  `create-source` rule refuses (`source_name_rejected`). The credential is
+  checked again inside the audited transaction, so a node revoked while the
+  Owner is at the prompt is refused there (`create_source` recorded
+  `failed`, no node row created). An expired but unrevoked credential counts
+  as active: such a node re-pairs with the same key and keeps its UUID and
+  sources.
+- `remote-sources` shows each source's node UUID and that node's credential
+  state (`active`, `revoked` (also when its registry row is revoked), or
+  `none`). Names are printed quoted and
+  escaped as `sources` prints them.
+- Renaming or disabling a `remote_agent` source is not available in this
+  command yet (`rename-source` refuses one with `source_not_local_uvc`).
+
 ### Detection section (optional; inference stays unavailable without it)
 
 The optional `detection` object binds reviewed detectors to sources. Values

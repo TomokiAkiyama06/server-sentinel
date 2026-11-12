@@ -289,6 +289,22 @@ live-instance label, USB vendor:product ids, serial `present`/`absent`/`shared`
 and formats, never a serial or path. An offline approval is refused for a
 camera without a serial or whose serial is not unique, because stored
 evidence could not identify it after the restart.
+A `remote_agent` source is created with the same command and trust model
+(`remote-sources|create-remote-source --node <node UUID> --name <name>`; Issue
+#14, Owner decision 2026-11-12) until the Owner Web UI exists. Its capture
+node is the pairing ledger's node UUID (the `urn:serversentinel:capture-node:`
+UUID of the node certificate, as `serversentinel-pairing list` prints it);
+the registry's `capture_nodes` row is created with exactly that UUID by
+`OwnerAdministration.create_remote_agent_source`, never under a second
+identity. In that one audited transaction the node's ledger credential must
+be `active` (none: `capture_node_not_paired`; revoked, or the registry row
+revoked: `capture_node_revoked`; also checked before the confirmation), a
+missing registry node row is created with its own `create_capture_node`
+record (target the node UUID), and the source is created enabled and admitted
+against the active-source limit of every type, recorded `create_source`
+(target the source UUID). Any refusal rolls back the node row too. The
+printed source UUID is the `source_id` the Agent's configuration names that
+camera by. `remote-sources` is read-only and allowed while the service runs.
 Unsupported multi-planar capture or codec/bitrate controls fail explicitly.
 An open capture that delivers no frame for the configured stall window
 (`frame_stall_seconds`, never shorter than 10 negotiated frame intervals) is
