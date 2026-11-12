@@ -219,9 +219,8 @@ this protocol.
   side (Issue #369).
 
 Not yet (follow-ups of #14): media frames and their continuity/ingest path
-with the durable consumer; the Owner
-notice and status for a degraded or offline node (including
-`storage_device_numbers_stale`, #324) and for an unavailable listener;
+with the durable consumer; an Owner status page for node health and the
+listener (the notices are `app/monitoring/capture_nodes.py`, Issue #14);
 renewal over the session (#109 PR2); heartbeat loss as an Owner notice (#397).
 
 ## Bootstrap enrollment listener and local approval CLI (Issue #13)

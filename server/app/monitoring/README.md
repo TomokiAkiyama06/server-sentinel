@@ -195,6 +195,21 @@ same alerting startup-failure path. Only the first failure of the episode alerts
 startup steps and binds admission. Slack remains optional and
 never determines local state.
 
+Capture nodes (Issue #14, Owner decision 2026-11-12): for a `capture_ingest`
+section `create_app` builds one `capture_nodes.CaptureNodeHealthMonitor`
+whose provider reads `application.state.capture_ingest_state` and the
+listener registry's `nodes()` (memory only). `_capture_tick` drains it on
+every tick in every runtime state, like the camera tick, and sets
+`capture_node_degraded` (a notified reason only) /
+`capture_ingest_unavailable`. On the first running tick it re-seeds the
+per-node hourly cap from the node notice rows of the last hour
+(`_capture_notice_rows` -> `restore_window`; each row is matched to its node
+by `capture_nodes.notice_id`). `capture_node_notices_held` reports an owed
+notice still held (cap, full queue, refused write). The daily summary fills
+`agents_online` / `agents_offline` from its counts; they are shown once a
+capture pipeline reports. The notice rules
+are in `capture_nodes.py` and SPECIFICATION §5.7.
+
 Camera offline (Issue #301 item 2, Owner decision 2026-10-22):
 `create_app` builds one `cameras.CameraOfflineMonitor` for the configured
 local UVC sources and hands it to the runtime as
