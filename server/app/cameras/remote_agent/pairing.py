@@ -255,11 +255,21 @@ def credential_state_on(connection, node_id: UUID) -> str | None:
     it). The state only: no key, serial or certificate digest, and no
     expiry: an expired but unrevoked node re-pairs under the same UUID.
     """
+    return credential_record_on(connection, node_id)[0]
+
+
+def credential_record_on(connection, node_id: UUID) -> tuple[str | None, float | None]:
+    """``(state, not_after)`` of ``node_id``'s credential, ``(None, None)`` without one.
+
+    For display only (PR #415 review: ``admin_cli remote-sources`` shows an
+    expired credential as ``expired``); admission decisions read
+    ``credential_state_on``. No key, serial or certificate digest.
+    """
     node = _identity(node_id, "node identity")
     row = connection.execute(
-        "SELECT state FROM pairing_node_credentials WHERE node_id = ?", (str(node),),
+        "SELECT state, not_after FROM pairing_node_credentials WHERE node_id = ?", (str(node),),
     ).fetchone()
-    return None if row is None else row[0]
+    return (None, None) if row is None else (row[0], row[1])
 
 
 class PairingLedger:

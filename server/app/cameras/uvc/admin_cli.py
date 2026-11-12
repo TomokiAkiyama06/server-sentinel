@@ -14,6 +14,7 @@ with ``sudo -u <service account>``, never plain ``sudo``::
     python -m app.cameras.uvc.admin_cli remote-sources --config <deployment.json>
     python -m app.cameras.uvc.admin_cli create-remote-source --config <deployment.json> \\
         --node <capture node uuid> --name <name>
+    python -m app.cameras.uvc.admin_cli disable-remote-source --config <deployment.json> <source id>
 
 Same trust model as ``app.auth.bootstrap_cli`` (Owner decision D3): the local
 administrative boundary is the host itself; whoever can run this as the
@@ -132,8 +133,15 @@ before the confirmation and again inside the audited transaction. It creates
 an **enabled** source (the active-source limit counts it) and prints its
 UUID, which is the ``source_id`` the Agent's configuration names that camera
 by. ``remote-sources`` lists every ``remote_agent`` source with its node UUID
-and that node's credential state; it is read-only and allowed while the
-service runs.
+and that node's credential state (``expired`` once its ``not_after`` has
+passed; creation still treats such a credential as active, because the node
+re-pairs with the same key and keeps its UUID); it is read-only and allowed
+while the service runs. ``disable-remote-source`` disables one
+``remote_agent`` source through ``OwnerAdministration.update_source``
+(``enabled=False``, recorded ``update_source``), which frees its
+active-source slot: revoking a node in the pairing ledger changes only the
+ledger, so the sources of a revoked node stay enabled until disabled here
+(PR #415 review).
 
 Exit status: ``0`` done, ``2`` refused (a fixed word on stderr).
 """
@@ -149,6 +157,7 @@ from pathlib import Path
 import re
 import unicodedata
 import sys
+import time
 from typing import Callable
 from uuid import UUID
 
@@ -160,7 +169,7 @@ from app.audit.store import AuditStore
 from app.cameras.registry import CameraRegistry, CaptureProfile, NodeHealthState, SourceType
 from app.cameras.registry.models import ValidationError
 from app.cameras.registry.repository import ActiveSourceLimitError, NotFoundError
-from app.cameras.remote_agent.pairing import credential_state_on
+from app.cameras.remote_agent.pairing import credential_record_on
 from app.deployment import Deployment, _runtime_roots
 from app.local_admin import (
     CliRefused, ControllingTerminal, _existing_database, _LedgerDatabaseChanged,
@@ -180,7 +189,10 @@ PROG = "python -m app.cameras.uvc.admin_cli"
 CREATE_WORD = "CREATE"
 APPROVE_WORD = "APPROVE"
 RENAME_WORD = "RENAME"
-MUTATIONS = ("create-source", "approve", "rename-source", "create-remote-source")
+DISABLE_WORD = "DISABLE"
+MUTATIONS = ("create-source", "approve", "rename-source", "create-remote-source",
+             "disable-remote-source")
+REMOTE_COMMANDS = ("create-remote-source", "disable-remote-source")
 LABEL_PREFIX = "cam-"
 _LABEL_DIGITS = 10
 _LABEL = re.compile(r"cam-[0-9a-f]{10}")
@@ -211,11 +223,29 @@ _HINTS = {
                                 "give the node_id that 'serversentinel-pairing list' shows with "
                                 "credential=active"),
     "capture_node_revoked": ("a revoked capture node re-pairs as a new node with a new node_id; "
-                             "create the source for that new node"),
+                             "disable the revoked node's sources ('remote-sources', then "
+                             "'disable-remote-source <source id>') to free their slots, then "
+                             "create the sources for that new node"),
     "committed_verification_failed": ("the change was committed, but maybe not to the database now at "
                                       "the path; run 'sources': if it is missing, investigate the state "
                                       "directory and re-run the command"),
 }
+# PR #415 review: 'sources' lists local_uvc sources only, so after a remote
+# command it would show the change as missing and a re-run would create a
+# second enabled source; these commands point at 'remote-sources' instead.
+_REMOTE_HINTS = {
+    "committed_verification_failed": ("the change was committed, but maybe not to the database now "
+                                      "at the path; run 'remote-sources' (not 'sources', which lists "
+                                      "local_uvc sources only): if the change is missing there, "
+                                      "investigate the state directory and only then re-run the "
+                                      "command"),
+}
+
+
+def _hint(reason: str, command: str) -> str | None:
+    if command in REMOTE_COMMANDS and reason in _REMOTE_HINTS:
+        return _REMOTE_HINTS[reason]
+    return _HINTS.get(reason)
 
 
 class LocalConsoleOwner:
@@ -635,7 +665,8 @@ def _committed(database) -> None:
 # -- commands ------------------------------------------------------------
 
 class _Context:
-    def __init__(self, database, registry, admin, owner, terminal, discovery, check, configured):
+    def __init__(self, database, registry, admin, owner, terminal, discovery, check, configured,
+                 clock=time.time):
         self.database = database
         self.registry = registry
         self.admin = admin
@@ -644,6 +675,7 @@ class _Context:
         self.discovery = discovery
         self.check = check
         self.configured = configured
+        self.clock = clock
 
 
 def _scan(context: _Context):
@@ -735,16 +767,23 @@ def _rename_source(context: _Context, source_id: UUID, name: str) -> list[str]:
 
 
 def _node_state(context: _Context, node_id: UUID) -> str:
-    """``active`` / ``revoked`` / ``none``: the node's ledger credential, revoked also by its registry row."""
+    """``active`` / ``expired`` / ``revoked`` / ``none``: the node's ledger credential.
+
+    ``revoked`` also when its registry row is revoked; ``expired`` is an
+    active credential whose ``not_after`` has passed (display only: creation
+    accepts it, the node re-pairs with the same key and keeps its UUID).
+    """
     try:
         with closing(context.database.connect()) as connection:
-            state = credential_state_on(connection, node_id)
+            state, not_after = credential_record_on(connection, node_id)
             node = context.registry.get_capture_node_on(connection, node_id)
     except Exception:
         raise _storage_refusal(context.database) from None
     if state == "revoked" or (node is not None and node.health_state is NodeHealthState.REVOKED):
         return "revoked"
-    return "active" if state == "active" else "none"
+    if state != "active":
+        return "none"
+    return "expired" if not_after is not None and not_after <= context.clock() else "active"
 
 
 def _remote_sources(context: _Context) -> list[str]:
@@ -769,12 +808,12 @@ def _create_remote_source(context: _Context, node_id: UUID, name: str) -> list[s
     state = _node_state(context, node_id)
     if state == "revoked":
         raise CliRefused("capture_node_revoked")
-    if state != "active":
+    if state not in ("active", "expired"):
         raise CliRefused("capture_node_not_paired")
     grant = context.owner.confirm(
         context.terminal,
         f"Create an enabled remote_agent source name={_quoted(name)} for capture node "
-        f"{node_id} (credential active). Type {CREATE_WORD} to confirm: ", CREATE_WORD)
+        f"{node_id} (credential {state}). Type {CREATE_WORD} to confirm: ", CREATE_WORD)
     try:
         source = context.admin.create_remote_agent_source(grant, node_id, name=name)
     except CliRefused:
@@ -793,6 +832,37 @@ def _create_remote_source(context: _Context, node_id: UUID, name: str) -> list[s
     return [f"remote source created: source_id={source.id} node_id={node_id}",
             "next: name this source_id as capture.sources[].source_id in that capture node's "
             "media-capture-agent configuration, then start the service"]
+
+
+def _disable_remote_source(context: _Context, source_id: UUID) -> list[str]:
+    """Disable a remote_agent source (frees its active-source slot; PR #415 review)."""
+    context.check.require_stopped()
+    try:
+        source = context.registry.get_source(source_id)
+    except NotFoundError:
+        raise CliRefused("source_not_found") from None
+    except Exception:
+        raise _storage_refusal(context.database) from None
+    if source.source_type is not SourceType.REMOTE_AGENT:
+        raise CliRefused("source_not_remote_agent")
+    if not source.enabled:
+        raise CliRefused("source_already_disabled")
+    grant = context.owner.confirm(
+        context.terminal,
+        f"Disable remote_agent source {source_id} name={_quoted(source.name)} of capture node "
+        f"{source.capture_node_id}; the Main then accepts no frames for it. "
+        f"Type {DISABLE_WORD} to confirm: ", DISABLE_WORD)
+    try:
+        context.admin.update_source(grant, source_id, enabled=False)
+    except CliRefused:
+        raise
+    except ValidationError:
+        raise CliRefused("source_configuration_rejected") from None
+    except Exception:
+        raise _storage_refusal(context.database) from None
+    _committed(context.database)
+    return [f"remote source disabled: source_id={source_id}",
+            "next: start the service; the source no longer counts towards the active-source limit"]
 
 
 def _select_candidate(scan, label: str) -> DeviceEvidence:
@@ -880,11 +950,12 @@ def _approve(context: _Context, source_id: UUID, label: str) -> list[str]:
 def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
          discovery_factory: Callable[[], object],
          holders: Callable[..., int],
-         markers: Callable[..., dict[str, frozenset[str]]]) -> int:
+         markers: Callable[..., dict[str, frozenset[str]]],
+         clock: Callable[[], float] = time.time) -> int:
     if os.geteuid() == 0:
         raise CliRefused("run_as_service_account")
     source_id = profile = node_id = None
-    if args.command in ("approve", "rename-source"):
+    if args.command in ("approve", "rename-source", "disable-remote-source"):
         source_id = _uuid_argument(args.source, "source_id_rejected")
     if args.command == "create-remote-source":
         node_id = _uuid_argument(args.node, "node_id_rejected")
@@ -922,7 +993,7 @@ def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
             owner = LocalConsoleOwner()
             admin = OwnerAdministration(OwnerAuditService(AuditStore(database), owner), registry)
             context = _Context(database, registry, admin, owner, terminal, discovery_factory(),
-                               check, configured)
+                               check, configured, clock)
             if args.command == "sources":
                 lines = _sources(context)
             elif args.command == "candidates":
@@ -935,6 +1006,8 @@ def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
                 lines = _remote_sources(context)
             elif args.command == "create-remote-source":
                 lines = _create_remote_source(context, node_id, args.name)
+            elif args.command == "disable-remote-source":
+                lines = _disable_remote_source(context, source_id)
             else:
                 lines = _approve(context, source_id, args.candidate)
         finally:
@@ -960,7 +1033,9 @@ def _parser() -> argparse.ArgumentParser:
                        ("rename-source", "change a local_uvc source's display name"),
                        ("remote-sources", "list the remote_agent sources and their capture nodes"),
                        ("create-remote-source",
-                        "create an enabled remote_agent source for a paired capture node")):
+                        "create an enabled remote_agent source for a paired capture node"),
+                       ("disable-remote-source",
+                        "disable a remote_agent source (frees its active-source slot)")):
         command = commands.add_parser(name, help=text)
         command.add_argument("--config", type=Path, required=True,
                              help="the deployment configuration the service runs with")
@@ -976,6 +1051,9 @@ def _parser() -> argparse.ArgumentParser:
                                  help="the capture node's UUID (as 'serversentinel-pairing list' "
                                       "prints it)")
             command.add_argument("--name", required=True, help="the source's display name")
+        if name == "disable-remote-source":
+            command.add_argument("source",
+                                 help="the source's UUID (as 'remote-sources' prints it)")
         if name == "approve":
             command.add_argument("source", help="the source's UUID (as 'sources' prints it)")
             command.add_argument("candidate", help="the camera's label (as 'candidates' prints it)")
@@ -986,15 +1064,17 @@ def main(argv: list[str] | None = None, *,
          terminal_factory: Callable[[], ControllingTerminal] = ControllingTerminal,
          discovery_factory: Callable[[], object] = LinuxDiscovery,
          holders: Callable[..., int] = _database_holders,
-         markers: Callable[..., dict[str, frozenset[str]]] = _current_run_markers) -> int:
+         markers: Callable[..., dict[str, frozenset[str]]] = _current_run_markers,
+         clock: Callable[[], float] = time.time) -> int:
     args = _parser().parse_args(argv)
     try:
         return _run(args, terminal_factory=terminal_factory, discovery_factory=discovery_factory,
-                    holders=holders, markers=markers)
+                    holders=holders, markers=markers, clock=clock)
     except CliRefused as error:
         print(f"{PROG}: refused: {error.reason}", file=sys.stderr)
-        if error.reason in _HINTS:
-            print(f"{PROG}: {_HINTS[error.reason]}", file=sys.stderr)
+        hint = _hint(error.reason, args.command)
+        if hint is not None:
+            print(f"{PROG}: {hint}", file=sys.stderr)
     except KeyboardInterrupt:
         print(f"{PROG}: stopped", file=sys.stderr)
     return 2

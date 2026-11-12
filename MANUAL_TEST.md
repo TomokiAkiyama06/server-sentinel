@@ -475,7 +475,8 @@ record.
 
 #### Issue #14 `remote_agent` source creation on the Main Server (pending; mock-verified only)
 
-`create-remote-source` / `remote-sources` (Owner decision 2026-11-12) are
+`create-remote-source` / `remote-sources` / `disable-remote-source` (Owner
+decision 2026-11-12; disable added in the PR #415 review) are
 verified only with a temporary SQLite database, nodes paired through the real
 `PairingLedger` with synthetic digests, a pseudo-terminal and a fake `/proc`
 holder count (`server/tests/test_uvc_admin_cli.py`). They have not been run
@@ -499,6 +500,17 @@ locally"). Record node UUIDs only in the private local record.
   than `CREATE` at the prompt: `owner_confirmation_declined`; each changes
   nothing; with four enabled sources of any type a fifth refuses
   `active_source_limit_reached`;
+- [ ] `disable-remote-source <source uuid>`, type `DISABLE`: one
+  `update_source` record (actor `owner`) with that UUID, `remote-sources`
+  shows `enabled=no`; a `local_uvc` source: `source_not_remote_agent`; a
+  disabled one: `source_already_disabled`; with the service running:
+  `service_running`;
+- [ ] with four enabled sources of a node, revoke that node, re-pair it
+  (`--repair revoked`), confirm `create-remote-source` for the new node
+  refuses `active_source_limit_reached`, disable the old node's sources and
+  confirm the new node's sources can then be created;
+- [ ] a node whose credential has passed its `not_after` without renewal is
+  listed `credential=expired` and still accepted by `create-remote-source`;
 - [ ] set the printed UUID as `capture.sources[].source_id` in that capture
   node's Agent configuration and confirm, once frame receive exists, that
   the Main accepts that node's frames for this source only (follow-up of

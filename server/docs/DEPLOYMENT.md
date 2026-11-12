@@ -823,6 +823,10 @@ sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
   `committed_verification_failed` means the change and its audit record were
   committed but re-verifying the pinned database afterwards failed: run
   `sources` and investigate the state directory if the change is missing.
+  After `create-remote-source` / `disable-remote-source` the hint names
+  `remote-sources` instead (`sources` lists `local_uvc` sources only, so a
+  remote source would always look missing there and a re-run would create
+  a second enabled source for the node).
 
 #### Creating `remote_agent` sources locally (Issue #14, Owner decision 2026-11-12)
 
@@ -855,6 +859,10 @@ sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
 sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
   remote-sources --config /etc/server-sentinel/deployment.json
 #    prints: source <uuid> enabled=yes node=<node uuid> credential=active name="<display name>"
+# 4. when a node was revoked: disable each of its sources (type DISABLE),
+#    which frees its active-source slot
+sudo -u <service account> ./venv/bin/python -m app.cameras.uvc.admin_cli \
+  disable-remote-source --config /etc/server-sentinel/deployment.json <source uuid>
 sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
 ```
 
@@ -869,7 +877,8 @@ sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
   credential in the ledger (`capture_node_not_paired`; an unfinished
   enrollment has none), a node whose credential, or whose registry row, is
   revoked (`capture_node_revoked`; a revoked node re-pairs as a new node
-  with a new UUID, "Capture-node re-pairing" below), and a name the
+  with a new UUID, "Capture-node re-pairing" below: disable the revoked
+  node's sources first, then create the new node's), and a name the
   `create-source` rule refuses (`source_name_rejected`). The credential is
   checked again inside the audited transaction, so a node revoked while the
   Owner is at the prompt is refused there (`create_source` recorded
@@ -877,11 +886,23 @@ sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
   as active: such a node re-pairs with the same key and keeps its UUID and
   sources.
 - `remote-sources` shows each source's node UUID and that node's credential
-  state (`active`, `revoked` (also when its registry row is revoked), or
-  `none`). Names are printed quoted and
+  state (`active`; `expired` once its `not_after` has passed, which
+  `create-remote-source` still accepts; `revoked`, also when its registry
+  row is revoked; or `none`). Names are printed quoted and
   escaped as `sources` prints them.
-- Renaming or disabling a `remote_agent` source is not available in this
-  command yet (`rename-source` refuses one with `source_not_local_uvc`).
+- `disable-remote-source <source uuid>` disables one `remote_agent` source
+  as one audited Owner operation (`update_source`, target the source UUID;
+  typed `DISABLE`, the stopped service, as for the other mutations). The
+  Main then accepts no frames for it and it no longer counts towards the
+  active-source limit; its row and recordings stay. Revoking a node
+  (`serversentinel-pairing revoke`) changes only the pairing ledger, so the
+  revoked node's sources **stay enabled and keep their slots** until they
+  are disabled here. Refused before the confirmation: a source that is not
+  a UUID (`source_id_rejected`), missing (`source_not_found`), of another
+  type (`source_not_remote_agent`) or already disabled
+  (`source_already_disabled`). Re-enabling one is not available yet.
+- Renaming a `remote_agent` source is not available in this command yet
+  (`rename-source` refuses one with `source_not_local_uvc`).
 
 ### Detection section (optional; inference stays unavailable without it)
 
@@ -1729,8 +1750,15 @@ first to see whether the node is `credential=revoked`:
   and prints the exact change (`config_update_required: set "node_id": "<new
   uuid>" ...`). Make that edit in the Agent's protected configuration by hand:
   until then the Agent refuses to start (`node_identity_mismatch`, also from
-  `--check`), with no capture or ingest. Then approve that node's camera
-  sources again. The revoked node stays listed as revoked, and
+  `--check`), with no capture or ingest. Then, on the Main with the service
+  stopped, disable each source of the revoked node (`admin_cli
+  remote-sources`, then `admin_cli disable-remote-source <source uuid>`:
+  revoking does not disable them, so they still hold their active-source
+  slots and a new source would be refused `active_source_limit_reached`),
+  create the new node's sources with `admin_cli create-remote-source --node
+  <new uuid>` ("Creating `remote_agent` sources locally" above) and set the
+  new source UUIDs in the Agent's `capture.sources[].source_id`. The revoked
+  node stays listed as revoked, and
   its recordings stay under it until normal retention removes them.
   `--repair revoked` does not revoke anything on the Main: if it was used for a
   node that was not revoked (for example one that had only expired), the
@@ -1749,7 +1777,8 @@ moves aside (does not delete until no longer needed for diagnosis)
 `<runtime_root>/node-credentials/`, `<runtime_root>/node-identity-installed` and
 any `pending-*` directories, then pairs again from scratch (`request`, `approve`,
 `pair`) as a new node, sets the printed `node_id` in the configuration and has
-the Owner approve its camera sources again.
+the Owner disable the old node's sources and create the new node's
+(`admin_cli disable-remote-source` / `create-remote-source`, as above).
 
 Stop the Agent's `media-capture-agent` service before re-pairing and start it
 afterwards. The full Agent-side procedure and its refusal words are in
