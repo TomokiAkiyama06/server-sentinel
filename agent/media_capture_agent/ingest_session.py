@@ -24,8 +24,13 @@ mismatched reply) drops the connection, forgets the clock exchange and raises
 ``IngestSessionError`` (a ``ConnectionError``, which the runtime reports as
 ``main_unavailable``). Reconnects back off from ``RETRY_FIRST_SECONDS`` up to
 ``RETRY_MAX_SECONDS``; while waiting, a heartbeat fails at once without
-traffic, so a tick never blocks on an unreachable Main for longer than one
-bounded connect plus one bounded reply.
+traffic. A tick's network work is bounded by ``CONNECT_TIMEOUT_SECONDS`` per
+TCP connect attempt (``socket.create_connection`` tries each resolved address
+in turn) and for the TLS handshake, ``REPLY_TIMEOUT_SECONDS`` for the send and
+its reply, and another ``REPLY_TIMEOUT_SECONDS`` when a frame the Main sent
+while the Agent was idle (a ``CLOSE``) is read before reconnecting. A DNS name
+adds name resolution, which has no timeout here: an IP literal endpoint is
+recommended (PR #406 review).
 
 The credential is read from the installed generation at every connect
 (``main_link.installed_credential``), so a pairing completed while the

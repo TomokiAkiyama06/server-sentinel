@@ -58,9 +58,24 @@ class UnpairedSession:
 
 
 class UnconfiguredIngestSession(UnpairedSession):
-    """No ``main_ingest`` endpoint is configured: no session is opened (Issue #14)."""
+    """No ``main_ingest`` endpoint is configured: no session is opened (Issue #14).
 
-    unavailable_reason = "main_ingest_unconfigured"
+    With ``store`` (a ``NodeCredentialStore``), an unpaired node still reports
+    ``pairing_required``, the step the Owner takes first (PR #406 review).
+    """
+
+    def __init__(self, store=None):
+        self._store = store
+
+    @property
+    def unavailable_reason(self):
+        if self._store is not None:
+            try:
+                if not self._store.installed():
+                    return "pairing_required"
+            except PairingRefused:
+                pass
+        return "main_ingest_unconfigured"
 
     def send_heartbeat(self, heartbeat):
         raise ConnectionError("main_ingest_unconfigured")

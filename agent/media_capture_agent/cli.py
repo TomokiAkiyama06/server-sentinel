@@ -106,10 +106,10 @@ def main(argv=None):
         runtime_phase = True
         # Issue #14: the ingest session opens only with a configured endpoint;
         # `--check` builds it but never connects.
-        session = (IngestSession(NodeCredentialStore(settings.runtime_root,
-                                                     owner_uid=settings.service_uid),
-                                 settings.main_ingest, settings.node_id)
-                   if settings.main_ingest is not None else UnconfiguredIngestSession())
+        credentials = NodeCredentialStore(settings.runtime_root, owner_uid=settings.service_uid)
+        session = (IngestSession(credentials, settings.main_ingest, settings.node_id)
+                   if settings.main_ingest is not None
+                   else UnconfiguredIngestSession(credentials))
         agent = Agent(settings, store, session=session)
         runtime_phase = False
         if args.check:

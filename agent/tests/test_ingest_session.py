@@ -365,9 +365,16 @@ class AgentSessionTests(NodeTlsHarness):
         self.assertEqual([frame[1]["sequence"] for frame in self.peer.received], [1, 2])
 
     def test_an_unconfigured_endpoint_is_its_own_reason(self):
-        heartbeat = self.agent(UnconfiguredIngestSession()).tick()
+        heartbeat = self.agent(UnconfiguredIngestSession(self.store)).tick()
         self.assertIn("main_ingest_unconfigured", heartbeat["node_reasons"])
         self.assertNotIn("pairing_required", heartbeat["node_reasons"])
+
+    def test_an_unpaired_node_without_an_endpoint_still_reports_pairing_required(self):
+        # PR #406 review: pairing is the Owner's first step.
+        empty = self.root / "unpaired"
+        empty.mkdir(mode=0o700)
+        session = UnconfiguredIngestSession(NodeCredentialStore(empty))
+        self.assertEqual(session.unavailable_reason, "pairing_required")
 
 
 class MainIngestSettingTests(unittest.TestCase):
