@@ -73,7 +73,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 from typing import Callable, Iterable
 from uuid import UUID, uuid5
@@ -232,6 +232,10 @@ class CaptureNodeHealthMonitor:
         self._observe_loss(nodes, expected, state == "running", at, monotonic)
         self._restored = [row for row in self._restored if monotonic - row[0] < _HOUR]
         held = 0
+        # Event IDs given on this drain: a held (recovered) and a current
+        # episode of one node and kind first attempted together must not
+        # share one (PR #408 review), so `at` moves by a microsecond.
+        used: set[UUID] = set()
         owed = [(key, episode, self._held) for key, episode in self._held.items()]
         owed += [(key, episode, self._episodes) for key, episode in self._episodes.items()]
         for key, episode, table in sorted(owed, key=lambda item: item[1].started):
@@ -244,8 +248,12 @@ class CaptureNodeHealthMonitor:
                 held += 1
                 continue
             if episode.at is None:
-                episode.at = at
-                episode.event_id = notice_id(episode.kind, node, at)
+                attempt = at
+                while notice_id(episode.kind, node, attempt) in used:
+                    attempt += timedelta(microseconds=1)
+                episode.at = attempt
+                episode.event_id = notice_id(episode.kind, node, attempt)
+            used.add(episode.event_id)
             if not notifications.can_accept(episode.event_id):
                 # Queue full or closed: retried on the next drain.
                 held += 1

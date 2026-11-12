@@ -1240,14 +1240,18 @@ class MonitoringRuntime:
         monitor = self.dependencies.capture_nodes
         if monitor is None or self.notifications is None:
             return
-        try:
-            if self.status.state == RuntimeState.RUNNING and not self._capture_window_restored:
-                # PR #408 review: the per-node hourly cap holds across a
-                # restart loop; the rows name no node, so they count for
-                # every node. A `pending` row holds its slot too.
+        if self.status.state == RuntimeState.RUNNING and not self._capture_window_restored:
+            # PR #408 review: the per-node hourly cap holds across a restart
+            # loop; each row is matched to its node by `notice_id`, and a
+            # `pending` row holds its slot too. A failed read is retried on
+            # the next tick and never stops this tick's notices.
+            try:
                 monitor.restore_window(self._capture_notice_rows(self.dependencies.utcnow()),
                                        monotonic=self.dependencies.monotonic())
                 self._capture_window_restored = True
+            except Exception:
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+        try:
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
                                    monotonic=self.dependencies.monotonic())
         except Exception:
