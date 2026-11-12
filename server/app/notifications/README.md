@@ -129,5 +129,8 @@ remain pending; transport and DST tests use generated fixtures and no network.
 `../monitoring/` now supplies the durable local sink, the owner-thread timer and
 the integrity/recording-health bridges; configured Slack acceptance remains
 pending. `DailySummary(pipeline_available=False)` renders monitored duration,
-source, agent and observation counts as unavailable instead of zero or uptime;
-service uptime is labeled separately.
+source and observation counts as unavailable instead of zero or uptime;
+service uptime is labeled separately. The agent counts follow
+`agents_available` instead (Issue #410): capture-node connection counts,
+labeled `(capture-node connections only)` while no pipeline reports, or
+`Agents: unavailable` when they could not be read.
