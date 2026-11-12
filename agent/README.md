@@ -29,6 +29,14 @@ is recorded yet, the ring buffer is wired later). `--check` only verifies the
 pipeline launcher (`capture_pipeline_unavailable`), never the approval state,
 because the running service holds its lock.
 
+With `main_ingest` too, `live_sender.LiveSender` sends each source's newest
+JPEG to the Main as a `LIVE_FRAME` (`0x10`: the 16-byte source UUID, then the
+JPEG, at most 1 MiB) at most 5 times a second per source, only when it is
+newer than the last one sent and only on the connection the heartbeat
+opened: it never connects or retries by itself, so nothing is queued while
+the Main is unreachable. The Main sends no reply and keeps the frame in
+memory for the live view only.
+
 Cameras are approved locally with the service stopped, as the service
 account, typing `APPROVE` on the controlling terminal:
 
