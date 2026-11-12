@@ -2,11 +2,22 @@
 
 Issue #12 supplies a native Linux service foundation with no third-party runtime
 dependencies. It has no GUI/tray, listener, microphone capture or audio setting.
-The current production entry point deliberately reports `pairing_required` and
-`capture_unconfigured`: authenticated transport (#13), approved physical UVC
+The current production entry point deliberately reports `capture_unconfigured`,
+and `pairing_required` until a node credential is installed, then
+`main_ingest_unconfigured` until the `main_ingest` endpoint is configured: authenticated transport (#13), approved physical UVC
 binding (#11/#14), media transport (#15) and ring management (#16) plug into the
 core before it can become an operational capture node. This is not hardware
 acceptance or a claim of functional remote video delivery.
+
+Issue #14 adds the Agent's capture ingest session (`ingest_session.py`,
+stdlib only; the connection helpers it shares with enrollment live in
+`main_link.py`, re-exported by `node_tls`). With `main_ingest` configured and a
+node credential installed, each tick sends the node heartbeat to the Main's
+ingest listener over TLS 1.3 mTLS (ALPN `serversentinel-capture-ingest/1`) and
+waits for its acknowledgement, whose times give the clock exchange of the
+next heartbeat. Failures report `main_unavailable` and reconnect with a
+1 s to 30 s back-off. It carries no media yet (#15 / #17). See
+`SPECIFICATION.md` §5.7.
 
 Issue #16 adds the tested disk-ring/incident core under `ring.py`, `ring_models.py`
 and `ring_ledger.py`. It uses real immutable disk segments and private SQLite;
@@ -114,10 +125,11 @@ all runtime/media data outside the Git checkout and the application install:
 | `service_uid` | Dedicated non-root numeric UID |
 | `safety_reserve_bytes` | Positive Owner-configured hard reserve |
 | `max_segment_bytes` | Positive bound for each opaque video segment |
-| `heartbeat_seconds` | Positive finite interval, at most 5 s: the Main closes an ingest session after its idle timeout (30 s by default) without a frame, which must allow three intervals plus a slow tick (Issue #14) |
+| `heartbeat_seconds` | Positive finite interval, at most 5 s: the Main closes an ingest session after its idle timeout (30 s by default) without a frame, which must allow three intervals plus a slow tick (Issue #14). With `main_ingest` it must also be at least 1 s, so a node stays within the Main's rate budget of 10 frames per second (PR #406 review) |
 | `clock_offset_limit_seconds` | Positive finite acceptable absolute clock offset |
 | `clock_uncertainty_limit_seconds` | Positive finite clock-exchange uncertainty bound |
 | `clock_step_limit_seconds` | Positive finite wall/monotonic elapsed-time disagreement bound |
+| `main_ingest` | Optional (absent or `null`: no ingest session, reason `main_ingest_unconfigured`). `{"host", "port"}` of the Main's capture ingest listener (its `capture_ingest` section, not the enrollment endpoint of the trust bundle). `host` is an IP literal (not unspecified, multicast or Tailscale) or a DNS name that resolves only to LAN addresses (Issue #14). An IP literal is recommended: name resolution has no timeout and would delay a tick |
 
 The Owner provisions paths and approves mount identity locally. Runtime never
 creates roots, follows path symlinks, repairs an unexpected mount, or substitutes
