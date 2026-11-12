@@ -208,10 +208,14 @@ every tick in every runtime state, like the camera tick, and sets
 `capture_ingest_unavailable`. On the first running tick it re-seeds the
 per-node hourly cap from the node notice rows of the last hour
 (`_capture_notice_rows` -> `restore_window`; each row is matched to its node
-by `capture_nodes.notice_id`). `capture_node_notices_held` reports an owed
-notice still held (cap, full queue, refused write). The daily summary fills
-`agents_online` / `agents_offline` from its counts; they are shown once a
-capture pipeline reports. The notice rules
+by `capture_nodes.notice_id`); while that read fails it is retried on every
+running tick, `capture_node_cap_unrestored` is set and `monitoring_degraded`
+is logged once per failure episode (Issue #410). `capture_node_notices_held`
+reports an owed notice still held (cap, full queue, refused write). The daily
+summary fills `agents_online` / `agents_offline` from its counts and shows them
+independently of the capture pipeline, as connection counts only, whenever the
+latest drain read the expected nodes (`nodes_counted`; otherwise
+`Agents: unavailable`). The notice rules
 are in `capture_nodes.py` and SPECIFICATION §5.7.
 
 Camera offline (Issue #301 item 2, Owner decision 2026-10-22):
