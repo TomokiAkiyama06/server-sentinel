@@ -13,7 +13,10 @@ traffic by itself: callers connect outbound to the Main with the returned
 * Trust is pinned to the deployment CA from the Owner-transferred public trust
   bundle: no system trust store, TLS 1.3 only, hostname verification against the
   bundle's server name, and no key-log file (``ssl.create_default_context`` is
-  deliberately not used because it honours ``SSLKEYLOGFILE``).
+  deliberately not used because it honours ``SSLKEYLOGFILE``). That TLS
+  client, ``connect_to_main`` and ``installed_credential`` live in the
+  stdlib-only ``main_link`` (Issue #14), so the service's ingest session does
+  not import ``cryptography``; they are re-exported here unchanged.
 
 Errors use fixed ``PairingRefused`` reasons and never include key, CSR,
 certificate or bundle bytes.
@@ -24,13 +27,9 @@ from dataclasses import dataclass, field
 import datetime
 import hashlib
 import hmac
-import ipaddress
 import json
 import os
 from pathlib import Path
-import re
-import socket
-import ssl
 from uuid import UUID
 
 from cryptography import x509
@@ -40,14 +39,23 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from .addresses import is_tailscale_host
+# Stdlib-only connection helpers (Issue #14), re-exported for existing callers.
+from .main_link import (
+    MAX_TRUST_BUNDLE_BYTES, TAILSCALE_ENDPOINT_REFUSED, InstalledCredential,
+    _valid_endpoint_host, _valid_server_name, build_capture_client_context, connect_to_main,
+    installed_credential,
+)
 from .pairing import EnrollmentLock, NodeCredentialMaterial, NodeCredentialStore, PairingRefused
 from .storage import StorageRefused, open_directory
+
+
+# Names kept importable from here (pairing CLI, e2e harness, transport PoC).
+_REEXPORTED = (InstalledCredential, build_capture_client_context, connect_to_main)
 
 
 NODE_URI_PREFIX = "urn:serversentinel:capture-node:"
 DEPLOYMENT_URI_PREFIX = "urn:serversentinel:deployment:"
 TRUST_BUNDLE_FORMAT = 1
-MAX_TRUST_BUNDLE_BYTES = 32 * 1024
 MAX_CERTIFICATE_BYTES = 16 * 1024
 _PENDING_DIRECTORY = "pending-enrollment"
 _RENEWAL_DIRECTORY = "pending-renewal"
@@ -60,10 +68,6 @@ RENEWAL_OVERDUE = datetime.timedelta(days=14)
 RENEWAL_FIRST_RETRY = datetime.timedelta(hours=1)
 RENEWAL_MAX_RETRY = datetime.timedelta(hours=24)
 _PENDING_KEY = "node-key.pem"
-# Fixed refusal for a Main endpoint (literal, override or connected peer) in a
-# Tailscale range: enrollment and ingest are private-LAN only (Issue #150).
-TAILSCALE_ENDPOINT_REFUSED = "main_endpoint_tailscale_address_refused"
-_DNS_LABEL = re.compile(r"(?!-)[a-z0-9-]{1,63}(?<!-)")
 
 
 def public_key_digest(public_key) -> str:
@@ -71,38 +75,6 @@ def public_key_digest(public_key) -> str:
     spki = public_key.public_bytes(serialization.Encoding.DER,
                                    serialization.PublicFormat.SubjectPublicKeyInfo)
     return hashlib.sha256(spki).hexdigest()
-
-
-def _valid_server_name(value: object) -> bool:
-    if not isinstance(value, str) or not value.isascii() or not 0 < len(value) <= 253:
-        return False
-    if value != value.lower() or value.endswith("."):
-        return False
-    try:
-        ipaddress.ip_address(value)
-        return False
-    except ValueError:
-        pass
-    labels = value.split(".")
-    return len(labels) >= 2 and all(_DNS_LABEL.fullmatch(label) for label in labels)
-
-
-def _valid_endpoint_host(value: object) -> bool:
-    if not isinstance(value, str) or not value.isascii():
-        return False
-    try:
-        address = ipaddress.ip_address(value)
-    except ValueError:
-        return _valid_server_name(value)
-    return not (address.is_unspecified or address.is_multicast)
-
-
-def _is_ip_literal(value: str) -> bool:
-    try:
-        ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    return True
 
 
 def _san_uris(certificate: x509.Certificate) -> list[str]:
@@ -311,54 +283,6 @@ def validate_issued_credential(bundle: TrustBundle, private_key: ec.EllipticCurv
         ca_certificate=bundle.ca_certificate_pem)
 
 
-@dataclass(frozen=True)
-class InstalledCredential:
-    """Validated paths of the committed credential generation (no key bytes)."""
-
-    deployment_id: UUID
-    node_id: UUID
-    server_name: str
-    ca_certificate_pem: bytes = field(repr=False)
-    certificate_path: Path
-    key_path: Path
-
-
-def installed_credential(store: NodeCredentialStore) -> InstalledCredential:
-    """Return the committed generation after the store's full integrity check.
-
-    ``ssl`` loads certificate chains by path only; the files are write-once,
-    0600 and inside a validated 0700 directory owned by the service account.
-    """
-    if not isinstance(store, NodeCredentialStore) or not store.installed():
-        raise PairingRefused("node_identity_unavailable")
-    root_fd = directory_fd = None
-    try:
-        root_fd = open_directory(store.runtime_root)
-        directory_fd = os.open("node-credentials",
-                               os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                               dir_fd=root_fd)
-        store._validate_directory(directory_fd, "credential_directory_rejected")
-        manifest = json.loads(store._read_file(directory_fd, "current.json", maximum=16 * 1024,
-                                               expected_links=2).decode("utf-8"))
-        files = manifest["files"]
-        ca_pem = store._read_file(directory_fd, files["ca_certificate"]["name"],
-                                  maximum=MAX_TRUST_BUNDLE_BYTES)
-        base = store.runtime_root / "node-credentials"
-        return InstalledCredential(
-            deployment_id=UUID(manifest["deployment_id"]), node_id=UUID(manifest["node_id"]),
-            server_name=manifest["server_name"], ca_certificate_pem=ca_pem,
-            certificate_path=base / files["client_certificate"]["name"],
-            key_path=base / files["private_key"]["name"])
-    except PairingRefused:
-        raise
-    except (OSError, StorageRefused, ValueError, KeyError, TypeError, UnicodeError):
-        raise PairingRefused("node_identity_unavailable") from None
-    finally:
-        for descriptor in (directory_fd, root_fd):
-            if descriptor is not None:
-                os.close(descriptor)
-
-
 def _validate_leaf(ca_certificate_pem: bytes, deployment_id: UUID,
                    private_key: ec.EllipticCurvePrivateKey, certificate_pem: bytes):
     if (not isinstance(private_key, ec.EllipticCurvePrivateKey)
@@ -518,83 +442,3 @@ def _complete_renewal_locked(store: NodeCredentialStore,
     store.rotate(material)
     pending.discard()
     return material
-
-
-def build_capture_client_context(ca_certificate_pem: bytes, *,
-                                 certificate_path: Path | None = None,
-                                 key_path: Path | None = None) -> ssl.SSLContext:
-    """TLS 1.3 client pinned to the deployment CA; client cert optional for bootstrap."""
-    if not isinstance(ca_certificate_pem, bytes) or not ca_certificate_pem:
-        raise PairingRefused("trust_anchor_missing")
-    if (certificate_path is None) != (key_path is None):
-        raise PairingRefused("client_credential_incomplete")
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.minimum_version = ssl.TLSVersion.TLSv1_3
-    context.maximum_version = ssl.TLSVersion.TLSv1_3
-    context.check_hostname = True
-    context.verify_mode = ssl.CERT_REQUIRED
-    context.verify_flags |= ssl.VERIFY_X509_STRICT
-    try:
-        context.load_verify_locations(cadata=ca_certificate_pem.decode("ascii"))
-        if certificate_path is not None:
-            context.load_cert_chain(certfile=str(certificate_path), keyfile=str(key_path))
-    except (ssl.SSLError, OSError, UnicodeError, ValueError):
-        raise PairingRefused("client_tls_material_rejected") from None
-    return context
-
-
-def connect_to_main(context: ssl.SSLContext, *, server_name: str, host: str, port: int,
-                    timeout_seconds: float = 10.0) -> ssl.SSLSocket:
-    """Open an outbound TLS 1.3 connection that verifies ``server_name``.
-
-    ``server_name`` comes from the trust bundle or the installed credential, never
-    from the network. Verification failures and downgrades raise
-    ``PairingRefused`` before any application byte is sent. ``timeout_seconds``
-    bounds only the TCP connect and TLS handshake; the returned socket is
-    blocking with no timeout, like the Main acceptor's admitted session, so a
-    long backpressure or response wait does not tear the session down. Any
-    session-level timeout belongs to the protocol layer above.
-
-    A Main endpoint in a Tailscale range (IPv4 ``100.64.0.0/10``, IPv6
-    ``fd7a:115c:a1e0::/48``) is refused with ``main_endpoint_tailscale_address_refused``:
-    an IP literal before connecting, and a DNS name by its connected peer
-    address before the TLS handshake (Issue #150).
-    """
-    if not isinstance(context, ssl.SSLContext) or not context.check_hostname:
-        raise PairingRefused("client_tls_context_rejected")
-    if (not _valid_server_name(server_name) or not _valid_endpoint_host(host)
-            or type(port) is not int or not 1 <= port <= 65535):
-        raise PairingRefused("main_endpoint_rejected")
-    if is_tailscale_host(host):
-        raise PairingRefused(TAILSCALE_ENDPOINT_REFUSED)
-    try:
-        raw = socket.create_connection((host, port), timeout=timeout_seconds)
-    except OSError:
-        raise PairingRefused("main_unreachable") from None
-    # A DNS name (or the bundle/--endpoint literal) must not have led to a
-    # Tailscale peer: checked on the connected address before any TLS byte.
-    # Fail closed: a peer address that cannot be read or classified is refused.
-    try:
-        peer = raw.getpeername()[0]
-    except (OSError, IndexError, TypeError):
-        raw.close()
-        raise PairingRefused("main_unreachable") from None
-    if not isinstance(peer, str) or not _is_ip_literal(peer):
-        raw.close()
-        raise PairingRefused("main_endpoint_rejected")
-    if is_tailscale_host(peer):
-        raw.close()
-        raise PairingRefused(TAILSCALE_ENDPOINT_REFUSED)
-    try:
-        connection = context.wrap_socket(raw, server_hostname=server_name)
-    except ssl.SSLCertVerificationError:
-        raw.close()
-        raise PairingRefused("main_identity_rejected") from None
-    except (ssl.SSLError, OSError):
-        raw.close()
-        raise PairingRefused("main_handshake_failed") from None
-    if connection.version() != "TLSv1.3":
-        connection.close()
-        raise PairingRefused("main_handshake_failed")
-    connection.settimeout(None)
-    return connection

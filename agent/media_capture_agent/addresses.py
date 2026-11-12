@@ -19,7 +19,9 @@ these ranges is refused too.
 from __future__ import annotations
 
 import ipaddress
+import re
 
+_DNS_LABEL = re.compile(r"(?!-)[a-z0-9-]{1,63}(?<!-)")
 TAILSCALE_NETWORKS = (
     ipaddress.IPv4Network("100.64.0.0/10"),
     ipaddress.IPv6Network("fd7a:115c:a1e0::/48"),
@@ -48,3 +50,29 @@ def is_tailscale_host(host: object) -> bool:
     except ValueError:
         return False
     return is_tailscale_address(address)
+
+
+def valid_server_name(value: object) -> bool:
+    """A lowercase DNS name with at least two labels (the bundle's server name)."""
+    if not isinstance(value, str) or not value.isascii() or not 0 < len(value) <= 253:
+        return False
+    if value != value.lower() or value.endswith("."):
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return False
+    except ValueError:
+        pass
+    labels = value.split(".")
+    return len(labels) >= 2 and all(_DNS_LABEL.fullmatch(label) for label in labels)
+
+
+def valid_endpoint_host(value: object) -> bool:
+    """A usable Main endpoint: a DNS name, or an IP literal that is not unspecified/multicast."""
+    if not isinstance(value, str) or not value.isascii():
+        return False
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return valid_server_name(value)
+    return not (address.is_unspecified or address.is_multicast)
