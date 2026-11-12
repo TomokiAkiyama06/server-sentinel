@@ -125,6 +125,7 @@ import json
 import os
 from pathlib import Path
 import re
+import unicodedata
 import sys
 from typing import Callable
 from uuid import UUID
@@ -162,6 +163,13 @@ _LABEL_DOMAIN = b"serversentinel-local-uvc-candidate-label-v1\0"
 _PROFILE = re.compile(r"([0-9]{1,5})x([0-9]{1,5})@([0-9]{1,4})/([0-9A-Z]{4})")
 _USB_ID = re.compile(r"[0-9a-f]{4}")
 _MAX_TEXT = 128
+# A source name typed here (PR #411 review): shown in full in the
+# confirmation prompt (`_quoted` keeps `_MAX_TEXT` characters) and in the
+# live view, so the characters refused for a person's display name
+# (`app.auth.store.REFUSED_DISPLAY_NAME_CATEGORIES`: controls, format
+# characters such as bidirectional overrides, surrogates, line and paragraph
+# separators) are refused too, and so is a blank name.
+_REFUSED_NAME_CATEGORIES = frozenset(("Cc", "Cf", "Cs", "Zl", "Zp"))
 _HINTS = {
     "service_running": ("stop the upstream socket and the service (sudo systemctl stop "
                         "server-sentinel-upstream.socket server-sentinel.service; with socket "
@@ -658,6 +666,12 @@ def _create_source(context: _Context, name: str, profile: CaptureProfile) -> lis
             "a camera for it with 'approve', then start the service"]
 
 
+def source_name_acceptable(value: object) -> bool:
+    return (isinstance(value, str) and 0 < len(value) <= _MAX_TEXT and bool(value.strip())
+            and not any(unicodedata.category(char) in _REFUSED_NAME_CATEGORIES
+                        for char in value))
+
+
 def _rename_source(context: _Context, source_id: UUID, name: str) -> list[str]:
     """Change a local_uvc source's display name only (camera, profile and approval stay)."""
     context.check.require_stopped()
@@ -782,6 +796,8 @@ def _run(args, *, terminal_factory: Callable[[], ControllingTerminal],
             raise CliRefused("candidate_label_rejected")
     if args.command == "create-source":
         profile = parse_profile(args.profile)
+    if args.command in ("create-source", "rename-source") and not source_name_acceptable(args.name):
+        raise CliRefused("source_name_rejected")
     try:
         deployment = _load_deployment(args.config)
         database_path = deployment.settings.database_path

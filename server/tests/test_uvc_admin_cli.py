@@ -483,6 +483,8 @@ class AdminCliTests(unittest.TestCase):
             "approve", str(source.id), self.labels()[0], lines=("APPROVE",))
         self.assertEqual(0, code, stderr)
         approved = self.approval(source.id)
+        # The approval records the camera's capabilities on the source.
+        source = self.fixture.get_source(source.id)
         code, stdout, stderr, terminal = self.run_cli(
             "rename-source", str(source.id), "--name", "入口", lines=("RENAME",))
         self.assertEqual((code, stderr), (0, ""))
@@ -492,8 +494,10 @@ class AdminCliTests(unittest.TestCase):
         self.assertIn(f"source renamed: source_id={source.id}", stdout)
         renamed = self.fixture.get_source(source.id)
         self.assertEqual("入口", renamed.name)
-        self.assertEqual((source.enabled, source.desired_capture_profile),
-                         (renamed.enabled, renamed.desired_capture_profile))
+        self.assertEqual((source.enabled, source.desired_capture_profile, source.role_label,
+                          source.capabilities, source.detection_bindings),
+                         (renamed.enabled, renamed.desired_capture_profile, renamed.role_label,
+                          renamed.capabilities, renamed.detection_bindings))
         self.assertEqual(approved, self.approval(source.id))
         self.assertEqual(("owner", "update_source", "source", str(source.id), "succeeded"),
                          self.rows(AUDIT)[-1])
@@ -512,15 +516,23 @@ class AdminCliTests(unittest.TestCase):
         self.assertEqual("camera-1", self.fixture.get_source(source.id).name)
         self.assertEqual(before, len(self.rows(AUDIT)))
 
-    def test_rename_source_rejects_a_blank_name_and_records_the_failure(self):
+    def test_unsafe_or_overlong_names_are_refused_before_the_confirmation(self):
+        # PR #411 review: shown in full in the prompt and in the live view.
         source = self.local_source("camera-1")
-        code, stdout, stderr, _ = self.run_cli(
-            "rename-source", str(source.id), "--name", "   ", lines=("RENAME",))
-        self.assertEqual((code, stdout), (2, ""))
-        self.assertIn("refused: source_configuration_rejected", stderr)
+        for name in ("   ", "a\x7fb", "a\x9b31mb", "a\u202ec", "a\u200bb", "a\u2028b",
+                     "x" * 129):
+            for argv in (("rename-source", str(source.id), "--name", name),
+                         ("create-source", "--name", name, "--profile", PROFILE)):
+                with self.subTest(name=repr(name), command=argv[0]):
+                    code, stdout, stderr, terminal = self.run_cli(*argv)
+                    self.assertEqual((code, stdout, terminal), (2, "", ""))
+                    self.assertIn("refused: source_name_rejected", stderr)
         self.assertEqual("camera-1", self.fixture.get_source(source.id).name)
-        self.assertEqual(("owner", "update_source", "failed"),
-                         (self.rows(AUDIT)[-1][0], self.rows(AUDIT)[-1][1], self.rows(AUDIT)[-1][4]))
+        self.assertEqual(1, len(self.fixture.list_sources()))
+        self.assertEqual([], self.rows(AUDIT))
+        code, _, stderr, _ = self.run_cli(
+            "rename-source", str(source.id), "--name", "x" * 128, lines=("RENAME",))
+        self.assertEqual(0, code, stderr)
 
     def test_rename_source_refuses_another_source_type(self):
         node = self.fixture.create_capture_node(name="Synthetic node")
@@ -556,7 +568,9 @@ class AdminCliTests(unittest.TestCase):
         source = self.local_source()
         for argv, lines, action in (
                 (("create-source", "--name", "x", "--profile", PROFILE), ("CREATE",), "create_source"),
-                (("approve", str(source.id), self.labels()[0]), ("APPROVE",), "approve_camera")):
+                (("approve", str(source.id), self.labels()[0]), ("APPROVE",), "approve_camera"),
+                (("rename-source", str(source.id), "--name", "入口"), ("RENAME",),
+                 "update_source")):
             with self.subTest(argv=argv[0]):
                 self.running = [0, 1]
                 code, stdout, stderr, _ = self.run_cli(*argv, lines=lines)
@@ -566,7 +580,8 @@ class AdminCliTests(unittest.TestCase):
                 self.assertEqual(("owner", action, "failed"), (row[0], row[1], row[4]))
         self.assertEqual(1, len(self.fixture.list_sources()))
         self.assertIsNone(self.approval(source.id))
-        self.assertEqual(["failed", "failed"], [row[4] for row in self.rows(AUDIT)])
+        self.assertEqual("Synthetic source", self.fixture.get_source(source.id).name)
+        self.assertEqual(["failed"] * 3, [row[4] for row in self.rows(AUDIT)])
 
     def test_mutations_need_the_controlling_terminal_and_the_service_account(self):
         def no_terminal():

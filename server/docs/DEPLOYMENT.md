@@ -699,9 +699,13 @@ sudo systemctl start server-sentinel-upstream.socket server-sentinel.service
 - `rename-source` changes only the display name the live view and the
   sources listing show, as one audited Owner operation (`update_source`,
   target the source UUID only). Like the other mutations it needs the typed
-  confirmation and the stopped service (`service_running` otherwise). A blank
-  or control-character name is refused (`source_configuration_rejected`); a
+  confirmation and the stopped service (`service_running` otherwise). A
   source of another type is refused (`source_not_local_uvc`).
+- `create-source` and `rename-source` refuse, before the confirmation, a
+  name that is blank, longer than 128 characters (the prompt shows it in
+  full) or contains a control, format (such as a bidirectional override or a
+  zero-width character), surrogate, line or paragraph separator character
+  (`source_name_rejected`), the rule a person's display name follows.
 
 - `create-source` creates an **enabled** `local_uvc` source with that
   explicit capture profile (`WIDTHxHEIGHT@FPS/FOURCC`). The registry refuses
