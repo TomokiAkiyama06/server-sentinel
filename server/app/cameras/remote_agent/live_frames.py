@@ -9,11 +9,12 @@ size (from its header) and the pairing ledger's current record:
 
 1. the body's form (``live_frame_invalid`` closes the session);
 2. ``LiveFrameBudget.flooding``: per-node flood bounds, of ten times the node
-   refill rate in frames (240 per second, burst 1200) and of 16 MB per second
-   (burst 80 MB, about 5 s) in body bytes, twice the ordinary 8 MB/s of four
-   sources at 5 fps with 0.4 MB frames (PR #416 review: a node sending 1 MiB
-   frames at line rate stays far below the frame bound); only a node beyond
-   either is closed (``rate_limited``);
+   refill rate in frames (240 per second, burst 1200) and, in body bytes, of
+   twice the node refill rate of maximum-size frames (2 x 24 x (1 MiB + 16),
+   about 50 MB per second, burst 5 s); a conforming Agent at the contract
+   maximum (4 sources x 5 fps x 1 MiB, about 21 MB/s) is never closed (PR #416
+   review: a node sending 1 MiB frames at line rate stays far below the frame
+   bound); only a node beyond either is closed (``rate_limited``);
 3. ``CachedLiveSources``: the camera registry must hold an enabled source of
    type ``remote_agent`` with that identity whose ``capture_node_id`` is the
    session's node (``RegistryLiveSources``), cached per (node, source) for

@@ -37,7 +37,8 @@ and the session goes on (PR #416 review: an Agent sends every camera it
 approved, which the Owner may not have created or may have disabled on the
 Main). Only a malformed body (``live_frame_invalid``) or a flood
 (``rate_limited``: more than ten times the node refill rate in frames, or more
-than 16 MB/s with an 80 MB burst in body bytes, sustained) closes the
+than about 50 MB/s with a 5 s burst in body bytes, twice the node refill of
+maximum-size frames, sustained) closes the
 session. The session's frames are dropped from the hub when it ends or is
 superseded.
 

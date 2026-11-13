@@ -283,12 +283,20 @@ class LiveFrameBudgetTests(unittest.TestCase):
             if self.budget.flooding(other, 1_000_000):
                 break
         self.assertLess(step, 100_000 - 1)
-        # Sending at the refill rate exactly is still not a flood.
+        # Sending just below the refill rate is still not a flood.
         steady = uuid4()
         per_second = FLOOD_BYTES_PER_SECOND // 1_000_000
         for _ in range(2000):
             self.clock.value += SECOND // per_second + 1
             self.assertFalse(self.budget.flooding(steady, 1_000_000))
+        # 1.1 times the refill rate, sustained, exhausts the burst (about 50 s).
+        above = uuid4()
+        frames_per_second = FLOOD_BYTES_PER_SECOND * 11 // 10 // 1_000_000
+        for step in range(frames_per_second * 120):
+            self.clock.value += SECOND // frames_per_second
+            if self.budget.flooding(above, 1_000_000):
+                break
+        self.assertLess(step, frames_per_second * 120 - 1)
         self.assertTrue(self.budget.flooding(uuid4(), -1))
 
     def test_the_node_table_is_bounded_and_reclaims_refilled_nodes(self):
