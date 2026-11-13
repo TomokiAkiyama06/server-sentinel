@@ -182,8 +182,16 @@ class AgentIngestSessionTests(CaptureTlsHarness):
         session = agent.ingest_session
         self.assertEqual(session.INGEST_ALPN, ingest_wire.INGEST_ALPN)
         self.assertEqual(session.HEADER.format, ingest_wire.HEADER.format)
-        self.assertEqual({kind.name: int(kind) for kind in session.FrameType},
-                         {kind.name: int(kind) for kind in ingest_wire.FrameType})
+        # Every Agent frame type is the Main's, with the same value. The
+        # Main's `LIVE_FRAME` (Issue #14, option A) is fixed on the Main
+        # first; the Agent's sender adds it to its copy.
+        # TODO(#413): once the Agent's LIVE_FRAME sender is merged, require
+        # the two sets to be equal again and compare the Agent's maximum JPEG
+        # size with `ingest_wire.MAXIMUM_LIVE_FRAME_BYTES` here.
+        agent_types = {kind.name: int(kind) for kind in session.FrameType}
+        main_types = {kind.name: int(kind) for kind in ingest_wire.FrameType}
+        self.assertEqual(agent_types, {name: main_types[name] for name in agent_types})
+        self.assertLessEqual(set(main_types) - set(agent_types), {"LIVE_FRAME"})
         self.assertLessEqual(session.MAXIMUM_HEARTBEAT_BYTES,
                              CaptureIngestLimits().maximum_frame_bytes)
         # One tick's network work fits the slow-tick allowance of the idle

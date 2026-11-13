@@ -107,6 +107,18 @@ seconds is disconnected, after which the frame is discarded. The source list a
 `live:view` viewer sees holds only each camera's name and coarse health. A
 viewer can still capture their own screen; live viewing does not prevent that.
 
+Remote camera live preview (Issue #14, Owner decision 2026-11-12): a paired
+`media-capture-agent` may send JPEG frames of its approved cameras to the Main
+Server over its private-LAN capture connection, at most 5 per second per
+camera. The Main Server keeps only the newest frame of each camera in memory,
+and its bytes only while an authorized `live:view` viewer is watching that
+camera; it writes nothing to disk or the database, keeps no frame history,
+does not record, detect or build a timeline from these frames, and treats a
+frame older than 5 seconds as no longer live. A node whose connection ends or
+whose pairing is revoked loses its frames at once. Viewers receive these
+frames only through the Main Server, under the same `live:view` checks as a
+local camera, never a download.
+
 ## Human viewer credentials
 
 The target deployment shares one Tailscale account across the research room, so a Tailscale login identifies the account rather than the person. ServerSentinel therefore issues each invited person its own credential from an owner invitation and verifies it on every human request; verified Tailscale login/device information is at most supplementary context.

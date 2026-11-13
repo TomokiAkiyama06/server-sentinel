@@ -35,6 +35,7 @@ from app.diagnostics import DiagnosticExportEndpoint
 from app.logging import Event
 from app.media.live.frame_pull import LiveFrameService
 from app.media.live.local_preview import LocalPreviewHub
+from app.media.live.remote_preview import RemotePreviewHub
 from app.monitoring.access import AccessFaultMonitor
 from app.monitoring.cameras import CameraOfflineMonitor
 from app.monitoring.config import MonitoringConfiguration
@@ -202,6 +203,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
                       if isinstance(scene_timeline, SceneTimelineConfiguration) else None)
     uvc_dependencies = local_uvc_dependencies or LocalUvcDependencies()
     local_preview = LocalPreviewHub(local_uvc.source_ids if local_uvc is not None else ())
+    # Issue #14 (Owner decision 2026-11-12, option A): with a capture ingest
+    # section, the newest live frame of each authorized `remote_agent`
+    # source, in memory only; written by the ingest listener, read only by
+    # the S7 frame pull.
+    remote_preview = RemotePreviewHub() if capture_ingest is not None else None
     # Calibrated ROI movement / camera tamper (#205). Capture threads only
     # hand it a bounded sample; detection runs on its own worker and confirmed
     # observations go to the injected durable critical recorder. Without a
@@ -449,7 +455,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # S7 interim live (Owner decision D10, #10/#19): the authorized frame
         # pull is the only reader of the preview hub; it retains nothing
         # without polling live:view viewers and starts/stops with run().
-        human_access.attach_live(LiveFrameService(local_preview, human_access.store))
+        human_access.attach_live(LiveFrameService(local_preview, human_access.store,
+                                                  remote=remote_preview))
         if scene_calibration_service is not None:
             # The Owner's calibration routes (#205); without the service
             # they stay the generic denial. The routes write the history
@@ -574,6 +581,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
             so a port that stays taken does not write a line every 30 s.
             """
             from app.cameras.remote_agent.ingest_server import CaptureIngestServer
+            from app.cameras.remote_agent.live_frames import RegistryLiveSources
             from app.cameras.remote_agent.ingest_tls import open_ingest_listener
             failures = 0
             while True:
@@ -581,7 +589,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 try:
                     listener = open_ingest_listener(capture_ingest.listener)
                     server = CaptureIngestServer(listener, capture_acceptor,
-                                                 limits=capture_ingest.limits)
+                                                 limits=capture_ingest.limits,
+                                                 live_preview=remote_preview,
+                                                 live_sources=RegistryLiveSources(store))
                     server.start()
                 except Exception:
                     if listener is not None:

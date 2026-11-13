@@ -1695,6 +1695,36 @@ Record:
 - audit event;
 - manual-intervention requirement if automatic recovery is unsafe.
 
+### Issue #14 remote live preview (pending, not executed; needs the Agent sender)
+
+Mock/loopback-verified only: `server/tests/test_capture_ingest_live.py` (real
+loopback TLS 1.3 mTLS, synthetic JPEG-shaped bytes) and
+`server/tests/test_live_remote_routes.py`. No real Agent has sent `LIVE_FRAME`
+yet, no browser has decoded a remote camera frame, and no registry row for a
+paired node exists on a real Main (there is no Owner path yet; open question
+of the PR). Record node and source UUIDs only in the private local record.
+
+- [ ] the registry's `remote_agent` source names the paired node's ledger
+  `node_id` as `capture_node_id` (`serversentinel-pairing list`), and the
+  Agent sends that source's registry UUID;
+- [ ] with the Agent sending live frames and no viewer: the Main's memory does
+  not grow, nothing new appears on disk or in the database, and the source is
+  listed `online` in the live screen of a `live:view` viewer;
+- [ ] a phone/Mac/desktop viewer with `live:view` opens the remote camera and
+  sees it update (at most 5 fps); a viewer with only `recordings:view` sees no
+  live screen; no download or export control exists;
+- [ ] stop the Agent: within about 5 s the frame stops updating and the source
+  is `offline`; start it again: it returns without any Main action;
+- [ ] disable the source on the Main: within about 1 s the viewer stops
+  receiving it, the Agent's session stays open (its heartbeats go on, no
+  heartbeat-loss notice) and the frames are counted as unauthorized;
+- [ ] pause the Main briefly (or the LAN link) while the Agent sends: when it
+  resumes, the session is not closed and the live view continues;
+- [ ] `serversentinel-pairing revoke` the node: its next frame ends the session
+  and the remote camera disappears from live (`offline`);
+- [ ] on a 1 Gbit/s LAN the stream at 5 fps per camera does not delay the
+  node's heartbeat acknowledgements beyond the Agent's reply timeout.
+
 ### Agent-to-Main transport PoC (Issue #15, ADR-0007 — harness run 2026-10-29; product ingest path pending)
 
 The checklist below is for the product path and stays open; the harness runs of
