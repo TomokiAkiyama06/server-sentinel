@@ -61,6 +61,8 @@ def _record(value):
     if type(value["requires_approval"]) is not bool or type(value["serial_ambiguous"]) is not bool:
         raise ValueError("invalid approval record")
     session = value["session"]
+    if session is not None and type(session) is not str:
+        raise ValueError("invalid approval record")
     if session is not None:
         UUID(session)
     evidence = value["evidence"]

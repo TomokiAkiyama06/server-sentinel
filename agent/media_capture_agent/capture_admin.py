@@ -22,7 +22,8 @@ serial, path or USB port, with the USB vendor:product, whether a serial is
 present, the formats and the configured source each is approved for. A label
 changes when the device is re-plugged or the host restarts (it hashes the
 per-boot device instance too); ``approved_for`` compares the serial identity.
-``candidates`` only reads the approval state (no session is started).
+``candidates`` starts no session; it only reads the approval state, except that
+it copies the recorded duplicated-serial latches into the runtime-wide set.
 ``approve`` refuses a camera without a serial, a serial shared with another
 connected camera or ever latched as ambiguous (``camera_serial_not_unique``;
 the latches are kept runtime-wide in ``uvc-latched-serials.json`` as digests,

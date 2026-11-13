@@ -421,6 +421,18 @@ class CaptureAdminTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_a_corrupted_session_field_is_a_fixed_refusal(self):
+        import json
+        self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        path = self.settings.runtime_root / "uvc-approvals.json"
+        document = json.loads(path.read_text())
+        document["sources"][str(SOURCES[0])]["session"] = 123
+        path.write_text(json.dumps(document))
+        code, stdout, stderr = self.run_cli("candidates")
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertEqual(stderr.strip().splitlines()[-1],
+                         f"{capture_admin.PROG}: refused: approval_state_unavailable")
+
     def test_the_signal_mask_is_restored_after_an_unexpected_error(self):
         import signal
         from media_capture_agent.uvc_capture import UvcCapture
