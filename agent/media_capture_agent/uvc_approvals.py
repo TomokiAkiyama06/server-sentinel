@@ -174,6 +174,26 @@ class ApprovalStore:
             finally:
                 os.close(descriptor)
 
+    def recorded_latches(self):
+        """Digests of every persisted record's latch, configured source or not.
+
+        A source removed from the configuration keeps its record; its latch
+        must still reach the runtime-wide set (Codex P2 on PR #412).
+        """
+        with self._lock:
+            if self.fd is None:
+                raise ApprovalStorageError("UVC approval store is closed")
+            try:
+                records = self._read()
+            except ApprovalStorageError:
+                raise
+            except (OSError, ValueError, UnicodeError) as error:
+                raise ApprovalStorageError("UVC approval state is unavailable") from error
+        digests = {strong_key_digest(state.approved) for state in records.values()
+                   if state.serial_ambiguous and state.approved is not None}
+        digests.discard(None)
+        return frozenset(digests)
+
     def add_latched(self, digests):
         """Add digests to the latch set; never removes one."""
         digests = frozenset(digests)

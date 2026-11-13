@@ -136,19 +136,18 @@ def _approvals(store, settings) -> dict:
         raise AdminRefused("approval_state_unavailable") from None
 
 
-def _latched(store, approvals) -> frozenset:
-    """Record every current duplicated-serial latch in the runtime-wide set, then read it.
+def _latched(store) -> frozenset:
+    """Record every persisted duplicated-serial latch in the runtime-wide set, then read it.
 
     A source's latch lives with its approval and disappears when that
     approval is replaced or removed (PR #412 review); the set keeps the
     serial unapprovable for good, so it never reconnects automatically
-    (SPECIFICATION §4.4).
+    (SPECIFICATION §4.4). Records of sources no longer configured are
+    included (Codex P2 on PR #412).
     """
-    from .uvc_approvals import ApprovalStorageError, strong_key_digest
-    digests = {strong_key_digest(state.approved) for state in approvals.values()
-               if state is not None and state.serial_ambiguous and state.approved is not None}
-    digests.discard(None)
+    from .uvc_approvals import ApprovalStorageError
     try:
+        digests = store.recorded_latches()
         if digests:
             store.add_latched(digests)
         return store.latched_digests()
@@ -182,7 +181,7 @@ def _candidates(settings, discovery) -> list[str]:
     store = _store(settings)
     try:
         approvals = _approvals(store, settings)
-        latched = _latched(store, approvals)
+        latched = _latched(store)
     finally:
         store.close()
     devices, failures = _scan(discovery)
@@ -213,7 +212,7 @@ def _approve(settings, discovery, source_id: UUID, label: str, *, confirm) -> li
     store = _store(settings)
     try:
         approvals = _approvals(store, settings)
-        latched = _latched(store, approvals)
+        latched = _latched(store)
     finally:
         store.close()
     devices, failures = _scan(discovery)
@@ -262,7 +261,7 @@ def _approve(settings, discovery, source_id: UUID, label: str, *, confirm) -> li
         # concurrent approval of this camera for another source, or a latch
         # set meanwhile, is seen here.
         locked = {source: capture.store.load(source) for source in configured}
-        if strong_key_digest(device) in _latched(capture.store, locked):
+        if strong_key_digest(device) in _latched(capture.store):
             raise AdminRefused("camera_serial_not_unique")
         if any(holder != source_id for holder in _holders(device, locked)):
             raise AdminRefused("camera_approved_for_another_source")
@@ -337,7 +336,7 @@ def _revoke(settings, source_id: UUID, *, confirm) -> list[str]:
             raise AdminRefused("source_not_approved")
         # A latch of this approval is kept in the runtime-wide set first, so
         # removing the approval never makes that serial approvable again.
-        _latched(store, _approvals(store, settings))
+        _latched(store)
         word = confirm(f"Remove the camera approval of source {source_id}; the Agent will not "
                        f"use any camera for it until one is approved again. "
                        f"Type {REVOKE_WORD} to confirm: ")

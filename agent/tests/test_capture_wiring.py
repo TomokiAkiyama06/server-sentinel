@@ -397,6 +397,30 @@ class CaptureAdminTests(unittest.TestCase):
         with open(self.settings.runtime_root / "uvc-latched-serials.json") as stream:
             self.assertNotIn("SYN-SERIAL", stream.read())
 
+    def test_a_latch_of_a_source_removed_from_the_configuration_is_kept(self):
+        # Codex P2 on PR #412: a source that latched a duplicated serial and
+        # was then removed from the configuration must not let a replacement
+        # source approve that camera.
+        from media_capture_agent.uvc_approvals import ApprovalStore as Store
+        store = Store(self.settings)
+        try:
+            token = store.start_session(SOURCES[1]).session_token
+            store.save(SOURCES[1], self.camera, False, session_token=token,
+                       serial_ambiguous=True, release=True)
+        finally:
+            store.close()
+        self.assertNotIn(SOURCES[1], {source.source_id
+                                      for source in self.settings.capture.sources})
+        self.assertIn("serial=latched", self.run_cli("candidates")[1])
+        code, _, stderr = self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        self.assertEqual(code, 2)
+        self.assertIn("refused: camera_serial_not_unique", stderr)
+        store = Store(self.settings)
+        try:
+            self.assertEqual(len(store.latched_digests()), 1)
+        finally:
+            store.close()
+
     def test_the_signal_mask_is_restored_after_an_unexpected_error(self):
         import signal
         from media_capture_agent.uvc_capture import UvcCapture
