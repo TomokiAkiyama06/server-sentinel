@@ -1137,6 +1137,23 @@ local record.
   made (`ss -tn` on the capture host); stopping the Main makes the Agent
   report `main_unavailable` and reconnect within about 30 s of the Main's
   return, with no restart of the Agent;
+- [ ] Agent capture (Issue #14, mock-verified only): with a `capture`
+  section naming the CS-800's source UUID and `1920x1080@30/MJPG`, `--check`
+  passes (`capture_pipeline_unavailable` with a non-root-owned
+  `gst_launch`); with the service stopped, `capture_admin candidates` lists
+  the camera without its serial or path, `approve` asks for `APPROVE` and the
+  service then reports the source `online` (`video_ready`) with no
+  `capture_overloaded`; while the service runs both commands refuse
+  `service_running`; `/dev/snd` is never opened (`lsof` / `/proc/<pid>/fd`);
+  the installed unit has `DeviceAllow=char-video4linux rw` and no sound
+  device, and the service reaches `online` although the camera also has a
+  UVC metadata node; re-plug the camera (it may get another `/dev/videoN`)
+  and restart the host: both reconnect by serial without a new approval;
+  boot the capture host with the camera unplugged, then plug it in: the
+  service reaches `online` without a restart (`modprobe@videodev` ordering);
+  `revoke <source>` then `approve` moves the camera to another source;
+  `approve` refuses a second source for the same camera
+  (`camera_approved_for_another_source`);
 - [ ] a plain HTTP request and a browser to the ingest port get no HTTP
   answer and no dashboard route; the dashboard is not reachable from the
   capture host through the ingest port;

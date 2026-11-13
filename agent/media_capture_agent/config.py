@@ -89,6 +89,64 @@ class MainIngestEndpoint:
         return cls(host, port)
 
 
+_PROFILE = re.compile(r"([0-9]{1,5})x([0-9]{1,5})@([0-9]{1,4})/MJPG")
+MAXIMUM_CAPTURE_SOURCES = 4
+
+
+@dataclass(frozen=True)
+class CaptureSourceSetting:
+    """One approved-camera slot: its stable source UUID and explicit MJPEG profile."""
+
+    source_id: UUID
+    width: int
+    height: int
+    fps: int
+
+
+@dataclass(frozen=True)
+class CaptureSettings:
+    """Optional ``capture`` section (Issue #14): the local UVC sources to run.
+
+    ``gst_launch`` is the operator-installed, root-owned ``gst-launch-1.0``
+    (checked again by ``uvc_pipeline.GStreamerLauncher`` at every start; never
+    PATH-searched). Each source names an explicit ``WIDTHxHEIGHT@FPS/MJPG``
+    profile. A camera is used only after the Owner approved one for the
+    source (``python -m media_capture_agent.capture_admin approve``).
+    """
+
+    gst_launch: Path
+    sources: tuple[CaptureSourceSetting, ...]
+
+    @classmethod
+    def parse(cls, value):
+        if not isinstance(value, dict) or set(value) != {"gst_launch", "sources"}:
+            raise ConfigurationError("capture requires gst_launch and sources")
+        executable = absolute_path(value["gst_launch"])
+        sources = value["sources"]
+        if (not isinstance(sources, list)
+                or not 1 <= len(sources) <= MAXIMUM_CAPTURE_SOURCES):
+            raise ConfigurationError("capture requires one to four sources")
+        parsed = []
+        for source in sources:
+            if not isinstance(source, dict) or set(source) != {"source_id", "profile"}:
+                raise ConfigurationError("capture source requires source_id and profile")
+            try:
+                identity = UUID(source["source_id"])
+            except (ValueError, TypeError, AttributeError):
+                raise ConfigurationError("invalid capture source identity") from None
+            match = (_PROFILE.fullmatch(source["profile"])
+                     if isinstance(source["profile"], str) else None)
+            if match is None:
+                raise ConfigurationError("capture profile must be WIDTHxHEIGHT@FPS/MJPG")
+            width, height, fps = (int(group) for group in match.groups())
+            if not (16 <= width <= 16384 and 16 <= height <= 16384 and 1 <= fps <= 240):
+                raise ConfigurationError("capture profile out of range")
+            parsed.append(CaptureSourceSetting(identity, width, height, fps))
+        if len({source.source_id for source in parsed}) != len(parsed):
+            raise ConfigurationError("duplicate capture source identity")
+        return cls(executable, tuple(parsed))
+
+
 # The longest heartbeat interval (Issue #14). The Main's capture ingest idle
 # timeout (30 s by default, `server/app/cameras/remote_agent/ingest_config.py`)
 # is at least three of these plus 15 s for a slow tick (storage check, clock
@@ -117,6 +175,9 @@ class Settings:
     clock_step_limit_seconds: float
     # Optional (Issue #14): without it the Agent opens no ingest session.
     main_ingest: MainIngestEndpoint | None = None
+    # Optional (Issue #14): without it no camera is opened
+    # (`capture_unconfigured`).
+    capture: CaptureSettings | None = None
 
     @classmethod
     def parse(cls, value, *, code_root):
@@ -156,11 +217,13 @@ class Settings:
         if (main_ingest is not None
                 and value["heartbeat_seconds"] < MINIMUM_INGEST_HEARTBEAT_SECONDS):
             raise ConfigurationError("heartbeat interval is below the Main ingest rate budget")
+        capture = (CaptureSettings.parse(value["capture"])
+                   if value.get("capture") is not None else None)
         return cls(node_id, runtime, media, expected, value["service_uid"],
                    value["safety_reserve_bytes"], value["max_segment_bytes"],
                    value["heartbeat_seconds"], value["clock_offset_limit_seconds"],
                    value["clock_uncertainty_limit_seconds"], value["clock_step_limit_seconds"],
-                   main_ingest)
+                   main_ingest, capture)
 
     @classmethod
     def load(cls, path, *, code_root):
@@ -170,7 +233,7 @@ class Settings:
         return cls.parse(value, code_root=code_root)
 
 
-_OPTIONAL_SETTINGS = ("main_ingest",)
+_OPTIONAL_SETTINGS = ("main_ingest", "capture")
 MAX_CONFIGURATION_BYTES = 65536
 
 
