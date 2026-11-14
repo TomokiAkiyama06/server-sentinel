@@ -49,6 +49,7 @@ import select
 import socket
 import ssl
 import struct
+import threading
 import time
 from typing import Callable
 from uuid import UUID
@@ -78,7 +79,15 @@ _ACK_KEYS = frozenset({"sequence", "receive_utc", "send_utc"})
 class FrameType(IntEnum):
     HEARTBEAT = 0x01
     HEARTBEAT_ACK = 0x02
+    # Agent to Main (Owner decision 2026-11-12, option A): one source's
+    # newest JPEG for the live view. The Main keeps it in memory only and
+    # sends no reply (it never acknowledges media it does not keep).
+    LIVE_FRAME = 0x10
     CLOSE = 0x7F
+
+
+# A live frame's JPEG bound; its body is the 16-byte source UUID then the JPEG.
+MAXIMUM_LIVE_FRAME_BYTES = 1_048_576
 
 
 class IngestSessionError(ConnectionError):
@@ -130,7 +139,8 @@ def read_reply(connection, deadline: float, *, clock: Callable[[], float] = time
     except ValueError:
         raise IngestSessionError("main_reply_invalid") from None
     body = _receive_exactly(connection, length, deadline, clock)
-    if frame_type is FrameType.HEARTBEAT:
+    if frame_type in (FrameType.HEARTBEAT, FrameType.LIVE_FRAME):
+        # Agent-to-Main types never come from the Main.
         raise IngestSessionError("main_reply_invalid")
     try:
         value = json.loads(body.decode("utf-8"), parse_constant=_refuse_constant)
@@ -182,6 +192,9 @@ class IngestSession:
         self._utc = utc
         self._monotonic = monotonic
         self._connection = None
+        # The heartbeat (tick thread) and the live frames (`live_sender`)
+        # share the one connection; every use of it holds this lock.
+        self._io = threading.RLock()
         self._exchange: ClockExchange | None = None
         self._failures = 0
         self._retry_at = None
@@ -208,6 +221,36 @@ class IngestSession:
         return self._exchange
 
     def send_heartbeat(self, heartbeat: dict) -> None:
+        with self._io:
+            self._send_heartbeat(heartbeat)
+
+    def send_live_frame(self, source_id: UUID, jpeg: bytes) -> bool:
+        """Send one live frame on the current connection; False if not sent.
+
+        It never connects (the heartbeat owns connecting and its back-off)
+        and expects no reply. A frame that is not one complete JPEG within
+        ``MAXIMUM_LIVE_FRAME_BYTES`` is skipped. A send failure drops the
+        connection like a heartbeat failure.
+        """
+        if (not isinstance(source_id, UUID) or not isinstance(jpeg, bytes)
+                or not 4 <= len(jpeg) <= MAXIMUM_LIVE_FRAME_BYTES
+                or not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9")):
+            return False
+        with self._io:
+            connection = self._connection
+            if connection is None:
+                return False
+            frame = HEADER.pack(16 + len(jpeg), int(FrameType.LIVE_FRAME)) + source_id.bytes + jpeg
+            try:
+                connection.settimeout(REPLY_TIMEOUT_SECONDS)
+                connection.sendall(frame)
+            except (OSError, ssl.SSLError, ValueError):
+                self._drop()
+                self._failed("main_send_failed")
+                return False
+            return True
+
+    def _send_heartbeat(self, heartbeat: dict) -> None:
         if self._connection is not None and not self._still_open():
             self._drop()
         if self._connection is None:
@@ -233,7 +276,8 @@ class IngestSession:
         self.last_failure = None
 
     def close(self) -> None:
-        self._drop()
+        with self._io:
+            self._drop()
 
     # -- internals ---------------------------------------------------------
 
