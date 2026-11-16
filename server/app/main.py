@@ -479,6 +479,14 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # camera offline delivery did not reach it; one fixed word.
             human_access.attach_camera_offline_notice(
                 lambda: monitoring_runtime.status.camera_offline_cause)
+        if monitoring_runtime is not None:
+            # Issue #301 follow-up: the Owner's dashboard notice while no
+            # notification destination (Slack) is configured, or a delivery
+            # of this process did not reach it. Mounted with every monitoring
+            # runtime (it sends every Owner notification); without one the
+            # route stays the generic denial ("could not be checked").
+            human_access.attach_notification_notice(
+                lambda: monitoring_runtime.status.notification_cause)
     # Issue #14: the dedicated capture ingest listener, from the deployment's
     # `capture_ingest` section (`remote_agent.ingest_config`). Its acceptor
     # reads this application's pairing ledger on every connection and frame;

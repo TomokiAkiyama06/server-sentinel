@@ -311,6 +311,17 @@ in `app.monitoring.cameras`) is what the Owner's dashboard shows, through
 `GET /api/monitoring/camera-offline` (`OWNER_READ`, one boolean and one fixed
 word; `unverified` is the generic denial; `app.auth.human_surface`).
 
+Whether any Owner notification leaves the Main Server at all (Issue #301
+follow-up) is `MonitoringStatus.notification_cause` (the words in
+`app.notifications.service`): `not_configured` while no Slack endpoint is
+configured (`notifications_configured`, set once from the configuration,
+whatever the runtime state), otherwise `unverified` while the runtime is not
+`running`, `delivery_failed` once a delivery of this process failed
+(`notification_delivery_failed`, kept until the restart) and `delivered`
+otherwise. The Owner's dashboard reads it through
+`GET /api/monitoring/notifications` (`OWNER_READ`, one fixed word or `null`;
+`unverified` is the generic denial), mounted with every monitoring runtime.
+
 Human access (Issue #232 item 4): `MonitoringDependencies(access_faults=)`
 takes the `AccessFaultMonitor` the composition root also passes to the
 `HostnameReservationCheck` (`sink=`) and `PasskeyCeremonies` (`findings=`).
