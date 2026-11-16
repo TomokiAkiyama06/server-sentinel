@@ -1,28 +1,32 @@
-# LXD host only (Issue #301 item 1): re-pass a serial-identified USB camera the
-# host re-enumerated to the ServerSentinel VM. Started by the udev rule on a
-# USB add and by the timer. Runs as root on the host because it changes the
-# LXD instance; ServerSentinel and media-capture-agent get no root for it.
+# LXD host only (Issue #301, #405): report a serial-identified USB camera that
+# looks not passed to the ServerSentinel VM. Read-only (Owner decision
+# 2026-11-16): it sends only GET requests to LXD and changes nothing; the
+# re-pass is done by hand (infra/lxd/README.md). Started by the timer only.
+# The unit fails while a camera needs the Owner's attention, so it shows in
+# `systemctl --failed`. ServerSentinel and media-capture-agent get no root
+# for it.
 [Unit]
-Description=ServerSentinel host USB camera re-pass to the LXD VM
+Description=ServerSentinel host check for USB cameras not passed to the LXD VM
 After=snap.lxd.daemon.service
 ConditionPathExists=/etc/server-sentinel-usb-repass.json
 
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 -I -S /usr/local/lib/server-sentinel-usb-repass/usb_repass.py --config /etc/server-sentinel-usb-repass.json
-StateDirectory=server-sentinel-usb-repass
-StateDirectoryMode=0700
-# usb_repass.UNIT_TIMEOUT_SECONDS: RUN_LIMIT_SECONDS (1200) + STARTUP_MARGIN_SECONDS (60).
-TimeoutStartSec=1260
-# Reads /proc/<qemu pid>/fd (CAP_SYS_PTRACE) and sysfs; talks to the LXD unix
-# socket only. No network, no other capability.
+# usb_repass.UNIT_TIMEOUT_SECONDS: a few LXD reads (30 s each at most), the
+# boot wait for LXD, a 5 s settle and a 2 s second sample.
+TimeoutStartSec=300
+# Reads /proc/<qemu pid>/fd (CAP_SYS_PTRACE), sysfs and, while it is still
+# there, the old state file; talks to the LXD unix socket only. No network,
+# no other capability, nothing writable.
 CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 AmbientCapabilities=
 NoNewPrivileges=yes
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+PrivateNetwork=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes

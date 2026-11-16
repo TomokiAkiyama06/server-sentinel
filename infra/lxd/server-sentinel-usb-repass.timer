@@ -1,12 +1,15 @@
-# LXD host only (Issue #301 item 1): the safety net for a missed udev event
-# and for a re-enumeration while the service was already running.
+# LXD host only (Issue #301, #405): the only trigger of the read-only check.
+# There is no udev rule any more: the check changes nothing, so it need not
+# react to a USB add within seconds, and the udev rule started runs on the
+# VM start's own USB resets (Issue #405, 19:56). Every 5 minutes, the default
+# `camera_offline_notification.after_seconds` of ServerSentinel.
 [Unit]
-Description=Periodic ServerSentinel host USB camera re-pass check
+Description=Periodic ServerSentinel host check for USB cameras not passed to the LXD VM
 
 [Timer]
-OnBootSec=3min
-OnUnitInactiveSec=2min
-AccuracySec=15s
+OnBootSec=10min
+OnUnitActiveSec=5min
+AccuracySec=30s
 
 [Install]
 WantedBy=timers.target

@@ -389,7 +389,7 @@ least 60):
   ("Issue #301 camera not passed back to the VM");
 - [ ] LXD VM configuration (D2): reproduce the host USB re-enumeration of
   Issue #301 (the VM loses the camera) and confirm the notification arrives;
-  the host-side automatic re-pass (Issue #301 item 1) is separate.
+  the host-side check (Issue #301 item 1, #405, read-only) is separate.
 
 #### Issue #11 / D3 local camera admin CLI on the Main Server (pending; requires the Owner)
 
@@ -2842,8 +2842,8 @@ recovery are mock-verified only (`server/tests/test_camera_offline_notice_route.
 `server/tests/test_access_fault_notifications.py`,
 `web/tests/offline_notice.test.mjs`). Changing the LXD devices changes the
 production host and needs the Owner. Record serials and device names only in
-the private record. The host-side automatic re-pass (Issue #301 item 1) is
-outside ServerSentinel and checked separately below.
+the private record. The host-side check (Issue #301 item 1, #405; read-only,
+it never re-passes) is outside ServerSentinel and checked separately below.
 
 - [ ] reproduce: a camera is lost by the guest while the host lists it (a
   host re-enumeration, or `sudo lxc config device remove <vm> <camN>` as a
@@ -2885,7 +2885,8 @@ outside ServerSentinel and checked separately below.
 - [ ] the notice names no camera, shows no setting value, and claims no
   cause;
 - [ ] recover with the documented `lxc config device remove` / `add` of that
-  camera's serial-identified `usb` device: no VM or service restart; the
+  camera's serial-identified `usb` device, after the verification of
+  `infra/lxd/README.md` "Manual re-pass" step 1: no VM or service restart; the
   guest lists the camera again, the source returns to `online` by itself,
   and the notice disappears at about the next monitoring tick;
 - [ ] while the notice is shown, stopping the network between the browser
@@ -2919,52 +2920,66 @@ Owner; restore it afterwards. Never record the webhook URL.
   確認できませんでした。" may show until the monitoring runtime runs, then
   disappears within about a minute.
 
-### Issue #301 host-side automatic re-pass (pending, not executed)
+### Issue #301 / #405 host-side check for cameras not passed (pending, not executed)
 
-Procedure: `infra/lxd/README.md`. Mock-verified only
+Procedure: `infra/lxd/README.md`. Owner decision 2026-11-16 (Issue #405):
+the check is read-only and the re-pass is done by hand. Mock-verified only
 (`tests/unit/test_lxd_usb_repass.py`: synthetic sysfs, `/proc` and LXD, a
-local unix-socket HTTP server for the REST client). Installing it and every
-step below change the production host and need the Owner. A read-only
-judgement on the real host on 2026-11-08 (LXD GET requests, sysfs and
-`/proc` reads only; nothing changed, nothing installed) reported
-`needs_repass` for both passed cameras: QEMU held only deleted nodes after
-host re-enumerations on 2026-11-06 and 2026-11-08, while the guest still
-listed both. Record serials, bus/device numbers and device names only in the
-private record.
+local unix-socket HTTP server that records every request method). Installing
+it changes the production host and needs the Owner; no non-production LXD
+environment is used (Owner decision 2026-11-16). History: the automatic
+remove / add of PR #399 removed both healthy cameras on 2026-11-08 and QEMU
+refused the add (`/dev/fdset`) until the VM was stopped (Issue #405). Record
+serials, bus/device numbers and device names only in the private record.
 
-- [ ] `--check` before enabling prints one fixed line per configured device
-  (after a `usb_repass_pending_restore` line per pending record, if any) and
-  changes nothing (`sudo lxc config device show <vm>` and the state file
-  unchanged);
-- [ ] after a host reboot the unit is not in `systemctl --failed` because of
-  the boot coldplug; a run before LXD answered shows
-  `usb_repass_lxd_not_ready` and the timer's run after it judges normally;
-- [ ] with a camera in `needs_repass`, the first service run prints
-  `usb_repass_done` for it; the guest lists it again
-  (`v4l2-ctl --list-devices`), the source returns to `online` without a VM
-  or service restart, and `--check` then prints `usb_repass_held`;
-- [ ] unplug a camera and plug it back into the same port: within about
-  30 s of the reconnect (udev trigger, 5 s settle, 2 s second sample, the
-  re-pass, a 5 s settle and up to 10 s of verification) the journal shows
-  `usb_repass_done` once, and the outage stays
-  shorter than `camera_offline_notification.after_seconds` (no Slack
-  `camera_offline`);
-- [ ] the other C960 resetting about a second later (memory 2026-09-30) is
-  either still `held` or re-passed in the same pass; both end
-  `usb_repass_done`; no loop (at most once per 60 s and five per hour per
-  device; `usb_repass_rate_limited` otherwise);
-- [ ] a camera left unplugged stays `usb_repass_absent` and its LXD device is
-  never removed;
-- [ ] a configured device without `serial` (a temporary copy of the
-  configuration naming a non-serial device, or none on this host: record as
-  not applicable) is `usb_repass_unidentified` and never touched;
-- [ ] the journal lines carry only the fixed words and the device label (no
-  serial, vendor/product id, bus or device number);
-- [ ] after `systemctl stop` of the service mid-run (or a host reboot during
-  a re-pass, if it can be arranged), the next run restores a device missing
-  from the instance (`usb_repass_restored`) or finds it present;
-- [ ] removal as documented leaves every camera device in the instance and
-  no `/var/lib/server-sentinel-usb-repass`.
+- [ ] deploy as in "Install or update": the old timer is disabled, both the
+  udev rule and `90-server-sentinel-usb-repass.rules.disabled` are gone
+  (`ls /etc/udev/rules.d/ | grep usb-repass` prints nothing), and
+  `systemctl list-timers server-sentinel-usb-repass.timer` shows the next run
+  within 5 minutes after enabling;
+- [ ] `--check` prints one fixed line per configured device (after a
+  `usb_repass_pending_record` line and a `usb_repass_pending_device_*` line
+  per leftover record of 2026-11-08, if any) and changes nothing:
+  `sudo lxc config device show <vm>` and
+  `/var/lib/server-sentinel-usb-repass/state.json` are byte-identical before
+  and after (`sha256sum`), and `sudo lxc operation list` shows no new
+  operation;
+- [ ] each leftover record is handled as in "Leftover pending records"
+  (record which line each one printed); the old state directory is moved to
+  `/root/usb-repass-state-20261108` whole (with any `state.json.tmp`), not
+  deleted; afterwards `--check` prints no `usb_repass_pending_*` line;
+- [ ] `--check` exits 0 also when it prints `usb_repass_attention`, and 1
+  only on a fixed failure word (e.g. a temporary copy of the configuration
+  with mode 0666: `usb_repass_config_unsafe`);
+- [ ] with both cameras passed and streaming (the sources `online`), the
+  journal of a timer run shows `usb_repass_held` for each and the unit is
+  not in `systemctl --failed`; if it shows `usb_repass_looks_unpassed`
+  instead, this is the wrong judgement of Issue #405: record the
+  `usb_repass_qemu_usb_fds` counts, the `ls -l /proc/<qemu pid>/fd | grep
+  /dev/bus/usb` output (numbers in the private record only) and the guest's
+  `v4l2-ctl --list-devices` in Issue #405, and change nothing;
+- [ ] after a VM restart, no run within 300 s of the QEMU start judges
+  (`usb_repass_instance_starting`), and the first judging run reports
+  `usb_repass_held` for every camera;
+- [ ] when a camera is really lost by the guest after a host re-enumeration
+  (only when it happens by itself; not provoked on the production host): the
+  source is `offline`, the `camera_offline` notice arrives after
+  `after_seconds`, the next timer run shows `usb_repass_looks_unpassed` and
+  `usb_repass_attention` and the unit is in `systemctl --failed`; the
+  instance's devices are unchanged by the check (`lxc config device show`);
+  the manual re-pass is done as in "Manual re-pass" (all five verification
+  steps recorded; the Web `offline` of step 1.1 is the guard independent of
+  the check's signal; the host node matched by vendor, product and serial),
+  and the next run shows `usb_repass_held` and leaves
+  `systemctl --failed`;
+- [ ] if the manual `add` fails with `/dev/fdset`, the recovery of "Manual
+  re-pass" step 4 (stop, add, check, start) restores every camera, and the
+  checks of "After a host or VM reboot" pass;
+- [ ] a camera left unplugged stays `usb_repass_absent` and does not fail the
+  unit;
+- [ ] the journal lines carry only the fixed words, device labels and counts
+  (no serial, vendor/product id, bus or device number);
+- [ ] removal as documented leaves every camera device in the instance.
 
 ### Uninvited ordinary Tailnet member
 
