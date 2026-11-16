@@ -52,6 +52,19 @@ running, or the ledger could not be read (``expected`` is None), loss
 episodes are paused: the listener notice covers the first, and the next
 tick retries the second.
 
+Credential contention (Issue #407, Owner decision 2026-11-16): the
+registry marks a node ``contended`` once 3 of its sessions replaced a
+still-live session of it (``superseded``) within 10 min, and keeps it so until
+10 min after the latest such replacement (``node_health``). A contended node
+sends one critical ``capture_node_credential_contention`` per episode at the
+next tick, under the same per-node cap and hold rules (an owed one that
+ended first says ``already recovered``); the episode ends, without a
+recovery notice, once 10 min pass without a replacement that kept the count.
+It counts whatever the node's heartbeat state, since replacements are
+recorded as they happen. The notice says only that more than one connection
+presents the node's credential (for example two Agents from a cloned SD
+card or a restored backup), never which host or that either is malicious.
+
 The listener: configured (state ``starting`` or ``unavailable``: material
 unreadable, bind being retried) but not ``running`` for 5 min sends one
 ``capture_ingest_unavailable`` per episode. ``disabled`` (no deployment
@@ -87,8 +100,10 @@ NODE_NOTICE_KINDS = (
     NotificationKind.CAPTURE_NODE_STORAGE_FAILURE,
     NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED,
     NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED, NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST,
+    NotificationKind.CAPTURE_NODE_CREDENTIAL_CONTENTION,
 )
 _LOST = NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST
+_CONTENTION = NotificationKind.CAPTURE_NODE_CREDENTIAL_CONTENTION
 HOURLY_LIMIT = 4
 _HOUR = 3600.0
 _NAMESPACE = UUID("7b0c55a4-4f3e-5d4b-9c55-2f1a8e5d0c14")
@@ -112,6 +127,8 @@ class CaptureNodeView:
     node_id: UUID
     state: str
     reasons: tuple[str, ...]
+    # Issue #407: replaced repeatedly within the window (`node_health`).
+    contended: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,6 +153,8 @@ class CaptureHealthStatus:
     # includes the expected nodes that never connected. Without it the
     # daily summary shows the agent counts as unavailable, not as a guess.
     nodes_counted: bool = False
+    # Issue #407: known nodes whose sessions keep replacing each other.
+    contended_nodes: int = 0
 
 
 def notice_id(kind: NotificationKind, node: object, at: datetime) -> UUID:
@@ -237,6 +256,7 @@ class CaptureNodeHealthMonitor:
         expected = None if expected is None else frozenset(expected)
         self._observe_listener(state, at, monotonic)
         self._observe_nodes(nodes, expected, at, monotonic)
+        self._observe_contention(nodes, at, monotonic)
         self._observe_loss(nodes, expected, state == "running", at, monotonic)
         self._restored = [row for row in self._restored if monotonic - row[0] < _HOUR]
         held = 0
@@ -299,7 +319,8 @@ class CaptureNodeHealthMonitor:
                                                       and view.state == "offline"
                                                       for view in nodes)),
             loss_watch_unavailable=expected is None and state == "running",
-            nodes_counted=expected is not None)
+            nodes_counted=expected is not None,
+            contended_nodes=sum(node.contended for node in nodes))
 
     # -- observation ---------------------------------------------------------
 
@@ -356,6 +377,18 @@ class CaptureNodeHealthMonitor:
             for key in [key for key in table if key[1] is _LOST and key[0] not in expected]:
                 # Revoked or superseded: no longer expected.
                 del table[key]
+
+    def _observe_contention(self, nodes: tuple[CaptureNodeView, ...], at: datetime,
+                            now: float) -> None:
+        # Not paused while offline: the registry keeps the replacement times
+        # and ends the condition itself 10 min after the latest one.
+        # Forgotten nodes lose their episodes in `_observe_nodes`.
+        for node in nodes:
+            key = (node.node_id, _CONTENTION)
+            if node.contended:
+                self._begin(key, _CONTENTION, 0.0, at, now)
+            else:
+                self._recovered(key, now)
 
     def _observe_nodes(self, nodes: tuple[CaptureNodeView, ...], expected, at: datetime,
                        now: float) -> None:

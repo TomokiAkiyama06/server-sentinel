@@ -13,10 +13,20 @@ empty: a node is known again once it connects.
 
 ``snapshot`` is value-free: counts and fixed reason words, never a node UUID,
 address or byte count.
+
+Repeated replacement (Issue #407, Owner decision 2026-11-16): the listener
+reports every admitted session that replaced a still-live session of the same
+node (``superseded``). Once ``SUPERSEDE_NOTICE_COUNT`` (3) replacements fall
+within ``SUPERSEDE_WINDOW_SECONDS`` (10 min), the node is ``contended`` until
+10 min after the latest replacement that kept the count: more than one
+connection presents this node's credential (for example two Agents from a
+cloned SD card or a restored backup). It says nothing about which host is
+which. Only the latest three replacement times are kept per node.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 import math
 from threading import Lock
 import time
@@ -26,12 +36,20 @@ from uuid import UUID
 from .ingest_wire import NodeHeartbeat
 
 
+SUPERSEDE_NOTICE_COUNT = 3
+SUPERSEDE_WINDOW_SECONDS = 600.0
+
+
 @dataclass
 class _Node:
     generation: int
     connected: bool
     last_heartbeat: float | None = None
     heartbeat: NodeHeartbeat | None = None
+    # Issue #407: the latest replacement times (bounded), and the latest one
+    # that completed `SUPERSEDE_NOTICE_COUNT` within the window.
+    supersedes: deque = field(default_factory=lambda: deque(maxlen=SUPERSEDE_NOTICE_COUNT))
+    contended_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +116,30 @@ class CaptureNodeHealthRegistry:
             entry.heartbeat = heartbeat
             entry.last_heartbeat = self._monotonic()
             return True
+
+    def superseded(self, node_id: UUID, generation: int) -> None:
+        """Record that session ``generation`` replaced a still-live session of the node.
+
+        The listener calls it under its own lock, right after ``connected``
+        admitted that generation, only when an older session was live.
+        """
+        with self._lock:
+            entry = self._nodes.get(node_id)
+            if entry is None or entry.generation != generation:
+                return
+            now = self._monotonic()
+            entry.supersedes.append(now)
+            if (len(entry.supersedes) == SUPERSEDE_NOTICE_COUNT
+                    and 0 <= now - entry.supersedes[0] <= SUPERSEDE_WINDOW_SECONDS):
+                entry.contended_at = now
+
+    def contended(self) -> frozenset[UUID]:
+        """Known nodes replaced repeatedly within the last window (Issue #407)."""
+        with self._lock:
+            now = self._monotonic()
+            return frozenset(node for node, entry in self._nodes.items()
+                             if entry.contended_at is not None
+                             and 0 <= now - entry.contended_at < SUPERSEDE_WINDOW_SECONDS)
 
     def disconnected(self, node_id: UUID, generation: int) -> None:
         with self._lock:

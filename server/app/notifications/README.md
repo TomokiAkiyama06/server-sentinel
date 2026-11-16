@@ -40,7 +40,11 @@ and `capture_ingest_unavailable` as critical alerts,
 `capture_node_device_numbers_changed` and `capture_node_clock_degraded` as
 attention notices. `capture_node_heartbeat_lost` (Issue #397) is a critical
 alert: a node with an active pairing credential sent no heartbeat for 5 min.
-The four node kinds accept `recovered=True` for a notice
+`capture_node_credential_contention` (Issue #407) is a critical alert: sessions
+presenting one node's credential replaced each other 3 times within 10 min, so
+more than one connection uses it (for example a cloned SD card or a restored
+backup); it names no host and claims no intent.
+The five node kinds accept `recovered=True` for a notice
 the per-node hourly cap held past the episode's end. No node, address or
 reason is in the text.
 Such a local-only event returns `suppressed` when it was written or retained for
