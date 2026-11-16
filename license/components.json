@@ -19,7 +19,7 @@
     },
     {
       "path": "web/tests/browser.mjs",
-      "sha256": "sha256:0b827a9529d646f5b13f73619eb1d252bf3e5cebfb95a509945be53c270dd1d2"
+      "sha256": "sha256:e8c4233187e339dd4dcfbcc8decf97387d5fbbfb6d23bf0365685cf28f0d2810"
     },
     {
       "path": "web/tests/chrome.mjs",
@@ -40,6 +40,10 @@
     {
       "path": "web/tests/core.test.mjs",
       "sha256": "sha256:0381b8d4166c78876377bb8af0215bf40cff238cd26a7f4ec2dc6140b09b0a42"
+    },
+    {
+      "path": "web/tests/notification_notice.test.mjs",
+      "sha256": "sha256:6764e6629c78c8af410b54bd9730ab500328a54b9085d4a1b78d6893dbba8b02"
     },
     {
       "path": "web/tests/smoke.mjs",
@@ -75,7 +79,7 @@
     },
     {
       "path": "web/tests/access_browser.mjs",
-      "sha256": "sha256:76248a5e5009fb8a3fab135b4ee2cc28e7a877549cee3effb11c518a1f56fafc"
+      "sha256": "sha256:4eaf00c8b825d790f703cc5e23299fd505bc951f33a34f3553745b852e7213f9"
     },
     {
       "path": "web/tests/calibration.test.mjs",
@@ -83,7 +87,7 @@
     },
     {
       "path": "web/tests/calibration_browser.mjs",
-      "sha256": "sha256:40a723c4a073eab7c27357b10a839fe0b0e7be8b6a99597dc02cbc27ed65a342"
+      "sha256": "sha256:d815abc52d6a3da3aa4ec3c0e3cfb459e24c1c2f0c2610b8f900a4101b3e7629"
     },
     {
       "path": "web/tests/offline_notice.test.mjs",
