@@ -130,7 +130,10 @@ test('every notice text exists in both locales, states facts only and carries no
   // Configured but failing: since this start, until a restart.
   assert.match(messages.ja.notificationsDeliveryFailed, /設定されていますが、Main Server の今回の起動以降に、Slack に届かなかった通知があります/);
   assert.match(messages.en.notificationsDeliveryFailed, /is configured, but since this Main Server start some notifications did not reach Slack/);
-  assert.match(messages.ja.notificationsDeliveryFailedHint, /再起動するまで残ります/);
+  // Claude review, PR #424: it stays until the next restart, and it never
+  // asks the Owner to restart production just to clear it.
+  assert.match(messages.ja.notificationsDeliveryFailedHint, /次の再起動まで残ります。表示を消すためだけに再起動する必要はありません/);
+  assert.match(messages.en.notificationsDeliveryFailedHint, /there is no need to restart only to clear it/);
 });
 
 test('the shared sampling carries the notification cause', async () => {

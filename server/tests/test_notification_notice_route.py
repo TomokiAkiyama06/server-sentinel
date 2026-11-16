@@ -144,15 +144,26 @@ class NotificationCauseTests(TestCase):
             for failed in (False, True):
                 # Not configured is a configuration fact, whatever the state.
                 cases[(state, False, failed)] = "not_configured"
+                # A known delivery failure is a fact in every state (a failed
+                # runtime still sends and polls); "no failure" only while running.
                 cases[(state, True, failed)] = (
-                    ("delivery_failed" if failed else "delivered")
-                    if state == RuntimeState.RUNNING else "unverified")
+                    "delivery_failed" if failed
+                    else "delivered" if state == RuntimeState.RUNNING else "unverified")
         for (state, configured, failed), expected in cases.items():
             with self.subTest(state=state, configured=configured, failed=failed):
                 status_ = MonitoringStatus(state, notifications_configured=configured,
                                            notification_delivery_failed=failed)
                 self.assertEqual(expected, status_.notification_cause)
                 self.assertIn(status_.notification_cause, NOTIFICATION_CAUSES)
+
+    def test_a_failed_runtime_reports_a_delivery_failure(self):
+        # Claude review, PR #424: the recording filesystem is missing (the
+        # runtime is `failed`) and the startup alert itself did not reach Slack.
+        status_ = MonitoringStatus(RuntimeState.FAILED, notifications_configured=True,
+                                   notification_delivery_failed=True)
+        self.assertEqual("delivery_failed", status_.notification_cause)
+        self.assertEqual("unverified", MonitoringStatus(
+            RuntimeState.FAILED, notifications_configured=True).notification_cause)
 
     def test_the_default_status_is_not_configured(self):
         self.assertEqual("not_configured", MonitoringStatus(RuntimeState.STARTING).notification_cause)

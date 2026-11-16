@@ -2067,12 +2067,13 @@ GET /api/monitoring/notifications -> OWNER_READ:
 Slack endpoint is configured (`notifications_configured`, from the
 configuration, whatever the runtime state: then no Owner notification,
 camera offline, capture node, hardware integrity, recording health, human
-access or scene, leaves the Main Server); otherwise `unverified` while the
-monitoring runtime is not `running` (served as the generic denial, "could not
-be checked"), `delivery_failed` once a delivery of this process did not reach
-Slack (`notification_delivery_failed`: a failed or refused delivery, kept
-until the process restarts, no automatic clear) and `delivered` (`null`)
-otherwise. Mounted with every monitoring runtime (without one, the generic
+access or scene, leaves the Main Server); otherwise `delivery_failed` once a
+delivery of this process did not reach Slack (`notification_delivery_failed`:
+a failed or refused delivery, kept until the process restarts, no automatic
+clear; also while the runtime is `failed`, which still sends and polls its
+immediate alerts), `unverified` while no failure is known and the monitoring
+runtime is not `running` (served as the generic denial, "could not be
+checked") and `delivered` (`null`) otherwise. Mounted with every monitoring runtime (without one, the generic
 denial); authorized, read and refused like the camera offline notice above
 (`touch=False`, inside `admit`, non-Owner sessions get the generic denial
 before the reader runs; one fixed word, never the webhook URL, an error, a

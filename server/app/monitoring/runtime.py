@@ -264,17 +264,20 @@ class MonitoringStatus:
         notification leaves the Main Server (a configuration fact, whatever
         the runtime state). ``delivery_failed``: Slack is configured and at
         least one delivery of this process did not reach it
-        (``notification_delivery_failed``, kept until the process restarts).
-        ``unverified``: Slack is configured but the runtime is not running,
-        so its delivery flag says nothing yet (served as the generic denial,
-        "could not be checked"). ``delivered`` otherwise.
+        (``notification_delivery_failed``, kept until the process restarts),
+        whatever the runtime state: a ``failed`` runtime still sends and
+        polls its immediate alerts, so a failure it saw is a fact (Claude
+        review, PR #424). ``unverified``: Slack is configured, no failure is
+        known and the runtime is not running, so "no failure" says nothing
+        yet (served as the generic denial, "could not be checked").
+        ``delivered`` otherwise.
         """
         if not self.notifications_configured:
             return NOTIFICATIONS_NOT_CONFIGURED
-        if self.state != RuntimeState.RUNNING:
-            return NOTIFICATIONS_UNVERIFIED
         if self.notification_delivery_failed:
             return NOTIFICATIONS_DELIVERY_FAILED
+        if self.state != RuntimeState.RUNNING:
+            return NOTIFICATIONS_UNVERIFIED
         return NOTIFICATIONS_DELIVERED
 
     @property

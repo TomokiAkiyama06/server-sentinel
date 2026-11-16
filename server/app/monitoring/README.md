@@ -315,9 +315,10 @@ Whether any Owner notification leaves the Main Server at all (Issue #301
 follow-up) is `MonitoringStatus.notification_cause` (the words in
 `app.notifications.service`): `not_configured` while no Slack endpoint is
 configured (`notifications_configured`, set once from the configuration,
-whatever the runtime state), otherwise `unverified` while the runtime is not
-`running`, `delivery_failed` once a delivery of this process failed
-(`notification_delivery_failed`, kept until the restart) and `delivered`
+whatever the runtime state), otherwise `delivery_failed` once a delivery of
+this process failed (`notification_delivery_failed`, kept until the restart,
+also while the runtime is `failed`, which still sends and polls), `unverified`
+while no failure is known and the runtime is not `running`, and `delivered`
 otherwise. The Owner's dashboard reads it through
 `GET /api/monitoring/notifications` (`OWNER_READ`, one fixed word or `null`;
 `unverified` is the generic denial), mounted with every monitoring runtime.

@@ -484,7 +484,10 @@ class CompositionTests(MonitoredAccessFixture):
         self.assertEqual("delivered", read())
         runtime._set(notification_delivery_failed=True)
         self.assertEqual("delivery_failed", read())
+        # A failed runtime still sends and polls: a known failure stays shown.
         runtime._set(state=RuntimeState.FAILED)
+        self.assertEqual("delivery_failed", read())
+        runtime._set(notification_delivery_failed=False)
         self.assertEqual("unverified", read())
         # No monitoring runtime: no reader, so the route is the generic denial.
         other_check, _, _, _ = checker(clock=self.clock, session_revoker=self.revoker)
