@@ -642,8 +642,10 @@ unchanged.
   application ledger. From the chain and the issuance log it requires a
   currently valid, logged node leaf of this CA for that node, within 31 days
   of expiry (the Agent's 30-day window plus one day of skew), not superseded
-  in the log (every later record of the node renews exactly it), a node not
-  revoked in the log, and a fresh key not bound elsewhere in the log. Rate
+  in the log (every later record of the node renews exactly it, or is a
+  sibling renewal of the same parent: two requests signed before either was
+  staged, of which the ledger keeps one; a re-enrollment or a renewal of a
+  sibling supersedes it), a node not revoked in the log, and a fresh key not bound elsewhere in the log. Rate
   limits use the Owner defaults: per node one signature per 50 minutes and 48
   per 30 days; deployment-wide 24 per day and 192 per 30 days (4 nodes x 48).
   Every signature is logged (fsync) with `renewal_of` before the answer.

@@ -250,6 +250,51 @@ class SignerDecisionTests(SignerHarness):
         reply, _ = self.renew(node, old)
         self.refused(reply)
 
+    def test_sibling_renewals_of_one_parent_each_stay_renewable(self):
+        # Two same-key requests signed B1 and B2 (both renewing A) before
+        # either was staged; the ledger keeps one of them (Codex P2, PR #420).
+        node, parent, _ = self.enroll()
+        first, key = self.renew(node, parent)
+        second, _ = self.renew(node, parent, key)
+        self.assertEqual(("ok", "ok"), (first["status"], second["status"]))
+        b1, b2 = first["certificate"], second["certificate"]
+        path = self.authority_dir / ISSUANCE_LOG
+        siblings = path.read_bytes()
+        self.clock.value = self.now + 370 * DAY  # B1 and B2 are now due.
+        for kept in (b1, b2):
+            with self.subTest(kept=kept == b1):
+                path.write_bytes(siblings)
+                reply, _ = self.renew(node, kept)
+                self.assertEqual("ok", reply["status"], reply)
+        # Once B2 is renewed to C, B1 (a renewal of A, not of B2) is superseded.
+        path.write_bytes(siblings)
+        reply, _ = self.renew(node, b2)
+        self.assertEqual("ok", reply["status"])
+        self.clock.value += MIN_NODE_RENEWAL_INTERVAL
+        reply, _ = self.renew(node, b1)
+        self.refused(reply)
+        # A re-enrollment of the node supersedes every sibling.
+        path.write_bytes(siblings)
+        self.enroll(node, days_ago=-1)
+        for kept in (b1, b2):
+            with self.subTest(repaired=kept == b1):
+                reply, _ = self.renew(node, kept)
+                self.refused(reply)
+
+    def test_a_sibling_key_is_not_fresh_for_the_other_sibling(self):
+        # B1 and B2 renew A with different keys (an answer lost, then a new
+        # key): B1 cannot renew to B2's key, a key the log gave a sibling.
+        node, parent, _ = self.enroll()
+        first, _ = self.renew(node, parent)
+        self.clock.value += MIN_NODE_RENEWAL_INTERVAL
+        second, second_key = self.renew(node, parent)
+        self.assertEqual(("ok", "ok"), (first["status"], second["status"]))
+        self.clock.value = self.now + 370 * DAY
+        reply, _ = self.renew(node, first["certificate"], second_key)
+        self.refused(reply)
+        reply, _ = self.renew(node, first["certificate"])
+        self.assertEqual("ok", reply["status"])
+
     def test_a_lost_answer_may_be_asked_again_with_the_same_certificate(self):
         node, certificate, _ = self.enroll()
         first, key = self.renew(node, certificate)

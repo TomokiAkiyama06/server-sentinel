@@ -19,7 +19,10 @@ the CA-only issuance log (``issuer_process.IssuanceLog``) alone:
   ``RENEWAL_SIGNING_WINDOW`` of its expiry;
 * it must not be superseded in the log: every later record of that node
   must be a renewal of exactly this certificate (an Agent that lost a
-  renewal answer may ask again with the same certificate);
+  renewal answer may ask again with the same certificate) or a sibling
+  renewal of the same parent (two requests signed before either was staged;
+  the ledger keeps one, which must stay renewable). A re-enrollment or a
+  renewal of a sibling supersedes it;
 * the node must not be revoked in the log, and the new key must be fresh:
   not the presented key, not recorded for another or a revoked node, and
   recorded for this node only as an earlier renewal of the same
@@ -266,9 +269,19 @@ class RenewalSigner:
         if position is None:
             # Not issued under the issuance log (for example before Issue #109).
             raise IssuerRefusedRequest("presented certificate is not in the issuance log")
+        # Later records of this node that do not supersede it: renewals of
+        # this certificate (a lost answer asked again) and sibling renewals of
+        # the same parent (two requests signed before either was staged; the
+        # ledger keeps one of them, so each must stay renewable). Anything
+        # else -- a re-enrollment (no ``renewal_of``) or a renewal of a
+        # sibling -- supersedes it.
+        allowed = {current.credential_digest}
+        parent = records[position].get("renewal_of")
+        if parent is not None:
+            allowed.add(parent)
         for record in records[position + 1:]:
             if (record["type"] == "node" and record["node_id"] == name
-                    and record.get("renewal_of") != current.credential_digest):
+                    and record.get("renewal_of") not in allowed):
                 raise IssuerRefusedRequest("presented certificate is superseded")
         if hmac.compare_digest(new_key, current.public_key_digest):
             raise IssuerRefusedRequest("renewal requires a fresh key")
