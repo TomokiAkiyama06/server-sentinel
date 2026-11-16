@@ -647,6 +647,11 @@ unchanged.
   limits use the Owner defaults: per node one signature per 50 minutes and 48
   per 30 days; deployment-wide 24 per day and 192 per 30 days (4 nodes x 48).
   Every signature is logged (fsync) with `renewal_of` before the answer.
+  A same-key retry (an answer lost after signing) is exempt from the
+  50-minute interval only and still counts toward, and is refused at, every
+  cap (Owner decision 2026-11-16). The Owner accepted the other defaults of
+  this PR on 2026-11-16: the socket path and permissions, Owner-installed
+  units, the 31-day window, 24/day and 192/30 days, and the 5-second lock wait.
   The ledger rules (admitted, current, unexpired, staging, same-key retry
   from the staged row, key bindings) stay in `renew_node_credential` in the
   service, which now holds only `DeploymentTrust` and verifies the answer.
@@ -656,6 +661,10 @@ unchanged.
   certificates for existing, unrevoked nodes near expiry, for keys it
   chooses, within the rate limits and recorded in the CA log, because the
   Agent's proof with its old key is deferred (Owner decision 2026-10-07).
+  Renewals from the same presented certificate do not supersede each other
+  at the signer, which cannot know which one the ledger staged, so up to 48
+  valid node certificates per node per 30 days can exist; revoking the node
+  stops all of them.
   After such a compromise the Owner revokes the affected nodes; the CA log
   lists what was signed.
 - **Compatibility.** A node whose current certificate predates the issuance

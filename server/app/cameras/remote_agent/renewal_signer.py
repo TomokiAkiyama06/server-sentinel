@@ -25,7 +25,9 @@ the CA-only issuance log (``issuer_process.IssuanceLog``) alone:
   recorded for this node only as an earlier renewal of the same
   certificate (a retry);
 * rate limits from the log (Owner default 2026-10-07): per node at most one
-  renewal signature per ``MIN_NODE_RENEWAL_INTERVAL`` (50 minutes) and
+  renewal signature per ``MIN_NODE_RENEWAL_INTERVAL`` (50 minutes; a
+  same-key retry of a renewal of the same certificate is exempt from this
+  interval only, Owner decision 2026-11-16) and
   ``MAX_NODE_RENEWALS`` (48) per ``RATE_PERIOD`` (30 days); deployment-wide
   ``MAX_DEPLOYMENT_RENEWALS_PER_DAY`` and ``MAX_DEPLOYMENT_RENEWALS``.
 
@@ -237,8 +239,8 @@ class RenewalSigner:
         except CaptureAuthorityError:
             raise IssuerRefusedRequest("renewal request is invalid") from None
         records = self._log.records()
-        self._require_current(records, node, current, new_key)
-        self._require_rate(records, node, now)
+        retry = self._require_current(records, node, current, new_key)
+        self._require_rate(records, node, now, retry=retry)
         issued = authority.issue_renewal_certificate(node, csr, validity=DEFAULT_NODE_VALIDITY)
         self._log.append({"type": "node", "node_id": str(node),
                           "public_key_digest": issued.public_key_digest,
@@ -249,7 +251,8 @@ class RenewalSigner:
 
     @staticmethod
     def _require_current(records: list[dict], node: UUID, current: IssuedNodeCredential,
-                         new_key: str) -> None:
+                         new_key: str) -> bool:
+        """Refuse unless ``current`` may renew to ``new_key``; True for a same-key retry."""
         name = str(node)
         if any(record["type"] == "node_revocation" and record["node_id"] == name
                for record in records):
@@ -269,6 +272,7 @@ class RenewalSigner:
                 raise IssuerRefusedRequest("presented certificate is superseded")
         if hmac.compare_digest(new_key, current.public_key_digest):
             raise IssuerRefusedRequest("renewal requires a fresh key")
+        retry = False
         for record in records:
             if record["type"] != "node" or not hmac.compare_digest(record["public_key_digest"],
                                                                    new_key):
@@ -277,15 +281,21 @@ class RenewalSigner:
             # (a retry whose staging failed); any other binding refuses.
             if record["node_id"] != name or record.get("renewal_of") != current.credential_digest:
                 raise IssuerRefusedRequest("key is bound at the issuer")
+            retry = True
+        return retry
 
     @staticmethod
-    def _require_rate(records: list[dict], node: UUID, now: datetime.datetime) -> None:
+    def _require_rate(records: list[dict], node: UUID, now: datetime.datetime, *,
+                      retry: bool) -> None:
         name = str(node)
         renewals = [(record["node_id"], _record_time(record)) for record in records
                     if record["type"] == "node" and "renewal_of" in record]
         # A record time after ``now`` (the clock moved back) counts as recent.
         mine = [moment for owner, moment in renewals if owner == name]
-        if any(now - moment < MIN_NODE_RENEWAL_INTERVAL for moment in mine):
+        # A same-key retry (Owner decision 2026-11-16) only re-signs a key the
+        # log already gave this node for this certificate, so it skips the
+        # interval; it still counts toward, and is refused at, every cap.
+        if not retry and any(now - moment < MIN_NODE_RENEWAL_INTERVAL for moment in mine):
             raise RenewalRateLimited("node renewed too recently")
         if sum(now - moment < RATE_PERIOD for moment in mine) >= MAX_NODE_RENEWALS:
             raise RenewalRateLimited("node renewal limit reached")

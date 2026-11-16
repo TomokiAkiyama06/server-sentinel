@@ -212,7 +212,7 @@ class SignerDecisionTests(SignerHarness):
         before = self.records()
         for presented, claimed in ((silent, node), (alien, node), (listener, node), (ca, node),
                                    (other_certificate, node), (certificate, other),
-                                   ("-----BEGIN CERTIFICATE-----\n", node)):
+                                   ("-" * 5 + "BEGIN CERTIFICATE" + "-" * 5 + "\n", node)):
             with self.subTest(claimed=claimed == node):
                 reply, _ = self.renew(claimed, presented)
                 self.refused(reply)
@@ -254,16 +254,46 @@ class SignerDecisionTests(SignerHarness):
         node, certificate, _ = self.enroll()
         first, key = self.renew(node, certificate)
         self.assertEqual("ok", first["status"])
-        # Same key (staging failed after signing) and a fresh key both renew
-        # again, once the per-node interval has passed.
+        # Owner decision 2026-11-16: the same key (an answer lost after
+        # signing) is re-signed at once, without the 50-minute interval ...
         reply, _ = self.renew(node, certificate, key)
+        self.assertEqual("ok", reply["status"], reply)
+        # ... and is counted: the log now holds two renewals.
+        self.assertEqual(2, sum("renewal_of" in record for record in self.records()))
+        # A different key inside the interval is still rate-limited.
+        reply, _ = self.renew(node, certificate)
         self.refused(reply, "renewal_rate_limited")
-        self.clock.value += MIN_NODE_RENEWAL_INTERVAL
-        reply, _ = self.renew(node, certificate, key)
-        self.assertEqual("ok", reply["status"])
         self.clock.value += MIN_NODE_RENEWAL_INTERVAL
         reply, _ = self.renew(node, certificate)
         self.assertEqual("ok", reply["status"])
+
+    def test_a_same_key_retry_still_counts_and_is_refused_at_the_caps(self):
+        node, certificate, _ = self.enroll()
+        first, key = self.renew(node, certificate)
+        self.assertEqual("ok", first["status"])
+        renewed = certificate_digest(x509.load_pem_x509_certificate(certificate.encode()))
+        log = IssuanceLog(PrivateDirectory(self.authority_dir), clock=self.clock)
+
+        def synthetic(owner, at):
+            log._clock = Clock(at)
+            log.append({"type": "node", "node_id": str(owner),
+                        "public_key_digest": os.urandom(32).hex(),
+                        "credential_digest": os.urandom(32).hex(),
+                        "not_after": self.now.isoformat(), "renewal_of": renewed})
+
+        # The per-node 30-day cap (one real renewal plus 47 synthetic ones).
+        for index in range(MAX_NODE_RENEWALS - 1):
+            synthetic(node, self.now - 29 * DAY + index * datetime.timedelta(hours=1))
+        reply, _ = self.renew(node, certificate, key)
+        self.refused(reply, "renewal_rate_limited")
+        # The deployment-wide daily cap refuses a retry of another node too.
+        second, second_certificate, _ = self.enroll()
+        reply, second_key = self.renew(second, second_certificate)
+        self.assertEqual("ok", reply["status"])
+        for _ in range(MAX_DEPLOYMENT_RENEWALS_PER_DAY - 1):
+            synthetic(uuid4(), self.now - datetime.timedelta(hours=2))
+        reply, _ = self.renew(second, second_certificate, second_key)
+        self.refused(reply, "renewal_rate_limited")
 
     def test_new_key_must_be_fresh_at_the_issuer(self):
         node, certificate, key = self.enroll()

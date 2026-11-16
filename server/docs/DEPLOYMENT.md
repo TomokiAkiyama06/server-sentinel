@@ -1563,13 +1563,23 @@ exits; the journal shows only `renewal-signer: signed` or the fixed refusal
 word. It decides from the certificate chain and the issuance log only: a
 logged, current, unsuperseded and unrevoked node leaf within 31 days of
 expiry, a fresh key, and the rate limits (per node one per 50 minutes and 48
-per 30 days; deployment-wide 24 per day and 192 per 30 days). Each renewal
+per 30 days; deployment-wide 24 per day and 192 per 30 days; a same-key
+retry after a lost answer skips only the 50-minute interval and still counts
+toward every cap). Each renewal
 is appended to `issuance-log.jsonl` with `renewal_of`, so back the CA
 directory up after renewals too. While a pairing command holds the CA
 directory (for example `approve` waiting at its prompt) a renewal waits 5
 seconds and is then refused `issuer_material_busy`; the Agent simply retries
 later. A node whose current certificate was issued before the issuance log
 existed (before Issue #109) cannot renew and must re-pair before it expires.
+For every paired node whose pairing date is unknown or before 2026-10-07,
+check before its certificate expires: as root,
+`grep -c '"credential_digest":"<digest>"' <ca_dir>/issuance-log.jsonl`, where
+`<digest>` is the SHA-256 of the node's current certificate in DER form
+(`openssl x509 -in <cert.pem> -outform DER | sha256sum` on the capture host
+for its installed certificate), and confirm the matching line is a
+`"type":"node"` record for that `node_id`. Without one, re-pair the node (MANUAL_TEST §B 15)
+before it expires.
 The ingest session does not carry renewal requests yet, so the socket is idle
 until that wiring ships; installing it early is harmless.
 
