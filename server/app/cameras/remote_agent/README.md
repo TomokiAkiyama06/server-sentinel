@@ -100,10 +100,16 @@ listener certificate. The renewal exchange and the monitor are not yet run by
 any listener or scheduler (#14/#15); meanwhile `pairing_cli` `init`,
 `rotate-listener`, `export-bundle` and `approve` print the CA expiry and the
 same warning words on stderr (`ca_expiry_reason` / `listener_expiry_reason`).
-Interim (Issue #109): renewal signs through `renewal.RenewalIssuer`, which
-today only an in-process `DeploymentAuthority` implements (tests); nothing in
-the application calls it, and wiring it into a listener waits for the
-renewal-only signer of Issue #109 PR2.
+Renewal signer (Issue #109 PR2): in a deployment `renewal.RenewalIssuer` is
+`renewal_signer.SignerRenewalIssuer`, which holds only the public CA
+certificate and asks the socket-activated, renewal-only signer
+(`serversentinel-pairing renewal-signer`, CA account, one request per
+instance) over `/run/serversentinel-renewal-signer.sock`. The signer decides
+from the certificate chain and the CA issuance log alone (logged, current,
+unsuperseded, unrevoked leaf within 31 days of expiry; fresh key; rate
+limits) and logs every renewal with `renewal_of`. An in-process
+`DeploymentAuthority` still satisfies the protocol for ledger-rule tests only.
+The ingest session does not carry renewal yet.
 
 Listener credential lifecycle (#124/#125). `PrivateDirectory(owner_uid=...)`
 may name another account than the process: new entries get their final 0600
@@ -229,7 +235,7 @@ this protocol.
 Not yet (follow-ups of #14): media frames and their continuity/ingest path
 with the durable consumer; an Owner status page for node health and the
 listener (the notices are `app/monitoring/capture_nodes.py`, Issue #14);
-renewal over the session (#109 PR2); heartbeat loss as an Owner notice (#397).
+renewal over the session (the renewal-only signer of #109 PR2 exists; the wire message does not); heartbeat loss as an Owner notice (#397).
 
 ## Bootstrap enrollment listener and local approval CLI (Issue #13)
 

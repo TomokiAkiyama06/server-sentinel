@@ -1538,6 +1538,41 @@ from then on. If the CA record cannot be written, the ledger revocation still
 stands, the command prints `ca_revocation_unrecorded` and exits 1; rerun the
 same `revoke` (it skips the already revoked ledger entry and records it).
 
+**Renewal-only signer (Issue #109 PR2).** Automatic node renewal is signed
+by a separate, socket-activated signer that runs as `serversentinel-ca`; the
+service only connects to its socket and never loads the CA key. Install the
+two Owner-managed units from `infra/systemd/` (root-owned, `0644`), adjusting
+`SocketGroup=` (the service account's primary group), `--authority-dir`,
+`ReadWritePaths=` and `--service-user` when the deployment uses other names:
+
+```sh
+sudo install -o root -g root -m 0644 infra/systemd/serversentinel-renewal-signer.socket \
+  infra/systemd/serversentinel-renewal-signer@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now serversentinel-renewal-signer.socket
+```
+
+systemd owns `/run/serversentinel-renewal-signer.sock` (root:service group
+`0660`) and starts one instance per connection (`Accept=yes`, at most 4 at
+once) with the connection on stdin/stdout. The instance runs
+`serversentinel-pairing renewal-signer` (the wrapper above, so it follows the
+installed release) without network access, capabilities or core dumps, with
+only the CA directory writable, refuses any peer other than the service
+account (`renewal_signer_peer_refused`), answers one `renew` request and
+exits; the journal shows only `renewal-signer: signed` or the fixed refusal
+word. It decides from the certificate chain and the issuance log only: a
+logged, current, unsuperseded and unrevoked node leaf within 31 days of
+expiry, a fresh key, and the rate limits (per node one per 50 minutes and 48
+per 30 days; deployment-wide 24 per day and 192 per 30 days). Each renewal
+is appended to `issuance-log.jsonl` with `renewal_of`, so back the CA
+directory up after renewals too. While a pairing command holds the CA
+directory (for example `approve` waiting at its prompt) a renewal waits 5
+seconds and is then refused `issuer_material_busy`; the Agent simply retries
+later. A node whose current certificate was issued before the issuance log
+existed (before Issue #109) cannot renew and must re-pair before it expires.
+The ingest session does not carry renewal requests yet, so the socket is idle
+until that wiring ships; installing it early is harmless.
+
 **Back up the CA directory.** Losing `ca-key.pem` means a new `init` and
 re-pairing every Agent; losing `issuance-log.jsonl` loses the CA-side record
 of issued keys and revocations. Back up the whole CA directory, as root,

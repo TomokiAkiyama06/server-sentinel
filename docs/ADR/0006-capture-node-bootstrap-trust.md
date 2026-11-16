@@ -612,11 +612,7 @@ unchanged.
   against the release it switches to (required for those, refused for
   earlier ones) before any change, so update and rollback across the
   boundary print the Owner steps instead of failing.
-- **Still open (PR2).** Automatic renewal still has only an in-process
-  signing primitive, used by tests and called by nothing in the application;
-  wiring renewal into the ingest listener waits for the socket-activated,
-  renewal-only signer of Issue #109 PR2 (rate limits and log checks as decided
-  on 2026-10-07).
+- **Still open (PR2).** Done; see the 2026-11-16 notes below.
 - **Evidence.** Unprivileged unit and loopback tests with seams for the root
   start, the drops and the fork (`server/tests/test_issuer_process.py`,
   `server/tests/issuer_fakes.py`), the real forked child as one account in the
@@ -626,3 +622,54 @@ unchanged.
   `EACCES` on the CA key for the service account, the serving process's
   credentials and the absence of CA key bytes in its memory. Real-host
   verification is in `MANUAL_TEST.md` §B and unverified.
+
+## Follow-up notes (2026-11-16, Issue #109 PR2: renewal-only signer)
+
+These notes record the second implementation step of the Owner decision of
+2026-10-07 ("Plan B"). The bootstrap trust decision and the ADR status are
+unchanged.
+
+- **Socket-activated, synchronous, renewal only.** systemd owns a local Unix
+  socket (`serversentinel-renewal-signer.socket`, root:service group 0660,
+  `Accept=yes`) and starts one `serversentinel-renewal-signer@.service`
+  instance per connection as `serversentinel-ca`, with no network, no
+  capability, no core dump and only the CA directory writable. The instance
+  checks the peer's `SO_PEERCRED` uid against the service account, answers
+  one request and exits, so no CA-key process stays alive between renewals.
+  The only request type is `renew`; there is no enrollment, listener, CA or
+  revocation request and no caller-chosen validity or profile.
+- **Decided from the CA side only.** As decided, the signer does not read the
+  application ledger. From the chain and the issuance log it requires a
+  currently valid, logged node leaf of this CA for that node, within 31 days
+  of expiry (the Agent's 30-day window plus one day of skew), not superseded
+  in the log (every later record of the node renews exactly it), a node not
+  revoked in the log, and a fresh key not bound elsewhere in the log. Rate
+  limits use the Owner defaults: per node one signature per 50 minutes and 48
+  per 30 days; deployment-wide 24 per day and 192 per 30 days (4 nodes x 48).
+  Every signature is logged (fsync) with `renewal_of` before the answer.
+  The ledger rules (admitted, current, unexpired, staging, same-key retry
+  from the staged row, key bindings) stay in `renew_node_credential` in the
+  service, which now holds only `DeploymentTrust` and verifies the answer.
+- **Effect and residual risk.** A compromised service, listener or ingest
+  process cannot read the CA key, obtain a serverAuth or CA certificate, or
+  a certificate for a node the CA never enrolled. It can still obtain renewal
+  certificates for existing, unrevoked nodes near expiry, for keys it
+  chooses, within the rate limits and recorded in the CA log, because the
+  Agent's proof with its old key is deferred (Owner decision 2026-10-07).
+  After such a compromise the Owner revokes the affected nodes; the CA log
+  lists what was signed.
+- **Compatibility.** A node whose current certificate predates the issuance
+  log (pre-#109) cannot renew and re-pairs. Earlier releases read
+  `renewal_of` records as plain node records, so key bindings survive a
+  rollback. The units are Owner-installed templates in `infra/systemd/`
+  (like the upstream socket); the installer does not place them yet.
+- **Not yet.** The ingest session does not carry the renewal request; that
+  wire message (ADR-0007) constructs only `SignerRenewalIssuer`.
+- **Evidence.** `server/tests/test_renewal_signer.py` (decision rules, rate
+  limits, fail-closed log and lock, peer check over a real Unix socket,
+  `renew_node_credential` end to end with the ledger, a memory scan with a
+  positive control showing the CA key never enters the requesting process,
+  the CLI entry and the unit files) and a two-account root test in
+  `server/tests/test_ca_privilege_separation_root.py` (signer as the CA
+  account, requester as the service account, memory scan, foreign peer
+  refused). Real-host operation is in `MANUAL_TEST.md` §B and unverified.

@@ -16,7 +16,11 @@ post-drop verification). It checks, with real processes:
   process's whole memory (``/proc/<pid>/mem``) finds no CA private key bytes;
   the enrollment then completes with the pre-signed certificate;
 * ``revoke`` records the revocation in the CA issuance log;
-* a CA directory owned by the wrong account is refused before the prompt.
+* a CA directory owned by the wrong account is refused before the prompt;
+* the renewal-only signer (Issue #109 PR2) runs as the CA account on an
+  accepted Unix-socket connection, as systemd's ``Accept=yes`` instance
+  would: it renews for a service-account peer, whose whole memory then holds
+  no CA key bytes, logs ``renewal_of`` and refuses any other peer uid.
 """
 from __future__ import annotations
 
@@ -54,6 +58,58 @@ SERVER_NAME = "capture-main.serversentinel.test"
 CA_ID = 61001
 SERVICE_ID = 61002
 ALPN = "serversentinel-capture-enroll/1"
+# The requesting (service-account) side of a renewal: public material only.
+RENEWAL_CLIENT = f"""
+import sys
+sys.path.insert(0, {str(SERVER_ROOT)!r})
+from pathlib import Path
+from uuid import UUID
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from app.cameras.remote_agent.ingest_tls import CaptureNodeIdentity
+from app.cameras.remote_agent.node_ca import DeploymentTrust, certificate_digest, public_key_digest
+from app.cameras.remote_agent.renewal_signer import SignerRenewalIssuer
+
+socket_path, ca_path, presented_path, csr_path, node = sys.argv[1:6]
+trust = DeploymentTrust.from_certificate_pem(Path(ca_path).read_bytes())
+leaf = x509.load_pem_x509_certificate(Path(presented_path).read_bytes())
+identity = CaptureNodeIdentity(node_id=UUID(node), public_key_digest=public_key_digest(
+    leaf.public_key()), credential_digest=certificate_digest(leaf),
+    not_valid_after=leaf.not_valid_after_utc)
+issued = SignerRenewalIssuer(trust, identity, leaf.public_bytes(serialization.Encoding.DER),
+                             socket_path=Path(socket_path)).issue_renewal_certificate(
+    UUID(node), Path(csr_path).read_bytes())
+print("renewed", issued.credential_digest, flush=True)
+sys.stdin.read()
+"""
+# Run as the CA account: a node leaf due for renewal (20 days), logged.
+ENROLL_DUE_NODE = f"""
+import datetime, sys
+sys.path.insert(0, {str(SERVER_ROOT)!r})
+from pathlib import Path
+from uuid import uuid4
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from app.cameras.remote_agent.issuer_process import IssuanceLog
+from app.cameras.remote_agent.node_ca import (
+    DeploymentAuthority, PrivateDirectory, deployment_id_of, public_key_digest)
+
+directory = PrivateDirectory(Path(sys.argv[1]))
+authority = DeploymentAuthority.load(directory, deployment_id_of(directory))
+key = ec.generate_private_key(ec.SECP256R1())
+csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([])).sign(
+    key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
+node = uuid4()
+issued = authority.issue_approved_node_certificate(
+    node, csr, public_key_digest(key.public_key()), validity=datetime.timedelta(days=20))
+IssuanceLog(directory, clock=lambda: datetime.datetime.now(datetime.timezone.utc)).append(
+    {{"type": "node", "node_id": str(node), "public_key_digest": issued.public_key_digest,
+      "credential_digest": issued.credential_digest,
+      "not_after": issued.not_after.isoformat(timespec="seconds")}})
+print(node)
+sys.stdout.write(issued.certificate_pem.decode())
+"""
 # Set by the CI root step: a skip (not root, or no memory access) is a failure.
 REQUIRE_ROOT = "CA_SEPARATION_REQUIRE_ROOT"
 REQUIRED = os.environ.get(REQUIRE_ROOT) == "1"
@@ -447,6 +503,87 @@ class TwoAccountSeparationTests(unittest.TestCase):
         os.removexattr(parent, "system.posix_acl_access")
         os.chmod(parent, 0o755)
         self.assertFalse(self.exposed_as_service(moved))
+
+    def signer_once(self, listener):
+        """Accept one connection and run one renewal-signer instance on it as the CA account."""
+        connection, _ = listener.accept()
+        with connection:
+            return subprocess.run(
+                self.cli("renewal-signer", "--authority-dir", self.authority,
+                         "--service-user", "svc"),
+                env=self.environment, cwd=SERVER_ROOT, stdin=connection, stdout=connection,
+                stderr=subprocess.PIPE, timeout=60, check=False, user=CA_ID, group=CA_ID,
+                extra_groups=[])
+
+    def test_renewal_signer_serves_the_service_account_without_the_key_reaching_it(self):
+        self.init()
+        enrolled = subprocess.run([sys.executable, "-c", ENROLL_DUE_NODE, str(self.authority)],
+                                  env=self.environment, cwd=SERVER_ROOT, capture_output=True,
+                                  timeout=60, check=False, user=CA_ID, group=CA_ID,
+                                  extra_groups=[])
+        self.assertEqual(0, enrolled.returncode, enrolled.stderr)
+        node, certificate = enrolled.stdout.decode().split("\n", 1)
+        public = self.root / "public"
+        public.mkdir(mode=0o755)
+        (public / "ca.pem").write_bytes((self.listener / "deployment-ca-certificate.pem")
+                                        .read_bytes())
+        (public / "presented.pem").write_text(certificate)
+        key = ec.generate_private_key(ec.SECP256R1())
+        (public / "renewal.csr").write_bytes(
+            x509.CertificateSigningRequestBuilder().subject_name(x509.Name([])).sign(
+                key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM))
+        for name in ("ca.pem", "presented.pem", "renewal.csr"):
+            os.chmod(public / name, 0o644)
+        path = public / "signer.sock"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(path))
+            os.chmod(path, 0o666)
+            listener.listen(2)
+            client = subprocess.Popen(
+                [sys.executable, "-c", RENEWAL_CLIENT, str(path), str(public / "ca.pem"),
+                 str(public / "presented.pem"), str(public / "renewal.csr"), node],
+                env=self.environment, cwd=SERVER_ROOT, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, user=SERVICE_ID,
+                group=SERVICE_ID, extra_groups=[])
+            self.addCleanup(lambda: client.poll() is None and client.kill())
+            signer = self.signer_once(listener)
+            self.assertEqual(0, signer.returncode, signer.stderr)
+            self.assertEqual(b"serversentinel-pairing: renewal-signer: signed\n", signer.stderr)
+            line = client.stdout.readline().decode()
+            self.assertTrue(line.startswith("renewed "), line or client.stderr.read())
+            ca_key = serialization.load_pem_private_key(
+                (self.authority / "ca-key.pem").read_bytes(), password=None)
+            scalar = ca_key.private_numbers().private_value.to_bytes(32, "big")
+            der = ca_key.private_bytes(serialization.Encoding.DER,
+                                       serialization.PrivateFormat.PKCS8,
+                                       serialization.NoEncryption())
+            body = "".join((self.authority / "ca-key.pem").read_text().splitlines()[1:-1])
+            needles = [scalar, scalar[::-1], der, body[:40].encode()]
+            try:
+                self.assertEqual([], _memory_contains(client.pid, needles))
+                scanned = True
+            except PermissionError:
+                scanned = False
+            client.communicate(b"", timeout=10)
+            logged = [json.loads(entry) for entry in
+                      (self.authority / "issuance-log.jsonl").read_text().splitlines()]
+            self.assertEqual(line.split()[1], logged[-1]["credential_digest"])
+            self.assertIn("renewal_of", logged[-1])
+            # A peer that is not the service account (here root) is refused
+            # before its request is read; nothing is logged.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as other:
+                other.connect(str(path))
+                other.sendall(struct.pack(">I", 2) + b"{}")
+                refused = self.signer_once(listener)
+                (length,) = struct.unpack(">I", other.recv(4))
+                answer = json.loads(other.recv(length))
+        self.assertEqual({"status": "refused", "reason": "renewal_signer_peer_refused"}, answer)
+        self.assertEqual(b"serversentinel-pairing: renewal-signer: renewal_signer_peer_refused\n",
+                         refused.stderr)
+        self.assertEqual(len(logged), len((self.authority / "issuance-log.jsonl")
+                                          .read_text().splitlines()))
+        if not scanned:
+            self.skip_or_fail("memory scan needs CAP_SYS_PTRACE (docker run --cap-add SYS_PTRACE)")
 
     def test_same_account_for_ca_and_service_is_refused(self):
         status, _stdout, stderr = self.run_cli(

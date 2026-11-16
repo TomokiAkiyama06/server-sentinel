@@ -1350,10 +1350,11 @@ class DeploymentAuthority(DeploymentTrust):
                                   ) -> IssuedNodeCredential:
         """Sign a renewal leaf for ``node_id``; use ``renewal.renew_node_credential``.
 
-        This primitive checks only the CSR. Eligibility (current, admitted,
-        unexpired identity) and ledger staging are enforced by the caller.
-        Interim (Issue #109): renewal is not wired to any listener yet; the
-        renewal-only signer of PR2 replaces this in-process path.
+        This primitive checks only the CSR. In a deployment only the
+        renewal-only signer (``renewal_signer.RenewalSigner``, CA account,
+        Issue #109 PR2) calls it, after its own issuance-log and rate-limit
+        checks; the ledger eligibility and staging stay with
+        ``renewal.renew_node_credential`` in the service.
         """
         if not isinstance(node_id, UUID):
             raise CaptureAuthorityError("invalid node identity")
