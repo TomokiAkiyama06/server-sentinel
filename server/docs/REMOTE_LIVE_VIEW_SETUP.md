@@ -676,46 +676,51 @@ What happens:
   camera look the same.
 
 Recovery by hand (only for cameras passed by `vendorid` + `productid` +
-`serial` as in Step 2; keep the serials out of GitHub):
+`serial` as in Step 2; keep the serials out of GitHub): follow "Manual
+re-pass" in `infra/lxd/README.md`. In short:
 
 1. [Web] Note which source is `offline` on the Live screen.
-2. [host] Confirm that the host re-enumerated it and still lists it, and
-   that the guest does not:
-   ```sh
-   sudo journalctl -k --since '-1 day' | grep -i 'usb.*disconnect'
-   # the sysfs loop of Step 2: the camera's serial is listed on the host again
-   sudo lxc exec <vm> -- v4l2-ctl --list-devices   # one camera fewer than passed
-   ```
-3. [host] Find the LXD `usb` device whose `serial` belongs to that camera
-   (`sudo lxc config device show <vm>`), then remove it and add it again with
-   the same three values:
+2. [host / guest] **Verify before removing anything**: the instance still has
+   the device (`sudo lxc config device show <vm>`), the host lists exactly one
+   node with that serial, the VM's QEMU process does not hold that node (only
+   `(deleted)` entries in `/proc/<qemu pid>/fd`), and the guest lacks the
+   camera (`sudo lxc exec <vm> -- v4l2-ctl --list-devices`). If one of these
+   does not agree, do not remove the device (Issue #405: a healthy camera was
+   removed on 2026-11-08 and could not be added back while the VM ran).
+3. [host] Save `sudo lxc config device show <vm>`, then remove and add the
+   device again in one command with the same values:
    ```sh
    sudo lxc config device remove <vm> <camN> && \
      sudo lxc config device add <vm> <camN> usb vendorid=<vvvv> productid=<pppp> serial=<serial N>
    ```
-   If the `add` fails after the `remove`, run the `add` line again; the
-   camera is not passed until it succeeds. No VM restart and no service
-   restart is needed: ServerSentinel finds the serial-identified camera
-   again and the source returns to `online` by itself (observed 2026-10-19).
-4. [guest / Web] `v4l2-ctl --list-devices` lists the camera again, the
+   One camera at a time. No VM restart and no service restart is needed:
+   ServerSentinel finds the serial-identified camera again and the source
+   returns to `online` by itself (observed 2026-10-19).
+4. If the `add` fails (`failed to open host usb device /dev/fdset/N`), do
+   not repeat it and do not re-pass another camera: QEMU refuses hot-plug
+   until the VM restarts. With the Owner's approval, `sudo lxc stop <vm>`,
+   add the device while it is stopped, check `sudo lxc config device show
+   <vm>`, `sudo lxc start <vm>`, then "After a host or VM reboot" below.
+5. [guest / Web] `v4l2-ctl --list-devices` lists the camera again, the
    Live screen shows the source `online`, and the Owner notice (if shown)
    disappears as described above.
-5. If the source does not return to `online`, or shows
+6. If the source does not return to `online`, or shows
    `manual_intervention_required` ("管理者の確認が必要"), the reconnect was not
    unambiguous and needs the Owner's re-approval (`DEPLOYMENT.md`, "Creating
    sources and approving cameras locally"). Never pass a camera by
    vendor/product only or by bus/device number to get it back.
 
-Automatic re-pass on the host (Issue #301 item 1, optional): `infra/lxd/`
-holds a udev rule, a timer and a root oneshot for the LXD host that does the
-`remove` / `add` above by itself, for the serial-identified `usb` devices
-named in its configuration only, when the VM's QEMU process no longer holds
-that camera's current host node (`infra/lxd/README.md`; install, `--check`
-and removal there). It lives outside ServerSentinel: ServerSentinel and
-`media-capture-agent` get no root, capability or LXD access for it. The
-manual steps above stay the fallback (an `absent`, `ambiguous` or
-rate-limited camera is left to the Owner). Record the checks in
-`MANUAL_TEST.md` (section J).
+Host-side check (Issue #301 item 1, optional; Owner decision 2026-11-16,
+Issue #405): `infra/lxd/` holds a timer and a read-only root oneshot for the
+LXD host that reports a serial-identified camera whose current host node the
+VM's QEMU process no longer holds (`usb_repass_looks_unpassed`, the unit in
+`systemctl --failed`). It never removes or adds a device, sends nothing off
+the host, and its judgement can be wrong, so it is a prompt for the
+verification above, not a replacement for it; the Owner's notification
+stays ServerSentinel's `camera_offline` (`infra/lxd/README.md`; install,
+`--check` and removal there). It lives outside ServerSentinel:
+ServerSentinel and `media-capture-agent` get no root, capability or LXD
+access for it. Record the checks in `MANUAL_TEST.md` (section J).
 
 ## After a host or VM reboot
 
