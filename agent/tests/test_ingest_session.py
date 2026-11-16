@@ -443,6 +443,8 @@ class StdlibOnlyServiceTests(unittest.TestCase):
                 "            raise ImportError('blocked')\n"
                 "sys.meta_path.insert(0, Block())\n"
                 "import media_capture_agent.cli, media_capture_agent.ingest_session\n"
+                "import media_capture_agent.capture_admin, media_capture_agent.preview\n"
+                "import media_capture_agent.uvc_capture\n"
                 "assert not any(m.startswith('cryptography') for m in sys.modules)\n")
         result = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True,
                                 text=True, timeout=60)

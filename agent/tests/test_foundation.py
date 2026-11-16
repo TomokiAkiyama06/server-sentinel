@@ -902,6 +902,7 @@ raise SystemExit(1)
         self.assertIn("Group=123", unit)
         self.assertIn("DevicePolicy=closed", unit)
         self.assertIn('DeviceAllow="/dev/video0" rw', unit)
+        self.assertNotIn("char-video4linux", unit)
         self.assertIn("--check", unit)
         self.assertNotIn("/dev/snd", unit)
         with self.assertRaises(ValueError):
