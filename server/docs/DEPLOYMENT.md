@@ -1586,8 +1586,11 @@ units, every renewal is answered `renewal_signer_unavailable` and the Agent
 keeps retrying with its back-off until its certificate expires, after which
 it must re-pair, so install them before the first node certificate enters
 its 30-day window. The Agent's service interpreter must be able to import
-`cryptography` for renewal (its status line shows
-`"renewal": "renewal_dependency_unavailable"` otherwise).
+`cryptography` for renewal: on the capture host install the OS package
+`python3-cryptography` (Owner decision 2026-11-16) and check it with
+`sudo -u <service account> python3 -c 'import cryptography'`
+(`agent/README.md`, "Versioned installation"); otherwise its status line shows
+`"renewal": "renewal_dependency_unavailable"`.
 
 **Back up the CA directory.** Losing `ca-key.pem` means a new `init` and
 re-pairing every Agent; losing `issuance-log.jsonl` loses the CA-side record

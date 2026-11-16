@@ -1073,9 +1073,13 @@ only by synthetic tests (`server/tests/test_release.py`,
     `agent/tests/test_credential_renewal.py`, all loopback. On a disposable
     deployment with the signer units of step 18 installed, and never on the
     production hosts without the Owner:
-    a. Confirm the Agent's service interpreter imports `cryptography`
-       (`sudo -u <service account> python3 -c 'import cryptography'`); the
-       status line otherwise shows `"renewal": "renewal_dependency_unavailable"`.
+    a. Install `cryptography` for the capture host's system `python3` from
+       the OS package (Owner decision 2026-11-16:
+       `sudo apt install python3-cryptography`) and, before relying on
+       renewal, confirm as the service account that
+       `sudo -u <service account> python3 -c 'import cryptography'` exits 0.
+       Without it the status line shows
+       `"renewal": "renewal_dependency_unavailable"`.
     b. Pair a node with a short explicit validity so it is within 30 days
        of expiry (and has an issuance-log record, step 18e). Start the Agent
        with `main_ingest`. Within one heartbeat its status line shows

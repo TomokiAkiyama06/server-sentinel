@@ -63,7 +63,9 @@ credential installed while the service runs (`enroll pair --repair expired`
 after an expiry, a rotation) re-reads its expiry and restarts the schedule.
 `credential_renewal.py` imports `node_tls`, and so `cryptography`, only when
 it first checks, so the service still starts without it; renewal then
-reports `renewal_dependency_unavailable`.
+reports `renewal_dependency_unavailable`. On the capture host the system
+`python3` gets it from the OS package (Owner decision 2026-11-16; see
+"Versioned installation").
 
 Cameras are approved locally with the service stopped, as the service
 account, typing `APPROVE` on the controlling terminal:
@@ -328,7 +330,20 @@ check. CI executes the artifact outside its development checkout.
 
 After the Owner provisions a dedicated account, approved storage, protected
 config, a root-controlled install directory and unit directory, an administrator
-may explicitly run:
+first installs `cryptography` for the system interpreter from the OS package
+(Owner decision 2026-11-16) and checks it as the service account:
+
+```text
+sudo apt install python3-cryptography
+sudo -u <service account> python3 -c 'import cryptography'
+```
+
+The service starts without it, but certificate renewal over the ingest
+session needs it (Issue #109); without it the status line shows
+`"renewal": "renewal_dependency_unavailable"` and the node must re-pair once
+its certificate expires. The OS package is the distribution's build, not the
+hash-pinned wheel of `requirements.lock`. Then the administrator may
+explicitly run:
 
 ```text
 python3 agent/install.py --artifact <verified-artifact> --sha256 <trusted-sha256> \
