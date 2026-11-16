@@ -46,12 +46,17 @@ class FakeLxd:
         self.deferred = None
         self.operation_outcome = None  # what a second poll of it finds
         self.waited = []
+        self.unreachable = 0  # instance reads that fail with `read_failure`
+        self.read_failure = "usb_repass_lxd_unreachable"
         self.host = host
 
     def __call__(self, socket_path):
         return self
 
     def instance(self, name):
+        if self.unreachable:
+            self.unreachable -= 1
+            raise repass.Failure(self.read_failure)
         return {"status": self.status, "devices": json.loads(json.dumps(self.devices)),
                 "config": {}, "profiles": ["default"]}, str(self.etag)
 
@@ -107,7 +112,8 @@ class Host:
         self.proc = base / "proc"
         self.sysfs.mkdir()
         (self.proc / str(PID) / "fd").mkdir(parents=True)
-        (self.proc / "uptime").write_text("100000.00 1.00\n")
+        self.uptime = 100000.0
+        (self.proc / "uptime").write_text(f"{self.uptime:.2f} 1.00\n")
         ticks = os.sysconf("SC_CLK_TCK")
         self.set_age(3600, ticks)
         self.nodes = {}
@@ -115,9 +121,15 @@ class Host:
 
     def set_age(self, seconds, ticks=None):
         ticks = ticks or os.sysconf("SC_CLK_TCK")
-        start = int((100000.0 - seconds) * ticks)
+        start = int((self.uptime - seconds) * ticks)
         fields = ["S"] + ["0"] * 18 + [str(start)] + ["0"] * 10
         (self.proc / str(PID) / "stat").write_text(f"{PID} (qemu-system-x86) " + " ".join(fields))
+
+    def boot(self, uptime):
+        """The host booted `uptime` seconds ago; QEMU started with it."""
+        self.uptime = uptime
+        (self.proc / "uptime").write_text(f"{uptime:.2f} 1.00\n")
+        self.set_age(uptime)
 
     def plug(self, serial, bus, dev, entry=None, vendor=VENDOR):
         path = self.sysfs / (entry or f"{bus}-{dev}")
@@ -178,7 +190,29 @@ class RepassTests(unittest.TestCase):
         self.assertEqual((0, ["usb_repass_held device=cam1", "usb_repass_held device=cam2"]),
                          self.run_once())
         self.assertEqual([], self.lxd.puts)
-        # The host was sampled after the settle and twice.
+        # Issue #402 (9): every camera held in one sample, so no settle and
+        # no second sample.
+        self.assertEqual([], self.sleeps)
+        self.assertEqual((0, ["usb_repass_held device=cam1", "usb_repass_held device=cam2"]),
+                         self.run_once(check=True))
+        self.assertEqual([], self.sleeps)
+
+    def test_one_camera_not_held_is_judged_after_the_settle_and_two_samples(self):
+        # Issue #402 (9): the quick path never leads to a remove.
+        self.host.plug(SERIAL_1, 1, 15)
+        self.host.plug(SERIAL_2, 9, 4)
+        self.host.link("/dev/bus/usb/001/003 (deleted)")
+        self.host.hold(SERIAL_2)
+        self.lxd.fail = ["remove"]
+        code, lines = self.run_once()
+        self.assertEqual([repass.SETTLE_SECONDS, repass.STABLE_GAP_SECONDS], self.sleeps[:2])
+        self.assertEqual((1, ["usb_repass_update_failed step=remove device=cam1", "usb_repass_held device=cam2"]),
+                         (code, lines))
+        # A camera not found is not "held" either: the full judgement runs.
+        self.sleeps.clear()
+        self.write_config({"instance": "vm", "devices": ["cam2", "cam3"]})
+        self.lxd.devices["cam3"] = camera("SYNTH0003")
+        self.assertEqual((0, ["usb_repass_held device=cam2", "usb_repass_absent device=cam3"]), self.run_once())
         self.assertEqual([repass.SETTLE_SECONDS, repass.STABLE_GAP_SECONDS], self.sleeps)
 
     def test_a_re_enumerated_camera_is_removed_and_added_with_its_configuration(self):
@@ -431,7 +465,9 @@ class RepassTests(unittest.TestCase):
         self.assertEqual(3 * (30 + 150) + 2 * 2 + 30, repass.ADD_WORST_SECONDS)
         # The first reads, the settle and the second sample leave room for at
         # least one whole re-pass and the verification.
-        first = 2 * repass.REQUEST_TIMEOUT_SECONDS + repass.SETTLE_SECONDS + repass.STABLE_GAP_SECONDS
+        # (Issue #402 (7): with the wait for LXD right after boot.)
+        first = (repass.LXD_WAIT_WORST_SECONDS + 2 * repass.REQUEST_TIMEOUT_SECONDS
+                 + repass.SETTLE_SECONDS + repass.STABLE_GAP_SECONDS)
         self.assertLessEqual(first + repass.REPASS_WORST_SECONDS + repass.VERIFY_WORST_SECONDS,
                              repass.RUN_LIMIT_SECONDS)
         service = (ROOT / "infra/lxd/server-sentinel-usb-repass.service").read_text()
@@ -517,6 +553,71 @@ class RepassTests(unittest.TestCase):
         self.assertEqual((0, ["usb_repass_needs_repass device=cam1"]), self.run_once(check=True))
         self.assertEqual([], self.lxd.puts)
         self.assertFalse((self.state / "state.json").exists())
+
+    def test_check_reports_a_pending_restore_and_changes_nothing(self):
+        # Issue #402 (6): a run stopped between the remove and the add.
+        self.needs_repass()
+        self.lxd.fail = ["add"] * repass.ADD_ATTEMPTS
+        self.run_once()
+        self.assertNotIn("cam1", self.lxd.devices)
+        before = (self.state / "state.json").read_bytes()
+        puts = list(self.lxd.puts)
+        code, lines = self.run_once(check=True)
+        self.assertEqual(0, code)
+        self.assertEqual("usb_repass_pending_restore device=cam1", lines[0])
+        self.assertEqual(puts, self.lxd.puts)
+        self.assertNotIn("cam1", self.lxd.devices)
+        self.assertEqual(before, (self.state / "state.json").read_bytes())
+        # Also while the VM is stopped, and for a label no longer configured.
+        self.lxd.status = "Stopped"
+        self.write_config({"instance": "vm", "devices": ["cam2"]})
+        self.assertEqual((0, ["usb_repass_pending_restore device=cam1", "usb_repass_instance_not_running"]),
+                         self.run_once(check=True))
+        # An unreadable state is reported and kept.
+        (self.state / "state.json").write_bytes(b"{not json")
+        with self.assertRaisesRegex(repass.Failure, "usb_repass_state_unreadable"):
+            self.run_once(check=True)
+        self.assertEqual(b"{not json", (self.state / "state.json").read_bytes())
+
+    def test_lxd_not_answering_right_after_boot_is_waited_for(self):
+        # Issue #402 (7): the boot coldplug starts a run before LXD answers.
+        self.needs_repass()
+        self.host.boot(30)
+        self.lxd.unreachable = 2
+        self.assertEqual((0, ["usb_repass_instance_starting"]), self.run_once())
+        self.assertEqual([repass.LXD_WAIT_GAP_SECONDS] * 2, self.sleeps)
+
+    def test_lxd_still_not_answering_after_boot_ends_the_run_without_failing(self):
+        # Issue #402 (7): the timer runs again; nothing is changed.
+        self.needs_repass()
+        self.lxd.fail = ["add"] * repass.ADD_ATTEMPTS
+        self.run_once()
+        pending = (self.state / "state.json").read_bytes()
+        self.host.boot(30)
+        self.lxd.unreachable = 1000
+        self.sleeps.clear()
+        self.assertEqual((0, ["usb_repass_lxd_not_ready"]), self.run_once())
+        self.assertLessEqual(sum(self.sleeps), repass.LXD_WAIT_SECONDS)
+        self.assertEqual(pending, (self.state / "state.json").read_bytes())
+        # LXD answers on a later run: the pending device is restored.
+        self.lxd.unreachable = 0
+        self.assertEqual("usb_repass_restored device=cam1", self.run_once()[1][0])
+        self.assertEqual(camera(SERIAL_1), self.lxd.devices["cam1"])
+
+    def test_lxd_not_answering_later_than_boot_still_fails(self):
+        self.needs_repass()
+        self.host.boot(repass.BOOT_GRACE_SECONDS + 1)
+        self.lxd.unreachable = 1000
+        with self.assertRaisesRegex(repass.Failure, "usb_repass_lxd_unreachable"):
+            self.run_once()
+        self.assertEqual([], self.sleeps)
+        # Not waited for either: only `lxd_unreachable` is.
+        self.host.boot(30)
+        self.lxd.unreachable = 1
+        self.lxd.read_failure = "usb_repass_instance_unreadable"
+        with self.assertRaisesRegex(repass.Failure, "usb_repass_instance_unreadable"):
+            self.run_once()
+        self.assertEqual([], self.sleeps)
 
     def test_configuration_is_validated(self):
         self.write_config({"instance": "vm", "devices": ["cam1"]}, mode=0o620)
@@ -698,6 +799,10 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("NoNewPrivileges=yes", service)
         self.assertIn("Type=oneshot", service)
         self.assertIn("WantedBy=timers.target", timer)
+        # Issue #402 (7): a run within the boot grace that ends on LXD not
+        # answering is followed by the timer's first run.
+        self.assertIn("\nOnBootSec=3min\n", timer)
+        self.assertLessEqual(repass.BOOT_GRACE_SECONDS, 180)
         example = json.loads((directory / "usb-repass.example.json").read_text())
         self.assertEqual({"instance", "devices"}, set(example))
 

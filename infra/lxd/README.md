@@ -27,6 +27,11 @@ device named in its configuration:
 | the VM's QEMU process holds that device's current node open | `held`: nothing is done |
 | otherwise | `needs_repass`: the device is removed and added again with exactly the same configuration, as the documented recovery does by hand |
 
+When one first sample already finds every configured camera `held`, nothing
+would be changed, so the settle and the second sample are skipped (Issue #402
+(9)); any other first sample is judged in full as in the table, and only that
+path can lead to a remove.
+
 It decides from host facts only (LXD's instance configuration and state over
 its unix socket, sysfs, `/proc/<qemu pid>/fd`), never from `/dev/videoN`, and
 never trusts anything from the guest. It judges nothing while the VM is not
@@ -73,7 +78,12 @@ Triggers: `90-server-sentinel-usb-repass.rules` starts
 `server-sentinel-usb-repass.service` on every USB device add (the service
 ignores devices it is not configured for), and
 `server-sentinel-usb-repass.timer` runs it 3 minutes after boot and every
-2 minutes after the last run, for a missed event.
+2 minutes after the last run, for a missed event. The boot coldplug can start
+a run before LXD answers on its socket (Issue #402 (7)): a run that starts
+within 180 s of the host's boot waits up to 60 s for LXD, and if LXD still
+does not answer it ends without failing the unit
+(`usb_repass_lxd_not_ready`, nothing changed); the timer runs it again. A
+later run still fails on `usb_repass_lxd_unreachable`.
 
 Journal lines (`journalctl -u server-sentinel-usb-repass.service`) are fixed
 words plus the configured device label, for example
@@ -117,6 +127,11 @@ sudo /usr/bin/python3 -I -S /usr/local/lib/server-sentinel-usb-repass/usb_repass
 
 `usb_repass_held` for every device is the normal state. `usb_repass_needs_repass`
 means that camera is not passed now and the first run will re-pass it.
+`usb_repass_pending_restore device=<label>` (printed first, Issue #402 (6))
+means the state holds the configuration of a device that a run removed and
+whose add was not confirmed: the next run adds it back if the instance lacks
+a device of that name, and drops the record if it is there. `--check` reads
+the state but never writes it.
 Then enable:
 
 ```sh
@@ -132,17 +147,34 @@ the LXD unix socket (default `/var/snap/lxd/common/lxd/unix.socket`).
 
 ## Remove
 
+Stop the triggers, then wait for a run in progress to end (it holds the lock
+until it ends; a run never stops between a remove and its add on its own):
+
 ```sh
 sudo systemctl disable --now server-sentinel-usb-repass.timer
-sudo rm /etc/udev/rules.d/90-server-sentinel-usb-repass.rules \
-  /etc/systemd/system/server-sentinel-usb-repass.service \
+sudo rm /etc/udev/rules.d/90-server-sentinel-usb-repass.rules
+sudo udevadm control --reload
+sudo flock /var/lib/server-sentinel-usb-repass/lock true
+sudo /usr/bin/python3 -I -S /usr/local/lib/server-sentinel-usb-repass/usb_repass.py \
+  --config /etc/server-sentinel-usb-repass.json --check
+```
+
+A `usb_repass_pending_restore` line names a device whose configuration only
+the state holds. If `sudo lxc config device show <vm>` lacks that device, add
+it by hand as in `REMOTE_LIVE_VIEW_SETUP.md` (the values are under `pending`
+in `/var/lib/server-sentinel-usb-repass/state.json`) before going on. Then
+remove the units and the state, so a later re-install does not restore a
+stale pending record (Issue #402 (5)):
+
+```sh
+sudo rm /etc/systemd/system/server-sentinel-usb-repass.service \
   /etc/systemd/system/server-sentinel-usb-repass.timer
-sudo systemctl daemon-reload && sudo udevadm control --reload
+sudo systemctl daemon-reload
+sudo rm -r /var/lib/server-sentinel-usb-repass
 ```
 
 Check `sudo lxc config device show <vm>` afterwards: every camera device is
-still there (a re-pass in progress at removal is restored only by a later
-run, so add it by hand as in `REMOTE_LIVE_VIEW_SETUP.md` if one is missing).
+still there.
 
 Tests: `tests/unit/test_lxd_usb_repass.py` (synthetic sysfs, `/proc` and LXD;
 no host is touched).
