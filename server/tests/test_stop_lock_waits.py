@@ -26,7 +26,7 @@ from app.presence.delivery import ActionResult
 from app.presence.service import PresenceService
 from app.storage import database as database_module
 from app.storage.database import (BUSY_TIMEOUT_SECONDS, Database, bounded_lock_waits,
-                                  bounded_transaction, lock_waits_bounded)
+                                  bounded_transaction)
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.test_storage_notifications import Transport, endpoint
@@ -103,12 +103,18 @@ class BoundedTransactionTests(unittest.TestCase):
     def test_a_write_that_gets_its_locks_in_time_commits(self):
         locks = _Locks(self, self.path, reserved_for=0.1)
         locks.reader.execute("ROLLBACK")
-        with bounded_lock_waits(time.monotonic() + 2):
-            self.assertTrue(lock_waits_bounded())
+        # Issue #403: the production path itself shows the bound applies
+        # inside the context (its retried BEGIN / COMMIT) and not after it.
+        with mock.patch.object(database_module, "_retry_busy",
+                               wraps=database_module._retry_busy) as retried:
+            with bounded_lock_waits(time.monotonic() + 2):
+                with bounded_transaction(self.db):
+                    self.db.execute("INSERT INTO t VALUES (1)")
+            locks.close()
+            self.assertEqual(2, retried.call_count)
             with bounded_transaction(self.db):
-                self.db.execute("INSERT INTO t VALUES (1)")
-        locks.close()
-        self.assertFalse(lock_waits_bounded())
+                pass
+            self.assertEqual(2, retried.call_count)
         self.assertEqual([(1,)], self.db.execute("SELECT v FROM t").fetchall())
         self.assertEqual(DEFAULT_BUSY_MS, self.busy_ms())
 
@@ -283,6 +289,61 @@ class SettlePollTests(unittest.TestCase):
         self.assertFalse(service.in_flight(other))
         self.assertFalse(service.retained(other))
         self.assertEqual(DeliveryResult.FAILED, written[-1].delivery)
+
+    def test_the_capacity_count_and_each_delivery_agree_before_and_after_the_stop(self):
+        # Issue #403: the count `can_accept` compares (`_occupied`) and the
+        # per-delivery answer of the `UnrecordedCriticalAlerts` share
+        # (`holds_capacity`) come from one rule, before and after the stop.
+        gate = threading.Event()
+
+        class SecondWaits(Transport):
+            def open(self, request, *, timeout):
+                if self.requests:
+                    gate.wait(10)
+                return super().open(request, timeout=timeout)
+
+        service = NotificationService(
+            lambda event: None, SlackDelivery(endpoint(), opener=SecondWaits()),
+            queue_capacity=2, stopping=lambda: self.stopping)
+        self.addCleanup(service.close)
+        self.addCleanup(gate.set)
+
+        def submit():
+            identifier = uuid4()
+            self.assertEqual(DeliveryResult.PENDING, service.record(
+                NotificationKind.RECORDING_HEALTH_FAILURE, at=datetime.now(timezone.utc),
+                event_id=identifier))
+            return identifier
+
+        def agree():
+            held = sum(service.holds_capacity(identifier) for identifier in tuple(service._pending))
+            self.assertEqual(held, service._occupied())
+            self.assertEqual(held < 2, service.can_accept(uuid4()))
+            return held
+
+        until = time.monotonic() + 5
+        finished = submit()
+        while service._pending[finished][2] is None:
+            service._collect()
+            self.assertLess(time.monotonic(), until)
+            time.sleep(0.01)
+        running = submit()
+        # Before the stop a finished, unwritten delivery keeps its place.
+        self.assertEqual(2, agree())
+        self.assertEqual((True, True), (service.holds_capacity(finished),
+                                        service.holds_capacity(running)))
+        self.stopping = True
+        # Once the stop began only the delivery still being sent holds one.
+        self.assertEqual(1, agree())
+        self.assertEqual((False, True), (service.holds_capacity(finished),
+                                         service.holds_capacity(running)))
+        gate.set()
+        while service.holds_capacity(running):
+            self.assertLess(time.monotonic(), until)
+            time.sleep(0.01)
+        self.assertEqual(0, agree())
+        self.assertFalse(service.holds_capacity(uuid4()))
+        self.assertEqual(2, service.pending_count)  # nothing was written
 
     def test_without_a_stop_a_poll_without_deadline_is_unbounded_as_before(self):
         self.submit_and_finish()
