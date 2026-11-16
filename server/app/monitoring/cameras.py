@@ -1134,8 +1134,7 @@ class CameraOfflineMonitor:
             for source in self._sources.values():
                 self._bound_held(source, now)
             offline = sum(1 for source in self._sources.values()
-                          if source.episode is not None and source.episode.recovered is None
-                          and source.episode.qualifies(now, self.after))
+                          if self._current_outage(source, now) is not None)
             alerts, undelivered = [], 0
             for source in self._sources.values():
                 if source.period != _BY_RATIO:
@@ -1178,6 +1177,19 @@ class CameraOfflineMonitor:
                     and event_id not in source.period_alert_ids):
                 source.period_alert_ids.append(event_id)
 
+    def _current_outage(self, source: _Source, now: float) -> _Episode | None:
+        """``source``'s outage in progress past the threshold, or ``None`` (#404).
+
+        The one condition both the degraded count (``offline_sources``) and
+        the alert deciding the current condition (``_current_alerts``) use,
+        so the two cannot diverge.
+        """
+        episode = source.episode
+        if (episode is not None and episode.recovered is None
+                and episode.qualifies(now, self.after)):
+            return episode
+        return None
+
     def _current_alerts(self, source, now: float) -> tuple[list[UUID], int]:
         """``(alert IDs, unsent)`` deciding ``source``'s current condition (#394).
 
@@ -1194,11 +1206,11 @@ class CameraOfflineMonitor:
         """
         ids, unsent = [], False
         episode = source.episode
-        if (episode is not None and episode.recovered is None
-                and episode.qualifies(now, self.after)):
-            if episode.alert_id is not None:
-                ids.append(episode.alert_id)
-            elif not episode.notified:
+        outage = self._current_outage(source, now)
+        if outage is not None:
+            if outage.alert_id is not None:
+                ids.append(outage.alert_id)
+            elif not outage.notified:
                 unsent = True
         if source.period == _BY_RATIO:
             if source.flap is not None and not source.flap.notified:
