@@ -132,7 +132,7 @@ def main(argv=None):
         parser.error("--json requires --check")
     agent = None
     store = None
-    capture = preview = None
+    capture = preview = sender = None
     stopped = threading.Event()
     previous = {}
     runtime_phase = False
@@ -162,6 +162,11 @@ def main(argv=None):
             # the pipeline launcher; the service opens the cameras.
             capture, preview = _capture(settings, launcher)
             agent.capture = capture
+        if preview is not None and isinstance(session, IngestSession):
+            # Issue #14 (option A): the newest JPEG of each source to the Main.
+            from .live_sender import LiveSender
+            sender = LiveSender(session, preview,
+                                [source.source_id for source in settings.capture.sources])
         runtime_phase = False
         if args.check:
             store.check()
@@ -199,6 +204,8 @@ def main(argv=None):
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
+        if sender is not None:
+            sender.close()
         try:
             if agent is not None:
                 agent.close()
