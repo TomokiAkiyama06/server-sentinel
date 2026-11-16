@@ -2918,8 +2918,12 @@ serials, bus/device numbers and device names only in the private record.
   and after (`sha256sum`), and `sudo lxc operation list` shows no new
   operation;
 - [ ] each leftover record is handled as in "Leftover pending records"
-  (record which line each one printed); afterwards `--check` prints no
-  `usb_repass_pending_*` line;
+  (record which line each one printed); the old state directory is moved to
+  `/root/usb-repass-state-20261108` whole (with any `state.json.tmp`), not
+  deleted; afterwards `--check` prints no `usb_repass_pending_*` line;
+- [ ] `--check` exits 0 also when it prints `usb_repass_attention`, and 1
+  only on a fixed failure word (e.g. a temporary copy of the configuration
+  with mode 0666: `usb_repass_config_unsafe`);
 - [ ] with both cameras passed and streaming (the sources `online`), the
   journal of a timer run shows `usb_repass_held` for each and the unit is
   not in `systemctl --failed`; if it shows `usb_repass_looks_unpassed`
@@ -2936,8 +2940,10 @@ serials, bus/device numbers and device names only in the private record.
   `after_seconds`, the next timer run shows `usb_repass_looks_unpassed` and
   `usb_repass_attention` and the unit is in `systemctl --failed`; the
   instance's devices are unchanged by the check (`lxc config device show`);
-  the manual re-pass is done as in "Manual re-pass" (each verification step
-  recorded), and the next run shows `usb_repass_held` and leaves
+  the manual re-pass is done as in "Manual re-pass" (all five verification
+  steps recorded; the Web `offline` of step 1.1 is the guard independent of
+  the check's signal; the host node matched by vendor, product and serial),
+  and the next run shows `usb_repass_held` and leaves
   `systemctl --failed`;
 - [ ] if the manual `add` fails with `/dev/fdset`, the recovery of "Manual
   re-pass" step 4 (stop, add, check, start) restores every camera, and the

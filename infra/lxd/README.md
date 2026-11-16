@@ -108,20 +108,29 @@ production host needs the Owner. One camera at a time; keep serials and
 bus/device numbers in the private record, not in GitHub. `<vm>` is the VM
 (`ss-main`), `<camN>` the LXD device.
 
-1. **Verify before anything is removed.** All four must agree; if one does
-   not, do not remove the device (record what was seen in Issue #405):
+1. **Verify before anything is removed.** All five must agree; if one does
+   not, do not remove the device (record what was seen in Issue #405).
+   Step 1.4 reads the same signal the check uses (`/proc/<qemu pid>/fd`),
+   which reported healthy cameras on 2026-11-08, so it cannot confirm the
+   check by itself; the independent guard is step 1.1 (ServerSentinel itself
+   sees the source `offline`), with step 1.5 from the guest:
    1. [Web] the source of that camera is `offline` (or a `camera_offline`
       notice arrived).
    2. [host] the instance has the device with the three values:
       ```sh
       sudo lxc config device show <vm>
       ```
-   3. [host] exactly one host node has that serial (prints one line, e.g.
-      `/dev/bus/usb/001/019`):
+   3. [host] exactly one host node has that `vendorid`, `productid` and
+      `serial`, as the check matches them (prints one line, e.g.
+      `/dev/bus/usb/001/019`; none or more than one: stop):
       ```sh
-      for d in /sys/bus/usb/devices/*; do [ "$(cat "$d/serial" 2>/dev/null)" = '<serial N>' ] && \
+      for d in /sys/bus/usb/devices/*; do \
+        [ "$(cat "$d/idVendor" 2>/dev/null)" = '<vvvv>' ] && \
+        [ "$(cat "$d/idProduct" 2>/dev/null)" = '<pppp>' ] && \
+        [ "$(cat "$d/serial" 2>/dev/null)" = '<serial N>' ] && \
         printf '/dev/bus/usb/%03d/%03d\n' "$(cat "$d/busnum")" "$(cat "$d/devnum")"; done
       ```
+      (`<vvvv>` / `<pppp>` in lower case, as sysfs prints them.)
    4. [host] QEMU does **not** hold that node (only `(deleted)` entries, or
       other numbers):
       ```sh
@@ -186,11 +195,14 @@ fails again, and only the records of that one incident exist.
 2. For `usb_repass_pending_device_differs`, compare the record with
    `sudo lxc config device show <vm>` and keep whichever is right by hand.
 3. When `--check` prints no `usb_repass_pending_device_missing` any more,
-   move the file away so it is no longer reported:
+   move the whole directory away (not delete it: a `state.json.tmp` left by
+   a save that died midway may hold a newer record), so it is no longer
+   reported:
    ```sh
-   sudo mv /var/lib/server-sentinel-usb-repass/state.json /root/usb-repass-state-20261108.json
-   sudo rm -r /var/lib/server-sentinel-usb-repass
+   sudo mv /var/lib/server-sentinel-usb-repass /root/usb-repass-state-20261108
+   sudo ls -l /root/usb-repass-state-20261108   # state.json, lock, maybe state.json.tmp
    ```
+   Keep it until the Owner decides it is no longer needed.
 
 ## Install or update (Owner, on the LXD host, as root; not executed)
 
@@ -217,7 +229,10 @@ sudo install -m 0600 /dev/null /etc/server-sentinel-usb-repass.json
 sudoedit /etc/server-sentinel-usb-repass.json   # {"instance": "<vm>", "devices": ["cam1", "cam2"]}
 ```
 
-Check (changes nothing; prints one line per device, always exits 0):
+Check (changes nothing; prints one line per device). It exits 0 whatever
+it judged, including `usb_repass_attention`; it exits 1 only when it cannot
+judge at all (a fixed word such as `usb_repass_config_unsafe`,
+`usb_repass_lxd_unreachable` or `usb_repass_qemu_unreadable`):
 
 ```sh
 sudo /usr/bin/python3 -I -S /usr/local/lib/server-sentinel-usb-repass/usb_repass.py \
@@ -263,7 +278,7 @@ sudo rm -r /usr/local/lib/server-sentinel-usb-repass /etc/server-sentinel-usb-re
 
 The check never changed the instance, so nothing else is left behind. A
 `/var/lib/server-sentinel-usb-repass` from the old version is handled as in
-"Leftover pending records" before it is removed.
+"Leftover pending records" (moved to `/root`, not deleted).
 
 Tests: `tests/unit/test_lxd_usb_repass.py` (synthetic sysfs, `/proc` and LXD;
 no host is touched).

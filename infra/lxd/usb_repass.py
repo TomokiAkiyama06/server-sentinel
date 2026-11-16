@@ -431,7 +431,8 @@ def main(argv=None):
     parser.add_argument("--config", default="/etc/server-sentinel-usb-repass.json")
     parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     parser.add_argument("--check", action="store_true",
-                        help="the same judgement without the settle; always exits 0")
+                        help="the same judgement without the settle; exits 0 whatever it judged "
+                             "(1 only when it cannot judge)")
     args = parser.parse_args(argv)
     if os.geteuid() != 0:
         log("usb_repass_requires_root")
