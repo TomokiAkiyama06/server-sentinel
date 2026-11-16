@@ -1022,6 +1022,48 @@ only by synthetic tests (`server/tests/test_release.py`,
        `deployment_ca_certificate_missing` until `sudo MAIN_CLI rotate-listener`
        has run once; existing nodes keep connecting.
 
+18. Renewal-only signer (Issue #109 PR2). Status: **unverified on real
+    hardware**; verified only by `server/tests/test_renewal_signer.py` and,
+    as root with two numeric accounts, by
+    `server/tests/test_ca_privilege_separation_root.py` (CI and a container
+    with `--cap-add SYS_PTRACE`). The ingest session does not carry the
+    renewal request yet, so an end-to-end Agent renewal waits for that wiring;
+    these steps check the signer itself on a disposable deployment:
+    a. Install the two units as `server/docs/DEPLOYMENT.md` "Renewal-only
+       signer" says, then `systemd-analyze verify` them and
+       `systemctl enable --now serversentinel-renewal-signer.socket`. Confirm
+       `/run/serversentinel-renewal-signer.sock` is `srw-rw----` root:<service
+       group> and that no instance runs while idle.
+    b. As root, `nc -U /run/serversentinel-renewal-signer.sock </dev/null`
+       (or a short Python client): the instance logs only
+       `renewal-signer: renewal_signer_peer_refused` (peer uid 0) and exits;
+       nothing is appended to `issuance-log.jsonl`. As another unprivileged
+       account the connect fails with `Permission denied`.
+    c. As the service account, send one `renew` request for a node leaf that
+       expires within 31 days (issue it with a short explicit validity) using
+       `renewal_signer.SignerRenewalIssuer` from the installed release; it
+       returns a certificate, the journal shows `renewal-signer: signed`, the
+       log gains a `node` record with `renewal_of`, and during the request
+       `/proc/<instance pid>/status` shows `serversentinel-ca`, `CapEff`
+       zero, `NoNewPrivs: 1`. A second request for the same node within 50
+       minutes with a different key is refused `renewal_rate_limited`
+       (the same key again is signed at once and counted); a leaf with more than 31
+       days left is refused `renewal_not_due`; after `sudo MAIN_CLI revoke`
+       the node is refused `issuer_refused_request`.
+    d. Scan the requesting service-account process's memory for the CA key as
+       in 17c (expect no match; positive control must match), and confirm
+       `coredumpctl` has no signer core after `systemctl kill
+       --signal=SIGSEGV` of an instance held open by a stalled client.
+    e. *Nodes paired before the issuance log (Owner decision 2026-11-16).*
+       The production capture host's pairing date is unknown, so treat it as
+       possibly before 2026-10-07. Before its certificate's expiry, compute
+       the SHA-256 of its current certificate in DER form and check, as root,
+       that `<ca_dir>/issuance-log.jsonl` has a `"type":"node"` record for
+       its `node_id` with that `credential_digest` (`server/docs/DEPLOYMENT.md`,
+       "Renewal-only signer"). If there is none, re-pair the node (step 15)
+       before it expires; the signer would refuse its renewal
+       (`issuer_refused_request`). This is an Owner step on the real host.
+
 15. Re-pairing (#116, Owner policy 2026-10-01; mock-verified only by
     `agent/tests/test_enroll.py` and
     `tests/e2e/test_capture_enrollment_scenarios.py`). Stop the

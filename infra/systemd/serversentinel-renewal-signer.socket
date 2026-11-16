@@ -1,0 +1,33 @@
+# ServerSentinel capture-node renewal signer socket (Issue #109 PR2,
+# Owner decision 2026-10-07).
+#
+# systemd (uid 0) owns this local Unix socket and starts one
+# serversentinel-renewal-signer@.service instance per connection
+# (Accept=yes). Only the service account can connect: the socket is
+# root:<service group> 0660, and each instance also checks the peer's
+# SO_PEERCRED uid against --service-user. The socket accepts renewal
+# requests only; enrollment, listener and CA operations stay with the
+# Owner's sudo serversentinel-pairing commands.
+#
+# Install as /etc/systemd/system/serversentinel-renewal-signer.socket
+# (root-owned, mode 0644) together with the service template. Replace
+# "server-sentinel" with the service account's primary group when it is
+# named differently. See server/docs/DEPLOYMENT.md.
+
+[Unit]
+Description=ServerSentinel capture renewal signer socket (renewal only)
+
+[Socket]
+ListenStream=/run/serversentinel-renewal-signer.sock
+SocketUser=root
+SocketGroup=server-sentinel
+SocketMode=0660
+RemoveOnStop=yes
+Accept=yes
+# Renewals are rare (about one per node per year, plus retries); a few
+# concurrent instances wait on the CA directory lock in turn.
+MaxConnections=4
+Backlog=8
+
+[Install]
+WantedBy=sockets.target

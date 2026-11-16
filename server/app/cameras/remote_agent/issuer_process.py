@@ -333,7 +333,9 @@ class IssuanceLog:
     ``deployment_ca`` (``deployment_id``, ``credential_digest``,
     ``not_after``), ``listener`` (``server_name``, ``public_key_digest``,
     ``credential_digest``, ``not_after``), ``node`` (``node_id``,
-    ``public_key_digest``, ``credential_digest``, ``not_after``) and
+    ``public_key_digest``, ``credential_digest``, ``not_after``; a renewal
+    signed by ``renewal_signer`` adds ``renewal_of``, the digest of the
+    certificate it renewed, Issue #109 PR2) and
     ``node_revocation`` (``node_id``). Every record carries ``at`` (UTC).
     Public digests and UUIDs only: no key, CSR, code or certificate body.
     A record that does not parse makes the whole log invalid, and the issuer
@@ -374,7 +376,10 @@ class IssuanceLog:
                         raise ValueError
                 except (KeyError, TypeError, ValueError, AttributeError):
                     raise IssuanceLogUnavailable("issuer log is invalid") from None
-            if value["type"] == "node" and not isinstance(value.get("public_key_digest"), str):
+            if value["type"] == "node" and (
+                    not isinstance(value.get("public_key_digest"), str)
+                    or not isinstance(value.get("credential_digest", ""), str)
+                    or ("renewal_of" in value and not _is_digest(value["renewal_of"]))):
                 raise IssuanceLogUnavailable("issuer log is invalid")
             records.append(value)
         return records
@@ -426,9 +431,13 @@ def _days(value: object, maximum: datetime.timedelta) -> datetime.timedelta:
     return datetime.timedelta(days=value)
 
 
+def _is_digest(value: object) -> bool:
+    return (isinstance(value, str) and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value))
+
+
 def _digest(value: object) -> str:
-    if (not isinstance(value, str) or len(value) != 64 or value != value.lower()
-            or any(character not in "0123456789abcdef" for character in value)):
+    if not _is_digest(value):
         raise IssuerRefusedRequest("issuer request is invalid")
     return value
 

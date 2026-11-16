@@ -15,6 +15,14 @@ backend gets no capability for it; the hostname reservation check verifies
 through unprivileged sock_diag that the upstream was created by this unit.
 Installation steps are in `server/docs/DEPLOYMENT.md`.
 
+`serversentinel-renewal-signer.socket` and
+`serversentinel-renewal-signer@.service` are the Owner-installed units of the
+capture-node renewal-only signer (Issue #109 PR2): systemd owns the local
+Unix socket (root:service group 0660, `Accept=yes`) and starts one hardened
+instance per connection as `serversentinel-ca`, which answers one renewal
+request of the service account and exits. Installation steps are in
+`server/docs/DEPLOYMENT.md`, "Renewal-only signer".
+
 `server-sentinel-failure-notice.service` is rendered and placed by
 `server/install.py` too (Issue #321 item 2): a hardened oneshot unit, started
 only by `OnFailure=` of `server-sentinel.service`, that runs the

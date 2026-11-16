@@ -31,14 +31,19 @@ ledger-admitted mTLS session. This module is the Main side of that exchange:
 No listener or wire protocol is added here; #14/#15 carry the renewal request
 over the ingest session.
 
-Interim signing path (Issue #109). Renewal needs a signature while the node
-is connected, so it cannot use the one-shot approval issuer. Until the
-renewal-only signer (Issue #109 PR2, socket-activated, CA account) exists,
-``renew_node_credential`` takes any ``RenewalIssuer``; the only implementation
-today is an in-process ``DeploymentAuthority``, used by tests. Nothing in the
-application calls it and no listener carries renewal yet, so no
-network-facing or database-owning process loads the CA key for it. Wiring
-renewal into the ingest listener must wait for that signer.
+Signing path (Issue #109 PR2). Renewal needs a signature while the node is
+connected, so it cannot use the one-shot approval issuer. In a deployment
+the issuer is ``renewal_signer.SignerRenewalIssuer``: it holds only the
+public CA certificate and asks the socket-activated, renewal-only signer
+(CA account) to sign, so no network-facing or database-owning process loads
+the CA key. The signer re-decides from its own issuance log (logged, current,
+unsuperseded and unrevoked certificate near expiry, fresh key, rate limits);
+its refusals are ``renewal_signer_refused`` and an unreachable or undecided
+signer is ``renewal_signer_unavailable``, both Owner-visible like any other
+refusal. An in-process ``DeploymentAuthority`` still satisfies
+``RenewalIssuer`` for tests of the ledger rules only. The ingest listener does
+not carry renewal yet; that wiring (ADR-0007) constructs only the signer
+issuer.
 """
 from __future__ import annotations
 
@@ -55,6 +60,7 @@ from .node_ca import (
     DEFAULT_NODE_VALIDITY, AuthorityValidityExceeded, CaptureAuthorityError, IssuedNodeCredential,
 )
 from .pairing import PairingError, PairingLedger
+from .renewal_signer import RenewalSignerRefused, RenewalSignerUnavailable
 
 
 RENEWAL_WINDOW = datetime.timedelta(days=30)
@@ -88,7 +94,7 @@ def _utc_now() -> datetime.datetime:
 
 
 class RenewalIssuer(Protocol):
-    """What renewal needs from the CA side (see the interim note above)."""
+    """What renewal needs from the CA side (see the signing-path note above)."""
 
     def renewal_key_digest(self, csr_pem: bytes) -> str:
         ...
@@ -148,6 +154,9 @@ def renew_node_credential(authority: RenewalIssuer, ledger: PairingLedger,
             # The CSR was valid; the deployment CA expires before the leaf
             # would. Not the node's fault, and not fixed by retrying.
             raise RenewalRefused(CA_VALIDITY_REFUSAL) from None
+        except (RenewalSignerRefused, RenewalSignerUnavailable) as error:
+            # The renewal-only signer's own decision (Issue #109 PR2).
+            raise RenewalRefused(error.reason) from None
         except CaptureAuthorityError:
             raise RenewalRefused("renewal_request_invalid") from None
         try:

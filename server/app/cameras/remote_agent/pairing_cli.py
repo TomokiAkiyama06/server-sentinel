@@ -21,8 +21,14 @@ Commands::
     sudo serversentinel-pairing revoke ...           # service account (+ CA log)
     serversentinel-pairing export-bundle ...         # as the service account
     serversentinel-pairing list ...                  # as the service account
+    serversentinel-pairing renewal-signer ...        # systemd, as the CA account
 
 (``serversentinel-pairing`` is ``python -m app.cameras.remote_agent.pairing_cli``.)
+
+``renewal-signer`` is not an Owner command: systemd starts it once per
+connection to ``serversentinel-renewal-signer.socket`` (``Accept=yes``), as
+the CA account, with the connection on stdin/stdout. It answers one renewal
+request of the service account and exits (``renewal_signer``, Issue #109 PR2).
 
 ``init``, ``rotate-listener``, ``approve`` and ``revoke`` must start as root.
 Before any thread exists they fork the CA child, which drops to the CA
@@ -135,6 +141,7 @@ from .node_ca import (
 )
 from .pairing import HmacCodeVerifier, PairingError, PairingLedger
 from .renewal import ca_expiry_reason, listener_expiry_reason
+from .renewal_signer import run_signer
 
 
 REQUEST_FORMAT = 1
@@ -825,6 +832,14 @@ def command_revoke(args) -> int:
     return 0
 
 
+def command_renewal_signer(args) -> int:
+    """One socket-activated renewal (Issue #109 PR2); prints only a fixed word."""
+    service = _PRIVILEGES.account(args.service_user)
+    outcome = run_signer(args.authority_dir, service)
+    print(f"serversentinel-pairing: renewal-signer: {outcome}", file=sys.stderr)
+    return 0
+
+
 def _separation_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("--ca-user", default=DEFAULT_CA_ACCOUNT,
                          help="static system account owning --authority-dir "
@@ -894,6 +909,15 @@ def _parser() -> argparse.ArgumentParser:
     revoke.add_argument("--node", type=UUID, required=True)
     _separation_arguments(revoke)
     revoke.set_defaults(handler=command_revoke)
+
+    signer = commands.add_parser(
+        "renewal-signer",
+        help="answer one renewal request on stdin (systemd socket activation, CA account)")
+    signer.add_argument("--authority-dir", type=Path, required=True)
+    signer.add_argument("--service-user", default=DEFAULT_SERVICE_ACCOUNT,
+                        help="the only account allowed to ask "
+                             f"(default {DEFAULT_SERVICE_ACCOUNT})")
+    signer.set_defaults(handler=command_renewal_signer)
     return parser
 
 

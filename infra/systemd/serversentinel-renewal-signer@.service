@@ -1,0 +1,53 @@
+# ServerSentinel capture-node renewal signer, one instance per connection
+# (Issue #109 PR2, Owner decision 2026-10-07).
+#
+# Started only by serversentinel-renewal-signer.socket. Runs as the static
+# CA account serversentinel-ca (not DynamicUser), with the accepted
+# connection on stdin/stdout, answers one renewal request and exits. It is
+# the only long-term path that loads ca-key.pem outside the Owner's sudo
+# pairing commands; it decides from the CA-only issuance log and the
+# certificate chain, never from the application database.
+#
+# Install as /etc/systemd/system/serversentinel-renewal-signer@.service
+# (root-owned, mode 0644). Replace /var/lib/serversentinel-ca and
+# server-sentinel if the deployment uses another CA directory or service
+# account. See server/docs/DEPLOYMENT.md.
+
+[Unit]
+Description=ServerSentinel capture renewal signer (one request)
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+User=serversentinel-ca
+Group=serversentinel-ca
+ExecStart=/usr/local/sbin/serversentinel-pairing renewal-signer --authority-dir /var/lib/serversentinel-ca --service-user server-sentinel
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=60
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/serversentinel-ca
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
