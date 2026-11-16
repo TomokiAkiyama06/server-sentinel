@@ -15,7 +15,10 @@ Bounds (ADR-0007 item 5, Issue #14):
   closed at accept. ``maximum_handshakes_per_address`` handshakes in progress
   per peer address, and each handshake ends within the acceptor's timeout.
 * One live session per node: a newer admitted session of the same node
-  supersedes the older, whose socket is shut down (ADR-0007 item 2).
+  supersedes the older, whose socket is shut down (ADR-0007 item 2). Each
+  replacement is reported to the registry (``superseded``), which marks a node
+  replaced 3 times within 10 min as ``contended`` for the Owner notice (Issue
+  #407).
 * Every frame length is checked before its body is read
   (``maximum_frame_bytes``); a session without a frame for
   ``idle_timeout_seconds`` is closed; every frame is charged to the node's
@@ -397,6 +400,10 @@ class CaptureIngestServer:
                 registered = True
                 previous = self._live.get(node)
                 self._live[node] = (generation, tls)
+                if previous is not None:
+                    # Issue #407: counted per node; repeated replacement is
+                    # notified by the monitoring worker (`capture_nodes.py`).
+                    self.registry.superseded(node, generation)
                 if self.live_preview is not None:
                     # The older session's live frames go with it (lock
                     # order: this lock, then the hub's).

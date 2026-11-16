@@ -270,8 +270,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
         def capture_health():
             # `application` is bound below; the first tick runs in the lifespan.
             server = application.state.capture_ingest
+            # Issue #407: nodes whose sessions kept replacing each other.
+            contended = frozenset() if server is None else server.registry.contended()
             nodes = () if server is None else tuple(
-                CaptureNodeView(node, state, reasons)
+                CaptureNodeView(node, state, reasons, node in contended)
                 for node, state, reasons in server.registry.nodes())
             # Issue #397: the nodes expected to send heartbeats. A ledger
             # read that fails skips heartbeat-loss detection for this tick

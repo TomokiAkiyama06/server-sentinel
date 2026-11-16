@@ -9,10 +9,13 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from app.cameras.remote_agent.ingest_wire import NodeHeartbeat
-from app.cameras.remote_agent.node_health import CaptureNodeHealthRegistry
+from app.cameras.remote_agent.node_health import (
+    SUPERSEDE_NOTICE_COUNT, SUPERSEDE_WINDOW_SECONDS, CaptureNodeHealthRegistry,
+)
 from app.main import create_app
 from app.monitoring.capture_nodes import (
-    HOURLY_LIMIT, NOTICE_AFTER_SECONDS, CaptureNodeHealthMonitor, CaptureNodeView, notice_id,
+    HOURLY_LIMIT, NODE_NOTICE_KINDS, NOTICE_AFTER_SECONDS, CaptureNodeHealthMonitor,
+    CaptureNodeView, notice_id,
 )
 from app.monitoring.runtime import MonitoringDependencies
 from app.notifications.service import NotificationKind, NotificationService
@@ -31,6 +34,7 @@ NUMBERS = NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED
 CLOCK = NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED
 LISTENER = NotificationKind.CAPTURE_INGEST_UNAVAILABLE
 LOST = NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST
+CONTENTION = NotificationKind.CAPTURE_NODE_CREDENTIAL_CONTENTION
 
 
 class Provider:
@@ -40,8 +44,8 @@ class Provider:
         # Issue #397: the ledger's active nodes (None: not readable).
         self.expected = None
 
-    def set(self, node, state, *reasons):
-        self.nodes[node] = CaptureNodeView(node, state, tuple(reasons))
+    def set(self, node, state, *reasons, contended=False):
+        self.nodes[node] = CaptureNodeView(node, state, tuple(reasons), contended)
 
     def __call__(self):
         return self.state, tuple(self.nodes.values()), self.expected
@@ -553,6 +557,140 @@ class AgentCountTests(MonitorFixture, unittest.TestCase):
         self.assertEqual((status.online_nodes, status.offline_nodes), (1, 1))
 
 
+class ContentionRegistryTests(unittest.TestCase):
+    """Issue #407 (Owner decision 2026-11-16): 3 replacements within 10 min."""
+
+    def setUp(self):
+        self.clock = [0.0]
+        self.registry = CaptureNodeHealthRegistry(monotonic=lambda: self.clock[0])
+        self.node = uuid4()
+        self.generation = 0
+
+    def replace(self, after=0.0):
+        self.clock[0] += after
+        self.generation += 1
+        self.assertTrue(self.registry.connected(self.node, self.generation))
+        self.registry.superseded(self.node, self.generation)
+
+    def test_the_owner_decision_is_three_within_ten_minutes(self):
+        self.assertEqual((SUPERSEDE_NOTICE_COUNT, SUPERSEDE_WINDOW_SECONDS), (3, 600.0))
+
+    def test_three_replacements_within_the_window_mark_the_node_until_it_passes(self):
+        self.replace()
+        self.replace(299)
+        self.assertEqual(self.registry.contended(), frozenset())
+        self.replace(301)
+        self.assertEqual(self.registry.contended(), {self.node})
+        # Until 10 min after the replacement that completed the count.
+        self.clock[0] += SUPERSEDE_WINDOW_SECONDS - 1
+        self.assertEqual(self.registry.contended(), {self.node})
+        self.clock[0] += 1
+        self.assertEqual(self.registry.contended(), frozenset())
+
+    def test_replacements_spread_wider_than_the_window_are_not_contention(self):
+        for _ in range(10):
+            self.replace(301)
+        self.assertEqual(self.registry.contended(), frozenset())
+        self.assertEqual(len(self.registry._nodes[self.node].supersedes),
+                         SUPERSEDE_NOTICE_COUNT)
+
+    def test_continued_replacement_extends_the_condition(self):
+        for _ in range(3):
+            self.replace(30)
+        for _ in range(40):
+            self.replace(30)
+            self.assertEqual(self.registry.contended(), {self.node})
+
+    def test_reconnects_without_a_live_session_and_old_generations_do_not_count(self):
+        for _ in range(5):
+            self.generation += 1
+            self.registry.connected(self.node, self.generation)
+            self.registry.disconnected(self.node, self.generation)
+        # A late report for a generation that is not the node's current one.
+        self.registry.superseded(self.node, self.generation - 1)
+        self.registry.superseded(uuid4(), 1)
+        self.assertEqual(self.registry.contended(), frozenset())
+        self.assertEqual(len(self.registry._nodes[self.node].supersedes), 0)
+
+    def test_a_forgotten_node_is_not_contended(self):
+        for _ in range(3):
+            self.replace(1)
+        self.registry.forget(self.node)
+        self.assertEqual(self.registry.contended(), frozenset())
+
+
+class ContentionNoticeTests(MonitorFixture, unittest.TestCase):
+    """Issue #407: one critical notice per episode, under the node cap."""
+
+    def test_a_contended_node_is_notified_at_once_and_once_per_episode(self):
+        self.provider.set(self.node, "online", contended=True)
+        status = self.drain()
+        self.assertEqual(self.kinds(), [CONTENTION.value])
+        self.assertEqual(status.contended_nodes, 1)
+        self.advance(3600)
+        self.drain(AT + timedelta(hours=1))
+        self.assertEqual(self.kinds(), [CONTENTION.value])
+        # It ends silently; a later recurrence is a new episode.
+        self.provider.set(self.node, "online")
+        self.assertEqual(self.drain().contended_nodes, 0)
+        self.assertEqual(self.kinds(), [CONTENTION.value])
+        self.provider.set(self.node, "online", contended=True)
+        self.drain(AT + timedelta(hours=2))
+        self.assertEqual(self.kinds(), [CONTENTION.value, CONTENTION.value])
+        texts = self.texts()
+        self.assertEqual(texts, ["ServerSentinel critical alert: "
+                                 "capture_node_credential_contention"] * 2)
+        self.assertFalse(any(str(self.node) in text for text in texts))
+
+    def test_contention_is_notified_whatever_the_heartbeat_state(self):
+        for state in ("offline", "degraded"):
+            with self.subTest(state=state):
+                self.texts()  # wait for in-flight deliveries first
+                self.sink.rows.clear()
+                node = uuid4()
+                self.provider.nodes.clear()
+                self.provider.set(node, state, contended=True)
+                self.drain()
+                self.assertEqual(self.kinds(), [CONTENTION.value])
+
+    def test_contention_shares_the_node_cap_and_a_held_one_says_it_recovered(self):
+        for index in range(HOURLY_LIMIT):
+            self.provider.set(self.node, "degraded", "storage_unavailable")
+            self.drain(AT + timedelta(minutes=index))
+            self.provider.set(self.node, "online")
+            self.drain(AT + timedelta(minutes=index))
+        self.provider.set(self.node, "online", contended=True)
+        self.assertEqual(self.drain().held_notices, 1)
+        self.assertNotIn(CONTENTION.value, self.kinds())
+        # Ended while held: still sent once, saying so, when the cap frees.
+        self.provider.set(self.node, "online")
+        self.drain()
+        self.advance(3600)
+        self.drain()
+        self.advance(60)
+        self.drain()
+        self.assertEqual(self.kinds().count(CONTENTION.value), 1)
+        self.assertIn("ServerSentinel critical alert: capture_node_credential_contention"
+                      " (already recovered)", self.texts())
+
+    def test_a_forgotten_node_drops_its_contention_episode(self):
+        for index in range(HOURLY_LIMIT):
+            self.provider.set(self.node, "degraded", "storage_unavailable")
+            self.drain(AT + timedelta(minutes=index))
+            self.provider.set(self.node, "online")
+            self.drain(AT + timedelta(minutes=index))
+        self.provider.set(self.node, "online", contended=True)
+        self.drain()
+        del self.provider.nodes[self.node]
+        self.drain()
+        self.advance(3600)
+        self.drain()
+        self.assertNotIn(CONTENTION.value, self.kinds())
+
+    def test_the_restored_hour_counts_contention_notices(self):
+        self.assertIn(CONTENTION, NODE_NOTICE_KINDS)
+
+
 class ActiveNodeLedgerTests(CaptureTlsHarness):
     """Issue #397: the nodes the Main expects heartbeats from."""
 
@@ -753,7 +891,8 @@ class RuntimeWiringTests(RuntimeFixture):
             views = (CaptureNodeView(capped, "degraded", ("storage_unavailable",)),
                      CaptureNodeView(other, "degraded", ("storage_unavailable",)))
             application.state.capture_ingest = SimpleNamespace(registry=SimpleNamespace(
-                nodes=lambda: tuple((v.node_id, v.state, v.reasons) for v in views)))
+                nodes=lambda: tuple((v.node_id, v.state, v.reasons) for v in views),
+                contended=frozenset))
             application.state.capture_ingest_state = "running"
             self.clock.advance(timedelta(seconds=1))
             await runtime.call(runtime.tick)
@@ -761,6 +900,35 @@ class RuntimeWiringTests(RuntimeFixture):
             self.assertTrue(runtime.status.capture_node_notices_held)
             rows = [row for row in self.events() if row[0] == STORAGE.value]
             self.assertEqual(len(rows), HOURLY_LIMIT + 1)
+
+    async def test_contention_is_notified_and_degrades_the_summary_through_the_runtime(self):
+        # Issue #407: the composition root's provider reads `contended()`.
+        from types import SimpleNamespace
+        node = uuid4()
+        values = dict(
+            integrity_probe=self.probe, slack_opener=self.transport, utcnow=self.clock.utcnow,
+            monotonic=lambda: self.clock.monotonic, tick_seconds=3600.0)
+        from tests.test_recording import SyntheticValidator
+        application = create_app(self.settings, monitoring=self.configuration(),
+                                 monitoring_dependencies=MonitoringDependencies(
+                                     segment_validator=SyntheticValidator(), **values),
+                                 capture_ingest_unavailable=True)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            application.state.capture_ingest = SimpleNamespace(registry=SimpleNamespace(
+                nodes=lambda: ((node, "online", ()),), contended=lambda: frozenset({node})))
+            application.state.capture_ingest_state = "running"
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertTrue(runtime.status.capture_node_contended)
+            self.assertIn(("capture_node_credential_contention", "sent"), self.events())
+            self.assertIn("ServerSentinel critical alert: capture_node_credential_contention",
+                          self.slack_texts())
+            contended = await runtime.call(runtime._summary, self.clock.utcnow())
+            await runtime.call(lambda: runtime._set(capture_node_contended=False))
+            clear = await runtime.call(runtime._summary, self.clock.utcnow())
+            # Degraded in the daily summary while it lasts.
+            self.assertEqual(contended.error_count, clear.error_count + 1)
 
     async def test_no_monitor_without_a_capture_ingest_section(self):
         application = self.application()

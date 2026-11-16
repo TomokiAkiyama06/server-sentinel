@@ -32,6 +32,19 @@ while the Agent was idle (a ``CLOSE``) is read before reconnecting. A DNS name
 adds name resolution, which has no timeout here: an IP literal endpoint is
 recommended (PR #406 review).
 
+A connection the Main closed while the Agent was idle (``_still_open``: an
+idle timeout, a Main restart, or this session superseded by a newer one of
+the same node) is reconnected within the same tick the first time. Issue #407
+(Owner decision 2026-11-16): an idle close within ``IDLE_DROP_STREAK_SECONDS``
+of the previous one continues a streak, and from the second close of a
+streak the reconnect waits ``RETRY_FIRST_SECONDS`` doubling up to
+``RETRY_MAX_SECONDS`` (reason ``main_closed_repeatedly``). Two Agents holding
+one node credential (a cloned SD card or a restored backup) then replace each
+other at most about every ``RETRY_MAX_SECONDS`` instead of on every tick,
+which the Main still sees and notifies. A successful heartbeat does not end
+the streak (each of those sessions acknowledges heartbeats); only a
+connection that stays open for the streak window does. Two numbers are kept.
+
 The credential is read from the installed generation at every connect
 (``main_link.installed_credential``), so a pairing completed while the
 service runs is picked up without a restart, and a credential naming another
@@ -82,6 +95,9 @@ NOT_SENT_LOW_WATER_BYTES = 131_072
 TCP_NOTSENT_LOWAT = getattr(socket, "TCP_NOTSENT_LOWAT", 25)
 RETRY_FIRST_SECONDS = 1.0
 RETRY_MAX_SECONDS = 30.0
+# Issue #407: idle closes this close together form a streak; above
+# `RETRY_MAX_SECONDS`, so a streak survives its longest back-off.
+IDLE_DROP_STREAK_SECONDS = 60.0
 _WORD = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _ACK_KEYS = frozenset({"sequence", "receive_utc", "send_utc"})
 
@@ -208,6 +224,9 @@ class IngestSession:
         self._exchange: ClockExchange | None = None
         self._failures = 0
         self._retry_at = None
+        # Issue #407: the current streak of idle closes and its latest time.
+        self._idle_drops = 0
+        self._idle_drop_at: float | None = None
         # Fixed words for status and tests; never peer bytes.
         self.last_failure: str | None = None
         self.last_close_reason: str | None = None
@@ -263,6 +282,7 @@ class IngestSession:
     def _send_heartbeat(self, heartbeat: dict) -> None:
         if self._connection is not None and not self._still_open():
             self._drop()
+            self._idle_dropped()
         if self._connection is None:
             if self._retry_at is not None and self._monotonic() < self._retry_at:
                 raise IngestSessionError("main_retry_wait")
@@ -296,6 +316,25 @@ class IngestSession:
         self._failures += 1
         delay = min(RETRY_FIRST_SECONDS * 2 ** min(self._failures - 1, 16), RETRY_MAX_SECONDS)
         self._retry_at = self._monotonic() + delay
+
+    def _idle_dropped(self) -> None:
+        """Back off from the second idle close of a streak (Issue #407).
+
+        The first one (a Main restart, an idle timeout, one replacement by
+        a reconnect of this node) reconnects at once, as before.
+        """
+        now = self._monotonic()
+        if (self._idle_drop_at is not None
+                and 0 <= now - self._idle_drop_at < IDLE_DROP_STREAK_SECONDS):
+            self._idle_drops = min(self._idle_drops + 1, 64)
+        else:
+            self._idle_drops = 1
+        self._idle_drop_at = now
+        if self._idle_drops < 2:
+            return
+        self.last_failure = "main_closed_repeatedly"
+        delay = min(RETRY_FIRST_SECONDS * 2 ** min(self._idle_drops - 2, 16), RETRY_MAX_SECONDS)
+        self._retry_at = max(self._retry_at or now, now + delay)
 
     def _drop(self) -> None:
         connection, self._connection = self._connection, None

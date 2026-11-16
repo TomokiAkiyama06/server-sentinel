@@ -65,7 +65,7 @@ CRITICAL_KINDS = (
     NotificationKind.SERVER_MOVEMENT, NotificationKind.CAMERA_TAMPER,
     NotificationKind.HUMAN_ACCESS_FAULT, NotificationKind.CREDENTIAL_FINDING,
     NotificationKind.CAPTURE_NODE_STORAGE_FAILURE, NotificationKind.CAPTURE_INGEST_UNAVAILABLE,
-    NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST,
+    NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST, NotificationKind.CAPTURE_NODE_CREDENTIAL_CONTENTION,
 )
 # `recording_device_numbers_changed` is not listed: the daily summary counts
 # the `recording_device_numbers_stale` flag instead, every day until fixed.
@@ -244,6 +244,9 @@ class MonitoringStatus:
     # Both are degraded in the daily summary.
     capture_node_lost: bool = False
     capture_node_watch_unavailable: bool = False
+    # Issue #407: a node's sessions keep replacing each other (more than one
+    # connection presents its credential). Degraded in the daily summary.
+    capture_node_contended: bool = False
 
     @property
     def camera_offline_cause(self) -> str:
@@ -1146,6 +1149,7 @@ class MonitoringRuntime:
             status.recording_device_numbers_stale, status.unclean_exit_detection_degraded,
             status.capture_node_degraded, status.capture_ingest_unavailable,
             status.capture_node_lost, status.capture_node_watch_unavailable,
+            status.capture_node_contended,
         ))
         capture = self._capture_health
         elapsed = self.dependencies.monotonic() - self._started_monotonic
@@ -1288,7 +1292,8 @@ class MonitoringRuntime:
                   capture_ingest_unavailable=status.listener_unavailable,
                   capture_node_notices_held=status.held_notices > 0,
                   capture_node_lost=status.lost_nodes > 0,
-                  capture_node_watch_unavailable=status.loss_watch_unavailable)
+                  capture_node_watch_unavailable=status.loss_watch_unavailable,
+                  capture_node_contended=status.contended_nodes > 0)
 
     def _capture_notice_rows(self, now: datetime):
         """``(event ID, kind, UTC at, age)`` of node notice rows accepted in the last hour.

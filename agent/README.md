@@ -16,7 +16,10 @@ node credential installed, each tick sends the node heartbeat to the Main's
 ingest listener over TLS 1.3 mTLS (ALPN `serversentinel-capture-ingest/1`) and
 waits for its acknowledgement, whose times give the clock exchange of the
 next heartbeat. Failures report `main_unavailable` and reconnect with a
-1 s to 30 s back-off. It carries no media yet (#15 / #17). See
+1 s to 30 s back-off. A session the Main closed while the Agent was idle is
+reconnected at once the first time; repeated idle closes (within 60 s of each
+other, as when two Agents share one node credential and supersede each
+other) back off the same way (Issue #407). It carries no media yet (#15 / #17). See
 `SPECIFICATION.md` §5.7.
 
 Issue #14 also wires the UVC capture into the service: with a `capture`

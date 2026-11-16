@@ -310,6 +310,63 @@ class IngestSessionTests(NodeTlsHarness):
         self.assertEqual([frame[1]["sequence"] for frame in peer.received], [1, 2])
         self.assertIsNotNone(session.exchange_clock())
 
+    def test_repeated_idle_closes_back_off_but_a_single_one_reconnects_at_once(self):
+        # Issue #407: another Agent with this node's credential supersedes
+        # every session; from the second idle close of a streak the
+        # reconnect waits instead of replacing the other one on every tick.
+        clock = [100.0]
+
+        def once_then_close(tls, received):
+            frame = read_frame(tls)
+            received.append(frame)
+            ack(tls, frame)
+
+        peer = self.main(once_then_close)
+        session = self.session(peer, monotonic=lambda: clock[0])
+        sequence = [0]
+
+        def tick():
+            sequence[0] += 1
+            if session._connection is not None:
+                # The Main's close arrives while the Agent waits for its tick.
+                self.assertTrue(select.select([session._connection], [], [], 5)[0])
+            session.send_heartbeat(heartbeat(sequence[0]))
+
+        tick()
+        clock[0] += 5
+        tick()  # the first idle close: reconnected within the tick
+        self.assertEqual(peer.connections, 2)
+        delays = []
+        for _ in range(7):
+            clock[0] += 5
+            with self.assertRaises(IngestSessionError) as raised:
+                tick()
+            self.assertEqual(raised.exception.reason, "main_retry_wait")
+            self.assertEqual(session.last_failure, "main_closed_repeatedly")
+            connections = peer.connections
+            # No traffic while waiting, live frames included (never connects).
+            self.assertFalse(session.send_live_frame(uuid4(), b"\xff\xd8\xff\xd9"))
+            waited = 0.0
+            while True:
+                clock[0] += 0.5
+                waited += 0.5
+                try:
+                    tick()
+                    break
+                except IngestSessionError as failure:
+                    self.assertEqual(failure.reason, "main_retry_wait")
+                    self.assertEqual(peer.connections, connections)
+            delays.append(waited)
+        # The successful heartbeats in between do not end the streak.
+        self.assertEqual(delays, [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0])
+        self.assertIsNone(session.last_failure)
+        # A connection that stayed open for the streak window ends it: the
+        # next idle close reconnects at once again.
+        clock[0] += ingest_session.IDLE_DROP_STREAK_SECONDS
+        connections = peer.connections
+        tick()
+        self.assertEqual(peer.connections, connections + 1)
+
     def test_a_readable_socket_without_application_data_keeps_the_session(self):
         # TLS 1.3 post-handshake records (session tickets) wake `select`
         # without application data; the session must stay, without waiting

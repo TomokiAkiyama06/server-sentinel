@@ -1166,6 +1166,15 @@ local record.
   stopped: one notice about 5 min after the start. A revoked node is never
   notified (revoke a node taken out of service, or every Main start notifies
   it once);
+- [ ] credential contention (Issue #407): run a second Agent with a copy of
+  the same node credential (a disposable copy of the capture host's runtime
+  directory on another test host, removed afterwards) against the same Main:
+  within about one monitoring tick after the third replacement Slack receives
+  one `capture_node_credential_contention`, and no second one while both run;
+  each Agent reconnects at most about every 30 s, not on every tick. Stop the
+  copy: no recovery notice, and after 10 min a new contention is notified
+  again (within the hourly cap). Revoke and re-pair if the copy cannot be
+  removed;
 - [ ] from the capture host, which is not on the Tailnet, a paired node's
   heartbeat over the private LAN is answered with `HEARTBEAT_ACK`; without
   the ALPN, without a client certificate, with another deployment's

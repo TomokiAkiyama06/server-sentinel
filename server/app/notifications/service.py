@@ -69,6 +69,11 @@ class NotificationKind(StrEnum):
     # credential sent no heartbeat for 5 min (its Agent stopped, failed to
     # start, or cannot reach the Main). Value-free.
     CAPTURE_NODE_HEARTBEAT_LOST = "capture_node_heartbeat_lost"
+    # Issue #407 (Owner decision 2026-11-16): sessions presenting one node's
+    # credential replaced each other 3 times within 10 min (more than one
+    # connection uses it, e.g. a cloned SD card or a restored backup). It
+    # names neither host and claims no intent. Value-free.
+    CAPTURE_NODE_CREDENTIAL_CONTENTION = "capture_node_credential_contention"
     DAILY_SUMMARY = "daily_summary"
 
 
@@ -80,7 +85,7 @@ IMMEDIATE_KINDS = frozenset({
     NotificationKind.SCENE_REFERENCE_REACQUIRED, NotificationKind.SCENE_CALIBRATION_REQUIRED,
     NotificationKind.CAPTURE_NODE_STORAGE_FAILURE, NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED,
     NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED, NotificationKind.CAPTURE_INGEST_UNAVAILABLE,
-    NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST,
+    NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST, NotificationKind.CAPTURE_NODE_CREDENTIAL_CONTENTION,
 })
 # Immediate only when confirmed: a confirmed server movement / camera tamper
 # (Issue #26), and a camera source offline for the deployment's threshold
@@ -106,6 +111,7 @@ RECOVERED_KINDS = frozenset({
     # Issue #14: a node notice held by its hourly cap past the episode's end.
     NotificationKind.CAPTURE_NODE_STORAGE_FAILURE, NotificationKind.CAPTURE_NODE_DEVICE_NUMBERS_CHANGED,
     NotificationKind.CAPTURE_NODE_CLOCK_DEGRADED, NotificationKind.CAPTURE_NODE_HEARTBEAT_LOST,
+    NotificationKind.CAPTURE_NODE_CREDENTIAL_CONTENTION,
 })
 # Issue #394: how many final outcomes `final_outcome` remembers. Far above
 # what one process keeps referring to (one latest alert per camera source,

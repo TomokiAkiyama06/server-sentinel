@@ -286,6 +286,39 @@ class CaptureIngestServerTests(CaptureTlsHarness):
         self.send_heartbeat(second, sequence=3)
         self.assertIs(self.reply(second)[0], FrameType.HEARTBEAT_ACK)
 
+    def test_each_replacement_of_a_live_session_is_counted_for_the_node(self):
+        # Issue #407: three replacements make the node contended; a reconnect
+        # after the older session ended is not a replacement.
+        server = self.serve()
+        reported = []
+        original = server.registry.superseded
+
+        def observed(node, generation):
+            reported.append((node, server._lock.locked()))
+            return original(node, generation)
+
+        server.registry.superseded = observed
+        first = self.connect()
+        self.send_heartbeat(first)
+        self.assertIs(self.reply(first)[0], FrameType.HEARTBEAT_ACK)
+        first.close()
+        self.assertTrue(self.wait_for(lambda: server.registry.snapshot().connected_nodes == 0))
+        sessions = []
+        for sequence in range(1, 4):
+            tls = self.connect()
+            self.send_heartbeat(tls, sequence=sequence)
+            self.assertIs(self.reply(tls)[0], FrameType.HEARTBEAT_ACK)
+            sessions.append(tls)
+            self.assertEqual(server.registry.contended(), frozenset())
+        self.assertEqual(reported, [(self.node, True)] * 2)
+        last = self.connect()
+        self.send_heartbeat(last, sequence=4)
+        self.assertIs(self.reply(last)[0], FrameType.HEARTBEAT_ACK)
+        self.assertEqual(reported, [(self.node, True)] * 3)
+        self.assertEqual(server.registry.contended(), {self.node})
+        self.assertTrue(self.wait_for(
+            lambda: server.last_close_reasons().count("superseded") == 3))
+
     def test_replacement_and_registration_are_one_step(self):
         # PR #401 Codex review: the health registration happens under the
         # same lock as the replacement, in generation order, so a concurrent

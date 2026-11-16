@@ -185,7 +185,8 @@ this protocol.
   authenticates nothing), one live session per node (a newer admitted session
   supersedes the older; the replacement and the health registration are one
   step under the listener lock, so an older session can never register after
-  a newer one), one deadline per frame (default 30 s from the end of the
+  a newer one; each replacement is counted per node, and 3 within 10 min
+  notify the Owner, Issue #407), one deadline per frame (default 30 s from the end of the
   previous frame, for the whole header and body however the peer splits its
   bytes, so a trickling peer cannot hold a session open), and
   every frame charged to the node's rate budget (default 10 per second,
