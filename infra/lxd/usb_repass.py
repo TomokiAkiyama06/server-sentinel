@@ -542,19 +542,21 @@ def run(config_path, state_dir, check=False, lxd_factory=Lxd, sleep=time.sleep, 
     # Read in --check too, never written there (Issue #402 (6)).
     state = State(state_dir)
     failed = False
+    if check:
+        # Reported before anything that needs LXD, so the recovery record is
+        # shown even while LXD does not answer (PR #419 review).
+        for name in sorted(state.pending):
+            # A remove whose add has not been confirmed: the next run adds
+            # this configuration back if the instance lacks the device, and
+            # drops the record if the device is there.
+            log("usb_repass_pending_restore", name)
     uptime = host_uptime(proc)
     if (uptime is not None and uptime < BOOT_GRACE_SECONDS
             and not wait_for_lxd(lxd, instance, sleep, monotonic)):
         # Issue #402 (7): not a failure yet; the timer runs again.
         log("usb_repass_lxd_not_ready")
         return 0
-    if check:
-        for name in sorted(state.pending):
-            # A remove whose add has not been confirmed: the next run adds
-            # this configuration back if the instance lacks the device, and
-            # drops the record if the device is there.
-            log("usb_repass_pending_restore", name)
-    elif state.pending:
+    if not check and state.pending:
         # A run that died between remove and add left the configuration here;
         # restored whether or not the VM runs (PR #399 review).
         for name, config in sorted(state.pending.items()):

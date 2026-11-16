@@ -599,6 +599,11 @@ class RepassTests(unittest.TestCase):
         self.assertEqual((0, ["usb_repass_lxd_not_ready"]), self.run_once())
         self.assertLessEqual(sum(self.sleeps), repass.LXD_WAIT_SECONDS)
         self.assertEqual(pending, (self.state / "state.json").read_bytes())
+        # --check still reports the pending record while LXD does not answer
+        # (PR #419 review: the Remove steps rely on it).
+        self.assertEqual((0, ["usb_repass_pending_restore device=cam1", "usb_repass_lxd_not_ready"]),
+                         self.run_once(check=True))
+        self.assertEqual(pending, (self.state / "state.json").read_bytes())
         # LXD answers on a later run: the pending device is restored.
         self.lxd.unreachable = 0
         self.assertEqual("usb_repass_restored device=cam1", self.run_once()[1][0])
