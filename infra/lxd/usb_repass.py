@@ -1,36 +1,40 @@
 #!/usr/bin/python3 -I
-"""Host-side re-pass of serial-identified USB cameras to the LXD VM (Issue #301 item 1).
+"""Host-side check for USB cameras that look not passed to the LXD VM (Issue #301, #405).
 
 Runs as root on the LXD host, never inside ServerSentinel. Standard library
-only. LXD (5.21 on the real host, 2026-10-19 and 2026-11-08) does not pass a
-camera that the host re-enumerated back to the running VM: QEMU keeps the
-deleted `/dev/bus/usb` node open and the guest keeps a device that no longer
-delivers frames. This script decides from host facts only:
+only. Read-only: it sends only GET requests to LXD and never removes, adds or
+changes a device (Owner decision 2026-11-16, Issue #405: the automatic
+remove / add of PR #399 removed healthy cameras on the real host, and QEMU
+then refused the add). The re-pass itself is done by hand
+(`infra/lxd/README.md`, "Manual re-pass").
 
-- the instance's own `usb` devices named in the configuration, each with
-  `vendorid`, `productid` and `serial` and no `busnum` / `devnum` (any other
-  device is never touched: identical non-serial cameras are not rebound
-  automatically); two configured devices for one camera are both refused;
-- exactly one host USB device with those three values (none: the camera is
-  absent; more than one: ambiguous, refused);
-- whether the VM's QEMU process holds that device's current node open.
+LXD (5.21 on the real host) does not pass a camera that the host
+re-enumerated back to the running VM: QEMU keeps the deleted
+`/dev/bus/usb` node open and the guest keeps a device that no longer delivers
+frames. For each LXD `usb` device named in the configuration this decides
+only from host facts (never `/dev/videoN`, never the guest):
 
-Only a camera whose current node QEMU does not hold is re-passed, as the
-documented recovery does (`lxc config device remove` then `add` with the same
-configuration), through the LXD REST API on its unix socket with the instance
-ETag, and only while the device is still exactly as judged. Before the remove
-the device configuration is written to the state directory, so a run that
-dies between remove and add restores it on the next run (also while the VM is
-stopped). All cameras found not passed are re-passed in one pass and then
-verified together. A run ends within `RUN_LIMIT_SECONDS`: a remove starts only
-while it, its add and the verification still fit. Each device is re-passed at
-most once per `MIN_INTERVAL_SECONDS` and `MAX_PER_HOUR` times an hour. Journal
-lines are fixed words plus the configured device label; no serial,
-vendor/product id, bus or device number is printed.
+- the instance's own device, with `vendorid`, `productid` and `serial` and no
+  `busnum` / `devnum` (any other device is `unidentified`); two configured
+  devices for one camera are both `ambiguous`;
+- exactly one host USB device with those three values (none: `absent`; more
+  than one: `ambiguous`; changed between two samples: `unsettled`);
+- whether the VM's QEMU process holds that device's current node open
+  (`held`); otherwise the camera *looks* not passed
+  (`usb_repass_looks_unpassed`). The judgement can be wrong (Issue #405: it
+  reported healthy cameras), so it is a prompt to verify by hand, never a
+  reason to change anything by itself.
+
+A run whose result needs the Owner's attention (a camera that looks not
+passed, a configured device missing from the instance, a pending record of
+the old automatic re-pass whose device is missing, or a state file that
+cannot be read) prints `usb_repass_attention` and exits 1, so the unit shows
+in `systemctl --failed`. Journal lines are fixed words plus the configured
+device label and counts; no serial, vendor/product id, bus or device number
+is printed. Nothing is written anywhere.
 """
 
 import argparse
-import fcntl
 import http.client
 import json
 import os
@@ -41,6 +45,8 @@ import sys
 import time
 
 DEFAULT_SOCKET = "/var/snap/lxd/common/lxd/unix.socket"
+# Only read: the pending records the automatic re-pass of PR #399 left
+# (2026-11-08 on the real host). Nothing writes here any more.
 DEFAULT_STATE_DIR = "/var/lib/server-sentinel-usb-repass"
 SYSFS_USB = "/sys/bus/usb/devices"
 PROC = "/proc"
@@ -48,69 +54,34 @@ PROC = "/proc"
 # (2026-09-30), so the host is sampled after a settle and twice.
 SETTLE_SECONDS = 5.0
 STABLE_GAP_SECONDS = 2.0
-# QEMU opens the passed devices while the VM starts; a younger process is not
-# judged.
-MIN_QEMU_AGE_SECONDS = 120.0
-MIN_INTERVAL_SECONDS = 60.0
-MAX_PER_HOUR = 5
-VERIFY_SECONDS = 10.0
-ADD_ATTEMPTS = 3
-ADD_RETRY_GAP_SECONDS = 2.0
-# One LXD request (socket timeout), the server-side wait of one operation
-# poll, and how long an operation is polled before it counts as not finished.
+# QEMU opens the passed devices while the VM starts, and the guest's USB
+# resets after the start re-enumerate on the host for a while (Issue #405:
+# events past 120 s); a younger process is not judged.
+MIN_QEMU_AGE_SECONDS = 300.0
 REQUEST_TIMEOUT_SECONDS = 30
-OPERATION_POLL_SECONDS = 20
-OPERATION_LIMIT_SECONDS = 60
-# Worst cases, derived (PR #399 review): a PUT is its GET, the PUT and polls
-# until OPERATION_LIMIT_SECONDS, the last poll starting just before it.
-PUT_WORST_SECONDS = 2 * REQUEST_TIMEOUT_SECONDS + OPERATION_LIMIT_SECONDS + REQUEST_TIMEOUT_SECONDS
-# A remove, a second poll of its operation when it had not finished, and the
-# re-read that decides an ambiguous failure.
-REMOVE_WORST_SECONDS = (PUT_WORST_SECONDS + OPERATION_LIMIT_SECONDS + REQUEST_TIMEOUT_SECONDS
-                        + REQUEST_TIMEOUT_SECONDS)
-# Each add attempt reads the device first; one more read after the last.
-ADD_WORST_SECONDS = (ADD_ATTEMPTS * (REQUEST_TIMEOUT_SECONDS + PUT_WORST_SECONDS)
-                     + (ADD_ATTEMPTS - 1) * ADD_RETRY_GAP_SECONDS + REQUEST_TIMEOUT_SECONDS)
-REPASS_WORST_SECONDS = REMOVE_WORST_SECONDS + ADD_WORST_SECONDS
-# The final settle and verification of the re-passed devices.
-VERIFY_WORST_SECONDS = SETTLE_SECONDS + VERIFY_SECONDS + 5.0
-# A run ends within this: a remove (or a restore) starts only while a whole
-# remove + add (or add) and the verification still fit, so a run never stops
-# between a remove and its add. The unit's TimeoutStartSec is this plus
-# STARTUP_MARGIN_SECONDS (interpreter start, the first reads before the
-# first deadline check are inside the limit).
-RUN_LIMIT_SECONDS = 1200
-STARTUP_MARGIN_SECONDS = 60
-UNIT_TIMEOUT_SECONDS = RUN_LIMIT_SECONDS + STARTUP_MARGIN_SECONDS
-# Host boot (Issue #402 (7)): the udev coldplug can start a run before LXD
-# answers on its socket. A run that starts within BOOT_GRACE_SECONDS of the
-# host's boot waits up to LXD_WAIT_SECONDS for it; if LXD still does not
-# answer, the run ends without failing the unit (`usb_repass_lxd_not_ready`)
-# and the timer (OnBootSec=3min, then every 2 minutes) runs it again. A later
-# run fails on `usb_repass_lxd_unreachable` as before.
+# Host boot (Issue #402 (7)): a run that starts within BOOT_GRACE_SECONDS of
+# the host's boot waits up to LXD_WAIT_SECONDS for LXD to answer; if it still
+# does not, the run ends without failing (`usb_repass_lxd_not_ready`) and the
+# timer runs it again. A later run fails on `usb_repass_lxd_unreachable`.
 BOOT_GRACE_SECONDS = 180.0
 LXD_WAIT_SECONDS = 60.0
 LXD_WAIT_GAP_SECONDS = 5.0
-# The last attempt starts before LXD_WAIT_SECONDS end and takes one request.
-LXD_WAIT_WORST_SECONDS = LXD_WAIT_SECONDS + REQUEST_TIMEOUT_SECONDS
+# The longest run: the boot wait (its last attempt starts before
+# LXD_WAIT_SECONDS end), the instance and state reads, the settle and the
+# second sample. The unit's TimeoutStartSec leaves a margin above it for the
+# interpreter start.
+RUN_WORST_SECONDS = (LXD_WAIT_SECONDS + REQUEST_TIMEOUT_SECONDS + 2 * REQUEST_TIMEOUT_SECONDS
+                     + SETTLE_SECONDS + STABLE_GAP_SECONDS)
+UNIT_TIMEOUT_SECONDS = 300
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 HEX4 = re.compile(r"[0-9a-fA-F]{4}\Z")
 IDENTITY_KEYS = ("vendorid", "productid", "serial")
 PINNED_KEYS = ("busnum", "devnum")
-# The writable instance fields a PUT takes (as `lxc config device` sends).
-PUT_KEYS = ("architecture", "config", "devices", "ephemeral", "profiles", "stateful", "description")
+ATTENTION = "usb_repass_attention see=infra/lxd/README.md#manual-re-pass"
 
 
 class Failure(Exception):
     """A fixed, value-free reason."""
-
-
-class Uncertain(Failure):
-    """An update whose outcome is not known; `operation` is its LXD operation, if any."""
-
-    def __init__(self, reason, operation=None):
-        super().__init__(reason)
-        self.operation = operation
 
 
 def log(event, device=None):
@@ -134,106 +105,44 @@ class _UnixConnection(http.client.HTTPConnection):
 
 
 class Lxd:
-    """The few LXD REST calls this needs, over the local unix socket."""
+    """The two LXD REST reads this needs, over the local unix socket.
 
-    def __init__(self, path, monotonic=time.monotonic):
+    Only GET is ever sent (Issue #405): there is no method parameter and no
+    request with a body.
+    """
+
+    def __init__(self, path):
         self.path = path
-        self.monotonic = monotonic
 
-    def request(self, method, url, body=None, etag=None):
+    def get(self, url):
         connection = _UnixConnection(self.path)
         try:
-            headers = {"Content-Type": "application/json"}
-            if etag:
-                headers["If-Match"] = etag
-            payload = None if body is None else json.dumps(body).encode()
-            connection.request(method, url, body=payload, headers=headers)
+            connection.request("GET", url)
             response = connection.getresponse()
             data = json.loads(response.read() or b"{}")
-            status, tag = response.status, response.getheader("ETag")
+            status = response.status
         except (OSError, ValueError, http.client.HTTPException):
             raise Failure("usb_repass_lxd_unreachable") from None
         finally:
             connection.close()
-        # Any JSON that is not an object is refused with a fixed word
-        # (PR #399 review), never a traceback.
         if not isinstance(data, dict):
             raise Failure("usb_repass_lxd_invalid")
-        return status, tag, data
+        return status, data
 
     def instance(self, name):
-        status, etag, data = self.request("GET", f"/1.0/instances/{name}")
+        status, data = self.get(f"/1.0/instances/{name}")
         if status != 200 or not isinstance(data.get("metadata"), dict):
             raise Failure("usb_repass_instance_unreadable")
         metadata = data["metadata"]
         if not isinstance(metadata.get("devices", {}), dict):
             raise Failure("usb_repass_instance_unreadable")
-        return metadata, etag
+        return metadata
 
     def state(self, name):
-        status, _, data = self.request("GET", f"/1.0/instances/{name}/state")
+        status, data = self.get(f"/1.0/instances/{name}/state")
         if status != 200 or not isinstance(data.get("metadata"), dict):
             raise Failure("usb_repass_instance_unreadable")
         return data["metadata"]
-
-    def wait_operation(self, operation, limit=OPERATION_LIMIT_SECONDS):
-        """`Success`, `Failure` (a terminal state other than success) or None (not finished)."""
-        deadline = self.monotonic() + limit
-        while True:
-            wait = max(1, min(OPERATION_POLL_SECONDS, int(deadline - self.monotonic())))
-            try:
-                status, _, data = self.request("GET", f"{operation}/wait?timeout={wait}")
-            except Failure:
-                return None
-            metadata = data.get("metadata")
-            outcome = metadata.get("status") if isinstance(metadata, dict) else None
-            if status == 200 and outcome == "Success":
-                return "Success"
-            if status == 200 and outcome in ("Running", "Pending"):
-                if self.monotonic() < deadline:
-                    continue
-                return None
-            if status == 200 and isinstance(outcome, str):
-                return "Failure"
-            return None
-
-    def put_devices(self, name, devices, require=None):
-        """Replace the instance's own devices (fresh GET + ETag), wait for it.
-
-        ``require`` sees the devices of that same GET; when it is false the
-        instance changed since the caller's snapshot and nothing is sent
-        (`usb_repass_changed`). An edit between the GET and the PUT makes LXD
-        refuse the PUT on the ETag (`usb_repass_update_refused`); a GET
-        without an ETag sends nothing (`usb_repass_etag_missing`, PR #399
-        review). A failure whose outcome is not known (the PUT's answer was
-        lost, or its operation had not finished within the poll limit) is
-        `Uncertain` and carries the operation when one is known.
-        """
-        metadata, etag = self.instance(name)
-        if not etag:
-            raise Failure("usb_repass_etag_missing")
-        current = dict(metadata.get("devices") or {})
-        if require is not None and not require(current):
-            raise Failure("usb_repass_changed")
-        body = {key: metadata[key] for key in PUT_KEYS if key in metadata}
-        body["devices"] = devices(current)
-        try:
-            status, _, data = self.request("PUT", f"/1.0/instances/{name}", body, etag)
-        except Failure:
-            raise Uncertain("usb_repass_update_unanswered") from None
-        if status == 200 and data.get("type") == "sync":
-            return
-        operation = data.get("operation")
-        if status != 202 or not isinstance(operation, str) or not operation.startswith("/1.0/operations/"):
-            raise Failure("usb_repass_update_refused")
-        # Polled until it finishes or OPERATION_LIMIT_SECONDS pass (PR #399
-        # review): one wait that timed out is not a failed update.
-        outcome = self.wait_operation(operation)
-        if outcome == "Success":
-            return
-        if outcome == "Failure":
-            raise Failure("usb_repass_update_failed")
-        raise Uncertain("usb_repass_update_unfinished", operation)
 
 
 def load_config(path, owner=0):
@@ -243,7 +152,7 @@ def load_config(path, owner=0):
         raise Failure("usb_repass_config_unreadable") from None
     try:
         info = os.fstat(fd)
-        # root-owned and not writable by anyone else: it decides what root changes.
+        # root-owned and not writable by anyone else: root acts on it.
         if not stat.S_ISREG(info.st_mode) or info.st_uid != owner or info.st_mode & 0o022:
             raise Failure("usb_repass_config_unsafe")
         with os.fdopen(os.dup(fd), "rb") as handle:
@@ -275,8 +184,8 @@ def identity(device):
     vendor, product, serial = values
     if not HEX4.match(vendor) or not HEX4.match(product):
         return None
-    # A device pinned to a bus or device number would be re-added with the
-    # numbers of the enumeration that is gone (PR #399 review): refused.
+    # A device pinned to a bus or device number names an enumeration, not a
+    # camera (PR #399 review): not judged.
     if any(device.get(key) not in (None, "") for key in PINNED_KEYS):
         return None
     return vendor.lower(), product.lower(), serial
@@ -312,22 +221,31 @@ def host_nodes(sysfs=SYSFS_USB):
     return found
 
 
-def held_nodes(pid, proc=PROC):
-    """The live `/dev/bus/usb` nodes the process holds open (deleted ones excluded)."""
+def usb_fds(pid, proc=PROC):
+    """`(live nodes, open fds on deleted nodes)` of the process's `/dev/bus/usb` fds."""
     base = os.path.join(proc, str(pid), "fd")
     try:
         entries = os.listdir(base)
     except OSError:
         raise Failure("usb_repass_qemu_unreadable") from None
-    held = set()
+    held, deleted = set(), 0
     for entry in entries:
         try:
             target = os.readlink(os.path.join(base, entry))
         except OSError:
             continue
-        if target.startswith("/dev/bus/usb/") and not target.endswith(" (deleted)"):
+        if not target.startswith("/dev/bus/usb/"):
+            continue
+        if target.endswith(" (deleted)"):
+            deleted += 1
+        else:
             held.add(target)
-    return held
+    return held, deleted
+
+
+def held_nodes(pid, proc=PROC):
+    """The live `/dev/bus/usb` nodes the process holds open (deleted ones excluded)."""
+    return usb_fds(pid, proc)[0]
 
 
 def host_uptime(proc=PROC):
@@ -371,52 +289,27 @@ def process_age(pid, proc=PROC):
         raise Failure("usb_repass_qemu_unreadable") from None
 
 
-class State:
-    """Pending device configurations and re-pass times, root-only, in the state directory."""
+def read_pending(directory):
+    """The pending device configurations the old automatic re-pass left, read only.
 
-    def __init__(self, directory):
-        self.directory = directory
-        self.path = os.path.join(directory, "state.json")
-        self.pending, self.history = {}, {}
-        try:
-            with open(self.path, "rb") as handle:
-                raw = json.loads(handle.read(1 << 20))
-        except FileNotFoundError:
-            return
-        except (OSError, ValueError):
-            raw = None
-        # An unreadable state may hold a removed device's only configuration
-        # (PR #399 review): the run is refused and the file is kept as it is.
-        pending = raw.get("pending") if isinstance(raw, dict) else None
-        history = raw.get("history") if isinstance(raw, dict) else None
-        if (not isinstance(pending, dict) or not isinstance(history, dict)
-                or not all(isinstance(k, str) and LABEL.match(k) and isinstance(v, dict)
-                           for k, v in pending.items())
-                or not all(isinstance(v, list) and all(isinstance(t, (int, float)) for t in v)
-                           for v in history.values())):
-            raise Failure("usb_repass_state_unreadable")
-        self.pending, self.history = pending, history
-
-    def save(self):
-        temporary = self.path + ".tmp"
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            json.dump({"pending": self.pending, "history": self.history}, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, self.path)
-        directory = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-
-    def allowed(self, device, now):
-        # A stamp in the future (the wall clock was stepped back) is dropped,
-        # not kept as a block (PR #399 review).
-        times = [t for t in self.history.get(device, []) if 0 <= now - t < 3600]
-        self.history[device] = times
-        return not times or (now - max(times) >= MIN_INTERVAL_SECONDS and len(times) < MAX_PER_HOUR)
+    A run of PR #399 wrote a device's configuration here before removing it
+    and dropped it after the add. A record left behind (2026-11-08) may be
+    the only copy of a removed device's configuration, so the file is never
+    changed here; restoring it is a manual step (README).
+    """
+    try:
+        with open(os.path.join(directory, "state.json"), "rb") as handle:
+            raw = json.loads(handle.read(1 << 20))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        raw = None
+    pending = raw.get("pending") if isinstance(raw, dict) else None
+    if (not isinstance(pending, dict)
+            or not all(isinstance(k, str) and LABEL.match(k) and isinstance(v, dict)
+                       for k, v in pending.items())):
+        raise Failure("usb_repass_state_unreadable")
+    return pending
 
 
 def classify(devices, names, nodes_first, nodes_second, held):
@@ -429,289 +322,126 @@ def classify(devices, names, nodes_first, nodes_second, held):
             counts[key] = counts.get(key, 0) + 1
     for name in names:
         if name not in devices:
-            result[name] = ("not_configured", None)
+            result[name] = "not_configured"
             continue
         key = keys[name]
         if key is None:
-            result[name] = ("unidentified", None)
+            result[name] = "unidentified"
             continue
         first, second = nodes_first.get(key, []), nodes_second.get(key, [])
         if counts[key] > 1:
-            # Two configured devices for one camera (PR #399 review): neither.
-            result[name] = ("ambiguous", None)
+            result[name] = "ambiguous"
         elif not second:
-            result[name] = ("absent", None)
+            result[name] = "absent"
         elif len(second) > 1 or len(first) > 1:
-            result[name] = ("ambiguous", None)
+            result[name] = "ambiguous"
         elif first != second:
-            result[name] = ("unsettled", None)
+            result[name] = "unsettled"
         elif second[0] in held:
-            result[name] = ("held", second[0])
+            result[name] = "held"
         else:
-            result[name] = ("needs_repass", second[0])
+            result[name] = "needs_repass"
     return result
 
 
-def device_state(lxd, instance, name, config):
-    """`absent`, `same` (exactly `config`) or `other` for the instance's device `name` now."""
-    metadata, _ = lxd.instance(instance)
-    devices = metadata.get("devices") or {}
-    if name not in devices:
-        return "absent"
-    return "same" if devices[name] == config else "other"
+# Verdicts that make the run ask for the Owner's attention. `absent` (the
+# host itself lost the camera) is not: ServerSentinel's camera_offline notice
+# covers it and no re-pass can help.
+ATTENTION_VERDICTS = {"needs_repass": "usb_repass_looks_unpassed",
+                      "not_configured": "usb_repass_not_configured"}
 
 
-def add_device(lxd, instance, name, config, sleep, step):
-    """Add `config` as `name` unless a device of that name exists.
-
-    `added` (this call put it there), `present` (it was there before any
-    PUT), `changed` (another configuration of that name, an Owner edit: left
-    as it is) or `failed`. A PUT whose outcome is unknown (an operation still
-    running, a lost answer) is decided by reading the device again, so this
-    call's own add is never reported as an Owner change (PR #399 review).
-    """
-    for attempt in range(ADD_ATTEMPTS + 1):
-        try:
-            current = device_state(lxd, instance, name, config)
-        except Failure as error:
-            log(f"{error.args[0]} step={step}", name)
-            current = None
-        if current == "same":
-            return "added" if attempt else "present"
-        if current == "other":
-            return "changed"
-        if attempt == ADD_ATTEMPTS:
-            return "failed"
-        if current == "absent":
-            try:
-                lxd.put_devices(instance, lambda d: {**d, name: config},
-                                require=lambda d: name not in d)
-                return "added"
-            except Failure as error:
-                if error.args[0] != "usb_repass_changed":
-                    log(f"{error.args[0]} step={step}", name)
-        if attempt + 1 < ADD_ATTEMPTS:
-            sleep(ADD_RETRY_GAP_SECONDS)
-    return "failed"
-
-
-def remove_device(lxd, instance, name, config):
-    """Remove `name` only if it is exactly `config`.
-
-    `removed`, `kept` (still there unchanged: nothing lost), `changed` (an
-    Owner edit since the snapshot, PR #399 Codex P2) or `unknown` (the state
-    could not be read; the pending record restores it on a later run). An
-    ambiguous failure is decided by reading the device again (PR #399 review).
-    """
-    uncertain = False
-    try:
-        lxd.put_devices(instance, lambda d: {k: v for k, v in d.items() if k != name},
-                        require=lambda d: d.get(name) == config)
-        return "removed"
-    except Uncertain as error:
-        # The remove may still happen (PR #399 review): its operation is
-        # polled again; while its end is not known the device counts as
-        # possibly removed, so the pending record stays.
-        log(f"{error.args[0]} step=remove", name)
-        outcome = lxd.wait_operation(error.operation) if error.operation else None
-        uncertain = outcome is None
-    except Failure as error:
-        if error.args[0] == "usb_repass_changed":
-            return "changed"
-        log(f"{error.args[0]} step=remove", name)
-    try:
-        current = device_state(lxd, instance, name, config)
-    except Failure as error:
-        log(f"{error.args[0]} step=remove", name)
-        return "unknown"
-    if current == "same":
-        return "unknown" if uncertain else "kept"
-    return "removed" if current == "absent" else "changed"
-
-
-def run(config_path, state_dir, check=False, lxd_factory=Lxd, sleep=time.sleep, now=time.time,
+def run(config_path, state_dir, check=False, lxd_factory=Lxd, sleep=time.sleep,
         monotonic=time.monotonic, sysfs=SYSFS_USB, proc=PROC, config_owner=0):
-    started = monotonic()
-
-    def fits(seconds):
-        # Whether `seconds` more and the final verification end within the limit.
-        return monotonic() - started + seconds + VERIFY_WORST_SECONDS <= RUN_LIMIT_SECONDS
-
+    """Judge every configured camera; 1 when one needs the Owner's attention (0 under --check)."""
     instance, names, sock = load_config(config_path, config_owner)
     lxd = lxd_factory(sock)
-    # Read in --check too, never written there (Issue #402 (6)).
-    state = State(state_dir)
-    failed = False
-    if check:
-        # Reported before anything that needs LXD, so the recovery record is
-        # shown even while LXD does not answer (PR #419 review).
-        for name in sorted(state.pending):
-            # A remove whose add has not been confirmed: the next run adds
-            # this configuration back if the instance lacks the device, and
-            # drops the record if the device is there.
-            log("usb_repass_pending_restore", name)
+    attention = False
+
+    def finish():
+        if attention:
+            log(ATTENTION)
+        return 1 if attention and not check else 0
+
+    try:
+        pending = read_pending(state_dir)
+    except Failure as error:
+        # Kept as it is: it may hold a removed device's only configuration.
+        log(error.args[0])
+        pending, attention = {}, True
+    # Reported before anything that needs LXD (PR #419 review).
+    for name in sorted(pending):
+        log("usb_repass_pending_record", name)
     uptime = host_uptime(proc)
     if (uptime is not None and uptime < BOOT_GRACE_SECONDS
             and not wait_for_lxd(lxd, instance, sleep, monotonic)):
-        # Issue #402 (7): not a failure yet; the timer runs again.
         log("usb_repass_lxd_not_ready")
-        return 0
-    if not check and state.pending:
-        # A run that died between remove and add left the configuration here;
-        # restored whether or not the VM runs (PR #399 review).
-        for name, config in sorted(state.pending.items()):
-            if not fits(ADD_WORST_SECONDS):
-                log("usb_repass_deferred step=restore", name)
-                failed = True
-                continue
-            outcome = add_device(lxd, instance, name, config, sleep, "restore")
-            if outcome == "failed":
-                log("usb_repass_restore_failed", name)
-                failed = True
-                continue
-            del state.pending[name]
-            if outcome == "added":
-                log("usb_repass_restored", name)
-            elif outcome == "changed":
-                log("usb_repass_changed step=restore", name)
-        state.save()
-    metadata, _ = lxd.instance(instance)
+        return finish()
+    metadata = lxd.instance(instance)
+    devices = metadata.get("devices") or {}
+    for name, config in sorted(pending.items()):
+        if name not in devices:
+            # Removed by the old re-pass and never added back: restore by hand.
+            log("usb_repass_pending_device_missing", name)
+            attention = True
+        elif devices[name] == config:
+            # The device is there as recorded: the record is stale.
+            log("usb_repass_pending_device_present", name)
+        else:
+            log("usb_repass_pending_device_differs", name)
     if metadata.get("status") != "Running":
         log("usb_repass_instance_not_running")
-        return 1 if failed else 0
+        return finish()
     pid = lxd.state(instance).get("pid")
     if not isinstance(pid, int) or pid <= 0:
         raise Failure("usb_repass_qemu_unreadable")
     if process_age(pid, proc) < MIN_QEMU_AGE_SECONDS:
         log("usb_repass_instance_starting")
-        return 1 if failed else 0
-    devices = metadata.get("devices") or {}
-    # Issue #402 (9): when one sample finds every configured camera held,
-    # nothing would be changed, so the settle and the second sample are
-    # skipped. Any other verdict is judged as before (settle, two samples),
-    # and only that path can lead to a remove.
+        return finish()
+    # Issue #402 (9): one sample finding every camera held is the normal
+    # state and needs no settle or second sample.
     nodes = host_nodes(sysfs)
     quick = classify(devices, names, nodes, nodes, held_nodes(pid, proc))
-    if all(verdict == "held" for verdict, _ in quick.values()):
+    if all(verdict == "held" for verdict in quick.values()):
         for name in names:
             log("usb_repass_held", name)
-        return 1 if failed else 0
+        return finish()
     if not check:
         sleep(SETTLE_SECONDS)
     first = host_nodes(sysfs)
     sleep(STABLE_GAP_SECONDS)
     second = host_nodes(sysfs)
-    verdicts = classify(devices, names, first, second, held_nodes(pid, proc))
-    repassed = []
-    # Every device found not passed is re-passed in this one pass, then all
-    # are verified together against a fresh sample (PR #399 review: the two
-    # C960 reset each other, so judging one before the other is re-passed
-    # would re-pass back and forth). Each counts once against the rate limit.
+    held, deleted = usb_fds(pid, proc)
+    verdicts = classify(devices, names, first, second, held)
     for name in names:
-        verdict, _ = verdicts[name]
-        if check or verdict != "needs_repass":
+        verdict = verdicts[name]
+        if verdict in ATTENTION_VERDICTS:
+            log(ATTENTION_VERDICTS[verdict], name)
+            attention = True
+        else:
             log(f"usb_repass_{verdict}", name)
-            continue
-        if not fits(REPASS_WORST_SECONDS):
-            # The timer runs again in about two minutes.
-            log("usb_repass_deferred", name)
-            continue
-        moment = now()
-        if not state.allowed(name, moment):
-            log("usb_repass_rate_limited", name)
-            state.save()
-            continue
-        config = dict(devices[name])
-        state.pending[name] = config
-        state.history.setdefault(name, []).append(moment)
-        state.save()
-        removed = remove_device(lxd, instance, name, config)
-        if removed in ("changed", "kept"):
-            del state.pending[name]
-            if removed == "changed":
-                # The Owner's edit stands; judged again next run, not counted.
-                state.history[name].remove(moment)
-                log("usb_repass_changed step=remove", name)
-            else:
-                failed = True
-            state.save()
-            continue
-        if removed == "unknown":
-            failed = True
-            continue
-        # Removed: the add always follows (fits() left room for it).
-        outcome = add_device(lxd, instance, name, config, sleep, "add")
-        if outcome == "failed":
-            log("usb_repass_add_failed", name)
-            failed = True
-            continue
-        del state.pending[name]
-        state.save()
-        if outcome == "changed":
-            log("usb_repass_changed step=add", name)
-            continue
-        repassed.append(name)
-    if repassed:
-        # Every configured camera that was held before is checked too
-        # (PR #399 review): a re-pass can reset its sibling.
-        siblings = [name for name in names if verdicts[name][0] == "held"]
-        watched = repassed + siblings
-        sleep(SETTLE_SECONDS)
-        deadline = monotonic() + VERIFY_SECONDS
-        while True:
-            nodes, held = host_nodes(sysfs), held_nodes(pid, proc)
-            verified = {name for name in watched
-                        if len(nodes.get(identity(devices[name]), [])) == 1
-                        and nodes[identity(devices[name])][0] in held}
-            if len(verified) == len(watched) or monotonic() >= deadline:
-                break
-            sleep(1.0)
-        for name in repassed:
-            if name in verified:
-                log("usb_repass_done", name)
-            else:
-                # The unit fails, so `systemctl --failed` shows it (PR #399 review).
-                log("usb_repass_unverified", name)
-                failed = True
-        for name in siblings:
-            if name not in verified:
-                # Not re-passed again in this run (no back and forth); the
-                # next run (udev or the timer) judges it afresh.
-                log("usb_repass_sibling_lost", name)
-                failed = True
-    return 1 if failed else 0
+    # Counts only, for the manual verification (Issue #405 compared them by
+    # hand): how many /dev/bus/usb fds QEMU holds on live and deleted nodes.
+    log(f"usb_repass_qemu_usb_fds live={len(held)} deleted={deleted}")
+    return finish()
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", default="/etc/server-sentinel-usb-repass.json")
-    parser.add_argument("--state-dir", default=os.environ.get("STATE_DIRECTORY", DEFAULT_STATE_DIR))
+    parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR)
     parser.add_argument("--check", action="store_true",
-                        help="report each device's state; change nothing")
+                        help="the same judgement without the settle; exits 0 whatever it judged "
+                             "(1 only when it cannot judge)")
     args = parser.parse_args(argv)
     if os.geteuid() != 0:
         log("usb_repass_requires_root")
         return 2
-    lock = None
     try:
-        if not args.check:
-            os.makedirs(args.state_dir, mode=0o700, exist_ok=True)
-            lock = os.open(os.path.join(args.state_dir, "lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                log("usb_repass_busy")
-                return 0
         return run(args.config, args.state_dir, check=args.check)
     except Failure as error:
         log(error.args[0])
         return 1
-    except OSError:
-        log("usb_repass_state_unwritable")
-        return 1
-    finally:
-        if lock is not None:
-            os.close(lock)
 
 
 if __name__ == "__main__":
