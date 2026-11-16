@@ -8,7 +8,7 @@ ALPN protocol ``INGEST_ALPN``. Inside it every message is a frame::
 
 The length is checked against the caller's limit *before* any body byte is
 read (ADR-0007 item 5: bounded pre-read limits), and a zero-length frame or an
-unknown type is refused. Version 1 has three frame types:
+unknown type is refused. Version 1 has four frame types:
 
 * ``HEARTBEAT`` (Agent to Main): a UTF-8 JSON object, the Agent's node
   heartbeat (``agent/media_capture_agent/runtime.py``, schema version 1). It is
@@ -20,8 +20,16 @@ unknown type is refused. Version 1 has three frame types:
   clocks itself.
 * ``CLOSE`` (Main to Agent): ``{"reason": <fixed word>}`` just before the Main
   closes the connection.
+* ``LIVE_FRAME`` (Agent to Main; Issue #14, Owner decision 2026-11-12, option
+  A): a live preview frame, ``source UUID (16 bytes, uuid.UUID.bytes) | one
+  complete JPEG`` (``parse_live_frame``). The JPEG starts with ``FF D8``, ends
+  with ``FF D9`` and is at most ``MAXIMUM_LIVE_FRAME_BYTES``; the frame's
+  body limit (``MAXIMUM_LIVE_FRAME_BODY_BYTES``) is applied from the header,
+  before the body is read, like every other type's. The Main sends **no**
+  reply: it keeps only the newest frame per source in memory, for the live
+  view, and stores nothing, so there is nothing to acknowledge.
 
-Media frames are not part of version 1: media is accepted only once the
+Recording media is not part of version 1: it is accepted only once the
 durable recording consumer exists (#17 / #313), so a Main never acknowledges
 media it cannot keep. A frame of any other type ends the connection with
 ``frame_type_refused``.
@@ -36,7 +44,7 @@ import re
 import socket
 import struct
 import time
-from typing import Callable
+from typing import Callable, Mapping
 from uuid import UUID
 
 
@@ -58,6 +66,13 @@ CLOCK_STATES = frozenset({"online", "degraded", "unknown"})
 MAXIMUM_NODE_REASONS = 16
 # The MVP's active-source limit (1-4 sources per deployment).
 MAXIMUM_HEARTBEAT_SOURCES = 4
+# LIVE_FRAME (Issue #14, Owner decision 2026-11-12): the JPEG after the
+# 16-byte source UUID is at most 1 MiB.
+LIVE_FRAME_SOURCE_BYTES = 16
+MAXIMUM_LIVE_FRAME_BYTES = 1_048_576
+MAXIMUM_LIVE_FRAME_BODY_BYTES = LIVE_FRAME_SOURCE_BYTES + MAXIMUM_LIVE_FRAME_BYTES
+_JPEG_START = b"\xff\xd8"
+_JPEG_END = b"\xff\xd9"
 _WORD = re.compile(r"[a-z][a-z0-9_]{0,63}")
 # The Agent's storage and source reasons are its refusal codes, some upper
 # case (`StorageRefused("STORAGE_HARD_STOP")`, sent as `str(exc)` by
@@ -75,6 +90,7 @@ _SOURCE_KEYS = frozenset({"source_id", "state", "reason"})
 class FrameType(IntEnum):
     HEARTBEAT = 0x01
     HEARTBEAT_ACK = 0x02
+    LIVE_FRAME = 0x10
     CLOSE = 0x7F
 
 
@@ -113,6 +129,18 @@ class NodeHeartbeat:
     source_count: int
 
 
+@dataclass(frozen=True)
+class LiveFrame:
+    """One live preview frame: the source it names and its JPEG bytes."""
+
+    source_id: UUID
+    jpeg: bytes
+
+    def __repr__(self) -> str:
+        # Never the media bytes.
+        return "LiveFrame(<redacted>)"
+
+
 def _receive_exactly(connection: socket.socket, size: int, deadline: float | None,
                      clock: Callable[[], float]) -> bytes:
     chunks = []
@@ -136,8 +164,14 @@ def _receive_exactly(connection: socket.socket, size: int, deadline: float | Non
 
 def read_frame(connection: socket.socket, maximum_body_bytes: int, *,
                deadline: float | None = None,
-               clock: Callable[[], float] = time.monotonic) -> Frame:
+               clock: Callable[[], float] = time.monotonic,
+               type_limits: Mapping[FrameType, int] | None = None) -> Frame:
     """Read one frame; the length is refused before its body is read.
+
+    ``maximum_body_bytes`` bounds every type that ``type_limits`` does not
+    name (and an unknown type); ``type_limits`` gives a known type its own
+    bound (``LIVE_FRAME``: ``MAXIMUM_LIVE_FRAME_BODY_BYTES``). The bound of
+    the header's type is applied before any body byte is read.
 
     With ``deadline`` (a ``clock`` value), the whole frame -- header and body
     -- must arrive before it, however the peer splits its bytes; otherwise
@@ -145,18 +179,47 @@ def read_frame(connection: socket.socket, maximum_body_bytes: int, *,
     to the caller; a stream that ends between or inside frames is
     ``PeerClosed``.
     """
-    if type(maximum_body_bytes) is not int or maximum_body_bytes <= 0:
+    limits = dict(type_limits or {})
+    if (type(maximum_body_bytes) is not int or maximum_body_bytes <= 0
+            or any(not isinstance(kind, FrameType) or type(limit) is not int or limit <= 0
+                   for kind, limit in limits.items())):
         raise ValueError("invalid frame limit")
     length, kind = HEADER.unpack(_receive_exactly(connection, HEADER.size, deadline, clock))
     if length == 0:
         raise WireRefused("frame_empty")
-    if length > maximum_body_bytes:
-        raise WireRefused("frame_too_large")
     try:
         frame_type = FrameType(kind)
     except ValueError:
-        raise WireRefused("frame_type_refused") from None
+        frame_type = None
+    if length > limits.get(frame_type, maximum_body_bytes):
+        raise WireRefused("frame_too_large")
+    if frame_type is None:
+        raise WireRefused("frame_type_refused")
     return Frame(frame_type, _receive_exactly(connection, length, deadline, clock))
+
+
+def parse_live_frame(body: bytes) -> LiveFrame:
+    """Split a ``LIVE_FRAME`` body; anything but one whole JPEG is ``live_frame_invalid``.
+
+    Only the JPEG's start and end markers are checked; the image is never
+    decoded here. The bytes are passed through to the live view unchanged.
+    """
+    if (not isinstance(body, bytes)
+            or not LIVE_FRAME_SOURCE_BYTES + len(_JPEG_START) + len(_JPEG_END)
+            <= len(body) <= MAXIMUM_LIVE_FRAME_BODY_BYTES):
+        raise WireRefused("live_frame_invalid")
+    jpeg = body[LIVE_FRAME_SOURCE_BYTES:]
+    if not jpeg.startswith(_JPEG_START) or not jpeg.endswith(_JPEG_END):
+        raise WireRefused("live_frame_invalid")
+    return LiveFrame(UUID(bytes=body[:LIVE_FRAME_SOURCE_BYTES]), jpeg)
+
+
+def encode_live_frame(source_id: UUID, jpeg: bytes) -> bytes:
+    """The Agent's ``LIVE_FRAME`` encoding (tests and the contract check)."""
+    if not isinstance(source_id, UUID) or not isinstance(jpeg, bytes):
+        raise ValueError("invalid live frame")
+    body = source_id.bytes + jpeg
+    return HEADER.pack(len(body), int(FrameType.LIVE_FRAME)) + body
 
 
 def encode_frame(kind: FrameType, payload: dict) -> bytes:

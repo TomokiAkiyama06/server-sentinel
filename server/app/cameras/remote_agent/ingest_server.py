@@ -23,9 +23,29 @@ Bounds (ADR-0007 item 5, Issue #14):
   (``still_admitted``) before it is acted on, so a revocation ends the session
   at the next frame.
 
-Nothing is written to the database or the disk here: the pairing ledger is
-only read (a staged renewal's promotion is the ledger's own admitted write),
-and node health is kept in memory (``node_health``). ``stop`` therefore waits
+Live preview frames (``LIVE_FRAME``; Issue #14, Owner decision 2026-11-12,
+option A) have their own bounds (``live_frames``): a body limit of
+``MAXIMUM_LIVE_FRAME_BODY_BYTES`` applied from the header, the ledger
+re-check like any frame, the camera registry's authorization of the source
+for this node (cached 1 s) and their own token buckets (never the heartbeat
+budget). An accepted frame replaces the source's newest frame in the
+in-memory ``RemotePreviewHub`` and gets **no reply**: it is not stored, so
+it is never acknowledged. A frame of a source the registry does not
+authorize, or beyond the buckets, is dropped and counted
+(``CaptureIngestStatus.live_frames_unauthorized`` / ``live_frames_dropped``)
+and the session goes on (PR #416 review: an Agent sends every camera it
+approved, which the Owner may not have created or may have disabled on the
+Main). Only a malformed body (``live_frame_invalid``) or a flood
+(``rate_limited``: more than ten times the node refill rate in frames, or more
+than about 50 MB/s with a 5 s burst in body bytes, twice the node refill of
+maximum-size frames, sustained) closes the
+session. The session's frames are dropped from the hub when it ends or is
+superseded.
+
+Nothing is written to the database or the disk here: the pairing ledger and
+the camera registry are only read (a staged renewal's promotion is the
+ledger's own admitted write), and node health and live frames are kept in
+memory (``node_health``, ``RemotePreviewHub``). ``stop`` therefore waits
 for nothing: it stops accepting and shuts every socket down, and the
 connection threads end on their own (Issue #383: it adds no bounded wait to
 the stop budget).
@@ -48,8 +68,10 @@ from .ingest import AgentIngestQueue, IngestLimits
 from .ingest_config import CaptureIngestLimits
 from .ingest_tls import CaptureIngestAcceptor, IngestTlsError
 from .ingest_wire import (
-    INGEST_ALPN, FrameType, PeerClosed, WireRefused, encode_frame, parse_heartbeat, read_frame,
+    INGEST_ALPN, MAXIMUM_LIVE_FRAME_BODY_BYTES, FrameType, PeerClosed, WireRefused, encode_frame,
+    parse_heartbeat, parse_live_frame, read_frame,
 )
+from .live_frames import CachedLiveSources, LiveFrameBudget
 from .node_health import CaptureNodeHealthRegistry
 
 
@@ -90,6 +112,11 @@ class CaptureIngestStatus:
     # Refused connections per fixed category (`connection_limit`,
     # `handshake`, `not_admitted`, `alpn`).
     refused_by_category: tuple[tuple[str, int], ...] = ()
+    # Live preview frames (Issue #14): kept, dropped as unauthorized, and
+    # dropped beyond the buckets or the hub's bounds.
+    live_frames_accepted: int = 0
+    live_frames_unauthorized: int = 0
+    live_frames_dropped: int = 0
 
 
 class _LiveNodes:
@@ -132,12 +159,27 @@ class CaptureIngestServer:
                  limits: CaptureIngestLimits | None = None,
                  registry: CaptureNodeHealthRegistry | None = None,
                  utc: Callable[[], float] = time.time,
-                 monotonic_ns: Callable[[], int] = time.monotonic_ns):
+                 monotonic_ns: Callable[[], int] = time.monotonic_ns,
+                 live_preview=None,
+                 live_sources: Callable[[UUID, UUID], bool] | None = None):
+        from app.media.live.remote_preview import RemotePreviewHub
         limits = limits or CaptureIngestLimits()
         if (not isinstance(listener, socket.socket) or not isinstance(acceptor, CaptureIngestAcceptor)
-                or not isinstance(limits, CaptureIngestLimits) or not callable(utc)):
+                or not isinstance(limits, CaptureIngestLimits) or not callable(utc)
+                or (live_preview is not None and not isinstance(live_preview, RemotePreviewHub))
+                or (live_sources is not None and not callable(live_sources))):
             raise ValueError("invalid capture ingest dependencies")
         self.limits = limits
+        # Issue #14 (option A): without both, every live frame is dropped and
+        # counted as `live_frames_unauthorized` (fail closed); the session
+        # and its heartbeats go on.
+        self.live_preview = live_preview
+        self._live_sources = (None if live_sources is None else CachedLiveSources(
+            live_sources, maximum_nodes=limits.maximum_nodes, clock_ns=monotonic_ns))
+        self._live_budget = LiveFrameBudget(maximum_nodes=limits.maximum_nodes,
+                                            clock_ns=monotonic_ns)
+        self._live_counts = {"accepted": 0, "unauthorized": 0, "dropped": 0}
+        self._frame_limits = {FrameType.LIVE_FRAME: MAXIMUM_LIVE_FRAME_BODY_BYTES}
         self.registry = registry or CaptureNodeHealthRegistry(
             maximum_nodes=limits.maximum_nodes,
             stale_after_seconds=limits.idle_timeout_seconds)
@@ -189,6 +231,9 @@ class CaptureIngestServer:
         _abort(self._listener)
         for connection in connections:
             _abort(connection)
+        if self.live_preview is not None:
+            # No live frame outlives the listener, nor is one accepted after.
+            self.live_preview.clear()
         LOGGER.info(Event.CAPTURE_INGEST_STOPPED)
 
     def join(self, timeout: float) -> bool:
@@ -204,7 +249,10 @@ class CaptureIngestServer:
     def status(self) -> CaptureIngestStatus:
         with self._lock:
             return CaptureIngestStatus(self._state, len(self._connections), self._refused,
-                                       self._closed, tuple(sorted(self._refused_by.items())))
+                                       self._closed, tuple(sorted(self._refused_by.items())),
+                                       self._live_counts["accepted"],
+                                       self._live_counts["unauthorized"],
+                                       self._live_counts["dropped"])
 
     def last_close_reasons(self) -> tuple[str, ...]:
         with self._lock:
@@ -349,6 +397,10 @@ class CaptureIngestServer:
                 registered = True
                 previous = self._live.get(node)
                 self._live[node] = (generation, tls)
+                if self.live_preview is not None:
+                    # The older session's live frames go with it (lock
+                    # order: this lock, then the hub's).
+                    self.live_preview.open_node(node, generation)
         if not registered:
             self._close_with(tls, "node_capacity")
             return
@@ -400,12 +452,18 @@ class CaptureIngestServer:
             if current is not None and current[0] != generation:
                 return
             self.registry.forget(node, generation)
+        if self._live_sources is not None:
+            self._live_sources.forget(node)
 
     def _end(self, node: UUID, generation: int) -> None:
         with self._lock:
             current = self._live.get(node)
             if current is not None and current[0] == generation:
                 del self._live[node]
+            if self.live_preview is not None:
+                # Under this lock, so it is ordered with every publish of
+                # this generation (`_live_frame`).
+                self.live_preview.close_node(node, generation)
         self.registry.disconnected(node, generation)
 
     def _close_with(self, tls, reason: str) -> None:
@@ -428,7 +486,8 @@ class CaptureIngestServer:
             # longer than the idle timeout.
             try:
                 frame = read_frame(tls, self.limits.maximum_frame_bytes,
-                                   deadline=time.monotonic() + self.limits.idle_timeout_seconds)
+                                   deadline=time.monotonic() + self.limits.idle_timeout_seconds,
+                                   type_limits=self._frame_limits)
             except WireRefused as refused:
                 self._close_with(tls, refused.reason)
                 return refused.reason
@@ -450,6 +509,15 @@ class CaptureIngestServer:
             if not session.still_admitted():
                 self._forget_revoked(node, generation)
                 return "not_admitted"
+            if frame.kind is FrameType.LIVE_FRAME:
+                # Its own budget, never the heartbeat budget below, and no
+                # reply (Issue #14, option A).
+                ended = self._live_frame(node, generation, frame.body)
+                if ended is None:
+                    continue
+                if ended != "superseded":
+                    self._close_with(tls, ended)
+                return ended
             refusal = self._rate.charge_attempt(node)
             if refusal is not None:
                 ended = _RATE_ENDS.get(refusal.reason, "rate_refused")
@@ -478,6 +546,45 @@ class CaptureIngestServer:
                 return "idle_timeout"
             except (OSError, ssl.SSLError):
                 return "peer_closed"
+
+    def _live_frame(self, node: UUID, generation: int, body: bytes) -> str | None:
+        """Keep one live frame in memory; ``None``, or the session's end reason.
+
+        Order: the body's form (malformed closes), the node's flood bound
+        (closes), the registry's authorization of the source for this node
+        (cached; unauthorized is dropped), the token buckets (dropped), then
+        the publish under this lock while the session is the node's current
+        one. Nothing is sent back to the Agent, whatever happens to a frame.
+        """
+        try:
+            live = parse_live_frame(body)
+        except WireRefused as refused:
+            return refused.reason
+        if self._live_budget.flooding(node, len(body)):
+            return "rate_limited"
+        authorized = False
+        if self.live_preview is not None and self._live_sources is not None:
+            authorized = self._live_sources(node, live.source_id) is True
+        if not authorized:
+            self._count_live("unauthorized")
+            return None
+        if not self._live_budget.charge(node, live.source_id):
+            self._count_live("dropped")
+            return None
+        with self._lock:
+            if not self._current_locked(node, generation):
+                return "superseded"
+            kept = self.live_preview.publish(node, generation, live.source_id, live.jpeg)
+            self._live_counts["accepted" if kept else "dropped"] += 1
+        return None
+
+    def _count_live(self, kind: str) -> None:
+        with self._lock:
+            self._live_counts[kind] += 1
+
+    def _current_locked(self, node: UUID, generation: int) -> bool:
+        current = self._live.get(node)
+        return current is not None and current[0] == generation
 
     def _current(self, node: UUID, generation: int) -> bool:
         with self._lock:
