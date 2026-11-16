@@ -541,6 +541,18 @@ class HeartbeatLossTests(MonitorFixture, unittest.TestCase):
         self.assertIn(LOST.value, self.kinds())
 
 
+class AgentCountTests(MonitorFixture, unittest.TestCase):
+    """Issue #410 item 1: counts only once the expected nodes were read."""
+
+    def test_counts_are_marked_counted_only_with_the_expected_nodes(self):
+        self.provider.set(self.node, "online")
+        self.assertFalse(self.drain().nodes_counted)
+        self.provider.expected = {self.node, uuid4()}
+        status = self.drain()
+        self.assertTrue(status.nodes_counted)
+        self.assertEqual((status.online_nodes, status.offline_nodes), (1, 1))
+
+
 class ActiveNodeLedgerTests(CaptureTlsHarness):
     """Issue #397: the nodes the Main expects heartbeats from."""
 
@@ -582,6 +594,17 @@ class HeartbeatLossEndToEndTests(RuntimeFixture):
                                  monitoring=self.configuration(),
                                  monitoring_dependencies=MonitoringDependencies(**values),
                                  capture_ingest=material)
+        # Issue #410 item 3: the listener state at each completed pin. The
+        # ledger is pinned before `running` (0bd5450), not after it, which a
+        # retry racing the first tick could otherwise hide.
+        from unittest import mock
+        from app.storage.database import PinnedDatabase
+        pinned_while, original_pin = [], PinnedDatabase.pin
+
+        def pin(database, admission=None):
+            original_pin(database, admission)
+            pinned_while.append(application.state.capture_ingest_state)
+        self.enterContext(mock.patch.object(PinnedDatabase, "pin", pin))
         async with application.router.lifespan_context(application):
             runtime = application.state.monitoring
             for _ in range(250):
@@ -589,18 +612,33 @@ class HeartbeatLossEndToEndTests(RuntimeFixture):
                     break
                 await asyncio.sleep(0.02)
             self.assertEqual(application.state.capture_ingest_state, "running")
+            self.assertEqual(pinned_while, ["starting"])
+            # Issue #410 item 3: exactly one tick after `running` already
+            # reads the pinned ledger (0bd5450): the watch is not paused.
             await runtime.call(runtime.tick)
-            for _ in range(250):
-                await runtime.call(runtime.tick)
-                if runtime.status.capture_node_lost:
-                    break
-                await asyncio.sleep(0.02)
-            self.assertTrue(runtime.status.capture_node_lost)
             self.assertFalse(runtime.status.capture_node_watch_unavailable)
+            self.assertTrue(runtime.status.capture_node_lost)
+            # Issue #410 item 1: the agent counts reach the summary on their
+            # own (the revoked node is not expected), as connections only.
+            summary = await runtime.call(runtime._summary, self.clock.utcnow())
+            self.assertEqual((summary.agents_online, summary.agents_offline), (0, 1))
+            self.assertIn("Agents online/offline: 0/1 (capture-node connections only)\n",
+                          summary.text())
+            self.assertIn("Person/motion/entry observations: unavailable", summary.text())
             self.clock.advance(timedelta(seconds=NOTICE_AFTER_SECONDS))
             await runtime.call(runtime.tick)
             await self.settle(runtime)
             texts = self.slack_texts()
+            # A failed drain leaves no stale counts behind.
+            monitor = runtime.dependencies.capture_nodes
+
+            def refuse(*_args, **_kwargs):
+                raise RuntimeError("synthetic")
+            monitor.drain = refuse
+            with self.assertLogs("app.monitoring.runtime", "ERROR"):
+                await runtime.call(runtime.tick)
+            summary = await runtime.call(runtime._summary, self.clock.utcnow())
+            self.assertIn("Agents: unavailable\n", summary.text())
         self.assertEqual(texts.count("ServerSentinel critical alert: capture_node_heartbeat_lost"),
                          1)
         self.assertNotIn(str(node), "".join(texts))
@@ -629,6 +667,42 @@ class RuntimeWiringTests(RuntimeFixture):
                           self.slack_texts())
             summary = await runtime.call(runtime._summary, self.clock.utcnow())
             self.assertEqual((summary.agents_online, summary.agents_offline), (0, 0))
+            # No ledger is read without a listener: not shown as "0/0".
+            self.assertIn("Agents: unavailable\n", summary.text())
+
+    async def test_a_cap_that_cannot_be_restored_is_flagged_and_logged_once(self):
+        # Issue #410 item 2.
+        values = dict(
+            integrity_probe=self.probe, slack_opener=self.transport, utcnow=self.clock.utcnow,
+            monotonic=lambda: self.clock.monotonic, tick_seconds=3600.0)
+        from tests.test_recording import SyntheticValidator
+        application = create_app(self.settings, monitoring=self.configuration(),
+                                 monitoring_dependencies=MonitoringDependencies(
+                                     segment_validator=SyntheticValidator(), **values),
+                                 capture_ingest_unavailable=True)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertFalse(runtime.status.capture_node_cap_unrestored)
+            runtime._capture_window_restored = False
+            reads = []
+
+            def unreadable(now):
+                reads.append(now)
+                raise RuntimeError("synthetic")
+            runtime._capture_notice_rows = unreadable
+            with self.assertLogs("app.monitoring.runtime", "ERROR") as logs:
+                for _ in range(3):
+                    self.clock.advance(timedelta(seconds=60))
+                    await runtime.call(runtime.tick)
+            self.assertEqual(len(reads), 3)
+            self.assertTrue(runtime.status.capture_node_cap_unrestored)
+            self.assertEqual(sum(record.getMessage() == "monitoring_degraded"
+                                 for record in logs.records), 1)
+            del runtime._capture_notice_rows
+            self.clock.advance(timedelta(seconds=60))
+            await runtime.call(runtime.tick)
+            self.assertFalse(runtime.status.capture_node_cap_unrestored)
+            self.assertTrue(runtime._capture_window_restored)
 
     async def test_the_cap_is_restored_per_node_from_the_rows(self):
         # PR #408 review: the runtime path (rows -> restore_window).

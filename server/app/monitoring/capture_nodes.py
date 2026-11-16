@@ -132,6 +132,10 @@ class CaptureHealthStatus:
     # running listener whose ledger could not be read (the watch is paused).
     lost_nodes: int = 0
     loss_watch_unavailable: bool = False
+    # Issue #410 item 1: the expected nodes were read, so the offline count
+    # includes the expected nodes that never connected. Without it the
+    # daily summary shows the agent counts as unavailable, not as a guess.
+    nodes_counted: bool = False
 
 
 def notice_id(kind: NotificationKind, node: object, at: datetime) -> UUID:
@@ -294,7 +298,8 @@ class CaptureNodeHealthMonitor:
                            if node not in seen or any(view.node_id == node
                                                       and view.state == "offline"
                                                       for view in nodes)),
-            loss_watch_unavailable=expected is None and state == "running")
+            loss_watch_unavailable=expected is None and state == "running",
+            nodes_counted=expected is not None)
 
     # -- observation ---------------------------------------------------------
 

@@ -98,10 +98,18 @@ def render_unit(executable, config, settings, account, group, devices=()):
         # (`uvc_identity`), and the capture child can open only the approved
         # device (`uvc_sandbox`). No sound device is allowed.
         device_rules = "\n".join(filter(None, (device_rules,
-                                               "DeviceAllow=char-video4linux rw")))
+                                               "DeviceAllow=char-video4linux rw",
+                                               # Video device files are group `video`;
+                                               # never `audio`.
+                                               "SupplementaryGroups=video")))
+    # A device class unknown when the service starts is silently dropped from
+    # the allow list (systemd.resource-control), so with capture the video
+    # class's module is loaded first (PR #412 review).
+    video_module = ("Wants=modprobe@videodev.service\nAfter=modprobe@videodev.service\n"
+                    if getattr(settings, "capture", None) is not None else "")
     return f"""[Unit]
 Description=ServerSentinel media-capture-agent
-After=local-fs.target network.target
+{video_module}After=local-fs.target network.target
 RequiresMountsFor={quote(settings.media_root)} {quote(settings.runtime_root)}
 
 [Service]

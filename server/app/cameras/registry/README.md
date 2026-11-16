@@ -12,6 +12,10 @@ management operations.
 - `local_uvc` has a null `capture_node_id`. `remote_agent` refers to an existing
   capture-node UUID distinct from the source UUID. Several sources may share a
   node. Creating a node record does not pair or authorize a capture machine.
+  For a paired node the record's UUID is the pairing ledger's node UUID:
+  `OwnerAdministration.create_remote_agent_source` (Issue #14) creates it with
+  that UUID, only while the node's ledger credential is active, in the same
+  audited transaction as the source.
 - `SourceHealthState` and `NodeHealthState` are distinct types persisted with
   separate state sets. Nodes use online/degraded/offline/revoked; sources use
   online/degraded/offline/manual_intervention_required. A node heartbeat cannot make

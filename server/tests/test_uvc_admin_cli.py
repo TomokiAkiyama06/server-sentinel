@@ -19,7 +19,13 @@ import unittest
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
+from app.audit.integration import (
+    CaptureNodeNotPairedError, CaptureNodeRevokedError, OwnerAdministration,
+)
+from app.audit.service import DenyAllOwners, OwnerAuditService, OwnerAuthorizationError
+from app.audit.store import AuditStore
 from app.cameras.registry import CameraRegistry, CaptureProfile, SourceType
+from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
 from app.cameras.uvc import admin_cli
 from app.cameras.uvc.discovery import DiscoveryResult
 from app.cameras.uvc.identity import DeviceEvidence
@@ -61,6 +67,39 @@ class FakeDiscovery:
     def scan(self):
         self.scans += 1
         return DiscoveryResult(self.devices, self.failures)
+
+
+class _LedgerOwner:
+    def require_owner(self, actor_context):
+        if actor_context != "owner":
+            raise PermissionError("synthetic denial")
+
+
+def _ledger(database):
+    return PairingLedger(database, HmacCodeVerifier(b"s" * 32), audit=AuditStore(database))
+
+
+def pair_node(database, index, *, revoked=False, not_after=None):
+    """A node paired through the real ledger (approve, redeem, activate); synthetic digests."""
+    ledger = _ledger(database)
+    key = f"{index:x}" * 64
+    approval, code = ledger.approve(_LedgerOwner(), "owner", node_id=uuid4(), public_key_digest=key)
+    claim = ledger.redeem(enrollment_id=approval.enrollment_id, public_key_digest=key,
+                          code=code.value)
+    ledger.activate(claim, credential_serial_digest=f"{index + 1:x}" * 64, not_after=not_after)
+    if revoked:
+        revoke_node(database, claim.node_id)
+    return claim.node_id
+
+
+def revoke_node(database, node):
+    _ledger(database).revoke(_LedgerOwner(), "owner", node_id=node)
+
+
+# The registry's own audit records (the ledger's pairing records left out).
+SOURCE_AUDIT = AUDIT.replace(
+    "ORDER BY", "WHERE action IN ('create_source', 'create_capture_node', 'approve_camera', "
+                "'update_source') ORDER BY")
 
 
 class AdminCliTests(unittest.TestCase):
@@ -545,9 +584,11 @@ class AdminCliTests(unittest.TestCase):
 
     def test_mutations_refuse_while_the_service_holds_the_database(self):
         source = self.local_source()
+        node = pair_node(self.database, 1)
         for argv in (("create-source", "--name", "x", "--profile", PROFILE),
                      ("approve", str(source.id), self.labels()[0]),
-                     ("rename-source", str(source.id), "--name", "x")):
+                     ("rename-source", str(source.id), "--name", "x"),
+                     ("create-remote-source", "--node", str(node), "--name", "x")):
             with self.subTest(argv=argv[0]):
                 self.running = [1]
                 console = Console(self)
@@ -562,11 +603,15 @@ class AdminCliTests(unittest.TestCase):
                 self.assertIn("a second admin_cli", stderr)
         self.assertEqual(1, len(self.fixture.list_sources()))
         self.assertIsNone(self.approval(source.id))
-        self.assertEqual([], self.rows(AUDIT))
+        self.assertEqual([], self.rows(SOURCE_AUDIT))
+        self.assertEqual([], self.rows("SELECT id FROM capture_nodes"))
 
     def test_a_service_started_during_the_confirmation_is_refused_inside_the_transaction(self):
         source = self.local_source()
+        node = pair_node(self.database, 1)
         for argv, lines, action in (
+                (("create-remote-source", "--node", str(node), "--name", "x"), ("CREATE",),
+                 "create_source"),
                 (("create-source", "--name", "x", "--profile", PROFILE), ("CREATE",), "create_source"),
                 (("approve", str(source.id), self.labels()[0]), ("APPROVE",), "approve_camera"),
                 (("rename-source", str(source.id), "--name", "入口"), ("RENAME",),
@@ -581,7 +626,8 @@ class AdminCliTests(unittest.TestCase):
         self.assertEqual(1, len(self.fixture.list_sources()))
         self.assertIsNone(self.approval(source.id))
         self.assertEqual("Synthetic source", self.fixture.get_source(source.id).name)
-        self.assertEqual(["failed"] * 3, [row[4] for row in self.rows(AUDIT)])
+        self.assertEqual([], self.rows("SELECT id FROM capture_nodes"))
+        self.assertEqual(["failed"] * 4, [row[4] for row in self.rows(SOURCE_AUDIT)])
 
     def test_mutations_need_the_controlling_terminal_and_the_service_account(self):
         def no_terminal():
@@ -607,6 +653,308 @@ class AdminCliTests(unittest.TestCase):
         code, _, stderr, _ = self.run_cli("candidates")
         self.assertEqual(2, code)
         self.assertIn("refused: database_schema_outdated", stderr)
+
+    # -- remote sources (Issue #14) -------------------------------------
+
+    def remote_rows(self):
+        return self.rows("SELECT id, capture_node_id, name, enabled FROM camera_sources "
+                         "WHERE source_type = 'remote_agent' ORDER BY created_at")
+
+    def node_rows(self):
+        return self.rows("SELECT id, health_state FROM capture_nodes ORDER BY id")
+
+    def create_remote(self, node, name="x", lines=("CREATE",), **kwargs):
+        return self.run_cli("create-remote-source", "--node", str(node), "--name", name,
+                            lines=lines, **kwargs)
+
+    def test_create_remote_source_binds_the_ledger_node_uuid_and_is_audited(self):
+        node = pair_node(self.database, 1)
+        code, stdout, stderr, terminal = self.create_remote(node, "入口")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(f'name="入口" for capture node {node}', terminal)
+        self.assertIn("Type CREATE to confirm", terminal)
+        match = re.fullmatch(
+            r"remote source created: source_id=([0-9a-f-]{36}) node_id=([0-9a-f-]{36})\n"
+            r"next: .*capture\.sources\[\]\.source_id.*\n", stdout)
+        self.assertIsNotNone(match, stdout)
+        source_id = UUID(match.group(1))
+        # Printed canonically, so the Agent configuration can take it as is.
+        self.assertEqual(str(source_id), match.group(1))
+        self.assertEqual(str(node), match.group(2))
+        source = self.fixture.get_source(source_id)
+        self.assertEqual((SourceType.REMOTE_AGENT, node, "入口", True, None),
+                         (source.source_type, source.capture_node_id, source.name, source.enabled,
+                          source.desired_capture_profile))
+        # The registry node row carries the ledger's UUID; no second identity.
+        self.assertEqual([(str(node), "offline")], self.node_rows())
+        self.assertEqual([("owner", "create_capture_node", "capture_node", str(node), "succeeded"),
+                          ("owner", "create_source", "source", str(source_id), "succeeded")],
+                         self.rows(SOURCE_AUDIT))
+        # A second camera of the same node reuses that row.
+        code, stdout, stderr, _ = self.create_remote(node, "rack")
+        self.assertEqual((code, stderr), (0, ""))
+        second = UUID(re.search(r"source_id=([0-9a-f-]{36})", stdout).group(1))
+        self.assertEqual([(str(node), "offline")], self.node_rows())
+        self.assertEqual(3, len(self.rows(SOURCE_AUDIT)))
+        self.assertEqual(("owner", "create_source", "source", str(second), "succeeded"),
+                         self.rows(SOURCE_AUDIT)[-1])
+        self.assertEqual([node, node], [row.capture_node_id for row in self.fixture.list_sources()])
+
+    def test_create_remote_source_refusals_change_and_record_nothing(self):
+        paired = pair_node(self.database, 1)
+        revoked = pair_node(self.database, 3, revoked=True)
+        registry_revoked = pair_node(self.database, 5)
+        # A registry node row of the ledger's UUID, revoked in the registry.
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self.fixture.create_capture_node_on(connection, registry_revoked, "node")
+            connection.execute("UPDATE capture_nodes SET health_state = 'revoked'")
+            connection.execute("COMMIT")
+        nodes_before = self.node_rows()
+        for node, name, lines, reason in (
+                ("not-a-uuid", "x", (), "node_id_rejected"),
+                (str(paired)[:-1], "x", (), "node_id_rejected"),
+                ("{" + str(paired) + "}", "x", (), "node_id_rejected"),
+                (uuid4(), "x", (), "capture_node_not_paired"),
+                (revoked, "x", (), "capture_node_revoked"),
+                (registry_revoked, "x", (), "capture_node_revoked"),
+                (paired, "a\u202ec", (), "source_name_rejected"),
+                (paired, "   ", (), "source_name_rejected"),
+                (paired, "x" * 129, (), "source_name_rejected"),
+                (paired, "x", ("no",), "owner_confirmation_declined")):
+            with self.subTest(node=str(node), reason=reason):
+                code, stdout, stderr, terminal = self.create_remote(node, name, lines)
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn(f"refused: {reason}", stderr)
+                self.assertNotIn(str(node), stderr)
+                if reason != "owner_confirmation_declined":
+                    self.assertEqual("", terminal)
+        self.assertEqual([], self.remote_rows())
+        self.assertEqual(nodes_before, self.node_rows())
+        self.assertEqual([], self.rows(SOURCE_AUDIT))
+
+    def test_a_node_revoked_during_the_confirmation_is_refused_inside_the_transaction(self):
+        node = pair_node(self.database, 1)
+        confirm = admin_cli.LocalConsoleOwner.confirm
+
+        def revoke_then_confirm(owner, terminal, prompt, word):
+            grant = confirm(owner, terminal, prompt, word)
+            revoke_node(self.database, node)
+            return grant
+
+        with patch.object(admin_cli.LocalConsoleOwner, "confirm", revoke_then_confirm):
+            code, stdout, stderr, _ = self.create_remote(node)
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("refused: capture_node_revoked", stderr)
+        self.assertEqual([], self.remote_rows())
+        self.assertEqual([], self.node_rows())
+        ((actor, action, _kind, _target, outcome),) = self.rows(SOURCE_AUDIT)
+        self.assertEqual(("owner", "create_source", "failed"), (actor, action, outcome))
+
+    def test_create_remote_source_respects_the_active_source_limit_of_every_type(self):
+        node = pair_node(self.database, 1)
+        for index in range(4):
+            self.local_source(f"Existing {index}")
+        code, stdout, stderr, _ = self.create_remote(node, "Fifth")
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("refused: active_source_limit_reached", stderr)
+        self.assertEqual([], self.remote_rows())
+        # Rolled back together with the source: no node row and no node record.
+        self.assertEqual([], self.node_rows())
+        ((actor, action, _kind, _target, outcome),) = self.rows(SOURCE_AUDIT)
+        self.assertEqual(("owner", "create_source", "failed"), (actor, action, outcome))
+        # A disabled source frees its slot.
+        self.fixture.update_source(self.fixture.list_sources()[0].id, enabled=False)
+        code, _, stderr, _ = self.create_remote(node, "Fifth")
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(4, sum(source.enabled for source in self.fixture.list_sources()))
+
+    def test_remote_sources_lists_nodes_and_credential_states_while_the_service_runs(self):
+        active = pair_node(self.database, 1)
+        revoked = pair_node(self.database, 3)
+        for node in (active, revoked):
+            code, _, stderr, _ = self.create_remote(node, "plain")
+            self.assertEqual(0, code, stderr)
+        first, second = self.fixture.list_sources()
+        # A stored name the command would refuse is still printed escaped.
+        self.fixture.update_source(first.id, name='say "hi" \\ \x7f\u202e')
+        revoke_node(self.database, revoked)
+        self.local_source()
+        self.running = [1, 1]
+        code, stdout, stderr, terminal = self.run_cli("remote-sources")
+        self.assertEqual((code, stderr, terminal), (0, "", ""))
+        self.assertEqual(
+            [f"source {first.id} enabled=yes node={active} credential=active "
+             'name="say \\"hi\\" \\\\ \\u007f\\u202e"',
+             f'source {second.id} enabled=yes node={revoked} credential=revoked name="plain"'],
+            stdout.splitlines())
+
+    def test_remote_sources_without_any(self):
+        self.local_source()
+        code, stdout, stderr, _ = self.run_cli("remote-sources")
+        self.assertEqual((code, stdout, stderr), (0, "no remote_agent sources\n", ""))
+
+    def test_an_expired_credential_is_listed_expired_and_still_accepted(self):
+        # PR #415 review suggestion: display only; creation keeps accepting it.
+        expired = pair_node(self.database, 1, not_after=1.0)
+        current = pair_node(self.database, 3, not_after=4_000_000_000.0)
+        code, _, stderr, terminal = self.create_remote(expired, "old")
+        self.assertEqual(0, code, stderr)
+        self.assertIn("(credential expired)", terminal)
+        code, _, stderr, _ = self.create_remote(current, "new")
+        self.assertEqual(0, code, stderr)
+        first, second = self.fixture.list_sources()
+        code, stdout, stderr, _ = self.run_cli("remote-sources")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual([f'source {first.id} enabled=yes node={expired} credential=expired '
+                          'name="old"',
+                          f'source {second.id} enabled=yes node={current} credential=active '
+                          'name="new"'], stdout.splitlines())
+        # The clock decides: the same credential before its not_after is active.
+        stdout = io.StringIO()
+        with redirect_stdout(stdout), patch.object(admin_cli, "_load_deployment", self.deployment):
+            self.assertEqual(0, admin_cli.main(
+                ["remote-sources", "--config", str(self.config)], holders=self.holders,
+                discovery_factory=lambda: self.discovery, clock=lambda: 0.5))
+        self.assertIn(f"node={expired} credential=active", stdout.getvalue())
+
+    # -- disable-remote-source (PR #415 review) -------------------------
+
+    def remote_source(self, node, name="x"):
+        code, stdout, stderr, _ = self.create_remote(node, name)
+        self.assertEqual(0, code, stderr)
+        return UUID(re.search(r"source_id=([0-9a-f-]{36})", stdout).group(1))
+
+    def test_disable_remote_source_is_confirmed_and_audited(self):
+        node = pair_node(self.database, 1)
+        source_id = self.remote_source(node, "入口")
+        code, stdout, stderr, terminal = self.run_cli(
+            "disable-remote-source", str(source_id), lines=("DISABLE",))
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(f'Disable remote_agent source {source_id} name="入口" of capture node {node}',
+                      terminal)
+        self.assertIn("Type DISABLE to confirm", terminal)
+        self.assertIn(f"remote source disabled: source_id={source_id}", stdout)
+        source = self.fixture.get_source(source_id)
+        self.assertEqual((False, node, "入口"), (source.enabled, source.capture_node_id, source.name))
+        self.assertEqual(("owner", "update_source", "source", str(source_id), "succeeded"),
+                         self.rows(SOURCE_AUDIT)[-1])
+        code, stdout, _, _ = self.run_cli("remote-sources")
+        self.assertIn(f"source {source_id} enabled=no node={node}", stdout)
+
+    def test_disable_remote_source_refusals_change_and_record_nothing(self):
+        node = pair_node(self.database, 1)
+        remote = self.remote_source(node)
+        disabled = self.remote_source(node)
+        self.fixture.update_source(disabled, enabled=False)
+        local = self.local_source()
+        before = self.rows(SOURCE_AUDIT)
+        for source, lines, reason in (
+                ("not-a-uuid", (), "source_id_rejected"),
+                (uuid4(), (), "source_not_found"),
+                (local.id, (), "source_not_remote_agent"),
+                (disabled, (), "source_already_disabled"),
+                (remote, ("no",), "owner_confirmation_declined")):
+            with self.subTest(reason=reason):
+                code, stdout, stderr, terminal = self.run_cli(
+                    "disable-remote-source", str(source), lines=lines)
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn(f"refused: {reason}", stderr)
+                self.assertNotIn(str(source), stderr)
+                if reason != "owner_confirmation_declined":
+                    self.assertEqual("", terminal)
+        self.assertEqual([True, False, True],
+                         [source.enabled for source in self.fixture.list_sources()])
+        self.assertEqual(before, self.rows(SOURCE_AUDIT))
+
+    def test_disable_remote_source_refuses_while_the_service_runs_or_starts(self):
+        node = pair_node(self.database, 1)
+        source_id = self.remote_source(node)
+        before = self.rows(SOURCE_AUDIT)
+        self.running = [1]
+        code, stdout, stderr, terminal = self.run_cli("disable-remote-source", str(source_id))
+        self.assertEqual((code, stdout, terminal), (2, "", ""))
+        self.assertIn("refused: service_running", stderr)
+        self.assertEqual(before, self.rows(SOURCE_AUDIT))
+        self.running = [0, 1]
+        code, stdout, stderr, _ = self.run_cli(
+            "disable-remote-source", str(source_id), lines=("DISABLE",))
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("refused: service_running", stderr)
+        self.assertEqual(("owner", "update_source", "source", str(source_id), "failed"),
+                         self.rows(SOURCE_AUDIT)[-1])
+        self.assertTrue(self.fixture.get_source(source_id).enabled)
+
+    def test_a_revoked_node_s_sources_are_disabled_to_re_pair_within_the_limit(self):
+        # PR #415 review: revoking a node changes only the ledger, so its
+        # sources keep their slots until they are disabled here.
+        old = pair_node(self.database, 1)
+        sources = [self.remote_source(old, f"camera {index}") for index in range(4)]
+        revoke_node(self.database, old)
+        new = pair_node(self.database, 3)
+        code, stdout, stderr, _ = self.create_remote(new, "camera 0")
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("refused: active_source_limit_reached", stderr)
+        code, _, stderr, _ = self.create_remote(old, "again")
+        self.assertIn("refused: capture_node_revoked", stderr)
+        self.assertIn("disable-remote-source", stderr)
+        code, _, stderr, _ = self.run_cli("disable-remote-source", str(sources[0]),
+                                          lines=("DISABLE",))
+        self.assertEqual(0, code, stderr)
+        code, _, stderr, _ = self.create_remote(new, "camera 0")
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(4, sum(source.enabled for source in self.fixture.list_sources()))
+
+    def test_a_failed_post_commit_verification_points_at_the_matching_listing(self):
+        # PR #415 review: 'sources' lists local_uvc sources only, so after a
+        # remote command the hint names 'remote-sources' instead.
+        node = pair_node(self.database, 1)
+        remote = self.remote_source(node)
+        refused = CliRefused("database_rejected")
+        for argv, lines, listing in (
+                (("create-source", "--name", "x", "--profile", PROFILE), ("CREATE",), "'sources'"),
+                (("create-remote-source", "--node", str(node), "--name", "y"), ("CREATE",),
+                 "'remote-sources'"),
+                (("disable-remote-source", str(remote)), ("DISABLE",), "'remote-sources'")):
+            with self.subTest(command=argv[0]):
+                with patch.object(admin_cli, "_verify_pinned", side_effect=refused):
+                    code, stdout, stderr, _ = self.run_cli(*argv, lines=lines)
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn("refused: committed_verification_failed", stderr)
+                self.assertIn(f"run {listing}", stderr)
+                if listing == "'remote-sources'":
+                    self.assertIn("not 'sources'", stderr)
+
+    def test_owner_administration_refuses_unpaired_nodes_and_denied_actors(self):
+        node = pair_node(self.database, 1)
+        audit = AuditStore(self.database)
+        registry = CameraRegistry(self.database)
+        denied = OwnerAdministration(OwnerAuditService(audit, DenyAllOwners()), registry)
+        with self.assertRaises(OwnerAuthorizationError):
+            denied.create_remote_agent_source(object(), node, name="x")
+        admin = OwnerAdministration(OwnerAuditService(audit, _LedgerOwner()), registry)
+        with self.assertRaises(CaptureNodeNotPairedError):
+            admin.create_remote_agent_source("owner", uuid4(), name="x")
+        with self.assertRaises(CaptureNodeNotPairedError):
+            admin.create_remote_agent_source("owner", str(node), name="x")
+        # A registry node row revoked by the Owner refuses, although the
+        # ledger credential is still active.
+        registry_revoked = pair_node(self.database, 5)
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            registry.create_capture_node_on(connection, registry_revoked, "node")
+            connection.execute("UPDATE capture_nodes SET health_state = 'revoked'")
+            connection.execute("COMMIT")
+        with self.assertRaises(CaptureNodeRevokedError):
+            admin.create_remote_agent_source("owner", registry_revoked, name="x")
+        revoke_node(self.database, node)
+        with self.assertRaises(CaptureNodeRevokedError):
+            admin.create_remote_agent_source("owner", node, name="x")
+        self.assertEqual([], self.remote_rows())
+        self.assertEqual([(str(registry_revoked), "revoked")], self.node_rows())
+        # A node that is not a UUID is refused before the boundary: no record.
+        self.assertEqual(["denied", "failed", "failed", "failed"],
+                         [row[4] for row in self.rows(SOURCE_AUDIT)])
 
     # -- approve --------------------------------------------------------
 

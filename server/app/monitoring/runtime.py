@@ -235,6 +235,10 @@ class MonitoringStatus:
     # PR #408 review: an owed node notice is held (cap, full queue, refused
     # local write). Diagnostic only; it is retried on every tick.
     capture_node_notices_held: bool = False
+    # Issue #410 item 2: the per-node hourly cap could not be re-seeded from
+    # the stored rows yet (read retried on every running tick), so notices
+    # of an earlier process are not counted. Diagnostic only.
+    capture_node_cap_unrestored: bool = False
     # Issue #397 (PR #409 review): an expected node sends no heartbeat, or
     # the heartbeat-loss watch is paused because the ledger is unreadable.
     # Both are degraded in the daily summary.
@@ -1152,6 +1156,9 @@ class MonitoringRuntime:
             self.notification_events.count_since(since, CRITICAL_KINDS), recordings,
             self.notification_events.count_since(since, WARNING_KINDS) + degraded,
             self.recordings.usage_bytes(), self._policy.state, pipeline_available=False,
+            # Issue #410 item 1: the agent counts are shown on their own once
+            # the latest drain read the expected nodes.
+            agents_available=capture.nodes_counted,
         )
 
     def _summary_tick(self) -> None:
@@ -1252,16 +1259,26 @@ class MonitoringRuntime:
             # loop; each row is matched to its node by `notice_id`, and a
             # `pending` row holds its slot too. A failed read is retried on
             # the next tick and never stops this tick's notices.
+            # Issue #410 item 2: while it keeps failing, notices of an earlier
+            # process are not counted (at worst one goes out early);
+            # `capture_node_cap_unrestored` says so, and the failure is logged
+            # once per episode, not on every tick.
             try:
                 monitor.restore_window(self._capture_notice_rows(self.dependencies.utcnow()),
                                        monotonic=self.dependencies.monotonic())
-                self._capture_window_restored = True
             except Exception:
-                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+                if not self.status.capture_node_cap_unrestored:
+                    logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+                self._set(capture_node_cap_unrestored=True)
+            else:
+                self._capture_window_restored = True
+                self._set(capture_node_cap_unrestored=False)
         try:
             status = monitor.drain(self.notifications, at=self.dependencies.utcnow(),
                                    monotonic=self.dependencies.monotonic())
         except Exception:
+            # The counts of an earlier drain are not current any more.
+            self._capture_health = CaptureHealthStatus()
             logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
             return
         self._capture_health = status

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -86,6 +87,10 @@ class UnitTests(unittest.TestCase):
                            Path("/etc/example/config.json"), parsed, "synthetic", 123)
         self.assertIn("DevicePolicy=closed", unit)
         self.assertIn("DeviceAllow=char-video4linux rw", unit)
+        self.assertIn("SupplementaryGroups=video", unit)
+        self.assertIn("Wants=modprobe@videodev.service", unit)
+        self.assertIn("After=modprobe@videodev.service", unit)
+        self.assertNotIn("audio", unit)
         self.assertNotIn("snd", unit)
         self.assertNotIn("char-alsa", unit)
 
@@ -343,6 +348,231 @@ class CaptureAdminTests(unittest.TestCase):
                          f"{capture_admin.PROG}: refused: candidate_unavailable")
         # The session was released: the next start is not a recovery.
         self.assertIsNone(self.approved().session_token)
+
+    def test_revoke_removes_the_approval_so_the_camera_can_move(self):
+        value = support.configuration(Path(tempfile.mkdtemp(prefix="agent-capture-move-")))
+        value["capture"] = {"gst_launch": "/usr/bin/gst-launch-1.0", "sources": [
+            {"source_id": str(SOURCES[0]), "profile": "640x480@15/MJPG"},
+            {"source_id": str(SOURCES[1]), "profile": "640x480@15/MJPG"}]}
+        two = Settings.parse(value, code_root=Path("/nonexistent/code"))
+        label = self.label(self.camera)
+        self.assertEqual(self.run_cli("approve", str(SOURCES[0]), label, settings=two)[0], 0)
+        code, _, stderr = self.run_cli("revoke", str(SOURCES[0]), typed="no", settings=two)
+        self.assertIn("refused: owner_confirmation_declined", stderr)
+        code, stdout, stderr = self.run_cli("revoke", str(SOURCES[0]), typed="REVOKE",
+                                            settings=two)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(f"camera approval removed: source_id={SOURCES[0]}", stdout)
+        self.assertIn("Type REVOKE to confirm", self.prompts[-1])
+        self.assertEqual(self.run_cli("approve", str(SOURCES[1]), label, settings=two)[0], 0)
+        code, _, stderr = self.run_cli("revoke", str(SOURCES[0]), typed="REVOKE", settings=two)
+        self.assertIn("refused: source_not_approved", stderr)
+
+    def test_a_latched_serial_stays_unapprovable_after_replacing_or_revoking(self):
+        # PR #412 review: approve another camera, revoke, approve the latched
+        # one again must still be refused.
+        from media_capture_agent.uvc_approvals import ApprovalStore as Store
+        store = Store(self.settings)
+        try:
+            token = store.start_session(SOURCES[0]).session_token
+            store.save(SOURCES[0], self.camera, False, session_token=token,
+                       serial_ambiguous=True, release=True)
+        finally:
+            store.close()
+        other = evidence(2, serial="SYN-SERIAL-0002")
+        self.assertIn("serial=latched", self.run_cli("candidates")[1])
+        code, _, stderr = self.run_cli("approve", str(SOURCES[0]), self.label(other))
+        self.assertEqual(code, 0, stderr)
+        code, _, stderr = self.run_cli("revoke", str(SOURCES[0]), typed="REVOKE")
+        self.assertEqual(code, 0, stderr)
+        code, _, stderr = self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        self.assertEqual(code, 2)
+        self.assertIn("refused: camera_serial_not_unique", stderr)
+        store = Store(self.settings)
+        try:
+            latched = store.latched_digests()
+        finally:
+            store.close()
+        self.assertEqual(len(latched), 1)
+        with open(self.settings.runtime_root / "uvc-latched-serials.json") as stream:
+            self.assertNotIn("SYN-SERIAL", stream.read())
+
+    def test_a_latch_of_a_source_removed_from_the_configuration_is_kept(self):
+        # Codex P2 on PR #412: a source that latched a duplicated serial and
+        # was then removed from the configuration must not let a replacement
+        # source approve that camera.
+        from media_capture_agent.uvc_approvals import ApprovalStore as Store
+        store = Store(self.settings)
+        try:
+            token = store.start_session(SOURCES[1]).session_token
+            store.save(SOURCES[1], self.camera, False, session_token=token,
+                       serial_ambiguous=True, release=True)
+        finally:
+            store.close()
+        self.assertNotIn(SOURCES[1], {source.source_id
+                                      for source in self.settings.capture.sources})
+        self.assertIn("serial=latched", self.run_cli("candidates")[1])
+        code, _, stderr = self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        self.assertEqual(code, 2)
+        self.assertIn("refused: camera_serial_not_unique", stderr)
+        store = Store(self.settings)
+        try:
+            self.assertEqual(len(store.latched_digests()), 1)
+        finally:
+            store.close()
+
+    def test_a_corrupted_session_field_is_a_fixed_refusal(self):
+        import json
+        self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        path = self.settings.runtime_root / "uvc-approvals.json"
+        document = json.loads(path.read_text())
+        document["sources"][str(SOURCES[0])]["session"] = 123
+        path.write_text(json.dumps(document))
+        code, stdout, stderr = self.run_cli("candidates")
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertEqual(stderr.strip().splitlines()[-1],
+                         f"{capture_admin.PROG}: refused: approval_state_unavailable")
+
+    def test_the_signal_mask_is_restored_after_an_unexpected_error(self):
+        import signal
+        from media_capture_agent.uvc_capture import UvcCapture
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        with patch.object(UvcCapture, "approve", side_effect=TypeError("synthetic")):
+            with self.assertRaises(TypeError):
+                self.run_cli("approve", str(SOURCES[0]), self.label(self.camera))
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, []), before)
+
+    def test_signals_are_blocked_while_the_approval_is_written(self):
+        import signal
+        from media_capture_agent.uvc_capture import UvcCapture
+        original = UvcCapture.approve
+        seen = []
+
+        def approve(capture, source, device):
+            seen.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+            os.kill(os.getpid(), signal.SIGTERM)
+            return original(capture, source, device)
+
+        with patch.object(UvcCapture, "approve", approve):
+            code, stdout, stderr = self.run_cli("approve", str(SOURCES[0]),
+                                                self.label(self.camera))
+        self.assertIn(signal.SIGTERM, seen[0])
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("camera approved", stdout)
+        self.assertEqual(self.approved().approved, self.camera)
+
+    def test_a_concurrent_approval_for_another_source_is_seen_under_the_lock(self):
+        # PR #412 review: the earlier snapshot is checked again after the prompt.
+        value = support.configuration(Path(tempfile.mkdtemp(prefix="agent-capture-race-")))
+        value["capture"] = {"gst_launch": "/usr/bin/gst-launch-1.0", "sources": [
+            {"source_id": str(SOURCES[0]), "profile": "640x480@15/MJPG"},
+            {"source_id": str(SOURCES[1]), "profile": "640x480@15/MJPG"}]}
+        two = Settings.parse(value, code_root=Path("/nonexistent/code"))
+
+        def confirm_while_another_approves(prompt):
+            store = ApprovalStore(two)
+            try:
+                token = store.start_session(SOURCES[1]).session_token
+                store.save(SOURCES[1], self.camera, False, session_token=token,
+                           serial_ambiguous=False, release=True)
+            finally:
+                store.close()
+            return "APPROVE"
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = capture_admin.main(
+                ["approve", "--config", "/nonexistent", str(SOURCES[0]), self.label(self.camera)],
+                settings_loader=lambda path: two, discovery=self.discovery,
+                confirm=confirm_while_another_approves)
+        self.assertEqual(code, 2)
+        self.assertIn("refused: camera_approved_for_another_source", stderr.getvalue())
+
+    def test_a_nested_cli_approval_for_another_source_is_seen_under_the_lock(self):
+        # Codex P2 on PR #412 (3f63ee1): the other approval runs through the
+        # real command while this one waits at its prompt.
+        value = support.configuration(Path(tempfile.mkdtemp(prefix="agent-capture-nested-")))
+        value["capture"] = {"gst_launch": "/usr/bin/gst-launch-1.0", "sources": [
+            {"source_id": str(SOURCES[0]), "profile": "640x480@15/MJPG"},
+            {"source_id": str(SOURCES[1]), "profile": "640x480@15/MJPG"}]}
+        two = Settings.parse(value, code_root=Path("/nonexistent/code"))
+        label = self.label(self.camera)
+        nested = []
+
+        def confirm_after_another_approval(prompt):
+            if "for source " + str(SOURCES[0]) in prompt:
+                with contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    nested.append(capture_admin.main(
+                        ["approve", "--config", "/nonexistent", str(SOURCES[1]), label],
+                        settings_loader=lambda path: two, discovery=self.discovery,
+                        confirm=lambda prompt: "APPROVE"))
+            return "APPROVE"
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = capture_admin.main(
+                ["approve", "--config", "/nonexistent", str(SOURCES[0]), label],
+                settings_loader=lambda path: two, discovery=self.discovery,
+                confirm=confirm_after_another_approval)
+        self.assertEqual(nested, [0])
+        self.assertEqual(code, 2, stdout.getvalue())
+        self.assertIn("refused: camera_approved_for_another_source", stderr.getvalue())
+
+    def test_ctrl_c_at_the_prompt_is_a_fixed_refusal(self):
+        import signal
+
+        def interrupted(prompt):
+            os.kill(os.getpid(), signal.SIGINT)
+            return "APPROVE"
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = capture_admin.main(
+                ["approve", "--config", "/nonexistent", str(SOURCES[0]), self.label(self.camera)],
+                settings_loader=lambda path: self.settings, discovery=self.discovery,
+                confirm=interrupted)
+        self.assertEqual(code, 2)
+        self.assertIn("refused: interrupted", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertIsNone(self.approved())
+
+    def test_the_confirmation_is_read_from_a_real_terminal(self):
+        # Codex P1 on PR #412: a terminal is not seekable.
+        import pty
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        os.write(master, b"APPROVE\n")
+        word = capture_admin.read_confirmation("Type APPROVE: ", opener=lambda *_: slave)
+        self.assertEqual(word, "APPROVE")
+        # The echo and the prompt may arrive in separate reads (Codex P2).
+        import select
+        output, deadline = b"", time.monotonic() + 5
+        while b"Type APPROVE: " not in output and time.monotonic() < deadline:
+            if select.select([master], [], [], 0.1)[0]:
+                output += os.read(master, 1024)
+        self.assertIn(b"Type APPROVE: ", output)
+        not_a_terminal = os.open(os.devnull, os.O_RDWR)
+        with self.assertRaises(capture_admin.AdminRefused):
+            capture_admin.read_confirmation("x", opener=lambda *_: not_a_terminal)
+
+    def test_a_same_serial_camera_connected_at_the_prompt_is_refused(self):
+        # Codex P2 on PR #412.
+        def confirm_and_plug_a_twin(prompt):
+            self.discovery.devices = [self.camera, evidence(6, serial="SYN-SERIAL-0001")]
+            return "APPROVE"
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = capture_admin.main(
+                ["approve", "--config", "/nonexistent", str(SOURCES[0]), self.label(self.camera)],
+                settings_loader=lambda path: self.settings, discovery=self.discovery,
+                confirm=confirm_and_plug_a_twin)
+        self.assertEqual(code, 2)
+        self.assertIn("refused: camera_serial_not_unique", stderr.getvalue())
+        state = self.approved()
+        self.assertIsNone(state.approved)
+        self.assertIsNone(state.session_token)
 
     def test_a_camera_without_a_serial_is_not_approved(self):
         self.discovery.devices = [evidence(4, serial=None)]

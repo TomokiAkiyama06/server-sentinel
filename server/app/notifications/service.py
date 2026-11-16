@@ -144,23 +144,40 @@ class DailySummary:
     recording_bytes: int
     storage_state: StorageState
     # False when no capture/detection pipeline reports into this summary. The
-    # source, agent and observation counts are then shown as unavailable, so a
+    # source and observation counts are then shown as unavailable, so a
     # summary never presents "0 person observations" as a verified absence.
     pipeline_available: bool = True
+    # Issue #410 item 1: whether the agent counts were read. They come from
+    # capture-node connections and the pairing ledger, not from a
+    # capture/detection pipeline, so they are shown on their own (marked as
+    # connections only, implying no observation). None follows
+    # ``pipeline_available``.
+    agents_available: bool | None = None
 
     def __post_init__(self):
+        flags = {"storage_state", "pipeline_available", "agents_available"}
         if (not isinstance(self.storage_state, StorageState)
-                or type(self.pipeline_available) is not bool or any(
-                    type(value) is not int or not 0 <= value < 2**63
-                    for key, value in vars(self).items()
-                    if key not in {"storage_state", "pipeline_available"})):
+                or type(self.pipeline_available) is not bool
+                or type(self.agents_available) not in (type(None), bool)
+                or any(type(value) is not int or not 0 <= value < 2**63
+                       for key, value in vars(self).items() if key not in flags)):
             raise ValueError("invalid summary aggregate")
 
     def text(self) -> str:
+        counted = (self.pipeline_available if self.agents_available is None
+                   else self.agents_available)
+        if not counted:
+            agents = "Agents: unavailable\n"
+        elif self.pipeline_available:
+            agents = f"Agents online/offline: {self.agents_online}/{self.agents_offline}\n"
+        else:
+            # Connections only: an online agent is not an observation.
+            agents = (f"Agents online/offline: {self.agents_online}/{self.agents_offline}"
+                      " (capture-node connections only)\n")
         if self.pipeline_available:
             pipeline = (f"Sources online/degraded/offline: {self.sources_online}/"
                         f"{self.sources_degraded}/{self.sources_offline}\n"
-                        f"Agents online/offline: {self.agents_online}/{self.agents_offline}\n"
+                        + agents +
                         f"Person/motion/entry observations: {self.person_count}/"
                         f"{self.motion_count}/{self.entry_count}\n")
             monitored = f"Monitored seconds: {self.monitored_seconds}\n"
@@ -170,7 +187,7 @@ class DailySummary:
             monitored = ("Monitored seconds: unavailable (no capture pipeline reporting; "
                          f"service uptime seconds: {self.monitored_seconds})\n")
             pipeline = ("Sources: unavailable (no capture pipeline reporting)\n"
-                        "Agents: unavailable\n"
+                        + agents +
                         "Person/motion/entry observations: unavailable\n")
         return ("ServerSentinel daily summary\n"
                 + monitored + pipeline +

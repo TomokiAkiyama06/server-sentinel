@@ -51,11 +51,48 @@ sudo systemctl start media-capture-agent.service
 ```
 
 `candidates` prints labels, never a serial, path or USB port; a label changes
-when the camera is re-plugged. `approve` refuses a camera without a serial
-(its approval would not survive the command), `service_running` while the
-service holds the approval state, and every other refusal with one fixed
-word. The installer's `--video-device /dev/videoN` must name the camera's
-capture node so the unit's `DeviceAllow=` lets the service open it.
+when the camera is re-plugged or the host restarts (`approved_for` follows the
+serial). `approve` refuses a camera without a serial, a serial shared with
+another connected camera or latched as ambiguous, and a camera already
+approved for another source (checked again under the approval store's lock
+after the confirmation); `revoke <source uuid>` (type `REVOKE`) removes a
+source's approval so its camera can be moved to another source. Every
+refusal is one fixed word; an interruption after an approval was stored no
+longer reports a refusal.
+
+The service account must be in the `video` group (device files are group
+`video`) and never in `audio`; `capture_admin` runs outside the unit and needs
+it too. With a `capture` section the generated unit allows the video device
+class (`DeviceAllow=char-video4linux rw`, `SupplementaryGroups=video`): the
+discovery probes every video node (a UVC camera also has a metadata node) and
+a re-plugged camera may get another number, so a per-path `--video-device`
+rule would block it. Which camera is used stays the identity check's
+decision, and the capture child can open only the approved device. The unit
+also loads the `videodev` module first (`Wants=`/`After=modprobe@videodev`),
+because systemd drops a device class unknown when the service starts.
+
+Adding `capture` to an already installed host changes the generated unit, and
+the installer has no operation to re-render it: `update` refuses a differing
+service configuration and `install` refuses an existing installation. On such
+a host, as the administrator: stop the service, move the installed unit file
+and the installation directory (`--destination`) aside (this gives up the
+`previous` release for rollback; configuration, credentials, runtime state and
+media are elsewhere and untouched), create the installation directory again
+at the same path, empty, root-owned and mode 0755, run `install` again with
+the same arguments, run `systemctl daemon-reload`, then review and enable the
+new unit. Restarting the old unit
+instead would let `capture_admin` approve a camera the service cannot open.
+Before rolling back to a release without Issue #14 capture support, remove the
+`capture` section, which that release refuses as an unknown key.
+
+A serial the Agent ever latched as duplicated stays unapprovable for good:
+`capture_admin` records every latch it sees in `uvc-latched-serials.json`
+under the runtime root (SHA-256 digests of the identity, never a serial)
+before it approves or revokes anything, so neither replacing nor revoking a
+source's approval makes that camera approvable again (`camera_serial_not_unique`;
+`candidates` shows it as `serial=latched`). Such a source can still be
+revoked and given another camera; the latched camera itself cannot be used
+by this tool.
 
 Issue #16 adds the tested disk-ring/incident core under `ring.py`, `ring_models.py`
 and `ring_ledger.py`. It uses real immutable disk segments and private SQLite;
@@ -277,7 +314,9 @@ through a nonblocking descriptor; FIFOs, devices and concurrent file changes
 are rejected before execution.
 
 The device path above is illustrative, never durable UVC identity. Repeat the
-option for explicitly allowed video nodes; the default device allowlist is empty.
+option for explicitly allowed video nodes; without a `capture` section the
+default device allowlist is empty, and with one the unit allows the video
+device class instead (see "Cameras are approved locally" above).
 The generated unit uses `DevicePolicy=closed` and never allows `/dev/snd`.
 Approved stable identity still must be verified by the capture layer on open and
 reconnect. The installer writes a new, root-owned version directory, runs local
