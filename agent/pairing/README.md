@@ -79,7 +79,8 @@ certificate for the same node and deployment, issued by the installed CA for the
 pending key and outliving the current certificate. It then calls
 `NodeCredentialStore.rotate`, which atomically renames the new generation over
 `current.json` and removes the old files. An expired credential cannot renew;
-the node must re-pair. No scheduler runs this yet (#15 transport).
+the node must re-pair. The service runs these steps over its ingest session
+(`credential_renewal.CredentialRenewal`, Issue #109; see `../README.md`).
 
 ### Serialization (#117)
 

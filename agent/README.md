@@ -42,6 +42,31 @@ memory for the live view only. The connection sets `TCP_NOTSENT_LOWAT`
 (128 KiB), so frames never queue megabytes of unsent bytes ahead of a
 heartbeat and widen its clock exchange.
 
+The node credential renews over the same session (Issue #109, ADR-0007
+addendum 2026-11-16; mock/loopback-verified only). From 30 days before the
+installed certificate expires (`node_tls.RenewalSchedule`), after an
+acknowledged heartbeat the session sends a `RENEWAL_REQUEST` (`0x20`,
+`{"csr": <PEM>}`) on the heartbeat's connection, under the same lock as the
+heartbeat and the live frames; it never connects for it, and at most one
+request is outstanding. The Main's `RENEWAL_REPLY` (`0x21`) comes directly
+before a later heartbeat's ack: an issued certificate is installed as a new
+credential generation (`node_tls.complete_renewal`) and the session
+reconnects with it at once; a refusal word, no reply within 60 s or a lost
+connection keeps the current credential and retries after 1 hour, doubling
+to 24 hours, with the same pending key. The status line then carries the
+fixed word as `"renewal"` (for example `renewal_requested`,
+`renewal_installed`, `renewal_signer_unavailable`,
+`renewal_unsupported_by_main` for a Main release without renewal, or
+`renewal_credential_expired`, after which only re-pairing helps).
+The installed generation is looked at again at most every 60 s, so a
+credential installed while the service runs (`enroll pair --repair expired`
+after an expiry, a rotation) re-reads its expiry and restarts the schedule.
+`credential_renewal.py` imports `node_tls`, and so `cryptography`, only when
+it first checks, so the service still starts without it; renewal then
+reports `renewal_dependency_unavailable`. On the capture host the system
+`python3` gets it from the OS package (Owner decision 2026-11-16; see
+"Versioned installation").
+
 Cameras are approved locally with the service stopped, as the service
 account, typing `APPROVE` on the controlling terminal:
 
@@ -305,7 +330,20 @@ check. CI executes the artifact outside its development checkout.
 
 After the Owner provisions a dedicated account, approved storage, protected
 config, a root-controlled install directory and unit directory, an administrator
-may explicitly run:
+first installs `cryptography` for the system interpreter from the OS package
+(Owner decision 2026-11-16) and checks it as the service account:
+
+```text
+sudo apt install python3-cryptography
+sudo -u <service account> python3 -c 'import cryptography'
+```
+
+The service starts without it, but certificate renewal over the ingest
+session needs it (Issue #109); without it the status line shows
+`"renewal": "renewal_dependency_unavailable"` and the node must re-pair once
+its certificate expires. The OS package is the distribution's build, not the
+hash-pinned wheel of `requirements.lock`. Then the administrator may
+explicitly run:
 
 ```text
 python3 agent/install.py --artifact <verified-artifact> --sha256 <trusted-sha256> \

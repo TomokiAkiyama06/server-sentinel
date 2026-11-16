@@ -136,7 +136,7 @@ class LiveFrameWireTests(unittest.TestCase):
         with self.assertRaises(WireRefused):
             read_frame(right, 16 * 1024)
         # An unknown type keeps the default limit, then is refused by type.
-        left.sendall(struct.pack(">IB", 16 * 1024 + 1, 0x20))
+        left.sendall(struct.pack(">IB", 16 * 1024 + 1, 0x30))
         with self.assertRaises(WireRefused) as refused:
             read_frame(right, 16 * 1024, type_limits=limits)
         self.assertEqual(refused.exception.reason, "frame_too_large")

@@ -142,12 +142,17 @@ class CaptureIngestMaterial:
     """What ``create_app`` needs to open the listener; holds no private key bytes.
 
     ``context`` is the ``ssl.SSLContext`` from ``build_ingest_server_context``.
+    ``trust`` is the public ``node_ca.DeploymentTrust`` (the CA certificate
+    only) that the session renewal verifies the signer's answers with (Issue
+    #109); without it the listener answers every renewal request
+    ``renewal_unavailable``.
     """
 
     listener: IngestListenerConfig
     limits: CaptureIngestLimits
     context: object
     deployment_id: UUID
+    trust: object = None
 
     def __repr__(self) -> str:
         return "CaptureIngestMaterial(<redacted>)"
@@ -223,4 +228,4 @@ def load_capture_ingest_material(section: CaptureIngestDeployment) -> CaptureIng
     except (CaptureAuthorityError, IngestConfigurationError, OSError, ValueError):
         raise CaptureIngestUnavailable("listener_material_unavailable") from None
     return CaptureIngestMaterial(section.listener, section.limits, context,
-                                 trust.deployment_id)
+                                 trust.deployment_id, trust)
