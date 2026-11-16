@@ -89,6 +89,10 @@ REPLY_TIMEOUT_SECONDS = 5.0
 # autotuned send buffer (MBs) would delay the heartbeat behind the frames,
 # widen its clock exchange (`clock_uncertain`) or exhaust its reply timeout.
 NOT_SENT_LOW_WATER_BYTES = 131_072
+# Linux's option number (include/uapi/linux/tcp.h). Some CPython builds (for
+# example python-build-standalone) lack `socket.TCP_NOTSENT_LOWAT`; without
+# the fallback every connect would fail with an uncaught AttributeError.
+TCP_NOTSENT_LOWAT = getattr(socket, "TCP_NOTSENT_LOWAT", 25)
 RETRY_FIRST_SECONDS = 1.0
 RETRY_MAX_SECONDS = 30.0
 # Issue #407: idle closes this close together form a streak; above
@@ -364,7 +368,7 @@ class IngestSession:
             # Stop-and-wait over small frames: without this, Nagle and delayed
             # ACK add ~40 ms per heartbeat (Issue #369, ADR-0007).
             connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NOTSENT_LOWAT,
+            connection.setsockopt(socket.IPPROTO_TCP, TCP_NOTSENT_LOWAT,
                                   NOT_SENT_LOW_WATER_BYTES)
         except IngestSessionError:
             _shutdown(connection)

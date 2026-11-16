@@ -176,10 +176,16 @@ class IngestSessionTests(NodeTlsHarness):
         self.assertTrue(session._connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
         # PR #413 review: live frames never queue MBs ahead of a heartbeat.
         self.assertEqual(session._connection.getsockopt(socket.IPPROTO_TCP,
-                                                        socket.TCP_NOTSENT_LOWAT),
+                                                        ingest_session.TCP_NOTSENT_LOWAT),
                          ingest_session.NOT_SENT_LOW_WATER_BYTES)
         session.send_heartbeat(heartbeat(4))
         self.assertEqual(peer.connections, 1)
+
+    def test_the_low_water_option_is_linux_s_number_without_the_constant(self):
+        # Some CPython builds lack `socket.TCP_NOTSENT_LOWAT` (PR #413 follow-up).
+        self.assertEqual(25, ingest_session.TCP_NOTSENT_LOWAT)
+        if hasattr(socket, "TCP_NOTSENT_LOWAT"):
+            self.assertEqual(socket.TCP_NOTSENT_LOWAT, ingest_session.TCP_NOTSENT_LOWAT)
 
     def test_an_unpaired_runtime_is_not_authenticated(self):
         empty = self.root / "empty"

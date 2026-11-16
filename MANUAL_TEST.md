@@ -2864,7 +2864,12 @@ listed both. Record serials, bus/device numbers and device names only in the
 private record.
 
 - [ ] `--check` before enabling prints one fixed line per configured device
-  and changes nothing (`sudo lxc config device show <vm>` unchanged);
+  (after a `usb_repass_pending_restore` line per pending record, if any) and
+  changes nothing (`sudo lxc config device show <vm>` and the state file
+  unchanged);
+- [ ] after a host reboot the unit is not in `systemctl --failed` because of
+  the boot coldplug; a run before LXD answered shows
+  `usb_repass_lxd_not_ready` and the timer's run after it judges normally;
 - [ ] with a camera in `needs_repass`, the first service run prints
   `usb_repass_done` for it; the guest lists it again
   (`v4l2-ctl --list-devices`), the source returns to `online` without a VM
@@ -2889,7 +2894,8 @@ private record.
 - [ ] after `systemctl stop` of the service mid-run (or a host reboot during
   a re-pass, if it can be arranged), the next run restores a device missing
   from the instance (`usb_repass_restored`) or finds it present;
-- [ ] removal as documented leaves every camera device in the instance.
+- [ ] removal as documented leaves every camera device in the instance and
+  no `/var/lib/server-sentinel-usb-repass`.
 
 ### Uninvited ordinary Tailnet member
 

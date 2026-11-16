@@ -82,6 +82,17 @@ VERIFY_WORST_SECONDS = SETTLE_SECONDS + VERIFY_SECONDS + 5.0
 RUN_LIMIT_SECONDS = 1200
 STARTUP_MARGIN_SECONDS = 60
 UNIT_TIMEOUT_SECONDS = RUN_LIMIT_SECONDS + STARTUP_MARGIN_SECONDS
+# Host boot (Issue #402 (7)): the udev coldplug can start a run before LXD
+# answers on its socket. A run that starts within BOOT_GRACE_SECONDS of the
+# host's boot waits up to LXD_WAIT_SECONDS for it; if LXD still does not
+# answer, the run ends without failing the unit (`usb_repass_lxd_not_ready`)
+# and the timer (OnBootSec=3min, then every 2 minutes) runs it again. A later
+# run fails on `usb_repass_lxd_unreachable` as before.
+BOOT_GRACE_SECONDS = 180.0
+LXD_WAIT_SECONDS = 60.0
+LXD_WAIT_GAP_SECONDS = 5.0
+# The last attempt starts before LXD_WAIT_SECONDS end and takes one request.
+LXD_WAIT_WORST_SECONDS = LXD_WAIT_SECONDS + REQUEST_TIMEOUT_SECONDS
 LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 HEX4 = re.compile(r"[0-9a-fA-F]{4}\Z")
 IDENTITY_KEYS = ("vendorid", "productid", "serial")
@@ -319,6 +330,34 @@ def held_nodes(pid, proc=PROC):
     return held
 
 
+def host_uptime(proc=PROC):
+    """Seconds since the host booted, or None when `/proc/uptime` cannot be read."""
+    try:
+        with open(os.path.join(proc, "uptime"), "rb") as handle:
+            return float(handle.read(64).split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def wait_for_lxd(lxd, instance, sleep, monotonic):
+    """Whether LXD answers within LXD_WAIT_SECONDS (Issue #402 (7)).
+
+    Only `usb_repass_lxd_unreachable` is waited for; any other failure is
+    raised as it is.
+    """
+    deadline = monotonic() + LXD_WAIT_SECONDS
+    while True:
+        try:
+            lxd.instance(instance)
+            return True
+        except Failure as error:
+            if error.args[0] != "usb_repass_lxd_unreachable":
+                raise
+        if monotonic() + LXD_WAIT_GAP_SECONDS > deadline:
+            return False
+        sleep(LXD_WAIT_GAP_SECONDS)
+
+
 def process_age(pid, proc=PROC):
     """Seconds since the process started (`stat` field 22 against `/proc/uptime`)."""
     try:
@@ -500,9 +539,24 @@ def run(config_path, state_dir, check=False, lxd_factory=Lxd, sleep=time.sleep, 
 
     instance, names, sock = load_config(config_path, config_owner)
     lxd = lxd_factory(sock)
-    state = None if check else State(state_dir)
+    # Read in --check too, never written there (Issue #402 (6)).
+    state = State(state_dir)
     failed = False
-    if state is not None and state.pending:
+    if check:
+        # Reported before anything that needs LXD, so the recovery record is
+        # shown even while LXD does not answer (PR #419 review).
+        for name in sorted(state.pending):
+            # A remove whose add has not been confirmed: the next run adds
+            # this configuration back if the instance lacks the device, and
+            # drops the record if the device is there.
+            log("usb_repass_pending_restore", name)
+    uptime = host_uptime(proc)
+    if (uptime is not None and uptime < BOOT_GRACE_SECONDS
+            and not wait_for_lxd(lxd, instance, sleep, monotonic)):
+        # Issue #402 (7): not a failure yet; the timer runs again.
+        log("usb_repass_lxd_not_ready")
+        return 0
+    if not check and state.pending:
         # A run that died between remove and add left the configuration here;
         # restored whether or not the VM runs (PR #399 review).
         for name, config in sorted(state.pending.items()):
@@ -531,12 +585,22 @@ def run(config_path, state_dir, check=False, lxd_factory=Lxd, sleep=time.sleep, 
     if process_age(pid, proc) < MIN_QEMU_AGE_SECONDS:
         log("usb_repass_instance_starting")
         return 1 if failed else 0
+    devices = metadata.get("devices") or {}
+    # Issue #402 (9): when one sample finds every configured camera held,
+    # nothing would be changed, so the settle and the second sample are
+    # skipped. Any other verdict is judged as before (settle, two samples),
+    # and only that path can lead to a remove.
+    nodes = host_nodes(sysfs)
+    quick = classify(devices, names, nodes, nodes, held_nodes(pid, proc))
+    if all(verdict == "held" for verdict, _ in quick.values()):
+        for name in names:
+            log("usb_repass_held", name)
+        return 1 if failed else 0
     if not check:
         sleep(SETTLE_SECONDS)
     first = host_nodes(sysfs)
     sleep(STABLE_GAP_SECONDS)
     second = host_nodes(sysfs)
-    devices = metadata.get("devices") or {}
     verdicts = classify(devices, names, first, second, held_nodes(pid, proc))
     repassed = []
     # Every device found not passed is re-passed in this one pass, then all
