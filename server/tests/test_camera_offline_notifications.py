@@ -1422,6 +1422,94 @@ class DeliveryFailingTests(MonitorFixture, unittest.TestCase):
         self.assertEqual((False, False), self.outcomes(status.alert_ids,
                                                       undelivered=status.undelivered))
 
+    def assert_current_outage_agrees(self, monitor, status):
+        # Issue #404: the degraded count and the alerts deciding the current
+        # condition come from one predicate, so they never diverge.
+        now = self.clock.value
+        current = {source_id: monitor._current_outage(source, now)
+                   for source_id, source in monitor._sources.items()}
+        current = {source_id: outage for source_id, outage in current.items()
+                   if outage is not None}
+        self.assertEqual(len(current), status.offline_sources)
+        for source_id, source in monitor._sources.items():
+            episode = source.episode
+            if episode is None or episode.alert_id is None:
+                continue
+            if source_id in current:
+                self.assertIn(episode.alert_id, status.alert_ids)
+            elif source.period != _BY_RATIO:
+                self.assertNotIn(episode.alert_id, status.alert_ids)
+
+    def test_the_degraded_count_and_the_current_alert_agree_at_the_threshold(self):
+        monitor = self.monitor()
+        first, second = self.sources
+        self.online(monitor)
+        monitor.health_sink(event(first, CameraState.OFFLINE))
+        self.advance(299)
+        status = self.drain(monitor)  # just before the threshold: neither
+        self.assertEqual((0, (), 0),
+                         (status.offline_sources, status.alert_ids, status.undelivered))
+        self.assert_current_outage_agrees(monitor, status)
+        self.advance(1)
+        status = self.drain(monitor)  # at the threshold: both
+        alert = monitor._sources[first].episode.alert_id
+        self.assertIsNotNone(alert)
+        self.assertEqual((1, (alert,)), (status.offline_sources, status.alert_ids))
+        self.assert_current_outage_agrees(monitor, status)
+        # The other source passes the threshold and recovers before the
+        # drain: notified, but neither counted nor deciding.
+        monitor.health_sink(event(second, CameraState.OFFLINE))
+        self.advance(310)
+        monitor.health_sink(event(second, CameraState.ONLINE, "video_capture_ready"))
+        status = self.drain(monitor)
+        self.texts()
+        self.assertEqual(2, len(self.sent()))
+        self.assertEqual((1, (alert,)), (status.offline_sources, status.alert_ids))
+        self.assert_current_outage_agrees(monitor, status)
+        monitor.health_sink(event(first, CameraState.ONLINE, "video_capture_ready"))
+        status = self.drain(monitor)
+        self.assertEqual((0, ()), (status.offline_sources, status.alert_ids))
+        self.assert_current_outage_agrees(monitor, status)
+
+    def test_the_degraded_count_and_the_current_alert_agree_in_a_ratio_period(self):
+        # A ratio-opened period decides the current condition by its alerts
+        # without counting the source offline; its outage past the threshold
+        # is counted and its alert decides too.
+        monitor = self.monitor()
+        source = self.sources[0]
+        self.online(monitor)
+
+        def down(seconds):
+            monitor.health_sink(event(source, CameraState.OFFLINE))
+            self.advance(seconds)
+
+        def up(seconds):
+            monitor.health_sink(event(source, CameraState.ONLINE, "video_capture_ready"))
+            self.advance(seconds)
+
+        down(200)
+        up(10)
+        down(110)
+        status = self.drain(monitor)  # the ratio alert only
+        self.texts()
+        self.assertEqual(_BY_RATIO, monitor._sources[source].period)
+        self.assertEqual(0, status.offline_sources)
+        self.assertEqual(1, len(status.alert_ids))
+        self.assert_current_outage_agrees(monitor, status)
+        self.advance(301)
+        status = self.drain(monitor)  # the period's outage past the threshold
+        self.texts()
+        episode = monitor._sources[source].episode
+        self.assertIsNotNone(episode.alert_id)
+        self.assertEqual(1, status.offline_sources)
+        self.assertIn(episode.alert_id, status.alert_ids)
+        self.assert_current_outage_agrees(monitor, status)
+        up(60)
+        status = self.drain(monitor)  # recovered, the period still open
+        self.assertEqual(_BY_RATIO, monitor._sources[source].period)
+        self.assertEqual(0, status.offline_sources)
+        self.assert_current_outage_agrees(monitor, status)
+
     def test_a_dropped_notice_of_a_ratio_period_is_unsent_until_it_closes(self):
         # Codex PR #398 P2: a third outage of the period held by the cap
         # drops the oldest held notice. The later two are sent once the hour
