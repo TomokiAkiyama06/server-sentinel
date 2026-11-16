@@ -70,6 +70,12 @@ MAXIMUM_REPLY_BYTES = 4096
 # TCP connect and the TLS handshake, then the heartbeat send and its reply.
 CONNECT_TIMEOUT_SECONDS = 5.0
 REPLY_TIMEOUT_SECONDS = 5.0
+# Issue #14 (PR #413 review): the live frames share the connection with the
+# heartbeat, so at most this many not-yet-sent bytes wait in the kernel ahead
+# of a heartbeat (a few ms on 1 GbE, ~10 ms on 100 Mbit/s); without it the
+# autotuned send buffer (MBs) would delay the heartbeat behind the frames,
+# widen its clock exchange (`clock_uncertain`) or exhaust its reply timeout.
+NOT_SENT_LOW_WATER_BYTES = 131_072
 RETRY_FIRST_SECONDS = 1.0
 RETRY_MAX_SECONDS = 30.0
 _WORD = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -319,6 +325,8 @@ class IngestSession:
             # Stop-and-wait over small frames: without this, Nagle and delayed
             # ACK add ~40 ms per heartbeat (Issue #369, ADR-0007).
             connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NOTSENT_LOWAT,
+                                  NOT_SENT_LOW_WATER_BYTES)
         except IngestSessionError:
             _shutdown(connection)
             raise

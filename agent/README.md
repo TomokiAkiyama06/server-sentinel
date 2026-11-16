@@ -35,7 +35,9 @@ JPEG, at most 1 MiB) at most 5 times a second per source, only when it is
 newer than the last one sent and only on the connection the heartbeat
 opened: it never connects or retries by itself, so nothing is queued while
 the Main is unreachable. The Main sends no reply and keeps the frame in
-memory for the live view only.
+memory for the live view only. The connection sets `TCP_NOTSENT_LOWAT`
+(128 KiB), so frames never queue megabytes of unsent bytes ahead of a
+heartbeat and widen its clock exchange.
 
 Cameras are approved locally with the service stopped, as the service
 account, typing `APPROVE` on the controlling terminal:

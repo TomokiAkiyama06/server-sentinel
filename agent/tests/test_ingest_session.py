@@ -174,6 +174,10 @@ class IngestSessionTests(NodeTlsHarness):
         self.assertEqual(peer.alpn, [INGEST_ALPN])
         # Issue #369: stop-and-wait heartbeats without Nagle's delay.
         self.assertTrue(session._connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY))
+        # PR #413 review: live frames never queue MBs ahead of a heartbeat.
+        self.assertEqual(session._connection.getsockopt(socket.IPPROTO_TCP,
+                                                        socket.TCP_NOTSENT_LOWAT),
+                         ingest_session.NOT_SENT_LOW_WATER_BYTES)
         session.send_heartbeat(heartbeat(4))
         self.assertEqual(peer.connections, 1)
 
