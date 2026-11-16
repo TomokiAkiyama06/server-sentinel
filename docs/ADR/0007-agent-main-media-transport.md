@@ -373,8 +373,10 @@ Wire (protocol version 1, ALPN `serversentinel-capture-ingest/1` unchanged):
   `renewal_credential_not_admitted`, `renewal_request_invalid`,
   `renewal_not_eligible`, `renewal_ca_validity_insufficient`,
   `renewal_signer_refused`, `renewal_signer_unavailable`, `renewal_busy`
-  (beyond the Main's concurrency bound) and `renewal_unavailable` (no
-  renewal configured, or an unexpected failure).
+  (beyond the Main's concurrency bound), `renewal_unavailable` (no
+  renewal configured, or an unexpected failure) and `renewal_rate_limited`
+  (beyond the Main's per-node admission: one start per 10 min, 4 per rolling
+  hour, answered without the signer).
 
 Why the version is not bumped: like `LIVE_FRAME` (Owner decision
 2026-11-12), the two types are additions an older peer never sends. A new
@@ -391,7 +393,10 @@ Main side (`ingest_server.py`, `renewal.SessionRenewal`): the renewal runs
 on its own short-lived thread (the signer may take up to its 30 s client
 timeout), never on the accept loop or a session thread; at most 2 run at
 once and at most 1 per node, a request beyond that is answered
-`renewal_busy` at once. Only the session thread writes to the socket. The
+`renewal_busy` at once. A node starts at most one renewal per 10 minutes and
+4 per rolling hour (`renewal_rate_limited`, no signer call), so a looping or
+leaked credential cannot keep starting signer instances and holding the CA
+lock; a conforming Agent asks at most once per hour. Only the session thread writes to the socket. The
 renewal builds `SignerRenewalIssuer` from the public `DeploymentTrust` only
 (the service never loads `DeploymentAuthority`) and calls
 `renew_node_credential`, so ledger eligibility, same-key retry and staging
@@ -405,7 +410,9 @@ due. An issued certificate is installed as a new credential generation
 (`node_tls.complete_renewal`) and the session reconnects at once with it,
 which promotes it on the Main. A refusal, a reply not received within 60 s,
 or a connection lost meanwhile is a failed attempt, retried per the
-schedule's back-off with the same pending key. `cryptography` (already
+schedule's back-off with the same pending key. The installed generation is
+looked at again at most every 60 s, so a credential installed by another
+path while the service runs restarts the schedule. `cryptography` (already
 reviewed for `node_tls`) is imported by the service only when the renewal
 first checks; without it renewal is off (`renewal_dependency_unavailable`)
 and the node keeps its current credential.

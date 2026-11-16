@@ -112,7 +112,10 @@ limits) and logs every renewal with `renewal_of`. An in-process
 The ingest listener carries the Agent's request (`RENEWAL_REQUEST` /
 `RENEWAL_REPLY`, ADR-0007 addendum 2026-11-16) and calls
 `renewal.SessionRenewal`, which builds only `SignerRenewalIssuer` from the
-public `DeploymentTrust` and the session's presented certificate.
+public `DeploymentTrust` and the session's presented certificate. The
+listener runs at most 2 renewals at once (1 per node) and lets a node start
+one at most every 10 minutes and 4 times per rolling hour
+(`renewal_rate_limited`, without the signer).
 
 Listener credential lifecycle (#124/#125). `PrivateDirectory(owner_uid=...)`
 may name another account than the process: new entries get their final 0600

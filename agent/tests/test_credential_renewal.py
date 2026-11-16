@@ -93,7 +93,7 @@ class RenewalHarness(NodeTlsHarness):
 
     def setUp(self):
         super().setUp()
-        _, _, self.node, material = self._enrolled()
+        _, self.node_key, self.node, material = self._enrolled()
         self.store = NodeCredentialStore(self.runtime)
         self.store.install(material)
         self.server_certificate, self.server_key = self.authority.server_files(
@@ -181,6 +181,58 @@ class CredentialRenewalTests(RenewalHarness):
     def _other_csr(self):
         from media_capture_agent.node_tls import build_enrollment_request, generate_node_key
         return build_enrollment_request(generate_node_key()).csr_pem
+
+    def reinstall(self, *, same_key):
+        """Install a new 397-day generation by another path than the renewal."""
+        from media_capture_agent.node_tls import (
+            build_enrollment_request, complete_renewal, prepare_renewal,
+            validate_issued_credential,
+        )
+        if same_key:
+            # As `enroll pair --repair expired`: the same key, a new certificate.
+            certificate = pem(self.authority.node_certificate(
+                build_enrollment_request(self.node_key).csr_pem, self.node, lifetime=397 * DAY))
+            self.store.rotate(validate_issued_credential(self.bundle, self.node_key, certificate))
+        else:
+            # A rotation through the renewal steps of another process.
+            request = prepare_renewal(self.store)
+            complete_renewal(self.store, pem(self.authority.node_certificate(
+                request.csr_pem, self.node, lifetime=397 * DAY)))
+        return installed_certificate_expiry(self.store)
+
+    def test_a_re_pair_after_expiry_while_running_re_arms_the_schedule(self):
+        expiry = installed_certificate_expiry(self.store)
+        clock = Clock(expiry + DAY)
+        monotonic = Clock(1000.0)
+        renewal = CredentialRenewal(self.store, clock=clock, monotonic=monotonic)
+        self.assertIsNone(renewal.due())
+        self.assertEqual(renewal.status, "renewal_credential_expired")
+        new_expiry = self.reinstall(same_key=True)
+        # Looked at again within `GENERATION_CHECK_SECONDS`.
+        monotonic.value += 61
+        self.assertIsNone(renewal.due())
+        self.assertIsNone(renewal.status)
+        clock.value = new_expiry - 10 * DAY
+        self.assertIsNotNone(renewal.due())
+        self.assertEqual(renewal.status, "renewal_requested")
+
+    def test_a_rotation_while_backing_off_starts_the_schedule_afresh(self):
+        expiry = installed_certificate_expiry(self.store)
+        clock = Clock(expiry - 10 * DAY)
+        monotonic = Clock(1000.0)
+        renewal = CredentialRenewal(self.store, clock=clock, monotonic=monotonic)
+        self.assertIsNotNone(renewal.due())
+        renewal.failed("renewal_signer_unavailable")
+        new_expiry = self.reinstall(same_key=False)
+        # Not looked at again yet: the cached schedule still holds.
+        monotonic.value += 30
+        self.assertIsNone(renewal.due())
+        monotonic.value += 31
+        self.assertIsNone(renewal.due())
+        self.assertIsNone(renewal.status)
+        # Due again at once for the new certificate, with no back-off left.
+        clock.value = new_expiry - 10 * DAY
+        self.assertIsNotNone(renewal.due())
 
     def test_a_held_pairing_lock_an_expired_credential_and_a_missing_dependency(self):
         expiry = installed_certificate_expiry(self.store)
@@ -334,6 +386,29 @@ class SessionRenewalTests(RenewalHarness):
                 except IngestSessionError:
                     pass
                 self.assertIn(("failed", failure), renewal.calls)
+
+    def test_an_older_main_s_close_is_read_when_a_live_frame_send_fails_first(self):
+        def close_after_request(tls, received):
+            kind, body = read_raw(tls)
+            tls.sendall(ack_frame(json.loads(body)["sequence"]))
+            read_raw(tls)
+            tls.sendall(encode_frame(FrameType.CLOSE, {"reason": "frame_type_refused"}))
+            read_raw(tls)
+
+        peer = self.main(close_after_request, acknowledge_all)
+        renewal = FakeRenewal(CSR)
+        session = self.session(peer, renewal=renewal)
+        session.send_heartbeat(heartbeat(1))
+        self.assertTrue(self.wait_for(
+            lambda: select.select([session._connection], [], [], 0)[0]))
+
+        def broken(_data):
+            raise OSError("synthetic broken pipe")
+
+        session._connection.sendall = broken
+        self.assertFalse(session.send_live_frame(uuid4(), b"\xff\xd8xx\xff\xd9"))
+        self.assertIn(("failed", "renewal_unsupported_by_main"), renewal.calls)
+        self.assertEqual(session.last_close_reason, "frame_type_refused")
 
     def test_a_reply_that_never_comes_times_out(self):
         peer = self.main(self.renewing(lambda csr: None))

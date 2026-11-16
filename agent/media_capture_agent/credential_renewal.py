@@ -20,6 +20,12 @@ none.
   pending key, outliving the current certificate); the ingest session then
   reconnects with it, which promotes it on the Main.
 
+The installed generation is looked at again at most every
+``GENERATION_CHECK_SECONDS`` (PR #425 review): a credential installed while
+the service runs by another path (``enroll pair --repair expired`` after an
+expiry, a rotation) re-reads the expiry and starts the schedule afresh, so a
+new certificate never expires unnoticed until the service restarts.
+
 ``node_tls`` needs ``cryptography``. The service runs on the system
 interpreter and must start without it (``StdlibOnlyServiceTests``), so it is
 imported only here and only at the first check; without it renewal is off
@@ -31,7 +37,11 @@ byte is kept beyond the call that uses it.
 from __future__ import annotations
 
 import datetime
+import time
 from typing import Callable
+
+
+GENERATION_CHECK_SECONDS = 60.0
 
 
 def _utc_now() -> datetime.datetime:
@@ -45,8 +55,9 @@ def _node_tls():
 
 class CredentialRenewal:
     def __init__(self, store, *, clock: Callable[[], datetime.datetime] = _utc_now,
-                 tls: Callable[[], object] = _node_tls):
-        if not callable(clock) or not callable(tls):
+                 tls: Callable[[], object] = _node_tls,
+                 monotonic: Callable[[], float] = time.monotonic):
+        if not callable(clock) or not callable(tls) or not callable(monotonic):
             raise ValueError("invalid credential renewal dependencies")
         self._store = store
         self._clock = clock
@@ -56,6 +67,11 @@ class CredentialRenewal:
         self._expiry: datetime.datetime | None = None
         self._failures = 0
         self._retry_at: datetime.datetime | None = None
+        # The installed generation the expiry belongs to (its certificate
+        # file name), and when it was last looked at.
+        self._monotonic = monotonic
+        self._generation: str | None = None
+        self._generation_checked: float | None = None
         # One fixed word for the status line, or None (nothing to report).
         self.status: str | None = None
 
@@ -64,6 +80,7 @@ class CredentialRenewal:
         tls = self._module()
         if tls is None:
             return None
+        self._check_generation(tls)
         now = self._clock()
         if self._retry_at is not None and now < self._retry_at:
             return None
@@ -102,6 +119,9 @@ class CredentialRenewal:
         self._failures = 0
         self._retry_at = None
         self._expiry = None
+        # The next check reads the new generation (and so its expiry).
+        self._generation = None
+        self._generation_checked = None
         self.status = "renewal_installed"
         return True
 
@@ -125,6 +145,28 @@ class CredentialRenewal:
                 self._unavailable = True
                 self.status = "renewal_dependency_unavailable"
         return self._tls
+
+    def _check_generation(self, tls) -> None:
+        """Start afresh if another generation was installed since the expiry was read."""
+        now = self._monotonic()
+        if (self._generation_checked is not None
+                and 0 <= now - self._generation_checked < GENERATION_CHECK_SECONDS):
+            return
+        self._generation_checked = now
+        try:
+            generation = tls.installed_credential(self._store).certificate_path.name
+        except tls.PairingRefused:
+            # `_installed_expiry` reports it.
+            return
+        if generation == self._generation:
+            return
+        if self._generation is not None:
+            # Installed by another path while the service runs.
+            self._expiry = None
+            self._failures = 0
+            self._retry_at = None
+            self.status = None
+        self._generation = generation
 
     def _installed_expiry(self, tls) -> datetime.datetime | None:
         if self._expiry is None:

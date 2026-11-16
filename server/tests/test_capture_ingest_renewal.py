@@ -87,7 +87,7 @@ class RenewalWireTests(unittest.TestCase):
         for word in RENEWAL_REFUSALS:
             self.assertEqual(json.loads(encode_renewal_reply(reason=word)[HEADER.size:]),
                              {"status": "refused", "reason": word})
-        for bad in ({"reason": "free text"}, {"reason": "renewal_rate_limited"},
+        for bad in ({"reason": "free text"}, {"reason": "renewal_not_due"},
                     {"certificate_pem": ("-" * 5 + "BEGIN PRIVATE KEY" + "-" * 5).encode()},
                     {"certificate_pem": certificate, "reason": "renewal_busy"}, {},
                     {"certificate_pem": certificate + b"A" * MAXIMUM_RENEWAL_REPLY_BODY_BYTES}):
@@ -307,7 +307,7 @@ class IngestRenewalTests(IngestRenewalHarness):
             return True
 
     def test_a_lost_reply_is_answered_again_from_the_ledger_with_the_same_key(self):
-        server = self.serve()
+        server = self.serve(renewal_interval_seconds=0)
         tls = self.connect()
         self.beat(tls)
         key, csr = renewal_csr()
@@ -337,16 +337,17 @@ class IngestRenewalTests(IngestRenewalHarness):
 
     def test_signer_unavailable_or_refused_is_a_fixed_word_and_the_session_goes_on(self):
         cases = (
-            (self.renewal(socket_path=self.root / "absent.sock"), "renewal_signer_unavailable"),
+            (self.renewal(socket_path=self.root / "absent.sock"), "renewal_signer_unavailable",
+             (0, 1)),
             (self.renewal(connect=SocketHarness.replying(
                 {"status": "refused", "reason": "renewal_rate_limited"})),
-             "renewal_signer_refused"),
+             "renewal_signer_refused", (1, 0)),
             (self.renewal(connect=SocketHarness.replying(
                 {"status": "refused", "reason": "issuance_log_unavailable"})),
-             "renewal_signer_unavailable"),
-            (None, "renewal_unavailable"),
+             "renewal_signer_unavailable", (0, 1)),
+            (None, "renewal_unavailable", (0, 1)),
         )
-        for renewal, word in cases:
+        for renewal, word, counts in cases:
             with self.subTest(word=word):
                 server = self.serve(renewal=renewal)
                 tls = self.connect()
@@ -356,7 +357,9 @@ class IngestRenewalTests(IngestRenewalHarness):
                 self.assertEqual(self.answered(tls), {"status": "refused", "reason": word})
                 self.assertEqual(self.beat(tls, sequence=50)[-1][0], FrameType.HEARTBEAT_ACK)
                 status = server.status()
-                self.assertEqual((status.renewals_issued, status.renewals_refused), (0, 1))
+                # Refused and unavailable are counted apart (PR #425 review).
+                self.assertEqual((status.renewals_issued, status.renewals_refused,
+                                  status.renewals_unavailable), (0, *counts))
                 self.assertEqual(status.renewal_refusals, ((word, 1),))
                 self.assertEqual(before, self.records())
                 server.stop()
@@ -470,6 +473,97 @@ class IngestRenewalTests(IngestRenewalHarness):
                          {"status": "refused", "reason": "renewal_signer_unavailable"})
         self.assertEqual(server.status().renewal_refusals,
                          (("renewal_busy", 1), ("renewal_signer_unavailable", 1)))
+        self.assertEqual((server.status().renewals_refused, server.status().renewals_unavailable),
+                         (0, 2))
+
+    def slow_signer(self):
+        release = threading.Event()
+        calls = []
+
+        def slow(path, timeout):
+            calls.append(path)
+            release.wait(10)
+            raise OSError("synthetic unavailable signer")
+        self.addCleanup(release.set)
+        return slow, calls, release
+
+    def test_the_default_bound_lets_two_nodes_renew_at_once_and_holds_a_third(self):
+        slow, calls, release = self.slow_signer()
+        nodes = [(self.node, self.certificate)] + [
+            self.activated_node(name)[:2] for name in ("b", "c")]
+        server = self.serve(renewal=self.renewal(connect=slow))
+        sessions = []
+        for node, credential in nodes:
+            tls = self.connect(credential)
+            self.beat(tls, node=node)
+            sessions.append(tls)
+        for (node, _), tls in zip(nodes[:2], sessions[:2]):
+            self.request(tls, renewal_csr()[1])
+        self.assertTrue(self.wait_for(lambda: len(calls) == 2))
+        self.request(sessions[2], renewal_csr()[1])
+        self.assertEqual(self.answered(sessions[2], node=nodes[2][0]),
+                         {"status": "refused", "reason": "renewal_busy"})
+        self.assertEqual(len(calls), 2)
+        release.set()
+        for (node, _), tls in zip(nodes[:2], sessions[:2]):
+            self.assertEqual(self.answered(tls, node=node)["reason"],
+                             "renewal_signer_unavailable")
+        self.assertEqual(server.status().renewal_refusals,
+                         (("renewal_busy", 1), ("renewal_signer_unavailable", 2)))
+
+    def test_a_superseded_session_s_renewal_keeps_the_node_busy_and_its_reply_is_dropped(self):
+        slow, calls, release = self.slow_signer()
+        server = self.serve(renewal=self.renewal(connect=slow))
+        older = self.connect()
+        self.beat(older)
+        self.request(older, renewal_csr()[1])
+        self.assertTrue(self.wait_for(lambda: calls))
+        newer = self.connect()
+        self.beat(newer)
+        self.assertTrue(self.wait_for(lambda: "superseded" in server.last_close_reasons()))
+        # One renewal per node, also across its sessions.
+        self.request(newer, renewal_csr()[1])
+        self.assertEqual(self.answered(newer), {"status": "refused", "reason": "renewal_busy"})
+        release.set()
+        # The older session's reply has nowhere to go: it never reaches the
+        # newer session, whose acks carry nothing more.
+        self.assertTrue(self.wait_for(lambda: server.status().renewals_unavailable == 2))
+        for sequence in (20, 21):
+            self.assertEqual(len(self.beat(newer, sequence=sequence)), 1)
+
+    def test_a_node_is_held_to_its_renewal_interval_and_hourly_cap_without_the_signer(self):
+        clock = [10 ** 12]
+        server = self.serve(renewal_interval_seconds=600, renewals_per_hour=2,
+                            monotonic_ns=lambda: clock[0],
+                            # The frozen clock also drives the frame budget.
+                            limits={"frames_per_second": 1000})
+        tls = self.connect()
+        self.beat(tls)
+        key, csr = renewal_csr()
+        self.request(tls, csr)
+        self.assertEqual(self.answered(tls)["status"], "issued")
+        signed = list(self.signer_socket.outcomes)
+        # Within 10 min the same request is answered without the signer.
+        clock[0] += 599 * 10 ** 9
+        self.request(tls, csr)
+        self.assertEqual(self.answered(tls),
+                         {"status": "refused", "reason": "renewal_rate_limited"})
+        # After the interval it is admitted (the same key: from the ledger).
+        clock[0] += 2 * 10 ** 9
+        self.request(tls, csr)
+        self.assertEqual(self.answered(tls)["status"], "issued")
+        # The hourly cap (2 here) holds the third start in the same hour.
+        clock[0] += 601 * 10 ** 9
+        self.request(tls, csr)
+        self.assertEqual(self.answered(tls)["reason"], "renewal_rate_limited")
+        clock[0] += 3600 * 10 ** 9
+        self.request(tls, csr)
+        self.assertEqual(self.answered(tls)["status"], "issued")
+        self.assertEqual(self.signer_socket.outcomes, signed)
+        status = server.status()
+        self.assertEqual((status.renewals_issued, status.renewals_refused,
+                          status.renewals_unavailable), (3, 2, 0))
+        self.assertIn(("renewal_rate_limited", 2), status.renewal_refusals)
 
     def test_logs_hold_no_certificate_or_request(self):
         self.serve()

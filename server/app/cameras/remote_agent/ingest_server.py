@@ -55,7 +55,13 @@ Since the signer can take up to its timeout, the renewal runs on its own
 short-lived thread, never on the accept loop or a session thread, and at
 most ``maximum_concurrent_renewals`` run at once, at most one per node; a
 request beyond that is answered ``renewal_busy`` at once, and a listener
-without ``renewal`` answers ``renewal_unavailable``. A session has at most
+without ``renewal`` answers ``renewal_unavailable``. Each node may start a
+renewal at most once per ``renewal_interval_seconds`` (10 min) and at most
+``renewals_per_hour`` (4) times per rolling hour; a request beyond that is
+answered ``renewal_rate_limited`` without calling the signer (PR #425
+review: a looping or leaked credential must not keep starting signer
+instances and holding the CA lock). A conforming Agent asks at most once
+per hour (its back-off starts at 1 h), so it never meets either bound. A session has at most
 one request outstanding (until its reply is sent): a second closes it with
 ``renewal_in_flight``. The reply is sent by the session thread only, directly
 before the next ``HEARTBEAT_ACK`` and in the same write, so one TLS socket is
@@ -129,6 +135,10 @@ _RATE_ENDS = {"rate_limit": "rate_limited", "rate_window_capacity": "rate_limite
 # Issue #109: renewals running at once (each holds one signer connection;
 # the signer socket accepts 4), and the log event of each outcome category.
 MAXIMUM_CONCURRENT_RENEWALS = 2
+# Per-node admission of renewals that reach the signer (PR #425 review).
+RENEWAL_INTERVAL_SECONDS = 600.0
+RENEWALS_PER_HOUR = 4
+_RENEWAL_WINDOW_NS = 3600 * 1_000_000_000
 _RENEWAL_UNAVAILABLE = frozenset({"renewal_signer_unavailable", "renewal_unavailable",
                                   "renewal_busy"})
 _RENEWAL_EVENTS = {
@@ -159,6 +169,9 @@ class CaptureIngestStatus:
     renewals_issued: int = 0
     renewals_refused: int = 0
     renewal_refusals: tuple[tuple[str, int], ...] = ()
+    # Replies `renewal_busy`, `renewal_unavailable` and
+    # `renewal_signer_unavailable` (counted apart from refusals, as logged).
+    renewals_unavailable: int = 0
 
 
 class _RenewalSlot:
@@ -220,7 +233,9 @@ class CaptureIngestServer:
                  live_preview=None,
                  live_sources: Callable[[UUID, UUID], bool] | None = None,
                  renewal: Callable[..., bytes] | None = None,
-                 maximum_concurrent_renewals: int = MAXIMUM_CONCURRENT_RENEWALS):
+                 maximum_concurrent_renewals: int = MAXIMUM_CONCURRENT_RENEWALS,
+                 renewal_interval_seconds: float = RENEWAL_INTERVAL_SECONDS,
+                 renewals_per_hour: int = RENEWALS_PER_HOUR):
         from app.media.live.remote_preview import RemotePreviewHub
         limits = limits or CaptureIngestLimits()
         if (not isinstance(listener, socket.socket) or not isinstance(acceptor, CaptureIngestAcceptor)
@@ -229,7 +244,10 @@ class CaptureIngestServer:
                 or (live_sources is not None and not callable(live_sources))
                 or (renewal is not None and not callable(renewal))
                 or type(maximum_concurrent_renewals) is not int
-                or not 1 <= maximum_concurrent_renewals <= 4):
+                or not 1 <= maximum_concurrent_renewals <= 4
+                or type(renewal_interval_seconds) not in (int, float)
+                or not 0 <= renewal_interval_seconds <= 3600
+                or type(renewals_per_hour) is not int or not 1 <= renewals_per_hour <= 60):
             raise ValueError("invalid capture ingest dependencies")
         self.limits = limits
         # Issue #109: `renewal.SessionRenewal`, or None (every request is
@@ -237,7 +255,12 @@ class CaptureIngestServer:
         self._renewal = renewal
         self._maximum_renewals = maximum_concurrent_renewals
         self._renewing: set[UUID] = set()
-        self._renewal_counts = {"issued": 0, "refused": 0}
+        self._renewal_counts = {"issued": 0, "refused": 0, "unavailable": 0}
+        self._renewal_interval_ns = int(renewal_interval_seconds * 1_000_000_000)
+        self._renewals_per_hour = renewals_per_hour
+        # Per node, the start times of its latest renewals (bounded).
+        self._renewal_starts: dict[UUID, deque] = {}
+        self._monotonic_ns = monotonic_ns
         self._renewal_refusals: dict[str, int] = {}
         self._renewal_logged = {"issued": 0, "refused": 0, "unavailable": 0}
         # Issue #14 (option A): without both, every live frame is dropped and
@@ -326,7 +349,8 @@ class CaptureIngestServer:
                                        self._live_counts["dropped"],
                                        self._renewal_counts["issued"],
                                        self._renewal_counts["refused"],
-                                       tuple(sorted(self._renewal_refusals.items())))
+                                       tuple(sorted(self._renewal_refusals.items())),
+                                       self._renewal_counts["unavailable"])
 
     def last_close_reasons(self) -> tuple[str, ...]:
         with self._lock:
@@ -659,8 +683,9 @@ class CaptureIngestServer:
             elif node in self._renewing or len(self._renewing) >= self._maximum_renewals:
                 immediate = "renewal_busy"
             else:
-                immediate = None
-                self._renewing.add(node)
+                immediate = self._admit_renewal_locked(node)
+                if immediate is None:
+                    self._renewing.add(node)
         if immediate is not None:
             self._renewal_done(slot, None, immediate)
             return None
@@ -683,6 +708,29 @@ class CaptureIngestServer:
                 self._threads.discard(thread)
                 self._renewing.discard(node)
             self._renewal_done(slot, None, "renewal_busy")
+        return None
+
+    def _admit_renewal_locked(self, node: UUID) -> str | None:
+        """Record one renewal start for ``node``; a fixed word if it is beyond the bounds."""
+        now = self._monotonic_ns()
+        starts = self._renewal_starts.get(node)
+        if starts is not None:
+            while starts and not 0 <= now - starts[0] < _RENEWAL_WINDOW_NS:
+                starts.popleft()
+            if starts and 0 <= now - starts[-1] < self._renewal_interval_ns:
+                return "renewal_rate_limited"
+            if len(starts) >= self._renewals_per_hour:
+                return "renewal_rate_limited"
+        else:
+            if len(self._renewal_starts) >= self.limits.maximum_nodes:
+                # Bounded: reclaim nodes without a start in the last hour.
+                for other in [other for other, times in self._renewal_starts.items()
+                              if not times or not 0 <= now - times[-1] < _RENEWAL_WINDOW_NS]:
+                    del self._renewal_starts[other]
+                if len(self._renewal_starts) >= self.limits.maximum_nodes:
+                    return "renewal_busy"
+            starts = self._renewal_starts[node] = deque(maxlen=self._renewals_per_hour)
+        starts.append(now)
         return None
 
     def _renew(self, identity, presented: bytes, csr: bytes, node: UUID,
@@ -727,7 +775,7 @@ class CaptureIngestServer:
                 self._renewal_counts["issued"] += 1
             else:
                 # Bounded: the keys are words of `RENEWAL_REFUSALS`.
-                self._renewal_counts["refused"] += 1
+                self._renewal_counts[category] += 1
                 self._renewal_refusals[reason] = self._renewal_refusals.get(reason, 0) + 1
             self._renewal_logged[category] += 1
             count = self._renewal_logged[category]

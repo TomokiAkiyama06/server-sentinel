@@ -106,12 +106,14 @@ _CSR_PEM_START = "-----BEGIN CERTIFICATE REQUEST-----"
 # Built, so the repository's secret-format scan does not mistake it for a PEM.
 _CERTIFICATE_PEM_START = "-" * 5 + "BEGIN CERTIFICATE" + "-" * 5
 # The words a refused RENEWAL_REPLY may carry: `renewal.RenewalRefused`
-# reasons and the listener's own `renewal_busy` / `renewal_unavailable`.
+# reasons and the listener's own `renewal_busy` / `renewal_unavailable` /
+# `renewal_rate_limited`.
 RENEWAL_REFUSALS = frozenset({
     "renewal_identity_invalid", "renewal_credential_expired",
     "renewal_credential_not_admitted", "renewal_request_invalid", "renewal_not_eligible",
     "renewal_ca_validity_insufficient", "renewal_signer_refused",
     "renewal_signer_unavailable", "renewal_busy", "renewal_unavailable",
+    "renewal_rate_limited",
 })
 
 

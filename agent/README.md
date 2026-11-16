@@ -58,6 +58,9 @@ fixed word as `"renewal"` (for example `renewal_requested`,
 `renewal_installed`, `renewal_signer_unavailable`,
 `renewal_unsupported_by_main` for a Main release without renewal, or
 `renewal_credential_expired`, after which only re-pairing helps).
+The installed generation is looked at again at most every 60 s, so a
+credential installed while the service runs (`enroll pair --repair expired`
+after an expiry, a rotation) re-reads its expiry and restarts the schedule.
 `credential_renewal.py` imports `node_tls`, and so `cryptography`, only when
 it first checks, so the service still starts without it; renewal then
 reports `renewal_dependency_unavailable`.

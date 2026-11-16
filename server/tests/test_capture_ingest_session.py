@@ -279,6 +279,50 @@ class AgentRenewalSessionTests(IngestRenewalHarness):
         self.assertEqual(server.status().renewals_issued, 1)
         self.assertEqual(server.registry.state(self.node), "online")
 
+    def test_the_real_agent_renewal_installs_a_generation_and_the_main_promotes_it(self):
+        # PR #425 review: the Agent's own `CredentialRenewal`, credential
+        # store and `node_tls` steps, against the real listener and signer.
+        import os
+        from cryptography.hazmat.primitives import serialization
+        from media_capture_agent.credential_renewal import CredentialRenewal
+        from media_capture_agent.node_tls import installed_credential
+        from media_capture_agent.pairing import NodeCredentialMaterial, NodeCredentialStore
+        server = self.serve()
+        runtime = self.root / "agent-runtime"
+        runtime.mkdir(mode=0o700)
+        store = NodeCredentialStore(runtime, owner_uid=os.getuid())
+        store.install(NodeCredentialMaterial(
+            deployment_id=self.deployment, node_id=self.node, server_name=SERVER_NAME,
+            private_key=self.key.private_bytes(serialization.Encoding.PEM,
+                                               serialization.PrivateFormat.PKCS8,
+                                               serialization.NoEncryption()),
+            client_certificate=self.certificate[0].read_bytes(),
+            ca_certificate=self.trust.ca_certificate_pem()))
+        before = installed_credential(store)
+        renewal = CredentialRenewal(store)
+        session = agent.ingest_session.IngestSession(
+            store, agent.config.MainIngestEndpoint("127.0.0.1", self.address[1]), self.node,
+            renewal=renewal)
+        self.addCleanup(session.close)
+        old_identity, _ = self.identity(self.certificate[0].read_text())
+        sequence = 0
+        deadline = time.monotonic() + 15
+        while renewal.status != "renewal_installed" and time.monotonic() < deadline:
+            sequence += 1
+            session.send_heartbeat(self.agent_heartbeat(sequence))
+            time.sleep(0.05)
+        self.assertEqual(renewal.status, "renewal_installed")
+        after = installed_credential(store)
+        self.assertNotEqual(after.certificate_path, before.certificate_path)
+        session.send_heartbeat(self.agent_heartbeat(sequence + 1))
+        self.assertTrue(self.wait_for(lambda: not self.admission.is_admitted(old_identity)))
+        new_identity, _ = self.identity(after.certificate_path.read_text())
+        self.assertTrue(self.admission.is_admitted(new_identity))
+        self.assertEqual(server.status().renewals_issued, 1)
+        # Not due any more: no further request.
+        session.send_heartbeat(self.agent_heartbeat(sequence + 2))
+        self.assertEqual(server.status().renewals_issued, 1)
+
     def agent_heartbeat(self, sequence):
         clock = {"state": "online", "reason": "clock_within_limit", "offset_seconds": 0.0,
                  "uncertainty_seconds": 0.001}

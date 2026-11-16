@@ -403,6 +403,14 @@ class IngestSession:
         self._retry_at = max(self._retry_at or now, now + delay)
 
     def _drop(self, *, keep_exchange: bool = False) -> None:
+        if (self._renewal_deadline is not None and self._connection is not None
+                and self.last_close_reason is None):
+            # A send that failed first (a live frame) must not hide the
+            # Main's CLOSE already waiting to be read (PR #425 review).
+            try:
+                self._still_open()
+            except Exception:
+                pass
         connection, self._connection = self._connection, None
         if not keep_exchange:
             self._exchange = None
