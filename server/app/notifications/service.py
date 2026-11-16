@@ -283,8 +283,8 @@ class NotificationService:
             self._pending[identifier][2] = result
             self._note_outcome(identifier, result)
 
-    def _occupied(self) -> int:
-        """How many submissions count against the queue capacity.
+    def _holds(self):
+        """The one rule of what holds queue capacity, as a `_pending` entry predicate.
 
         Every delivery not yet persisted, as before; once the stop began
         (Issue #396, PR #400 review) only those still being sent. A poll
@@ -292,15 +292,23 @@ class NotificationService:
         otherwise keep their slots until the settle and refuse the last
         confirmed criticals the shutdown dispatch submits (`can_accept`).
         The finished ones stay in `_pending` and are written by the settle or
-        the stop's `persist_completed`.
+        the stop's `persist_completed`. Once the stop began the worker's
+        finished results are taken first. `_occupied` and `holds_capacity`
+        both use it (Issue #403), so `can_accept` and the share of
+        `UnrecordedCriticalAlerts` cannot count differently.
         """
         if not self._stopping():
-            return len(self._pending)
+            return lambda _entry: True
         self._collect()
-        return sum(1 for _event, _callbacks, result in self._pending.values() if result is None)
+        return lambda entry: entry[2] is None
+
+    def _occupied(self) -> int:
+        """How many submissions count against the queue capacity (`_holds`)."""
+        holds = self._holds()
+        return sum(1 for entry in self._pending.values() if holds(entry))
 
     def holds_capacity(self, event_id: UUID) -> bool:
-        """Whether ``event_id`` counts against the queue capacity (`_occupied`).
+        """Whether ``event_id`` counts against the queue capacity (`_holds`).
 
         Before the stop that is `in_flight`: a finished delivery whose outcome
         is not yet persisted keeps its place until a poll writes it. Once the
@@ -308,10 +316,7 @@ class NotificationService:
         """
         self._check()
         entry = self._pending.get(event_id)
-        if entry is None or not self._stopping():
-            return entry is not None
-        self._collect()
-        return entry[2] is None
+        return entry is not None and self._holds()(entry)
 
     @property
     def unpersisted_count(self) -> int:

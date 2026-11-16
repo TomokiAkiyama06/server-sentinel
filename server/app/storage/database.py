@@ -51,11 +51,6 @@ def bounded_lock_waits(end: float):
         _LOCK_WAIT_END.reset(token)
 
 
-def lock_waits_bounded() -> bool:
-    """Whether the calling context is inside `bounded_lock_waits`."""
-    return _LOCK_WAIT_END.get() is not None
-
-
 def _busy(error: sqlite3.OperationalError) -> bool:
     code = getattr(error, "sqlite_errorcode", None)
     if code is not None:
