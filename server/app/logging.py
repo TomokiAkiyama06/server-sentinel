@@ -119,6 +119,10 @@ class Event(StrEnum):
     CAPTURE_INGEST_SESSION_OPENED = "capture_ingest_session_opened"
     CAPTURE_INGEST_SESSION_CLOSED = "capture_ingest_session_closed"
     CAPTURE_INGEST_SESSION_REFUSED = "capture_ingest_session_refused"
+    # Issue #109: renewal outcomes on the ingest session, rate-limited with a count.
+    CAPTURE_INGEST_RENEWAL_ISSUED = "capture_ingest_renewal_issued"
+    CAPTURE_INGEST_RENEWAL_REFUSED = "capture_ingest_renewal_refused"
+    CAPTURE_INGEST_RENEWAL_UNAVAILABLE = "capture_ingest_renewal_unavailable"
     UNSTRUCTURED = "unstructured_redacted"
 
 

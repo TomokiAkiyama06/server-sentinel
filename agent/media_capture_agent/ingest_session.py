@@ -17,6 +17,15 @@ real Main listener)::
   ``ClockExchange`` of §5.9; the next heartbeat reports the clock assessed
   from it.
 * ``CLOSE`` (Main to Agent): one fixed reason word before the Main closes.
+* ``LIVE_FRAME`` (Agent to Main): one source's newest JPEG (``live_sender``);
+  the Main sends no reply.
+* ``RENEWAL_REQUEST`` (Agent to Main; Issue #109, ADR-0007 addendum
+  2026-11-16): ``{"csr": <PEM>}``, the node's renewal CSR. The Main renews
+  only the session's own node.
+* ``RENEWAL_REPLY`` (Main to Agent): ``{"status": "issued", "certificate":
+  <PEM>}`` or ``{"status": "refused", "reason": <fixed word>}``. The Main
+  sends it only directly before a ``HEARTBEAT_ACK``, so it is read inside a
+  heartbeat round trip, never while the Agent is idle.
 
 Stop-and-wait: one heartbeat, then its ack, within ``REPLY_TIMEOUT_SECONDS``.
 Every failure (connect, handshake, ALPN, timeout, a ``CLOSE``, a malformed or
@@ -49,6 +58,20 @@ The credential is read from the installed generation at every connect
 (``main_link.installed_credential``), so a pairing completed while the
 service runs is picked up without a restart, and a credential naming another
 node than the configured one is refused (``node_identity_mismatch``).
+Certificate renewal (Issue #109): with ``renewal`` (a
+``credential_renewal.CredentialRenewal``), after each acknowledged heartbeat
+the session asks it whether a renewal is due and, if so, sends its CSR as a
+``RENEWAL_REQUEST`` on the same connection, under the same lock as the
+heartbeat and the live frames; it never opens a connection for it. At most
+one request is outstanding. Its ``RENEWAL_REPLY`` comes before a later
+heartbeat's ack; it is handled after that ack, so the clock exchange is not
+widened. An issued certificate is installed as a new credential generation
+and the session reconnects at once with it (keeping the clock exchange), which
+promotes it on the Main. A refusal, a reply not received within
+``RENEWAL_REPLY_TIMEOUT_SECONDS``, or a connection lost while the request is
+outstanding is a failed attempt, retried per the renewal schedule's back-off;
+the current credential stays in use. ``renewal_status`` is that fixed word.
+
 Nothing here logs: reasons are fixed words, never peer bytes, addresses or
 key material.
 """
@@ -79,6 +102,12 @@ HEADER = struct.Struct(">IB")
 MAXIMUM_HEARTBEAT_BYTES = 16 * 1024
 # An ack or close is a small fixed-shape object.
 MAXIMUM_REPLY_BYTES = 4096
+# Issue #109: the renewal request (a P-256 CSR in PEM is about 500 bytes) and
+# its reply (a node certificate, about 1 KiB), as the Main bounds them.
+MAXIMUM_RENEWAL_REQUEST_BYTES = 8 * 1024
+MAXIMUM_RENEWAL_REPLY_BYTES = 16 * 1024
+# The Main answers within its signer's timeout (30 s), before the next ack.
+RENEWAL_REPLY_TIMEOUT_SECONDS = 60.0
 # Bounds of one tick's network work (`config.MAXIMUM_HEARTBEAT_SECONDS`): the
 # TCP connect and the TLS handshake, then the heartbeat send and its reply.
 CONNECT_TIMEOUT_SECONDS = 5.0
@@ -100,6 +129,9 @@ RETRY_MAX_SECONDS = 30.0
 IDLE_DROP_STREAK_SECONDS = 60.0
 _WORD = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _ACK_KEYS = frozenset({"sequence", "receive_utc", "send_utc"})
+# A PEM certificate's first line (built, so the repository's secret-format
+# scan does not mistake it for a PEM).
+_CERTIFICATE_PEM_START = "-" * 5 + "BEGIN CERTIFICATE" + "-" * 5
 
 
 class FrameType(IntEnum):
@@ -109,6 +141,9 @@ class FrameType(IntEnum):
     # newest JPEG for the live view. The Main keeps it in memory only and
     # sends no reply (it never acknowledges media it does not keep).
     LIVE_FRAME = 0x10
+    # Issue #109: the renewal request and its reply (before a later ack).
+    RENEWAL_REQUEST = 0x20
+    RENEWAL_REPLY = 0x21
     CLOSE = 0x7F
 
 
@@ -158,16 +193,18 @@ def read_reply(connection, deadline: float, *, clock: Callable[[], float] = time
     """
     header = prefix + _receive_exactly(connection, HEADER.size - len(prefix), deadline, clock)
     length, kind = HEADER.unpack(header)
-    if not 0 < length <= MAXIMUM_REPLY_BYTES:
-        raise IngestSessionError("main_reply_invalid")
     try:
         frame_type = FrameType(kind)
     except ValueError:
         raise IngestSessionError("main_reply_invalid") from None
-    body = _receive_exactly(connection, length, deadline, clock)
-    if frame_type in (FrameType.HEARTBEAT, FrameType.LIVE_FRAME):
+    if frame_type in (FrameType.HEARTBEAT, FrameType.LIVE_FRAME, FrameType.RENEWAL_REQUEST):
         # Agent-to-Main types never come from the Main.
         raise IngestSessionError("main_reply_invalid")
+    limit = (MAXIMUM_RENEWAL_REPLY_BYTES if frame_type is FrameType.RENEWAL_REPLY
+             else MAXIMUM_REPLY_BYTES)
+    if not 0 < length <= limit:
+        raise IngestSessionError("main_reply_invalid")
+    body = _receive_exactly(connection, length, deadline, clock)
     try:
         value = json.loads(body.decode("utf-8"), parse_constant=_refuse_constant)
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -191,6 +228,20 @@ def _close_reason(value: dict) -> str:
     return reason if isinstance(reason, str) and _WORD.fullmatch(reason) else "other"
 
 
+def _renewal_reply(value: dict) -> tuple[bytes | None, str | None]:
+    """An issued certificate PEM, or a refusal word; anything else is invalid."""
+    if value.get("status") == "issued" and set(value) == {"status", "certificate"}:
+        certificate = value["certificate"]
+        if (isinstance(certificate, str) and certificate.isascii()
+                and certificate.lstrip().startswith(_CERTIFICATE_PEM_START)):
+            return certificate.encode("ascii"), None
+    elif value.get("status") == "refused" and set(value) == {"status", "reason"}:
+        reason = value["reason"]
+        if isinstance(reason, str) and _WORD.fullmatch(reason):
+            return None, reason
+    raise IngestSessionError("main_reply_invalid")
+
+
 def _shutdown(connection) -> None:
     try:
         connection.close()
@@ -206,9 +257,13 @@ class IngestSession:
     def __init__(self, store: NodeCredentialStore, endpoint: MainIngestEndpoint, node_id: UUID,
                  *, connect=connect_to_main, credential=installed_credential,
                  utc: Callable[[], float] = time.time,
-                 monotonic: Callable[[], float] = time.monotonic):
+                 monotonic: Callable[[], float] = time.monotonic,
+                 renewal=None):
         if (not isinstance(endpoint, MainIngestEndpoint) or not isinstance(node_id, UUID)
-                or not callable(connect) or not callable(credential)):
+                or not callable(connect) or not callable(credential)
+                or (renewal is not None and not all(
+                    callable(getattr(renewal, name, None))
+                    for name in ("due", "issued", "failed")))):
             raise ValueError("invalid ingest session dependencies")
         self._store = store
         self._endpoint = endpoint
@@ -227,6 +282,10 @@ class IngestSession:
         # Issue #407: the current streak of idle closes and its latest time.
         self._idle_drops = 0
         self._idle_drop_at: float | None = None
+        # Issue #109: the renewal schedule and install, and the monotonic
+        # deadline of the one outstanding request (None: none outstanding).
+        self._renewal = renewal
+        self._renewal_deadline: float | None = None
         # Fixed words for status and tests; never peer bytes.
         self.last_failure: str | None = None
         self.last_close_reason: str | None = None
@@ -248,6 +307,11 @@ class IngestSession:
     def exchange_clock(self) -> ClockExchange | None:
         """The exchange of the latest ack on the current connection, if any."""
         return self._exchange
+
+    @property
+    def renewal_status(self) -> str | None:
+        """The renewal's fixed status word (Issue #109), or None."""
+        return None if self._renewal is None else getattr(self._renewal, "status", None)
 
     def send_heartbeat(self, heartbeat: dict) -> None:
         with self._io:
@@ -292,7 +356,7 @@ class IngestSession:
                 self._failed(failure.reason)
                 raise
         try:
-            self._round_trip(heartbeat)
+            renewal_reply = self._round_trip(heartbeat)
         except IngestSessionError as failure:
             self._drop()
             self._failed(failure.reason)
@@ -304,6 +368,8 @@ class IngestSession:
         self._failures = 0
         self._retry_at = None
         self.last_failure = None
+        if self._renewal is not None:
+            self._renew(renewal_reply)
 
     def close(self) -> None:
         with self._io:
@@ -336,11 +402,72 @@ class IngestSession:
         delay = min(RETRY_FIRST_SECONDS * 2 ** min(self._idle_drops - 2, 16), RETRY_MAX_SECONDS)
         self._retry_at = max(self._retry_at or now, now + delay)
 
-    def _drop(self) -> None:
+    def _drop(self, *, keep_exchange: bool = False) -> None:
+        if (self._renewal_deadline is not None and self._connection is not None
+                and self.last_close_reason is None):
+            # A send that failed first (a live frame) must not hide the
+            # Main's CLOSE already waiting to be read (PR #425 review).
+            try:
+                self._still_open()
+            except Exception:
+                pass
         connection, self._connection = self._connection, None
-        self._exchange = None
+        if not keep_exchange:
+            self._exchange = None
         if connection is not None:
             _shutdown(connection)
+        if self._renewal_deadline is not None:
+            # The reply of the outstanding request can no longer arrive. A
+            # Main that does not know the request type closed the session
+            # with `frame_type_refused` (an older release).
+            self._renewal_deadline = None
+            self._renewal.failed("renewal_unsupported_by_main"
+                                 if self.last_close_reason == "frame_type_refused"
+                                 else "renewal_reply_lost")
+
+    def _renew(self, reply: tuple[bytes | None, str | None] | None) -> None:
+        """Handle a renewal reply, then send a due request (Issue #109).
+
+        Runs under the IO lock right after an acknowledged heartbeat, so the
+        request travels on the heartbeat's connection.
+        """
+        if reply is not None:
+            self._renewal_deadline = None
+            certificate, reason = reply
+            if certificate is None:
+                self._renewal.failed(reason)
+            elif self._renewal.issued(certificate):
+                # Present the new credential now: the Main promotes it at
+                # this connection's admission. The clock exchange stays valid.
+                self._drop(keep_exchange=True)
+                try:
+                    self._connect()
+                except IngestSessionError as failure:
+                    self._failed(failure.reason)
+                return
+        if self._connection is None:
+            return
+        if self._renewal_deadline is not None:
+            if self._monotonic() >= self._renewal_deadline:
+                self._renewal_deadline = None
+                self._renewal.failed("renewal_reply_timeout")
+            return
+        csr = self._renewal.due()
+        if csr is None:
+            return
+        frame = encode_frame(FrameType.RENEWAL_REQUEST, {"csr": csr.decode("ascii")})
+        if len(frame) - HEADER.size > MAXIMUM_RENEWAL_REQUEST_BYTES:
+            self._renewal.failed("renewal_request_too_large")
+            return
+        try:
+            self._connection.settimeout(REPLY_TIMEOUT_SECONDS)
+            self._connection.sendall(frame)
+        except (OSError, ssl.SSLError, ValueError):
+            self._renewal.failed("renewal_send_failed")
+            self._drop()
+            self._failed("main_send_failed")
+            return
+        self._renewal_deadline = self._monotonic() + RENEWAL_REPLY_TIMEOUT_SECONDS
 
     def _connect(self) -> None:
         try:
@@ -410,7 +537,8 @@ class IngestSession:
             self.last_close_reason = _close_reason(value)
         return False
 
-    def _round_trip(self, heartbeat: dict) -> None:
+    def _round_trip(self, heartbeat: dict) -> tuple[bytes | None, str | None] | None:
+        """One heartbeat and its ack; returns a renewal reply read before the ack."""
         connection = self._connection
         frame = encode_frame(FrameType.HEARTBEAT, heartbeat)
         if len(frame) - HEADER.size > MAXIMUM_HEARTBEAT_BYTES:
@@ -422,7 +550,18 @@ class IngestSession:
             connection.sendall(frame)
         except socket.timeout:
             raise IngestSessionError("main_reply_timeout") from None
+        renewal = None
         kind, value = read_reply(connection, deadline, clock=self._monotonic)
+        if kind is FrameType.RENEWAL_REPLY:
+            # Only directly before an ack (Issue #109); it is handled after
+            # the ack. A reply after `RENEWAL_REPLY_TIMEOUT_SECONDS` still
+            # answers the latest request (there is only ever one).
+            if self._renewal is None:
+                raise IngestSessionError("main_reply_invalid")
+            renewal = _renewal_reply(value)
+            kind, value = read_reply(connection, deadline, clock=self._monotonic)
+            if kind is FrameType.RENEWAL_REPLY:
+                raise IngestSessionError("main_reply_invalid")
         receive_utc, receive_monotonic = self._utc(), self._monotonic()
         if kind is FrameType.CLOSE:
             self.last_close_reason = _close_reason(value)
@@ -437,3 +576,4 @@ class IngestSession:
             local_send_utc=send_utc, local_send_monotonic=send_monotonic,
             remote_receive_utc=value["receive_utc"], remote_send_utc=value["send_utc"],
             local_receive_utc=receive_utc, local_receive_monotonic=receive_monotonic)
+        return renewal

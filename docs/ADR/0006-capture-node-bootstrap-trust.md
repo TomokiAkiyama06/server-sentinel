@@ -674,8 +674,10 @@ unchanged.
   `renewal_of` records as plain node records, so key bindings survive a
   rollback. The units are Owner-installed templates in `infra/systemd/`
   (like the upstream socket); the installer does not place them yet.
-- **Not yet.** The ingest session does not carry the renewal request; that
-  wire message (ADR-0007) constructs only `SignerRenewalIssuer`.
+- **Wiring (2026-11-16).** The ingest session carries the renewal request
+  (ADR-0007 addendum 2026-11-16); the listener's `renewal.SessionRenewal`
+  constructs only `SignerRenewalIssuer`, from the public `DeploymentTrust`
+  and the session's presented certificate.
 - **Evidence.** `server/tests/test_renewal_signer.py` (decision rules, rate
   limits, fail-closed log and lock, peer check over a real Unix socket,
   `renew_node_credential` end to end with the ledger, a memory scan with a

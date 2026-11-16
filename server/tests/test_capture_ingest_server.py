@@ -242,7 +242,7 @@ class CaptureIngestServerTests(CaptureTlsHarness):
     def test_media_and_other_frame_types_are_refused(self):
         self.serve()
         tls = self.connect()
-        tls.sendall(struct.pack(">IB", 4, 0x20) + b"data")
+        tls.sendall(struct.pack(">IB", 4, 0x30) + b"data")
         self.assertEqual(self.closed_with(tls), "frame_type_refused")
         tls = self.connect()
         tls.sendall(encode_frame(FrameType.HEARTBEAT_ACK, {"sequence": 1}))

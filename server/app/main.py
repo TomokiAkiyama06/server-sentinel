@@ -495,6 +495,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
     if capture_ingest is not None and not isinstance(capture_ingest, CaptureIngestMaterial):
         raise TypeError("capture ingest material is invalid")
     capture_acceptor = None
+    capture_renewal = None
     if capture_ingest is not None:
         import secrets
 
@@ -507,9 +508,17 @@ def create_app(settings: Settings, *, database: Database | None = None,
         # CLI approves), so its code verifier key is per process and unused.
         capture_ledger = PairingLedger(store, HmacCodeVerifier(secrets.token_bytes(32)),
                                        audit=audit_store)
+        capture_admission = CaptureNodeAdmission(capture_ledger, capture_ingest.deployment_id)
+        if capture_ingest.trust is not None:
+            # Issue #109: renewal over the ingest session, signed by the
+            # renewal-only signer over its Unix socket; this process holds
+            # only the public CA certificate (`DeploymentTrust`).
+            from app.cameras.remote_agent.renewal import SessionRenewal
+            capture_renewal = SessionRenewal(capture_ingest.trust, capture_ledger,
+                                             capture_admission)
         capture_acceptor = CaptureIngestAcceptor(
             capture_ingest.context,
-            CaptureNodeAdmission(capture_ledger, capture_ingest.deployment_id),
+            capture_admission,
             handshake_timeout_seconds=capture_ingest.listener.handshake_timeout_seconds,
             # The listener logs refusals rate-limited (`ingest_server`) and
             # serves one protocol, checked before any ledger read.
@@ -601,7 +610,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
                     server = CaptureIngestServer(listener, capture_acceptor,
                                                  limits=capture_ingest.limits,
                                                  live_preview=remote_preview,
-                                                 live_sources=RegistryLiveSources(store))
+                                                 live_sources=RegistryLiveSources(store),
+                                                 renewal=capture_renewal)
                     server.start()
                 except Exception:
                     if listener is not None:

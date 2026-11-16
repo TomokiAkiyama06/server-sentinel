@@ -19,7 +19,9 @@ from app.cameras.remote_agent.ingest_config import CaptureIngestLimits
 from app.cameras.remote_agent.ingest_server import CaptureIngestServer
 from app.cameras.remote_agent.ingest_tls import CaptureIngestAcceptor
 from app.cameras.remote_agent import ingest_wire
+from tests.test_capture_ingest_renewal import IngestRenewalHarness
 from tests.test_capture_mtls import SERVER_NAME, CaptureTlsHarness, Owner
+from tests.test_renewal_signer import renewal_csr
 
 
 AGENT = str(Path(__file__).resolve().parents[2] / "agent")
@@ -182,18 +184,22 @@ class AgentIngestSessionTests(CaptureTlsHarness):
         session = agent.ingest_session
         self.assertEqual(session.INGEST_ALPN, ingest_wire.INGEST_ALPN)
         self.assertEqual(session.HEADER.format, ingest_wire.HEADER.format)
-        # Every Agent frame type is the Main's, with the same value. The
-        # Main's `LIVE_FRAME` (Issue #14, option A) is fixed on the Main
-        # first; the Agent's sender adds it to its copy.
-        # TODO(#413): once the Agent's LIVE_FRAME sender is merged, require
-        # the two sets to be equal again and compare the Agent's maximum JPEG
-        # size with `ingest_wire.MAXIMUM_LIVE_FRAME_BYTES` here.
+        # Every frame type, with the same value, and the same bounds.
         agent_types = {kind.name: int(kind) for kind in session.FrameType}
         main_types = {kind.name: int(kind) for kind in ingest_wire.FrameType}
-        self.assertEqual(agent_types, {name: main_types[name] for name in agent_types})
-        self.assertLessEqual(set(main_types) - set(agent_types), {"LIVE_FRAME"})
+        self.assertEqual(agent_types, main_types)
+        self.assertEqual(session.MAXIMUM_LIVE_FRAME_BYTES, ingest_wire.MAXIMUM_LIVE_FRAME_BYTES)
+        self.assertEqual(session.MAXIMUM_RENEWAL_REQUEST_BYTES,
+                         ingest_wire.MAXIMUM_RENEWAL_REQUEST_BODY_BYTES)
+        self.assertEqual(session.MAXIMUM_RENEWAL_REPLY_BYTES,
+                         ingest_wire.MAXIMUM_RENEWAL_REPLY_BODY_BYTES)
         self.assertLessEqual(session.MAXIMUM_HEARTBEAT_BYTES,
                              CaptureIngestLimits().maximum_frame_bytes)
+        # The Agent waits for a renewal reply longer than the Main's signer
+        # may take, plus the longest heartbeat interval.
+        from app.cameras.remote_agent.renewal_signer import CLIENT_TIMEOUT_SECONDS
+        self.assertGreater(session.RENEWAL_REPLY_TIMEOUT_SECONDS,
+                           CLIENT_TIMEOUT_SECONDS + agent.config.MAXIMUM_HEARTBEAT_SECONDS)
         # One tick's network work fits the slow-tick allowance of the idle
         # timeout (`config.MAXIMUM_HEARTBEAT_SECONDS`, 15 s).
         # PR #406 review: the shortest interval with a session, plus the one
@@ -204,6 +210,126 @@ class AgentIngestSessionTests(CaptureTlsHarness):
         self.assertLessEqual(minimum, agent.config.MAXIMUM_HEARTBEAT_SECONDS)
         self.assertLessEqual(session.CONNECT_TIMEOUT_SECONDS * 2
                              + session.REPLY_TIMEOUT_SECONDS, 15)
+
+
+
+class AgentRenewal:
+    """The Agent's renewal stand-in: one CSR, and the install of its certificate.
+
+    The real ``CredentialRenewal`` and its generation install have their own
+    tests (``agent/tests/test_credential_renewal.py``); this one switches the
+    session's credential to the issued certificate.
+    """
+
+    def __init__(self, harness, csr, key):
+        self.harness = harness
+        self.csr = csr
+        self.key = key
+        self.calls = []
+        self.status = None
+
+    def due(self):
+        self.calls.append("due")
+        csr, self.csr = self.csr, None
+        return csr
+
+    def issued(self, certificate):
+        self.calls.append("issued")
+        self.harness.credential_paths = self.harness.write_credential("renewed", certificate,
+                                                                      self.key)
+        self.harness.issued = certificate
+        return True
+
+    def failed(self, reason):
+        self.calls.append(("failed", reason))
+
+
+class AgentRenewalSessionTests(IngestRenewalHarness):
+    """The real Agent session renews against the real listener and signer socket."""
+
+    def credential(self, _store):
+        certificate, key = self.credential_paths
+        return SimpleNamespace(ca_certificate_pem=self.ca_path.read_bytes(),
+                               certificate_path=certificate, key_path=key,
+                               server_name=SERVER_NAME, node_id=self.node)
+
+    def test_the_agent_renews_over_its_heartbeat_session_and_reconnects_with_it(self):
+        server = self.serve()
+        self.credential_paths = self.certificate
+        key, csr = renewal_csr()
+        renewal = AgentRenewal(self, csr, key)
+        session = agent.ingest_session.IngestSession(
+            InstalledStore(), agent.config.MainIngestEndpoint("127.0.0.1", self.address[1]),
+            self.node, credential=self.credential, renewal=renewal)
+        self.addCleanup(session.close)
+        old_identity, _ = self.identity(self.certificate[0].read_text())
+        sequence = 0
+        deadline = time.monotonic() + 15
+        while "issued" not in renewal.calls and time.monotonic() < deadline:
+            sequence += 1
+            session.send_heartbeat(self.agent_heartbeat(sequence))
+            time.sleep(0.05)
+        self.assertIn("issued", renewal.calls, renewal.calls)
+        # The session reconnected with the new certificate; its next
+        # heartbeat is acknowledged and the old certificate is superseded.
+        session.send_heartbeat(self.agent_heartbeat(sequence + 1))
+        self.assertTrue(self.wait_for(lambda: not self.admission.is_admitted(old_identity)))
+        new_identity, _ = self.identity(self.issued.decode())
+        self.assertTrue(self.admission.is_admitted(new_identity))
+        self.assertEqual(server.status().renewals_issued, 1)
+        self.assertEqual(server.registry.state(self.node), "online")
+
+    def test_the_real_agent_renewal_installs_a_generation_and_the_main_promotes_it(self):
+        # PR #425 review: the Agent's own `CredentialRenewal`, credential
+        # store and `node_tls` steps, against the real listener and signer.
+        import os
+        from cryptography.hazmat.primitives import serialization
+        from media_capture_agent.credential_renewal import CredentialRenewal
+        from media_capture_agent.node_tls import installed_credential
+        from media_capture_agent.pairing import NodeCredentialMaterial, NodeCredentialStore
+        server = self.serve()
+        runtime = self.root / "agent-runtime"
+        runtime.mkdir(mode=0o700)
+        store = NodeCredentialStore(runtime, owner_uid=os.getuid())
+        store.install(NodeCredentialMaterial(
+            deployment_id=self.deployment, node_id=self.node, server_name=SERVER_NAME,
+            private_key=self.key.private_bytes(serialization.Encoding.PEM,
+                                               serialization.PrivateFormat.PKCS8,
+                                               serialization.NoEncryption()),
+            client_certificate=self.certificate[0].read_bytes(),
+            ca_certificate=self.trust.ca_certificate_pem()))
+        before = installed_credential(store)
+        renewal = CredentialRenewal(store)
+        session = agent.ingest_session.IngestSession(
+            store, agent.config.MainIngestEndpoint("127.0.0.1", self.address[1]), self.node,
+            renewal=renewal)
+        self.addCleanup(session.close)
+        old_identity, _ = self.identity(self.certificate[0].read_text())
+        sequence = 0
+        deadline = time.monotonic() + 15
+        while renewal.status != "renewal_installed" and time.monotonic() < deadline:
+            sequence += 1
+            session.send_heartbeat(self.agent_heartbeat(sequence))
+            time.sleep(0.05)
+        self.assertEqual(renewal.status, "renewal_installed")
+        after = installed_credential(store)
+        self.assertNotEqual(after.certificate_path, before.certificate_path)
+        session.send_heartbeat(self.agent_heartbeat(sequence + 1))
+        self.assertTrue(self.wait_for(lambda: not self.admission.is_admitted(old_identity)))
+        new_identity, _ = self.identity(after.certificate_path.read_text())
+        self.assertTrue(self.admission.is_admitted(new_identity))
+        self.assertEqual(server.status().renewals_issued, 1)
+        # Not due any more: no further request.
+        session.send_heartbeat(self.agent_heartbeat(sequence + 2))
+        self.assertEqual(server.status().renewals_issued, 1)
+
+    def agent_heartbeat(self, sequence):
+        clock = {"state": "online", "reason": "clock_within_limit", "offset_seconds": 0.0,
+                 "uncertainty_seconds": 0.001}
+        return {"schema_version": 1, "node_id": str(self.node), "sequence": sequence,
+                "utc_seconds": 1.0, "monotonic_seconds": 1.0, "node_state": "online",
+                "node_reasons": [], "clock": clock, "storage": {"state": "online"},
+                "sources": []}
 
 
 if __name__ == "__main__":

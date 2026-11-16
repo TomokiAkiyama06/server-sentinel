@@ -45,12 +45,40 @@ maximum-size frames, sustained) closes the
 session. The session's frames are dropped from the hub when it ends or is
 superseded.
 
+Certificate renewal (``RENEWAL_REQUEST`` / ``RENEWAL_REPLY``; Issue #109,
+ADR-0007 addendum 2026-11-16). A request is a frame like a heartbeat: the
+ledger re-check and the node's rate budget come first, and its form is
+checked (``renewal_request_invalid`` closes). The node is the session's: the
+injected ``renewal`` (``renewal.SessionRenewal``) receives the session's
+identity and its presented certificate, never a node named by the Agent.
+Since the signer can take up to its timeout, the renewal runs on its own
+short-lived thread, never on the accept loop or a session thread, and at
+most ``maximum_concurrent_renewals`` run at once, at most one per node; a
+request beyond that is answered ``renewal_busy`` at once, and a listener
+without ``renewal`` answers ``renewal_unavailable``. Each node may start a
+renewal at most once per ``renewal_interval_seconds`` (10 min) and at most
+``renewals_per_hour`` (4) times per rolling hour; a request beyond that is
+answered ``renewal_rate_limited`` without calling the signer (PR #425
+review: a looping or leaked credential must not keep starting signer
+instances and holding the CA lock). A conforming Agent asks at most once
+per hour (its back-off starts at 1 h), so it never meets either bound. A session has at most
+one request outstanding (until its reply is sent): a second closes it with
+``renewal_in_flight``. The reply is sent by the session thread only, directly
+before the next ``HEARTBEAT_ACK`` and in the same write, so one TLS socket is
+never written from two threads and the Agent reads the reply inside a
+heartbeat round trip. A reply whose session ended is dropped; the ledger
+keeps the staged certificate, and the Agent's retry with the same key is
+answered with it. Outcomes are counted in the status (value-free: counts and
+the fixed refusal words) and logged at the first and every power of two per
+category.
+
 Nothing is written to the database or the disk here: the pairing ledger and
-the camera registry are only read (a staged renewal's promotion is the
-ledger's own admitted write), and node health and live frames are kept in
-memory (``node_health``, ``RemotePreviewHub``). ``stop`` therefore waits
-for nothing: it stops accepting and shuts every socket down, and the
-connection threads end on their own (Issue #383: it adds no bounded wait to
+the camera registry are only read (a staged renewal's promotion and a
+renewal's staging are the ledger's own admitted writes), and node health and
+live frames are kept in memory (``node_health``, ``RemotePreviewHub``).
+``stop`` therefore waits for nothing: it stops accepting and shuts every
+socket down, and the connection and renewal threads end on their own (a
+renewal within the signer's timeout; Issue #383: it adds no bounded wait to
 the stop budget).
 """
 from __future__ import annotations
@@ -71,11 +99,13 @@ from .ingest import AgentIngestQueue, IngestLimits
 from .ingest_config import CaptureIngestLimits
 from .ingest_tls import CaptureIngestAcceptor, IngestTlsError
 from .ingest_wire import (
-    INGEST_ALPN, MAXIMUM_LIVE_FRAME_BODY_BYTES, FrameType, PeerClosed, WireRefused, encode_frame,
-    parse_heartbeat, parse_live_frame, read_frame,
+    INGEST_ALPN, MAXIMUM_LIVE_FRAME_BODY_BYTES, MAXIMUM_RENEWAL_REQUEST_BODY_BYTES,
+    RENEWAL_REFUSALS, FrameType, PeerClosed, WireRefused, encode_frame, encode_renewal_reply,
+    parse_heartbeat, parse_live_frame, parse_renewal_request, read_frame,
 )
 from .live_frames import CachedLiveSources, LiveFrameBudget
 from .node_health import CaptureNodeHealthRegistry
+from .renewal import RenewalRefused
 
 
 LOGGER = logging.getLogger("serversentinel.capture_ingest")
@@ -102,6 +132,20 @@ _REFUSAL_EVENTS = {
 # without a live session here was replaced meanwhile, not rate limited.
 _RATE_ENDS = {"rate_limit": "rate_limited", "rate_window_capacity": "rate_limited",
               "unauthorized": "superseded", "clock_regression": "clock_regression"}
+# Issue #109: renewals running at once (each holds one signer connection;
+# the signer socket accepts 4), and the log event of each outcome category.
+MAXIMUM_CONCURRENT_RENEWALS = 2
+# Per-node admission of renewals that reach the signer (PR #425 review).
+RENEWAL_INTERVAL_SECONDS = 600.0
+RENEWALS_PER_HOUR = 4
+_RENEWAL_WINDOW_NS = 3600 * 1_000_000_000
+_RENEWAL_UNAVAILABLE = frozenset({"renewal_signer_unavailable", "renewal_unavailable",
+                                  "renewal_busy"})
+_RENEWAL_EVENTS = {
+    "issued": Event.CAPTURE_INGEST_RENEWAL_ISSUED,
+    "refused": Event.CAPTURE_INGEST_RENEWAL_REFUSED,
+    "unavailable": Event.CAPTURE_INGEST_RENEWAL_UNAVAILABLE,
+}
 
 
 @dataclass(frozen=True)
@@ -120,6 +164,29 @@ class CaptureIngestStatus:
     live_frames_accepted: int = 0
     live_frames_unauthorized: int = 0
     live_frames_dropped: int = 0
+    # Certificate renewal (Issue #109): issued replies, refused replies, and
+    # the refused replies per fixed word (`ingest_wire.RENEWAL_REFUSALS`).
+    renewals_issued: int = 0
+    renewals_refused: int = 0
+    renewal_refusals: tuple[tuple[str, int], ...] = ()
+    # Replies `renewal_busy`, `renewal_unavailable` and
+    # `renewal_signer_unavailable` (counted apart from refusals, as logged).
+    renewals_unavailable: int = 0
+
+
+class _RenewalSlot:
+    """One session's renewal: whether a request is outstanding, and its reply.
+
+    Guarded by the listener's lock. ``outstanding`` lasts from the request
+    until its reply is sent (or the session ends); ``reply`` is the encoded
+    ``RENEWAL_REPLY`` waiting for the next heartbeat acknowledgement.
+    """
+
+    __slots__ = ("outstanding", "reply")
+
+    def __init__(self):
+        self.outstanding = False
+        self.reply: bytes | None = None
 
 
 class _LiveNodes:
@@ -164,15 +231,38 @@ class CaptureIngestServer:
                  utc: Callable[[], float] = time.time,
                  monotonic_ns: Callable[[], int] = time.monotonic_ns,
                  live_preview=None,
-                 live_sources: Callable[[UUID, UUID], bool] | None = None):
+                 live_sources: Callable[[UUID, UUID], bool] | None = None,
+                 renewal: Callable[..., bytes] | None = None,
+                 maximum_concurrent_renewals: int = MAXIMUM_CONCURRENT_RENEWALS,
+                 renewal_interval_seconds: float = RENEWAL_INTERVAL_SECONDS,
+                 renewals_per_hour: int = RENEWALS_PER_HOUR):
         from app.media.live.remote_preview import RemotePreviewHub
         limits = limits or CaptureIngestLimits()
         if (not isinstance(listener, socket.socket) or not isinstance(acceptor, CaptureIngestAcceptor)
                 or not isinstance(limits, CaptureIngestLimits) or not callable(utc)
                 or (live_preview is not None and not isinstance(live_preview, RemotePreviewHub))
-                or (live_sources is not None and not callable(live_sources))):
+                or (live_sources is not None and not callable(live_sources))
+                or (renewal is not None and not callable(renewal))
+                or type(maximum_concurrent_renewals) is not int
+                or not 1 <= maximum_concurrent_renewals <= 4
+                or type(renewal_interval_seconds) not in (int, float)
+                or not 0 <= renewal_interval_seconds <= 3600
+                or type(renewals_per_hour) is not int or not 1 <= renewals_per_hour <= 60):
             raise ValueError("invalid capture ingest dependencies")
         self.limits = limits
+        # Issue #109: `renewal.SessionRenewal`, or None (every request is
+        # answered `renewal_unavailable`).
+        self._renewal = renewal
+        self._maximum_renewals = maximum_concurrent_renewals
+        self._renewing: set[UUID] = set()
+        self._renewal_counts = {"issued": 0, "refused": 0, "unavailable": 0}
+        self._renewal_interval_ns = int(renewal_interval_seconds * 1_000_000_000)
+        self._renewals_per_hour = renewals_per_hour
+        # Per node, the start times of its latest renewals (bounded).
+        self._renewal_starts: dict[UUID, deque] = {}
+        self._monotonic_ns = monotonic_ns
+        self._renewal_refusals: dict[str, int] = {}
+        self._renewal_logged = {"issued": 0, "refused": 0, "unavailable": 0}
         # Issue #14 (option A): without both, every live frame is dropped and
         # counted as `live_frames_unauthorized` (fail closed); the session
         # and its heartbeats go on.
@@ -182,7 +272,8 @@ class CaptureIngestServer:
         self._live_budget = LiveFrameBudget(maximum_nodes=limits.maximum_nodes,
                                             clock_ns=monotonic_ns)
         self._live_counts = {"accepted": 0, "unauthorized": 0, "dropped": 0}
-        self._frame_limits = {FrameType.LIVE_FRAME: MAXIMUM_LIVE_FRAME_BODY_BYTES}
+        self._frame_limits = {FrameType.LIVE_FRAME: MAXIMUM_LIVE_FRAME_BODY_BYTES,
+                              FrameType.RENEWAL_REQUEST: MAXIMUM_RENEWAL_REQUEST_BODY_BYTES}
         self.registry = registry or CaptureNodeHealthRegistry(
             maximum_nodes=limits.maximum_nodes,
             stale_after_seconds=limits.idle_timeout_seconds)
@@ -255,7 +346,11 @@ class CaptureIngestServer:
                                        self._closed, tuple(sorted(self._refused_by.items())),
                                        self._live_counts["accepted"],
                                        self._live_counts["unauthorized"],
-                                       self._live_counts["dropped"])
+                                       self._live_counts["dropped"],
+                                       self._renewal_counts["issued"],
+                                       self._renewal_counts["refused"],
+                                       tuple(sorted(self._renewal_refusals.items())),
+                                       self._renewal_counts["unavailable"])
 
     def last_close_reasons(self) -> tuple[str, ...]:
         with self._lock:
@@ -418,7 +513,7 @@ class CaptureIngestServer:
         LOGGER.info(Event.CAPTURE_INGEST_SESSION_OPENED)
         reason = "closed"
         try:
-            reason = self._frames(session, tls, node, generation)
+            reason = self._frames(session, tls, node, generation, _RenewalSlot())
         finally:
             self._end(node, generation)
             if reason not in ("not_admitted", "superseded") and not self._stopping():
@@ -482,7 +577,7 @@ class CaptureIngestServer:
         except (OSError, ValueError):
             pass
 
-    def _frames(self, session, tls, node: UUID, generation: int) -> str:
+    def _frames(self, session, tls, node: UUID, generation: int, renewal: _RenewalSlot) -> str:
         while True:
             # One deadline per frame, from the end of the previous one: the
             # whole next frame must arrive within the idle timeout, however
@@ -531,6 +626,13 @@ class CaptureIngestServer:
                 if ended != "superseded":
                     self._close_with(tls, ended)
                 return ended
+            if frame.kind is FrameType.RENEWAL_REQUEST:
+                # Issue #109: answered before a later acknowledgement.
+                ended = self._renewal_request(session, tls, node, renewal, frame.body)
+                if ended is None:
+                    continue
+                self._close_with(tls, ended)
+                return ended
             if frame.kind is not FrameType.HEARTBEAT:
                 self._close_with(tls, "frame_type_refused")
                 return "frame_type_refused"
@@ -544,15 +646,144 @@ class CaptureIngestServer:
                 return "node_identity_mismatch"
             if not self.registry.heartbeat(generation, heartbeat):
                 return "superseded"
+            with self._lock:
+                # A finished renewal's reply goes first, in the same write
+                # (Issue #109); only this thread writes to the socket.
+                reply, renewal.reply = renewal.reply, None
+                if reply is not None:
+                    renewal.outstanding = False
             try:
                 tls.settimeout(self.limits.idle_timeout_seconds)
-                tls.sendall(encode_frame(FrameType.HEARTBEAT_ACK, {
+                tls.sendall((reply or b"") + encode_frame(FrameType.HEARTBEAT_ACK, {
                     "sequence": heartbeat.sequence, "receive_utc": received,
                     "send_utc": self._utc()}))
             except socket.timeout:
                 return "idle_timeout"
             except (OSError, ssl.SSLError):
                 return "peer_closed"
+
+    def _renewal_request(self, session, tls, node: UUID, slot: _RenewalSlot,
+                         body: bytes) -> str | None:
+        """Start one renewal off this thread; ``None``, or the session's end reason.
+
+        The reply is left in ``slot`` for the next acknowledgement: at once
+        for ``renewal_unavailable`` / ``renewal_busy``, otherwise when the
+        renewal thread finishes.
+        """
+        try:
+            csr = parse_renewal_request(body)
+        except WireRefused as refused:
+            return refused.reason
+        with self._lock:
+            if slot.outstanding:
+                return "renewal_in_flight"
+            slot.outstanding = True
+            if self._renewal is None:
+                immediate = "renewal_unavailable"
+            elif node in self._renewing or len(self._renewing) >= self._maximum_renewals:
+                immediate = "renewal_busy"
+            else:
+                immediate = self._admit_renewal_locked(node)
+                if immediate is None:
+                    self._renewing.add(node)
+        if immediate is not None:
+            self._renewal_done(slot, None, immediate)
+            return None
+        # The exact certificate this session presented; its identity was
+        # derived from it at admission (`SignerRenewalIssuer` checks that
+        # both agree). Read here, while no other thread uses the socket.
+        try:
+            presented = tls.getpeercert(binary_form=True) or b""
+        except (OSError, ValueError):
+            presented = b""
+        thread = threading.Thread(target=self._renew,
+                                  args=(session.identity, presented, csr, node, slot),
+                                  daemon=True, name="capture-ingest-renewal")
+        with self._lock:
+            self._threads.add(thread)
+        try:
+            thread.start()
+        except RuntimeError:
+            with self._lock:
+                self._threads.discard(thread)
+                self._renewing.discard(node)
+            self._renewal_done(slot, None, "renewal_busy")
+        return None
+
+    def _admit_renewal_locked(self, node: UUID) -> str | None:
+        """Record one renewal start for ``node``; a fixed word if it is beyond the bounds."""
+        now = self._monotonic_ns()
+        starts = self._renewal_starts.get(node)
+        if starts is not None:
+            while starts and not 0 <= now - starts[0] < _RENEWAL_WINDOW_NS:
+                starts.popleft()
+            if starts and 0 <= now - starts[-1] < self._renewal_interval_ns:
+                return "renewal_rate_limited"
+            if len(starts) >= self._renewals_per_hour:
+                return "renewal_rate_limited"
+        else:
+            if len(self._renewal_starts) >= self.limits.maximum_nodes:
+                # Bounded: reclaim nodes without a start in the last hour.
+                for other in [other for other, times in self._renewal_starts.items()
+                              if not times or not 0 <= now - times[-1] < _RENEWAL_WINDOW_NS]:
+                    del self._renewal_starts[other]
+                if len(self._renewal_starts) >= self.limits.maximum_nodes:
+                    return "renewal_busy"
+            starts = self._renewal_starts[node] = deque(maxlen=self._renewals_per_hour)
+        starts.append(now)
+        return None
+
+    def _renew(self, identity, presented: bytes, csr: bytes, node: UUID,
+               slot: _RenewalSlot) -> None:
+        certificate = None
+        reason = None
+        try:
+            certificate = self._renewal(identity, presented, csr)
+        except RenewalRefused as refused:
+            reason = (refused.reason if refused.reason in RENEWAL_REFUSALS
+                      else "renewal_unavailable")
+        except Exception:
+            # Never let a renewal thread's failure reach the process.
+            reason = "renewal_unavailable"
+        finally:
+            with self._lock:
+                self._renewing.discard(node)
+        try:
+            self._renewal_done(slot, certificate, reason)
+        finally:
+            with self._lock:
+                self._threads.discard(threading.current_thread())
+
+    def _renewal_done(self, slot: _RenewalSlot, certificate: bytes | None,
+                      reason: str | None) -> None:
+        """Leave the reply for the session's next acknowledgement; count and log it."""
+        reply = None
+        if certificate is not None:
+            try:
+                reply = encode_renewal_reply(certificate_pem=certificate)
+            except ValueError:
+                reason = "renewal_unavailable"
+        if reply is not None:
+            category = "issued"
+        else:
+            reason = reason if reason in RENEWAL_REFUSALS else "renewal_unavailable"
+            reply = encode_renewal_reply(reason=reason)
+            category = "unavailable" if reason in _RENEWAL_UNAVAILABLE else "refused"
+        with self._lock:
+            slot.reply = reply
+            if category == "issued":
+                self._renewal_counts["issued"] += 1
+            else:
+                # Bounded: the keys are words of `RENEWAL_REFUSALS`.
+                self._renewal_counts[category] += 1
+                self._renewal_refusals[reason] = self._renewal_refusals.get(reason, 0) + 1
+            self._renewal_logged[category] += 1
+            count = self._renewal_logged[category]
+        # Value-free, the first and every power of two per category, so a
+        # node cannot write one log line per request.
+        if count & (count - 1) == 0:
+            LOGGER.log(logging.INFO if category == "issued" else logging.WARNING,
+                       _RENEWAL_EVENTS[category], extra={"count": count})
 
     def _live_frame(self, node: UUID, generation: int, body: bytes) -> str | None:
         """Keep one live frame in memory; ``None``, or the session's end reason.
