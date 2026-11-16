@@ -19,6 +19,73 @@ next heartbeat. Failures report `main_unavailable` and reconnect with a
 1 s to 30 s back-off. It carries no media yet (#15 / #17). See
 `SPECIFICATION.md` §5.7.
 
+Issue #14 also wires the UVC capture into the service: with a `capture`
+section the service runs `uvc_capture.UvcCapture` for its sources (each
+camera in its sandboxed GStreamer child, see `capture/README.md`) and
+`preview.PreviewTap`, which keeps only the newest JPEG of each source in
+memory for the live preview the ingest session sends to the Main (Owner
+decision 2026-11-12, option A: the Main shows it in the live view; nothing
+is recorded yet, the ring buffer is wired later). `--check` only verifies the
+pipeline launcher (`capture_pipeline_unavailable`), never the approval state,
+because the running service holds its lock.
+
+Cameras are approved locally with the service stopped, as the service
+account, typing `APPROVE` on the controlling terminal:
+
+```bash
+sudo systemctl stop media-capture-agent.service
+sudo -u <service account> env PYTHONPATH=<installed artifact> python3 -m \
+    media_capture_agent.capture_admin candidates --config <agent config>
+#   candidate cam-<10 hex> usb=<vendor>:<product> serial=present formats=MJPG,YUYV approved_for=-
+sudo -u <service account> env PYTHONPATH=<installed artifact> python3 -m \
+    media_capture_agent.capture_admin approve --config <agent config> <source uuid> cam-<10 hex>
+sudo systemctl start media-capture-agent.service
+```
+
+`candidates` prints labels, never a serial, path or USB port; a label changes
+when the camera is re-plugged or the host restarts (`approved_for` follows the
+serial). `approve` refuses a camera without a serial, a serial shared with
+another connected camera or latched as ambiguous, and a camera already
+approved for another source (checked again under the approval store's lock
+after the confirmation); `revoke <source uuid>` (type `REVOKE`) removes a
+source's approval so its camera can be moved to another source. Every
+refusal is one fixed word; an interruption after an approval was stored no
+longer reports a refusal.
+
+The service account must be in the `video` group (device files are group
+`video`) and never in `audio`; `capture_admin` runs outside the unit and needs
+it too. With a `capture` section the generated unit allows the video device
+class (`DeviceAllow=char-video4linux rw`, `SupplementaryGroups=video`): the
+discovery probes every video node (a UVC camera also has a metadata node) and
+a re-plugged camera may get another number, so a per-path `--video-device`
+rule would block it. Which camera is used stays the identity check's
+decision, and the capture child can open only the approved device. The unit
+also loads the `videodev` module first (`Wants=`/`After=modprobe@videodev`),
+because systemd drops a device class unknown when the service starts.
+
+Adding `capture` to an already installed host changes the generated unit, and
+the installer has no operation to re-render it: `update` refuses a differing
+service configuration and `install` refuses an existing installation. On such
+a host, as the administrator: stop the service, move the installed unit file
+and the installation directory (`--destination`) aside (this gives up the
+`previous` release for rollback; configuration, credentials, runtime state and
+media are elsewhere and untouched), create the installation directory again
+at the same path, empty, root-owned and mode 0755, run `install` again with
+the same arguments, run `systemctl daemon-reload`, then review and enable the
+new unit. Restarting the old unit
+instead would let `capture_admin` approve a camera the service cannot open.
+Before rolling back to a release without Issue #14 capture support, remove the
+`capture` section, which that release refuses as an unknown key.
+
+A serial the Agent ever latched as duplicated stays unapprovable for good:
+`capture_admin` records every latch it sees in `uvc-latched-serials.json`
+under the runtime root (SHA-256 digests of the identity, never a serial)
+before it approves or revokes anything, so neither replacing nor revoking a
+source's approval makes that camera approvable again (`camera_serial_not_unique`;
+`candidates` shows it as `serial=latched`). Such a source can still be
+revoked and given another camera; the latched camera itself cannot be used
+by this tool.
+
 Issue #16 adds the tested disk-ring/incident core under `ring.py`, `ring_models.py`
 and `ring_ledger.py`. It uses real immutable disk segments and private SQLite;
 its production capture/transport/Owner-UI integration is still pending. See
@@ -98,6 +165,8 @@ is reported; fix it and rerun to reveal any later failure.
 | `runtime_root_not_writable` | The owner lacks write or search permission on the runtime root |
 | `node_identity_mismatch` | An installed node credential names a different node than the configuration's `node_id` (for example after `enroll pair --repair revoked` before `node_id` was updated); the Agent starts no capture or session |
 | `node_credential_unavailable` | The installed node credential under the runtime root is damaged or unreadable (never treated as unpaired) |
+| `capture_pipeline_unavailable` | With a `capture` section: `gst_launch` is not a root-controlled executable (not root-owned, group/world-writable, or under such a directory), its `coreelements` / `video4linux2` plugins or the sandbox helper are not root-controlled, or Landlock is unavailable (`uvc_pipeline.GStreamerLauncher`; fail closed) |
+| `capture_state_unavailable` | At service start only: the UVC approval state under the runtime root cannot be opened (unsafe ownership, damaged, or another process holds its lock) |
 | `check_failed` | Any other internal error; exception text is suppressed |
 
 `--check` can also pass with a warning (Issue #324). The exit status is 0 and
@@ -129,6 +198,7 @@ all runtime/media data outside the Git checkout and the application install:
 | `clock_offset_limit_seconds` | Positive finite acceptable absolute clock offset |
 | `clock_uncertainty_limit_seconds` | Positive finite clock-exchange uncertainty bound |
 | `clock_step_limit_seconds` | Positive finite wall/monotonic elapsed-time disagreement bound |
+| `capture` | Optional (absent or `null`: no camera is opened, reason `capture_unconfigured`). `{"gst_launch": "/usr/bin/gst-launch-1.0", "sources": [{"source_id": "<uuid>", "profile": "1920x1080@30/MJPG"}]}`: the operator-installed, root-owned `gst-launch-1.0` (never PATH-searched) and one to four sources, each with the UUID the Main gave its `remote_agent` source and an explicit MJPEG profile. A source opens a camera only after the Owner approved one for it with `capture_admin approve` (below) (Issue #14) |
 | `main_ingest` | Optional (absent or `null`: no ingest session, reason `main_ingest_unconfigured`). `{"host", "port"}` of the Main's capture ingest listener (its `capture_ingest` section, not the enrollment endpoint of the trust bundle). `host` is an IP literal (not unspecified, multicast or Tailscale) or a DNS name that resolves only to LAN addresses (Issue #14). An IP literal is recommended: name resolution has no timeout and would delay a tick |
 
 The Owner provisions paths and approves mount identity locally. Runtime never
@@ -236,7 +306,9 @@ through a nonblocking descriptor; FIFOs, devices and concurrent file changes
 are rejected before execution.
 
 The device path above is illustrative, never durable UVC identity. Repeat the
-option for explicitly allowed video nodes; the default device allowlist is empty.
+option for explicitly allowed video nodes; without a `capture` section the
+default device allowlist is empty, and with one the unit allows the video
+device class instead (see "Cameras are approved locally" above).
 The generated unit uses `DevicePolicy=closed` and never allows `/dev/snd`.
 Approved stable identity still must be verified by the capture layer on open and
 reconnect. The installer writes a new, root-owned version directory, runs local
