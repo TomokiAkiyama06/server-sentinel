@@ -670,6 +670,8 @@ class StdlibOnlyServiceTests(unittest.TestCase):
                 "import media_capture_agent.cli, media_capture_agent.ingest_session\n"
                 "import media_capture_agent.capture_admin, media_capture_agent.preview\n"
                 "import media_capture_agent.uvc_capture\n"
+                # Issue #109: imports `node_tls` only when a renewal first checks.
+                "import media_capture_agent.credential_renewal\n"
                 "assert not any(m.startswith('cryptography') for m in sys.modules)\n")
         result = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True,
                                 text=True, timeout=60)

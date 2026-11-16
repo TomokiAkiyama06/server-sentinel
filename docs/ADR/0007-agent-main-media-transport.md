@@ -343,6 +343,73 @@ jitter; glass-to-glass latency.
   narrower than the all-run raw review MANUAL_TEST.md §G asks for; the Owner
   confirmed knowing that this scope would be recorded here.
 
+## Addendum 2026-11-16: certificate renewal on the ingest session (Issue #109)
+
+Status: implemented and verified with mocks and loopback only (no real host).
+Owner decision 2026-10-22: the renewal-only signer (ADR-0006 follow-up notes,
+PR #420) is wired together with the LAN ingest, so the Agent's renewal
+request travels on its existing ingest session; the Agent opens no other
+connection for it and the Main opens no new listener.
+
+Wire (protocol version 1, ALPN `serversentinel-capture-ingest/1` unchanged):
+
+- `RENEWAL_REQUEST = 0x20` (Agent to Main): JSON `{"csr": <PEM>}` and
+  nothing else; the body is at most 8 KiB, checked from the header before the
+  body is read (`frame_too_large`). Any other shape closes the session with
+  `renewal_request_invalid`. The frame names no node: the node is the
+  session's mTLS identity, and the Main passes exactly the session's
+  presented certificate to the signer.
+- `RENEWAL_REPLY = 0x21` (Main to Agent): `{"status": "issued",
+  "certificate": <PEM>}` or `{"status": "refused", "reason": <fixed word>}`,
+  at most 16 KiB. The Main sends it only directly before a `HEARTBEAT_ACK`,
+  in the same write. The Agent reads it inside that heartbeat round trip and
+  handles it after the ack, so the clock exchange is not widened, and the
+  Agent's idle-close check (a frame between ticks means the Main ended the
+  session) stays valid.
+- At most one request is outstanding per session, until its reply is sent;
+  a second closes the session with `renewal_in_flight`. A request is charged
+  to the node's frame budget like a heartbeat and re-checks the ledger first.
+- Refusal words: `renewal_identity_invalid`, `renewal_credential_expired`,
+  `renewal_credential_not_admitted`, `renewal_request_invalid`,
+  `renewal_not_eligible`, `renewal_ca_validity_insufficient`,
+  `renewal_signer_refused`, `renewal_signer_unavailable`, `renewal_busy`
+  (beyond the Main's concurrency bound) and `renewal_unavailable` (no
+  renewal configured, or an unexpected failure).
+
+Why the version is not bumped: like `LIVE_FRAME` (Owner decision
+2026-11-12), the two types are additions an older peer never sends. A new
+Main serves an older Agent unchanged. An older Main answers a new Agent's
+request with `CLOSE` `frame_type_refused`, which the Agent records as the
+failed attempt `renewal_unsupported_by_main` and retries only per its renewal
+back-off (1 hour doubling to 24 hours), so the extra reconnects are bounded
+and the heartbeats go on. A version bump would instead make the two releases
+unable to talk at all during a staggered update. The Main never sends
+`RENEWAL_REPLY` to an Agent that did not ask, so an older Agent never sees
+the type.
+
+Main side (`ingest_server.py`, `renewal.SessionRenewal`): the renewal runs
+on its own short-lived thread (the signer may take up to its 30 s client
+timeout), never on the accept loop or a session thread; at most 2 run at
+once and at most 1 per node, a request beyond that is answered
+`renewal_busy` at once. Only the session thread writes to the socket. The
+renewal builds `SignerRenewalIssuer` from the public `DeploymentTrust` only
+(the service never loads `DeploymentAuthority`) and calls
+`renew_node_credential`, so ledger eligibility, same-key retry and staging
+are unchanged. A reply whose session ended is dropped; the Agent's retry
+with the same pending key is answered from the ledger's staged certificate.
+
+Agent side (`ingest_session.py`, `credential_renewal.py`): after an
+acknowledged heartbeat, under the session's IO lock (shared with heartbeats
+and live frames), the Agent sends the CSR when `RenewalSchedule` says it is
+due. An issued certificate is installed as a new credential generation
+(`node_tls.complete_renewal`) and the session reconnects at once with it,
+which promotes it on the Main. A refusal, a reply not received within 60 s,
+or a connection lost meanwhile is a failed attempt, retried per the
+schedule's back-off with the same pending key. `cryptography` (already
+reviewed for `node_tls`) is imported by the service only when the renewal
+first checks; without it renewal is off (`renewal_dependency_unavailable`)
+and the node keeps its current credential.
+
 ## Follow-up
 
 - Agent-side envelope sender and `capture_epoch` persistence (#12/#16).

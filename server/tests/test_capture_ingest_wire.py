@@ -70,7 +70,7 @@ class FrameTests(unittest.TestCase):
         with self.assertRaises(WireRefused) as refused:
             read_frame(right, 1024)
         self.assertEqual(refused.exception.reason, "frame_empty")
-        left.sendall(struct.pack(">IB", 1, 0x20) + b"x")
+        left.sendall(struct.pack(">IB", 1, 0x30) + b"x")
         with self.assertRaises(WireRefused) as refused:
             read_frame(right, 1024)
         self.assertEqual(refused.exception.reason, "frame_type_refused")

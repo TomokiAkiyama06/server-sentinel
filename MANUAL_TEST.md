@@ -926,7 +926,8 @@ only by synthetic tests (`server/tests/test_release.py`,
     retry receives the same certificate (same SHA-256) and that it is admitted. A revoked node's renewal must be refused. After
     the credential expires, the node must re-pair. Block renewal (for example
     stop the Main) until the 14-day threshold and confirm the Owner sees a
-    `capture_credential_warning`. *(needs transport wiring and a scheduler)*
+    `capture_credential_warning`. *(the renewal over the ingest session is
+    step 19; the Owner warning still needs the monitor's application hook)*
 15. Main listener certificate rotation (Issue #125), on a disposable
     deployment after step 7: record the listener `not_after`, run
     `sudo MAIN_CLI rotate-listener --authority-dir <ca_dir> --listener-dir <listener_dir>`
@@ -1026,9 +1027,9 @@ only by synthetic tests (`server/tests/test_release.py`,
     hardware**; verified only by `server/tests/test_renewal_signer.py` and,
     as root with two numeric accounts, by
     `server/tests/test_ca_privilege_separation_root.py` (CI and a container
-    with `--cap-add SYS_PTRACE`). The ingest session does not carry the
-    renewal request yet, so an end-to-end Agent renewal waits for that wiring;
-    these steps check the signer itself on a disposable deployment:
+    with `--cap-add SYS_PTRACE`). These steps check the signer itself on a
+    disposable deployment; the Agent's renewal over the ingest session is
+    step 19:
     a. Install the two units as `server/docs/DEPLOYMENT.md` "Renewal-only
        signer" says, then `systemd-analyze verify` them and
        `systemctl enable --now serversentinel-renewal-signer.socket`. Confirm
@@ -1063,6 +1064,42 @@ only by synthetic tests (`server/tests/test_release.py`,
        "Renewal-only signer"). If there is none, re-pair the node (step 15)
        before it expires; the signer would refuse its renewal
        (`issuer_refused_request`). This is an Owner step on the real host.
+
+19. Renewal over the ingest session (Issue #109, ADR-0007 addendum
+    2026-11-16). Status: **not executed on real hardware**; verified only
+    by `server/tests/test_capture_ingest_renewal.py`,
+    `server/tests/test_capture_ingest_session.py` (the real Agent session
+    against the real listener and a signer socket) and
+    `agent/tests/test_credential_renewal.py`, all loopback. On a disposable
+    deployment with the signer units of step 18 installed, and never on the
+    production hosts without the Owner:
+    a. Confirm the Agent's service interpreter imports `cryptography`
+       (`sudo -u <service account> python3 -c 'import cryptography'`); the
+       status line otherwise shows `"renewal": "renewal_dependency_unavailable"`.
+    b. Pair a node with a short explicit validity so it is within 30 days
+       of expiry (and has an issuance-log record, step 18e). Start the Agent
+       with `main_ingest`. Within one heartbeat its status line shows
+       `"renewal": "renewal_requested"`, then `renewal_installed`; the
+       signer journal shows one `renewal-signer: signed`, the CA log gains a
+       `node` record with `renewal_of`, and `node-credentials/current.json`
+       names a new generation (0600 files) while `pending-renewal/` is
+       empty. The Main log shows `capture_ingest_renewal_issued`, and
+       `sudo -u <service account> MAIN_CLI list` shows the node's new expiry
+       about 397 days ahead once the Agent reconnected.
+    c. While the request is outstanding (stall the signer, for example
+       `systemctl stop serversentinel-renewal-signer.socket` just before step
+       b), confirm heartbeats keep arriving (node `online` on the Main) and
+       the live view keeps updating; with the socket stopped the reply is
+       `renewal_signer_unavailable`, the status line shows that word, and no
+       second request is sent for one hour.
+    d. Stop the Main between the request and the reply; after the Main is
+       back the Agent reports `renewal_reply_lost` and, after its back-off,
+       receives the same certificate (same SHA-256) without a second
+       `signed` line.
+    e. Against a Main release without renewal the Agent reports
+       `renewal_unsupported_by_main` and its heartbeats continue.
+    f. Inspect the Main and Agent journals, `ps` and `/proc/<pid>/environ`
+       during the exchange for key, CSR or certificate text; expect none.
 
 15. Re-pairing (#116, Owner policy 2026-10-01; mock-verified only by
     `agent/tests/test_enroll.py` and

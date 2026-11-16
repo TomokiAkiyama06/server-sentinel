@@ -8,7 +8,7 @@ ALPN protocol ``INGEST_ALPN``. Inside it every message is a frame::
 
 The length is checked against the caller's limit *before* any body byte is
 read (ADR-0007 item 5: bounded pre-read limits), and a zero-length frame or an
-unknown type is refused. Version 1 has four frame types:
+unknown type is refused. Version 1 has six frame types:
 
 * ``HEARTBEAT`` (Agent to Main): a UTF-8 JSON object, the Agent's node
   heartbeat (``agent/media_capture_agent/runtime.py``, schema version 1). It is
@@ -28,6 +28,17 @@ unknown type is refused. Version 1 has four frame types:
   before the body is read, like every other type's. The Main sends **no**
   reply: it keeps only the newest frame per source in memory, for the live
   view, and stores nothing, so there is nothing to acknowledge.
+* ``RENEWAL_REQUEST`` (Agent to Main; Issue #109, ADR-0007 addendum
+  2026-11-16): ``{"csr": <PEM>}``, the Agent's renewal CSR for its own node
+  (``parse_renewal_request``). The node is the session's, never named in the
+  frame. The body limit (``MAXIMUM_RENEWAL_REQUEST_BODY_BYTES``) is applied
+  from the header. At most one request is outstanding per session.
+* ``RENEWAL_REPLY`` (Main to Agent): ``{"status": "issued", "certificate":
+  <PEM>}`` or ``{"status": "refused", "reason": <fixed word>}``
+  (``encode_renewal_reply``), at most ``MAXIMUM_RENEWAL_REPLY_BODY_BYTES``.
+  The Main sends it only directly before a ``HEARTBEAT_ACK``, in the same
+  write, so the Agent reads it inside a heartbeat round trip and a session
+  never has the Main writing while the Agent is not reading.
 
 Recording media is not part of version 1: it is accepted only once the
 durable recording consumer exists (#17 / #313), so a Main never acknowledges
@@ -87,10 +98,29 @@ _STORAGE_KEYS = frozenset({"state", "reason", "available_bytes", "safety_reserve
 _SOURCE_KEYS = frozenset({"source_id", "state", "reason"})
 
 
+# RENEWAL_REQUEST / RENEWAL_REPLY (Issue #109): a P-256 CSR in PEM is about
+# 500 bytes and a node leaf about 1 KiB; both bounds leave ample room.
+MAXIMUM_RENEWAL_REQUEST_BODY_BYTES = 8 * 1024
+MAXIMUM_RENEWAL_REPLY_BODY_BYTES = 16 * 1024
+_CSR_PEM_START = "-----BEGIN CERTIFICATE REQUEST-----"
+# Built, so the repository's secret-format scan does not mistake it for a PEM.
+_CERTIFICATE_PEM_START = "-" * 5 + "BEGIN CERTIFICATE" + "-" * 5
+# The words a refused RENEWAL_REPLY may carry: `renewal.RenewalRefused`
+# reasons and the listener's own `renewal_busy` / `renewal_unavailable`.
+RENEWAL_REFUSALS = frozenset({
+    "renewal_identity_invalid", "renewal_credential_expired",
+    "renewal_credential_not_admitted", "renewal_request_invalid", "renewal_not_eligible",
+    "renewal_ca_validity_insufficient", "renewal_signer_refused",
+    "renewal_signer_unavailable", "renewal_busy", "renewal_unavailable",
+})
+
+
 class FrameType(IntEnum):
     HEARTBEAT = 0x01
     HEARTBEAT_ACK = 0x02
     LIVE_FRAME = 0x10
+    RENEWAL_REQUEST = 0x20
+    RENEWAL_REPLY = 0x21
     CLOSE = 0x7F
 
 
@@ -220,6 +250,46 @@ def encode_live_frame(source_id: UUID, jpeg: bytes) -> bytes:
         raise ValueError("invalid live frame")
     body = source_id.bytes + jpeg
     return HEADER.pack(len(body), int(FrameType.LIVE_FRAME)) + body
+
+
+def parse_renewal_request(body: bytes) -> bytes:
+    """The CSR PEM of a ``RENEWAL_REQUEST``; any other shape is ``renewal_request_invalid``.
+
+    Only the frame's form is checked here (one ASCII PEM CSR); the CSR itself
+    is checked by the renewal (``renewal.renew_node_credential``), whose
+    refusal is answered, not a reason to close.
+    """
+    if not isinstance(body, bytes) or len(body) > MAXIMUM_RENEWAL_REQUEST_BODY_BYTES:
+        raise WireRefused("renewal_request_invalid")
+    try:
+        value = parse_json_object(body)
+    except WireRefused:
+        raise WireRefused("renewal_request_invalid") from None
+    csr = value.get("csr") if set(value) == {"csr"} else None
+    if (not isinstance(csr, str) or not csr.isascii()
+            or not csr.lstrip().startswith(_CSR_PEM_START)):
+        raise WireRefused("renewal_request_invalid")
+    return csr.encode("ascii")
+
+
+def encode_renewal_reply(*, certificate_pem: bytes | None = None,
+                         reason: str | None = None) -> bytes:
+    """One ``RENEWAL_REPLY`` frame: an issued certificate, or a fixed refusal word."""
+    if (certificate_pem is None) == (reason is None):
+        raise ValueError("invalid renewal reply")
+    if certificate_pem is not None:
+        if (not isinstance(certificate_pem, bytes) or not certificate_pem.isascii()
+                or not certificate_pem.lstrip().startswith(_CERTIFICATE_PEM_START.encode())):
+            raise ValueError("invalid renewal reply")
+        payload = {"status": "issued", "certificate": certificate_pem.decode("ascii")}
+    else:
+        if reason not in RENEWAL_REFUSALS:
+            raise ValueError("invalid renewal reply")
+        payload = {"status": "refused", "reason": reason}
+    frame = encode_frame(FrameType.RENEWAL_REPLY, payload)
+    if len(frame) - HEADER.size > MAXIMUM_RENEWAL_REPLY_BODY_BYTES:
+        raise ValueError("invalid renewal reply")
+    return frame
 
 
 def encode_frame(kind: FrameType, payload: dict) -> bytes:

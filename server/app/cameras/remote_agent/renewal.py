@@ -28,8 +28,9 @@ ledger-admitted mTLS session. This module is the Main side of that exchange:
   ``capture_trust_warning`` instead, as do an expiring CA and an expiring Main
   listener certificate when the monitor is given their expiry.
 
-No listener or wire protocol is added here; #14/#15 carry the renewal request
-over the ingest session.
+The ingest listener (``ingest_server``) carries the Agent's request over the
+admitted ingest session (``RENEWAL_REQUEST`` / ``RENEWAL_REPLY``, ADR-0007
+addendum 2026-11-16) and calls ``SessionRenewal``.
 
 Signing path (Issue #109 PR2). Renewal needs a signature while the node is
 connected, so it cannot use the one-shot approval issuer. In a deployment
@@ -41,9 +42,9 @@ unsuperseded and unrevoked certificate near expiry, fresh key, rate limits);
 its refusals are ``renewal_signer_refused`` and an unreachable or undecided
 signer is ``renewal_signer_unavailable``, both Owner-visible like any other
 refusal. An in-process ``DeploymentAuthority`` still satisfies
-``RenewalIssuer`` for tests of the ledger rules only. The ingest listener does
-not carry renewal yet; that wiring (ADR-0007) constructs only the signer
-issuer.
+``RenewalIssuer`` for tests of the ledger rules only. The ingest listener's
+``SessionRenewal`` constructs only the signer issuer, from the public
+``DeploymentTrust`` and the session's presented certificate.
 """
 from __future__ import annotations
 
@@ -60,7 +61,10 @@ from .node_ca import (
     DEFAULT_NODE_VALIDITY, AuthorityValidityExceeded, CaptureAuthorityError, IssuedNodeCredential,
 )
 from .pairing import PairingError, PairingLedger
-from .renewal_signer import RenewalSignerRefused, RenewalSignerUnavailable
+from .renewal_signer import (
+    CLIENT_TIMEOUT_SECONDS, RENEWAL_SIGNER_SOCKET, RenewalSignerRefused,
+    RenewalSignerUnavailable, SignerRenewalIssuer,
+)
 
 
 RENEWAL_WINDOW = datetime.timedelta(days=30)
@@ -184,6 +188,59 @@ def renew_node_credential(authority: RenewalIssuer, ledger: PairingLedger,
             monitor.renewal_refused(identity if isinstance(identity, CaptureNodeIdentity) else None,
                                     refusal.reason)
         raise
+
+
+class SessionRenewal:
+    """The ingest listener's renewal of one admitted session (Issue #109).
+
+    ``renew(identity, presented_certificate_der, csr_pem)`` builds a
+    ``SignerRenewalIssuer`` from the public ``DeploymentTrust`` and exactly
+    the session's presented certificate (the issuer refuses a certificate
+    ``identity`` was not derived from), then runs ``renew_node_credential``:
+    the ledger's eligibility, same-key retry and staging stay there, and the
+    signer is reached over its Unix socket (at most ``timeout`` seconds).
+    It returns the certificate PEM or raises ``RenewalRefused`` with a fixed
+    word. It blocks for up to the signer timeout, so the listener calls it
+    off its session threads, with bounded concurrency. Holding a
+    ``DeploymentAuthority`` here is refused: the service never loads the CA
+    key.
+    """
+
+    def __init__(self, trust, ledger: PairingLedger, admission: CaptureNodeAdmission, *,
+                 socket_path=RENEWAL_SIGNER_SOCKET, timeout: float = CLIENT_TIMEOUT_SECONDS,
+                 connect=None, monitor: "CaptureCredentialMonitor | None" = None):
+        from .node_ca import DeploymentAuthority, DeploymentTrust
+        if isinstance(trust, DeploymentAuthority) or not isinstance(trust, DeploymentTrust):
+            raise ValueError("renewal_signer_requires_public_trust")
+        if (not isinstance(ledger, PairingLedger)
+                or not isinstance(admission, CaptureNodeAdmission)
+                or type(timeout) not in (int, float) or not 0 < timeout <= 60
+                or (connect is not None and not callable(connect))):
+            raise ValueError("invalid session renewal dependency")
+        self._trust = trust
+        self._ledger = ledger
+        self._admission = admission
+        self._socket_path = socket_path
+        self._timeout = float(timeout)
+        self._connect = connect
+        self._monitor = monitor
+
+    def __call__(self, identity: CaptureNodeIdentity, presented_certificate_der: bytes,
+                 csr_pem: bytes) -> bytes:
+        try:
+            issuer = SignerRenewalIssuer(self._trust, identity, presented_certificate_der,
+                                         socket_path=self._socket_path, timeout=self._timeout,
+                                         connect=self._connect)
+        except ValueError:
+            refusal = RenewalRefused("renewal_identity_invalid")
+            if self._monitor is not None:
+                self._monitor.renewal_refused(
+                    identity if isinstance(identity, CaptureNodeIdentity) else None,
+                    refusal.reason)
+            raise refusal from None
+        issued = renew_node_credential(issuer, self._ledger, self._admission, identity, csr_pem,
+                                       monitor=self._monitor)
+        return issued.certificate_pem
 
 
 def ca_expiry_reason(now: datetime.datetime, ca_not_after: datetime.datetime | None, *,

@@ -1580,8 +1580,14 @@ check before its certificate expires: as root,
 for its installed certificate), and confirm the matching line is a
 `"type":"node"` record for that `node_id`. Without one, re-pair the node (MANUAL_TEST §B 15)
 before it expires.
-The ingest session does not carry renewal requests yet, so the socket is idle
-until that wiring ships; installing it early is harmless.
+The ingest listener asks the signer when a connected Agent's certificate is
+within 30 days of expiry (ADR-0007 addendum 2026-11-16). Without the socket
+units, every renewal is answered `renewal_signer_unavailable` and the Agent
+keeps retrying with its back-off until its certificate expires, after which
+it must re-pair, so install them before the first node certificate enters
+its 30-day window. The Agent's service interpreter must be able to import
+`cryptography` for renewal (its status line shows
+`"renewal": "renewal_dependency_unavailable"` otherwise).
 
 **Back up the CA directory.** Losing `ca-key.pem` means a new `init` and
 re-pairing every Agent; losing `issuance-log.jsonl` loses the CA-side record

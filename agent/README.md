@@ -42,6 +42,26 @@ memory for the live view only. The connection sets `TCP_NOTSENT_LOWAT`
 (128 KiB), so frames never queue megabytes of unsent bytes ahead of a
 heartbeat and widen its clock exchange.
 
+The node credential renews over the same session (Issue #109, ADR-0007
+addendum 2026-11-16; mock/loopback-verified only). From 30 days before the
+installed certificate expires (`node_tls.RenewalSchedule`), after an
+acknowledged heartbeat the session sends a `RENEWAL_REQUEST` (`0x20`,
+`{"csr": <PEM>}`) on the heartbeat's connection, under the same lock as the
+heartbeat and the live frames; it never connects for it, and at most one
+request is outstanding. The Main's `RENEWAL_REPLY` (`0x21`) comes directly
+before a later heartbeat's ack: an issued certificate is installed as a new
+credential generation (`node_tls.complete_renewal`) and the session
+reconnects with it at once; a refusal word, no reply within 60 s or a lost
+connection keeps the current credential and retries after 1 hour, doubling
+to 24 hours, with the same pending key. The status line then carries the
+fixed word as `"renewal"` (for example `renewal_requested`,
+`renewal_installed`, `renewal_signer_unavailable`,
+`renewal_unsupported_by_main` for a Main release without renewal, or
+`renewal_credential_expired`, after which only re-pairing helps).
+`credential_renewal.py` imports `node_tls`, and so `cryptography`, only when
+it first checks, so the service still starts without it; renewal then
+reports `renewal_dependency_unavailable`.
+
 Cameras are approved locally with the service stopped, as the service
 account, typing `APPROVE` on the controlling terminal:
 

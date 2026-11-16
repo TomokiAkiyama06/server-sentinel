@@ -9,6 +9,7 @@ import threading
 import zipimport
 
 from .config import ConfigurationError, Settings
+from .credential_renewal import CredentialRenewal
 from .ingest_session import IngestSession
 from .pairing import NodeCredentialStore
 from .runtime import Agent, UnconfiguredIngestSession
@@ -149,7 +150,10 @@ def main(argv=None):
         # Issue #14: the ingest session opens only with a configured endpoint;
         # `--check` builds it but never connects.
         credentials = NodeCredentialStore(settings.runtime_root, owner_uid=settings.service_uid)
-        session = (IngestSession(credentials, settings.main_ingest, settings.node_id)
+        # Issue #109: the credential renews over the same session; its
+        # `cryptography` use is imported only when the renewal first checks.
+        session = (IngestSession(credentials, settings.main_ingest, settings.node_id,
+                                 renewal=CredentialRenewal(credentials))
                    if settings.main_ingest is not None
                    else UnconfiguredIngestSession(credentials))
         # The Agent's account, runtime-root and node-identity checks come
@@ -186,9 +190,13 @@ def main(argv=None):
         while not stopped.is_set():
             heartbeat = agent.tick()
             # Operational status only; no media, device paths or raw exceptions.
-            print(json.dumps({"service": "media-capture-agent",
-                              "node_state": heartbeat["node_state"],
-                              "reasons": heartbeat["node_reasons"]}), flush=True)
+            status = {"service": "media-capture-agent", "node_state": heartbeat["node_state"],
+                      "reasons": heartbeat["node_reasons"]}
+            # Issue #109: the credential renewal's fixed word, when it has one.
+            renewal = getattr(session, "renewal_status", None)
+            if renewal is not None:
+                status["renewal"] = renewal
+            print(json.dumps(status), flush=True)
             # A new session's first acknowledgement gives the clock exchange:
             # send the next heartbeat at once rather than a whole interval
             # later (once per session; `Agent.tick`).
